@@ -14,13 +14,21 @@
 //! | syscalls | condition | action |
 //! |---|---|---|
 //! | `chmod`, `fchmod`, `fchmodat`, `fchmodat2` | mode has `S_ISUID\|S_ISGID` | `EPERM` |
-//! | `setxattr`, `lsetxattr`, `fsetxattr` | always | `ENOTSUP` |
+//! | `setxattr`, `lsetxattr`, `fsetxattr`, `setxattrat` | always | `ENOTSUP` |
+//! | `getxattr`, `lgetxattr`, `fgetxattr`, `getxattrat` | always | `ENOTSUP` |
 //! | anything else | | allow |
 //! | unknown `seccomp_data.arch` | | kill |
 //!
-//! Only the *set* half of the xattr family is filtered: purity requires
-//! preventing xattr creation; reading them back is harmless (there are
-//! none to read inside the sandbox).
+//! The *set* half is what purity actually requires: an xattr/ACL that
+//! the output archive cannot represent must fail loudly inside the
+//! build instead of being stripped after the fact. The *get* half is
+//! denied as well because the CppNix sandbox returns `ENOTSUP` for
+//! xattr reads, and the differential oracle therefore expects
+//! probe-style builds to observe that errno; the list/remove calls stay
+//! allowed on both sides. The kernel ≥ 6.13 `*xattrat` spellings of the
+//! same operations are included so they cannot bypass the rule
+//! (CppNix 2.34 does not know them yet; Lix's allowlist filter rejects
+//! them with `ENOSYS`).
 //!
 //! # Why the program is hand-assembled
 //!
@@ -69,6 +77,13 @@ const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 /// representable in the output archive and stays allowed.
 const SETID_BITS: u32 = 0o6000;
 
+/// `setxattrat`/`getxattrat` (kernel ≥ 6.13) use the post-6.6 unified
+/// syscall numbering — the same number on every ABI, exactly like
+/// `fchmodat2` = 452 in the tables below. libc 0.2 does not export them
+/// for every target yet, so they are spelled out here.
+const SYS_SETXATTRAT: u32 = 463;
+const SYS_GETXATTRAT: u32 = 464;
+
 /// Byte offsets into `struct seccomp_data` (`include/uapi/linux/seccomp.h`):
 /// `{ int nr; __u32 arch; __u64 instruction_pointer; __u64 args[6]; }`.
 const OFF_NR: u32 = 0;
@@ -94,7 +109,8 @@ compile_error!(
 /// One syscall ABI's view of the filtered syscalls: the
 /// `seccomp_data.arch` token that selects the table, the
 /// `(syscall_nr, index_of_the_mode_argument)` pairs for the
-/// chmod family, and the unconditional-`ENOTSUP` xattr-set numbers.
+/// chmod family, and the unconditionally-`ENOTSUP` xattr numbers
+/// (the set and get families plus their `*at` forms).
 struct AbiTable {
     /// Human-readable ABI label. Only read by the test suite's
     /// assertion messages; the emitted program identifies an ABI by
@@ -103,7 +119,7 @@ struct AbiTable {
     name: &'static str,
     arch: u32,
     chmod_like: &'static [(u32, u32)],
-    xattr_set: &'static [u32],
+    xattr_enotsup: &'static [u32],
 }
 
 /// The mode argument is `args[1]` for `chmod(path, mode)` and
@@ -141,13 +157,23 @@ const ABIS: &[AbiTable] = &[
                 MODE_ARG_CHMODAT,
             ),
         ],
-        xattr_set: &[
+        xattr_enotsup: &[
             libc::SYS_setxattr as u32,
             libc::SYS_lsetxattr as u32,
             libc::SYS_fsetxattr as u32,
+            libc::SYS_getxattr as u32,
+            libc::SYS_lgetxattr as u32,
+            libc::SYS_fgetxattr as u32,
+            SYS_SETXATTRAT,
+            SYS_GETXATTRAT,
             libc::SYS_setxattr as u32 | X32_SYSCALL_BIT,
             libc::SYS_lsetxattr as u32 | X32_SYSCALL_BIT,
             libc::SYS_fsetxattr as u32 | X32_SYSCALL_BIT,
+            libc::SYS_getxattr as u32 | X32_SYSCALL_BIT,
+            libc::SYS_lgetxattr as u32 | X32_SYSCALL_BIT,
+            libc::SYS_fgetxattr as u32 | X32_SYSCALL_BIT,
+            SYS_SETXATTRAT | X32_SYSCALL_BIT,
+            SYS_GETXATTRAT | X32_SYSCALL_BIT,
         ],
     },
     AbiTable {
@@ -158,14 +184,15 @@ const ABIS: &[AbiTable] = &[
         // and fchmod=94 (the v7-inherited block), fchmodat=306 (the
         // 2.6.16 *at block, 295..=307), fchmodat2=452 (the post-6.6
         // unified numbering shared by every ABI), setxattr/lsetxattr/
-        // fsetxattr = 226/227/228 (the 2.6.0 xattr block, 226..=237).
+        // fsetxattr = 226/227/228 and getxattr/lgetxattr/fgetxattr =
+        // 229/230/231 (the 2.6.0 xattr block, 226..=237).
         chmod_like: &[
             (15, MODE_ARG_CHMOD),
             (94, MODE_ARG_CHMOD),
             (306, MODE_ARG_CHMODAT),
             (452, MODE_ARG_CHMODAT),
         ],
-        xattr_set: &[226, 227, 228],
+        xattr_enotsup: &[226, 227, 228, 229, 230, 231, SYS_SETXATTRAT, SYS_GETXATTRAT],
     },
 ];
 
@@ -184,10 +211,15 @@ const ABIS: &[AbiTable] = &[
             (libc::SYS_fchmodat as u32, MODE_ARG_CHMODAT),
             (libc::SYS_fchmodat2 as u32, MODE_ARG_CHMODAT),
         ],
-        xattr_set: &[
+        xattr_enotsup: &[
             libc::SYS_setxattr as u32,
             libc::SYS_lsetxattr as u32,
             libc::SYS_fsetxattr as u32,
+            libc::SYS_getxattr as u32,
+            libc::SYS_lgetxattr as u32,
+            libc::SYS_fgetxattr as u32,
+            SYS_SETXATTRAT,
+            SYS_GETXATTRAT,
         ],
     },
     AbiTable {
@@ -195,14 +227,15 @@ const ABIS: &[AbiTable] = &[
         arch: AUDIT_ARCH_ARM,
         // arch/arm/tools/syscall.tbl (EABI): chmod=15, fchmod=94,
         // fchmodat=333 (arm's *at block is 322..=334), fchmodat2=452,
-        // setxattr/lsetxattr/fsetxattr=226/227/228.
+        // setxattr/lsetxattr/fsetxattr=226/227/228 and getxattr/
+        // lgetxattr/fgetxattr=229/230/231.
         chmod_like: &[
             (15, MODE_ARG_CHMOD),
             (94, MODE_ARG_CHMOD),
             (333, MODE_ARG_CHMODAT),
             (452, MODE_ARG_CHMODAT),
         ],
-        xattr_set: &[226, 227, 228],
+        xattr_enotsup: &[226, 227, 228, 229, 230, 231, SYS_SETXATTRAT, SYS_GETXATTRAT],
     },
 ];
 
@@ -414,7 +447,7 @@ pub(crate) fn build_filter() -> Vec<sock_filter> {
             a.ld_abs(OFF_NR);
             a.bind(skip);
         }
-        for &nr in abi.xattr_set {
+        for &nr in abi.xattr_enotsup {
             a.jeq(nr, Jump::To(enotsup), Jump::Next);
         }
 
@@ -636,22 +669,60 @@ mod tests {
         }
     }
 
-    /// Every xattr-set entry of every registered ABI returns ENOTSUP
-    /// regardless of arguments.
+    /// Every xattr entry (set and get families plus their `*at` forms)
+    /// of every registered ABI returns ENOTSUP regardless of arguments.
     #[test]
-    fn xattr_set_family_is_enotsup_per_abi() {
+    fn xattr_family_is_enotsup_per_abi() {
         let prog = build_filter();
         for abi in ABIS {
-            for &nr in abi.xattr_set {
+            for &nr in abi.xattr_enotsup {
                 let d = Data::new(abi.arch, nr).arg(1, 0o6777);
                 assert_eq!(
                     run(&prog, &d),
                     ENOTSUP_RET,
-                    "{}: xattr-set nr {nr:#x} should be ENOTSUP",
+                    "{}: xattr nr {nr:#x} should be ENOTSUP",
                     abi.name
                 );
             }
         }
+    }
+
+    /// The deny boundary is exactly the get/set halves: the list and
+    /// remove calls stay allowed (matching both CppNix and Lix), and the
+    /// post-6.13 unified-numbering forms are denied under every
+    /// registered ABI while `listxattrat` (465) stays allowed.
+    #[test]
+    fn xattr_list_and_remove_stay_allowed() {
+        let prog = build_filter();
+        let native = ABIS[0].arch;
+        for nr in [
+            libc::SYS_listxattr as u32,
+            libc::SYS_llistxattr as u32,
+            libc::SYS_flistxattr as u32,
+            libc::SYS_removexattr as u32,
+            libc::SYS_lremovexattr as u32,
+            libc::SYS_fremovexattr as u32,
+            465, // listxattrat
+            466, // removexattrat
+        ] {
+            assert_eq!(
+                run(&prog, &Data::new(native, nr)),
+                ALLOW,
+                "nr {nr} should stay allowed"
+            );
+        }
+        assert_eq!(run(&prog, &Data::new(native, SYS_SETXATTRAT)), ENOTSUP_RET);
+        assert_eq!(run(&prog, &Data::new(native, SYS_GETXATTRAT)), ENOTSUP_RET);
+        assert_eq!(
+            run(&prog, &Data::new(ABIS[1].arch, SYS_SETXATTRAT)),
+            ENOTSUP_RET,
+            "unified numbering also covered on the 32-bit sibling ABI"
+        );
+        assert_eq!(
+            run(&prog, &Data::new(native, libc::SYS_getxattr as u32)),
+            ENOTSUP_RET,
+            "the read half is denied for oracle parity"
+        );
     }
 
     /// Unfiltered syscalls are allowed under every registered ABI; an
