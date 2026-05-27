@@ -437,6 +437,67 @@ message HeartbeatResponse {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
+// Pull-mode dispatch (ExecutorService.PullAssignment / ReportOutcome)
+// ───────────────────────────────────────────────────────────────────────────
+
+// The pull-mode pod's one ask: "give me the work I was spawned for."
+message PullAssignmentRequest {
+  // The HMAC-signed executor token injected at Job spawn
+  // (RIO_EXECUTOR_TOKEN). Same credential the stream/heartbeat path
+  // carries in `x-rio-executor-token` metadata; carried in the body
+  // here so the unary is self-contained for clients that cannot set
+  // per-call metadata. The scheduler accepts either carrier and
+  // verifies the token↔intent binding before any state is touched
+  // (sec.executor.identity-token, applied per-unary).
+  string executor_token = 1;
+  // The SpawnIntent.intent_id (== drv hash) this pod was spawned for
+  // (RIO_INTENT_ID). Must match the token's attested intent.
+  string intent_id = 2;
+}
+
+// The drv is no longer wanted (cancelled, substituted, completed,
+// queue re-solved). The pod exits 0; the Job completes successfully and
+// charges nothing.
+message Gone {}
+
+// The drv is still wanted but not currently deliverable to THIS pod:
+// its dependencies are not yet built (forecast-spawned pod arrived
+// early), or the drv is currently open on another executor (a stream
+// assignment during coexistence, or an open attempt bound to a
+// different pod). Never a write; the pod re-pulls after retry_after.
+message NotYetReady {
+  // Server-suggested re-pull delay in seconds. The pod adds jitter.
+  uint32 retry_after_seconds = 1;
+}
+
+message PullAssignmentResponse {
+  oneof outcome {
+    // Deps Ready and the open attempt is bound to this pod: the
+    // existing dispatch payload, identical on every re-pull while the
+    // attempt is open. `WorkAssignment.generation` is observability
+    // only on this path — the generation fence is transaction-side.
+    WorkAssignment assignment = 1;
+    Gone gone = 2;
+    NotYetReady not_yet_ready = 3;
+  }
+}
+
+// Terminal outcome for a pulled assignment, idempotent by exec_id.
+message ReportOutcomeRequest {
+  // The per-execution identifier the PullAssignment payload carried
+  // (`WorkAssignment.exec_id`). Identifies the open attempt; a report
+  // for an unknown/never-pulled exec_id is acknowledged and ignored.
+  string exec_id = 1;
+  // Today's completion payload, unchanged (drv_path, BuildResult,
+  // telemetry, final_line_count).
+  CompletionReport report = 2;
+}
+
+// Empty ack. Returned only after the scheduler's appending transaction
+// committed — the pod may exit 0 once it has this.
+message ReportOutcomeResponse {}
+
+// ───────────────────────────────────────────────────────────────────────────
 // Build status (QueryBuildStatus)
 // ───────────────────────────────────────────────────────────────────────────
 

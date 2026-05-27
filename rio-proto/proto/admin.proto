@@ -61,6 +61,35 @@ service AdminService {
   rpc ReportExecutorTermination(rio.types.ReportExecutorTerminationRequest)
       returns (rio.types.ReportExecutorTerminationResponse);
 
+  // ─── Pull-mode attempt lifecycle (additive; controller-facing) ──────
+
+  // Controller reports the terminal status of one attempt (pod/Job
+  // terminal classification, or a synthesized cancel/preempt/reap
+  // verdict emitted when the controller deletes a Job that still has an
+  // open attempt). The C4/C5 unification: replaces both
+  // ReportExecutorTermination and the deadline-exceeded Job report for
+  // pull-mode attempts (the old RPC keeps serving stream-mode pools
+  // until the deletion wave). Idempotency key: the attempt identity
+  // (exec_id preferred; intent_id / job_name accepted) — the fill is
+  // the existing second-installment column fill (first writer wins); a
+  // report for an identity with NO attempt row (a pod that died
+  // without ever completing a pull) is acknowledged and charges
+  // nothing — no insert, no budget consumption, no floor bump, no
+  // establishment; its only permitted side effects are clearing the
+  // intent's ICE cell and re-arming the spawn intent.
+  rpc ReportAttemptOutcome(rio.types.ReportAttemptOutcomeRequest)
+      returns (rio.types.ReportAttemptOutcomeResponse);
+
+  // Ledger-backed open-attempt view: every open pull-mode attempt
+  // (active assignment ⋈ execution, dispatch_mode = 'pull', no
+  // terminal fill yet). Serves the controller's busy-signal bridge
+  // (orphan-reap consults it), the cancel/preempt read, the OA2
+  // node-clustering aggregation, and the operator fleet view (OA5).
+  // Stream-mode executors are NOT listed here — `ListExecutors` stays
+  // the stream-fleet surface, untouched.
+  rpc ListOpenAttempts(rio.types.ListOpenAttemptsRequest)
+      returns (rio.types.ListOpenAttemptsResponse);
+
   // Clear a poisoned derivation so it can be retried.
   rpc ClearPoison(rio.types.ClearPoisonRequest) returns (rio.types.ClearPoisonResponse);
 

@@ -25,4 +25,34 @@ service ExecutorService {
   // Heartbeat with the same executor_id. Only then is the executor eligible
   // for assignments.
   rpc Heartbeat(rio.types.HeartbeatRequest) returns (rio.types.HeartbeatResponse);
+
+  // ─── Pull-mode dispatch (additive; coexists with the stream path) ──────
+  //
+  // A pull-mode pod is born knowing its derivation (RIO_INTENT_ID +
+  // HMAC executor token injected at Job spawn) and speaks exactly two
+  // idempotent unaries instead of the registration/heartbeat/stream
+  // session above. Nothing in the stream path changes; a pool opts in
+  // per its dispatch mode.
+
+  // The pod's first and only ask. Leader-served, three-outcome:
+  // WorkAssignment (the existing payload, deps Ready, this pod now owns
+  // the open attempt), Gone (drv no longer wanted — pod exits 0,
+  // charge-free), or NotYetReady{retry_after_seconds} (wanted but not
+  // currently deliverable to THIS pod — deps not yet built, or the drv
+  // is open on another executor; the pod re-pulls after the suggested
+  // delay). Idempotency key: the open attempt for (intent, pod) — a
+  // re-pull while the attempt is open returns the identical payload and
+  // exec_id; the bind/transition/mint/pin writes happen exactly once,
+  // fenced by the serving replica's lease generation against the
+  // durable claims floor.
+  rpc PullAssignment(rio.types.PullAssignmentRequest) returns (rio.types.PullAssignmentResponse);
+
+  // Terminal outcome report for a pulled assignment. Leader-served,
+  // retried by the pod until acked; the ack is returned only after the
+  // appending transaction commits (the pod's exit-0 depends on it).
+  // Idempotency key: exec_id — a duplicate or post-establishment report
+  // is acknowledged and ignored (the row-already-terminal guard); a
+  // report whose exec_id matches no open attempt acknowledges and
+  // writes nothing.
+  rpc ReportOutcome(rio.types.ReportOutcomeRequest) returns (rio.types.ReportOutcomeResponse);
 }

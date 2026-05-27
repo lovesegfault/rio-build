@@ -174,6 +174,88 @@ message ReportExecutorTerminationResponse {
   bool promoted = 1;
 }
 
+// ───────────────────────────────────────────────────────────────────────────
+// Pull-mode attempt lifecycle (AdminService.ReportAttemptOutcome /
+// ListOpenAttempts)
+// ───────────────────────────────────────────────────────────────────────────
+
+// Why an attempt's pod/Job went terminal, as classified by the
+// controller. Covers both the k8s pod-terminal classifications (the
+// TerminationReason vocabulary) and the controller-synthesized
+// verdicts emitted when it deletes a Job that still has an open
+// attempt (cancelled / preempted / reaped).
+enum AttemptTerminalReason {
+  // Wire-default: controller couldn't classify. Scheduler treats the
+  // fill as an unclassified pod-terminal.
+  ATTEMPT_TERMINAL_REASON_UNSPECIFIED = 0;
+  ATTEMPT_TERMINAL_REASON_OOM_KILLED = 1;
+  ATTEMPT_TERMINAL_REASON_EVICTED_DISK_PRESSURE = 2;
+  ATTEMPT_TERMINAL_REASON_EVICTED_OTHER = 3;
+  // Pod exited 0 (expected one-shot exit after the outcome report).
+  ATTEMPT_TERMINAL_REASON_COMPLETED = 4;
+  // Pod exited nonzero, non-OOM (panic, node failure, report never acked).
+  ATTEMPT_TERMINAL_REASON_ERROR = 5;
+  // Job hit activeDeadlineSeconds.
+  ATTEMPT_TERMINAL_REASON_DEADLINE_EXCEEDED = 6;
+  // Synthesized by the controller on Job deletion for a cancelled build.
+  ATTEMPT_TERMINAL_REASON_CANCELLED = 7;
+  // Synthesized by the controller on DisruptionTarget preemption.
+  ATTEMPT_TERMINAL_REASON_PREEMPTED = 8;
+  // Synthesized by the controller when a reap path deletes the Job.
+  ATTEMPT_TERMINAL_REASON_REAPED = 9;
+}
+
+message ReportAttemptOutcomeRequest {
+  // Attempt identity — exec_id preferred when known; intent_id (== drv
+  // hash) and job_name accepted (the Job name is derived from the
+  // intent, so either resolves to the same open attempt). At least one
+  // must be set.
+  string intent_id = 1;
+  string job_name = 2;
+  string exec_id = 3;
+  AttemptTerminalReason reason = 4;
+  // kube-authoritative spec.nodeName the pod ran on, when known.
+  // Persisted as the attempt's source attribution (AD2c).
+  string node_name = 5;
+}
+
+// Empty ack: the report is recorded (or was already recorded / matched
+// no attempt and was deliberately ignored). Always returned on success
+// so the controller never retries on semantics, only on transport.
+message ReportAttemptOutcomeResponse {}
+
+message ListOpenAttemptsRequest {}
+
+// One open pull-mode attempt: an active assignment + execution pair
+// minted by PullAssignment with no terminal classification yet.
+message OpenAttempt {
+  // SpawnIntent.intent_id == drv hash (the DAG key).
+  string intent_id = 1;
+  // Full .drv store path, when resolvable.
+  string derivation = 2;
+  // Per-execution identifier (UUIDv7) minted by the pull transaction.
+  string exec_id = 3;
+  // Executor identity the attempt is bound to (the HMAC-attested
+  // intent identity for pull-mode attempts).
+  string executor_id = 4;
+  // kube-authoritative node the pod was bound to, when known ("" = unknown).
+  string source_node = 5;
+  // Lease generation the pull transaction committed under.
+  uint64 generation = 6;
+  // Seconds since the assignment row was (re)written by the pull.
+  uint64 assigned_at_age_secs = 7;
+  // The intent deadline (activeDeadlineSeconds basis) in seconds, when
+  // known to the scheduler; 0 = unknown.
+  uint64 deadline_secs = 8;
+}
+
+message ListOpenAttemptsResponse {
+  repeated OpenAttempt attempts = 1;
+  // Seconds since this replica acquired leadership — same fail-closed
+  // input shape as ListExecutorsResponse.leader_for_secs.
+  uint64 leader_for_secs = 2;
+}
+
 message ClearPoisonRequest {
   // Key the scheduler's DAG is keyed on — in production this is the
   // full .drv store path (e.g. `/nix/store/abc...-foo.drv`). rio-cli

@@ -104,6 +104,10 @@ service ExecutorService {
   // executor sends log batches + completion reports + ack messages
   rpc BuildExecution(stream ExecutorMessage) returns (stream SchedulerMessage);
   rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+  // Pull-mode dispatch (additive): a pod born knowing its derivation asks
+  // for it and reports the outcome; no registration, heartbeat, or stream.
+  rpc PullAssignment(PullAssignmentRequest) returns (PullAssignmentResponse);
+  rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
 }
 ```
 
@@ -116,6 +120,27 @@ service ExecutorService {
   `BuildExecution` stream. Periodic heartbeats update resource usage. See the
   rio-scheduler chapter §Executor registration protocol for deregistration
   rules.
+]
+
+#info(title: [Pull-mode dispatch messages])[
+  `PullAssignmentRequest{executor_token, intent_id}` →
+  `PullAssignmentResponse{oneof outcome: WorkAssignment | Gone |
+  NotYetReady{retry_after_seconds}}`: the pull-mode pod's single ask. The
+  `WorkAssignment` arm reuses the existing dispatch payload unchanged (its
+  `generation` field is observability-only on this path --- the fence is
+  transaction-side). `ReportOutcomeRequest{exec_id, CompletionReport}` →
+  `ReportOutcomeResponse{}` carries today's completion payload, idempotent
+  by `exec_id`. On the admin surface,
+  `ReportAttemptOutcomeRequest{intent_id, job_name, exec_id,
+  AttemptTerminalReason, node_name}` is the controller's unified
+  pod-terminal classification (the C4/C5 unification), and
+  `ListOpenAttemptsRequest{}` → `ListOpenAttemptsResponse{repeated
+  OpenAttempt, leader_for_secs}` is the ledger-backed open-attempt view
+  (intent id, derivation, exec_id, executor identity, source node,
+  generation, assignment age, deadline) that serves the controller's busy
+  bridge and the operator fleet view. Semantics live in the rio-scheduler
+  chapter §Pull-Mode Dispatch, the rio-controller chapter §Pull-mode
+  attempt lifecycle, and the rio-builder chapter §Pull-Mode Client.
 ]
 
 ```protobuf
@@ -196,6 +221,8 @@ service AdminService {
   rpc ListPoisoned(Empty) returns (ListPoisonedResponse);
   rpc InspectBuildDag(InspectBuildDagRequest) returns (InspectBuildDagResponse);  // actor in-memory DAG snapshot (I-025 diag)
   rpc DebugListExecutors(Empty) returns (DebugListExecutorsResponse);             // actor in-memory executor map (I-048b/c diag)
+  rpc ReportAttemptOutcome(ReportAttemptOutcomeRequest) returns (ReportAttemptOutcomeResponse);  // pull-mode pod-terminal classification (C4/C5 unification)
+  rpc ListOpenAttempts(ListOpenAttemptsRequest) returns (ListOpenAttemptsResponse);              // ledger-backed open pull-mode attempts (busy bridge + OA5 fleet view)
 }
 ```
 

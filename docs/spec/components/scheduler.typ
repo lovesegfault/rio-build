@@ -2394,6 +2394,105 @@ isolation.
   healthy gateways means the gateway-side cancel is not firing.
 ]
 
+= Pull-Mode Dispatch (additive)
+
+The pull/report path replaces the session protocol for pools that opt in
+(`dispatchMode: Pull`): a pod born knowing its derivation speaks two
+idempotent unaries --- `ExecutorService.PullAssignment` and
+`ExecutorService.ReportOutcome` --- and the controller folds pod/Job terminal
+status through `AdminService.ReportAttemptOutcome`. The stream path above is
+untouched during coexistence; everything in this section applies only to
+attempts minted by the pull transaction (`drv_executions.dispatch_mode =
+'pull'`).
+
+#r("sched.executor.pull-transaction")[
+  `PullAssignment(executor_token, intent_id)` MUST be leader-served and MUST
+  perform its work as one atomic transaction: validate the token↔intent
+  binding (#rref("sec.executor.identity-token") applied per-unary), resolve
+  the derivation by intent id, transition it out of Ready, mint `exec_id`,
+  insert the `drv_executions` row (with `dispatch_mode = 'pull'` and
+  `source_node` when known), write or refresh the active `assignments` row
+  carrying the serving generation, pin GC live-inputs, and commit only if
+  the serving generation is not below the durable claims floor (GREATEST
+  over `leader_generation_claims` and `assignments`); a below-floor serving
+  generation MUST abort the transaction with no row written and return the
+  same retryable not-leader error `ensure_leader` produces. A re-pull while
+  the attempt is open and bound to the same pulling identity MUST return
+  the identical payload and `exec_id` without writing anything.
+]
+The fence is transaction-side (the worker-side generation latch has no
+distribution channel without the stream); `WorkAssignment.generation` stays
+on the wire as observability only. The two-believer pull race (two open
+attempts, double charge for one pod death) is closed at the same place the
+work-binding authority lives.
+
+#r("sched.executor.pull-gone")[
+  `PullAssignment` MUST return `Gone` --- and MUST NOT write any state ---
+  when the derivation is no longer wanted by anyone: cancelled, substituted,
+  completed, skipped, failed permanently/poisoned, or absent from the DAG.
+  `Gone` is terminal for the pod: it exits 0, the Job completes, and nothing
+  is charged.
+]
+
+#r("sched.executor.pull-not-ready")[
+  `PullAssignment` MUST return `NotYetReady{retry_after_seconds}` --- never
+  `Gone`, never another attempt's payload, and never a write --- when the
+  derivation is still wanted but not currently deliverable to the pulling
+  pod: its dependencies are not yet built (forecast-spawned pod arrived
+  early), it is being substituted, it is awaiting retry, or it is currently
+  open/Assigned/Running on a different executor (a stream-mode assignment
+  during coexistence, or an open attempt bound to another pod). The pod
+  re-pulls after the suggested delay and exits 0 charge-free if it has
+  received only `NotYetReady` for its idle-timeout bound.
+]
+This is the OA6(a) decision: returning `Gone` for a wanted-but-not-Ready
+derivation would produce a reap→respawn→Gone churn loop (the controller's
+stale-intent reap deletes the terminal Job for a still-wanted intent every
+tick), and delivering while an attempt is open elsewhere would re-point the
+active assignment away from the executor actually building it.
+
+#r("sched.executor.report-idempotent")[
+  `ReportOutcome(exec_id, CompletionReport)` MUST be idempotent by
+  `exec_id`: the first report for an open attempt runs the existing
+  classification path and appends the attempt row exactly once; a duplicate
+  report, a report for an attempt already established or otherwise
+  terminal, or a report whose `exec_id` matches no open attempt MUST be
+  acknowledged and MUST NOT write a second row, a second verdict, or any
+  new state. The ack MUST be returned only after the appending transaction
+  commits.
+]
+
+#r("sched.attempt.no-attempt-no-op")[
+  A pod-terminal report (`ReportAttemptOutcome`) for an attempt identity
+  with no attempt row --- a pod that died, was reaped, or hit its deadline
+  without ever completing a pull --- MUST be acknowledged and MUST charge
+  nothing: no attempt row is inserted, no retry budget is consumed, no
+  resource floor is bumped, and no establishment is triggered; its only
+  permitted side effects are clearing the intent's ICE cell and re-arming
+  the spawn intent.
+]
+This carries forward the as-built rule that never-assigned/assigned-only pod
+deaths never count (the `recently_disconnected` no-entry no-op arms), re-keyed
+onto the durable open-attempt view.
+
+#r("sched.attempt.establishment-window")[
+  The establishment sweep MUST visit every open pull-mode attempt
+  (`dispatch_mode = 'pull'`, no terminal classification) on every sweep, and
+  MUST establish an attempt only after its deadline plus the configured
+  `establishment_report_slack` has elapsed with no terminal row: the
+  store-probe arm adopts the attempt as completed when its outputs are
+  present, otherwise the establishment appends exactly one
+  executor-crash/unreported classification (charged per the existing C2
+  discipline) and requeues the derivation. Establishment MUST never fire
+  inside the window, MUST never visit stream-mode attempts, and the
+  establishing transaction MUST apply the same generation-floor fence as
+  the pull transaction.
+]
+The sweep reads durable rows --- not an in-memory claim a one-shot timer can
+forget --- so the post-failover "deferred claim forgotten" defect class is
+closed structurally. Stream-mode attempts keep the as-built 60 s correlation
+machinery as their only establishment vehicle during coexistence.
+
 = Backpressure
 
 The scheduler applies @backpressure at multiple layers to prevent overload:

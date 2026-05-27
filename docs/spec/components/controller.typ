@@ -758,6 +758,50 @@ the drain. The Job pod template does NOT define a preStop.
   is the fallback if the watcher misses the window.
 ]
 
+== Pull-mode attempt lifecycle (additive)
+
+For pools whose pods dispatch via `PullAssignment`/`ReportOutcome`, the
+controller is the classifier of pod/Job terminal status and the consumer of
+the scheduler's ledger-backed open-attempt view. The stream-mode paths above
+(`ReportExecutorTermination`, `DrainExecutor`, the deadline-exceeded Job
+report) keep serving stream-mode pools unchanged during coexistence.
+
+#r("ctrl.report.attempt-outcome")[
+  The controller MUST fold a pull-mode attempt's pod/Job terminal status to
+  the scheduler as one idempotent `AdminService.ReportAttemptOutcome` call
+  keyed by the attempt identity (exec_id when known, otherwise intent id /
+  Job name), and the scheduler MUST treat it as the second-installment
+  column fill on the existing attempt row (first classifier wins, `WHERE
+  termination_reason IS NULL`); re-reports and reports for already-terminal
+  attempts MUST be acknowledged without writing.
+]
+This is the C4/C5 unification: one idempotent unary replaces the
+terminated-pod report and the deadline-exceeded Job report for pull-mode
+attempts, with no re-report dedup window and no Job-name prefix matching.
+
+#r("ctrl.job.synthesize-on-delete")[
+  Whenever the controller deletes a Job that still has an open pull-mode
+  attempt (cancel, preemption, or any reap path), it MUST synthesize the
+  terminal `ReportAttemptOutcome` (reason cancelled / preempted / reaped as
+  appropriate) for that attempt before or with the foreground deletion;
+  deleting a Job with no open pull-mode attempt MUST NOT synthesize or send
+  anything.
+]
+The deletion destroys the only Job/pod terminal status the unified report
+could otherwise fold; synthesizing keeps requeue at the next fold instead of
+waiting for the establishment sweep.
+
+#r("ctrl.job.busy-from-open-attempts")[
+  During coexistence the orphan-Running reap MUST treat a Job as busy when
+  either the stream-mode busy signal (`ListExecutors.running_build`) or an
+  open pull-mode attempt from `AdminService.ListOpenAttempts` covers it, and
+  MUST keep the existing fail-closed posture: an RPC error on either source
+  means no reap this tick.
+]
+At no point during the transition may the orphan reap evaluate a pull-mode
+pod against the raw stream-registered list alone --- the not-in-list arm
+would foreground-delete every pull-mode build older than the reap grace.
+
 = ComponentScaler
 
 #r("ctrl.scaler.component+2")[

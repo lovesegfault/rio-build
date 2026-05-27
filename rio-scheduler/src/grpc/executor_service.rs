@@ -655,4 +655,30 @@ impl ExecutorService for SchedulerGrpc {
             generation: self.actor.advertised_generation(),
         }))
     }
+
+    // Pull-mode dispatch surface (additive). Stubs until the handler
+    // tasks land: the wire surface exists, nothing in production calls
+    // it, and the stream path above is untouched.
+
+    #[instrument(skip(self, request), fields(rpc = "PullAssignment"))]
+    async fn pull_assignment(
+        &self,
+        request: Request<rio_proto::types::PullAssignmentRequest>,
+    ) -> Result<Response<rio_proto::types::PullAssignmentResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        Err(Status::unimplemented(
+            "PullAssignment is not implemented yet (pull-mode dispatch lands incrementally)",
+        ))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ReportOutcome"))]
+    async fn report_outcome(
+        &self,
+        request: Request<rio_proto::types::ReportOutcomeRequest>,
+    ) -> Result<Response<rio_proto::types::ReportOutcomeResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        Err(Status::unimplemented(
+            "ReportOutcome is not implemented yet (pull-mode dispatch lands incrementally)",
+        ))
+    }
 }

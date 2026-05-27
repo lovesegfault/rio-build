@@ -518,6 +518,32 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 
+    // Pull-mode attempt lifecycle surface (additive). Stubs until the
+    // handler tasks land: the wire surface exists, nothing in
+    // production calls it, and every existing RPC is untouched.
+
+    #[instrument(skip(self, request), fields(rpc = "ReportAttemptOutcome"))]
+    async fn report_attempt_outcome(
+        &self,
+        request: Request<rio_proto::types::ReportAttemptOutcomeRequest>,
+    ) -> Result<Response<rio_proto::types::ReportAttemptOutcomeResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        Err(Status::unimplemented(
+            "ReportAttemptOutcome is not implemented yet (pull-mode dispatch lands incrementally)",
+        ))
+    }
+
+    #[instrument(skip(self, request), fields(rpc = "ListOpenAttempts"))]
+    async fn list_open_attempts(
+        &self,
+        request: Request<rio_proto::types::ListOpenAttemptsRequest>,
+    ) -> Result<Response<rio_proto::types::ListOpenAttemptsResponse>, Status> {
+        rio_proto::interceptor::link_parent(&request);
+        Err(Status::unimplemented(
+            "ListOpenAttempts is not implemented yet (pull-mode dispatch lands incrementally)",
+        ))
+    }
+
     // r[impl sched.admin.list-poisoned]
     #[instrument(skip(self, request), fields(rpc = "ListPoisoned"))]
     async fn list_poisoned(

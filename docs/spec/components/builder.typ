@@ -1369,6 +1369,35 @@ implicit in six cooperating mechanisms.
   materialization failures.
 ]
 
+= Pull-Mode Client (additive)
+
+In pull mode (`dispatch_mode = pull`, selected per pool) the builder does not
+register, heartbeat, or open the `BuildExecution` stream: it asks for its work
+with `ExecutorService.PullAssignment` and reports the outcome with
+`ExecutorService.ReportOutcome`, both retried until acked. The stream-mode
+client below is unchanged and remains the default.
+
+#r("builder.pull.retry-loop")[
+  In pull mode the builder MUST retry an unservable `PullAssignment`
+  (not-leader, recovery-gated, RPC error/timeout) with jittered exponential
+  backoff for as long as the pod lives, MUST re-pull after the suggested
+  `retry_after` on `NotYetReady`, and MUST retry `ReportOutcome` until it is
+  acknowledged or the pod's remaining lifetime is exhausted; the pod never
+  exits merely because the pull cannot land --- `activeDeadlineSeconds`
+  bounds the wait.
+]
+Scheduler unavailability shorter than the Job deadline shows up as pull
+retries (pods parked, building the moment the leader returns), not as Failed
+Jobs.
+
+#r("builder.pull.exit-codes")[
+  In pull mode exit code 0 is reserved for exactly three cases: a `Gone`
+  response, a `ReportOutcome` acknowledged by the scheduler, and the
+  charge-free idle exit after receiving only `NotYetReady` for the
+  `idle_timeout` bound; every other termination MUST exit nonzero so the Job
+  goes Failed and classification arrives via the pod-terminal path.
+]
+
 = Shutdown
 
 #r("builder.idle-exit+2")[
