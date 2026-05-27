@@ -69,16 +69,33 @@ pub enum ParsedEvalLine {
     Error(EvalErrorRecord),
 }
 
+/// Clip an evaluator output line to a short prefix for error messages.
+/// nix-eval-jobs lines can run to tens of kilobytes (large `outputs`
+/// maps), and serde_json errors already report the offending byte
+/// offset, so a 200-character prefix is enough to identify the line
+/// without flooding the error chain.
+fn line_snippet(line: &str) -> String {
+    const MAX_CHARS: usize = 200;
+    let mut chars = line.chars();
+    let snippet: String = chars.by_ref().take(MAX_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{snippet}…")
+    } else {
+        snippet
+    }
+}
+
 pub fn parse_eval_jobs_line(line: &str) -> anyhow::Result<ParsedEvalLine> {
     let raw: RawEvalLine = serde_json::from_str(line)
-        .with_context(|| format!("parse nix-eval-jobs output line: {line}"))?;
+        .with_context(|| format!("parse nix-eval-jobs output line: {}", line_snippet(line)))?;
     let attr = raw.attr.clone().unwrap_or_default();
     if let Some(error) = raw.error {
         return Ok(ParsedEvalLine::Error(EvalErrorRecord { attr, error }));
     }
     let Some(drv_path) = raw.drv_path else {
         anyhow::bail!(
-            "nix-eval-jobs line for attr {attr:?} has neither `error` nor `drvPath`: {line}"
+            "nix-eval-jobs line for attr {attr:?} has neither `error` nor `drvPath`: {}",
+            line_snippet(line)
         );
     };
     if !raw.constituents.is_empty() {
@@ -104,7 +121,7 @@ pub struct EvalOutput {
     pub aggregates: Vec<(String, String)>,
 }
 
-/// Run nix-eval-jobs and parse its stdout. stderr is appended to
+/// Run nix-eval-jobs and parse its stdout. stderr is written to
 /// `stderr_log` for debugging (it carries eval warnings and OOM/restart
 /// notices). Needs `nix-eval-jobs`, a Nix store, and (for a real
 /// jobset) network access, so the offline unit suite never calls it; it
@@ -123,6 +140,10 @@ pub async fn run_evaluator(
         .args(argv)
         .stdout(Stdio::piped())
         .stderr(Stdio::from(stderr_file))
+        // A parse error mid-stream returns early and drops `child`;
+        // kill_on_drop keeps that early return from orphaning a
+        // still-running nix-eval-jobs.
+        .kill_on_drop(true)
         .spawn()
         .with_context(|| format!("spawn {nix_eval_jobs_bin}"))?;
 
@@ -234,5 +255,29 @@ mod tests {
         // A line with neither error nor drvPath is malformed too.
         let err = parse_eval_jobs_line(r#"{"attr":"x"}"#).unwrap_err();
         assert!(format!("{err:#}").contains("neither"), "got: {err:#}");
+    }
+
+    #[test]
+    fn parse_errors_clip_overlong_lines() {
+        // Malformed JSON: the error embeds a bounded snippet of the
+        // line, not the full line (serde_json names the byte offset).
+        let unterminated = format!(r#"{{"attr":"x","junk":"{}"#, "y".repeat(5_000));
+        let err = format!("{:#}", parse_eval_jobs_line(&unterminated).unwrap_err());
+        assert!(
+            err.len() < 600,
+            "expected a clipped snippet, got {} chars",
+            err.len()
+        );
+        assert!(err.contains('…'), "got: {err}");
+
+        // Valid JSON missing both `error` and `drvPath`: same clipping.
+        let incomplete = format!(r#"{{"attr":"x","name":"{}"}}"#, "y".repeat(5_000));
+        let err = format!("{:#}", parse_eval_jobs_line(&incomplete).unwrap_err());
+        assert!(err.contains("neither"), "got: {err}");
+        assert!(
+            err.len() < 600,
+            "expected a clipped snippet, got {} chars",
+            err.len()
+        );
     }
 }

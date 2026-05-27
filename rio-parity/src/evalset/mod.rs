@@ -7,6 +7,7 @@
 
 pub mod artifacts;
 pub mod evaluator;
+pub mod fidelity;
 pub mod recipe;
 
 /// What part of the Hydra evaluation an eval set covers.

@@ -776,6 +776,11 @@
       "doc": "nix-eval-jobs runner and JSONL output parsing."
     },
     {
+      "path": "evalset/fidelity.rs",
+      "depth": 1,
+      "doc": "drvPath fidelity gate for locally produced eval sets."
+    },
+    {
       "path": "evalset/recipe.rs",
       "depth": 1,
       "doc": "Hydra-faithful eval recipe."

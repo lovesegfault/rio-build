@@ -34,7 +34,8 @@ impl EvalSetDir {
         self.root.join(file)
     }
 
-    /// Write a JSONL file (one serialized record per line).
+    /// Write a JSONL file (one serialized record per line). Any
+    /// existing file at that path is overwritten.
     pub fn write_jsonl<T: serde::Serialize>(
         &self,
         file: &str,
@@ -53,7 +54,8 @@ impl EvalSetDir {
         Ok(path)
     }
 
-    /// Write a pretty-printed JSON file.
+    /// Write a pretty-printed JSON file. Any existing file at that
+    /// path is overwritten.
     pub fn write_json<T: serde::Serialize>(
         &self,
         file: &str,
