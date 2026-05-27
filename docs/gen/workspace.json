@@ -71,6 +71,7 @@
     },
     "rio-builder": {
       "prod": [
+        "rio-auth",
         "rio-common",
         "rio-nix",
         "rio-proto"

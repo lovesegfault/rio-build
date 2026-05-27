@@ -335,12 +335,22 @@ impl Conn {
         }
     }
 
-    /// `Mount{build_id}` as the first request on this connection,
-    /// handing the daemon a dup of `fuse_fd` via `SCM_RIGHTS`.
-    fn mount(&self, build_id: &str, fuse_fd: RawFd, timeout: Duration) -> Result<u64, MountdError> {
+    /// `Mount{build_id, token}` as the first request on this
+    /// connection, handing the daemon a dup of `fuse_fd` via
+    /// `SCM_RIGHTS`. `token` is the scheduler-minted Mount-admission
+    /// credential (`WorkAssignment.mountd_token`); `None` when the
+    /// deployment mints none (gid-admitted standalone path).
+    fn mount(
+        &self,
+        build_id: &str,
+        token: Option<&str>,
+        fuse_fd: RawFd,
+        timeout: Duration,
+    ) -> Result<u64, MountdError> {
         let (resp, _) = self.call(
             &Req::Mount {
                 build_id: build_id.to_owned(),
+                token: token.map(str::to_owned),
             },
             &[fuse_fd],
             timeout,
@@ -361,6 +371,12 @@ impl Conn {
 /// Captured by the first successful [`MountdClient::mount`].
 struct MountSession {
     build_id: String,
+    /// The Mount-admission token the original `Mount` presented
+    /// (ADR-022 §P0559), retained so the re-`Mount` on a restarted
+    /// daemon presents the same credential — its TTL covers the whole
+    /// build window precisely so this mid-build re-issue stays valid.
+    /// `None` when the deployment mints none.
+    token: Option<String>,
     /// A dup of the build's own `/dev/fuse` fd, held so a re-`Mount`
     /// can hand the restarted daemon a fresh `SCM_RIGHTS` copy (its
     /// previous dup died with the old process). Closing this dup at
@@ -536,9 +552,12 @@ impl MountdClient {
             // The capped timeout (not the original Mount's): a healthy
             // daemon answers Mount in milliseconds, and this round-trip
             // both holds the connection-slot lock and multiplies into
-            // the worst-case cycle bound.
+            // the worst-case cycle bound. The retained token rides
+            // along — a token-admitted build must re-authenticate its
+            // re-Mount the same way it authenticated the first one.
             conn.mount(
                 &session.build_id,
+                session.token.as_deref(),
                 session.fuse_fd.as_raw_fd(),
                 session.mount_timeout.min(MOUNTD_RECONNECT_MOUNT_TIMEOUT),
             )?;
@@ -627,25 +646,29 @@ impl MountdClient {
         }
     }
 
-    /// `Mount{build_id}`: claim the build id, hand the daemon a dup of
-    /// `fuse_fd` (this build's own `/dev/fuse`, which the caller mounts
-    /// itself — see [`super::mount::mount_castore_background`]) so it
-    /// can broker `BackingOpen`/`BackingClose` against that connection,
-    /// and have the daemon set up this build's staging dir + quota.
-    /// Must be the first request on a connection; exactly one per
-    /// connection lifetime. Returns `staging_quota_bytes`.
+    /// `Mount{build_id, token}`: claim the build id, hand the daemon a
+    /// dup of `fuse_fd` (this build's own `/dev/fuse`, which the caller
+    /// mounts itself — see [`super::mount::mount_castore_background`])
+    /// so it can broker `BackingOpen`/`BackingClose` against that
+    /// connection, and have the daemon set up this build's staging dir
+    /// and quota. `token` is the scheduler-minted Mount-admission
+    /// credential from `WorkAssignment.mountd_token` (`None` = none
+    /// minted; the daemon then admits by peer gid). Must be the first
+    /// request on a connection; exactly one per connection lifetime.
+    /// Returns `staging_quota_bytes`.
     ///
-    /// On success the client keeps `build_id` and a dup of `fuse_fd` so
-    /// a daemon restart can be survived by re-issuing the same `Mount`
-    /// on a fresh connection (see the module docs).
+    /// On success the client keeps `build_id`, the token, and a dup of
+    /// `fuse_fd` so a daemon restart can be survived by re-issuing the
+    /// same `Mount` on a fresh connection (see the module docs).
     pub fn mount(
         &self,
         build_id: &str,
+        token: Option<&str>,
         fuse_fd: RawFd,
         timeout: Duration,
     ) -> Result<u64, MountdError> {
         let conn = self.current_conn();
-        let quota = conn.mount(build_id, fuse_fd, timeout)?;
+        let quota = conn.mount(build_id, token, fuse_fd, timeout)?;
         // Keep what a re-Mount needs. Best-effort: if the dup fails the
         // client simply cannot reconnect (the pre-reconnect behavior).
         // SAFETY: `fuse_fd` is a live fd owned by the caller for the
@@ -655,6 +678,7 @@ impl MountdClient {
             Ok(dup) => {
                 *self.inner.session.lock().ignore_poison() = Some(MountSession {
                     build_id: build_id.to_owned(),
+                    token: token.map(str::to_owned),
                     fuse_fd: dup,
                     mount_timeout: timeout,
                 });
@@ -1028,6 +1052,8 @@ mod tests {
         requests: Mutex<Vec<String>>,
         /// Whether each Mount frame carried at least one SCM_RIGHTS fd.
         mount_had_fd: Mutex<Vec<bool>>,
+        /// The token each Mount frame carried (None = token-less).
+        mount_tokens: Mutex<Vec<Option<String>>>,
         /// The accepted connection, so the test can kill this
         /// incarnation (shutdown → the client sees EOF, the serve
         /// thread exits) the way a real daemon restart does.
@@ -1087,12 +1113,13 @@ mod tests {
                     Err(_) => return,
                 };
                 let resp = match &req.req {
-                    Req::Mount { build_id } => {
+                    Req::Mount { build_id, token } => {
                         log.requests
                             .lock()
                             .unwrap()
                             .push(format!("mount:{build_id}"));
                         log.mount_had_fd.lock().unwrap().push(!frame.fds.is_empty());
+                        log.mount_tokens.lock().unwrap().push(token.clone());
                         Resp::Mounted {
                             staging_quota_bytes: 0,
                         }
@@ -1124,10 +1151,12 @@ mod tests {
 
     /// The headline reconnect contract: an RPC that fails because the
     /// daemon went away re-dials the socket, re-issues `Mount{build_id}`
-    /// (with the kept /dev/fuse dup) as the new connection's first
-    /// request, and then retries the original RPC — so a Promote issued
-    /// across a daemon restart succeeds instead of surfacing EIO.
+    /// (with the kept /dev/fuse dup AND the kept admission token) as
+    /// the new connection's first request, and then retries the
+    /// original RPC — so a Promote issued across a daemon restart
+    /// succeeds instead of surfacing EIO.
     // r[verify builder.fs.mountd-reconnect]
+    // r[verify builder.mountd.token-admission]
     #[test]
     fn promote_across_a_daemon_restart_redials_and_remounts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1140,11 +1169,21 @@ mod tests {
         let client = MountdClient::connect(&sock).expect("connect to incarnation 1");
         let fuse_stub = tempfile::tempfile().unwrap();
         client
-            .mount("b-restart", fuse_stub.as_raw_fd(), T)
+            .mount(
+                "b-restart",
+                Some("mountd-token-claims.sig"),
+                fuse_stub.as_raw_fd(),
+                T,
+            )
             .expect("initial mount");
         assert_eq!(
             log1.requests.lock().unwrap().as_slice(),
             ["mount:b-restart"]
+        );
+        assert_eq!(
+            log1.mount_tokens.lock().unwrap().as_slice(),
+            [Some("mountd-token-claims.sig".to_string())],
+            "the initial Mount must carry the admission token"
         );
 
         // Kill incarnation 1: unlink the socket so dials fail exactly
@@ -1180,6 +1219,11 @@ mod tests {
             log2.mount_had_fd.lock().unwrap().iter().all(|had| *had),
             "the re-Mount must carry the kept /dev/fuse dup in SCM_RIGHTS"
         );
+        assert_eq!(
+            log2.mount_tokens.lock().unwrap().as_slice(),
+            [Some("mountd-token-claims.sig".to_string())],
+            "the re-Mount must present the same admission token as the original Mount"
+        );
         drop(client);
         daemon2.join().unwrap();
     }
@@ -1199,7 +1243,7 @@ mod tests {
         let client = MountdClient::connect(&sock).expect("connect");
         let fuse_stub = tempfile::tempfile().unwrap();
         client
-            .mount("b-gone", fuse_stub.as_raw_fd(), T)
+            .mount("b-gone", None, fuse_stub.as_raw_fd(), T)
             .expect("initial mount");
 
         // The daemon dies and never returns.
@@ -1259,7 +1303,7 @@ mod tests {
         let client = MountdClient::connect(&sock).expect("connect");
         let fuse_stub = tempfile::tempfile().unwrap();
         client
-            .mount("b-fastfail", fuse_stub.as_raw_fd(), T)
+            .mount("b-fastfail", None, fuse_stub.as_raw_fd(), T)
             .expect("initial mount");
 
         // The daemon dies; its replacement is ALREADY listening, so a

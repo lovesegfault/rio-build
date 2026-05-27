@@ -535,31 +535,22 @@ pub fn build_executor_pod_spec(
         // Localhost enforcement is on the executor container's
         // SecurityContext.
         //
-        // TODO: socket access under `hostUsers: false` (§P0559) is the
-        // remaining production-k8s blocker for the castore stack. The
-        // in-process rio-mountd client is ALREADY in place — every
-        // build's castore mount connects to
-        // /run/rio-mountd/mountd.sock (0660 root:990, plus an
-        // `SO_PEERCRED.gid == 990` check — 990 is `mountd.allowedGid`
-        // in helm values.yaml and `users.groups.rio-builder.gid` in
-        // nix/nixos-node/eks-node.nix), and the standalone/systemd
-        // worker path already passes that production-shaped gate (the
-        // builder service joins the rio-builder group). What is still
-        // open is THIS pod spec: `fsGroup: rio-builder` (the old plan
-        // row) only grants a SUPPLEMENTARY group — enough for the
-        // socket-inode DAC, not for SO_PEERCRED, which reports the
-        // egid — the field that changes the egid is `runAsGroup`. And
-        // under the production `hostUsers: false` the pod's gid is
-        // userns-remapped to a per-pod offset, so NO static in-pod gid
-        // maps to host gid 990 at all. The owning work item stays the
-        // "socket access under hostUsers:false" row in §P0559 of the
-        // ADR-022 implementation plan — it must pick the mechanism
-        // (and the matching pod-spec field here) before executor pods
-        // can run the castore stack on production k8s. Do NOT relax
-        // `mountd.allowedGid` outside the vmtest values to paper over
-        // this; landing `fs_group: Some(990)` now would change
-        // emptyDir ownership for zero functional benefit and bake in
-        // the wrong half of the answer.
+        // Socket access under `hostUsers: false` (§P0559) is resolved
+        // by the per-build mountd token, NOT by any field on this pod
+        // spec: the scheduler mints `WorkAssignment.mountd_token`
+        // (HMAC `MountdClaims`, dedicated `mountdHmac` key), the
+        // builder presents it in the rio-mountd `Mount{}` frame, and
+        // the daemon verifies it offline — so a userns-confined pod
+        // whose gids are all kubelet-remapped never needs to present
+        // host gid 990 at all. The /run/rio-mountd RO hostPath this
+        // spec already mounts is the only pod-spec ingredient (socket
+        // reachability); in token mode mountd's socket is
+        // world-connectable and the token is the gate. Deliberately
+        // NOT set here: `fsGroup` / `runAsGroup: 990` (under
+        // hostUsers:false no in-pod gid maps to host 990, and
+        // SO_PEERCRED reads the egid anyway) — keep
+        // `mountd.allowedGid: 990` for the standalone/systemd path and
+        // do not relax it outside the vmtest values.
         security_context: if !privileged {
             Some(PodSecurityContext {
                 seccomp_profile: Some(if seccomp_localhost {

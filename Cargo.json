@@ -19331,6 +19331,10 @@
           "packageId": "regex"
         },
         {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
+        },
+        {
           "name": "rio-common",
           "packageId": "rio-common"
         },

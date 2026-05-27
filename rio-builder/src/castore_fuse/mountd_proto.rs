@@ -73,7 +73,36 @@ pub enum Req {
     /// propagate into builder pods — so the builder opens the device
     /// and `mount(2)`s it on a mountpoint it owns inside its own mount
     /// namespace, where the build can actually see it.
-    Mount { build_id: String },
+    ///
+    /// `token` is the scheduler-minted Mount-admission credential
+    /// (ADR-022 §P0559, `WorkAssignment.mountd_token`): an HMAC-signed
+    /// `MountdClaims{aud, build_id, …}` the daemon verifies offline
+    /// when the connection's peer gid is not the allowed gid (the
+    /// `hostUsers: false` executor-pod case). `None` = no token (the
+    /// gid-admitted standalone/systemd path, or a keyless deployment).
+    ///
+    /// **Wire evolution / rollout skew.** The field was appended to an
+    /// existing postcard-encoded variant, which is safe in both skew
+    /// directions because the two ends are tolerant in complementary
+    /// ways:
+    /// - *new client → old daemon:* `postcard::from_bytes` ignores
+    ///   trailing bytes, so a token-bearing Mount decodes as the legacy
+    ///   `Mount{build_id}` and the daemon proceeds exactly as before
+    ///   (such a connection necessarily passed the old daemon's gid
+    ///   gate, so dropping the token loses nothing).
+    /// - *old client → new daemon:* the legacy frame ends after
+    ///   `build_id`, so decoding the new shape hits end-of-input; the
+    ///   daemon's [`decode_request_compat`] then falls back to the
+    ///   legacy shape and maps it to `token: None` (the live-build
+    ///   reconnect-across-a-DS-upgrade case — those clients are
+    ///   gid-admitted or get rejected by token mode, never mis-parsed).
+    ///
+    /// Both directions are pinned by the `mount_wire_*_skew` tests
+    /// below.
+    Mount {
+        build_id: String,
+        token: Option<String>,
+    },
     /// Register the fd in this frame's `SCM_RIGHTS` cmsg as a FUSE
     /// passthrough backing file: the daemon issues
     /// `ioctl(kept_fuse_fd, FUSE_DEV_IOC_BACKING_OPEN)` and replies the
@@ -150,6 +179,20 @@ pub enum ErrKind {
     /// Build-fatal: the same client would send the same fd again, so
     /// retrying cannot succeed — fix the builder, not the request.
     BadFuseFd,
+    /// The connection is not authorized to `Mount`: the daemon runs in
+    /// token mode, the peer's gid is not the allowed gid, and the
+    /// request carried no token that verifies for the requested
+    /// `build_id` (missing, malformed, wrong key, expired, wrong
+    /// audience, or minted for a different build). Deliberately one
+    /// variant for every cause — the daemon logs the specific reason,
+    /// the wire reply does not leak it. The daemon closes the
+    /// connection after replying. Build-fatal: re-presenting the same
+    /// credential cannot succeed.
+    ///
+    /// Appended after [`ErrKind::BadFuseFd`] so every pre-existing
+    /// variant keeps its postcard discriminant; only a daemon that
+    /// understands tokens ever emits it.
+    Unauthorized,
 }
 
 impl ErrKind {
@@ -177,6 +220,11 @@ impl std::fmt::Display for ErrKind {
                 f,
                 "Mount did not carry a usable /dev/fuse fd (missing from SCM_RIGHTS, or not the \
                  fuse character device)"
+            ),
+            ErrKind::Unauthorized => write!(
+                f,
+                "connection not authorized to Mount (peer gid is not the allowed gid and no \
+                 valid mountd token was presented)"
             ),
         }
     }
@@ -211,6 +259,67 @@ pub fn encode<T: Serialize>(frame: &T) -> Result<Vec<u8>, FrameError> {
 /// Deserialize a frame received from the socket.
 pub fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> Result<T, FrameError> {
     Ok(postcard::from_bytes(bytes)?)
+}
+
+/// Pre-token request shapes, kept only so [`decode_request_compat`] can
+/// accept frames from a not-yet-upgraded client (a build that was
+/// running when the rio-mountd DaemonSet rolled re-issues the legacy
+/// `Mount{build_id}` on its reconnect). Field order and variant order
+/// mirror the originals exactly — postcard encodes by position.
+mod compat {
+    use serde::Deserialize;
+
+    #[derive(Deserialize)]
+    pub(super) struct LegacyRequest {
+        pub seq: u32,
+        pub req: LegacyReq,
+    }
+
+    #[derive(Deserialize)]
+    pub(super) enum LegacyReq {
+        Mount { build_id: String },
+        BackingOpen,
+        BackingClose { backing_id: u32 },
+        Promote { digest: [u8; 32] },
+        PromoteChunks { chunk_digests: Vec<[u8; 32]> },
+    }
+
+    impl From<LegacyRequest> for super::Request {
+        fn from(legacy: LegacyRequest) -> Self {
+            let req = match legacy.req {
+                LegacyReq::Mount { build_id } => super::Req::Mount {
+                    build_id,
+                    token: None,
+                },
+                LegacyReq::BackingOpen => super::Req::BackingOpen,
+                LegacyReq::BackingClose { backing_id } => super::Req::BackingClose { backing_id },
+                LegacyReq::Promote { digest } => super::Req::Promote { digest },
+                LegacyReq::PromoteChunks { chunk_digests } => {
+                    super::Req::PromoteChunks { chunk_digests }
+                }
+            };
+            super::Request {
+                seq: legacy.seq,
+                req,
+            }
+        }
+    }
+}
+
+/// Daemon-side request decode that tolerates the pre-token `Mount`
+/// frame shape: try the current [`Request`] first, and on failure fall
+/// back to the legacy shape (mapped to `token: None`). Only the daemon
+/// uses this — replies never changed shape, so the client keeps the
+/// strict [`decode`]. A frame that fails BOTH decodes is genuinely
+/// malformed and surfaces the current-shape error.
+pub fn decode_request_compat(bytes: &[u8]) -> Result<Request, FrameError> {
+    match postcard::from_bytes::<Request>(bytes) {
+        Ok(req) => Ok(req),
+        Err(current_err) => match postcard::from_bytes::<compat::LegacyRequest>(bytes) {
+            Ok(legacy) => Ok(legacy.into()),
+            Err(_) => Err(current_err.into()),
+        },
+    }
 }
 
 /// One received datagram: the frame bytes and any fds that arrived in
@@ -304,6 +413,11 @@ mod tests {
         for req in [
             Req::Mount {
                 build_id: "b-1234_ABC".into(),
+                token: None,
+            },
+            Req::Mount {
+                build_id: "b-1234_ABC".into(),
+                token: Some("claims-b64.sig-b64".into()),
             },
             Req::BackingOpen,
             Req::BackingClose { backing_id: 7 },
@@ -315,6 +429,136 @@ mod tests {
             let frame = Request { seq: 42, req };
             assert_eq!(roundtrip(&frame), frame);
         }
+    }
+
+    /// Old client → new daemon: a pre-token `Mount{build_id}` frame
+    /// (exactly what a build that survived a DaemonSet upgrade re-sends
+    /// on reconnect) must decode via the compat path as `token: None`,
+    /// and every other legacy request must decode identically through
+    /// it. A genuinely malformed frame still errors.
+    #[test]
+    fn mount_wire_old_client_new_daemon_skew() {
+        // Hand-rolled legacy encoder: same field/variant order as the
+        // pre-token enum, so the bytes are exactly what an old client
+        // emits.
+        #[derive(serde::Serialize)]
+        struct OldRequest {
+            seq: u32,
+            req: OldReq,
+        }
+        #[derive(serde::Serialize)]
+        enum OldReq {
+            Mount {
+                build_id: String,
+            },
+            #[allow(dead_code)]
+            BackingOpen,
+            BackingClose {
+                backing_id: u32,
+            },
+            #[allow(dead_code)]
+            Promote {
+                digest: [u8; 32],
+            },
+            #[allow(dead_code)]
+            PromoteChunks {
+                chunk_digests: Vec<[u8; 32]>,
+            },
+        }
+
+        let legacy_mount = postcard::to_stdvec(&OldRequest {
+            seq: 9,
+            req: OldReq::Mount {
+                build_id: "b-legacy".into(),
+            },
+        })
+        .unwrap();
+        // The new shape alone cannot parse it (the Option byte is
+        // missing)…
+        assert!(decode::<Request>(&legacy_mount).is_err());
+        // …but the daemon's compat decode maps it to token: None.
+        let req = decode_request_compat(&legacy_mount).expect("legacy Mount must decode");
+        assert_eq!(
+            req,
+            Request {
+                seq: 9,
+                req: Req::Mount {
+                    build_id: "b-legacy".into(),
+                    token: None
+                }
+            }
+        );
+
+        // Non-Mount legacy frames are byte-identical in both shapes and
+        // pass straight through.
+        let legacy_close = postcard::to_stdvec(&OldRequest {
+            seq: 10,
+            req: OldReq::BackingClose { backing_id: 3 },
+        })
+        .unwrap();
+        assert_eq!(
+            decode_request_compat(&legacy_close).unwrap(),
+            Request {
+                seq: 10,
+                req: Req::BackingClose { backing_id: 3 }
+            }
+        );
+
+        // Garbage is still rejected.
+        assert!(decode_request_compat(&[0xFF, 0xFF, 0xFF, 0xFF, 0xFF]).is_err());
+    }
+
+    /// New client → old daemon: a token-bearing Mount must still decode
+    /// under the PRE-token request shape (postcard ignores the trailing
+    /// token bytes), so an old daemon treats it as a plain
+    /// `Mount{build_id}` instead of failing the build. This pins the
+    /// postcard property the rollout-skew story relies on.
+    #[test]
+    fn mount_wire_new_client_old_daemon_skew() {
+        // Mirror of the pre-token shape, as the OLD DAEMON would decode it.
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct OldRequest {
+            seq: u32,
+            req: OldReq,
+        }
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        enum OldReq {
+            Mount {
+                build_id: String,
+            },
+            #[allow(dead_code)]
+            BackingOpen,
+            #[allow(dead_code)]
+            BackingClose {
+                backing_id: u32,
+            },
+            #[allow(dead_code)]
+            Promote {
+                digest: [u8; 32],
+            },
+            #[allow(dead_code)]
+            PromoteChunks {
+                chunk_digests: Vec<[u8; 32]>,
+            },
+        }
+
+        let new_frame = encode(&Request {
+            seq: 4,
+            req: Req::Mount {
+                build_id: "b-new".into(),
+                token: Some("claims.sig".into()),
+            },
+        })
+        .unwrap();
+        let old: OldRequest =
+            postcard::from_bytes(&new_frame).expect("old daemon must still parse the build_id");
+        assert_eq!(old.seq, 4);
+        assert_eq!(
+            old.req,
+            OldReq::Mount {
+                build_id: "b-new".into()
+            }
+        );
     }
 
     #[test]
@@ -377,6 +621,7 @@ mod tests {
             ErrKind::DuplicateBuildId,
             ErrKind::BatchTooLarge,
             ErrKind::BadFuseFd,
+            ErrKind::Unauthorized,
         ] {
             assert!(fatal.is_build_fatal(), "{fatal:?} must be build-fatal");
         }

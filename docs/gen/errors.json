@@ -71,6 +71,27 @@
       "doc": "Signing key → PKCS#8 DER encoding. Only reachable from [`sign`] (verify uses raw pubkey bytes). Never fails for a valid ed25519 key — it's a fixed-format serialization — so this variant firing means the key itself is corrupt. Kept as a variant rather than `.expect()` because key material comes from outside (K8s Secret) and a corrupt mount should error cleanly, not panic the gateway."
     },
     {
+      "enum": "MountdTokenError",
+      "name": "Audience",
+      "crate": "rio-auth",
+      "msg": "mountd token audience mismatch",
+      "doc": "The token verified but its audience is not [`MOUNTD_TOKEN_AUDIENCE`] — it was minted for some other consumer and must not admit a Mount."
+    },
+    {
+      "enum": "MountdTokenError",
+      "name": "BuildIdMismatch",
+      "crate": "rio-auth",
+      "msg": "mountd token build_id mismatch",
+      "doc": "The token verified but was minted for a different `build_id` than the one the Mount requests."
+    },
+    {
+      "enum": "MountdTokenError",
+      "name": "Token",
+      "crate": "rio-auth",
+      "msg": "mountd token invalid: {0}",
+      "doc": "Signature, format, or expiry failure from the shared HMAC envelope (or a claims shape that is not `MountdClaims`)."
+    },
+    {
       "enum": "CastoreMountError",
       "name": "FuseDevice",
       "crate": "rio-builder",
@@ -1565,6 +1586,11 @@
       "name": "JwtError",
       "crate": "rio-auth",
       "doc": ""
+    },
+    {
+      "name": "MountdTokenError",
+      "crate": "rio-auth",
+      "doc": "Why a presented mountd token does not authorize the requested `Mount{}`. Variants deliberately carry no token material; the daemon logs the variant and replies with a generic rejection."
     },
     {
       "name": "CastoreMountError",

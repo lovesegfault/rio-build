@@ -644,6 +644,11 @@ pub async fn execute_build(
         // the same token the upload path presents on PutPathChunked;
         // rio-store derives the build's tenant from it.
         let assignment_token = assignment.assignment_token.clone();
+        // The mountd token (ADR-022 §P0559) is a SEPARATE credential:
+        // it admits this build's Mount{} at the node's rio-mountd when
+        // the pod's userns-remapped gid cannot match the daemon's
+        // allowed gid. Empty when the scheduler minted none.
+        let mountd_token = assignment.mountd_token.clone();
         let runtime = tokio::runtime::Handle::current();
         let overlay_base = env.overlay_base_dir.clone();
         let build_id_owned = build_id.clone();
@@ -654,6 +659,7 @@ pub async fn execute_build(
                     build_id: &castore_build_id,
                     roots: &roots,
                     assignment_token: &assignment_token,
+                    mountd_token: &mountd_token,
                 },
                 castore_clients,
                 runtime,
@@ -1628,6 +1634,33 @@ mod tests {
             sanitize_build_id("0123456789abcdfghijklmnpqrsvwxyz-name_drv"),
             "0123456789abcdfghijklmnpqrsvwxyz-name_drv"
         );
+    }
+
+    /// The mountd build_id this executor sends in `Mount{}`
+    /// (`mountd_build_id(sanitize_build_id(drv_path))`) must equal the
+    /// id the scheduler signs into `MountdClaims.build_id`
+    /// (`MountdClaims::build_id_for_drv_path(drv_path)`) — rio-mountd
+    /// compares the two on token-admitted Mounts, so any drift makes
+    /// every such Mount fail closed with a build-id mismatch. This is
+    /// the cross-crate coupling tripwire for ADR-022 §P0559.
+    // r[verify builder.mountd.token-admission]
+    #[test]
+    fn castore_build_id_matches_token_claim() {
+        for drv_path in [
+            "/nix/store/abc123-hello.drv",
+            "/nix/store/vwb2lprckpd4kbg67sczakiqqqd4jxzy-llvm-tblgen-src-21_1_8.drv",
+            // I-167: fetchpatch query strings leak into drv names.
+            "/nix/store/q2x9mcm9hzf2cdh22cbjmaqm6qmh1k1f-opensp-1.5.2-c11-using.patch?id=688d9675.drv",
+            // Longer than 64 chars once sanitized → truncated.
+            &format!("/nix/store/{}-{}.drv", "a".repeat(32), "b".repeat(80)),
+            "simple",
+        ] {
+            assert_eq!(
+                mountd_build_id(&sanitize_build_id(drv_path)),
+                rio_auth::hmac::MountdClaims::build_id_for_drv_path(drv_path),
+                "executor and scheduler derive different mountd build_ids for {drv_path:?}"
+            );
+        }
     }
 
     #[test]

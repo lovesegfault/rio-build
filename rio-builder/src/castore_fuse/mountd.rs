@@ -77,6 +77,14 @@ const PROMOTE_RACE_WAIT: Duration = Duration::from_secs(2);
 /// (50 MiB/s)` — any live promote finishes well inside it.
 const PROMOTE_STALE_AFTER: Duration = Duration::from_secs(90);
 
+/// How long a provisionally-admitted connection (token mode, peer gid
+/// outside `allowed_gid`) may exist without a successfully
+/// token-verified `Mount{}` before the daemon closes it. Sized to one
+/// builder-side `mountd_request_timeout` — the legitimate client
+/// connects and Mounts immediately, so anything still unauthenticated
+/// after this is squatting an fd/task on the world-connectable socket.
+const TOKEN_AUTH_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Copy-loop buffer. 64 KiB amortizes syscall overhead without holding
 /// a large allocation per concurrent promote.
 const PROMOTE_BUF: usize = 64 * 1024;
@@ -113,9 +121,26 @@ pub struct MountdConfig {
     pub staging_quota_bytes: u64,
     /// Per-`Promote` size ceiling ([`ErrKind::TooLarge`] above it).
     pub max_promote_bytes: u64,
-    /// `SO_PEERCRED.gid` allowed to connect. Connections from any other
-    /// gid are dropped before a single frame is read.
+    /// `SO_PEERCRED.gid` allowed to connect. Without a token key
+    /// (below) connections from any other gid are dropped before a
+    /// single frame is read; with one, a non-matching gid is admitted
+    /// only if its first frame is a `Mount{}` carrying a token that
+    /// verifies (ADR-022 §P0559).
     pub allowed_gid: u32,
+    /// HMAC key file for verifying scheduler-minted Mount-admission
+    /// tokens (ADR-022 §P0559). `None` = token mode off: admission is
+    /// the gid gate alone and the socket stays 0660 — exactly the
+    /// pre-token behavior. `Some` = token mode on: the socket becomes
+    /// world-connectable (0666) so `hostUsers: false` executor pods —
+    /// whose remapped uids/gids cannot present the host gid — can
+    /// reach it, and a connection is admitted EITHER by the gid match
+    /// OR by a verifying token in its `Mount{}`.
+    ///
+    /// MUST be the dedicated mountd key (`RIO_MOUNTD_HMAC_KEY_PATH`),
+    /// never the store-facing assignment key — this key lives on every
+    /// builder node, and a node compromise must not yield a key the
+    /// store trusts.
+    pub token_key_path: Option<PathBuf>,
     /// How often the disk-pressure sweep ([`super::sweep`]) probes the
     /// cache/chunks/staging trees. `Duration::ZERO` disables it (unit
     /// and bring-up environments where the daemon does not own the
@@ -508,6 +533,11 @@ fn wait_for_concurrent_promote(
 
 struct Shared {
     cfg: MountdConfig,
+    /// Verifier for scheduler-minted Mount-admission tokens (ADR-022
+    /// §P0559), loaded from [`MountdConfig::token_key_path`]. `Some` =
+    /// token mode: peers outside `allowed_gid` may be admitted by a
+    /// verifying token in their `Mount{}`. `None` = gid gate only.
+    token_verifier: Option<rio_auth::hmac::HmacVerifier>,
     staging_base: OwnedFd,
     cache_base: OwnedFd,
     chunks_base: OwnedFd,
@@ -534,6 +564,14 @@ struct Shared {
 struct ConnState {
     peer_uid: libc::uid_t,
     peer_gid: libc::gid_t,
+    /// Token mode is on and this peer's gid did NOT match
+    /// `allowed_gid`: the connection is only provisionally admitted —
+    /// its FIRST frame must be a `Mount{}` whose token verifies, and
+    /// anything else (other request, undecodable frame, missing or
+    /// invalid token) closes the connection. Always `false` when token
+    /// mode is off (such peers are rejected at accept) or when the gid
+    /// matched.
+    needs_token: bool,
     /// The builder's `/dev/fuse` fd (received in `Mount{}`'s
     /// `SCM_RIGHTS`), held for the lifetime of the connection so
     /// `BACKING_OPEN`/`BACKING_CLOSE` can be issued against the
@@ -582,6 +620,19 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
     let cache_base = open_base(&cfg.cache_dir)?;
     let chunks_base = open_base(&cfg.chunks_dir)?;
 
+    // Mount-admission token verifier (ADR-022 §P0559). A configured but
+    // unreadable/empty key file is a startup error, not a silent
+    // fall-back to gid-only — the operator asked for token mode.
+    let token_verifier = rio_auth::hmac::HmacVerifier::load(cfg.token_key_path.as_deref())
+        .context("load mountd token key")?;
+    if token_verifier.is_some() {
+        info!(
+            allowed_gid = cfg.allowed_gid,
+            "Mount-admission token mode enabled: peers outside the allowed gid are admitted \
+             by a verifying Mount token (socket becomes world-connectable)"
+        );
+    }
+
     reap_orphans(&cfg);
 
     // Staging dirs that survived the scan (their builder still holds
@@ -596,6 +647,7 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
         .map_or(1, |max| max.saturating_add(1));
 
     let shared = Arc::new(Shared {
+        token_verifier,
         staging_base,
         cache_base,
         chunks_base,
@@ -610,7 +662,7 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
 
     spawn_sweep(&shared);
 
-    let listener = bind_socket(&shared.cfg)?;
+    let listener = bind_socket(&shared.cfg, shared.token_verifier.is_some())?;
     info!(socket = %shared.cfg.socket_path.display(), "rio-mountd listening");
     let listener = AsyncFd::with_interest(listener, Interest::READABLE)?;
 
@@ -678,10 +730,18 @@ fn spawn_sweep(shared: &Arc<Shared>) {
     });
 }
 
-/// `SOCK_SEQPACKET` listener at `cfg.socket_path`, mode 0660, group
+/// `SOCK_SEQPACKET` listener at `cfg.socket_path`, group
 /// `cfg.allowed_gid`. A stale socket from a previous incarnation is
 /// unlinked first (the DaemonSet is the only writer of this path).
-fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
+///
+/// Mode is derived from the admission mode rather than configured
+/// separately, so the permissive DAC can never be enabled without the
+/// token gate that justifies it: 0660 (gid-only admission — the
+/// pre-token posture, unchanged) or 0666 when `token_mode` is on
+/// (`hostUsers: false` executor pods present arbitrary remapped
+/// uids/gids, so the inode must be connectable by anyone; admission
+/// then happens in-protocol via the Mount token or the gid check).
+fn bind_socket(cfg: &MountdConfig, token_mode: bool) -> anyhow::Result<OwnedFd> {
     // The default socket lives in a dedicated /run/rio-mountd/
     // directory (so the DaemonSet hostPath-mounts one directory, not
     // all of /run) and /run is a tmpfs wiped every boot — own the
@@ -711,9 +771,12 @@ fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
     let addr = UnixAddr::new(&cfg.socket_path).context("socket path")?;
     bind(fd.as_raw_fd(), &addr).context("bind")?;
     // Tighten before listen() so there is no window where a foreign gid
-    // can connect to a 0777 socket.
+    // can connect to a 0777 socket. (In token mode the final mode is
+    // permissive anyway, but setting it before listen keeps the two
+    // postures on the same code path.)
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(&cfg.socket_path, std::fs::Permissions::from_mode(0o660))
+    let mode = if token_mode { 0o666 } else { 0o660 };
+    std::fs::set_permissions(&cfg.socket_path, std::fs::Permissions::from_mode(mode))
         .context("chmod socket")?;
     fchownat(
         nix::fcntl::AT_FDCWD,
@@ -814,8 +877,19 @@ type ReplyTx = mpsc::UnboundedSender<(Reply, Option<OwnedFd>)>;
 
 async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
     // ── Peer-credential gate, before any frame is read.
+    //
+    // Two admission modes (ADR-022 §P0559):
+    //   - token mode OFF (no key configured): the gid must match, full
+    //     stop — exactly the pre-token behavior.
+    //   - token mode ON: a matching gid still admits unconditionally
+    //     (the standalone/systemd path), and a non-matching gid is
+    //     admitted PROVISIONALLY — its first frame must be a Mount{}
+    //     whose token verifies, otherwise the connection is closed.
+    // r[impl builder.mountd.token-admission]
     let creds = getsockopt(&fd, sockopt::PeerCredentials).context("SO_PEERCRED")?;
-    if creds.gid() != shared.cfg.allowed_gid {
+    let gid_ok = creds.gid() == shared.cfg.allowed_gid;
+    let token_mode = shared.token_verifier.is_some();
+    if !gid_ok && !token_mode {
         warn!(
             uid = creds.uid(),
             gid = creds.gid(),
@@ -823,6 +897,7 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    let needs_token = !gid_ok;
     // Every fallible setup step happens BEFORE the uid is registered:
     // an early `?` between registration and the teardown call at the
     // bottom would leave the uid in `live_uids` forever, permanently
@@ -845,11 +920,17 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
         }
     }
     metrics::gauge!("rio_mountd_connections_current").increment(1.0);
-    info!(uid = creds.uid(), gid = creds.gid(), "connection accepted");
+    info!(
+        uid = creds.uid(),
+        gid = creds.gid(),
+        needs_token,
+        "connection accepted"
+    );
 
     let mut state = ConnState {
         peer_uid: creds.uid(),
         peer_gid: creds.gid(),
+        needs_token,
         kept: None,
         build_id: None,
         staging_dirfd: None,
@@ -857,6 +938,13 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
         projid: None,
         live_backing_ids: 0,
     };
+
+    // Provisionally-admitted peers (token mode, non-matching gid) get a
+    // bounded window to authenticate. Without it, any local process
+    // could hold a connection slot (an fd, a task, a uid-slot of its
+    // own uid) open indefinitely on the now world-connectable socket
+    // without ever sending a frame.
+    let auth_deadline = tokio::time::Instant::now() + TOKEN_AUTH_TIMEOUT;
 
     let result = loop {
         tokio::select! {
@@ -874,7 +962,23 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
                     Err(FrameError::Eof) => break Ok(()),
                     Err(e) => break Err(anyhow::anyhow!(e)),
                 };
-                handle_frame(&shared, &mut state, frame, &reply_tx).await;
+                if handle_frame(&shared, &mut state, frame, &reply_tx).await.is_break() {
+                    // Flush whatever the handler queued (the typed
+                    // rejection) so the peer sees it before the close.
+                    while let Ok((reply, fd_to_send)) = reply_rx.try_recv() {
+                        let _ = write_reply(&async_fd, &reply, fd_to_send).await;
+                    }
+                    break Ok(());
+                }
+            }
+            // Pre-auth deadline: only armed while a token is still owed.
+            () = tokio::time::sleep_until(auth_deadline), if state.needs_token && state.kept.is_none() => {
+                warn!(
+                    uid = creds.uid(),
+                    gid = creds.gid(),
+                    "closing connection: no authenticated Mount within the pre-auth window"
+                );
+                break Ok(());
             }
         }
     };
@@ -932,13 +1036,29 @@ async fn write_reply(
 
 /// Dispatch one request. Replies are pushed onto `reply_tx` — inline
 /// for the cheap ops, from a `spawn_blocking` task for promotes.
+///
+/// Returns [`ControlFlow::Break`] when the connection must be closed:
+/// a provisionally-admitted peer (token mode, gid outside
+/// `allowed_gid`) sent anything other than a successfully
+/// token-verified `Mount{}` as its pre-auth traffic. The caller flushes
+/// the queued rejection reply and drops the connection, keeping the
+/// pre-auth parsing surface at exactly one frame.
 async fn handle_frame(
     shared: &Arc<Shared>,
     state: &mut ConnState,
     frame: proto::RecvFrame,
     reply_tx: &ReplyTx,
-) {
-    let req: Request = match proto::decode(&frame.bytes) {
+) -> std::ops::ControlFlow<()> {
+    use std::ops::ControlFlow;
+
+    // True until this connection has a completed Mount, for peers that
+    // still owe a token: only a Mount may be processed, and any failure
+    // closes the connection.
+    let pre_auth = state.needs_token && state.kept.is_none();
+
+    // Compat decode: tolerate the pre-token Mount{build_id} shape from
+    // a not-yet-upgraded client (see mountd_proto::decode_request_compat).
+    let req: Request = match proto::decode_request_compat(&frame.bytes) {
         Ok(r) => r,
         Err(e) => {
             // Without a decoded seq there is nothing to correlate the
@@ -950,7 +1070,11 @@ async fn handle_frame(
                 },
                 None,
             ));
-            return;
+            return if pre_auth {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            };
         }
     };
     let seq = req.seq;
@@ -958,10 +1082,23 @@ async fn handle_frame(
         let _ = reply_tx.send((Reply { seq, resp }, fd));
     };
 
-    // Every request other than Mount requires a completed Mount.
+    // Every request other than Mount requires a completed Mount; on a
+    // connection that still owes a token it is also an admission
+    // violation (the first frame must be the authenticating Mount).
     if state.kept.is_none() && !matches!(req.req, Req::Mount { .. }) {
+        if pre_auth {
+            warn!(
+                uid = state.peer_uid,
+                gid = state.peer_gid,
+                "closing connection: pre-auth request other than Mount"
+            );
+            metrics::counter!("rio_mountd_mount_rejected_total", "reason" => "token-missing")
+                .increment(1);
+            reply(Resp::Err(ErrKind::Unauthorized), None);
+            return ControlFlow::Break(());
+        }
         reply(Resp::Err(ErrKind::Retryable("not mounted".into())), None);
-        return;
+        return ControlFlow::Continue(());
     }
 
     // Request→reply latency. For the inline ops the recording happens
@@ -979,9 +1116,15 @@ async fn handle_frame(
     };
 
     match req.req {
-        Req::Mount { build_id } => {
-            let resp = handle_mount(shared, state, build_id, &frame.fds);
+        Req::Mount { build_id, token } => {
+            let resp = handle_mount(shared, state, build_id, token.as_deref(), &frame.fds);
+            let unauthorized = matches!(resp, Resp::Err(ErrKind::Unauthorized));
             reply(resp, None);
+            if unauthorized {
+                // The peer had no business Mounting; nothing it sends
+                // afterwards can change that — drop the connection.
+                return ControlFlow::Break(());
+            }
         }
         Req::BackingOpen => {
             let resp = if state.live_backing_ids >= MAX_LIVE_BACKING_IDS {
@@ -1031,7 +1174,7 @@ async fn handle_frame(
         Req::Promote { digest } => {
             let Some(staging) = state.staging_dirfd.clone() else {
                 reply(Resp::Err(ErrKind::Retryable("not mounted".into())), None);
-                return;
+                return ControlFlow::Continue(());
             };
             spawn_promote(
                 shared,
@@ -1044,16 +1187,16 @@ async fn handle_frame(
                 timer,
                 op,
             );
-            return;
+            return ControlFlow::Continue(());
         }
         Req::PromoteChunks { chunk_digests } => {
             if chunk_digests.len() > PROMOTE_CHUNKS_MAX {
                 reply(Resp::Err(ErrKind::BatchTooLarge), None);
-                return;
+                return ControlFlow::Continue(());
             }
             let Some(staging_chunks) = state.staging_chunks_dirfd.clone() else {
                 reply(Resp::Err(ErrKind::Retryable("not mounted".into())), None);
-                return;
+                return ControlFlow::Continue(());
             };
             spawn_promote(
                 shared,
@@ -1070,11 +1213,12 @@ async fn handle_frame(
                 timer,
                 op,
             );
-            return;
+            return ControlFlow::Continue(());
         }
     }
     metrics::histogram!("rio_mountd_request_seconds", "op" => op)
         .record(timer.elapsed().as_secs_f64());
+    ControlFlow::Continue(())
 }
 
 /// Which shared destination a promote writes into.
@@ -1153,9 +1297,10 @@ fn reject_reason(kind: &ErrKind) -> &'static str {
     }
 }
 
-/// `Mount{build_id}`: claim the id, set up staging with a
-/// kernel-enforced quota, and keep the builder's `/dev/fuse` fd (sent
-/// in the request's `SCM_RIGHTS`) for later `BackingOpen` brokering.
+/// `Mount{build_id, token}`: authorize the connection (token mode),
+/// claim the id, set up staging with a kernel-enforced quota, and keep
+/// the builder's `/dev/fuse` fd (sent in the request's `SCM_RIGHTS`)
+/// for later `BackingOpen` brokering.
 ///
 /// The daemon neither opens `/dev/fuse` nor creates/mounts any castore
 /// mountpoint (P0560 option (b)): the kernel requires a fuse mount to
@@ -1174,6 +1319,7 @@ fn handle_mount(
     shared: &Arc<Shared>,
     state: &mut ConnState,
     build_id: String,
+    token: Option<&str>,
     fds: &[OwnedFd],
 ) -> Resp {
     if state.kept.is_some() {
@@ -1181,6 +1327,56 @@ fn handle_mount(
     }
     if !validate_build_id(&build_id) {
         return Resp::Err(ErrKind::BadBuildId);
+    }
+    // ── Admission (ADR-022 §P0559). Peers whose gid matched
+    // `allowed_gid` were admitted at accept time and skip this; a
+    // provisionally-admitted peer must present a token that verifies
+    // (signature with the mountd key, unexpired, audience "rio-mountd")
+    // for EXACTLY the build_id it is claiming. The reply never says
+    // which check failed — the specifics go to the daemon log and the
+    // reject counter only.
+    // r[impl builder.mountd.token-admission]
+    if state.needs_token {
+        let verifier = shared
+            .token_verifier
+            .as_ref()
+            .expect("needs_token is only ever set when a token verifier is configured");
+        let outcome = match token {
+            None => Err("token-missing"),
+            Some(tok) => match rio_auth::hmac::MountdClaims::verify(verifier, tok, &build_id) {
+                Ok(claims) => Ok(claims),
+                Err(rio_auth::hmac::MountdTokenError::BuildIdMismatch) => Err("build-id-mismatch"),
+                Err(rio_auth::hmac::MountdTokenError::Audience) => Err("audience-mismatch"),
+                Err(rio_auth::hmac::MountdTokenError::Token(_)) => Err("token-invalid"),
+            },
+        };
+        match outcome {
+            Ok(claims) => {
+                info!(
+                    build_id,
+                    uid = state.peer_uid,
+                    tenant = claims.tenant.as_deref().unwrap_or(""),
+                    "Mount admitted by token"
+                );
+                metrics::counter!("rio_mountd_mount_admission_total", "method" => "token")
+                    .increment(1);
+            }
+            Err(reason) => {
+                warn!(
+                    build_id,
+                    uid = state.peer_uid,
+                    gid = state.peer_gid,
+                    reason,
+                    "rejecting Mount: peer gid is not the allowed gid and the presented \
+                     token does not authorize this build"
+                );
+                metrics::counter!("rio_mountd_mount_rejected_total", "reason" => reason)
+                    .increment(1);
+                return Resp::Err(ErrKind::Unauthorized);
+            }
+        }
+    } else {
+        metrics::counter!("rio_mountd_mount_admission_total", "method" => "gid").increment(1);
     }
     // The builder's /dev/fuse fd: required, and gated to actually BE the
     // fuse character device before the daemon keeps a root-held
@@ -1406,6 +1602,16 @@ pub fn describe_metrics() {
         "rio_mountd_connections_current",
         "Live UDS connections (== builds being served on this node)"
     );
+    describe_counter!(
+        "rio_mountd_mount_admission_total",
+        "Successful Mount admissions (labeled by method: gid = SO_PEERCRED gid matched \
+         allowedGid, token = scheduler-minted Mount token verified)"
+    );
+    describe_counter!(
+        "rio_mountd_mount_rejected_total",
+        "Mount admission rejections in token mode (labeled by reason: token-missing/\
+         token-invalid/build-id-mismatch/audience-mismatch)"
+    );
     describe_gauge!(
         "rio_mountd_cache_free_bytes",
         "Free bytes (statvfs f_bavail × f_frsize) on the filesystem hosting the shared \
@@ -1440,8 +1646,25 @@ mod tests {
 
     /// Build a minimal [`Shared`] rooted in a tempdir so connection-level
     /// handlers (`handle_mount`) can run without a daemon, a socket, or
-    /// CAP_SYS_ADMIN. Quota is disabled (0) so no XFS is needed.
+    /// CAP_SYS_ADMIN. Quota is disabled (0) so no XFS is needed. Token
+    /// mode off; [`test_shared_with_token_key`] turns it on.
     fn test_shared(tmp: &Path) -> Arc<Shared> {
+        test_shared_inner(tmp, None)
+    }
+
+    /// [`test_shared`] with the Mount-admission token verifier
+    /// configured from `key` (token mode ON).
+    fn test_shared_with_token_key(tmp: &Path, key: &[u8]) -> Arc<Shared> {
+        test_shared_inner(
+            tmp,
+            Some(rio_auth::hmac::HmacVerifier::from_key(key.to_vec())),
+        )
+    }
+
+    fn test_shared_inner(
+        tmp: &Path,
+        token_verifier: Option<rio_auth::hmac::HmacVerifier>,
+    ) -> Arc<Shared> {
         let sub = |name: &str| {
             let p = tmp.join(name);
             std::fs::create_dir_all(&p).unwrap();
@@ -1457,8 +1680,10 @@ mod tests {
                 staging_quota_bytes: 0,
                 max_promote_bytes: DEFAULT_MAX_PROMOTE_BYTES,
                 allowed_gid: nix::unistd::getegid().as_raw(),
+                token_key_path: None,
                 sweep_interval: Duration::ZERO,
             },
+            token_verifier,
             staging_base: sub("staging"),
             cache_base: sub("cache"),
             chunks_base: sub("chunks"),
@@ -1473,12 +1698,22 @@ mod tests {
         ConnState {
             peer_uid: nix::unistd::geteuid().as_raw(),
             peer_gid: nix::unistd::getegid().as_raw(),
+            needs_token: false,
             kept: None,
             build_id: None,
             staging_dirfd: None,
             staging_chunks_dirfd: None,
             projid: None,
             live_backing_ids: 0,
+        }
+    }
+
+    /// [`test_conn_state`] for a peer that was only provisionally
+    /// admitted (token mode, gid outside `allowed_gid`).
+    fn test_conn_state_needs_token() -> ConnState {
+        ConnState {
+            needs_token: true,
+            ..test_conn_state()
         }
     }
 
@@ -1620,7 +1855,7 @@ mod tests {
 
         // No fd at all.
         let mut state = test_conn_state();
-        let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[]);
+        let resp = handle_mount(&shared, &mut state, "b-nofd".into(), None, &[]);
         assert_eq!(resp, Resp::Err(ErrKind::BadFuseFd));
         assert!(state.kept.is_none() && state.build_id.is_none());
         assert!(
@@ -1634,7 +1869,7 @@ mod tests {
             .unwrap()
             .into();
         let mut state = test_conn_state();
-        let resp = handle_mount(&shared, &mut state, "b-bogus".into(), &[bogus]);
+        let resp = handle_mount(&shared, &mut state, "b-bogus".into(), None, &[bogus]);
         assert_eq!(resp, Resp::Err(ErrKind::BadFuseFd));
         assert!(state.kept.is_none() && state.build_id.is_none());
         assert!(!shared.live_build_ids.lock().unwrap().contains("b-bogus"));
@@ -1649,7 +1884,7 @@ mod tests {
         {
             Ok(fuse) => {
                 let mut state = test_conn_state();
-                let resp = handle_mount(&shared, &mut state, "b-nofd".into(), &[fuse.into()]);
+                let resp = handle_mount(&shared, &mut state, "b-nofd".into(), None, &[fuse.into()]);
                 assert!(
                     matches!(resp, Resp::Mounted { .. }),
                     "well-formed Mount after a rejected one must succeed, got {resp:?}"
@@ -1662,6 +1897,282 @@ mod tests {
                  (cannot open /dev/fuse: {e})"
             ),
         }
+    }
+
+    const TEST_TOKEN_KEY: &[u8] = b"mountd-test-token-key-32-bytes!!";
+
+    /// Sign a [`rio_auth::hmac::MountdClaims`] token the way the
+    /// scheduler does, with knobs for the negative cases.
+    fn mint_token(key: &[u8], build_id: &str, aud: &str, expiry_offset_secs: i64) -> String {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        rio_auth::hmac::HmacSigner::from_key(key.to_vec()).sign(&rio_auth::hmac::MountdClaims {
+            aud: aud.into(),
+            build_id: build_id.into(),
+            tenant: None,
+            issued_unix: now,
+            expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
+        })
+    }
+
+    /// The §P0559 admission matrix at the `handle_mount` level. The
+    /// fuse-fd gate sits AFTER admission, so in environments without
+    /// /dev/fuse an admitted Mount surfaces as `BadFuseFd` — every
+    /// assertion therefore distinguishes only "admitted past the token
+    /// gate" (anything but `Unauthorized`) from "rejected by it"
+    /// (`Unauthorized`), plus the no-state-left-behind invariant.
+    // r[verify builder.mountd.token-admission]
+    // r[verify builder.mountd.token-key-separate]
+    #[test]
+    fn mount_admission_matrix() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared_with_token_key(tmp.path(), TEST_TOKEN_KEY);
+        let admitted = |resp: &Resp| !matches!(resp, Resp::Err(ErrKind::Unauthorized));
+
+        // gid-admitted connection (needs_token = false): no token
+        // required even though token mode is on — the standalone /
+        // systemd path keeps working unchanged.
+        let resp = handle_mount(&shared, &mut test_conn_state(), "b-gid".into(), None, &[]);
+        assert!(admitted(&resp), "gid-admitted Mount must not need a token");
+
+        // Token-admitted connection: a valid token for the requested
+        // build_id passes the gate.
+        let tok = mint_token(
+            TEST_TOKEN_KEY,
+            "b-tok",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        let resp = handle_mount(
+            &shared,
+            &mut test_conn_state_needs_token(),
+            "b-tok".into(),
+            Some(&tok),
+            &[],
+        );
+        assert!(admitted(&resp), "valid token must admit, got {resp:?}");
+
+        // Every rejection in one sweep: missing, garbage, wrong key,
+        // expired, wrong audience, and a token minted for a DIFFERENT
+        // build_id. None may claim the id or create staging.
+        let wrong_key = mint_token(
+            b"some-other-key-32-bytes-long-!!!",
+            "b-rej",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        let expired = mint_token(
+            TEST_TOKEN_KEY,
+            "b-rej",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            -120,
+        );
+        let wrong_aud = mint_token(TEST_TOKEN_KEY, "b-rej", "rio-store", 3600);
+        let other_build = mint_token(
+            TEST_TOKEN_KEY,
+            "b-someone-else",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        for (what, token) in [
+            ("missing", None),
+            ("garbage", Some("not-a-token".to_string())),
+            ("wrong-key", Some(wrong_key)),
+            ("expired", Some(expired)),
+            ("wrong-audience", Some(wrong_aud)),
+            ("other-build", Some(other_build)),
+        ] {
+            let mut state = test_conn_state_needs_token();
+            let resp = handle_mount(&shared, &mut state, "b-rej".into(), token.as_deref(), &[]);
+            assert_eq!(
+                resp,
+                Resp::Err(ErrKind::Unauthorized),
+                "{what}: token-required Mount must be rejected"
+            );
+            assert!(state.kept.is_none() && state.build_id.is_none());
+            assert!(
+                !shared.live_build_ids.lock().unwrap().contains("b-rej"),
+                "{what}: a rejected Mount must not leave the build_id claimed"
+            );
+            assert!(
+                !tmp.path().join("staging/b-rej").exists(),
+                "{what}: a rejected Mount must not create staging"
+            );
+        }
+
+        // Key separation: a token with the ASSIGNMENT claims shape,
+        // even when signed with the mountd key, is not a Mount
+        // credential.
+        let assignment_shaped = rio_auth::hmac::HmacSigner::from_key(TEST_TOKEN_KEY.to_vec()).sign(
+            &rio_auth::hmac::AssignmentClaims {
+                executor_id: "w".into(),
+                drv_hash: "b-rej".into(),
+                expected_outputs: vec![],
+                is_ca: false,
+                expiry_unix: u64::MAX,
+                tenant: None,
+                role: rio_auth::hmac::TokenRole::Builder,
+                input_closure_digest: String::new(),
+            },
+        );
+        let resp = handle_mount(
+            &shared,
+            &mut test_conn_state_needs_token(),
+            "b-rej".into(),
+            Some(&assignment_shaped),
+            &[],
+        );
+        assert_eq!(resp, Resp::Err(ErrKind::Unauthorized));
+
+        // Token mode OFF (no verifier): gid-admitted connections behave
+        // exactly as before — and a token, if one is sent anyway, is
+        // simply ignored.
+        let off = test_shared(tmp.path());
+        let tok = mint_token(
+            TEST_TOKEN_KEY,
+            "b-off",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        let resp = handle_mount(
+            &off,
+            &mut test_conn_state(),
+            "b-off".into(),
+            Some(&tok),
+            &[],
+        );
+        assert!(admitted(&resp), "token mode off must not consult tokens");
+    }
+
+    /// Full happy path for a token-admitted Mount where the environment
+    /// provides /dev/fuse: staging is created and owned by the peer uid
+    /// exactly like a gid-admitted Mount — token admission changes who
+    /// may Mount, never what a Mount sets up.
+    // r[verify builder.mountd.token-admission]
+    #[test]
+    fn token_admitted_mount_sets_up_staging() {
+        let Ok(fuse) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/fuse")
+        else {
+            eprintln!("skipping: /dev/fuse unavailable in this environment");
+            return;
+        };
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared_with_token_key(tmp.path(), TEST_TOKEN_KEY);
+        let mut state = test_conn_state_needs_token();
+        let tok = mint_token(
+            TEST_TOKEN_KEY,
+            "b-tok-happy",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        let resp = handle_mount(
+            &shared,
+            &mut state,
+            "b-tok-happy".into(),
+            Some(&tok),
+            &[fuse.into()],
+        );
+        assert!(matches!(resp, Resp::Mounted { .. }), "got {resp:?}");
+        assert!(state.kept.is_some());
+        assert!(tmp.path().join("staging/b-tok-happy").exists());
+    }
+
+    /// Connection-close semantics for provisionally-admitted peers: any
+    /// pre-auth frame other than a token-verified Mount (a non-Mount
+    /// request, an undecodable frame, a Mount with a bad token) replies
+    /// and then closes the connection; a token-verified Mount keeps it
+    /// open. Post-auth (or gid-admitted) connections keep the existing
+    /// keep-open behavior for protocol errors.
+    // r[verify builder.mountd.token-admission]
+    #[tokio::test]
+    async fn pre_auth_frames_close_the_connection() {
+        use std::ops::ControlFlow;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared_with_token_key(tmp.path(), TEST_TOKEN_KEY);
+        let frame = |req: Req| proto::RecvFrame {
+            bytes: proto::encode(&Request { seq: 1, req }).unwrap(),
+            fds: Vec::new(),
+        };
+        let recv_resp = |rx: &mut mpsc::UnboundedReceiver<(Reply, Option<OwnedFd>)>| {
+            let (reply, _) = rx.try_recv().expect("a reply must have been queued");
+            reply.resp
+        };
+
+        // Pre-auth non-Mount request → Unauthorized + close.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state_needs_token();
+        let flow = handle_frame(&shared, &mut state, frame(Req::BackingOpen), &tx).await;
+        assert_eq!(flow, ControlFlow::Break(()));
+        assert_eq!(recv_resp(&mut rx), Resp::Err(ErrKind::Unauthorized));
+
+        // Pre-auth undecodable frame → close (the queued reply is
+        // Retryable so even a confused peer sees a typed error first).
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state_needs_token();
+        let bad = proto::RecvFrame {
+            bytes: vec![0xFF; 16],
+            fds: Vec::new(),
+        };
+        assert_eq!(
+            handle_frame(&shared, &mut state, bad, &tx).await,
+            ControlFlow::Break(())
+        );
+
+        // Pre-auth Mount with a bad token → Unauthorized + close.
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state_needs_token();
+        let flow = handle_frame(
+            &shared,
+            &mut state,
+            frame(Req::Mount {
+                build_id: "b-close".into(),
+                token: Some("garbage".into()),
+            }),
+            &tx,
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Break(()));
+        assert_eq!(recv_resp(&mut rx), Resp::Err(ErrKind::Unauthorized));
+
+        // Pre-auth Mount with a VALID token → connection stays open
+        // (the Mount itself may still fail on the fuse-fd gate in this
+        // environment, which is not an admission failure).
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state_needs_token();
+        let tok = mint_token(
+            TEST_TOKEN_KEY,
+            "b-open",
+            rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE,
+            3600,
+        );
+        let flow = handle_frame(
+            &shared,
+            &mut state,
+            frame(Req::Mount {
+                build_id: "b-open".into(),
+                token: Some(tok),
+            }),
+            &tx,
+        )
+        .await;
+        assert_eq!(flow, ControlFlow::Continue(()));
+
+        // Gid-admitted connection: a pre-Mount non-Mount request keeps
+        // the pre-token behavior (Retryable reply, connection open).
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = test_conn_state();
+        let flow = handle_frame(&shared, &mut state, frame(Req::BackingOpen), &tx).await;
+        assert_eq!(flow, ControlFlow::Continue(()));
+        assert!(matches!(
+            recv_resp(&mut rx),
+            Resp::Err(ErrKind::Retryable(_))
+        ));
     }
 
     /// A restarted daemon accepting a re-`Mount{build_id}` for a build

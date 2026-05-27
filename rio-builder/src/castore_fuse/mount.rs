@@ -145,6 +145,14 @@ pub struct MountInputs<'a> {
     pub build_id: &'a str,
     pub roots: &'a [(String, RootNode)],
     pub assignment_token: &'a str,
+    /// `WorkAssignment.mountd_token` — the scheduler-minted Mount
+    /// admission credential rio-mountd verifies when this build's peer
+    /// gid cannot match the daemon's allowed gid (the `hostUsers:
+    /// false` executor-pod case, ADR-022 §P0559). Empty = none minted
+    /// (keyless dev / standalone — the gid gate admits instead). It is
+    /// a DIFFERENT token from `assignment_token`: separate key,
+    /// separate audience; never send one where the other belongs.
+    pub mountd_token: &'a str,
 }
 
 /// Why a castore mount could not be assembled. Every variant is an
@@ -323,8 +331,18 @@ pub(super) fn prepare_mount(
             source,
         }
     })?;
+    // The mountd token (when the scheduler minted one) rides in the
+    // Mount{} frame; the client retains it alongside build_id + the
+    // /dev/fuse dup so a re-Mount after a daemon restart presents the
+    // same credential.
+    let mountd_token = (!inputs.mountd_token.is_empty()).then_some(inputs.mountd_token);
     let staging_quota_bytes = client
-        .mount(build_id, fuse_fd.as_raw_fd(), opts.mountd_request_timeout)
+        .mount(
+            build_id,
+            mountd_token,
+            fuse_fd.as_raw_fd(),
+            opts.mountd_request_timeout,
+        )
         .map_err(|source| CastoreMountError::Mountd {
             build_id: build_id.to_string(),
             source,

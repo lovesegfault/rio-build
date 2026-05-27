@@ -81,6 +81,8 @@
     "rio_gateway_quota_rejections_total",
     "rio_mountd_cache_free_bytes",
     "rio_mountd_connections_current",
+    "rio_mountd_mount_admission_total",
+    "rio_mountd_mount_rejected_total",
     "rio_mountd_promote_bytes_total",
     "rio_mountd_promote_inflight",
     "rio_mountd_promote_reject_total",
@@ -666,6 +668,16 @@
         "name": "rio_mountd_connections_current",
         "kind": "gauge",
         "help": "Live UDS connections (== builds being served on this node)"
+      },
+      {
+        "name": "rio_mountd_mount_admission_total",
+        "kind": "counter",
+        "help": "Successful Mount admissions (labeled by method: gid = SO_PEERCRED gid matched allowedGid, token = scheduler-minted Mount token verified)"
+      },
+      {
+        "name": "rio_mountd_mount_rejected_total",
+        "kind": "counter",
+        "help": "Mount admission rejections in token mode (labeled by reason: token-missing/ token-invalid/build-id-mismatch/audience-mismatch)"
       },
       {
         "name": "rio_mountd_promote_bytes_total",

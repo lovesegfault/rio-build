@@ -157,12 +157,19 @@ fn open_dev_fuse() -> anyhow::Result<OwnedFd> {
         .into())
 }
 
-/// `Mount{build_id}` carrying `fuse_fd` in `SCM_RIGHTS`; unpack the
-/// success reply into the staging quota.
-fn mount(conn: &mut Conn, build_id: &str, fuse_fd: &OwnedFd) -> anyhow::Result<u64> {
+/// `Mount{build_id, token}` carrying `fuse_fd` in `SCM_RIGHTS`; unpack
+/// the success reply into the staging quota. `token` is the §P0559
+/// Mount-admission credential (None = rely on the gid gate).
+fn mount(
+    conn: &mut Conn,
+    build_id: &str,
+    token: Option<&str>,
+    fuse_fd: &OwnedFd,
+) -> anyhow::Result<u64> {
     let (resp, _fds) = conn.call(
         Req::Mount {
             build_id: build_id.to_owned(),
+            token: token.map(str::to_owned),
         },
         &[fuse_fd.as_raw_fd()],
     )?;
@@ -263,10 +270,11 @@ fn fstype_of(mount_point: &Path) -> anyhow::Result<String> {
 fn mount_and_serve(
     conn: &mut Conn,
     build_id: &str,
+    token: Option<&str>,
     mount_point: &Path,
 ) -> anyhow::Result<(u64, fuser::BackgroundSession, String)> {
     let fuse_fd = open_dev_fuse()?;
-    let quota = mount(conn, build_id, &fuse_fd)?;
+    let quota = mount(conn, build_id, token, &fuse_fd)?;
     // Order is load-bearing: mount(2) first (queues FUSE_INIT), then
     // Session::from_fd (answers it) — from_fd on an unattached fd fails.
     mount_castore_fd(&fuse_fd, mount_point)?;
@@ -289,6 +297,7 @@ fn kind_name(kind: &ErrKind) -> &'static str {
         ErrKind::DuplicateBuildId => "DuplicateBuildId",
         ErrKind::BatchTooLarge => "BatchTooLarge",
         ErrKind::BadFuseFd => "BadFuseFd",
+        ErrKind::Unauthorized => "Unauthorized",
     }
 }
 
@@ -357,6 +366,10 @@ enum Cmd {
         /// inside its own mount namespace).
         #[arg(long, default_value = "/tmp/castore-serve")]
         mount_point: PathBuf,
+        /// §P0559 Mount-admission token to present in Mount{} (what the
+        /// production builder takes from WorkAssignment.mountd_token).
+        #[arg(long)]
+        token: Option<String>,
     },
     /// Mount and assert the daemon replies `Err(<expect>)`.
     ExpectMountErr {
@@ -365,6 +378,31 @@ enum Cmd {
         /// ErrKind variant name, e.g. `BadBuildId`.
         #[arg(long)]
         expect: String,
+        /// §P0559 Mount-admission token to present (omit to exercise
+        /// the missing-token rejection).
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// Mint a §P0559 Mount-admission token the way the scheduler does
+    /// (HMAC-signed MountdClaims) and print it to stdout — the VM test
+    /// uses this to drive the token-mode subtests without a scheduler.
+    MintToken {
+        /// Raw key file (the daemon's --token-key-path counterpart).
+        #[arg(long)]
+        key_file: PathBuf,
+        #[arg(long)]
+        build_id: String,
+        /// Seconds until expiry (from now).
+        #[arg(long, default_value_t = 3600)]
+        ttl_secs: u64,
+        /// Mint an ALREADY-EXPIRED token (expiry 120 s in the past) for
+        /// the rejection subtest.
+        #[arg(long)]
+        expired: bool,
+        /// Audience claim; anything other than the default is rejected
+        /// by the daemon.
+        #[arg(long, default_value = rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE)]
+        audience: String,
     },
     /// Assert the daemon drops the connection without answering the
     /// first request (gid gate, uid-bound rejection).
@@ -447,10 +485,26 @@ fn main() -> anyhow::Result<()> {
             build_id,
             ready_file,
             mount_point,
-        } => serve(&args.socket, &build_id, &ready_file, &mount_point),
-        Cmd::ExpectMountErr { build_id, expect } => {
-            expect_mount_err(&args.socket, &build_id, &expect)
-        }
+            token,
+        } => serve(
+            &args.socket,
+            &build_id,
+            token.as_deref(),
+            &ready_file,
+            &mount_point,
+        ),
+        Cmd::ExpectMountErr {
+            build_id,
+            expect,
+            token,
+        } => expect_mount_err(&args.socket, &build_id, token.as_deref(), &expect),
+        Cmd::MintToken {
+            key_file,
+            build_id,
+            ttl_secs,
+            expired,
+            audience,
+        } => mint_token(&key_file, &build_id, ttl_secs, expired, &audience),
         Cmd::ExpectRejected => expect_rejected(&args.socket),
         Cmd::DoubleMount { build_id } => double_mount(&args.socket, &build_id),
         Cmd::Promote {
@@ -511,13 +565,14 @@ fn start_fuse(fuse_fd: OwnedFd) -> anyhow::Result<fuser::BackgroundSession> {
 fn serve(
     socket: &Path,
     build_id: &str,
+    token: Option<&str>,
     ready_file: &Path,
     mount_point: &Path,
 ) -> anyhow::Result<()> {
     // Before any thread exists: the userns this client will mount in.
     enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (quota, bg, fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
+    let (quota, bg, fstype) = mount_and_serve(&mut conn, build_id, token, mount_point)?;
     // The mount lives only in this namespace, so the readability check
     // has to happen here; the driver greps the ready file for it.
     let readable = match std::fs::read_dir(mount_point) {
@@ -539,14 +594,21 @@ fn serve(
     Ok(())
 }
 
-fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Result<()> {
+fn expect_mount_err(
+    socket: &Path,
+    build_id: &str,
+    token: Option<&str>,
+    expect: &str,
+) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
     // A well-formed Mount (fd attached) so the only thing the daemon
-    // can object to is what the test scripted (bad id, duplicate id).
+    // can object to is what the test scripted (bad id, duplicate id,
+    // missing/invalid token).
     let fuse_fd = open_dev_fuse()?;
     let (resp, _) = conn.call(
         Req::Mount {
             build_id: build_id.to_owned(),
+            token: token.map(str::to_owned),
         },
         &[fuse_fd.as_raw_fd()],
     )?;
@@ -568,6 +630,7 @@ fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
     let sent = conn.send(
         Req::Mount {
             build_id: "rejected".to_owned(),
+            token: None,
         },
         &[],
     );
@@ -584,12 +647,51 @@ fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
     }
 }
 
+/// Mint a Mount-admission token exactly the way the scheduler's
+/// dispatch does (same claims type, same envelope), so the VM test can
+/// exercise the daemon's verifier without a scheduler in the loop.
+fn mint_token(
+    key_file: &Path,
+    build_id: &str,
+    ttl_secs: u64,
+    expired: bool,
+    audience: &str,
+) -> anyhow::Result<()> {
+    let signer = rio_auth::hmac::HmacSigner::load(Some(key_file))
+        .map_err(|e| anyhow::anyhow!("load {}: {e}", key_file.display()))?
+        .context("key file missing")?;
+    let now = std::time::SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock before epoch")?
+        .as_secs();
+    let expiry_unix = if expired {
+        now.saturating_sub(120)
+    } else {
+        now.saturating_add(ttl_secs)
+    };
+    let token = signer.sign(&rio_auth::hmac::MountdClaims {
+        aud: audience.to_owned(),
+        build_id: build_id.to_owned(),
+        tenant: None,
+        issued_unix: now,
+        expiry_unix,
+    });
+    println!("{token}");
+    Ok(())
+}
+
 fn double_mount(socket: &Path, build_id: &str) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
     let fuse_fd = open_dev_fuse()?;
-    let _ = mount(&mut conn, build_id, &fuse_fd)?;
+    let _ = mount(&mut conn, build_id, None, &fuse_fd)?;
     let second = format!("{build_id}-second");
-    let (resp, _) = conn.call(Req::Mount { build_id: second }, &[fuse_fd.as_raw_fd()])?;
+    let (resp, _) = conn.call(
+        Req::Mount {
+            build_id: second,
+            token: None,
+        },
+        &[fuse_fd.as_raw_fd()],
+    )?;
     match resp {
         Resp::Err(ErrKind::AlreadyMounted) => {
             println!("RESULT second_mount=AlreadyMounted");
@@ -608,7 +710,7 @@ fn promote(
 ) -> anyhow::Result<()> {
     let mut conn = Conn::connect(socket)?;
     let fuse_fd = open_dev_fuse()?;
-    let _ = mount(&mut conn, build_id, &fuse_fd)?;
+    let _ = mount(&mut conn, build_id, None, &fuse_fd)?;
     let content = gen_content(0, size_mib << 20);
     // A corrupted stage claims a digest the content does not hash to:
     // the digest of the content with its first byte flipped.
@@ -664,7 +766,7 @@ fn append_promote(
 
     let mut conn = Conn::connect(socket)?;
     let fuse_fd = open_dev_fuse()?;
-    let _ = mount(&mut conn, build_id, &fuse_fd)?;
+    let _ = mount(&mut conn, build_id, None, &fuse_fd)?;
     let content = gen_content(0xA99E4D, size_mib << 20);
     let digest = *blake3::hash(&content).as_bytes();
     let path = stage(staging_root, build_id, &digest, &content)?;
@@ -719,7 +821,7 @@ fn backing_bench(
 ) -> anyhow::Result<()> {
     enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
+    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, None, mount_point)?;
 
     let mut rtts = Vec::with_capacity(iters);
     for _ in 0..iters {
@@ -759,7 +861,7 @@ fn concurrency(
 ) -> anyhow::Result<()> {
     enter_userns()?;
     let mut conn = Conn::connect(socket)?;
-    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, mount_point)?;
+    let (_, _bg, _fstype) = mount_and_serve(&mut conn, build_id, None, mount_point)?;
 
     let content = gen_content(0xC04C44, promote_mib << 20);
     let digest = *blake3::hash(&content).as_bytes();
@@ -846,7 +948,7 @@ fn fill_staging(
 
     let mut conn = Conn::connect(socket)?;
     let fuse_fd = open_dev_fuse()?;
-    let quota = mount(&mut conn, build_id, &fuse_fd)?;
+    let quota = mount(&mut conn, build_id, None, &fuse_fd)?;
     let path = staging_root.join(build_id).join("fill");
     let mut f =
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;

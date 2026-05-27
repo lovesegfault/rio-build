@@ -41,13 +41,23 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MAX_PROMOTE_BYTES)]
     max_promote_bytes: u64,
     /// SO_PEERCRED gid allowed to connect — the host `rio-builder`
-    /// group (helm `mountd.allowedGid`). How a userns-confined builder
-    /// pod presents this gid is the open "socket access under
-    /// hostUsers:false" question owned by §P0559 of the ADR-022
-    /// implementation plan; it is NOT the pod's `fsGroup` (a
-    /// supplementary group, which SO_PEERCRED never reports).
+    /// group (helm `mountd.allowedGid`). Without --token-key-path this
+    /// is the only admission path (socket 0660, wrong gid dropped
+    /// before any frame); with it, peers outside this gid may instead
+    /// be admitted by a verifying Mount token (ADR-022 §P0559).
     #[arg(long)]
     allowed_gid: u32,
+    /// HMAC key file for verifying scheduler-minted Mount-admission
+    /// tokens (ADR-022 §P0559) — the DEDICATED mountd key, never the
+    /// store-facing assignment key. Enables token mode: the socket
+    /// becomes world-connectable (0666) and a connection whose gid is
+    /// not --allowed-gid is admitted only if its Mount{} carries a
+    /// token that verifies (signature, expiry, audience, build_id).
+    /// Unset = token mode off; gid-only admission, socket 0660 —
+    /// exactly the pre-token posture. Helm sets this via the
+    /// `mountdHmac.secretName` Secret mount + env.
+    #[arg(long, env = "RIO_MOUNTD_HMAC_KEY_PATH")]
+    token_key_path: Option<PathBuf>,
     /// Disk-pressure sweep period in seconds: how often statvfs probes
     /// the cache/chunks/staging trees and, below 10% free, evicts
     /// (orphaned staging, then chunks, then cache, oldest first) until
@@ -96,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
         staging_quota_bytes: args.staging_quota_bytes,
         max_promote_bytes: args.max_promote_bytes,
         allowed_gid: args.allowed_gid,
+        token_key_path: args.token_key_path,
         sweep_interval: std::time::Duration::from_secs(args.sweep_interval_secs),
     });
     tokio::select! {

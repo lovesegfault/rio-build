@@ -59,6 +59,10 @@ test-fixtures = ["dep:toml"]
 
 [dependencies]
 rio-common = { workspace = true }
+# rio-mountd Mount-admission tokens (ADR-022 §P0559): the daemon
+# verifies scheduler-minted MountdClaims offline; the builder threads
+# the token from the WorkAssignment into Mount{}.
+rio-auth = { workspace = true }
 rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 schemars = { workspace = true }

@@ -6155,6 +6155,7 @@ dependencies = [
  "prost",
  "prost-types",
  "regex",
+ "rio-auth",
  "rio-common",
  "rio-nix",
  "rio-proto",

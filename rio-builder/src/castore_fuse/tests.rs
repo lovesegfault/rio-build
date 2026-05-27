@@ -807,6 +807,7 @@ async fn unauthenticated_castore_prefetch_is_an_actionable_mount_failure() {
                 // No token → the mock (like rio-store) rejects with
                 // UNAUTHENTICATED before streaming any Directory body.
                 assignment_token: "",
+                mountd_token: "",
             },
             clients,
             runtime,
