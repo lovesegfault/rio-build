@@ -271,6 +271,17 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
     },
 
+    /// The controller's unified pod-terminal classification for one
+    /// pull-mode attempt (`AdminService.ReportAttemptOutcome`, the
+    /// C4/C5 unification). Idempotent by attempt identity; a report
+    /// for an identity with no attempt charges nothing.
+    ReportAttemptOutcome {
+        identity: super::pull::AttemptIdentity,
+        reason: rio_proto::types::AttemptTerminalReason,
+        node_name: Option<String>,
+        reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
+    },
+
     /// Controller acked it created Jobs for these intents → arm the
     /// Pending-watch (ICE-backoff) timer for each band-targeted one.
     /// Separated from `GetSpawnIntents` so that path stays read-only:
@@ -762,6 +773,7 @@ impl ActorCommand {
             Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
             Self::PullAssignment { .. } => "PullAssignment",
             Self::ReportPullOutcome { .. } => "ReportPullOutcome",
+            Self::ReportAttemptOutcome { .. } => "ReportAttemptOutcome",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
             Self::Heartbeat(_) => "Heartbeat",

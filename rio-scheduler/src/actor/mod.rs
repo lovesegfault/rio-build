@@ -1279,6 +1279,18 @@ impl DagActor {
                     self.handle_report_outcome(exec_id, auth_intent, payload, reply)
                         .await;
                 }
+                ActorCommand::ReportAttemptOutcome {
+                    identity,
+                    reason,
+                    node_name,
+                    reply,
+                } => {
+                    // r[sched.lease.standby-drops-writes]: the handler
+                    // self-gates on is_leader(); its only write is the
+                    // first-writer-wins reason fill.
+                    self.handle_report_attempt_outcome(identity, reason, node_name, reply)
+                        .await;
+                }
                 ActorCommand::ReportExecutorTermination {
                     executor_id,
                     reason,

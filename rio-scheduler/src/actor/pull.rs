@@ -609,3 +609,189 @@ impl DagActor {
         }
     }
 }
+
+/// The attempt identity carried by `ReportAttemptOutcome` (exec_id
+/// preferred; intent id accepted; the Job name is recorded for
+/// diagnostics — its full resolution arrives with the controller-side
+/// re-point, which always knows the exec/intent from the open-attempt
+/// view).
+#[derive(Debug, Default)]
+pub(crate) struct AttemptIdentity {
+    pub intent_id: Option<String>,
+    pub job_name: Option<String>,
+    pub exec_id: Option<Uuid>,
+}
+
+/// Map the wire reason to the `termination_reason` label the second
+/// installment records.
+pub(crate) fn attempt_terminal_reason_label(
+    reason: rio_proto::types::AttemptTerminalReason,
+) -> &'static str {
+    use rio_proto::types::AttemptTerminalReason as R;
+    match reason {
+        R::Unspecified => "unspecified",
+        R::OomKilled => "oom_killed",
+        R::EvictedDiskPressure => "evicted_disk_pressure",
+        R::EvictedOther => "evicted_other",
+        R::Completed => "pod_completed",
+        R::Error => "pod_error",
+        R::DeadlineExceeded => "deadline_exceeded",
+        R::Cancelled => "cancelled",
+        R::Preempted => "preempted",
+        R::Reaped => "reaped",
+    }
+}
+
+impl DagActor {
+    /// Handle one `ReportAttemptOutcome` (the unified pod-terminal
+    /// intake, scheduler half). Idempotent: the only write it ever
+    /// performs is the reason-only second-installment fill on an
+    /// existing, still-unfilled classification row; it never inserts a
+    /// row, never consumes budget, and never bumps a floor.
+    ///
+    /// The no-attempt arm (a pod that died without ever completing a
+    /// pull) acknowledges and charges nothing; its only permitted side
+    /// effects are clearing the intent's ICE cell (the
+    /// `dispatched_cells` arm for that intent) and re-arming the spawn
+    /// intent — which, for a still-wanted drv, simply means leaving it
+    /// Ready so the next `GetSpawnIntents` re-emits it.
+    // r[impl ctrl.report.attempt-outcome]
+    // r[impl sched.attempt.no-attempt-no-op]
+    pub(super) async fn handle_report_attempt_outcome(
+        &mut self,
+        identity: AttemptIdentity,
+        reason: rio_proto::types::AttemptTerminalReason,
+        _node_name: Option<String>,
+        reply: oneshot::Sender<Result<(), PullRejection>>,
+    ) {
+        let result = self.report_attempt_outcome_inner(identity, reason).await;
+        let _ = reply.send(result);
+    }
+
+    async fn report_attempt_outcome_inner(
+        &mut self,
+        identity: AttemptIdentity,
+        reason: rio_proto::types::AttemptTerminalReason,
+    ) -> Result<(), PullRejection> {
+        if !self.leader.is_leader() {
+            return Err(PullRejection::NotLeader);
+        }
+        // Resolve the attempt: exec_id first, then the intent's open
+        // pull-mode attempt. A Job-name-only report cannot be resolved
+        // here yet (the deterministic name embeds only a derived
+        // suffix); the controller-side callers always know the
+        // exec/intent from ListOpenAttempts.
+        let resolved = if let Some(exec_id) = identity.exec_id {
+            self.db
+                .find_attempt_by_exec_id(exec_id)
+                .await
+                .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?
+                .map(|row| (exec_id, row))
+        } else if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
+            self.db
+                .find_open_pull_attempt_by_drv_hash(intent)
+                .await
+                .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?
+        } else {
+            None
+        };
+
+        let Some((exec_id, attempt)) = resolved else {
+            // The no-attempt no-op arm: acknowledge, charge nothing.
+            // Permitted side effects only — drop the intent's ICE-clear
+            // arm so a never-pulled pod death cannot leave a stale
+            // Pending-watch entry behind, and leave the (still-wanted)
+            // drv exactly as it is so the spawn intent re-arms on the
+            // next controller poll.
+            if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
+                self.dispatched_cells.remove(intent);
+            }
+            debug!(
+                intent_id = ?identity.intent_id,
+                job_name = ?identity.job_name,
+                exec_id = ?identity.exec_id,
+                ?reason,
+                "ReportAttemptOutcome with no matching attempt acknowledged charge-free"
+            );
+            return Ok(());
+        };
+
+        // Stream-mode attempts stay owned by the as-built report paths
+        // (ReportExecutorTermination / the deadline-exceeded Job
+        // report) during coexistence — never classified from here.
+        if attempt.dispatch_mode != "pull" {
+            debug!(%exec_id, "ReportAttemptOutcome for a stream-mode attempt ignored (as-built paths own it)");
+            return Ok(());
+        }
+        if attempt.attempt_terminal {
+            // Duplicate / already established: idempotent no-op.
+            return Ok(());
+        }
+
+        let label = attempt_terminal_reason_label(reason);
+        if attempt.attempt_recorded {
+            // Second installment on the worker-reported row: fill the
+            // termination reason only — never a reclassification, never
+            // a new row, never a budget or floor change.
+            let derivation_id = attempt.derivation_id;
+            let won = self
+                .db
+                .fill_termination_reason_only(derivation_id, exec_id, label)
+                .await
+                .map_err(|e| PullRejection::Internal(format!("installment fill failed: {e}")))?;
+            let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+            if won {
+                if let Some(state) = self.dag.node_mut(&drv_hash) {
+                    state.fill_attempt_termination_reason(exec_id, label);
+                }
+                // A won fill on an attempt whose derivation is still
+                // in-flight on this attempt means no other observer has
+                // resolved it yet — requeue now (the pod is gone), and
+                // record the pod-terminal requeue interval.
+                let still_in_flight = self.dag.node(&drv_hash).is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Assigned | DerivationStatus::Running
+                    ) && s.exec_id == Some(exec_id)
+                });
+                if still_in_flight {
+                    // OA1 interval, pod-terminal cause: the attempt's
+                    // classifying observation -> this requeue.
+                    let observed_at = self
+                        .dag
+                        .node(&drv_hash)
+                        .and_then(|s| {
+                            s.attempt_history()
+                                .iter()
+                                .rev()
+                                .find(|r| r.exec_id == Some(exec_id))
+                                .map(|r| r.occurred_at_epoch_secs)
+                        })
+                        .unwrap_or_else(crate::db::attempts::epoch_now);
+                    metrics::histogram!(
+                        "rio_scheduler_attempt_requeue_seconds",
+                        "cause" => "pod-terminal"
+                    )
+                    .record((crate::db::attempts::epoch_now() - observed_at).max(0.0));
+                    let executor = ExecutorId::from(attempt.executor_id.as_str());
+                    self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                        .await;
+                }
+            }
+            return Ok(());
+        }
+
+        // Open attempt with no classification row yet (pulled, never
+        // worker-reported, pod now terminal): nothing is filled and
+        // nothing is inserted at this slice — the establishment sweep
+        // (deadline + report-slack) remains the classification vehicle
+        // until the controller-side re-point lands. Acknowledged.
+        debug!(
+            %exec_id,
+            drv_hash = %attempt.drv_hash,
+            ?reason,
+            "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill target)"
+        );
+        Ok(())
+    }
+}

@@ -414,6 +414,32 @@ impl SchedulerDb {
         Ok(result.rows_affected() == 1)
     }
 
+    /// Reason-only second installment: fill `termination_reason` on the
+    /// row identified by `(derivation_id, exec_id)` WITHOUT touching its
+    /// `outcome_class` or floor flags — the unified pod-terminal report
+    /// (`ReportAttemptOutcome`) enriches an already-classified row, it
+    /// never reclassifies it. Same first-writer-wins guard as
+    /// [`Self::fill_termination`]; returns whether THIS call filled it.
+    pub(crate) async fn fill_termination_reason_only(
+        &self,
+        derivation_id: Uuid,
+        exec_id: Uuid,
+        termination_reason: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            "UPDATE drv_attempts \
+             SET termination_reason = $3 \
+             WHERE derivation_id = $1 AND exec_id = $2 \
+               AND termination_reason IS NULL",
+        )
+        .bind(derivation_id)
+        .bind(exec_id)
+        .bind(termination_reason)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     /// Single-derivation suffix load **inside the caller's transaction**
     /// — the read half of the Phase-1b appending transaction (append the
     /// observation's row, read the post-reset suffix it now belongs to,

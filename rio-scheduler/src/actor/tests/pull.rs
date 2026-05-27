@@ -575,3 +575,216 @@ async fn report_outcome_unknown_exec_writes_nothing() -> TestResult {
     );
     Ok(())
 }
+
+// ─── ReportAttemptOutcome (the unified pod-terminal intake) ─────────────
+
+/// Send one `ReportAttemptOutcome` through the actor.
+async fn report_attempt_outcome(
+    handle: &ActorHandle,
+    intent_id: Option<&str>,
+    exec_id: Option<uuid::Uuid>,
+    reason: rio_proto::types::AttemptTerminalReason,
+) -> Result<(), PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: intent_id.map(Into::into),
+                job_name: None,
+                exec_id,
+            },
+            reason,
+            node_name: Some("node-9".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify sched.attempt.no-attempt-no-op]
+/// A terminal report for an attempt identity with no attempt row (a pod
+/// that died without ever completing a pull) is acknowledged and
+/// charges nothing: no insert, no budget consumption, no floor bump, no
+/// establishment — and the still-wanted drv stays Ready so the spawn
+/// intent re-arms naturally.
+#[tokio::test]
+async fn attempt_outcome_no_attempt_is_charge_free() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rao-a", PriorityClass::Scheduled).await?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("rao-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("no-attempt report acked");
+
+    let total_attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(total_attempts, 0, "no insert");
+    let (assignments, executions) = row_counts(&db.pool, "rao-a").await;
+    assert_eq!(
+        (assignments, executions),
+        (0, 0),
+        "no establishment, no rows"
+    );
+    let info = expect_drv(&handle, "rao-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the drv stays Ready (spawnable) — no budget or floor was consumed"
+    );
+    assert_eq!(info.retry.failure_count, 0, "no budget consumption");
+    assert!(info.retry.failed_builders.is_empty(), "no exclusion charge");
+    Ok(())
+}
+
+// r[verify ctrl.report.attempt-outcome]
+/// A report for an already worker-reported attempt fills only
+/// termination_reason (the second installment), never creates a new
+/// row, and a duplicate is a no-op.
+#[tokio::test]
+async fn attempt_outcome_second_installment_fills_reason_only() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rao-b", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "rao-b", Some("rao-b")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // The worker reports a transient failure first (the first
+    // installment: a classified row with no termination_reason).
+    report(
+        &handle,
+        exec_id,
+        Some("rao-b"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("worker report acked");
+    let rows = ledger_rows(&db.pool, "rao-b").await;
+    assert_eq!(rows.len(), 1);
+    assert!(rows[0].termination_reason.is_none());
+    let worker_class = rows[0].outcome_class.clone();
+
+    // The controller's pod-terminal classification arrives second.
+    report_attempt_outcome(
+        &handle,
+        None,
+        Some(exec_id),
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("second installment acked");
+    let rows = ledger_rows(&db.pool, "rao-b").await;
+    assert_eq!(rows.len(), 1, "the second installment never creates a row");
+    assert_eq!(
+        rows[0].termination_reason.as_deref(),
+        Some("oom_killed"),
+        "termination_reason is filled"
+    );
+    assert_eq!(
+        rows[0].outcome_class, worker_class,
+        "the worker's classification is never overwritten"
+    );
+
+    // A duplicate report is a no-op (first writer wins).
+    report_attempt_outcome(
+        &handle,
+        None,
+        Some(exec_id),
+        rio_proto::types::AttemptTerminalReason::Error,
+    )
+    .await
+    .expect("duplicate acked");
+    let rows = ledger_rows(&db.pool, "rao-b").await;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("oom_killed"));
+    Ok(())
+}
+
+// r[verify ctrl.report.attempt-outcome]
+/// When the fill wins on an attempt whose derivation is still in
+/// flight on that exec (no other observer requeued it), the
+/// pod-terminal classification requeues the drv.
+#[tokio::test]
+async fn attempt_outcome_requeues_still_inflight_attempt() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rao-c", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "rao-c", Some("rao-c")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    let info = expect_drv(&handle, "rao-c").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Running);
+
+    // A first-installment row exists (classified, unfilled) but nothing
+    // has requeued the drv yet.
+    let derivation_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind("rao-c")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO drv_attempts \
+             (attempt_id, derivation_id, exec_id, executor_id, event_kind, outcome_class, \
+              termination_reason, reporting_party, occurred_at) \
+         VALUES ($1, $2, $3, 'rao-c', 'attempt', 'disconnected', NULL, 'controller', now())",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(derivation_id)
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    report_attempt_outcome(
+        &handle,
+        None,
+        Some(exec_id),
+        rio_proto::types::AttemptTerminalReason::Preempted,
+    )
+    .await
+    .expect("pod-terminal report acked");
+
+    let rows = ledger_rows(&db.pool, "rao-c").await;
+    assert_eq!(rows.len(), 1, "fill, not insert");
+    assert_eq!(rows[0].termination_reason.as_deref(), Some("preempted"));
+    let info = expect_drv(&handle, "rao-c").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the pod-terminal classification requeues the still-in-flight drv"
+    );
+    Ok(())
+}
+
+// r[verify sched.attempt.no-attempt-no-op]
+/// A stream-mode attempt identity is never classified from this RPC
+/// during coexistence (the as-built report paths own it).
+#[tokio::test]
+async fn attempt_outcome_ignores_stream_attempts() -> TestResult {
+    let (db, handle, _task, mut rx) = setup_with_worker("w-rao", "x86_64-linux").await?;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rao-d", PriorityClass::Scheduled).await?;
+    let stream_assignment = recv_assignment(&mut rx).await;
+    let stream_exec: uuid::Uuid = stream_assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        None,
+        Some(stream_exec),
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("stream-attempt report acked");
+
+    assert!(
+        ledger_rows(&db.pool, "rao-d").await.is_empty(),
+        "nothing recorded"
+    );
+    let info = expect_drv(&handle, "rao-d").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Assigned,
+        "the stream attempt is untouched"
+    );
+    Ok(())
+}

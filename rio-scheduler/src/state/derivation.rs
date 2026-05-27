@@ -1783,6 +1783,28 @@ impl DerivationState {
         false
     }
 
+    /// Mirror a successful reason-only fill (the unified pod-terminal
+    /// report's second installment) onto the in-memory record for
+    /// `exec_id`: sets `termination_reason` if it is still empty and
+    /// touches nothing else (class and floor flags keep the values the
+    /// classifying append wrote). Returns whether a record was updated.
+    pub(crate) fn fill_attempt_termination_reason(
+        &mut self,
+        exec_id: Uuid,
+        termination_reason: &str,
+    ) -> bool {
+        for record in self.attempt_history.iter_mut().rev() {
+            if record.exec_id == Some(exec_id) {
+                if record.termination_reason.is_none() {
+                    record.termination_reason = Some(termination_reason.to_string());
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
     /// The in-memory attempt history (the committed suffix mirror).
     /// Consulted by the Phase-1b collapsed sites' uncommitted-merge
     /// fallback (no `derivations` row to read the suffix from yet) and,

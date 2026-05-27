@@ -518,19 +518,76 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(ClearPoisonResponse { cleared }))
     }
 
-    // Pull-mode attempt lifecycle surface (additive). Stubs until the
-    // handler tasks land: the wire surface exists, nothing in
-    // production calls it, and every existing RPC is untouched.
+    // Pull-mode attempt lifecycle surface (additive): the controller's
+    // unified pod-terminal intake and the open-attempt view. Nothing in
+    // production calls these until a pool opts into pull mode; every
+    // existing RPC is untouched.
 
+    /// Controller reports one pull-mode attempt's terminal status (the
+    /// C4/C5 unification). Idempotent by attempt identity; the only
+    /// write is the first-writer-wins reason fill on an existing
+    /// classification row. A report for an identity with no attempt —
+    /// a pod that died without ever completing a pull — is acknowledged
+    /// and charges nothing (the no-attempt no-op rule); stream-mode
+    /// attempts stay owned by `ReportExecutorTermination` during
+    /// coexistence.
+    // r[impl ctrl.report.attempt-outcome]
     #[instrument(skip(self, request), fields(rpc = "ReportAttemptOutcome"))]
     async fn report_attempt_outcome(
         &self,
         request: Request<rio_proto::types::ReportAttemptOutcomeRequest>,
     ) -> Result<Response<rio_proto::types::ReportAttemptOutcomeResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "ReportAttemptOutcome is not implemented yet (pull-mode dispatch lands incrementally)",
-        ))
+        // Same gate as ReportExecutorTermination: a forged terminal
+        // report from a compromised builder must not be able to touch
+        // attempt classification.
+        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        let req = request.into_inner();
+        if req.intent_id.is_empty() && req.job_name.is_empty() && req.exec_id.is_empty() {
+            return Err(Status::invalid_argument(
+                "at least one of intent_id, job_name, exec_id is required",
+            ));
+        }
+        let exec_id = if req.exec_id.is_empty() {
+            None
+        } else {
+            Some(
+                req.exec_id
+                    .parse::<Uuid>()
+                    .map_err(|_| Status::invalid_argument("exec_id must be a UUID when present"))?,
+            )
+        };
+        let identity = crate::actor::pull::AttemptIdentity {
+            intent_id: (!req.intent_id.is_empty()).then_some(req.intent_id),
+            job_name: (!req.job_name.is_empty()).then_some(req.job_name),
+            exec_id,
+        };
+        let reason = rio_proto::types::AttemptTerminalReason::try_from(req.reason)
+            .unwrap_or(rio_proto::types::AttemptTerminalReason::Unspecified);
+        let node_name = (!req.node_name.is_empty()).then_some(req.node_name);
+
+        let result = query_actor(&self.actor, |reply| ActorCommand::ReportAttemptOutcome {
+            identity,
+            reason,
+            node_name,
+            reply,
+        })
+        .await?;
+        match result {
+            Ok(()) => Ok(Response::new(
+                rio_proto::types::ReportAttemptOutcomeResponse {},
+            )),
+            Err(crate::actor::PullRejection::NotLeader)
+            | Err(crate::actor::PullRejection::StaleGeneration) => {
+                Err(Status::unavailable("not leader (standby replica)"))
+            }
+            Err(crate::actor::PullRejection::TokenMismatch) => {
+                Err(Status::permission_denied("attempt identity mismatch"))
+            }
+            Err(crate::actor::PullRejection::Internal(msg)) => Err(Status::internal(msg)),
+        }
     }
 
     /// Ledger-backed open pull-mode attempt view: the controller's
@@ -548,6 +605,15 @@ impl AdminService for AdminServiceImpl {
         request: Request<rio_proto::types::ListOpenAttemptsRequest>,
     ) -> Result<Response<rio_proto::types::ListOpenAttemptsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // Read-path gate (r[sched.sla.threat.read-path-auth] posture):
+        // the view names other tenants' in-flight derivation paths and
+        // node bindings, so it is service-token gated like the other
+        // topology-revealing reads. The controller (busy bridge), CLI,
+        // and dashboard are the legitimate consumers.
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-controller", "rio-cli", "rio-dashboard"],
+        )?;
         self.ensure_leader()?;
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db

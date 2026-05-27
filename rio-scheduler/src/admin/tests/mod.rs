@@ -274,7 +274,9 @@ const SERVICE_GATED: &[&str] = &[
     "ImportSlaCorpus",
     "InjectBuildSample",
     "AppendInterruptSample",
+    "ReportAttemptOutcome",
     // Read-path gated ([`read_path_rpcs_require_service_token`]):
+    "ListOpenAttempts",
     "ListPoisoned",
     "ListTenants",
     "GetBuildGraph",
@@ -334,6 +336,18 @@ async fn mutating_rpcs_require_service_token() {
             executor_id: "victim".into(),
             reason: TerminationReason::OomKilled as i32,
         }))
+    );
+    assert_gated!(
+        "ReportAttemptOutcome",
+        svc.report_attempt_outcome(Request::new(
+            rio_proto::types::ReportAttemptOutcomeRequest {
+                intent_id: "victim-drv".into(),
+                job_name: String::new(),
+                exec_id: String::new(),
+                reason: rio_proto::types::AttemptTerminalReason::Reaped as i32,
+                node_name: String::new(),
+            }
+        ))
     );
     assert_gated!(
         "AckSpawnedIntents",
@@ -434,6 +448,10 @@ async fn read_path_rpcs_require_service_token() {
     }
 
     assert_gated!("ListPoisoned", svc.list_poisoned(Request::new(())));
+    assert_gated!(
+        "ListOpenAttempts",
+        svc.list_open_attempts(Request::new(rio_proto::types::ListOpenAttemptsRequest {}))
+    );
     assert_gated!("ListTenants", svc.list_tenants(Request::new(())));
     assert_gated!(
         "GetBuildGraph",

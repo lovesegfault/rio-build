@@ -39,6 +39,24 @@ pub(crate) struct AttemptByExecRow {
     /// A terminal `drv_attempts` fill exists for this exec
     /// (establishment or the controller's second installment).
     pub attempt_terminal: bool,
+    /// `drv_executions.dispatch_mode` for this exec ('stream' when the
+    /// execution row predates the pull path or was written by it).
+    pub dispatch_mode: String,
+}
+
+/// Row shape for [`SchedulerDb::find_open_pull_attempt_by_drv_hash`]
+/// (the same columns plus the exec_id key).
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AttemptByExecByHashRow {
+    exec_id: Uuid,
+    derivation_id: Uuid,
+    drv_hash: String,
+    drv_path: String,
+    executor_id: String,
+    assignment_active: bool,
+    attempt_recorded: bool,
+    attempt_terminal: bool,
+    dispatch_mode: String,
 }
 
 /// One open pull-mode attempt as read back from the view query.
@@ -171,9 +189,11 @@ impl SchedulerDb {
                         AS attempt_recorded, \
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
-                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
+                    COALESCE(e.dispatch_mode, 'stream') AS dispatch_mode \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
+             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE a.exec_id = $1 \
              ORDER BY a.assigned_at DESC \
              LIMIT 1",
@@ -181,6 +201,53 @@ impl SchedulerDb {
         .bind(exec_id)
         .fetch_optional(&self.pool)
         .await
+    }
+
+    /// Resolve the OPEN pull-mode attempt for one derivation (the
+    /// `intent_id` arm of `ReportAttemptOutcome`'s identity
+    /// resolution): the active assignment for that drv whose execution
+    /// row carries `dispatch_mode = 'pull'`.
+    pub(crate) async fn find_open_pull_attempt_by_drv_hash(
+        &self,
+        drv_hash: &str,
+    ) -> Result<Option<(Uuid, AttemptByExecRow)>, sqlx::Error> {
+        let row: Option<AttemptByExecByHashRow> = sqlx::query_as(
+            "SELECT a.exec_id, d.derivation_id, d.drv_hash, d.drv_path, \
+                    a.builder_id AS executor_id, \
+                    (a.status IN ('pending', 'acknowledged')) AS assignment_active, \
+                    EXISTS (SELECT 1 FROM drv_attempts t WHERE t.exec_id = a.exec_id) \
+                        AS attempt_recorded, \
+                    EXISTS (SELECT 1 FROM drv_attempts t \
+                            WHERE t.exec_id = a.exec_id \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
+                    e.dispatch_mode \
+             FROM assignments a \
+             JOIN derivations d ON d.derivation_id = a.derivation_id \
+             JOIN drv_executions e ON e.exec_id = a.exec_id \
+             WHERE d.drv_hash = $1 \
+               AND a.status IN ('pending', 'acknowledged') \
+               AND e.dispatch_mode = 'pull' \
+             ORDER BY a.assigned_at DESC \
+             LIMIT 1",
+        )
+        .bind(drv_hash)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| {
+            (
+                r.exec_id,
+                AttemptByExecRow {
+                    derivation_id: r.derivation_id,
+                    drv_hash: r.drv_hash,
+                    drv_path: r.drv_path,
+                    executor_id: r.executor_id,
+                    assignment_active: r.assignment_active,
+                    attempt_recorded: r.attempt_recorded,
+                    attempt_terminal: r.attempt_terminal,
+                    dispatch_mode: r.dispatch_mode,
+                },
+            )
+        }))
     }
 
     /// Every open **pull-mode** attempt: active assignment ⋈ execution
