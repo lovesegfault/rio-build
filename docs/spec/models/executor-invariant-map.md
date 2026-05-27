@@ -2015,3 +2015,281 @@ What changes in the retry model's environment, action by action:
   (the `retryPolicyAsBuilt` freeze precedent), and the retirement is
   recorded in retry-invariant-map.md by the campaign that performs
   it.
+
+### Open adjudications at 0e (T-0e.4)
+
+Status verbs used below: **AWAITING OWNER** — the decision package is
+prepared, the options and recommendation are recorded, and no decision
+is recorded here (the campaign owner decides; for OA2/OA6 jointly with
+the controller-campaign owner — the same person, but the signature is
+that campaign's to give). **CARRIED** — not 0e-blocking; carried into
+Phase 1 with a named owner and the pre-registered default standing.
+
+#### OA1 — establishment-window numbers and the AD5 latency budget: AWAITING OWNER
+
+Where it stands at this cut: the 0a source audit showed interval (i)
+(Job/pod-terminal → report acked) has neither endpoint durably
+timestamped at production retention, so the option-(b) join can only
+measure interval (ii)'s per-cause requeue/processing lag; the
+option-(a) authorization request (the additive histogram pair, the
+design's single sanctioned Phase-0 production change) was escalated
+to the campaign owner at 0a with a decide-by of "before 0b closes".
+No authorization or refusal has been recorded; no interval-(i)
+baseline exists; the controller-outage arm has been exercised only as
+the VM-suite behavior (delayed report → establishment), not measured
+against a production population. Consequence: the AD5 composite
+budget (death→requeue, cancel/preempt) cannot be signed at this cut,
+and no-go conditions 4 and 5 cannot be discharged.
+
+The decision package:
+
+- **Option A — authorize the histogram pair** (`rio_controller_job_terminal_report_seconds`,
+  `rio_scheduler_attempt_requeue_seconds`), landed as the additive
+  observability change the design sanctions, either immediately or
+  co-located with the 1a handlers (the 1a gate already requires the
+  new handlers to emit the OA1 instrument). Costs: one small
+  production change + the observability checklist + red-first
+  registration tests; the baseline then accumulates only from
+  authorization forward, so the 0e signing of AD5 happens late
+  (against the first weeks of data) rather than now. Unblocks: a
+  stated-population interval-(i) baseline, the AD5 budget signature,
+  no-go conditions 4 and 5, and the like-for-like 1b canary
+  comparison the design requires.
+- **Option B — accept the measurement gap** and sign the AD5 budget
+  against what option (b) can measure (interval (ii) per cause from
+  `drv_attempts`) plus the VM-suite controller-outage arm. Costs: the
+  budget is signed against a population the design explicitly says is
+  not sufficient ("a VM-suite run alone does not satisfy this"), so
+  the owner is signing a known-weaker basis; condition 5 is then
+  discharged only by that explicit signature, not by data. Unblocks:
+  nothing else — Phase 0 stays paper-clean, but the 1b gate's
+  "death→requeue latency within the budget signed at 0e" criterion
+  inherits the weak baseline.
+- **Option C — neither** (refuse A, do not sign B): no-go condition 5
+  stands and Phase-1 planning is blocked on the OA1 row alone.
+
+Recommendation: **Option A**, authorized now rather than at 1a. The
+gap is structural — the rio side writes no timestamps for interval
+(i) and the k8s side ages out in ≤600 s, so no amount of
+query-writing recovers it; the instrument is small, additive,
+checklisted, and the design pre-sanctioned exactly this exception;
+and every later gate (0e AD5 signature, 1b canary latency criterion,
+1c fleet-wide criterion) reads the same instrument, so landing it
+early is what makes those gates comparable. Option B is recorded as
+viable only if the owner judges the schedule cost of waiting for
+data to outweigh gating the cutover on a measured baseline — the
+design's own no-go wording leans against it.
+
+#### OA2 — hung-node signal owner and shape: AWAITING OWNER
+
+Where it stands: the ask was issued at 0a (decision-by 0e, target
+2026-06-06) with the four candidate shapes from design §5.2; no
+shape, owner, landing slot, or signed gap has been recorded. The
+as-built detector cannot cover the transition (pull-mode pods never
+feed it; 1c' deletes its substrate), so "keep the code" is not an
+option that needs pricing.
+
+The decision package:
+
+- **Option A — controller-side aggregation, landing ≤1c**: per-node
+  clustering of attempt-deadline expiries / pull-latency over the
+  ledger plus the spawn-ack node binding (the controller already
+  holds the node informers and the Job census), feeding the same
+  dead_nodes-shaped input `reap_unhealthy` consumes today. Costs: a
+  new controller-side input and its tests, inside the controller
+  campaign's Model N scope (its checklist re-derivation is already a
+  planned 1c'/1d item); the canary window 1b→1c still needs an
+  interim statement (alert + runbook). Unblocks: obligation-table row
+  5 becomes plain meetable; no-go condition 9 discharged with no
+  coverage gap beyond the canary window; node-wedge detection keeps
+  roughly today's latency class for the Ready-but-wedged failure mode
+  (EBS/kernel/D-state) that the k8s-native backstops do not see.
+- **Option B — rely on node conditions / NotReady-age + Karpenter
+  NodeRepair + the L10 health reap only** (no rio-side aggregation).
+  Costs: the Ready-but-wedged class regresses to deadline-bound
+  detection (activeDeadlineSeconds + establishment sweep) — the exact
+  class the as-built detector was built for; per-node blast radius is
+  bounded only by AD2's node-keyed exclusion re-routing future
+  attempts. Unblocks: condition 9 only via the signed-gap clause —
+  this IS the accepted-gap option in permanent form, and the design
+  treats it as acceptable only with the bound and compensating
+  controls named and signed.
+- **Option C — signed accepted gap for 1b→1d only** (defer the
+  decision on the permanent shape to Phase 1, accept the gap for the
+  transition): bound = per-build impact ≤ activeDeadlineSeconds + the
+  establishment sweep; no automatic NodeClaim reap of wedged-but-Ready
+  nodes during the gap; compensating controls = the AD2 node-keyed
+  exclusion, an alert on per-node attempt-deadline clustering, the
+  manual NodeClaim-reap runbook, Karpenter NodeRepair for
+  NotReady-surfacing wedges. Costs: the gap is real for every pool
+  from its flip until the permanent signal lands; the controller
+  campaign must still take the re-derivation work later. Unblocks:
+  condition 9 via the recorded-gap clause; 1b is not blocked on new
+  controller work.
+
+Recommendation: **Option A with C as the explicit canary-window
+interim** — i.e. commit the controller-side deadline/pull-latency
+clustering aggregation with a landing slot no later than 1c, and sign
+the narrow 1b→1c canary-pool gap with option C's controls. This keeps
+the only detection capability for Ready-but-wedged nodes (the failure
+mode with real incident history behind the detector), puts the
+aggregation where the informers and the Job census already live, and
+matches the design's stated preference that the signal land before
+the deletion wave removes the heartbeat substrate. Option B is the
+fallback if the controller campaign refuses the scope — but it should
+be signed as what it is (a permanent regression for one failure
+class), not slid into.
+
+#### OA6 — the pod-arrives-before-Ready pull outcome: AWAITING OWNER
+
+Where it stands: the data query was issued at 0a (due before 0d
+closes, target 2026-06-03) and the results have not been recorded in
+this map; the choice is data-driven and jointly owned with the
+controller campaign, so no side is taken here. The unary signatures
+below are frozen except for this outcome (the design: they do not
+freeze without it; Gone-on-not-Ready is not a neutral default — it
+produces a reap→respawn→Gone churn loop).
+
+The decision package:
+
+- **Option (a) — a third pull outcome `NotYetReady{retry_after}`**
+  (or a bounded long-poll): the pod waits/retries up to an explicit
+  idle bound (the B7/I-116 successor; a named number or tied to
+  `activeDeadlineSeconds`) and then exits 0 charge-free. Costs:
+  re-introduces a (small) wait state that must be priced into §4.2
+  rows 13/B7 and the re-targeted Model S; the idle bound is a new
+  number to own; the signature gains a third outcome. Unblocks: keeps
+  the §13b forecast warm-start (a forecast-warmed pod starts building
+  the moment its drv goes Ready, no spawn latency); no controller
+  spec change.
+- **Option (b) — forecast intents stop minting Jobs** (the
+  ready-filter at the placeable-gate publish or the pool spawn pass;
+  NodeClaim pre-provisioning continues): Builder Jobs are created
+  only for ready=true intents. Costs: the recorded cold-start
+  regression — the first build per forecast-warmed node pays ≤1
+  controller tick + pod cold start instead of dispatching to an
+  already-registered pod; amends `ctrl.nodeclaim.placeable-gate+5`
+  (tracey bump, gate-retain unit tests and the kwok
+  forecast-provisioning VM wiring re-pointed); needs the controller
+  campaign's sign-off because Model J/N's input distribution changes.
+  Unblocks: the pull protocol has exactly two outcomes; the
+  not-yet-Ready state is unrepresentable instead of priced; the spec
+  contradiction C1 (sla-sizing.typ @alg-pool vs the gate) resolves in
+  the direction the design book already documents; Model J's
+  Ready-set abstraction becomes exact.
+- Decision rule for when the data lands (so the owner can decide
+  without re-opening the analysis): take (a) if a material fraction
+  of forecast-spawned pods see their drv go Ready within the idle
+  bound AND the measured registration→Ready latency saving is
+  material against typical build duration; take (b) if
+  forecast-spawned pods mostly idle-exit (low hit rate) or the
+  cold-start saving is marginal.
+
+Recommendation: **lean (b)** unless the OA6 data shows a material
+warm-start win. The spec already promises ready-gating (contradiction
+C1), Model J's verified abstraction assumes it, and (b) deletes a
+protocol state instead of pricing one in — the same simplification
+direction as the rest of the campaign; its cost is a bounded
+cold-start regression on exactly the pods that today mostly idle-exit
+at I-116. Option (a) is the right call only if the forecast-hit data
+contradicts that picture, which is precisely what the outstanding
+query measures.
+
+#### OA3 — fetcher pull cardinality: CARRIED
+
+The churn/cost data (pod creations per FOD fetch, fetch duration vs
+cold-start, fetcher I-116 idle-exit rate) had not been recorded at
+this cut. Carried into Phase 1 with the campaign owner; the
+pre-registered default stands — **fetchers are one-pull** — and a
+multi-pull exception, if the data later justifies it, gets its own
+small model in Phase 1 (never silent session retention). Not
+0e-blocking; no no-go condition reads it.
+
+#### OA4 — BuildPhase fate: CARRIED
+
+No dashboard-owner decision recorded (same person as the campaign
+owner). Inventory §1.11 records BuildPhase as cosmetic (dashboard
+phase column only). Carried with the dashboard owner; the
+recommendation on record is **drop it** and derive the phase column
+from attempt-row status, with the fire-and-forget unary as the
+fallback if the dashboard owner objects when the OA5 surface is
+reviewed at 1b. Not 0e-blocking.
+
+#### OA5 — operator-facing fleet view and controls: surface and owner RECORDED, sign-off carried to 1b
+
+The 0e deliverable is the surface, the owner, and the sign-off plan
+(the sign-off itself happens against the running replacement at the
+1b gate):
+
+- **Successor surface:** open attempts (the `drv_attempts` open rows:
+  derivation, exec_id, source node from the ≥067 column, age,
+  deadline) joined with the controller's Job census (Job name, pod
+  phase, node, age) — served as the replacement fleet/admin view and
+  the source for the `workers_active` successor gauge (open-attempt
+  count) and ClusterStatus. Pull-mode pods appear in this view from
+  1a (the 1a gate requires it) so the canary is never blind.
+- **What the dashboard loses, named:** per-pod heartbeat age,
+  store_degraded / capacity flags, and live stream state — none of
+  which exist for pull-mode pods; the per-pod liveness proxy becomes
+  the Job/pod phase plus attempt age.
+- **Operator controls (O1–O3) successors acknowledged:** O1
+  per-executor drain → k8s cordon + AD2 node exclusion (no dispatch
+  decision exists to steer); O2 force-evict → cancel verdict on the
+  open attempt + controller Job deletion under the AD5 budget; O3
+  fleet-wide stop → pause spawn-intent emission (maxConcurrent=0 /
+  pools-paused switch) + bulk cancel of open attempts; expected stop
+  latency = one controller tick + the AD5 abort bound.
+- **Sign-off owner:** the operator/dashboard owner (B. Meurer at
+  present); sign-off is a 1b gate criterion against the running
+  canary view, and 1c'/deletion remains gated on it (the old surfaces
+  are not deleted before the successor is signed off).
+
+### The §4.5 choices (T-0e.5)
+
+Recorded as the contract's choices; they take effect with the
+owner's overall 0e go signature (they are design choices inside the
+campaign's own scope, not external adjudications, so they are decided
+here rather than packaged — but a no-go or an owner override at the
+go review reopens them).
+
+- **Busy-signal bridge vehicle: option (b)** — `reap_orphan_running`
+  switches to the ledger-backed open-attempt query at 1a, treating a
+  Job as busy when EITHER the stream view says busy OR an open
+  pull-mode attempt exists for it, with the leader-age and RPC-error
+  fail-closed arms retained unchanged until the cleanup slice.
+  Reasoning: (b) is the §4.2 C3 successor pulled forward — built
+  once, verified at 1a/1b, and still the consumer at 1c'/1d — whereas
+  option (a)'s synthesized `ListExecutors` entries are throwaway
+  bridge code that 1c' deletes, put synthetic rows into an
+  operator-facing view during exactly the window operators are
+  watching the canary (OA5 already gives pull-mode pods their own
+  honest view), and would re-point the Model J busy-view re-derivation
+  twice. The 1a red-first test (mixed fleet: Running Job older than
+  the grace backed only by an open pull-mode attempt is NOT selected;
+  the same Job with no open attempt IS selected — the I-165 reap
+  preserved) is written against (b).
+- **Post-deletion rollback posture: revert-clean deletion-wave
+  commits kept rebased until the Phase-2 close-out.** Deletion wave
+  1c' lands as a small set of named, revert-clean commits whose
+  reverts are kept rebased and re-tested until the campaign close-out;
+  forward-fix-only is explicitly NOT adopted at this cut. Reasoning:
+  the wave deletes ~14 mechanisms, the session maps, and operator
+  surfaces in one slice; the families whose fault-regime coverage is
+  thinnest (the open 0c budget item) are exactly the ones whose
+  unmodeled-property risk the standing rule warns about, and the VM
+  scenarios that back their NOT-ENC rows run at gate cadence, not
+  continuously — keeping the reverts warm is cheap insurance over the
+  one window where a latent gap can still surface, and the cost is
+  bounded by the campaign's existing rebase discipline.
+- **Deletion-gate observable: the live stream-registration gauge
+  (`workers_active`, or its successor name if the OA5 surface renames
+  it) read in every production environment and in the VM suite, at
+  zero for a full deadline horizon defined as
+  max(`activeDeadlineSeconds` over all pools' live intents) + the
+  builder idle-timeout + report-flush slack.** The fixed-conservative-
+  number alternative is rejected: `activeDeadlineSeconds` is
+  intent/operator-controlled, so any fixed number either over-waits
+  the common case or silently under-covers a long-deadline pool. The
+  horizon is computed at gate-evaluation time from the live intents;
+  it is falsifiable and observable, and it is checked at the 1c'
+  gate alongside the model re-target.
