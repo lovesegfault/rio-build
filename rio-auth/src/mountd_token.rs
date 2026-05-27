@@ -264,10 +264,13 @@ pub enum MountdKeyError {
 /// Why a presented Mount-admission token does not authorize the requested
 /// `Mount{}`.
 ///
-/// Variants deliberately carry no token or claim material (the same
-/// discipline as the legacy [`MountdTokenError`]): the daemon logs the
-/// variant and replies with one opaque `Unauthorized`, so nothing here
-/// can leak what was presented or what would have been accepted.
+/// Variants carry no key material and no full token/claims content — at
+/// most a single offending byte/offset reported by the base64 decoder
+/// ([`Self::Base64`]) or a claim field name reported by serde
+/// ([`Self::Json`], reachable only after a trust root has verified the
+/// signature). Same discipline as the legacy [`MountdTokenError`]: the
+/// daemon logs the variant and replies with one opaque `Unauthorized` on
+/// the wire.
 #[derive(Debug, thiserror::Error)]
 pub enum MountdVerifyError {
     /// Not an `rmt2.<claims>.<signature>` shape (wrong segment count or
@@ -333,8 +336,8 @@ pub enum MountdVerifyError {
     Legacy(#[from] MountdTokenError),
 }
 
-/// Strip one trailing newline (LF or CRLF) and surrounding whitespace from
-/// a key-file payload. Same forgiveness as every other key loader in the
+/// Trim leading/trailing whitespace (trailing newlines included) from a
+/// key-file payload. Same forgiveness as every other key loader in the
 /// workspace: `echo` vs `echo -n` (or a Windows-edited Secret) must not
 /// produce a different key.
 fn trim_key_file(content: &str) -> &str {
@@ -358,10 +361,12 @@ fn split_named_entry(entry: &str) -> Result<(&str, &str), MountdKeyError> {
 ///
 /// Loaded once at startup from `RIO_MOUNTD_SIGNING_KEY_PATH` (later
 /// phase); only the control plane ever holds it. Deliberately not
-/// `Clone` and without a `Debug` impl — same hygiene as
-/// [`HmacKey`]: exactly one copy of the secret in memory, and no
-/// formatting path that could end up in a log line. (The underlying
-/// `ed25519_dalek::SigningKey` zeroizes its secret half on drop.)
+/// `Clone` and without a `Debug` impl — same hygiene as [`HmacKey`]:
+/// no copies are handed out and there is no formatting path that could
+/// land key material in a log line. The `ed25519_dalek::SigningKey`
+/// inside zeroizes its secret half on drop; the transient file/base64
+/// buffers in [`Self::load`]/[`Self::parse`] are dropped without
+/// explicit zeroization, same as [`HmacKey::load`].
 pub struct MountdSigningKey {
     /// Key name (`rio-mountd-<n>`), logged at mint time and echoed in
     /// [`Self::trust_root_entry`]. Never part of the token itself.
@@ -570,6 +575,16 @@ impl MountdTrustRoots {
         self.roots.iter().map(|(n, _)| n.as_str())
     }
 
+    // TODO: add a fuzz target for the rmt2 token parser — a new
+    // fuzz/rio-auth workspace with a target driving
+    // `MountdVerifier::verify_for_build` on arbitrary token bytes (plus
+    // `MountdSigningKey::sign` outputs as seed corpus), wired into
+    // `fuzzTargets` in nix/fuzz.nix. Deferred to the ADR-022
+    // mountd-admission-credentials Phase-2 daemon wiring: until
+    // rio-mountd consumes these tokens off its UDS nothing
+    // attacker-reachable parses this format, and the fuzz workspace
+    // belongs in the same change that makes it reachable (tracked as a
+    // Phase-2 row in the §P0590 implementation-plan table).
     /// Verify the envelope of an `rmt2` token: shape, signature (against
     /// every root), then claims decode. Claim-level checks (expiry,
     /// audience, build_id, node) belong to
