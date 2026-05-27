@@ -516,7 +516,7 @@ pub(crate) async fn append_signatures(
 /// [`crate::castore::build`] (`r[store.chunk.lock-order]`).
 // r[impl store.index.table-cascade]
 // r[impl store.castore.gc]
-// r[impl store.castore.tenant-scope]
+// r[impl store.castore.tenant-scope+2]
 #[instrument(
     skip(pool, entries, dag),
     fields(store_path_hash = hex::encode(store_path_hash), bytes = entries.len())
@@ -1505,7 +1505,7 @@ mod tests {
     /// tenant added after first-index sees the path's directories and
     /// blobs.
     // r[verify store.castore.gc]
-    // r[verify store.castore.tenant-scope]
+    // r[verify store.castore.tenant-scope+2]
     #[tokio::test]
     async fn nar_index_castore_inserts() {
         let db = TestDb::new(&crate::MIGRATOR).await;

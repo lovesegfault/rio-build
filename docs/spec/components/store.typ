@@ -415,7 +415,7 @@ whose refcount drops to 0 become eligible for S3 deletion via
 ]
 
 Rationale: `path_tenants` is the read-time tenancy source of truth for the
-castore RPCs (#rref("store.castore.tenant-scope")) and narinfo visibility
+castore RPCs (#rref("store.castore.tenant-scope+2")) and narinfo visibility
 (#rref("store.tenant.narinfo-filter"),
 #rref("store.substitute.tenant-sig-visibility")). Builder uploads are
 attributed by the `PutPathChunked` commit (HMAC claim tenant) and derivation
@@ -766,15 +766,18 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   threshold.
 ]
 
-#r("store.castore.tenant-scope")[
+#r("store.castore.tenant-scope+2")[
   `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
   tenant-scoped: queries resolve a digest to its containing store path(s)
   (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
   on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC
-  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). `path_tenants` is
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims+2")). `path_tenants` is
   the single source of tenancy truth at read time. Return NotFound for
-  digests the caller's tenant cannot reach via any owned path. Directory
-  bodies
+  digests the caller's tenant cannot reach via any owned path. For
+  assignment-token callers the tenant join is additionally narrowed by the
+  closure read scope (#rref("store.castore.closure-scope")) --- the membership
+  predicate is ANDed with, never substituted for, the `path_tenants` join.
+  Directory bodies
   leak child names/digests --- cross-tenant exposure here is a confidentiality
   issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in
   the security spec). `GetChunks` is *not* tenant-scoped: a 32-byte BLAKE3
@@ -782,6 +785,62 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   `StatBlob`/`ReadBlob` or by self-computing it from bytes the caller already
   holds --- knowing the digest is the read capability. Adding a `chunk_tenants`
   JOIN would cost dedup-hot-path PG round-trips for no confidentiality gain.
+]
+
+#r("store.castore.closure-scope")[
+  When the caller of `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/
+  `StatBlob` authenticates with an HMAC assignment token and
+  `castore_read_scope.mode = "enforce"`, the store MUST additionally require
+  every requested digest to resolve through a containing store path that is a
+  member of that token's closure read scope --- the ScopeSet established via
+  `PresentClosure` (#rref("store.castore.scope-establish")) or rebuilt
+  server-side from `scheduler_live_pins` seeds plus a `narinfo."references"`
+  walk when no presentation has reached this replica. The membership
+  predicate is ANDed with the #rref("store.castore.tenant-scope+2") tenant join
+  and never widens it. Out-of-scope digests MUST be answered exactly like
+  absent digests (`NOT_FOUND` / a cleared presence bit --- no existence
+  oracle); the deny reason is carried only by the
+  `rio_store_castore_scope_denied_total` / `would_deny` metrics and the
+  structured deny log. Under enforce, a token with an empty
+  `input_closure_digest` MUST be rejected with `PERMISSION_DENIED` (no
+  tenant-wide fallback), and a scope that cannot be resolved on this replica
+  (not presented, evicted, and not derivable) MUST be rejected with
+  `FAILED_PRECONDITION` carrying the `CASTORE_SCOPE_REQUIRED` reason so the
+  builder can present and retry. In `mode = "log"` the store MUST serve every
+  such read unchanged while counting the would-deny / scope-absent metrics;
+  `mode = "off"` is byte-identical to tenant scoping alone. Recursive
+  `GetDirectory` applies the membership filter to the seed frontier only ---
+  children discovered during the descent inherit scope from their authorized
+  containing path. JWT (gateway/user) callers, the digest-keyed chunk RPCs,
+  uploads, FindMissingPaths, and GC are unaffected.
+]
+
+The leaked-token property this buys: a build's assignment token can read at
+most the byte set that build itself mounts (its scheduler-signed input
+closure), until terminal revocation or expiry --- not the tenant's whole
+store. Assignment tokens MUST NOT be accepted as a credential for the
+name-keyed `StoreService` reads (`GetPath`, `QueryPathInfo`,
+`BatchQueryPathInfo`, ...): those stay anonymous-in-cluster until the
+name-keyed surface is brought under credentials, and accepting the token
+there would re-widen exactly the surface this rule narrows
+(#rref("common.hmac.claims+2")).
+
+#r("store.castore.scope-establish")[
+  `PresentClosure` establishes the closure read scope for the presenting
+  assignment token: the store MUST recompute
+  `blake3(sorted(closure).join("\n"))` over the presented entries (the same
+  `digest_input_closure` the chunked-upload `Begin` validation uses) and
+  require equality with the token's signed `input_closure_digest`, rejecting
+  with `INVALID_ARGUMENT` --- in every `castore_read_scope.mode`, without
+  echoing any stored data --- on mismatch, on a token with no closure
+  attestation, on a list exceeding `MAX_INPUT_CLOSURE`, or on an entry that is
+  not a parseable store path. On success the store caches the ScopeSet in RAM
+  keyed by the closure digest, with each entry keyed as
+  `StorePath::sha256_digest()` (the `path_tenants`/`directory_paths`/
+  `file_blobs` junction key). Establishment MUST be idempotent and MUST NOT
+  write any Postgres state; the cache is bounded (capacity-capped,
+  idle-TTL-evicted) and eviction is recoverable by re-presenting or by the
+  derivation fallback of #rref("store.castore.closure-scope").
 ]
 
 #r("store.castore.terminal-revocation")[
@@ -812,7 +871,12 @@ uploads are not gated here, and a resubmit that returns the derivation to a
 non-terminal status re-enables previously minted, still-unexpired tokens.
 The status lives in the shared Postgres the store already queries on every
 castore read, so the probe is one indexed lookup amortized by the cache;
-`GetChunks` stays digest-keyed and pays nothing.
+`GetChunks` stays digest-keyed and pays nothing. Closure scoping
+(#rref("store.castore.closure-scope")) layers on top without changing this
+rule: the revocation probe stays exactly where it is in the check order
+(HMAC verify → terminal-revocation → scope resolution), revocation bounds
+*when* a token works while the scope bounds *what* it can read, and neither
+check ever widens what the other allows.
 
 #r("store.castore.gc")[
   `directories` rows are refcounted (one increment per referencing manifest).

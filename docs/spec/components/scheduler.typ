@@ -695,7 +695,7 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   children's outputs ∪ `inputSrcs`), not the shallow `approx_input_closure`
   prefetch hint. The same sorted `input_closure` is what
   `AssignmentClaims.input_closure_digest` hashes
-  (#rref("common.hmac.claims")). On PG failure the scheduler sends both empty
+  (#rref("common.hmac.claims+2")). On PG failure the scheduler sends both empty
   and the builder falls back to its own `QueryPathInfo` BFS.
 ]
 The `nar_index.root_node` column is populated asynchronously by the indexer

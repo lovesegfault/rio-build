@@ -206,7 +206,7 @@ async fn fixture() -> Fixture {
 /// returns both bodies; non-recursive returns one; cross-tenant calls
 /// see nothing.
 // r[verify store.castore.directory-rpc]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn get_directory_recursive_and_tenant_scoped() {
     let mut f = fixture().await;
@@ -304,7 +304,7 @@ async fn get_directory_recursive_and_tenant_scoped() {
 
 /// Bitmap responses: bit i ⇔ digests[i] present and tenant-visible.
 // r[verify store.castore.directory-rpc]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn has_directories_and_blobs_bitmaps() {
     let mut f = fixture().await;
@@ -618,7 +618,7 @@ async fn read_blob_single_chunk_skip_and_take() {
 /// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
 /// same status as an unknown digest, so the RPC isn't a presence oracle.
 // r[verify store.castore.blob-read]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn read_blob_tenant_scoped() {
     let mut f = fixture().await;
@@ -818,7 +818,7 @@ async fn stat_blob_presence_probe() {
 /// Cross-tenant: a digest tenant A produced is NotFound for tenant B,
 /// same status as an unknown digest.
 // r[verify store.castore.blob-stat]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn stat_blob_tenant_scoped() {
     let mut f = fixture().await;

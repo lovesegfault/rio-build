@@ -8,7 +8,7 @@
 //! same tenant is attributed to the pushed path in `path_tenants` at
 //! commit time — without that row a tenant's own pushed sources are
 //! invisible to the tenant-scoped castore RPCs
-//! (`r[store.castore.tenant-scope]`) and every build that mounts them
+//! (`r[store.castore.tenant-scope+2]`) and every build that mounts them
 //! fails with "store returned no Directory body for digest".
 
 use super::*;
@@ -115,7 +115,7 @@ async fn attribution_count(pool: &sqlx::PgPool, path: &str, tenant: uuid::Uuid) 
 /// the tenant-scoped castore RPCs; a different tenant still gets
 /// NotFound for the same digests (isolation preserved).
 // r[verify store.put.tenant-attribution+2]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn put_path_with_tenant_attributes_pushing_tenant() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
@@ -315,7 +315,7 @@ async fn put_path_batch_with_tenant_attributes_all_outputs() -> TestResult {
 /// re-pusher's next push takes the idempotent fast path again.
 // r[verify store.put.tenant-attribution+2]
 // r[verify store.put.idempotent+2]
-// r[verify store.castore.tenant-scope]
+// r[verify store.castore.tenant-scope+2]
 #[tokio::test]
 async fn repush_of_identical_content_grants_attribution() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;

@@ -38,7 +38,7 @@
 # walks 6 (root + d1..d5), prunes 76, and fetches 1 blob.
 #
 # Tenancy plumbing: the castore RPC surface is tenant-scoped
-# (r[store.castore.tenant-scope]) and `nix copy` populates no
+# (r[store.castore.tenant-scope+2]) and `nix copy` populates no
 # path_tenants rows (only build-completion does), so the test seeds
 # the junction rows directly in both databases under one shared tenant
 # UUID — the same state the scheduler's upsert_path_tenants would have

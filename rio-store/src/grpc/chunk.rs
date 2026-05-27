@@ -122,7 +122,7 @@ impl ChunkService for ChunkServiceImpl {
     /// permanently strands the digest.
     ///
     /// **No tenant JOIN** — chunks are content-addressed and
-    /// tenant-agnostic per `r[store.castore.tenant-scope]`
+    /// tenant-agnostic per `r[store.castore.tenant-scope+2]`
     /// (`chunk_tenants` was dropped in migration 035); knowing a BLAKE3
     /// hash already proves you have (or had) the bytes.
     // r[impl store.chunk.has-chunks-durable]

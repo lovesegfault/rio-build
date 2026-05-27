@@ -57,7 +57,7 @@ let
   protoset = import ../lib/protoset.nix { inherit pkgs; };
 
   # Every scheduling build runs as this tenant. The castore-FUSE store
-  # RPCs are tenant-scoped (r[store.castore.tenant-scope]) and only
+  # RPCs are tenant-scoped (r[store.castore.tenant-scope+2]) and only
   # authenticate via the per-build assignment token, so the dispatched
   # token must carry a tenant claim: ssh-ng builds get it from the
   # client key's comment (mkBootstrap `tenant` below); the gRPC-direct

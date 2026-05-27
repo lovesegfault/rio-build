@@ -139,7 +139,7 @@ impl CastoreOptions {
 /// `WorkAssignment`: the (mountd-compliant) build id, the closure's
 /// castore roots, and the HMAC assignment token every castore RPC
 /// carries as `x-rio-assignment-token` (rio-store derives the caller's
-/// tenant from it — `r[store.castore.tenant-scope]`; without it the
+/// tenant from it — `r[store.castore.tenant-scope+2]`; without it the
 /// DAG prefetch and every JIT fetch are rejected as `UNAUTHENTICATED`).
 pub struct MountInputs<'a> {
     pub build_id: &'a str,

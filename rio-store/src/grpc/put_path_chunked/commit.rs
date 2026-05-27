@@ -29,7 +29,7 @@ impl StoreServiceImpl {
     /// (`None` only for skipped outputs — every non-skipped output
     /// holds a claim by the time this runs, CA outputs included).
     // r[impl store.atomic.multi-output]
-    // r[impl store.castore.tenant-scope]
+    // r[impl store.castore.tenant-scope+2]
     pub(super) async fn commit_chunked(
         &self,
         validated: &ValidatedBegin,

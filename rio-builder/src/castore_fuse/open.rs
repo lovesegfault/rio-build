@@ -266,7 +266,7 @@ pub struct OpenPath {
     mountd: MountdClient,
     /// This build's HMAC assignment token, attached as
     /// `x-rio-assignment-token` to every castore RPC (the store derives
-    /// the caller's tenant from it — `r[store.castore.tenant-scope]`).
+    /// the caller's tenant from it — `r[store.castore.tenant-scope+2]`).
     assignment_token: String,
     cfg: OpenConfig,
 }

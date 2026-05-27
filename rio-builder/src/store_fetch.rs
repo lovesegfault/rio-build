@@ -65,7 +65,7 @@ impl StoreClients {
 /// ([`crate::upload::common::attach_assignment_token`]). rio-store's
 /// castore surface (`GetDirectory`/`ReadBlob`/`StatBlob`/`GetChunks`)
 /// derives the caller's tenant from this token
-/// (`r[store.castore.tenant-scope]`); a request without it is rejected
+/// (`r[store.castore.tenant-scope+2]`); a request without it is rejected
 /// as `UNAUTHENTICATED`, so every castore-FUSE RPC goes through here.
 pub(crate) fn authed_request<T>(
     msg: T,

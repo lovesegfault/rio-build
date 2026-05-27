@@ -181,7 +181,7 @@ rec {
       # the gateway attributes every ssh-ng build to it
       # (r[gw.auth.tenant-from-key-comment]) and the scheduler's
       # assignment tokens carry its UUID — which the castore-FUSE store
-      # RPCs require (r[store.castore.tenant-scope]). `null` keeps the
+      # RPCs require (r[store.castore.tenant-scope+2]). `null` keeps the
       # legacy single-tenant flow (tenant_id NULL; castore-FUSE builds
       # cannot work in that mode). k3s scenarios provision tenants in
       # their own preludes (lifecycle.nix is the reference) — passing

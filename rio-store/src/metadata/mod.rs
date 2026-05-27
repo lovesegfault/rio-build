@@ -321,7 +321,7 @@ pub(crate) async fn complete_manifest_in_conn(
 /// as `PutPathChunked`'s commit).
 ///
 /// `path_tenants` is the read-time tenancy join for the castore RPCs
-/// (`r[store.castore.tenant-scope]`) and the narinfo visibility gate, so
+/// (`r[store.castore.tenant-scope+2]`) and the narinfo visibility gate, so
 /// callers run this in the same transaction that flips the manifest to
 /// `'complete'` — a committed upload is never visible-but-unattributed,
 /// and a rolled-back commit never leaves a stray attribution row.

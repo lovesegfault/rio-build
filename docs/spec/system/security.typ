@@ -111,7 +111,7 @@
   certificate to rotate or expire.
 ]
 
-#r("common.hmac.claims")[
+#r("common.hmac.claims+2")[
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
@@ -126,7 +126,9 @@
   `role` (`TokenRole` enum --- what the holder may do; the store gates `PutPath`
   and `Begin` on `Builder`), and `input_closure_digest` (hex
   `blake3(sorted(input_closure).join("\n"))`, the §6.3 server-side refscan
-  attestation; empty = scheduler couldn't compute the closure at dispatch ---
+  attestation, reused at read time as the closure read-scope commitment
+  (#rref("store.castore.scope-establish")); empty = scheduler couldn't
+  compute the closure at dispatch ---
   see #rref("sched.dispatch.input-roots")). `tenant`, `role`, and
   `input_closure_digest` are `#[serde(default)]` (old token still parses) and
   `#[serde(skip_serializing_if = …)]` (default-valued token serializes to the
@@ -144,15 +146,25 @@
     configurable TTL (default: 2× the build timeout).
   - The signing key is a shared HMAC secret between the scheduler and store,
     stored as a Kubernetes Secret (recommend KMS/Vault for production).
-  - *Read authorization:* Executors call `GetPath` and `QueryPathInfo` on the
-    store for FUSE cache fetches. Read access is gated by CiliumNetworkPolicy
-    (only labeled executor pods can reach `rio-store:9002`); any reachable
-    executor can read any store path. This is acceptable because: (a) store
-    paths are content-addressed and immutable, (b) executors need access to
-    shared paths (glibc, coreutils) regardless of tenant, (c) output isolation
-    is enforced at the scheduling level (executors only build what they are
-    assigned). For deployments requiring strict tenant read isolation, a future
-    enhancement could add tenant-scoped read tokens.
+  - *Read authorization:* The castore-FUSE read surface (`GetDirectory`,
+    `HasDirectories`, `HasBlobs`, `ReadBlob`, `StatBlob`) takes the same
+    assignment token and is tenant-scoped
+    (#rref("store.castore.tenant-scope+2")), closure-scoped
+    (#rref("store.castore.closure-scope")), and revoked at terminal state
+    (#rref("store.castore.terminal-revocation")) --- a leaked token reads at
+    most its own build's input closure, for at most its build's lifetime. The
+    *name-keyed* `StoreService` reads (`GetPath`, `QueryPathInfo`,
+    `BatchQueryPathInfo`, `BatchGetManifest`, `GetNarIndex*`,
+    `QueryPathFromHashPart`, non-attribution `FindMissingPaths`) remain
+    anonymous in-cluster, gated only by CiliumNetworkPolicy (only labeled
+    executor pods can reach `rio-store:9002`): any caller with in-cluster
+    network reach can read any store path *by name*. That residual surface is
+    tolerated for now because (a) store paths are content-addressed and
+    immutable, (b) executors need shared paths (glibc, coreutils) regardless
+    of tenant, and (c) output isolation is enforced at the scheduling level;
+    bringing it under credentials is the committed follow-up of ADR-022's
+    closure-scope decision (its Phase 4), and assignment tokens MUST NOT be
+    accepted as a credential for those name-keyed reads in the meantime.
 ]
 
 #r("common.hmac.expiry-cap")[

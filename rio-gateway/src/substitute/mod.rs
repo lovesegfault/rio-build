@@ -92,7 +92,7 @@ impl DagSyncPeer {
 
 /// A [`CastoreView`] over one `DirectoryServiceClient`. The JWT is the
 /// session's tenant token — `DirectoryService` requires a tenant on
-/// every call (`r[store.castore.tenant-scope]`), so an unauthenticated
+/// every call (`r[store.castore.tenant-scope+2]`), so an unauthenticated
 /// session cannot delta-sync (the probe fails and the client falls
 /// back to the whole-NAR push).
 struct GrpcCastore {

@@ -50,7 +50,7 @@ pub trait HmacClaims: Serialize + serde::de::DeserializeOwned {
 /// [`crate::jwt::TenantClaims`] — both appear together in PutPath
 /// handlers, and `hmac::Claims` vs `jwt::Claims` was a recurring
 /// source of confusion.
-// r[impl common.hmac.claims]
+// r[impl common.hmac.claims+2]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct AssignmentClaims {
@@ -176,7 +176,7 @@ impl HmacClaims for AssignmentClaims {
 /// Today every assignment token is `Builder`; the enum exists so the
 /// store's `PutPath` and `Begin` gates have something to check. Closed
 /// (no `#[non_exhaustive]`) so the gates can't grow `_ =>` arms.
-// r[impl common.hmac.claims]
+// r[impl common.hmac.claims+2]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TokenRole {
     /// Dispatched build assignment. May `PutPath` its
@@ -701,7 +701,7 @@ mod tests {
     /// converse — defaulted fields are NOT serialized — keeps the
     /// wire body byte-identical to the pre-P0589 shape so a defaulted
     /// new token also passes a pre-P0589 store's `deny_unknown_fields`.
-    // r[verify common.hmac.claims]
+    // r[verify common.hmac.claims+2]
     #[test]
     fn old_token_without_p0589_fields_parses() {
         let signer = HmacSigner::from_key(TEST_KEY.to_vec());
@@ -753,7 +753,7 @@ mod tests {
     /// `digest_input_closure` is order-sensitive over its newline-join
     /// — the spec says "sorted closure" because the scheduler and the
     /// store must produce the same bytes from the same set.
-    // r[verify common.hmac.claims]
+    // r[verify common.hmac.claims+2]
     #[test]
     fn closure_digest_deterministic_and_order_sensitive() {
         let a = vec![
