@@ -19,6 +19,28 @@ use uuid::Uuid;
 
 use super::SchedulerDb;
 
+/// One attempt resolved by `exec_id` (the `ReportOutcome` lookup).
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub(crate) struct AttemptByExecRow {
+    /// The DAG key (`derivations.derivation_id`).
+    #[allow(dead_code)]
+    pub derivation_id: Uuid,
+    /// `derivations.drv_hash` — the intent id / DAG key string.
+    pub drv_hash: String,
+    /// Full `.drv` store path (what the completion path keys on).
+    pub drv_path: String,
+    /// Executor identity the attempt is bound to.
+    pub executor_id: String,
+    /// The assignment row is still active (pending/acknowledged).
+    pub assignment_active: bool,
+    /// Some `drv_attempts` row already exists for this exec
+    /// (a worker-reported classification).
+    pub attempt_recorded: bool,
+    /// A terminal `drv_attempts` fill exists for this exec
+    /// (establishment or the controller's second installment).
+    pub attempt_terminal: bool,
+}
+
 /// One open pull-mode attempt as read back from the view query.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct OpenAttemptRow {
@@ -128,6 +150,37 @@ impl SchedulerDb {
         .await?;
         tx.commit().await?;
         Ok(true)
+    }
+
+    /// Resolve one attempt by its `exec_id` (the `ReportOutcome`
+    /// idempotency key): the assignment row that carries this exec, its
+    /// derivation, whether the assignment is still active, and whether
+    /// any `drv_attempts` classification already exists for it. `None`
+    /// when no assignment carries the exec — never pulled, or already
+    /// superseded by a newer attempt (the active-row upsert re-keyed
+    /// the row).
+    pub(crate) async fn find_attempt_by_exec_id(
+        &self,
+        exec_id: Uuid,
+    ) -> Result<Option<AttemptByExecRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT d.derivation_id, d.drv_hash, d.drv_path, \
+                    a.builder_id AS executor_id, \
+                    (a.status IN ('pending', 'acknowledged')) AS assignment_active, \
+                    EXISTS (SELECT 1 FROM drv_attempts t WHERE t.exec_id = a.exec_id) \
+                        AS attempt_recorded, \
+                    EXISTS (SELECT 1 FROM drv_attempts t \
+                            WHERE t.exec_id = a.exec_id \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
+             FROM assignments a \
+             JOIN derivations d ON d.derivation_id = a.derivation_id \
+             WHERE a.exec_id = $1 \
+             ORDER BY a.assigned_at DESC \
+             LIMIT 1",
+        )
+        .bind(exec_id)
+        .fetch_optional(&self.pool)
+        .await
     }
 
     /// Every open **pull-mode** attempt: active assignment ⋈ execution

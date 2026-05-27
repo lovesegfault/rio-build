@@ -319,3 +319,259 @@ async fn pull_after_failed_attempt_requeues_then_delivers() -> TestResult {
     assert_eq!(dispatch_mode_of(&db.pool, exec_id).await, "pull");
     Ok(())
 }
+
+// ─── ReportOutcome (the idempotent completion intake) ───────────────────
+
+/// Send one `ReportOutcome` through the actor and return the reply.
+async fn report(
+    handle: &ActorHandle,
+    exec_id: uuid::Uuid,
+    auth_intent: Option<&str>,
+    status: rio_proto::types::BuildResultStatus,
+    output_path: Option<&str>,
+) -> Result<(), PullRejection> {
+    let built_outputs = output_path
+        .map(|p| {
+            vec![rio_proto::types::BuiltOutput {
+                output_name: "out".into(),
+                output_path: p.into(),
+                output_hash: vec![0u8; 32],
+            }]
+        })
+        .unwrap_or_default();
+    let error_msg = if built_outputs.is_empty() {
+        "reported failure".to_string()
+    } else {
+        String::new()
+    };
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: auth_intent.map(Into::into),
+            payload: crate::actor::pull::PullReportPayload {
+                result: rio_proto::types::BuildResult {
+                    status: status.into(),
+                    error_msg,
+                    built_outputs,
+                    ..Default::default()
+                },
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+            },
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+async fn assignment_status_of(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String> {
+    sqlx::query_scalar(
+        "SELECT a.status FROM assignments a \
+         JOIN derivations d ON d.derivation_id = a.derivation_id \
+         WHERE d.drv_hash = $1 ORDER BY a.assigned_at",
+    )
+    .bind(drv_hash)
+    .fetch_all(pool)
+    .await
+    .expect("assignment status")
+}
+
+// r[verify sched.executor.report-idempotent]
+/// (a) A duplicate ReportOutcome for the same exec_id is
+/// acknowledged-and-ignored: one terminal state, no second verdict, no
+/// new rows — for a successful first report.
+#[tokio::test]
+async fn report_outcome_success_duplicate_ignored() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rep-a", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "rep-a", Some("rep-a")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+    let out = rio_test_support::fixtures::test_store_path("rep-a-out");
+
+    report(
+        &handle,
+        exec_id,
+        Some("rep-a"),
+        rio_proto::types::BuildResultStatus::Built,
+        Some(&out),
+    )
+    .await
+    .expect("first report acked");
+    let info = expect_drv(&handle, "rep-a").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Completed);
+    assert_eq!(
+        assignment_status_of(&db.pool, "rep-a").await,
+        vec!["completed"]
+    );
+    assert!(
+        ledger_rows(&db.pool, "rep-a").await.is_empty(),
+        "success appends no attempt row"
+    );
+
+    // Duplicate (now claiming failure — must not overwrite the outcome).
+    report(
+        &handle,
+        exec_id,
+        Some("rep-a"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("duplicate report acked");
+    let info = expect_drv(&handle, "rep-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Completed,
+        "duplicate report must not change the terminal outcome"
+    );
+    assert_eq!(
+        assignment_status_of(&db.pool, "rep-a").await,
+        vec!["completed"]
+    );
+    assert!(
+        ledger_rows(&db.pool, "rep-a").await.is_empty(),
+        "duplicate writes nothing"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// (a) The failure flavor: one attempt row, one verdict; the duplicate
+/// adds nothing.
+#[tokio::test]
+async fn report_outcome_failure_duplicate_single_charge() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rep-b", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "rep-b", Some("rep-b")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report(
+        &handle,
+        exec_id,
+        Some("rep-b"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("first report acked");
+    let rows = ledger_rows(&db.pool, "rep-b").await;
+    assert_eq!(rows.len(), 1, "exactly one attempt row for the failure");
+    let info = expect_drv(&handle, "rep-b").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "transient failure requeues the drv"
+    );
+
+    report(
+        &handle,
+        exec_id,
+        Some("rep-b"),
+        rio_proto::types::BuildResultStatus::TransientFailure,
+        None,
+    )
+    .await
+    .expect("duplicate report acked");
+    let rows = ledger_rows(&db.pool, "rep-b").await;
+    assert_eq!(rows.len(), 1, "the duplicate charges nothing");
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// (b) A report arriving after the attempt was already established as
+/// an executor crash is acknowledged and ignored: the terminal row is
+/// not overwritten and no completion is fabricated.
+#[tokio::test]
+async fn report_outcome_after_establishment_ignored() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rep-c", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "rep-c", Some("rep-c")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // Simulate the establishment having already classified the attempt
+    // (terminal fill present; assignment row deliberately left active
+    // so the terminal-row-wins arm — not the closed-assignment arm —
+    // is what ignores the report).
+    let derivation_id: uuid::Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind("rep-c")
+            .fetch_one(&db.pool)
+            .await?;
+    sqlx::query(
+        "INSERT INTO drv_attempts \
+             (attempt_id, derivation_id, exec_id, executor_id, event_kind, outcome_class, \
+              termination_reason, reporting_party, occurred_at) \
+         VALUES ($1, $2, $3, 'rep-c', 'attempt', 'executor_crash', 'unreported', \
+                 'scheduler', now())",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(derivation_id)
+    .bind(exec_id)
+    .execute(&db.pool)
+    .await?;
+
+    let out = rio_test_support::fixtures::test_store_path("rep-c-out");
+    report(
+        &handle,
+        exec_id,
+        Some("rep-c"),
+        rio_proto::types::BuildResultStatus::Built,
+        Some(&out),
+    )
+    .await
+    .expect("late report acked");
+
+    let rows = ledger_rows(&db.pool, "rep-c").await;
+    assert_eq!(rows.len(), 1, "no second row");
+    assert_eq!(rows[0].outcome_class, "executor_crash");
+    assert_eq!(
+        rows[0].termination_reason.as_deref(),
+        Some("unreported"),
+        "the established terminal row is never overwritten"
+    );
+    let info = expect_drv(&handle, "rep-c").await;
+    assert_ne!(
+        info.status,
+        crate::state::DerivationStatus::Completed,
+        "no completion is fabricated from a post-establishment report"
+    );
+    Ok(())
+}
+
+// r[verify sched.executor.report-idempotent]
+/// (c) A report whose exec_id matches no open attempt (never pulled) is
+/// acknowledged and writes nothing.
+#[tokio::test]
+async fn report_outcome_unknown_exec_writes_nothing() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rep-d", PriorityClass::Scheduled).await?;
+
+    let out = rio_test_support::fixtures::test_store_path("rep-d-out");
+    report(
+        &handle,
+        uuid::Uuid::now_v7(),
+        Some("rep-d"),
+        rio_proto::types::BuildResultStatus::Built,
+        Some(&out),
+    )
+    .await
+    .expect("unknown-exec report acked");
+
+    let total_attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(total_attempts, 0, "no attempt rows are created");
+    let (assignments, executions) = row_counts(&db.pool, "rep-d").await;
+    assert_eq!((assignments, executions), (0, 0), "no rows are created");
+    let info = expect_drv(&handle, "rep-d").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the drv is untouched by a never-pulled report"
+    );
+    Ok(())
+}

@@ -257,6 +257,20 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<super::pull::PullOutcome, super::pull::PullRejection>>,
     },
 
+    /// Pull-mode dispatch: a pod reports the terminal outcome of its
+    /// pulled attempt (`ExecutorService.ReportOutcome`), idempotent by
+    /// exec_id. The reply is sent only after the classification's
+    /// appending transaction has committed (the pod's exit-0 waits on
+    /// it). `send_unchecked`: dropping a report would strand the
+    /// attempt until the establishment sweep.
+    ReportPullOutcome {
+        exec_id: uuid::Uuid,
+        /// HMAC-attested intent binding (None = dev mode, no key).
+        auth_intent: Option<String>,
+        payload: super::pull::PullReportPayload,
+        reply: oneshot::Sender<Result<(), super::pull::PullRejection>>,
+    },
+
     /// Controller acked it created Jobs for these intents → arm the
     /// Pending-watch (ICE-backoff) timer for each band-targeted one.
     /// Separated from `GetSpawnIntents` so that path stays read-only:
@@ -747,6 +761,7 @@ impl ActorCommand {
             Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
             Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
             Self::PullAssignment { .. } => "PullAssignment",
+            Self::ReportPullOutcome { .. } => "ReportPullOutcome",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
             Self::PrefetchComplete { .. } => "PrefetchComplete",
             Self::Heartbeat(_) => "Heartbeat",

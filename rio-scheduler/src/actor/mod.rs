@@ -1266,6 +1266,19 @@ impl DagActor {
                     self.handle_pull_assignment(intent_id, auth_intent, reply)
                         .await;
                 }
+                ActorCommand::ReportPullOutcome {
+                    exec_id,
+                    auth_intent,
+                    payload,
+                    reply,
+                } => {
+                    // r[sched.lease.standby-drops-writes]: the handler
+                    // self-gates on is_leader(); the classification
+                    // path it funnels into carries the same appending
+                    // discipline as the stream Completion arm.
+                    self.handle_report_outcome(exec_id, auth_intent, payload, reply)
+                        .await;
+                }
                 ActorCommand::ReportExecutorTermination {
                     executor_id,
                     reason,

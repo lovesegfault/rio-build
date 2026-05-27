@@ -477,3 +477,135 @@ mod kernel_tests {
         assert_eq!(admit_pull(&inputs), PullDecision::DeliverNew);
     }
 }
+
+/// What to do with one `ReportOutcome` (the pure half of the report
+/// intake — terminal-row-wins / no-transition-out-of-terminal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReportAdmission {
+    /// First report for an open attempt: run the existing
+    /// classification path (the same entry point the stream arm uses).
+    Process,
+    /// Duplicate, post-establishment, superseded, or never-pulled:
+    /// acknowledge and write nothing.
+    AckIgnore,
+}
+
+// r[impl sched.executor.report-idempotent]
+/// Decide one report from the attempt's durable state. Pure (decision
+/// P10): the attempt is processed only when it is still open
+/// (assignment active) and no classification row exists for its exec —
+/// a terminal or already-classified row always wins and is never
+/// overwritten or re-charged.
+pub(crate) fn fold_report(
+    assignment_active: bool,
+    attempt_already_classified: bool,
+) -> ReportAdmission {
+    if assignment_active && !attempt_already_classified {
+        ReportAdmission::Process
+    } else {
+        ReportAdmission::AckIgnore
+    }
+}
+
+/// The report payload fields forwarded from the gRPC layer — the same
+/// set the stream `ProcessCompletion` arm carries, so the intake can
+/// funnel into the identical internal entry point.
+#[derive(Debug)]
+pub(crate) struct PullReportPayload {
+    pub result: rio_proto::types::BuildResult,
+    pub peak_memory_bytes: u64,
+    pub peak_cpu_cores: f64,
+    pub node_name: Option<String>,
+    pub hw_class: Option<String>,
+    pub final_resources: Option<rio_proto::types::ResourceUsage>,
+    pub final_line_count: u64,
+}
+
+impl DagActor {
+    /// Handle one `ReportOutcome` (the actor turn): resolve the exec_id
+    /// to its attempt, decide via [`fold_report`], and on Process run
+    /// the existing completion path — the same `handle_completion`
+    /// entry point the stream arm calls, so the worker-report→fold feed
+    /// is identical in classification terms. The reply is sent only
+    /// after that call returns (its appending transaction has
+    /// committed by then), which is what the pod's exit-0 waits for.
+    // r[impl sched.executor.report-idempotent]
+    pub(super) async fn handle_report_outcome(
+        &mut self,
+        exec_id: Uuid,
+        auth_intent: Option<String>,
+        payload: PullReportPayload,
+        reply: oneshot::Sender<Result<(), PullRejection>>,
+    ) {
+        let result = self
+            .report_outcome_inner(exec_id, auth_intent.as_deref(), payload)
+            .await;
+        let _ = reply.send(result);
+    }
+
+    async fn report_outcome_inner(
+        &mut self,
+        exec_id: Uuid,
+        auth_intent: Option<&str>,
+        payload: PullReportPayload,
+    ) -> Result<(), PullRejection> {
+        if !self.leader.is_leader() {
+            return Err(PullRejection::NotLeader);
+        }
+        let attempt = self
+            .db
+            .find_attempt_by_exec_id(exec_id)
+            .await
+            .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?;
+
+        let Some(attempt) = attempt else {
+            // Never-pulled (or superseded) exec: acknowledged, nothing
+            // written — the no-open-attempt arm of report idempotency.
+            debug!(%exec_id, "ReportOutcome for unknown/superseded exec acknowledged-and-ignored");
+            return Ok(());
+        };
+        // Token↔intent binding (per-unary, same as the pull): the
+        // attested intent must be the attempt's derivation.
+        if let Some(auth) = auth_intent
+            && auth != attempt.drv_hash
+        {
+            // r[impl sec.executor.identity-token+2]
+            warn!(%exec_id, "ReportOutcome rejected: executor token bound to a different intent");
+            return Err(PullRejection::TokenMismatch);
+        }
+        match fold_report(
+            attempt.assignment_active,
+            attempt.attempt_recorded || attempt.attempt_terminal,
+        ) {
+            ReportAdmission::AckIgnore => {
+                debug!(
+                    %exec_id,
+                    drv_hash = %attempt.drv_hash,
+                    assignment_active = attempt.assignment_active,
+                    "duplicate/late ReportOutcome acknowledged-and-ignored"
+                );
+                Ok(())
+            }
+            ReportAdmission::Process => {
+                let executor_id = ExecutorId::from(attempt.executor_id.as_str());
+                // Same internal entry point as the stream Completion
+                // arm — classification, verdict, attempt-row append,
+                // status persist, realisations, SLA samples all happen
+                // exactly as they do for stream-reported outcomes. The
+                // drv is addressed by the attempt's own derivation (the
+                // exec_id is the key; the report's drv_path is not
+                // trusted to re-route it).
+                self.handle_completion(
+                    &executor_id,
+                    &attempt.drv_path,
+                    payload.result,
+                    (payload.peak_memory_bytes, payload.peak_cpu_cores),
+                    (payload.node_name, payload.hw_class),
+                    (payload.final_resources, payload.final_line_count),
+                )
+                .await;
+                Ok(())
+            }
+        }
+    }
+}

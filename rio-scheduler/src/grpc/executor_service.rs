@@ -771,14 +771,77 @@ impl ExecutorService for SchedulerGrpc {
         }))
     }
 
+    /// Terminal-outcome intake for a pulled attempt, idempotent by
+    /// exec_id. The empty ack is returned only after the scheduler's
+    /// classification (and its appending transaction) has run — the
+    /// pod's exit-0 depends on it.
+    // r[impl sched.executor.report-idempotent]
     #[instrument(skip(self, request), fields(rpc = "ReportOutcome"))]
     async fn report_outcome(
         &self,
         request: Request<rio_proto::types::ReportOutcomeRequest>,
     ) -> Result<Response<rio_proto::types::ReportOutcomeResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "ReportOutcome is not implemented yet (pull-mode dispatch lands incrementally)",
-        ))
+        self.ensure_leader()?;
+        self.check_actor_alive()?;
+        // r[impl sec.executor.identity-token+2]
+        let auth_intent = self.require_executor(&request)?.map(|c| c.intent_id);
+        let req = request.into_inner();
+
+        let exec_id: uuid::Uuid = req
+            .exec_id
+            .parse()
+            .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
+        let report = req.report.unwrap_or_default();
+        // The exec_id names the attempt; the report's drv_path is not
+        // used for routing (and is therefore not length-gated here —
+        // it is dropped before the actor sees it). Payload fields get
+        // the same bound-don't-reject treatment as the stream arm.
+        let mut result = report.result.unwrap_or_else(|| {
+            warn!(exec_id = %req.exec_id, "ReportOutcome with no result, synthesizing InfrastructureFailure");
+            rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::InfrastructureFailure.into(),
+                error_msg: "pod sent ReportOutcome with no result".into(),
+                ..Default::default()
+            }
+        });
+        // r[impl sched.executor.input-bounds+2]
+        rio_common::grpc::truncate_utf8(&mut result.error_msg, MAX_ERROR_MSG_LEN);
+        let payload = crate::actor::pull::PullReportPayload {
+            result,
+            peak_memory_bytes: report.peak_memory_bytes,
+            peak_cpu_cores: report.peak_cpu_cores,
+            node_name: report.node_name.filter(|s| s.len() <= MAX_IDENT_LEN),
+            hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
+            final_resources: report.final_resources,
+            final_line_count: report.final_line_count,
+        };
+
+        // send_unchecked: a dropped report would strand the attempt
+        // until the establishment sweep; the pod retries until acked.
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.actor
+            .send_unchecked(ActorCommand::ReportPullOutcome {
+                exec_id,
+                auth_intent,
+                payload,
+                reply: reply_tx,
+            })
+            .await
+            .map_err(Self::actor_error_to_status)?;
+        match reply_rx
+            .await
+            .map_err(|_| Status::internal("actor dropped ReportOutcome reply"))?
+        {
+            Ok(()) => Ok(Response::new(rio_proto::types::ReportOutcomeResponse {})),
+            Err(crate::actor::PullRejection::NotLeader)
+            | Err(crate::actor::PullRejection::StaleGeneration) => {
+                Err(Status::unavailable("not leader (standby replica)"))
+            }
+            Err(crate::actor::PullRejection::TokenMismatch) => Err(Status::permission_denied(
+                "executor token is bound to a different intent",
+            )),
+            Err(crate::actor::PullRejection::Internal(msg)) => Err(Status::internal(msg)),
+        }
     }
 }
