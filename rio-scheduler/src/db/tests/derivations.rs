@@ -37,15 +37,43 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     assert!(has_ts, "poisoned_at must be set in the same statement");
     assert!(worker.is_none(), "assigned_builder_id must be NULLed");
 
+    // bug_007: give the row an authoritative creation-time snapshot so the
+    // load below proves the recovery SELECT returns the full column set
+    // (the merge gate keys on the recovered node's content + identity).
+    sqlx::query(
+        "UPDATE derivations SET drv_content=$2, output_names=$3, \
+         expected_output_paths=$4, is_ca=true, required_features=$5 \
+         WHERE drv_hash=$1",
+    )
+    .bind(drv_hash.as_str())
+    .bind(b"Derive(A)".as_slice())
+    .bind(vec!["out".to_string()])
+    .bind(vec![String::new()])
+    .bind(vec!["big-parallel".to_string()])
+    .execute(&test_db.pool)
+    .await?;
+
     let rows = db.load_poisoned_derivations().await?;
     assert_eq!(rows.len(), 1, "persist_poisoned should make row loadable");
-    assert_eq!(rows[0].drv_hash, drv_hash.as_str());
-    assert_ne!(rows[0].derivation_id, Uuid::nil());
+    assert_eq!(rows[0].base.drv_hash, drv_hash.as_str());
+    assert_ne!(rows[0].base.derivation_id, Uuid::nil());
     assert!(
         rows[0].elapsed_secs >= 0.0 && rows[0].elapsed_secs < 5.0,
         "elapsed should be ~0s, got {}",
         rows[0].elapsed_secs
     );
+    // Full creation-time snapshot comes back, not a minimal stub.
+    assert_eq!(
+        rows[0].base.drv_content.as_deref(),
+        Some(b"Derive(A)".as_slice())
+    );
+    assert!(rows[0].base.is_ca);
+    assert_eq!(rows[0].base.output_names, vec!["out"]);
+    assert_eq!(rows[0].base.expected_output_paths, vec![String::new()]);
+    assert_eq!(rows[0].base.required_features, vec!["big-parallel"]);
+    // Poisoned executions are finalized — no live assignment surfaces.
+    assert!(rows[0].base.exec_id.is_none());
+    assert!(rows[0].base.assigned_builder_id.is_none());
 
     // clear_poison → no longer loadable; status reset to 'created'.
     db.clear_poison(&drv_hash).await?;

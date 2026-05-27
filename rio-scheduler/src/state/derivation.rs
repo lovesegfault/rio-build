@@ -1332,17 +1332,19 @@ impl DerivationState {
     }
 
     /// Construct from a `PoisonedDerivationRow` during recovery.
-    /// Minimal — poisoned rows aren't dispatched, just TTL-tracked +
-    /// resubmit-bound checked (`is_retriable_on_resubmit`).
-    /// `elapsed_secs` comes from PG's `EXTRACT(EPOCH FROM (now() -
-    /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
+    /// Delegates to [`Self::from_recovery_row`] over the row's full
+    /// creation-time snapshot, so a recovered Poisoned node carries the
+    /// same authoritative content, flag, identity, expected outputs,
+    /// floors, and recomputed CA modular hash it held while live — the
+    /// merge gate (`sched.merge.authoritative-conflict`) is only as
+    /// strong as recovery is truthful. The poisoned-specific extra is
+    /// `elapsed_secs` from PG's `EXTRACT(EPOCH FROM (now() -
+    /// poisoned_at))`, converted back to `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
     /// for a 24h TTL.
     pub(crate) fn from_poisoned_row(
         row: crate::db::PoisonedDerivationRow,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
-        let drv_path = rio_nix::store_path::StorePath::parse(&row.drv_path)
-            .map_err(|e| (row.drv_hash.clone(), e))?;
         let now = Instant::now();
         // Convert PG-computed elapsed seconds back to an Instant.
         // Clamp: negative/NaN → 0 (conservative full TTL), +inf → 1yr
@@ -1361,54 +1363,9 @@ impl DerivationState {
         let clamped = row.elapsed_secs.max(0.0).min(MAX_ELAPSED_SECS);
         let elapsed = std::time::Duration::from_secs_f64(clamped);
         let poisoned_at = now.checked_sub(elapsed).unwrap_or(now);
-        // §13e+r35: recovered Poisoned has no persisted features
-        // (`required_features = []`). FOD ⟹ `[fetcher]` still derives
-        // correctly; non-FOD ⟹ `[]`.
-        let effective_features =
-            EffectiveFeatures::derive(row.is_fixed_output, &[], row.pname.as_deref());
-        Ok(Self {
-            drv_hash: row.drv_hash.into(),
-            drv_path,
-            pname: row.pname,
-            version: None,
-            enable_parallel_building: None,
-            enable_parallel_checking: None,
-            prefer_local_build: None,
-            system: row.system,
-            required_features: Vec::new(),
-            effective_features,
-            output_names: Vec::new(),
-            is_fixed_output: row.is_fixed_output,
-            ca: CaState::default(),
-            status: DerivationStatus::Poisoned,
-            interested_builds: HashSet::new(),
-            assigned_executor: None,
-            exec_id: None,
-            sched: SchedHint::default(),
-            drv_content: Vec::new(),
-            drv_content_authoritative: false,
-            input_srcs: Vec::new(),
-            retry: RetryState {
-                resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-                failure_count: row.failed_builders.len() as u32,
-                failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
-                poisoned_at: Some(poisoned_at),
-                ..Default::default()
-            },
-            output_paths: Vec::new(),
-            expected_output_paths: Vec::new(),
-            wanted_output_names: Vec::new(),
-            wanted_by_build: HashMap::new(),
-            db_id: Some(row.derivation_id),
-            ready_at: None,
-            running_since: None,
-            traceparent: String::new(),
-            probed_generation: 0,
-            substitute_tried: false,
-            topdown_pruned: false,
-            closure_hole: false,
-            never_forgive_paths: HashSet::new(),
-        })
+        let mut state = Self::from_recovery_row(row.base, DerivationStatus::Poisoned)?;
+        state.retry.poisoned_at = Some(poisoned_at);
+        Ok(state)
     }
 
     /// Store path of the .drv file (read-only; DAG owns the reverse index).
@@ -2308,21 +2265,66 @@ mod tests {
         // Malformed drv_path (not a store path) → Err((hash, StorePathError)).
         // Covers the error branch that recovery.rs logs-and-skips.
         let row = crate::db::PoisonedDerivationRow {
-            derivation_id: uuid::Uuid::new_v4(),
-            drv_hash: "somehash".into(),
-            drv_path: "not-a-store-path".into(),
-            pname: None,
-            system: "x86_64-linux".into(),
-            failed_builders: vec![],
+            base: crate::db::RecoveryDerivationRow {
+                drv_path: "not-a-store-path".into(),
+                ..crate::db::RecoveryDerivationRow::test_default("somehash", "x86_64-linux")
+            },
             elapsed_secs: 100.0,
-            is_fixed_output: false,
-            resubmit_cycles: 0,
         };
         let err = DerivationState::from_poisoned_row(row).unwrap_err();
         assert_eq!(
             err.0, "somehash",
             "error tuple returns drv_hash for logging"
         );
+    }
+
+    // r[verify sched.merge.authoritative-conflict+3]
+    /// Poisoned-row recovery must restore the same creation-time snapshot
+    /// as non-poisoned recovery (bug_007): the merge gate keys on the
+    /// existing node's authoritative content, flag, and verifiable
+    /// identity, so an empty-stub recovery would silently disable it
+    /// after failover.
+    #[test]
+    fn from_poisoned_row_restores_authoritative_snapshot() {
+        let base = crate::db::RecoveryDerivationRow {
+            drv_content: Some(b"Derive-A".to_vec()),
+            required_features: vec!["big-parallel".into()],
+            expected_output_paths: vec![String::new()],
+            output_names: vec!["out".into(), "dev".into()],
+            status: "poisoned".into(),
+            failed_builders: vec!["builder-1".into()],
+            resubmit_cycles: 2,
+            floor_mem_bytes: 1024,
+            ..crate::db::RecoveryDerivationRow::test_default("poisonhash", "x86_64-linux")
+        };
+        let row = crate::db::PoisonedDerivationRow {
+            base,
+            elapsed_secs: 100.0,
+        };
+        let state = DerivationState::from_poisoned_row(row).unwrap();
+        assert_eq!(state.status(), DerivationStatus::Poisoned);
+        assert!(
+            state.drv_content_authoritative,
+            "flag re-derived from row presence on the poisoned path too"
+        );
+        assert_eq!(state.drv_content, b"Derive-A");
+        assert_eq!(state.output_names, vec!["out", "dev"]);
+        assert_eq!(state.expected_output_paths, vec![String::new()]);
+        assert_eq!(state.required_features, vec!["big-parallel"]);
+        assert_eq!(state.retry.resubmit_cycles, 2);
+        assert_eq!(state.retry.failure_count, 1);
+        assert!(state.retry.poisoned_at.is_some());
+        assert_eq!(state.sched.resource_floor.mem_bytes, 1024);
+
+        // Store-backed poisoned row (drv_content NULL) keeps recovering
+        // with the flag false → exempt from the authoritative gate.
+        let row = crate::db::PoisonedDerivationRow {
+            base: crate::db::RecoveryDerivationRow::test_default("storehash", "x86_64-linux"),
+            elapsed_secs: 5.0,
+        };
+        let state = DerivationState::from_poisoned_row(row).unwrap();
+        assert!(!state.drv_content_authoritative);
+        assert!(state.drv_content.is_empty());
     }
 
     // r[verify sched.ca.cutoff-compare]
@@ -2543,15 +2545,8 @@ mod tests {
         // (requires manual DB corruption, but a panic here bricks
         // scheduler startup entirely — disproportionate).
         let row = crate::db::PoisonedDerivationRow {
-            derivation_id: uuid::Uuid::new_v4(),
-            drv_hash: "infhash".into(),
-            drv_path: rio_test_support::fixtures::test_drv_path("inf"),
-            pname: None,
-            system: "x86_64-linux".into(),
-            failed_builders: vec![],
+            base: crate::db::RecoveryDerivationRow::test_default("infhash", "x86_64-linux"),
             elapsed_secs: f64::INFINITY,
-            is_fixed_output: false,
-            resubmit_cycles: 0,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
         // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →

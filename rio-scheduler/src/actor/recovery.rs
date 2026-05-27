@@ -290,7 +290,7 @@ impl DagActor {
         }
         let ttl_secs = crate::state::POISON_TTL.as_secs_f64();
         for row in poisoned_rows {
-            let derivation_id = row.derivation_id;
+            let derivation_id = row.base.derivation_id;
             // Expired-at-load: clear in PG, don't insert. Avoids the
             // from_poisoned_row Instant-arithmetic trap on fresh
             // nodes — checked_sub(30h) on a node booted 1h ago returns
@@ -310,9 +310,9 @@ impl DagActor {
             // the same actor turn. Not worth the re-load complexity
             // for a 24h-outage + crash-window intersection.
             if row.elapsed_secs > ttl_secs {
-                info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
+                info!(drv_hash = %row.base.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
-                let hash: crate::state::DrvHash = row.drv_hash.into();
+                let hash: crate::state::DrvHash = row.base.drv_hash.into();
                 if let Err(e) = self.db.clear_poison(&hash).await {
                     warn!(drv_hash = %hash, error = %e,
                           "clear_poison for expired-at-load failed; next recovery will retry");

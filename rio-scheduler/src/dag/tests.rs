@@ -2989,3 +2989,85 @@ fn fod_path_agreement_is_sufficient_evidence() -> anyhow::Result<()> {
     assert!(node.drv_content_authoritative);
     Ok(())
 }
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// The conflict gate must keep holding for a node REBUILT FROM PG after a
+/// leader failover (bug_007): `from_poisoned_row` restores the
+/// authoritative bytes/flag/identity, so a recovered poisoned squat is
+/// judged exactly like the live node was — conflicting authoritative
+/// bytes rejected, the byte-identical resubmit admitted, and a
+/// conflicting store-backed definition displaced rather than silently
+/// joined onto attacker content.
+#[test]
+fn recovered_poisoned_squat_keeps_authoritative_gate() -> anyhow::Result<()> {
+    fn recovered_squat(tag: &str) -> crate::state::DerivationState {
+        let base = crate::db::RecoveryDerivationRow {
+            drv_content: Some(b"Derive-A".to_vec()),
+            is_ca: true,
+            expected_output_paths: vec![String::new()],
+            status: "poisoned".into(),
+            ..crate::db::RecoveryDerivationRow::test_default(tag, "x86_64-linux")
+        };
+        crate::state::DerivationState::from_poisoned_row(crate::db::PoisonedDerivationRow {
+            base,
+            elapsed_secs: 60.0,
+        })
+        .expect("recovered poisoned row is valid")
+    }
+
+    // (a) Post-failover authoritative submission with DIFFERENT bytes →
+    // rejected; the recovered bytes survive untouched. Pre-fix the
+    // recovered stub carried drv_content_authoritative=false, so this
+    // submission silently redefined the squat through the resubmit-reset.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-squat"));
+    let attacker = Uuid::new_v4();
+    let err = dag
+        .merge(
+            attacker,
+            &[authoritative_node("rec-squat", b"Derive-B")],
+            &[],
+            "",
+        )
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("rec-squat").unwrap();
+    assert!(node.drv_content_authoritative);
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert_eq!(node.status(), DerivationStatus::Poisoned);
+    assert!(!node.interested_builds.contains(&attacker));
+
+    // (b) Byte-identical authoritative resubmit (the legitimate hook
+    // producer retrying after failover) is admitted through the normal
+    // resubmit-reset, keeps the bytes, and carries the new interest.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-retry"));
+    let producer = Uuid::new_v4();
+    let res = dag.merge(
+        producer,
+        &[authoritative_node("rec-retry", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    assert!(res.reset_on_resubmit.contains(&"rec-retry".into()));
+    let node = dag.node("rec-retry").unwrap();
+    assert!(node.drv_content_authoritative);
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert_ne!(node.status(), DerivationStatus::Poisoned);
+    assert!(node.interested_builds.contains(&producer));
+
+    // (c) A conflicting store-backed definition displaces the recovered
+    // (terminal) squat instead of joining it — same as pre-failover.
+    let mut dag = DerivationDag::new();
+    dag.insert_recovered_node(recovered_squat("rec-displace"));
+    let victim = Uuid::new_v4();
+    let mut displacing = make_node("rec-displace", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let res = dag.merge(victim, &[displacing], &[], "")?;
+    assert!(res.displaced.contains(&"rec-displace".into()));
+    let node = dag.node("rec-displace").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert_eq!(node.system, "aarch64-linux");
+    assert_eq!(node.interested_builds, HashSet::from([victim]));
+    Ok(())
+}

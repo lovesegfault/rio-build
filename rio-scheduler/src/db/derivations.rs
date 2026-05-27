@@ -408,18 +408,31 @@ impl SchedulerDb {
     /// Succeeded on recovery. After `persist_poisoned` landed, new rows
     /// can never be in this state.
     ///
-    /// Returns minimal fields — poisoned rows aren't dispatched, just
-    /// TTL-tracked + resubmit-bound checked. `failed_builders` matters
-    /// for display; `resubmit_cycles` for `is_retriable_on_resubmit`;
-    /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
-    /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
+    /// Returns the full creation-time snapshot (the same column set as
+    /// `load_nonterminal_derivations`): the merge gate
+    /// (`sched.merge.authoritative-conflict`) keys on the recovered
+    /// node's authoritative content and verifiable identity, so a
+    /// poisoned row recovered as an empty stub would silently disable
+    /// the gate after failover. Poisoned executions are already
+    /// finalized by `persist_poisoned`, so `exec_id` /
+    /// `assigned_builder_id` are selected as NULL. `elapsed_secs` is
+    /// `now() - poisoned_at` computed PG-side so the caller can convert
+    /// `Instant::now() - Duration::from_secs(elapsed)`.
     pub(crate) async fn load_poisoned_derivations(
         &self,
     ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
-            SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders, is_fixed_output, resubmit_cycles,
+            SELECT derivation_id, drv_hash, drv_path, pname, system, status,
+                   required_features,
+                   NULL::text AS assigned_builder_id,
+                   retry_count, resubmit_cycles,
+                   expected_output_paths, output_names, is_fixed_output,
+                   is_ca,
+                   failed_builders,
+                   floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                   drv_content,
+                   NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0

@@ -204,29 +204,28 @@ pub(crate) struct RecoveryBuildRow {
     pub submitted_age_secs: f64,
 }
 
-/// Row from `load_poisoned_derivations`. Minimal — poisoned rows
-/// aren't dispatched, just TTL-tracked + resubmit-bound checked
-/// (`is_retriable_on_resubmit` reads `resubmit_cycles`). `elapsed_secs`
-/// is computed PG-side (`now() - poisoned_at`) so the caller can
-/// reconstruct an `Instant` via
-/// `Instant::now() - Duration::from_secs_f64(elapsed)`.
+/// Row from `load_poisoned_derivations`. Carries the same creation-time
+/// snapshot as [`RecoveryDerivationRow`] (identity, expected outputs,
+/// authoritative inline content, floors) plus the PG-computed
+/// `elapsed_secs`: the merge gate (`sched.merge.authoritative-conflict`)
+/// keys on the existing node's authoritative content and verifiable
+/// identity, so a poisoned row recovered as an empty stub would silently
+/// disable the gate after failover (and historically did — I-057 grew
+/// `is_fixed_output` for the same reason before the row was unified).
+/// Poisoned rows are still only TTL-tracked + resubmit-bound checked
+/// (`is_retriable_on_resubmit` reads `resubmit_cycles`), never
+/// dispatched. `elapsed_secs` is computed PG-side
+/// (`now() - poisoned_at`) so the caller can reconstruct an `Instant`
+/// via `Instant::now() - Duration::from_secs_f64(elapsed)`.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct PoisonedDerivationRow {
-    pub derivation_id: Uuid,
-    pub drv_hash: String,
-    pub drv_path: String,
-    pub pname: Option<String>,
-    pub system: String,
-    pub failed_builders: Vec<String>,
+    /// Full creation-time recovery snapshot (same columns as the
+    /// non-terminal recovery query; `exec_id` / `assigned_builder_id`
+    /// are selected as NULL because poisoned executions are already
+    /// finalized by `persist_poisoned`).
+    #[sqlx(flatten)]
+    pub base: RecoveryDerivationRow,
     pub elapsed_secs: f64,
-    /// I-057: previously hardcoded false in `from_poisoned_row`. A
-    /// poison-recovered FOD with `is_fixed_output: false` would route
-    /// to a builder via the kind XOR in `hard_filter`, hit `WrongKind`
-    /// at executor/mod.rs:390, and re-poison. Thread it through.
-    pub is_fixed_output: bool,
-    /// `M_051`: resubmit-bound counter; persisted so the bound survives
-    /// failover (bug_001).
-    pub resubmit_cycles: i32,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
