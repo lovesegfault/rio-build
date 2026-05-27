@@ -1077,8 +1077,9 @@ pub const M_062: () = ();
 /// unrelated non-pruned merge of the same drv never clears it; cleared
 /// only once the node's children are all produced (by
 /// `clear_topdown_pruned_for_parents` in the edge-insert transaction,
-/// by the lazy clear in `handle_substitute_complete` as children
-/// finish) and by the topdown fail-fast when it consumes the marker.
+/// by the lazy clear in `handle_substitute_complete` when the node's
+/// own substitute fetch fails while its children are all produced)
+/// and by the topdown fail-fast when it consumes the marker.
 /// The header comment in the frozen `.sql` keeps the original
 /// childless-era wording — this doc-const is the corrected record. See
 /// `rio-scheduler/src/db/batch.rs` and `actor/merge.rs`.

@@ -1275,8 +1275,8 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
             .await?;
     assert!(
         !pruned,
-        "a full merge that adds children for a previously-pruned node must \
-         clear topdown_pruned in PG (its deps are now in the DAG, so the \
+        "a full merge that adds an already-produced child must clear \
+         topdown_pruned in PG (the closure is in the store, so the \
          substitution-only invariant no longer holds)"
     );
     // The same merge clears the in-memory flag too — the lazy children
@@ -1284,7 +1284,7 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
     // clearing site.
     assert!(
         !expect_drv(&handle, "tdpg-root").await.topdown_pruned,
-        "the merge that adds children must clear the in-memory flag as well"
+        "a full merge that adds an already-produced child must clear the in-memory flag as well"
     );
     Ok(())
 }

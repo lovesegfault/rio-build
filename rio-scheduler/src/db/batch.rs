@@ -295,10 +295,12 @@ impl SchedulerDb {
     }
 
     /// Best-effort single-row `topdown_pruned` clear, keyed by
-    /// `drv_hash`, outside any transaction. Used by the topdown
-    /// fail-fast when it parks a node: the marker it just consumed must
+    /// `drv_hash`, outside any transaction. Two callers: the topdown
+    /// fail-fast when it parks a node (the marker it just consumed must
     /// not survive in PG, or the next leader restores it onto a
-    /// childless node and the fail-fast re-arms after every failover.
+    /// childless node and the fail-fast re-arms after every failover),
+    /// and the lazy clear in `handle_substitute_complete` when the
+    /// node's children are all already produced at walk-failure time.
     /// Callers treat an error as warn-and-continue — the in-memory
     /// clear already happened and the build verdict must not depend on
     /// this write.

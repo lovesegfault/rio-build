@@ -336,9 +336,11 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
 // r[verify sched.merge.substitute-topdown+9]
 /// `topdown_pruned` persists with OR-on-conflict semantics (a pruned
 /// merge sets it; an unrelated non-pruned merge of the same drv never
-/// clears it), is cleared only by `clear_topdown_pruned_for_parents`
-/// (the node gained children, in the same tx as its edges), and rides
-/// the recovery SELECT so a new leader can restore it.
+/// clears it), is cleared by `clear_topdown_pruned_for_parents` for
+/// the parent ids the caller passes (under the produced-children
+/// policy enforced by the caller, in the same tx as the edges) and by
+/// `clear_topdown_pruned_by_hash`, and rides the recovery SELECT so a
+/// new leader can restore it.
 #[tokio::test]
 async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -397,14 +399,15 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         "recovery SELECT must carry topdown_pruned"
     );
 
-    // 4. Gaining children clears it (same-tx helper used by
-    //    persist_merge_to_db right after batch_insert_edges).
+    // 4. The same-tx helper clears the rows it is handed
+    //    (persist_merge_to_db only hands it parents whose children are
+    //    all produced, right after batch_insert_edges).
     let mut tx = db.pool().begin().await?;
     SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &[id]).await?;
     tx.commit().await?;
     assert!(
         !read().await?,
-        "a node that gained children must have the marker cleared"
+        "the helper must clear the marker for the ids it is given"
     );
 
     Ok(())
