@@ -161,12 +161,15 @@ pub struct MergeResult {
     /// accounting and to prune the displaced hash from prior interested
     /// builds' completion accounting.
     pub displaced: Vec<DrvHash>,
-    /// Full prior state of each retriable node destructively removed by
-    /// the resubmit-retry path. `rollback_merge` re-inserts these AFTER
-    /// scrubbing `newly_inserted` so a failed merge restores the exact
-    /// pre-merge DAG (status, `interested_builds`, `retry.count`).
-    /// Without this, a `{retriable-X, cycle}` submission would wipe X
-    /// and reset its `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
+    /// Full prior state of every pre-existing node this merge
+    /// destructively removed — resubmit-reset of retriable nodes and
+    /// displacement of terminal authoritative-content nodes
+    /// (`sched.merge.authoritative-conflict`). `rollback_merge`
+    /// re-inserts these AFTER scrubbing `newly_inserted` so a failed
+    /// merge restores the exact pre-merge DAG (status,
+    /// `interested_builds`, `retry.count`). Without this, a
+    /// `{retriable-X, cycle}` submission would wipe X and reset its
+    /// `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
     pub removed_retriable: Vec<(DrvHash, DerivationState)>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
@@ -475,11 +478,12 @@ impl DerivationDag {
         // nodes where this merge recorded the submitting build's
         // contribution, so rollback can remove/restore it.
         let mut contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)> = Vec::new();
-        // Full prior state of retriable nodes destructively removed below
-        // for resubmit-reset. rollback_merge restores these so a failed
-        // merge leaves the DAG exactly as it was (status, interest set,
-        // retry.resubmit_cycles toward POISON_RESUBMIT_RETRY_LIMIT all
-        // preserved).
+        // Full prior state of every pre-existing node destructively
+        // removed below (resubmit-reset of retriable nodes, displacement
+        // of terminal authoritative-content squats). rollback_merge
+        // restores these so a failed merge leaves the DAG exactly as it
+        // was (status, interest set, retry.resubmit_cycles toward
+        // POISON_RESUBMIT_RETRY_LIMIT all preserved).
         let mut removed_retriable: Vec<(DrvHash, DerivationState)> = Vec::new();
         // Pre-existing nodes whose empty traceparent was upgraded below.
         let mut traceparent_upgraded: Vec<DrvHash> = Vec::new();
@@ -921,8 +925,8 @@ impl DerivationDag {
     /// Rollback a failed merge: remove newly-inserted nodes and edges,
     /// remove build interest from pre-existing nodes that gained it during
     /// this merge (but not from nodes where build_id was already present),
-    /// and restore any retriable nodes that the resubmit-reset path
-    /// destructively removed.
+    /// and restore every node the merge destructively removed
+    /// (resubmit-reset and displacement alike).
     // The parameters mirror `MergeResult`'s fields one-to-one (the two
     // inline callers in `merge()` hold them as locals, not as a
     // `MergeResult`); a struct param would just rename the args.
@@ -955,9 +959,10 @@ impl DerivationDag {
         }
 
         // Hashes being restored below — their children[X]/parents[X]
-        // entries are pre-existing (the resubmit-reset path removed only
-        // nodes[X], never edges) and must NOT be scrubbed. The new_edges
-        // loop above already reverted any edges THIS merge added to them.
+        // entries are pre-existing (the destructive-removal paths,
+        // resubmit-reset and displacement, remove only nodes[X], never
+        // edges) and must NOT be scrubbed. The new_edges loop above
+        // already reverted any edges THIS merge added to them.
         // Owned (not borrowed) because the per-field restore loops at the
         // bottom also consult it, after `removed_retriable` is consumed.
         let restoring: HashSet<DrvHash> =
@@ -969,7 +974,8 @@ impl DerivationDag {
                 self.path_to_hash.remove(state.drv_path().as_str());
             }
             // Also clean up any edge entries keyed on this hash — but only
-            // for truly-fresh nodes. For resubmit-reset nodes, these entries
+            // for truly-fresh nodes. For restored nodes (resubmit-reset or
+            // displacement), these entries
             // are the prior node's pre-existing edges; scrubbing them would
             // leave dangling one-way edges (e.g. children[W]∋X survives,
             // parents[X]∋W gone → X completes but W never sees it).
@@ -979,8 +985,9 @@ impl DerivationDag {
             }
         }
 
-        // Restore retriable nodes that were destructively removed for
-        // resubmit-reset. Runs AFTER newly_inserted removal so the fresh
+        // Restore the nodes this merge destructively removed
+        // (resubmit-reset or displacement). Runs AFTER newly_inserted
+        // removal so the fresh
         // replacement (same hash key) is gone first.
         for (hash, state) in removed_retriable {
             self.path_to_hash

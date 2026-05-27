@@ -427,8 +427,9 @@ pub(crate) struct DerivationRow {
     /// fallback) — `Some` only when the gateway marked the node
     /// `drv_content_authoritative` (and SubmitBuild ingress validated
     /// the bytes against the node's claimed identity); `None` for every
-    /// other node. Last write wins on re-upsert: a later submission
-    /// that can rely on the store clears the column.
+    /// other node. Refreshed or cleared only by the submission that
+    /// (re)creates the node (sched.persist.creation-scoped);
+    /// submissions that join a live node never reach the upsert.
     pub drv_content: Option<Vec<u8>>,
 }
 

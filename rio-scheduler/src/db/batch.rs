@@ -80,8 +80,11 @@ impl SchedulerDb {
         // bytea[] bind: sqlx's array encoder wants a homogeneous
         // element type, so None is encoded as an EMPTY bytea and
         // converted back to NULL SQL-side via NULLIF — the column
-        // must be NULL (not '') for non-authoritative nodes; persisted
-        // authoritative bytes are replaced last-write-wins by design.
+        // must be NULL (not '') for nodes without authoritative bytes.
+        // The statement itself is last-write-wins for the rows it
+        // receives; its only production caller is creation-scoped
+        // (sched.persist.creation-scoped), so live-node joins never
+        // reach it.
         let mut drv_content = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
@@ -180,12 +183,14 @@ impl SchedulerDb {
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
                    closure_hole, drv_content)
-            -- is_ca UPDATE is idempotent-by-construction: drv_hash is
-            -- deterministic (input-addressed=store path; CA=modular hash
-            -- per rio-nix hashDerivationModulo). Same drv_hash → same
-            -- .drv content → same outputs[] → same is_ca. The EXCLUDED
-            -- value always equals the existing row's value. Kept in the
-            -- SET-list for insert-columns parity (UNNEST binds $10).
+            -- is_ca rides the same creation-snapshot refresh as the
+            -- other identity columns: rows are written only by
+            -- submissions that (re)create the node, and a displacing
+            -- re-creation (sched.merge.authoritative-conflict) may
+            -- legitimately carry a different declared identity than the
+            -- row it replaces, so EXCLUDED is applied rather than
+            -- assumed equal. Kept in the SET-list alongside the other
+            -- UNNEST-bound columns ($10).
             --
             -- wanted_output_names is NOT idempotent-by-construction (it
             -- depends on the consumers, not the drv): union-with-empty-
@@ -231,14 +236,16 @@ impl SchedulerDb {
                 END,
                 topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned,
                 closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole,
-                -- Last write wins: a later authoritative submission
-                -- refreshes the persisted bytes, and a later
-                -- NON-authoritative submission of the same drv_hash
-                -- clears them — non-authoritative means the .drv is
-                -- fetchable from the store, so the persisted copy is
-                -- no longer needed, and clearing it bounds how long a
-                -- stale (or hostile, pre-validation) blob can outlive
-                -- the submission that wrote it.
+                -- Only merges that (re)create the node reach this
+                -- statement (sched.persist.creation-scoped); for those
+                -- rows last write wins — an authoritative re-creation
+                -- refreshes the persisted bytes, a store-backed
+                -- re-creation clears them (the .drv is then fetchable
+                -- from the store, so a persisted copy is unnecessary).
+                -- A live node's bytes are never cleared by a later
+                -- join; hostile content is bounded by SubmitBuild
+                -- ingress validation plus node lifecycle, not by this
+                -- clear.
                 drv_content = EXCLUDED.drv_content
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs

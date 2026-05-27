@@ -889,12 +889,15 @@ pub enum ActorError {
     #[error("DAG merge failed: {0}")]
     Dag(#[from] crate::dag::DagError),
 
-    /// Invariant violation: an edge references a derivation that was never
-    /// persisted to PG. Merge assigns db_ids to every node before processing
-    /// edges; if `DerivationDag::db_id_for_path` returns None for an endpoint, the
-    /// node was never in the submission (malformed request) or the id_map
-    /// build loop has a bug.
-    #[error("edge references unpersisted derivation (db_id missing): {drv_path}")]
+    /// Invariant violation: merge persistence needed a derivation's
+    /// `db_id` and none exists. Two producers: the build→derivation
+    /// link loop (a node this submission merely joins should have had
+    /// its `db_id` committed by the merge that created it) and edge
+    /// endpoint resolution (id_map for rows this merge wrote, the live
+    /// DAG for everything else). Either way the node was never part of
+    /// a committed submission (malformed request) or the resolution
+    /// logic has a bug.
+    #[error("merge persistence references an unpersisted derivation (db_id missing): {drv_path}")]
     MissingDbId { drv_path: String },
 
     /// Store service is unreachable (cache-check circuit breaker is open).

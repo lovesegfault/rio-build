@@ -2065,15 +2065,16 @@ impl DagActor {
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:
-        //   1. this tx's id_map (covers newly-inserted + re-upserted
-        //      nodes from this batch — ON CONFLICT RETURNING gives
-        //      back existing ids for the latter),
-        //   2. fall back to self.dag (covers cross-batch edges to
-        //      nodes merged by a PRIOR SubmitBuild that aren't in
-        //      this request's `nodes` list at all — rare but legal
-        //      when gateway deduplicates against live DAG).
-        // Does NOT read self.dag.node().db_id for nodes in THIS
-        // batch — that field isn't set until after commit() below.
+        //   1. this tx's id_map — exactly the rows this merge wrote,
+        //      i.e. (re)created nodes (sched.persist.creation-scoped);
+        //      ON CONFLICT RETURNING hands back the existing id when a
+        //      re-created node's row already existed,
+        //   2. fall back to self.dag for everything this merge did NOT
+        //      (re)create: live nodes this submission merely joins and
+        //      cross-batch edge endpoints merged by a PRIOR SubmitBuild
+        //      — their db_id was committed by their creating merge.
+        // A node (re)created by THIS merge is never resolved via
+        // self.dag — its db_id isn't set until after commit() below.
         let resolve = |drv_path: &str| -> Option<Uuid> {
             path_to_hash
                 .get(drv_path)
