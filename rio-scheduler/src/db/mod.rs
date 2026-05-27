@@ -253,10 +253,10 @@ pub(crate) struct RecoveryDerivationRow {
     pub is_fixed_output: bool,
     pub is_ca: bool,
     /// Roots-only-prune marker (`migrations/063`): the node was kept by
-    /// a topdown prune and its dependency closure was never merged, so
-    /// it MUST complete via substitution. Restored verbatim by
-    /// `from_recovery_row` — resetting it to false is what allowed the
-    /// post-failover doomed from-source dispatch.
+    /// a topdown prune and its dependency closure was never merged (or
+    /// never produced), so it MUST complete via substitution. Restored
+    /// verbatim by `from_recovery_row` — resetting it to false is what
+    /// allowed the post-failover doomed from-source dispatch.
     pub topdown_pruned: bool,
     pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
@@ -368,13 +368,18 @@ pub(crate) struct DerivationRow {
     pub wanted_output_names: Vec<String>,
     /// Roots-only-prune marker (`migrations/063`): true for kept
     /// (demanded) nodes of a topdown-fired merge whose dependency
-    /// closure the prune dropped and that are childless in the DAG at
-    /// stamp time; false otherwise (including dep-less demanded
-    /// leaves, which never had a closure to drop). OR-combined on
-    /// conflict so an unrelated non-pruned merge of the same drv never
-    /// clears it; cleared when the node gains children
-    /// (`clear_topdown_pruned_for_parents`) and when the topdown
-    /// fail-fast consumes it.
+    /// closure the prune dropped and whose existing DAG children (if
+    /// any) are not already all produced at stamp time (see
+    /// `children_all_produced`); false otherwise (including dep-less
+    /// demanded leaves, which never had a closure to drop, and nodes
+    /// whose children are all Completed/Skipped). Childless kept
+    /// nodes ARE stamped; present-but-unbuilt children do not exempt
+    /// the node. OR-combined on conflict so an unrelated non-pruned
+    /// merge of the same drv never clears it; cleared only once its
+    /// children are all produced (`clear_topdown_pruned_for_parents`
+    /// in the edge-insert transaction, the lazy clear in
+    /// `handle_substitute_complete`) and when the topdown fail-fast
+    /// consumes it.
     pub topdown_pruned: bool,
 }
 

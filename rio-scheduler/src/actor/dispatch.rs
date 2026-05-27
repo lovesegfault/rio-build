@@ -1500,7 +1500,8 @@ impl DagActor {
             // could build from source. Clearing loses nothing: after
             // the park there is no surviving interest, and a
             // resubmitted genuinely-pruned root either re-prunes
-            // (re-stamped) or full-merges (children ⇒ cleared).
+            // (re-stamped) or full-merges (children all produced ⇒
+            // cleared).
             s.topdown_pruned = false;
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");

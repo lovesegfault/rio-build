@@ -1066,14 +1066,21 @@ pub const M_062: () = ();
 ///
 /// Written `true` — inside the same transaction that persists a pruned
 /// merge — for the kept nodes whose dependency closure the prune
-/// dropped and that are childless in the DAG at stamp time (a dep-less
-/// demanded leaf never had a closure to drop and is not marked);
+/// dropped and whose existing DAG children (if any) are not already
+/// all produced at stamp time (a dep-less demanded leaf never had a
+/// closure to drop and is not marked, and a kept node whose children
+/// are all Completed/Skipped has its closure in the store; childless
+/// kept nodes ARE marked, and present-but-unbuilt children do not
+/// exempt a node — see `children_all_produced` in `actor/merge.rs`);
 /// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared
-/// in the same transaction that inserts edges where the node is the
-/// parent (its deps are then in the DAG, so the guard is moot) and by
-/// the topdown fail-fast when it consumes the marker. See
+/// only once the node's children are all produced (by
+/// `clear_topdown_pruned_for_parents` in the edge-insert transaction,
+/// by the lazy clear in `handle_substitute_complete` as children
+/// finish) and by the topdown fail-fast when it consumes the marker.
+/// The header comment in the frozen `.sql` keeps the original
+/// childless-era wording — this doc-const is the corrected record. See
 /// `rio-scheduler/src/db/batch.rs` and `actor/merge.rs`.
 ///
 /// Read/written by **rio-scheduler** only.
