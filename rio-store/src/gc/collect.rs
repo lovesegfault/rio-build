@@ -1231,11 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn cycle_leaves_no_session_state_in_pool() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let h = ChunkSeed::new(0x91)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let h = ChunkSeed::new(0x91).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "guc-leak", "complete", &make_chunk_list(&[h])).await;
 
         let baseline = show_on_all_pool_connections(&db.pool, "work_mem").await[0].clone();
@@ -1277,11 +1273,7 @@ mod tests {
     #[tokio::test]
     async fn failed_cycle_leaves_no_session_state_in_pool() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let h = ChunkSeed::new(0x92)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let h = ChunkSeed::new(0x92).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "guc-leak-err", "complete", &make_chunk_list(&[h])).await;
 
         let baseline = show_on_all_pool_connections(&db.pool, "work_mem").await[0].clone();
@@ -1331,11 +1323,7 @@ mod tests {
     #[tokio::test]
     async fn temp_table_does_not_leak_across_cycles() {
         let db = TestDb::new(&crate::MIGRATOR).await;
-        let h = ChunkSeed::new(0x77)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let h = ChunkSeed::new(0x77).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "leak-a", "complete", &make_chunk_list(&[h])).await;
 
         for _ in 0..2 {
@@ -1362,11 +1350,7 @@ mod tests {
 
         let db = TestDb::new(&crate::MIGRATOR).await;
         reset_collector_state();
-        let h = ChunkSeed::new(0x42)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let h = ChunkSeed::new(0x42).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "phase3", "complete", &make_chunk_list(&[h])).await;
         // An old, unreferenced victim the live phase 3 must collect.
         ChunkSeed::new(0x43)
@@ -1674,31 +1658,28 @@ mod tests {
 
     // r[verify store.chunk.liveness-derived]
     // r[verify store.gc.chunk-collect]
-    /// The historical-leak shape: an unreferenced chunk past grace with
-    /// a stale `refcount > 0` is soft-deleted and enqueued by a live
-    /// cycle — eligibility is the manifest fold, the counter is never
-    /// consulted. Collected chunks land in `pending_s3_deletes` exactly
-    /// once, and a follow-up cycle finds nothing left to collect.
+    /// The historical-leak shape: an uploaded chunk past grace that no
+    /// existing manifest references is soft-deleted and enqueued by a
+    /// live cycle — eligibility is the manifest fold and nothing else
+    /// (the rows the pre-cutover counter leaked are exactly this shape
+    /// once the column is gone). Collected chunks land in
+    /// `pending_s3_deletes` exactly once, and a follow-up cycle finds
+    /// nothing left to collect.
     #[tokio::test]
-    async fn live_cycle_collects_stale_refcount_leak() {
+    async fn live_cycle_collects_unreferenced_chunk_exactly_once() {
         let db = TestDb::new(&crate::MIGRATOR).await;
         reset_collector_state();
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
-        // The leaked chunk: unreferenced, past grace, stale refcount=3.
+        // The leaked chunk: unreferenced, past grace.
         let leaked = ChunkSeed::new(0xB1)
-            .with_refcount(3)
             .with_size(4096)
             .age_secs(3600)
             .uploaded()
             .seed(&db.pool)
             .await;
         // A referenced control chunk that must survive.
-        let live = ChunkSeed::new(0xA7)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let live = ChunkSeed::new(0xA7).uploaded().seed(&db.pool).await;
         seed_chunked_manifest(&db.pool, "leak-live", "complete", &make_chunk_list(&[live])).await;
 
         let rec = CountingRecorder::default();
@@ -1726,7 +1707,7 @@ mod tests {
         .fetch_one(&db.pool)
         .await
         .unwrap();
-        assert!(deleted, "leaked chunk soft-deleted despite refcount > 0");
+        assert!(deleted, "unreferenced chunk soft-deleted");
         assert!(uploaded_cleared, "soft-delete clears uploaded_at");
         let live_deleted: bool =
             sqlx::query_scalar("SELECT deleted FROM chunks WHERE blake3_hash = $1")

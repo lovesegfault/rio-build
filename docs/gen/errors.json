@@ -1335,7 +1335,7 @@
       "name": "Ingest",
       "crate": "rio-store",
       "msg": "ingest failed: {0}",
-      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3/refcount)."
+      "doc": "Metadata-layer failure during ingest (write-ahead, complete_manifest, chunked S3 upload / chunk-row upsert)."
     },
     {
       "enum": "SubstituteError",

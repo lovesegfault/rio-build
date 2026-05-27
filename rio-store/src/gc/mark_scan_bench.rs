@@ -1076,9 +1076,9 @@ struct ChunkFixtureStats {
 }
 
 /// Seed the `chunks` table to match the manifest fixture: one row per
-/// distinct referenced hash (refcount 1, week-old created_at and
-/// uploaded_at, `last_referenced_at` NULL — the column's steady state
-/// for rows never re-referenced since insert), plus the unreferenced
+/// distinct referenced hash (week-old created_at and uploaded_at,
+/// `last_referenced_at` NULL — the column's steady state for rows
+/// never re-referenced since insert), plus the unreferenced
 /// would-collect population per [`UNREF_PER_MILLE_OF_LIVE`] /
 /// [`UNREF_PROTECTED_DIVISOR`]. The referenced set is derived by the
 /// same server-side expansion the mark statement uses (its SELECT body
@@ -1100,8 +1100,8 @@ async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats
         .expect("SERVER_MARK_SQL starts with the CTAS prefix");
     // AssertSqlSafe: splices only this module's fixed statement body.
     let insert_live = format!(
-        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
-         SELECT s.blake3_hash, 1, 65536, now() - interval '7 days', \
+        "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at, deleted) \
+         SELECT s.blake3_hash, 65536, now() - interval '7 days', \
                 now() - interval '7 days', FALSE \
            FROM ({select_body}) AS s \
           ORDER BY s.blake3_hash"
@@ -1127,8 +1127,8 @@ async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats
     let touch_protected = unref_rows / UNREF_PROTECTED_DIVISOR;
     let collectable = unref_rows - grace_protected - touch_protected;
     sqlx::query(
-        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
-         SELECT decode(md5('unref-' || g.i) || md5('unref-tail-' || g.i), 'hex'), 0, 65536, \
+        "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at, deleted) \
+         SELECT decode(md5('unref-' || g.i) || md5('unref-tail-' || g.i), 'hex'), 65536, \
                 now() - interval '7 days', NULL, FALSE \
            FROM generate_series(1, $1::bigint) AS g(i) \
           ORDER BY 1",
@@ -1151,9 +1151,9 @@ async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats
     // timestamps really are recent relative to the cycle snapshot the
     // measured phase takes a few statements from now.
     sqlx::query(
-        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
+        "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at, deleted) \
          SELECT decode(md5('unref-grace-' || g.i) || md5('unref-grace-tail-' || g.i), 'hex'), \
-                0, 65536, now(), NULL, FALSE \
+                65536, now(), NULL, FALSE \
            FROM generate_series(1, $1::bigint) AS g(i) \
           ORDER BY 1",
     )
@@ -1162,10 +1162,10 @@ async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats
     .await
     .expect("seed grace-protected chunks");
     sqlx::query(
-        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted, \
+        "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at, deleted, \
                              last_referenced_at) \
          SELECT decode(md5('unref-touch-' || g.i) || md5('unref-touch-tail-' || g.i), 'hex'), \
-                0, 65536, now() - interval '7 days', NULL, FALSE, now() \
+                65536, now() - interval '7 days', NULL, FALSE, now() \
            FROM generate_series(1, $1::bigint) AS g(i) \
           ORDER BY 1",
     )

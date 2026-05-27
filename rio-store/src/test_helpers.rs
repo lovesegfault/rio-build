@@ -423,7 +423,6 @@ impl StoreSeed {
 /// enough to discriminate chunks in a single-test DB.
 pub struct ChunkSeed {
     tag: u8,
-    refcount: i32,
     size: i64,
     age_secs: Option<i64>,
     uploaded: bool,
@@ -433,16 +432,10 @@ impl ChunkSeed {
     pub fn new(tag: u8) -> Self {
         Self {
             tag,
-            refcount: 0,
             size: 0,
             age_secs: None,
             uploaded: false,
         }
-    }
-
-    pub fn with_refcount(mut self, rc: i32) -> Self {
-        self.refcount = rc;
-        self
     }
 
     pub fn with_size(mut self, size: i64) -> Self {
@@ -472,12 +465,11 @@ impl ChunkSeed {
         let mut hash = [0u8; 32];
         hash[0] = self.tag;
         sqlx::query(
-            "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at) \
-             VALUES ($1, $2, $3, now() - make_interval(secs => COALESCE($4, 0)), \
-                     CASE WHEN $5 THEN now() END)",
+            "INSERT INTO chunks (blake3_hash, size, created_at, uploaded_at) \
+             VALUES ($1, $2, now() - make_interval(secs => COALESCE($3, 0)), \
+                     CASE WHEN $4 THEN now() END)",
         )
         .bind(&hash[..])
-        .bind(self.refcount)
         .bind(self.size)
         .bind(self.age_secs)
         .bind(self.uploaded)

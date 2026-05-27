@@ -8,9 +8,9 @@
 //! Direct probe: sample confirmed-uploaded chunks from PG, S3
 //! HeadObject each. Presence is keyed on `uploaded_at` — the same
 //! predicate as the server-side VerifyChunks scan — never on the
-//! refcount liveness signal (liveness is not presence; the in-flight
-//! window where refcount >= 1 but the PUT has not finished is not a
-//! finding).
+//! chunk-liveness signal (liveness is not presence; the in-flight
+//! window where a manifest already references the chunk but the PUT
+//! has not finished is not a finding).
 //! S3 key layout is `chunks/{aa}/{blake3-hex}` (rio-store/backend.rs).
 
 use std::time::Duration;

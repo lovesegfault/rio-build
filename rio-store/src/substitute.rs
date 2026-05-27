@@ -223,7 +223,7 @@ pub enum SubstituteError {
     Admission(#[from] AdmissionError),
 
     /// Metadata-layer failure during ingest (write-ahead,
-    /// complete_manifest, chunked S3/refcount).
+    /// complete_manifest, chunked S3 upload / chunk-row upsert).
     #[error("ingest failed: {0}")]
     Ingest(String),
 }

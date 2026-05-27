@@ -44,7 +44,7 @@ pub struct StoreAdminServiceImpl {
     pool: PgPool,
     /// Chunk backend for sweep's key_for (enqueue to pending_s3_
     /// deletes). None = inline-only store, sweep does CASCADE
-    /// delete only (no chunk refcounting).
+    /// delete only (no chunk handling).
     chunk_backend: Option<Arc<dyn ChunkBackend>>,
     /// Process-wide shutdown token. Threaded into the `run_gc`
     /// spawn so a multi-minute sweep can bail between batches on
@@ -353,8 +353,9 @@ impl rio_proto::StoreAdminService for StoreAdminServiceImpl {
                 //   not exist yet. Not a verification target either —
                 //   reporting it as "missing" would be a false
                 //   positive on every in-flight PutPath.
-                // refcount=0 IS verified — once uploaded_at is set the
-                // object SHOULD exist regardless of refcount.
+                // Reference state is irrelevant here — once uploaded_at
+                // is set the object SHOULD exist whether or not any
+                // manifest still references the chunk.
                 let rows: Vec<(Vec<u8>,)> = match sqlx::query_as(
                     "SELECT blake3_hash FROM chunks \
                      WHERE deleted = FALSE AND uploaded_at IS NOT NULL \
@@ -1000,30 +1001,22 @@ mod tests {
         let db = TestDb::new(&crate::MIGRATOR).await;
         let backend: Arc<dyn ChunkBackend> = mem_backend();
 
-        // Consistent: refcount=1 in PG, present in backend.
-        let h_ok = ChunkSeed::new(0x10)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        // Consistent: confirmed-uploaded in PG, present in backend.
+        let h_ok = ChunkSeed::new(0x10).uploaded().seed(&db.pool).await;
         backend
             .put(&h_ok, bytes::Bytes::from_static(b"ok"))
             .await
             .unwrap();
 
-        // The I-040 case: refcount=1 in PG, NOT in backend.
-        let h_missing = ChunkSeed::new(0x20)
-            .with_refcount(1)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        // The I-040 case: confirmed-uploaded in PG, NOT in backend.
+        let h_missing = ChunkSeed::new(0x20).uploaded().seed(&db.pool).await;
 
-        // In-flight upload: refcount=1, uploaded_at=NULL, NOT in
-        // backend. MUST be skipped — the cas.rs window between
+        // In-flight upload: uploaded_at=NULL, NOT in backend. MUST be
+        // skipped — the cas.rs window between
         // upgrade_manifest_to_chunked and mark_chunks_uploaded. Tag
         // 0x08 sorts between 0x05 (deleted) and 0x10 so a buggy WHERE
         // would scan it.
-        let h_inflight = ChunkSeed::new(0x08).with_refcount(1).seed(&db.pool).await;
+        let h_inflight = ChunkSeed::new(0x08).seed(&db.pool).await;
 
         // deleted=true in PG → MUST be skipped (it's awaiting drain;
         // backend state is undefined). Tag 0x05 sorts before 0x10 so
@@ -1032,11 +1025,7 @@ mod tests {
         // — isolates that predicate (drop it → scanned=3 → test fails).
         // ChunkSeed synthesizes hash as [tag, 0, 0, ...] — bind the
         // returned hash, not a literal.
-        let h_deleted = ChunkSeed::new(0x05)
-            .with_refcount(0)
-            .uploaded()
-            .seed(&db.pool)
-            .await;
+        let h_deleted = ChunkSeed::new(0x05).uploaded().seed(&db.pool).await;
         sqlx::query("UPDATE chunks SET deleted = TRUE WHERE blake3_hash = $1")
             .bind(h_deleted.as_slice())
             .execute(&db.pool)

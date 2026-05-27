@@ -1421,11 +1421,43 @@ pub const M_070: () = ();
 /// rollback, and reapers still name `chunks.refcount` in their SQL for
 /// the duration of the rollout; dropping the column at the first B
 /// pod's boot would break every A-pod chunked upload. The column drop
-/// is migration 072, a separate follow-up applied only after the
-/// Release-B rollout is complete everywhere that shares the database
-/// (the §4.5 (ii) ordering; see the deployment validation checklist in
-/// `docs/ops/gc-enablement.typ`).
+/// is migration 072 (see M_072 for the §4.5 (ii) ordering rationale
+/// and why it ships in-tree).
 pub const M_071: () = ();
+
+/// `migrations/072_drop_chunks_refcount.sql`
+///
+/// Phase 1c of the refcount-formal campaign (lazy mark-and-collect
+/// chunk GC, design §4.5): drops the `chunks.refcount` column itself.
+/// Metadata-only on PG (catalog update, no table rewrite); `IF EXISTS`
+/// per the 035 style. 071 dropped the M_023 CHECK and `idx_chunks_gc`;
+/// this completes the schema retirement — chunk liveness is the
+/// manifest fold computed by the collect cycle
+/// (`store.chunk.liveness-derived`), and no production code has read
+/// or written the counter since the Release B writer deletion.
+///
+/// **Why this is a separate migration from 071 (the §4.5 (ii)
+/// ordering):** migrations run at new-pod startup, so a release that
+/// carried both the writer deletion and the column drop would drop the
+/// column while previous-release pods still serve, and their upsert,
+/// rollback (DEC-1), and reapers (DEC-2/ZERO) name the column in their
+/// SQL — every chunked upload on those pods would fail for the
+/// duration of the rollout. Keeping the drop in its own migration is
+/// what makes a staged rollout of the pre-cutover releases safe.
+///
+/// **Why it ships in-tree rather than as an operator-gated
+/// follow-up:** the campaign owner clarified (2026-05-27) that there
+/// is no staged rollout and no existing cluster or live database —
+/// every eventual deployment is fresh — so the mixed-fleet hazard
+/// above is vacuous and the drop is ordinary development work. On a
+/// fresh database the chain (… 070, 071, 072, 073) applies in order at
+/// first startup before any pod serves; the former deployment-time
+/// "apply 072 only after the Release-B rollout completes"
+/// precondition (checklist row D7 in `docs/ops/gc-enablement.typ`)
+/// reduces to the ordinary "migrations run on deploy" statement and
+/// matters again only if pre-Release-B images were ever deliberately
+/// staged against a shared database.
+pub const M_072: () = ();
 
 /// `migrations/073_attempt_source_node.sql`
 ///
@@ -1459,10 +1491,10 @@ pub const M_071: () = ();
 /// because it is only populated when known for pull attempts and would
 /// fail unsafe by dropping pull attempts from the sweep/busy view.
 ///
-/// **Numbering:** 071/072 are claimed by the refcount campaign
-/// (Release B / post-rollout drop); the gap is deliberate, not missing
-/// files. 074 stays reserved for this campaign as the open-attempt-view
-/// escape hatch and is unused unless that view needs an extra column.
+/// **Numbering:** 071/072 are the refcount campaign's Release B and
+/// column-drop migrations (see M_071/M_072). 074 stays reserved for
+/// this campaign as the open-attempt-view escape hatch and is unused
+/// unless that view needs an extra column.
 pub const M_073: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.

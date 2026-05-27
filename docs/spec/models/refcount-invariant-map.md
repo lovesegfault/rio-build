@@ -1855,11 +1855,13 @@ Family-level verdict: CONSTRUCTION. There is no chunk accounting for a
 cleanup path to forget — an unreferenced chunk is an ordinary collect
 victim regardless of which path deleted its manifests, which is also
 why the historical leaks this family produced become reclaimable
-(`live_cycle_collects_stale_refcount_leak`).
+(`live_cycle_collects_unreferenced_chunk_exactly_once`, named
+`live_cycle_collects_stale_refcount_leak` until the 070 column drop
+made the stale-counter seeding inexpressible).
 
 | Corpus row | Replacement verdict | Mechanism / checker |
 |---|---|---|
-| `e5bdbff1b` (I-040 inline-only reap) | CONSTRUCTION | A reap that deletes only manifest rows is now the *correct* behavior; the chunks it leaves behind are unmarked next cycle and collected after grace. `quint-chunk-collect-witness-abandoned-upload` pins the crashed-upload garbage shape as reachable, the crash-regime `cr2NoStrandedGarbage` HOLDS structurally, and `live_cycle_collects_stale_refcount_leak` pins the end-to-end reclamation. The retired `quint-refcount-calib-g2-inline-reap` guard is recorded in the Release B disposition. |
+| `e5bdbff1b` (I-040 inline-only reap) | CONSTRUCTION | A reap that deletes only manifest rows is now the *correct* behavior; the chunks it leaves behind are unmarked next cycle and collected after grace. `quint-chunk-collect-witness-abandoned-upload` pins the crashed-upload garbage shape as reachable, the crash-regime `cr2NoStrandedGarbage` HOLDS structurally, and `live_cycle_collects_unreferenced_chunk_exactly_once` (renamed from `live_cycle_collects_stale_refcount_leak` at the 070 column drop) pins the end-to-end reclamation. The retired `quint-refcount-calib-g2-inline-reap` guard is recorded in the Release B disposition. |
 | `dbb42232a` (abort/batch-drop still inline-only) | CONSTRUCTION | Same mechanism; the abort/drop-guard paths are pure path-row janitors (`gt13_batch_chunked_abort_leaves_chunks_unreferenced`, `batch_guard_drop_reaps_placeholders` pin the post-Release-B behavior). |
 | `adfd303d7` C2 (shared chunk decremented once, not N times) | CONSTRUCTION | No by-count arithmetic exists; a chunk shared by N dying manifests is simply absent from the mark fold once all N are gone, however they die. |
 | `d617bf3e5` (M_023 CHECK + orphan-chunk sweep wiring) | CONSTRUCTION + OUTSIDE | The CHECK was dropped by 069 because the quantity it constrained no longer exists (see the M_023 lesson row below). The sweep-wiring half (a background collection loop must exist and run) is OUTSIDE the model, exactly as the Phase-1 input list pre-registered: collector existence/cadence is carried by `run_gc_phase3_runs_live_cycle`, `backstop_first_cycle_waits_one_interval_after_spawn`, `backstop_skips_when_gc_lock_held`, the `RioStoreGcCollectStalled` alert, and the runbook — not by a model invariant. |
