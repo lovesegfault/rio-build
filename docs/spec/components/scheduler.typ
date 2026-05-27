@@ -2118,6 +2118,13 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   the #rref("sched.lease.generation-fence") dual-writer window.
 ]
 
+- *Terminal-build cleanup:* the `CleanupTerminalBuild` arm also stays ungated
+  (in-memory build/event-map removal, the DAG reap, and log-buffer bookkeeping
+  run on standby); its post-reap survivor re-evaluation --- which can persist
+  derivation status, clear the persisted `topdown_pruned` mark, and terminally
+  fail builds via the topdown fail-fast --- is individually leader-gated, like
+  the per-sub-call gates above.
+
 #r("sched.lease.generation-fence")[
   *Generation-based staleness detection is executor-side only.* On each lease
   acquisition, the new leader increments an in-memory `Arc<AtomicU64>`

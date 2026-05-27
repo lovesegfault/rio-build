@@ -1075,10 +1075,12 @@ pub const M_062: () = ();
 /// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared
-/// only once the node's children are all produced (by
-/// `clear_topdown_pruned_for_parents` in the edge-insert transaction,
-/// by the lazy clear in `handle_substitute_complete` when the node's
-/// own substitute fetch fails while its children are all produced)
+/// only once the node's children are all produced (by the
+/// post-reconciliation clear pass in `handle_merge_dag` at merge time,
+/// by the completion-time `clear_topdown_pruned_for_produced_parents`
+/// when children become produced later, by the recovery-time gate that
+/// drops a restored mark whose persisted children are all produced, or
+/// by the lazy walk-failure backstop in `handle_substitute_complete`)
 /// and by the topdown fail-fast when it consumes the marker.
 /// The header comment in the frozen `.sql` keeps the original
 /// childless-era wording — this doc-const is the corrected record. See

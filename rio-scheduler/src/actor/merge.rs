@@ -1780,11 +1780,13 @@ impl DagActor {
     /// to the unbounded doomed-dispatch corner. Used by both
     /// the in-memory stamping loop in `validate_and_ingest` and the
     /// row-level bind in `persist_merge_to_db` so the two always agree.
-    /// Also gates every clear site (the post-reconciliation clear pass
-    /// in `handle_merge_dag`, the completion-time clear in
+    /// Also gates the in-process clear sites (the post-reconciliation
+    /// clear pass in `handle_merge_dag`, the completion-time clear in
     /// `clear_topdown_pruned_for_produced_parents`, and the lazy clear
-    /// in `handle_substitute_complete`) so stamp and clear always use
-    /// the same criterion.
+    /// in `handle_substitute_complete`); the recovery-time gate applies
+    /// the same children-all-produced criterion in SQL
+    /// (`load_parents_with_all_children_produced`) rather than through
+    /// this helper, so stamp and every clear still share one criterion.
     pub(super) fn children_all_produced(&self, drv_hash: &str) -> bool {
         let children = self.dag.get_children(drv_hash);
         !children.is_empty()

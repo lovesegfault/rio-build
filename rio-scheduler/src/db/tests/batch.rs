@@ -336,11 +336,13 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
 // r[verify sched.merge.substitute-topdown+9]
 /// `topdown_pruned` persists with OR-on-conflict semantics (a pruned
 /// merge sets it; an unrelated non-pruned merge of the same drv never
-/// clears it), is cleared by `clear_topdown_pruned_for_parents` for
-/// the parent ids the caller passes (under the produced-children
-/// policy enforced by the caller, in the same tx as the edges) and by
-/// `clear_topdown_pruned_by_hash`, and rides the recovery SELECT so a
-/// new leader can restore it.
+/// clears it), is cleared by the tx-scoped
+/// `clear_topdown_pruned_for_parents` for the parent ids the caller
+/// passes (now test-only — its merge-time production caller was
+/// replaced by the post-reconciliation clear pass; production clears
+/// go through `clear_topdown_pruned_by_hashes` /
+/// `clear_topdown_pruned_by_hash`, callers per their docs), and rides
+/// the recovery SELECT so a new leader can restore it.
 #[tokio::test]
 async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
