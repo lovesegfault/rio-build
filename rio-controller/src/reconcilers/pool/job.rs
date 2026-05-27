@@ -432,6 +432,12 @@ pub(super) fn select_excess_pending<'a>(
 /// restart would otherwise nuke every Pending Job. Returns 0
 /// immediately.
 ///
+/// Deletions route through [`delete_job_with_synthesized_report`]
+/// (reason `Reaped`): a Pending Job's pod normally has never pulled,
+/// so the synthesize arm degenerates to today's plain delete; the rare
+/// pulled-then-crashed-before-ready case gets its open attempt closed
+/// at deletion instead of waiting for the establishment sweep.
+///
 /// Returns the count actually deleted (for the reconcile summary log).
 pub(super) async fn reap_excess_pending(
     jobs_api: &Api<Job>,
@@ -439,6 +445,7 @@ pub(super) async fn reap_excess_pending(
     jobs: &[Job],
     reaped: &HashSet<String>,
     queued: Option<u32>,
+    ctx: &Ctx,
     pool: &str,
 ) -> u32 {
     let Some(queued) = queued else {
@@ -452,6 +459,9 @@ pub(super) async fn reap_excess_pending(
     if excess.is_empty() {
         return 0;
     }
+    // One best-effort view read per tick-with-deletions (never per Job)
+    // for the synthesize-on-delete arm.
+    let open_attempts = open_attempts_best_effort(ctx, pool).await;
     let mut reaped = 0u32;
     for job in excess {
         let job_name = job.metadata.name.as_deref().unwrap_or("<unnamed>");
@@ -487,7 +497,17 @@ pub(super) async fn reap_excess_pending(
         // — >180s under TCG, which times out the lifecycle VM-test
         // pod-phase wait. Reap targets are ready==0 (unscheduled /
         // ContainerCreating / just-completed) so foreground adds <1s.
-        match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
+        match delete_job_with_synthesized_report(
+            jobs_api,
+            ctx,
+            job,
+            job_name,
+            &DeleteParams::foreground(),
+            rio_proto::types::AttemptTerminalReason::Reaped,
+            &open_attempts,
+        )
+        .await
+        {
             Ok(_) => {
                 info!(
                     pool, job = %job_name, queued,
@@ -514,6 +534,150 @@ pub(super) async fn reap_excess_pending(
         .increment(reaped.into());
     }
     reaped
+}
+
+/// Prometheus `reason` label for the OA1 histogram on the
+/// synthesize-on-delete path. The controller-synthesized verdicts only
+/// (cancelled / preempted / reaped); the pod-terminal classifications
+/// keep flowing through [`termination_reason_label`].
+fn attempt_reason_label(reason: rio_proto::types::AttemptTerminalReason) -> &'static str {
+    use rio_proto::types::AttemptTerminalReason as R;
+    match reason {
+        R::Cancelled => "cancelled",
+        R::Preempted => "preempted",
+        R::Reaped => "reaped",
+        _ => "other",
+    }
+}
+
+/// The synthesize-on-delete decision: `Some(request)` exactly when an
+/// open **pull-mode** attempt covers the Job about to be deleted (the
+/// pull-filtered `ListOpenAttempts` view is the input — stream-mode
+/// builds never appear in it, so a stream Job mid-build degenerates to
+/// `None` and today's plain deletion). Pure, so the no-RPC-when-no-
+/// attempt property is unit-testable without a wire.
+///
+/// The request is keyed by the attempt's `exec_id` (the strongest
+/// identity), carries the Job name and the attempt's intent id for the
+/// scheduler's resolution fallbacks, and forwards the attempt's
+/// `source_node` as the AD2c attribution when known.
+// r[impl ctrl.job.synthesize-on-delete]
+pub(super) fn synthesized_report_for_job(
+    job: &Job,
+    reason: rio_proto::types::AttemptTerminalReason,
+    open_attempts: &[rio_proto::types::OpenAttempt],
+) -> Option<rio_proto::types::ReportAttemptOutcomeRequest> {
+    let intent = job_intent_id(job);
+    let prefix = job.metadata.name.as_deref().map(|n| format!("{n}-"));
+    let attempt = open_attempts.iter().find(|a| {
+        intent.is_some_and(|i| !i.is_empty() && a.intent_id == i)
+            || prefix
+                .as_deref()
+                .is_some_and(|p| a.executor_id.starts_with(p))
+    })?;
+    Some(rio_proto::types::ReportAttemptOutcomeRequest {
+        intent_id: attempt.intent_id.clone(),
+        job_name: job.metadata.name.clone().unwrap_or_default(),
+        exec_id: attempt.exec_id.clone(),
+        reason: reason.into(),
+        node_name: attempt.source_node.clone(),
+    })
+}
+
+/// Delete one Job, synthesizing the terminal `ReportAttemptOutcome`
+/// first when (and only when) the Job still has an open pull-mode
+/// attempt. The deletion this performs destroys the only Job/pod
+/// terminal status the unified report path could otherwise fold, so
+/// the controller speaks for it (reason cancelled / preempted /
+/// reaped) before the object goes away; for any Job without an open
+/// pull-mode attempt — including stream Jobs mid-build, which the
+/// pull-filtered view never lists — this is exactly today's deletion
+/// and no `ReportAttemptOutcome` RPC is attempted.
+///
+/// The synthesis is best-effort: a failed report is logged and the
+/// deletion proceeds — the establishment sweep remains the fallback
+/// classifier (the cost of a missed synthesis is requeue latency,
+/// never a lost or doubled charge, by the scheduler's idempotent-fill
+/// rule). The delete error is returned unchanged so call sites keep
+/// their existing Ok/NotFound/Err handling (the deleted-object body is
+/// dropped — no current call site reads it).
+// r[impl ctrl.job.synthesize-on-delete]
+pub(super) async fn delete_job_with_synthesized_report(
+    jobs_api: &Api<Job>,
+    ctx: &Ctx,
+    job: &Job,
+    job_name: &str,
+    params: &DeleteParams,
+    reason: rio_proto::types::AttemptTerminalReason,
+    open_attempts: &[rio_proto::types::OpenAttempt],
+) -> kube::Result<()> {
+    if let Some(request) = synthesized_report_for_job(job, reason, open_attempts) {
+        let exec_id = request.exec_id.clone();
+        match admin_call(ctx.admin.clone().report_attempt_outcome(request)).await {
+            Ok(_) => {
+                info!(
+                    job = %job_name, exec_id = %exec_id, reason = ?reason,
+                    "synthesized ReportAttemptOutcome for open pull-mode attempt before Job deletion"
+                );
+                // OA1: the synthesized path closes the terminal→report
+                // interval at the moment of deletion (the controller is
+                // the initiator, so the interval is ~0 by construction).
+                // Sampled once per Job name so a delete that fails and
+                // retries next tick doesn't re-record.
+                if first_terminal_report_sample(
+                    &mut ctx.terminal_report_sampled.lock(),
+                    job_name,
+                    epoch_now_secs(),
+                    epoch_now_secs(),
+                )
+                .is_some()
+                {
+                    metrics::histogram!(
+                        "rio_controller_job_terminal_report_seconds",
+                        "reason" => attempt_reason_label(reason)
+                    )
+                    .record(0.0);
+                }
+            }
+            Err(e) => {
+                warn!(
+                    job = %job_name, exec_id = %exec_id, reason = ?reason, error = %e,
+                    "failed to synthesize ReportAttemptOutcome before Job deletion; \
+                     proceeding with the delete (establishment sweep is the fallback)"
+                );
+            }
+        }
+    }
+    jobs_api.delete(job_name, params).await.map(|_| ())
+}
+
+/// Best-effort read of the open pull-mode attempt view for the
+/// synthesize-on-delete arm of the C1/C2 reap paths. `&[]` (empty) when
+/// the view is unavailable this tick — callers proceed with the plain
+/// delete; the establishment sweep is the fallback classifier. The
+/// orphan-Running reap (C3) does NOT use this: its read is fail-closed
+/// (`reap_orphan_running` skips the whole reap on error) because there
+/// the view is a busy-signal input, not just attribution.
+pub(super) async fn open_attempts_best_effort(
+    ctx: &Ctx,
+    pool: &str,
+) -> Vec<rio_proto::types::OpenAttempt> {
+    match admin_call(
+        ctx.admin
+            .clone()
+            .list_open_attempts(rio_proto::types::ListOpenAttemptsRequest {}),
+    )
+    .await
+    {
+        Ok(resp) => resp.into_inner().attempts,
+        Err(e) => {
+            debug!(
+                pool, error = %e,
+                "ListOpenAttempts unavailable; deleting without synthesized reports this tick"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// `creation_timestamp` strictly before `now - min_age`. `None` →
@@ -763,7 +927,23 @@ pub(super) async fn reap_orphan_running(
         // terminates, but orphans are past the grace with no
         // scheduler assignment — there's nothing to preempt. The wait
         // is per-reconcile-tick, not per-build.
-        match jobs_api.delete(job_name, &DeleteParams::foreground()).await {
+        //
+        // The synthesize arm is structurally inert here: a Job covered
+        // by an open pull-mode attempt was never selected as orphan
+        // (the busy bridge above), so the helper degenerates to the
+        // plain delete. Routed through it anyway so every controller
+        // Job-delete call site speaks the same way.
+        match delete_job_with_synthesized_report(
+            jobs_api,
+            ctx,
+            job,
+            job_name,
+            &DeleteParams::foreground(),
+            rio_proto::types::AttemptTerminalReason::Reaped,
+            &open_attempts,
+        )
+        .await
+        {
             Ok(_) => {
                 info!(
                     pool, job = %job_name,

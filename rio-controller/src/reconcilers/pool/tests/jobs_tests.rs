@@ -12,19 +12,22 @@
 
 use std::collections::{BTreeMap, HashSet};
 
-use k8s_openapi::api::batch::v1::{Job, JobStatus};
-use k8s_openapi::api::core::v1::{Pod, PodStatus};
+use k8s_openapi::api::batch::v1::{Job, JobSpec, JobStatus};
+use k8s_openapi::api::core::v1::{Pod, PodStatus, PodTemplateSpec};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-use kube::api::{Api, ObjectList, ObjectMeta};
+use kube::api::{Api, DeleteParams, ObjectList, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
-    JobCensus, ORPHAN_REAP_GRACE, SpawnOutcome, is_active_job, job_census, orphan_reap_gate,
-    reap_excess_pending, spawn_for_each, try_spawn_job,
+    JobCensus, ORPHAN_REAP_GRACE, SpawnOutcome, delete_job_with_synthesized_report, is_active_job,
+    job_census, orphan_reap_gate, reap_excess_pending, spawn_for_each, synthesized_report_for_job,
+    try_spawn_job,
 };
-use crate::reconcilers::pool::jobs::{INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents};
+use crate::reconcilers::pool::jobs::{
+    INTENT_ID_ANNOTATION, INTENT_SELECTOR_ANNOTATION, reap_stale_for_intents,
+};
 use rio_crds::pool::ExecutorKind;
-use rio_proto::types::SpawnIntent;
+use rio_proto::types::{AttemptTerminalReason, OpenAttempt, SpawnIntent};
 
 // r[verify ctrl.pool.ephemeral+1]
 #[test]
@@ -226,6 +229,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
     let _g = metrics::set_default_local_recorder(&recorder);
 
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
     let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
@@ -270,6 +274,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
         &jobs,
         &HashSet::new(),
         Some(1),
+        &ctx,
         "med-pool",
     )
     .await;
@@ -309,6 +314,7 @@ async fn reap_excess_pending_deletes_oldest_and_counts() {
 #[tokio::test]
 async fn reap_stale_for_intents_selector_drift_and_terminal() {
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     fn job(name: &str, sel: Option<&str>, ready: i32, succeeded: i32) -> Job {
@@ -393,8 +399,15 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
         },
     ]);
 
-    let reaped =
-        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+    )
+    .await;
     guard.verified().await;
     assert_eq!(
         reaped,
@@ -420,6 +433,7 @@ async fn reap_stale_for_intents_selector_drift_and_terminal() {
 #[tokio::test]
 async fn reap_stale_at_ceiling_saturation() {
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let drifted = |name: &str| Job {
@@ -477,8 +491,15 @@ async fn reap_stale_at_ceiling_saturation() {
     let census = job_census(&existing);
     assert_eq!(census.headroom(Some(2), 0), 0);
     // Reap over the FULL intent set (NOT a headroom-truncated slice).
-    let reaped =
-        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+    )
+    .await;
     assert_eq!(reaped.len(), 2, "both drifted Pending reaped");
     // Freed = reaped that were active → headroom=2 post-reap.
     let freed = existing
@@ -648,6 +669,7 @@ async fn spawn_for_each_acks_spawned_only() {
 #[tokio::test]
 async fn reap_excess_pending_noop_when_covered_or_unknown() {
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
     let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
@@ -660,14 +682,14 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
     let guard = verifier.run(vec![]);
     // pending=2, queued=2 → covered.
     assert_eq!(
-        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, Some(2), "p").await,
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, Some(2), &ctx, "p").await,
         0
     );
     // queued=None → fail-closed (scheduler unreachable; spawn treats
     // as 0 fail-open, reap MUST NOT — would nuke every Pending Job
     // on a scheduler restart).
     assert_eq!(
-        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, None, "p").await,
+        reap_excess_pending(&jobs_api, &pods_api, &jobs, &none, None, &ctx, "p").await,
         0
     );
     guard.verified().await;
@@ -682,6 +704,7 @@ async fn reap_excess_pending_noop_when_covered_or_unknown() {
 #[tokio::test]
 async fn reap_excess_pending_skips_live_running_pod() {
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client.clone(), "rio");
     let pods_api: Api<Pod> = Api::namespaced(client, "rio");
 
@@ -703,8 +726,16 @@ async fn reap_excess_pending_skips_live_running_pod() {
         ),
     ]);
 
-    let reaped =
-        reap_excess_pending(&jobs_api, &pods_api, &jobs, &HashSet::new(), Some(0), "p").await;
+    let reaped = reap_excess_pending(
+        &jobs_api,
+        &pods_api,
+        &jobs,
+        &HashSet::new(),
+        Some(0),
+        &ctx,
+        "p",
+    )
+    .await;
     guard.verified().await;
     assert_eq!(reaped, 0, "Running pod and list-error both skip DELETE");
 }
@@ -774,6 +805,7 @@ fn headroom_recompute_never_exceeds_ceiling() {
 #[tokio::test]
 async fn reap_stale_for_intents_reaps_orphan_pending() {
     let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let intent = |id: &str| SpawnIntent {
@@ -807,19 +839,249 @@ async fn reap_stale_for_intents_reaps_orphan_pending() {
         status: 200,
         body_json: serde_json::to_string(&Job::default()).unwrap(),
     }]);
-    let reaped =
-        reap_stale_for_intents(&jobs_api, &existing, &intents, "p", ExecutorKind::Builder).await;
+    let reaped = reap_stale_for_intents(
+        &jobs_api,
+        &existing,
+        &intents,
+        &ctx,
+        "p",
+        ExecutorKind::Builder,
+    )
+    .await;
     assert_eq!(reaped, HashSet::from(["rio-builder-p-ccc".into()]));
     guard.verified().await;
 
     // Fail-closed: intents=[] → want.is_empty() early-return → no
     // reap (scheduler error must not nuke every Pending Job).
     let (client2, verifier2) = ApiServerVerifier::new();
+    let ctx2 = super::test_ctx(client2.clone());
     let jobs_api2: Api<Job> = Api::namespaced(client2, "rio");
     let guard = verifier2.run(vec![]);
-    let reaped =
-        reap_stale_for_intents(&jobs_api2, &existing, &[], "p", ExecutorKind::Builder).await;
+    let reaped = reap_stale_for_intents(
+        &jobs_api2,
+        &existing,
+        &[],
+        &ctx2,
+        "p",
+        ExecutorKind::Builder,
+    )
+    .await;
     assert!(reaped.is_empty(), "scheduler error → no orphan-reap");
+    guard.verified().await;
+}
+
+// ───────────────────────────────────────────────────────────────────
+// Synthesize-on-delete (ctrl.job.synthesize-on-delete)
+// ───────────────────────────────────────────────────────────────────
+
+/// A Running Job carrying the `rio.build/intent-id` pod-template
+/// annotation, as `build_job` spawns it.
+fn running_job_for_intent(name: &str, intent_id: &str) -> Job {
+    let mut j = pending_job(name, 1, 600);
+    j.spec = Some(JobSpec {
+        template: PodTemplateSpec {
+            metadata: Some(ObjectMeta {
+                annotations: Some(BTreeMap::from([(
+                    INTENT_ID_ANNOTATION.to_string(),
+                    intent_id.to_string(),
+                )])),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    });
+    j
+}
+
+/// One open pull-mode attempt as the pull-filtered `ListOpenAttempts`
+/// view returns it (executor identity == the attested intent id).
+fn pull_attempt(intent_id: &str, exec_id: &str, source_node: &str) -> OpenAttempt {
+    OpenAttempt {
+        intent_id: intent_id.into(),
+        executor_id: intent_id.into(),
+        exec_id: exec_id.into(),
+        source_node: source_node.into(),
+        ..Default::default()
+    }
+}
+
+/// The expected one-foreground-DELETE scenario for `name`.
+fn delete_scenario(name: &str) -> Scenario {
+    Scenario {
+        method: http::Method::DELETE,
+        path_contains: Box::leak(format!("/namespaces/rio/jobs/{name}").into_boxed_str()),
+        body_contains: Some(r#""propagationPolicy":"Foreground""#),
+        status: 200,
+        body_json: serde_json::to_string(&Job::default()).unwrap(),
+    }
+}
+
+/// Spawn an in-process MockAdmin (acks every unary) and build a Ctx
+/// whose admin client points at it, so the synthesized
+/// `ReportAttemptOutcome` actually lands and the OA1 histogram sample
+/// is observable.
+async fn ctx_with_mock_admin(
+    client: kube::Client,
+) -> (
+    std::sync::Arc<crate::reconcilers::Ctx>,
+    tokio::task::JoinHandle<()>,
+) {
+    let (_mock, addr, handle) = rio_test_support::grpc::spawn_mock_admin()
+        .await
+        .expect("spawn mock admin");
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))
+        .expect("mock admin uri")
+        .connect_lazy();
+    (super::test_ctx_with_admin(client, channel), handle)
+}
+
+// r[verify ctrl.job.synthesize-on-delete]
+/// The pure synthesize decision: `Some` exactly when an open pull-mode
+/// attempt covers the Job (so a no-attempt delete attempts no RPC by
+/// construction), carrying the attempt's exec_id / intent and the
+/// requested reason; a stream Job mid-build is `None` because the
+/// pull-filtered view never lists stream attempts.
+#[test]
+fn synthesized_report_decision_pull_only() {
+    let job = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
+
+    // (a) Covered by an open pull-mode attempt → one request, keyed by
+    // the attempt's exec_id, carrying the AD2c node attribution.
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
+    let req = synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &attempts)
+        .expect("open pull attempt → synthesize");
+    assert_eq!(req.exec_id, "exec-1");
+    assert_eq!(req.intent_id, "drv-pull-1");
+    assert_eq!(req.job_name, "rio-builder-p-pull1");
+    assert_eq!(req.node_name, "node-a");
+    assert_eq!(req.reason, i32::from(AttemptTerminalReason::Reaped));
+
+    // (b) No open attempt → None (no RPC is even attempted).
+    assert!(
+        synthesized_report_for_job(&job, AttemptTerminalReason::Reaped, &[]).is_none(),
+        "no open attempt → nothing synthesized"
+    );
+
+    // (c) Mixed fleet: a stream Job mid-build has an active assignment
+    // in the ledger, but the pull-filtered view never lists it — the
+    // attempt list only carries OTHER (pull) intents → None.
+    let stream_job = running_job_for_intent("rio-builder-p-strm1", "drv-stream-9");
+    assert!(
+        synthesized_report_for_job(
+            &stream_job,
+            AttemptTerminalReason::Reaped,
+            &[pull_attempt("drv-pull-1", "exec-1", "")]
+        )
+        .is_none(),
+        "stream-dispatch Jobs are invisible to the pull-filtered view → no synthesis"
+    );
+}
+
+// r[verify ctrl.job.synthesize-on-delete]
+/// Deleting a Job that still has an open pull-mode attempt synthesizes
+/// the `ReportAttemptOutcome` (observed via the OA1 histogram sample
+/// the helper records only after the report is ACKED) and still issues
+/// the foreground DELETE. The decision fn returning at most one request
+/// per delete plus the once-per-Job sample gate carry the
+/// "exactly one" half.
+#[tokio::test]
+async fn delete_job_synthesizes_report_for_open_pull_attempt() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let covered = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "node-a")];
+
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-pull1")]);
+    delete_job_with_synthesized_report(
+        &jobs_api,
+        &ctx,
+        &covered,
+        "rio-builder-p-pull1",
+        &DeleteParams::foreground(),
+        AttemptTerminalReason::Reaped,
+        &attempts,
+    )
+    .await
+    .expect("delete succeeds");
+    guard.verified().await;
+
+    assert!(
+        recorder.histogram_touched("rio_controller_job_terminal_report_seconds"),
+        "the synthesize→ack→OA1-sample path must have run for the covered Job"
+    );
+}
+
+// r[verify ctrl.job.synthesize-on-delete]
+/// Deleting a Job with NO covering open pull-mode attempt (here: a
+/// stream Job mid-build — the pull-filtered view never lists stream
+/// attempts) attempts no `ReportAttemptOutcome` at all: with a working
+/// mock admin (every report would be acked and sampled), the OA1
+/// histogram stays untouched, and the foreground DELETE is the only
+/// effect — today's deletion exactly.
+#[tokio::test]
+async fn delete_job_without_open_attempt_attempts_no_rpc() {
+    let recorder = rio_test_support::metrics::CountingRecorder::default();
+    let _g = metrics::set_default_local_recorder(&recorder);
+
+    let (client, verifier) = ApiServerVerifier::new();
+    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let stream_job = running_job_for_intent("rio-builder-p-strm1", "drv-stream-9");
+    // The pull-filtered view lists only OTHER (pull) intents.
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "")];
+
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-strm1")]);
+    delete_job_with_synthesized_report(
+        &jobs_api,
+        &ctx,
+        &stream_job,
+        "rio-builder-p-strm1",
+        &DeleteParams::foreground(),
+        AttemptTerminalReason::Reaped,
+        &attempts,
+    )
+    .await
+    .expect("delete succeeds");
+    guard.verified().await;
+
+    assert!(
+        !recorder.histogram_touched("rio_controller_job_terminal_report_seconds"),
+        "no covering pull attempt → no report attempted → no OA1 sample"
+    );
+}
+
+// r[verify ctrl.job.synthesize-on-delete]
+/// The synthesis is best-effort: with the admin channel dead, the
+/// foreground DELETE still goes out and the helper returns the delete
+/// result (the establishment sweep is the fallback classifier).
+#[tokio::test]
+async fn delete_job_report_failure_does_not_block_delete() {
+    let (client, verifier) = ApiServerVerifier::new();
+    let ctx = super::test_ctx(client.clone());
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let covered = running_job_for_intent("rio-builder-p-pull1", "drv-pull-1");
+    let attempts = vec![pull_attempt("drv-pull-1", "exec-1", "")];
+
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-pull1")]);
+    delete_job_with_synthesized_report(
+        &jobs_api,
+        &ctx,
+        &covered,
+        "rio-builder-p-pull1",
+        &DeleteParams::foreground(),
+        AttemptTerminalReason::Reaped,
+        &attempts,
+    )
+    .await
+    .expect("delete proceeds despite the failed report");
     guard.verified().await;
 }
 

@@ -436,7 +436,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // headroom stays 0 forever. Reaping frees slots; it doesn't
     // consume headroom, so the cap doesn't apply.
     let reaped =
-        reap_stale_for_intents(&jobs_api, &jobs.items, &intents, &name, pool.spec.kind).await;
+        reap_stale_for_intents(&jobs_api, &jobs.items, &intents, ctx, &name, pool.spec.kind).await;
     // Reaped active Jobs (selector-drifted / orphan Pending) free
     // slots THIS tick; terminal reaped Jobs weren't counted in
     // `census.active` so don't double-count.
@@ -639,6 +639,7 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         &jobs.items,
         &reaped,
         queued_known,
+        ctx,
         &name,
     )
     .await;
@@ -782,10 +783,18 @@ fn intent_suffix(intent_id: &str) -> String {
 ///
 /// A Pending Job whose selector MATCHES the current intent is NOT
 /// reaped — that's the intended NameCollision dedupe.
+///
+/// Deletions route through
+/// [`super::job::delete_job_with_synthesized_report`] (reason
+/// `Reaped`): the targets are terminal or Pending Jobs, so the
+/// synthesize arm is normally inert, but a stale Job whose pod pulled
+/// and crashed gets its open attempt closed at deletion instead of
+/// waiting for the establishment sweep.
 pub(super) async fn reap_stale_for_intents(
     jobs_api: &Api<Job>,
     existing: &[Job],
     intents: &[SpawnIntent],
+    ctx: &Ctx,
     pool: &str,
     kind: ExecutorKind,
 ) -> HashSet<String> {
@@ -802,6 +811,9 @@ pub(super) async fn reap_stale_for_intents(
     if want.is_empty() {
         return reaped;
     }
+    // Lazily fetched once per tick, only if a delete is actually about
+    // to happen (the synthesize-on-delete input; best-effort).
+    let mut open_attempts: Option<Vec<rio_proto::types::OpenAttempt>> = None;
     for j in existing {
         let Some(jn) = j.metadata.name.as_deref() else {
             continue;
@@ -836,7 +848,24 @@ pub(super) async fn reap_stale_for_intents(
             }
             Some(_) => continue,
         };
-        match jobs_api.delete(jn, &params).await {
+        let attempts = match &open_attempts {
+            Some(a) => a,
+            None => {
+                open_attempts = Some(super::job::open_attempts_best_effort(ctx, pool).await);
+                open_attempts.as_ref().expect("just set")
+            }
+        };
+        match super::job::delete_job_with_synthesized_report(
+            jobs_api,
+            ctx,
+            j,
+            jn,
+            &params,
+            rio_proto::types::AttemptTerminalReason::Reaped,
+            attempts,
+        )
+        .await
+        {
             Ok(_) => {
                 info!(
                     pool, job = %jn, why,

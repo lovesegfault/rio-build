@@ -41,6 +41,17 @@ pub(crate) fn test_pod_spec(pool: &Pool) -> PodSpec {
 
 /// Build a `Ctx` wired to the mock apiserver client.
 pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
+    test_ctx_with_admin(client, rio_test_support::grpc::dead_channel())
+}
+
+/// [`test_ctx`] with an explicit admin-side channel — the
+/// synthesize-on-delete tests point this at an in-process
+/// `MockAdmin` so the `ReportAttemptOutcome` ack path is reachable;
+/// everything else uses the dead channel (admin RPCs fail fast).
+pub(crate) fn test_ctx_with_admin(
+    client: kube::Client,
+    admin_channel: tonic::transport::Channel,
+) -> Arc<Ctx> {
     let recorder = kube::runtime::events::Recorder::new(
         client.clone(),
         kube::runtime::events::Reporter {
@@ -51,7 +62,7 @@ pub(crate) fn test_ctx(client: kube::Client) -> Arc<Ctx> {
     Arc::new(Ctx {
         client,
         admin: rio_proto::AdminServiceClient::with_interceptor(
-            rio_test_support::grpc::dead_channel(),
+            admin_channel,
             rio_auth::hmac::ServiceTokenInterceptor::new(None, "rio-controller"),
         ),
         scheduler: rio_common::config::UpstreamAddrs {
