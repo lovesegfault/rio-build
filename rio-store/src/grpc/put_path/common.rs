@@ -240,6 +240,72 @@ pub(in crate::grpc) async fn read_first_metadata(
 ///
 /// Status messages contain the substrings "size mismatch" / "hash
 /// mismatch"; protocol tests assert on those.
+/// Verify that a `.drv` upload is the text content-address of its bytes.
+///
+/// CppNix mints every derivation path as
+/// `makeTextPath(name, sha256(text), inputSrcs ∪ inputDrvs)` and an
+/// untrusted `nix-daemon` client can only add an unsigned path when it
+/// is genuinely content-addressed; rio's multi-tenant gateway clients
+/// (and any worker relay) are the analogue, so the store enforces the
+/// same invariant at ingestion: the claimed path MUST equal
+/// `make_text(name, sha256(single-file contents), declared references)`.
+/// This binds the registered bytes to the path for every caller —
+/// including service-token relays — so the derivation a gateway
+/// validated at submission is byte-identical to the one a worker later
+/// fetches from the store (`gw.dag.drv-cache-text-ca` is the cache-side
+/// half of the same invariant).
+///
+/// Non-`.drv` paths are untouched. Error split follows the existing
+/// gate convention: a NAR that is not a single regular file is
+/// `InvalidArgument`; a well-formed upload whose path does not derive
+/// from its bytes is `PermissionDenied`.
+// r[impl store.put.drv-text-ca]
+pub(in crate::grpc) fn verify_drv_text_path(
+    info: &ValidatedPathInfo,
+    nar_data: &[u8],
+    ctx_label: &str,
+) -> Result<(), Status> {
+    if !info.store_path.is_derivation() {
+        return Ok(());
+    }
+    let (off, len) = single_file_nar_content_range(nar_data).map_err(|e| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: a .drv upload must be a single regular-file NAR: {e}"
+        ))
+    })?;
+    let len = usize::try_from(len).map_err(|_| {
+        Status::invalid_argument(format!(
+            "{ctx_label}: .drv content length does not fit this platform"
+        ))
+    })?;
+    let file_bytes = &nar_data[off..off + len];
+    use std::io::Write as _;
+    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+    w.write_all(file_bytes)
+        .map_err(|e| Status::internal(format!("{ctx_label}: .drv hash: {e}")))?;
+    let hash = w.finish();
+    let expected =
+        rio_nix::store_path::StorePath::make_text(info.store_path.name(), &hash, &info.references)
+            .map_err(|e| {
+                Status::invalid_argument(format!(
+                    "{ctx_label}: cannot derive the text content-address: {e}"
+                ))
+            })?;
+    if expected != info.store_path {
+        warn!(
+            claimed = %info.store_path,
+            derived = %expected,
+            "{ctx_label}: .drv path is not the text content-address of its bytes"
+        );
+        return Err(Status::permission_denied(format!(
+            "{ctx_label}: .drv path {} is not the text content-address of the uploaded \
+             bytes with the declared references (derived {})",
+            info.store_path, expected
+        )));
+    }
+    Ok(())
+}
+
 pub(in crate::grpc) fn verify_nar(
     computed_hash: [u8; 32],
     actual_size: u64,
@@ -795,6 +861,8 @@ impl StoreServiceImpl {
             info,
             "PutPath",
         )?;
+        // r[impl store.put.drv-text-ca]
+        verify_drv_text_path(info, &nar_data, "PutPath")?;
         verify_ca_store_path(info, &nar_data, hmac_claims, "PutPath")?;
         Ok((nar_data, held_permits))
     }
@@ -1365,6 +1433,66 @@ mod verify_nar_tests {
         info.content_address = Some(format!("fixed:{}", flat_hash.to_colon()));
         verify_ca_store_path(&info, &nar, Some(&ca_claims()), "t")
             .expect("flat upload larger than the old parser cap must pass");
+    }
+
+    // r[verify store.put.drv-text-ca]
+    /// A `.drv` upload is bound to its bytes: the canonical text-CA path
+    /// (with and without references) is accepted, anything else is not.
+    #[test]
+    fn drv_text_path_binds_path_bytes_and_references() {
+        use std::io::Write as _;
+        let drv_text = br#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-x-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#;
+        let nar = nar_of_file(drv_text);
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(drv_text).unwrap();
+        let hash = w.finish();
+
+        // No references.
+        let path = rio_nix::store_path::StorePath::make_text("x.drv", &hash, &[]).unwrap();
+        let info = ca_info(&path, &[], &nar);
+        verify_drv_text_path(&info, &nar, "t").expect("canonical .drv path accepted");
+
+        // With references: the path embeds them, and the declared set
+        // must match what the path was minted with.
+        let dep = rio_nix::store_path::StorePath::parse(&test_store_path("some-input")).unwrap();
+        let path_with_refs =
+            rio_nix::store_path::StorePath::make_text("x.drv", &hash, std::slice::from_ref(&dep))
+                .unwrap();
+        let info = ca_info(&path_with_refs, std::slice::from_ref(&dep), &nar);
+        verify_drv_text_path(&info, &nar, "t").expect("canonical .drv path with refs accepted");
+
+        // Same bytes, but the declared references do not match the path.
+        let info = ca_info(&path_with_refs, &[], &nar);
+        let err = verify_drv_text_path(&info, &nar, "t")
+            .expect_err("reference mismatch must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+        // Different bytes under the canonical path of the original.
+        let other_nar = nar_of_file(b"Derive(tampered)");
+        let info = ca_info(&path, &[], &other_nar);
+        let err = verify_drv_text_path(&info, &other_nar, "t")
+            .expect_err("non-derived .drv path must be rejected");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(err.message().contains("text content-address"), "msg: {err}");
+
+        // A non-.drv path is not subject to the check.
+        let plain = rio_nix::store_path::StorePath::parse(&test_store_path("not-a-drv")).unwrap();
+        let info = ca_info(&plain, &[], &other_nar);
+        verify_drv_text_path(&info, &other_nar, "t").expect("non-.drv paths ignored");
+    }
+
+    // r[verify store.put.drv-text-ca]
+    /// A `.drv` claiming path with a directory NAR is malformed input.
+    #[test]
+    fn drv_text_path_requires_single_file_nar() {
+        let node = rio_nix::nar::NarNode::Directory { entries: vec![] };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let path = rio_nix::store_path::StorePath::parse(&test_drv_path("dir-shaped")).unwrap();
+        let info = ca_info(&path, &[], &nar);
+        let err = verify_drv_text_path(&info, &nar, "t")
+            .expect_err("directory NAR claiming a .drv path must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 
     #[test]

@@ -130,6 +130,27 @@ fn parse_fetched_drv(
 /// Best-effort: if `path` is a `.drv`, parse the ATerm from NAR data and
 /// cache it. Logs and continues on parse error or cap hit — the upload
 /// itself still proceeds.
+/// Canonical text content-address of a `.drv` upload: CppNix mints
+/// every derivation path as `makeTextPath(name, sha256(text),
+/// inputSrcs ∪ inputDrvs)`, so recompute exactly that from the uploaded
+/// bytes and the parsed derivation's own input sets.
+fn drv_text_ca_path(
+    path: &StorePath,
+    nar_data: &[u8],
+    drv: &Derivation,
+) -> anyhow::Result<StorePath> {
+    use std::io::Write as _;
+    let bytes = rio_nix::nar::extract_single_file(nar_data)?;
+    let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+    w.write_all(&bytes)?;
+    let hash = w.finish();
+    let mut refs: Vec<StorePath> = Vec::new();
+    for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+        refs.push(StorePath::parse(r)?);
+    }
+    Ok(StorePath::make_text(path.name(), &hash, &refs)?)
+}
+
 pub(crate) fn try_cache_drv(
     path: &StorePath,
     nar_data: &[u8],
@@ -140,6 +161,33 @@ pub(crate) fn try_cache_drv(
     }
     match Derivation::parse_from_nar(nar_data) {
         Ok(drv) => {
+            // r[impl gw.dag.drv-cache-text-ca]
+            // Bind the cache key to the bytes: only cache content whose
+            // canonical text content-address equals the claimed path —
+            // the same invariant the store enforces at ingestion
+            // (store.put.drv-text-ca). The session cache is what
+            // validate_dag judges and what expected_outputs are derived
+            // from, while a worker may later fetch the store's copy of
+            // the same path; if the cache could hold content that is not
+            // the unique preimage of its key, those two could diverge.
+            // On mismatch the store rejects the upload anyway — skipping
+            // the cache here just keeps the gateway's view consistent
+            // (warn, no client-visible behaviour change at this layer).
+            match drv_text_ca_path(path, nar_data, &drv) {
+                Ok(expected) if expected == *path => {}
+                Ok(expected) => {
+                    warn!(
+                        claimed = %path,
+                        derived = %expected,
+                        "claimed .drv path is not the text CA of its bytes; not caching"
+                    );
+                    return;
+                }
+                Err(e) => {
+                    warn!(path = %path, error = %e, "cannot derive .drv text CA; not caching");
+                    return;
+                }
+            }
             if insert_drv_bounded(drv_cache, path.clone(), drv) {
                 debug!(path = %path, "cached parsed derivation");
             } else {
@@ -297,6 +345,53 @@ mod tests {
             StorePath::parse(&path).unwrap(),
             Derivation::parse(&aterm).unwrap(),
         )
+    }
+
+    /// Build a `.drv` NAR plus its CANONICAL text-CA store path (the
+    /// path nix's `writeDerivation` would mint for these bytes).
+    fn canonical_drv(tag: &str) -> (StorePath, Vec<u8>) {
+        use std::io::Write as _;
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/{}-{tag}-out","","")],[],[],"x86_64-linux","/bin/sh",[],[])"#,
+            "b".repeat(32)
+        );
+        let node = rio_nix::nar::NarNode::Regular {
+            executable: false,
+            contents: aterm.clone().into_bytes(),
+        };
+        let mut nar = Vec::new();
+        rio_nix::nar::serialize(&mut nar, &node).unwrap();
+        let mut w = rio_nix::ca::HashWriter::new(rio_nix::hash::HashAlgo::SHA256);
+        w.write_all(aterm.as_bytes()).unwrap();
+        let hash = w.finish();
+        let path = StorePath::make_text(&format!("{tag}.drv"), &hash, &[]).unwrap();
+        (path, nar)
+    }
+
+    // r[verify gw.dag.drv-cache-text-ca]
+    /// The session cache only binds a claimed `.drv` path to content
+    /// whose canonical text CA equals it; anything else is not cached.
+    #[test]
+    fn try_cache_drv_requires_canonical_text_ca_path() {
+        let mut cache: HashMap<StorePath, Derivation> = HashMap::new();
+
+        // Canonical path → cached.
+        let (path, nar) = canonical_drv("honest");
+        try_cache_drv(&path, &nar, &mut cache);
+        assert!(cache.contains_key(&path), "canonical .drv must be cached");
+
+        // Same bytes claimed under a fabricated path → not cached.
+        let (fab_path, _) = parse_drv("fabricated");
+        try_cache_drv(&fab_path, &nar, &mut cache);
+        assert!(
+            !cache.contains_key(&fab_path),
+            "non-canonical claimed path must not be cached"
+        );
+
+        // Non-.drv paths are ignored entirely (unchanged behaviour).
+        let plain = StorePath::parse(&format!("/nix/store/{}-plain", "c".repeat(32))).unwrap();
+        try_cache_drv(&plain, &nar, &mut cache);
+        assert!(!cache.contains_key(&plain));
     }
 
     /// Pre-fetch gate must account for existing `drv_cache` occupancy,

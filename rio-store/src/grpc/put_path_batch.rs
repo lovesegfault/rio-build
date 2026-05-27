@@ -38,7 +38,8 @@ use crate::metadata::{self};
 
 use super::put_path::common::{NarPersist, PlaceholderGuard};
 use super::put_path::{
-    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path, verify_nar,
+    PlaceholderClaim, apply_trailer, validate_put_metadata, verify_ca_store_path,
+    verify_drv_text_path, verify_nar,
 };
 use super::{StoreServiceImpl, putpath_metadata_status};
 use rio_common::limits::{MAX_BATCH_OUTPUTS, MAX_NAR_SIZE};
@@ -140,6 +141,10 @@ impl StoreServiceImpl {
             }
             let computed: [u8; 32] = std::mem::take(&mut accum.hasher).finalize().into();
             if let Err(e) = verify_nar(computed, accum.nar_data.len() as u64, info, &ctx) {
+                bail!(e);
+            }
+            // r[impl store.put.drv-text-ca]
+            if let Err(e) = verify_drv_text_path(info, &accum.nar_data, &ctx) {
                 bail!(e);
             }
             // r[impl sec.authz.ca-path-derived+6]

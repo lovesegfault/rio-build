@@ -411,6 +411,20 @@ whose refcount drops to 0 become eligible for S3 deletion via
   16-minute upload over 50Mbps would be reaped at the 15-minute mark.
 ]
 
+#r("store.put.drv-text-ca")[
+  Every `PutPath` / `PutPathBatch` upload whose claimed path is a `.drv` MUST
+  be verified as a text content-addressed object: the claimed path must equal
+  `make_text(name, sha256(file bytes), declared references)` --- for every
+  caller, including service-token relays --- and mismatches are rejected. A
+  registered `.drv` path is therefore always the unique preimage of its
+  bytes, so the derivation the gateway validates at submission is
+  byte-identical to the one a worker later fetches from the store.
+]
+The gateway's session derivation cache enforces the same invariant on its
+side (`gw.dag.drv-cache-text-ca`); `store.put.idempotent` is unchanged ---
+an already-complete `.drv` path no-ops, which is harmless because the
+registered copy is content-bound to the path.
+
 #r("store.put.idempotent")[
   *Idempotency:* If `PutPath` is called for a store path that already has a
   `'complete'` manifest, the call returns success immediately without

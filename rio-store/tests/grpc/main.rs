@@ -241,6 +241,7 @@ mod admin;
 mod chunk_service;
 mod chunked;
 mod core;
+mod drv_text_ca;
 mod hash_part;
 mod hmac;
 mod realisations;
