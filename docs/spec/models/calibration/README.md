@@ -1,12 +1,18 @@
-# Stage-C calibration overrides for the controller reconcile models
+# Stage-C calibration overrides for the as-built protocol models
 
 One file per fix family of the controller-formal calibration corpus
 (G-A/G-B/G-G over `spawnCoherence.qnt`, M1/M2/M3-M4/FFD-cover over
 `nodeclaimLifecycle.qnt`; the families whose every member is NOT-ENCODED
-have no file). Each module instantiates the as-built model, defines a
-local PRE-FIX variant of one tick action (the behavior the named
+have no file), one file per fix family of the refcount corpus
+(`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), and —
+the executor-lifecycle campaign's variant of the layout — one file per
+*representative* of the executor corpus
+(`executor-<family>-<slug>.qnt` over `executorSession.qnt` /
+`executorDelivery.qnt`; a family with two falsifying representatives
+has two files). Each module instantiates the as-built model, defines a
+local PRE-FIX variant of one action (the behavior the named
 historical fix removed), and exposes it through a `calibStep`. The
-violation latches inside the pre-fix tick keep the AS-BUILT oracle: the
+violation latches inside the pre-fix action keep the AS-BUILT oracle: the
 behavior vals are reverted, the violation vals are not, so a
 falsification means the as-built invariant set re-finds that bug class.
 
@@ -27,8 +33,10 @@ constants use the wired Stage-B regime checks as their baseline.
 
 The verdict table — every corpus commit, its classification, override
 module, predicted vs. actual verdict, depth/state counts, and
-disposition — lives in `docs/spec/models/controller-invariant-map.md`
-(the Stage-C calibration section). A subset of the overrides is wired
-into `nix/quint.nix` as permanent expect-violation checks
-(`quint-ctrl-calib-*`); the rest are evidence modules, re-runnable on
+disposition — lives next to the owning campaign's invariant map
+(`controller-invariant-map.md`, `refcount-invariant-map.md`,
+`executor-invariant-map.md`, each in its Stage-C calibration section).
+A subset of the overrides is wired into `nix/quint.nix` as permanent
+expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
+`quint-executor-calib-*`); the rest are evidence modules, re-runnable on
 demand with the command above.
