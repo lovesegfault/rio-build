@@ -3175,5 +3175,109 @@ in
       step = "calibStep";
       witness = "neverOfferUnrunnableWork";
     };
+
+    # ------------------------------------------------------------------
+    # Executor-lifecycle campaign, slice 1b: the retryPolicy PULL-MODE
+    # environment regime (the T-0e.3 re-derivation, executed at 1b).
+    # Same fold, same invariants as the as-built channel regimes above —
+    # what changes is the event-arrival environment: the attempt opens at
+    # PullAssignment, the worker classes arrive over the ReportOutcome
+    # unary, the controller's pod-terminal classification is the
+    # idempotent ReportAttemptOutcome row fill (with the no-attempt
+    # no-op), the establishment sweep is the only time-based repair, and
+    # the exclusion/fleet-exhaust inputs are re-keyed to source nodes
+    # with the AD2 small-fleet clause (the spawn-intent gate's
+    # NoEligibleSource arm). The as-built regimes stay wired and
+    # authoritative for the stream path until the executor campaign's
+    # 1c' retires it; this block is additive (Phase-1 plan T-1b.7,
+    # gate-plan check-budget row "1b adds the pull-mode retryPolicy
+    # cfg(s) + ~4 witnesses").
+    #
+    # The regime module is retryPolicyPull in retryPolicy.qnt; its
+    # transition relation is `pullStep` (the as-built `step` and its
+    # stream channels are not reachable from it), selected via --step.
+    # ------------------------------------------------------------------
+
+    # The exhaustive pull-mode regime check: two source nodes, the full
+    # pull alphabet (pull-open, worker-report classes, pod deaths with
+    # the OOM/Deadline controller fills, the no-attempt no-op, the
+    # establishment, the spawn-gate exhaust, source-universe shrink, the
+    # resets) plus one leader failover with the open-attempt carve-out
+    # (the pull attempt and the durable budgets survive; nothing is
+    # forgiven or fabricated). The HOLD list is the same invariant set
+    # the as-built regimes prove — the refinement tripwires, the
+    # charge-once/no-double-count discipline, the poison/clear
+    # lifecycle, and the failover-budget acceptance property — now over
+    # the pull-path event-arrival environment.
+    # r[verify sched.retry.per-executor-budget+3]
+    # r[verify sched.dispatch.fleet-exhaust+4]
+    quint-retry-policy-pull = mkQuintCheck {
+      name = "retry-policy-pull";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      invariants = [
+        "boundsOK"
+        "attemptsChargedOnce"
+        "countersRefineHistory"
+        "verdictMatchesFold"
+        "durableMirrorsCharges"
+        "noDoubleCount"
+        "poisonIsTerminalUntilCleared"
+        "cascadeReachesExactlyTheDependents"
+        "failoverPreservesHistory"
+        "recoveryNeverFabricatesFailures"
+        "placementSound"
+        "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
+        "recoveryPreservesPoisonStatus"
+      ];
+    };
+
+    # Non-vacuity witnesses for the pull-mode regime (same
+    # expect-violation discipline as the other witness checks; no tracey
+    # markers on witnesses). The four scenarios the 1b gate names plus
+    # the controller-fill charge: a pull opens an attempt; a no-report
+    # crash is established and charged; a pod-terminal report that finds
+    # no open attempt is dropped charge-free (the
+    # sched.attempt.no-attempt-no-op arm); the exhausted source universe
+    # poisons FleetExhausted (the AD2 small-fleet clause / spawn-gate
+    # arm); and the ReportAttemptOutcome fill actually charges (the
+    # C4/C5-unified pod-terminal second installment feeds the fold).
+    quint-retry-policy-pull-witness-opens-attempt = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-opens-attempt";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noPullOpensAttempt";
+    };
+    quint-retry-policy-pull-witness-establishment = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-establishment";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noEstablishedCrashCharge";
+    };
+    quint-retry-policy-pull-witness-no-attempt-noop = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-no-attempt-noop";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noNoAttemptReportNoop";
+    };
+    quint-retry-policy-pull-witness-fleet-exhaust = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-fleet-exhaust";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noFleetExhaustPoison";
+    };
+    quint-retry-policy-pull-witness-fill-charge = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-fill-charge";
+      spec = "retryPolicy";
+      main = "retryPolicyPull";
+      step = "pullStep";
+      witness = "noAtCapTermination";
+    };
   };
 }

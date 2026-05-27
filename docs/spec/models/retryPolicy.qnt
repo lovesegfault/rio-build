@@ -2724,3 +2724,736 @@ module retryPolicyFailover {
         durableMirrorsCharges,
       })
 }
+
+// ===========================================================================
+// THE PULL-MODE ENVIRONMENT REGIME (executor-lifecycle campaign, slice 1b —
+// the T-0e.3 re-derivation executed). Same fold, same invariants, different
+// event-arrival environment: the events the fold consumes arrive through the
+// pull-path unaries (`PullAssignment` opens the attempt, `ReportOutcome`
+// carries the worker classes, `ReportAttemptOutcome` is the controller's
+// idempotent pod-terminal fill) and the establishment sweep, instead of the
+// dispatch stream / disconnect / recently_disconnected correlation channels.
+// The as-built channel regimes above stay authoritative for the stream path
+// until the executor campaign's 1c' retires it; this regime is additive.
+//
+// WHAT CHANGES (exactly the T-0e.3 list in
+// docs/spec/models/executor-invariant-map.md):
+//   - dispatchTo -> pullOpensAttempt: the attempt opens at PullAssignment
+//     (Ready->Running + exec mint + row insert in one fenced transaction).
+//     The dispatch-time eligibility/exclusion precondition moves to the
+//     spawn-intent gate per AD2: the EXECUTORS constant is the set of
+//     SOURCE NODES (not pod slots), the exclusion set carries node keys,
+//     and a pull can only arrive from a non-excluded spawnable source
+//     (the controller renders anti-affinity from the intent's
+//     excluded_nodes, so an excluded source never hosts the pod).
+//   - E6/E7 (controller channel + recently_disconnected correlation) ->
+//     pullAttemptOutcomeOom / pullAttemptOutcomeDeadline: the single
+//     idempotent column fill keyed by attempt identity. The fold events
+//     and their charging semantics are UNCHANGED (FControllerTermination /
+//     FControllerDeadlineExceeded); what changes is the dedup vehicle —
+//     the `WHERE termination_reason IS NULL` fill discipline replaces the
+//     correlation entry. A fill that finds no open attempt (never pulled,
+//     already closed by the worker report or the establishment, or a
+//     duplicate delivery) is the no-attempt no-op: pullAttemptOutcomeNoOp
+//     consumes the pending report, charges nothing, creates nothing.
+//   - establishUnreportedCrash -> pullEstablish: the precondition becomes
+//     "open attempt past deadline + report-slack with no terminal row"
+//     instead of "released attempt with no deliverable classifying
+//     report". The charge (FEstablishedCrash: failed_builders[source] +
+//     failure_count + threshold re-check) is unchanged.
+//   - E9 / fleet-exhaust re-keyed per AD2: the exclusion set carries
+//     source nodes; the exhausted-universe verdict is evaluated at the
+//     spawn-intent gate (excluded ⊇ spawnable -> NoEligibleSource ->
+//     Poison(FleetExhausted)). Encoded two ways, matching the code: the
+//     fold application at every charging site receives the live
+//     spawnable-source set (so a charge that completes the exclusion of
+//     the whole universe poisons in the same transaction — the
+//     small-fleet clause of sched.retry.per-executor-budget+3: the
+//     threshold is effectively min(threshold, |sources|)), and the
+//     standalone spawnGateExhaust action covers the no-new-charge case
+//     where the spawnable universe shrinks under an existing exclusion
+//     set (sourceLeavesPool models the shrink; the empty-universe defer
+//     arm of sched.dispatch.fleet-exhaust+4 is preserved).
+//   - Identity freshness is structural: a fresh pod per attempt. No
+//     respawn action, no draining bookkeeping, no executor-map identity
+//     reuse; a source node hosts at most one open attempt for this
+//     derivation at a time and stays spawnable after the attempt closes
+//     (only the exclusion set removes it).
+//   - What stays imported unchanged: specApply (the fold), and the
+//     invariants attemptsChargedOnce, verdictMatchesFold,
+//     failoverPreservesHistory, countersRefineHistory, noDoubleCount,
+//     durableMirrorsCharges, poisonIsTerminalUntilCleared,
+//     cascadeReachesExactlyTheDependents, recoveryNeverFabricatesFailures,
+//     placementSound, clearedPoisonClearsDurably,
+//     clearedPoisonScrubsExclusions, recoveryPreservesPoisonStatus,
+//     boundsOK — none are redefined here.
+//
+// WHAT IS NOT MODELED (deliberate scope boundaries, each priced)
+//   - The establishment window's clock (deadline + report-slack): the
+//     pullEstablish action is enabled as soon as an open attempt exists,
+//     over-approximating production timing exactly as the as-built
+//     regimes over-approximate the 60 s correlation TTL. This is
+//     conservative for the safety invariants (more interleavings,
+//     including the establishment racing the controller fill and the
+//     in-flight worker report); the only-after-the-window timing is
+//     asserted end-to-end by the pull-canary VM scenario and the
+//     establishment-sweep unit battery (sched.attempt.establishment-window).
+//   - The NotYetReady pull outcome (OA6) and the idempotent re-pull of an
+//     open attempt: both are charge-free reads (no row, no fold event),
+//     i.e. stuttering steps at this model's resolution. Their semantics
+//     are owned by the scheduler pull battery and the Model-S re-target
+//     at 1c'.
+//   - The pre-pull pod death (a pod that dies before its first
+//     PullAssignment): it never opens an attempt, so the controller's
+//     report resolves to no attempt row — the same no-op arm
+//     pullAttemptOutcomeNoOp encodes for the already-closed case. The
+//     model does not distinguish the two producers of that no-op.
+//   - Pull/report RPC retry envelopes and unary transport faults: the
+//     unaries are idempotent and bounded-retried by the pod (builder
+//     consts); a failed appending transaction behind ReportOutcome is the
+//     same atomic-tx inversion the as-built fault regime prices
+//     (TX_FAULTS = 0 here).
+//   - The wedge as a distinct state (ENABLE_WEDGE = false): a pull-mode
+//     build that never reports is closed by activeDeadlineSeconds (the
+//     controller's deadline fill) or by the establishment sweep; with
+//     pullEstablish enabled on any open attempt the Wedged state adds no
+//     distinct outcome, and the as-built backstop (E8) has no pull-mode
+//     successor (the establishment sweep is the only scheduler-side
+//     time-based repair).
+//   - Multi-derivation interference and the spawn/Job lifecycle itself
+//     (Model J/N territory); the busy bridge and synthesize-on-delete
+//     arms are controller-side and carry no retry charge.
+//
+// The wired checks, their invariant lists and the witness wiring live in
+// nix/quint.nix (the executor-campaign appended block). Measured state
+// counts, depths and wall-clocks live in the introducing commit's message
+// and the checks' transcripts, never here.
+module retryPolicyPull {
+  import retryPolicy(
+    EXECUTORS = Set("n1", "n2"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 1,
+    TX_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = true,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = true
+  ).*
+
+  // --- derived state (pull-mode environment) ------------------------------
+
+  /// The spawnable-source universe as the spawn-intent gate sees it: the
+  /// pool's nodes still present in the controller's informer view.
+  /// (eligibleFleet's registered/non-draining filter carries exactly
+  /// that meaning here: sourceLeavesPool clears `registered`, nothing
+  /// ever sets `draining`.)
+  def spawnableSources: Set[str] = eligibleFleet
+
+  /// Where the next pod can be placed: spawnable and not excluded by the
+  /// fold-derived, source-keyed exclusion set (the AD2 anti-affinity
+  /// render of the intent's excluded_nodes).
+  def pullPlaceableSources: Set[str] =
+    spawnableSources.filter(n => not(live.failedBuilders.contains(n)))
+
+  // --- expect-violation witnesses (pull-specific non-vacuity probes) ------
+
+  /// Violated when a pull has opened an attempt (the post-pull state is
+  /// reachable: Ready->Running with an open attempt bound to a source).
+  val noPullOpensAttempt = not(dStatus == DRunning and attempt != NoAttempt)
+
+  /// Violated when a controller pod-terminal report arrives with no open
+  /// attempt to consume it and is dropped charge-free (the
+  /// sched.attempt.no-attempt-no-op arm is reachable).
+  val noNoAttemptReportNoop = not(last.kind == OE6 and last.dropped)
+
+  // --- actions (the pull-path environment) ---------------------------------
+
+  /// PullAssignment delivers: the fenced pull transaction opens the
+  /// attempt (Ready->Running, exec mint, assignments/executions rows) for
+  /// a pod the controller placed on a non-excluded spawnable source.
+  /// The backoff defer and the dispatch ceiling gate the pull exactly as
+  /// they gated the push (the intent is not deliverable while the defer
+  /// is pending), and the fold observes the same FDispatched event
+  /// (backoff cleared in RAM, no ledger row).
+  // Mirrors: actor/pull.rs::admit_pull (Deliver arm) + the pull
+  //          transaction; the AD2 spawn-gate exclusion stands in for
+  //          hard_filter.
+  action pullOpensAttempt(n: str): bool = all {
+    dStatus == DReady,
+    backoffElapsed,
+    physAttempts < MAX_ATTEMPTS,
+    attempt == NoAttempt,
+    pullPlaceableSources.contains(n),
+    dStatus' = DRunning,
+    attempt' = Running(n),
+    execs' = execs.put(n, { ...execs.get(n), runningOurs: true }),
+    live' = { ...live, backoffUntil: NoTime },
+    val applied = specApply(spec, FDispatched(now), eligibleFleet)
+    all {
+      spec' = applied.c,
+      specVerdict' = applied.v,
+    },
+    pg' = pg,
+    physAttempts' = physAttempts + 1,
+    now' = now, poisonSrc' = poisonSrc,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    promotionsLeft' = promotionsLeft, failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft, last' = noObs,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// ReportOutcome intake (E1-E4 over the unary): the worker's
+  /// CompletionReport classes charge exactly as on the stream path —
+  /// the per-class fold events and verdict handling are unchanged. What
+  /// differs is the environment bookkeeping: the pod is gone after its
+  /// one report (identity freshness), the source node stays spawnable
+  /// (no draining), and the fold's fleet snapshot is the live
+  /// spawnable-source set INCLUDING the reporting source — the AD2
+  /// spawn-gate evaluation would see that source as both spawnable and
+  /// excluded, so a charge that completes the exclusion of the whole
+  /// universe poisons FleetExhausted in the same transaction (the
+  /// small-fleet clause; on larger universes the distinct-source
+  /// threshold fires first, exactly as for the as-built regimes).
+  // Mirrors: grpc executor_service.rs::report_outcome ->
+  //          completion.rs handle_* per class through
+  //          append_and_decide_in_tx (charging semantics unchanged).
+  action pullReportOutcome(n: str, class: ReportClass, dual: bool, promoted: bool, atCap: bool): bool = all {
+    attempt == Reported({ exec: n, class: class, dual: dual }),
+    // the floor oracle, exactly as for the stream-path intake
+    promoted implies (class == RcInfraOom and promotionsLeft > 0),
+    atCap implies class == RcInfraOom,
+    not(promoted and atCap),
+    (class == RcInfraOom) implies (promoted or atCap),
+    dStatus == DRunning,
+
+    // the pod exits after reporting; the source stays in the universe
+    val execAfter = { ...execs.get(n), runningOurs: false }
+    val sourceFleet = eligibleFleet
+    match class {
+      // ── E1: transient ──────────────────────────────────────────────
+      | RcTransient =>
+        val applied = specApply(spec, FTransient({ at: now, exec: n }), sourceFleet)
+        all {
+          execs' = execs.put(n, execAfter),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          live' = applied.c,
+          promotionsLeft' = promotionsLeft,
+          match applied.v {
+            | VPoison(r) => all {
+              dStatus' = DPoisoned,
+              poisonSrc' = EventPoison,
+              lastPoisonReason' = r,
+              pg' = { status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+              depStatus' = DepFailed,
+              everFailureTerminal' = true,
+              last' = { ...noObs, kind: OE1, chargedAny: true, terminal: true },
+            }
+            | VRequeue => all {
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE1, chargedAny: true },
+            }
+            | VCancel => all {
+              // unreachable: the transient arm never cancels
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE1, chargedAny: true },
+            }
+          },
+        }
+
+      // ── E2: the three infra classes, via the shared infra arm ───────
+      | RcInfraPutPath => infraArm(n, execAfter, sourceFleet, true, false, false)
+      | RcInfraOom => infraArm(n, execAfter, sourceFleet, promoted, atCap, promoted)
+      | RcInfraOther => infraArm(n, execAfter, sourceFleet, false, false, false)
+
+      // ── E3: permanent ──────────────────────────────────────────────
+      | RcPermanent =>
+        val applied = specApply(spec, FPermanent({ at: now, exec: n }), sourceFleet)
+        all {
+          execs' = execs.put(n, execAfter),
+          attempt' = NoAttempt,
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          live' = applied.c,
+          dStatus' = DPoisoned,
+          poisonSrc' = EventPoison,
+          lastPoisonReason' = RPermanent,
+          pg' = { status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OE3, chargedAny: true, terminal: true },
+          promotionsLeft' = promotionsLeft,
+        }
+
+      // ── E4: worker-reported timeout ────────────────────────────────
+      | RcTimeout =>
+        val applied = specApply(spec, FWorkerTimeout(now), sourceFleet)
+        all {
+          spec' = applied.c,
+          specVerdict' = applied.v,
+          live' = applied.c,
+          attempt' = NoAttempt,
+          promotionsLeft' = promotionsLeft,
+          // the dual flag marks the deadline kill the controller also
+          // observed: this report is that death's one counted event;
+          // the controller's later fill finds the row closed (no-op).
+          execs' = execs.put(n, if (dual) { ...execAfter, deathCharges: execAfter.deathCharges + 1 } else execAfter),
+          match applied.v {
+            | VRequeue => all {
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE4, chargedAny: true },
+            }
+            | VCancel => all {
+              dStatus' = DCancelled,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, status: PgCancelled, ledger: applied.c },
+              depStatus' = DepFailed,
+              everFailureTerminal' = true,
+              last' = { ...noObs, kind: OE4, terminal: true },
+            }
+            | VPoison(r) => all {
+              // unreachable: the worker-timeout arm never poisons
+              dStatus' = DReady,
+              poisonSrc' = poisonSrc,
+              lastPoisonReason' = lastPoisonReason,
+              pg' = { ...pg, ledger: applied.c },
+              depStatus' = depStatus,
+              everFailureTerminal' = everFailureTerminal,
+              last' = { ...noObs, kind: OE4, chargedAny: true },
+            }
+          },
+        }
+    },
+
+    txFaultsLeft' = txFaultsLeft,
+    everFailedBuilders' = if (class == RcTransient or class == RcPermanent)
+      everFailedBuilders.union(Set(n)) else everFailedBuilders,
+    now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    justFailedOver' = false,
+  }
+
+  /// ReportAttemptOutcome, OOM/disk-pressure reason: the controller's
+  /// pod-terminal classification lands on the open attempt row, keyed
+  /// by attempt identity. The fold event and its {promoted, atCap}
+  /// floor outcome are exactly the as-built E6's
+  /// (FControllerTermination); the fill closes the attempt and the
+  /// verdict acts in the same transaction (requeue or poison). No
+  /// correlation entry, no race-ahead/late-installment split: the row
+  /// fill is the dedup. (Slice note: the 1a/1b code resolves a pulled
+  /// but never-worker-reported pod death via the establishment sweep —
+  /// also modeled — and reserves the fill for the reason-only second
+  /// installment; this action additionally covers the frozen-contract
+  /// arrival order in which the unified fill itself classifies the
+  /// open attempt, so both orders are explored.)
+  // Mirrors: the T-0e.6 ReportAttemptOutcome contract (C4/C5
+  //          unification, WHERE termination_reason IS NULL) for
+  //          OOMKilled / EvictedDiskPressure.
+  action pullAttemptOutcomeOom(n: str, promoted: bool, atCap: bool): bool = all {
+    match attempt { | PodDead(p) => p.exec == n and p.kind == DkOom | _ => false },
+    execs.get(n).ctrl == CtrlOom,
+    promoted implies promotionsLeft > 0,
+    not(promoted and atCap),
+    promoted or atCap,
+    val e = execs.get(n)
+    val applied = specApply(spec,
+      FControllerTermination({ at: now, promoted: promoted, atCap: atCap }), eligibleFleet)
+    all {
+      execs' = execs.put(n, { ...e, runningOurs: false, ctrl: NoCtrl,
+        deathCharges: e.deathCharges + 1 }),
+      attempt' = NoAttempt,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      live' = applied.c,
+      promotionsLeft' = if (promoted) promotionsLeft - 1 else promotionsLeft,
+      match applied.v {
+        | VPoison(r) => all {
+          dStatus' = DPoisoned,
+          poisonSrc' = EventPoison,
+          lastPoisonReason' = r,
+          pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OE6, chargedAny: true, terminal: true,
+            promoted: promoted, atCap: atCap },
+        }
+        | VRequeue => all {
+          // the fill closes the attempt and requeues the derivation in
+          // the same transaction (the pull path has no separate
+          // disconnect/reassign step)
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OE6, chargedAny: true,
+            promoted: promoted, atCap: atCap },
+        }
+        | VCancel => all {
+          // unreachable: the termination arm never cancels
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OE6, chargedAny: true,
+            promoted: promoted, atCap: atCap },
+        }
+      },
+    },
+    now' = now, physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// ReportAttemptOutcome, DeadlineExceeded reason: the controller's
+  /// activeDeadlineSeconds kill fills the open attempt row as a timeout.
+  /// Under the cap the timeout budget is charged; at the cap the verdict
+  /// is terminal Cancelled — the same terminal the worker-reported E4
+  /// produces (the D1-adjudicated channel invariance, unchanged by the
+  /// pull re-key).
+  // Mirrors: admin ReportAttemptOutcome -> the scheduler fill for
+  //          DeadlineExceeded.
+  action pullAttemptOutcomeDeadline(n: str): bool = all {
+    match attempt { | PodDead(p) => p.exec == n and p.kind == DkDeadline | _ => false },
+    execs.get(n).ctrl == CtrlDeadline,
+    val e = execs.get(n)
+    val applied = specApply(spec, FControllerDeadlineExceeded(now), eligibleFleet)
+    all {
+      execs' = execs.put(n, { ...e, runningOurs: false, ctrl: NoCtrl,
+        deathCharges: e.deathCharges + 1 }),
+      attempt' = NoAttempt,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      live' = applied.c,
+      match applied.v {
+        | VCancel => all {
+          dStatus' = DCancelled,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, status: PgCancelled, ledger: applied.c },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OE7, terminal: true },
+        }
+        | VRequeue => all {
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OE7, chargedAny: true },
+        }
+        | VPoison(r) => all {
+          // unreachable: the deadline arm never poisons post-collapse
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OE7, chargedAny: true },
+        }
+      },
+    },
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
+    justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// ReportAttemptOutcome with no open attempt to consume it: the report
+  /// targets an attempt row that is already terminal (closed by the
+  /// worker report, the deadline fill, or the establishment — including
+  /// after the derivation re-pulled on the same or another source) or
+  /// that never existed (a pod that died before its first pull). The
+  /// no-attempt no-op rule: acknowledged, nothing charged, nothing
+  /// created, no derivation state touched.
+  // Mirrors: the ReportAttemptOutcome no-attempt / already-filled arms
+  //          (sched.attempt.no-attempt-no-op).
+  action pullAttemptOutcomeNoOp(n: str): bool = all {
+    execs.get(n).ctrl != NoCtrl,
+    // the pending report's own attempt is no longer open: anything but a
+    // PodDead attempt on this source means the row it targets is closed
+    // (a Running/Reported attempt on the same source is a NEWER pull).
+    match attempt { | PodDead(p) => p.exec != n | _ => true },
+    execs' = execs.put(n, { ...execs.get(n), ctrl: NoCtrl }),
+    last' = { ...noObs, kind: OE6, dropped: true },
+    now' = now, dStatus' = dStatus, live' = live, poisonSrc' = poisonSrc,
+    spec' = spec, specVerdict' = specVerdict, pg' = pg,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, promotionsLeft' = promotionsLeft,
+    physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft, lastPoisonReason' = lastPoisonReason,
+    justFailedOver' = false, everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// The establishment sweep: an open attempt whose deadline +
+  /// report-slack elapsed with no terminal row is established as
+  /// executor_crash/unreported and charged (failed_builders[source] +
+  /// failure_count + threshold re-check), closing the attempt and
+  /// requeueing or poisoning in the same transaction. The clock gate is
+  /// over-approximated away (see the header); the establishment may
+  /// therefore race the controller fill and the in-flight worker report
+  /// here — whichever lands first closes the row, the loser is the
+  /// no-attempt no-op.
+  // Mirrors: actor/housekeeping.rs establishment sweep for open
+  //          pull-mode attempts (sched.attempt.establishment-window's
+  //          charge half; the window timing itself is not modeled).
+  action pullEstablish(n: str): bool = all {
+    match attempt {
+      | NoAttempt => false
+      | Running(w) => w == n
+      | Reported(r) => r.exec == n
+      | PodDead(p) => p.exec == n
+      | Wedged(w) => w == n
+    },
+    dStatus == DRunning,
+    val e = execs.get(n)
+    // the charge counts against the pod's death only if the pod actually
+    // died unreported (the PodDead shape); establishing a still-running
+    // or already-reported attempt charges the budget but there is no
+    // death to double-count.
+    val isDeath = match attempt { | PodDead(p) => true | _ => false }
+    val applied = specApply(spec, FEstablishedCrash({ at: now, exec: n }), eligibleFleet)
+    all {
+      execs' = execs.put(n, { ...e, runningOurs: false,
+        deathCharges: if (isDeath) e.deathCharges + 1 else e.deathCharges }),
+      attempt' = NoAttempt,
+      spec' = applied.c,
+      specVerdict' = applied.v,
+      live' = applied.c,
+      match applied.v {
+        | VPoison(r) => all {
+          dStatus' = DPoisoned,
+          poisonSrc' = EventPoison,
+          lastPoisonReason' = r,
+          pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now), ledger: applied.c },
+          depStatus' = DepFailed,
+          everFailureTerminal' = true,
+          last' = { ...noObs, kind: OEstablish, chargedAny: true, terminal: true },
+        }
+        | VRequeue => all {
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OEstablish, chargedAny: true },
+        }
+        | VCancel => all {
+          // unreachable: the establishment arm never cancels
+          dStatus' = DReady,
+          poisonSrc' = poisonSrc,
+          lastPoisonReason' = lastPoisonReason,
+          pg' = { ...pg, ledger: applied.c },
+          depStatus' = depStatus,
+          everFailureTerminal' = everFailureTerminal,
+          last' = { ...noObs, kind: OEstablish, chargedAny: true },
+        }
+      },
+    },
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    failoversLeft' = failoversLeft, txFaultsLeft' = txFaultsLeft,
+    justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders.union(Set(n)),
+  }
+
+  /// The spawn-intent gate's exhausted-universe verdict with no new
+  /// charge: every spawnable source is already excluded for this
+  /// derivation (the universe shrank under an existing exclusion set),
+  /// so the controller reports NoEligibleSource instead of spawning an
+  /// unschedulable Job and the scheduler maps it to the same
+  /// fleet-exhaust poison the dispatch-time backstop produced (no fold
+  /// event — the marker row is a fold no-op). The empty universe defers
+  /// instead (the action is disabled), per
+  /// sched.dispatch.fleet-exhaust+4's empty-fleet arm.
+  // Mirrors: pool/jobs.rs spawn pass (excluded ⊇ spawnable ->
+  //          ReportAttemptOutcome(NoEligibleSource)) -> actor/pull.rs
+  //          fleet-exhaust mapping (still-Ready only).
+  action spawnGateExhaust = all {
+    dStatus == DReady,
+    backoffElapsed,
+    attempt == NoAttempt,
+    exhaustsFleet(live.failedBuilders, spawnableSources),
+    dStatus' = DPoisoned,
+    poisonSrc' = DispatchPoison,
+    live' = { ...live, poisonedAt: At(now) },
+    lastPoisonReason' = RFleetExhausted,
+    pg' = { ...pg, status: PgPoisoned, poisonedAt: At(now) },
+    depStatus' = DepFailed,
+    everFailureTerminal' = true,
+    spec' = spec, specVerdict' = specVerdict,
+    attempt' = attempt, execs' = execs,
+    now' = now, promotionsLeft' = promotionsLeft,
+    physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft,
+    last' = { ...noObs, kind: OE9Dispatch, terminal: true },
+    justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// A source node leaves the spawnable universe (cordon, consolidation,
+  /// node repair, pool shrink): the controller's informer view no longer
+  /// offers it, so the spawn gate's universe shrinks. Only a source not
+  /// hosting our open attempt leaves here — the node dying under a
+  /// running build is the pod-death event, already modeled.
+  action sourceLeavesPool(n: str): bool = all {
+    execs.get(n).registered,
+    not(execs.get(n).runningOurs),
+    execs' = execs.put(n, { ...execs.get(n), registered: false }),
+    now' = now, dStatus' = dStatus, live' = live, poisonSrc' = poisonSrc,
+    spec' = spec, specVerdict' = specVerdict, pg' = pg,
+    depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt, promotionsLeft' = promotionsLeft,
+    physAttempts' = physAttempts, failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft, last' = last,
+    lastPoisonReason' = lastPoisonReason, justFailedOver' = false,
+    everFailedBuilders' = everFailedBuilders,
+  }
+
+  /// Leader failover, pull-mode shape: the cached counter view is lost
+  /// and rebuilt by the fold over the durable attempt ledger exactly as
+  /// on the stream path (sched.retry.failover-budget,
+  /// sched.retry.recovery-projection+2) — but the open pull-mode
+  /// attempt SURVIVES the failover (the assignments/executions rows are
+  /// durable and the post-failover orphan reconcile skips
+  /// dispatch_mode='pull' rows; the establishment sweep, not the orphan
+  /// reconcile, owns them), and the controller's pending pod-terminal
+  /// report obligation is controller-side state that a scheduler
+  /// failover does not erase. Nothing is forgiven, nothing is
+  /// fabricated, and the open attempt is not re-dispatched out from
+  /// under its pod.
+  // Mirrors: actor/mod.rs LeaderLost wipe + recovery.rs ledger-fold
+  //          rebuild + the reconcile_assignments pull carve-out
+  //          (collect_orphaned_assignments skips open pull attempts).
+  action pullLeaderFailover = all {
+    failoversLeft > 0,
+    val gone = dStatus == DAbsent or dStatus == DCompleted
+    val expiredInDowntime = and {
+      pg.status == PgPoisoned,
+      match pg.poisonedAt { | NoTime => false | At(t) => now - t > POISON_TTL },
+    }
+    val recovered = { ...pg.ledger, poisonedAt: pg.poisonedAt }
+    all {
+      failoversLeft' = failoversLeft - 1,
+      execs' = execs,
+      attempt' = attempt,
+      justFailedOver' = true,
+      last' = { ...noObs, kind: OFailover },
+      if (gone) all {
+        dStatus' = dStatus, live' = live, spec' = spec, specVerdict' = specVerdict,
+        pg' = pg, poisonSrc' = poisonSrc, depStatus' = depStatus,
+        everFailureTerminal' = everFailureTerminal, lastPoisonReason' = lastPoisonReason,
+      } else if (pg.status == PgPoisoned and expiredInDowntime) all {
+        // the TTL elapsed while no leader was watching: clear in PG, do
+        // not reload (same as the stream-path failover arm)
+        dStatus' = DAbsent, live' = zeroCounters, spec' = zeroCounters,
+        specVerdict' = VRequeue, pg' = freshPg, poisonSrc' = NoPoison,
+        depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+        lastPoisonReason' = lastPoisonReason,
+      } else if (pg.status == PgPoisoned) all {
+        dStatus' = DPoisoned,
+        live' = recovered,
+        spec' = pg.ledger,
+        specVerdict' = specVerdict,
+        pg' = pg,
+        poisonSrc' = if (poisonSrc == NoPoison) EventPoison else poisonSrc,
+        depStatus' = DepFailed,
+        everFailureTerminal' = true,
+        lastPoisonReason' = lastPoisonReason,
+      } else if (pg.status == PgNonTerminal) all {
+        // the retry view is the ledger fold; an open pull attempt keeps
+        // the derivation Running (the orphan-reconcile carve-out), a
+        // closed one comes back Ready.
+        dStatus' = if (attempt == NoAttempt) DReady else DRunning,
+        live' = recovered,
+        spec' = pg.ledger,
+        specVerdict' = specVerdict,
+        pg' = pg,
+        poisonSrc' = NoPoison,
+        depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+        lastPoisonReason' = lastPoisonReason,
+      } else all {
+        // PgCancelled / PgCompleted: terminal rows are not reloaded.
+        dStatus' = DAbsent, live' = zeroCounters, spec' = zeroCounters,
+        specVerdict' = VRequeue, pg' = pg, poisonSrc' = NoPoison,
+        depStatus' = depStatus, everFailureTerminal' = everFailureTerminal,
+        lastPoisonReason' = lastPoisonReason,
+      },
+    },
+    now' = now, promotionsLeft' = promotionsLeft, physAttempts' = physAttempts,
+    txFaultsLeft' = txFaultsLeft, everFailedBuilders' = everFailedBuilders,
+  }
+
+  // --- step (pull-mode alphabet) -------------------------------------------
+
+  action pullOpensAttemptAny = { nondet n = EXECUTORS.oneOf() pullOpensAttempt(n) }
+  action pullReportOutcomeAny = {
+    nondet n = EXECUTORS.oneOf()
+    nondet class = REPORT_CLASSES.oneOf()
+    nondet dual = BOOLS.oneOf()
+    nondet promoted = BOOLS.oneOf()
+    nondet atCap = BOOLS.oneOf()
+    pullReportOutcome(n, class, dual, promoted, atCap)
+  }
+  action pullAttemptOutcomeOomAny = {
+    nondet n = EXECUTORS.oneOf()
+    nondet promoted = BOOLS.oneOf()
+    nondet atCap = BOOLS.oneOf()
+    pullAttemptOutcomeOom(n, promoted, atCap)
+  }
+  action pullAttemptOutcomeDeadlineAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeDeadline(n) }
+  action pullAttemptOutcomeNoOpAny = { nondet n = EXECUTORS.oneOf() pullAttemptOutcomeNoOp(n) }
+  action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
+  action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
+
+  /// The pull-mode transition relation. The physical attempt-end events
+  /// (buildEndsReported / buildEndsPodDeath) and the lost controller
+  /// report are the imported environment actions; the resets and the
+  /// clock are imported unchanged; everything channel-shaped is the
+  /// pull-path encoding above. The as-built `step` (dispatch stream,
+  /// disconnect, correlation channels, backstop, respawn) is not
+  /// reachable from here.
+  action pullStep = any {
+    tick,
+    pullOpensAttemptAny,
+    spawnGateExhaust,
+    buildEndsReportedAny,
+    buildEndsPodDeathAny,
+    pullReportOutcomeAny,
+    pullAttemptOutcomeOomAny,
+    pullAttemptOutcomeDeadlineAny,
+    pullAttemptOutcomeNoOpAny,
+    ctrlReportLostAny,
+    pullEstablishAny,
+    sourceLeavesPoolAny,
+    resubmitReset,
+    cacheHitClear,
+    poisonTtlExpires,
+    pullLeaderFailover,
+  }
+}

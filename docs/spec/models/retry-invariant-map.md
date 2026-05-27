@@ -2235,3 +2235,31 @@ each handler also gains a durable write).
   policy changes, not refactoring debt).
 - Model-based testing of the fold: the reasoned omission above, with
   its reconsideration triggers.
+
+## Cross-campaign addendum — the pull-mode environment regime (executor-lifecycle campaign, slice 1b)
+
+Added by the executor-lifecycle campaign (Phase-1 plan T-1b.7, the
+T-0e.3 re-derivation recorded in
+`docs/spec/models/executor-invariant-map.md`): `retryPolicy.qnt` now
+carries an additional regime module, `retryPolicyPull`, that re-derives
+the model's *environment* for the pull-path protocol — the attempt
+opens at `PullAssignment`, the worker classes arrive over the
+`ReportOutcome` unary, the controller's pod-terminal classification is
+the idempotent `ReportAttemptOutcome` row fill (with the no-attempt
+no-op), the establishment sweep is the only time-based repair, and the
+exclusion / fleet-exhaust inputs are re-keyed to source nodes with the
+AD2 small-fleet clause. The fold (`specApply`) and every invariant of
+this map are imported unchanged; no as-built module or regime was
+edited, and the wired as-built checks' state counts are unchanged
+(re-verified at the introducing commit). The new wired checks are
+`quint-retry-policy-pull` plus the `quint-retry-policy-pull-witness-*`
+expect-violation probes in `nix/quint.nix`.
+
+Authority boundary: the as-built channel regimes
+(`retryPolicyWorker`/`Dual`/`Crash`/`Failover`) remain the
+authoritative verification of the stream dispatch path for as long as
+that path exists; the pull regime is additive coverage for the
+coexistence window. Their retirement is scheduled with the stream
+path's own retirement (executor campaign slice 1c', plan T-1c'.6) and
+will be recorded here by the campaign that performs it, exactly as the
+`retryPolicyAsBuilt` retirement above was.
