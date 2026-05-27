@@ -800,6 +800,61 @@ async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> an
     Ok(())
 }
 
+/// ATerm with a floating-CA-shaped output (`outputHashAlgo` set, empty
+/// `outputHash`) that nevertheless declares an output path — a shape
+/// CppNix refuses to parse and the gateway rejects at submission
+/// (`gw.reject.floating-ca-declared-path`).
+const FLOATING_CA_DECLARED_PATH_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+
+/// wopBuildDerivation (36): a cached derivation with a floating-CA-shaped
+/// output that declares a non-empty path is rejected by `validate_dag`'s
+/// shape rule before SubmitBuild.
+// r[verify gw.reject.floating-ca-declared-path]
+#[tokio::test]
+async fn test_build_derivation_floating_ca_declared_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000007-fca.drv";
+    h.store
+        .seed_with_content(drv_path, FLOATING_CA_DECLARED_PATH_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+        string: "r:sha256",                      // hash_algo (floating-CA shape)
+        string: "",                              // hash (empty)
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+        u64: 0,                                  // build_mode
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_ne!(status, 0, "floating-CA-with-path must be rejected");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.contains("floating content-addressed"),
+        "errorMsg should name the shape violation: {error_msg:?}"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "the shape rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// wopBuildDerivation (36) after the .drv was uploaded in-session
 /// (wopAddToStoreNar): the resolve-success shape — what a hook client that
 /// does upload its derivations gets — goes through the full-DAG pipeline,

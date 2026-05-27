@@ -566,7 +566,11 @@ pub(crate) fn validate_output_path_bindings(
         // are bound by the derivation hash; content-bound outputs
         // (fixed-output / floating-CA) are governed by the
         // content-hash rules and deferred (empty) paths have
-        // nothing to validate. The derivation-level fast path
+        // nothing to validate. (A floating-CA output that DOES
+        // declare a path is rejected earlier by validate_dag's
+        // gw.reject.floating-ca-declared-path shape rule, so it can
+        // never reach — let alone exempt itself from — this gate.)
+        // The derivation-level fast path
         // therefore applies only when EVERY output is
         // content-bound — neither a deferred output nor a
         // floating-CA output may exempt a sibling static path
@@ -657,6 +661,10 @@ pub(crate) fn validate_output_path_bindings(
 /// Keep the accepted algo set in sync with [`fod_algo_verifiable`]
 /// (the algo gate runs first, so unsupported algos already carry their
 /// own error message).
+///
+/// Also enforces the floating-CA shape rule
+/// (`gw.reject.floating-ca-declared-path`): an output with an algo but
+/// no hash must not declare an output path — see the inline comment.
 pub(crate) fn validate_declared_hash_outputs<'a>(
     drv_path: &str,
     outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
@@ -664,6 +672,29 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
     use rio_nix::hash::{HashAlgo, NixHash};
 
     let outputs: Vec<(&str, &str, &str, &str)> = outputs.collect();
+
+    // r[impl gw.reject.floating-ca-declared-path]
+    // Floating-CA shape rule: an output that sets outputHashAlgo with an
+    // EMPTY outputHash (floating content-addressed) must not declare an
+    // output path — CppNix refuses to even parse that shape
+    // ("content-addressing derivation output should not specify output
+    // path"), so no legitimate client can produce it, and accepting it
+    // would exempt the declared path from both the input-addressed and
+    // the declared-hash bindings. Checked for every output (including
+    // unverifiable-algo offenders) and independent of the realization
+    // exemption.
+    if let Some((name, path, algo, _)) = outputs
+        .iter()
+        .find(|(_, path, algo, hash)| !algo.is_empty() && hash.is_empty() && !path.is_empty())
+    {
+        return Err(format!(
+            "derivation {drv_path} output '{name}' declares outputHashAlgo '{algo}' with no \
+             outputHash (floating content-addressed) but also declares output path {path} — \
+             CppNix refuses this shape and rio rejects it: floating-CA outputs must leave the \
+             output path empty"
+        ));
+    }
+
     let declared_hash: Vec<&(&str, &str, &str, &str)> = outputs
         .iter()
         .filter(|(_, _, algo, hash)| !algo.is_empty() && !hash.is_empty())
@@ -1557,6 +1588,80 @@ mod tests {
 
     /// Any output declaring a hash algorithm the builder cannot handle
     /// is rejected at submission: a FOD with an md5 hash and a
+    /// A floating-CA-shaped output (algo set, hash EMPTY) that also
+    /// declares a non-empty output path is rejected: CppNix refuses to
+    /// parse that shape, and accepting it would exempt the declared
+    /// path from every output-path binding. Proper floating-CA (empty
+    /// path) stays accepted; the rule applies to any declared path
+    /// string, parseable or not, and to mixed multi-output shapes.
+    // r[verify gw.reject.floating-ca-declared-path]
+    #[test]
+    fn validate_dag_rejects_floating_ca_with_declared_path() {
+        let drv_with_outputs = |outs: &[(&str, &str, &str, &str)]| -> Derivation {
+            let rendered: Vec<String> = outs
+                .iter()
+                .map(|(n, p, a, h)| format!(r#"("{n}","{p}","{a}","{h}")"#))
+                .collect();
+            let env: Vec<String> = outs
+                .iter()
+                .map(|(n, p, _, _)| format!(r#"("{n}","{p}")"#))
+                .collect();
+            let aterm = format!(
+                r#"Derive([{}],[],[],"x86_64-linux","/bin/sh",[],[{}])"#,
+                rendered.join(","),
+                env.join(",")
+            );
+            Derivation::parse(&aterm).expect("test ATerm parses")
+        };
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-src.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "bbb".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let victim = "/nix/store/cccccccccccccccccccccccccccccccc-victim";
+
+        // (a) single floating-CA output declaring a path → rejected,
+        // naming the output and the declared path.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            drv_with_outputs(&[("out", victim, "r:sha256", "")]),
+        );
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("floating content-addressed"), "{err}");
+        assert!(err.contains(victim), "{err}");
+
+        // (b) proper floating-CA (empty path) → accepted.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            drv_with_outputs(&[("out", "", "r:sha256", "")]),
+        );
+        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+
+        // (c) mixed multi-output shape: the offending floating-CA-with-
+        // path output is rejected even with an innocent sibling.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            drv_with_outputs(&[("out", victim, "r:sha256", ""), ("doc", "", "", "")]),
+        );
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("floating content-addressed"), "{err}");
+
+        // (d) the declared path need not parse as a store path — the
+        // shape itself is the violation.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            drv_with_outputs(&[("out", "not-a-store-path", "sha256", "")]),
+        );
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("floating content-addressed"), "{err}");
+    }
+
     /// floating-CA output (algo set, hash empty) with an unsupported
     /// algo alike. Verifiable algorithms (sha256, r:sha512) pass in
     /// both shapes, and input-addressed outputs (no hash, no algo) are
@@ -1615,10 +1720,10 @@ mod tests {
             );
         }
 
-        // Floating-CA (algo set, hash EMPTY) with a supported algo →
-        // accepted.
+        // Floating-CA (algo set, hash EMPTY, path EMPTY — the only shape
+        // CppNix can produce) with a supported algo → accepted.
         let mut cache = HashMap::new();
-        cache.insert(key.clone(), fod_drv("r:sha256", ""));
+        cache.insert(key.clone(), fod_drv_at("r:sha256", "", ""));
         assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
 
         // Floating-CA with an algo the builder's CA finalization cannot

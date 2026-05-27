@@ -1020,6 +1020,9 @@ the handshake before the client will send any opcodes.
     #rref("gw.reject.nochroot"));
   - any output declaring an `outputHash`/`outputHashAlgo` the builder cannot
     verify or finalize (#rref("gw.reject.unsupported-hash-algo"));
+  - any floating-CA-shaped output (`outputHashAlgo` set, `outputHash` empty)
+    that nevertheless declares an output path — a shape CppNix refuses to
+    parse (#rref("gw.reject.floating-ca-declared-path"));
   - declared-hash (fixed-output) outputs whose declared path does not derive
     from the declared hash, including CppNix's single-`out` shape rule
     (#rref("gw.reject.output-path-mismatch")).
@@ -1067,6 +1070,21 @@ Both code paths are fail-closed on the worker side too, but only after the
 build has burned a pod; rejecting at submission lands the error on the
 submitting client immediately.
 
+#r("gw.reject.floating-ca-declared-path")[
+  The gateway MUST reject at submission any derivation output that sets
+  `outputHashAlgo` with an empty `outputHash` (floating content-addressed
+  shape) while declaring a non-empty output path. CppNix refuses to parse
+  this shape ("content-addressing derivation output should not specify
+  output path"), and accepting it would exempt the declared path from both
+  the input-addressed and the declared-hash output-path bindings. The
+  rejection applies both in `validate_dag` over cached derivations and
+  inline on `wopBuildDerivation`'s `BasicDerivation`, for every output
+  regardless of whether its hash algorithm is otherwise verifiable.
+]
+No legitimate client can produce this shape, so the rule rejects only
+crafted submissions; proper floating-CA outputs (empty declared path) are
+unaffected.
+
 #r("gw.reject.output-path-mismatch")[
   The gateway MUST NOT trust declared output paths. For input-addressed
   outputs it MUST re-derive the paths from the derivation contents
@@ -1091,7 +1109,9 @@ uploads at registration time. Declared paths that do not parse as store
 paths are out of scope --- they cannot alias a real store object and keep
 failing later exactly as before. Content-bound outputs (fixed-output /
 floating-CA) have no static derivation-derived path; their binding is the
-declared-hash rule above and the store-side content verification.
+declared-hash rule above and the store-side content verification, and a
+floating-CA output that nevertheless declares a path is rejected outright
+(#rref("gw.reject.floating-ca-declared-path")) rather than exempted.
 
 #r("gw.dag.drv-cache-text-ca")[
   The gateway MUST NOT use cached derivation content whose text
