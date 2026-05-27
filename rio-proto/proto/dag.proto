@@ -49,9 +49,15 @@ message DerivationNode {
   // composite PK — the same value Nix sends as the `sha256:<hex>` prefix
   // of wopRegisterDrvOutput's `id` field. Populated by the gateway after
   // DAG BFS from the same drv_cache that resolves inputDrvs (so the full
-  // transitive closure is available). Empty (zero-length) for IA
-  // derivations AND for the single-node BasicDerivation fallback (no
-  // transitive closure to compute over).
+  // transitive closure is available). Empty (zero-length) for
+  // input-addressed derivations. For the single-node BasicDerivation
+  // fallback, build_fallback_node populates it when the inline
+  // derivation is content-addressed (CppNix staticOutputHashes:
+  // hashDerivationModulo over the lifted derivation, which has no
+  // inputDrvs); the scheduler's authoritative-content validation
+  // requires it to match the inline drv_content whenever a floating-CA
+  // output is present (FOD-only fallbacks may leave it empty, but a
+  // present value must still match).
   bytes ca_modular_hash = 12;
 
   // ADR-018 Appendix B `shouldResolve`: true if this derivation needs

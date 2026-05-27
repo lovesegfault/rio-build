@@ -436,13 +436,16 @@ message DerivationNode {
                                               //  TOCTOU between gateway FindMissingPaths
                                               //  and DAG merge)
   bytes drv_content = 9;           // Inline ATerm-serialized .drv. Empty = executor fetches from store.
-                                   // Populated by gateway's filter_and_inline_drv ONLY for nodes with
-                                   // missing outputs (≤64KB per node, 16MB total DAG budget).
+                                   // Two gateway producers: filter_and_inline_drv for cache-resident nodes
+                                   // with missing outputs (≤64KB per node, 16MB total DAG budget) and the
+                                   // content-bound hook fallback (≤1MiB, rio-common MAX_DRV_CONTENT_BYTES).
   reserved 10;                     // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
   bool is_content_addressed = 11;  // CA cutoff: set by gateway from has_ca_floating_outputs() ||
                                    // is_fixed_output(). Gates scheduler's hash-compare on completion.
-  bytes ca_modular_hash = 12;      // 32-byte blake3 modular derivation hash (CA nodes from gateway BFS only;
-                                   // empty for IA and single-node BasicDerivation fallback)
+  bytes ca_modular_hash = 12;      // 32-byte SHA-256 modular derivation hash (hashDerivationModulo). Empty for
+                                   // IA; populated for CA nodes from gateway BFS and for content-addressed
+                                   // single-node fallbacks, and must match the authoritative drv_content when a
+                                   // floating-CA output is present.
   bool needs_resolve = 13;         // ADR-018 shouldResolve: this node needs dispatch-time placeholder resolution
                                    // (CA floating OR IA with a CA-floating input's placeholder in env/args)
 }

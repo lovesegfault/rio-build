@@ -610,9 +610,9 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
 }
 
 /// Authoritative inline drv_content (content-bound hook fallback) must
-/// round-trip through batch upsert, survive a later non-authoritative
-/// re-upsert (COALESCE), be refreshed by a later authoritative one, and
-/// come back from the recovery query.
+/// round-trip through batch upsert, be refreshed by a later
+/// authoritative re-upsert, be cleared by a later non-authoritative
+/// re-upsert (last write wins), and come back from the recovery query.
 // r[verify sched.recovery.inline-drv-durability]
 #[tokio::test]
 async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Result<()> {
