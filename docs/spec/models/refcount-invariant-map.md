@@ -964,3 +964,89 @@ write-amplification and blob-vs-junction drift obligations against a
 server-side mark whose remaining risks are production-hardware margin,
 the strictness of the linear-growth clause, and plan-shape sensitivity
 across PostgreSQL versions, rather than against a 38-minute scan.
+
+#### T-1a.1b — collect-phase anti-join (re-entry gate (c))
+
+Both records above cover the mark phase only; design §5b gate (c)
+requires the collect-phase anti-join priced on a populated
+production-scale `chunks` table, recorded before any Wave A2 task
+starts. The bench gained a third entry point
+(`mark_scan_bench_collect_phase`) that seeds `chunks` to match the
+manifest fixture and then runs the full cycle of the adopted
+formulation on one connection, timing three phases separately: the
+server-side mark (validation pass + set-based expansion into
+`live_chunks`), a one-time prepare step on the mark product (a unique
+index plus ANALYZE — what makes the per-batch anti-join an index probe
+instead of a per-batch hash or sort of the whole mark set), and the
+batched collect loop itself in the orphan-chunk-sweep skeleton (per
+batch, one transaction: a candidate scan with the `NOT EXISTS`
+anti-join and the `GREATEST(created_at, last_referenced_at)` grace
+term, then a sorted `= ANY` soft-delete `RETURNING`), with a keyset
+cursor on the candidate scan, mirrored into the anti-join's inner
+side, so each `chunks` row and each mark-set entry is examined once
+across the whole loop. Without the cursor the loop is quadratic in
+batch count at the design point — every batch re-probes all marked
+rows that precede its candidates (and the as-written single-statement
+`IN (… LIMIT …)` form additionally seq-scans `chunks` once per batch
+on the UPDATE side, which the first 15 k probe run surfaced) — so the
+live arm (T-1a.8) is expected to adopt the same candidate-scan +
+sorted-`ANY` + cursor shape, and the bench's EXPLAIN guard pins it.
+
+Fixture: one `chunks` row per distinct referenced hash (refcount 1,
+`uploaded_at` set, `last_referenced_at` NULL), plus a 10 %
+unreferenced population — 90 % of it old and untouched (the expected
+victims), 5 % younger than grace, 5 % old but freshly touched via
+`last_referenced_at` — so the grace term and the migration-068 touch
+column both do real filtering work and the victim volume is a
+deliberately generous bound on one cycle's garbage (a store turning
+over a tenth of its references between collect cycles). Same hardware,
+PostgreSQL, `work_mem`, and synthetic mix as the mark records; collect
+batch LIMIT 10,000. Raw figures are in the introducing commit message
+and the run transcripts; the verdict-relevant magnitudes:
+
+| paths | mark | prepare | collect (victims) | combined |
+|---|---|---|---|---|
+| 15 k | 1.6 s | 0.5 s | 4.1 s (136 k) | 6.3 s |
+| 150 k | 18.5 s | 4.3 s | 35.3 s (1.26 M) | 58.1 s |
+| 1.5 M | 3 min 24 s | 51 s | 7 min 40 s (12.4 M, 1,243 batches) | 11 min 54 s |
+
+**Verdict against the amended budget (the five-minute-class lock-held
+window of §5b, graceful-growth qualification): exceeded.** The mark
+phase alone stays within the budget (3 min 24 s here, consistent with
+the adopted record); adding the prepare step and the collect pass —
+every existing chunk row probed once against the mark product plus the
+soft-delete writes for the victim volume — brings the lock-held window
+for a full cycle to ~12 minutes at the design point, ~2.4× the
+five-minute-class budget, growing ~1.0–1.3× per decade on top of the
+mark's own growth (combined 6.3 s → 58.1 s → 714 s across the three
+points). Per the plan's T-1a.1b step 4 and the rollback-story abort
+criterion, this routes to an explicit adjudication by the campaign
+owner — an accepted cadence/lock-budget relaxation recorded here, or a
+further design re-entry — and Wave A2 does not start until that
+adjudication is recorded. Scan/collect duration does not enter the
+collect-soundness condition (§4.1), so the breach is a cost/cadence
+question, not a correctness one; the candidate levers the §5b record
+already names (backstop-only cadence, parallel-query headroom —
+`workers_planned = 0` throughout these runs too) apply to the combined
+cycle as much as to the mark.
+
+**EXPLAIN plan-shape guard (gate (b)) extended to the anti-join.** The
+bench now asserts, at and above the 150 k scale point, that the
+expansion plan keeps its set-based aggregate over the server-side
+expansion and that the per-batch candidate scan is index-driven on
+both sides (`chunks_pkey` and the `live_chunks` index; no Seq Scan of
+either relation, no Sort) — the plan regression that would silently
+reproduce the NO-GO cost class now fails the bench instead of
+shipping. The measured candidate-scan shape at the enforced scale
+points is a Merge Anti Join over the two indexes with the keyset bound
+on both sides; `workers_planned = 0` throughout, so the parallel-query
+headroom noted in the mark record remains unexploited here too.
+
+Caveats carried forward: same dev-box hardware as the mark records
+(tmpfs-backed PostgreSQL, fsync off, EPYC clocks), so absolute times
+are a lower bound on production cost; the victim-write term scales
+with the unreferenced ratio (10 % here — a generous steady-state
+bound), while the scan term (every existing chunk row probed against
+the mark set once) is fixed by store size; the prepare term is paid
+once per cycle and could be folded into the expansion statement later
+without changing the architecture.

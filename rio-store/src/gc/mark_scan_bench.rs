@@ -21,6 +21,18 @@
 //!   followed by one `CREATE TEMP TABLE live_chunks AS SELECT DISTINCT
 //!   <hash slice>` that expands every `chunk_list` inside the server
 //!   (`generate_series` + `substring` over a once-per-row detoasted copy).
+//! - `mark_scan_bench_collect_phase` — the design §5b re-entry gate (c)
+//!   measurement: seeds a `chunks` table to match the manifest fixture
+//!   (one row per distinct referenced hash, plus an unreferenced
+//!   would-collect population — see [`UNREF_PER_MILLE_OF_LIVE`]), then runs
+//!   the full collect cycle the adopted design prescribes — server-side
+//!   mark, a one-time unique index + ANALYZE on the mark product, and the
+//!   batched soft-delete anti-join (`NOT EXISTS` against `live_chunks`,
+//!   `GREATEST(created_at, last_referenced_at)` grace term, keyset cursor +
+//!   LIMIT batches, loop-until-short, one statement per batch) — timing
+//!   mark, prepare, and collect separately plus combined. Also carries the
+//!   EXPLAIN plan-shape guard (re-entry gate (b)) over the expansion and
+//!   the per-batch anti-join statement.
 //!
 //! Each test reports wall-clock (per phase and total), rows scanned,
 //! references parsed/expanded, mark-set size (distinct hashes), table sizes,
@@ -44,9 +56,12 @@
 //! - `MARK_SCAN_BENCH_SEED_WORKERS` — parallel seeding tasks (default 12; seeding only — the
 //!   mark scan itself is always one connection, like the collector)
 //! - `MARK_SCAN_BENCH_WORK_MEM`     — session `work_mem` for the set-based formulations
-//!   (default 4GB; bounds the dedup aggregate, which spills to temp files past it)
+//!   (default 4GB; bounds the dedup aggregate, which spills to temp files past it; also used
+//!   as `maintenance_work_mem` for the collect bench's one-time `live_chunks` index build)
 //! - `MARK_SCAN_BENCH_COPY_ROWS`    — references per `COPY` statement in the copy+GROUP BY
 //!   formulation (default 1,000,000)
+//! - `MARK_SCAN_BENCH_COLLECT_BATCH` — per-batch LIMIT for the collect-phase soft-delete loop
+//!   (default 10,000)
 //!
 //! At or below 20 k paths the alternative formulations also run the
 //! prescribed shape on the same fixture and assert both produce a mark set
@@ -663,6 +678,28 @@ const SERVER_MARK_SQL: &str = "CREATE TEMP TABLE live_chunks AS \
        CROSS JOIN LATERAL \
          generate_series(1, d.n) AS g(i)";
 
+/// The fail-closed validation pass over every joined `chunk_list`,
+/// shared by the server-side mark formulation and the collect-phase
+/// bench. Manifest format invariants enforced server-side: a corrupt
+/// chunk_list must abort the cycle, never read as "references
+/// nothing". 36 = the serialized entry size (32-byte BLAKE3 + u32 LE
+/// size), \x01 = the format version byte; both fixed by
+/// rio_store::manifest. The version probe uses substring (empty on an
+/// empty blob) rather than get_byte so a zero-length blob is reported
+/// as malformed instead of erroring mid-scan.
+fn server_validate_sql() -> String {
+    format!(
+        "SELECT COUNT(*) \
+           FROM manifest_data md \
+           JOIN manifests m USING (store_path_hash) \
+          WHERE octet_length(md.chunk_list) < 1 \
+             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
+             OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
+             OR (octet_length(md.chunk_list) - 1) / 36 > {}",
+        crate::manifest::MAX_CHUNKS
+    )
+}
+
 /// Candidate "server-side expansion": no client round-trip — a
 /// fail-closed validation pass over the joined manifests (version byte,
 /// 36-byte entry alignment, `MAX_CHUNKS` bound; any violation aborts,
@@ -688,23 +725,8 @@ async fn run_mark_scan_server_side(
         .expect("set work_mem");
     let spill_before = db_temp_bytes(&mut conn).await;
 
-    // Manifest format invariants enforced server-side, fail-closed: a
-    // corrupt chunk_list must abort the cycle, never read as "references
-    // nothing". 36 = the serialized entry size (32-byte BLAKE3 + u32 LE
-    // size), \x01 = the format version byte; both fixed by
-    // rio_store::manifest. The version probe uses substring (empty on an
-    // empty blob) rather than get_byte so a zero-length blob is reported
-    // as malformed instead of erroring mid-scan.
-    let validate_sql = format!(
-        "SELECT COUNT(*) \
-           FROM manifest_data md \
-           JOIN manifests m USING (store_path_hash) \
-          WHERE octet_length(md.chunk_list) < 1 \
-             OR substring(md.chunk_list FROM 1 FOR 1) <> '\\x01'::bytea \
-             OR (octet_length(md.chunk_list) - 1) % 36 <> 0 \
-             OR (octet_length(md.chunk_list) - 1) / 36 > {}",
-        crate::manifest::MAX_CHUNKS
-    );
+    // Fail-closed validation pass; see server_validate_sql.
+    let validate_sql = server_validate_sql();
 
     let plan = explain_lines(&mut conn, SERVER_MARK_SQL).await;
     if print_plan {
@@ -965,4 +987,554 @@ async fn mark_scan_bench_server_side() {
             "both formulations derive the same live-set cardinality"
         );
     }
+}
+
+// ===========================================================================
+// Collect-phase measurement (design §5b re-entry gate (c))
+// ===========================================================================
+
+/// Unreferenced (would-collect) chunk rows seeded per 1000 live rows:
+/// 100 ⇒ 10 % of the mark set. Rationale: in steady state the
+/// would-collect population of one cycle is the garbage produced since
+/// the previous cycle (path deletions plus crashed uploads); 10 % of
+/// the live set models a store turning over a tenth of its references
+/// between cycles — generous enough that the soft-delete UPDATE volume
+/// is clearly visible in the measurement, small enough that the scan
+/// side (every existing chunk row probed against the mark set once)
+/// stays the dominant term, as it will be in production.
+const UNREF_PER_MILLE_OF_LIVE: i64 = 100;
+
+/// Of the unreferenced population, one part in this divisor is seeded
+/// younger than grace (created_at at the fixture's end) and another
+/// part carries a fresh `last_referenced_at` touch on an old
+/// created_at — 5 % each. Both sub-populations MUST survive the
+/// collect, so the grace term and the GREATEST branch over the 068
+/// touch column are exercised non-vacuously; the remaining 90 % is the
+/// expected collect victim set. The protected rows are inserted LAST,
+/// with their timestamps anchored at that moment, because the bulk
+/// fixture inserts take minutes at the design-point scale — anchoring
+/// them earlier would silently age them past grace before the cycle
+/// snapshot is taken.
+const UNREF_PROTECTED_DIVISOR: i64 = 20;
+
+/// Default LIMIT per collect batch (`MARK_SCAN_BENCH_COLLECT_BATCH`
+/// overrides). Large enough to amortize per-statement overhead over a
+/// ~12 M-victim run, small enough that one batch's row locks and undo
+/// stay bounded (the production arm batches for the same reason the
+/// orphan-chunk sweep does).
+const COLLECT_BATCH_DEFAULT: u64 = 10_000;
+
+/// Below this fixture scale the EXPLAIN plan-shape guard only prints
+/// (small tables legitimately plan differently); at or above it the
+/// guard asserts. The 150 k and 1.5 M measurement points both enforce.
+const PLAN_SHAPE_ENFORCE_MIN_PATHS: u64 = 100_000;
+
+/// One collect batch's candidate scan: the next `LIMIT` unmarked
+/// chunks past grace, in `blake3_hash` order, resuming from a keyset
+/// cursor ($1). This is the design §4.1 step-3 predicate (anti-join
+/// against the mark product, `GREATEST(created_at, last_referenced_at)`
+/// against the cycle snapshot) in the orphan-chunk-sweep skeleton the
+/// design names (candidate SELECT, then a sorted `= ANY` soft-delete in
+/// the same per-batch transaction — [`COLLECT_BATCH_UPDATE_SQL`]). The
+/// keyset cursor is the bench's one addition over the as-written
+/// skeleton: without it every batch re-probes all marked rows that
+/// precede its candidates (quadratic in batch count at the design-point
+/// scale); the cursor also bounds the anti-join's inner side so each
+/// index is walked once across the whole loop. The live arm is expected
+/// to adopt the same cursor; the EXPLAIN guard pins this statement's
+/// shape (re-entry gate (b)).
+const COLLECT_BATCH_SELECT_SQL: &str = "SELECT c.blake3_hash FROM chunks c \
+     WHERE c.blake3_hash > $1 \
+       AND c.deleted = FALSE \
+       AND NOT EXISTS (SELECT 1 FROM live_chunks lc \
+                        WHERE lc.blake3_hash = c.blake3_hash AND lc.blake3_hash > $1) \
+       AND GREATEST(c.created_at, c.last_referenced_at) < $2::timestamptz \
+     ORDER BY c.blake3_hash \
+     LIMIT $3";
+
+/// One collect batch's soft-delete: the `sweep_orphan_batch` UPDATE
+/// with the predicate swapped (the candidates already passed the
+/// anti-join + grace scan; the `deleted = FALSE` conjunct is the same
+/// re-check-at-execution-time the orphan sweep carries). The bind is
+/// the candidate scan's result, which is already in ascending hash
+/// order — the `r[store.chunk.lock-order]` discipline for `= ANY`
+/// writers.
+const COLLECT_BATCH_UPDATE_SQL: &str = "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL \
+     WHERE blake3_hash = ANY($1) AND deleted = FALSE \
+     RETURNING blake3_hash, size";
+
+/// The candidate-scan statement with literals spliced in place of the
+/// bind parameters, for `EXPLAIN` only (EXPLAIN cannot carry binds and
+/// a generic plan would not reflect the custom plan the loop gets).
+fn collect_batch_explain_sql(cutoff: &str, batch_limit: i64) -> String {
+    COLLECT_BATCH_SELECT_SQL
+        .replace("$1", "'\\x'::bytea")
+        .replace("$2::timestamptz", &format!("'{cutoff}'::timestamptz"))
+        .replace("$3", &batch_limit.to_string())
+}
+
+/// Structural EXPLAIN plan-shape check (design §5b gate (b)): every
+/// `required` substring must appear in the plan and no `forbidden`
+/// substring may. Prints a note instead of panicking when `enforce` is
+/// false (small fixtures plan differently and are not the guarded
+/// regime).
+fn check_plan_shape(
+    name: &str,
+    lines: &[String],
+    required: &[&str],
+    forbidden: &[&str],
+    enforce: bool,
+) {
+    let text = lines.join("\n");
+    let mut violations: Vec<String> = Vec::new();
+    for r in required {
+        if !text.contains(r) {
+            violations.push(format!("missing required plan node {r:?}"));
+        }
+    }
+    for f in forbidden {
+        if text.contains(f) {
+            violations.push(format!("contains forbidden plan node {f:?}"));
+        }
+    }
+    if violations.is_empty() {
+        println!("mark_scan_bench plan-shape[{name}]: OK");
+        return;
+    }
+    let report = format!(
+        "plan-shape guard [{name}]: {}\nplan:\n{text}",
+        violations.join("; ")
+    );
+    assert!(!enforce, "{report}");
+    println!("mark_scan_bench plan-shape[{name}] (not enforced at this scale): {report}");
+}
+
+/// What `seed_chunks_fixture` produced (fixture setup, never measured).
+struct ChunkFixtureStats {
+    live_rows: i64,
+    unref_rows: i64,
+    expected_collectable: i64,
+    grace_protected: i64,
+    touch_protected: i64,
+    chunks_table_bytes: i64,
+    seed_secs: f64,
+}
+
+/// Seed the `chunks` table to match the manifest fixture: one row per
+/// distinct referenced hash (refcount 1, week-old created_at and
+/// uploaded_at, `last_referenced_at` NULL — the column's steady state
+/// for rows never re-referenced since insert), plus the unreferenced
+/// would-collect population per [`UNREF_PER_MILLE_OF_LIVE`] /
+/// [`UNREF_PROTECTED_DIVISOR`]. The referenced set is derived by the
+/// same server-side expansion the mark statement uses (its SELECT body
+/// is re-used verbatim) so the fixture cannot drift from the measured
+/// statement; rows are inserted in hash order so the PK btree builds
+/// by rightmost-page appends instead of random descent.
+async fn seed_chunks_fixture(pool: &PgPool, work_mem: &str) -> ChunkFixtureStats {
+    let mut conn = pool.acquire().await.expect("acquire chunk-seed connection");
+    // AssertSqlSafe: SET can't take bind parameters; the value is
+    // alphanumeric-guarded by env_work_mem. Test-only.
+    sqlx::query(sqlx::AssertSqlSafe(format!("SET work_mem = '{work_mem}'")))
+        .execute(&mut *conn)
+        .await
+        .expect("set work_mem");
+
+    let started = Instant::now();
+    let select_body = SERVER_MARK_SQL
+        .strip_prefix("CREATE TEMP TABLE live_chunks AS ")
+        .expect("SERVER_MARK_SQL starts with the CTAS prefix");
+    // AssertSqlSafe: splices only this module's fixed statement body.
+    let insert_live = format!(
+        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
+         SELECT s.blake3_hash, 1, 65536, now() - interval '7 days', \
+                now() - interval '7 days', FALSE \
+           FROM ({select_body}) AS s \
+          ORDER BY s.blake3_hash"
+    );
+    sqlx::query(sqlx::AssertSqlSafe(insert_live))
+        .execute(&mut *conn)
+        .await
+        .expect("seed referenced chunks");
+    let live_rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chunks")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("live chunk count");
+
+    // Unreferenced population: deterministic md5-derived 32-byte hashes
+    // (domain-separated from the splitmix-derived manifest hashes), 90 %
+    // old + untouched (the expected victims), 5 % younger than grace,
+    // 5 % old but freshly touched via last_referenced_at. The
+    // collectable bulk goes in first; the two protected sub-populations
+    // go in LAST with their timestamps anchored at that moment — see
+    // UNREF_PROTECTED_DIVISOR.
+    let unref_rows = (live_rows * UNREF_PER_MILLE_OF_LIVE / 1000).max(20);
+    let grace_protected = unref_rows / UNREF_PROTECTED_DIVISOR;
+    let touch_protected = unref_rows / UNREF_PROTECTED_DIVISOR;
+    let collectable = unref_rows - grace_protected - touch_protected;
+    sqlx::query(
+        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
+         SELECT decode(md5('unref-' || g.i) || md5('unref-tail-' || g.i), 'hex'), 0, 65536, \
+                now() - interval '7 days', NULL, FALSE \
+           FROM generate_series(1, $1::bigint) AS g(i) \
+          ORDER BY 1",
+    )
+    .bind(collectable)
+    .execute(&mut *conn)
+    .await
+    .expect("seed collectable unreferenced chunks");
+
+    sqlx::query("ANALYZE chunks")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze chunks");
+    let chunks_table_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('chunks')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("chunks table size");
+
+    // Protected sub-populations, inserted last so their "recent"
+    // timestamps really are recent relative to the cycle snapshot the
+    // measured phase takes a few statements from now.
+    sqlx::query(
+        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted) \
+         SELECT decode(md5('unref-grace-' || g.i) || md5('unref-grace-tail-' || g.i), 'hex'), \
+                0, 65536, now(), NULL, FALSE \
+           FROM generate_series(1, $1::bigint) AS g(i) \
+          ORDER BY 1",
+    )
+    .bind(grace_protected)
+    .execute(&mut *conn)
+    .await
+    .expect("seed grace-protected chunks");
+    sqlx::query(
+        "INSERT INTO chunks (blake3_hash, refcount, size, created_at, uploaded_at, deleted, \
+                             last_referenced_at) \
+         SELECT decode(md5('unref-touch-' || g.i) || md5('unref-touch-tail-' || g.i), 'hex'), \
+                0, 65536, now() - interval '7 days', NULL, FALSE, now() \
+           FROM generate_series(1, $1::bigint) AS g(i) \
+          ORDER BY 1",
+    )
+    .bind(touch_protected)
+    .execute(&mut *conn)
+    .await
+    .expect("seed touch-protected chunks");
+    let seed_secs = started.elapsed().as_secs_f64();
+
+    ChunkFixtureStats {
+        live_rows,
+        unref_rows,
+        expected_collectable: collectable,
+        grace_protected,
+        touch_protected,
+        chunks_table_bytes,
+        seed_secs,
+    }
+}
+
+/// Outcome of one collect-phase run. `combined` is mark + prepare +
+/// collect — the lock-held window the §5b gate-(c) verdict is judged
+/// against; bookkeeping between the phases (sample probes, EXPLAIN,
+/// counts) is excluded.
+struct CollectPhaseStats {
+    mark_validate: std::time::Duration,
+    mark_expand: std::time::Duration,
+    prepare: std::time::Duration,
+    collect: std::time::Duration,
+    combined: std::time::Duration,
+    batches: u64,
+    rows_collected: u64,
+    mark_set_size: i64,
+    live_table_bytes: i64,
+    spill_delta_bytes: i64,
+    expand_plan_summary: String,
+    collect_plan_summary: String,
+}
+
+/// The full collect cycle as the adopted design prescribes it, on one
+/// connection: fail-closed validation pass, server-side set-based
+/// expansion into `live_chunks`, a one-time unique index + ANALYZE on
+/// the mark product (what makes the per-batch anti-join an index probe
+/// instead of a per-batch hash/sort of the whole mark set), then the
+/// batched keyset soft-delete loop.
+async fn run_collect_phase(
+    pool: &PgPool,
+    work_mem: &str,
+    batch_limit: u64,
+    sample: &[[u8; 32]],
+    enforce_plan_shape: bool,
+) -> CollectPhaseStats {
+    let mut conn = pool.acquire().await.expect("acquire collect connection");
+    // AssertSqlSafe: SET can't take bind parameters; the value is
+    // alphanumeric-guarded by env_work_mem. Test-only. work_mem bounds
+    // the expansion's dedup; maintenance_work_mem bounds the one-time
+    // index build's sort.
+    sqlx::query(sqlx::AssertSqlSafe(format!("SET work_mem = '{work_mem}'")))
+        .execute(&mut *conn)
+        .await
+        .expect("set work_mem");
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET maintenance_work_mem = '{work_mem}'"
+    )))
+    .execute(&mut *conn)
+    .await
+    .expect("set maintenance_work_mem");
+    let spill_before = db_temp_bytes(&mut conn).await;
+
+    // Cycle snapshot: the grace cutoff is anchored at cycle start (the
+    // production predicate compares against cycle_started_at − grace,
+    // never against a per-batch now()). Same bigint bind pattern for
+    // make_interval as orphan.rs / sweep.rs.
+    let cutoff: String = sqlx::query_scalar("SELECT (now() - make_interval(secs => $1))::text")
+        .bind(super::sweep::CHUNK_GRACE_SECS)
+        .fetch_one(&mut *conn)
+        .await
+        .expect("grace cutoff");
+
+    // Plans are captured before execution (EXPLAIN of the CTAS must run
+    // while live_chunks does not exist yet); untimed.
+    let expand_plan = explain_lines(&mut conn, SERVER_MARK_SQL).await;
+    for line in &expand_plan {
+        println!("mark_scan_bench[collect_phase] expand plan| {line}");
+    }
+    check_plan_shape(
+        "mark-expansion",
+        &expand_plan,
+        &["generate_series"],
+        &[],
+        enforce_plan_shape,
+    );
+    assert!(
+        expand_plan
+            .iter()
+            .any(|l| l.contains("HashAggregate") || l.contains("Unique") || l.contains("Group")),
+        "mark expansion must deduplicate set-based (HashAggregate/Unique), got:\n{}",
+        expand_plan.join("\n")
+    );
+
+    // ---- Mark (timed) ----
+    let t0 = Instant::now();
+    let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(server_validate_sql()))
+        .fetch_one(&mut *conn)
+        .await
+        .expect("validation pass");
+    assert_eq!(
+        malformed, 0,
+        "fail-closed: the fixture seeds only well-formed manifests"
+    );
+    let t1 = Instant::now();
+    sqlx::query(SERVER_MARK_SQL)
+        .execute(&mut *conn)
+        .await
+        .expect("server-side mark");
+    let t2 = Instant::now();
+
+    // Untimed bookkeeping between phases.
+    assert_sample_marked(&mut conn, sample).await;
+    let mark_set_size: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("mark set count");
+    let live_table_bytes: i64 = sqlx::query_scalar("SELECT pg_total_relation_size('live_chunks')")
+        .fetch_one(&mut *conn)
+        .await
+        .expect("live_chunks size");
+
+    // ---- Prepare (timed): index + stats on the mark product ----
+    let t3 = Instant::now();
+    sqlx::query("CREATE UNIQUE INDEX live_chunks_hash_idx ON live_chunks (blake3_hash)")
+        .execute(&mut *conn)
+        .await
+        .expect("index live_chunks");
+    sqlx::query("ANALYZE live_chunks")
+        .execute(&mut *conn)
+        .await
+        .expect("analyze live_chunks");
+    let t4 = Instant::now();
+
+    // Per-batch plan, captured against the pristine pre-collect state
+    // the first batches will see; untimed.
+    let collect_plan = explain_lines(
+        &mut conn,
+        &collect_batch_explain_sql(&cutoff, batch_limit as i64),
+    )
+    .await;
+    for line in &collect_plan {
+        println!("mark_scan_bench[collect_phase] collect plan| {line}");
+    }
+    check_plan_shape(
+        "collect-anti-join",
+        &collect_plan,
+        &["chunks_pkey", "live_chunks_hash_idx"],
+        &["Seq Scan on live_chunks", "Seq Scan on chunks", "Sort"],
+        enforce_plan_shape,
+    );
+
+    // ---- Collect (timed): keyset-batched soft-delete loop ----
+    // Per batch, one transaction: candidate scan (already hash-ordered
+    // by the keyset SELECT), then the sorted `= ANY` soft-delete — the
+    // sweep_orphan_batch shape with the predicate swapped. The loop
+    // ends on the first short candidate scan.
+    let t5 = Instant::now();
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut batches = 0u64;
+    let mut rows_collected = 0u64;
+    loop {
+        let mut tx = sqlx::Connection::begin(&mut *conn)
+            .await
+            .expect("begin collect batch tx");
+        let candidates: Vec<Vec<u8>> = sqlx::query_scalar(COLLECT_BATCH_SELECT_SQL)
+            .bind(&cursor)
+            .bind(&cutoff)
+            .bind(batch_limit as i64)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("collect candidate scan");
+        if candidates.is_empty() {
+            tx.commit().await.expect("commit empty collect batch");
+            break;
+        }
+        batches += 1;
+        let rows: Vec<(Vec<u8>, i64)> = sqlx::query_as(COLLECT_BATCH_UPDATE_SQL)
+            .bind(&candidates)
+            .fetch_all(&mut *tx)
+            .await
+            .expect("collect soft-delete batch");
+        rows_collected += rows.len() as u64;
+        tx.commit().await.expect("commit collect batch");
+        if candidates.len() < batch_limit as usize {
+            break;
+        }
+        cursor = candidates
+            .last()
+            .expect("full batch has a last hash")
+            .clone();
+    }
+    let t6 = Instant::now();
+
+    let spill_delta_bytes = db_temp_bytes(&mut conn).await - spill_before;
+    sqlx::query("DROP TABLE live_chunks")
+        .execute(&mut *conn)
+        .await
+        .expect("drop temp table");
+
+    CollectPhaseStats {
+        mark_validate: t1 - t0,
+        mark_expand: t2 - t1,
+        prepare: t4 - t3,
+        collect: t6 - t5,
+        combined: (t2 - t0) + (t4 - t3) + (t6 - t5),
+        batches,
+        rows_collected,
+        mark_set_size,
+        live_table_bytes,
+        spill_delta_bytes,
+        expand_plan_summary: summarize_plan(&expand_plan),
+        collect_plan_summary: summarize_plan(&collect_plan),
+    }
+}
+
+/// The collect-phase measurement (re-entry gate (c)). Smoke scale by
+/// default; see the module doc for the measurement-scale invocation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "collect-phase cost measurement: minutes-long at measurement scale, run explicitly"]
+async fn mark_scan_bench_collect_phase() {
+    let n_paths = env_u64("MARK_SCAN_BENCH_PATHS", 2_000);
+    let seed_workers = env_u64("MARK_SCAN_BENCH_SEED_WORKERS", 12).max(1);
+    let work_mem = env_work_mem();
+    let batch_limit = env_u64("MARK_SCAN_BENCH_COLLECT_BATCH", COLLECT_BATCH_DEFAULT).max(1);
+    let pool_size = (n_paths * 4).clamp(4_096, 8_000_000);
+
+    let db = rio_test_support::TestDb::new(&crate::MIGRATOR).await;
+    let seeded = seed_fixture(&db, n_paths, seed_workers, pool_size).await;
+    let sample = sample_hashes(pool_size);
+    let chunks_fixture = seed_chunks_fixture(&db.pool, &work_mem).await;
+
+    let stats = run_collect_phase(
+        &db.pool,
+        &work_mem,
+        batch_limit,
+        &sample,
+        n_paths >= PLAN_SHAPE_ENFORCE_MIN_PATHS,
+    )
+    .await;
+
+    println!(
+        "mark_scan_bench[collect_phase]: paths={n_paths} seed_workers={seed_workers} \
+         shared_pool={pool_size} work_mem={work_mem} batch_limit={batch_limit}\n\
+         mark_scan_bench[collect_phase]: seeded entries={} blob_bytes={} \
+         manifest_data_total_bytes={} seed_secs={:.1}\n\
+         mark_scan_bench[collect_phase]: CHUNKS live_rows={} unref_rows={} \
+         expected_collectable={} grace_protected={} touch_protected={} \
+         chunks_table_bytes={} chunk_seed_secs={:.1}\n\
+         mark_scan_bench[collect_phase]: MARK validate_secs={:.3} expand_secs={:.3} \
+         mark_set_size={} live_table_bytes={}\n\
+         mark_scan_bench[collect_phase]: PREPARE index_analyze_secs={:.3}\n\
+         mark_scan_bench[collect_phase]: COLLECT batches={} rows_soft_deleted={} \
+         collect_secs={:.3} spill_delta_bytes={}\n\
+         mark_scan_bench[collect_phase]: COMBINED mark+prepare+collect_secs={:.3}\n\
+         mark_scan_bench[collect_phase]: expand_plan={}\n\
+         mark_scan_bench[collect_phase]: collect_plan={}",
+        seeded.entries_seeded,
+        seeded.blob_bytes,
+        seeded.manifest_data_bytes,
+        seeded.seed_secs,
+        chunks_fixture.live_rows,
+        chunks_fixture.unref_rows,
+        chunks_fixture.expected_collectable,
+        chunks_fixture.grace_protected,
+        chunks_fixture.touch_protected,
+        chunks_fixture.chunks_table_bytes,
+        chunks_fixture.seed_secs,
+        stats.mark_validate.as_secs_f64(),
+        stats.mark_expand.as_secs_f64(),
+        stats.mark_set_size,
+        stats.live_table_bytes,
+        stats.prepare.as_secs_f64(),
+        stats.batches,
+        stats.rows_collected,
+        stats.collect.as_secs_f64(),
+        stats.spill_delta_bytes,
+        stats.combined.as_secs_f64(),
+        stats.expand_plan_summary,
+        stats.collect_plan_summary,
+    );
+
+    // Mark-side sanity (same as the mark-only formulations).
+    assert_eq!(
+        stats.mark_set_size, chunks_fixture.live_rows,
+        "the mark set and the seeded referenced population are the same set"
+    );
+
+    // Collect-side correctness: exactly the old, untouched, unreferenced
+    // population is soft-deleted; both protected sub-populations and
+    // every referenced row survive.
+    assert_eq!(
+        stats.rows_collected, chunks_fixture.expected_collectable as u64,
+        "collect soft-deletes exactly the old unreferenced population"
+    );
+    let (deleted_rows, surviving_rows): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(*) FILTER (WHERE deleted), COUNT(*) FILTER (WHERE NOT deleted) FROM chunks",
+    )
+    .fetch_one(&db.pool)
+    .await
+    .expect("post-collect chunk counts");
+    assert_eq!(
+        deleted_rows, chunks_fixture.expected_collectable,
+        "soft-deleted rows match the expected victim set"
+    );
+    assert_eq!(
+        surviving_rows,
+        chunks_fixture.live_rows + chunks_fixture.grace_protected + chunks_fixture.touch_protected,
+        "referenced, younger-than-grace, and freshly-touched rows all survive"
+    );
+    let sample_deleted: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM chunks WHERE deleted AND blake3_hash = ANY($1)")
+            .bind(sample.iter().map(|h| h.to_vec()).collect::<Vec<Vec<u8>>>())
+            .fetch_one(&db.pool)
+            .await
+            .expect("sample survival probe");
+    assert_eq!(
+        sample_deleted, 0,
+        "no chunk of the sampled known manifest is collected"
+    );
 }
