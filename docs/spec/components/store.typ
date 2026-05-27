@@ -800,7 +800,8 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   and never widens it. Out-of-scope digests MUST be answered exactly like
   absent digests (`NOT_FOUND` / a cleared presence bit --- no existence
   oracle); the deny reason is carried only by the
-  `rio_store_castore_scope_denied_total` / `would_deny` metrics and the
+  #(refs.metric)("rio_store_castore_scope_denied_total") /
+  #(refs.metric)("rio_store_castore_scope_would_deny_total") metrics and the
   structured deny log. Under enforce, a token with an empty
   `input_closure_digest` MUST be rejected with `PERMISSION_DENIED` (no
   tenant-wide fallback), and a scope that cannot be resolved on this replica
