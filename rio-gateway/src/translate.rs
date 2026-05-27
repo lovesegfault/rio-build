@@ -484,7 +484,7 @@ pub fn validate_dag(
         ));
     }
 
-    // r[impl gw.reject.unsupported-hash-algo+2]
+    // r[impl gw.reject.unsupported-hash-algo+3]
     // Outputs whose declared hash algorithm the builder cannot verify
     // are CLASSIFIED here and decided by the realization probe
     // (`reject_unrealized_fod_offenders`). For fixed-output derivations
@@ -560,7 +560,8 @@ pub fn validate_dag(
 /// (or built directly from an inline `BasicDerivation`). The
 /// submission-time decision for these nodes is made by
 /// [`reject_unrealized_fod_offenders`]: exempt iff every declared
-/// output path is already realized in the store.
+/// output path is already realized for the submitting tenant or
+/// substitutable from its upstreams.
 #[derive(Debug, Clone)]
 pub struct UnverifiableFodOffender {
     pub drv_path: String,
@@ -582,27 +583,35 @@ pub(crate) const MAX_FOD_EXEMPTION_PROBE_PATHS: usize = 1024;
 
 /// Decide the unverifiable-algo offenders collected by
 /// [`validate_dag`]: exempt a node iff every one of its declared
-/// output paths is already present in the store (it can never
-/// dispatch — the scheduler cache-cuts it), reject otherwise.
+/// output paths either is already present and visible to the
+/// submitting tenant (the scheduler cache-cuts it) or is
+/// substitutable from the tenant's configured upstreams (the
+/// scheduler's substitute lane completes it without dispatching);
+/// reject otherwise. This mirrors exactly the scheduler's no-dispatch
+/// predicate, evaluated with the same tenant identity.
 ///
 /// Fail-closed by construction: any offender with an empty or
 /// unparseable declared path (floating-CA with an unsupported algo has
 /// no path at all), an offender set larger than
-/// [`MAX_FOD_EXEMPTION_PROBE_PATHS`], a store error, or a probe
-/// timeout all reject the submission — the gate never exempts a node
-/// it cannot prove realized. The probe is a single anonymous
-/// `FindMissingPaths` (same timeout and anonymous-lookup rationale as
-/// [`filter_and_inline_drv`]'s): it gates a submission-shape decision,
-/// not tenant-scoped visibility.
+/// [`MAX_FOD_EXEMPTION_PROBE_PATHS`], an indeterminate probe answer
+/// (upstream 429/5xx/deadline), a store error, or a probe timeout all
+/// reject the submission — the gate never exempts a node it cannot
+/// prove will skip dispatch. The probe is a single bounded
+/// `FindMissingPaths` carrying the session tenant token (anonymous
+/// only in dual-mode, matching the scheduler's anonymous merge probe
+/// in that mode), so the answer is the same one the scheduler will
+/// act on at merge time.
 ///
 /// The exemption can go stale between this probe and dispatch (GC
-/// races): the node then dispatches and fails at the worker's
+/// races, or a substitute fetch that fails after a positive upstream
+/// probe): the node then dispatches and fails at the worker's
 /// fail-closed FOD gate — a node-level failure instead of a
 /// submission rejection, never an unverified build.
-// r[impl gw.reject.unsupported-hash-algo+2]
+// r[impl gw.reject.unsupported-hash-algo+3]
 pub(crate) async fn reject_unrealized_fod_offenders(
     offenders: &[UnverifiableFodOffender],
     store_client: &mut StoreServiceClient<Channel>,
+    jwt_token: Option<&str>,
 ) -> Result<(), String> {
     if offenders.is_empty() {
         return Ok(());
@@ -639,17 +648,40 @@ pub(crate) async fn reject_unrealized_fod_offenders(
         ));
     }
 
-    // no-jwt: anonymous lookup — gates a submission-shape decision
-    // (would this node dispatch at all?), not tenant-scoped visibility.
-    let missing: HashSet<String> = match tokio::time::timeout(
-        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-        store_client.find_missing_paths(types::FindMissingPathsRequest {
+    // The probe carries the session tenant token (gw.jwt.propagate):
+    // the exemption must be decided with the same tenant-scoped answer
+    // the scheduler's merge-time cache-cut and substitute lane will
+    // act on. In dual-mode (no JWT) nothing is attached and the store
+    // answers anonymously — matching the scheduler's anonymous merge
+    // probe in that mode.
+    let probe_req = crate::handler::with_jwt(
+        types::FindMissingPathsRequest {
             store_paths: probe_paths,
-        }),
+        },
+        jwt_token,
+    )
+    .map_err(|e| {
+        format!(
+            "cannot verify prior realization of derivations declaring unsupported \
+             outputHashAlgo values (probe construction failed: {e}) — {remediation}"
+        )
+    })?;
+    let (missing, substitutable): (HashSet<String>, HashSet<String>) = match tokio::time::timeout(
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(probe_req),
     )
     .await
     {
-        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+        Ok(Ok(r)) => {
+            let r = r.into_inner();
+            (
+                r.missing_paths.into_iter().collect(),
+                // indeterminate_paths are deliberately NOT collected as
+                // exemptable: neither confirmed-present nor confirmed-
+                // substitutable answers fail closed.
+                r.substitutable_paths.into_iter().collect(),
+            )
+        }
         Ok(Err(e)) => {
             return Err(format!(
                 "cannot verify prior realization of derivations declaring unsupported \
@@ -665,15 +697,20 @@ pub(crate) async fn reject_unrealized_fod_offenders(
     };
 
     for offender in offenders {
+        // Exempt iff every declared output is present-and-visible to
+        // the submitting tenant OR substitutable from its upstreams —
+        // i.e. the node will cache-cut or substitute, never dispatch.
+        // Plain-missing and indeterminate paths reject (fail-closed).
         if let Some(missing_path) = offender
             .declared_paths
             .iter()
-            .find(|p| missing.contains(*p))
+            .find(|p| missing.contains(*p) && !substitutable.contains(*p))
         {
             return Err(format!(
                 "derivation {} output '{}' declares unsupported outputHashAlgo '{}' and its \
-                 declared output {} is not already realized in the store — the build could \
-                 only fail after burning a pod; {remediation}",
+                 declared output {} is not already realized in the store for this tenant (nor \
+                 substitutable from its configured upstreams) — the build could only fail \
+                 after burning a pod; {remediation}",
                 offender.drv_path, offender.output_name, offender.algo, missing_path
             ));
         }
@@ -681,7 +718,7 @@ pub(crate) async fn reject_unrealized_fod_offenders(
             drv_path = %offender.drv_path,
             algo = %offender.algo,
             "exempting unverifiable-outputHashAlgo derivation: all declared outputs already \
-             realized (node will cache-cut, never dispatch)"
+             realized or substitutable (node will cache-cut or substitute, never dispatch)"
         );
     }
 
@@ -1926,7 +1963,7 @@ mod tests {
     /// algorithms (sha256, r:sha512) pass in both shapes with no
     /// offenders, and input-addressed outputs (no hash, no algo) are
     /// never classified.
-    // r[verify gw.reject.unsupported-hash-algo+2]
+    // r[verify gw.reject.unsupported-hash-algo+3]
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
         let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
@@ -2183,7 +2220,7 @@ mod tests {
 
     /// The realization probe: offenders are exempt iff every declared
     /// output is already present; everything uncertain rejects.
-    // r[verify gw.reject.unsupported-hash-algo+2]
+    // r[verify gw.reject.unsupported-hash-algo+3]
     #[tokio::test]
     async fn reject_unrealized_fod_offenders_decides_by_realization() -> anyhow::Result<()> {
         use rio_test_support::grpc::spawn_mock_store_with_client;
@@ -2215,7 +2252,7 @@ mod tests {
         );
 
         // No offenders → Ok without any store RPC.
-        reject_unrealized_fod_offenders(&[], &mut store_client)
+        reject_unrealized_fod_offenders(&[], &mut store_client, None)
             .await
             .expect("empty offender set is a no-op");
         assert_eq!(
@@ -2228,13 +2265,13 @@ mod tests {
         );
 
         // All declared outputs realized → exempt.
-        reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client)
+        reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client, None)
             .await
             .expect("realized offender is exempt");
 
         // Any declared output missing → rejected, naming the algo and
         // the remediation.
-        let err = reject_unrealized_fod_offenders(&[offender(&[missing])], &mut store_client)
+        let err = reject_unrealized_fod_offenders(&[offender(&[missing])], &mut store_client, None)
             .await
             .unwrap_err();
         assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
@@ -2248,6 +2285,7 @@ mod tests {
         let err = reject_unrealized_fod_offenders(
             &[offender(&[realized]), offender(&[missing])],
             &mut store_client,
+            None,
         )
         .await
         .unwrap_err();
@@ -2259,7 +2297,7 @@ mod tests {
             .calls
             .find_missing_calls
             .load(std::sync::atomic::Ordering::SeqCst);
-        let err = reject_unrealized_fod_offenders(&[offender(&[""])], &mut store_client)
+        let err = reject_unrealized_fod_offenders(&[offender(&[""])], &mut store_client, None)
             .await
             .unwrap_err();
         assert!(err.contains("cannot be checked"), "{err}");
@@ -2276,19 +2314,84 @@ mod tests {
         let many: Vec<UnverifiableFodOffender> = (0..(MAX_FOD_EXEMPTION_PROBE_PATHS + 1))
             .map(|_| offender(&[realized]))
             .collect();
-        let err = reject_unrealized_fod_offenders(&many, &mut store_client)
+        let err = reject_unrealized_fod_offenders(&many, &mut store_client, None)
             .await
             .unwrap_err();
         assert!(err.contains("probe cap"), "{err}");
+
+        // Declared output missing but substitutable from the tenant's
+        // upstreams → exempt (the scheduler's substitute lane completes
+        // it without dispatching).
+        let substitutable_path = "/nix/store/ssssssssssssssssssssssssssssssss-legacy-out";
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(substitutable_path.to_string());
+        reject_unrealized_fod_offenders(
+            &[offender(&[substitutable_path])],
+            &mut store_client,
+            None,
+        )
+        .await
+        .expect("substitutable offender is exempt");
+
+        // Missing and INDETERMINATE (upstream probe failed) → fail-closed
+        // rejection, even though it is also seeded substitutable.
+        let indeterminate_path = "/nix/store/iiiiiiiiiiiiiiiiiiiiiiiiiiiiiiii-legacy-out";
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(indeterminate_path.to_string());
+        store
+            .state
+            .indeterminate
+            .write()
+            .unwrap()
+            .push(indeterminate_path.to_string());
+        let err = reject_unrealized_fod_offenders(
+            &[offender(&[indeterminate_path])],
+            &mut store_client,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("not already realized"), "{err}");
+
+        // The probe carries the session tenant token when one exists,
+        // and stays anonymous (None) in dual-mode.
+        reject_unrealized_fod_offenders(
+            &[offender(&[realized])],
+            &mut store_client,
+            Some("tok-fod-probe"),
+        )
+        .await
+        .expect("realized offender exempt with a token too");
+        {
+            let meta = store.calls.find_missing_metadata.read().unwrap();
+            assert_eq!(
+                meta.last().unwrap().as_deref(),
+                Some("tok-fod-probe"),
+                "tenant token forwarded on the probe"
+            );
+            assert!(
+                meta.iter().rev().nth(1).unwrap().is_none(),
+                "dual-mode probes stay anonymous"
+            );
+        }
 
         // Store error → fail-closed rejection.
         store
             .faults
             .fail_find_missing
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let err = reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client)
-            .await
-            .unwrap_err();
+        let err =
+            reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client, None)
+                .await
+                .unwrap_err();
         assert!(err.contains("store error"), "{err}");
 
         Ok(())

@@ -1216,7 +1216,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
-    // r[impl gw.reject.unsupported-hash-algo+2]
+    // r[impl gw.reject.unsupported-hash-algo+3]
     // Same treatment for unverifiable hash algorithms as validate_dag
     // applies to the cached DAG: the builder's FOD hash gate and
     // floating-CA finalization are both fail-closed, so an
@@ -1260,6 +1260,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         if let Err(reason) = translate::reject_unrealized_fod_offenders(
             std::slice::from_ref(&offender),
             store_client,
+            jwt.token(),
         )
         .await
         {
@@ -1435,12 +1436,13 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             return Ok(());
         }
     };
-    // r[impl gw.reject.unsupported-hash-algo+2]
+    // r[impl gw.reject.unsupported-hash-algo+3]
     // Unverifiable-algo offenders are exempt only when every declared
     // output is already realized (the node cache-cuts and never
     // dispatches); otherwise the submission is rejected fail-closed,
     // with the same delivery as a validate_dag rejection.
-    if let Err(reason) = translate::reject_unrealized_fod_offenders(&offenders, store_client).await
+    if let Err(reason) =
+        translate::reject_unrealized_fod_offenders(&offenders, store_client, jwt.token()).await
     {
         warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
@@ -1958,10 +1960,11 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
             return Ok(DagSubmitOutcome::Rejected(reason));
         }
     };
-    // r[impl gw.reject.unsupported-hash-algo+2]
+    // r[impl gw.reject.unsupported-hash-algo+3]
     // Unverifiable-algo offenders: exempt only when already realized
     // (single bounded FindMissingPaths probe, fail-closed).
-    if let Err(reason) = translate::reject_unrealized_fod_offenders(&offenders, store_client).await
+    if let Err(reason) =
+        translate::reject_unrealized_fod_offenders(&offenders, store_client, jwt.token()).await
     {
         warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         return Ok(DagSubmitOutcome::Rejected(reason));

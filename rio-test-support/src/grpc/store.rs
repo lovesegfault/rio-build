@@ -109,6 +109,11 @@ pub struct MockStoreCalls {
     /// (`None` = absent). For `r[gw.jwt.propagate]` — floating-CA
     /// output resolution in `wopBuildPathsWithResults`.
     pub query_realisation_metadata: Arc<RwLock<Vec<Option<String>>>>,
+    /// `x-rio-tenant-token` value on each FindMissingPaths call
+    /// (`None` = absent). For the gateway's tenant-scoped
+    /// unverifiable-algo exemption probe
+    /// (`r[gw.reject.unsupported-hash-algo]`).
+    pub find_missing_metadata: Arc<RwLock<Vec<Option<String>>>>,
 }
 
 /// Fault injection knobs. All default to "no fault"; tests flip them
@@ -845,6 +850,13 @@ impl StoreService for MockStore {
         request: Request<types::FindMissingPathsRequest>,
     ) -> Result<Response<types::FindMissingPathsResponse>, Status> {
         self.calls.find_missing_calls.fetch_add(1, Ordering::SeqCst);
+        self.calls.find_missing_metadata.write().unwrap().push(
+            request
+                .metadata()
+                .get(rio_proto::TENANT_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        );
         if self.faults.fail_find_missing.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected find_missing failure"));
         }

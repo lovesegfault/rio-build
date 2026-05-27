@@ -5,7 +5,7 @@
 // r[verify gw.dag.reconstruct+3]
 // r[verify gw.hook.single-node-dag+2]
 // r[verify gw.reject.output-path-mismatch]
-// r[verify gw.reject.unsupported-hash-algo+2]
+// r[verify gw.reject.unsupported-hash-algo+3]
 // r[verify gw.hook.ifd-detection+3]
 // r[verify gw.hook.inline-drv-content+2]
 // r[verify gw.stderr.activity+2]
@@ -1209,7 +1209,7 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
 /// outputHashAlgo the builder cannot verify (md5) is rejected at the
 /// gateway's inline check, before resolve/SubmitBuild — same rule the
 /// cached-DAG algo gate enforces — when the declared output is NOT already
-/// realized in the store. r[verify gw.reject.unsupported-hash-algo+2]
+/// realized in the store. r[verify gw.reject.unsupported-hash-algo+3]
 #[tokio::test]
 async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1255,7 +1255,7 @@ async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result
 /// wopBuildDerivation (36): the same inline md5 FOD is ACCEPTED when its
 /// declared output path is already realized in the store — the node can
 /// only cache-cut, so the realization probe exempts it and the submission
-/// proceeds. r[verify gw.reject.unsupported-hash-algo+2]
+/// proceeds. r[verify gw.reject.unsupported-hash-algo+3]
 #[tokio::test]
 async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1310,7 +1310,7 @@ const MD5_FOD_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffff
 /// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
 /// already realized in the store is submitted (the scheduler cache-cuts
 /// it) instead of rejecting the whole submission.
-/// r[verify gw.reject.unsupported-hash-algo+2]
+/// r[verify gw.reject.unsupported-hash-algo+3]
 #[tokio::test]
 async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1344,9 +1344,91 @@ async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// wopBuildPaths (9): the unverifiable-algo exemption probe carries the
+/// session JWT — the answer must be the tenant-scoped one the scheduler
+/// will act on, not an anonymous one.
+/// r[verify gw.reject.unsupported-hash-algo+3]
+/// r[verify gw.jwt.propagate]
+#[tokio::test]
+async fn test_build_paths_md5_fod_probe_carries_session_jwt() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_jwt_handshake("tok-fod-exemption").await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000d-legacy-md5-jwt.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    h.store.seed_with_content(
+        "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        b"already realized",
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(h.scheduler.submit_calls.read().unwrap().len(), 1);
+    {
+        let meta = h.store.calls.find_missing_metadata.read().unwrap();
+        assert!(
+            meta.iter()
+                .any(|m| m.as_deref() == Some("tok-fod-exemption")),
+            "the exemption probe must carry the session tenant token, got {meta:?}"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
+/// absent locally but substitutable from the tenant's upstreams is
+/// exempted and submitted — the scheduler's substitute lane completes it
+/// without dispatching, so rejecting it would over-reject a flow that
+/// works end-to-end. r[verify gw.reject.unsupported-hash-algo+3]
+#[tokio::test]
+async fn test_build_paths_md5_fod_substitutable_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000g-legacy-md5-subst.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // The declared output is NOT in the store, but the upstream probe
+    // says it is substitutable.
+    h.store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push("/nix/store/ffffffffffffffffffffffffffffffff-fetched".to_string());
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "substitutable legacy-algo FOD must not block the submission"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// wopBuildPaths (9): the same cached legacy md5 FOD is REJECTED when its
 /// declared output is not already realized — the build could only fail
-/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+2]
+/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+3]
 #[tokio::test]
 async fn test_build_paths_md5_fod_unrealized_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

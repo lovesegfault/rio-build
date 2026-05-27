@@ -1004,9 +1004,9 @@ the handshake before the client will send any opcodes.
   `RIO_MAX_TRANSITIVE_INPUTS`) to prevent DoS via pathological derivation
   graphs. The gateway sends the *full DAG* to the scheduler; cache-hit
   determination (which nodes have outputs already in the store) happens in the
-  scheduler, not here --- the one exception is the bounded realization probe
-  that decides unverifiable-hash-algo offenders
-  (#rref("gw.reject.unsupported-hash-algo+2")).
+  scheduler, not here --- the one exception is the bounded tenant-scoped
+  realization probe that decides unverifiable-hash-algo offenders
+  (#rref("gw.reject.unsupported-hash-algo+3")).
 + *Validation:* Malformed `.drv` files and missing `.drv`
   files (referenced by `inputDrvs` but not in the store) are rejected via
   `BuildResult::failure` delivered through `STDERR_LAST` --- the session stays
@@ -1022,8 +1022,9 @@ the handshake before the client will send any opcodes.
     #rref("gw.reject.nochroot"));
   - any output declaring an `outputHash`/`outputHashAlgo` the builder cannot
     verify or finalize, unless every declared output of that derivation is
-    already realized in the store --- a single bounded `FindMissingPaths`
-    probe decides, fail-closed (#rref("gw.reject.unsupported-hash-algo+2"));
+    already realized for the submitting tenant or substitutable from its
+    upstreams --- a single bounded tenant-scoped `FindMissingPaths` probe
+    decides, fail-closed (#rref("gw.reject.unsupported-hash-algo+3"));
   - any floating-CA-shaped output (`outputHashAlgo` set, `outputHash` empty)
     that nevertheless declares an output path — a shape CppNix refuses to
     parse (#rref("gw.reject.floating-ca-declared-path"));
@@ -1060,37 +1061,44 @@ target even when another target's closure swallows it as a non-root.
   gateway-only.
 ]
 
-#r("gw.reject.unsupported-hash-algo+2")[
+#r("gw.reject.unsupported-hash-algo+3")[
   The gateway MUST reject at submission any derivation output declaring an
   `outputHash` and/or `outputHashAlgo` that the builder cannot verify
   (fixed-output) or finalize (floating-CA) --- the supported set is `sha1`,
   `sha256`, `sha512`, each optionally `r:`-prefixed, mirroring
   #rref("builder.fod.verify-hash+2") and the floating-CA finalization rules
   --- unless every declared output path of that derivation is already
-  present in the store, verified by a single bounded anonymous
-  `FindMissingPaths` probe at submission time. The exemption is fail-closed:
-  a floating-CA output with an unsupported algorithm (no declared path), an
-  empty or unparseable declared path, an offender set larger than the probe
-  cap, a probe error, or a probe timeout all reject the submission. The
-  rejection (and the probe-backed exemption) applies both in `validate_dag`
-  over cached full derivations (`BuildResult::failure` → `STDERR_LAST`) and
-  inline on `wopBuildDerivation`'s `BasicDerivation` (`STDERR_ERROR`).
+  present and visible to the submitting tenant, or substitutable from that
+  tenant's configured upstreams, verified by a single bounded
+  `FindMissingPaths` probe at submission time that carries the session
+  tenant token (anonymous only in dual-mode sessions, matching the
+  scheduler's anonymous merge-time probe in that mode). The exemption is
+  fail-closed: a floating-CA output with an unsupported algorithm (no
+  declared path), an empty or unparseable declared path, an offender set
+  larger than the probe cap, an indeterminate probe answer, a probe error,
+  or a probe timeout all reject the submission. The rejection (and the
+  probe-backed exemption) applies both in `validate_dag` over cached full
+  derivations (`BuildResult::failure` → `STDERR_LAST`) and inline on
+  `wopBuildDerivation`'s `BasicDerivation` (`STDERR_ERROR`).
 ]
 Both code paths are fail-closed on the worker side too, but only after the
 build has burned a pod; rejecting at submission lands the error on the
-submitting client immediately. The realization exemption exists because a
-derivation whose declared outputs are all present never dispatches --- the
-scheduler cache-cuts it --- so rejecting the whole submission for a legacy
-(e.g. `md5`) fixed-output derivation that already exists in the store would
-block otherwise-valid DAGs that merely reference it. The exemption mirrors
-the scheduler's skip-dispatch predicate (all expected outputs present) and
-never lets a node that would actually build escape the gate. Residual
+submitting client immediately. The exemption exists because a derivation
+whose declared outputs are all present (and visible to the submitting
+tenant) or substitutable from its upstreams never dispatches --- the
+scheduler cache-cuts it or completes it through the substitute lane --- so
+rejecting the whole submission for a legacy (e.g. `md5`) fixed-output
+derivation that already exists for that tenant would block otherwise-valid
+DAGs that merely reference it. The exemption mirrors the scheduler's
+no-dispatch predicate (tenant-scoped cache-cut OR substitute lane),
+evaluated with the same tenant identity the submission itself will carry,
+and never lets a node that would actually build escape the gate. Residual
 divergences, accepted deliberately: a garbage-collection race between the
 probe and dispatch makes the node dispatch and fail at the worker's
 fail-closed FOD gate (a node-level failure instead of a submission
-rejection); and an output that is substitutable upstream but not yet present
-in the rio store is not exempt --- copy it into the store first or re-pin
-the derivation to a supported hash algorithm.
+rejection); a substitute fetch that fails after a positive upstream probe
+ends the same way; and dual-mode sessions probe anonymously, which matches
+the scheduler's anonymous merge-time probe in that mode.
 
 #r("gw.reject.floating-ca-declared-path")[
   The gateway MUST reject at submission any derivation output that sets
