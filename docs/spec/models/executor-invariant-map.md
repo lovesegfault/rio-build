@@ -2969,10 +2969,23 @@ the OA1 baseline once it accumulates); the OA1 latency comparison and
 the establishment-slack re-baseline are rows D1/D2; the production
 rollback drill is row D5. Development-time stand-ins shipped: the AD5
 component structure, the 45 s pull-mode TGPS (P8/delta 9), and the
-OA1 emission paths exercised by tests. The VM-topology cancel/preempt
-timing bounds planned by T-1b.9 have NOT been measured in this batch
-(no canary VM scenario landed here); when they land they are VM
-numbers only, never the production budget.
+OA1 emission paths exercised by tests. The T-1b.9 VM-topology
+re-baseline is now recorded from the `vm-pull-canary-k3s` scenario
+(executor follow-up, single KVM run, test script ~700 s; VM-topology
+numbers only, never the production budget): CancelBuild verdict →
+Job/pod/build-cgroup gone, attempt closed, drv Cancelled in 9.9 s;
+DisruptionTarget patch → pod+Job gone and the attempt closed at the
+report fold in 64.1 s; both asserted against the scenario's 90 s
+composite bound and structurally below the establishment window. The
+unreported-death establishment charge landed at attempt age 307 s
+against the fixture's 180 s solved deadline + 120 s report slack
+(the scenario asserts the slack as the universal floor and that no
+charge lands inside the window). The composite's component figures
+remain the constants the plan names — 10 s controller reconcile tick
+(`JOB_REQUEUE`), 45 s pull-mode termination grace
+(`PULL_MODE_TGPS_SECS`), 10 s SIGTERM best-effort report timeout —
+all unit-covered; no production claim is made from any of these
+numbers.
 
 ### Phase-1b gate evidence table (assembled by the verification batch; close-out input)
 
@@ -2986,8 +2999,8 @@ rows D0–D5.
 | Gate item | Artifact | Verdict at assembly |
 |---|---|---|
 | Pull-mode end-to-end VM evidence (T-1a.11) | `pull-mode` subtest in `vm-lifecycle-autoscale-k3s` (no-attempt charge-free death, pull build + report + ListOpenAttempts surface, killed-mid-build charged once + requeued + rebuilt under a fresh exec) | GREEN (wired in checks.*; landed at 1a, re-asserted by the 415d15e6f killed-mid-build update) |
-| 1b canary VM scenario (T-1b.8: establishment window, busy bridge, preempt, NotYetReady, AD2 node key, small-fleet poison, rollback-by-template-flip; retry-feed/fold-input assertions steps 1–4) | NOT DELIVERED in this batch — no `pull-canary` scenario exists in the tree | **PENDING (executor follow-up)**: scenario design, fixture knobs (SLA probe-deadline overlay, controller `RIO_ORPHAN_REAP_GRACE_OVERRIDE_SECS` extraEnv, hosting/codecov decision) and budget arithmetic are recorded in the batch hand-off note; the fold-input items already covered by `pull-mode` (one open attempt per pull, second-installment same-row, single charge for a killed exec) stand, the rest are unverified at VM level |
-| Cancel/preempt timing re-baseline (T-1b.9, VM-topology numbers) | NOT DELIVERED in this batch (depends on the T-1b.8 scenario) | **PENDING (executor follow-up)**; production budget remains deployment-time row D1 regardless |
+| 1b canary VM scenario (T-1b.8: establishment window, busy bridge, preempt, NotYetReady, AD2 node key, small-fleet poison, rollback-by-template-flip; retry-feed/fold-input assertions steps 1–4) | `pull-canary` fragment hosted by the dedicated `vm-pull-canary-k3s` check (lifecycle module on a separate k3s fixture instantiation; `values/vmtest-pull-canary.yaml` pins the probe deadline to the 180 s floor; codecov `after_n_builds` 42→43) | **DELIVERED (executor follow-up, 2026-05-27; check green on its first run)**: retry-feed equivalence over the fold input — the same scripted success+failure sequence on the stream pool and a `dispatchMode: Pull` pool yields the same `permanent` outcome class, exactly one worker-reported charge per failure leg, no double charges, charge-free successes, the same poisoned/client-visible verdict, and the AD2 exclusion-key columns (executor key for stream rows, intent identity for pull rows) — plus the establishment window end-to-end (executor_crash/unreported, only after deadline+slack, requeued and rebuilt), the DisruptionTarget pull-mode preemption, and the CancelBuild cancel successor. NOT covered at VM level (carve-outs in the fragment header): busy bridge, NotYetReady arm, rollback-by-template-flip, the small-fleet NoEligibleSource ending and the node-keyed `source_node` exclusion (the per-pool reconciler ships no controller-authoritative binding in this fixture) — these stay on the T-1b.1/T-1b.2 unit/contract batteries and the close-out list |
+| Cancel/preempt timing re-baseline (T-1b.9, VM-topology numbers) | Cancel/preempt timing assertions in `vm-pull-canary-k3s` + the figures recorded next to the AD5/OA1 deferral note in the Phase-1b record above | **RECORDED (executor follow-up, 2026-05-27)**: cancel 9.9 s and preempt 64.1 s against the asserted 90 s composite bound, establishment charge at attempt age 307 s vs the 180 s + 120 s window — VM-topology numbers only; the production budget remains deployment-time row D1 regardless |
 | Pull-mode retryPolicy regime (T-1b.7) | `retryPolicyPull` in `retryPolicy.qnt`; wired `quint-retry-policy-pull` (exhaustive, 14 invariants) + 5 `quint-retry-policy-pull-witness-*` checks; as-built regime counts bit-identical | GREEN (all invariants HOLD; all five witnesses violate; figures in the introducing commit) |
 | Model J / Model N re-runs (T-1b.10) | Wired `quint-spawn-coherence-*` and `quint-nodeclaim-*` exhaustive checks at this tree | GREEN, counts bit-identical to the recorded baselines (models unchanged at 1b) |
 | Controller-map re-audit (T-1b.10) | `controller-invariant-map.md` "Executor-campaign 1b re-audit" entry | RECORDED; controller-campaign owner counter-signature PENDING at the close-out review |
@@ -2999,9 +3012,12 @@ rows D0–D5.
 Deferral notes carried with the table: the AD5 numeric budget stays
 unsigned until deployment-time row D1; the OA1 baseline only starts
 accumulating at deployment; the rollback-by-template-flip production
-drill is row D5 (the VM demonstration planned in T-1b.8 step 9 is part
-of the PENDING scenario row above); no pool template is flipped during
-development. The two PENDING-executor-follow-up rows and the two
-PENDING-owner rows are the complete list of open 1b gate items at this
-assembly; everything else in the v3 gate list is green in CI-wired
-form at this tree.
+drill is row D5 (the VM rollback-flip demonstration planned as T-1b.8
+step 9 was NOT included in the landed `pull-canary` scenario — it
+remains an open close-out item alongside the busy-bridge and
+NotYetReady arms); no pool template is flipped during development.
+The two executor-follow-up rows above were resolved on 2026-05-27 by
+the landed `vm-pull-canary-k3s` scenario (with the carve-outs named in
+their verdicts); the two PENDING-owner rows and those named carve-outs
+are the open 1b gate items remaining for the close-out; everything
+else in the v3 gate list is green in CI-wired form at this tree.
