@@ -6,7 +6,7 @@
 // r[verify gw.hook.single-node-dag+2]
 // r[verify gw.reject.output-path-mismatch]
 // r[verify gw.reject.unsupported-hash-algo+2]
-// r[verify gw.hook.ifd-detection+2]
+// r[verify gw.hook.ifd-detection+3]
 // r[verify gw.hook.inline-drv-content]
 // r[verify gw.stderr.activity+2]
 
@@ -3818,6 +3818,265 @@ async fn test_build_derivation_store_error_during_verification() -> anyhow::Resu
         err.message
     );
 
+    h.finish().await;
+    Ok(())
+}
+
+// ===========================================================================
+// Priority classification (gw.hook.ifd-detection+3)
+// ===========================================================================
+
+/// Helper: assert the priority_class of the only SubmitBuild call.
+fn assert_only_submit_priority(h: &GatewaySession, expected: &str) {
+    let submits = h.scheduler.submit_calls.read().unwrap();
+    assert_eq!(submits.len(), 1, "exactly one SubmitBuild expected");
+    assert_eq!(
+        submits[0].priority_class, expected,
+        "priority_class should be {expected:?}"
+    );
+}
+
+/// Drain a successful bPWR response (count + per-entry path/result tail).
+async fn drain_bpwr_success(stream: &mut tokio::io::DuplexStream) -> anyhow::Result<()> {
+    drain_stderr_until_last(stream).await?;
+    let count = wire::read_u64(stream).await?;
+    for _ in 0..count {
+        let _path = wire::read_string(stream).await?;
+        let status = wire::read_u64(stream).await?;
+        assert_eq!(status, 0, "expected Built status");
+        let _error_msg = wire::read_string(stream).await?;
+        let _times_built = wire::read_u64(stream).await?;
+        let _is_non_det = wire::read_bool(stream).await?;
+        let _start = wire::read_u64(stream).await?;
+        let _stop = wire::read_u64(stream).await?;
+        let cpu_user_tag = wire::read_u64(stream).await?;
+        if cpu_user_tag == 1 {
+            let _ = wire::read_u64(stream).await?;
+        }
+        let cpu_system_tag = wire::read_u64(stream).await?;
+        if cpu_system_tag == 1 {
+            let _ = wire::read_u64(stream).await?;
+        }
+        let built_outputs = wire::read_u64(stream).await?;
+        for _ in 0..built_outputs {
+            let _id = wire::read_string(stream).await?;
+            let _realisation = wire::read_string(stream).await?;
+        }
+    }
+    Ok(())
+}
+
+/// First bPWR of the session with a single all-outputs target — the
+/// build-remote hook shape — is classified "interactive".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_hook_shape_first_is_interactive() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: &[format!("{drv_path}!*")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "interactive");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// First bPWR with a single NAMED-output target (`drv!out`, the
+/// remote-store-mode shape) stays "ci". r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_named_output_first_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// First bPWR with TWO targets stays "ci". r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_multi_target_first_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_a = "/nix/store/00000000000000000000000000000000-test.drv";
+    let drv_b = "/nix/store/00000000000000000000000000000001-other.drv";
+    h.store.seed_with_content(drv_a, TEST_DRV_ATERM.as_bytes());
+    h.store.seed_with_content(
+        drv_b,
+        TEST_DRV_ATERM
+            .replace("zzz-output", "yyy-output")
+            .as_bytes(),
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_a}!*"), format!("{drv_b}!*")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// A SECOND hook-shaped bPWR on the same session stays "ci".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_bpwr_hook_shape_second_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    for _ in 0..2 {
+        wire_send!(&mut h.stream;
+            u64: 46,
+            strings: &[format!("{drv_path}!*")],
+            u64: 0,
+        );
+        drain_bpwr_success(&mut h.stream).await?;
+    }
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 2);
+        assert_eq!(
+            submits[0].priority_class, "interactive",
+            "first is the hook shape"
+        );
+        assert_eq!(
+            submits[1].priority_class, "ci",
+            "second bPWR is a CI driver"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (opcode 9) with a single all-outputs target stays "ci"
+/// — the hook shape only applies to bPWR. r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_build_paths_single_all_outputs_is_ci() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!*")],
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1);
+    assert_only_submit_priority(&h, "ci");
+
+    h.finish().await;
+    Ok(())
+}
+
+/// The wopBuildDerivation heuristic is unchanged: the first one on a
+/// session is "interactive", and one arriving after a bPWR is "ci".
+/// r[verify gw.hook.ifd-detection+3]
+#[tokio::test]
+async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
+    // First wopBuildDerivation on a fresh session → interactive.
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+    let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/zzz-output",
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let _status = wire::read_u64(&mut h.stream).await?;
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+    assert_only_submit_priority(&h, "interactive");
+    h.finish().await;
+
+    // A bPWR first, then wopBuildDerivation → the latter is "ci".
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+    h.store
+        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    wire_send!(&mut h.stream;
+        u64: 46,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+    drain_bpwr_success(&mut h.stream).await?;
+    wire_send!(&mut h.stream;
+        u64: 36,
+        string: drv_path,
+        u64: 1,
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",
+        string: "",
+        strings: wire::NO_STRINGS,
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,
+        string: "out",
+        string: "/nix/store/zzz-output",
+        u64: 0,
+    );
+    drain_stderr_until_last(&mut h.stream).await?;
+    let _status = wire::read_u64(&mut h.stream).await?;
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 2);
+        assert_eq!(
+            submits[1].priority_class, "ci",
+            "post-bPWR wopBuildDerivation is ci"
+        );
+    }
     h.finish().await;
     Ok(())
 }

@@ -530,7 +530,11 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
   `wopBuildPathsWithResults`. The gateway annotates the `SubmitBuildRequest`
   with `priority_class = "interactive"` when the session has not yet seen a
   `wopBuildPathsWithResults` call (see `rio-gateway/src/handler/build.rs`).
-  There is no dedicated `is_ifd_hint` field; priority classification is
+  Build-hook delegations from Nix ≥ 2.16 / Lix arrive instead as the
+  session's first `wopBuildPathsWithResults` with a single all-outputs
+  target (`<drv>!*`, after the client copies the `.drv` closure to the
+  untrusted gateway); that shape is classified `"interactive"` too. There
+  is no dedicated `is_ifd_hint` field; priority classification is
   conveyed entirely through `priority_class`.
 ]
 

@@ -1937,13 +1937,27 @@ hook-mode input-addressed builds is Nix 2.16 or Lix.
 - *No CA early cutoff* --- without the full DAG, the scheduler cannot propagate
   cutoffs to downstream nodes
 
-#r("gw.hook.ifd-detection+2")[
-  *IFD detection:* When a `wopBuildDerivation` call arrives without a preceding
-  `wopBuildPathsWithResults` on the same session, the gateway sets
-  `SubmitBuildRequest.priority_class = "interactive"` (otherwise `"ci"`). There
-  is no dedicated `is_ifd_hint` proto field --- the hint is encoded entirely in
-  the `priority_class` string and the gateway, not the scheduler, makes the
-  assignment.
+Interactive priority is *not* lost: the hook-shaped first
+`wopBuildPathsWithResults` of a session is classified `"interactive"` exactly
+like the inline `wopBuildDerivation` flow (#rref("gw.hook.ifd-detection+3")),
+so steering ≥ 2.16 clients onto the `.drv`-upload flow does not silently
+demote their hook builds to `"ci"`.
+
+#r("gw.hook.ifd-detection+3")[
+  *IFD / hook detection:* The gateway sets
+  `SubmitBuildRequest.priority_class = "interactive"` for exactly two request
+  shapes, and `"ci"` for everything else: (1) a `wopBuildDerivation` call that
+  arrives without a preceding `wopBuildPathsWithResults` on the same session
+  (an IFD or inline hook delegation); (2) the FIRST
+  `wopBuildPathsWithResults` of a session whose only target is a single
+  `DerivedPath::Built` with the all-outputs spec (`<drv>!*`) --- the shape
+  stock `build-remote` (Nix ≥ 2.16, Lix) emits when delegating one
+  derivation in build-hook mode against an untrusted remote. Named-output
+  targets, multi-target batches, `wopBuildPaths` (opcode 9), and any
+  subsequent `wopBuildPathsWithResults` on the session remain `"ci"`. There
+  is no dedicated `is_ifd_hint` proto field --- the hint is encoded entirely
+  in the `priority_class` string and the gateway, not the scheduler, makes
+  the assignment.
 ]
 
 #tip(title: [Recommendation])[

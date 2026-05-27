@@ -1155,7 +1155,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
 // r[impl gw.opcode.build-derivation+2]
 // r[impl gw.hook.single-node-dag+2]
-// r[impl gw.hook.ifd-detection+2]
+// r[impl gw.hook.ifd-detection+3]
 /// wopBuildDerivation (36): Build a derivation via scheduler.
 ///
 /// Receives an inline BasicDerivation (no inputDrvs). Recovers the full
@@ -1908,11 +1908,16 @@ enum DagSubmitOutcome {
 /// Returns `Err` only when `submit_and_process_build` itself errors
 /// (scheduler transport/timeout); caller decides whether that is
 /// session-terminal (`stderr_err!`) or a per-path `TransientFailure`.
+///
+/// `priority_class` is decided by the caller: `wopBuildPaths` is always
+/// `"ci"`, `wopBuildPathsWithResults` passes `"interactive"` for the
+/// hook-shaped first request of a session (`gw.hook.ifd-detection+3`).
 async fn submit_dag<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
     mut nodes: Vec<types::DerivationNode>,
     mut edges: Vec<types::DerivationEdge>,
+    priority_class: &'static str,
 ) -> anyhow::Result<DagSubmitOutcome> {
     let SessionContext {
         store_client,
@@ -1971,7 +1976,8 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
-    let request = translate::build_submit_request(nodes, edges, "ci", tenant_name.as_ref());
+    let request =
+        translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
     let result = submit_and_process_build(
         stderr,
         scheduler_client,
@@ -2072,7 +2078,10 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     }
 
     if !all_nodes.is_empty() {
-        match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        // Remote-store-mode DAG submissions are CI-shaped: the goal DAG
+        // arrives via opcode 9/46 with the IFD trigger being a separate
+        // wopBuildDerivation — see gw.hook.ifd-detection+3.
+        match submit_dag(stderr, ctx, all_nodes, all_edges, "ci").await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 stderr_err!(stderr, "build rejected: {reason}")
@@ -2121,11 +2130,42 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     stderr: &mut StderrWriter<&mut W>,
     ctx: &mut SessionContext,
 ) -> anyhow::Result<()> {
+    // r[impl gw.hook.ifd-detection+3]
+    // Hook-shape classification. Stock build-remote (Nix >= 2.16, Lix)
+    // delegates one derivation per SSH session in build-hook mode: it
+    // copies the .drv closure and drives a single
+    // wopBuildPathsWithResults whose only target is `<drv>!*`
+    // (DerivedPath::Built with OutputSpec::All). That request gets the
+    // interactive priority class the wopBuildDerivation flow already
+    // gets — a developer is blocked on it right now. Everything else
+    // stays "ci": opcode 9, named-output targets ("drv!out" — the
+    // remote-store-mode CI shape), multi-target or mixed batches, and
+    // any second bPWR on the same session (a CI driver pushing many
+    // DAGs through one connection). The flag is captured-then-set HERE
+    // (not in the dispatcher) so this call can observe whether it is
+    // the session's first.
+    let first_bpwr_of_session = !ctx.has_seen_build_paths_with_results;
+    ctx.has_seen_build_paths_with_results = true;
+
     let raw_paths = wire::read_strings(reader).await?;
     read_build_mode_normal_only(reader, stderr, "wopBuildPathsWithResults").await?;
 
     tracing::Span::current().record("count", raw_paths.len());
     debug!(count = raw_paths.len(), "wopBuildPathsWithResults");
+
+    let hook_shaped = raw_paths.len() == 1
+        && matches!(
+            DerivedPath::parse(&raw_paths[0]),
+            Ok(DerivedPath::Built {
+                outputs: rio_nix::protocol::derived_path::OutputSpec::All,
+                ..
+            })
+        );
+    let priority_class: &'static str = if first_bpwr_of_session && hook_shaped {
+        "interactive"
+    } else {
+        "ci"
+    };
 
     let mut results = Vec::new();
 
@@ -2200,7 +2240,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges, priority_class).await
+        {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 BuildResult::failure(BuildStatus::InputRejected, reason)
