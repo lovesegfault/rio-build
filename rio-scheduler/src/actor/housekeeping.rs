@@ -914,7 +914,7 @@ impl DagActor {
     /// Leader-only via the `handle_tick` early-return; the establishing
     /// transaction additionally carries the same generation-floor fence
     /// as the pull transaction.
-    // r[impl sched.attempt.establishment-window]
+    // r[impl sched.attempt.establishment-window+2]
     pub(super) async fn tick_sweep_open_pull_attempts(&mut self) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,
@@ -928,14 +928,22 @@ impl DagActor {
             return;
         }
         let slack_secs = self.establishment_report_slack.as_secs_f64();
-        // The window: the intent deadline (the same solved deadline the
-        // spawn intent advertises and activeDeadlineSeconds is set
-        // from) plus the configured report slack.
+        // The window: anchored to the deadline the attempt was actually
+        // dispatched under (persisted by the pull mint — the same solve
+        // activeDeadlineSeconds is rendered from), plus the configured
+        // report slack. The sweep-time re-solve may only WIDEN the
+        // window (estimate grew, floor bump): a fitted estimate or
+        // hw-table change that shrinks between dispatch and sweep must
+        // never establish a healthy attempt that is still inside the
+        // deadline its pod is really running under. Rows minted before
+        // the column existed (and a node evicted from the DAG) fall
+        // back to whichever anchor is available.
         let (hw, cost, inputs_gen) = self.solve_inputs();
         let expired: Vec<crate::db::open_attempts::OpenAttemptRow> = opens
             .into_iter()
             .filter(|attempt| {
-                let deadline_secs = self
+                let dispatched_deadline = attempt.deadline_secs.unwrap_or(0.0);
+                let resolved_deadline = self
                     .dag
                     .node(attempt.drv_hash.as_str())
                     .map(|state| {
@@ -945,6 +953,7 @@ impl DagActor {
                         )
                     })
                     .unwrap_or(0.0);
+                let deadline_secs = dispatched_deadline.max(resolved_deadline);
                 attempt.age_secs > deadline_secs + slack_secs
             })
             .collect();

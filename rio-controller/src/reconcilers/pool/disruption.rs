@@ -224,18 +224,11 @@ pub(super) struct PullPreemption {
 /// pool iff its executor container carries `RIO_DISPATCH_MODE=pull` —
 /// the rendering of the Pool CR's `dispatchMode: Pull` (T-1b.6), so
 /// gating on the env IS gating on the CR field without an extra
-/// apiserver read from the watcher's hot path. Stream pods return
-/// `None` and keep the force-drain hop.
+/// apiserver read from the watcher's hot path (the shared
+/// `pod::pod_is_pull_mode` discriminator). Stream pods return `None`
+/// and keep the force-drain hop.
 pub(super) fn pull_mode_preemption(pod: &Pod) -> Option<PullPreemption> {
-    let pull = pod.spec.as_ref().is_some_and(|s| {
-        s.containers.iter().any(|c| {
-            c.env.as_ref().is_some_and(|env| {
-                env.iter()
-                    .any(|e| e.name == "RIO_DISPATCH_MODE" && e.value.as_deref() == Some("pull"))
-            })
-        })
-    });
-    if !pull {
+    if !super::pod::pod_is_pull_mode(pod) {
         return None;
     }
     let pod_name = pod.metadata.name.clone()?;

@@ -192,3 +192,38 @@ async fn open_pull_attempt_view_respects_terminal_fill_alone() -> anyhow::Result
     );
     Ok(())
 }
+
+// r[verify sched.attempt.establishment-window+2]
+/// The dispatched deadline persisted by the fenced mint round-trips
+/// through the open-attempt view (the establishment window's anchor).
+#[tokio::test]
+async fn mint_persists_dispatched_deadline_and_view_returns_it() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv = insert_test_derivation(&db, "oa-deadline").await?;
+    let exec = Uuid::now_v7();
+    let committed = db
+        .mint_pull_attempt_fenced(
+            drv,
+            &ExecutorId::from("oa-deadline"),
+            1,
+            exec,
+            &log_hash("oadeadline"),
+            Some("node-1"),
+            Some(1234.0),
+        )
+        .await?;
+    assert!(committed, "the fenced mint commits on a fresh cluster");
+
+    let rows = db.list_open_pull_attempts().await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].exec_id, exec);
+    assert_eq!(
+        rows[0].deadline_secs,
+        Some(1234.0),
+        "the dispatched deadline round-trips through the view"
+    );
+    assert_eq!(rows[0].source_node.as_deref(), Some("node-1"));
+    Ok(())
+}

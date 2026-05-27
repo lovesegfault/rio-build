@@ -2526,23 +2526,31 @@ closure. Pod-initiated aborts of still-wanted work are platform terminations
 them as infrastructure failures would burn the infra budget on disruptions
 the design accepts as charge-free.
 
-#r("sched.attempt.establishment-window")[
+#r("sched.attempt.establishment-window+2")[
   The establishment sweep MUST visit every open pull-mode attempt
   (`dispatch_mode = 'pull'`, no terminal classification) on every sweep, and
   MUST establish an attempt only after its deadline plus the configured
-  `establishment_report_slack` has elapsed with no terminal row: the
-  store-probe arm adopts the attempt as completed when its outputs are
-  present, otherwise the establishment appends exactly one
-  executor-crash/unreported classification (charged per the existing C2
-  discipline) and requeues the derivation. Establishment MUST never fire
-  inside the window, MUST never visit stream-mode attempts, and the
-  establishing transaction MUST apply the same generation-floor fence as
-  the pull transaction.
+  `establishment_report_slack` has elapsed with no terminal row, where the
+  deadline is anchored to the value the attempt was dispatched with (the
+  solved deadline persisted by the pull mint): a sweep-time re-solve may
+  widen the window but MUST never shrink it below the dispatched deadline
+  while the attempt is open. The store-probe arm adopts the attempt as
+  completed when its outputs are present, otherwise the establishment
+  appends exactly one executor-crash/unreported classification (charged per
+  the existing C2 discipline) and requeues the derivation. Establishment
+  MUST never fire inside the window, MUST never visit stream-mode attempts,
+  and the establishing transaction MUST apply the same generation-floor
+  fence as the pull transaction.
 ]
 The sweep reads durable rows --- not an in-memory claim a one-shot timer can
 forget --- so the post-failover "deferred claim forgotten" defect class is
 closed structurally. Stream-mode attempts keep the as-built 60 s correlation
-machinery as their only establishment vehicle during coexistence.
+machinery as their only establishment vehicle during coexistence. Anchoring
+the window to the dispatched deadline (072's `deadline_secs`) keeps a fitted
+estimate or hw-table change that shrinks mid-flight from establishing a
+healthy attempt that is still inside the deadline its pod really runs under;
+the residual gap between the Job's `activeDeadlineSeconds` render and the
+mint-time solve is covered by the report slack.
 
 #r("sched.admin.list-open-attempts")[
   `AdminService.ListOpenAttempts` MUST return every open pull-mode attempt

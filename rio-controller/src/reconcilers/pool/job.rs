@@ -1502,6 +1502,36 @@ fn unified_attempt_reason(reason: TerminationReason) -> rio_proto::types::Attemp
     }
 }
 
+/// The intent id a pod-terminal `ReportAttemptOutcome` should carry:
+/// the pod's `rio.build/intent-id` annotation for PULL-MODE pods
+/// (their attempt is keyed by the attested intent identity), the empty
+/// string for stream pods (their classification is keyed by pod name
+/// on the legacy path — an intent id on a stream report could resolve
+/// to another pod's open pull attempt for the same intent during
+/// coexistence and be consumed there).
+pub(super) fn report_intent_id_for_pod(pod: &Pod) -> String {
+    if super::pod::pod_is_pull_mode(pod) {
+        pod.metadata
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get(super::jobs::INTENT_ID_ANNOTATION))
+            .cloned()
+            .unwrap_or_default()
+    } else {
+        String::new()
+    }
+}
+
+/// The same population rule for the deadline-exceeded JOB report (the
+/// pull discriminator read from the Job's pod template).
+pub(super) fn report_intent_id_for_job(job: &Job) -> String {
+    if super::pod::job_is_pull_mode(job) {
+        job_intent_id(job).unwrap_or_default().to_owned()
+    } else {
+        String::new()
+    }
+}
+
 /// How long a sampled Pod/Job name stays in `Ctx::terminal_report_sampled`
 /// before pruning: 2× the Job TTL, by which point the object is no
 /// longer listable so the entry can never suppress a legitimate new
@@ -1592,19 +1622,21 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         };
         // C4/C5 unification: the classification rides the unified
         // idempotent ReportAttemptOutcome, keyed by the pod/Job name
-        // (the legacy correlation the scheduler already speaks) plus
-        // the pod's intent annotation and kube-authoritative node when
-        // known (the AD2c attribution for pull-mode attempts; inert
-        // for stream ones). `ReportExecutorTermination` is no longer
-        // called by the controller for any pod; the scheduler keeps
-        // serving it untouched until the stream path retires.
-        let intent_id = pod
-            .metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(super::jobs::INTENT_ID_ANNOTATION))
-            .cloned()
-            .unwrap_or_default();
+        // (the legacy correlation the scheduler already speaks) plus —
+        // for PULL-MODE pods only — the pod's intent annotation and
+        // kube-authoritative node (the AD2c attribution). Stream pods
+        // send no intent id (`report_intent_id_for_pod`): their
+        // identity is the pod name and their classification belongs to
+        // the legacy stream path; an intent id on a stream report
+        // could otherwise resolve to another pod's open pull attempt
+        // for the same intent during coexistence (the double-spawn
+        // overlap) and be consumed there. The per-pod RIO_DISPATCH_MODE
+        // discriminator (not the Pool CR) keeps pods spawned before a
+        // dispatchMode flip correctly keyed. `ReportExecutorTermination`
+        // is no longer called by the controller for any pod; the
+        // scheduler keeps serving it untouched until the stream path
+        // retires.
+        let intent_id = report_intent_id_for_pod(pod);
         let node_name = pod
             .spec
             .as_ref()
@@ -1701,10 +1733,13 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
         // C4/C5 unification: keyed by the JOB name (the pod is already
         // deleted by the Job controller when the deadline fires); the
         // scheduler's legacy prefix-match against recently_disconnected
-        // is unchanged behind the unified RPC.
+        // is unchanged behind the unified RPC. The intent id rides
+        // along only for pull-mode Jobs (`report_intent_id_for_job`,
+        // read from the pod template's RIO_DISPATCH_MODE), for the same
+        // coexistence-routing reason as report_terminated_pods.
         match admin_call(admin.report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
-                intent_id: job_intent_id(job).unwrap_or_default().to_owned(),
+                intent_id: report_intent_id_for_job(job),
                 job_name: name.to_owned(),
                 exec_id: String::new(),
                 reason: rio_proto::types::AttemptTerminalReason::DeadlineExceeded.into(),

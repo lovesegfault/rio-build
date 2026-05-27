@@ -50,7 +50,7 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
     .expect("assignment statuses")
 }
 
-// r[verify sched.attempt.establishment-window]
+// r[verify sched.attempt.establishment-window+2]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failed_builders + failure_count, and the drv requeues.
@@ -96,7 +96,7 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window]
+// r[verify sched.attempt.establishment-window+2]
 /// (b) The same attempt with its outputs present in the store is
 /// adopted as completed (store-probe arm) and never charged.
 #[tokio::test]
@@ -139,7 +139,7 @@ async fn establishment_store_probe_adopts_completed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window]
+// r[verify sched.attempt.establishment-window+2]
 /// (c) An attempt inside the window is never established.
 #[tokio::test]
 async fn establishment_never_fires_inside_window() -> TestResult {
@@ -164,7 +164,7 @@ async fn establishment_never_fires_inside_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window]
+// r[verify sched.attempt.establishment-window+2]
 /// (d) The establishment transaction at a below-floor serving
 /// generation writes nothing (the fence applies to establishment too).
 #[tokio::test]
@@ -198,6 +198,68 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
         vec!["pending"],
         "the assignment row stays open"
     );
+    Ok(())
+}
+
+// r[verify sched.attempt.establishment-window+2]
+/// (g) The window is anchored to the deadline the attempt was
+/// dispatched with: a sweep-time re-solve that is smaller than the
+/// persisted deadline must NOT shrink the window (no establishment
+/// while the attempt is inside the dispatched deadline + slack), and
+/// the attempt still establishes once the persisted anchor has passed.
+#[tokio::test]
+async fn establishment_window_anchored_to_dispatched_deadline() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "est-g", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "est-g").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // The mint persisted the deadline this attempt was dispatched
+    // under (the same solve that sizes activeDeadlineSeconds).
+    let minted: Option<f64> =
+        sqlx::query_scalar("SELECT deadline_secs FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        minted.is_some_and(|d| d > 0.0),
+        "the pull mint persists the dispatched deadline, got {minted:?}"
+    );
+
+    // Simulate the dispatched deadline being far LARGER than anything
+    // the sweep can re-solve now (the inverse of an estimator/hw-table
+    // shrink): the attempt is backdated past the re-solved window but
+    // not past the dispatched one — it must stay open and uncharged.
+    sqlx::query("UPDATE drv_executions SET deadline_secs = $2 WHERE exec_id = $1")
+        .bind(exec_id)
+        .bind(20_000_000.0_f64)
+        .execute(&db.pool)
+        .await?;
+    backdate_assignment(&db.pool, exec_id).await?;
+    tick(&handle).await?;
+    assert!(
+        attempt_rows_for(&db.pool, "est-g").await.is_empty(),
+        "no establishment while the attempt is inside its dispatched deadline + slack"
+    );
+    let info = expect_drv(&handle, "est-g").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Running);
+    assert_eq!(info.retry.failure_count, 0, "no charge inside the window");
+    assert_eq!(
+        assignment_statuses(&db.pool, "est-g").await,
+        vec!["pending"],
+        "the assignment row stays open"
+    );
+
+    // Once the dispatched anchor is genuinely in the past the sweep
+    // establishes exactly as before.
+    sqlx::query("UPDATE drv_executions SET deadline_secs = 1.0 WHERE exec_id = $1")
+        .bind(exec_id)
+        .execute(&db.pool)
+        .await?;
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "est-g").await;
+    assert_eq!(rows.len(), 1, "established once the window truly closed");
+    assert_eq!(rows[0].outcome_class, OutcomeClass::ExecutorCrash.as_str());
     Ok(())
 }
 
@@ -250,7 +312,7 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window]
+// r[verify sched.attempt.establishment-window+2]
 /// (e) Mixed fleet: an active assignment+execution pair written exactly
 /// as the as-built stream dispatch writes them, past any window, is
 /// NEVER visited or established by the new sweep.

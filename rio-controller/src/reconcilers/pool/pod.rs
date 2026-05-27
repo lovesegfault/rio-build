@@ -63,6 +63,44 @@ pub(super) fn is_pull_mode(pool: &Pool) -> bool {
     pool.spec.dispatch_mode == Some(rio_crds::pool::DispatchMode::Pull)
 }
 
+/// Whether one already-rendered POD speaks the pull protocol: its
+/// executor container carries `RIO_DISPATCH_MODE=pull` (the rendering
+/// of `dispatchMode: Pull`). Gating on the pod's own env rather than
+/// the Pool CR keeps pods spawned before a `dispatchMode` flip
+/// correctly keyed — the protocol a pod speaks is fixed at render
+/// time, not at observation time. Used by the DisruptionTarget watcher
+/// and the pod-terminal report path.
+pub(super) fn pod_is_pull_mode(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
+    pod.spec.as_ref().is_some_and(|s| {
+        s.containers.iter().any(|c| {
+            c.env.as_ref().is_some_and(|env| {
+                env.iter()
+                    .any(|e| e.name == "RIO_DISPATCH_MODE" && e.value.as_deref() == Some("pull"))
+            })
+        })
+    })
+}
+
+/// Whether one JOB's pod template speaks the pull protocol (the same
+/// `RIO_DISPATCH_MODE=pull` discriminator read from
+/// `spec.template.spec.containers[].env`). Used by the
+/// deadline-exceeded report path, where only the Job object is in
+/// hand.
+pub(super) fn job_is_pull_mode(job: &k8s_openapi::api::batch::v1::Job) -> bool {
+    job.spec
+        .as_ref()
+        .and_then(|s| s.template.spec.as_ref())
+        .is_some_and(|spec| {
+            spec.containers.iter().any(|c| {
+                c.env.as_ref().is_some_and(|env| {
+                    env.iter().any(|e| {
+                        e.name == "RIO_DISPATCH_MODE" && e.value.as_deref() == Some("pull")
+                    })
+                })
+            })
+        })
+}
+
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all
 /// key on this.

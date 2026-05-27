@@ -305,6 +305,19 @@ impl DagActor {
             .authoritative_binding
             .get(drv_hash)
             .map(|b| b.node.clone());
+        // The deadline this attempt is dispatched under (the same solve
+        // that sized the spawn intent / activeDeadlineSeconds),
+        // persisted so the establishment window is anchored to it and
+        // can never shrink below it while the attempt is open.
+        let deadline_secs = {
+            let (hw, cost, inputs_gen) = self.solve_inputs();
+            self.dag.node(drv_hash).map(|state| {
+                f64::from(
+                    self.solve_intent_for(state, &hw, &cost, inputs_gen)
+                        .deadline_secs,
+                )
+            })
+        };
 
         let committed = self
             .db
@@ -315,6 +328,7 @@ impl DagActor {
                 exec_id,
                 &log_hash,
                 source_node.as_deref(),
+                deadline_secs,
             )
             .await
             .map_err(|e| PullRejection::Internal(format!("pull mint transaction failed: {e}")))?;
@@ -884,17 +898,49 @@ impl DagActor {
         if reason == rio_proto::types::AttemptTerminalReason::NoEligibleSource {
             return self.handle_no_eligible_source(&identity).await;
         }
+        // Defense in depth for the unified intake's routing during
+        // coexistence: a report whose job/pod name the scheduler knows
+        // as a STREAM identity (currently registered, or recently
+        // disconnected mid-build) belongs to the as-built stream
+        // classification path even when the sender also attached an
+        // intent id — the same intent can simultaneously carry another
+        // pod's open pull attempt (the documented double-spawn
+        // overlap), and that attempt must never absorb a stream pod's
+        // classification or node attribution. The controller gates
+        // intent_id population to pull-mode pods at the source; this
+        // guard covers any sender that does not. Residual: a stream
+        // pod the scheduler no longer remembers (entry expired) with a
+        // both-keys report still resolves by intent, where the legacy
+        // arm would have been a no-op anyway.
+        let job_is_stream_identity = identity
+            .job_name
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .is_some_and(|job| {
+                let as_executor = ExecutorId::from(job);
+                let prefix = format!("{job}-");
+                self.executors.contains_key(&as_executor)
+                    || self.recently_disconnected.contains_key(&as_executor)
+                    || self
+                        .executors
+                        .keys()
+                        .chain(self.recently_disconnected.keys())
+                        .any(|k| k.as_str().starts_with(&prefix))
+            });
         // Resolve the attempt: exec_id first, then the intent's open
-        // pull-mode attempt. A Job-name-only report cannot be resolved
-        // here yet (the deterministic name embeds only a derived
-        // suffix); the controller-side callers always know the
-        // exec/intent from ListOpenAttempts.
+        // pull-mode attempt (never for a stream identity). A
+        // Job-name-only report cannot be resolved here yet (the
+        // deterministic name embeds only a derived suffix); the
+        // controller-side callers always know the exec/intent from
+        // ListOpenAttempts.
         let resolved = if let Some(exec_id) = identity.exec_id {
             self.db
                 .find_attempt_by_exec_id(exec_id)
                 .await
                 .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?
                 .map(|row| (exec_id, row))
+        } else if job_is_stream_identity {
+            None
         } else if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
             self.db
                 .find_open_pull_attempt_by_drv_hash(intent)
@@ -905,6 +951,14 @@ impl DagActor {
         };
 
         let Some((exec_id, attempt)) = resolved else {
+            // Pull-side no-attempt side effect first (the never-pulled
+            // pod-death case): drop the intent's ICE-clear arm so a
+            // death before the first pull cannot leave a stale
+            // Pending-watch entry behind, regardless of whether the
+            // report also carries a job name that routes below.
+            if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
+                self.dispatched_cells.remove(intent);
+            }
             // C4/C5 unification: an identity with no pull-mode attempt
             // but a Job/pod name and a k8s pod-terminal classification
             // is a stream-mode report — route it through the SAME
@@ -923,15 +977,9 @@ impl DagActor {
                 self.handle_executor_termination(&executor_id, legacy).await;
                 return Ok(());
             }
-            // The no-attempt no-op arm: acknowledge, charge nothing.
-            // Permitted side effects only — drop the intent's ICE-clear
-            // arm so a never-pulled pod death cannot leave a stale
-            // Pending-watch entry behind, and leave the (still-wanted)
-            // drv exactly as it is so the spawn intent re-arms on the
-            // next controller poll.
-            if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
-                self.dispatched_cells.remove(intent);
-            }
+            // The no-attempt no-op arm: acknowledge, charge nothing,
+            // and leave the (still-wanted) drv exactly as it is so the
+            // spawn intent re-arms on the next controller poll.
             debug!(
                 intent_id = ?identity.intent_id,
                 job_name = ?identity.job_name,

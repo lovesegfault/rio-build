@@ -1497,6 +1497,30 @@ pub const M_072: () = ();
 /// unless that view needs an extra column.
 pub const M_073: () = ();
 
+/// `drv_executions.deadline_secs` (nullable DOUBLE PRECISION, no
+/// backfill, no index) — the open-attempt-view extra column M_073
+/// reserved 074 for.
+///
+/// The establishment sweep's window must be anchored to the deadline
+/// the attempt was actually dispatched under (the same solve that
+/// sized the spawn intent and the Job's `activeDeadlineSeconds`), not
+/// re-derived at sweep time: a fitted estimate or hw-table change that
+/// shrinks between dispatch and sweep would otherwise establish a
+/// healthy, still-building attempt as an unreported executor crash
+/// (spurious charge toward the poison threshold, duplicate build, the
+/// genuine report later AckIgnored as assignment-inactive). The fenced
+/// pull mint writes the solved deadline here; the sweep takes
+/// `max(persisted, re-solved)` so the window can widen (estimate grew,
+/// floor bump) but never shrink while the attempt is open
+/// (`sched.attempt.establishment-window+2`). Nullable: pre-074 rows
+/// fall back to the sweep-time re-solve, and stream rows never
+/// populate it. Known residual: the Job's `activeDeadlineSeconds` is
+/// rendered slightly before the pull mint, so the persisted value can
+/// in principle undershoot the Job's by however much the estimate
+/// moved inside that gap; the configured report slack plus the
+/// controller's worker-timeout margin covers that residue.
+pub const M_074: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

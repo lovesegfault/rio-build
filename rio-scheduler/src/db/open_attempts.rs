@@ -89,6 +89,11 @@ pub(crate) struct OpenAttemptRow {
     /// lib readers (the WHERE clause is the discriminator).
     #[allow(dead_code)]
     pub dispatch_mode: String,
+    /// The deadline (seconds) this attempt was dispatched under,
+    /// persisted by the pull mint (072). The establishment sweep's
+    /// window anchor: the window may widen via the sweep-time re-solve
+    /// but never shrink below this. `None` for rows minted before 072.
+    pub deadline_secs: Option<f64>,
 }
 
 impl SchedulerDb {
@@ -111,6 +116,7 @@ impl SchedulerDb {
         exec_id: Uuid,
         log_hash: &str,
         source_node: Option<&str>,
+        deadline_secs: Option<f64>,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         // The floor read runs on the transaction's connection so the
@@ -147,18 +153,22 @@ impl SchedulerDb {
         .bind(exec_id)
         .execute(&mut *tx)
         .await?;
-        // The execution lifecycle row carries the pull discriminator
-        // and the controller-authoritative source attribution (071).
+        // The execution lifecycle row carries the pull discriminator,
+        // the controller-authoritative source attribution (071), and
+        // the dispatched-deadline anchor for the establishment window
+        // (072).
         sqlx::query(
             "INSERT INTO drv_executions \
-                 (exec_id, drv_hash, executor_id, started_at, dispatch_mode, source_node) \
-             VALUES ($1, $2, $3, now(), 'pull', $4) \
+                 (exec_id, drv_hash, executor_id, started_at, dispatch_mode, source_node, \
+                  deadline_secs) \
+             VALUES ($1, $2, $3, now(), 'pull', $4, $5) \
              ON CONFLICT (exec_id) DO NOTHING",
         )
         .bind(exec_id)
         .bind(log_hash)
         .bind(executor_id.as_str())
         .bind(source_node)
+        .bind(deadline_secs)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -256,7 +266,7 @@ impl SchedulerDb {
         let rows: Vec<OpenAttemptRow> = sqlx::query_as(
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
-                    e.source_node, e.dispatch_mode, \
+                    e.source_node, e.dispatch_mode, e.deadline_secs, \
                     EXTRACT(EPOCH FROM a.assigned_at)::float8 AS assigned_at_epoch_secs, \
                     GREATEST(EXTRACT(EPOCH FROM (now() - a.assigned_at))::float8, 0.0) \
                         AS age_secs \
