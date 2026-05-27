@@ -148,8 +148,8 @@ impl HydraClient {
         if st.used >= self.cap {
             anyhow::bail!(
                 "hydra politeness budget exhausted ({} requests used, cap {}); \
-                 narrow the scope, or raise the cap passed to HydraClient::new only \
-                 if the extra load on hydra.nixos.org is justified",
+                 narrow the scope, or raise --hydra-request-cap only if the extra \
+                 load on hydra.nixos.org is justified",
                 st.used,
                 self.cap
             );

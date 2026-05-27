@@ -9,7 +9,9 @@
 //! the nix-eval-jobs argv for full or scoped (selection-expression)
 //! runs.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+use anyhow::Context as _;
 
 use crate::hydra::HydraJobset;
 
@@ -118,7 +120,7 @@ pub fn tarball_url(git_uri: &str, rev: &str) -> anyhow::Result<String> {
     anyhow::ensure!(
         base.starts_with("https://github.com/"),
         "only github.com nixpkgs inputs are supported (got {git_uri}); \
-         supply an explicit source tarball URL to override"
+         pass --source-tarball-url to override"
     );
     Ok(format!("{base}/archive/{rev}.tar.gz"))
 }
@@ -271,6 +273,142 @@ pub fn selection_expr(
 /// real nixpkgs revision.
 pub fn short_rev_matches(short_rev: &str, full_rev: &str) -> bool {
     !short_rev.is_empty() && full_rev.starts_with(short_rev)
+}
+
+// ── Source-prep subprocess helpers ───────────────────────────────────
+//
+// Network/nix-dependent: the offline unit suite never calls these; they
+// are exercised end-to-end when an eval set is actually built (and by
+// the #[ignore]d eval_e2e integration test).
+
+/// Download the pinned-revision source tarball to `dest`. The whole
+/// body is buffered in memory (a nixpkgs GitHub archive is ~50 MB);
+/// non-2xx responses are errors carrying a clipped body snippet.
+pub async fn download_tarball(url: &str, user_agent: &str, dest: &Path) -> anyhow::Result<()> {
+    tracing::info!(%url, "downloading nixpkgs tarball");
+    let client = reqwest::Client::builder()
+        .user_agent(user_agent)
+        .timeout(std::time::Duration::from_secs(600))
+        .build()
+        .context("build tarball HTTP client")?;
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!(
+            "GET {url}: HTTP {status}: {}",
+            crate::body_snippet(&resp.text().await.unwrap_or_default())
+        );
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .with_context(|| format!("download {url}"))?;
+    std::fs::write(dest, &bytes).with_context(|| format!("write {}", dest.display()))?;
+    tracing::info!(bytes = bytes.len(), dest = %dest.display(), "tarball downloaded");
+    Ok(())
+}
+
+/// Unpack the tarball into `unpack_dir` and return the single
+/// top-level directory it contains (`nixpkgs-<rev>` for a GitHub
+/// archive tarball). More than one top-level directory — e.g. a reused
+/// scratch dir holding a previous revision's unpack — is an error
+/// rather than a guess.
+pub async fn unpack_tarball(tarball: &Path, unpack_dir: &Path) -> anyhow::Result<PathBuf> {
+    std::fs::create_dir_all(unpack_dir)
+        .with_context(|| format!("create {}", unpack_dir.display()))?;
+    let out = tokio::process::Command::new("tar")
+        .arg("-xzf")
+        .arg(tarball)
+        .arg("-C")
+        .arg(unpack_dir)
+        // Cancelling the caller (e.g. a failure elsewhere in the build)
+        // drops this future; kill_on_drop keeps that from orphaning a
+        // still-running tar.
+        .kill_on_drop(true)
+        .output()
+        .await
+        .context("spawn tar -xzf")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "tar -xzf {} exited with {}: {}",
+        tarball.display(),
+        out.status,
+        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
+    );
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(unpack_dir)
+        .with_context(|| format!("read {}", unpack_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.is_dir())
+        .collect();
+    anyhow::ensure!(
+        dirs.len() == 1,
+        "expected exactly one unpacked top-level directory in {}, found {}",
+        unpack_dir.display(),
+        dirs.len()
+    );
+    Ok(dirs.remove(0))
+}
+
+/// `nix store add-path --name source <tree>` — adds the unpacked tree
+/// to the local store under the SAME store-path name Hydra's git-input
+/// export uses (`source`), which is what lets jobs that embed the
+/// source path in their outputs (nixos.channel, nixpkgs.tarball)
+/// reproduce Hydra's drvPaths bit-for-bit. Returns the store path.
+pub async fn store_add_source(nix_bin: &str, tree: &Path) -> anyhow::Result<String> {
+    let out = tokio::process::Command::new(nix_bin)
+        .args([
+            "--extra-experimental-features",
+            "nix-command",
+            "store",
+            "add-path",
+            "--name",
+            "source",
+        ])
+        .arg(tree)
+        // Cancelling the caller drops this future; kill_on_drop keeps
+        // that from orphaning a still-running nix process.
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("spawn {nix_bin} store add-path"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "nix store add-path failed ({}): {}",
+        out.status,
+        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
+    );
+    let path = String::from_utf8(out.stdout).context("nix store add-path output is not UTF-8")?;
+    let path = path.trim().to_string();
+    anyhow::ensure!(
+        path.starts_with("/nix/store/") && path.ends_with("-source"),
+        "unexpected nix store add-path output: {path:?}"
+    );
+    Ok(path)
+}
+
+/// `<bin> --version` first line (e.g. `nix (Nix) 2.34.7`), recorded in
+/// the eval-set key so a tooling upgrade forks the key digest instead
+/// of silently landing on an existing prefix.
+pub async fn tool_version(bin: &str) -> anyhow::Result<String> {
+    let out = tokio::process::Command::new(bin)
+        .arg("--version")
+        // kill_on_drop so a cancelled caller cannot orphan the child.
+        .kill_on_drop(true)
+        .output()
+        .await
+        .with_context(|| format!("spawn {bin} --version"))?;
+    anyhow::ensure!(
+        out.status.success(),
+        "{bin} --version exited with {}: {}",
+        out.status,
+        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
+    );
+    let stdout = std::str::from_utf8(&out.stdout).context("--version output is not UTF-8")?;
+    Ok(stdout.lines().next().unwrap_or_default().trim().to_string())
 }
 
 #[cfg(test)]

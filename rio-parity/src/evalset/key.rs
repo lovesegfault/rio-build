@@ -15,13 +15,18 @@ use sha2::Digest as _;
 use crate::evalset::Scope;
 
 /// Identity of one eval set: every input that determines its contents.
-/// Hashed by [`EvalSetKey::digest`] into the digest that names the S3
-/// prefix and the local output directory.
+/// Hashed by [`EvalSetKey::digest`]; the SHORT form of that digest
+/// ([`EvalSetKey::short_digest`], first 16 hex chars) is what names the
+/// S3 prefix and the local output directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalSetKey {
     pub hydra_eval_id: u64,
     pub project: String,
     pub jobset: String,
+    /// Systems in scope, sorted and deduplicated (callers normalize CLI
+    /// input through [`EvalSetKey::normalize_systems`]) so that
+    /// `--systems` argument order or repetition can never fork the
+    /// digest of an otherwise identical eval set.
     pub systems: Vec<String>,
     pub scope: Scope,
     pub engine_version: String,
@@ -37,6 +42,15 @@ pub struct EvalSetKey {
 }
 
 impl EvalSetKey {
+    /// Sort + dedupe a systems list into the canonical form the
+    /// `systems` field requires, so two invocations that only differ in
+    /// `--systems` order or repetition produce the same key digest.
+    pub fn normalize_systems(mut systems: Vec<String>) -> Vec<String> {
+        systems.sort();
+        systems.dedup();
+        systems
+    }
+
     /// Full hex SHA-256 over the serde_json encoding of the key.
     ///
     /// That encoding is part of the identity: fields serialize in
@@ -152,6 +166,27 @@ mod tests {
         let mut e = key();
         e.forced_at = Some("2026-05-26T12:00:00Z".into());
         assert_ne!(a.digest(), e.digest());
+    }
+
+    #[test]
+    fn normalized_systems_make_the_digest_order_independent() {
+        // The same systems set spelled in different orders (and with a
+        // duplicate) must land on the same digest once normalized —
+        // otherwise CLI argument order would fork S3 prefixes.
+        let mut a = key();
+        a.systems = EvalSetKey::normalize_systems(vec![
+            "x86_64-linux".into(),
+            "aarch64-linux".into(),
+            "x86_64-linux".into(),
+        ]);
+        let mut b = key();
+        b.systems =
+            EvalSetKey::normalize_systems(vec!["aarch64-linux".into(), "x86_64-linux".into()]);
+        assert_eq!(
+            a.systems,
+            vec!["aarch64-linux".to_string(), "x86_64-linux".to_string()]
+        );
+        assert_eq!(a.digest(), b.digest());
     }
 
     #[test]
