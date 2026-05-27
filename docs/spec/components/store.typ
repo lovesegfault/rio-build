@@ -839,6 +839,15 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   reject end-user tenant tokens instead (see #rref("store.api.batch-query")).
 ]
 
+The signature gate is not an absolute ceiling on visibility: a tenant that
+proves possession of the full NAR via the content-verified re-upload
+(#rref("store.tenant.find-missing-attribution") drives the re-push,
+#rref("store.put.tenant-attribution") grants the row) becomes *attributed* to
+the path, and attributed reads pass the tenant filter directly — the
+signature gate no longer applies for that tenant, and the stored signature
+key names (including the original pusher's) become visible to it. Possession
+of the bytes, not a trusted signature, is what that carve-out requires.
+
 #r("store.substitute.find-missing-gated")[
   `FindMissingPaths` MUST apply #rref("store.substitute.tenant-sig-visibility")
   to the locally-present subset and report gate-failed paths as missing.

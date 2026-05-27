@@ -552,9 +552,18 @@ Response (after STDERR loop):
   [S → C],
   [`validPaths`],
   [string collection],
-  [Subset of input paths that
-    exist in the store],
+  [Subset of input paths valid *for the
+    requesting tenant* (see below)],
 )
+
+The reply is tenant-scoped, not a bare existence check: the gateway forwards
+this opcode as `FindMissingPaths` with `require_tenant_attribution` set
+(#rref("store.tenant.find-missing-attribution")), so a locally-present path
+the session tenant is not attributed to is reported as invalid/missing for
+that tenant — which makes the client's normal copy flow re-push it and earn
+attribution via the content-verified re-upload
+(#rref("store.put.tenant-attribution")). Anonymous sessions are unaffected
+(the store ignores the flag without a tenant identity).
 
 == wopBuildPaths (9) Wire Format
 
