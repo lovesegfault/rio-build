@@ -313,7 +313,7 @@ the `pending_s3_deletes` table.
   via a service token --- see #rref("sec.authz.service-token").
 ]
 
-#r("sec.authz.ca-path-derived+6")[
+#r("sec.authz.ca-path-derived+7")[
   Workers are untrusted: builder-side hash checks are defense-in-depth, and
   the store is the authority on whether a claimed path is derivable from the
   uploaded bytes. The store MUST verify every worker upload that makes a
@@ -340,13 +340,17 @@ the `pending_s3_deletes` table.
   worker cannot register content at a fixed-output path that the content does
   not derive; a non-`fixed:` descriptor on a worker upload is rejected. The
   trigger for that verification is trusted-plane data, not the worker's own
-  claim: the scheduler signs `is_fixed_output` into the assignment token, and
-  the store MUST reject a descriptor-less upload under a fixed-output-flagged
-  token with `PERMISSION_DENIED` — a worker cannot opt out of content
-  verification by omitting its descriptor. Descriptor-less `is_ca = false`
-  uploads under a token that does not mark the assignment fixed-output
-  (input-addressed outputs, daemon-era workers) remain authorized by
-  membership alone. The server-side CA-path recompute MUST run BEFORE the
+  claim: the scheduler signs `is_fixed_output` into the assignment token (only
+  once its `sign_fod_claims` rollout gate is armed --- helm
+  `scheduler.signFodClaims`, default off; Phase 2 of
+  #cross-link("/spec/system/deployment.typ")[Deployment: Upgrades]), and the
+  store MUST reject a descriptor-less upload under a fixed-output-flagged
+  token with `PERMISSION_DENIED` — under an armed scheduler a worker cannot
+  opt out of content verification by omitting its descriptor. Descriptor-less
+  `is_ca = false` uploads under a token that does not mark the assignment
+  fixed-output (input-addressed outputs, daemon-era workers, and every
+  fixed-output assignment while `sign_fod_claims` is unarmed) remain
+  authorized by membership alone. The server-side CA-path recompute MUST run BEFORE the
   `'uploading'` placeholder is claimed (#rref("store.put.wal-manifest") step
   1), so a worker holding an `is_ca` token cannot squat placeholders for paths
   it has not content-proven (it would otherwise drip-feed chunks while

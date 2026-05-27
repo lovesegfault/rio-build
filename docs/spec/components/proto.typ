@@ -49,8 +49,9 @@ mandatory.
     [`ASSIGNMENT_TOKEN_HEADER`],
     [`x-rio-assignment-token`],
     [executor → store (request metadata on `PutPath` / `PutPathBatch`)],
-    [HMAC-SHA256 token signed by scheduler; store verifies (executor_id,
-      drv_hash, expected_outputs, expiry)],
+    [HMAC-SHA256 token signed by scheduler; store verifies the seven-field
+      `AssignmentClaims` (executor_id, drv_hash, expected_outputs, is_ca,
+      is_fixed_output, tenant, expiry_unix)],
 
     [`TENANT_TOKEN_HEADER`],
     [`x-rio-tenant-token`],
@@ -67,10 +68,14 @@ mandatory.
   between MergeDag commit and the first `BuildEvent`.
 ]
 
-#r("proto.metadata.assignment-token")[
+#r("proto.metadata.assignment-token+1")[
   `x-rio-assignment-token` is the *only* input the store trusts when
   authorizing `PutPath`. The token is minted scheduler-side at dispatch (HMAC
-  over executor_id + drv_hash + expected_outputs + expiry) and carried through
+  over the seven-field `AssignmentClaims` tuple --- executor_id, drv_hash,
+  expected_outputs, is_ca, is_fixed_output, tenant, expiry_unix; optional
+  fields use serde defaults, and `is_fixed_output` is only emitted while the
+  scheduler's `sign_fod_claims` gate is armed --- see
+  #rref("common.hmac.claims+1")) and carried through
   the executor verbatim. The store MUST reject uploads with a missing,
   expired, or mismatched-output token. Builder pods are airgapped and
   untrusted --- builder-supplied data MUST NOT drive authorization; the token

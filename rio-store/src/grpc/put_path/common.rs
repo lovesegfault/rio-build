@@ -366,7 +366,7 @@ fn parse_fixed_ca_descriptor(s: &str, ctx_label: &str) -> Result<FixedCaDescript
     Ok(FixedCaDescriptor { recursive, hash })
 }
 
-// r[impl sec.authz.ca-path-derived+6]
+// r[impl sec.authz.ca-path-derived+7]
 /// Content-address authorization gate. Workers are untrusted, so the
 /// store — not the builder — is the authority on whether a claimed
 /// store path is actually derivable from the uploaded bytes. The gate
@@ -1584,7 +1584,7 @@ mod verify_nar_tests {
         c
     }
 
-    // r[verify sec.authz.ca-path-derived+6]
+    // r[verify sec.authz.ca-path-derived+7]
     /// A fixed-output assignment (signed `is_fixed_output = true`) may
     /// not skip content verification by omitting the descriptor: the
     /// store rejects rather than falling back to membership-only
@@ -1629,7 +1629,7 @@ mod verify_nar_tests {
         (path, nar, descriptor)
     }
 
-    // r[verify sec.authz.ca-path-derived+6]
+    // r[verify sec.authz.ca-path-derived+7]
     /// Fixed-output uploads (is_ca = false, `fixed:` descriptor present)
     /// are content-verified server-side: the descriptor must match the
     /// uploaded bytes AND the claimed path must re-derive from it. A
@@ -1675,7 +1675,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+6]
+    // r[verify sec.authz.ca-path-derived+7]
     /// Flat-mode fixed-output uploads get the same binding, using the
     /// file-bytes hash instead of the NAR hash.
     #[test]
@@ -1713,7 +1713,7 @@ mod verify_nar_tests {
         );
     }
 
-    // r[verify sec.authz.ca-path-derived+6]
+    // r[verify sec.authz.ca-path-derived+7]
     /// Method confusion on the fixed-output arm: the descriptor honestly
     /// matches the bytes under the WRONG method (flat) while the claimed
     /// path was minted recursively — the path re-derivation rejects, the
