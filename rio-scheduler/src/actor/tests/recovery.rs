@@ -5106,3 +5106,66 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
     );
     Ok(())
 }
+
+/// Displacement must survive leader failover: once a conflicting
+/// store-backed definition displaces a terminal authoritative squat, the
+/// persisted row carries the DISPLACING identity, so recovery rebuilds
+/// (and re-dispatches) that definition — not the squatter's — and without
+/// the squatter's stale authoritative bytes.
+// r[verify sched.merge.authoritative-conflict]
+#[tokio::test]
+async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter: authoritative single-node build, completed by an
+        // x86_64 worker → node terminal.
+        let mut squat = make_node("squat-recover");
+        squat.drv_content = b"Derive-squat".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-x86", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        complete_success(
+            &handle,
+            "w-x86",
+            &assn.drv_path,
+            &test_store_path("squat-out"),
+        )
+        .await?;
+        wait_for_status(&handle, "squat-recover", DerivationStatus::Completed).await;
+
+        // Displacer: conflicting verifiable identity (different system)
+        // displaces the terminal squat; its fresh node is still pending
+        // at failover time.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-recover", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: only an aarch64 worker can receive the recovered
+    // node — proof the row (and thus the rebuilt in-memory state) carries
+    // the displacing identity, not the squatter's. The assignment must
+    // not resurrect the squatter's authoritative bytes either.
+    let mut rx = connect_executor(&handle, "w-arm", "aarch64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_path,
+        test_drv_path("squat-recover"),
+        "recovered displaced node dispatches to the displacing system"
+    );
+    assert!(
+        assignment.drv_content.is_empty(),
+        "displaced squat's authoritative bytes must not survive into the displacing definition"
+    );
+    Ok(())
+}

@@ -694,3 +694,94 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
 
     Ok(())
 }
+
+/// Displacement persistence: a later creation-scoped upsert of the same
+/// drv_hash refreshes the full creation-time snapshot — pname, system,
+/// required_features, status — so a leader failover rebuilds the node
+/// from the identity that won the merge (the displacing submission), not
+/// the squatter's. Live accumulators (poison/failure/floor columns) keep
+/// their own writers and must NOT be touched by the upsert.
+// r[verify sched.merge.authoritative-conflict]
+#[tokio::test]
+async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let squatter = DerivationRow {
+        drv_hash: "displaced".into(),
+        drv_path: format!("/nix/store/{}-displaced.drv", "d".repeat(32)),
+        pname: Some("squat".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Completed,
+        required_features: vec!["kvm".into()],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: Some(b"Derive-squat".to_vec()),
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[squatter]).await?;
+    tx.commit().await?;
+
+    // Simulate live accumulator state written by other writers.
+    sqlx::query(
+        "UPDATE derivations
+         SET poisoned_at = now(), failed_builders = '{w1}', retry_count = 2,
+             resubmit_cycles = 3, floor_mem_bytes = 4096
+         WHERE drv_hash = 'displaced'",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    // The displacing submission re-creates the node with a different
+    // verifiable identity.
+    let displacer = DerivationRow {
+        drv_hash: "displaced".into(),
+        drv_path: format!("/nix/store/{}-displaced.drv", "d".repeat(32)),
+        pname: Some("victim".into()),
+        system: "aarch64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: None,
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[displacer]).await?;
+    tx.commit().await?;
+
+    let (pname, system, status, features): (Option<String>, String, String, Vec<String>) =
+        sqlx::query_as(
+            "SELECT pname, system, status, required_features
+             FROM derivations WHERE drv_hash = 'displaced'",
+        )
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(pname.as_deref(), Some("victim"), "pname refreshed");
+    assert_eq!(system, "aarch64-linux", "system refreshed");
+    assert_eq!(status, "created", "status reset to the creation snapshot");
+    assert!(features.is_empty(), "required_features refreshed");
+
+    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem): (
+        bool,
+        Vec<String>,
+        i32,
+        i32,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT poisoned_at IS NOT NULL, failed_builders, retry_count,
+                resubmit_cycles, floor_mem_bytes
+         FROM derivations WHERE drv_hash = 'displaced'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert!(has_poison, "poisoned_at untouched by the upsert");
+    assert_eq!(failed, vec!["w1".to_string()], "failed_builders untouched");
+    assert_eq!(retry_count, 2, "retry_count untouched");
+    assert_eq!(resubmit_cycles, 3, "resubmit_cycles untouched");
+    assert_eq!(floor_mem, 4096, "floor columns untouched");
+    Ok(())
+}

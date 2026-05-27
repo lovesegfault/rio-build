@@ -8781,3 +8781,111 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
     store.faults.query_path_info_gate.notify_waiters();
     Ok(())
 }
+
+// ===========================================================================
+// Authoritative-squat displacement: persistence + accounting reconciliation
+// ===========================================================================
+
+/// End-to-end displacement of a terminal authoritative squat
+/// (sched.merge.authoritative-conflict): the displacing submission's
+/// identity is what PG persists, the displaced hash stops counting toward
+/// prior interested builds (they complete instead of hanging Active), and
+/// the displaced fresh node belongs to the displacer only.
+// r[verify sched.merge.authoritative-conflict]
+#[tokio::test]
+async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1 (the squatter): single authoritative node. Connect the
+    // worker while this is the only Ready node so the first assignment is
+    // deterministically the squat.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatA");
+    squat.drv_content = b"Derive-squat".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let squat_path = test_drv_path("squatA");
+    let filler_path = test_drv_path("fillerB");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "squat dispatched first");
+
+    // Build 2 (prior-interested victim of the prune): joins the in-flight
+    // squat with a MATCHING identity and brings one extra node of its own.
+    let joiner = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        joiner,
+        vec![make_node("squatA"), make_node("fillerB")],
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Complete the squat only — build1 succeeds, build2 stays Active on
+    // fillerB.
+    complete_success(&handle, "w1", &squat_path, &test_store_path("squatA-out")).await?;
+    wait_for_status(&handle, "squatA", DerivationStatus::Completed).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "squatter build completes"
+    );
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "joiner still waiting on fillerB"
+    );
+
+    // Build 3 (the displacer): conflicting verifiable identity (different
+    // system) for the same drv_hash → displaces the now-terminal squat.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatA", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The persisted row now carries the displacing identity and is no
+    // longer terminal — a leader failover would rebuild THIS definition.
+    let (system, status): (String, String) =
+        sqlx::query_as("SELECT system, status FROM derivations WHERE drv_path = $1")
+            .bind(&squat_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        system, "aarch64-linux",
+        "row refreshed to displacer identity"
+    );
+    assert!(
+        matches!(status.as_str(), "created" | "queued" | "ready"),
+        "row no longer claims the squatter's terminal status (got {status})"
+    );
+
+    // The joiner's accounting no longer includes the displaced hash:
+    // completing fillerB is enough to finish the build (no Active hang).
+    // Executors are one-shot (drain after their completion), so a second
+    // worker runs fillerB; the displaced fresh node is aarch64-only and
+    // cannot be what gets dispatched here.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, filler_path, "unexpected assignment");
+    complete_success(&handle, "w2", &filler_path, &test_store_path("fillerB-out")).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "prior-interested build completes after displacement (hash pruned)"
+    );
+    // The displacer owns the fresh node (aarch64 → never dispatched to w1).
+    assert_eq!(
+        query_status(&handle, displacer).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "displacer build is live on the fresh node"
+    );
+    Ok(())
+}

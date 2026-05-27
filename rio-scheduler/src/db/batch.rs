@@ -100,26 +100,34 @@ impl SchedulerDb {
             drv_content.push(r.drv_content.clone().unwrap_or_default());
         }
 
-        // ON CONFLICT: update the recovery columns too. For
-        // expected_output_paths / output_names / is_* a second build
-        // requesting the same derivation carries identical values
-        // (same drv_hash → same .drv content → same declared outputs),
-        // so overwriting with EXCLUDED is idempotent and just keeps
-        // the row in sync with in-mem. status/retry etc stay as-is —
-        // those reflect LIVE state, not merge-time snapshot.
+        // ON CONFLICT: refresh the full creation-time snapshot. Rows are
+        // written only by submissions that (re)create the in-memory node
+        // (sched.persist.creation-scoped) — joins never reach this query —
+        // so last-write-wins on the declared identity (pname/system/
+        // required_features) and on status='created' simply mirrors the
+        // in-memory first-writer/displacement truth. The old "same
+        // drv_hash → same content" justification is exactly what the
+        // displacement path (sched.merge.authoritative-conflict)
+        // invalidates: a displacing submission may carry a DIFFERENT
+        // verifiable identity, and without the refresh a leader failover
+        // would rebuild the node from the displaced squatter's identity.
+        // Live accumulators (floor_*, poisoned_at, failed_builders,
+        // retry_count, resubmit_cycles) are NOT touched — they have their
+        // own writers (clear_poison/clear_poison_batch, floor updates).
         //
-        // wanted_output_names is the exception: it is NOT a function of
-        // drv_hash — it is a function of who CONSUMES the derivation,
-        // and a second build may want a different output subset.
-        // Overwrite would let build B's narrower {out} clobber build
-        // A's {out,dev} and un-want an output a still-live build needs.
-        // It is therefore UNIONED on conflict, with empty saturating to
-        // empty: '{}' is the "all declared outputs wanted" sentinel, so
-        // all ∪ X = all (mirrors `DerivationState::union_wanted`). The
-        // stored union only ever grows for a given drv_hash; it is the
-        // persistence/recovery fallback — classification reads the live
-        // effective set (`effective_wanted`, in-memory per-build
-        // contributions) and only falls back to this column.
+        // wanted_output_names is the exception to last-write-wins: it is
+        // NOT a function of drv_hash — it is a function of who CONSUMES
+        // the derivation, and a second build may want a different output
+        // subset. Overwrite would let build B's narrower {out} clobber
+        // build A's {out,dev} and un-want an output a still-live build
+        // needs. It is therefore UNIONED on conflict, with empty
+        // saturating to empty: '{}' is the "all declared outputs wanted"
+        // sentinel, so all ∪ X = all (mirrors
+        // `DerivationState::union_wanted`). The stored union only ever
+        // grows for a given drv_hash; it is the persistence/recovery
+        // fallback — classification reads the live effective set
+        // (`effective_wanted`, in-memory per-build contributions) and
+        // only falls back to this column.
         //
         // topdown_pruned is OR-combined on conflict for the same reason:
         // an unrelated, non-pruned merge of the same drv elsewhere must
@@ -201,6 +209,10 @@ impl SchedulerDb {
             -- single-row clear_topdown_pruned_by_hash is mark-only).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
+                pname = EXCLUDED.pname,
+                system = EXCLUDED.system,
+                required_features = EXCLUDED.required_features,
+                status = EXCLUDED.status,
                 expected_output_paths = EXCLUDED.expected_output_paths,
                 output_names = EXCLUDED.output_names,
                 is_fixed_output = EXCLUDED.is_fixed_output,

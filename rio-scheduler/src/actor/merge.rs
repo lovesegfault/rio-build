@@ -767,6 +767,38 @@ impl DagActor {
         let node_index: HashMap<&str, &crate::domain::DerivationNode> =
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
+        // Displacement accounting (sched.merge.authoritative-conflict):
+        // a displaced node is a DIFFERENT derivation definition, so the
+        // spec forbids carrying the squat's interest onto the fresh node
+        // — but every removal path must either carry or prune interest,
+        // otherwise a prior-interested build keeps counting a hash that
+        // no longer exists for it and can hang Active forever. Prune the
+        // displaced hash from those builds' accounting (they keep any
+        // results they already received) and re-check their completion
+        // via the same `other_builds` fan-out used for shared-node
+        // re-probes. Runs after the point of no return (the build is
+        // already committed), so a later rollback can no longer occur.
+        let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
+        for hash in &merge_result.displaced {
+            let Some((_, prior)) = merge_result
+                .removed_retriable
+                .iter()
+                .find(|(h, _)| h == hash)
+            else {
+                continue;
+            };
+            for prior_build in &prior.interested_builds {
+                if *prior_build == ingest.build_id {
+                    continue;
+                }
+                if let Some(b) = self.builds.get_mut(prior_build)
+                    && b.derivation_hashes.remove(hash)
+                {
+                    displaced_prune_builds.insert(*prior_build);
+                }
+            }
+        }
+
         let mut t_phase = Instant::now();
         macro_rules! phase {
             ($name:literal) => {
@@ -949,6 +981,9 @@ impl DagActor {
         }
         phase!("6h-preexisting-nodes-loop");
         let _ = &mut t_phase; // last phase! write is intentionally unread
+
+        let mut other_builds = other_builds;
+        other_builds.extend(displaced_prune_builds);
 
         MergeReconcile {
             cached_count,
