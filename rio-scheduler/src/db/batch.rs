@@ -80,8 +80,8 @@ impl SchedulerDb {
         // bytea[] bind: sqlx's array encoder wants a homogeneous
         // element type, so None is encoded as an EMPTY bytea and
         // converted back to NULL SQL-side via NULLIF — the column
-        // must be NULL (not '') for non-authoritative nodes so the
-        // ON CONFLICT COALESCE never wipes persisted bytes.
+        // must be NULL (not '') for non-authoritative nodes; persisted
+        // authoritative bytes are replaced last-write-wins by design.
         let mut drv_content = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
