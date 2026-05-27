@@ -296,39 +296,62 @@ impl StoreServiceImpl {
         // re-upload grants attribution (store.put.tenant-attribution).
         // Without the flag (scheduler cache-check, builder pre-check,
         // anonymous callers) the sig-trust gate semantics are unchanged.
+        let attribution_scoped = req.require_tenant_attribution && tenant_id.is_some();
         let visible = match tenant_id {
             Some(tid) if req.require_tenant_attribution => {
                 self.attribution_visibility_batch(tid, &present).await?
             }
             _ => self.sig_visibility_gate_batch(tenant_id, &present).await?,
         };
+        // Everything in `missing` up to here is locally absent; the
+        // gate-hidden (locally PRESENT) paths are appended after this
+        // index.
+        let n_locally_absent = missing.len();
         for p in present {
             if !visible.contains(&p) {
                 missing.push(p);
             }
         }
 
-        // HEAD-probe each missing path against the tenant's upstreams.
+        // HEAD-probe missing paths against the tenant's upstreams.
         // Fails-open on probe errors (a down upstream shouldn't hide
         // paths the scheduler can otherwise substitute). Empty if no
         // substituter / no tenant / no upstreams — the normal case.
+        //
+        // Under the attribution-scoped arm, paths reported missing only
+        // because the tenant lacks a `path_tenants` row are locally
+        // present — probing upstreams for whether they could be
+        // substituted is wasted load: the bytes are already here, the
+        // tenant's route to them is the content-verified re-upload, and
+        // the only caller of that arm (the gateway's wopQueryValidPaths
+        // forward) consumes `missing_paths` and discards the
+        // substitutable/indeterminate fields. Probe only the
+        // locally-absent prefix there. The sig-trust arm keeps probing
+        // every missing path: a sig-hidden substitution-only path can
+        // legitimately be re-substituted from the caller's own trusted
+        // upstream, so its probe result is meaningful.
         // r[impl sched.merge.substitute-probe-indeterminate]
         // `indeterminate` = paths the probe couldn't classify (429,
         // 5xx, deadline). Scheduler treats them optimistically; without
         // this field they were silently treated as confirmed-miss and
         // dispatched as builds even when in cache.nixos.org.
+        let probe_targets: &[String] = if attribution_scoped {
+            &missing[..n_locally_absent]
+        } else {
+            &missing
+        };
         let (substitutable, indeterminate) = match (&self.substituter, tenant_id) {
-            (Some(sub), Some(tid)) if !missing.is_empty() => sub
+            (Some(sub), Some(tid)) if !probe_targets.is_empty() => sub
                 .check_available(
                     tid,
-                    &missing,
+                    probe_targets,
                     entry + crate::substitute::CHECK_AVAILABLE_DEFAULT_BUDGET,
                 )
                 .await
                 .map(|r| (r.hits, r.indeterminate))
                 .unwrap_or_else(|e| {
-                    warn!(error = %e, "check_available failed; reporting all missing as indeterminate");
-                    (Vec::new(), missing.clone())
+                    warn!(error = %e, "check_available failed; reporting all probed paths as indeterminate");
+                    (Vec::new(), probe_targets.to_vec())
                 }),
             _ => (Vec::new(), Vec::new()),
         };

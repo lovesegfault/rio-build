@@ -823,3 +823,138 @@ async fn find_missing_paths_attribution_scope() -> TestResult {
     }
     Ok(())
 }
+
+/// The attribution-scoped FindMissingPaths arm reports a
+/// present-but-unattributed path as missing WITHOUT probing the
+/// tenant's upstreams for it — the bytes are already local and the
+/// tenant's route to them is the verified re-upload, not substitution —
+/// while a genuinely-absent path in the same request is still probed
+/// against the upstream and reported substitutable exactly as before.
+// r[verify store.tenant.find-missing-attribution]
+#[tokio::test]
+async fn find_missing_paths_attribution_arm_skips_probe_for_present_paths() -> TestResult {
+    use rio_store::substitute::Substituter;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let tenant_a = seed_tenant(&db.pool, "probe-skip-a").await;
+    let tenant_b = seed_tenant(&db.pool, "probe-skip-b").await;
+
+    // Recording fake upstream: answers every narinfo HEAD with 200 (so
+    // any probed path counts as substitutable) and logs every request
+    // path it saw. Plaintext http on loopback — no TLS involved.
+    let probed: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let recorder = Arc::clone(&probed);
+    let app = axum::Router::new()
+        .route(
+            "/nix-cache-info",
+            axum::routing::get(|| async {
+                "StoreDir: /nix/store\nWantMassQuery: 1\nPriority: 40\n"
+            }),
+        )
+        .fallback(move |uri: axum::http::Uri| {
+            let recorder = Arc::clone(&recorder);
+            async move {
+                recorder
+                    .lock()
+                    .expect("recorder lock")
+                    .push(uri.path().to_string());
+                ""
+            }
+        });
+    let listener =
+        tokio::net::TcpListener::bind(std::net::SocketAddr::from(([127, 0, 0, 1], 0))).await?;
+    let upstream_url = format!("http://{}", listener.local_addr()?);
+    let upstream_task = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("fake upstream serves");
+    });
+    let _upstream_guard = scopeguard::guard(upstream_task, |h| h.abort());
+
+    // Tenant B has that upstream configured. Direct insert (defaults
+    // for priority/trusted_keys/sig_mode): the HEAD probe never reads
+    // trusted_keys, and the admin RPC's pubkey-format validation would
+    // only add noise here.
+    sqlx::query("INSERT INTO tenant_upstreams (tenant_id, url) VALUES ($1, $2)")
+        .bind(tenant_b)
+        .bind(&upstream_url)
+        .execute(&db.pool)
+        .await?;
+
+    // Distinct hash parts so the recorded narinfo probes are
+    // unambiguous (`test_store_path` shares one hash across names).
+    let present_path = format!("/nix/store/{}-probe-skip-present", "1".repeat(32));
+    let absent_path = format!("/nix/store/{}-probe-skip-absent", "2".repeat(32));
+
+    // A pushes the present path; B never gains attribution for it.
+    let (mut store_a, server_a) =
+        spawn_store_with_fake_jwt(StoreServiceImpl::new(db.pool.clone()), tenant_a).await?;
+    let _guard_a = scopeguard::guard(server_a, |h| h.abort());
+    let (nar, nar_hash) = make_nar(b"probe-skip payload");
+    assert!(
+        put_path(
+            &mut store_a,
+            make_path_info(&present_path, &nar, nar_hash),
+            nar
+        )
+        .await?,
+        "seed push creates"
+    );
+
+    // B's store has a working substituter. Empty root-cert store: the
+    // fake upstream is plaintext http, and the native-CA load that
+    // `Client::new()` does fails inside the nix sandbox.
+    let http = reqwest::Client::builder()
+        .tls_certs_only(std::iter::empty())
+        .build()
+        .expect("empty-cert client builds");
+    let sub = Arc::new(Substituter::new(db.pool.clone(), mem_backend()).with_http_client(http));
+    let (mut store_b, server_b) = spawn_store_with_fake_jwt(
+        StoreServiceImpl::new(db.pool.clone()).with_substituter(sub),
+        tenant_b,
+    )
+    .await?;
+    let _guard_b = scopeguard::guard(server_b, |h| h.abort());
+
+    let resp = store_b
+        .find_missing_paths(FindMissingPathsRequest {
+            store_paths: vec![present_path.clone(), absent_path.clone()],
+            require_tenant_attribution: true,
+        })
+        .await?
+        .into_inner();
+
+    // Both report missing for B: the absent one because it does not
+    // exist, the present one because B holds no attribution for it.
+    let missing: std::collections::HashSet<&str> =
+        resp.missing_paths.iter().map(String::as_str).collect();
+    assert_eq!(
+        missing,
+        [present_path.as_str(), absent_path.as_str()]
+            .into_iter()
+            .collect(),
+        "both paths must be reported missing for the unattributed tenant"
+    );
+    // The genuinely-absent path was probed (and the upstream's 200
+    // makes it substitutable); the present-but-unattributed one was
+    // neither probed nor reported substitutable.
+    assert!(
+        resp.substitutable_paths.contains(&absent_path),
+        "absent path must still be probed and reported substitutable, got {:?}",
+        resp.substitutable_paths
+    );
+    assert!(
+        !resp.substitutable_paths.contains(&present_path),
+        "present-but-unattributed path must not be reported substitutable"
+    );
+    let seen = probed.lock().expect("recorder lock").clone();
+    assert!(
+        seen.iter().any(|p| p.contains(&"2".repeat(32))),
+        "upstream must receive a narinfo probe for the absent path, saw {seen:?}"
+    );
+    assert!(
+        !seen.iter().any(|p| p.contains(&"1".repeat(32))),
+        "upstream must NOT be probed for a locally-present path, saw {seen:?}"
+    );
+    Ok(())
+}
