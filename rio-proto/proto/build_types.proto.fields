@@ -94,6 +94,7 @@ string executor_id = 1;
 string executor_id = 4;
 string failed_derivation = 2;
 string intent_id = 13;
+string mountd_token = 16;
 string output_name = 1;
 string output_path = 2;
 string phase = 2;

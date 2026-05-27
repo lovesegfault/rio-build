@@ -336,6 +336,19 @@ message WorkAssignment {
   // the scheduler hashes into AssignmentClaims.input_closure_digest
   // (P0589) so the builder can echo it without recomputing the BFS.
   repeated string input_closure = 15;
+  // ADR-022 §P0559: HMAC-signed MountdClaims{aud, build_id, tenant,
+  // issued, expiry} the builder presents in the rio-mountd
+  // Mount{build_id, token} frame so a hostUsers:false executor pod
+  // (whose remapped gids can never match the host rio-builder gid) is
+  // admitted by the node's mountd. Signed with the DEDICATED mountd
+  // key (RIO_MOUNTD_HMAC_KEY_PATH), never the assignment key. Empty =
+  // scheduler has no mountd key configured (dev/standalone — the
+  // builder then sends no token and mountd's gid gate is the only
+  // admission path). Empty and absent are indistinguishable on the
+  // consumer side (both mean "no token"), so a plain string keeps the
+  // wire backward-compatible: old schedulers send nothing, old
+  // builders ignore the field.
+  string mountd_token = 16;
 }
 
 // One closure input path with its castore root for the FUSE prefetch.

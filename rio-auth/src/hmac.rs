@@ -266,6 +266,153 @@ impl HmacClaims for ExecutorClaims {
     }
 }
 
+/// Audience discriminator carried in every [`MountdClaims`] token.
+///
+/// Belt-and-suspenders on top of the two structural defences (separate
+/// key, divergent serde shape): even if the mountd key and the
+/// assignment key were ever mixed up operationally, a token without
+/// `aud == "rio-mountd"` can never admit a `Mount{}`, and a mountd
+/// token can never satisfy a verifier expecting one of the other claims
+/// types (their `deny_unknown_fields` rejects the `aud`/`build_id`
+/// keys).
+pub const MOUNTD_TOKEN_AUDIENCE: &str = "rio-mountd";
+
+/// Maximum `build_id` length accepted by rio-mountd
+/// (`r[builder.mountd.build-id-validated]`). Mirrored here so
+/// [`MountdClaims::build_id_for_drv_path`] can produce a compliant id
+/// without rio-auth depending on rio-builder.
+const MOUNTD_BUILD_ID_MAX_LEN: usize = 64;
+
+/// Claims for a rio-mountd Mount-admission token (ADR-022 §P0559).
+///
+/// Minted by the scheduler at dispatch (alongside the assignment
+/// token, same TTL), delivered to the builder in
+/// `WorkAssignment.mountd_token`, presented in the mountd UDS
+/// `Mount{build_id, token}` frame, and verified offline by rio-mountd.
+/// This is how a `hostUsers: false` executor pod — whose uids/gids are
+/// kubelet-remapped so it can never present the host `rio-builder` gid
+/// — proves it is a scheduler-dispatched build rather than an arbitrary
+/// local process that can reach the node socket.
+///
+/// Signed with a DEDICATED mountd key (`RIO_MOUNTD_HMAC_KEY_PATH`),
+/// never the store-facing assignment key: the verification key must
+/// live on every builder node (the mountd DaemonSet), and a node
+/// compromise must not yield a key that the store trusts for uploads
+/// or castore reads. The [`MOUNTD_TOKEN_AUDIENCE`] field plus the
+/// divergent serde shape (`deny_unknown_fields`, no
+/// `drv_hash`/`expected_outputs`/`intent_id`) keep the token families
+/// mutually unverifiable even under key mix-ups.
+// r[impl builder.mountd.token-key-separate]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MountdClaims {
+    /// Always [`MOUNTD_TOKEN_AUDIENCE`]. Checked by
+    /// [`MountdClaims::verify`]; anything else is rejected.
+    pub aud: String,
+    /// The mountd `build_id` this token authorizes — the exact string
+    /// the builder sends in `Mount{build_id}`, i.e.
+    /// [`MountdClaims::build_id_for_drv_path`] of the assignment's
+    /// `drv_path`. mountd compares it against the requested id, so a
+    /// stolen token cannot be replayed to claim (squat) a different
+    /// build's id.
+    pub build_id: String,
+    /// Attributing tenant UUID (hyphenated), when the dispatch had one.
+    /// Audit/debug only — mountd performs no tenant-scoped decisions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
+    /// Unix seconds when the token was minted. Audit/debug only.
+    pub issued_unix: u64,
+    /// Unix seconds; token invalid after this. The scheduler sets the
+    /// same TTL as the assignment token (2× build_timeout clamped to
+    /// [4 h, `assignment_token_ttl_cap_secs`]) so a mid-build re-Mount
+    /// after a mountd restart — the builder's reconnect path re-issues
+    /// `Mount{}` with the same token — stays within validity for the
+    /// whole build.
+    pub expiry_unix: u64,
+}
+
+/// Why a presented mountd token does not authorize the requested
+/// `Mount{}`. Variants deliberately carry no token material; the
+/// daemon logs the variant and replies with a generic rejection.
+#[derive(Debug, thiserror::Error)]
+pub enum MountdTokenError {
+    /// Signature, format, or expiry failure from the shared HMAC
+    /// envelope (or a claims shape that is not `MountdClaims`).
+    #[error("mountd token invalid: {0}")]
+    Token(#[from] HmacError),
+    /// The token verified but its audience is not
+    /// [`MOUNTD_TOKEN_AUDIENCE`] — it was minted for some other
+    /// consumer and must not admit a Mount.
+    #[error("mountd token audience mismatch")]
+    Audience,
+    /// The token verified but was minted for a different `build_id`
+    /// than the one the Mount requests.
+    #[error("mountd token build_id mismatch")]
+    BuildIdMismatch,
+}
+
+impl MountdClaims {
+    /// The mountd `build_id` for a derivation path: basename of
+    /// `drv_path`, every byte outside `[A-Za-z0-9_-]` collapsed to
+    /// `_`, truncated to [`MOUNTD_BUILD_ID_MAX_LEN`], `_` if empty.
+    ///
+    /// One definition shared by the scheduler (which signs the id into
+    /// [`MountdClaims::build_id`]) and — via an equality test in
+    /// rio-builder — the builder's own derivation
+    /// (`mountd_build_id(sanitize_build_id(drv_path))`). Drift here
+    /// makes every token-admitted Mount fail closed with a build_id
+    /// mismatch, so the coupling is pinned by tests on both sides.
+    /// Store-path basenames keep their leading 32-char nixbase32 hash,
+    /// so truncation never collides two distinct derivations.
+    pub fn build_id_for_drv_path(drv_path: &str) -> String {
+        let mut id: String = drv_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(drv_path)
+            .chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                    c
+                } else {
+                    '_'
+                }
+            })
+            .take(MOUNTD_BUILD_ID_MAX_LEN)
+            .collect();
+        if id.is_empty() {
+            id.push('_');
+        }
+        id
+    }
+
+    /// Verify `token` as a Mount-admission credential for `build_id`:
+    /// HMAC signature with the mountd key, not expired, audience is
+    /// [`MOUNTD_TOKEN_AUDIENCE`], and the signed `build_id` equals the
+    /// requested one. Returns the claims so callers can log/attribute
+    /// the admitted build.
+    // r[impl builder.mountd.token-admission]
+    pub fn verify(
+        verifier: &HmacVerifier,
+        token: &str,
+        build_id: &str,
+    ) -> Result<Self, MountdTokenError> {
+        let claims = verifier.verify::<Self>(token)?;
+        if claims.aud != MOUNTD_TOKEN_AUDIENCE {
+            return Err(MountdTokenError::Audience);
+        }
+        if claims.build_id != build_id {
+            return Err(MountdTokenError::BuildIdMismatch);
+        }
+        Ok(claims)
+    }
+}
+
+impl HmacClaims for MountdClaims {
+    fn expiry_unix(&self) -> u64 {
+        self.expiry_unix
+    }
+}
+
 /// tonic client interceptor that mints `x-rio-service-token` (HMAC-signed
 /// [`ServiceClaims`]) on every outgoing request.
 ///
@@ -1052,6 +1199,163 @@ mod tests {
             .verify::<AssignmentClaims>(&token)
             .expect("CRLF trimmed → same key → verify succeeds");
         assert_eq!(verified, claims);
+    }
+
+    fn test_mountd_claims(build_id: &str, expiry_offset_secs: i64) -> MountdClaims {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        MountdClaims {
+            aud: MOUNTD_TOKEN_AUDIENCE.into(),
+            build_id: build_id.into(),
+            tenant: Some("4f8a3c0e-0000-4000-8000-000000000001".into()),
+            issued_unix: now,
+            expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
+        }
+    }
+
+    /// Mountd-token happy path plus every rejection the daemon's
+    /// admission gate relies on: wrong key, expiry, tampering, audience
+    /// mismatch, and build_id mismatch.
+    // r[verify builder.mountd.token-admission]
+    #[test]
+    fn mountd_token_verify_matrix() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let claims = test_mountd_claims("b-alpha_drv", 3600);
+        let token = signer.sign(&claims);
+
+        // Round-trip with the matching build_id.
+        let got = MountdClaims::verify(&verifier, &token, "b-alpha_drv").expect("valid token");
+        assert_eq!(got, claims);
+
+        // Wrong key → InvalidSignature.
+        let other = HmacVerifier::from_key(b"completely-different-key-32bytes".to_vec());
+        assert!(matches!(
+            MountdClaims::verify(&other, &token, "b-alpha_drv"),
+            Err(MountdTokenError::Token(HmacError::InvalidSignature))
+        ));
+
+        // Expired → Expired.
+        let expired = signer.sign(&test_mountd_claims("b-alpha_drv", -60));
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &expired, "b-alpha_drv"),
+            Err(MountdTokenError::Token(HmacError::Expired { .. }))
+        ));
+
+        // build_id mismatch → BuildIdMismatch (token bound to one build).
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &token, "b-other_drv"),
+            Err(MountdTokenError::BuildIdMismatch)
+        ));
+
+        // Audience mismatch → Audience, even though the signature and
+        // build_id are fine.
+        let mut wrong_aud = test_mountd_claims("b-alpha_drv", 3600);
+        wrong_aud.aud = "rio-store".into();
+        let wrong_aud_token = signer.sign(&wrong_aud);
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &wrong_aud_token, "b-alpha_drv"),
+            Err(MountdTokenError::Audience)
+        ));
+
+        // Garbage → token-format error, not a panic.
+        assert!(matches!(
+            MountdClaims::verify(&verifier, "not-a-token", "b-alpha_drv"),
+            Err(MountdTokenError::Token(_))
+        ));
+    }
+
+    /// The two token families can never satisfy each other's verifier,
+    /// even when signed with the SAME key (the worst-case operational
+    /// mix-up): the serde shapes diverge (`deny_unknown_fields`), so a
+    /// store assignment token is not a mountd Mount credential and a
+    /// mountd token is not a store upload/read credential. In
+    /// production the keys are also separate — this is the second,
+    /// independent defence.
+    // r[verify builder.mountd.token-key-separate]
+    #[test]
+    fn mountd_and_assignment_tokens_are_mutually_unverifiable() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+
+        let assignment_token = signer.sign(&test_claims(3600));
+        let mountd_token = signer.sign(&test_mountd_claims("b-alpha_drv", 3600));
+        let executor_token = signer.sign(&ExecutorClaims {
+            intent_id: "abc123".into(),
+            kind: 0,
+            expiry_unix: u64::MAX,
+        });
+
+        // Assignment/executor tokens do not admit a Mount.
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &assignment_token, "b-alpha_drv"),
+            Err(MountdTokenError::Token(HmacError::Json(_)))
+        ));
+        assert!(matches!(
+            MountdClaims::verify(&verifier, &executor_token, "b-alpha_drv"),
+            Err(MountdTokenError::Token(HmacError::Json(_)))
+        ));
+
+        // A mountd token does not parse as any of the other claim types.
+        assert!(matches!(
+            verifier.verify::<AssignmentClaims>(&mountd_token),
+            Err(HmacError::Json(_))
+        ));
+        assert!(matches!(
+            verifier.verify::<ServiceClaims>(&mountd_token),
+            Err(HmacError::Json(_))
+        ));
+        assert!(matches!(
+            verifier.verify::<ExecutorClaims>(&mountd_token),
+            Err(HmacError::Json(_))
+        ));
+    }
+
+    /// `build_id_for_drv_path` always emits something rio-mountd's
+    /// validator accepts and keeps distinct store-path hashes distinct
+    /// under truncation. Mirrors the builder-side derivation
+    /// (`mountd_build_id(sanitize_build_id(..))`) — the cross-crate
+    /// equality is pinned by `castore_build_id_matches_token_claim` in
+    /// rio-builder.
+    #[test]
+    fn mountd_build_id_for_drv_path_is_compliant() {
+        let valid = |id: &str| {
+            !id.is_empty()
+                && id.len() <= MOUNTD_BUILD_ID_MAX_LEN
+                && id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        };
+        for raw in [
+            "/nix/store/abc123-hello.drv",
+            "/nix/store/vwb2lprckpd4kbg67sczakiqqqd4jxzy-llvm-tblgen-src-21_1_8.drv",
+            "/nix/store/q2x9mcm9hzf2cdh22cbjmaqm6qmh1k1f-opensp-1.5.2-c11-using.patch?id=688d9675",
+            "simple",
+            "",
+            "weird/../traversal",
+        ] {
+            let id = MountdClaims::build_id_for_drv_path(raw);
+            assert!(valid(&id), "{raw:?} → {id:?} is not mountd-compliant");
+        }
+        assert_eq!(
+            MountdClaims::build_id_for_drv_path("/nix/store/abc123-hello.drv"),
+            "abc123-hello_drv"
+        );
+        // The discriminating hash prefix survives truncation.
+        let a = MountdClaims::build_id_for_drv_path(&format!(
+            "/nix/store/{}-{}",
+            "a".repeat(32),
+            "x".repeat(80)
+        ));
+        let b = MountdClaims::build_id_for_drv_path(&format!(
+            "/nix/store/{}-{}",
+            "b".repeat(32),
+            "x".repeat(80)
+        ));
+        assert_ne!(a, b, "distinct drv hashes must stay distinct");
+        assert_eq!(a.len(), MOUNTD_BUILD_ID_MAX_LEN);
     }
 
     /// Token is human-debuggable: base64-decode the first part →
