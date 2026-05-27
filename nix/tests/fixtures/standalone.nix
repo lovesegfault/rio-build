@@ -43,7 +43,7 @@ in
   # and mints a session JWT, and the store gets the matching PUBKEY so
   # it verifies that JWT — which is what attributes gateway-pushed
   # paths (the seed closure) to the pushing tenant in `path_tenants`
-  # (r[store.put.tenant-attribution]); without it the seed stays
+  # (r[store.put.tenant-attribution+2]); without it the seed stays
   # tenant-less and every castore mount of it fails NotFound. The
   # scheduler deliberately does NOT get the pubkey: that would flip it
   # into JWT mode (`r[sched.tenant.authz]` rejects tokenless

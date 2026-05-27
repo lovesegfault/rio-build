@@ -227,18 +227,26 @@ scope: with scope; ''
       )
       # The copy must have ATTRIBUTED, not just no-op'd: the junction
       # rows for (seed closure, gc-tenant-test) are what the castore
-      # mount of the build below depends on.
+      # mount of the build below depends on. The expected cardinality
+      # is exactly the seed closure (closureInfo store-paths, one path
+      # per line): the tenant is brand new, so every closure path is
+      # reported missing for it and every re-push earns one row.
+      seed_paths_expected = int(client.succeed(
+          "wc -l < /etc/rio/busybox-closure/store-paths"
+      ).strip())
       seed_rows_tenant = int(psql_k8s(k3s_server,
           "SELECT count(*) FROM path_tenants pt "
           "JOIN tenants t USING (tenant_id) "
           "WHERE t.tenant_name = 'gc-tenant-test'"
       ))
-      assert seed_rows_tenant > 0, (
-          "tenant-key nix copy of the seed closure must attribute the "
-          "already-complete paths to gc-tenant-test (attribution-scoped "
-          "FindMissingPaths + content-verified re-upload); got 0 rows — "
-          "either the session JWT was not minted for the gc-tenant key "
-          "or the store-side re-upload attribution is broken"
+      assert seed_rows_tenant == seed_paths_expected, (
+          f"tenant-key nix copy of the seed closure must attribute every "
+          f"closure path to gc-tenant-test (attribution-scoped "
+          f"FindMissingPaths + content-verified re-upload); expected "
+          f"{seed_paths_expected} rows, got {seed_rows_tenant} — 0 means "
+          f"the session JWT was not minted for the gc-tenant key or the "
+          f"store-side re-upload attribution is broken; a partial count "
+          f"means some closure paths were not re-pushed or not attributed"
       )
       print(f"second-tenant seed copy attributed {seed_rows_tenant} path(s) to gc-tenant-test")
 

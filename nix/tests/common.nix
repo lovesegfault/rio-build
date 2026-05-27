@@ -217,7 +217,7 @@ rec {
         # gateway must have minted the tenant's session JWT for the
         # ssh-ng push (fixture `withJwt`) and the store must have
         # written path_tenants junction rows for the seeded closure
-        # (r[store.put.tenant-attribution]). Without them every castore
+        # (r[store.put.tenant-attribution+2]). Without them every castore
         # mount of the seed returns NotFound and builds die at mount
         # time — catch that here, at the recipe, instead of N infra
         # retries later. Needs psql on ${gatewayHost} (fixture
