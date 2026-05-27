@@ -1693,12 +1693,15 @@ in
       #   status gate missing the post-`\2` PermanentFailure wrap.)
       "eio-infra-retry"
       # r[verify builder.fs.fetch-circuit]
-      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
-      #   concurrent never-cached opens fail within their fetch budgets,
-      #   the breaker opens (circuit_open=1), and the next open fails
-      #   fast against the open breaker. Last: the most disruptive fault
-      #   (whole-store outage), so a restoration hiccup cannot poison a
-      #   later subtest.
+      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — the six
+      #   concurrent never-cached opens fail within their fetch budgets
+      #   (served in two waves under fuse_threads=4) and the breaker
+      #   opens during the real outage (circuit_open=1); that is what
+      #   this subtest asserts. Fail-fast of subsequent opens against
+      #   the open breaker is unit-verified (castore_fuse/tests.rs
+      #   open_fails_fast_once_the_circuit_trips + circuit.rs tests).
+      #   Last: the most disruptive fault (whole-store outage), so a
+      #   restoration hiccup cannot poison a later subtest.
       "eio-circuit-breaker"
     ];
     globalTimeout = 1800;

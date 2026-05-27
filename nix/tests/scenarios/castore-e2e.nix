@@ -310,12 +310,14 @@ let
   # the 60 s pre-read window gives the test time to scale the store to 0
   # (observed ~10-25 s); the six never-before-read inputs are then read
   # CONCURRENTLY — with the store gone each open fails at its own
-  # jit_fetch_timeout, so running them in parallel keeps the whole
-  # failure burst at ~one fetch budget of wall time (sequential reads
-  # would stack five 60 s budgets and push the build past the
-  # scheduler's 300 s client-less-build reaping). Six consecutive
-  # failures open the breaker; the seventh, sequential read then hits
-  # the OPEN breaker. All failures are swallowed — the script itself
+  # jit_fetch_timeout, and fuse_threads=4 serves the reads in two waves
+  # (4 then 2), so the burst costs ~two fetch budgets (~185 s observed
+  # to breaker-open) instead of stacking the cold reads' 60 s budgets
+  # sequentially past the scheduler's 300 s client-less-build reaping.
+  # The recorded failures open the breaker (observed on the fifth); the
+  # seventh, late read then hits the OPEN breaker (fail-fast there is
+  # unit-verified, not asserted in the VM — the gate asserts
+  # circuit_open=1). All failures are swallowed — the script itself
   # never fails; the test scrapes during the tail and cancels.
   eioBreakerDrv = pkgs.writeText "castore-eio-breaker.nix" ''
     { busybox, e1, e2, e3, e4, e5, e6, e7 }:
@@ -342,7 +344,10 @@ let
   # script whose store-side chunk the test takes offline — the daemon's
   # execve gets EIO from the castore lower, nix-daemon reports
   # "executing '<closure root>': Input/output error", and the executor
-  # must reclassify that MiscFailure as InfrastructureFailure
+  # must reclassify the resulting builder-exit failure wrap (a
+  # PermanentFailure in the live shape, since the daemon child writes
+  # its setup-done marker before execve; MiscFailure remains one of the
+  # eligible variants) as InfrastructureFailure
   # (r[builder.result.input-eio-is-infra]) so the scheduler re-queues
   # instead of poisoning. Once the test restores the chunk, the retry
   # must complete. busybox is referenced via the env attr so the

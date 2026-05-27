@@ -3,8 +3,10 @@ scope: with scope; ''
   # P0560 round 3b finding (b): the first two wirings (sequential
   # reads, then a 300 s gate) never saw the breaker open before their
   # deadline / the orphan watcher. This wiring reads the six inputs
-  # CONCURRENTLY (≈ one fetch budget of wall time even if every open
-  # rides its full 60 s jit_fetch_timeout), sizes the gate at 360 s,
+  # CONCURRENTLY — fuse_threads=4 serves them in two waves (four EIOs
+  # at ~+60 s, two more at ~+120 s), so the burst costs ~two fetch
+  # budgets (~185 s observed to breaker-open even with every open
+  # riding its full 60 s jit_fetch_timeout) — sizes the gate at 360 s,
   # and prints a counters/pod-phase timeline every poll so a failure
   # documents exactly how the fetch path behaved (opens reaching the
   # fetch? eio counted? failures recorded but breaker closed?) instead
@@ -17,17 +19,20 @@ scope: with scope; ''
   # ~10-25 s). The six never-before-read 64 KiB inputs it then reads
   # CONCURRENTLY all fail their fetches: with the deployment scaled away
   # the connections hang rather than reset, so each open is bounded by
-  # its own jit_fetch_timeout (60 s) — never an unbounded hang — and
-  # because the reads run in parallel the whole burst costs ~one fetch
-  # budget of wall time. Six consecutive failures open the breaker
-  # (circuit_open = 1); the script's seventh, sequential read then hits
-  # the already-open breaker. All failures are swallowed — the build is
-  # reclaimed by cancel and the store scaled back up before the next
-  # subtest.
+  # its own jit_fetch_timeout (60 s) — never an unbounded hang.
+  # fuse_threads=4 serves the six in two waves (4 then 2), so the burst
+  # costs ~two fetch budgets of wall time, with the breaker observed
+  # open ~185 s after scale-down on the fifth recorded failure
+  # (circuit_open = 1) — that is what the gate below asserts. The
+  # script's seventh, sequential read then hits the already-open
+  # breaker; fail-fast there is unit-verified in castore_fuse
+  # (open_fails_fast_once_the_circuit_trips + circuit.rs), not asserted
+  # here. All failures are swallowed — the build is reclaimed by cancel
+  # and the store scaled back up before the next subtest.
   #
   # The breaker-gate budget is the bounded-EIO proof: 60 s pre-read
-  # window + ~one concurrent fetch budget (60 s) + headroom = 300 s. An
-  # open that hung past its budget would blow the gate.
+  # window + ~two wave-serialized fetch budgets (120 s) + headroom
+  # = 360 s. An open that hung past its budget would blow the gate.
   with subtest("eio-circuit-breaker: store outage trips the fetch breaker, opens stay bounded"):
       extras_args = " ".join(
           f"--arg e{i + 1} '(builtins.storePath {p})'" for i, p in enumerate(p_eio_extras)

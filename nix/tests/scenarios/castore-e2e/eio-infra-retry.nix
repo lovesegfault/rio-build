@@ -23,10 +23,12 @@ scope: with scope; ''
   # the mount succeeds and the failure happens exactly at the input
   # read). The kernel's open-for-exec gets EIO from the castore lower,
   # nix-daemon reports `executing '<closure root>': Input/output error`,
-  # and the executor must reclassify that MiscFailure as
-  # InfrastructureFailure: the scheduler re-queues (status never reaches
-  # failed/poisoned) and, once the chunks are restored, a retry
-  # completes. State-based fault injection — no timing window at all.
+  # and the executor must reclassify the resulting builder-exit failure
+  # wrap (PermanentFailure in the live shape; MiscFailure stays
+  # eligible) as InfrastructureFailure: the scheduler re-queues (status
+  # never reaches failed/poisoned) and, once the chunks are restored, a
+  # retry completes. State-based fault injection — no timing window at
+  # all.
   with subtest("eio-infra-retry: input-read EIO classifies as infra and recovers"):
       assert_not_cached(b3_eio_builder, "eio builder before the build")
 
@@ -131,19 +133,23 @@ scope: with scope; ''
       # Classification evidence: the executor's reclassified error
       # message ("input materialization failed (I-043/I-178): …
       # executing '<builder>': Input/output error") flows into the
-      # scheduler's infrastructure-failure handler log line. One bounded
-      # fetch after the fact — the line distinguishes the infra path
-      # from a permanent-failure retry, which the PG status alone
-      # cannot.
+      # scheduler's infrastructure-failure handler log line, which also
+      # carries drv_hash (the .drv basename) — so the count is scoped
+      # to THIS subtest's derivation and an unrelated reclassification
+      # cannot satisfy it. One bounded fetch after the fact — the line
+      # distinguishes the infra path from a permanent-failure retry,
+      # which the PG status alone cannot.
+      drv_base_eio = drv_eio.rsplit("/", 1)[-1]
       sched_tail = k3s_server.succeed(
           "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
           "--tail=20000 --since=20m 2>/dev/null | "
+          f"grep -aF '{drv_base_eio}' | "
           "grep -c 'input materialization failed' || true"
       ).strip()
       assert int(sched_tail or "0") >= 1, (
           "eio-infra-retry: the scheduler never logged the input-materialization "
-          "reclassification for the failed attempt — the EIO was not classified "
-          "as an infrastructure failure"
+          f"reclassification for {drv_base_eio} — the EIO was not classified "
+          "as an infrastructure failure for this derivation"
       )
       print("eio-infra-retry PASS: EIO classified as infra, re-queued, recovered")
 ''
