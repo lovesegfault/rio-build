@@ -750,6 +750,9 @@ let
       nsBuilders
       busybox
       b3sum
+      grpcurl
+      grpcurlTls
+      protoset
       coreutilsStatic
       coreutilsClosure
       coldDrv
@@ -834,6 +837,21 @@ let
         before = "seed-faults";
         after = "eio-infra-retry";
         msg = "eio-infra-retry uses the seeded eio builder — seed-faults must run first";
+      }
+      {
+        before = "seed-faults";
+        after = "scope-denied";
+        msg = "scope-denied probes the seeded big_f/post_seed digests — seed-faults must run first";
+      }
+      {
+        before = "chunk-warm";
+        after = "scope-denied";
+        msg = "scope-denied replays against build A's (chunk-warm's) input — A must have built under enforce first";
+      }
+      {
+        before = "scope-denied";
+        after = "eio-circuit-breaker";
+        msg = "scope-denied talks to the live store — keep it before the whole-store outage";
       }
       {
         before = "chunk-warm";

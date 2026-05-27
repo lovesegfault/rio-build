@@ -1672,7 +1672,21 @@ in
       "seed-faults"
       #   chunk-warm: clean streaming baseline (fixture canary) + cache
       #   pre-warm; fills the chunk inventory integrity-fail corrupts.
+      #   Under the castore_read_scope enforce default this build (and
+      #   every other real build in the suite) only works because the
+      #   builder presents its closure — the green run is the positive
+      #   half of the scope-denied evidence below.
       "chunk-warm"
+      # r[verify builder.castore.scope-present]
+      # r[verify store.castore.closure-scope]
+      #   scope-denied: ADR-022 P0591 negative evidence — a sibling
+      #   assignment token (same tenant, minted in-VM with the cluster's
+      #   own HMAC key, closure digest over a disjoint closure) presents
+      #   its closure, gets served for an in-closure object (positive
+      #   control), and gets NOT_FOUND + an out_of_scope deny count on
+      #   build A's (chunk-warm's) 24 MiB input — the object a
+      #   tenant-wide token could read before closure scoping.
+      "scope-denied"
       # r[verify builder.fs.file-digest-integrity]
       #   integrity-fail: a size-preserving corruption of a node-cache
       #   chunk is caught by the streaming fill's whole-file BLAKE3 —
