@@ -167,6 +167,15 @@
     accepted as a credential for those name-keyed reads in the meantime.
 ]
 
+The closure bound in the read-authorization bullet above is mode-gated
+(#rref("store.castore.closure-scope")): it is enforced once
+`castore_read_scope.mode = "enforce"` — until the builder-side presentation
+lands and flips that default (P0591 Phase 2), the shipped `log` mode observes
+and counts out-of-scope reads without rejecting them, so the leaked-token
+exposure in the interim is the tenant-wide read of
+#rref("store.castore.tenant-scope+2") bounded by
+#rref("store.castore.terminal-revocation").
+
 #r("common.hmac.expiry-cap")[
   The scheduler MUST bound the assignment-token lifetime at mint time:
   `expiry_unix - now` is `2 × build_timeout` clamped to a 4 h floor and to the
