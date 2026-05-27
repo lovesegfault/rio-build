@@ -35,6 +35,8 @@ rio_builder_castore_fuse_open_case_total:case
 rio_builder_castore_fuse_open_seconds_bucket:hit
 rio_builder_castore_fuse_fetch_bytes_total:hit
 rio_builder_castore_fuse_chunk_source_total:src
+rio_builder_castore_scope_present_total:trigger
+rio_builder_castore_scope_present_total:outcome
 rio_builder_upload_chunks_total:kind
 rio_mountd_request_seconds_bucket:op
 rio_mountd_promote_reject_total:reason
@@ -43,6 +45,9 @@ rio_mountd_sweep_bytes_freed_total:tier
 rio_store_nar_index_eager_total:outcome
 rio_store_directory_has_batch_size_bucket:rpc
 rio_store_hmac_rejected_total:reason
+rio_store_castore_scope_absent_total:resolution
+rio_store_castore_scope_denied_total:reason
+rio_store_castore_scope_would_deny_total:reason
 '
 
 scratch=$TMPDIR/dashlabels

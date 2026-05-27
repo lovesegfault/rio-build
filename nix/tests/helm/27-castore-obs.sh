@@ -56,6 +56,8 @@ want_alerts='RioBuilderCastoreEio
 RioBuilderCastoreIntegrityFail
 RioBuilderDagPrefetchSlow
 RioMountdPromoteRejectMismatch
+RioStoreCastoreScopeDenied
+RioStoreCastoreScopeUnresolvable
 RioStoreFileDigestMismatch
 RioStoreNarIndexEagerErrors'
 test "$got_alerts" = "$want_alerts" || {
@@ -77,7 +79,8 @@ for a in RioBuilderCastoreIntegrityFail RioBuilderCastoreEio RioStoreFileDigestM
     exit 1
   }
 done
-for a in RioMountdPromoteRejectMismatch RioBuilderDagPrefetchSlow RioStoreNarIndexEagerErrors; do
+for a in RioMountdPromoteRejectMismatch RioBuilderDagPrefetchSlow RioStoreNarIndexEagerErrors \
+  RioStoreCastoreScopeDenied RioStoreCastoreScopeUnresolvable; do
   test "$(sev_of "$a")" = "warning" || {
     echo "FAIL: $a must be severity: warning (degradation, not a page)" >&2
     exit 1
@@ -99,6 +102,29 @@ grep -q 'reason="mismatch"' <<<"$prm_block" || {
 nie_block=$(grep -A4 'alert: RioStoreNarIndexEagerErrors' "$mon" || true)
 grep -q 'outcome="error"' <<<"$nie_block" || {
   echo "FAIL: RioStoreNarIndexEagerErrors expr does not select outcome=\"error\"" >&2
+  exit 1
+}
+
+# P0591 closure-scope alerts. The deny alert must cover BOTH counters:
+# denied (enforce, the default) AND would_deny (the log rollback mode)
+# — dropping the would_deny arm makes the rollback mode blind, and the
+# would-deny backlog is the gate for flipping back to enforce.
+csd_block=$(grep -A8 'alert: RioStoreCastoreScopeDenied' "$mon" || true)
+grep -q 'rio_store_castore_scope_denied_total' <<<"$csd_block" || {
+  echo "FAIL: RioStoreCastoreScopeDenied expr does not watch rio_store_castore_scope_denied_total" >&2
+  exit 1
+}
+grep -q 'rio_store_castore_scope_would_deny_total' <<<"$csd_block" || {
+  echo "FAIL: RioStoreCastoreScopeDenied expr no longer covers rio_store_castore_scope_would_deny_total — the log rollback mode would have no deny signal" >&2
+  exit 1
+}
+
+# The unresolvable warn must key on resolution="denied" — the served
+# (log-mode) and derived (fallback-hit) resolutions are healthy paths,
+# and widening to them turns routine new-replica churn into alerts.
+csu_block=$(grep -A4 'alert: RioStoreCastoreScopeUnresolvable' "$mon" || true)
+grep -q 'resolution="denied"' <<<"$csu_block" || {
+  echo "FAIL: RioStoreCastoreScopeUnresolvable expr does not select resolution=\"denied\"" >&2
   exit 1
 }
 

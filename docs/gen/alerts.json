@@ -18,6 +18,8 @@
     "RioSlaHwCostStale",
     "RioSlaPredictionDrift",
     "RioSlaPriorDivergenceClamped",
+    "RioStoreCastoreScopeDenied",
+    "RioStoreCastoreScopeUnresolvable",
     "RioStoreFileDigestMismatch",
     "RioStoreNarIndexEagerErrors",
     "RioStorePutPathRetries"

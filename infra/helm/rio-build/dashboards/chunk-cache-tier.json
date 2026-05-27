@@ -415,6 +415,76 @@
         "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Castore scope establishment & churn",
+      "description": "rate(rio_store_castore_scope_established_total[5m]) — closure scopes established via PresentClosure (verified against the token's signed input_closure_digest, P0591). rio_store_castore_scope_absent_total by resolution — assignment-token reads that arrived without a scope on this replica: derived = rebuilt from pins+references (normal for a fresh replica), denied = answered CASTORE_SCOPE_REQUIRED so the builder re-presents, served = log/rollback mode only. increase(rio_store_castore_scope_mismatch_total[15m]) — presented closure ≠ signed digest (a builder presenting something it was not dispatched with). Sustained absent→denied alongside a quiet established rate means builders are not presenting — cross-check the presenter panel on the castore-fuse dashboard.",
+      "gridPos": {"x": 0, "y": 48, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_store_castore_scope_established_total[5m]))",
+          "legendFormat": "scopes established/s",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (resolution) (rate(rio_store_castore_scope_absent_total[5m]))",
+          "legendFormat": "scope absent → {{resolution}}",
+          "refId": "B"
+        },
+        {
+          "expr": "sum(increase(rio_store_castore_scope_mismatch_total[15m]))",
+          "legendFormat": "presented ≠ signed digest (15m)",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 14,
+      "type": "timeseries",
+      "title": "Castore scope denials by reason",
+      "description": "increase(rio_store_castore_scope_denied_total[15m]) by reason — castore reads denied by closure scoping under enforce mode: out_of_scope (digest only reachable outside the attested closure; the wire answer is an uninformative NOT_FOUND) or unattested (token carries no closure digest; PERMISSION_DENIED). increase(rio_store_castore_scope_would_deny_total[15m]) by reason — what enforce WOULD have denied while running the log rollback mode; it must drain to zero before flipping back to enforce. Any sustained movement here is either a token being replayed outside its build or a presentation/coverage bug — the structured deny log on rio-store carries the drv/executor/digest detail (RioStoreCastoreScopeDenied alert).",
+      "gridPos": {"x": 12, "y": 48, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (reason) (increase(rio_store_castore_scope_denied_total[15m]))",
+          "legendFormat": "denied: {{reason}} (15m)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (reason) (increase(rio_store_castore_scope_would_deny_total[15m]))",
+          "legendFormat": "would-deny (log mode): {{reason}} (15m)",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "red", "value": 1}]},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 20, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ]
 }

@@ -594,4 +594,64 @@ spec:
               rio-store logs for "eager nar_index compute failed",
               chunk-backend read errors, and
               rio_store_nar_index_compute_seconds for timeouts.
+
+        # P0591 closure-scoped castore reads: under the enforce default
+        # a healthy fleet denies nothing — every legitimate read is
+        # inside the closure the scheduler signed and the builder
+        # presented. Any deny is therefore either a token replayed
+        # outside its build (the property the scope exists to enforce)
+        # or a presentation/coverage bug failing real builds with
+        # NOT_FOUND (which RioBuilderCastoreEio escalates to a page if
+        # widespread). would_deny is the same signal while running the
+        # `log` rollback mode — it must drain to zero before flipping
+        # back to enforce. Warn on either; the structured deny log on
+        # rio-store carries the drv/executor/digest detail the wire
+        # status deliberately omits.
+        - alert: RioStoreCastoreScopeDenied
+          expr: |
+            sum by (reason) (increase(rio_store_castore_scope_denied_total[15m])) > 0
+              or
+            sum by (reason) (increase(rio_store_castore_scope_would_deny_total[15m])) > 0
+          for: 0m
+          labels:
+            severity: warning
+          annotations:
+            summary: "castore reads denied by closure scoping ({{`{{ $labels.reason }}`}})"
+            description: >-
+              {{`{{ $value | humanize }}`}} castore read(s) denied (or
+              would-deny under log mode) by closure scoping over 15m
+              with reason={{`{{ $labels.reason }}`}}. out_of_scope: a
+              build's token was used on a digest outside its attested
+              closure — token replay or a scope-coverage bug.
+              unattested: an assignment token without a closure digest
+              reached the castore surface. Check the rio-store deny log
+              (drv, executor, digest, closure digest) and
+              rio_builder_castore_scope_present_total{outcome="error"}.
+
+        # Scope unresolvable: an assignment-token read reached a replica
+        # that has no presented scope AND could not rebuild one from
+        # scheduler_live_pins + narinfo.references, so it answered
+        # CASTORE_SCOPE_REQUIRED and made the builder re-present. The
+        # present-then-retry loop absorbs occasional occurrences (new
+        # replica, cache eviction); a sustained rate means builders are
+        # not presenting (pre-P0591 builder image) or the derivation
+        # fallback is broken (pins missing for live builds) and every
+        # cold read is paying an extra round-trip. resolution="denied"
+        # only — derived/served are the healthy resolutions.
+        - alert: RioStoreCastoreScopeUnresolvable
+          expr: sum(increase(rio_store_castore_scope_absent_total{resolution="denied"}[15m])) > 10
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: castore read scopes repeatedly unresolvable on store replicas
+            description: >-
+              {{`{{ $value | humanize }}`}} assignment-token castore
+              reads over 15m hit a replica with no resolvable closure
+              scope (not presented, derivation fallback failed) and
+              were answered CASTORE_SCOPE_REQUIRED. Check that builders
+              present closures
+              (rio_builder_castore_scope_present_total), that
+              scheduler_live_pins rows exist for live builds, and the
+              scope cache size/TTL on rio-store.
 {{- end }}

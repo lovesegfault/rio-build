@@ -402,6 +402,33 @@
         "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "id": 13,
+      "type": "timeseries",
+      "title": "Closure scope presentations (PresentClosure)",
+      "description": "rate(rio_builder_castore_scope_present_total[5m]) by trigger and outcome — the builder-side half of closure-scoped castore reads (P0591). trigger=mount is the proactive presentation before a build's first castore read; trigger=scope_required is a re-presentation after a store replica answered CASTORE_SCOPE_REQUIRED (per-replica churn under L7 balancing — cross-check the store-side scope panels on the chunk-cache-tier dashboard). outcome=error means presentations are being rejected: check rio_store_castore_scope_mismatch_total and the scheduler's closure attestation. outcome=unsupported should only appear against pre-P0591 stores.",
+      "gridPos": {"x": 0, "y": 48, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum by (trigger, outcome) (rate(rio_builder_castore_scope_present_total[5m]))",
+          "legendFormat": "{{trigger}} → {{outcome}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "list", "placement": "bottom", "showLegend": true},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ]
 }
