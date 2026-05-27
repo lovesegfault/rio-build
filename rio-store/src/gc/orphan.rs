@@ -372,7 +372,7 @@ mod tests {
     use rio_test_support::TestDb;
 
     /// Seed an 'uploading' placeholder, upgrade to chunked (chunk row
-    /// + manifest_data written), backdate. Simulates: prior
+    /// and manifest_data written), backdate. Simulates: prior
     /// `cas::put_chunked` crashed AFTER `upgrade_manifest_to_chunked`.
     ///
     /// Returns (chunk_hash, claim_id) so callers can check the chunk
