@@ -71,9 +71,11 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // malformed paths — both also pre-screened at ingress) EXCEPT the
         // authoritative-content protections, which are client-actionable
         // conflicts with state another submission established
-        // (sched.merge.authoritative-conflict): retrying the identical
-        // submission cannot succeed, so they map to FAILED_PRECONDITION
-        // rather than INTERNAL.
+        // (sched.merge.authoritative-conflict): they map to
+        // FAILED_PRECONDITION rather than INTERNAL. The precondition can
+        // clear later — once the conflicting node reaches a terminal
+        // state it is displaced by the verifiable definition, so a retry
+        // of the same submission can then succeed.
         ActorError::Dag(e) => match &e {
             crate::dag::DagError::AuthoritativeContentMismatch { .. }
             | crate::dag::DagError::ConflictingInFlightContent { .. } => {

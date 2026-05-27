@@ -2612,6 +2612,10 @@ fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Resul
     victim.is_content_addressed = true;
     let res = dag.merge(b2, &[victim], &[], "")?;
     assert!(res.newly_inserted.contains("squat2"));
+    // Displacement is surfaced to the actor via `displaced` (for poison /
+    // accounting reconciliation), never via `reset_on_resubmit`.
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat2"));
+    assert!(res.reset_on_resubmit.is_empty());
     let node = dag.node("squat2").unwrap();
     assert_eq!(node.system, "aarch64-linux");
     assert!(node.drv_content.is_empty());
@@ -2664,5 +2668,215 @@ fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::R
     assert!(node.interested_builds.contains(&b2));
     assert!(node.drv_content.is_empty());
     assert!(!node.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+/// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
+/// node in a retriable state (Failed / Cancelled / DependencyFailed /
+/// Poisoned-under-budget) cannot be silently redefined by different
+/// authoritative bytes — while the legitimate byte-identical retry still
+/// flows through the resubmit-reset (interest carry + cycle increment).
+#[rstest]
+#[case::failed(DerivationStatus::Failed)]
+#[case::cancelled(DerivationStatus::Cancelled)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed)]
+#[case::poisoned_under_budget(DerivationStatus::Poisoned)]
+fn authoritative_redefinition_rejected_in_retriable_states(
+    #[case] prior: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let b3 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("retriable", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("retriable")
+        .unwrap()
+        .set_status_for_test(prior);
+
+    // Different authoritative bytes → rejected even though the node is
+    // retriable; node untouched.
+    let err = dag
+        .merge(b2, &[authoritative_node("retriable", b"Derive-B")], &[], "")
+        .unwrap_err();
+    assert!(matches!(err, DagError::AuthoritativeContentMismatch { .. }));
+    let node = dag.node("retriable").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert_eq!(node.status(), prior);
+    assert!(!node.interested_builds.contains(&b2));
+
+    // Byte-identical retry (the legitimate hook producer) is admitted and
+    // takes the resubmit-reset path: fresh node, prior interest carried,
+    // poison-cycle accumulator incremented.
+    let prior_cycles = dag.node("retriable").unwrap().retry.resubmit_cycles;
+    let res = dag.merge(b3, &[authoritative_node("retriable", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.contains("retriable"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "retriable")
+    );
+    assert!(res.displaced.is_empty());
+    let node = dag.node("retriable").unwrap();
+    assert!(node.interested_builds.contains(&b1));
+    assert!(node.interested_builds.contains(&b3));
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles + 1);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+/// A poison-budget-exhausted authoritative squat is terminal and gets
+/// displaced by the conflicting verifiable (store-backed) definition —
+/// fresh node without inherited interest or failure history, surfaced in
+/// `MergeResult::displaced` (and NOT in `reset_on_resubmit`).
+#[test]
+fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat3", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("squat3").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut node = make_node("squat3", "aarch64-linux");
+    node.is_content_addressed = true;
+    let res = dag.merge(victim, &[node], &[], "")?;
+
+    assert!(res.newly_inserted.contains("squat3"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat3"));
+    assert!(res.reset_on_resubmit.is_empty());
+    let n = dag.node("squat3").unwrap();
+    assert_eq!(n.system, "aarch64-linux");
+    assert!(n.drv_content.is_empty());
+    assert!(!n.drv_content_authoritative);
+    assert_eq!(n.interested_builds, HashSet::from([victim]));
+    assert_eq!(n.retry.resubmit_cycles, 0);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+/// Cancelled is terminal: a conflicting store-backed definition takes the
+/// displacement path (fresh node, no inherited interest), NOT the
+/// interest-carrying resubmit-reset.
+#[test]
+fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest()
+-> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat4", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat4")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    let mut node = make_node("squat4", "aarch64-linux");
+    node.is_content_addressed = true;
+    let res = dag.merge(victim, &[node], &[], "")?;
+
+    assert!(res.newly_inserted.contains("squat4"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat4"));
+    assert!(res.reset_on_resubmit.is_empty());
+    let n = dag.node("squat4").unwrap();
+    assert!(!n.interested_builds.contains(&squatter));
+    assert!(n.interested_builds.contains(&victim));
+    assert!(!n.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+/// Failed is NOT terminal (the retry machinery still owns it): a
+/// conflicting store-backed submission is rejected, not displaced.
+#[test]
+fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat5", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat5")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let mut node = make_node("squat5", "aarch64-linux");
+    node.is_content_addressed = true;
+    let err = dag.merge(victim, &[node], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+    let n = dag.node("squat5").unwrap();
+    assert_eq!(n.status(), DerivationStatus::Failed);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert!(!n.interested_builds.contains(&victim));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict]
+/// A merge that displaces a poisoned-over-budget squat but fails on a
+/// LATER node in the same submission must restore the squat exactly
+/// (status, bytes, interest, poison accumulator) — displacement rides the
+/// same rollback container as the resubmit-reset.
+#[test]
+fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat6", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("squat6").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("squat6", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("squat6").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(n.system, "x86_64-linux");
+    assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(n.interested_builds, HashSet::from([squatter]));
     Ok(())
 }

@@ -127,6 +127,17 @@ pub struct MergeResult {
     /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
     /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
     pub reset_on_resubmit: Vec<DrvHash>,
+    /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
+    /// node whose verifiable identity conflicted with this submission
+    /// (`sched.merge.authoritative-conflict`). Mutually exclusive with
+    /// `reset_on_resubmit`: a hash appears in exactly one of the two.
+    /// Unlike the resubmit-reset path, displacement carries NO prior
+    /// interest and starts `resubmit_cycles` at 0 — the fresh node is a
+    /// different derivation definition, not a retry of the old one. The
+    /// actor uses this to reset the displaced row's poison/failure
+    /// accounting and to prune the displaced hash from prior interested
+    /// builds' completion accounting.
+    pub displaced: Vec<DrvHash>,
     /// Full prior state of each retriable node destructively removed by
     /// the resubmit-retry path. `rollback_merge` re-inserts these AFTER
     /// scrubbing `newly_inserted` so a failed merge restores the exact
@@ -424,6 +435,7 @@ impl DerivationDag {
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
+        let mut displaced: Vec<DrvHash> = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
@@ -461,9 +473,87 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
+            // r[impl sched.merge.authoritative-conflict]
+            // Authoritative-content protection. Evaluated BEFORE the
+            // resubmit-reset below so the existing node is examined in
+            // EVERY lifecycle state — running it after the reset would
+            // structurally exempt retriable nodes (Failed / Cancelled /
+            // DependencyFailed / Poisoned-under-budget), letting the only
+            // copy of their derivation be silently redefined with
+            // inherited interest. When the existing node carries the only
+            // copy of its derivation (content-bound hook fallback), a
+            // later submission for the same drv_hash must not be able to
+            // redefine it:
+            //   - another AUTHORITATIVE submission must be byte-identical
+            //     (identical hook resubmissions — the only legitimate
+            //     producer — are; anything else is a conflict, in every
+            //     lifecycle state);
+            //   - a store-backed (non-authoritative) submission whose
+            //     verifiable identity conflicts is rejected while the
+            //     node is in flight, and DISPLACES it once the node is
+            //     terminal — `is_terminal()`, which includes a
+            //     poison-budget-exhausted squat — (the verifiable
+            //     definition wins; prior interest is NOT carried and the
+            //     fresh node starts with a fresh poison budget: it is a
+            //     different definition, not a retry of the old one).
+            // Store-backed existing nodes are exempt: their truth lives
+            // in the store, so a later submission's bytes are ignored
+            // and the node joins as before.
+            if let Some(existing) = self.nodes.get(&drv_hash) {
+                if node.drv_content_authoritative && existing.drv_content_authoritative {
+                    if existing.drv_content != node.drv_content {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            build_id,
+                            removed_retriable,
+                        );
+                        return Err(DagError::AuthoritativeContentMismatch {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                } else if !node.drv_content_authoritative
+                    && existing.drv_content_authoritative
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    if existing.status().is_terminal() {
+                        // Displacement: remove the squat so the fresh
+                        // store-backed definition is inserted below as a
+                        // brand-new node (prior=None → no interest carry,
+                        // resubmit_cycles=0, not in reset_on_resubmit).
+                        // The prior state still rides in removed_retriable
+                        // so rollback_merge restores it if a LATER node in
+                        // this same submission fails the merge.
+                        let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                        removed_retriable.push((drv_hash.clone(), old));
+                        displaced.push(drv_hash.clone());
+                    } else {
+                        self.rollback_merge(
+                            &newly_inserted,
+                            &new_edges,
+                            &interest_added,
+                            &traceparent_upgraded,
+                            build_id,
+                            removed_retriable,
+                        );
+                        return Err(DagError::ConflictingInFlightContent {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                }
+            }
+
             // Resubmit-retry: if the existing node is Cancelled or Failed,
             // remove it so the else-branch below re-inserts fresh state and
             // it flows through `compute_initial_states` → `newly_inserted`.
+            // The authoritative-conflict gate above has already admitted
+            // this submission (byte-identical authoritative retry,
+            // identity-matching store-backed resubmit, or a store-backed
+            // existing node), so the reset only ever recreates the SAME
+            // derivation definition. A displaced node is already gone from
+            // `self.nodes` at this point, so `prior` stays `None` for it.
             // Defense-in-depth: reap now removes Cancelled nodes for terminal
             // builds, so the reset is only load-bearing during the
             // TERMINAL_CLEANUP_DELAY window or for nodes shared with a
@@ -516,64 +606,6 @@ impl DerivationDag {
             } else {
                 None
             };
-
-            // r[impl sched.merge.authoritative-conflict]
-            // Authoritative-content protection. When the surviving
-            // existing node carries the only copy of its derivation
-            // (content-bound hook fallback), a later submission for the
-            // same drv_hash must not be able to redefine it:
-            //   - another AUTHORITATIVE submission must be byte-identical
-            //     (identical hook resubmissions — the only legitimate
-            //     producer — are; anything else is a conflict);
-            //   - a store-backed (non-authoritative) submission whose
-            //     verifiable identity conflicts is rejected while the
-            //     node is in flight, and DISPLACES it once the node is
-            //     terminal (the verifiable definition wins over the
-            //     squat; prior interest is NOT carried — those builds
-            //     already received the old node's results).
-            // Store-backed existing nodes are exempt: their truth lives
-            // in the store, so a later submission's bytes are ignored
-            // and the node joins as before.
-            if let Some(existing) = self.nodes.get(&drv_hash) {
-                if node.drv_content_authoritative && existing.drv_content_authoritative {
-                    if existing.drv_content != node.drv_content {
-                        self.rollback_merge(
-                            &newly_inserted,
-                            &new_edges,
-                            &interest_added,
-                            &traceparent_upgraded,
-                            build_id,
-                            removed_retriable,
-                        );
-                        return Err(DagError::AuthoritativeContentMismatch {
-                            drv_path: node.drv_path.clone(),
-                        });
-                    }
-                } else if !node.drv_content_authoritative
-                    && existing.drv_content_authoritative
-                    && !verifiable_identity_matches(existing, node)
-                {
-                    if matches!(
-                        existing.status(),
-                        DerivationStatus::Completed | DerivationStatus::Skipped
-                    ) {
-                        let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                        removed_retriable.push((drv_hash.clone(), old));
-                    } else {
-                        self.rollback_merge(
-                            &newly_inserted,
-                            &new_edges,
-                            &interest_added,
-                            &traceparent_upgraded,
-                            build_id,
-                            removed_retriable,
-                        );
-                        return Err(DagError::ConflictingInFlightContent {
-                            drv_path: node.drv_path.clone(),
-                        });
-                    }
-                }
-            }
 
             // Every mutation in this branch MUST be tracked for
             // `rollback_merge` — a failed merge restores the exact
@@ -783,6 +815,7 @@ impl DerivationDag {
         Ok(MergeResult {
             newly_inserted,
             reset_on_resubmit,
+            displaced,
             new_edges,
             interest_added,
             removed_retriable,

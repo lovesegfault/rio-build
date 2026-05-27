@@ -703,6 +703,23 @@ impl DagActor {
             );
         }
 
+        // Displaced authoritative squats (sched.merge.authoritative-conflict)
+        // get the FULL reset (`clear_poison`, which zeroes
+        // `resubmit_cycles`), not `clear_poison_batch`: the fresh node is a
+        // different derivation definition, not a retry of the squat, so it
+        // must not inherit the squat's failure history or consume its
+        // poison-resubmit budget. Per-hash is fine — displacement is a
+        // rare, adversarial-only path. Best-effort like the batch above.
+        for drv_hash in &merge_result.displaced {
+            if let Err(e) = self.db.clear_poison(drv_hash).await {
+                warn!(
+                    drv_hash = %drv_hash,
+                    error = %e,
+                    "failed to reset poison/failure accounting for displaced node"
+                );
+            }
+        }
+
         // The PG half of Pending→Active already committed inside the
         // merge transaction (activate_build_tx); apply the in-memory
         // half now that the commit is durable. Pending→Active is always
