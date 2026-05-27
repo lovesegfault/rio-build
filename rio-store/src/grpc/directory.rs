@@ -184,9 +184,15 @@ impl DirectoryServiceImpl {
     /// terminal state is rejected with `PERMISSION_DENIED` before any
     /// data-plane query runs; scope resolution never widens what the
     /// tenant join alone would have allowed.
+    ///
+    /// `rpc` names the calling RPC for the scope deny log/metrics.
     // r[impl store.castore.tenant-scope+2]
     // r[impl store.castore.closure-scope]
-    async fn castore_authz<T>(&self, request: &Request<T>) -> Result<CastoreAuthz, Status> {
+    async fn castore_authz<T>(
+        &self,
+        request: &Request<T>,
+        rpc: &'static str,
+    ) -> Result<CastoreAuthz, Status> {
         if let Some(jwt) = request
             .extensions()
             .get::<rio_auth::jwt::TenantClaims>()
@@ -227,7 +233,7 @@ impl DirectoryServiceImpl {
                     Status::unauthenticated("assignment token tenant is not a UUID")
                 })?,
             };
-            let scope = self.scope.resolve(&claims, &self.pool).await?;
+            let scope = self.scope.resolve(&claims, &self.pool, rpc).await?;
             return Ok(CastoreAuthz { tenant, scope });
         }
         Err(Status::unauthenticated(
@@ -236,10 +242,35 @@ impl DirectoryServiceImpl {
         ))
     }
 
+    /// Accounting-only variant of [`Self::has_in`]: used by the deny /
+    /// would-deny attribution probes, which must never change the RPC's
+    /// outcome. A Postgres error here is logged and swallowed (`None` ⇒
+    /// the caller skips the accounting); the serving query has already
+    /// decided the response.
+    async fn has_in_audit(
+        &self,
+        table: HasTable,
+        digests: &[[u8; 32]],
+        tenant: uuid::Uuid,
+        scope: Option<&ScopeSet>,
+    ) -> Option<HashSet<[u8; 32]>> {
+        match self.has_in(table, digests, tenant, scope).await {
+            Ok(set) => Some(set),
+            Err(e) => {
+                warn!(
+                    error = %e.message(),
+                    "closure-scope accounting probe failed; skipping deny attribution"
+                );
+                None
+            }
+        }
+    }
+
     /// Post-query closure-scope accounting for the single-digest read
     /// RPCs. Never changes the response — the wire status for an
     /// out-of-scope digest is the same `NOT_FOUND` an absent digest
-    /// gets; this is where the deny metric/log learn the real reason.
+    /// gets, and a failed accounting probe only skips the metric; this
+    /// is where the deny metric/log learn the real reason.
     ///
     /// - `Audit` (log mode) + row served: probe membership and count a
     ///   `would_deny` if every containing path is outside the scope.
@@ -247,6 +278,16 @@ impl DirectoryServiceImpl {
     ///   "absent / not tenant-visible" from "denied by closure scope".
     ///   (The probe ignores `manifests.status`, so an in-flight upload
     ///   can over-count a deny — metrics-only, accepted.)
+    ///
+    // TODO: accounting-probe cost — under Audit (log mode) every served
+    // single-digest read pays this second `has_in`, the recursive walk
+    // pays two seed probes, and under Enforce the recursive seed filter
+    // runs its visibility probe even when nothing was denied (skippable
+    // when `in_scope` already covers the frontier). All of it is
+    // metrics-only and off the enforce-mode hot path, but it is exactly
+    // the kind of overhead the P0591 Phase-3 measurement pass should
+    // weigh together with the L1 per-(closure, digest) verdict-memo
+    // lever before the enforce default flips fleet-wide.
     async fn scope_audit_single(
         &self,
         rpc: &'static str,
@@ -255,25 +296,26 @@ impl DirectoryServiceImpl {
         tenant: uuid::Uuid,
         scope: &ReadScope,
         found: bool,
-    ) -> Result<(), Status> {
+    ) {
         match scope {
             ReadScope::Audit(set, ctx) if found => {
-                let in_scope = self
-                    .has_in(table, &[digest], tenant, Some(set.as_ref()))
-                    .await?;
-                if !in_scope.contains(&digest) {
+                if let Some(in_scope) = self
+                    .has_in_audit(table, &[digest], tenant, Some(set.as_ref()))
+                    .await
+                    && !in_scope.contains(&digest)
+                {
                     self.scope.record_out_of_scope(false, rpc, ctx, &digest);
                 }
             }
             ReadScope::Enforce(_, ctx) if !found => {
-                let visible = self.has_in(table, &[digest], tenant, None).await?;
-                if visible.contains(&digest) {
+                if let Some(visible) = self.has_in_audit(table, &[digest], tenant, None).await
+                    && visible.contains(&digest)
+                {
                     self.scope.record_out_of_scope(true, rpc, ctx, &digest);
                 }
             }
             _ => {}
         }
-        Ok(())
     }
 }
 
@@ -324,7 +366,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<GetDirectoryRequest>,
     ) -> Result<Response<Self::GetDirectoryStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let authz = self.castore_authz(&request).await?;
+        let authz = self.castore_authz(&request, "GetDirectory").await?;
         let tenant = authz.tenant;
         let req = request.into_inner();
 
@@ -377,7 +419,7 @@ impl DirectoryService for DirectoryServiceImpl {
                 &authz.scope,
                 body.is_some(),
             )
-            .await?;
+            .await;
             let Some((body,)) = body else {
                 return Err(Status::not_found("directory not found"));
             };
@@ -396,32 +438,42 @@ impl DirectoryService for DirectoryServiceImpl {
         match &authz.scope {
             ReadScope::Unscoped => {}
             ReadScope::Enforce(set, ctx) => {
+                // Enforcement: this probe decides the allowed frontier,
+                // so a failure here fails the RPC (fail-closed).
                 let in_scope = self
                     .has_in(HasTable::Directories, &frontier, tenant, Some(set.as_ref()))
                     .await?;
-                let visible = self
-                    .has_in(HasTable::Directories, &frontier, tenant, None)
-                    .await?;
-                let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
-                if denied > 0 {
-                    self.scope
-                        .record_out_of_scope_batch(true, "GetDirectory", ctx, denied);
+                // Deny attribution only — fail-open, and skippable when
+                // the scope already covers every seed.
+                if frontier.iter().any(|d| !in_scope.contains(d))
+                    && let Some(visible) = self
+                        .has_in_audit(HasTable::Directories, &frontier, tenant, None)
+                        .await
+                {
+                    let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
+                    if denied > 0 {
+                        self.scope
+                            .record_out_of_scope_batch(true, "GetDirectory", ctx, denied);
+                    }
                 }
                 // Out-of-scope seeds are simply absent from the stream —
                 // the same silent skip a non-tenant-visible seed gets.
                 frontier.retain(|d| in_scope.contains(d));
             }
             ReadScope::Audit(set, ctx) => {
-                let in_scope = self
-                    .has_in(HasTable::Directories, &frontier, tenant, Some(set.as_ref()))
-                    .await?;
-                let visible = self
-                    .has_in(HasTable::Directories, &frontier, tenant, None)
-                    .await?;
-                let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
-                if denied > 0 {
-                    self.scope
-                        .record_out_of_scope_batch(false, "GetDirectory", ctx, denied);
+                // Both probes are accounting-only in log mode: a failure
+                // skips the would-deny attribution, never the read.
+                if let (Some(in_scope), Some(visible)) = (
+                    self.has_in_audit(HasTable::Directories, &frontier, tenant, Some(set.as_ref()))
+                        .await,
+                    self.has_in_audit(HasTable::Directories, &frontier, tenant, None)
+                        .await,
+                ) {
+                    let denied = visible.iter().filter(|d| !in_scope.contains(*d)).count();
+                    if denied > 0 {
+                        self.scope
+                            .record_out_of_scope_batch(false, "GetDirectory", ctx, denied);
+                    }
                 }
             }
         }
@@ -566,7 +618,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<HasDirectoriesRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let authz = self.castore_authz(&request).await?;
+        let authz = self.castore_authz(&request, "HasDirectories").await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasDirectories")
             .record(digests.len() as f64);
@@ -589,7 +641,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<HasBlobsRequest>,
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let authz = self.castore_authz(&request).await?;
+        let authz = self.castore_authz(&request, "HasBlobs").await?;
         let digests = parse_digests(&request.into_inner().digests)?;
         metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasBlobs")
             .record(digests.len() as f64);
@@ -613,7 +665,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<ReadBlobRequest>,
     ) -> Result<Response<Self::ReadBlobStream>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let authz = self.castore_authz(&request).await?;
+        let authz = self.castore_authz(&request, "ReadBlob").await?;
         let tenant = authz.tenant;
         let digest = parse_digest(&request.into_inner().file_digest)?;
         let started = Instant::now();
@@ -654,7 +706,7 @@ impl DirectoryService for DirectoryServiceImpl {
             &authz.scope,
             row.is_some(),
         )
-        .await?;
+        .await;
         let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -710,7 +762,7 @@ impl DirectoryService for DirectoryServiceImpl {
         request: Request<StatBlobRequest>,
     ) -> Result<Response<StatBlobResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let authz = self.castore_authz(&request).await?;
+        let authz = self.castore_authz(&request, "StatBlob").await?;
         let tenant = authz.tenant;
         let req = request.into_inner();
         let digest = parse_digest(&req.file_digest)?;
@@ -740,7 +792,7 @@ impl DirectoryService for DirectoryServiceImpl {
                 &authz.scope,
                 exists.is_some(),
             )
-            .await?;
+            .await;
             return exists
                 .map(|_| Response::new(StatBlobResponse::default()))
                 .ok_or_else(|| Status::not_found("file blob not found"));
@@ -770,7 +822,7 @@ impl DirectoryService for DirectoryServiceImpl {
             &authz.scope,
             row.is_some(),
         )
-        .await?;
+        .await;
         let Some((nar_offset, file_size, chunk_list)) = row else {
             return Err(Status::not_found("file blob not found"));
         };
@@ -1056,9 +1108,13 @@ impl DirectoryServiceImpl {
 
     /// `HasDirectories`/`HasBlobs` presence set under the caller's
     /// scope decision: enforce filters the bitmap (a presence bit means
-    /// present AND tenant-visible AND in-closure); log mode serves
-    /// today's tenant-wide bitmap while counting how many bits enforce
-    /// would have cleared; JWT/off callers are exactly today's query.
+    /// present AND tenant-visible AND in-closure) and attributes the
+    /// bits it cleared to the deny counter; log mode serves today's
+    /// tenant-wide bitmap while counting how many bits enforce would
+    /// have cleared; JWT/off callers are exactly today's query. The
+    /// attribution probes are accounting-only and fail open
+    /// ([`Self::has_in_audit`]) — only the serving query decides the
+    /// bitmap.
     async fn has_scoped(
         &self,
         table: HasTable,
@@ -1068,19 +1124,36 @@ impl DirectoryServiceImpl {
     ) -> Result<HashSet<[u8; 32]>, Status> {
         match &authz.scope {
             ReadScope::Unscoped => self.has_in(table, digests, authz.tenant, None).await,
-            ReadScope::Enforce(set, _) => {
-                self.has_in(table, digests, authz.tenant, Some(set.as_ref()))
-                    .await
-            }
-            ReadScope::Audit(set, ctx) => {
-                let all = self.has_in(table, digests, authz.tenant, None).await?;
+            ReadScope::Enforce(set, ctx) => {
                 let scoped = self
                     .has_in(table, digests, authz.tenant, Some(set.as_ref()))
                     .await?;
-                let denied = all.iter().filter(|d| !scoped.contains(*d)).count();
-                if denied > 0 {
-                    self.scope
-                        .record_out_of_scope_batch(false, rpc, ctx, denied);
+                // Deny attribution (metrics/log only): when the scoped
+                // answer clears at least one requested bit, one unscoped
+                // probe tells how many of those were tenant-visible but
+                // out of closure (vs. genuinely absent).
+                if digests.iter().any(|d| !scoped.contains(d))
+                    && let Some(visible) =
+                        self.has_in_audit(table, digests, authz.tenant, None).await
+                {
+                    let denied = visible.iter().filter(|d| !scoped.contains(*d)).count();
+                    if denied > 0 {
+                        self.scope.record_out_of_scope_batch(true, rpc, ctx, denied);
+                    }
+                }
+                Ok(scoped)
+            }
+            ReadScope::Audit(set, ctx) => {
+                let all = self.has_in(table, digests, authz.tenant, None).await?;
+                if let Some(scoped) = self
+                    .has_in_audit(table, digests, authz.tenant, Some(set.as_ref()))
+                    .await
+                {
+                    let denied = all.iter().filter(|d| !scoped.contains(*d)).count();
+                    if denied > 0 {
+                        self.scope
+                            .record_out_of_scope_batch(false, rpc, ctx, denied);
+                    }
                 }
                 Ok(all)
             }
@@ -1124,6 +1197,66 @@ fn corrupt(e: impl std::fmt::Display) -> Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The deny/would-deny attribution probes are accounting-only: a
+    /// Postgres failure inside [`DirectoryServiceImpl::has_in_audit`]
+    /// (and therefore inside `scope_audit_single` / the seed-filter and
+    /// `has_scoped` attribution paths that build on it) must be
+    /// swallowed, never bubbled into the RPC outcome.
+    // r[verify store.castore.closure-scope]
+    #[tokio::test]
+    async fn audit_probe_failure_is_swallowed() {
+        use crate::backend::ChunkBackend;
+        use crate::test_helpers::mem_backend;
+
+        // A pool whose connections can never be established (nothing
+        // speaks Postgres on 127.0.0.1:1); connect_lazy defers the
+        // failure into the first query — i.e. inside the probe.
+        let broken = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(std::time::Duration::from_secs(2))
+            .connect_lazy("postgres://rio:rio@127.0.0.1:1/rio")
+            .expect("lazy pool construction never connects");
+        let svc = DirectoryServiceImpl::new(
+            broken,
+            None,
+            Arc::new(ChunkCache::new(mem_backend() as Arc<dyn ChunkBackend>)),
+        );
+
+        let digest = [7u8; 32];
+        let tenant = uuid::Uuid::nil();
+        assert!(
+            svc.has_in_audit(HasTable::Directories, &[digest], tenant, None)
+                .await
+                .is_none(),
+            "a failed accounting probe reports None (skip attribution), not an error"
+        );
+        // The serving-path variant of the same query DOES surface the
+        // failure — only the audit wrapper is fail-open.
+        assert!(
+            svc.has_in(HasTable::Directories, &[digest], tenant, None)
+                .await
+                .is_err()
+        );
+        // And the composite accounting helper built on it completes
+        // without affecting anything (it returns nothing to affect).
+        let scope = ReadScope::Audit(
+            Arc::new(ScopeSet::from_hashes(vec![[1u8; 32]])),
+            crate::grpc::scope::ScopeCtx {
+                drv_hash: "drv-audit-err".into(),
+                executor_id: "audit-err".into(),
+                closure_digest: "00".repeat(32),
+            },
+        );
+        svc.scope_audit_single(
+            "StatBlob",
+            HasTable::FileBlobs,
+            digest,
+            tenant,
+            &scope,
+            true,
+        )
+        .await;
+    }
 
     #[test]
     fn parse_digests_batch_boundary() {

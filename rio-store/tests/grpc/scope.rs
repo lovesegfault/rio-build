@@ -445,10 +445,12 @@ async fn enforce_allows_own_closure_and_denies_disjoint_closure() {
     assert_eq!(denied_stat.code(), tonic::Code::NotFound);
 
     // The deny counter (not the wire status) carries the real reason:
-    // one per denied single-digest read (B dir, B blob, B stat).
+    // one per denied single-digest read (B dir, B blob, B stat) plus
+    // one per scope-cleared presence bit (B's dir in HasDirectories,
+    // B's blob in HasBlobs).
     assert_eq!(
         recorder.get("rio_store_castore_scope_denied_total{reason=out_of_scope}"),
-        3,
+        5,
         "saw counters: {:?}",
         recorder.all_keys()
     );

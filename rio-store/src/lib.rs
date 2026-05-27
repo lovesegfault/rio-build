@@ -285,9 +285,11 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_castore_scope_mismatch_total",
-        "PresentClosure rejections: presented closure does not match the token's signed \
-         input_closure_digest (or the token carries no attestation). Nonzero means a \
-         builder presenting a closure it was not dispatched with."
+        "PresentClosure verification rejections: presented closure does not match the \
+         token's signed input_closure_digest, the token carries no attestation, the list \
+         exceeds MAX_INPUT_CLOSURE, or an entry is not a parseable store path. Nonzero \
+         means a builder presenting something other than the closure it was dispatched \
+         with."
     );
     describe_counter!(
         "rio_store_castore_scope_denied_total",

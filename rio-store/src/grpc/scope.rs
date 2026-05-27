@@ -205,7 +205,11 @@ pub struct CastoreScope {
     presented: moka::future::Cache<String, Arc<ScopeSet>>,
     /// Server-side derived scopes (`§3.5` fallback), keyed by
     /// `drv_hash`. Short TTL; used only on presentation miss under
-    /// `enforce`.
+    /// `enforce`. The key is deliberately the build, not the attested
+    /// closure digest: the derived set reflects the current
+    /// pins+references state, so concurrent dispatches of the same drv
+    /// share one entry for at most the TTL — at worst a slightly
+    /// stale-but-still-build-bounded scope until re-derivation.
     derived: moka::future::Cache<String, Arc<ScopeSet>>,
     /// Deny/would-deny log sampler sequence (logs are sampled; the
     /// counters are exact).
@@ -270,6 +274,9 @@ impl CastoreScope {
             ));
         }
         if closure.len() > MAX_INPUT_CLOSURE {
+            // Counted with the mismatches: every PresentClosure
+            // verification rejection lands in the same counter.
+            metrics::counter!("rio_store_castore_scope_mismatch_total").increment(1);
             return Err(Status::invalid_argument(format!(
                 "closure has {} entries, exceeds MAX_INPUT_CLOSURE {MAX_INPUT_CLOSURE}",
                 closure.len()
@@ -298,7 +305,12 @@ impl CastoreScope {
         if let Some(existing) = self.presented.get(&claims.input_closure_digest).await {
             return Ok(existing.len());
         }
-        let set = Arc::new(ScopeSet::from_closure(&sorted).map_err(Status::invalid_argument)?);
+        let set = Arc::new(ScopeSet::from_closure(&sorted).map_err(|e| {
+            // An entry that cannot be keyed is a verification rejection
+            // like any other — count it with the mismatches.
+            metrics::counter!("rio_store_castore_scope_mismatch_total").increment(1);
+            Status::invalid_argument(e)
+        })?);
         self.presented
             .insert(claims.input_closure_digest.clone(), Arc::clone(&set))
             .await;
@@ -326,11 +338,14 @@ impl CastoreScope {
     ///
     /// Never widens access and never silently falls back to tenant-wide
     /// under enforce.
+    ///
+    /// `rpc` names the calling read RPC for the deny log/metrics.
     // r[impl store.castore.closure-scope]
     pub async fn resolve(
         &self,
         claims: &AssignmentClaims,
         pool: &PgPool,
+        rpc: &'static str,
     ) -> Result<ReadScope, Status> {
         if self.mode == ScopeMode::Off {
             return Ok(ReadScope::Unscoped);
@@ -351,7 +366,7 @@ impl CastoreScope {
                         "reason" => "unattested"
                     )
                     .increment(1);
-                    self.log_denied(true, "unattested", &ctx, None);
+                    self.log_denied(true, rpc, "unattested", &ctx, None);
                     // Same opaque phrasing as every other token
                     // rejection on this surface.
                     Err(Status::permission_denied("assignment token rejected"))
@@ -362,7 +377,7 @@ impl CastoreScope {
                         "reason" => "unattested"
                     )
                     .increment(1);
-                    self.log_denied(false, "unattested", &ctx, None);
+                    self.log_denied(false, rpc, "unattested", &ctx, None);
                     Ok(ReadScope::Unscoped)
                 }
                 ScopeMode::Off => unreachable!("handled above"),
@@ -406,6 +421,7 @@ impl CastoreScope {
                     )
                     .increment(1);
                     warn!(
+                        rpc,
                         drv_hash = %ctx.drv_hash,
                         executor_id = %ctx.executor_id,
                         closure_digest = %ctx.closure_digest,
@@ -521,7 +537,13 @@ impl CastoreScope {
             )
             .increment(1);
         }
-        self.log_denied(enforced, rpc, ctx, Some(hex::encode(digest)));
+        self.log_denied(
+            enforced,
+            rpc,
+            "out_of_scope",
+            ctx,
+            Some(hex::encode(digest)),
+        );
     }
 
     /// Like [`Self::record_out_of_scope`] but for batch presence RPCs,
@@ -551,17 +573,18 @@ impl CastoreScope {
             )
             .increment(n);
         }
-        self.log_denied(enforced, rpc, ctx, None);
+        self.log_denied(enforced, rpc, "out_of_scope", ctx, None);
     }
 
     /// Sampled structured deny/would-deny log: the counters are exact,
-    /// the log is the triage detail (drv, executor, digest, closure
-    /// digest) and is sampled so a hot out-of-scope loop cannot flood
-    /// the collector.
+    /// the log is the triage detail (rpc, reason, drv, executor, digest,
+    /// closure digest) and is sampled so a hot out-of-scope loop cannot
+    /// flood the collector.
     fn log_denied(
         &self,
         enforced: bool,
         rpc: &'static str,
+        reason: &'static str,
         ctx: &ScopeCtx,
         digest: Option<String>,
     ) {
@@ -571,12 +594,13 @@ impl CastoreScope {
         }
         warn!(
             rpc,
+            reason,
             enforced,
             drv_hash = %ctx.drv_hash,
             executor_id = %ctx.executor_id,
             closure_digest = %ctx.closure_digest,
             digest = digest.as_deref().unwrap_or(""),
-            "castore read outside the assignment's input closure"
+            "castore read denied (or would be denied) by the closure scope"
         );
     }
 }
@@ -641,11 +665,15 @@ mod tests {
     }
 
     /// Establish: matching digest is accepted (and idempotent); a
-    /// mismatched digest, an over-cap list, and an unattested token are
-    /// all INVALID_ARGUMENT regardless of mode.
+    /// mismatched digest, an unattested token, an over-cap list, and an
+    /// unparseable entry are all INVALID_ARGUMENT regardless of mode —
+    /// and every one of those rejections lands in the mismatch counter.
     // r[verify store.castore.scope-establish]
     #[tokio::test]
     async fn establish_verifies_digest_cap_and_attestation() {
+        let recorder = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
         let closure = vec![test_store_path("est-a"), test_store_path("est-b")];
         let s = scope(ScopeMode::Enforce);
 
@@ -676,6 +704,29 @@ mod tests {
         let huge = attested("drv-est", &oversized);
         let err = s.establish(&huge, &oversized).await.expect_err("over cap");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // An entry that cannot be keyed as a store path (the token
+        // attests it, so the digest matches — keying is what fails).
+        let bogus = vec!["not-a-store-path".to_string()];
+        let bogus_claims = attested("drv-est", &bogus);
+        let err = s
+            .establish(&bogus_claims, &bogus)
+            .await
+            .expect_err("unparseable entry");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+        // One establishment (the idempotent re-present is not counted),
+        // four rejections (mismatch, unattested, over-cap, unparseable).
+        assert_eq!(
+            recorder.get("rio_store_castore_scope_established_total{}"),
+            1
+        );
+        assert_eq!(
+            recorder.get("rio_store_castore_scope_mismatch_total{}"),
+            4,
+            "every PresentClosure verification rejection is counted; saw: {:?}",
+            recorder.all_keys()
+        );
     }
 
     /// Mode matrix for `resolve` with a presented scope and with an
@@ -691,7 +742,9 @@ mod tests {
         // off → Unscoped without touching anything.
         let off = scope(ScopeMode::Off);
         assert!(matches!(
-            off.resolve(&c, &db.pool).await.expect("off never errors"),
+            off.resolve(&c, &db.pool, "ScopeUnitTest")
+                .await
+                .expect("off never errors"),
             ReadScope::Unscoped
         ));
 
@@ -699,7 +752,11 @@ mod tests {
         for (mode, want_enforce) in [(ScopeMode::Log, false), (ScopeMode::Enforce, true)] {
             let s = scope(mode);
             s.establish(&c, &closure).await.expect("establish");
-            match s.resolve(&c, &db.pool).await.expect("resolves") {
+            match s
+                .resolve(&c, &db.pool, "ScopeUnitTest")
+                .await
+                .expect("resolves")
+            {
                 ReadScope::Enforce(set, ctx) => {
                     assert!(want_enforce, "Enforce only under enforce mode");
                     assert_eq!(set.len(), 1);
@@ -717,12 +774,14 @@ mod tests {
         let unattested = claims("drv-unattested", "");
         let log = scope(ScopeMode::Log);
         assert!(matches!(
-            log.resolve(&unattested, &db.pool).await.expect("served"),
+            log.resolve(&unattested, &db.pool, "ScopeUnitTest")
+                .await
+                .expect("served"),
             ReadScope::Unscoped
         ));
         let enforce = scope(ScopeMode::Enforce);
         let err = enforce
-            .resolve(&unattested, &db.pool)
+            .resolve(&unattested, &db.pool, "ScopeUnitTest")
             .await
             .expect_err("denied under enforce");
         assert_eq!(err.code(), tonic::Code::PermissionDenied);
@@ -744,13 +803,15 @@ mod tests {
 
         let log = scope(ScopeMode::Log);
         assert!(matches!(
-            log.resolve(&c, &db.pool).await.expect("served"),
+            log.resolve(&c, &db.pool, "ScopeUnitTest")
+                .await
+                .expect("served"),
             ReadScope::Unscoped
         ));
 
         let enforce = scope(ScopeMode::Enforce);
         let err = enforce
-            .resolve(&c, &db.pool)
+            .resolve(&c, &db.pool, "ScopeUnitTest")
             .await
             .expect_err("unresolvable under enforce");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
@@ -796,7 +857,10 @@ mod tests {
 
         let s = scope(ScopeMode::Enforce);
         let c = attested("drv-derive", std::slice::from_ref(&root_path));
-        let resolved = s.resolve(&c, &db.pool).await.expect("derived");
+        let resolved = s
+            .resolve(&c, &db.pool, "ScopeUnitTest")
+            .await
+            .expect("derived");
         let ReadScope::Enforce(set, _) = resolved else {
             panic!("enforce + derivable must yield ReadScope::Enforce");
         };
@@ -812,7 +876,10 @@ mod tests {
         // A drv with no pins stays unresolved (and is NOT cached as
         // empty): FAILED_PRECONDITION asks the builder to present.
         let no_pins = attested("drv-no-pins", &[root_path]);
-        let err = s.resolve(&no_pins, &db.pool).await.expect_err("no pins");
+        let err = s
+            .resolve(&no_pins, &db.pool, "ScopeUnitTest")
+            .await
+            .expect_err("no pins");
         assert_eq!(err.code(), tonic::Code::FailedPrecondition);
     }
 }
