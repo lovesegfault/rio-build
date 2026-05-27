@@ -3118,7 +3118,7 @@ async fn test_build_derivation_store_error_during_verification() -> anyhow::Resu
     Ok(())
 }
 
-// r[verify gw.build.per-tenant-policy]
+// r[verify gw.build.per-tenant-policy+2]
 /// Per-tenant build policy reaches the scheduler: a session whose resolved
 /// per-tenant policy has `keep_going=true` submits with
 /// `SubmitBuildRequest.keep_going=true`. (The policy-less default staying
@@ -3161,7 +3161,7 @@ async fn test_build_paths_policy_sets_keep_going() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.build.per-tenant-policy]
+// r[verify gw.build.per-tenant-policy+2]
 /// Per-tenant build policy reaches the scheduler: a session whose resolved
 /// per-tenant policy has `force_build_roots=true` submits with
 /// `SubmitBuildRequest.force_build_roots=true`. (The policy-less default

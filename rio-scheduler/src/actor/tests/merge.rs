@@ -644,8 +644,8 @@ async fn missing_unwanted_output_is_still_a_cache_hit() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-probe]
-// r[verify sched.merge.substitute-fetch]
+// r[verify sched.merge.substitute-probe+2]
+// r[verify sched.merge.substitute-fetch+2]
 /// Substitutable-probe matrix at merge time. A path NOT in the store
 /// but reported as `substitutable_paths` by FindMissingPaths should
 /// cache-hit (eager-fetch via QueryPathInfo, no dispatch). If QPI
@@ -8835,7 +8835,7 @@ async fn test_force_build_roots_persisted() -> TestResult {
 /// QueryPathInfo fetch, not Substituting/Completed), and the build stays
 /// Active waiting for a builder.
 // r[verify sched.merge.force-build-roots]
-// r[verify sched.merge.substitute-topdown+5]
+// r[verify sched.merge.substitute-topdown+10]
 #[tokio::test]
 async fn test_force_build_root_not_substituted_at_merge() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;

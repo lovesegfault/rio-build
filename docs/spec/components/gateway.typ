@@ -112,20 +112,24 @@ store/builder.
   protocol feature that rio-gateway does not implement.
 ]
 
-#r("gw.build.per-tenant-policy")[
-  The gateway MUST populate `SubmitBuildRequest.keep_going` from a per-tenant
-  build-policy map in gateway configuration (`build_policy`, keyed by tenant
-  name), resolved once per channel from the authenticated tenant; tenants
-  absent from the map MUST get the default (`keep_going = false`), preserving
-  prior behavior.
+#r("gw.build.per-tenant-policy+2")[
+  The gateway MUST populate `SubmitBuildRequest.keep_going` and
+  `SubmitBuildRequest.force_build_roots` from a per-tenant build-policy map in
+  gateway configuration (`build_policy`, keyed by tenant name), resolved once
+  per channel from the authenticated tenant; tenants absent from the map MUST
+  get the default (`keep_going = false`, `force_build_roots = false`),
+  preserving prior behavior. `force_build_roots` requests the scheduler-side
+  force-build guarantee for that tenant's submission roots
+  (#rref("sched.merge.force-build-roots")).
 ]
 
 Because `wopSetOptions` never arrives over ssh-ng (see
 #rref("gw.opcode.set-options.propagation") --- and the gateway discards
 `keepGoing` even when it does arrive), gateway configuration is the only place
-this per-submission behavior can be set for ssh-ng clients. The map is
-deployed as `/etc/rio/gateway.toml` (helm `gateway.buildPolicy`); entries for
-tenants that do not yet exist are inert.
+these per-submission behaviors can be set for ssh-ng clients;
+`force_build_roots` has no Nix client option at all. The map is deployed as
+`/etc/rio/gateway.toml` (helm `gateway.buildPolicy`); entries for tenants that
+do not yet exist are inert.
 
 == wopNarFromPath (38) Wire Format
 

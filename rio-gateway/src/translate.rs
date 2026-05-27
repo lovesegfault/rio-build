@@ -859,7 +859,7 @@ pub fn build_submit_request(
     edges: Vec<types::DerivationEdge>,
     priority_class: &str,
     tenant_name: Option<&NormalizedName>,
-    // r[impl gw.build.per-tenant-policy]
+    // r[impl gw.build.per-tenant-policy+2]
     policy: crate::config::BuildPolicy,
 ) -> types::SubmitBuildRequest {
     types::SubmitBuildRequest {

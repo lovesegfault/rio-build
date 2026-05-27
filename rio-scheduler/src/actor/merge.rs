@@ -2246,7 +2246,7 @@ impl DagActor {
     ///
     /// `jwt_token` is forwarded as `x-rio-tenant-token` metadata so the
     /// store's per-tenant upstream probe fires and populates
-    /// `substitutable_paths` — see r[sched.merge.substitute-probe].
+    /// `substitutable_paths` — see r[sched.merge.substitute-probe+2].
     #[allow(clippy::type_complexity)]
     async fn check_cached_outputs(
         &mut self,
@@ -2275,8 +2275,8 @@ impl DagActor {
             return Ok((hits, Vec::new()));
         };
 
-        // r[impl sched.merge.substitute-probe]
-        // r[impl sched.merge.substitute-fetch]
+        // r[impl sched.merge.substitute-probe+2]
+        // r[impl sched.merge.substitute-fetch+2]
         // r[impl sched.substitute.detached+5]
         // Locally-present → cached_hits (Created→Completed inline).
         // Upstream-substitutable → pending_substitute (caller spawns
@@ -2555,7 +2555,7 @@ impl DagActor {
             store_paths: check_paths,
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-        // r[impl sched.merge.substitute-probe]
+        // r[impl sched.merge.substitute-probe+2]
         // JWT propagation: x-rio-tenant-token → store's interceptor →
         // tenant_id → check_available HEAD probe. Without this header
         // the store sees tenant_id=None and substitutable_paths stays
@@ -2773,7 +2773,7 @@ impl DagActor {
             store_paths: demanded_paths.clone(),
         });
         rio_proto::interceptor::inject_current(fmp_req.metadata_mut());
-        // JWT propagation — same as r[sched.merge.substitute-probe].
+        // JWT propagation — same as r[sched.merge.substitute-probe+2].
         if let Some(t) = jwt_token
             && let Ok(v) = tonic::metadata::MetadataValue::try_from(t)
         {

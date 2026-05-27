@@ -1150,7 +1150,7 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.dispatch.fod-substitute+2]
+// r[verify sched.dispatch.fod-substitute+3]
 /// Dispatch-time substitution: a Ready IA derivation (FOD or non-FOD)
 /// whose output becomes substitutable AFTER merge (so merge-time
 /// `check_cached_outputs` missed it) is completed by
@@ -3409,7 +3409,7 @@ async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
 // ---------------------------------------------------------------------------
 
-// r[verify sched.dispatch.fod-substitute+2]
+// r[verify sched.dispatch.fod-substitute+3]
 /// With > `DISPATCH_PROBE_BATCH_CAP` Ready leaves and the batch RPC
 /// failing-open, the truncated tail must NOT fall through to the
 /// per-drv `ready_check_or_spawn` (one inline-awaited FMP each =

@@ -461,7 +461,7 @@ impl StoreServiceImpl {
         {
             return Some(jwt);
         }
-        // r[impl sched.dispatch.fod-substitute+2]
+        // r[impl sched.dispatch.fod-substitute+3]
         if self.verified_service_caller(request).is_some()
             && let Some(hdr) = request
                 .metadata()
@@ -865,7 +865,7 @@ mod tests {
         assert_eq!(status.message(), "storage operation failed");
     }
 
-    // r[verify sched.dispatch.fod-substitute+2]
+    // r[verify sched.dispatch.fod-substitute+3]
     /// `x-rio-probe-tenant-id` is honoured ONLY behind a valid
     /// allowlisted service-token. An unauthenticated request (or one
     /// from a non-allowlisted caller) cannot self-select a tenant.

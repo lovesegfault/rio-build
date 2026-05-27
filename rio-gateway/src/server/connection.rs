@@ -1557,7 +1557,7 @@ impl Handler for ConnectionHandler {
         let mut store_client = self.store_client.clone();
         let mut scheduler_client = self.scheduler_client.clone();
         let tenant_name = self.tenant_name.clone();
-        // r[impl gw.build.per-tenant-policy]
+        // r[impl gw.build.per-tenant-policy+2]
         // Per-tenant build policy. Resolved once per channel; tenants
         // not in the map (and single-tenant mode) get the default
         // (all-false) — identical to pre-policy behavior.

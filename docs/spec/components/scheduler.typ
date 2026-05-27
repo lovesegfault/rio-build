@@ -808,13 +808,15 @@ recovery rebuilds their interest but not their contributions, and they never
 re-merge, so only their terminal cleanup ends the degradation (builds
 submitted after the failover record contributions as usual).
 
-#r("sched.merge.substitute-probe")[
+#r("sched.merge.substitute-probe+2")[
   The merge-time cache check (`check_cached_outputs`) MUST forward the
   submitting session's JWT (`x-rio-tenant-token`) on its `FindMissingPaths`
   store call, and MUST treat paths in the response's `substitutable_paths` as
   cache hits. Without the JWT, the store's per-tenant upstream probe is skipped
   and `substitutable_paths` stays empty --- the scheduler then dispatches
-  builds for paths the store could fetch.
+  builds for paths the store could fetch. Submission roots of a
+  `force_build_roots` build MUST NOT be treated as substitutable cache hits
+  (#rref("sched.merge.force-build-roots")).
 ]
 
 #r("sched.merge.substitute-probe-indeterminate")[
@@ -830,7 +832,7 @@ submitted after the failover record contributions as usual).
   whenever a fresh-wipe burst trips Fastly's edge rate-limit.
 ]
 
-#r("sched.merge.substitute-fetch")[
+#r("sched.merge.substitute-fetch+2")[
   Before marking a substitutable-probed derivation as completed, the scheduler
   MUST eagerly trigger the store's NAR fetch for each substitutable path by
   issuing `QueryPathInfo` with the session JWT. `FindMissingPaths`'s probe is
@@ -843,8 +845,33 @@ submitted after the failover record contributions as usual).
   actor's gRPC timeout, since the call blocks the single-threaded actor event
   loop. A fetch that fails or returns NotFound demotes that path from the
   substitutable set --- the derivation falls through to normal dispatch instead
-  of being marked completed against a phantom cache hit.
+  of being marked completed against a phantom cache hit. Force-build
+  submission roots never enter this fetch path
+  (#rref("sched.merge.force-build-roots")).
 ]
+
+#r("sched.merge.force-build-roots")[
+  When a submission carries `force_build_roots`, the scheduler MUST NOT
+  substitute that submission's root derivations from upstream at any of the
+  substitution decision points --- the merge-time top-down root check, the
+  merge-time cache check's upstream-substitutable arm, the stale-output
+  re-substitution arm (#rref("sched.merge.stale-substitutable")), and the
+  dispatch-time Ready probe's substitute-spawn arms --- and MUST instead let
+  them dispatch as builds; roots whose outputs are already locally present
+  still short-circuit to Completed, and the submission's dependencies remain
+  substitutable. The per-node decision is a sticky OR over the node's
+  interested builds (any live interested build with `force_build_roots` that
+  names the node among its submission roots), so a later non-force
+  submission of the same derivation does not strip the protection while the
+  force-build build is live. The inputs to that decision are persisted via
+  `builds.force_build_roots` and `build_derivations.is_root` and re-derived
+  at recovery, so a leader failover cannot turn a force-build root that was
+  not yet terminal at failover into a substitution.
+]
+
+The flag exists for validation campaigns (nixpkgs-parity leaf mode): without
+it every Hydra-green target submitted under a cache.nixos.org-backed tenant
+would come back `substituted` instead of exercising the build path.
 
 #r("sched.merge.ca-fod-substitute")[
   The path-based lane of `check_cached_outputs` MUST cover every probe-set node
@@ -904,6 +931,9 @@ submitted after the failover record contributions as usual).
   fail every interested build with a resubmit-directing error --- the
   dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
   --- and this MUST hold across leader failover.
+  Submissions with `force_build_roots`
+  (#rref("sched.merge.force-build-roots")) are exempt: the top-down check MUST
+  NOT fire for them.
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the
@@ -958,7 +988,7 @@ can be GC'd before the failover, and without the durable breadcrumb the
 surviving produced siblings would launder the clear and re-arm exactly that
 doomed dispatch.
 
-#r("sched.dispatch.fod-substitute+2")[
+#r("sched.dispatch.fod-substitute+3")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
   substitutability for every Ready input-addressed derivation, not just FODs
@@ -978,7 +1008,9 @@ doomed dispatch.
   Substitutable paths MUST be fetched (`QueryPathInfo` with the same metadata)
   before the derivation is marked Completed --- builders' subsequent `GetPath`
   calls have no tenant context, so the lazy `try_substitute_on_miss` cannot
-  fire there.
+  fire there. Force-build roots (#rref("sched.merge.force-build-roots")) MUST
+  be excluded from the substitute-spawn arm while remaining in the probe batch
+  (the probe-tenant selection and locally-present completion are unchanged).
 ]
 
 #r("sched.substitute.eager-probe")[
