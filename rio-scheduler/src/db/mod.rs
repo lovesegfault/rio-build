@@ -281,6 +281,11 @@ pub(crate) struct RecoveryDerivationRow {
     pub floor_mem_bytes: i64,
     pub floor_disk_bytes: i64,
     pub floor_deadline_secs: i64,
+    /// Persisted authoritative inline derivation (`M_062`) — `Some`
+    /// only for content-bound hook-fallback nodes; rehydrated into
+    /// `DerivationState::drv_content` so post-failover dispatch still
+    /// carries the only copy of the derivation.
+    pub drv_content: Option<Vec<u8>>,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -319,6 +324,7 @@ impl RecoveryDerivationRow {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            drv_content: None,
             exec_id: None,
         }
     }
@@ -326,7 +332,8 @@ impl RecoveryDerivationRow {
 
 /// Row from `load_build_graph` nodes query. Thin — ~200B.
 /// Mirrors proto `GraphNode` (NOT `DerivationNode`, which carries
-/// ≤64KB `drv_content`). `pname` and `assigned_builder_id` are COALESCE'd
+/// inline `drv_content` — typically ≤64KB, up to 1 MiB for
+/// hook-fallback nodes). `pname` and `assigned_builder_id` are COALESCE'd
 /// to empty-string SQL-side to match proto3's non-optional string fields.
 ///
 /// `derivation_id` is NOT in the proto — it's collected here so the edge
@@ -416,6 +423,12 @@ pub(crate) struct DerivationRow {
     /// the single-row `clear_topdown_pruned_by_hash` is mark-only, so
     /// the topdown fail-fast retains the hole it leaves behind.
     pub closure_hole: bool,
+    /// Authoritative inline derivation bytes (content-bound hook
+    /// fallback) — `Some` only when the gateway marked the node
+    /// `drv_content_authoritative`; `None` for every other node so the
+    /// column stays NULL and a re-upsert can never wipe persisted
+    /// bytes (COALESCE on conflict).
+    pub drv_content: Option<Vec<u8>>,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

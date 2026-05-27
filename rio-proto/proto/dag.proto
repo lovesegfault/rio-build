@@ -29,12 +29,13 @@ message DerivationNode {
   // between the gateway's FindMissingPaths and the scheduler's queue.
   repeated string expected_output_paths = 8;
   // ATerm-serialized .drv content. Empty = scheduler/executor fetches
-  // from store (the inline-content fallback). Populated by the
-  // gateway via filter_and_inline_drv ONLY for nodes whose outputs
-  // are missing from the store (= will actually dispatch). Cache-hit
-  // nodes stay empty — no point inflating SubmitBuild for derivations
-  // that won't build. Per-node ≤64KB (gateway enforces); scheduler
-  // validates ≤256KB defensively. 16MB total budget across the DAG.
+  // from store (the inline-content fallback). Two gateway producers:
+  // filter_and_inline_drv inlines cache-resident derivations whose
+  // outputs are missing from the store (≤64 KiB each, 16 MiB total
+  // budget — cache-hit nodes stay empty), and the content-bound hook
+  // fallback (build_fallback_node) carries a single derivation up to
+  // 1 MiB (rio-common MAX_DRV_CONTENT_BYTES). The scheduler validates
+  // the same shared bound defensively at SubmitBuild ingress.
   bytes drv_content = 9;
   reserved 10;  // was input_srcs_nar_size (closure-size proxy; ADR-023 supersedes)
 
@@ -105,6 +106,16 @@ message DerivationNode {
   // are not structural roots. False (the proto3 default) means "only
   // demanded as a dependency", which is the pre-addition behaviour.
   bool explicitly_requested = 19;
+
+  // Set by the gateway when the inline drv_content is the ONLY copy of
+  // the derivation anywhere (content-bound hook fallback: the .drv was
+  // never uploaded and the gateway never writes its re-serialization to
+  // any store). The scheduler MUST persist these bytes with the
+  // derivation row so a post-failover dispatch still carries them —
+  // otherwise the build can only fail after recovery. False for the
+  // inline-.drv optimization (the worker can always fetch those from
+  // the store).
+  bool drv_content_authoritative = 20;
 }
 
 // A dependency edge in the derivation DAG.
@@ -147,8 +158,9 @@ enum DerivationEventKind {
 // Dashboard DAG (GetBuildGraph — AdminService)
 // ───────────────────────────────────────────────────────────────────────────
 
-// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode is ≤64KB
-// (drv_content inline). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
+// Dashboard DAG — deliberately THIN (~200B/node). DerivationNode carries
+// inline drv_content (typically ≤64KB, up to 1 MiB for hook-fallback
+// nodes). 2000 nodes × 64KB = 128MB > max_encoding_message_size.
 // GraphNode carries a handful of strings — just what the dashboard needs to render a
 // node box with a status color.
 message GraphNode {

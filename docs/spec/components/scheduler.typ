@@ -1564,6 +1564,20 @@ tables) during state recovery.
   partially-loaded DAG from issuing assignments.
 ]
 
+#r("sched.recovery.inline-drv-durability")[
+  A `DerivationNode` submitted with authoritative inline derivation content
+  (`drv_content_authoritative`, the content-bound hook fallback) MUST have
+  those bytes persisted with the derivation row at merge time and restored
+  into the in-memory state on recovery, so a post-failover dispatch carries
+  the same content. The persisted bytes are dispatch payload only --- they
+  MUST never be written to any store or served as a store object.
+]
+The column is `NULL` for every other derivation and is merged with
+`COALESCE` on re-upsert, so a later non-authoritative submission of the same
+derivation never erases the persisted copy. Rows written before the column
+existed (or by a pre-upgrade scheduler) recover with empty content and keep
+the pre-durability failure mode for that one window.
+
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to
   `completed`/`skipped` children are dropped (those dependencies are

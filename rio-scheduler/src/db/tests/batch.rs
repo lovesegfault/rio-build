@@ -113,6 +113,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             wanted_output_names: vec![],
             topdown_pruned: false,
             closure_hole: false,
+            drv_content: None,
         })
         .collect();
 
@@ -194,6 +195,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             wanted_output_names: vec![],
             topdown_pruned: false,
             closure_hole: false,
+            drv_content: None,
         })
         .collect();
 
@@ -579,6 +581,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             wanted_output_names: vec![],
             topdown_pruned: false,
             closure_hole: false,
+            drv_content: None,
         })
         .collect();
     let mut tx = db.pool().begin().await?;
@@ -603,5 +606,88 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
         .await?;
     // ≤ edges.len() because of ON CONFLICT dedup, but > old limit.
     assert!(count > 32_768);
+    Ok(())
+}
+
+/// Authoritative inline drv_content (content-bound hook fallback) must
+/// round-trip through batch upsert, survive a later non-authoritative
+/// re-upsert (COALESCE), be refreshed by a later authoritative one, and
+/// come back from the recovery query.
+// r[verify sched.recovery.inline-drv-durability]
+#[tokio::test]
+async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let row = |hash: &str, content: Option<Vec<u8>>| DerivationRow {
+        drv_hash: hash.into(),
+        drv_path: format!("/nix/store/{}-{hash}.drv", "c".repeat(32)),
+        pname: Some("hook-fallback".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: content,
+    };
+    let aterm = b"Derive([(\"out\",\"\",\"r:sha256\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[\"-c\",\"echo hi\"],[(\"out\",\"\")])".to_vec();
+
+    // Insert: one authoritative, one ordinary.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        &[row("hookdrv", Some(aterm.clone())), row("plaindrv", None)],
+    )
+    .await?;
+    tx.commit().await?;
+
+    let fetch = |hash: &'static str| {
+        let pool = test_db.pool.clone();
+        async move {
+            let (content,): (Option<Vec<u8>>,) =
+                sqlx::query_as("SELECT drv_content FROM derivations WHERE drv_hash = $1")
+                    .bind(hash)
+                    .fetch_one(&pool)
+                    .await?;
+            anyhow::Ok(content)
+        }
+    };
+    assert_eq!(fetch("hookdrv").await?, Some(aterm.clone()), "persisted");
+    assert_eq!(fetch("plaindrv").await?, None, "ordinary node stays NULL");
+
+    // Re-upsert the same drv_hash WITHOUT content (a later full-DAG
+    // submission of the same derivation) — COALESCE keeps the bytes.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", None)]).await?;
+    tx.commit().await?;
+    assert_eq!(
+        fetch("hookdrv").await?,
+        Some(aterm.clone()),
+        "non-authoritative re-upsert must not wipe persisted bytes"
+    );
+
+    // A later authoritative upsert refreshes them.
+    let aterm2 = b"Derive([],[],[],\"x86_64-linux\",\"/bin/sh\",[],[])".to_vec();
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("hookdrv", Some(aterm2.clone()))]).await?;
+    tx.commit().await?;
+    assert_eq!(fetch("hookdrv").await?, Some(aterm2.clone()), "refreshed");
+
+    // The recovery query returns the bytes (status 'created' is
+    // non-terminal, so the row qualifies).
+    let recovered = db.load_nonterminal_derivations().await?;
+    let hook = recovered
+        .iter()
+        .find(|r| r.drv_hash == "hookdrv")
+        .expect("hookdrv loaded");
+    assert_eq!(hook.drv_content.as_deref(), Some(aterm2.as_slice()));
+    let plain = recovered
+        .iter()
+        .find(|r| r.drv_hash == "plaindrv")
+        .expect("plaindrv loaded");
+    assert_eq!(plain.drv_content, None);
+
     Ok(())
 }

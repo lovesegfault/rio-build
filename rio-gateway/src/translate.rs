@@ -1098,6 +1098,7 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // fallback's caller flags its single node directly.
         explicitly_requested: false,
         drv_content: Vec::new(),
+        drv_content_authoritative: false,
         is_content_addressed: drv.is_content_addressed(),
         // Empty here — populate_ca_modular_hashes() fills AFTER the
         // full BFS so hash_derivation_modulo has the complete
@@ -1140,7 +1141,7 @@ pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = rio_common::limits::MAX_
 /// path cannot work any other way (the worker has nowhere to fetch the
 /// derivation from), so failing fast at submission is the only honest
 /// answer.
-// r[impl gw.hook.inline-drv-content]
+// r[impl gw.hook.inline-drv-content+2]
 pub fn build_fallback_node(
     drv_path: &str,
     basic: &rio_nix::derivation::BasicDerivation,
@@ -1158,6 +1159,10 @@ pub fn build_fallback_node(
     }
     let mut node = build_node(drv_path, basic);
     node.drv_content = aterm.into_bytes();
+    // The inline bytes are the only copy of this derivation anywhere —
+    // mark them authoritative so the scheduler persists them with the
+    // derivation row and a post-failover dispatch still carries them.
+    node.drv_content_authoritative = true;
     Ok(node)
 }
 
@@ -2033,7 +2038,7 @@ mod tests {
 
     /// The content-bound single-node fallback carries the serialized
     /// derivation; oversized derivations are rejected with remediation.
-    // r[verify gw.hook.inline-drv-content]
+    // r[verify gw.hook.inline-drv-content+2]
     #[test]
     fn build_fallback_node_inlines_the_basic_derivation() {
         use rio_nix::derivation::BasicDerivation;
@@ -2068,6 +2073,14 @@ mod tests {
         let node = build_fallback_node(drv_path, &basic).expect("under the cap");
         assert_eq!(node.drv_path, drv_path);
         assert!(node.is_fixed_output, "FOD detection preserved");
+        assert!(
+            node.drv_content_authoritative,
+            "fallback nodes carry the only copy of the derivation — must be marked authoritative"
+        );
+        assert!(
+            !build_node(drv_path, &basic).drv_content_authoritative,
+            "ordinary nodes are not authoritative (worker fetches the .drv from the store)"
+        );
         assert_eq!(
             node.drv_content,
             basic.to_aterm().into_bytes(),

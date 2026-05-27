@@ -2641,7 +2641,9 @@ impl DagActor {
         }
 
         // No drv_content → recovered derivation (scheduler restart,
-        // DAG reloaded from PG, drv_content not persisted). The store
+        // DAG reloaded from PG; only authoritative hook-fallback
+        // content is persisted — M_062 — everything else is
+        // refetched). The store
         // has the ATerm — fetch it. Workers do the same when the
         // inline is empty (build_types.proto:231: "Empty = fallback;
         // worker fetches via GetPath"). ~10-50ms round-trip, once

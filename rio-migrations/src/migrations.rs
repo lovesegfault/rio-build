@@ -1156,6 +1156,31 @@ pub const M_063: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_064: () = ();
 
+/// 065: `derivations.drv_content` — persist the authoritative inline
+/// derivation for content-bound hook-fallback nodes.
+///
+/// The gateway's single-node hook fallback carries the serialized
+/// `BasicDerivation` inline because the `.drv` was never uploaded and
+/// the gateway deliberately never writes its re-serialization to any
+/// store (it would not text-hash to the client's claimed path). Until
+/// this migration those bytes lived only in scheduler memory, so a
+/// failover rebuilt the node with empty `drv_content` and the build
+/// could only fail (the worker has nowhere to fetch the derivation
+/// from). Supersedes `004_recovery.sql`'s "drv_content not persisted"
+/// note for authoritative nodes — 004 is frozen and stays as written.
+///
+/// NULL for every non-fallback derivation; written via COALESCE on
+/// re-upsert so a later non-authoritative submission of the same
+/// drv_hash never wipes the persisted bytes. No size CHECK (the shared
+/// ingress bound in rio-common is authoritative; a SQL literal would
+/// drift). Bounded at one row per hook submission and ≤ the ingress cap
+/// (TOAST-able, no index), so row growth is negligible.
+///
+/// Rolling-upgrade caveat: rows written before this migration (or by an
+/// old scheduler) have NULL drv_content, so a hook-fallback build that
+/// crosses a failover during that window keeps the old failure mode.
+pub const M_065: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

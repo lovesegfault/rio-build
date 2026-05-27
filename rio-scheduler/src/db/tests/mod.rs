@@ -51,6 +51,7 @@ pub(super) async fn insert_test_derivation(
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
+        drv_content: None,
     };
     let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
     tx.commit().await?;

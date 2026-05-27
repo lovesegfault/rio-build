@@ -1382,7 +1382,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     out.path()
                 );
             }
-            // r[impl gw.hook.inline-drv-content]
+            // r[impl gw.hook.inline-drv-content+2]
             // Content-bound fallback: the .drv exists in no store (the
             // client never uploaded it), so the worker can only execute
             // this build if the serialized derivation rides along in

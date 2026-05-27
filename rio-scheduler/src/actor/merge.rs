@@ -1954,6 +1954,16 @@ impl DagActor {
                     // in `handle_merge_dag` and the both-bits batched
                     // mark clear it runs for Vouched parents.
                     closure_hole: false,
+                    // r[impl sched.recovery.inline-drv-durability]
+                    // Persist the authoritative inline derivation
+                    // (content-bound hook fallback: these bytes are
+                    // the only copy anywhere) so post-failover
+                    // dispatch still carries it. Plain inline-
+                    // optimization content stays NULL — workers can
+                    // always fetch those .drvs from the store.
+                    drv_content: node
+                        .drv_content_authoritative
+                        .then(|| node.drv_content.clone()),
                 }
             })
             .collect();

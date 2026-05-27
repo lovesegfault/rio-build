@@ -1909,7 +1909,7 @@ untrusted handshake):*
   a missing or unrealized output is reported as a failure result, not an
   empty-`outPath` success
 
-#r("gw.hook.inline-drv-content")[
+#r("gw.hook.inline-drv-content+2")[
   When the gateway accepts a content-bound derivation through the inline
   `wopBuildDerivation` single-node fallback (the full `.drv` cannot be
   resolved from the session cache or the store), it MUST embed the
@@ -1918,7 +1918,10 @@ untrusted handshake):*
   reject submissions whose serialized derivation exceeds the fallback
   inline cap (1 MiB, `MAX_FALLBACK_INLINE_DRV_BYTES`) with remediation
   guidance (upload the `.drv` first via `nix copy --derivation`, or use
-  `--store ssh-ng://`). The inlined bytes are never written to the store or
+  `--store ssh-ng://`). It MUST mark the node as carrying the authoritative
+  copy (`drv_content_authoritative`) so the scheduler persists those bytes
+  for recovery (#rref("sched.recovery.inline-drv-durability")). The inlined
+  bytes are never written to the store or
   the session derivation cache: re-serialized content does not text-hash to
   the client's claimed `.drv` path, so persisting it would poison later
   full-DAG builds of the same derivation.

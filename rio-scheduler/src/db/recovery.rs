@@ -86,6 +86,7 @@ impl SchedulerDb {
                    d.is_ca, d.topdown_pruned, d.closure_hole,
                    d.failed_builders,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
+                   d.drv_content,
                    a.exec_id
             FROM derivations d
             LEFT JOIN assignments a ON a.derivation_id = d.derivation_id

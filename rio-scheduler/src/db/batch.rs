@@ -77,6 +77,12 @@ impl SchedulerDb {
         let mut wanted_output_names = Vec::with_capacity(rows.len());
         let mut topdown_pruned = Vec::with_capacity(rows.len());
         let mut closure_hole = Vec::with_capacity(rows.len());
+        // bytea[] bind: sqlx's array encoder wants a homogeneous
+        // element type, so None is encoded as an EMPTY bytea and
+        // converted back to NULL SQL-side via NULLIF — the column
+        // must be NULL (not '') for non-authoritative nodes so the
+        // ON CONFLICT COALESCE never wipes persisted bytes.
+        let mut drv_content = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -91,6 +97,7 @@ impl SchedulerDb {
             wanted_output_names.push(encode_pg_text_array(&r.wanted_output_names));
             topdown_pruned.push(r.topdown_pruned);
             closure_hole.push(r.closure_hole);
+            drv_content.push(r.drv_content.clone().unwrap_or_default());
         }
 
         // ON CONFLICT: update the recovery columns too. For
@@ -146,7 +153,7 @@ impl SchedulerDb {
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names, topdown_pruned, closure_hole)
+                 wanted_output_names, topdown_pruned, closure_hole, drv_content)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
@@ -154,15 +161,16 @@ impl SchedulerDb {
                 output_names::text[],
                 is_fixed_output, is_ca,
                 wanted_output_names::text[],
-                topdown_pruned, closure_hole
+                topdown_pruned, closure_hole,
+                NULLIF(drv_content, ''::bytea)
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[], $12::bool[], $13::bool[]
+                $11::text[], $12::bool[], $13::bool[], $14::bytea[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
-                   closure_hole)
+                   closure_hole, drv_content)
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
@@ -209,7 +217,12 @@ impl SchedulerDb {
                     )
                 END,
                 topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned,
-                closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole
+                closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole,
+                -- A later non-authoritative submission of the same
+                -- drv_hash (NULL here) must never wipe persisted
+                -- authoritative bytes; a later authoritative one
+                -- refreshes them.
+                drv_content = COALESCE(EXCLUDED.drv_content, derivations.drv_content)
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
@@ -227,6 +240,7 @@ impl SchedulerDb {
         .bind(&wanted_output_names)
         .bind(&topdown_pruned)
         .bind(&closure_hole)
+        .bind(&drv_content)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result

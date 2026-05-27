@@ -5008,3 +5008,36 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     );
     Ok(())
 }
+
+/// Authoritative inline drv_content (content-bound hook fallback) must
+/// survive scheduler failover: the bytes are the only copy of the
+/// derivation anywhere, so the recovered node's dispatch must carry
+/// exactly what the gateway submitted.
+// r[verify sched.recovery.inline-drv-durability]
+#[tokio::test]
+async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let aterm: Vec<u8> = br#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hook-ca","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hook-ca")])"#.to_vec();
+    let aterm_seed = aterm.clone();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        let mut node = make_node("hook-durable");
+        node.drv_content = aterm_seed;
+        node.drv_content_authoritative = true;
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: a worker connects and the recovered Ready node is
+    // dispatched — the assignment must carry the original bytes (the
+    // worker has nowhere else to fetch this derivation from).
+    let mut rx = connect_executor(&handle, "durable-w", "x86_64-linux").await?;
+    let assignment = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assignment.drv_content, aterm,
+        "post-failover dispatch must carry the persisted authoritative drv_content"
+    );
+    Ok(())
+}

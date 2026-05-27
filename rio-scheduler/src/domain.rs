@@ -68,6 +68,10 @@ pub struct DerivationNode {
     /// crate — the one extra copy at the boundary is per-merge, not
     /// per-tick.
     pub drv_content: Vec<u8>,
+    /// True when `drv_content` is the only copy of the derivation
+    /// anywhere (content-bound hook fallback) — the scheduler must
+    /// persist those bytes with the derivation row for recovery.
+    pub drv_content_authoritative: bool,
     pub is_content_addressed: bool,
     /// Decoded `ca_modular_hash` — `Some` iff the wire field was
     /// exactly 32 bytes. The proto carries raw `bytes`; downstream
@@ -99,6 +103,7 @@ impl From<proto::DerivationNode> for DerivationNode {
             wanted_output_names: n.wanted_output_names,
             explicitly_requested: n.explicitly_requested,
             drv_content: n.drv_content.to_vec(),
+            drv_content_authoritative: n.drv_content_authoritative,
             is_content_addressed: n.is_content_addressed,
             needs_resolve: n.needs_resolve,
             version: n.version,

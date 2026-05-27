@@ -7,7 +7,7 @@
 // r[verify gw.reject.output-path-mismatch]
 // r[verify gw.reject.unsupported-hash-algo+2]
 // r[verify gw.hook.ifd-detection+3]
-// r[verify gw.hook.inline-drv-content]
+// r[verify gw.hook.inline-drv-content+2]
 // r[verify gw.stderr.activity+2]
 
 use super::*;
@@ -724,7 +724,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
             1,
             "the content-bound inline fallback is submitted"
         );
-        // r[verify gw.hook.inline-drv-content]
+        // r[verify gw.hook.inline-drv-content+2]
         // The submitted node carries the serialized derivation (the .drv
         // exists in no store for the worker to fetch) and it parses back
         // to the same fixed-output derivation.
@@ -751,7 +751,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
 /// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
 /// hash and path empty) with no uploaded .drv is accepted, and the
 /// submitted node carries parseable drv_content with needs_resolve set.
-/// r[verify gw.hook.inline-drv-content]
+/// r[verify gw.hook.inline-drv-content+2]
 #[tokio::test]
 async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
 -> anyhow::Result<()> {
@@ -804,7 +804,7 @@ async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
 
 /// wopBuildDerivation (36): an inline content-bound derivation whose
 /// serialized form exceeds the 1 MiB fallback cap is rejected with
-/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content]
+/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+2]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -854,7 +854,7 @@ async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::R
 /// submitted node carries the full drv_content — the producer cap and
 /// the SubmitBuild ingress bound are the same shared constant, so the
 /// (256 KiB, 1 MiB] window cannot be rejected downstream.
-/// r[verify gw.hook.inline-drv-content]
+/// r[verify gw.hook.inline-drv-content+2]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

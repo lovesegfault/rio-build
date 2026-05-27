@@ -1120,8 +1120,12 @@ impl DerivationState {
     /// the poison-TTL check never fires — the derivation stays
     /// poisoned forever until a new build re-merges it.
     ///
-    /// `drv_content` is empty — worker fetches from store via
-    /// GetPath (fallback path, still supported in executor).
+    /// `drv_content` is restored from the persisted row when the
+    /// gateway marked it authoritative (content-bound hook fallback,
+    /// `M_062`) — those bytes exist nowhere else, so the worker could
+    /// not fetch them. For every other node it is empty and the
+    /// worker fetches the `.drv` from the store via GetPath (fallback
+    /// path, still supported in executor).
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but
@@ -1185,8 +1189,20 @@ impl DerivationState {
                 // dispatch / full_sweep — see SchedHint doc.
                 ..Default::default()
             },
-            drv_content: Vec::new(), // worker fetches from store
-            input_srcs: Vec::new(),  // unparsed (no drv_content); DAG-children-only prefetch
+            // Authoritative inline derivation (hook fallback) is the
+            // only copy anywhere — restore it so post-failover
+            // dispatch still works; everything else stays empty and
+            // the worker fetches the .drv from the store. Re-run the
+            // same best-effort inputSrcs parse as try_from_node so
+            // prefetch hints are also restored.
+            input_srcs: row
+                .drv_content
+                .as_deref()
+                .and_then(|c| std::str::from_utf8(c).ok())
+                .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok())
+                .map(|d| d.input_srcs().iter().cloned().collect())
+                .unwrap_or_default(),
+            drv_content: row.drv_content.unwrap_or_default(),
             retry: RetryState {
                 count: row.retry_count.max(0) as u32,
                 resubmit_cycles: row.resubmit_cycles.max(0) as u32,
@@ -2270,6 +2286,7 @@ mod tests {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            drv_content: None,
             exec_id: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
@@ -2508,6 +2525,35 @@ mod tests {
             "insertion order irrelevant"
         );
         Ok(())
+    }
+
+    /// `M_062`: a recovery row carrying authoritative inline drv_content
+    /// hydrates both the bytes and the re-parsed inputSrcs; a row
+    /// without it keeps the empty defaults (worker fetches from store).
+    // r[verify sched.recovery.inline-drv-durability]
+    #[test]
+    fn from_recovery_row_hydrates_authoritative_drv_content() {
+        let aterm = br#"Derive([("out","/nix/store/abc-out","","")],[],["/nix/store/abc-gcc","/nix/store/abc-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/abc-out")])"#;
+        let row = crate::db::RecoveryDerivationRow {
+            drv_content: Some(aterm.to_vec()),
+            ..crate::db::RecoveryDerivationRow::test_default("durable-drv", "x86_64-linux")
+        };
+        let state =
+            DerivationState::from_recovery_row(row, DerivationStatus::Ready).expect("row hydrates");
+        assert_eq!(state.drv_content, aterm.to_vec(), "bytes restored");
+        assert_eq!(
+            state.input_srcs,
+            vec!["/nix/store/abc-gcc", "/nix/store/abc-glibc"],
+            "inputSrcs re-parsed from the restored content"
+        );
+
+        let bare = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow::test_default("plain-drv", "x86_64-linux"),
+            DerivationStatus::Ready,
+        )
+        .expect("row hydrates");
+        assert!(bare.drv_content.is_empty(), "no persisted content → empty");
+        assert!(bare.input_srcs.is_empty());
     }
 }
 
