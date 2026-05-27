@@ -918,9 +918,12 @@ it: stamping before the fallible cache-check and persist steps would leak a
 rejected build's prune verdict onto a shared pre-existing childless node, and
 a later routine fetch failure would terminally fail innocent builds through
 the fail-fast arm. The flag is persisted (migration 063, OR-on-conflict on
-upsert, cleared by the post-reconciliation clear pass only when those
-children are already produced and verified (otherwise the mark stays until
-they produce or the fail-fast consumes it)) because the post-failover shape
+upsert, cleared --- by the post-reconciliation clear pass at merge time when
+those children are already produced and verified, by the completion-time
+clear when children become produced, or by the recovery-time gate that
+drops a restored mark whose persisted children are all produced ---
+otherwise the mark stays until they produce or the fail-fast consumes it)
+because the post-failover shape
 is exactly where the from-source hazard bites: the recovered node is
 childless and re-probed against the stored wanted union (migration 062,
 empty = all declared) ---

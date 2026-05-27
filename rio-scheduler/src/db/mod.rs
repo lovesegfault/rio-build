@@ -257,6 +257,9 @@ pub(crate) struct RecoveryDerivationRow {
     /// never produced), so it MUST complete via substitution. Restored
     /// verbatim by `from_recovery_row` — resetting it to false is what
     /// allowed the post-failover doomed from-source dispatch.
+    /// `load_dag_from_rows` then drops the restored mark when the row's
+    /// persisted children are all produced (see
+    /// `load_parents_with_all_children_produced`).
     pub topdown_pruned: bool,
     pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`

@@ -293,10 +293,14 @@ impl SchedulerDb {
     }
 
     /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
-    /// on the pool (outside any transaction). Caller: the
-    /// post-reconciliation clear pass in `handle_merge_dag`, which
-    /// collects the unique parents whose children are all produced
-    /// (and verified) after `reconcile_merged_state` and clears them in
+    /// on the pool (outside any transaction). Callers: the
+    /// post-reconciliation clear pass in `handle_merge_dag` (unique
+    /// parents whose children are all produced — and verified — after
+    /// `reconcile_merged_state`),
+    /// `clear_topdown_pruned_for_produced_parents` in completion.rs
+    /// (parents whose last child just became produced), and the
+    /// recovery-time gate in `load_dag_from_rows` (restored marks whose
+    /// persisted children are all produced); each clears its batch in
     /// one statement. Returns the number of rows actually cleared.
     /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
     /// warns and continues — the in-memory clear already happened and

@@ -1173,9 +1173,9 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 /// failover, so it is persisted: once a pruned merge commits, the kept
 /// (demanded) node's PG row carries `topdown_pruned = true`; a later
 /// full merge that gives that node children **that are already
-/// produced** clears the column in the same transaction that persists
-/// those edges (a merge adding only unbuilt children keeps it — see
-/// the reap-hazard test below).
+/// produced** clears the column via the post-reconciliation clear pass
+/// after the merge is reconciled (a merge adding only unbuilt children
+/// keeps it — see the reap-hazard test below).
 #[tokio::test]
 async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
