@@ -771,6 +771,11 @@
       "doc": "Local eval-set artifact directory layout and JSON/JSONL writers."
     },
     {
+      "path": "evalset/depclosure.rs",
+      "depth": 1,
+      "doc": "Per-target dependency closures from `nix derivation show -r` output."
+    },
+    {
       "path": "evalset/evaluator.rs",
       "depth": 1,
       "doc": "nix-eval-jobs runner and JSONL output parsing."

@@ -6,6 +6,7 @@
 //! archive, and the eval-set key/metadata.
 
 pub mod artifacts;
+pub mod depclosure;
 pub mod evaluator;
 pub mod fidelity;
 pub mod recipe;

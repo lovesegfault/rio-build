@@ -9,11 +9,17 @@
 //! the other are reported as coverage gaps and do not gate. The
 //! resulting report is written verbatim as `fidelity.json`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
 use crate::evalset::evaluator::ManifestRecord;
+
+/// [`FidelityReport::mode`] value when every in-scope job was compared.
+pub const MODE_EXHAUSTIVE: &str = "exhaustive";
+/// [`FidelityReport::mode`] value when only a bounded sample of jobs
+/// was compared.
+pub const MODE_SAMPLED: &str = "sampled";
 
 /// One job whose locally evaluated drvPath differs from Hydra's.
 #[derive(Debug, Clone, Serialize)]
@@ -26,9 +32,9 @@ pub struct FidelityMismatch {
 /// Contents of `fidelity.json`.
 #[derive(Debug, Clone, Serialize)]
 pub struct FidelityReport {
-    /// `"exhaustive"` when every in-scope job was compared (scoped
-    /// sets) or `"sampled"` when only a bounded sample of jobs was
-    /// (full-evaluation sets).
+    /// [`MODE_EXHAUSTIVE`] when every in-scope job was compared (scoped
+    /// sets) or [`MODE_SAMPLED`] when only a bounded sample of jobs was
+    /// compared (full-evaluation sets).
     pub mode: String,
     /// Jobs compared (present on both sides).
     pub checked: usize,
@@ -43,6 +49,11 @@ pub struct FidelityReport {
 }
 
 /// Compare manifest drvPaths against Hydra ground truth (job → drvpath).
+///
+/// Both inputs must already be restricted to the comparison scope — the
+/// caller does any sampling — so a sampled Hydra map is never compared
+/// against a full manifest (the asymmetry would only inflate the
+/// coverage-gap lists, never fabricate a mismatch).
 pub fn compare_drv_paths(
     manifest: &[ManifestRecord],
     hydra: &BTreeMap<String, String>,
@@ -52,8 +63,7 @@ pub fn compare_drv_paths(
     let mut checked = 0usize;
     let mut mismatches = Vec::new();
     let mut missing_on_hydra = Vec::new();
-    let local_jobs: BTreeMap<&str, &ManifestRecord> =
-        manifest.iter().map(|r| (r.job.as_str(), r)).collect();
+    let local_jobs: BTreeSet<&str> = manifest.iter().map(|r| r.job.as_str()).collect();
 
     for rec in manifest {
         match hydra.get(&rec.job) {
@@ -74,7 +84,7 @@ pub fn compare_drv_paths(
     }
     let missing_locally: Vec<String> = hydra
         .keys()
-        .filter(|job| !local_jobs.contains_key(job.as_str()))
+        .filter(|job| !local_jobs.contains(job.as_str()))
         .cloned()
         .collect();
 
@@ -127,7 +137,7 @@ mod tests {
             "nixpkgs.hello.x86_64-linux",
             "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv",
         )];
-        let report = compare_drv_paths(&manifest, &hydra_truth(), "exhaustive");
+        let report = compare_drv_paths(&manifest, &hydra_truth(), MODE_EXHAUSTIVE);
         assert_eq!(report.checked, 1);
         assert_eq!(report.matched, 1);
         assert!(report.mismatches.is_empty());
@@ -140,7 +150,7 @@ mod tests {
             "nixpkgs.hello.x86_64-linux",
             "/nix/store/0000000000000000000000000000000-hello-2.12.3.drv",
         )];
-        let report = compare_drv_paths(&manifest, &hydra_truth(), "exhaustive");
+        let report = compare_drv_paths(&manifest, &hydra_truth(), MODE_EXHAUSTIVE);
         assert_eq!(report.matched, 0);
         assert_eq!(report.mismatches.len(), 1);
         assert_eq!(report.mismatches[0].job, "nixpkgs.hello.x86_64-linux");
@@ -162,7 +172,7 @@ mod tests {
         )];
         let mut truth = hydra_truth();
         truth.remove("nixpkgs.onlylocal.x86_64-linux");
-        let report = compare_drv_paths(&manifest, &truth, "exhaustive");
+        let report = compare_drv_paths(&manifest, &truth, MODE_EXHAUSTIVE);
         assert_eq!(report.checked, 0);
         assert_eq!(
             report.missing_on_hydra,
@@ -183,7 +193,7 @@ mod tests {
             ),
             rec("nixpkgs.onlylocal.x86_64-linux", "/nix/store/aaa-x.drv"),
         ];
-        let report = compare_drv_paths(&manifest, &hydra_truth(), "sampled");
+        let report = compare_drv_paths(&manifest, &hydra_truth(), MODE_SAMPLED);
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = EvalSetDir::create(tmp.path()).unwrap();

@@ -1,0 +1,350 @@
+{
+  "derivations": {
+    "00d529rs5cfj1kwz79sm79qackf9gppk-strncpy.drv": {
+      "args": [
+        "--verbose",
+        "--strict",
+        "--file",
+        "/nix/store/vrza83f5pwasbz4rl0773zzpmfqmsmy6-strncpy-builder"
+      ],
+      "builder": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1/bin/kaem",
+      "env": {
+        "PATH": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1/bin:/nix/store/53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1/bin:/nix/store/nf45b5s985mn73828jb6pfq0g85j0hvg-mescc-tools-extra-1.9.1/bin",
+        "builder": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1/bin/kaem",
+        "name": "strncpy",
+        "out": "/nix/store/wh601bizr79g0x5h9r7m06hcahr07skz-strncpy",
+        "system": "x86_64-linux"
+      },
+      "inputs": {
+        "drvs": {
+          "8y8aadripzcsxfvg4hsdacwcgw6ypm50-strncpy-builder.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "pz3m6g7iabylyazm40p363y8795vybf9-mescc-tools-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "yjp7zwabw9xcm6g42736mbhlvcddw410-mescc-tools-extra-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "zlsfxdxsnzp1nzzw113avl2v0s5mgjpr-kaem-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          }
+        },
+        "srcs": []
+      },
+      "name": "strncpy",
+      "outputs": {
+        "out": {
+          "path": "wh601bizr79g0x5h9r7m06hcahr07skz-strncpy"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    },
+    "013mqc5ymx4cih72blz21l6ync49i3jg-expr-strcmp.patch.drv": {
+      "args": [],
+      "builder": "builtin:fetchurl",
+      "env": {
+        "builder": "builtin:fetchurl",
+        "executable": "",
+        "impureEnvVars": "http_proxy https_proxy ftp_proxy all_proxy no_proxy",
+        "name": "expr-strcmp.patch",
+        "out": "/nix/store/h24jwyqgava9fwnq8rxfk56n2gi25wgs-expr-strcmp.patch",
+        "outputHash": "19f31lfsm1iwqzvp2fyv97lmqg4730prfygz9zip58651jf739a9",
+        "outputHashAlgo": "sha256",
+        "outputHashMode": "flat",
+        "preferLocalBuild": "1",
+        "system": "builtin",
+        "unpack": "",
+        "url": "https://github.com/fosslinux/live-bootstrap/raw/a8752029f60217a5c41c548b16f5cdd2a1a0e0db/sysa/coreutils-5.0/patches/expr-strcmp.patch",
+        "urls": "https://github.com/fosslinux/live-bootstrap/raw/a8752029f60217a5c41c548b16f5cdd2a1a0e0db/sysa/coreutils-5.0/patches/expr-strcmp.patch"
+      },
+      "inputs": {
+        "drvs": {},
+        "srcs": []
+      },
+      "name": "expr-strcmp.patch",
+      "outputs": {
+        "out": {
+          "hash": "sha256-SaVxnAzFoHLjT/95ly8Yhzxc6UnbO3H3xzyGqh0Nw6U=",
+          "method": "flat"
+        }
+      },
+      "system": "builtin",
+      "version": 4
+    },
+    "8y8aadripzcsxfvg4hsdacwcgw6ypm50-strncpy-builder.drv": {
+      "args": [
+        "--verbose",
+        "--strict",
+        "--file",
+        "/nix/store/m48r7nsm8wgjy69jg442vc7jjdfmcnl7-write-text-file.kaem"
+      ],
+      "builder": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1/bin/kaem",
+      "env": {
+        "PATH": "/nix/store/nf45b5s985mn73828jb6pfq0g85j0hvg-mescc-tools-extra-1.9.1/bin",
+        "builder": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1/bin/kaem",
+        "destination": "",
+        "destinationDir": ".",
+        "name": "strncpy-builder",
+        "out": "/nix/store/vrza83f5pwasbz4rl0773zzpmfqmsmy6-strncpy-builder",
+        "passAsFile": "text",
+        "system": "x86_64-linux",
+        "text": "mkdir ${out}\ncd ${out}\n/nix/store/n9mj1f0ipsva4vyd2llpdgv3wyrcmsm1-mes-src-0.27.1-bin/bin/mes-m2 -e main /nix/store/n9mj1f0ipsva4vyd2llpdgv3wyrcmsm1-mes-src-0.27.1-bin/bin/mescc.scm -D HAVE_CONFIG_H=1 -I /nix/store/vhbf57apsjqv01fnvhavm6iyk91m91si-mes-src-0.27.1/mes-0.27.1/include -I /nix/store/vhbf57apsjqv01fnvhavm6iyk91m91si-mes-src-0.27.1/mes-0.27.1/include/linux/x86_64 -c /nix/store/vhbf57apsjqv01fnvhavm6iyk91m91si-mes-src-0.27.1/mes-0.27.1/lib/string/strncpy.c\n"
+      },
+      "inputs": {
+        "drvs": {
+          "h6pi2cyw7j5liy0fbzq8i1ippcqwdjd3-mes-src-0.27.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "bin",
+              "out"
+            ]
+          },
+          "yjp7zwabw9xcm6g42736mbhlvcddw410-mescc-tools-extra-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "zlsfxdxsnzp1nzzw113avl2v0s5mgjpr-kaem-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          }
+        },
+        "srcs": [
+          "m48r7nsm8wgjy69jg442vc7jjdfmcnl7-write-text-file.kaem"
+        ]
+      },
+      "name": "strncpy-builder",
+      "outputs": {
+        "out": {
+          "path": "vrza83f5pwasbz4rl0773zzpmfqmsmy6-strncpy-builder"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    },
+    "pz3m6g7iabylyazm40p363y8795vybf9-mescc-tools-1.9.1.drv": {
+      "args": [
+        "--verbose",
+        "--strict",
+        "--file",
+        "/nix/store/dxq2nj9xx3fvcaypniaxwzfya1chng7b-build.kaem"
+      ],
+      "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+      "env": {
+        "M1": "/nix/store/40nlys32r8ra0qrab1b27igpm6skkvnw-M1-1.9.1",
+        "M2": "/nix/store/c933x2407ahyia5bd2z39109zsk2q2b7-M2-1.9.1",
+        "baseAddress": "0x00600000",
+        "blood-elf-0": "/nix/store/pc7xsqqlrmd36wlnpikj5kfr2rrpfmck-blood-elf-0-1.9.1",
+        "bloodFlag": "--64",
+        "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+        "chmod": "/nix/store/mp3hy2pkak9ffl6341qk8dmk7w9izfrw-mescc-tools-extra-chmod-1.9.1",
+        "cp": "/nix/store/nlbjwqmwj9n962kvnwkjaz43w016xykc-mescc-tools-extra-cp-1.9.1",
+        "endianFlag": "--little-endian",
+        "hex2": "/nix/store/932x535fjpinpaw2crsjay29snjpclfx-hex2-1.9.1",
+        "m2libc": "/nix/store/4f7nm8dblrdy74gmsl62b25rjrh4jcz3-stage0-posix-1.9.1-source/M2libc",
+        "m2libcArch": "amd64",
+        "mkdir": "/nix/store/6a44xajrn7clk0z76z20f4ylz4shalkp-mescc-tools-extra-mkdir-1.9.1",
+        "name": "mescc-tools-1.9.1",
+        "out": "/nix/store/53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1",
+        "pname": "mescc-tools",
+        "replace": "/nix/store/3ixws48vxbsnc2wx2yviglkvdhalk951-mescc-tools-extra-replace-1.9.1",
+        "src": "/nix/store/4f7nm8dblrdy74gmsl62b25rjrh4jcz3-stage0-posix-1.9.1-source",
+        "system": "x86_64-linux",
+        "version": "1.9.1"
+      },
+      "inputs": {
+        "drvs": {
+          "2kbbzfsz1hzd21yj0h989s3z40cgrp58-stage0-posix-1.9.1-source.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "46c2vwwb9lcd8976mmwaqiy2glsh8a6s-M2-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "dbasqqw4gv4864jxfc7i9fir1ik1h91b-mescc-tools-extra-mkdir-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "faklixjfqrpfwz3z513s6p9lmk2qf3mw-mescc-tools-extra-cp-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "fx1ariccq0k411lvhjl3iwbql4qq6xiv-mescc-tools-extra-replace-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "gs9mwc2r1p7hs6xrnqz5s36dsw3c9nqm-mescc-tools-extra-chmod-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "jfgdmzd75pybl8jbyv0qharzncawvfjk-hex2-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "mls5sqcps3yi6iwbn5bbyr1pymsk8cyy-kaem-unwrapped-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "xsn3z4sqkn6ac7mlq35b62qs31mlnhbw-blood-elf-0-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "zf7smly23scq1jpgwy8lbv6vksd5si6b-M1-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          }
+        },
+        "srcs": [
+          "dxq2nj9xx3fvcaypniaxwzfya1chng7b-build.kaem"
+        ]
+      },
+      "name": "mescc-tools-1.9.1",
+      "outputs": {
+        "out": {
+          "path": "53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    },
+    "yjp7zwabw9xcm6g42736mbhlvcddw410-mescc-tools-extra-1.9.1.drv": {
+      "args": [
+        "--verbose",
+        "--strict",
+        "--file",
+        "/nix/store/prb84n7lxm49jic6sj1lndwd20pmgm01-build.kaem"
+      ],
+      "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+      "env": {
+        "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+        "m2libcArch": "amd64",
+        "m2libcOS": "Linux",
+        "mescc-tools": "/nix/store/53zd871rgpcvi7qmqkffxhzaiq0is7k4-mescc-tools-1.9.1",
+        "name": "mescc-tools-extra-1.9.1",
+        "out": "/nix/store/nf45b5s985mn73828jb6pfq0g85j0hvg-mescc-tools-extra-1.9.1",
+        "pname": "mescc-tools-extra",
+        "src": "/nix/store/4f7nm8dblrdy74gmsl62b25rjrh4jcz3-stage0-posix-1.9.1-source",
+        "system": "x86_64-linux",
+        "version": "1.9.1"
+      },
+      "inputs": {
+        "drvs": {
+          "2kbbzfsz1hzd21yj0h989s3z40cgrp58-stage0-posix-1.9.1-source.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "mls5sqcps3yi6iwbn5bbyr1pymsk8cyy-kaem-unwrapped-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "pz3m6g7iabylyazm40p363y8795vybf9-mescc-tools-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          }
+        },
+        "srcs": [
+          "prb84n7lxm49jic6sj1lndwd20pmgm01-build.kaem"
+        ]
+      },
+      "name": "mescc-tools-extra-1.9.1",
+      "outputs": {
+        "out": {
+          "path": "nf45b5s985mn73828jb6pfq0g85j0hvg-mescc-tools-extra-1.9.1"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    },
+    "zlsfxdxsnzp1nzzw113avl2v0s5mgjpr-kaem-1.9.1.drv": {
+      "args": [
+        "--verbose",
+        "--strict",
+        "--file",
+        "/nix/store/sc7r0g8x9qhyr5y4yhm9x2h3ayajs94w-kaem-wrapper.kaem"
+      ],
+      "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+      "env": {
+        "PATH": "/nix/store/nf45b5s985mn73828jb6pfq0g85j0hvg-mescc-tools-extra-1.9.1/bin",
+        "builder": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+        "kaem-unwrapped": "/nix/store/0ql80hyg6dqs00x15fggfz7a0dhs7swq-kaem-unwrapped-1.9.1",
+        "name": "kaem-1.9.1",
+        "out": "/nix/store/n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1",
+        "pname": "kaem",
+        "system": "x86_64-linux",
+        "version": "1.9.1"
+      },
+      "inputs": {
+        "drvs": {
+          "mls5sqcps3yi6iwbn5bbyr1pymsk8cyy-kaem-unwrapped-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          },
+          "yjp7zwabw9xcm6g42736mbhlvcddw410-mescc-tools-extra-1.9.1.drv": {
+            "dynamicOutputs": {},
+            "outputs": [
+              "out"
+            ]
+          }
+        },
+        "srcs": [
+          "sc7r0g8x9qhyr5y4yhm9x2h3ayajs94w-kaem-wrapper.kaem"
+        ]
+      },
+      "name": "kaem-1.9.1",
+      "outputs": {
+        "out": {
+          "path": "n3mfz1lj8rbz0cspkfrvxiy9h5hm0vzg-kaem-1.9.1"
+        }
+      },
+      "system": "x86_64-linux",
+      "version": 4
+    }
+  },
+  "version": 4
+}
