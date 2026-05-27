@@ -246,6 +246,18 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // and no store-side verification. helm/30 locks this value
             // against the chart's ESO target name.
             .set("assignmentHmac.secretName", "rio-hmac")
+            // Mountd Mount-admission HMAC (ADR-022 §P0559): the
+            // scheduler mints WorkAssignment.mountd_token with this
+            // key; the rio-mountd DaemonSet verifies it so
+            // hostUsers:false executor pods (whose remapped gids can
+            // never match host gid 990) are admitted to the castore
+            // broker socket. SEPARATE Secret from rio-hmac — the
+            // verifier key sits on every builder node. The chart
+            // default is unset (gid-only admission, no token minted),
+            // so without this production builder pods cannot Mount at
+            // all once they run hostUsers:false. helm/31 locks this
+            // value against the chart's ESO target name.
+            .set("mountdHmac.secretName", "rio-mountd-hmac")
             // store-egress CiliumNetworkPolicy admits postgres on this
             // CIDR; the chart default fc00::/7 (ULA) does NOT match a
             // VPC GUA, so without this rio-store→Aurora is dropped.

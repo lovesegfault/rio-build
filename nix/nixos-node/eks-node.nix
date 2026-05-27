@@ -187,12 +187,12 @@ in
     ];
 
     # Host-side group owning /run/rio-mountd/mountd.sock (created 0660
-    # root:rio-builder by rio-mountd). The gid is FIXED and must agree
-    # with two other sites:
-    #   - helm `mountd.allowedGid` → rio-mountd `--allowed-gid` (the
-    #     SO_PEERCRED gate + the socket fchown)
-    #   - the builder pod's group (P0559 wires the client; see the TODO
-    #     at rio-controller/src/reconcilers/pool/pod.rs)
+    # root:rio-builder by rio-mountd when no mountd token key is
+    # configured). The gid is FIXED and must agree with helm
+    # `mountd.allowedGid` → rio-mountd `--allowed-gid` (the SO_PEERCRED
+    # gate + the socket fchown). Builder PODS never present this gid:
+    # under hostUsers:false their gids are userns-remapped, so pod
+    # admission is the §P0559 mountd token (helm `mountdHmac`) instead.
     # 990 matches nix/tests/scenarios/mountd.nix. NixOS allocates
     # dynamic system gids downward from 999 but skips explicitly-taken
     # ids, and ids.nix has no static 990, so this cannot collide.

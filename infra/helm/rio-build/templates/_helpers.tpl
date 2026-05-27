@@ -87,6 +87,16 @@ Families:
              castore reads are rejected UNAUTHENTICATED. SEPARATE
              mountPath from serviceHmac: scheduler+store carry both
              families and two volumes cannot share one mountPath.
+  mountdHmac  .Values.mountdHmac.secretName non-empty. SCHEDULER
+             (signer: WorkAssignment.mountd_token) + MOUNTD DaemonSet
+             (verifier: Mount{} admission for hostUsers:false executor
+             pods, ADR-022 §P0559). Secret <secretName> →
+             /etc/rio/mountd-hmac/mountd-hmac.key, env
+             RIO_MOUNTD_HMAC_KEY_PATH. SEPARATE key from
+             assignmentHmac — its verifier lives on every builder
+             node, and a node compromise must not yield a key the
+             store trusts. Unset → no token minted, mountd keeps
+             gid-only admission (fail-closed-keyless default).
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -132,6 +142,12 @@ Families:
         "src"  (dict "secret" (dict "secretName" $root.Values.assignmentHmac.secretName))
         "env"  (list
           (dict "name" "RIO_HMAC_KEY_PATH" "value" "/etc/rio/assignment-hmac/hmac.key")))
+      "mountdHmac" (dict
+        "on"   (not (empty $root.Values.mountdHmac.secretName))
+        "vol"  "mountd-hmac" "path" "/etc/rio/mountd-hmac" "ro" true
+        "src"  (dict "secret" (dict "secretName" $root.Values.mountdHmac.secretName))
+        "env"  (list
+          (dict "name" "RIO_MOUNTD_HMAC_KEY_PATH" "value" "/etc/rio/mountd-hmac/mountd-hmac.key")))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}

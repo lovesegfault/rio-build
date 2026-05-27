@@ -188,9 +188,11 @@ poolDefaults:
 # NixOS AMI:
 #   - allowedGid 0: vmtest executor pods run privileged as root
 #     (poolDefaults.privileged above) in the host userns, so their
-#     SO_PEERCRED.gid is 0. Production keeps 990; how an unprivileged
-#     hostUsers:false pod presents gid 990 is the §P0559 "socket access
-#     under hostUsers:false" work item. The gid gate itself is verified
+#     SO_PEERCRED.gid is 0 and the gid arm admits them. Production
+#     keeps 990; an unprivileged hostUsers:false pod never presents a
+#     host gid at all — it is admitted by the §P0559 mountd token
+#     (mountdHmac.secretName, unset here so this fixture stays on the
+#     gid arm). Both the gid gate and the token admission are verified
 #     by vm-mountd.
 #   - stagingQuotaBytes 0: the k3s nodes have no XFS-prjquota /var/rio
 #     loopback (that is eks-node.nix provisioning, asserted by

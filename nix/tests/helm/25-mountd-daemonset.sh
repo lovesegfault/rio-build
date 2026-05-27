@@ -116,6 +116,17 @@ test "$(yq "$ds | .spec.template.spec.automountServiceAccountToken" "$out")" = "
   exit 1
 }
 
+# Fail-closed-keyless default (§P0559): with mountdHmac.secretName unset
+# (the chart default) the DaemonSet must carry NO Mount-admission key
+# material — no mountd-hmac Secret volume, no RIO_MOUNTD_HMAC_KEY_PATH
+# env. Token mode (and the world-connectable socket it implies) must be
+# an explicit operator decision; helm/31 locks the enabled wiring.
+ds_yaml=$(yq "$ds" "$out")
+if grep -q 'mountd-hmac\|RIO_MOUNTD_HMAC_KEY_PATH' <<<"$ds_yaml"; then
+  echo "FAIL: default render mounts the mountd-hmac key into the DaemonSet — the keyless default must stay gid-only" >&2
+  exit 1
+fi
+
 # No readiness probe exists, so minReadySeconds is what stops a
 # crash-looping image from rolling across the whole fleet one node at a
 # time (liveness restarts do not pause a rollout).

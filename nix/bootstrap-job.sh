@@ -24,6 +24,22 @@ else
     --secret-binary fileb:///tmp/service-hmac
 fi
 
+if aws secretsmanager describe-secret --secret-id rio/mountd-hmac >/dev/null 2>&1; then
+  echo "[bootstrap] rio/mountd-hmac already exists, skipping"
+else
+  echo "[bootstrap] generating rio/mountd-hmac"
+  # SEPARATE key from rio/hmac (ADR-022 §P0559) — the scheduler signs
+  # per-build Mount-admission tokens with this; the rio-mountd
+  # DaemonSet on every builder node verifies them. Keeping it distinct
+  # means a builder-node compromise cannot forge store-valid
+  # assignment tokens. Regenerating only invalidates in-flight mountd
+  # tokens (builds re-dispatch), but the describe-secret guard keeps
+  # it stable like the others.
+  openssl rand 32 > /tmp/mountd-hmac
+  aws secretsmanager create-secret --name rio/mountd-hmac \
+    --secret-binary fileb:///tmp/mountd-hmac
+fi
+
 # Guard on BOTH halves. With one guard and two creates, a Job
 # retry after dying between the two creates (or a rotation by
 # deleting only the private half) left a permanently mismatched

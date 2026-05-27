@@ -95,6 +95,26 @@ assignmentHmac:
   # ("DirectoryService requires a tenant") and builds fail closed.
   secretName: ""
 
+# Mountd Mount-admission HMAC (ADR-022 §P0559) — the scheduler signs a
+# per-build MountdClaims token into WorkAssignment.mountd_token with
+# this key; rio-mountd (the per-node DaemonSet) verifies it offline on
+# Mount{} so hostUsers:false executor pods — whose userns-remapped gids
+# can never present the host rio-builder gid 990 — are admitted to the
+# castore broker socket. SEPARATE key from assignmentHmac on purpose:
+# the verifier key sits on every builder node, and a node compromise
+# must not yield a key the store trusts for uploads or castore reads.
+mountdHmac:
+  # Name of a pre-existing Secret carrying the key under data key
+  # `mountd-hmac.key`, present in BOTH the rio-system (scheduler, mints)
+  # and rio-builders (mountd DaemonSet, verifies) namespaces.
+  # externalSecrets.enabled syncs `rio-mountd-hmac` into both from the
+  # bootstrap-Job-generated rio/mountd-hmac Secrets Manager entry.
+  # Empty (default) = token mode off, fail-closed-keyless: the scheduler
+  # mints no mountd token and mountd keeps today's gid-990-only
+  # admission with the 0660 socket. Setting it flips mountd's socket to
+  # 0666 and enables token-OR-gid admission.
+  secretName: ""
+
 # External Secrets Operator sync from AWS Secrets Manager.
 # When enabled: renders ClusterSecretStore + 3 ExternalSecrets (rio-postgres
 # with templated Aurora URL, rio-hmac, rio-signing-key). Requires ESO in the
@@ -987,14 +1007,18 @@ mountd:
   # connect attempt. The container overrides the entrypoint to
   # /bin/rio-mountd.
   image: rio-builder
-  # Numeric gid of the `rio-builder` group. THREE sites must agree on
-  # this value — it is the trust boundary for who may talk to mountd:
-  #   - here → `--allowed-gid` (mountd chowns the socket to it and
-  #     drops any connection whose SO_PEERCRED.gid differs)
+  # Numeric gid of the `rio-builder` group. TWO host-side sites must
+  # agree on this value — it is the standalone/systemd trust boundary
+  # for who may talk to mountd:
+  #   - here → `--allowed-gid` (mountd chowns the socket to it and,
+  #     without a mountdHmac key, drops any connection whose
+  #     SO_PEERCRED.gid differs)
   #   - nix/nixos-node/eks-node.nix `users.groups.rio-builder.gid`
   #     (the host-side group the socket inode is owned by)
-  #   - the builder pod's group (P0559 wires the in-process client;
-  #     see the TODO at rio-controller/src/reconcilers/pool/pod.rs)
+  # Builder PODS never present this gid: under hostUsers:false every
+  # in-pod gid is userns-remapped, so pod admission is the §P0559
+  # Mount-admission token instead (mountdHmac.secretName above) — do
+  # not relax this gid to paper over a missing mountd key.
   allowedGid: 990
   # Kernel-enforced per-build staging quota in bytes (XFS project
   # quota on /var/rio/staging/<build_id>). 10 GiB. 0 disables

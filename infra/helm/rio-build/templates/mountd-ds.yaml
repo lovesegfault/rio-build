@@ -127,7 +127,7 @@ spec:
               containerPort: 9095
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "mountdHmac")) | nindent 12 }}
           volumeMounts:
             # The socket's PARENT DIRECTORY is mounted, not the socket
             # file: the daemon unlinks and re-binds the socket on
@@ -146,7 +146,7 @@ spec:
               mountPath: /var/rio/chunks
             - name: var-rio-staging
               mountPath: /var/rio/staging
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "mountdHmac")) | nindent 12 }}
           # The daemon serves on a UDS, not TCP — the only TCP listener
           # is the metrics exporter, which binds before the socket
           # accept loop starts. Good enough for liveness (a wedged
@@ -186,5 +186,5 @@ spec:
           hostPath: {path: /var/rio/chunks, type: Directory}
         - name: var-rio-staging
           hostPath: {path: /var/rio/staging, type: Directory}
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "mountdHmac")) | nindent 8 }}
 {{- end }}
