@@ -292,6 +292,11 @@ async fn cross_service_schema_contract() {
         ("tenants", "tenant_name",        "text"),
         ("tenants", "cache_token",        "text"),
         ("tenants", "gc_max_store_bytes", "int8"),
+        // revocation.rs terminal-status probe for assignment-token
+        // revocation on castore reads (keyed by the token's drv_hash;
+        // status classified via schema::DERIVATION_TERMINAL_STATUSES)
+        ("derivations", "drv_hash", "text"),
+        ("derivations", "status",   "text"),
     ];
 
     for &(table, col, want_udt) in STORE_READS {

@@ -65,6 +65,24 @@ fn test_terminal_statuses_match_is_terminal() {
         TERMINAL_STATUS_SQL, expected_sql,
         "TERMINAL_STATUS_SQL out of sync with TERMINAL_STATUSES const"
     );
+
+    // Cross-service copy: rio-store's assignment-token revocation
+    // (`r[store.castore.terminal-revocation]`) reads `derivations.status`
+    // and classifies terminality via the shared
+    // `rio_migrations::schema::DERIVATION_TERMINAL_STATUSES`. Keep that
+    // const in lockstep with the enum ground truth so the store never
+    // disagrees with the scheduler about what "terminal" means.
+    let shared: std::collections::HashSet<&str> =
+        rio_migrations::schema::DERIVATION_TERMINAL_STATUSES
+            .iter()
+            .copied()
+            .collect();
+    assert_eq!(
+        shared, terminal_set,
+        "rio_migrations::schema::DERIVATION_TERMINAL_STATUSES drifted from \
+         DerivationStatus::is_terminal() — update the shared const (and the \
+         004/021/038 partial-index predicate) together"
+    );
 }
 
 // r[verify sched.db.partial-index-literal]

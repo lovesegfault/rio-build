@@ -18,6 +18,32 @@
 
 use uuid::Uuid;
 
+/// Terminal `derivations.status` values — the set after which a
+/// derivation makes no further progress without an external reset.
+///
+/// Scheduler-owned, store-read: rio-scheduler writes the column
+/// (`DerivationStatus::is_terminal()` in
+/// `rio-scheduler/src/state/derivation.rs` is the enum ground truth,
+/// spliced into its recovery SQL by `terminal_status_sql!`); rio-store
+/// reads it for assignment-token revocation on the castore read
+/// surface (`r[store.castore.terminal-revocation]`,
+/// `rio-store/src/revocation.rs`). The same set backs the partial-index
+/// predicate in `migrations/004_recovery.sql` (extended by 021/038).
+///
+/// Drift guards: the scheduler's
+/// `test_terminal_statuses_match_is_terminal` asserts this const ⇔
+/// `is_terminal()` ⇔ its SQL literal ⇔ the migrated partial-index
+/// predicate; `cross_service_schema_contract` (this crate's tests)
+/// pins the column shape the store reads. Adding a terminal variant
+/// without updating this const fails the scheduler drift test.
+pub const DERIVATION_TERMINAL_STATUSES: &[&str] = &[
+    "completed",
+    "poisoned",
+    "dependency_failed",
+    "cancelled",
+    "skipped",
+];
+
 /// `scheduler_live_pins` row.
 ///
 /// Scheduler INSERTs at dispatch (`rio-scheduler/src/db/live_pins.rs`
