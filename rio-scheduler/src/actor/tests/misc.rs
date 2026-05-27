@@ -463,12 +463,14 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     Ok(())
 }
 
-/// bug_001 (round 6): the scheduler signs `is_fixed_output` from the
-/// persisted node flag so the store can refuse descriptor-less uploads
-/// for content-bound (fixed-output) assignments. Writer-side pin — the
-/// serde wire-shape halves live in `rio-auth`
-/// (`assignment_claims_fixed_output_*`), and the store-side enforcement
-/// in `rio-store` (`hmac_fod_descriptorless_rejected`).
+/// bug_001 (round 6): with the `sign_fod_claims` rollout gate armed,
+/// the scheduler signs `is_fixed_output` from the persisted node flag
+/// so the store can refuse descriptor-less uploads for content-bound
+/// (fixed-output) assignments. Writer-side pin — the serde wire-shape
+/// halves live in `rio-auth` (`assignment_claims_fixed_output_*`), the
+/// store-side enforcement in `rio-store`
+/// (`hmac_fod_descriptorless_rejected`), and the default-off (Phase 1)
+/// wire shape in `test_hmac_fod_claim_off_by_default`.
 #[tokio::test]
 async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
@@ -476,7 +478,11 @@ async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let test_key = b"test-fod-claims-key-32-bytes!!!!".to_vec();
 
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, p| {
+        // Phase-2 writer shape: arm the rollout gate so the claim is
+        // actually emitted (the default-off wire shape is pinned by
+        // test_hmac_fod_claim_off_by_default below).
+        c.sign_fod_claims = true;
         p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
@@ -512,6 +518,73 @@ async fn test_hmac_assignment_marks_fixed_output() -> TestResult {
         claims.expected_outputs,
         vec![expected_out],
         "the declared FOD path is membership-bound as usual"
+    );
+
+    Ok(())
+}
+
+/// Phase-1 rollout-safety pin (merged_bug_011): with the default
+/// configuration (`sign_fod_claims = false`) a fixed-output assignment
+/// still verifies but signs `is_fixed_output = false`, and — the part
+/// that actually protects a rolling upgrade — the serialized claims
+/// body does not contain the `is_fixed_output` key at all, so a
+/// pre-field store (`deny_unknown_fields`) can parse it.
+#[tokio::test]
+async fn test_hmac_fod_claim_off_by_default() -> TestResult {
+    use rio_auth::hmac::{HmacSigner, HmacVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let test_key = b"test-fod-default-key-32-bytes!!!".to_vec();
+
+    // Note: default DagActorConfig — the rollout gate stays off.
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |_, p| {
+        p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
+    });
+
+    let mut worker_rx = connect_executor_kind(
+        &handle,
+        "fod-default-w",
+        "x86_64-linux",
+        rio_proto::types::ExecutorKind::Fetcher,
+    )
+    .await?;
+
+    let expected_out = test_store_path("fod-default-out");
+    let mut node = make_node("fod-default-drv");
+    node.is_fixed_output = true;
+    node.expected_output_paths = vec![expected_out.clone()];
+    merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
+
+    let assignment = recv_assignment(&mut worker_rx).await;
+    let claims = HmacVerifier::from_key(test_key)
+        .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
+        .expect("token verifies");
+
+    assert!(
+        !claims.is_fixed_output,
+        "with sign_fod_claims off the claim must deserialize as false"
+    );
+    assert_eq!(
+        claims.expected_outputs,
+        vec![expected_out],
+        "membership binding is unchanged by the rollout gate"
+    );
+
+    // Wire-shape half: the key must be absent from the claims JSON so
+    // a pre-field store's deny_unknown_fields parser accepts it.
+    let claims_b64 = assignment
+        .assignment_token
+        .split('.')
+        .next()
+        .expect("token has a claims segment");
+    use base64::Engine as _;
+    let claims_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims_b64)
+        .expect("claims segment is base64url");
+    let claims_text = String::from_utf8(claims_json).expect("claims are UTF-8 JSON");
+    assert!(
+        !claims_text.contains("is_fixed_output"),
+        "default-off tokens must not emit the is_fixed_output key (got: {claims_text})"
     );
 
     Ok(())

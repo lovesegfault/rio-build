@@ -2434,8 +2434,13 @@ impl DagActor {
                 // descriptor-less uploads under a FOD-flagged token, so
                 // a worker cannot skip the content⇔path verification by
                 // simply omitting its `fixed:` descriptor
-                // (sec.authz.ca-path-derived).
-                is_fixed_output: state.is_fixed_output,
+                // (sec.authz.ca-path-derived). Gated behind
+                // `sign_fod_claims` (default off) because emitting the
+                // key is a forward wire break against pre-field stores
+                // and arms enforcement that pre-descriptor worker
+                // images cannot satisfy — Phase 1 of the two-phase
+                // rollout omits it; Phase 2 flips the config default.
+                is_fixed_output: self.sign_fod_claims && state.is_fixed_output,
                 expiry_unix,
                 // Tenant attribution for hw_perf_samples.submitting_tenant (M_054).
                 // Phase 2 of the bug_011 two-phase rollout (Phase 1 = fb096e50f);

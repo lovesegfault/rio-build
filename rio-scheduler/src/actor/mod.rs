@@ -470,6 +470,12 @@ pub struct DagActor {
     /// `clear_persisted_state` replaces `self.dag` on every leader
     /// transition — this copy is what survives.
     pub(crate) soft_features: Vec<String>,
+    /// Sign `is_fixed_output` into assignment-token claims at
+    /// dispatch (Phase 2 writer shape). `false` (the default) keeps
+    /// the signed claims body byte-identical to the pre-field wire
+    /// shape so not-yet-rolled stores still verify the token — see
+    /// [`crate::config::Config::sign_fod_claims`].
+    pub(crate) sign_fod_claims: bool,
     /// HMAC signer for assignment tokens. When Some, dispatch
     /// signs a Claims { executor_id, drv_hash, expected_output_paths,
     /// expiry } into WorkAssignment.assignment_token. The store
@@ -749,6 +755,7 @@ impl DagActor {
             dag_authoritative,
             self_tx: None,
             soft_features: cfg.soft_features,
+            sign_fod_claims: cfg.sign_fod_claims,
             hmac_signer: plumbing.hmac_signer,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
@@ -835,6 +842,7 @@ impl DagActor {
             leader: _,
             self_tx: _,
             soft_features,
+            sign_fod_claims: _,
             hmac_signer: _,
             service_signer: _,
             shutdown: _,

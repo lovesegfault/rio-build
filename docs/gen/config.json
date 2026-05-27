@@ -320,6 +320,12 @@
         "type": "boolean",
         "default": "false",
         "description": "Permit a `[sla].reference_hw_class` change vs the value persisted in `sla_config_epoch` (M_058)."
+      },
+      {
+        "key": "sign_fod_claims",
+        "type": "boolean",
+        "default": "false",
+        "description": "Sign `is_fixed_output` into assignment-token claims (Phase 2 of the claims rollout)."
       }
     ],
     "store": [

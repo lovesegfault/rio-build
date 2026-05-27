@@ -147,6 +147,11 @@
         "description": "Permit a `[sla].reference_hw_class` change vs the value\npersisted in `sla_config_epoch` (M_058). DESTRUCTIVE — resets\n`build_samples`, `hw_perf_samples`, and this cluster's\n`sla_ema_state`. CLI-only (`--allow-reference-change`); never\nset from TOML/env so a stale flag can't survive a rollout.",
         "type": "boolean",
         "default": false
+      },
+      "sign_fod_claims": {
+        "description": "Sign `is_fixed_output` into assignment-token claims (Phase 2 of\nthe claims rollout). Emitting the field is a forward wire break\nagainst pre-field stores (`AssignmentClaims` is\n`deny_unknown_fields`) and arms the store's rejection of\ndescriptor-less fixed-output uploads, so it must stay off until\n(a) every rio-store replica and (b) every builder/fetcher worker\nimage (including warm Pool pods) carry the descriptor-recording\nrelease; a wipe deploy satisfies both. Env:\n`RIO_SIGN_FOD_CLAIMS`. Helm: `scheduler.signFodClaims`.",
+        "type": "boolean",
+        "default": false
       }
     },
     "$defs": {
@@ -372,6 +377,7 @@
       "cluster": "",
       "metal_sizes": []
     },
-    "allow_reference_change": false
+    "allow_reference_change": false,
+    "sign_fod_claims": false
   }
 }

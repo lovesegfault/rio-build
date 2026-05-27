@@ -47,6 +47,12 @@ pub struct DagActorConfig {
     /// `Default` uses [`crate::sla::config::SlaConfig::test_default`]
     /// (single best-effort tier, tiny ceilings).
     pub sla: crate::sla::config::SlaConfig,
+    /// Sign `is_fixed_output` into assignment-token claims. Mirrors
+    /// scheduler.toml `sign_fod_claims` (default `false` — Phase 1 of
+    /// the two-phase rollout; see the field doc on
+    /// [`crate::config::Config::sign_fod_claims`]). Tests that pin the
+    /// Phase-2 writer shape arm this explicitly.
+    pub sign_fod_claims: bool,
 }
 
 impl Default for DagActorConfig {
@@ -58,6 +64,7 @@ impl Default for DagActorConfig {
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
+            sign_fod_claims: false,
         }
     }
 }

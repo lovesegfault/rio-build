@@ -172,8 +172,15 @@ let
           extraSchedulerConfig
           extraStoreConfig
           extraPackages
-          extraSchedulerEnv
           ;
+        # Arm the Phase-2 claims gate (sign_fod_claims) for the scheduler
+        # whenever HMAC verification is on: standalone deployments are
+        # single-version (store, scheduler and workers all built from this
+        # tree), so the store's descriptor-required FOD enforcement is
+        # exercised end-to-end. Caller-provided env merges on top and wins
+        # on key conflicts.
+        extraSchedulerEnv =
+          (lib.optionalAttrs withHmac { RIO_SIGN_FOD_CLAIMS = "true"; }) // extraSchedulerEnv;
         # Metrics ports open for cross-VM scraping (scheduling fanout
         # scenario asserts worker metrics from control).
         extraFirewallPorts = [
