@@ -1675,6 +1675,131 @@ MBT-lite integration tests, and the closing bug-sweep rounds — are
 listed with owners and conditions in the campaign close-out, which is
 the final section of this document.
 
+### Kani on the collect decision logic: reasoned omission
+
+Design §4.6 named a pure
+`decide_collect(candidate_timestamps, in_mark_set, grace, cycle_started_at, now) -> bool`
+kernel, extracted from the collect predicate and proven total and
+sound against the model's predicate, as a Phase-2 Kani target. That
+kernel is **not built**, and the decision is recorded here with the
+reasoning rather than discharged with a token harness.
+
+What changed between the design text and the landed code: the §4.6
+sentence was written against the v2 collector, where the mark was a
+client-side per-row parse and the collect predicate would have been
+evaluated in Rust. The v3/v4 re-entries moved the mark expansion, the
+fail-closed validation, *and* the eligibility predicate into SQL — the
+landed decision surface is `MARK_EXPANSION_SQL`,
+`mark_validation_sql()`, `COLLECT_BATCH_SELECT_SQL`, and
+`COLLECT_BATCH_UPDATE_SQL` in `rio-store/src/gc/collect.rs`, with the
+cutoff itself computed by PostgreSQL
+(`now() - make_interval(secs => grace)`) on the cycle snapshot. The
+only decision logic that remains on the Rust side of the cycle is loop
+scheduling: the saturating cap arithmetic
+(`COLLECT_CYCLE_VICTIM_CAP - victims_collected`, clamped to
+`COLLECT_BATCH_LIMIT`), the cap-reached / pass-complete stopping
+rules, and the keyset-cursor advance (the last hash of the previous
+batch). The design itself classifies exactly these as cycle-scheduling
+mechanisms below the model's granularity (§4.6 v4 note).
+
+Why a Rust-side proof would not bind the real behavior: a
+`decide_collect` kernel would be a re-transcription of the SQL
+predicate into a function production never calls — a third copy of
+the predicate (after the SQL and the model's `collect_sweep` guard)
+with its own drift risk and no caller. Proving that transcription
+total and sound says nothing about the statement PostgreSQL executes;
+the rio-retry-kernel precedent the deferral pointed at applies when
+the production decision arithmetic *is* Rust, which after the v3/v4
+re-entries it is not. A bounded harness over the thin Rust remainder
+(the cap/cursor loop control) was also considered and rejected as
+vacuous: its arithmetic is u64 `saturating_sub`/`min` whose properties
+are immediate, the load-bearing clauses (each batch returns at most
+`LIMIT` rows, in ascending hash order, all matching the predicate) are
+facts about the SQL that the harness would have to assume, and the
+async sqlx loop the proof would have to model is not the code that
+runs. That is the "harness that proves nothing new" shape the retry
+campaign's MBT omission rejected, and it is rejected here for the same
+reason.
+
+What carries the §4.6 obligations instead — each named, all wired:
+
+- **Soundness of the predicate against the invariants:** the
+  `quint-chunk-collect-{base,crash,contend,corrupt}` exhaustive
+  regimes plus `quint-chunk-collect-writer-bounded` (CR-1, CR-2
+  carved, CR-4, S4/S5/L3, `noReferencedChunkSwept`), with the four
+  required-falsification pairs (touch/grace, writer-overrun,
+  parse-skip, late-mark) proving the load-bearing terms are
+  load-bearing.
+- **The SQL expansion equals the Rust definition of a manifest's chunk
+  set:** the differential pinning test
+  (`mark_expansion_matches_rust_parser`) plus the fail-closed abort
+  tests (`validation_failure_aborts_cycle`,
+  `live_cycle_parse_failure_collects_nothing`).
+- **Plan-shape (cost) regressions:** the EXPLAIN guard in
+  `gc::mark_scan_bench` over the shared statement constants (design
+  §5b gate (b)).
+- **Cap arithmetic, cursor advance, and the predicate re-check:** the
+  structural postgres-backed tests
+  (`live_cycle_cap_stop_then_cursor_resume_drains_backlog`,
+  `live_cycle_cap_stop_survives_cursor_loss`,
+  `live_cycle_multi_batch_below_cap_collects_all`,
+  `live_cycle_per_batch_isolation_on_midcycle_failure`,
+  `collect_batch_update_rechecks_collect_predicate`) and the model's
+  `cappedCycleResumeRun` named run. Overflow is excluded structurally:
+  the counters are u64 with saturating arithmetic and a cycle is
+  bounded at 500,000 victims.
+
+Reconsideration trigger: if the eligibility decision ever moves back
+into Rust — a junction-table mark with client-side filtering, a
+Rust-evaluated per-row predicate, or a backfill job that re-implements
+the fold — the §4.6 contract text still describes the right
+properties and the rio-retry-kernel bounded-representation pattern
+(cfg(kani)-swapped fixed-capacity types, explicit unwind bounds, the
+exact-harness-count tripwire) is the template to build it with.
+
+### The deferred parse-contract harness: closed as a reasoned omission
+
+Phase 1-pre attempted the §4.6 Kani contract for
+`try_parse_unique_chunk_hashes` (no panic on arbitrary input; `Err`
+exactly when `Manifest::deserialize` rejects; on `Ok` an exact dedup
+that is empty only for a zero-entry manifest) and recorded it as NOT
+wired after three bounded attempts failed to converge inside the
+merge-gate budget (the Phase 1-pre subsection above; the measured
+figures live in the introducing commit message). The deferral note in
+`nix/kani.nix` kept it open as a candidate for the bounded-
+representation pattern "or revisit alongside the Phase-2
+decide_collect kernel work". Disposition now that Release B has
+landed: **closed as a reasoned omission, not revived.**
+
+- The function is `#[cfg(test)]`-only since Release B deleted its last
+  production callers (the legacy decrement paths' chunk_list parse).
+  It survives as the test/bench oracle that the differential pinning
+  test compares the SQL expansion against. A machine-checked contract
+  on a test-only oracle would not bind any production behavior — the
+  same reason the `decide_collect` kernel is not built.
+- The production corrupt-vs-valid arbiters, and their coverage, are:
+  `Manifest::deserialize` on the GetPath decode path (the
+  `fuzz-manifest_deserialize` target and the manifest unit tests,
+  unchanged by this campaign) and the collector's SQL validation pass
+  (`mark_validation_sql()`), which is held to the Rust definition by
+  the differential pinning test and exercised by the abort tests. The
+  C12-polarity property the contract existed to state — corrupt input
+  is never reported as an empty chunk set — is pinned by
+  `try_parse_rejects_corrupt_chunk_list` /
+  `try_parse_empty_manifest_is_ok_and_empty` on the oracle and by
+  `quint-chunk-collect-parse-skip-falsifies-cr1` plus the abort tests
+  on the production path.
+- The `nix/kani.nix` comment is updated with this disposition so the
+  member's deferral list carries no open refcount-campaign item; the
+  CBMC non-convergence history stays recorded there and in the
+  Phase 1-pre subsection for whoever next attempts a parse-shaped
+  harness in this member.
+
+Reconsideration trigger: a Rust-side chunk_list parse returning to a
+production decision path (for example a junction backfill or a
+client-side mark) revives the contract as written in §4.6, with the
+bounded-representation pattern as the implementation route.
+
 ### The acceptance table: the calibration corpus against the replacement architecture
 
 Design §4.6/§5's Phase-2 obligation: every family of the Stage-C

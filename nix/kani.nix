@@ -156,7 +156,7 @@ in
   #     covering [0, up_to) really has no gap (the soundness direction
   #     of the completeness predicate that seals a log against appends).
   #
-  # NOT wired (deferred): a sixth harness for the GC chunk-list parse
+  # NOT wired (closed): a sixth harness for the GC chunk-list parse
   # contract (rio-store/src/gc/mod.rs try_parse_unique_chunk_hashes —
   # no panic on arbitrary input; Err exactly when Manifest::deserialize
   # rejects; on Ok an exact dedup of the entry hashes that is empty only
@@ -170,14 +170,24 @@ in
   # use, which travels with the code into the goto model (the same
   # blowup class that kept rio-retry-kernel out of the gate before its
   # bounded-representation change), not the contract assertions
-  # themselves. This parse contract is the next candidate for exactly
-  # that pattern: a proof-only bounded parse/dedup representation
-  # swapped in under cfg(kani) (rio-retry-kernel's IdSet/BoundedIdSet
-  # template), or revisit alongside the Phase-2 decide_collect kernel
-  # work. Until one of those lands, the contract is NOT claimed as
-  # verified here and no verify marker is carried for it; the parse's
-  # corrupt-class and dedup behavior is pinned by its unit tests in
-  # gc/mod.rs and the fuzz/rio-store manifest_deserialize target.
+  # themselves. The deferral was closed as a reasoned omission at the
+  # refcount campaign's Phase-2 close-out instead of being revived:
+  # the refcount Release B deletion left try_parse_unique_chunk_hashes
+  # #[cfg(test)]-only (it is the differential-test oracle for the
+  # collector's server-side SQL expansion, not a production decision
+  # path), so a proof of it would not bind production behavior, and the
+  # collect eligibility predicate itself lives in SQL rather than Rust,
+  # so the once-planned decide_collect kernel proof has no production
+  # subject either. The production corrupt-vs-valid arbiters keep their
+  # coverage: Manifest::deserialize via the fuzz/rio-store
+  # manifest_deserialize target and unit tests, and the collector's
+  # fail-closed SQL validation pass via the differential pinning and
+  # abort tests in gc/collect.rs. No verify marker is claimed for the
+  # parse contract. Full record: docs/spec/models/refcount-invariant-map.md,
+  # "Phase-2 assurance layer". If a Rust-side parse or eligibility
+  # kernel ever returns to a production path, the cfg(kani) bounded
+  # representation used by rio-retry-kernel is the template to bring a
+  # harness for it into this member within the gate budget.
   # r[verify store.log.session-keyed]
   # r[verify store.log.ingest-bounds]
   # r[verify store.log.completeness-gate]
