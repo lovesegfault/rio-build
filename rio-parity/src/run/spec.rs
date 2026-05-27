@@ -245,20 +245,71 @@ impl Default for CampaignSpec {
 }
 
 impl CampaignSpec {
-    /// Read and parse a campaign spec JSON file.
+    /// Read and parse a campaign spec JSON file, then [`validate`](Self::validate) it.
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read campaign spec {}", path.display()))?;
         let spec: Self = serde_json::from_str(&text)
             .with_context(|| format!("parse campaign spec {}", path.display()))?;
+        spec.validate()
+            .with_context(|| format!("invalid campaign spec {}", path.display()))?;
         Ok(spec)
+    }
+
+    /// Reject specs missing anything a campaign cannot run without. Every
+    /// field is defaultable at the serde level (so partial specs parse),
+    /// but these must be filled in before the engine will accept the spec;
+    /// each error names the offending field as it appears in the JSON.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        let non_empty = [
+            (
+                "cluster.gateway_store_url",
+                self.cluster.gateway_store_url.as_str(),
+            ),
+            (
+                "cluster.scheduler_addr",
+                self.cluster.scheduler_addr.as_str(),
+            ),
+            ("cluster.store_addr", self.cluster.store_addr.as_str()),
+            ("tenants.build_tenant", self.tenants.build_tenant.as_str()),
+            ("eval_set.key_digest", self.eval_set.key_digest.as_str()),
+            ("hydra.cache_url", self.hydra.cache_url.as_str()),
+        ];
+        for (field, value) in non_empty {
+            anyhow::ensure!(
+                !value.trim().is_empty(),
+                "campaign spec field {field} must not be empty"
+            );
+        }
+        anyhow::ensure!(
+            self.eval_set.hydra_eval_id != 0,
+            "campaign spec field eval_set.hydra_eval_id must be a nonzero Hydra eval id"
+        );
+        let nonzero_knobs = [
+            ("knobs.batch_max_jobs", self.knobs.batch_max_jobs),
+            ("knobs.batch_max_nodes", self.knobs.batch_max_nodes),
+            ("knobs.submit_concurrency", self.knobs.submit_concurrency),
+            ("knobs.narinfo_concurrency", self.knobs.narinfo_concurrency),
+        ];
+        for (field, value) in nonzero_knobs {
+            anyhow::ensure!(value != 0, "campaign spec field {field} must be nonzero");
+        }
+        Ok(())
     }
 }
 
 /// Generate a campaign id when the spec doesn't pin one:
 /// `c<UTC yyyymmddthhmmssz>-<8 hex>` — sortable, unique, k8s-name safe.
+/// The timestamp is truncated to whole seconds, so sub-second precision in
+/// the input cannot change the id's documented shape.
 pub fn generate_campaign_id(now_rfc3339: &str) -> String {
-    let compact: String = now_rfc3339
+    let whole_seconds = now_rfc3339
+        .parse::<jiff::Timestamp>()
+        .ok()
+        .and_then(|ts| jiff::Timestamp::from_second(ts.as_second()).ok())
+        .map(|ts| ts.to_string())
+        .unwrap_or_else(|| now_rfc3339.to_string());
+    let compact: String = whole_seconds
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect::<String>()
@@ -417,6 +468,54 @@ mod tests {
         assert!(
             id.chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        );
+        // Sub-second precision (what `now_rfc3339()` emits) is truncated to
+        // whole seconds so the id keeps the same documented shape.
+        let id = generate_campaign_id("2026-05-26T12:34:56.789012345Z");
+        assert!(id.starts_with("c20260526t123456z-"), "{id}");
+        assert_eq!(id.len(), "c20260526t123456z-".len() + 8);
+    }
+
+    #[test]
+    fn empty_spec_is_rejected_naming_the_first_missing_field() {
+        let spec: CampaignSpec = serde_json::from_str("{}").unwrap();
+        let err = spec.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster.gateway_store_url"),
+            "expected the first missing field to be named, got: {err:#}"
+        );
+    }
+
+    #[test]
+    fn spec_tolerates_unknown_fields() {
+        // Forward compatibility: a spec written by a newer launch tool (or
+        // carrying operator annotations) still parses and validates.
+        let json = r#"{
+            "mode": "leaf",
+            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
+                        "store_addr": "rio-store.rio-store.svc:9002"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true},
+            "bogus_future_field": {"nested": [1, 2, 3]}
+        }"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        spec.validate().unwrap();
+        assert_eq!(spec.eval_set.hydra_eval_id, 1824219);
+    }
+
+    #[test]
+    fn knobs_partial_override_keeps_other_defaults() {
+        let spec: CampaignSpec =
+            serde_json::from_str(r#"{"knobs": {"batch_max_jobs": 10}}"#).unwrap();
+        assert_eq!(spec.knobs.batch_max_jobs, 10);
+        let defaults = Knobs::default();
+        assert_eq!(spec.knobs.batch_max_nodes, defaults.batch_max_nodes);
+        assert_eq!(spec.knobs.submit_concurrency, defaults.submit_concurrency);
+        assert_eq!(
+            spec.knobs.s3_sync_interval_secs,
+            defaults.s3_sync_interval_secs
         );
     }
 

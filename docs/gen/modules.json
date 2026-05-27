@@ -826,6 +826,11 @@
       "doc": "`rio-parity run` — the parity campaign engine."
     },
     {
+      "path": "run/artifact.rs",
+      "depth": 1,
+      "doc": "Campaign artifact storage (S3 or a local directory) plus state sync."
+    },
+    {
       "path": "run/glob.rs",
       "depth": 1,
       "doc": "Minimal glob matching for job-name filters (`*` = any run of"

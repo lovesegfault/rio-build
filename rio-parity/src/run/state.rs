@@ -8,9 +8,11 @@
 //!
 //! Atomicity model:
 //! - JSONL appends: the full serialized line (with trailing '\n') is written
-//!   with ONE `write_all` call on a file opened with `O_APPEND`, then flushed.
-//!   A crash can only lose the tail line, never interleave or tear earlier
-//!   lines; the loader skips a trailing partial line.
+//!   with ONE `write_all` call on a file opened with `O_APPEND`. A process
+//!   crash can only lose the tail line, never interleave or tear earlier
+//!   lines; the loader skips a trailing partial line. Appends are not
+//!   fsynced — node-loss/power-loss durability comes from the periodic S3
+//!   sync, not from the local file.
 //! - JSON documents (campaign.json, progress.json): write to `<name>.tmp`,
 //!   fsync, rename over the target.
 //! - Stage done-markers: empty files under `markers/<stage>.done`.
@@ -64,10 +66,11 @@ impl StateDir {
         let root = root.into();
         fs::create_dir_all(&root)
             .with_context(|| format!("create state dir {}", root.display()))?;
-        fs::create_dir_all(root.join("markers")).context("create markers dir")?;
-        fs::create_dir_all(root.join("logs")).context("create logs dir")?;
-        fs::create_dir_all(root.join("buckets")).context("create buckets dir")?;
-        fs::create_dir_all(root.join("report")).context("create report dir")?;
+        for sub in ["markers", "logs", "buckets", "report"] {
+            let dir = root.join(sub);
+            fs::create_dir_all(&dir)
+                .with_context(|| format!("create state subdir {}", dir.display()))?;
+        }
         Ok(Self { root })
     }
 
@@ -91,7 +94,6 @@ impl StateDir {
             .with_context(|| format!("open {} for append", path.display()))?;
         f.write_all(line.as_bytes())
             .with_context(|| format!("append to {}", path.display()))?;
-        f.flush().ok();
         Ok(())
     }
 
@@ -125,7 +127,7 @@ impl StateDir {
                     );
                 }
                 Err(e) => {
-                    anyhow::bail!("corrupt {} line {}: {e}", file.file_name(), i + 1);
+                    anyhow::bail!("corrupt {} line {}: {e}", path.display(), i + 1);
                 }
             }
         }

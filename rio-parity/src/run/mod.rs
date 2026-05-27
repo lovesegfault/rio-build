@@ -11,6 +11,7 @@
 //! Submodules are wired incrementally; [`run`] gains the full stage
 //! machine once every stage exists.
 
+pub mod artifact;
 pub mod glob;
 pub mod model;
 pub mod spec;

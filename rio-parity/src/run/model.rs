@@ -2,6 +2,12 @@
 //! hydra-truth cache entries, warm dispositions, batch records, and the
 //! engine's pause state. Wire field names are camelCase, matching the
 //! rest of the campaign artifacts.
+//!
+//! Convention: the stringly-typed `bucket`/`outcome` fields in the JSONL
+//! record structs stay `String` on the wire, but they MUST be written via
+//! the corresponding enums ([`Bucket::as_str`], [`HydraOutcome`] /
+//! [`RioOutcome`] serde forms) — never hand-typed literals — so the
+//! record values can never drift from the enum vocabulary.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -80,7 +86,7 @@ pub enum RootCauseKind {
 
 /// Final comparison bucket for one job. The string forms are the
 /// kebab-case names used as the `bucket` field in results.jsonl and as
-/// the buckets/<bucket>.jsonl file names.
+/// the `buckets/<bucket>.jsonl` file names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
 #[serde(rename_all = "kebab-case")]
 pub enum Bucket {
@@ -335,6 +341,16 @@ mod tests {
         );
         let b: Bucket = serde_json::from_str("\"rio-infra-failure\"").unwrap();
         assert_eq!(b, Bucket::RioInfraFailure);
+    }
+
+    #[test]
+    fn bucket_serde_form_matches_as_str_for_every_variant() {
+        for bucket in Bucket::ALL {
+            let json = serde_json::to_string(&bucket).unwrap();
+            assert_eq!(json, format!("\"{}\"", bucket.as_str()), "{bucket:?}");
+            let back: Bucket = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bucket);
+        }
     }
 
     #[test]
