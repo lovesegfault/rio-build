@@ -123,41 +123,52 @@ impl Scenario for ChunkVerify {
 
         // Pick a chunk that belongs to the SEED'S OWN manifest. The
         // earlier unscoped pick (`WHERE refcount=1 ORDER BY created_at
-        // DESC LIMIT 1`) picked "the most recent refcount=1 chunk in the
-        // whole table" — which after a phase-2 predecessor substitutes a
-        // new shared input is *that input's* chunk, not the seed's.
-        // Round 7 (2026-05-14) deleted busybox chunk `574e8a43f…`,
-        // round-8 i201 then found it stranded (PG row re-INSERTed by a
-        // subsequent build, S3 object still gone). Scoping to the seed
-        // makes "we never delete another path's chunk" structural.
+        // DESC LIMIT 1`) picked "the most recent single-reference chunk
+        // in the whole table" — which after a phase-2 predecessor
+        // substitutes a new shared input is *that input's* chunk, not
+        // the seed's. Round 7 (2026-05-14) deleted busybox chunk
+        // `574e8a43f…`, round-8 i201 then found it stranded (PG row
+        // re-INSERTed by a subsequent build, S3 object still gone).
+        // Scoping to the seed makes "we never delete another path's
+        // chunk" structural.
         //
         // No `manifest_chunks` join table exists — `manifest_data.
         // chunk_list` is the packed binary format from
         // `rio-store/src/manifest.rs` (`r[store.manifest.format]`):
         //   [version: u8 = 1] [entry: 36 B = blake3[32] ++ size_u32_le]*
         // so the chunk hashes are extracted with `substring … FOR 32`
-        // over `generate_series`. The `refcount=1` filter still applies
-        // — within the seed's own manifest a chunk could theoretically
+        // over `generate_series`. The "unshared" filter is
+        // manifest-reference-based: the candidate hash must appear in
+        // NO other manifest's chunk_list (a `position()` scan over
+        // manifest_data — fine for a QA probe; every manifest_data row
+        // has a manifests parent by FK, so no extra join is needed).
+        // Within the seed's own manifest a chunk could theoretically
         // collide with another path's via FastCDC; the nonce in every
         // line makes that astronomically unlikely, but if it happens we
         // want to skip that chunk, not corrupt the colliding path.
         let row = sqlx::query(
             "WITH seed AS (
-                SELECT md.chunk_list
+                SELECT md.store_path_hash, md.chunk_list
                 FROM narinfo n
                 JOIN manifests m USING (store_path_hash)
                 JOIN manifest_data md USING (store_path_hash)
                 WHERE n.store_path = $1 AND m.status = 'complete'
              ),
              ch AS (
-                SELECT substring(chunk_list FROM 2 + 36 * g FOR 32) AS blake3_hash
+                SELECT seed.store_path_hash AS seed_hash,
+                       substring(seed.chunk_list FROM 2 + 36 * g FOR 32) AS blake3_hash
                 FROM seed,
-                     generate_series(0, (octet_length(chunk_list) - 1) / 36 - 1) AS g
+                     generate_series(0, (octet_length(seed.chunk_list) - 1) / 36 - 1) AS g
              )
              SELECT encode(ch.blake3_hash, 'hex') AS h
              FROM ch
              JOIN chunks c USING (blake3_hash)
-             WHERE c.refcount = 1 AND NOT c.deleted
+             WHERE NOT c.deleted
+               AND NOT EXISTS (
+                   SELECT 1 FROM manifest_data md2
+                    WHERE md2.store_path_hash <> ch.seed_hash
+                      AND position(ch.blake3_hash IN md2.chunk_list) > 0
+               )
              LIMIT 1",
         )
         .bind(&target_out)
@@ -246,7 +257,7 @@ impl Scenario for ChunkVerify {
 /// Why didn't the seed produce a deletable chunk? Each branch of the
 /// chunked-PutPath pipeline (narinfo → manifest → manifest_data →
 /// chunks) has a different failure mode and a different fix; the old
-/// catch-all "no refcount=1 chunk appeared" message couldn't tell them
+/// catch-all "no deletable chunk appeared" message couldn't tell them
 /// apart, so the round-8 occurrence had to be re-run with manual SQL.
 async fn diagnose_missing_chunk(ctx: &QaCtx, target_out: &str) -> Result<String> {
     let diag = sqlx::query(
@@ -282,14 +293,15 @@ async fn diagnose_missing_chunk(ctx: &QaCtx, target_out: &str) -> Result<String>
                 )
             } else {
                 format!(
-                    "manifest is chunked ({} chunks, NAR {nar_size} B) but none have \
-                     refcount=1 — unique seed produced shared chunks (CDC collision?)",
+                    "manifest is chunked ({} chunks, NAR {nar_size} B) but none is \
+                     uniquely referenced — every candidate also appears in another \
+                     manifest's chunk_list (CDC collision?)",
                     n_chunks.map_or_else(|| "?".into(), |n| n.to_string()),
                 )
             }
         }
     };
     Ok(format!(
-        "no deletable refcount=1 chunk for seed {target_out}: {why}"
+        "no uniquely-referenced deletable chunk for seed {target_out}: {why}"
     ))
 }
