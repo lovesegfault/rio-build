@@ -753,12 +753,17 @@
     {
       "path": "cmd/",
       "depth": 0,
-      "doc": "Subcommand implementations. Each submodule owns its clap `Args`"
+      "doc": "Subcommand implementations live here, one submodule per subcommand."
     },
     {
       "path": "cmd/eval.rs",
       "depth": 1,
-      "doc": "`rio-parity eval` — build an eval set (design §5)."
+      "doc": "`rio-parity eval` — build an eval set from a Hydra evaluation: the"
+    },
+    {
+      "path": "hydra.rs",
+      "depth": 0,
+      "doc": "hydra.nixos.org API client."
     },
     {
       "path": "lib.rs",
@@ -769,6 +774,11 @@
       "path": "main.rs",
       "depth": 0,
       "doc": "rio-parity binary entry point."
+    },
+    {
+      "path": "nixcache.rs",
+      "depth": 0,
+      "doc": "cache.nixos.org narinfo client (mass per-path ground truth; Fastly"
     }
   ],
   "rio-proto": [
