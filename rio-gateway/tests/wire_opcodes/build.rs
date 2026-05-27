@@ -5,7 +5,7 @@
 // r[verify gw.dag.reconstruct+3]
 // r[verify gw.hook.single-node-dag+2]
 // r[verify gw.reject.output-path-mismatch]
-// r[verify gw.reject.unsupported-hash-algo]
+// r[verify gw.reject.unsupported-hash-algo+2]
 // r[verify gw.hook.ifd-detection+2]
 // r[verify gw.stderr.activity+2]
 
@@ -928,7 +928,8 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
 /// wopBuildDerivation (36): an inline BasicDerivation declaring an
 /// outputHashAlgo the builder cannot verify (md5) is rejected at the
 /// gateway's inline check, before resolve/SubmitBuild — same rule the
-/// cached-DAG algo gate enforces. r[verify gw.reject.unsupported-hash-algo]
+/// cached-DAG algo gate enforces — when the declared output is NOT already
+/// realized in the store. r[verify gw.reject.unsupported-hash-algo+2]
 #[tokio::test]
 async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -965,6 +966,132 @@ async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result
         h.scheduler.submit_calls.read().unwrap().len(),
         0,
         "unsupported-algo rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the same inline md5 FOD is ACCEPTED when its
+/// declared output path is already realized in the store — the node can
+/// only cache-cut, so the realization probe exempts it and the submission
+/// proceeds. r[verify gw.reject.unsupported-hash-algo+2]
+#[tokio::test]
+async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000b-inline-md5-realized.drv";
+    let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
+    // The declared output is already in the store — only the .drv is absent.
+    h.store.seed_with_content(out_path, b"already realized");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: out_path,
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: out_path,
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "realized md5 FOD must be accepted (Built=0), got {status}"
+    );
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(error_msg.is_empty(), "no error: {error_msg:?}");
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "the realized offender is exempted and submitted (scheduler cache-cuts it)"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// ATerm for a legacy md5 fixed-output derivation (cached-DAG path).
+const MD5_FOD_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-fetched","md5","deadbeefdeadbeefdeadbeefdeadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-fetched")])"#;
+
+/// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
+/// already realized in the store is submitted (the scheduler cache-cuts
+/// it) instead of rejecting the whole submission.
+/// r[verify gw.reject.unsupported-hash-algo+2]
+#[tokio::test]
+async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000c-legacy-md5.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // The declared output already exists.
+    h.store.seed_with_content(
+        "/nix/store/ffffffffffffffffffffffffffffffff-fetched",
+        b"already realized",
+    );
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "BuildPaths returns u64(1) on success");
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        1,
+        "realized legacy-algo FOD must not block the submission"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPaths (9): the same cached legacy md5 FOD is REJECTED when its
+/// declared output is not already realized — the build could only fail
+/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+2]
+#[tokio::test]
+async fn test_build_paths_md5_fod_unrealized_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/0000000000000000000000000000000d-legacy-md5-missing.drv";
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    // Declared output NOT seeded — the probe reports it missing.
+
+    wire_send!(&mut h.stream;
+        u64: 9,                                  // wopBuildPaths
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("outputHashAlgo 'md5'"),
+        "error names the unsupported algo: {:?}",
+        err.message
+    );
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "unrealized legacy-algo FOD rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;

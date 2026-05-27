@@ -1216,31 +1216,66 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
-    // r[impl gw.reject.unsupported-hash-algo]
-    // Same early rejection for unverifiable hash algorithms as
-    // validate_dag performs on the cached DAG: the builder's FOD hash
-    // gate and floating-CA finalization are both fail-closed, so an
+    // r[impl gw.reject.unsupported-hash-algo+2]
+    // Same treatment for unverifiable hash algorithms as validate_dag
+    // applies to the cached DAG: the builder's FOD hash gate and
+    // floating-CA finalization are both fail-closed, so an
     // `outputHashAlgo` they cannot handle — declared with a hash (FOD)
     // or without one (floating-CA) — can only ever fail the build after
-    // burning a pod. The inline BasicDerivation is all we have on the
-    // single-node fallback path.
+    // burning a pod… unless the declared outputs are already realized,
+    // in which case the node cache-cuts and never dispatches. The
+    // realization probe decides; rejection keeps the existing
+    // STDERR_ERROR delivery. The inline BasicDerivation is all we have
+    // on the single-node fallback path.
+    let mut inline_offender_realized = false;
     if let Some(out) = basic_drv.outputs().iter().find(|o| {
         (!o.hash().is_empty() || !o.hash_algo().is_empty())
             && !translate::fod_algo_verifiable(o.hash_algo())
     }) {
-        warn!(
-            drv_path = %drv_path_str,
-            output = out.name(),
-            algo = out.hash_algo(),
-            "rejecting unverifiable outputHashAlgo via inline BasicDerivation"
-        );
-        stderr_err!(
-            stderr,
-            "output '{}' declares unsupported outputHashAlgo '{}' \
-             (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)",
-            out.name(),
-            out.hash_algo()
-        );
+        // The floating-CA shape rule applies to offenders too.
+        if let Err(reason) = translate::validate_floating_ca_shape(
+            &drv_path_str,
+            basic_drv
+                .outputs()
+                .iter()
+                .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
+        ) {
+            warn!(
+                drv_path = %drv_path_str,
+                reason = %reason,
+                "rejecting inline derivation: floating-CA output declares a path"
+            );
+            stderr_err!(stderr, "{reason}");
+        }
+        let offender = translate::UnverifiableFodOffender {
+            drv_path: drv_path_str.clone(),
+            output_name: out.name().to_string(),
+            algo: out.hash_algo().to_string(),
+            declared_paths: basic_drv
+                .outputs()
+                .iter()
+                .map(|o| o.path().to_string())
+                .collect(),
+        };
+        if let Err(reason) = translate::reject_unrealized_fod_offenders(
+            std::slice::from_ref(&offender),
+            store_client,
+        )
+        .await
+        {
+            warn!(
+                drv_path = %drv_path_str,
+                output = out.name(),
+                algo = out.hash_algo(),
+                "rejecting unverifiable outputHashAlgo via inline BasicDerivation"
+            );
+            stderr_err!(stderr, "{reason}");
+        }
+        // All declared outputs are already realized: the node will
+        // cache-cut at the scheduler. Skip the declared-hash binding
+        // below — the algo cannot be parsed for it, and there is
+        // nothing to build from this derivation.
+        inline_offender_realized = true;
     }
 
     // Recover full Derivation from drv_cache (BasicDerivation has no inputDrvs).
@@ -1274,13 +1309,18 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             // derive from the declared hash, single-'out' shape rule.
             // Without this, a junk outputHash on an inline derivation
             // would exempt an arbitrary declared path from validation.
-            if let Err(reason) = translate::validate_declared_hash_outputs(
-                &drv_path_str,
-                basic_drv
-                    .outputs()
-                    .iter()
-                    .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
-            ) {
+            // Skipped only when the realization probe above exempted an
+            // unverifiable-algo offender (its algo cannot be parsed and
+            // nothing will be built from it).
+            if !inline_offender_realized
+                && let Err(reason) = translate::validate_declared_hash_outputs(
+                    &drv_path_str,
+                    basic_drv
+                        .outputs()
+                        .iter()
+                        .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
+                )
+            {
                 warn!(
                     drv_path = %drv_path_str,
                     reason = %reason,
@@ -1358,13 +1398,31 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     // Cheap validation BEFORE anything else (no point rate-limiting or
     // hashing a DAG we can reject from the node list alone):
-    // __noChroot check + early MAX_DAG_NODES + unverifiable algos.
-    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
-        warn!(reason = %reason, "rejecting build: DAG validation failed");
-        // Do NOT send STDERR_ERROR here — it is a terminal frame.
-        // The client receives the rejection via BuildResult.errorMsg
-        // after STDERR_LAST. See build.rs:160-164 for the inverse
-        // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
+    // __noChroot check + early MAX_DAG_NODES + declared-hash binding;
+    // unverifiable-algo offenders come back classified and are decided
+    // by the bounded realization probe right after.
+    let offenders = match translate::validate_dag(&nodes, drv_cache) {
+        Ok(offenders) => offenders,
+        Err(reason) => {
+            warn!(reason = %reason, "rejecting build: DAG validation failed");
+            // Do NOT send STDERR_ERROR here — it is a terminal frame.
+            // The client receives the rejection via BuildResult.errorMsg
+            // after STDERR_LAST. See build.rs:160-164 for the inverse
+            // invariant (STDERR_ERROR → STDERR_LAST is equally invalid).
+            let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
+            stderr.finish().await?;
+            write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
+            return Ok(());
+        }
+    };
+    // r[impl gw.reject.unsupported-hash-algo+2]
+    // Unverifiable-algo offenders are exempt only when every declared
+    // output is already realized (the node cache-cuts and never
+    // dispatches); otherwise the submission is rejected fail-closed,
+    // with the same delivery as a validate_dag rejection.
+    if let Err(reason) = translate::reject_unrealized_fod_offenders(&offenders, store_client).await
+    {
+        warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
         stderr.finish().await?;
         write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
@@ -1812,15 +1870,19 @@ enum DagSubmitOutcome {
 }
 
 /// Shared DAG-submit pipeline:
-/// `dedup → validate (cheap) → rate-limit → quota → output-path
-/// binding (blocking pool) → inline-drv → SubmitBuild`.
+/// `dedup → validate (cheap) → realization probe (offenders only) →
+/// rate-limit → quota → output-path binding (blocking pool) →
+/// inline-drv → SubmitBuild`.
 ///
 /// Runs every gate between DAG reconstruction and the scheduler RPC.
 /// Gate ORDER is fixed here so the two build-paths opcodes cannot drift:
-/// cheap validation first (no I/O, no hashing), then rate/quota (may
-/// send `STDERR_ERROR`) so a limited client cannot trigger the
-/// expensive work, then the declared-output-path binding gate on the
-/// blocking pool, then inline (store I/O), then submit.
+/// cheap validation first (no I/O, no hashing), then the bounded
+/// unverifiable-algo realization probe (a single `FindMissingPaths`,
+/// fired only when `validate_dag` classified offenders — same I/O
+/// class as the GetPath BFS both flows already performed), then
+/// rate/quota (may send `STDERR_ERROR`) so a limited client cannot
+/// trigger the expensive work, then the declared-output-path binding
+/// gate on the blocking pool, then inline (store I/O), then submit.
 /// `handle_build_derivation` follows the same order.
 ///
 /// Returns `Err` only when `submit_and_process_build` itself errors
@@ -1846,8 +1908,19 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
 
     dedup_dag(&mut nodes, &mut edges);
 
-    if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
-        warn!(reason = %reason, "rejecting build: DAG validation failed");
+    let offenders = match translate::validate_dag(&nodes, drv_cache) {
+        Ok(offenders) => offenders,
+        Err(reason) => {
+            warn!(reason = %reason, "rejecting build: DAG validation failed");
+            return Ok(DagSubmitOutcome::Rejected(reason));
+        }
+    };
+    // r[impl gw.reject.unsupported-hash-algo+2]
+    // Unverifiable-algo offenders: exempt only when already realized
+    // (single bounded FindMissingPaths probe, fail-closed).
+    if let Err(reason) = translate::reject_unrealized_fod_offenders(&offenders, store_client).await
+    {
+        warn!(reason = %reason, "rejecting build: unverifiable outputHashAlgo not already realized");
         return Ok(DagSubmitOutcome::Rejected(reason));
     }
 

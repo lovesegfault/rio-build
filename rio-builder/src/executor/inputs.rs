@@ -30,7 +30,11 @@ impl FodHashAlgo {
     /// fails closed and rejects the output rather than shipping
     /// unverified content; the gateway pre-screens the same algorithm
     /// set at submission (`fod_algo_verifiable`), so a None here in
-    /// production means that gate was bypassed or has drifted.
+    /// production means that gate was bypassed or has drifted — or that
+    /// the derivation was admitted under the gateway's realized-outputs
+    /// exemption and its outputs were lost (e.g. GC'd) between the
+    /// submission-time probe and dispatch, in which case failing the
+    /// build here is exactly the intended fail-closed behavior.
     fn from_nix_str(s: &str) -> Option<Self> {
         match s.strip_prefix("r:").unwrap_or(s) {
             "sha1" => Some(Self::Sha1),

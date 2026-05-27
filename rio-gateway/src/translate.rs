@@ -14,7 +14,7 @@ use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
 use rio_proto::types;
 use tonic::transport::Channel;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 /// Per-node inline threshold. Most .drv files are 1-10 KB; 64 KB is
 /// a generous cap. Anything larger is probably a generated derivation
@@ -409,15 +409,27 @@ fn populate_wanted_outputs(
 
 /// Validate a DAG before SubmitBuild — the CHEAP checks only. Returns
 /// `Err(reason)` if the DAG should be rejected — caller sends
-/// STDERR_ERROR with the reason. Returns `Ok(())` if valid.
+/// STDERR_ERROR with the reason. Returns `Ok(offenders)` if valid,
+/// where `offenders` lists derivations that declare an
+/// `outputHash`/`outputHashAlgo` the builder cannot verify or finalize:
+/// those are NOT rejected here — the caller must pass them to
+/// [`reject_unrealized_fod_offenders`], which exempts them only when
+/// every declared output is already realized in the store (and rejects
+/// otherwise, fail-closed).
 ///
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
 /// - `nodes.len() > MAX_DAG_NODES` → reject (early, before gRPC)
-/// - any output declaring an `outputHash` and/or `outputHashAlgo` the
-///   builder cannot verify → reject (both the FOD hash gate and
-///   floating-CA finalization are fail-closed; the build could only
-///   ever fail after burning a pod)
+/// - floating-CA-shaped outputs declaring an output path → reject
+///   (CppNix cannot produce that shape; applies to unverifiable-algo
+///   offenders too)
+/// - declared-hash (fixed-output) outputs with a verifiable algo:
+///   declared path must derive from the declared hash
+/// - outputs with an unverifiable algo → classified as offenders and
+///   returned (the FOD hash gate and floating-CA finalization are
+///   fail-closed worker-side; a build of such a node could only ever
+///   fail after burning a pod — but a node whose outputs already exist
+///   never dispatches, so the realization probe decides)
 ///
 /// The expensive declared-output-path binding (one
 /// `hashDerivationModulo`-shaped pass over every cached derivation)
@@ -435,7 +447,7 @@ fn populate_wanted_outputs(
 pub fn validate_dag(
     nodes: &[types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
-) -> Result<(), String> {
+) -> Result<Vec<UnverifiableFodOffender>, String> {
     // MAX_DAG_NODES: early reject. Scheduler enforces too but
     // this saves a 100MB+ gRPC message for obvious over-size.
     if nodes.len() > rio_common::limits::MAX_DAG_NODES {
@@ -472,33 +484,25 @@ pub fn validate_dag(
         ));
     }
 
-    // r[impl gw.reject.unsupported-hash-algo]
+    // r[impl gw.reject.unsupported-hash-algo+2]
     // Outputs whose declared hash algorithm the builder cannot verify
-    // are rejected at submission. For fixed-output derivations the
-    // builder's `verify_fod_hashes` is fail-closed (it is the sole
-    // content check between an egress-open fetcher and the signed
-    // cache); for floating-CA outputs (hash_algo set, hash empty)
-    // `FloatingCaSpec::from_outputs` is equally fail-closed
+    // are CLASSIFIED here and decided by the realization probe
+    // (`reject_unrealized_fod_offenders`). For fixed-output derivations
+    // the builder's `verify_fod_hashes` is fail-closed (it is the sole
+    // worker-side content check between an egress-open fetcher and the
+    // signed cache); for floating-CA outputs (hash_algo set, hash
+    // empty) `FloatingCaSpec::from_outputs` is equally fail-closed
     // (`CaUnsupportedAlgo`) — but only after the build has run to
-    // completion on a builder pod. Either way the build can only ever
-    // fail, so rejecting it here lands the error on the submitting
-    // client instead of burning a pod first. Input-addressed outputs
-    // (no hash, no algo) are untouched.
-    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-        if let Some(out) = drv.outputs().iter().find(|o| {
-            (!o.hash().is_empty() || !o.hash_algo().is_empty())
-                && !fod_algo_verifiable(o.hash_algo())
-        }) {
-            return Err(format!(
-                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' \
-                 (supported: sha1, sha256, sha512, optionally 'r:'-prefixed)",
-                node.drv_path,
-                out.name(),
-                out.hash_algo()
-            ));
-        }
-    }
-
+    // completion on a builder pod. A node that would BUILD with such an
+    // algo can therefore only ever fail and is rejected; a node whose
+    // declared outputs are already realized in the store never
+    // dispatches (the scheduler cache-cuts it), so rejecting the whole
+    // submission for it would block otherwise-valid DAGs that merely
+    // reference a legacy (e.g. md5) FOD that already exists. Offender
+    // nodes skip the declared-hash binding below (the algo cannot be
+    // parsed), but the floating-CA shape rule still applies to them.
+    // Input-addressed outputs (no hash, no algo) are untouched.
+    //
     // r[impl gw.reject.output-path-mismatch]
     // Declared-hash (fixed-output) outputs: bind the declared path to
     // the declared hash and enforce CppNix's single-'out' shape rule.
@@ -508,13 +512,177 @@ pub fn validate_dag(
     // re-verifies FOD uploads and rejects descriptor-less ones under a
     // scheduler-signed fixed-output assignment — but only at upload
     // time, after a pod has already run).
+    let mut offenders = Vec::new();
     for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        let unverifiable = drv.outputs().iter().any(|o| {
+            (!o.hash().is_empty() || !o.hash_algo().is_empty())
+                && !fod_algo_verifiable(o.hash_algo())
+        });
+        if unverifiable {
+            // The floating-CA shape rule applies to every output,
+            // offenders included — a path-declaring floating-CA output
+            // must never slip through via an unparseable algo.
+            validate_floating_ca_shape(
+                &node.drv_path,
+                drv.outputs()
+                    .iter()
+                    .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
+            )?;
+            let out = drv
+                .outputs()
+                .iter()
+                .find(|o| {
+                    (!o.hash().is_empty() || !o.hash_algo().is_empty())
+                        && !fod_algo_verifiable(o.hash_algo())
+                })
+                .expect("checked by `unverifiable` above");
+            offenders.push(UnverifiableFodOffender {
+                drv_path: node.drv_path.clone(),
+                output_name: out.name().to_string(),
+                algo: out.hash_algo().to_string(),
+                declared_paths: drv.outputs().iter().map(|o| o.path().to_string()).collect(),
+            });
+            continue;
+        }
         validate_declared_hash_outputs(
             &node.drv_path,
             drv.outputs()
                 .iter()
                 .map(|o| (o.name(), o.path(), o.hash_algo(), o.hash())),
         )?;
+    }
+
+    Ok(offenders)
+}
+
+/// A derivation that declares an `outputHash`/`outputHashAlgo` the
+/// builder cannot verify or finalize, classified by [`validate_dag`]
+/// (or built directly from an inline `BasicDerivation`). The
+/// submission-time decision for these nodes is made by
+/// [`reject_unrealized_fod_offenders`]: exempt iff every declared
+/// output path is already realized in the store.
+#[derive(Debug, Clone)]
+pub struct UnverifiableFodOffender {
+    pub drv_path: String,
+    pub output_name: String,
+    pub algo: String,
+    /// Every declared output path of the derivation (not just the
+    /// offending output's): exemption requires the WHOLE node to be a
+    /// guaranteed cache-hit, mirroring the scheduler's skip-dispatch
+    /// predicate (all expected outputs present).
+    pub declared_paths: Vec<String>,
+}
+
+/// Cap on the total number of store paths the unverifiable-algo
+/// realization probe will check in one submission. A DAG referencing
+/// more legacy-algo derivations than this is rejected fail-closed —
+/// the probe must stay one bounded RPC, not a vector for amplifying
+/// store load.
+pub(crate) const MAX_FOD_EXEMPTION_PROBE_PATHS: usize = 1024;
+
+/// Decide the unverifiable-algo offenders collected by
+/// [`validate_dag`]: exempt a node iff every one of its declared
+/// output paths is already present in the store (it can never
+/// dispatch — the scheduler cache-cuts it), reject otherwise.
+///
+/// Fail-closed by construction: any offender with an empty or
+/// unparseable declared path (floating-CA with an unsupported algo has
+/// no path at all), an offender set larger than
+/// [`MAX_FOD_EXEMPTION_PROBE_PATHS`], a store error, or a probe
+/// timeout all reject the submission — the gate never exempts a node
+/// it cannot prove realized. The probe is a single anonymous
+/// `FindMissingPaths` (same timeout and anonymous-lookup rationale as
+/// [`filter_and_inline_drv`]'s): it gates a submission-shape decision,
+/// not tenant-scoped visibility.
+///
+/// The exemption can go stale between this probe and dispatch (GC
+/// races): the node then dispatches and fails at the worker's
+/// fail-closed FOD gate — a node-level failure instead of a
+/// submission rejection, never an unverified build.
+// r[impl gw.reject.unsupported-hash-algo+2]
+pub(crate) async fn reject_unrealized_fod_offenders(
+    offenders: &[UnverifiableFodOffender],
+    store_client: &mut StoreServiceClient<Channel>,
+) -> Result<(), String> {
+    if offenders.is_empty() {
+        return Ok(());
+    }
+
+    let remediation = "re-pin the derivation to a supported outputHashAlgo (supported: sha1, \
+                       sha256, sha512, optionally 'r:'-prefixed) or copy its output into the \
+                       store first";
+
+    let mut probe_paths: Vec<String> = Vec::new();
+    for offender in offenders {
+        if offender.declared_paths.is_empty()
+            || offender
+                .declared_paths
+                .iter()
+                .any(|p| p.is_empty() || StorePath::parse(p).is_err())
+        {
+            return Err(format!(
+                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' and its \
+                 declared output paths cannot be checked for prior realization — {remediation}",
+                offender.drv_path, offender.output_name, offender.algo
+            ));
+        }
+        probe_paths.extend(offender.declared_paths.iter().cloned());
+    }
+
+    if probe_paths.len() > MAX_FOD_EXEMPTION_PROBE_PATHS {
+        return Err(format!(
+            "{} derivations declare unsupported outputHashAlgo values ({} output paths > {} \
+             probe cap) — {remediation}",
+            offenders.len(),
+            probe_paths.len(),
+            MAX_FOD_EXEMPTION_PROBE_PATHS
+        ));
+    }
+
+    // no-jwt: anonymous lookup — gates a submission-shape decision
+    // (would this node dispatch at all?), not tenant-scoped visibility.
+    let missing: HashSet<String> = match tokio::time::timeout(
+        rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+        store_client.find_missing_paths(types::FindMissingPathsRequest {
+            store_paths: probe_paths,
+        }),
+    )
+    .await
+    {
+        Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
+        Ok(Err(e)) => {
+            return Err(format!(
+                "cannot verify prior realization of derivations declaring unsupported \
+                 outputHashAlgo values (store error: {e}) — {remediation}"
+            ));
+        }
+        Err(_) => {
+            return Err(format!(
+                "cannot verify prior realization of derivations declaring unsupported \
+                 outputHashAlgo values (store probe timed out) — {remediation}"
+            ));
+        }
+    };
+
+    for offender in offenders {
+        if let Some(missing_path) = offender
+            .declared_paths
+            .iter()
+            .find(|p| missing.contains(*p))
+        {
+            return Err(format!(
+                "derivation {} output '{}' declares unsupported outputHashAlgo '{}' and its \
+                 declared output {} is not already realized in the store — the build could \
+                 only fail after burning a pod; {remediation}",
+                offender.drv_path, offender.output_name, offender.algo, missing_path
+            ));
+        }
+        info!(
+            drv_path = %offender.drv_path,
+            algo = %offender.algo,
+            "exempting unverifiable-outputHashAlgo derivation: all declared outputs already \
+             realized (node will cache-cut, never dispatch)"
+        );
     }
 
     Ok(())
@@ -675,27 +843,7 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
 
     let outputs: Vec<(&str, &str, &str, &str)> = outputs.collect();
 
-    // r[impl gw.reject.floating-ca-declared-path]
-    // Floating-CA shape rule: an output that sets outputHashAlgo with an
-    // EMPTY outputHash (floating content-addressed) must not declare an
-    // output path — CppNix refuses to even parse that shape
-    // ("content-addressing derivation output should not specify output
-    // path"), so no legitimate client can produce it, and accepting it
-    // would exempt the declared path from both the input-addressed and
-    // the declared-hash bindings. Checked for every output (including
-    // unverifiable-algo offenders) and independent of the realization
-    // exemption.
-    if let Some((name, path, algo, _)) = outputs
-        .iter()
-        .find(|(_, path, algo, hash)| !algo.is_empty() && hash.is_empty() && !path.is_empty())
-    {
-        return Err(format!(
-            "derivation {drv_path} output '{name}' declares outputHashAlgo '{algo}' with no \
-             outputHash (floating content-addressed) but also declares output path {path} — \
-             CppNix refuses this shape and rio rejects it: floating-CA outputs must leave the \
-             output path empty"
-        ));
-    }
+    validate_floating_ca_shape(drv_path, outputs.iter().copied())?;
 
     let declared_hash: Vec<&(&str, &str, &str, &str)> = outputs
         .iter()
@@ -760,6 +908,35 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
             "derivation {drv_path} declares fixed output '{name}' at {declared_path} but the \
              declared hash derives to {} — declared output paths must match the derivation",
             expected.as_str()
+        ));
+    }
+    Ok(())
+}
+
+/// Floating-CA shape rule (`gw.reject.floating-ca-declared-path`): an
+/// output that sets `outputHashAlgo` with an EMPTY `outputHash`
+/// (floating content-addressed) must not declare an output path —
+/// CppNix refuses to even parse that shape ("content-addressing
+/// derivation output should not specify output path"), so no
+/// legitimate client can produce it, and accepting it would exempt the
+/// declared path from both the input-addressed and the declared-hash
+/// bindings. Checked for every output — including unverifiable-algo
+/// offenders, which skip the rest of the declared-hash binding — and
+/// independent of the realization exemption.
+// r[impl gw.reject.floating-ca-declared-path]
+pub(crate) fn validate_floating_ca_shape<'a>(
+    drv_path: &str,
+    outputs: impl Iterator<Item = (&'a str, &'a str, &'a str, &'a str)>,
+) -> Result<(), String> {
+    if let Some((name, path, algo, _)) = outputs
+        .into_iter()
+        .find(|(_, path, algo, hash)| !algo.is_empty() && hash.is_empty() && !path.is_empty())
+    {
+        return Err(format!(
+            "derivation {drv_path} output '{name}' declares outputHashAlgo '{algo}' with no \
+             outputHash (floating content-addressed) but also declares output path {path} — \
+             CppNix refuses this shape and rio rejects it: floating-CA outputs must leave the \
+             output path empty"
         ));
     }
     Ok(())
@@ -1664,11 +1841,13 @@ mod tests {
         assert!(err.contains("floating content-addressed"), "{err}");
     }
 
-    /// floating-CA output (algo set, hash empty) with an unsupported
-    /// algo alike. Verifiable algorithms (sha256, r:sha512) pass in
-    /// both shapes, and input-addressed outputs (no hash, no algo) are
-    /// never checked.
-    // r[verify gw.reject.unsupported-hash-algo]
+    /// Unverifiable outputHashAlgo values are CLASSIFIED (returned as
+    /// offenders for the realization probe), not rejected outright:
+    /// fixed-output md5 and floating-CA md5/blake3 alike. Verifiable
+    /// algorithms (sha256, r:sha512) pass in both shapes with no
+    /// offenders, and input-addressed outputs (no hash, no algo) are
+    /// never classified.
+    // r[verify gw.reject.unsupported-hash-algo+2]
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
         let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
@@ -1692,15 +1871,25 @@ mod tests {
         };
         let key = StorePath::parse(drv_path).unwrap();
 
-        // md5 → rejected, naming the algorithm.
+        // md5 FOD → classified as an offender (NOT an immediate Err),
+        // carrying the algo, the offending output and every declared
+        // path; the declared-hash binding is skipped for it (a junk
+        // declared path does not produce the "must match" error).
         let mut cache = HashMap::new();
         cache.insert(key.clone(), fod_drv("md5", &"de".repeat(16)));
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
+        let offenders = validate_dag(std::slice::from_ref(&node), &cache).unwrap();
+        assert_eq!(offenders.len(), 1);
+        assert_eq!(offenders[0].drv_path, drv_path);
+        assert_eq!(offenders[0].output_name, "out");
+        assert_eq!(offenders[0].algo, "md5");
+        assert_eq!(
+            offenders[0].declared_paths,
+            vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-src".to_string()]
+        );
 
-        // sha256 and r:sha512 → accepted, with hash-consistent declared
-        // paths and correctly-sized digests (the declared-hash binding
-        // gate requires both).
+        // sha256 and r:sha512 → accepted with NO offenders, with
+        // hash-consistent declared paths and correctly-sized digests
+        // (the declared-hash binding gate requires both).
         for (algo, digest_len) in [("sha256", 32usize), ("r:sha512", 64)] {
             let digest = vec![0xabu8; digest_len];
             let nix_hash = rio_nix::hash::NixHash::new(
@@ -1717,29 +1906,52 @@ mod tests {
                 fod_drv_at(algo, &hex::encode(&digest), honest.as_str()),
             );
             assert!(
-                validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
-                "{algo} must be accepted"
+                validate_dag(std::slice::from_ref(&node), &cache)
+                    .unwrap()
+                    .is_empty(),
+                "{algo} must be accepted with no offenders"
             );
         }
 
         // Floating-CA (algo set, hash EMPTY, path EMPTY — the only shape
-        // CppNix can produce) with a supported algo → accepted.
+        // CppNix can produce) with a supported algo → accepted, no
+        // offenders.
         let mut cache = HashMap::new();
         cache.insert(key.clone(), fod_drv_at("r:sha256", "", ""));
-        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache)
+                .unwrap()
+                .is_empty()
+        );
 
         // Floating-CA with an algo the builder's CA finalization cannot
-        // produce (md5, blake3) → rejected at submission instead of
-        // after a full build (`CaUnsupportedAlgo` post-build otherwise).
+        // produce (md5, blake3) → classified; its declared path is empty,
+        // which the realization probe rejects (floating-CA is never
+        // exempt — see reject_unrealized_fod_offenders tests).
         for algo in ["md5", "blake3"] {
             let mut cache = HashMap::new();
-            cache.insert(key.clone(), fod_drv(algo, ""));
-            let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-            assert!(
-                err.contains(&format!("outputHashAlgo '{algo}'")),
-                "{algo}: {err}"
-            );
+            cache.insert(key.clone(), fod_drv_at(algo, "", ""));
+            let offenders = validate_dag(std::slice::from_ref(&node), &cache).unwrap();
+            assert_eq!(offenders.len(), 1, "{algo}: classified, not rejected");
+            assert_eq!(offenders[0].algo, algo);
+            assert_eq!(offenders[0].declared_paths, vec![String::new()]);
         }
+
+        // An offender that ALSO violates the floating-CA shape rule
+        // (algo set, hash empty, path declared) is still rejected
+        // outright — the shape rule is independent of the realization
+        // exemption.
+        let mut cache = HashMap::new();
+        cache.insert(
+            key.clone(),
+            fod_drv_at(
+                "md5",
+                "",
+                "/nix/store/cccccccccccccccccccccccccccccccc-squat",
+            ),
+        );
+        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(err.contains("floating content-addressed"), "{err}");
 
         // Input-addressed output (no hash, no algo) → never checked by
         // the ALGO gate. The IA path gate does apply, so give the
@@ -1764,7 +1976,124 @@ mod tests {
             .to_owned();
         let mut cache = HashMap::new();
         cache.insert(key.clone(), ia_with(&honest));
-        assert!(validate_dag(std::slice::from_ref(&node), &cache).is_ok());
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    /// The realization probe: offenders are exempt iff every declared
+    /// output is already present; everything uncertain rejects.
+    // r[verify gw.reject.unsupported-hash-algo+2]
+    #[tokio::test]
+    async fn reject_unrealized_fod_offenders_decides_by_realization() -> anyhow::Result<()> {
+        use rio_test_support::grpc::spawn_mock_store_with_client;
+
+        let offender = |paths: &[&str]| UnverifiableFodOffender {
+            drv_path: "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-legacy.drv".into(),
+            output_name: "out".into(),
+            algo: "md5".into(),
+            declared_paths: paths.iter().map(|s| s.to_string()).collect(),
+        };
+        let realized = "/nix/store/cccccccccccccccccccccccccccccccc-legacy-out";
+        let missing = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-legacy-out";
+
+        let (store, mut store_client, _handle) = spawn_mock_store_with_client().await?;
+        store.seed(
+            rio_proto::validated::ValidatedPathInfo {
+                store_path: StorePath::parse(realized)?,
+                nar_hash: [0u8; 32],
+                nar_size: 1,
+                store_path_hash: vec![],
+                deriver: None,
+                references: vec![],
+                signatures: vec![],
+                content_address: None,
+                registration_time: 0,
+                ultimate: false,
+            },
+            vec![0u8; 1],
+        );
+
+        // No offenders → Ok without any store RPC.
+        reject_unrealized_fod_offenders(&[], &mut store_client)
+            .await
+            .expect("empty offender set is a no-op");
+        assert_eq!(
+            store
+                .calls
+                .find_missing_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "no probe RPC for an empty offender set"
+        );
+
+        // All declared outputs realized → exempt.
+        reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client)
+            .await
+            .expect("realized offender is exempt");
+
+        // Any declared output missing → rejected, naming the algo and
+        // the remediation.
+        let err = reject_unrealized_fod_offenders(&[offender(&[missing])], &mut store_client)
+            .await
+            .unwrap_err();
+        assert!(err.contains("outputHashAlgo 'md5'"), "{err}");
+        assert!(
+            err.contains("sha256"),
+            "remediation names the supported set: {err}"
+        );
+
+        // Two offenders, one realized one not → rejected, naming the
+        // unrealized one.
+        let err = reject_unrealized_fod_offenders(
+            &[offender(&[realized]), offender(&[missing])],
+            &mut store_client,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains(missing), "{err}");
+
+        // Empty declared path (floating-CA with unsupported algo) →
+        // rejected WITHOUT a probe RPC.
+        let before = store
+            .calls
+            .find_missing_calls
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let err = reject_unrealized_fod_offenders(&[offender(&[""])], &mut store_client)
+            .await
+            .unwrap_err();
+        assert!(err.contains("cannot be checked"), "{err}");
+        assert_eq!(
+            store
+                .calls
+                .find_missing_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "no probe RPC when a declared path is empty/unparseable"
+        );
+
+        // Oversized offender set → rejected without a probe RPC.
+        let many: Vec<UnverifiableFodOffender> = (0..(MAX_FOD_EXEMPTION_PROBE_PATHS + 1))
+            .map(|_| offender(&[realized]))
+            .collect();
+        let err = reject_unrealized_fod_offenders(&many, &mut store_client)
+            .await
+            .unwrap_err();
+        assert!(err.contains("probe cap"), "{err}");
+
+        // Store error → fail-closed rejection.
+        store
+            .faults
+            .fail_find_missing
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let err = reject_unrealized_fod_offenders(&[offender(&[realized])], &mut store_client)
+            .await
+            .unwrap_err();
+        assert!(err.contains("store error"), "{err}");
+
+        Ok(())
     }
 
     #[test]
