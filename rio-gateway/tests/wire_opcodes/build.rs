@@ -2667,7 +2667,7 @@ async fn read_keyed_result(
     Ok((path, result))
 }
 
-// r[verify gw.opcode.build-results-honest]
+// r[verify gw.opcode.build-results-honest+2]
 /// Wrong-success: the scheduler reports the combined DAG as completed, but
 /// only target A's wanted output is actually in the store. A must be Built
 /// with builtOutputs for exactly its wanted output; B must be a failure
@@ -2733,7 +2733,7 @@ async fn test_build_paths_with_results_missing_output_fails_only_that_target() -
     Ok(())
 }
 
-// r[verify gw.opcode.build-results-honest]
+// r[verify gw.opcode.build-results-honest+2]
 /// Partial outcome, the other direction: the aggregate build FAILS, but
 /// target A's wanted output is present in the store. A must report success;
 /// B keeps the mapped failure status + message.
@@ -2801,7 +2801,7 @@ async fn test_build_paths_with_results_failure_keeps_verified_target_built() -> 
     Ok(())
 }
 
-// r[verify gw.opcode.build-results-honest]
+// r[verify gw.opcode.build-results-honest+2]
 /// wopBuildPaths (9): the bare success word is gated on the same store
 /// verification. Aggregate success but the wanted output path is missing
 /// from the store ⇒ STDERR_ERROR naming the path, not u64(1).
@@ -2831,7 +2831,7 @@ async fn test_build_paths_success_word_gated_on_outputs_present() -> anyhow::Res
     Ok(())
 }
 
-// r[verify gw.opcode.build-results-honest]
+// r[verify gw.opcode.build-results-honest+2]
 /// Single fully-valid target: still reports Built, and builtOutputs cover
 /// ONLY the wanted output — the unrequested `dev` output of a multi-output
 /// derivation is not echoed back.
@@ -2875,7 +2875,7 @@ async fn test_build_paths_with_results_built_outputs_cover_only_wanted() -> anyh
     Ok(())
 }
 
-// r[verify gw.opcode.build-results-honest]
+// r[verify gw.opcode.build-results-honest+2]
 /// A wanted floating-CA output with no realisation row must fail that
 /// target's verification — not ship a Built result whose builtOutputs carry
 /// an empty outPath (which stock clients reject / assert on).

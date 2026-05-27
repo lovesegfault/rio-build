@@ -1426,7 +1426,7 @@ struct TargetOutputsCheck {
     unverifiable: bool,
 }
 
-// r[impl gw.opcode.build-results-honest]
+// r[impl gw.opcode.build-results-honest+2]
 /// Resolve every target's wanted outputs to concrete store paths and ask the
 /// store — ONE batched `FindMissingPaths` over the union, tenant-scoped via
 /// the session JWT like `wopQueryValidPaths` — which of them actually exist.
@@ -1590,7 +1590,7 @@ async fn check_targets_against_store<W: AsyncWrite + Unpin>(
     Ok(checks)
 }
 
-// r[impl gw.opcode.build-results-honest]
+// r[impl gw.opcode.build-results-honest+2]
 /// Build the success-side `BuildResult` for ONE verified target: status and
 /// timing from `base`, `builtOutputs` covering exactly the wanted outputs
 /// (drvHashModulo ids; floating-CA paths from the realisations resolved
@@ -1857,7 +1857,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
                 stderr_err!(stderr, "build failed: {}", r.error_msg)
             }
             Ok(DagSubmitOutcome::Built(_)) => {
-                // r[impl gw.opcode.build-results-honest]
+                // r[impl gw.opcode.build-results-honest+2]
                 // The scheduler says the DAG completed; gate the success
                 // word on the store actually holding every requested
                 // output (same verification as wopBuildPathsWithResults).
@@ -1993,7 +1993,7 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
             }
         };
 
-        // r[impl gw.opcode.build-results-honest]
+        // r[impl gw.opcode.build-results-honest+2]
         // Honest per-target results: a target is reported successful only
         // when the store confirms the outputs the client asked for actually
         // exist (defense in depth on top of the scheduler-side guarantees),

@@ -443,6 +443,14 @@ full DAG by parsing the `.drv` files uploaded in the preceding
 `wopAddToStoreNar`/`wopAddMultipleToStore` step. Each `.drv` file contains
 `inputDrvs` references that form the DAG edges.
 
+*Response* (after the STDERR loop): a single `BuildResult` (see the
+_BuildResult Wire Format_ section below). On success, `builtOutputs` covers
+every declared output — declared paths for input-addressed and fixed-CA
+outputs, the registered realisation for floating-CA outputs — gated by the
+store verification of #rref("gw.opcode.build-results-honest") when the
+gateway holds the resolved `.drv`; in the single-node fallback no
+verification is possible and `builtOutputs` stays empty.
+
 == wopQueryDerivationOutputMap (41) Wire Format
 
 #r("gw.opcode.query-derivation-output-map")[
@@ -634,7 +642,7 @@ Response (after STDERR loop):
 
 === Per-Target Result Honesty
 
-#r("gw.opcode.build-results-honest")[
+#r("gw.opcode.build-results-honest+2")[
   A derivation (`Built`) target in a `wopBuildPathsWithResults` batch MUST be
   reported successful only if every output the client requested for that
   target is valid in the rio store (tenant-scoped) at completion time, and a
@@ -646,7 +654,10 @@ Response (after STDERR loop):
   remaining entries of the batch are still reported normally (one entry per
   requested path, in request order, no batch-wide `STDERR_ERROR` for an
   individual target's failure). The same verification MUST gate the success
-  reply (`u64(1)`) of `wopBuildPaths`.
+  reply (`u64(1)`) of `wopBuildPaths`, and — whenever the gateway holds the
+  resolved derivation — the single `BuildResult` of `wopBuildDerivation`;
+  on success its `builtOutputs` MUST cover exactly the declared outputs
+  (the opcode carries no client-side output selection).
 ]
 
 This is defense in depth on top of the scheduler-side completion guarantees:
@@ -668,6 +679,18 @@ is the contract the success status hands to the client. When the aggregate
 outcome was a failure, a target is promoted to success only on positive
 store evidence for every requested output; outputs that cannot be mapped to
 a queryable store path leave the scheduler's outcome authoritative.
+
+`wopBuildDerivation` (the build-hook path) is a single-target reply, so the
+batch-aggregation hazards above do not apply, but the client-crash one does:
+an unrealized floating-CA output reported as successful would carry an empty
+`outPath` in `builtOutputs`, and in hook mode the local `nix-daemon` registers
+the returned outputs in its own database, propagating the wrong-success
+further than an ssh-ng client would. Verification requires the resolved
+`.drv` — the modular hash that keys the Realisations lookup needs `inputDrvs`,
+which the inline `BasicDerivation` lacks — so in the single-node fallback
+(#rref("gw.hook.single-node-dag")) the gateway cannot verify and keeps the
+pre-verification behavior: empty `builtOutputs`, scheduler outcome passed
+through.
 
 === BuildResult Wire Format
 
@@ -1744,6 +1767,11 @@ derivation without the full DAG context.
   are surfaced to the client --- degrading to single-node would dispatch an
   input-addressed root with missing inputs.
 - Submits to the scheduler via `SubmitBuild` as usual
+- On a successful outcome with the resolved `.drv` available, verifies the
+  declared outputs against the store
+  (#rref("gw.opcode.build-results-honest")) before writing the `BuildResult`;
+  a missing or unrealized output is reported as a failure result, not an
+  empty-`outPath` success
 
 *Scheduling optimizations lost in build hook mode:*
 - *No critical-path analysis* --- the scheduler sees each derivation in
