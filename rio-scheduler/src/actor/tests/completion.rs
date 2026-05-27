@@ -3321,6 +3321,7 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
                     edges: vec![],
                     options: BuildOptions::default(),
                     keep_going: false,
+                    force_build_roots: false,
                     traceparent: String::new(),
                     jti: None,
                     jwt_token: None,

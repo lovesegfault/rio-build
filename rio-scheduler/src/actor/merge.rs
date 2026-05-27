@@ -331,6 +331,7 @@ impl DagActor {
             edges,
             options,
             keep_going,
+            force_build_roots,
             traceparent,
             jti,
             jwt_token,
@@ -424,6 +425,20 @@ impl DagActor {
         };
         phase!("0-topdown-roots");
 
+        // Submission roots: nodes no edge names as a child (same root
+        // definition as check_roots_topdown). Used by the force-build
+        // gates (r[sched.merge.force-build-roots]) and persisted as
+        // build_derivations.is_root. Computed on the (possibly pruned)
+        // node/edge set — pruning only drops deps, never roots, so the
+        // set is identical either way.
+        let root_children: HashSet<&str> =
+            edges.iter().map(|e| e.child_drv_path.as_str()).collect();
+        let submission_roots: HashSet<DrvHash> = nodes
+            .iter()
+            .filter(|n| !root_children.contains(n.drv_path.as_str()))
+            .map(|n| DrvHash::from(n.drv_hash.as_str()))
+            .collect();
+
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.
         self.db
@@ -432,6 +447,7 @@ impl DagActor {
                 tenant_id,
                 priority_class,
                 keep_going,
+                force_build_roots,
                 &options,
                 jti.as_deref(),
             )
@@ -460,7 +476,7 @@ impl DagActor {
         // === Step 3: In-memory map inserts ============================
         let event_rx = self.events.register(build_id);
 
-        let build_info = BuildInfo::new_pending(
+        let mut build_info = BuildInfo::new_pending(
             build_id,
             tenant_id,
             priority_class,
@@ -468,6 +484,8 @@ impl DagActor {
             options,
             nodes.iter().map(|n| n.drv_hash.as_str().into()).collect(),
         );
+        build_info.force_build_roots = force_build_roots;
+        build_info.root_hashes = submission_roots.clone();
         self.builds.insert(build_id, build_info);
 
         // Index proto nodes by hash for efficient lookup during cache-check + transitions.
@@ -549,6 +567,7 @@ impl DagActor {
                 &edges,
                 &merge_result,
                 &pruned_closure_parents,
+                &submission_roots,
             )
             .await
         {
@@ -666,6 +685,7 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
+        submission_roots: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(
             build_id,
@@ -673,6 +693,7 @@ impl DagActor {
             edges,
             &merge_result.newly_inserted,
             topdown_pruned_parents,
+            submission_roots,
         )
         .await
         .inspect_err(
@@ -1890,6 +1911,7 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
         topdown_pruned_parents: &HashSet<String>,
+        submission_roots: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -1971,8 +1993,13 @@ impl DagActor {
         // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
-        // Batch 2: link all nodes to this build.
-        let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        // Batch 2: link all nodes to this build. Submission roots get
+        // is_root = TRUE (recovery re-derives the per-build force-build
+        // root set from these rows; non-roots stay FALSE).
+        let db_ids: Vec<(Uuid, bool)> = id_map
+            .iter()
+            .map(|(hash, (id, _))| (*id, submission_roots.contains(hash.as_str())))
+            .collect();
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:

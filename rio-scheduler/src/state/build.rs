@@ -100,6 +100,14 @@ pub struct BuildInfo {
     state: BuildState,
     /// Whether to continue building independent derivations on failure.
     pub keep_going: bool,
+    /// `SubmitBuildRequest.force_build_roots` — gates root substitution;
+    /// persisted on builds. Defaulted false by [`new_pending`](Self::new_pending);
+    /// merge (and recovery) set it explicitly from the request / PG row.
+    pub force_build_roots: bool,
+    /// Submission-root drv hashes of THIS build — the set the force-build
+    /// gates consult; persisted as `build_derivations.is_root`. Empty by
+    /// default; set explicitly by merge and recovery.
+    pub root_hashes: HashSet<DrvHash>,
     /// Build options propagated from the client.
     pub options: BuildOptions,
     /// All derivation hashes involved in this build.
@@ -159,6 +167,8 @@ impl BuildInfo {
             priority_class,
             state: BuildState::Pending,
             keep_going,
+            force_build_roots: false,
+            root_hashes: HashSet::new(),
             options,
             derivation_hashes,
             total_count,

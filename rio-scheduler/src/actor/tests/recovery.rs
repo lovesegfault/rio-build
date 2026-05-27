@@ -490,6 +490,7 @@ async fn merge_chain(
                 edges,
                 options: Default::default(),
                 keep_going: true,
+                force_build_roots: false,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
@@ -2401,6 +2402,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
                         ..Default::default()
                     },
                     keep_going: false,
+                    force_build_roots: false,
                     traceparent: String::new(),
                     jti: None,
                     jwt_token: None,

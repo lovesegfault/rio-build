@@ -208,6 +208,7 @@ impl SchedulerService for SchedulerGrpc {
             edges: req.edges,
             options,
             keep_going: req.keep_going,
+            force_build_roots: req.force_build_roots,
             traceparent,
             jti,
             jwt_token,

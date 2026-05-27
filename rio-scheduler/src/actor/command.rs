@@ -73,6 +73,9 @@ pub struct MergeDagRequest {
     pub edges: Vec<rio_proto::types::DerivationEdge>,
     pub options: BuildOptions,
     pub keep_going: bool,
+    /// `SubmitBuildRequest.force_build_roots` — gates root substitution;
+    /// persisted on builds.
+    pub force_build_roots: bool,
     /// W3C traceparent of the submitting gRPC handler's span. Span
     /// context does NOT cross the mpsc channel to the actor task, so
     /// we carry it as plain data. Stored on each newly-inserted

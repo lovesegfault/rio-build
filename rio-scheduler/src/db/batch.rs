@@ -248,25 +248,34 @@ impl SchedulerDb {
     }
 
     /// Batch-insert build_derivations links.
+    ///
+    /// Each row is `(derivation_id, is_root)` — `is_root = TRUE` marks
+    /// the derivations that were submission roots of THIS build
+    /// (migration 062), so recovery can re-derive the per-node
+    /// force-build set after failover.
     pub async fn batch_insert_build_derivations(
         tx: &mut PgConnection,
         build_id: Uuid,
-        derivation_ids: &[Uuid],
+        derivation_ids: &[(Uuid, bool)],
     ) -> Result<(), sqlx::Error> {
         if derivation_ids.is_empty() {
             return Ok(());
         }
         // build_id is constant across rows — bind once as scalar $1,
-        // cross-join UNNEST of the derivation_id array. Two binds total.
+        // parallel UNNEST of the (derivation_id, is_root) arrays.
+        // Three binds total.
+        let (ids, is_root): (Vec<Uuid>, Vec<bool>) = derivation_ids.iter().copied().unzip();
         sqlx::query(
             r#"
-            INSERT INTO build_derivations (build_id, derivation_id)
-            SELECT $1, derivation_id FROM UNNEST($2::uuid[]) AS t(derivation_id)
+            INSERT INTO build_derivations (build_id, derivation_id, is_root)
+            SELECT $1, derivation_id, is_root
+            FROM UNNEST($2::uuid[], $3::bool[]) AS t(derivation_id, is_root)
             ON CONFLICT DO NOTHING
             "#,
         )
         .bind(build_id)
-        .bind(derivation_ids)
+        .bind(&ids)
+        .bind(&is_root)
         .execute(&mut *tx)
         .await?;
         Ok(())

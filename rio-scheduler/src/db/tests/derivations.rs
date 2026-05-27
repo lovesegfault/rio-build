@@ -153,6 +153,7 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
         None,
         crate::state::PriorityClass::Scheduled,
         false,
+        false,
         &crate::state::BuildOptions::default(),
         None,
     )

@@ -18,6 +18,7 @@ async fn test_update_build_status_pending_no_timestamps() -> anyhow::Result<()> 
         None,
         crate::state::PriorityClass::Scheduled,
         true,
+        false,
         &Default::default(),
         None,
     )
@@ -76,6 +77,7 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
         None,
         crate::state::PriorityClass::Ci,
         true,
+        false,
         &Default::default(),
         None,
     )

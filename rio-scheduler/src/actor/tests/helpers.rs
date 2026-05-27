@@ -539,6 +539,7 @@ pub(crate) async fn merge_single_node(
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                force_build_roots: false,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
@@ -570,6 +571,36 @@ pub(crate) async fn merge_dag(
                 edges,
                 options: BuildOptions::default(),
                 keep_going,
+                force_build_roots: false,
+                traceparent: String::new(),
+                jti: None,
+                jwt_token: None,
+            },
+            reply: reply_tx,
+        })
+        .await?;
+    Ok(reply_rx.await??.state)
+}
+
+/// `merge_dag` with `force_build_roots = true` (r[sched.merge.force-build-roots]).
+pub(crate) async fn merge_dag_force_roots(
+    handle: &ActorHandle,
+    build_id: Uuid,
+    nodes: Vec<rio_proto::types::DerivationNode>,
+    edges: Vec<rio_proto::types::DerivationEdge>,
+) -> anyhow::Result<broadcast::Receiver<rio_proto::types::BuildEvent>> {
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::MergeDag {
+            req: MergeDagRequest {
+                build_id,
+                tenant_id: None,
+                priority_class: PriorityClass::Scheduled,
+                nodes,
+                edges,
+                options: BuildOptions::default(),
+                keep_going: true,
+                force_build_roots: true,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,

@@ -435,6 +435,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
+            force_build_roots: false,
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
@@ -488,6 +489,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
                 ..Default::default()
             },
             keep_going: false,
+            force_build_roots: false,
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
@@ -633,6 +635,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                force_build_roots: false,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,

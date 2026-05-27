@@ -151,12 +151,18 @@ impl SchedulerDb {
     /// `recover_from_pg()` reads them back to rebuild BuildInfo.
     /// `options` is serialized to JSONB (`sqlx::types::Json`
     /// wrapper handles the serde round-trip).
+    ///
+    /// `force_build_roots` is the per-build substitution policy from
+    /// `SubmitBuildRequest.force_build_roots` (migration 062) — stamped
+    /// here so recovery can rebuild it after leader failover.
+    #[allow(clippy::too_many_arguments)] // one INSERT with the full row — a struct param would just rename the args
     pub async fn insert_build(
         &self,
         build_id: Uuid,
         tenant_id: Option<Uuid>,
         priority_class: crate::state::PriorityClass,
         keep_going: bool,
+        force_build_roots: bool,
         options: &crate::state::BuildOptions,
         // r[impl gw.jwt.issue]
         // JWT ID for audit trail — migration 016 added builds.jwt_jti
@@ -168,14 +174,15 @@ impl SchedulerDb {
             r#"
             INSERT INTO builds
                 (build_id, tenant_id, status, priority_class,
-                 keep_going, options_json, jwt_jti)
-            VALUES ($1, $2, 'pending', $3, $4, $5, $6)
+                 keep_going, force_build_roots, options_json, jwt_jti)
+            VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7)
             "#,
         )
         .bind(build_id)
         .bind(tenant_id)
         .bind(priority_class.as_str())
         .bind(keep_going)
+        .bind(force_build_roots)
         // Json<&T>: sqlx serializes via serde_json and binds as
         // JSONB. BuildOptions derives Serialize (add if missing).
         .bind(sqlx::types::Json(options))

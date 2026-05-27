@@ -60,6 +60,7 @@ async fn test_insert_build_derivation_idempotent() -> anyhow::Result<()> {
         None,
         crate::state::PriorityClass::Scheduled,
         true,
+        false,
         &Default::default(),
         None,
     )
@@ -174,6 +175,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
         None,
         crate::state::PriorityClass::Scheduled,
         true,
+        false,
         &Default::default(),
         None,
     )
@@ -203,7 +205,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
     let t_derivs = t0.elapsed();
 
-    let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+    let db_ids: Vec<(Uuid, bool)> = id_map.values().map(|(id, _)| (*id, false)).collect();
     SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
     let t_bd = t0.elapsed();
 

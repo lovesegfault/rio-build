@@ -3050,6 +3050,7 @@ async fn test_per_build_timeout_fails_build_on_tick() -> TestResult {
                 build_cores: 0,
             },
             keep_going: false,
+            force_build_roots: false,
             traceparent: String::new(),
             jti: None,
             jwt_token: None,

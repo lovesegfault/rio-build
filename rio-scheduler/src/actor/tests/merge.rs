@@ -61,6 +61,7 @@ async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
             edges: vec![],
             options: BuildOptions::default(),
             keep_going: false,
+            force_build_roots: false,
             traceparent: String::new(),
             jti: None,
             jwt_token: None,
@@ -186,6 +187,7 @@ async fn test_cache_check_circuit_breaker_opens_then_closes() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                force_build_roots: false,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
@@ -285,6 +287,7 @@ async fn test_merge_rollback_on_store_unavailable_no_orphan() -> TestResult {
                 edges: vec![],
                 options: BuildOptions::default(),
                 keep_going: false,
+                force_build_roots: false,
                 traceparent: String::new(),
                 jti: None,
                 jwt_token: None,
@@ -8779,5 +8782,50 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
         .query_path_info_gate_armed
         .store(false, std::sync::atomic::Ordering::SeqCst);
     store.faults.query_path_info_gate.notify_waiters();
+    Ok(())
+}
+
+// ===========================================================================
+// force_build_roots / is_root persistence
+// ===========================================================================
+
+/// force_build_roots is stamped on the builds row and is_root on the
+/// submission's root link rows (recovery re-derivation input).
+// r[verify sched.merge.force-build-roots]
+#[tokio::test]
+async fn test_force_build_roots_persisted() -> TestResult {
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let mut root = make_node("fbr-root");
+    root.expected_output_paths = vec![test_store_path("fbr-root-out")];
+    let mut dep = make_node("fbr-dep");
+    dep.expected_output_paths = vec![test_store_path("fbr-dep-out")];
+    let edges = vec![make_test_edge("fbr-root", "fbr-dep")];
+    let build_id = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_id, vec![root, dep], edges).await?;
+    barrier(&handle).await;
+
+    let (fbr,): (bool,) =
+        sqlx::query_as("SELECT force_build_roots FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(fbr, "builds.force_build_roots must be stamped");
+
+    let rows: Vec<(String, bool)> = sqlx::query_as(
+        "SELECT d.drv_hash, bd.is_root FROM build_derivations bd
+         JOIN derivations d ON d.derivation_id = bd.derivation_id
+         WHERE bd.build_id = $1",
+    )
+    .bind(build_id)
+    .fetch_all(&db.pool)
+    .await?;
+    let is_root = |h: &str| rows.iter().find(|(hash, _)| hash == h).map(|(_, r)| *r);
+    assert_eq!(is_root("fbr-root"), Some(true), "root link must be is_root");
+    assert_eq!(
+        is_root("fbr-dep"),
+        Some(false),
+        "dep link must not be is_root"
+    );
     Ok(())
 }

@@ -24,6 +24,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
                 None,
                 PriorityClass::Scheduled,
                 false,
+                false,
                 &BuildOptions::default(),
                 None,
             )
@@ -101,6 +102,7 @@ async fn test_list_builds_filter_and_pagination() -> anyhow::Result<()> {
             Some(tenant_id),
             PriorityClass::Scheduled,
             false,
+            false,
             &BuildOptions::default(),
             None,
         )
@@ -154,6 +156,7 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
             Some(tenant_a),
             PriorityClass::Scheduled,
             false,
+            false,
             &BuildOptions::default(),
             None,
         )
@@ -164,6 +167,7 @@ async fn test_list_builds_cross_tenant_isolation() -> anyhow::Result<()> {
             build_b,
             Some(tenant_b),
             PriorityClass::Scheduled,
+            false,
             false,
             &BuildOptions::default(),
             None,
