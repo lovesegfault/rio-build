@@ -354,7 +354,7 @@ pub enum MountdTokenError {
 impl MountdClaims {
     /// The mountd `build_id` for a derivation path: basename of
     /// `drv_path`, every byte outside `[A-Za-z0-9_-]` collapsed to
-    /// `_`, truncated to [`MOUNTD_BUILD_ID_MAX_LEN`], `_` if empty.
+    /// `_`, truncated to `MOUNTD_BUILD_ID_MAX_LEN`, `_` if empty.
     ///
     /// One definition shared by the scheduler (which signs the id into
     /// [`MountdClaims::build_id`]) and — via an equality test in
