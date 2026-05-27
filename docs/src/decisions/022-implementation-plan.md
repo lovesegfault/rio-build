@@ -1016,7 +1016,6 @@ Moves chunking to the builder; rio-store's per-stream working set drops from `na
 | `store.compat.stock-nix-substitute` | components/store.md | rio-store/src/compat/mod.rs (P0580) | vm-store-compat `stock-nix-substitute` (P0580) |
 | `store.compat.gc-coupled` | components/store.md | gc/sweep.rs (P0581) | rio-store/tests/gc.rs (P0581) |
 | `obs.metric.compat` | observability.md | rio-store/lib.rs (P0566) | vm-store-compat (P0580) |
-| `obs.metric.chunk-backend-tiered` | observability.md | rio-store/lib.rs (P0548) | vm-store-tiered (P0555) |
 | `infra.express.cache-tier` | decisions/023 | rio-store config.rs `Tiered`/`select_express_bucket` + backend/tiered.rs (P0554; documentary marker also in infra/eks/s3-express.tf) | (live-only — runbook P0565) |
 | `infra.express.bounded-eviction` | 022-design-overview §9 | backend/express_sweep.rs (P0585) | unit (P0585) |
 | `obs.metric.express-eviction` | 022-design-overview §14 | backend/express_sweep.rs (P0585) | unit (P0585) |
