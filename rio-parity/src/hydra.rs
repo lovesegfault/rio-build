@@ -6,7 +6,9 @@
 //! cache.nixos.org, never from Hydra.
 
 use std::collections::BTreeMap;
+use std::time::Duration;
 
+use anyhow::Context as _;
 use serde::Deserialize;
 
 /// `GET /eval/<id>` — note: there are NO `project`/`jobset` keys in
@@ -83,10 +85,6 @@ pub struct HydraBuildOutput {
     pub path: Option<String>,
 }
 
-use std::time::Duration;
-
-use anyhow::Context as _;
-
 /// Default hard cap on hydra.nixos.org requests per eval-set build. A
 /// scoped build needs only a handful of structural requests (the eval,
 /// the jobset, a bounded number of sampled per-job lookups), so 150
@@ -150,7 +148,8 @@ impl HydraClient {
         if st.used >= self.cap {
             anyhow::bail!(
                 "hydra politeness budget exhausted ({} requests used, cap {}); \
-                 raise --hydra-request-cap only if you are sure the extra load is justified",
+                 narrow the scope, or raise the cap passed to HydraClient::new only \
+                 if the extra load on hydra.nixos.org is justified",
                 st.used,
                 self.cap
             );
@@ -182,7 +181,10 @@ impl HydraClient {
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
         if !status.is_success() {
-            anyhow::bail!("GET {url}: HTTP {status}");
+            anyhow::bail!(
+                "GET {url}: HTTP {status}: {}",
+                crate::body_snippet(&resp.text().await.unwrap_or_default())
+            );
         }
         resp.json::<T>()
             .await
@@ -199,6 +201,11 @@ impl HydraClient {
 
     /// `GET /eval/<id>/job/<name>` — the per-job lookup the politeness
     /// pattern allows for single jobs (fidelity samples, scoped sets).
+    ///
+    /// Job names are Nix attribute paths (e.g.
+    /// `nixpkgs.hello.x86_64-linux`) with no characters that need
+    /// percent-encoding, so the name is interpolated into the URL path
+    /// as-is.
     pub async fn get_eval_job(&self, eval_id: u64, job: &str) -> anyhow::Result<HydraBuild> {
         self.get_json(&format!("eval/{eval_id}/job/{job}")).await
     }
@@ -209,10 +216,10 @@ impl HydraClient {
 
     /// `GET /build/<id>/constituents` for an aggregate build.
     ///
-    /// NOTE: the response shape (a JSON array of build objects) is the
-    /// one endpoint here without a recorded fixture; it must be
-    /// confirmed by the ignored live-network smoke test before the
-    /// first constituents-scoped eval set is built against real Hydra.
+    /// TODO: the response shape (a JSON array of build objects) is the
+    /// one endpoint here without a recorded fixture; confirm it against
+    /// real hydra.nixos.org before the first constituents-scoped eval
+    /// set is built.
     pub async fn get_constituents(&self, build_id: u64) -> anyhow::Result<Vec<HydraBuild>> {
         self.get_json(&format!("build/{build_id}/constituents"))
             .await
@@ -222,6 +229,8 @@ impl HydraClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use axum::http::HeaderMap;
 
     fn fixture(name: &str) -> String {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -309,7 +318,24 @@ mod tests {
         );
     }
 
-    use axum::http::HeaderMap;
+    #[test]
+    fn unfinished_build_null_buildstatus_is_none() {
+        // Hydra serves `"buildstatus": null` while a build is still
+        // running; the recorded fixtures only cover finished builds, so
+        // pin the null handling with an inline sample.
+        let b: HydraBuild = serde_json::from_str(
+            r#"{
+                "id": 325000000,
+                "job": "nixpkgs.hello.x86_64-linux",
+                "drvpath": "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv",
+                "buildstatus": null,
+                "finished": 0
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(b.buildstatus, None);
+        assert_eq!(b.finished, Some(0));
+    }
 
     /// Loopback fake Hydra serving the recorded fixtures. Returns 406
     /// when the politeness headers are missing so a header regression
@@ -440,8 +466,40 @@ mod tests {
         );
     }
 
+    /// The default 500 ms min interval must actually delay the second
+    /// request. Exercises `charge()` (the hook `get_json` runs before
+    /// every request — `client_fetches_eval_jobset_and_job` proves that
+    /// wiring) directly under a paused clock, so the assertion is on
+    /// virtual time and never entangles auto-advance with real socket
+    /// I/O.
+    #[tokio::test(start_paused = true)]
+    async fn min_interval_delays_second_request() {
+        // The base URL is never contacted; only budget bookkeeping runs.
+        let c = HydraClient::new(
+            "http://hydra.invalid/",
+            &crate::user_agent(None),
+            10,
+            DEFAULT_HYDRA_MIN_INTERVAL,
+        )
+        .unwrap();
+        let start = tokio::time::Instant::now();
+        c.charge().await.unwrap();
+        assert_eq!(
+            start.elapsed(),
+            Duration::ZERO,
+            "the first request must not be delayed"
+        );
+        c.charge().await.unwrap();
+        assert!(
+            start.elapsed() >= DEFAULT_HYDRA_MIN_INTERVAL,
+            "the second request must wait out the min interval, elapsed only {:?}",
+            start.elapsed()
+        );
+        assert_eq!(c.requests_used().await, 2);
+    }
+
     #[tokio::test]
-    async fn http_errors_name_the_url() {
+    async fn http_errors_name_the_url_and_include_a_body_snippet() {
         let (base, _srv) = spawn_fake_hydra().await;
         let c = test_client(&base, 10);
         // No fixture for this job → fake server returns 404.
@@ -451,5 +509,8 @@ mod tests {
             msg.contains("404") && msg.contains("no.such.job"),
             "got: {msg}"
         );
+        // The response body ("no fixture …") is carried as a snippet so
+        // Hydra-side error text is visible without re-running the request.
+        assert!(msg.contains("no fixture"), "got: {msg}");
     }
 }

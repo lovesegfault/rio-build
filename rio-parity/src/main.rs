@@ -34,7 +34,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cli_args_parse_help() {
+    fn cli_command_debug_assert() {
         use clap::CommandFactory;
         Cli::command().debug_assert();
     }

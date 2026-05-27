@@ -48,3 +48,5 @@ aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-smithy-mocks = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
+# Politeness-budget spacing test uses paused-clock time (start_paused).
+tokio = { workspace = true, features = ["test-util"] }
