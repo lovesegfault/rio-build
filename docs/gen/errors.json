@@ -989,6 +989,20 @@
     },
     {
       "enum": "DagError",
+      "name": "AuthoritativeContentMismatch",
+      "crate": "rio-scheduler",
+      "msg": "conflicting authoritative derivation content for {drv_path}: a node with different inline content already exists",
+      "doc": "A submission claimed authoritative inline derivation content for a node that already holds DIFFERENT authoritative content. Those bytes are the only copy of their derivation anywhere, so silently joining would let the second submitter redefine what the first one's build runs and what recovery rebuilds. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
+    },
+    {
+      "enum": "DagError",
+      "name": "ConflictingInFlightContent",
+      "crate": "rio-scheduler",
+      "msg": "in-flight derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity",
+      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that provably differs. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead."
+    },
+    {
+      "enum": "DagError",
       "name": "CycleDetected",
       "crate": "rio-scheduler",
       "msg": "dependency cycle detected",
