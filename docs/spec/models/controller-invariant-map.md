@@ -1122,3 +1122,66 @@ scope it leaves unchanged:
   - The G-C/G-D/G-F NOT-ENCODED families and the FFD/cover sizing tail
     are where the §3.6 Kani candidates live if Phase 2 wants more than
     unit tests there.
+
+## Executor-campaign 1b re-audit (the contained delta pass this map's cross-campaign entry requires)
+
+Recorded by the executor-lifecycle campaign's 1b verification batch
+(Phase-1 plan T-1b.10), against the formal-sprint tree carrying the 1a
+additive slice and the 1b code batch (AD2 both halves, the C4/C5
+re-point, the AD5 successors, the ICE re-trigger, the Pool
+`dispatchMode` field). Scope: exactly the sections the cross-campaign
+entry names — J11, the orphan-reap rows, F1/F3 — plus the model
+re-runs that license "no transition change needed".
+
+- **J11 (termination reports).** `report_terminated_pods` /
+  `report_deadline_exceeded_jobs` keep their selection and
+  once-per-terminal-object sampling behavior; what changed is the RPC
+  they speak (`ReportAttemptOutcome`, the C4/C5 unification — T-1b.3).
+  For stream-mode identities the scheduler routes the unified report
+  through the same internal path `ReportExecutorTermination` served,
+  so the J11 row's behavioral description stands unchanged; for
+  pull-mode attempts the report is the idempotent second-installment
+  fill (no new row, no reclassification). No Model J encoding change:
+  the model's termination-report environment action abstracts the
+  channel, not the RPC name.
+- **Orphan-reap rows (J10 / `ctrl.ephemeral.reap-orphan-running+3`).**
+  The busy view is now the OR of `ListExecutors.busy` and the durable
+  open pull-mode attempt view (`ListOpenAttempts`), fail-closed on
+  either read (landed at 1a, T-1a.8; the spawnCoherence.qnt busy-view
+  header note from the 1a landing already records the abstraction).
+  The "busy but never registered" documented residual is closed in the
+  code for pull-mode pods (their busyness is ledger-backed); it
+  remains the documented bound for stream pods until 1c'. The 3-arm
+  fail-closed gate is unchanged. New at 1b and adjacent to (not part
+  of) the reap rows: the AD5 cancel arm
+  (`cancel_closed_attempt_jobs`, pull-mode pools only, closed-edge
+  evidence required, fail-closed on the view read) and the pull-mode
+  preemption branch of the DisruptionTarget watcher
+  (synthesize-preempted + foreground Job delete, no `DrainExecutor`).
+  Both are pull-pool-scoped, evidence-gated, and covered by their
+  red-first unit batteries; neither is encoded in Model J at this
+  slice — their model pricing rides the 1c'/1d Model J/N checklist
+  re-derivation this map already carries as an obligation.
+- **F1/F3 rows.** No change to the same-tick coherence machinery or to
+  the ack/ICE protocol as modeled. The ICE-clear re-trigger (T-1b.5)
+  moves the *scheduler-side* clear for pull-mode intents from the
+  registration edge to the first successful pull; the controller-side
+  arming (`AckSpawnedIntents`) and the modeled tick ordering are
+  untouched, so the F3 rows' statements stand. The F1/F3 rows remain a
+  prerequisite review input to that campaign's deletion slices exactly
+  as the re-pin protocol states.
+- **Model re-runs (no transition change).** Models J and N are
+  byte-unchanged at this slice; every wired exhaustive check was
+  re-confirmed green at this tree with state counts bit-identical to
+  the recorded baselines (spawn-coherence base/fault-rpc/fault-lease/
+  fault-stale/crd-absent/fetcher and nodeclaim base/fault-rpc/
+  fault-lease/fault-karpenter; figures in the recording commit's
+  message and the checks' transcripts).
+- **Stage-C calibration table delta pass:** not triggered by 1b — no
+  modeled mechanism's behavior changed; the full delta pass remains
+  scheduled with the 1c'/1d re-derivation as already recorded above.
+
+Controller-campaign owner counter-signature for this re-audit entry:
+PENDING (to be collected at the executor campaign's 1b close-out
+review; the executor-campaign records reference this entry from
+`docs/spec/models/executor-invariant-map.md`'s Phase-1b record).

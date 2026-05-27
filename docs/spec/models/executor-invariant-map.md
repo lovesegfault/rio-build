@@ -2873,3 +2873,103 @@ gained coexistence/busy-view header notes only (assumption text; no
 transition change); the affected wired checks were re-run at this
 landing with bit-identical state counts (recorded in the landing
 commit message per the volatile-figures convention).
+
+## Phase-1b record (Slice 1b — verification batch, model/map half)
+
+Recorded by the 1b verification batch (Phase-1 plan T-1b.10) against
+the tree carrying the 1a slice and the 1b code batch
+(T-1b.1–T-1b.6). Under the 2026-05-27 directive the 1b gate is
+verification-only: no pool template flips, no canary deployment, no
+soak; the deployment-time validation checklist rows D0–D5 hold every
+formerly-gating production observation.
+
+**Obligation-table rows (status at 1b).**
+
+- Row 1 (busy view): unchanged from the 1a record — the option-(b)
+  bridge is the OR of the stream view and the durable open pull-mode
+  attempt view, fail-closed on either read. The busy-but-never-
+  registered residual stays closed for pull-mode pods, documented for
+  stream pods until 1c'.
+- Rows 2/3 (ICE arming and the DAG-state sweep): untouched by 1b; the
+  ICE-clear re-trigger (T-1b.5) moves only the clear edge for
+  pull-mode intents to the first successful pull (registration-edge
+  clear retained for stream executors), with the red-first ICE
+  batteries green.
+- Row 4 (termination-report idempotency): the controller report paths
+  now speak `ReportAttemptOutcome` (T-1b.3, C4/C5 unification);
+  stream-mode identities route through the same internal path as
+  before (bit-identical classification), pull-mode attempts get the
+  reason-only second-installment fill (`WHERE termination_reason IS
+  NULL`); re-report dedup demonstrated against the scheduler handler
+  in the unit batteries.
+- Row 6 (exclusion re-key): AD2 landed on both halves — source_node
+  stamping + node-keyed exclusion + mixed-era both-keys carry
+  (T-1b.1), anti-affinity rendering + NoEligibleSource at the spawn
+  gate (T-1b.2) — with the small-fleet clause encoded and the spec
+  rules bumped (`sched.retry.per-executor-budget+3`,
+  `sched.dispatch.fleet-exhaust+4`).
+- Row 7 (cancel/preempt read): the consumer landed (T-1b.4) — the AD5
+  cancel arm keys on positive closed-edge evidence from
+  `ListOpenAttempts` (never bare absence), and the DisruptionTarget
+  watcher's pull-mode branch synthesizes `preempted` + foreground Job
+  delete with no `DrainExecutor` hop. No extra signal beyond the
+  T-0e.6 surface was needed (obligation row 7's wording holds).
+
+**Model bookkeeping (the 1b re-runs).** `spawnCoherence.qnt`,
+`nodeclaimLifecycle.qnt` and `executorSession.qnt` are byte-unchanged
+at this slice (the busy-view/coexistence header notes were added at
+the 1a landing); every wired Model J and Model N exhaustive check was
+re-confirmed green at this tree with state counts bit-identical to
+the recorded baselines (figures in the recording commit's message and
+the check transcripts). The retryPolicy.qnt pull-mode environment
+regime (T-0e.3, executed as T-1b.7) is recorded in
+`retry-invariant-map.md`'s cross-campaign addendum: one new wired
+exhaustive regime (`quint-retry-policy-pull`, all imported invariants
+HOLD) plus five wired expect-violation witnesses, with the as-built
+regimes' counts unchanged. The controller-map re-audit entry this
+slice owes is recorded in `controller-invariant-map.md`
+("Executor-campaign 1b re-audit"), owner counter-signature pending at
+the close-out review.
+
+**OA2 (restated per the v3 amendment).** The interim gap is a
+development-time code-ordering artifact only: the controller-side
+deadline/pull-latency clustering aggregation is absent from the tree
+between the 1b landing and T-1c.1, with zero production exposure (no
+deployment happens during development); it is closed by T-1c.1
+landing no later than 1c. The option-C compensating controls (the
+T-1a.12 per-node establishment-cluster alert + manual-reap runbook,
+the AD2 node-keyed exclusion, Karpenter NodeRepair) are in the tree;
+their live observation is deployment-time checklist row D3.
+
+**OA6 consequences.** Items 1–3 (protocol enum, pod-side bounded
+retry reusing `idle_timeout`, the `sched.executor.pull-not-ready`
+rule) remain DONE as recorded at 1a; the model half now additionally
+covers the charge-free nature of the not-deliverable answer (the
+pull regime's NotYetReady/Gone reads are charge-free stutters, and
+the no-attempt no-op witness is wired). Item 4 (Model-S pricing of
+the NotYetReady wait state and its inertness invariant) remains
+PENDING until 1c' (T-1c'.5). The end-to-end VM exercise of the
+NotYetReady retry loop (planned as canary-scenario step 7) has NOT
+been executed in this batch — see the Phase-1b evidence table.
+
+**OA5 surface notes.** The operator surface for the 1b review is
+`ListOpenAttempts` (service-token-gated; pull-filtered server-side)
+plus the `rio_scheduler_open_attempts` gauge and the existing Job
+census, as demonstrated by the `pull-mode` VM subtest and the
+admin-surface unit tests; no rio-cli/dashboard code was added this
+slice (the thin `list-open-attempts` subcommand remains an
+owner-review ask to record if requested). The OA5 surface review and
+the OA4 (BuildPhase) call are owner actions at the 1b close-out
+review; the live-fleet OA5 confirmation is deployment-time checklist
+row D7.
+
+**AD5 / OA1 deferrals.** The AD5 numeric cancel/preempt budget
+remains UNSIGNED (deployment-time checklist row D1, signed against
+the OA1 baseline once it accumulates); the OA1 latency comparison and
+the establishment-slack re-baseline are rows D1/D2; the production
+rollback drill is row D5. Development-time stand-ins shipped: the AD5
+component structure, the 45 s pull-mode TGPS (P8/delta 9), and the
+OA1 emission paths exercised by tests. The VM-topology cancel/preempt
+timing bounds planned by T-1b.9 have NOT been measured in this batch
+(no canary VM scenario landed here); when they land they are VM
+numbers only, never the production budget.
