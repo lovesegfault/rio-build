@@ -7,6 +7,7 @@
 // r[verify gw.reject.output-path-mismatch]
 // r[verify gw.reject.unsupported-hash-algo+2]
 // r[verify gw.hook.ifd-detection+2]
+// r[verify gw.hook.inline-drv-content]
 // r[verify gw.stderr.activity+2]
 
 use super::*;
@@ -716,10 +717,131 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
     );
     drain_build_result_tail(&mut h.stream).await?;
 
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(
+            submits.len(),
+            1,
+            "the content-bound inline fallback is submitted"
+        );
+        // r[verify gw.hook.inline-drv-content]
+        // The submitted node carries the serialized derivation (the .drv
+        // exists in no store for the worker to fetch) and it parses back
+        // to the same fixed-output derivation.
+        let node = &submits[0].nodes[0];
+        assert!(
+            !node.drv_content.is_empty(),
+            "inline fallback must carry drv_content"
+        );
+        let reparsed =
+            rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
+                .expect("inlined drv_content parses");
+        assert!(node.is_fixed_output, "FOD flag preserved");
+        assert_eq!(
+            reparsed.outputs()[0].path(),
+            honest_path,
+            "inlined derivation declares the same output path"
+        );
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
+/// hash and path empty) with no uploaded .drv is accepted, and the
+/// submitted node carries parseable drv_content with needs_resolve set.
+/// r[verify gw.hook.inline-drv-content]
+#[tokio::test]
+async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
+-> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/0000000000000000000000000000000g-inline-ca.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA: no static path
+        string: "r:sha256",
+        string: "",                              // no hash either
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "",
+        u64: 0,                                  // build_mode
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(
+        status, 0,
+        "inline floating-CA must build (Built=0), got {status}"
+    );
+    let _error_msg = wire::read_string(&mut h.stream).await?;
+    drain_build_result_tail(&mut h.stream).await?;
+
+    {
+        let submits = h.scheduler.submit_calls.read().unwrap();
+        assert_eq!(submits.len(), 1);
+        let node = &submits[0].nodes[0];
+        assert!(!node.drv_content.is_empty(), "drv_content inlined");
+        assert!(node.needs_resolve, "floating-CA node needs resolution");
+        rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
+            .expect("inlined drv_content parses");
+    }
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): an inline content-bound derivation whose
+/// serialized form exceeds the 1 MiB fallback cap is rejected with
+/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content]
+#[tokio::test]
+async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — single-node fallback path.
+    let drv_path = "/nix/store/0000000000000000000000000000000f-inline-huge.drv";
+    let huge_env = "x".repeat(1024 * 1024 + 1);
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // floating-CA
+        string: "r:sha256",
+        string: "",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "big",
+        string: &huge_env,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("nix copy --derivation"),
+        "remediation present: {:?}",
+        err.message
+    );
+
     assert_eq!(
         h.scheduler.submit_calls.read().unwrap().len(),
-        1,
-        "the content-bound inline fallback is submitted"
+        0,
+        "oversized fallback rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;

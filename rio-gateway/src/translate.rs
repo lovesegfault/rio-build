@@ -1113,6 +1113,49 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
     }
 }
 
+/// Cap on the serialized size of an inline `BasicDerivation` carried in
+/// the content-bound single-node fallback ([`build_fallback_node`]).
+/// 16× the per-node inline-optimization cap and well under the 4 MiB
+/// tonic default message limit; a derivation bigger than this almost
+/// certainly has a pathological env, and the size-unbounded path
+/// (upload the `.drv`, let the worker fetch it from the store) is
+/// always available.
+pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = 1024 * 1024;
+
+/// Build the submission node for the content-bound single-node
+/// fallback: like [`build_node`], but the serialized derivation is
+/// embedded in `drv_content` so the worker can execute it even though
+/// the `.drv` exists in no store (the client never uploaded it and the
+/// gateway deliberately does not write it — re-serialized content
+/// would not text-hash to the client's claimed `.drv` path, so caching
+/// or uploading it would poison later full-DAG builds).
+///
+/// Rejects derivations whose serialized form exceeds
+/// [`MAX_FALLBACK_INLINE_DRV_BYTES`] with remediation guidance — that
+/// path cannot work any other way (the worker has nowhere to fetch the
+/// derivation from), so failing fast at submission is the only honest
+/// answer.
+// r[impl gw.hook.inline-drv-content]
+pub fn build_fallback_node(
+    drv_path: &str,
+    basic: &rio_nix::derivation::BasicDerivation,
+) -> Result<types::DerivationNode, String> {
+    let aterm = basic.to_aterm();
+    if aterm.len() > MAX_FALLBACK_INLINE_DRV_BYTES {
+        return Err(format!(
+            "cannot build '{drv_path}': the full derivation is not in the store and its inline \
+             form is {} bytes (> {} byte cap for the single-node fallback) — upload the .drv \
+             first with `nix copy --derivation` or use --store ssh-ng:// so the worker can \
+             fetch it from the store",
+            aterm.len(),
+            MAX_FALLBACK_INLINE_DRV_BYTES
+        ));
+    }
+    let mut node = build_node(drv_path, basic);
+    node.drv_content = aterm.into_bytes();
+    Ok(node)
+}
+
 /// Inline .drv content into nodes whose outputs are missing from the
 /// store — i.e., nodes that will actually dispatch. Saves one worker
 /// → store round-trip per dispatched derivation (the `GetPath` fetch
@@ -1981,6 +2024,78 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    /// The content-bound single-node fallback carries the serialized
+    /// derivation; oversized derivations are rejected with remediation.
+    // r[verify gw.hook.inline-drv-content]
+    #[test]
+    fn build_fallback_node_inlines_the_basic_derivation() {
+        use rio_nix::derivation::BasicDerivation;
+
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        // A FOD-shaped BasicDerivation with one input source.
+        let basic = BasicDerivation::new(
+            vec![
+                rio_nix::derivation::DerivationOutput::new(
+                    "out",
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch",
+                    "r:sha256",
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                )
+                .unwrap(),
+            ],
+            ["/nix/store/cccccccccccccccccccccccccccccccc-src".to_string()]
+                .into_iter()
+                .collect(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec!["-c".into(), "echo hi".into()],
+            [(
+                "out".to_string(),
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("test BasicDerivation constructs");
+
+        let node = build_fallback_node(drv_path, &basic).expect("under the cap");
+        assert_eq!(node.drv_path, drv_path);
+        assert!(node.is_fixed_output, "FOD detection preserved");
+        assert_eq!(
+            node.drv_content,
+            basic.to_aterm().into_bytes(),
+            "drv_content is exactly the serialized BasicDerivation"
+        );
+        // The inlined bytes are a parseable derivation (what the worker
+        // will do with them).
+        let reparsed = Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap()).unwrap();
+        assert_eq!(reparsed.platform(), "x86_64-linux");
+        assert_eq!(reparsed.input_srcs().len(), 1, "input sources preserved");
+
+        // Over the cap → Err with actionable remediation.
+        let huge_env = "x".repeat(MAX_FALLBACK_INLINE_DRV_BYTES + 1);
+        let huge = BasicDerivation::new(
+            vec![
+                rio_nix::derivation::DerivationOutput::new(
+                    "out",
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-fetch",
+                    "r:sha256",
+                    "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
+                )
+                .unwrap(),
+            ],
+            Default::default(),
+            "x86_64-linux".into(),
+            "/bin/sh".into(),
+            vec![],
+            [("big".to_string(), huge_env)].into_iter().collect(),
+        )
+        .expect("constructs");
+        let err = build_fallback_node(drv_path, &huge).unwrap_err();
+        assert!(err.contains("nix copy --derivation"), "{err}");
+        assert!(err.contains("byte cap"), "{err}");
     }
 
     /// The realization probe: offenders are exempt iff every declared

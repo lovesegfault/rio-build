@@ -1896,16 +1896,33 @@ untrusted handshake):*
 - *Content-bound derivations (any client):* the inline `wopBuildDerivation`
   single-node fallback still applies when the full `.drv` is unavailable ---
   the output paths are governed by the content-hash rules, not by trust in
-  the declared paths. DAG-reconstruction errors (transitive-input cap
-  exceeded, child-`.drv` resolve failure mid-BFS) are surfaced to the
-  client --- degrading to single-node would dispatch an input-addressed root
-  with missing inputs.
+  the declared paths. The serialized derivation is carried inline in the
+  submission (#rref("gw.hook.inline-drv-content")) because the `.drv`
+  exists in no store for the worker to fetch. DAG-reconstruction errors
+  (transitive-input cap exceeded, child-`.drv` resolve failure mid-BFS) are
+  surfaced to the client --- degrading to single-node would dispatch an
+  input-addressed root with missing inputs.
 - Submits to the scheduler via `SubmitBuild` as usual
 - On a successful outcome with the resolved `.drv` available, verifies the
   declared outputs against the store
   (#rref("gw.opcode.build-results-honest")) before writing the `BuildResult`;
   a missing or unrealized output is reported as a failure result, not an
   empty-`outPath` success
+
+#r("gw.hook.inline-drv-content")[
+  When the gateway accepts a content-bound derivation through the inline
+  `wopBuildDerivation` single-node fallback (the full `.drv` cannot be
+  resolved from the session cache or the store), it MUST embed the
+  serialized derivation in the submitted node's `drv_content` so the worker
+  can execute it without the `.drv` existing in any store, and it MUST
+  reject submissions whose serialized derivation exceeds the fallback
+  inline cap (1 MiB, `MAX_FALLBACK_INLINE_DRV_BYTES`) with remediation
+  guidance (upload the `.drv` first via `nix copy --derivation`, or use
+  `--store ssh-ng://`). The inlined bytes are never written to the store or
+  the session derivation cache: re-serialized content does not text-hash to
+  the client's claimed `.drv` path, so persisting it would poison later
+  full-DAG builds of the same derivation.
+]
 
 Pre-2.16 hook clients that send inline input-addressed derivations without
 uploading the `.drv` receive the rejection described in

@@ -1382,15 +1382,35 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     out.path()
                 );
             }
-            debug!(error = %e, "full derivation not available, using single-node DAG");
-            // Single-node fallback skips reconstruct_dag (which is
-            // where the BFS root gets flagged), so mark the requested
-            // target here. Behaviour-neutral for a 1-node submission
-            // (it is trivially a structural root) but keeps the
-            // "client named it" marker consistent across opcodes.
-            let mut node = translate::build_node(&drv_path_str, &basic_drv);
-            node.explicitly_requested = true;
-            (vec![node], Vec::new())
+            // r[impl gw.hook.inline-drv-content]
+            // Content-bound fallback: the .drv exists in no store (the
+            // client never uploaded it), so the worker can only execute
+            // this build if the serialized derivation rides along in
+            // the submission. Oversized derivations are rejected with
+            // remediation — there is no other delivery path for them.
+            debug!(
+                error = %e,
+                "full derivation not available, using single-node DAG with inline drv_content"
+            );
+            match translate::build_fallback_node(&drv_path_str, &basic_drv) {
+                Ok(mut node) => {
+                    // Single-node fallback skips reconstruct_dag (which is
+                    // where the BFS root gets flagged), so mark the requested
+                    // target here. Behaviour-neutral for a 1-node submission
+                    // (it is trivially a structural root) but keeps the
+                    // "client named it" marker consistent across opcodes.
+                    node.explicitly_requested = true;
+                    (vec![node], Vec::new())
+                }
+                Err(reason) => {
+                    warn!(
+                        drv_path = %drv_path_str,
+                        reason = %reason,
+                        "rejecting oversized inline single-node fallback"
+                    );
+                    stderr_err!(stderr, "{reason}");
+                }
+            }
         }
     };
 
