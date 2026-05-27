@@ -520,33 +520,53 @@ spec:
               docs/ops/gc-enablement.typ (chunk collector, parse-failure
               abort) for the remediation ladder.
 
-        # No successful collect cycle in >25h (daily backstop + slack).
-        # A capped cycle counts as success -- the cap is the designed
-        # backlog-drain behavior, not a failure. The ok-outcome counter
-        # is pre-registered at 0 at startup so this expression has a
-        # series to evaluate from boot (no absent()).
+        # No successful collect cycle ANYWHERE in >25h (daily backstop +
+        # slack). Cluster-level: sum() across store replicas is required
+        # because each replica arms its own daily backstop and a replica
+        # whose tick skips on a held GC_LOCK_ID (or that simply never
+        # personally wins a cycle) is not a stall -- per-series
+        # evaluation would page on every fresh pod for up to 24h.
+        # `for: 30m` keeps a freshly rolled-out store from firing while
+        # its first cycle (controller gc-cron startup delay + cycle
+        # duration) is still pending. A capped cycle counts as success
+        # -- the cap is the designed backlog-drain behavior, not a
+        # failure. The ok-outcome counter is pre-registered at 0 at
+        # startup so this expression has a series to evaluate from boot
+        # (no absent()); DB-error cycles surface separately under
+        # outcome="error".
         - alert: RioStoreGcCollectStalled
-          expr: increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h]) == 0
-          for: 0m
+          expr: sum(increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h])) == 0
+          for: 30m
           labels:
             severity: warning
           annotations:
             summary: rio-store chunk-collect cycles are not completing
             description: >-
-              No successful chunk-collect cycle in the last 25h (the daily
-              backstop should produce at least one). Either GC and the
-              backstop are not running, every cycle is aborting (check
-              RioStoreGcCollectParseFailure and the store error logs), or
-              cycles are failing against PostgreSQL. See
-              docs/ops/gc-enablement.typ (chunk collector, stalled cycles).
+              No successful chunk-collect cycle on any store replica in the
+              last 25h (the daily backstop should produce at least one).
+              Either GC and the backstop are not running, every cycle is
+              aborting (check RioStoreGcCollectParseFailure and the store
+              error logs), or cycles are failing against PostgreSQL (check
+              the outcome="error" rate of rio_store_gc_collect_cycles_total
+              and the store error logs). See docs/ops/gc-enablement.typ
+              (chunk collector, stalled cycles).
 
         # refcount-formal Wave A1 (collect-soundness assumption, design
         # 4.1): the chunk collector's grace term protects post-snapshot
         # manifests only while no chunk-referencing write transaction
         # outlives the grace window. The chunked-upgrade transaction is
         # the single such transaction; its duration is monitored, not
-        # enforced (no statement_timeout). Warning at grace/2, critical
-        # at grace - 60s. Same alert name, two severities/thresholds.
+        # enforced (no statement_timeout). Same alert name, two
+        # severities: warning = p99 over 15m above grace/2 (the margin
+        # is eroding as a trend); critical = an exact count of committed
+        # transactions over grace - 60s in the window, read straight off
+        # the 240s histogram bucket boundary -- a p99 structurally
+        # tolerates a single overrun once upload volume is non-trivial,
+        # and one overrun is all the falsified model trace needs. The
+        # histogram is recorded only at commit (success path), so a
+        # still-open transaction is invisible to either arm until it
+        # commits; the pg_stat_activity query in the runbook is the only
+        # live view.
         - alert: RioStoreChunkUpgradeTxSlow
           expr: histogram_quantile(0.99, sum by (le) (rate(rio_store_chunk_upgrade_tx_seconds_bucket[15m]))) > 150
           for: 5m
@@ -561,17 +581,18 @@ spec:
               eroding; find long transactions in pg_stat_activity and see
               docs/ops/gc-enablement.typ (slow upgrade transactions).
         - alert: RioStoreChunkUpgradeTxSlow
-          expr: histogram_quantile(0.99, sum by (le) (rate(rio_store_chunk_upgrade_tx_seconds_bucket[15m]))) > 240
+          expr: (sum(increase(rio_store_chunk_upgrade_tx_seconds_bucket{le="+Inf"}[15m])) - sum(increase(rio_store_chunk_upgrade_tx_seconds_bucket{le="240"}[15m]))) > 0
           for: 0m
           labels:
             severity: critical
           annotations:
-            summary: rio-store chunked-upgrade transactions near the collect grace window
+            summary: rio-store chunked-upgrade transaction exceeded grace - 60s
             description: >-
-              p99 upgrade_manifest_to_chunked transaction duration over the
-              last 15m is {{`{{ $value | humanizeDuration }}`}} (above
-              grace - 60s = 240s). A transaction that outlives the grace
-              window can defeat the collector's mark-snapshot protection
-              once the live collect arm is enabled. Investigate immediately;
-              see docs/ops/gc-enablement.typ (slow upgrade transactions).
+              {{`{{ $value | humanize }}`}} committed chunked-upgrade
+              transaction(s) exceeded 240s (grace - 60s) in the last 15m.
+              A transaction that outlives the grace window can defeat the
+              collector's mark-snapshot protection once the live collect
+              arm is enabled. Investigate immediately: find long
+              transactions in pg_stat_activity and see
+              docs/ops/gc-enablement.typ (slow upgrade transactions).
 {{- end }}

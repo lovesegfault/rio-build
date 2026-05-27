@@ -1139,24 +1139,44 @@ monitored assumption**, not as enforcement (plan P4 / sign-off
 item 3):
 
 - `rio_store_chunk_upgrade_tx_seconds` (histogram) measures every
-  `upgrade_manifest_to_chunked` transaction from `begin()` to
-  `commit()` — the single chunk-referencing write transaction in the
-  system. Bucket boundaries are placed at the alert thresholds so the
-  threshold queries are exact.
+  *committed* `upgrade_manifest_to_chunked` transaction from `begin()`
+  to `commit()` — the single chunk-referencing write transaction in
+  the system; the histogram is recorded at commit on the success path,
+  so an aborted upgrade (which commits no manifest and cannot endanger
+  collect soundness) is not recorded. Bucket boundaries are placed at
+  the alert thresholds so the threshold queries are exact.
 - The wired alert `RioStoreChunkUpgradeTxSlow`
   (infra/helm/rio-build/templates/prometheusrule.yaml) fires at
   warning when the p99 over a 15-minute window exceeds `grace/2`
-  (150 s) and at critical above `grace − 60 s` (240 s). This is the
-  runtime carrier of the assumption, in the same sense that the
-  READ-COMMITTED re-evaluation assumption is carried as a named
-  assumption: a firing alert means the soundness margin is eroding
-  and grace (or the upload path) needs attention before the live
-  collect arm is enabled or kept enabled.
+  (150 s), and at critical when at least one committed transaction
+  exceeded `grace − 60 s` (240 s) in the window — an exact
+  per-violation count read off the 240 s histogram bucket (the
+  Wave-A1 review, findings C5/C10, replaced the original p99-form
+  critical arm: a p99 structurally tolerates a single overrun once
+  upload volume is non-trivial, and the chunkCollect
+  writer-overrun falsification shows a single overrun is sufficient
+  once the live arm deletes). This is the runtime carrier of the
+  assumption, in the same sense that the READ-COMMITTED re-evaluation
+  assumption is carried as a named assumption: a firing alert means
+  the soundness margin is eroding (warning) or was within 60 s of
+  violated (critical) and grace (or the upload path) needs attention
+  before the live collect arm is enabled or kept enabled.
+- Residual blind spot, accepted for Phase 1: because the histogram is
+  recorded only at commit, a still-open transaction is invisible to
+  the carrier until the moment it commits — which is exactly when it
+  becomes dangerous. In shadow mode nothing is deleted, so the gap has
+  no harm reach in Phase 1; before the Wave A2 live arm is enabled the
+  campaign owner must either accept the gap explicitly for the live
+  arm or close it with a store-DB long-transaction check
+  (`max(now() − xact_start)` from `pg_stat_activity`) and/or the §4.1
+  collector-side `least(cycle_started_at, min(xact_start))` snapshot
+  anchor. Recorded here so the A2 entry decision sees it.
 - No `statement_timeout` is set in Phase 1 (the
   enforcement-by-timeout option of §4.1): a timeout would add a new
   writer-failure mode for zero observed need, and the histogram is
   exactly the data that would justify a timeout value later if one is
-  wanted.
+  wanted. The carrier change above alters only the monitor's
+  statistic, not this decision.
 - The collector-side alternative — anchoring the collect threshold at
   `least(cycle_started_at, min(xact_start) of transactions open at
   the snapshot)` — is noted as available but not taken (it
@@ -1172,6 +1192,73 @@ and remediation; the histogram is live from the additive release, so
 the Release-A observation window (re-entry gate (a), T-1a.7) also
 produces the empirical upgrade-transaction-duration distribution this
 assumption is judged against.
+
+#### Wave-A1 collector code review — recorded findings and dispositions (T-1a.7 step 3 / plan v5 start-condition item 7)
+
+A three-reviewer adversarial review of the Wave-A1 shadow collector
+(SQL/data, concurrency/lifecycle, operability/tests; 2026-05-27) was
+recorded as the Wave-A2 entry criterion requires, and the confirmed
+findings were fixed (or explicitly adjudicated) in the
+collector-hardening change set before any Wave-A2 task starts. Eleven
+confirmed findings deduplicate to six issues; one further claim was
+refuted during verification; two minors were applied. Dispositions:
+
+- **C1/C11 (blocking) — pinned soft-delete template omitted the grace
+  conjunct.** Fixed: `COLLECT_BATCH_UPDATE_SQL` re-checks
+  `deleted = FALSE AND GREATEST(created_at, last_referenced_at) <
+  cutoff` in its own WHERE with a cutoff bind, the rationalizing
+  comment is gone, and `collect_batch_update_rechecks_collect_predicate`
+  (structural pin + touched-candidate-survives behavior) fails if the
+  conjunct is dropped again. Recorded against the gate-(c) records in
+  T-1a.1b above.
+- **C2 (important) — no single cycle snapshot.** Fixed: the cycle's
+  read phase (cutoff, validation, mark expansion, prepare, shadow
+  report) runs in one REPEATABLE READ transaction, so the drift
+  gauges/would-collect are computed on one MVCC snapshot and the
+  validation→expansion TOCTOU is closed structurally. The
+  separately-reported TOCTOU claim had been downgraded by the
+  reviewers (the fail-closed re-validation inside the expansion's own
+  snapshot already bounded it); the transaction closes it regardless.
+- **C3/C4/C8 (important) — 4GB work_mem / temp-table session leak into
+  the shared pool.** Fixed: `SET LOCAL` for both GUCs and an
+  `ON COMMIT DROP` variant of the expansion CTAS inside the cycle
+  transaction (shared constant untouched for the bench); leak
+  regression tests drain the pool after a completed and a mid-cycle
+  failed cycle.
+- **C5/C10 (important) — collect-soundness carrier was a p99.** Fixed:
+  the critical arm of `RioStoreChunkUpgradeTxSlow` is now the exact
+  over-240 s violation count from the histogram buckets; T-1a.4 above
+  records the carrier change and the accepted commit-time blind spot.
+- **C6 (important) — stalled alert false-fires per pod from boot.**
+  Fixed: `RioStoreGcCollectStalled` aggregates across replicas
+  (`sum(increase(...))`) with `for: 30m`; the helm alert-quality
+  fragment gained a staleness-aggregation bug class so the next
+  zero-activity alert cannot regress this.
+- **C7/C9 (important) — the daily backstop ran the heaviest cycle at
+  every pod boot on every replica.** Fixed for the boot-firing half:
+  the backstop ticker is armed one full interval after spawn
+  (regression test pins it), the cadence is documented in the spawn
+  docs, metric help, and runbook, and cross-replica dedup remains the
+  GC advisory lock. The additional C9 proposal — a persisted
+  cluster-wide recency gate (new `gc_collect_state` table + migration)
+  capping the backstop at one cycle per ~24 h fleet-wide — is
+  **adjudicated not adopted** in this batch: with the boot trigger
+  removed the worst case is one lock-serialized cycle per replica per
+  day (bounded by the autoscaler's replica count), shadow-mode cycles
+  are read-only, and adding write-path schema for a cadence question
+  is not warranted before the A2 lock-budget pricing; if Release-A
+  observation shows the per-replica cadence is still too hot, the
+  recency gate is the named follow-up and belongs with the A2
+  lock-held budget work.
+- **Minors:** DB-error cycles are now visible immediately
+  (`outcome="error"` incremented by both callers, pre-registered,
+  described) instead of only via the 25 h stalled alert; the stalled
+  alert's cluster-wide aggregation (the second minor) is the C6 fix.
+- **Out-of-repo records:** the campaign design record's §4.1/T-1a.4
+  monitored-assumption wording and the phase-1 plan's T-1a.8 step-1
+  soft-delete sketch live outside this repository; aligning them with
+  the amended carrier and the predicate-re-checking soft-delete shape
+  is flagged to the campaign owner rather than edited here.
 
 ## Replacement model (Phase 1a) — `chunkCollect.qnt` (plan T-1a.5)
 

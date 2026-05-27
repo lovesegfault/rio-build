@@ -1,6 +1,6 @@
 # r38 (§process-strike — sibling of 21-control-plane-readiness.sh):
 # every alert in prometheusrule.yaml has shipped with at least one
-# quality bug per round since r37. This check encodes the three
+# quality bug per round since r37. This check encodes the four
 # bug classes found so far so the NEXT alert fails CI on day 1:
 #
 # 1. absent()-polarity: an alert using `absent()` watches a series
@@ -12,6 +12,10 @@
 #    the StuckPending sibling already names this anti-pattern).
 # 3. runbook coverage: every RioNodeclaimPool* alert has a runbook
 #    table row (r38 merged_001 — alert added without one).
+# 4. staleness aggregation: a zero-activity alert
+#    (`increase(...) == 0`) evaluates per series, so it must aggregate
+#    across pods (sum) and carry a non-zero `for:` or it pages on
+#    every fresh pod (Wave-A1 collector review C6).
 #
 # Harness contract (nix/misc-checks.nix `helm-lint` runCommand): the runner
 # already `cd`s into `$TMPDIR/chart` and executes us with `bash -euo pipefail`.
@@ -124,6 +128,55 @@ done < <(yq -N '.spec.groups[].rules[] | select(.alert // "" | test("^RioNodecla
 test "$missing" -eq 0 || exit 1
 test "$n_alerts" -ge 5 || {
   echo "FAIL: expected ≥5 RioNodeclaimPool* alerts, got $n_alerts — assertion vacuous" >&2
+  exit 1
+}
+
+# --- (4) staleness / zero-activity alerts ---
+# An `increase(...) == 0` staleness alert evaluates per series: on a
+# multi-replica component every fresh pod fires it until that pod
+# personally produces an event, and a replica that never wins the
+# deduplicated work (e.g. another replica holds the GC advisory lock)
+# looks stalled forever. Such alerts MUST aggregate across pods
+# (sum(increase(...)) == 0) and carry a non-zero `for:` so a rolling
+# restart does not page (Wave-A1 collector review C6).
+# Positive smoke-test first — guards regex rot, same pattern as §2.
+smoke4=$(printf 'spec:\n  groups:\n  - rules:\n    - alert: Smoke4\n      expr: increase(x_total[25h]) == 0\n' \
+  | yq -N '.spec.groups[].rules[] | select(.expr // "" | test("increase\(.*\)\s*==\s*0")) | .alert')
+test "$smoke4" = "Smoke4" || {
+  echo "FAIL: §4 staleness regex is vacuous — does not match the shape it claims to catch" >&2
+  exit 1
+}
+stale_alerts=$(yq -N \
+  '.spec.groups[].rules[] | select(.expr // "" | test("increase\(.*\)\s*==\s*0")) | .alert' "$mon_on")
+n_stale=0
+stale_bad=0
+while read -r alert; do
+  [ -z "$alert" ] && continue
+  n_stale=$((n_stale + 1))
+  expr=$(yq -N ".spec.groups[].rules[] | select(.alert == \"$alert\" and (.expr // \"\" | test(\"increase\(.*\)\s*==\s*0\"))) | .expr" "$mon_on")
+  for_val=$(yq -N ".spec.groups[].rules[] | select(.alert == \"$alert\" and (.expr // \"\" | test(\"increase\(.*\)\s*==\s*0\"))) | .[\"for\"]" "$mon_on")
+  case "$expr" in
+    sum*) : ;;
+    *)
+      echo "FAIL: staleness alert $alert evaluates per series" \
+           "— aggregate across pods: sum(increase(...)) == 0" >&2
+      stale_bad=$((stale_bad + 1))
+      ;;
+  esac
+  case "$for_val" in
+    0m | 0s | null | "")
+      echo "FAIL: staleness alert $alert needs a non-zero 'for:'" \
+           "so a freshly rolled-out pod does not page" >&2
+      stale_bad=$((stale_bad + 1))
+      ;;
+  esac
+done <<<"$stale_alerts"
+test "$stale_bad" -eq 0 || exit 1
+# Vacuity guard: the collector's stalled alert is the canonical member
+# of this class; if no staleness alert renders, §4 selected nothing.
+test "$n_stale" -ge 1 || {
+  echo "FAIL: expected ≥1 'increase(...) == 0' staleness alert (RioStoreGcCollectStalled)" \
+       "— §4 assertion vacuous" >&2
   exit 1
 }
 

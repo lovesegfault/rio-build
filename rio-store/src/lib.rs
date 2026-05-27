@@ -108,7 +108,11 @@ const GC_COLLECT_CYCLE_BUCKETS: &[f64] = &[
 /// The 150 s and 240 s boundaries are exactly the
 /// RioStoreChunkUpgradeTxSlow alert thresholds (grace/2 and
 /// grace − 60 s — the chunk collector's collect-soundness assumption),
-/// so the alert's bucket arithmetic is exact rather than interpolated.
+/// so the alert's bucket arithmetic is exact rather than interpolated:
+/// the warning arm reads a p99 over these buckets, the critical arm
+/// counts observations above the 240 s boundary directly (an exact
+/// per-violation count, not a quantile). 300 s = grace itself, so an
+/// outright assumption violation is also countable exactly.
 #[cfg(feature = "server")]
 const CHUNK_UPGRADE_TX_BUCKETS: &[f64] = &[
     0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 150.0, 240.0, 300.0,
@@ -301,13 +305,15 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_store_gc_collect_cycles_total",
-        "Chunk-collect cycles by outcome (ok | parse_failure). A cycle that \
-         stops at the per-cycle victim cap counts as ok; staleness of ok \
-         cycles (summed across replicas) drives the RioStoreGcCollectStalled \
-         alert. Cycles run as phase 3 of every GC run and from each \
-         replica's daily backstop timer, which arms one full interval after \
-         boot (pod boot never triggers a cycle) and skips its tick when \
-         another cycle holds the GC advisory lock."
+        "Chunk-collect cycles by outcome (ok | parse_failure | error). A \
+         cycle that stops at the per-cycle victim cap counts as ok; error = \
+         the cycle failed against PostgreSQL (counted by the caller: run_gc \
+         phase 3 or the backstop). Staleness of ok cycles (summed across \
+         replicas) drives the RioStoreGcCollectStalled alert. Cycles run as \
+         phase 3 of every GC run and from each replica's daily backstop \
+         timer, which arms one full interval after boot (pod boot never \
+         triggers a cycle) and skips its tick when another cycle holds the \
+         GC advisory lock."
     );
     describe_counter!(
         "rio_store_gc_collect_parse_failures_total",
@@ -571,12 +577,17 @@ pub fn describe_metrics() {
     metrics::gauge!("rio_store_gc_refcount_drift_undercount").set(0.0);
     metrics::gauge!("rio_store_gc_collect_backlog_chunks").set(0.0);
     // Chunk-collect counters: pre-register at 0 so the staleness alert
-    // (increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h])
-    // == 0) and the parse-failure alert have a series to evaluate from
-    // boot instead of returning empty until the first cycle/failure.
+    // (sum(increase(rio_store_gc_collect_cycles_total{outcome="ok"}[25h]))
+    // == 0, aggregated across replicas with for: 30m) and the
+    // parse-failure alert have a series to evaluate from boot instead
+    // of returning empty until the first cycle/failure. The error
+    // outcome is pre-registered for the same reason: a store whose
+    // every cycle fails against PostgreSQL surfaces immediately instead
+    // of staying invisible until the stalled alert's 25h window.
     metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "ok").absolute(0);
     metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
         .absolute(0);
+    metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error").absolute(0);
     metrics::counter!("rio_store_gc_collect_parse_failures_total").absolute(0);
     metrics::counter!("rio_store_gc_collect_cycles_capped_total").absolute(0);
 }

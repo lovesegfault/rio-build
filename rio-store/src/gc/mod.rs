@@ -327,7 +327,14 @@ pub async fn run_gc(
                 "GC: collect phase 3 (shadow) complete"
             );
         }
-        Err(e) => warn!(error = %e, "GC: collect phase 3 (shadow) failed"),
+        Err(e) => {
+            // Same error-outcome accounting as the backstop caller: a
+            // cycle that fails against PostgreSQL is visible immediately
+            // instead of only via the 25h stalled alert.
+            metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error")
+                .increment(1);
+            warn!(error = %e, "GC: collect phase 3 (shadow) failed");
+        }
     }
 
     // Final progress: complete with stats. paths_scanned echoes the

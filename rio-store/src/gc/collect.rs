@@ -489,6 +489,13 @@ pub(crate) async fn collect_backstop_once(
     });
 
     let result = collect_cycle(pool, grace_secs, CollectMode::Shadow).await;
+    if result.is_err() {
+        // A DB-error cycle would otherwise be invisible to metrics for
+        // up to a full backstop interval (the parse-failure abort
+        // carries its own outcome and is NOT an error here). run_gc
+        // phase 3 counts its own failures, so the outcomes partition.
+        metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "error").increment(1);
+    }
 
     let mut lock_conn = scopeguard::ScopeGuard::into_inner(lock_conn);
     if let Err(e) = sqlx::query("SELECT pg_advisory_unlock($1)")
@@ -1123,6 +1130,55 @@ mod tests {
             .await
             .unwrap();
         assert!(free, "backstop released GC_LOCK_ID");
+        sqlx::query("SELECT pg_advisory_unlock($1)")
+            .bind(super::super::GC_LOCK_ID)
+            .execute(&mut *probe)
+            .await
+            .unwrap();
+    }
+
+    /// A cycle that fails against PostgreSQL is counted by its caller
+    /// under outcome="error" (the parse-failure abort keeps its own
+    /// outcome), so DB-error cycles are visible immediately instead of
+    /// only via the 25h stalled alert.
+    #[tokio::test]
+    async fn backstop_counts_error_outcome() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let rec = CountingRecorder::default();
+        let _g = metrics::set_default_local_recorder(&rec);
+
+        // Force a mid-cycle DB failure: the shadow report reads
+        // `chunks`, so dropping the table fails the cycle after the
+        // mark expansion.
+        sqlx::query("DROP TABLE chunks CASCADE")
+            .execute(&db.pool)
+            .await
+            .expect("drop chunks");
+
+        let result = collect_backstop_once(&db.pool, super::super::sweep::CHUNK_GRACE_SECS).await;
+        assert!(result.is_err(), "the cycle must fail without chunks");
+
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=error}"),
+            1,
+            "a failed cycle is counted under outcome=error"
+        );
+        assert_eq!(rec.get("rio_store_gc_collect_cycles_total{outcome=ok}"), 0);
+        assert_eq!(
+            rec.get("rio_store_gc_collect_cycles_total{outcome=parse_failure}"),
+            0,
+            "a DB error is not a parse failure"
+        );
+
+        // The backstop still released the GC lock on the error path.
+        let mut probe = db.pool.acquire().await.unwrap();
+        let free: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(super::super::GC_LOCK_ID)
+            .fetch_one(&mut *probe)
+            .await
+            .unwrap();
+        assert!(free, "GC_LOCK_ID is released after a failed cycle");
         sqlx::query("SELECT pg_advisory_unlock($1)")
             .bind(super::super::GC_LOCK_ID)
             .execute(&mut *probe)

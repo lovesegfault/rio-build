@@ -91,26 +91,42 @@ or write path), not a one-off.
 
 == Stalled cycles: #(refs.alert)("RioStoreGcCollectStalled") (warning)
 
-No successful collect cycle (a capped cycle counts as success) for more
-than 25 hours --- the daily backstop plus slack. Causes, in rough order
+No successful collect cycle (a capped cycle counts as success) on *any*
+store replica for more than 25 hours --- the daily backstop plus slack.
+The expression is aggregated (`sum`) across replicas: each replica arms
+its own daily backstop and a replica that skips its tick because
+another replica or a GC run holds the GC advisory lock --- or that
+simply never personally wins a cycle --- is expected behaviour, not a
+stall. The 30-minute `for:` keeps a freshly rolled-out store from
+paging while its first cycle is still pending. Causes, in rough order
 of likelihood: the store has not run GC and the backstop task is not
 firing (check store logs for `gc-collect-backstop`), every cycle is
 aborting on a parse failure (the parse-failure alert should also be
-firing), or cycles are erroring against PostgreSQL (check the store
+firing), or cycles are erroring against PostgreSQL (check the
+`outcome="error"` rate of
+#(refs.metric)("rio_store_gc_collect_cycles_total") and the store
 error logs). The collector holds the GC advisory lock for the duration
 of a cycle, so a wedged GC run also blocks backstop cycles.
 
 == Slow upgrade transactions: #(refs.alert)("RioStoreChunkUpgradeTxSlow") (warning / critical)
 
 #(refs.metric)("rio_store_chunk_upgrade_tx_seconds") measures every
-chunked-upgrade transaction (begin to commit) --- the single
+*committed* chunked-upgrade transaction (begin to commit; an aborted
+upgrade commits no manifest and is not recorded) --- the single
 transaction that makes chunks referenced. The collector's soundness
 argument assumes no such transaction outlives the collect grace
 window: a manifest that commits after a cycle's mark snapshot is
 protected by its own upsert touch only if its transaction is shorter
-than grace. The alert fires at warning when the p99 over 15 minutes
-exceeds half the grace window (150 s) and at critical above grace
-minus 60 s (240 s) --- the margin is eroding, not yet gone.
+than grace. The two severities measure different things: *warning*
+fires when the p99 over 15 minutes exceeds half the grace window
+(150 s) --- the margin is eroding as a trend; *critical* fires when at
+least one committed transaction exceeded grace minus 60 s (240 s) in
+the last 15 minutes, counted exactly from the 240 s histogram bucket
+--- the assumption is at the edge of violation regardless of how much
+upload volume surrounds the one slow transaction. A transaction that
+is still open is invisible to the histogram (and to both alert arms)
+until it commits; the `pg_stat_activity` query below is the only live
+view of an in-flight hang.
 
 If it fires: find the long transactions
 (`SELECT now() - xact_start, query FROM pg_stat_activity WHERE state <> 'idle' ORDER BY xact_start LIMIT 10`)
