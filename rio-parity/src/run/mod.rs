@@ -12,6 +12,7 @@
 //! machine once every stage exists.
 
 pub mod artifact;
+pub mod batch;
 pub mod classify;
 pub mod evalset_input;
 pub mod glob;
@@ -21,6 +22,7 @@ pub mod model;
 pub mod plan;
 pub mod spec;
 pub mod state;
+pub mod stderrparse;
 
 use std::path::PathBuf;
 

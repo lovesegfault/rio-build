@@ -2,6 +2,13 @@
 //! outcome × auxiliary flags), plus the per-output NAR comparison verdict
 //! and the headline arithmetic. No I/O, no clocks — everything here is
 //! deterministic and exhaustively testable.
+//!
+//! Precedence rationale: operator skips and evaluation failures are
+//! dispositive on their own, so they are honored before any build evidence
+//! is consulted; infrastructure failures and upstream source rot say
+//! nothing about parity (the build never got a fair attempt), so they are
+//! pulled out before the Hydra-keyed cross product that actually scores
+//! agreement.
 
 use std::collections::BTreeMap;
 
@@ -149,6 +156,9 @@ pub const NAR_NOT_COMPARABLE: &str = "not-comparable";
 
 /// Compare one output: comparable iff both sides have a hash; equality is on
 /// the raw SHA-256 digest (cache.nixos.org NarHash is nixbase32, rio's is hex).
+/// Anything that cannot be compared meaningfully — an upstream hash that is
+/// not SHA-256, or a rio value that is not 64 lowercase hex characters — is
+/// `not-comparable` rather than a false `differs`.
 pub fn compare_output(h: &OutputHashes) -> &'static str {
     let (Some(rio_hex), Some(hydra)) = (&h.rio_hex, &h.hydra_narhash) else {
         return NAR_NOT_COMPARABLE;
@@ -156,6 +166,16 @@ pub fn compare_output(h: &OutputHashes) -> &'static str {
     let Ok(parsed) = rio_nix::hash::NixHash::parse(hydra) else {
         return NAR_NOT_COMPARABLE;
     };
+    if parsed.algo() != rio_nix::hash::HashAlgo::SHA256 {
+        return NAR_NOT_COMPARABLE;
+    }
+    if rio_hex.len() != 64
+        || !rio_hex
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return NAR_NOT_COMPARABLE;
+    }
     if parsed.to_hex().eq_ignore_ascii_case(rio_hex) {
         NAR_EQUAL
     } else {
@@ -165,10 +185,15 @@ pub fn compare_output(h: &OutputHashes) -> &'static str {
 
 /// Job-level verdict: `differs` if any comparable output differs; `equal` if
 /// ≥1 comparable and all match; else `not-comparable`.
-pub fn job_nar_verdict(outputs: &BTreeMap<String, &'static str>) -> &'static str {
-    if outputs.values().any(|v| *v == NAR_DIFFERS) {
+///
+/// Generic over the verdict string type so callers can pass either the
+/// `&'static str` verdicts produced by [`compare_output`] or owned `String`
+/// values reloaded from results.jsonl — either way this function stays the
+/// single source of the any-differs / any-equal rule.
+pub fn job_nar_verdict<S: AsRef<str>>(outputs: &BTreeMap<String, S>) -> &'static str {
+    if outputs.values().any(|v| v.as_ref() == NAR_DIFFERS) {
         NAR_DIFFERS
-    } else if outputs.values().any(|v| *v == NAR_EQUAL) {
+    } else if outputs.values().any(|v| v.as_ref() == NAR_EQUAL) {
         NAR_EQUAL
     } else {
         NAR_NOT_COMPARABLE
@@ -413,37 +438,41 @@ mod tests {
                                     };
                                     grid += 1;
                                     let c = classify(hydra, rio, &aux);
+                                    let ctx = format!("hydra={hydra:?} rio={rio:?} aux={aux:?}");
                                     // Total: as_str never panics, bucket is one of ALL.
-                                    assert!(Bucket::ALL.contains(&c.bucket));
+                                    assert!(Bucket::ALL.contains(&c.bucket), "{ctx}");
                                     // Precedence assertions.
                                     if aux.skipped.is_some() {
-                                        assert_eq!(c.bucket, Bucket::Skipped);
+                                        assert_eq!(c.bucket, Bucket::Skipped, "{ctx}");
                                     } else if aux.eval_error {
-                                        assert_eq!(c.bucket, Bucket::EvalError);
+                                        assert_eq!(c.bucket, Bucket::EvalError, "{ctx}");
                                     } else if aux.plan_not_attemptable {
-                                        assert_eq!(c.bucket, Bucket::NotAttemptable);
+                                        assert_eq!(c.bucket, Bucket::NotAttemptable, "{ctx}");
                                     } else if matches!(rio, RioOutcome::NotAttempted) {
-                                        assert_eq!(c.bucket, Bucket::NotAttempted);
+                                        assert_eq!(c.bucket, Bucket::NotAttempted, "{ctx}");
                                     }
                                     // Headline buckets only ever come from executed builds
                                     // or genuine failures.
                                     if c.bucket == Bucket::MatchBuilt {
-                                        assert!(matches!(
-                                            rio,
-                                            RioOutcome::Built { executed: true }
-                                        ));
+                                        assert!(
+                                            matches!(rio, RioOutcome::Built { executed: true }),
+                                            "{ctx}"
+                                        );
                                     }
                                     // Cascaded is only ever set for dependency failures
                                     // with infra/source-rot roots.
                                     if c.cascaded {
-                                        assert!(matches!(
-                                            rio,
-                                            RioOutcome::DependencyFailed {
-                                                root: RootCauseKind::Infra
-                                                    | RootCauseKind::SourceRot,
-                                                ..
-                                            }
-                                        ));
+                                        assert!(
+                                            matches!(
+                                                rio,
+                                                RioOutcome::DependencyFailed {
+                                                    root: RootCauseKind::Infra
+                                                        | RootCauseKind::SourceRot,
+                                                    ..
+                                                }
+                                            ),
+                                            "{ctx}"
+                                        );
                                     }
                                 }
                             }
@@ -498,6 +527,60 @@ mod tests {
         assert_eq!(job_nar_verdict(&outs), NAR_DIFFERS);
         let empty: BTreeMap<String, &'static str> = BTreeMap::new();
         assert_eq!(job_nar_verdict(&empty), NAR_NOT_COMPARABLE);
+        // Owned-String verdict values (the shape reloaded from results.jsonl)
+        // go through the same single source of the any-differs/any-equal rule.
+        let owned: BTreeMap<String, String> = outs
+            .iter()
+            .map(|(k, v)| (k.clone(), (*v).to_string()))
+            .collect();
+        assert_eq!(job_nar_verdict(&owned), NAR_DIFFERS);
+    }
+
+    /// A hash pair the engine cannot meaningfully compare must come out
+    /// `not-comparable`, never a false `differs`.
+    #[test]
+    fn nar_comparison_guards_against_unusable_hashes() {
+        // 0xab digests so the hex form contains letters (the uppercase case
+        // below must actually differ from the lowercase form).
+        let digest = [0xab_u8; 32];
+        let rio_hex = hex::encode(digest);
+        // Upstream NarHash with a non-SHA-256 algorithm.
+        let sha512 =
+            rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA512, vec![7u8; 64]).unwrap();
+        assert_eq!(
+            compare_output(&OutputHashes {
+                rio_hex: Some(rio_hex.clone()),
+                hydra_narhash: Some(sha512.to_colon()),
+            }),
+            NAR_NOT_COMPARABLE
+        );
+        // Rio-side value that is not a 64-char lowercase hex digest: wrong
+        // length, non-hex characters, or uppercase hex.
+        let sha256 = rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec())
+            .unwrap()
+            .to_colon();
+        for bad in [
+            "0badc0ffee".to_string(),
+            format!("{}zz", &rio_hex[..62]),
+            rio_hex.to_ascii_uppercase(),
+        ] {
+            assert_eq!(
+                compare_output(&OutputHashes {
+                    rio_hex: Some(bad.clone()),
+                    hydra_narhash: Some(sha256.clone()),
+                }),
+                NAR_NOT_COMPARABLE,
+                "rio_hex={bad}"
+            );
+        }
+        // The well-formed pair still compares equal.
+        assert_eq!(
+            compare_output(&OutputHashes {
+                rio_hex: Some(rio_hex),
+                hydra_narhash: Some(sha256),
+            }),
+            NAR_EQUAL
+        );
     }
 
     #[test]

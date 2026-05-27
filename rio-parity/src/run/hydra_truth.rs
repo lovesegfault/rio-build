@@ -201,7 +201,7 @@ pub async fn run_hydra_truth(
         if stats.fetched.is_multiple_of(PROGRESS_LOG_EVERY) {
             tracing::info!(
                 fetched = stats.fetched,
-                total = to_fetch,
+                to_fetch,
                 found = stats.found,
                 not_found = stats.not_found,
                 "hydra-truth sweep progress"

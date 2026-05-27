@@ -831,6 +831,11 @@
       "doc": "Campaign artifact storage (S3 or a local directory) plus state sync."
     },
     {
+      "path": "run/batch.rs",
+      "depth": 1,
+      "doc": "Greedy batch assembly with the dual cap: batches are capped on BOTH job"
+    },
+    {
       "path": "run/classify.rs",
       "depth": 1,
       "doc": "The bucket classifier: ONE pure function over (Hydra outcome × rio"
@@ -874,6 +879,11 @@
       "path": "run/state.rs",
       "depth": 1,
       "doc": "Append-only campaign state on the pod volume."
+    },
+    {
+      "path": "run/stderrparse.rs",
+      "depth": 1,
+      "doc": "Parsing of the `nix build -L` child's stderr: the gateway's"
     },
     {
       "path": "s3.rs",
