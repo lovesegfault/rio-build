@@ -581,13 +581,24 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
 
     reap_orphans(&cfg);
 
+    // Staging dirs that survived the scan (their builder still holds
+    // the live sentinel) keep the projid the PREVIOUS incarnation
+    // assigned them. Start numbering above those so a fresh build's
+    // quota bucket is never shared with a survivor's — sharing would
+    // count the survivor's staged bytes against the new build's limit.
+    let next_projid = list_dir(&cfg.staging_dir)
+        .into_iter()
+        .filter_map(|name| crate::quota::project_id(&cfg.staging_dir.join(name)))
+        .max()
+        .map_or(1, |max| max.saturating_add(1));
+
     let shared = Arc::new(Shared {
         staging_base,
         cache_base,
         chunks_base,
         live_uids: Mutex::new(HashSet::new()),
         live_build_ids: Mutex::new(HashSet::new()),
-        next_projid: AtomicU32::new(1),
+        next_projid: AtomicU32::new(next_projid),
         promote_sem: Arc::new(tokio::sync::Semaphore::new(
             std::thread::available_parallelism().map_or(4, |n| n.get()),
         )),
@@ -713,14 +724,25 @@ fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
     Ok(fd)
 }
 
-/// Reap leftovers from a previous daemon incarnation. No connection can
-/// be live before the listener exists, so everything found here is an
-/// orphan: castore mountpoints (lazily unmounted then removed — only
-/// pre-cutover daemons created these; the current protocol never
-/// mounts host-side, and the dir is optional — a missing path is
-/// skipped via `list_dir`'s empty result), staging trees (removed), and
-/// `.promoting`/`.tmp` placeholders in the shared caches (removed —
-/// their owning copy loop is gone).
+/// Reap leftovers from a previous daemon incarnation: castore
+/// mountpoints (lazily unmounted then removed — only pre-cutover
+/// daemons created these; the current protocol never mounts host-side,
+/// and the dir is optional — a missing path is skipped via `list_dir`'s
+/// empty result), staging trees (removed), and `.promoting`/`.tmp`
+/// placeholders in the shared caches (removed — their owning copy loop
+/// is gone).
+///
+/// "No connection can be live before the listener exists" does NOT mean
+/// every staging tree is an orphan: a daemon restart (force-delete,
+/// upgrade, crash) kills the *connections* but the builds themselves
+/// keep running on the node — the ADR's resilience claim — and their
+/// staging dirs are still in active use by the builder's fill path.
+/// Those dirs hold the builder's [`sweep::LIVE_SENTINEL`] flock, and
+/// the scan skips them (P0560 round 3b finding (c): the restarted
+/// daemon's scan deleted an in-flight build's staging). They are reaped
+/// later, once the holding build exits, by the disk-pressure sweep or
+/// the next restart's scan.
+///
 /// The scan walks the configured *paths* rather than pre-opened base
 /// dirfds: it runs once at startup before any connection exists, so
 /// there is no concurrent attacker to race — the openat-only discipline
@@ -739,6 +761,14 @@ fn reap_orphans(cfg: &MountdConfig) {
     }
     for name in list_dir(&cfg.staging_dir) {
         let path = cfg.staging_dir.join(&name);
+        if sweep::staging_dir_is_live(&path) {
+            info!(
+                staging = %path.display(),
+                "startup scan: staging dir belongs to a still-running build (live \
+                 sentinel held); leaving it alone"
+            );
+            continue;
+        }
         if let Err(e) = std::fs::remove_dir_all(&path) {
             warn!(orphan = %path.display(), error = %e, "could not remove orphan staging dir");
         } else {
@@ -1408,6 +1438,60 @@ mod tests {
             projid: None,
             live_backing_ids: 0,
         }
+    }
+
+    /// The startup orphan scan reaps staging trees and cache
+    /// placeholders left by a previous incarnation, but a staging dir
+    /// whose builder still holds the [`sweep::LIVE_SENTINEL`] flock
+    /// belongs to a build that survived the daemon restart and MUST be
+    /// left alone (P0560 round 3b finding (c)). Once the holder exits
+    /// (lock released) a later scan reaps it like any other orphan.
+    // r[verify builder.mountd.orphan-scan]
+    #[test]
+    fn reap_orphans_spares_flock_held_staging() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared(tmp.path());
+        let cfg = &shared.cfg;
+
+        // A build that outlived the previous daemon: sentinel flock held.
+        let survivor = cfg.staging_dir.join("restart-survivor_drv");
+        std::fs::create_dir_all(&survivor).unwrap();
+        std::fs::write(survivor.join("deadbeef"), b"staged bytes").unwrap();
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(survivor.join(sweep::LIVE_SENTINEL))
+            .unwrap();
+        let held = nix::fcntl::Flock::lock(sentinel, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+
+        // A genuine orphan (crashed build, no flock holder) and a stale
+        // promote placeholder.
+        let orphan = cfg.staging_dir.join("crashed-build_drv");
+        std::fs::create_dir_all(&orphan).unwrap();
+        std::fs::write(orphan.join("leftover"), b"junk").unwrap();
+        let shard = cfg.cache_dir.join("ab");
+        std::fs::create_dir_all(&shard).unwrap();
+        let placeholder = shard.join("cafe.promoting");
+        std::fs::write(&placeholder, b"half a promote").unwrap();
+
+        reap_orphans(cfg);
+        assert!(
+            survivor.join("deadbeef").exists(),
+            "live build's staging must survive the startup scan"
+        );
+        assert!(!orphan.exists(), "unheld staging dir is reaped");
+        assert!(!placeholder.exists(), "stale .promoting is reaped");
+
+        // Builder exits → flock released → the next scan reaps it.
+        drop(held);
+        reap_orphans(cfg);
+        assert!(
+            !survivor.exists(),
+            "released staging dir is reaped by the next scan"
+        );
     }
 
     /// The pure (mode, rdev) predicate behind the Mount fd gate, with

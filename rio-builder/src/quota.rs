@@ -106,6 +106,22 @@ pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
     Ok(Some(dq.dqb_curspace))
 }
 
+/// Project id assigned to `dir`, or `None` when none is (projid 0) or
+/// the filesystem cannot answer (tmpfs, ext4 without prjquota, missing
+/// path). Used by rio-mountd's startup to keep its monotonic projid
+/// counter above the ids still held by staging dirs that survived a
+/// daemon restart.
+pub fn project_id(dir: &Path) -> Option<u32> {
+    let f = File::open(dir).ok()?;
+    let mut x = Fsxattr::default();
+    // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
+    // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
+    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        return None;
+    }
+    (x.fsx_projid != 0).then_some(x.fsx_projid)
+}
+
 /// Assign XFS project `projid` to the directory behind `dirfd` (with
 /// `PROJINHERIT` so children are accounted against it) and set a hard
 /// block limit of `limit_bytes`. `limit_bytes == 0` clears the limit

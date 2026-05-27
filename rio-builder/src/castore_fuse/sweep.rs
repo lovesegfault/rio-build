@@ -62,6 +62,62 @@ pub const HIGH_WATER_PCT: f64 = 20.0;
 /// `.` in build ids, so a tombstone can never collide with a real one.
 const TOMBSTONE_PREFIX: &str = ".sweep-";
 
+/// Liveness sentinel the *builder* creates inside its staging dir right
+/// after `Mount{build_id}` succeeds and holds an exclusive `flock` on
+/// for the build's lifetime (`mount.rs::acquire_staging_live_lock`).
+///
+/// Why it exists: `live_build_ids` only knows about builds whose
+/// connection terminates at THIS daemon incarnation. After a mountd
+/// restart (force-delete, crash, upgrade) the connections died with the
+/// old process, but the builds themselves — the builder pods, their
+/// FUSE mounts, their staging contents — are still running on the node
+/// (the ADR's resilience claim). The startup orphan scan and the
+/// disk-pressure sweep must not treat those dirs as orphans: deleting a
+/// live build's staging makes its next whole-file fill fail at
+/// `create_partial` (ENOENT) and EIO the build (P0560 round 3b finding
+/// (c) — the restarted daemon reaped the in-flight build's staging).
+///
+/// The flock is the liveness signal because the kernel releases it
+/// automatically when the holding process dies, no matter how: a
+/// crashed builder cannot leak an immortal staging dir, and a live one
+/// cannot lose its protection. Outside the build-id namespace (leading
+/// `.`), so it never collides with a staged digest or a tombstone.
+pub(super) const LIVE_SENTINEL: &str = ".rio-live";
+
+/// Whether `dir` belongs to a build that is still alive on this node:
+/// its [`LIVE_SENTINEL`] exists and some process is holding the flock.
+///
+/// `false` for: no sentinel (pre-sentinel daemons, planted/foreign
+/// dirs), an unlockable/irregular sentinel (symlink, FIFO — `O_NOFOLLOW
+/// |O_NONBLOCK` keeps the probe from following or blocking), or a
+/// sentinel whose lock is free (the owning build exited). Probe-only:
+/// the acquired probe lock is dropped immediately.
+pub(super) fn staging_dir_is_live(dir: &Path) -> bool {
+    use std::os::unix::fs::OpenOptionsExt;
+    let sentinel = dir.join(LIVE_SENTINEL);
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_CLOEXEC)
+        .open(&sentinel)
+    {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockSharedNonblock) {
+        // Lock free → nobody owns the build any more → not live.
+        Ok(_probe) => false,
+        // EWOULDBLOCK → the builder still holds its exclusive lock.
+        Err((_, nix::errno::Errno::EWOULDBLOCK)) => true,
+        // Anything else (EINTR, ENOLCK, …): err on the safe side and
+        // treat the dir as live — a skipped orphan costs disk until the
+        // next pass, a deleted live build costs the build.
+        Err((_, e)) => {
+            warn!(sentinel = %sentinel.display(), error = %e, "live-sentinel probe failed; treating staging dir as live");
+            true
+        }
+    }
+}
+
 /// The three mountd-owned roots the sweep watches. They may live on
 /// one filesystem (the production XFS loopback) or on separate
 /// partitions — `min_free_pct` takes the minimum either way.
@@ -360,6 +416,12 @@ fn cache_candidates(root: &Path) -> Vec<Candidate> {
 /// live `build_id`. The liveness check here is only a pre-filter — the
 /// authoritative re-check happens under the lock in
 /// [`remove_staging_orphan`].
+///
+/// "Live" has two sources, either protects: the daemon's own
+/// `live_build_ids` (builds whose connection terminates at THIS daemon
+/// incarnation) and the builder-held [`LIVE_SENTINEL`] flock (builds
+/// that outlived a daemon restart — their connection died with the old
+/// process but the build is still running on the node).
 fn staging_candidates(
     staging: &Path,
     live_build_ids: &Mutex<HashSet<String>>,
@@ -373,7 +435,9 @@ fn staging_candidates(
             if !meta.is_dir() {
                 return None;
             }
-            if !name.starts_with(TOMBSTONE_PREFIX) && live.contains(&name) {
+            if !name.starts_with(TOMBSTONE_PREFIX)
+                && (live.contains(&name) || staging_dir_is_live(&entry.path()))
+            {
                 return None;
             }
             Some((name, meta.modified().unwrap_or(SystemTime::UNIX_EPOCH)))
@@ -662,6 +726,69 @@ mod tests {
         assert!(!tomb_dir.exists(), "old tombstone reaped");
         assert!(promoting.exists(), "in-flight .promoting spared");
         assert!(partial.exists(), ".partial spared");
+    }
+
+    /// A staging dir whose build outlived a daemon restart is not in
+    /// `live_build_ids` (that set died with the old process) — the
+    /// builder-held [`LIVE_SENTINEL`] flock is what keeps the sweep off
+    /// it. Once the holder drops the lock (build exited), the dir is an
+    /// ordinary orphan again.
+    #[test]
+    fn staging_with_held_live_sentinel_is_spared_until_released() {
+        let fx = Fx::new();
+        const KIB: usize = 1024;
+        // NOT inserted into fx.live — simulates a post-restart daemon
+        // that has no connection (and thus no claim) for this build.
+        let survivor = fx.stage_build("restart-survivor", 6 * KIB, 900);
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(survivor.join(LIVE_SENTINEL))
+            .unwrap();
+        let held = nix::fcntl::Flock::lock(sentinel, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+        assert!(staging_dir_is_live(&survivor), "held flock ⇒ live");
+
+        // Make some reapable pressure so the pass actually runs:
+        // 6 KiB (survivor) + 3.5 KiB (filler) on a 10 KiB disk → 5%
+        // free, under the 10% trigger.
+        let filler = fx.put(&fx.dirs.chunks, "filler", 3 * KIB + 512, 100);
+        let stats = fx.sweep(10 * KIB as u64);
+        assert!(stats.triggered);
+        assert!(
+            survivor.exists(),
+            "flock-held staging dir must survive the sweep"
+        );
+        assert!(!filler.exists(), "pressure was relieved elsewhere");
+
+        // Build exits → lock released → next pass (still under
+        // pressure: 6 KiB used on a 6.5 KiB disk) reaps it.
+        drop(held);
+        assert!(!staging_dir_is_live(&survivor), "released flock ⇒ orphan");
+        let stats = fx.sweep(6 * KIB as u64 + 512);
+        assert!(stats.triggered);
+        assert!(
+            !survivor.exists(),
+            "released staging dir is reaped on the next pass"
+        );
+    }
+
+    /// `staging_dir_is_live` edge cases: missing sentinel and a symlink
+    /// planted as the sentinel are both "not live".
+    #[test]
+    fn staging_dir_is_live_rejects_missing_and_symlink_sentinels() {
+        let fx = Fx::new();
+        let plain = fx.stage_build("no-sentinel", 16, 100);
+        assert!(!staging_dir_is_live(&plain), "no sentinel ⇒ not live");
+
+        let tricky = fx.stage_build("symlink-sentinel", 16, 100);
+        std::os::unix::fs::symlink("/etc/hostname", tricky.join(LIVE_SENTINEL)).unwrap();
+        assert!(
+            !staging_dir_is_live(&tricky),
+            "symlink sentinel must not be followed"
+        );
     }
 
     /// The cache-tier candidate filter, exercised by a pass that

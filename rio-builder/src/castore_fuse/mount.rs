@@ -253,6 +253,13 @@ pub(super) struct PreparedMount {
     pub(super) client: MountdClient,
     pub(super) fuse_fd: std::os::fd::OwnedFd,
     pub(super) staging_quota_bytes: u64,
+    /// Held flock on `staging/{build_id}/.rio-live` — the liveness
+    /// signal that keeps a *restarted* mountd's orphan scan and
+    /// disk-pressure sweep off this build's staging dir (the daemon
+    /// that created the dir dies with its connections; the build does
+    /// not). `None` when the sentinel could not be created (best-effort
+    /// — e.g. a fixture without a real staging dir).
+    pub(super) staging_live_lock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
 /// Steps (1) and (2): DAG prefetch, opening `/dev/fuse`, and the mountd
@@ -323,6 +330,18 @@ pub(super) fn prepare_mount(
             source,
         })?;
 
+    // The staging dir now exists (the daemon just created it, owned by
+    // this uid). Plant the liveness sentinel and hold its flock for the
+    // mount's lifetime so a RESTARTED daemon — whose `live_build_ids`
+    // and connections start empty — can tell this dir apart from a
+    // crashed build's leftovers (its startup orphan scan and the
+    // disk-pressure sweep skip flock-held dirs). The kernel drops the
+    // lock with this process, so a crashed builder cannot leak an
+    // unreapable dir. Best-effort: a build without the sentinel just
+    // loses staging protection across daemon restarts (the pre-sentinel
+    // status quo), which is not worth failing the mount over.
+    let staging_live_lock = acquire_staging_live_lock(&opts.staging_root.join(build_id));
+
     // ── Assemble the filesystem that will serve the fd.
     let open_path = OpenPath::new(
         opts.cache_dir.clone(),
@@ -345,7 +364,47 @@ pub(super) fn prepare_mount(
         client,
         fuse_fd,
         staging_quota_bytes,
+        staging_live_lock,
     })
+}
+
+/// Create `staging/{build_id}/.rio-live` ([`sweep::LIVE_SENTINEL`]) and
+/// take the exclusive flock that marks this build's staging dir as
+/// in-use to any *future* mountd incarnation. Returns `None` (with a
+/// warning) when the sentinel cannot be created or locked — protection
+/// is then simply absent, matching pre-sentinel behavior.
+fn acquire_staging_live_lock(staging_dir: &Path) -> Option<nix::fcntl::Flock<std::fs::File>> {
+    let sentinel = staging_dir.join(super::sweep::LIVE_SENTINEL);
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&sentinel)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            tracing::warn!(
+                sentinel = %sentinel.display(),
+                error = %e,
+                "could not create the staging live sentinel; this build's staging dir is \
+                 not protected across a mountd restart"
+            );
+            return None;
+        }
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(lock) => Some(lock),
+        Err((_, e)) => {
+            tracing::warn!(
+                sentinel = %sentinel.display(),
+                error = %e,
+                "could not flock the staging live sentinel; this build's staging dir is \
+                 not protected across a mountd restart"
+            );
+            None
+        }
+    }
 }
 
 /// Mount and serve the per-build castore FUSE. Returns only once the
@@ -385,6 +444,7 @@ fn serve_prepared(
         client,
         fuse_fd,
         staging_quota_bytes,
+        staging_live_lock,
     } = prepared;
 
     std::fs::create_dir_all(mount_point).map_err(|source| CastoreMountError::MountPoint {
@@ -473,6 +533,7 @@ fn serve_prepared(
         client: Some(client),
         abort_path,
         staging_quota_bytes,
+        staging_live_lock,
         torn_down: false,
     })
 }
@@ -501,6 +562,11 @@ pub struct CastoreMount {
     /// behind the very requests an abort exists to flush).
     abort_path: Option<PathBuf>,
     staging_quota_bytes: u64,
+    /// Held flock on the staging live sentinel (see
+    /// [`acquire_staging_live_lock`]). Released at teardown so the
+    /// daemon-side reapers may reclaim the dir; until then a restarted
+    /// mountd's orphan scan / sweep leaves this build's staging alone.
+    staging_live_lock: Option<nix::fcntl::Flock<std::fs::File>>,
     torn_down: bool,
 }
 
@@ -555,6 +621,12 @@ impl CastoreMount {
         // streaming-fill thread also hold clones, so the daemon-side
         // reap is prompt but not synchronous with this line.
         drop(self.client.take());
+        // Release the staging liveness flock alongside the connection:
+        // whichever reaper gets to the dir (this daemon's conn-teardown,
+        // a restarted daemon's scan, the disk-pressure sweep) must no
+        // longer see the build as live. flock removal does not block
+        // deletion, so ordering vs the daemon's reap is not load-bearing.
+        drop(self.staging_live_lock.take());
 
         // 3. Abort the FUSE connection. Pending kernel-side requests get
         // ECONNABORTED and the fuser worker threads' next read returns
