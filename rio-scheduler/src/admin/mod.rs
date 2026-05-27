@@ -564,7 +564,10 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<ListPoisonedResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         // r[impl sched.sla.threat.read-path-auth]
-        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-parity", "rio-cli", "rio-dashboard"],
+        )?;
         self.ensure_leader()?;
         // DB is the source of truth for poisoned_at (the in-memory DAG
         // reconstructs Instant from elapsed_secs at startup but doesn't
@@ -644,7 +647,10 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<GetBuildGraphResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         // r[impl sched.sla.threat.read-path-auth]
-        self.ensure_service_caller(request.metadata(), &["rio-cli", "rio-dashboard"])?;
+        self.ensure_service_caller(
+            request.metadata(),
+            &["rio-parity", "rio-cli", "rio-dashboard"],
+        )?;
         self.ensure_leader()?;
         let req = request.into_inner();
         let db = crate::db::SchedulerDb::new(self.pool.clone());
@@ -669,7 +675,7 @@ impl AdminService for AdminServiceImpl {
         // dashboard/CLI hold plain data.
         self.ensure_service_caller(
             request.metadata(),
-            &["rio-controller", "rio-dashboard", "rio-cli"],
+            &["rio-controller", "rio-dashboard", "rio-cli", "rio-parity"],
         )?;
         self.ensure_leader()?;
         self.check_actor_alive()?;

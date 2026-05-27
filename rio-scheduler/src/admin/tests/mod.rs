@@ -766,6 +766,26 @@ async fn service_token_allowlist_enforced() {
         .await
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // parity+cli+dashboard read allowlist
+    // (`["rio-parity","rio-cli","rio-dashboard"]`). GetBuildGraph reads
+    // PG directly: an unknown build_id under the (default-leader) test
+    // state yields an empty graph, so Ok proves the rio-parity caller
+    // got PAST the gate (cf. admin_cancel_build_gated_on_service_token's
+    // reaches-the-actor pattern); a builder identity is still rejected
+    // at the gate.
+    let gb = GetBuildGraphRequest {
+        build_id: Uuid::new_v4().to_string(),
+    };
+    svc.get_build_graph(req_with_token(&signer, "rio-parity", gb.clone()))
+        .await
+        .expect("rio-parity allowed on GetBuildGraph");
+    let err = svc
+        .get_build_graph(req_with_token(&signer, "rio-builder", gb))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    assert!(err.message().contains("allowlist"));
 }
 
 /// `AdminService.CancelBuild` is service-token gated. Builders share
