@@ -11,6 +11,7 @@ use crate::state::{BuildState, BuildStateExt, DerivationStatus};
 
 mod assignments;
 mod batch;
+mod builder_nodes;
 mod builds;
 mod closure;
 mod derivations;

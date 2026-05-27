@@ -556,11 +556,12 @@ async fn ack_bound_intents_populates_authoritative_binding() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor_hw(db.pool.clone());
     assert!(actor.authoritative_binding.is_empty());
+    assert!(actor.binding_by_executor.is_empty());
 
-    let bi = |id: &str, node: &str| BoundIntent {
+    let bi = |id: &str, node: &str, pod: &str| BoundIntent {
         intent_id: id.into(),
         node_name: node.into(),
-        pod_name: String::new(),
+        pod_name: pod.into(),
     };
     let abc = crate::state::DrvHash::from("abc123");
     let def = crate::state::DrvHash::from("def456");
@@ -571,8 +572,11 @@ async fn ack_bound_intents_populates_authoritative_binding() {
         &[],
         &[],
         &[
-            bi("abc123", "ip-10-0-1-5.ec2.internal"),
-            bi("def456", "ip-10-0-1-6.ec2.internal"),
+            bi("abc123", "ip-10-0-1-5.ec2.internal", "rb-abc123-x1"),
+            // Pre-P0590 controller shape: no pod_name. Must still feed
+            // the intent-keyed map but stay OUT of the executor-keyed
+            // one (an empty key would shadow nothing useful).
+            bi("def456", "ip-10-0-1-6.ec2.internal", ""),
         ],
     );
 
@@ -584,6 +588,16 @@ async fn ack_bound_intents_populates_authoritative_binding() {
         Some("ip-10-0-1-5.ec2.internal")
     );
     assert_eq!(actor.authoritative_binding.len(), 2);
+    // §P0590 executor-keyed companion view: keyed by pod_name, entries
+    // with an empty pod_name filtered out.
+    assert_eq!(actor.binding_by_executor.len(), 1);
+    assert_eq!(
+        actor
+            .binding_by_executor
+            .get("rb-abc123-x1")
+            .map(String::as_str),
+        Some("ip-10-0-1-5.ec2.internal")
+    );
     // DAG empty in bare_actor_hw → tenant captured as None on first Ack.
     assert!(
         actor
@@ -596,21 +610,32 @@ async fn ack_bound_intents_populates_authoritative_binding() {
 
     // Wholesale-rebuild: second Ack omitting `def456` → that entry
     // dropped (the Ack IS the authoritative snapshot; deleted pods
-    // disappear from the controller's `PodRequestedCache`).
+    // disappear from the controller's `PodRequestedCache`). The
+    // executor-keyed view rebuilds from the same snapshot: the retried
+    // pod's new name replaces the old one.
     actor.handle_ack_spawned_intents(
         &[],
         &[],
         &[],
         &[],
-        &[bi("abc123", "ip-10-0-1-5.ec2.internal")],
+        &[bi("abc123", "ip-10-0-1-5.ec2.internal", "rb-abc123-x2")],
     );
     assert_eq!(actor.authoritative_binding.len(), 1);
     assert!(!actor.authoritative_binding.contains_key(&def));
     assert!(actor.authoritative_binding.contains_key(&abc));
+    assert_eq!(actor.binding_by_executor.len(), 1);
+    assert!(!actor.binding_by_executor.contains_key("rb-abc123-x1"));
+    assert_eq!(
+        actor
+            .binding_by_executor
+            .get("rb-abc123-x2")
+            .map(String::as_str),
+        Some("ip-10-0-1-5.ec2.internal")
+    );
 
     // Empty `bound_intents` = "this Ack carries no binding snapshot"
     // (per-pool reconciler at pool/jobs.rs sends `vec![]`; the
-    // nodeclaim_pool reconciler owns the stream) → map unchanged.
+    // nodeclaim_pool reconciler owns the stream) → both maps unchanged.
     actor.handle_ack_spawned_intents(&[], &[], &[], &[], &[]);
     assert_eq!(
         actor.authoritative_binding.len(),
@@ -618,6 +643,11 @@ async fn ack_bound_intents_populates_authoritative_binding() {
         "empty bound_intents must be a no-op (per-pool ack), not a wipe"
     );
     assert!(actor.authoritative_binding.contains_key(&abc));
+    assert_eq!(
+        actor.binding_by_executor.len(),
+        1,
+        "empty bound_intents must not wipe the executor-keyed view either"
+    );
 }
 
 /// `observe_instance_types` is gated on the shared `cost_was_leader`
