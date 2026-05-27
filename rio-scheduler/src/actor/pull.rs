@@ -605,6 +605,51 @@ impl DagActor {
             }
             ReportAdmission::Process => {
                 let executor_id = ExecutorId::from(attempt.executor_id.as_str());
+                // r[impl sched.attempt.synthesized-verdict]
+                // AD5 abort charge class: a pull-mode pod reporting
+                // `Cancelled` for a derivation the scheduler still
+                // wants is the SIGTERM-abort report (preemption,
+                // scale-down, controller delete) — a platform
+                // termination, not a worker fault. It closes the
+                // attempt charge-free and requeues at this fold; it is
+                // never charged as an infrastructure failure. A
+                // genuinely-cancelled (no-longer-wanted) derivation
+                // falls through to the completion path's Cancelled
+                // early-return and stays exactly as the cancel arm
+                // leaves it (no row, no requeue).
+                let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+                let abort_of_still_wanted = attempt.dispatch_mode == "pull"
+                    && payload.result.status() == rio_proto::types::BuildResultStatus::Cancelled
+                    && self.dag.node(&drv_hash).is_some_and(|s| {
+                        matches!(
+                            s.status(),
+                            DerivationStatus::Assigned | DerivationStatus::Running
+                        ) && s.exec_id == Some(exec_id)
+                    });
+                if abort_of_still_wanted {
+                    info!(
+                        %exec_id,
+                        drv_hash = %attempt.drv_hash,
+                        "pull-mode SIGTERM-abort report for still-wanted work: closing the \
+                         attempt charge-free and requeueing (AD5)"
+                    );
+                    // AD2c: node attribution comes from the
+                    // controller-authoritative binding only — never the
+                    // worker-supplied report fields.
+                    let source_node = self.pull_attempt_source_node(&drv_hash);
+                    self.close_pull_attempt_uncharged(
+                        attempt.derivation_id,
+                        exec_id,
+                        &drv_hash,
+                        &executor_id,
+                        "worker_abort",
+                        crate::state::ReportingParty::Worker,
+                        source_node,
+                        "worker-abort",
+                    )
+                    .await;
+                    return Ok(());
+                }
                 // Same internal entry point as the stream Completion
                 // arm — classification, verdict, attempt-row append,
                 // status persist, realisations, SLA samples all happen
@@ -623,6 +668,116 @@ impl DagActor {
                 .await;
                 Ok(())
             }
+        }
+    }
+
+    /// Close one open pull-mode attempt charge-free (the AD5 abort /
+    /// synthesized-verdict closure): append exactly one uncharged
+    /// terminal row (`disconnected`, `termination_reason` filled — the
+    /// fold treats it as a no-charge event and the open-attempt view
+    /// drops it) and close the assignment row in ONE transaction
+    /// carrying the same claims-floor fence as the pull mint and the
+    /// establishment sweep, then mirror the row in memory and requeue
+    /// the derivation if this attempt was still the in-flight one.
+    /// Idempotent: a row already present for the exec (any classifier
+    /// won first) makes the append a no-op and nothing else changes.
+    // r[impl sched.attempt.synthesized-verdict]
+    #[allow(clippy::too_many_arguments)]
+    async fn close_pull_attempt_uncharged(
+        &mut self,
+        derivation_id: Uuid,
+        exec_id: Uuid,
+        drv_hash: &DrvHash,
+        executor_id: &ExecutorId,
+        termination_reason: &str,
+        reporting_party: crate::state::ReportingParty,
+        source_node: Option<String>,
+        requeue_cause: &'static str,
+    ) {
+        if !self.leader.is_leader() {
+            return;
+        }
+        let serving_generation = self.leader.generation() as i64;
+        let mut row = crate::db::attempts::AttemptRow::new(
+            derivation_id,
+            crate::state::OutcomeClass::Disconnected,
+            reporting_party,
+        );
+        row.exec_id = Some(exec_id);
+        row.executor_id = Some(executor_id.clone());
+        row.source_node = source_node;
+        row.termination_reason = Some(termination_reason.to_owned());
+        if let Some(state) = self.dag.node(drv_hash) {
+            row.resubmit_cycle = i32::try_from(state.retry.resubmit_cycles).unwrap_or(i32::MAX);
+        }
+        let result: Result<Option<bool>, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            // The same generation fence the pull mint and the
+            // establishment sweep apply: a below-floor serving
+            // generation writes nothing.
+            let floor: Option<i64> = sqlx::query_scalar(
+                "SELECT GREATEST( \
+                     (SELECT MAX(generation) FROM assignments), \
+                     (SELECT MAX(generation) FROM leader_generation_claims))",
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+            if floor.is_some_and(|f| serving_generation < f) {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
+            sqlx::query(
+                "UPDATE assignments SET status = 'failed', completed_at = now() \
+                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
+            )
+            .bind(exec_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(inserted))
+        }
+        .await;
+        let inserted = match result {
+            Ok(Some(inserted)) => inserted,
+            Ok(None) => {
+                info!(drv_hash = %drv_hash, serving_generation,
+                      "uncharged close: serving generation below the claims floor; nothing written");
+                return;
+            }
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, %exec_id, error = %e,
+                      "uncharged close failed; the attempt stays open (the establishment \
+                       sweep remains the backstop)");
+                return;
+            }
+        };
+        if !inserted {
+            // Another classifier won the row; its verdict stands.
+            return;
+        }
+        if let Some(state) = self.dag.node_mut(drv_hash) {
+            state.push_attempt_record(row.to_record());
+        }
+        self.refresh_retry_view(drv_hash);
+        // OA1 interval: the closing observation and the requeue happen
+        // in this same actor turn, so the recorded latency is the
+        // in-turn processing time (the same shape as the worker-report
+        // cause).
+        metrics::histogram!(
+            "rio_scheduler_attempt_requeue_seconds",
+            "cause" => requeue_cause
+        )
+        .record((crate::db::attempts::epoch_now() - row.occurred_at_epoch_secs).max(0.0));
+        let still_in_flight = self.dag.node(drv_hash).is_some_and(|s| {
+            matches!(
+                s.status(),
+                DerivationStatus::Assigned | DerivationStatus::Running
+            ) && s.exec_id == Some(exec_id)
+        });
+        if still_in_flight {
+            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
+                .await;
         }
     }
 }
@@ -853,15 +1008,55 @@ impl DagActor {
         }
 
         // Open attempt with no classification row yet (pulled, never
-        // worker-reported, pod now terminal): nothing is filled and
-        // nothing is inserted at this slice — the establishment sweep
-        // (deadline + report-slack) remains the classification vehicle
-        // until the controller-side re-point lands. Acknowledged.
+        // worker-reported, pod now terminal). The split:
+        //
+        //   - Controller-synthesized verdicts (cancelled / preempted /
+        //     reaped — the AD5/C5/C6 synthesize-on-delete and
+        //     DisruptionTarget arms) classify HERE: the controller is
+        //     deleting (or has deleted) the Job, so no other observer
+        //     will ever report this attempt; the close is charge-free
+        //     and the still-wanted derivation requeues at this fold,
+        //     never at the establishment sweep.
+        //   - Pod-terminal reasons without a worker row (OOM, eviction,
+        //     deadline, plain error) keep waiting: the establishment
+        //     sweep stays their classifier (the 1b gate text), because
+        //     the worker's own classifying report may still arrive.
+        // r[impl sched.attempt.synthesized-verdict]
+        use rio_proto::types::AttemptTerminalReason as R;
+        if attempt.assignment_active && matches!(reason, R::Cancelled | R::Preempted | R::Reaped) {
+            let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+            let executor_id = ExecutorId::from(attempt.executor_id.as_str());
+            // AD2c: prefer the controller-reported node from this very
+            // report, fall back to the spawn-ack binding; never a
+            // worker-supplied value.
+            let source_node = node_name
+                .clone()
+                .or_else(|| self.pull_attempt_source_node(&drv_hash));
+            info!(
+                %exec_id,
+                drv_hash = %attempt.drv_hash,
+                ?reason,
+                "controller-synthesized verdict for an open pull attempt: closing charge-free"
+            );
+            self.close_pull_attempt_uncharged(
+                attempt.derivation_id,
+                exec_id,
+                &drv_hash,
+                &executor_id,
+                label,
+                crate::state::ReportingParty::Controller,
+                source_node,
+                "synthesized",
+            )
+            .await;
+            return Ok(());
+        }
         debug!(
             %exec_id,
             drv_hash = %attempt.drv_hash,
             ?reason,
-            "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill target)"
+            "ReportAttemptOutcome for an unclassified open attempt acknowledged (no fill \
+             target; the establishment sweep remains its classifier)"
         );
         Ok(())
     }

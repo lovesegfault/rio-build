@@ -2393,7 +2393,12 @@ go review reopens them).
   bump, no establishment); permitted side effects of the no-attempt
   arm: clear the intent's ICE cell, re-arm the spawn intent. The
   controller synthesizes this report whenever it deletes a Job that
-  still has an open attempt (cancel/preempt/reap).
+  still has an open attempt (cancel/preempt/reap), and a synthesized
+  cancelled/preempted/reaped verdict for an open attempt with no
+  worker-reported row closes that attempt charge-free at the same
+  fold (uncharged terminal row, assignment closed, still-wanted drv
+  requeued — never left to the establishment sweep), per AD5 and
+  `sched.attempt.synthesized-verdict` (review fix P1, 2026-05-27).
 
 #### The frozen invariant list (what the replacement must preserve)
 

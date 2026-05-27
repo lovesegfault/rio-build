@@ -23,7 +23,6 @@ use super::SchedulerDb;
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub(crate) struct AttemptByExecRow {
     /// The DAG key (`derivations.derivation_id`).
-    #[allow(dead_code)]
     pub derivation_id: Uuid,
     /// `derivations.drv_hash` — the intent id / DAG key string.
     pub drv_hash: String,

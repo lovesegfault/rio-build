@@ -201,6 +201,55 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.attempt.synthesized-verdict]
+/// (f) An attempt closed charge-free by a controller-synthesized verdict
+/// is never re-established: the sweep adds no executor_crash row and no
+/// charge for that exec, even far past the window.
+#[tokio::test]
+async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "est-f", PriorityClass::Scheduled).await?;
+    let assignment = pull_deliver(&handle, "est-f").await;
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // The controller synthesizes Preempted for the open attempt (the
+    // AD5/C6 successor): closed charge-free, requeued at that fold.
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: Some("est-f".into()),
+                job_name: None,
+                exec_id: None,
+            },
+            reason: rio_proto::types::AttemptTerminalReason::Preempted,
+            node_name: Some("node-est-f".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+        .expect("synthesized report acked");
+    let rows = attempt_rows_for(&db.pool, "est-f").await;
+    assert_eq!(rows.len(), 1, "the synthesized close wrote one row");
+    assert_eq!(rows[0].outcome_class, OutcomeClass::Disconnected.as_str());
+
+    // Even far past any window the sweep establishes nothing further.
+    backdate_assignment(&db.pool, exec_id).await?;
+    tick(&handle).await?;
+    let rows = attempt_rows_for(&db.pool, "est-f").await;
+    assert_eq!(
+        rows.len(),
+        1,
+        "no executor_crash establishment lands on a synthesized-closed attempt"
+    );
+    assert_eq!(rows[0].outcome_class, OutcomeClass::Disconnected.as_str());
+    let info = expect_drv(&handle, "est-f").await;
+    assert_eq!(
+        info.retry.failure_count, 0,
+        "still uncharged after the sweep"
+    );
+    Ok(())
+}
+
 // r[verify sched.attempt.establishment-window]
 /// (e) Mixed fleet: an active assignment+execution pair written exactly
 /// as the as-built stream dispatch writes them, past any window, is

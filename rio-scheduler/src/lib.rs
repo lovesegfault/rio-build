@@ -575,7 +575,12 @@ pub fn describe_metrics() {
          the in-turn processing latency). cause=pod-terminal: disconnect \
          observation → the controller's classifying termination report \
          consumed. cause=establishment: disconnect observation → the \
-         TTL-sweep establishment fill. In stream mode the requeue itself \
+         TTL-sweep establishment fill. cause=synthesized: a \
+         controller-synthesized cancelled/preempted/reaped verdict closed \
+         an open pull attempt charge-free (in-turn latency, AD5). \
+         cause=worker-abort: the builder's SIGTERM-abort report closed a \
+         still-wanted pull attempt charge-free (in-turn latency, AD5). \
+         In stream mode the requeue itself \
          happens at the disconnect, so the pod-terminal/establishment \
          samples measure how long the released attempt waited for its \
          classification — the controller-report-slack input the \

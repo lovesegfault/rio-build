@@ -789,6 +789,263 @@ async fn attempt_outcome_ignores_stream_attempts() -> TestResult {
     Ok(())
 }
 
+// ─── AD5 synthesized verdicts and the SIGTERM-abort charge class ─────────
+
+/// (outcome_class, termination_reason, reporting_party, source_node) of
+/// every drv_attempts row for one exec_id.
+async fn exec_charge_facts(
+    pool: &sqlx::PgPool,
+    exec_id: uuid::Uuid,
+) -> Vec<(String, Option<String>, String, Option<String>)> {
+    sqlx::query_as(
+        "SELECT outcome_class, termination_reason, reporting_party, source_node \
+         FROM drv_attempts WHERE exec_id = $1 ORDER BY recorded_at",
+    )
+    .bind(exec_id)
+    .fetch_all(pool)
+    .await
+    .expect("exec charge facts")
+}
+
+// r[verify sched.attempt.synthesized-verdict]
+/// A controller-synthesized Preempted verdict (intent-keyed, no exec_id
+/// — the disruption-watcher shape) for an open, never-worker-reported
+/// pull attempt closes it charge-free at this fold: exactly one
+/// uncharged terminal row, the assignment closed, the drv requeued, no
+/// budget or exclusion consumed — and a duplicate appends nothing.
+#[tokio::test]
+async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "syn-a", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "syn-a", Some("syn-a")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("syn-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::Preempted,
+    )
+    .await
+    .expect("synthesized preempted report acked");
+
+    let facts = exec_charge_facts(&db.pool, exec_id).await;
+    assert_eq!(facts.len(), 1, "exactly one terminal row for the exec");
+    let (class, reason, party, source_node) = &facts[0];
+    assert_eq!(class, "disconnected", "the close is the uncharged class");
+    assert_eq!(reason.as_deref(), Some("preempted"));
+    assert_eq!(party, "controller");
+    assert_eq!(
+        source_node.as_deref(),
+        Some("node-9"),
+        "the synthesized close carries the controller-reported node"
+    );
+    assert_eq!(
+        assignment_status_of(&db.pool, "syn-a").await,
+        vec!["failed"],
+        "the assignment row is closed in the same transaction"
+    );
+    let info = expect_drv(&handle, "syn-a").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the still-wanted drv requeues at this fold, not the establishment sweep"
+    );
+    assert_eq!(info.retry.failure_count, 0, "charge-free (no budget)");
+    assert!(
+        info.retry.failed_builders.is_empty(),
+        "charge-free (no exclusion entry)"
+    );
+
+    // A duplicate synthesized report resolves as attempt-terminal and
+    // appends nothing.
+    report_attempt_outcome(
+        &handle,
+        Some("syn-a"),
+        None,
+        rio_proto::types::AttemptTerminalReason::Preempted,
+    )
+    .await
+    .expect("duplicate acked");
+    assert_eq!(exec_charge_facts(&db.pool, exec_id).await.len(), 1);
+    Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict]
+/// The same close keyed by exec_id with reason Reaped (the
+/// synthesize-on-delete shape used by the controller's reap arms).
+#[tokio::test]
+async fn attempt_outcome_synthesized_reaped_by_exec_id_closes_uncharged() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "syn-b", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "syn-b", Some("syn-b")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        None,
+        Some(exec_id),
+        rio_proto::types::AttemptTerminalReason::Reaped,
+    )
+    .await
+    .expect("synthesized reaped report acked");
+
+    let facts = exec_charge_facts(&db.pool, exec_id).await;
+    assert_eq!(facts.len(), 1);
+    assert_eq!(facts[0].0, "disconnected");
+    assert_eq!(facts[0].1.as_deref(), Some("reaped"));
+    let info = expect_drv(&handle, "syn-b").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Ready);
+    assert_eq!(info.retry.failure_count, 0, "charge-free");
+    assert!(info.retry.failed_builders.is_empty());
+    Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict]
+/// Pod-terminal reasons that are NOT controller-synthesized verdicts
+/// (OOM, eviction, deadline, plain error) keep the as-built behavior on
+/// an unclassified open attempt: acknowledged, nothing written — the
+/// establishment sweep stays their classifier.
+#[tokio::test]
+async fn attempt_outcome_pod_terminal_reason_still_waits_for_establishment() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "syn-c", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "syn-c", Some("syn-c")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report_attempt_outcome(
+        &handle,
+        Some("syn-c"),
+        None,
+        rio_proto::types::AttemptTerminalReason::OomKilled,
+    )
+    .await
+    .expect("pod-terminal report acked");
+
+    assert!(
+        exec_charge_facts(&db.pool, exec_id).await.is_empty(),
+        "no row is written for a pod-terminal reason without a worker classification"
+    );
+    let info = expect_drv(&handle, "syn-c").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Running,
+        "the attempt stays open for the establishment sweep"
+    );
+    Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict]
+/// The builder's AD5 SIGTERM-abort report (`BuildResultStatus::Cancelled`
+/// on a still-wanted derivation) resolves the pull attempt charge-free
+/// and requeues it — never an infrastructure-failure charge.
+#[tokio::test]
+async fn report_outcome_worker_abort_still_wanted_closes_uncharged() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let _ev = merge_single_node(&handle, Uuid::new_v4(), "syn-d", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "syn-d", Some("syn-d")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    report(
+        &handle,
+        exec_id,
+        Some("syn-d"),
+        rio_proto::types::BuildResultStatus::Cancelled,
+        None,
+    )
+    .await
+    .expect("abort report acked");
+
+    let facts = exec_charge_facts(&db.pool, exec_id).await;
+    assert_eq!(facts.len(), 1, "exactly one terminal row for the abort");
+    let (class, reason, party, _node) = &facts[0];
+    assert_eq!(
+        class, "disconnected",
+        "the abort of still-wanted work is uncharged, never infra"
+    );
+    assert_eq!(reason.as_deref(), Some("worker_abort"));
+    assert_eq!(party, "worker");
+    let info = expect_drv(&handle, "syn-d").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Ready,
+        "the aborted still-wanted drv requeues at this fold"
+    );
+    assert_eq!(info.retry.failure_count, 0, "no budget consumed");
+    assert_eq!(info.retry.infra_count, 0, "no infra budget consumed");
+    assert!(info.retry.failed_builders.is_empty(), "no exclusion entry");
+    assert_eq!(
+        assignment_status_of(&db.pool, "syn-d").await,
+        vec!["failed"],
+        "the assignment row is closed"
+    );
+
+    // Duplicate abort report: terminal row wins, nothing more is written.
+    report(
+        &handle,
+        exec_id,
+        Some("syn-d"),
+        rio_proto::types::BuildResultStatus::Cancelled,
+        None,
+    )
+    .await
+    .expect("duplicate abort acked");
+    assert_eq!(exec_charge_facts(&db.pool, exec_id).await.len(), 1);
+    Ok(())
+}
+
+// r[verify sched.attempt.synthesized-verdict]
+/// A genuinely-cancelled (no-longer-wanted) derivation keeps the cancel
+/// arm's exact shape: the worker's abort report after CancelBuild writes
+/// nothing, charges nothing, and the drv stays Cancelled (never
+/// requeued).
+#[tokio::test]
+async fn report_outcome_abort_after_cancel_build_stays_cancelled_and_uncharged() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let build_id = Uuid::new_v4();
+    let _ev = merge_single_node(&handle, build_id, "syn-e", PriorityClass::Scheduled).await?;
+    let assignment = expect_deliver(pull(&handle, "syn-e", Some("syn-e")).await);
+    let exec_id: uuid::Uuid = assignment.exec_id.parse()?;
+
+    // Scheduler-side cancel verdict (the genuine cancel arm).
+    let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: reply_tx,
+        })
+        .await?;
+    assert!(reply_rx.await??, "CancelBuild succeeds");
+    let info = expect_drv(&handle, "syn-e").await;
+    assert_eq!(info.status, crate::state::DerivationStatus::Cancelled);
+
+    // The pod's SIGTERM-abort report arrives after the cancel.
+    report(
+        &handle,
+        exec_id,
+        Some("syn-e"),
+        rio_proto::types::BuildResultStatus::Cancelled,
+        None,
+    )
+    .await
+    .expect("abort report acked");
+
+    assert!(
+        exec_charge_facts(&db.pool, exec_id).await.is_empty(),
+        "a cancelled drv's abort report writes nothing (the cancel arm shape)"
+    );
+    let info = expect_drv(&handle, "syn-e").await;
+    assert_eq!(
+        info.status,
+        crate::state::DerivationStatus::Cancelled,
+        "the no-longer-wanted drv is never requeued"
+    );
+    assert_eq!(info.retry.failure_count, 0);
+    Ok(())
+}
+
 // ─── AD2 scheduler half: source-keyed exclusion (T-1b.1) ────────────────
 
 /// `source_node` of every drv_attempts row for one drv hash, in append

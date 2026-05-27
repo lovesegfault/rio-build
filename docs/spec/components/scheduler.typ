@@ -2502,6 +2502,30 @@ This carries forward the as-built rule that never-assigned/assigned-only pod
 deaths never count (the `recently_disconnected` no-entry no-op arms), re-keyed
 onto the durable open-attempt view.
 
+#r("sched.attempt.synthesized-verdict")[
+  A controller-synthesized terminal report (reason cancelled, preempted, or
+  reaped) for an open pull-mode attempt that has no worker-reported
+  classification row MUST close that attempt charge-free in one
+  generation-fenced appending transaction --- exactly one uncharged terminal
+  row whose `termination_reason` carries the synthesized reason, with the
+  assignment row closed --- and MUST requeue a still-wanted derivation at
+  that fold, never at the establishment sweep. A worker `ReportOutcome`
+  whose result is `Cancelled` for a still-wanted open pull-mode attempt (the
+  AD5 SIGTERM-abort report) MUST resolve the same way: charge-free closure
+  and requeue, never an infrastructure-failure charge. Neither path may
+  requeue a derivation that is no longer wanted, and other pod-terminal
+  reasons without a worker classification remain the establishment sweep's
+  to classify.
+]
+The synthesized-verdict close is the scheduler half of the AD5/C5/C6
+successor (`ctrl.job.synthesize-on-delete`, `ctrl.drain.disruption-target`):
+the controller's deletion destroys the only pod-terminal status the unified
+report could otherwise fold, so the synthesized report itself must carry the
+closure. Pod-initiated aborts of still-wanted work are platform terminations
+(preemption, scale-down, controller deletes), not worker faults --- charging
+them as infrastructure failures would burn the infra budget on disruptions
+the design accepts as charge-free.
+
 #r("sched.attempt.establishment-window")[
   The establishment sweep MUST visit every open pull-mode attempt
   (`dispatch_mode = 'pull'`, no terminal classification) on every sweep, and
