@@ -28,7 +28,7 @@ impl SchedulerDb {
         sqlx::query_as(
             r#"
             SELECT build_id, tenant_id, status, priority_class,
-                   keep_going, options_json,
+                   keep_going, force_build_roots, options_json,
                    total_drvs, completed_drvs, cached_drvs,
                    EXTRACT(EPOCH FROM (now() - submitted_at))::float8
                        AS submitted_age_secs
@@ -340,19 +340,21 @@ impl SchedulerDb {
         .await
     }
 
-    /// Load (build_id, derivation_id) links for a set of builds.
+    /// Load (build_id, derivation_id, is_root) links for a set of builds.
     /// `recover_from_pg` uses this to rebuild `interested_builds`
-    /// on each DerivationState and `derivation_hashes` on BuildInfo.
+    /// on each DerivationState and `derivation_hashes` on BuildInfo;
+    /// `is_root` (migration 062) re-derives `BuildInfo::root_hashes` so
+    /// the force-build substitution gates survive failover.
     pub(crate) async fn load_build_derivations(
         &self,
         build_ids: &[Uuid],
-    ) -> Result<Vec<(Uuid, Uuid)>, sqlx::Error> {
+    ) -> Result<Vec<(Uuid, Uuid, bool)>, sqlx::Error> {
         if build_ids.is_empty() {
             return Ok(Vec::new());
         }
         sqlx::query_as(
             r#"
-            SELECT build_id, derivation_id FROM build_derivations
+            SELECT build_id, derivation_id, is_root FROM build_derivations
             WHERE build_id = ANY($1)
             "#,
         )

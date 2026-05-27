@@ -188,6 +188,10 @@ pub(crate) struct RecoveryBuildRow {
     pub status: String,
     pub priority_class: String,
     pub keep_going: bool,
+    /// `r[sched.merge.force-build-roots]`: per-build force-build flag
+    /// (migration 062). Recovery re-stamps `BuildInfo::force_build_roots`
+    /// from this so the substitution gates survive failover.
+    pub force_build_roots: bool,
     pub options_json: Option<sqlx::types::Json<crate::state::BuildOptions>>,
     /// I-111: denormalized counts (migration 030). Recovery seeds the
     /// in-memory `BuildInfo` from these — the DB is authoritative since

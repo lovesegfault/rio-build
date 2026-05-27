@@ -79,7 +79,7 @@ pub(super) struct MergeReconcile {
 }
 
 /// Submission roots: nodes that appear as no edge's child. Edges key by
-/// `drv_path` (proto-level), so collect child paths and filter.
+/// `drv_path`, so collect child paths and filter.
 ///
 /// THE single root definition — `validate_and_ingest` maps it to the
 /// `submission_roots` hash set (force-build gates +
@@ -366,8 +366,9 @@ impl DagActor {
         // definition check_roots_topdown consumes). Used by the
         // force-build gates (r[sched.merge.force-build-roots]) and
         // persisted as build_derivations.is_root. Computed BEFORE the
-        // top-down prune so gate 1 can consult it; pruning only drops
-        // deps, never roots, so the set is identical either way.
+        // top-down prune so `topdown_blocked` can consult it; pruning
+        // only drops deps, never roots, so the set is identical either
+        // way.
         let submission_roots: HashSet<DrvHash> = submission_root_nodes(&nodes, &edges)
             .into_iter()
             .map(|n| DrvHash::from(n.drv_hash.as_str()))
@@ -588,8 +589,11 @@ impl DagActor {
         // exclude (a) THIS submission's roots when it is force-build and
         // (b) any node that is a live force-build build's root (a later
         // non-force submission re-probing it must not substitute it).
-        // Locally-present roots still short-circuit to Completed via
-        // cached_hits.
+        // By this step the build is already in `self.builds` and the DAG,
+        // so for a force-build submission both arms agree — the explicit
+        // request-local arm (a) keeps the gate independent of that step
+        // ordering. Locally-present roots still short-circuit to
+        // Completed via cached_hits.
         let pending_substitute: Vec<(DrvHash, Vec<String>)> = pending_substitute
             .into_iter()
             .filter(|(h, _)| {
@@ -1819,7 +1823,9 @@ impl DagActor {
             // r[impl sched.merge.force-build-roots]
             // Force-build roots are never re-fetched from upstream even
             // when their vanished output is substitutable — push to the
-            // ready queue and let dispatch (gate 3) route them to a builder.
+            // ready queue and let the dispatch-time probes
+            // (`batch_probe_cached_ready` / `ready_check_or_spawn`)
+            // route them to a builder.
             if !self.is_force_build_root(&drv_hash_k)
                 && output_paths.iter().all(|p| {
                     !missing.contains(p.as_str())

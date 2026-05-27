@@ -54,12 +54,17 @@ use crate::state::{DerivationState, verifiable_wanted_paths};
 struct RecoveryLoad {
     build_rows: Vec<RecoveryBuildRow>,
     build_ids: Vec<Uuid>,
-    /// Flat (build_id, derivation_id) link rows. `restore_builds` only
-    /// needs the per-build hash sets (`build_drv_hashes` below);
-    /// `finalize_recovered_builds` needs the raw rows again to count
-    /// per-build links for the orphan guard.
-    bd_rows: Vec<(Uuid, Uuid)>,
+    /// Flat (build_id, derivation_id, is_root) link rows. `restore_builds`
+    /// only needs the per-build hash sets (`build_drv_hashes` /
+    /// `build_root_hashes` below); `finalize_recovered_builds` needs the
+    /// raw rows again to count per-build links for the orphan guard.
+    bd_rows: Vec<(Uuid, Uuid, bool)>,
     build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
+    /// Per-build submission-root hash sets (rows with
+    /// `build_derivations.is_root = TRUE`). `restore_builds` re-derives
+    /// `BuildInfo::root_hashes` from this so the force-build substitution
+    /// gates (`is_force_build_root`) survive failover.
+    build_root_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     /// Recovered parents with ≥1 `poisoned`/`dependency_failed`/
     /// `cancelled` child in PG that a live co-owning build vouches
     /// for. `seed_ready_queue` short-circuits these to
@@ -143,6 +148,7 @@ impl DagActor {
             build_ids,
             bd_rows,
             build_drv_hashes,
+            build_root_hashes,
             failed_dep_parents,
         } = self.load_dag_from_rows().await?;
 
@@ -155,7 +161,7 @@ impl DagActor {
         // before the 24h TTL). r[sched.recovery.log-buffer-sweep+2]
         self.sweep_stale_log_buffers();
 
-        self.restore_builds(build_rows, &build_ids, build_drv_hashes)
+        self.restore_builds(build_rows, &build_ids, build_drv_hashes, build_root_hashes)
             .await?;
 
         // --- Fetch PG generation high-water mark (caller seeds) ---
@@ -515,9 +521,12 @@ impl DagActor {
 
         // --- Load build_derivations + rebuild interested_builds ---
         let bd_rows = self.db.load_build_derivations(&build_ids).await?;
-        // Also accumulate derivation_hashes per build (for BuildInfo).
+        // Also accumulate derivation_hashes per build (for BuildInfo) and
+        // the per-build submission-root sets (rows with is_root = TRUE)
+        // from which restore_builds re-derives BuildInfo::root_hashes.
         let mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>> = HashMap::new();
-        for (build_id, drv_id) in &bd_rows {
+        let mut build_root_hashes: HashMap<Uuid, HashSet<DrvHash>> = HashMap::new();
+        for (build_id, drv_id, is_root) in &bd_rows {
             let Some(hash) = id_to_hash.get(drv_id) else {
                 // Derivation is success-terminal (Completed) OR in a
                 // terminal state we don't load (Cancelled,
@@ -547,6 +556,12 @@ impl DagActor {
                 .entry(*build_id)
                 .or_default()
                 .insert(hash.clone());
+            if *is_root {
+                build_root_hashes
+                    .entry(*build_id)
+                    .or_default()
+                    .insert(hash.clone());
+            }
         }
 
         Ok(RecoveryLoad {
@@ -554,6 +569,7 @@ impl DagActor {
             build_ids,
             bd_rows,
             build_drv_hashes,
+            build_root_hashes,
             failed_dep_parents,
         })
     }
@@ -621,12 +637,15 @@ impl DagActor {
     /// from the loaded rows. `submitted_at` is reconstructed from PG's
     /// `now() - submitted_at` (so `r[sched.timeout.per-build]` survives
     /// failover); total/completed/cached counts are seeded from PG
-    /// denorm columns (I-111).
+    /// denorm columns (I-111); the force-build substitution-gate inputs
+    /// (`force_build_roots`, `root_hashes`) are re-derived from
+    /// `builds.force_build_roots` + `build_derivations.is_root`.
     async fn restore_builds(
         &mut self,
         build_rows: Vec<RecoveryBuildRow>,
         build_ids: &[Uuid],
         mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
+        mut build_root_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     ) -> Result<(), ActorError> {
         // --- Build BuildInfo + broadcast channels ---
         for row in build_rows {
@@ -665,6 +684,12 @@ impl DagActor {
                 options,
                 hashes,
             );
+            // r[impl sched.merge.force-build-roots]
+            // Re-derive the force-build sticky-OR inputs after failover:
+            // per-build flag from builds.force_build_roots, per-build root
+            // set from build_derivations.is_root.
+            info.force_build_roots = row.force_build_roots;
+            info.root_hashes = build_root_hashes.remove(&row.build_id).unwrap_or_default();
             info.total_count = row.total_drvs as u32;
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
@@ -926,7 +951,7 @@ impl DagActor {
     /// `persist_merge_to_db` leaves an Active build with ZERO
     /// `build_derivations` rows; this skips it (orphan guard) so it
     /// doesn't emit a spurious BuildCompleted with empty outputs.
-    async fn finalize_recovered_builds(&mut self, bd_rows: &[(Uuid, Uuid)]) {
+    async fn finalize_recovered_builds(&mut self, bd_rows: &[(Uuid, Uuid, bool)]) {
         // --- Check for all-complete builds ---
         // A crash between "last drv → Completed" and "build →
         // Succeeded" leaves the build Active in PG with all its
@@ -948,7 +973,7 @@ impl DagActor {
         // out in load_nonterminal_derivations. bd_rows is the flat
         // list from PG; count per-build to distinguish.
         let mut bd_counts: HashMap<Uuid, usize> = HashMap::new();
-        for (build_id, _) in bd_rows {
+        for (build_id, _, _) in bd_rows {
             *bd_counts.entry(*build_id).or_insert(0) += 1;
         }
 
