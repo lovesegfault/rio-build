@@ -795,16 +795,21 @@ snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
   be served from a per-`drv_hash` cache for at most
   `assignment_revocation.cache_ttl_secs` (default 10 s); a `drv_hash` with no
   `derivations` row MUST be treated as non-terminal (the check only narrows
-  access, never widens it). JWT-authenticated callers and the digest-keyed
-  `GetChunks` surface are not affected.
+  access, never widens it). If the status probe itself fails (Postgres error),
+  the store MAY allow the call --- the check is best-effort and only narrows
+  access. JWT-authenticated callers and the digest-keyed `GetChunks` surface
+  are not affected.
 ]
 
 This bounds a leaked assignment token's useful life to roughly its build's own
 runtime regardless of `expiry_unix` (#rref("common.hmac.expiry-cap")): once the
 scheduler records a terminal status, the token stops working as a castore read
-credential within one cache TTL. The predicate is deliberately permissive
-(terminal-state only, no executor-match): a presumed-dead worker finishing an
-upload after re-dispatch is tolerated today and uploads are not gated here.
+credential within one cache TTL --- provided the status probe is healthy (a
+probe that errors fails open, per the rule above). The predicate is
+deliberately permissive (terminal-state only, no executor-match): a
+presumed-dead worker finishing an upload after re-dispatch is tolerated today,
+uploads are not gated here, and a resubmit that returns the derivation to a
+non-terminal status re-enables previously minted, still-unexpired tokens.
 The status lives in the shared Postgres the store already queries on every
 castore read, so the probe is one indexed lookup amortized by the cache;
 `GetChunks` stays digest-keyed and pays nothing.
