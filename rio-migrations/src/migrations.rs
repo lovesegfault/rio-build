@@ -1392,6 +1392,44 @@ pub const M_068: () = ();
 /// is deliberate, not a missing file.
 pub const M_070: () = ();
 
+/// `migrations/073_attempt_source_node.sql`
+///
+/// Three additive columns for the executor-lifecycle campaign's
+/// pull-mode dispatch (Phase 1, Wave 1a): `drv_attempts.source_node`,
+/// `drv_executions.source_node`, and `drv_executions.dispatch_mode`.
+///
+/// **`source_node` (both tables, nullable, no backfill, no index):**
+/// AD2c durable source attribution. The retry exclusion set re-keys
+/// from executor/pod identity to the node the pod ran on, and the key
+/// must be the *controller-authoritative* pod→node binding (the
+/// `AckSpawnedIntents.bound_intents` informer data, or the controller's
+/// `ReportAttemptOutcome.node_name`), persisted so the re-keyed
+/// exclusion survives leader failover per `sched.retry.failover-budget`.
+/// The in-memory `authoritative_binding` map is explicitly NOT the
+/// home — it dies with the leader. Worker-supplied node identity is
+/// not accepted as the writer (the hung-node detector's threat model).
+/// Nullable because the binding is only known once the controller has
+/// reported it; no decision input requires a backfill. No index: the
+/// exclusion fold reads recent rows per derivation via the existing
+/// derivation/exec_id indexes — revisit only with EXPLAIN evidence.
+///
+/// **`dispatch_mode` (`drv_executions`, NOT NULL DEFAULT 'stream',
+/// CHECK IN ('stream','pull')):** the pull/stream coexistence
+/// discriminator. Only the pull transaction writes `'pull'`; the
+/// as-built stream dispatch path is never modified and relies on the
+/// default. Every pull-only consumer (the establishment sweep, the
+/// open-attempt view behind `ListOpenAttempts`, the controller's
+/// synthesize-on-delete arm, the open-attempts gauge) filters on this
+/// column — `source_node IS NOT NULL` is NOT the discriminator,
+/// because it is only populated when known for pull attempts and would
+/// fail unsafe by dropping pull attempts from the sweep/busy view.
+///
+/// **Numbering:** 069/070 are claimed by the refcount campaign
+/// (Release B / post-rollout drop); the gap is deliberate, not missing
+/// files. 072 stays reserved for this campaign as the open-attempt-view
+/// escape hatch and is unused unless that view needs an extra column.
+pub const M_073: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql
