@@ -2015,7 +2015,7 @@ impl DagActor {
                     // in `handle_merge_dag` and the both-bits batched
                     // mark clear it runs for Vouched parents.
                     closure_hole: false,
-                    // r[impl sched.recovery.inline-drv-durability]
+                    // r[impl sched.recovery.inline-drv-durability+2]
                     // Persist the authoritative inline derivation
                     // (content-bound hook fallback: these bytes are
                     // the only copy anywhere) so post-failover

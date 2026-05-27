@@ -148,7 +148,7 @@ impl SchedulerService for SchedulerGrpc {
                 rio_common::limits::MAX_DRV_CONTENT_BYTES,
             )?;
         }
-        // r[impl sched.recovery.inline-drv-durability]
+        // r[impl sched.recovery.inline-drv-durability+2]
         // Authoritative inline derivations are persisted and rebuilt
         // verbatim after a failover, so the scheduler must not take the
         // submitter's word for them (workers and direct submitters are
@@ -464,12 +464,14 @@ impl SchedulerService for SchedulerGrpc {
 /// shape and bind the bytes to the node's claimed identity:
 ///
 /// - single-node submission (the hook fallback is never part of a DAG);
-/// - the bytes parse as a derivation whose platform and output names
-///   match the node's `system` / `output_names`;
-/// - every output is content-bound — fixed-output (declared hash, whose
+/// - the bytes parse as a derivation whose platform, output names,
+///   fixed-output flag, and content-addressed flag match the node's
+///   `system` / `output_names` / `is_fixed_output` / `is_content_addressed`;
+/// - exactly one `expected_output_paths` entry per output, and every
+///   output is content-bound — fixed-output (declared hash, whose
 ///   recomputed store path must equal both the path declared inside the
-///   ATerm and the node's `expected_output_paths` entry) or floating-CA
-///   (no declared path, empty expected path);
+///   ATerm and the node's `expected_output_paths` entry, which MUST be
+///   declared) or floating-CA (no declared path, empty expected path);
 /// - plain input-addressed outputs are rejected outright (the gateway
 ///   refuses inline IA derivations, and an IA-shaped authoritative blob
 ///   is exactly the poisoning shape this check exists to stop);
@@ -535,6 +537,26 @@ fn validate_authoritative_drv_content(
             "node.is_fixed_output does not match the authoritative drv_content",
         ));
     }
+    // The merge-time conflict gate (sched.merge.authoritative-conflict)
+    // compares is_content_addressed and the per-output expected paths, so
+    // both must be BOUND to the bytes here — otherwise a squatter could
+    // freely choose the very fields a later victim submission is compared
+    // against. The legitimate producer (the gateway's content-bound hook
+    // fallback) always sends the derived flag and exactly one entry per
+    // output, so nothing legitimate is rejected.
+    if node.is_content_addressed != drv.is_content_addressed() {
+        return Err(Status::invalid_argument(
+            "node.is_content_addressed does not match the authoritative drv_content",
+        ));
+    }
+    if node.expected_output_paths.len() != node.output_names.len() {
+        return Err(Status::invalid_argument(format!(
+            "authoritative submissions must declare exactly one expected_output_paths entry per \
+             output: got {} entries for {} outputs",
+            node.expected_output_paths.len(),
+            node.output_names.len()
+        )));
+    }
 
     let expected: std::collections::HashMap<&str, &str> = node
         .output_names
@@ -592,15 +614,27 @@ fn validate_authoritative_drv_content(
                     derived.as_str()
                 )));
             }
-            if let Some(exp) = expected.get(name)
-                && !exp.is_empty()
-                && *exp != derived.as_str()
-            {
-                return Err(Status::invalid_argument(format!(
-                    "node.expected_output_paths['{name}'] = {exp} does not match the \
-                     fixed-output path {} derived from the authoritative drv_content",
-                    derived.as_str()
-                )));
+            match expected.get(name) {
+                Some(exp) if !exp.is_empty() => {
+                    if *exp != derived.as_str() {
+                        return Err(Status::invalid_argument(format!(
+                            "node.expected_output_paths['{name}'] = {exp} does not match the \
+                             fixed-output path {} derived from the authoritative drv_content",
+                            derived.as_str()
+                        )));
+                    }
+                }
+                // The entry MUST be present and non-empty: the merge gate
+                // uses fixed-output path agreement as content evidence, so
+                // an undeclared path would leave the persisted identity
+                // unbound to the bytes.
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "node.expected_output_paths['{name}'] must declare the fixed-output \
+                         path {} derived from the authoritative drv_content",
+                        derived.as_str()
+                    )));
+                }
             }
         } else if !algo.is_empty() {
             // Floating-CA output: no static path exists yet anywhere.

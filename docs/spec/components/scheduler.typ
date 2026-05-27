@@ -1563,7 +1563,7 @@ tables) during state recovery.
   partially-loaded DAG from issuing assignments.
 ]
 
-#r("sched.recovery.inline-drv-durability")[
+#r("sched.recovery.inline-drv-durability+2")[
   A `DerivationNode` submitted with authoritative inline derivation content
   (`drv_content_authoritative`, the content-bound hook fallback) MUST have
   those bytes persisted with the derivation row at merge time and restored
@@ -1571,7 +1571,9 @@ tables) during state recovery.
   the same content. Before persisting, `SubmitBuild` ingress MUST validate
   the claim: a single-node submission whose bytes parse as a content-bound
   derivation consistent with the node's declared system, output names,
-  fixed-output paths, and `ca_modular_hash` --- submitters are untrusted,
+  fixed-output flag, content-addressed flag, expected output paths (exactly
+  one entry per output: the hash-derived path for a fixed output, empty for
+  a floating output), and `ca_modular_hash` --- submitters are untrusted,
   and unvalidated authoritative bytes would let one tenant poison the
   persisted content rebuilt under another derivation's identity after a
   failover. The persisted bytes are dispatch payload only --- they MUST
@@ -1602,26 +1604,47 @@ cannot drift, no migration is needed, and a row whose bytes fail to parse
 degrades to an unset hash (the build still completes; only realisation
 registration is lost, with a warning).
 
-#r("sched.merge.authoritative-conflict")[
+#r("sched.merge.authoritative-conflict+2")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
   `drv_hash`: a submission that itself claims authoritative content MUST be
   rejected unless its bytes are identical to the existing node's, and a
-  store-backed (non-authoritative) submission whose verifiable identity
-  (system, output names, fixed-output flag, content-addressed flag, declared
-  expected output paths) conflicts with the existing node MUST be rejected
-  while that node is non-terminal and MUST displace it as a fresh node ---
-  without inheriting the old node's interest --- once it is terminal. Both
-  rejections surface as `FAILED_PRECONDITION`.
+  store-backed (non-authoritative) submission MUST only join the node when
+  its verifiable identity matches --- the public attributes (system, output
+  names, fixed-output flag, content-addressed flag, declared expected
+  output paths) AND at least one piece of content-bound evidence: agreement
+  on a non-empty fixed-output expected path, or a byte-equal CA modular
+  hash. A store-backed submission whose identity conflicts --- or that
+  carries no content-bound evidence --- MUST be rejected while the node is
+  non-terminal and MUST displace it as a fresh node --- without inheriting
+  the old node's interest --- once it is terminal. Displacement MUST
+  refresh the persisted recovery row to the displacing submission's
+  verifiable identity with its status reset to the creation snapshot, and
+  MUST remove the displaced node from prior interested builds' completion
+  accounting. Both rejections surface as `FAILED_PRECONDITION`.
 ]
 The byte-equality arm makes the legitimate producer's behaviour (identical
 hook-fallback resubmissions) a no-op while closing the cross-tenant
 pre-squat: a predictable `drv_path` cannot be claimed with attacker bytes
 and then silently joined by --- or built on behalf of --- the victim's
-submission. `ca_modular_hash` is deliberately not part of the
-verifiable-identity comparison: the basic-form hash of a hook fallback
-legitimately differs from the full-form hash of the same derivation once its
-`inputDrvs` closure is known.
+submission. Public attributes alone are copyable from the victim's public
+derivation, and floating-CA expected paths are empty by construction, so a
+match must additionally rest on content the submitter cannot fake: a
+fixed-output expected path commits to the declared output hash (and ingress
+binds it to the authoritative bytes), and the CA modular hash is recomputed
+from the bytes at ingress, so agreement means byte-level knowledge of the
+same derivation (forging it requires a SHA-256 preimage). Identical content
+still joins: the hook receives an already-resolved derivation --- CppNix
+resolves CA derivations before hook dispatch (the building goal asserts
+`inputDrvs` is empty) --- so the fallback's modular hash equals the
+full-form hash a store-backed submission of the same derivation computes.
+The gate is evaluated against the existing node in every lifecycle state
+(before any resubmit-reset is applied), and terminal includes a
+poison-budget-exhausted node, so a squat cannot dodge the rule by parking
+in a retriable or poisoned state. Displaced interest is not carried;
+instead the displaced hash stops counting toward prior interested builds
+(they keep any results already received), so those builds neither hang nor
+get silently re-pointed at a definition they never submitted.
 
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from
@@ -1635,6 +1658,21 @@ upsert stays last-write-wins, but the only writers are creations, so an
 in-flight node's recovery row can no longer be overwritten --- or its
 authoritative inline content cleared --- by a submission that did not create
 it.
+
+#r("sched.persist.recreate-refresh")[
+  A submission that (re)creates a derivation's in-memory node MUST refresh
+  the persisted row's full creation-time snapshot --- declared identity
+  (pname, system, required features), output names, expected output paths,
+  content flags, inline content, and status --- and MUST NOT touch the
+  row's live accumulator columns (poison timestamps, failed builders, retry
+  and resubmit counters, resource floors), which have their own writers.
+]
+Same `drv_hash` no longer implies same content: a displacing submission
+(#rref("sched.merge.authoritative-conflict")) carries a different verifiable
+identity, and without the snapshot refresh a leader failover would rebuild
+the node from the displaced squatter's identity, silently undoing the
+displacement. Reap-then-resubmit and crash-retry re-creations get the same
+refresh for free.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

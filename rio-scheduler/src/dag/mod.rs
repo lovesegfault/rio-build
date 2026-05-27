@@ -45,10 +45,12 @@ pub enum DagError {
     AuthoritativeContentMismatch { drv_path: String },
     /// A store-backed (non-authoritative) submission's verifiable identity
     /// (system, output names, fixed-output flag, content-addressed flag,
-    /// declared expected output paths) conflicts with an in-flight node
-    /// that carries authoritative inline content. Joining would attribute
-    /// that in-flight build's results to a derivation that provably
-    /// differs. Maps to `FAILED_PRECONDITION`; once the conflicting node
+    /// declared expected output paths, plus content-bound evidence — a
+    /// shared fixed-output path or a matching CA modular hash) conflicts
+    /// with an in-flight node that carries authoritative inline content.
+    /// Joining would attribute that in-flight build's results to a
+    /// derivation that either provably differs or cannot be shown to be
+    /// the same. Maps to `FAILED_PRECONDITION`; once the conflicting node
     /// is terminal the verifiable definition displaces it instead.
     #[error(
         "in-flight derivation {drv_path} carries authoritative inline content \
@@ -60,13 +62,26 @@ pub enum DagError {
 /// `sched.merge.authoritative-conflict` cross-check: does the submission's
 /// verifiable identity agree with an existing authoritative node?
 ///
-/// Compared: `system`, output names (order-insensitive), the fixed-output
-/// flag, the content-addressed flag, and expected output paths for output
-/// names where BOTH sides declare one (an empty path carries no
-/// information — floating-CA outputs declare `""`). `ca_modular_hash` is
-/// deliberately NOT compared: the basic-form hash of a hook fallback
-/// legitimately differs from the full-form hash of the same derivation
-/// once its `inputDrvs` closure is known.
+/// Public attributes are compared first: `system`, output names
+/// (order-insensitive), the fixed-output flag, the content-addressed flag,
+/// and expected output paths for output names where BOTH sides declare one
+/// (an empty path carries no information — floating-CA outputs declare
+/// `""`). Public attributes alone are never sufficient — they are copyable
+/// from the victim's public derivation — so a match additionally requires
+/// at least one piece of CONTENT-BOUND evidence:
+///
+///   - fixed-output: at least one output whose expected path is non-empty
+///     on both sides and equal (the path commits to the declared output
+///     hash, and ingress binds it to the authoritative bytes), or
+///   - floating-CA: a byte-equal `ca_modular_hash` on both sides (forging
+///     it requires a SHA-256 preimage). The hook fallback is built from an
+///     already-RESOLVED derivation (no `inputDrvs`), so its modular hash
+///     equals the full-form hash a store-backed submission of the same
+///     derivation computes — identical content still joins.
+///
+/// No evidence (the degenerate floating-CA case where the incoming side
+/// carries no hash, or the hashes differ) is treated as a conflict and
+/// falls through to the reject-in-flight / displace-when-terminal arms.
 fn verifiable_identity_matches(
     existing: &DerivationState,
     node: &crate::domain::DerivationNode,
@@ -90,6 +105,7 @@ fn verifiable_identity_matches(
         .zip(existing.expected_output_paths.iter())
         .map(|(n, p)| (n.as_str(), p.as_str()))
         .collect();
+    let mut path_evidence = false;
     for (name, path) in node
         .output_names
         .iter()
@@ -100,12 +116,19 @@ fn verifiable_identity_matches(
         }
         if let Some(existing_path) = existing_paths.get(name.as_str())
             && !existing_path.is_empty()
-            && *existing_path != path.as_str()
         {
-            return false;
+            if *existing_path != path.as_str() {
+                return false;
+            }
+            // Both sides declare this output's path and they agree.
+            path_evidence = true;
         }
     }
-    true
+    let hash_evidence = matches!(
+        (existing.ca.modular_hash, node.ca_modular_hash),
+        (Some(a), Some(b)) if a == b
+    );
+    path_evidence || hash_evidence
 }
 
 /// Result of a successful `merge()` operation. Surfaces all the rollback
@@ -473,7 +496,7 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // r[impl sched.merge.authoritative-conflict]
+            // r[impl sched.merge.authoritative-conflict+2]
             // Authoritative-content protection. Evaluated BEFORE the
             // resubmit-reset below so the existing node is examined in
             // EVERY lifecycle state — running it after the reset would

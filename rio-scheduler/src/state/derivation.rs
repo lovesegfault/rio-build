@@ -2606,7 +2606,7 @@ mod tests {
     /// `M_062`: a recovery row carrying authoritative inline drv_content
     /// hydrates both the bytes and the re-parsed inputSrcs; a row
     /// without it keeps the empty defaults (worker fetches from store).
-    // r[verify sched.recovery.inline-drv-durability]
+    // r[verify sched.recovery.inline-drv-durability+2]
     #[test]
     fn from_recovery_row_hydrates_authoritative_drv_content() {
         let aterm = br#"Derive([("out","/nix/store/abc-out","","")],[],["/nix/store/abc-gcc","/nix/store/abc-glibc"],"x86_64-linux","/bin/sh",[],[("out","/nix/store/abc-out")])"#;

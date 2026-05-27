@@ -999,7 +999,7 @@
       "name": "ConflictingInFlightContent",
       "crate": "rio-scheduler",
       "msg": "in-flight derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity",
-      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that provably differs. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead."
+      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that either provably differs or cannot be shown to be the same. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead."
     },
     {
       "enum": "DagError",

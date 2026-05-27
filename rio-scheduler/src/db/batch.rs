@@ -100,6 +100,7 @@ impl SchedulerDb {
             drv_content.push(r.drv_content.clone().unwrap_or_default());
         }
 
+        // r[impl sched.persist.recreate-refresh]
         // ON CONFLICT: refresh the full creation-time snapshot. Rows are
         // written only by submissions that (re)create the in-memory node
         // (sched.persist.creation-scoped) — joins never reach this query —

@@ -2544,10 +2544,13 @@ fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
     n.drv_content_authoritative = true;
     n.is_content_addressed = true;
     n.expected_output_paths = vec![String::new()];
+    // The realisation key ingress binds to the bytes; the merge gate uses
+    // it as the floating-CA content evidence.
+    n.ca_modular_hash = Some([0xAB; 32]);
     n
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[test]
 fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2574,7 +2577,7 @@ fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[test]
 fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2593,7 +2596,7 @@ fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Res
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[test]
 fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2625,7 +2628,7 @@ fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[test]
 fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2634,9 +2637,12 @@ fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
 
     dag.merge(b1, &[authoritative_node("join", b"Derive-A")], &[], "")?;
 
-    // Same verifiable identity → joins as before; bytes untouched.
+    // Same verifiable identity WITH content evidence (the matching CA
+    // modular hash a store-backed submission of the same resolved
+    // derivation computes) → joins as before; bytes untouched.
     let mut same = make_node("join", "x86_64-linux");
     same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
     let res = dag.merge(b2, &[same], &[], "")?;
     assert!(res.newly_inserted.is_empty());
     let node = dag.node("join").unwrap();
@@ -2646,7 +2652,7 @@ fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[test]
 fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2671,7 +2677,7 @@ fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::R
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node in a retriable state (Failed / Cancelled / DependencyFailed /
 /// Poisoned-under-budget) cannot be silently redefined by different
@@ -2726,7 +2732,7 @@ fn authoritative_redefinition_rejected_in_retriable_states(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 /// A poison-budget-exhausted authoritative squat is terminal and gets
 /// displaced by the conflicting verifiable (store-backed) definition —
 /// fresh node without inherited interest or failure history, surfaced in
@@ -2766,7 +2772,7 @@ fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 /// Cancelled is terminal: a conflicting store-backed definition takes the
 /// displacement path (fresh node, no inherited interest), NOT the
 /// interest-carrying resubmit-reset.
@@ -2802,7 +2808,7 @@ fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 /// Failed is NOT terminal (the retry machinery still owns it): a
 /// conflicting store-backed submission is rejected, not displaced.
 #[test]
@@ -2834,7 +2840,7 @@ fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 /// A merge that displaces a poisoned-over-budget squat but fails on a
 /// LATER node in the same submission must restore the squat exactly
 /// (status, bytes, interest, poison accumulator) — displacement rides the
@@ -2878,5 +2884,108 @@ fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
     assert_eq!(n.system, "x86_64-linux");
     assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
     assert_eq!(n.interested_builds, HashSet::from([squatter]));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+2]
+/// Floating-CA squat scenario: public attributes (system, output names,
+/// flags) are copyable from the victim's public derivation and floating-CA
+/// expected paths are empty by construction, so a store-backed submission
+/// with NO content evidence (no CA modular hash, or a different one) must
+/// NOT silently join an in-flight authoritative node.
+#[test]
+fn floating_ca_squat_without_evidence_conflicts_in_flight() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat-ev", b"Derive-A")],
+        &[],
+        "",
+    )?;
+
+    // Same public attributes, no modular hash at all → no evidence.
+    let mut no_hash = make_node("squat-ev", "x86_64-linux");
+    no_hash.is_content_addressed = true;
+    let err = dag.merge(victim, &[no_hash], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // Same public attributes, DIFFERENT modular hash → still no evidence.
+    let mut wrong_hash = make_node("squat-ev", "x86_64-linux");
+    wrong_hash.is_content_addressed = true;
+    wrong_hash.ca_modular_hash = Some([0xCD; 32]);
+    let err = dag.merge(victim, &[wrong_hash], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    let node = dag.node("squat-ev").unwrap();
+    assert!(node.drv_content_authoritative, "squat untouched");
+    assert!(!node.interested_builds.contains(&victim));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+2]
+/// Once the no-evidence conflict target is terminal, the store-backed
+/// definition displaces it instead of being rejected — same displacement
+/// semantics as any other verifiable-identity conflict.
+#[test]
+fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat-ev2", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat-ev2")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let mut no_hash = make_node("squat-ev2", "x86_64-linux");
+    no_hash.is_content_addressed = true;
+    let res = dag.merge(victim, &[no_hash], &[], "")?;
+    assert!(res.newly_inserted.contains("squat-ev2"));
+    assert!(res.displaced.iter().any(|h| h.as_str() == "squat-ev2"));
+    let node = dag.node("squat-ev2").unwrap();
+    assert!(node.drv_content.is_empty());
+    assert!(!node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&victim));
+    assert!(!node.interested_builds.contains(&squatter));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+2]
+/// Fixed-output derivations carry their content commitment in the expected
+/// output path (derived from the declared hash and bound to the bytes at
+/// ingress), so agreement on a non-empty path is sufficient evidence — no
+/// modular hash required.
+#[test]
+fn fod_path_agreement_is_sufficient_evidence() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let fod_path = "/nix/store/ffffffffffffffffffffffffffffffff-fod-out";
+
+    let mut fod_auth = authoritative_node("fod-join", b"Derive-FOD");
+    fod_auth.is_fixed_output = true;
+    fod_auth.expected_output_paths = vec![fod_path.to_string()];
+    fod_auth.ca_modular_hash = None;
+    dag.merge(b1, &[fod_auth], &[], "")?;
+
+    let mut store_backed = make_node("fod-join", "x86_64-linux");
+    store_backed.is_fixed_output = true;
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![fod_path.to_string()];
+    let res = dag.merge(b2, &[store_backed], &[], "")?;
+    assert!(res.newly_inserted.is_empty(), "joins, not displaced");
+    let node = dag.node("fod-join").unwrap();
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.drv_content, b"Derive-FOD", "bytes untouched");
+    assert!(node.drv_content_authoritative);
     Ok(())
 }

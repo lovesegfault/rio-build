@@ -8791,7 +8791,7 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 /// identity is what PG persists, the displaced hash stops counting toward
 /// prior interested builds (they complete instead of hanging Active), and
 /// the displaced fresh node belongs to the displacer only.
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[tokio::test]
 async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -8803,6 +8803,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     let mut squat = make_node("squatA");
     squat.drv_content = b"Derive-squat".to_vec();
     squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![test_store_path("squatA-out")];
     merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
     let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
     let squat_path = test_drv_path("squatA");
@@ -8811,12 +8812,15 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     assert_eq!(assn.drv_path, squat_path, "squat dispatched first");
 
     // Build 2 (prior-interested victim of the prune): joins the in-flight
-    // squat with a MATCHING identity and brings one extra node of its own.
+    // squat with a MATCHING identity (including the shared expected output
+    // path as content evidence) and brings one extra node of its own.
     let joiner = Uuid::new_v4();
+    let mut squat_join = make_node("squatA");
+    squat_join.expected_output_paths = vec![test_store_path("squatA-out")];
     merge_dag(
         &handle,
         joiner,
-        vec![make_node("squatA"), make_node("fillerB")],
+        vec![squat_join, make_node("fillerB")],
         vec![],
         false,
     )

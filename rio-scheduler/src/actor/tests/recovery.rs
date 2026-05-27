@@ -5013,7 +5013,7 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
 /// survive scheduler failover: the bytes are the only copy of the
 /// derivation anywhere, so the recovered node's dispatch must carry
 /// exactly what the gateway submitted.
-// r[verify sched.recovery.inline-drv-durability]
+// r[verify sched.recovery.inline-drv-durability+2]
 #[tokio::test]
 async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
     let build_id = Uuid::new_v4();
@@ -5112,7 +5112,7 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
 /// persisted row carries the DISPLACING identity, so recovery rebuilds
 /// (and re-dispatches) that definition — not the squatter's — and without
 /// the squatter's stale authoritative bytes.
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
     let squatter = Uuid::new_v4();

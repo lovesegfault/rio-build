@@ -613,7 +613,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
 /// round-trip through batch upsert, be refreshed by a later
 /// authoritative re-upsert, be cleared by a later non-authoritative
 /// re-upsert (last write wins), and come back from the recovery query.
-// r[verify sched.recovery.inline-drv-durability]
+// r[verify sched.recovery.inline-drv-durability+2]
 #[tokio::test]
 async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -701,7 +701,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
 /// from the identity that won the merge (the displacing submission), not
 /// the squatter's. Live accumulators (poison/failure/floor columns) keep
 /// their own writers and must NOT be touched by the upsert.
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.persist.recreate-refresh]
 #[tokio::test]
 async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;

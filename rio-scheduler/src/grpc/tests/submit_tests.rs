@@ -789,7 +789,7 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
 // word for them: the bytes must describe a content-bound derivation
 // consistent with the node's claimed identity, and the flag is only valid
 // for the single-node hook-fallback shape.
-// r[verify sched.recovery.inline-drv-durability]
+// r[verify sched.recovery.inline-drv-durability+2]
 
 /// Helper: a floating-CA ATerm + the node fields that legitimately
 /// describe it (what the gateway's content-bound fallback produces).
@@ -843,6 +843,7 @@ async fn test_submit_build_rejects_authoritative_identity_mismatch() {
     node.drv_content = aterm.as_bytes().to_vec();
     node.drv_content_authoritative = true;
     node.is_fixed_output = true;
+    node.is_content_addressed = true;
     node.expected_output_paths = vec!["/nix/store/ffffffffffffffffffffffffffffffff-victim".into()];
     let status = grpc
         .submit_build(Request::new(Req {
@@ -976,7 +977,7 @@ async fn test_submit_build_rejects_authoritative_modular_hash_mismatch() {
 // cannot redefine an in-flight authoritative node, and a joining
 // submission cannot rewrite or clear its persisted recovery row.
 
-// r[verify sched.merge.authoritative-conflict]
+// r[verify sched.merge.authoritative-conflict+2]
 #[tokio::test]
 async fn test_submit_build_authoritative_conflict_is_failed_precondition() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
@@ -1058,12 +1059,15 @@ async fn test_submit_build_join_does_not_clear_authoritative_row() {
     .expect("authoritative submission accepted");
 
     // A later store-backed submission with the SAME verifiable identity
+    // (including the matching CA modular hash the gateway computes for
+    // this no-inputDrvs derivation — the merge gate's content evidence)
     // joins the live node. Before creation-scoped persistence this
     // re-upserted the row and cleared the authoritative bytes.
     let mut joiner = make_node("auth-keep");
     joiner.is_content_addressed = true;
     joiner.needs_resolve = true;
     joiner.expected_output_paths = vec![String::new()];
+    joiner.ca_modular_hash = authoritative_ca_node("auth-keep").ca_modular_hash;
     grpc.submit_build(Request::new(Req {
         nodes: vec![joiner],
         edges: vec![],
@@ -1128,5 +1132,100 @@ async fn test_submit_build_accepts_non_authoritative_md5_fod_content() {
     assert!(
         result.is_ok(),
         "non-authoritative md5-FOD inline content accepted: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_ca_flag_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // Floating-CA bytes but the node claims is_content_addressed=false:
+    // the merge-time conflict gate compares that flag, so it must be bound
+    // to the bytes at ingress.
+    let mut node = authoritative_ca_node("auth-ca-flag");
+    node.is_content_addressed = false;
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("is_content_addressed"),
+        "should name the content-addressed flag mismatch: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_missing_expected_paths() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // The expected_output_paths vec must carry exactly one entry per
+    // output — a short (or absent) vec previously truncated the zip and
+    // skipped the per-output binding silently.
+    let mut node = authoritative_ca_node("auth-ca-nopaths");
+    node.expected_output_paths = vec![];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("expected_output_paths"),
+        "should name the missing expected_output_paths entries: {}",
+        status.message()
+    );
+}
+
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_fod_without_expected_path() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    // Honest FOD bytes, but the node declares an EMPTY expected path for
+    // the fixed output: the path is the merge gate's content evidence, so
+    // its presence is mandatory (not merely checked when present).
+    let mut node = make_node("auth-fod-nopath");
+    let digest =
+        hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest).unwrap();
+    let drv_name = {
+        let sp = rio_nix::store_path::StorePath::parse(&node.drv_path).unwrap();
+        sp.name()
+            .strip_suffix(".drv")
+            .unwrap_or(sp.name())
+            .to_owned()
+    };
+    let honest = rio_nix::store_path::StorePath::make_fixed_output(&drv_name, &nix_hash, true, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let aterm = format!(
+        r#"Derive([("out","{honest}","r:sha256","e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{honest}")])"#
+    );
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = true;
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![String::new()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("must declare the fixed-output path"),
+        "should require the fixed-output expected path: {}",
+        status.message()
     );
 }
