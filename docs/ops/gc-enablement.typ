@@ -45,7 +45,12 @@ the refcount drift pair
 #(refs.metric)("rio_store_gc_collect_backlog_chunks") and a
 cycle-duration histogram, but modifies nothing. A later release turns
 on the collecting arm (soft-delete + S3-delete enqueue), capped per
-cycle so a backlog drains across cycles.
+cycle so a backlog drains across cycles. The cycle's validation pass,
+mark, and report all run on one REPEATABLE READ snapshot, so the drift
+gauges measure real refcount drift --- uploads or rollbacks that commit
+while a cycle is running cannot show up as drift, and a nonzero
+under-count reading is a real abort signal, not cycle-concurrent
+traffic.
 
 == Parse-failure abort: #(refs.alert)("RioStoreGcCollectParseFailure") (critical)
 

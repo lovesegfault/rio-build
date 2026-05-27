@@ -270,15 +270,19 @@ pub fn describe_metrics() {
     describe_gauge!(
         "rio_store_gc_refcount_drift_leaked",
         "Refcount drift, leak direction: chunks with refcount > 0 that no \
-         existing manifest references (not deleted). Expected to match the \
-         historical leak classes before the cutover and stopped-decrement \
-         artifacts after it; growth beyond those is unexplained drift."
+         existing manifest references (not deleted). Computed on the collect \
+         cycle's single REPEATABLE READ snapshot, so traffic concurrent with \
+         the cycle cannot surface here. Expected to match the historical \
+         leak classes before the cutover and stopped-decrement artifacts \
+         after it; growth beyond those is unexplained drift."
     );
     describe_gauge!(
         "rio_store_gc_refcount_drift_undercount",
         "Refcount drift, under-count direction: chunks referenced by an \
-         existing manifest while refcount = 0 (not deleted). Never expected \
-         while the increment still fires; any occurrence during the Release A \
+         existing manifest while refcount = 0 (not deleted). Computed on the \
+         collect cycle's single REPEATABLE READ snapshot, so traffic \
+         concurrent with the cycle cannot surface here. Never expected while \
+         the increment still fires; any occurrence during the Release A \
          window is an abort signal for the cutover."
     );
     describe_gauge!(

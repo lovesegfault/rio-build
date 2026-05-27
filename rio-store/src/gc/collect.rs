@@ -77,7 +77,7 @@ pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_secs(24 * 
 #[cfg(test)]
 pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_millis(200);
 
-/// Session `work_mem` for the mark expansion's set-based dedup (and
+/// `work_mem` for the mark expansion's set-based dedup (and
 /// `maintenance_work_mem` for the one-time index build on the mark
 /// product). The expansion's `SELECT DISTINCT` hash-aggregates the
 /// expanded reference stream and spills to temp files past this bound,
@@ -85,9 +85,12 @@ pub(crate) const COLLECT_BACKSTOP_INTERVAL: Duration = Duration::from_millis(200
 /// instead of inheriting whatever the cluster default happens to be.
 /// 4GB matches the measured configuration of the gate-(b)/(c) bench
 /// records (the 1.5 M-path design point spilled ~10 GB to temp files
-/// under it — bounded, disk-backed, not resident). Session-scoped on
-/// the cycle's own pooled connection; one cycle runs at a time (GC
-/// advisory lock), so this is not multiplied across connections.
+/// under it — bounded, disk-backed, not resident). Applied with
+/// `SET LOCAL` inside the cycle's transaction, so the budget is
+/// transaction-scoped: it reverts on commit, rollback, and cancellation
+/// alike and can never leak into the shared pool that serves normal
+/// store traffic. One cycle runs at a time (GC advisory lock), so the
+/// budget is never multiplied across concurrent cycles either.
 const COLLECT_WORK_MEM: &str = "4GB";
 
 /// The server-side mark statement: expand every `chunk_list` joined to
@@ -253,6 +256,23 @@ pub static COLLECT_CURSOR: CollectCursor = CollectCursor::new();
 /// callers hold [`super::GC_LOCK_ID`] on a different connection
 /// (run_gc phase 3, [`collect_backstop_once`]).
 ///
+/// The whole read phase — cutoff, fail-closed validation, mark
+/// expansion, prepare, and the shadow report — runs in one
+/// REPEATABLE READ transaction, i.e. on one MVCC snapshot. That makes
+/// the [`CollectReport`] "at the cycle snapshot" semantics true as
+/// written: the validation pass and the expansion see the same manifest
+/// set (no TOCTOU inside the fail-closed guarantee), and uploads or
+/// PutPath rollbacks that commit during the multi-minute mark→report
+/// window cannot surface in the drift gauges — a nonzero drift reading
+/// is real refcount drift, not cycle-concurrent traffic. The
+/// transaction also scopes the cycle's session state (`SET LOCAL`
+/// memory budget, `ON COMMIT DROP` temp table) so nothing outlives the
+/// cycle on any exit path. The snapshot (and with it the xmin horizon)
+/// is held for the full mark+prepare+report span — the same order the
+/// expansion statement alone already held — and takes no locks that
+/// block writers; acceptable at the once-per-GC + daily-backstop
+/// cadence (measured spans: invariant map T-1a.1b/T-1a.1c records).
+///
 /// The cycle-duration histogram records completed cycles only; an
 /// aborted (parse-failure) cycle is counted by its own counter and the
 /// `outcome="parse_failure"` cycle counter instead.
@@ -269,43 +289,57 @@ pub(crate) async fn collect_cycle(
     let cycle_started = Instant::now();
     let mut conn = pool.acquire().await?;
 
-    // Session memory bounds for the expansion + index build; see
-    // COLLECT_WORK_MEM. AssertSqlSafe: interpolates only that const.
+    // One cycle = one transaction = one MVCC snapshot (see the function
+    // doc). Not READ ONLY: PostgreSQL forbids CREATE TEMP TABLE in
+    // read-only transactions. Every early `?` return drops the
+    // Transaction, which queues a ROLLBACK — the SET LOCAL budget and
+    // the ON COMMIT DROP temp table below die with it on every exit
+    // path, so nothing leaks back into the shared pool.
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        .execute(&mut *tx)
+        .await?;
+
+    // Transaction-scoped memory bounds for the expansion + index build;
+    // see COLLECT_WORK_MEM. AssertSqlSafe: interpolates only that const.
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SET work_mem = '{COLLECT_WORK_MEM}'"
+        "SET LOCAL work_mem = '{COLLECT_WORK_MEM}'"
     )))
-    .execute(&mut *conn)
+    .execute(&mut *tx)
     .await?;
     sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SET maintenance_work_mem = '{COLLECT_WORK_MEM}'"
+        "SET LOCAL maintenance_work_mem = '{COLLECT_WORK_MEM}'"
     )))
-    .execute(&mut *conn)
+    .execute(&mut *tx)
     .await?;
 
-    // Defensive: a previous cycle that died mid-flight on this pooled
-    // connection may have left the session temp table behind (same
-    // rationale as the sweep's setup_sweep_unreachable).
+    // Defensive, no longer load-bearing: the ON COMMIT DROP expansion
+    // below cannot leave the temp table behind, but a session poisoned
+    // by a binary predating the transaction-scoped cycle may still
+    // carry one (same rationale as the sweep's setup_sweep_unreachable).
     sqlx::query("DROP TABLE IF EXISTS live_chunks")
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
 
     // --- Snapshot ---
     // The eligibility cutoff is anchored at the cycle snapshot on the
     // DB clock (the predicate compares against DB-written timestamps),
-    // never re-evaluated per batch.
+    // never re-evaluated per batch. now() is the cycle transaction's
+    // start time — the snapshot anchor the design's §4.1 derivation
+    // names cycle_started_at.
     let cutoff: String = sqlx::query_scalar("SELECT (now() - make_interval(secs => $1))::text")
         .bind(grace_secs)
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut *tx)
         .await?;
 
     // --- Mark (i): fail-closed validation pass ---
     let malformed: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_sql()))
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut *tx)
         .await?;
     if malformed > 0 {
         let offenders: Vec<String> =
             sqlx::query_scalar(sqlx::AssertSqlSafe(mark_validation_offenders_sql()))
-                .fetch_all(&mut *conn)
+                .fetch_all(&mut *tx)
                 .await?;
         error!(
             malformed,
@@ -316,6 +350,8 @@ pub(crate) async fn collect_cycle(
         metrics::counter!("rio_store_gc_collect_parse_failures_total").increment(1);
         metrics::counter!("rio_store_gc_collect_cycles_total", "outcome" => "parse_failure")
             .increment(1);
+        // Dropping `tx` rolls the cycle transaction back; the abort
+        // wrote nothing and leaves nothing on the session.
         return Ok(CollectReport {
             outcome: CollectOutcome::ParseFailure,
             mark_set_size: 0,
@@ -331,20 +367,32 @@ pub(crate) async fn collect_cycle(
     }
 
     // --- Mark (ii): server-side set-based expansion ---
-    sqlx::query(MARK_EXPANSION_SQL).execute(&mut *conn).await?;
+    // The cycle runs the shared statement with ON COMMIT DROP added, so
+    // the mark product cannot outlive the cycle transaction on any exit
+    // path. The shared constant stays free of the clause: the bench's
+    // EXPLAIN plan-shape guard (gate (b)) runs it outside a transaction,
+    // where ON COMMIT DROP would drop the table at statement end.
+    // AssertSqlSafe: splices only the shared constant.
+    let expansion_on_commit_drop = format!(
+        "CREATE TEMP TABLE live_chunks ON COMMIT DROP AS {}",
+        MARK_EXPANSION_SQL
+            .strip_prefix("CREATE TEMP TABLE live_chunks AS ")
+            .expect("MARK_EXPANSION_SQL starts with the live_chunks CTAS prefix")
+    );
+    sqlx::query(sqlx::AssertSqlSafe(expansion_on_commit_drop))
+        .execute(&mut *tx)
+        .await?;
 
     // --- Prepare: unique index + stats on the mark product, so the
     // anti-join probes an index instead of hashing/sorting the whole
     // mark set per query (the same step the live arm's batches need).
     sqlx::query("CREATE UNIQUE INDEX live_chunks_hash_idx ON live_chunks (blake3_hash)")
-        .execute(&mut *conn)
+        .execute(&mut *tx)
         .await?;
-    sqlx::query("ANALYZE live_chunks")
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query("ANALYZE live_chunks").execute(&mut *tx).await?;
 
     let mark_set_size: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM live_chunks")
-        .fetch_one(&mut *conn)
+        .fetch_one(&mut *tx)
         .await?;
 
     // --- Shadow report: one pass over the not-deleted chunk rows ---
@@ -364,14 +412,12 @@ pub(crate) async fn collect_cycle(
                 WHERE c.deleted = FALSE) AS s",
     )
     .bind(&cutoff)
-    .fetch_one(&mut *conn)
+    .fetch_one(&mut *tx)
     .await?;
 
-    // One cycle = one connection; drop the session temp table before
-    // the connection returns to the pool.
-    sqlx::query("DROP TABLE live_chunks")
-        .execute(&mut *conn)
-        .await?;
+    // Commit ends the cycle's snapshot and drops the temp table (ON
+    // COMMIT DROP) before the connection returns to the pool.
+    tx.commit().await?;
 
     let cycle_seconds = cycle_started.elapsed().as_secs_f64();
 
@@ -797,6 +843,144 @@ mod tests {
         assert!(!rec.histogram_touched("rio_store_gc_collect_cycle_seconds"));
         // Zero UPDATEs to chunks.
         assert_eq!(chunks_table_digest(&db.pool).await, before);
+    }
+
+    /// `SHOW <setting>` on every connection the pool can hand out (the
+    /// pool is fully drained, so the cycle's connection is necessarily
+    /// among them).
+    async fn show_on_all_pool_connections(pool: &PgPool, setting: &str) -> Vec<String> {
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(pool.acquire().await.expect("drain pool"));
+        }
+        let mut values = Vec::new();
+        for conn in &mut held {
+            let v: String = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SHOW {setting}")))
+                .fetch_one(&mut **conn)
+                .await
+                .expect("show setting");
+            values.push(v);
+        }
+        values
+    }
+
+    /// `to_regclass('pg_temp.live_chunks')` on every connection the
+    /// pool can hand out — Some(name) on any session still carrying the
+    /// cycle's temp table, None everywhere once nothing leaked.
+    async fn temp_table_on_any_pool_connection(pool: &PgPool) -> Vec<Option<String>> {
+        let mut held = Vec::new();
+        for _ in 0..5 {
+            held.push(pool.acquire().await.expect("drain pool"));
+        }
+        let mut values = Vec::new();
+        for conn in &mut held {
+            let v: Option<String> =
+                sqlx::query_scalar("SELECT to_regclass('pg_temp.live_chunks')::text")
+                    .fetch_one(&mut **conn)
+                    .await
+                    .expect("temp-table probe");
+            values.push(v);
+        }
+        values
+    }
+
+    /// The cycle's session state (the 4GB work_mem/maintenance_work_mem
+    /// budget and the live_chunks temp table) is transaction-scoped: a
+    /// completed cycle returns its pooled connection with the server
+    /// defaults restored and no temp table, so the shared pool serving
+    /// PutPath/GetPath traffic never inherits the cycle's memory budget.
+    #[tokio::test]
+    async fn cycle_leaves_no_session_state_in_pool() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h = ChunkSeed::new(0x91)
+            .with_refcount(1)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        seed_chunked_manifest(&db.pool, "guc-leak", "complete", &make_chunk_list(&[h])).await;
+
+        let baseline = show_on_all_pool_connections(&db.pool, "work_mem").await[0].clone();
+        assert_ne!(
+            baseline, COLLECT_WORK_MEM,
+            "vacuity guard: the server default must differ from the cycle budget"
+        );
+
+        let report = collect_cycle(
+            &db.pool,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow,
+        )
+        .await
+        .expect("cycle");
+        assert_eq!(report.outcome, CollectOutcome::Ok);
+
+        for setting in ["work_mem", "maintenance_work_mem"] {
+            for v in show_on_all_pool_connections(&db.pool, setting).await {
+                assert_ne!(
+                    v, COLLECT_WORK_MEM,
+                    "{setting} leaked into the shared pool after a completed cycle"
+                );
+            }
+        }
+        for t in temp_table_on_any_pool_connection(&db.pool).await {
+            assert!(
+                t.is_none(),
+                "live_chunks leaked into the shared pool after a completed cycle"
+            );
+        }
+    }
+
+    /// A cycle that fails mid-flight (after the mark expansion) leaves
+    /// nothing behind either: the transaction rollback discards the
+    /// SET LOCAL budget and the ON COMMIT DROP temp table on the same
+    /// pooled connection that ran the failed cycle.
+    #[tokio::test]
+    async fn failed_cycle_leaves_no_session_state_in_pool() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let h = ChunkSeed::new(0x92)
+            .with_refcount(1)
+            .uploaded()
+            .seed(&db.pool)
+            .await;
+        seed_chunked_manifest(&db.pool, "guc-leak-err", "complete", &make_chunk_list(&[h])).await;
+
+        let baseline = show_on_all_pool_connections(&db.pool, "work_mem").await[0].clone();
+        assert_ne!(
+            baseline, COLLECT_WORK_MEM,
+            "vacuity guard: the server default must differ from the cycle budget"
+        );
+
+        // Make the cycle fail AFTER the validation pass and the mark
+        // expansion: the shadow report reads `chunks`, so dropping the
+        // table forces the failure exactly in the mid-cycle window the
+        // leak lived in.
+        sqlx::query("DROP TABLE chunks CASCADE")
+            .execute(&db.pool)
+            .await
+            .expect("drop chunks");
+
+        let result = collect_cycle(
+            &db.pool,
+            super::super::sweep::CHUNK_GRACE_SECS,
+            CollectMode::Shadow,
+        )
+        .await;
+        assert!(result.is_err(), "the report query must fail without chunks");
+
+        for setting in ["work_mem", "maintenance_work_mem"] {
+            for v in show_on_all_pool_connections(&db.pool, setting).await {
+                assert_ne!(
+                    v, COLLECT_WORK_MEM,
+                    "{setting} leaked into the shared pool after a failed cycle"
+                );
+            }
+        }
+        for t in temp_table_on_any_pool_connection(&db.pool).await {
+            assert!(
+                t.is_none(),
+                "live_chunks leaked into the shared pool after a failed cycle"
+            );
+        }
     }
 
     /// The session temp table never leaks across cycles: two
