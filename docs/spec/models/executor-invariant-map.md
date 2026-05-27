@@ -1326,6 +1326,43 @@ slot".
   cfgs (falsified pre-fix, now resolved and held back on budget — see
   the adjudication record) and the optional node regime add 0.
 
+## Stage-C corpus freeze (0d, T-0d.1)
+
+Frozen 2026-05-27 at the formal-sprint tip `2f92ba735`, immediately
+before any override module or calibration run, per the re-pin
+protocol's pre-Stage-C trigger.
+
+- **Churn re-pin re-run** (`git log 277618342..HEAD -- <the nine
+  churn/corpus paths>`): exactly one commit touches the in-scope set —
+  `48c00e9d1` (the 0b spec-rule commit: comment-only `r[impl]` markers
+  plus the five new rules). Per the re-pin protocol's exclusion list
+  (comment-only / marker-only changes) it does not trigger
+  re-validation; the 0a/0b artifacts stand unchanged under this
+  freeze. The post-0c commits on the shared actor files
+  (`1bbad1ee7` recovery re-arm fix, `5e2867a40` actor submodule
+  refactor) touch no corpus path and are already accounted for in the
+  Stage-B adjudication record above.
+- **Corpus query re-run at the freeze tip**: returns the same **170**
+  fix commits as the 0a pin — zero new corpus commits landed during
+  0b/0c, so the 0a/0b denominators (50 in-family / 21 retry-owned /
+  43 controller-owned / 56 out-of-scope) carry into 0d with **no
+  delta**. The 0d gate is audited against exactly the counts
+  pre-registered above.
+- **Representative-hash drift check**: every design-named
+  representative and cross-campaign exemplar hash re-verified as a
+  HEAD ancestor at the freeze tip; no rebase has rewritten any pinned
+  hash since 0a, so the 0a cross-walk (`5c47af5ad` → `0ea9bd701`,
+  `f1902fe63` → `125feb450`) stands and no new old→new substitution
+  is needed.
+- **Known-defect record**: the `unresolvedClaimHasRepairArmed` defect
+  found at 0c was fixed by `1bbad1ee7` (re-arm the post-recovery
+  reconcile when its sweep defers a claim) on `actor/recovery.rs` — a
+  shared actor file outside the nine-path corpus — so it does not
+  enter the corpus or move the denominators; its calibration-table
+  treatment is the known-defect cross-reference row in the Stage-C
+  section below, citing the fix and the now-holding invariant rather
+  than a re-derivation.
+
 ## Open adjudications (0a tracking)
 
 Owner for every entry: B. Meurer (campaign owner; also the
