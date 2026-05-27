@@ -798,12 +798,20 @@ impl DagActor {
         //    children now reaped, nothing else will ever re-evaluate it
         //    (`find_newly_ready` only fires on completions), so the
         //    surviving build would hang Active forever. Take the
-        //    resubmit-directing fail-fast now. The arm requires
-        //    `substitute_tried`: a node whose walk is still in flight keeps
-        //    its chance — its own SubstituteComplete verdict re-evaluates
-        //    it (the reap-before-verdict ordering relies on exactly that),
-        //    and a never-walked node is re-probed by the next dispatch
-        //    pass, which has its own carve-out and fail-fast arms.
+        //    resubmit-directing fail-fast now. Two restrictions:
+        //    `substitute_tried` keeps never-walked nodes out (the next
+        //    dispatch pass re-probes those, with its own carve-out and
+        //    fail-fast arms), and the arm is skipped while the survivor is
+        //    `Substituting` — a walk in flight keeps its chance, and
+        //    STATUS is the only reliable signal for that: the one-shot
+        //    `substitute_tried` bit is sticky (never cleared on a live
+        //    node), and a later build's merge re-probe (`existing_reprobe`)
+        //    re-spawns a walk for an existing Queued node without
+        //    resetting it. That in-flight walk's own SubstituteComplete
+        //    settles the now-childless root (ok=false → the established
+        //    fail-fast there, ok=true → completion); parking it here would
+        //    terminally fail its builds prematurely and the late verdict
+        //    would then be dropped by the not-Substituting guard.
         //  - A Queued parent whose last unbuilt children were reaped: it is
         //    now vacuously all-deps-completed, but no completion will ever
         //    promote it. Promote it to Ready here so the next dispatch pass
@@ -836,7 +844,11 @@ impl DagActor {
                 let status = node.status();
                 let topdown_pruned = node.topdown_pruned;
                 let substitute_tried = node.substitute_tried;
-                if topdown_pruned && substitute_tried && self.dag.get_children(&parent).is_empty() {
+                if topdown_pruned
+                    && substitute_tried
+                    && status != DerivationStatus::Substituting
+                    && self.dag.get_children(&parent).is_empty()
+                {
                     self.fail_fast_topdown_pruned_root(
                         &parent,
                         "deps reaped after a failed substitute fetch while the closure \
