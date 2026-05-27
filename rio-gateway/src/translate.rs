@@ -503,9 +503,11 @@ pub fn validate_dag(
     // Declared-hash (fixed-output) outputs: bind the declared path to
     // the declared hash and enforce CppNix's single-'out' shape rule.
     // Without this a junk outputHash would exempt an arbitrary declared
-    // path from every trusted-plane binding (the builder-side check is
-    // defense in depth; the store only verifies content the worker
-    // volunteers a descriptor for).
+    // path from every submission-time trusted-plane binding (the
+    // builder-side check is defense in depth; the store independently
+    // re-verifies FOD uploads and rejects descriptor-less ones under a
+    // scheduler-signed fixed-output assignment — but only at upload
+    // time, after a pod has already run).
     for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
         validate_declared_hash_outputs(
             &node.drv_path,
