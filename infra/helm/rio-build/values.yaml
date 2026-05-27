@@ -103,6 +103,11 @@ assignmentHmac:
 # castore broker socket. SEPARATE key from assignmentHmac on purpose:
 # the verifier key sits on every builder node, and a node compromise
 # must not yield a key the store trusts for uploads or castore reads.
+# SUPERSEDED by mountdSigning below (ADR-022 mount-admission
+# credentials, §P0590): the symmetric scheme was never provisioned in
+# any cluster and must stay that way — the chart refuses to render
+# both families together. This family remains only until the §P0590
+# Phase-5 sweep deletes it.
 mountdHmac:
   # Name of a pre-existing Secret carrying the key under data key
   # `mountd-hmac.key`, present in BOTH the rio-system (scheduler, mints)
@@ -114,6 +119,43 @@ mountdHmac:
   # admission with the 0660 socket. Setting it flips mountd's socket to
   # 0666 and enables token-OR-gid admission.
   secretName: ""
+
+# Mountd Mount-admission signing (ADR-022 mount-admission credentials,
+# §P0590) — scheduler-signed Ed25519 `rmt2` tokens; supersedes the
+# symmetric mountdHmac family above. The scheduler (rio-system) holds
+# the ONLY private signing key and signs a per-build, node-scoped
+# MountdClaims token into WorkAssignment.mountd_token; the rio-mountd
+# DaemonSet holds PUBLIC trust roots only and verifies offline, so a
+# builder-node compromise yields no Mount-admission minting ability
+# anywhere and requires no key rotation. The DaemonSet also learns its
+# own node name via the downward API so a token stolen on node A is
+# rejected on node B (node-scoped claims).
+mountdSigning:
+  # Name of a pre-existing Secret in rio-system carrying the PRIVATE
+  # Ed25519 signing key under data key `mountd-signing.key`
+  # (`rio-mountd-<n>:base64(64-byte keypair)`, the format
+  # `spike_mountd_client keygen` writes). Mounted ONLY into the
+  # scheduler Deployment (RIO_MOUNTD_SIGNING_KEY_PATH) — never into
+  # anything that runs on builder/fetcher nodes. externalSecrets.enabled
+  # syncs `rio-mountd-signing-key` into rio-system from the
+  # bootstrap-Job-generated rio/mountd-signing-key Secrets Manager
+  # entry.
+  privateKeySecretName: ""
+  # Name of a pre-existing Secret in rio-builders carrying the PUBLIC
+  # trust roots under data key `mountd-signing.pub` (one
+  # `rio-mountd-<n>:base64(32-byte pubkey)` line per active key;
+  # multiple lines = rotation overlap). Public material — holding it
+  # mints nothing; the Secret is transport convenience only. Mounted
+  # ONLY into the rio-mountd DaemonSet (RIO_MOUNTD_PUBKEY_PATH), which
+  # also gets RIO_MOUNTD_NODE_NAME from the downward API for the node
+  # claim check. externalSecrets.enabled syncs `rio-mountd-signing-pub`
+  # into rio-builders from rio/mountd-signing-pub.
+  #
+  # Both halves must be set together (the chart fails the render on a
+  # half-configured pair) and never alongside mountdHmac.secretName.
+  # Both empty (default) = keyless: no token minted, mountd keeps the
+  # gid-990-only admission with the 0660 socket.
+  publicKeySecretName: ""
 
 # External Secrets Operator sync from AWS Secrets Manager.
 # When enabled: renders the ClusterSecretStore + the ExternalSecrets for

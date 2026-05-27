@@ -97,6 +97,29 @@ Families:
              node, and a node compromise must not yield a key the
              store trusts. Unset → no token minted, mountd keeps
              gid-only admission (fail-closed-keyless default).
+             SUPERSEDED by the mountdSigning pair below (§P0590);
+             never enable both — the guard at the top of rio.mounts
+             fails the render.
+  mountdSigningKey  .Values.mountdSigning.privateKeySecretName
+             non-empty. SCHEDULER ONLY (ADR-022 mount-admission
+             credentials, §P0590): the private Ed25519 key that signs
+             per-build node-scoped `rmt2` Mount-admission tokens into
+             WorkAssignment.mountd_token. Secret <name> →
+             /etc/rio/mountd-signing/mountd-signing.key, env
+             RIO_MOUNTD_SIGNING_KEY_PATH. MUST NOT be wanted by any
+             object that runs on builder/fetcher nodes — keeping
+             minting material off those nodes is the whole point of
+             the scheme (helm/33 locks this).
+  mountdSigningPub  .Values.mountdSigning.publicKeySecretName
+             non-empty. MOUNTD DaemonSet ONLY: the public trust roots
+             the daemon verifies `rmt2` tokens against (one
+             name:base64 line per active key; public material, mints
+             nothing). Secret <name> →
+             /etc/rio/mountd-signing/mountd-signing.pub, env
+             RIO_MOUNTD_PUBKEY_PATH, plus RIO_MOUNTD_NODE_NAME from
+             the downward API (spec.nodeName) so the daemon can
+             enforce the token's node claim. Never wanted by the
+             scheduler (it has no token to verify).
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -110,6 +133,24 @@ Families:
 {{- define "rio.mounts" -}}
 {{- $root := .root -}}
 {{- $form := .form -}}
+{{- /* ADR-022 §P0590 cutover guards. Evaluated here (rio.mounts is
+       included by every component template, so any render hits them)
+       rather than per-consumer so a future template can't forget them.
+       (1) mountdSigning and mountdHmac are mutually exclusive: the
+       Ed25519 scheme supersedes the never-provisioned symmetric one,
+       and rendering both would put a Mount-admission SIGNING key on
+       every builder node again. (2) pair-or-nothing: a signer without
+       trust roots mints tokens no daemon accepts (every
+       hostUsers:false Mount fails); trust roots without a signer flip
+       the socket to 0666 with no token ever minted. Fail loudly at
+       template time instead. */ -}}
+{{- $sig := $root.Values.mountdSigning -}}
+{{- if and (or $sig.privateKeySecretName $sig.publicKeySecretName) $root.Values.mountdHmac.secretName -}}
+{{- fail "mountdSigning.* and mountdHmac.secretName are mutually exclusive: the Ed25519 mountdSigning scheme (ADR-022 §P0590) supersedes the symmetric mountdHmac token, which must never be provisioned. Unset mountdHmac.secretName." -}}
+{{- end -}}
+{{- if or (and $sig.privateKeySecretName (not $sig.publicKeySecretName)) (and $sig.publicKeySecretName (not $sig.privateKeySecretName)) -}}
+{{- fail "mountdSigning requires BOTH privateKeySecretName (scheduler signer) and publicKeySecretName (mountd trust roots): a half-configured pair either mints tokens no daemon accepts or opens the 0666 socket with nothing to verify. Set both or neither." -}}
+{{- end -}}
 {{- $fams := dict
       "jwtVerify" (dict
         "on"   $root.Values.jwt.enabled
@@ -148,6 +189,19 @@ Families:
         "src"  (dict "secret" (dict "secretName" $root.Values.mountdHmac.secretName))
         "env"  (list
           (dict "name" "RIO_MOUNTD_HMAC_KEY_PATH" "value" "/etc/rio/mountd-hmac/mountd-hmac.key")))
+      "mountdSigningKey" (dict
+        "on"   (not (empty $sig.privateKeySecretName))
+        "vol"  "mountd-signing-key" "path" "/etc/rio/mountd-signing" "ro" true
+        "src"  (dict "secret" (dict "secretName" $sig.privateKeySecretName))
+        "env"  (list
+          (dict "name" "RIO_MOUNTD_SIGNING_KEY_PATH" "value" "/etc/rio/mountd-signing/mountd-signing.key")))
+      "mountdSigningPub" (dict
+        "on"   (not (empty $sig.publicKeySecretName))
+        "vol"  "mountd-signing-pub" "path" "/etc/rio/mountd-signing" "ro" true
+        "src"  (dict "secret" (dict "secretName" $sig.publicKeySecretName))
+        "env"  (list
+          (dict "name" "RIO_MOUNTD_PUBKEY_PATH" "value" "/etc/rio/mountd-signing/mountd-signing.pub")
+          (dict "name" "RIO_MOUNTD_NODE_NAME" "valueFrom" (dict "fieldRef" (dict "fieldPath" "spec.nodeName")))))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}

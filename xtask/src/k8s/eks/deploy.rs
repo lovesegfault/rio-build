@@ -246,18 +246,31 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // and no store-side verification. helm/30 locks this value
             // against the chart's ESO target name.
             .set("assignmentHmac.secretName", "rio-hmac")
-            // Mountd Mount-admission HMAC (ADR-022 §P0559): the
-            // scheduler mints WorkAssignment.mountd_token with this
-            // key; the rio-mountd DaemonSet verifies it so
+            // Mountd Mount-admission signing (ADR-022 mount-admission
+            // credentials, §P0590): the scheduler signs a per-build,
+            // node-scoped Ed25519 token into
+            // WorkAssignment.mountd_token; the rio-mountd DaemonSet
+            // verifies it against public trust roots so
             // hostUsers:false executor pods (whose remapped gids can
             // never match host gid 990) are admitted to the castore
-            // broker socket. SEPARATE Secret from rio-hmac — the
-            // verifier key sits on every builder node. The chart
-            // default is unset (gid-only admission, no token minted),
-            // so without this production builder pods cannot Mount at
-            // all once they run hostUsers:false. helm/31 locks this
-            // value against the chart's ESO target name.
-            .set("mountdHmac.secretName", "rio-mountd-hmac")
+            // broker socket. The PRIVATE key Secret lands in
+            // rio-system only (scheduler); builder nodes get PUBLIC
+            // material only, so a node compromise mints nothing. The
+            // chart default is unset (gid-only admission, no token
+            // minted), so without these production builder pods
+            // cannot Mount at all once they run hostUsers:false.
+            // Deliberately NOT setting mountdHmac.secretName: the
+            // symmetric scheme is superseded and must never be
+            // provisioned (the chart refuses to render both). helm/33
+            // locks these values against the chart's ESO target names.
+            .set(
+                "mountdSigning.privateKeySecretName",
+                "rio-mountd-signing-key",
+            )
+            .set(
+                "mountdSigning.publicKeySecretName",
+                "rio-mountd-signing-pub",
+            )
             // store-egress CiliumNetworkPolicy admits postgres on this
             // CIDR; the chart default fc00::/7 (ULA) does NOT match a
             // VPC GUA, so without this rio-store→Aurora is dropped.

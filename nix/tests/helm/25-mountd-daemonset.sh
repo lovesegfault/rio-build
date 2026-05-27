@@ -116,14 +116,17 @@ test "$(yq "$ds | .spec.template.spec.automountServiceAccountToken" "$out")" = "
   exit 1
 }
 
-# Fail-closed-keyless default (§P0559): with mountdHmac.secretName unset
-# (the chart default) the DaemonSet must carry NO Mount-admission key
-# material — no mountd-hmac Secret volume, no RIO_MOUNTD_HMAC_KEY_PATH
-# env. Token mode (and the world-connectable socket it implies) must be
-# an explicit operator decision; helm/31 locks the enabled wiring.
+# Fail-closed-keyless default (§P0559/§P0590): with mountdHmac.secretName
+# AND the mountdSigning pair unset (the chart default) the DaemonSet must
+# carry NO Mount-admission token material at all — no mountd-hmac Secret
+# volume / RIO_MOUNTD_HMAC_KEY_PATH, no mountd-signing trust-root volume /
+# RIO_MOUNTD_PUBKEY_PATH, and no RIO_MOUNTD_NODE_NAME (the node claim
+# only exists for signed tokens). Token mode (and the world-connectable
+# socket it implies) must be an explicit operator decision; helm/31 and
+# helm/33 lock the respective enabled wirings.
 ds_yaml=$(yq "$ds" "$out")
-if grep -q 'mountd-hmac\|RIO_MOUNTD_HMAC_KEY_PATH' <<<"$ds_yaml"; then
-  echo "FAIL: default render mounts the mountd-hmac key into the DaemonSet — the keyless default must stay gid-only" >&2
+if grep -q 'mountd-hmac\|RIO_MOUNTD_HMAC_KEY_PATH\|mountd-signing\|RIO_MOUNTD_PUBKEY_PATH\|RIO_MOUNTD_SIGNING_KEY_PATH\|RIO_MOUNTD_NODE_NAME' <<<"$ds_yaml"; then
+  echo "FAIL: default render mounts Mount-admission token material into the DaemonSet — the keyless default must stay gid-only" >&2
   exit 1
 fi
 

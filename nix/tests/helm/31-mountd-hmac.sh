@@ -1,4 +1,4 @@
-# Mountd Mount-admission HMAC wiring (ADR-022 §P0559).
+# Mountd Mount-admission HMAC wiring (ADR-022 §P0559) — chart side only.
 #
 # mountdHmac.secretName set MUST render the Secret volume + mount +
 # RIO_MOUNTD_HMAC_KEY_PATH env on the scheduler Deployment (it mints
@@ -9,12 +9,14 @@
 # Unset (the default) MUST render none of it (helm/25 also pins the
 # DaemonSet half of that posture).
 #
-# Like helm/30 for the assignment key, this fragment also locks the
-# production-EKS deploy: the chart default is keyless, so only
-# xtask/src/k8s/eks/deploy.rs setting mountdHmac.secretName makes
-# hostUsers:false executor pods admissible at all — and the name it
-# sets must be the Secret the chart's ESO ExternalSecret actually
-# creates, in exactly the two consumer namespaces.
+# The symmetric scheme is SUPERSEDED by the Ed25519 mountdSigning
+# family (ADR-022 mount-admission credentials, §P0590) and was never
+# provisioned in any cluster: the production EKS deploy no longer sets
+# mountdHmac.secretName (helm/33 asserts that, plus the mountdSigning
+# wiring that replaced it). Until the §P0590 Phase-5 sweep deletes the
+# family, this fragment keeps the chart-side render contract locked so
+# the residual code path cannot silently rot or leak into other
+# components.
 
 # ── (1) chart render with the family enabled ─────────────────────────
 on=$TMPDIR/mountd-hmac-on.yaml
@@ -86,33 +88,14 @@ helm template rio . \
   exit 1
 }
 
-# ── (3) the EKS deploy sets it, and to the ESO-created name ──────────
-deploy_src=.eks-deploy.rs
-test -f "$deploy_src" || {
-  echo "FAIL: $deploy_src not staged — keep the cp in nix/misc-checks.nix helm-lint in sync with this fragment" >&2
-  exit 1
-}
-mountd_set=$(grep -o '"mountdHmac\.secretName", *"[^"]*"' "$deploy_src" | head -n1 || true)
-test -n "$mountd_set" || {
-  echo 'FAIL: the xtask EKS deploy no longer sets mountdHmac.secretName —' >&2
-  echo '      production mountd would stay gid-only and hostUsers:false executor' >&2
-  echo '      pods could never Mount. Restore the .set() in' >&2
-  echo '      xtask/src/k8s/eks/deploy.rs (or update this fragment if the call' >&2
-  echo '      was reformatted onto multiple lines).' >&2
-  exit 1
-}
-name=$(printf '%s' "$mountd_set" | sed 's/.*, *"\([^"]*\)"/\1/')
-test -n "$name" || {
-  echo "FAIL: could not extract the secretName value from: $mountd_set" >&2
-  exit 1
-}
-
-# ── (4) the chart's ESO object creates exactly that Secret ───────────
-# Render what the EKS deploy renders (ESO on + the secretName from
-# deploy.rs): the rio-mountd-hmac ExternalSecret must land in BOTH
+# ── (3) the chart's ESO object stays consistent with the mounts ──────
+# Render with ESO on + the chart's own canonical Secret name (the EKS
+# deploy no longer sets this family — helm/33 owns the deploy-side
+# assertions): the rio-mountd-hmac ExternalSecret must land in BOTH
 # consumer namespaces (rio-system for the scheduler, rio-builders for
-# the DaemonSet — and NOT rio-store), target the same Secret name, and
+# the DaemonSet — and NOT rio-store), target that same Secret name, and
 # use the mountd-hmac.key data key the mount path expects.
+name=rio-mountd-hmac
 eks=$TMPDIR/eks-mountd-hmac.yaml
 helm template rio . \
   --set externalSecrets.enabled=true \
@@ -131,7 +114,7 @@ test "$ns_list" = "rio-builders rio-system" || {
 
 target=$(yq -N "$es | .spec.target.name" "$eks" | sort -u)
 test "$target" = "$name" || {
-  echo "FAIL: ESO target Secret name '$target' != deploy.rs mountdHmac.secretName '$name'" >&2
+  echo "FAIL: ESO target Secret name '$target' != the chart's canonical mountdHmac Secret name '$name'" >&2
   exit 1
 }
 
@@ -147,7 +130,7 @@ test "$remote" = "rio/mountd-hmac" || {
   exit 1
 }
 
-# ── (5) those Deployments/DaemonSet mount THAT Secret ────────────────
+# ── (4) those Deployments/DaemonSet mount THAT Secret ────────────────
 for spec in "Deployment rio-scheduler" "DaemonSet rio-mountd"; do
   set -- $spec
   vol=$(yq -N "select(.kind==\"$1\" and .metadata.name==\"$2\")

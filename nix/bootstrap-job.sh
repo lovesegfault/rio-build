@@ -79,6 +79,52 @@ else
   cat "$tmp/key.pub"
 fi
 
+# Mountd Mount-admission Ed25519 keypair (ADR-022 mount-admission
+# credentials, §P0590). The PRIVATE half is mounted only into the
+# scheduler (rio-system); builder nodes get the PUBLIC trust roots
+# only, so a node compromise yields no minting ability. Same dual
+# guard + pub-first create||put as the narinfo signing key above:
+# converge from any partial state without ever leaving a mismatched
+# pair behind. Regenerating would orphan in-flight mountd tokens
+# (builds re-dispatch) — the guard keeps the pair stable.
+if aws secretsmanager describe-secret --secret-id rio/mountd-signing-key >/dev/null 2>&1 \
+  && aws secretsmanager describe-secret --secret-id rio/mountd-signing-pub >/dev/null 2>&1; then
+  echo "[bootstrap] rio/mountd-signing-key{,-pub} already exist, skipping"
+else
+  echo "[bootstrap] generating rio/mountd-signing-key"
+  tmp=$(mktemp -d)
+  # File formats are rio-auth's mountd_token loaders (what
+  # `spike_mountd_client keygen` writes for VM tests/standalone):
+  #   private: rio-mountd-<n>:base64(seed[32] || pubkey[32])  (one line)
+  #   public:  rio-mountd-<n>:base64(pubkey[32])              (one line per active key)
+  # The rio-mountd- name prefix is load-bearing — the loaders hard-fail
+  # on anything else to prevent cross-wiring with the narinfo keypair.
+  # Raw key material via openssl: the last 32 bytes of the PKCS#8 DER
+  # are the Ed25519 seed; the last 32 bytes of the SPKI DER are the
+  # raw public key.
+  openssl genpkey -algorithm ed25519 -out "$tmp/mountd-signing.pem"
+  openssl pkey -in "$tmp/mountd-signing.pem" -outform DER \
+    | tail -c 32 > "$tmp/mountd-seed.bin"
+  openssl pkey -in "$tmp/mountd-signing.pem" -pubout -outform DER \
+    | tail -c 32 > "$tmp/mountd-pub.bin"
+  printf 'rio-mountd-1:%s\n' \
+    "$(cat "$tmp/mountd-seed.bin" "$tmp/mountd-pub.bin" | base64 -w0)" \
+    > "$tmp/mountd-signing.key"
+  printf 'rio-mountd-1:%s\n' \
+    "$(base64 -w0 < "$tmp/mountd-pub.bin")" \
+    > "$tmp/mountd-signing.pub"
+  aws secretsmanager create-secret --name rio/mountd-signing-pub \
+    --secret-string "file://$tmp/mountd-signing.pub" 2>/dev/null \
+    || aws secretsmanager put-secret-value --secret-id rio/mountd-signing-pub \
+      --secret-string "file://$tmp/mountd-signing.pub"
+  aws secretsmanager create-secret --name rio/mountd-signing-key \
+    --secret-string "file://$tmp/mountd-signing.key" 2>/dev/null \
+    || aws secretsmanager put-secret-value --secret-id rio/mountd-signing-key \
+      --secret-string "file://$tmp/mountd-signing.key"
+  echo "[bootstrap] mountd trust root (public; verifiers accept tokens signed by it):"
+  cat "$tmp/mountd-signing.pub"
+fi
+
 if aws secretsmanager describe-secret --secret-id rio/gateway-host-key >/dev/null 2>&1; then
   echo "[bootstrap] rio/gateway-host-key already exists, skipping"
 else

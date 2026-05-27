@@ -210,7 +210,11 @@ spec:
               containerPort: 9091
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac")) | nindent 12 }}
+            {{- /* mountdSigningKey, never mountdSigningPub: the
+                   scheduler signs Mount-admission tokens and has
+                   nothing to verify — and helm/33 asserts the public
+                   trust roots stay off this Deployment. */}}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac" "mountdSigningKey")) | nindent 12 }}
             # All replicas contend for SAME Lease. Presence ENABLES lease mode
             # (LeaseConfig::from_env returns None without it → always-leader,
             # WRONG with replicas>1).
@@ -252,7 +256,7 @@ spec:
             - name: RIO_DASHBOARD__CORS_ALLOW_ORIGINS
               value: {{ .Values.dashboard.cors.allowOrigins | join "," | quote }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac" "mountdSigningKey")) | nindent 12 }}
             # rio_common::config::load reads /etc/rio/scheduler.toml. The
             # ConfigMap carries the [sla] table + soft_features;
             # everything else stays env-driven (the config loader merges
@@ -294,7 +298,7 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac" "mountdHmac" "mountdSigningKey")) | nindent 8 }}
         - name: config
           configMap:
             name: rio-scheduler-config

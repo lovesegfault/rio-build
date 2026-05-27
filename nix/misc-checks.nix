@@ -945,10 +945,14 @@ in
 
         run() { $sh ${dockerImages.bootstrapScript}; }
 
-        # Scenario A: fresh → both halves exist.
+        # Scenario A: fresh → both halves exist (narinfo signing key and
+        # the §P0590 mountd Ed25519 keypair, which clones the same
+        # dual-guard shape).
         run
         [ -f secrets/rio_signing-key ] && [ -f secrets/rio_signing-key-pub ] \
           || { echo "FAIL-A: fresh run did not create both signing-key halves" >&2; exit 1; }
+        [ -f secrets/rio_mountd-signing-key ] && [ -f secrets/rio_mountd-signing-pub ] \
+          || { echo "FAIL-A: fresh run did not create both mountd-signing halves" >&2; exit 1; }
 
         # Scenario B (the bug): private exists, pub missing → must
         # converge. Old guard checked private only → skipped → pub
@@ -970,6 +974,22 @@ in
           || { echo "FAIL-C: private not recreated" >&2; exit 1; }
         if grep -qx OLD secrets/rio_signing-key-pub; then
           echo "FAIL-C: pub not overwritten (stale pair)" >&2; exit 1
+        fi
+
+        # Scenarios D/E: the same two partial states for the mountd
+        # Ed25519 pair — the block claims to clone the signing-key
+        # dual-guard, so hold it to the same convergence bar.
+        rm secrets/rio_mountd-signing-pub
+        run
+        [ -f secrets/rio_mountd-signing-pub ] \
+          || { echo "FAIL-D: mountd pub missing after retry (guard checked private only?)" >&2; exit 1; }
+        rm secrets/rio_mountd-signing-key
+        echo OLD > secrets/rio_mountd-signing-pub
+        run
+        [ -f secrets/rio_mountd-signing-key ] \
+          || { echo "FAIL-E: mountd private not recreated" >&2; exit 1; }
+        if grep -qx OLD secrets/rio_mountd-signing-pub; then
+          echo "FAIL-E: mountd pub not overwritten (stale pair)" >&2; exit 1
         fi
         touch $out
       '';
