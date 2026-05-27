@@ -47,6 +47,11 @@ pub struct DagActorConfig {
     /// `Default` uses [`crate::sla::config::SlaConfig::test_default`]
     /// (single best-effort tier, tiny ceilings).
     pub sla: crate::sla::config::SlaConfig,
+    /// Cap (seconds) on the assignment-token TTL minted at dispatch —
+    /// `r[common.hmac.expiry-cap]`. main.rs loads from scheduler.toml
+    /// `assignment_token_ttl_cap_secs`. Default
+    /// [`super::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS`] (48 h).
+    pub assignment_token_ttl_cap_secs: u64,
 }
 
 impl Default for DagActorConfig {
@@ -58,6 +63,7 @@ impl Default for DagActorConfig {
             substitute_max_concurrent: super::DEFAULT_SUBSTITUTE_CONCURRENCY,
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
+            assignment_token_ttl_cap_secs: super::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
         }
     }
 }

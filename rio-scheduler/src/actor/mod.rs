@@ -127,6 +127,30 @@ pub(crate) const LOG_EVENT_BUFFER_SIZE: usize = 1024;
 // r[impl sched.substitute.fanout-bound]
 pub const DEFAULT_SUBSTITUTE_CONCURRENCY: usize = 256;
 
+/// Default cap on the assignment-token TTL minted at dispatch
+/// (`Config.assignment_token_ttl_cap_secs`): 48 h.
+///
+/// Grounded in what the system enforces elsewhere: executor pods are
+/// one-shot Jobs whose `activeDeadlineSeconds` derives from the
+/// SpawnIntent deadline capped at [`floor::DEADLINE_CAP_SECS`] (24 h),
+/// so 48 h = 2× the longest a legitimate k8s holder can exist.
+/// Standalone (non-k8s) workers have no pod deadline; the same 2× slack
+/// covers a ~24 h build plus its post-build upload window. The
+/// `assignment_token_ttl_default_cap_is_twice_pod_deadline` test in
+/// `actor/tests/misc.rs` pins the 2× relationship.
+pub const DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS: u64 = 172_800;
+
+/// Floor on the assignment-token TTL minted at dispatch: 4 h.
+///
+/// 2× the builder's `DEFAULT_DAEMON_TIMEOUT` (7200 s — duplicated
+/// because the const can't be referenced cross-crate). A tiny
+/// client-supplied `build_timeout` (say 60 s) must not produce a token
+/// that expires before the post-build upload and the tolerated
+/// late-upload-after-completion window. `build_timeout = 0`
+/// ("unlimited") does NOT take this floor — it maps to the cap
+/// (`r[common.hmac.expiry-cap]`).
+pub const ASSIGNMENT_TOKEN_TTL_FLOOR_SECS: u64 = 14_400;
+
 /// Retry policy for the detached substitute fetch's `QueryPathInfo`.
 /// Transient store errors (`Unavailable`/`Aborted`/`ResourceExhausted`
 /// per [`rio_common::grpc::is_transient`]) retry up to
@@ -481,6 +505,10 @@ pub struct DagActor {
     /// Arc because assign_to_worker is hot path and cloning the
     /// underlying key Vec on every dispatch would allocate.
     hmac_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// Cap (seconds) on the assignment-token TTL minted at dispatch —
+    /// `r[common.hmac.expiry-cap]`. From
+    /// [`DagActorConfig::assignment_token_ttl_cap_secs`].
+    assignment_token_ttl_cap_secs: u64,
     /// HMAC signer for `x-rio-service-token`. When Some, the
     /// dispatch-time store-check
     /// ([`dispatch::DagActor::batch_probe_cached_ready`]) sets
@@ -750,6 +778,7 @@ impl DagActor {
             self_tx: None,
             soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
+            assignment_token_ttl_cap_secs: cfg.assignment_token_ttl_cap_secs,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
             freeze_builders_since: None,
@@ -836,6 +865,9 @@ impl DagActor {
             self_tx: _,
             soft_features,
             hmac_signer: _,
+            // Retained: deploy config, not persisted state — a leader
+            // transition doesn't change the operator's TTL cap.
+            assignment_token_ttl_cap_secs: _,
             service_signer: _,
             shutdown: _,
             freeze_builders_since: _,

@@ -74,6 +74,13 @@
         ],
         "default": null
       },
+      "assignment_token_ttl_cap_secs": {
+        "description": "Cap (seconds) on the assignment-token TTL minted at dispatch.\nThe TTL is 2× the client-supplied `build_timeout` clamped to\n[4 h, this cap]; `build_timeout = 0` (\"unlimited\") gets the cap\n— `r[common.hmac.expiry-cap]`. Default 172800 (48 h): 2× the\nexecutor-pod `activeDeadlineSeconds` ceiling (24 h), so the\ntoken comfortably outlives the longest k8s build plus its\nupload window, and covers a ~24 h standalone build with the\nsame 2× slack. Raise only if standalone builds legitimately run\nlonger than 24 h; must be ≥ 14400 (the 4 h floor). Env:\n`RIO_ASSIGNMENT_TOKEN_TTL_CAP_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 172800
+      },
       "service_hmac_key_path": {
         "description": "HMAC key file for signing `x-rio-service-token` (SEPARATE from\n`hmac_key_path`). The scheduler mints `ServiceClaims { caller:\n\"rio-scheduler\" }` so the store honours `x-rio-probe-tenant-id`\non dispatch-time `FindMissingPaths`/`QueryPathInfo` —\n`r[sched.dispatch.fod-substitute]`. Unset = dispatch-time\nsubstitution probe disabled (falls back to local-presence-only).",
         "type": [
@@ -306,6 +313,7 @@
     "log_retention_days": 30,
     "soft_features": [],
     "hmac_key_path": null,
+    "assignment_token_ttl_cap_secs": 172800,
     "service_hmac_key_path": null,
     "jwt": {
       "required": false,

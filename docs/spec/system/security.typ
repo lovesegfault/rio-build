@@ -155,6 +155,27 @@
     enhancement could add tenant-scoped read tokens.
 ]
 
+#r("common.hmac.expiry-cap")[
+  The scheduler MUST bound the assignment-token lifetime at mint time:
+  `expiry_unix - now` is `2 × build_timeout` clamped to a 4 h floor and to the
+  operator-configurable cap `assignment_token_ttl_cap_secs` (scheduler config,
+  default 48 h), and a `build_timeout` of 0 ("unlimited") MUST map to the cap,
+  never to the floor.
+]
+
+The cap default is grounded in what the system actually enforces elsewhere:
+executor pods are one-shot Jobs whose `activeDeadlineSeconds` derives from the
+SpawnIntent deadline capped at 24 h (`DEADLINE_CAP_SECS`), so 48 h = 2× the
+longest a legitimate k8s holder can exist; standalone (non-k8s) workers have no
+pod deadline, and the same 2× slack covers a ~24 h build plus its upload
+window. The floor (4 h = 2× the builder's default daemon timeout) keeps a
+tiny client-supplied `build_timeout` from producing a token that expires
+before the post-build upload completes. Before this rule the expiry was
+2× a client-supplied number clamped only at 7 days (worst case ≈14 days of
+tenant-wide castore read capability from one leaked token), and
+`build_timeout=0` produced a 4 h token that could expire mid-build for a
+legitimate >4 h "unlimited" standalone build.
+
 #r("sec.executor.identity-token+2")[
   The scheduler signs *executor-identity tokens* (`ExecutorClaims { intent_id,
   kind, expiry_unix }`, same HMAC envelope as `AssignmentClaims`, same key) per

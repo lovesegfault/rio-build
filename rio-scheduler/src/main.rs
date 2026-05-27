@@ -355,6 +355,7 @@ async fn main() -> anyhow::Result<()> {
             retry_policy: cfg.retry,
             substitute_max_concurrent: cfg.substitute_max_concurrent,
             sla: cfg.sla,
+            assignment_token_ttl_cap_secs: cfg.assignment_token_ttl_cap_secs,
             ..Default::default()
         },
         rio_scheduler::actor::DagActorPlumbing {

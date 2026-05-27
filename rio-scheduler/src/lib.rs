@@ -44,6 +44,10 @@ pub mod state;
 pub use state::{PoisonConfig, RetryPolicy};
 // Default for main.rs Config's `#[serde(default = ...)]` fn.
 pub use actor::DEFAULT_SUBSTITUTE_CONCURRENCY;
+// Default + floor for `Config.assignment_token_ttl_cap_secs`
+// (`r[common.hmac.expiry-cap]`): config.rs uses both, the floor also
+// gates the ValidateConfig bounds check.
+pub use actor::{ASSIGNMENT_TOKEN_TTL_FLOOR_SECS, DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS};
 
 /// Re-export of the shared embedded migrator from `rio-migrations`.
 /// Test-only (`TestDb::new(&MIGRATOR)`) — production goes through

@@ -48,6 +48,17 @@ pub struct Config {
     /// verifies on PutPath with the SAME key. Unset = unsigned
     /// tokens (dev mode). Generate: `openssl rand -out /path 32`.
     pub hmac_key_path: Option<std::path::PathBuf>,
+    /// Cap (seconds) on the assignment-token TTL minted at dispatch.
+    /// The TTL is 2× the client-supplied `build_timeout` clamped to
+    /// [4 h, this cap]; `build_timeout = 0` ("unlimited") gets the cap
+    /// — `r[common.hmac.expiry-cap]`. Default 172800 (48 h): 2× the
+    /// executor-pod `activeDeadlineSeconds` ceiling (24 h), so the
+    /// token comfortably outlives the longest k8s build plus its
+    /// upload window, and covers a ~24 h standalone build with the
+    /// same 2× slack. Raise only if standalone builds legitimately run
+    /// longer than 24 h; must be ≥ 14400 (the 4 h floor). Env:
+    /// `RIO_ASSIGNMENT_TOKEN_TTL_CAP_SECS`.
+    pub assignment_token_ttl_cap_secs: u64,
     /// HMAC key file for signing `x-rio-service-token` (SEPARATE from
     /// `hmac_key_path`). The scheduler mints `ServiceClaims { caller:
     /// "rio-scheduler" }` so the store honours `x-rio-probe-tenant-id`
@@ -158,6 +169,7 @@ impl Default for Config {
             log_retention_days: 30,
             soft_features: Vec::new(),
             hmac_key_path: None,
+            assignment_token_ttl_cap_secs: crate::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
             service_hmac_key_path: None,
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,
@@ -318,6 +330,21 @@ impl rio_common::config::ValidateConfig for Config {
          (<=0 makes the elapsed-reset comparison always true → max_infra_retries \
          cap never reached → infra-failure hot-loop)",
             cfg.retry.infra_retry_window_secs
+        );
+        // r[impl common.hmac.expiry-cap]
+        // Below the 4 h floor the dispatch-time clamp would silently
+        // resolve every token TTL to the cap (the non-panicking
+        // max/min ordering lets cap win), i.e. the operator's number
+        // is ignored; 0 would mint already-expired tokens and every
+        // castore read / upload would fail UNAUTHENTICATED at the
+        // store. Reject at config load instead.
+        anyhow::ensure!(
+            cfg.assignment_token_ttl_cap_secs >= crate::ASSIGNMENT_TOKEN_TTL_FLOOR_SECS,
+            "assignment_token_ttl_cap_secs must be >= {} (the 4h floor), got {} \
+             (a smaller cap is silently ignored by the dispatch-time clamp; \
+             0 would mint already-expired assignment tokens)",
+            crate::ASSIGNMENT_TOKEN_TTL_FLOOR_SECS,
+            cfg.assignment_token_ttl_cap_secs
         );
         // `PoisonConfig::is_poisoned` checks `count >= threshold` — threshold=0
         // makes `0 >= 0` vacuously true at DAG-merge time, before any dispatch.

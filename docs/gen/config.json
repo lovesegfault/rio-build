@@ -202,6 +202,12 @@
         "description": "HMAC key file for signing assignment tokens."
       },
       {
+        "key": "assignment_token_ttl_cap_secs",
+        "type": "uint64",
+        "default": "172800",
+        "description": "Cap (seconds) on the assignment-token TTL minted at dispatch."
+      },
+      {
         "key": "service_hmac_key_path",
         "type": "string",
         "default": "",

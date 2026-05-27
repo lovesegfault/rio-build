@@ -459,10 +459,14 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     Ok(())
 }
 
-/// MAX_HMAC_TIMEOUT_SECS clamp: even if build_timeout is u64::MAX,
-/// the token's expiry stays bounded (≤ ~14 days from now: 7d × 2).
+/// TTL-cap clamp on the wired dispatch path: even if the client sends
+/// build_timeout = u64::MAX, the minted token's expiry is bounded by
+/// `assignment_token_ttl_cap_secs` (default 48 h) — not the old 7-day
+/// constant, and certainly not year 584942417355. Behavior change from
+/// the pre-cap formula is intentional (`r[common.hmac.expiry-cap]`).
+// r[verify common.hmac.expiry-cap]
 #[tokio::test]
-async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
+async fn test_hmac_timeout_clamps_to_ttl_cap() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier};
 
     let db = TestDb::new(&MIGRATOR).await;
@@ -505,16 +509,70 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
-    // 7 days × 2 = 14 days max. Allow 15 for clock skew tolerance.
-    let max_expected = now + 15 * 86400;
+    let cap = crate::actor::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS;
+    // Exactly the cap, modulo the wall-clock between mint and assert
+    // (generous 10-minute slack — structural bound, not a timing gate).
     assert!(
-        claims.expiry_unix < max_expected,
-        "expiry {} should be clamped (< {}), not year 584942417355",
+        claims.expiry_unix <= now + cap,
+        "expiry {} must be capped at now+{cap} ({}), not the old 7d clamp",
         claims.expiry_unix,
-        max_expected
+        now + cap
+    );
+    assert!(
+        claims.expiry_unix >= now + cap - 600,
+        "expiry {} should sit at the cap (≈ now+{cap}); a much smaller value \
+         means the huge timeout fell through to the floor instead",
+        claims.expiry_unix
     );
 
     Ok(())
+}
+
+/// Pure clamp-formula coverage for `assignment_token_ttl_secs`
+/// (`r[common.hmac.expiry-cap]`): typical, huge (capped), zero
+/// (unlimited → cap, NOT the old 4 h floor), and tiny (floored).
+// r[verify common.hmac.expiry-cap]
+#[test]
+fn assignment_token_ttl_clamp_table() {
+    use crate::actor::dispatch::assignment_token_ttl_secs;
+    use crate::actor::{ASSIGNMENT_TOKEN_TTL_FLOOR_SECS, DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS};
+
+    let cap = DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS;
+
+    // Typical: a 6 h build_timeout → 12 h token (2×, inside the band).
+    assert_eq!(assignment_token_ttl_secs(6 * 3600, cap), 12 * 3600);
+    // Huge client-supplied timeout: capped (u64::MAX must not overflow
+    // into an immortal token either).
+    assert_eq!(assignment_token_ttl_secs(7 * 86_400, cap), cap);
+    assert_eq!(assignment_token_ttl_secs(u64::MAX, cap), cap);
+    // Zero = "unlimited": gets the cap, not the floor — the old
+    // 4 h-token-for-unlimited-builds behavior was a bug.
+    assert_eq!(assignment_token_ttl_secs(0, cap), cap);
+    // Tiny timeout: floored at 4 h so the post-build upload window
+    // never collapses to minutes.
+    assert_eq!(
+        assignment_token_ttl_secs(60, cap),
+        ASSIGNMENT_TOKEN_TTL_FLOOR_SECS
+    );
+    // Exactly at the boundaries: 2 h doubles to the floor, 24 h doubles
+    // to the cap.
+    assert_eq!(
+        assignment_token_ttl_secs(2 * 3600, cap),
+        ASSIGNMENT_TOKEN_TTL_FLOOR_SECS
+    );
+    assert_eq!(assignment_token_ttl_secs(86_400, cap), cap);
+}
+
+/// The default cap is grounded in the executor-pod deadline: 2× the
+/// `activeDeadlineSeconds` ceiling (`DEADLINE_CAP_SECS` = 24 h). If the
+/// pod deadline changes, this forces a deliberate decision about the
+/// token cap instead of silent drift.
+#[test]
+fn assignment_token_ttl_default_cap_is_twice_pod_deadline() {
+    assert_eq!(
+        crate::actor::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
+        2 * u64::from(crate::actor::floor::DEADLINE_CAP_SECS)
+    );
 }
 
 // ---------------------------------------------------------------------------

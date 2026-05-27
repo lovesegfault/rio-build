@@ -102,6 +102,38 @@ fn check_freeze(
     }
 }
 
+/// Assignment-token TTL (seconds until expiry) minted at dispatch:
+/// `clamp(2 × build_timeout, ASSIGNMENT_TOKEN_TTL_FLOOR_SECS, cap_secs)`,
+/// with `build_timeout = 0` ("unlimited") mapping to the cap.
+///
+/// Why a cap: `build_timeout` is client-supplied; before the cap the
+/// only bound was 7 days (worst case ≈14 d of tenant-wide castore read
+/// capability from one leaked token), and `saturating_mul` is what kept
+/// `u64::MAX` from minting an immortal token. The cap default (48 h =
+/// 2× the executor-pod `activeDeadlineSeconds` ceiling,
+/// [`super::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS`]) is operator
+/// config — `Config::assignment_token_ttl_cap_secs`.
+///
+/// Why the zero case maps to the cap, not the floor: `build_timeout=0`
+/// means "unlimited"; the old behaviour (treat as the 2 h daemon
+/// default → 4 h token) made a legitimate >4 h unlimited standalone
+/// build lose castore access mid-build.
+///
+/// `max(floor).min(cap)` rather than `clamp()` so a misconfigured
+/// `cap < floor` resolves to the cap (operator explicitly wants short
+/// tokens) instead of panicking on the dispatch hot path; config
+/// validation rejects that combination at startup anyway.
+// r[impl common.hmac.expiry-cap]
+pub(super) fn assignment_token_ttl_secs(build_timeout_secs: u64, cap_secs: u64) -> u64 {
+    if build_timeout_secs == 0 {
+        return cap_secs;
+    }
+    build_timeout_secs
+        .saturating_mul(2)
+        .max(super::ASSIGNMENT_TOKEN_TTL_FLOOR_SECS)
+        .min(cap_secs)
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // Dispatch
@@ -1895,32 +1927,22 @@ impl DagActor {
         // from a compromised worker). Unsigned tokens are
         // accepted by a store with hmac_verifier=None (dev).
         //
-        // Expiry: 2× build_timeout (or 2× daemon_timeout
-        // default if timeout=0). A worker legitimately
+        // Expiry: 2× build_timeout, clamped to [4h floor,
+        // assignment_token_ttl_cap_secs]; build_timeout=0
+        // ("unlimited") gets the cap. A worker legitimately
         // uploading after completion is well within that
-        // window. Prevents replay from a leaked token later.
+        // window. Prevents replay from a leaked token later —
+        // see assignment_token_ttl_secs for the rationale.
         let assignment_token = if let Some(signer) = &self.hmac_signer {
-            let timeout_secs = if build_opts.build_timeout > 0 {
-                build_opts.build_timeout
-            } else {
-                // Match rio-builder's DEFAULT_DAEMON_TIMEOUT.
-                // Can't reference the const cross-crate, so
-                // duplicate the value. 7200s = 2h.
-                7200
-            };
-            // Clamp BEFORE saturating_mul: a client sending
-            // build_timeout=u64::MAX would get saturating_mul
-            // → u64::MAX → expiry_unix = u64::MAX = immortal
-            // token. A leaked immortal token defeats the
-            // replay-prevention purpose of expiry entirely.
-            // 7 days max: well above any real build duration.
-            const MAX_HMAC_TIMEOUT_SECS: u64 = 7 * 86400;
-            let timeout_secs = timeout_secs.min(MAX_HMAC_TIMEOUT_SECS);
+            let ttl_secs = assignment_token_ttl_secs(
+                build_opts.build_timeout,
+                self.assignment_token_ttl_cap_secs,
+            );
             let expiry_unix = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0)
-                .saturating_add(timeout_secs.saturating_mul(2));
+                .saturating_add(ttl_secs);
             signer.sign(&rio_auth::hmac::AssignmentClaims {
                 executor_id: executor_id.to_string(),
                 drv_hash: drv_hash.to_string(),
