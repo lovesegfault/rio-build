@@ -2512,3 +2512,161 @@ mid-campaign") in full:
 - **Stage-C calibration-table delta pass** on the controller map:
   added to the Phase-1 input list below as a 1b/1d deliverable signed
   by that campaign's owner.
+
+### The go/no-go evaluation (T-0e.7)
+
+Every design §6 no-go condition (nine bullets) plus the plan's
+regime-coverage input (item 10), each with a verdict and its evidence
+pointer. Verdict vocabulary: **clear** — the condition is not
+triggered by the 0a–0e record; **conditional** — the condition's
+discharge depends on a named AWAITING-OWNER row (it clears if that
+row resolves either of its prepared ways, and stands as a no-go only
+if the row is left unresolved); **triggered** — the condition holds
+and the replacement design must be redrawn (none below). Per the
+design, the verification artifacts (0b–0d) stand regardless of the
+outcome.
+
+| # | No-go condition (design §6) | Verdict | Evidence |
+|---|---|---|---|
+| 1 | A calibration family protected only by a deleted mechanism with no named successor and no by-construction argument | **Clear** | The finalized disposition table × the 0d calibration table: every "unnecessary" row names its carrier (frozen-invariant list + per-mechanism table above); the two rows the calibration sharpened (#9 economy-not-safety, #10 by-construction `confirmedPhantomIsDrained`) are cited in-row |
+| 2 | One pod death cannot be reduced to ≤1 charged attempt from post-replacement signals alone | **Clear** (paper re-derivation; mechanical re-check at 1b/1c') | The two-installment shape survives keyed by `exec_id` (durable, no TTL race); the no-attempt rule prevents charging never-pulled pods; `attemptsChargedOnce` stays the imported oracle; the §4.1 transaction fence closes the two-believer double-pull race; F4's calibration rows map onto the re-keyed lifecycle (frozen-invariant rows 13–14) |
+| 3 | AD2 re-keying cannot preserve `sched.retry.per-executor-budget`'s intent (incl. small-fleet and exhausted-universe clauses) | **Clear** | AD2's three-part contract is confirmed at the freeze (exhaustion survives re-keyed and relocated to the spawn gate; small-fleet clause min(threshold, |sources|); durable source attribution via migration ≥067); the 0d F5 re-dispositions name the placeable()/eligibility unit suite as the binding coverage for the eligibility content; the exhausted-universe verdict stays a structural poison, never deadline churn |
+| 4 | The OA1 latency model shows death→requeue or cancel latency past the signed budget | **Conditional on OA1** | No baseline and no signed budget exist at this cut, so the condition can be neither triggered nor discharged; the AD5 component structure shows no structural blowout (every component is tick-, propagation- or grace-bounded), but the design requires the measured baseline. Clears when OA1 resolves and the budget is signed against it |
+| 5 | The OA1 baseline cannot be obtained | **Conditional on OA1** | Today the interval-(i) baseline does not exist and cannot be reconstructed retroactively (the 0a source audit); it becomes obtainable the moment the owner authorizes the instrument (option A) or signs the weaker-population basis (option B). Stands as a no-go only if OA1 is left unresolved |
+| 6 | The Model J/N obligation table marks any imported obligation unmeetable | **Clear** (no unmeetable row), with one row conditional | Obligation table above: 5 of 7 rows meetable with named successors; rows 5 (dead_nodes/OA2) and 6 (placeable input/OA6) are meetable under either prepared resolution of their owner rows; none is unmeetable under any prepared option |
+| 7 | The dual-belief residual has no checked successor / a lease guarantee becomes unconsumable | **Clear** | T-0e.2: the transaction-side fence + `StaleAuthorityWritesAreInert` (1c' re-target) + the `admit_pull` Kani contract are the named checked successors; all four leaderElection.qnt exports remain consumed; claim-before-advertise's successor (claim-before-serve) is named |
+| 8 | OA6 unadjudicated — no committed pull outcome for the not-yet-Ready case | **Conditional on OA6** | The decision package (both options, costs, decision rule, recommendation) is prepared and AWAITING OWNER; the unary signatures are frozen except for this rider. Clears with either option; stands only if unresolved |
+| 9 | OA2 unresolved — no signed-off node-health successor and no recorded accepted gap | **Conditional on OA2** | The decision package (three options incl. the signed-gap shape with bound and compensating controls) is prepared and AWAITING OWNER. Clears with any of the three; stands only if unresolved |
+| 10 | (plan addition) Regime-coverage input: families whose only exhaustive fault-regime coverage was demoted out of `checks.*` or dropped to representative-revert-only | **AWAITING OWNER signature** (prepared below) | More than two families are affected, so the plan requires the campaign owner's explicit signed acceptance naming the gap and its compensating coverage; absent that signature this item is treated as a no-go for Phase-1 planning |
+
+The item-10 statement prepared for the owner's signature (it is the
+same adjudication as the still-open 0c budget stop-and-report, not a
+new one):
+
+- **The gap.** The exhaustive cfgs for fault-stream-conn and
+  fault-process were never wired (budget non-convergence at the
+  witness-preserving bounds; the deep-simulation runs are recorded but
+  are not exhaustive verdicts), and the fault-leader / fault-persist
+  cfgs are documented manual targets whose post-fix bounded-exhaustive
+  re-runs were stopped over the gate budget after clearing well past
+  the falsifying trace class's depth. The node regime was not
+  attempted (pre-registered fallback). Families whose contended fault
+  class therefore has no completed exhaustive verdict anywhere: F2's
+  pod-death/failover arms, F3's death channel, F4, F6 (F1/F5 and
+  Model D's families have wired exhaustive coverage of their
+  contended regimes; F2's stream-message and base arms are wired).
+- **The compensating coverage on record:** every witness for the
+  affected regimes is wired and violating in `checks.*` (the contended
+  states stay pinned reachable); the Stage-B deep-simulation evidence
+  and the fault-leader/persist bounded re-runs; the 0d
+  first-counterexample calibration runs at those regime constants
+  (F2 phantom/no-adopt, F4's two falsifying hand-off overrides, F6
+  deposed-reassign) plus the six wired `quint-executor-calib-*`
+  regression guards; the named VM scenarios (`chaos`,
+  `lifecycle/recovery`, `ephemeral-pool`, `reassign`) and the
+  detector/establishment unit tests; and the lease campaign's wired
+  checks for the failover machinery Model S imports.
+- **The owner outcomes available** (from the 0c stop-and-report,
+  unchanged): accept multi-ten-minute checks and wire the cfgs;
+  authorize a further per-fault-class split; authorize a coarser
+  re-encoding; or accept representative-revert-only calibration for
+  the affected slices and sign exactly this statement as the item-10
+  acceptance.
+
+**Overall verdict at this cut: no condition is triggered — nothing in
+the 0a–0e record indicates the replacement design must be redrawn —
+but the gate cannot be signed "go" yet, because four owner items
+remain open: OA1 (conditions 4 and 5), OA2 (condition 9), OA6
+(condition 8), and the item-10 regime-coverage acceptance. The 0e
+record is therefore a conditional close: the contract above is frozen
+and Phase-1 planning inputs are complete, and the go signature waits
+on those four decisions; if any of them is resolved "no" (OA1 refused
+with no signed alternative, OA2 left unresolved, OA6 left
+unadjudicated, or the item-10 acceptance withheld), the corresponding
+condition stands and the design is redrawn before Phase 1 per the
+design's own rule.**
+
+### Phase-1 input list (T-0e.8)
+
+Everything the Phase-1 planner needs, in one place. The Phase-1 plan
+is written as a separate document against this contract only after
+the owner resolves the four open items above.
+
+1. **The frozen contract** (this Stage-0e section): the unary
+   signatures and payload reuse (with the OA6 rider), the frozen
+   invariant list (where verified today / what the replacement owes),
+   the finalized per-mechanism disposition table with the
+   introduced-mechanism list and k8s-native carriers, the coexistence
+   invariant, AD1–AD6 status (AD5 unsigned pending OA1), and the §4.5
+   choices: bridge = ledger-backed open-attempt query in
+   `reap_orphan_running` (lands 1a, verified 1b), rollback posture =
+   revert-clean deletion-wave commits kept rebased to the Phase-2
+   close-out, deletion-gate observable = stream-registration gauge at
+   zero for the computed deadline horizon.
+2. **The owner-decision queue (Phase-1 blockers):** OA1, OA2, OA6
+   decision packages and the item-10 regime-coverage acceptance —
+   all AWAITING OWNER above; plus the still-open 0c budget
+   stop-and-report they fold into.
+3. **The interface re-derivation plans:** the Model J/N obligation
+   table with re-derivation work items (i)–(iii) (1c'/1d); the
+   lease-seam note with `StaleAuthorityWritesAreInert` and
+   claim-before-serve (1c'); the retryPolicy.qnt pull-mode environment
+   plan (lands 1b).
+4. **The calibration record to build the acceptance table against:**
+   the 0d calibration table (50 in-family rows, the hand-off rows,
+   the cross-campaign links), the six wired `quint-executor-calib-*`
+   witnesses and six evidence modules, and the Phase-1/0e-contract
+   inputs subsection (confirmedPhantomIsDrained retirement statement,
+   the be3ad068e economy finding, the 0ea9bd701 lease dependency, the
+   F5 unit-suite binding coverage).
+5. **The Stage-B record:** both models, their bounds, the verdict
+   table (wired cfgs vs manual targets), the witness set, the
+   falsification adjudication and its production fix (`1bbad1ee7`),
+   and the open budget stop-and-report — including which regimes the
+   1c' re-target must re-cover (a fault-leader regime is retained by
+   design §4.4) and which retire with the stream path.
+6. **The OA carry list with owners:** OA3 (one-pull default stands;
+   data owner: campaign owner), OA4 (BuildPhase; dashboard owner),
+   OA5 (surface + owner recorded; operator sign-off due at the 1b
+   gate; old surfaces deleted only after sign-off at 1c').
+7. **The OA1 instrument decision** (whichever option the owner takes)
+   and the environment/population statement it carries, so the 1a
+   handlers emit the same instrument and the 1b/1c gates read the
+   same source.
+8. **Spec consequences queued for Phase 1** (none executed in Phase
+   0): the C2 deregister-rule epoch qualification, AD2's
+   `sched.retry.per-executor-budget+2` re-key and
+   `sched.dispatch.fleet-exhaust+3` re-statement, AD4's
+   `sched.lease.generation-fence+2` amendment and
+   claim-before-advertise successor, AD5's `ctrl.pod.tgps-default` /
+   cancel-path / drain-rule amendments, OA6(b)'s
+   `ctrl.nodeclaim.placeable-gate+5` amendment if that option is
+   taken, the C3/C4 stale-prose fixes, and retiring/re-pointing the
+   five 0b rules' verify markers when the checks they cite are
+   re-targeted at 1c'.
+9. **Migration ≥067** (AD2c): the source-node column on the attempt
+   row, written from the controller-authoritative binding
+   (`AckSpawnedIntents.bound_intents`) and/or `ReportAttemptOutcome`;
+   never an edit to a shipped migration.
+10. **The check-budget envelope:** 28 executor checks wired today (5
+    exhaustive cfgs, 17 witnesses, 6 calibration witnesses); the
+    unwired exhaustive cfgs and their owner adjudication; what 1c'
+    re-targets (Model S), what 1d retires (Model D, the as-built
+    retry-channel regimes) and what replaces them (pull-mode regimes,
+    `StaleAuthorityWritesAreInert`, the Kani kernels).
+11. **The controller-map re-validation owed because this campaign is
+    green-lit mid-campaign** (carried forward explicitly, signed by
+    that campaign's owner): the re-audit of the affected sections
+    (J11, the orphan-reap rows, F1/F3, the I12 out-of-model entry) at
+    this campaign's 1b and 1d; the delta pass on its Stage-C
+    calibration table at the same slices; the F1/F3 prerequisite
+    review already performed and recorded above; the Stage-B re-check
+    with heartbeat-authority assumptions removed, carried by the
+    1c'/1d Model J/N re-derivation rather than re-scheduled.
+12. **The Phase-1 gate skeleton:** design §6 rows 1a–1d/2 with the
+    0e-fixed items slotted in (the 1a bridge + red-first idempotency
+    and orphan-reap tests, the 1b canary gate's fold-input assertions
+    and AD5 re-baselined VM scenarios, the 1c deletion-gate
+    observable, the 1c' deletion-wave gate items (a)–(d), the 1d
+    cleanup and Model D retirement, the Phase-2 acceptance table and
+    close-out honesty contract).
