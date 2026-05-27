@@ -105,6 +105,7 @@ Teardown — builder unmounts (or its pod exits), then closes the UDS:
 
 - builder: `umount2(castore_mnt, MNT_DETACH)` → drop the UDS connection → abort the FUSE connection (fusectl) so nothing stays parked on it; its mount-ns death takes both the overlay and the castore mount with it anyway.
 - `rio-mountd` on UDS close: `rm -rf staging/{build_id}` + release the uid/`build_id` claims + `close(kept_fuse_fd)`.
+- liveness for any *reaper* (startup orphan scan, disk-pressure sweep) is decided by the flock'd `.rio-live` sentinel each staging dir carries: the builder flocks it at Mount time, the kernel drops the lock with the process, and reapers skip flock-held dirs.
 
 r[builder.mountd.orphan-scan]
 
