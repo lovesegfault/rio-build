@@ -33,7 +33,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{
-    NodeAffinity, NodeSelector, Pod, PodSpec, ResourceRequirements, Toleration,
+    Node, NodeAffinity, NodeSelector, Pod, PodSpec, ResourceRequirements, Toleration,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
@@ -318,6 +318,133 @@ impl HwSampledCache {
 /// Status: `replicas` / `readyReplicas` / `desiredReplicas` mean
 /// "active Jobs." `desiredReplicas` is the concurrent-Job ceiling
 /// (`spec.maxConcurrent`).
+/// AD2 spawn-gate exhaustion predicate: every node this pool could
+/// currently schedule onto is already in the intent's `excluded_nodes`.
+/// An empty spawnable universe NEVER reads as exhausted (an empty pool
+/// is a provisioning transient — autoscaling may mint a node that is
+/// not excluded), mirroring `placeable()`'s empty-fleet defer; an
+/// intent with no exclusions is trivially spawnable.
+// r[impl sched.dispatch.fleet-exhaust+4]
+pub(super) fn no_eligible_source(
+    intent: &SpawnIntent,
+    spawnable: &std::collections::BTreeSet<String>,
+) -> bool {
+    !intent.excluded_nodes.is_empty()
+        && !spawnable.is_empty()
+        && spawnable.iter().all(|n| intent.excluded_nodes.contains(n))
+}
+
+/// The spawnable-source universe for `pool`: the names of schedulable,
+/// Ready nodes matching the pool's static placement constraints (the
+/// effective node selector — kind constraints like the fetcher
+/// selector — plus the arch derived from `spec.systems`); the same
+/// data the FFD's node view keys on, read lazily from the apiserver
+/// only on ticks where some intent actually carries exclusions.
+/// `None` when the list fails — callers treat that as "cannot prove
+/// exhaustion" and spawn as today (fail-open: the anti-affinity makes
+/// the pod Pending at worst, exactly the pre-gate behavior).
+pub(super) async fn spawnable_nodes_for_pool(
+    client: &kube::Client,
+    pool: &Pool,
+) -> Option<std::collections::BTreeSet<String>> {
+    let mut selector: Vec<String> = pod::effective_node_selector(pool)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect();
+    if let Some(arch) = pod::nix_systems_to_k8s_arch(&pool.spec.systems) {
+        selector.push(format!("kubernetes.io/arch={arch}"));
+    }
+    let mut params = ListParams::default();
+    if !selector.is_empty() {
+        params = params.labels(&selector.join(","));
+    }
+    let nodes: Api<Node> = Api::all(client.clone());
+    let list = match nodes.list(&params).await {
+        Ok(l) => l,
+        Err(e) => {
+            debug!(pool = %pool.name_any(), error = %e,
+                   "spawnable-node list failed; skipping the NoEligibleSource gate this tick");
+            return None;
+        }
+    };
+    Some(
+        list.items
+            .iter()
+            .filter(|n| {
+                // Schedulable (not cordoned) and Ready: an unschedulable
+                // or NotReady node cannot host the pod, so counting it
+                // would under-fire the gate (fail-open) — acceptable —
+                // but counting only genuinely placeable nodes keeps the
+                // small-fleet clause exact on single-node fixtures.
+                let schedulable = n
+                    .spec
+                    .as_ref()
+                    .and_then(|s| s.unschedulable)
+                    .is_none_or(|u| !u);
+                let ready = n.status.as_ref().is_some_and(|s| {
+                    s.conditions.as_ref().is_some_and(|conds| {
+                        conds
+                            .iter()
+                            .any(|c| c.type_ == "Ready" && c.status == "True")
+                    })
+                });
+                schedulable && ready
+            })
+            .filter_map(|n| n.metadata.name.clone())
+            .collect(),
+    )
+}
+
+/// Report one `NoEligibleSource` spawn-gate verdict per gated intent
+/// (instead of spawning an unschedulable Job). Returns how many reports
+/// were acked. Best-effort: an RPC error leaves the intent un-reported
+/// — it stays Ready scheduler-side and is re-evaluated next tick. A
+/// successfully acked report poisons the derivation scheduler-side
+/// (fleet-exhaust arm), so it leaves the intent stream and re-ticks
+/// send nothing further; a duplicate ack is a server-side no-op either
+/// way.
+// r[impl sched.dispatch.fleet-exhaust+4]
+pub(super) async fn report_no_eligible_source(
+    ctx: &Ctx,
+    pool: &str,
+    gated: &[&SpawnIntent],
+) -> u32 {
+    let mut acked = 0u32;
+    for intent in gated {
+        match admin_call(ctx.admin.clone().report_attempt_outcome(
+            rio_proto::types::ReportAttemptOutcomeRequest {
+                intent_id: intent.intent_id.clone(),
+                job_name: String::new(),
+                exec_id: String::new(),
+                reason: rio_proto::types::AttemptTerminalReason::NoEligibleSource.into(),
+                node_name: String::new(),
+            },
+        ))
+        .await
+        {
+            Ok(_) => {
+                warn!(
+                    pool,
+                    intent_id = %intent.intent_id,
+                    excluded = intent.excluded_nodes.len(),
+                    "every spawnable node is excluded for this intent; reported NoEligibleSource \
+                     instead of spawning an unschedulable Job"
+                );
+                acked += 1;
+            }
+            Err(e) => {
+                warn!(
+                    pool, intent_id = %intent.intent_id, error = %e,
+                    "NoEligibleSource report failed; the intent stays Ready and is re-evaluated \
+                     next tick"
+                );
+            }
+        }
+    }
+    acked
+}
+
 pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // Namespace-missing is `InvalidSpec` not `NotFound` — a Pool CR
     // without `.metadata.namespace` is a cluster-scoped apply error
@@ -498,6 +625,34 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
         .take(headroom)
         .cloned()
         .collect();
+
+    // ---- AD2 spawn gate: excluded ⊇ spawnable ⇒ NoEligibleSource ----
+    // Evaluated only when an intent actually carries exclusions (the
+    // node list is lazy); a gated intent is reported instead of
+    // spawned, so no Job burns an activeDeadlineSeconds period sitting
+    // unschedulable behind its own anti-affinity. Fail-open on a
+    // failed node list: cannot prove exhaustion ⇒ spawn as today.
+    let to_spawn_intents: Vec<SpawnIntent> = if to_spawn_intents
+        .iter()
+        .any(|i| !i.excluded_nodes.is_empty())
+    {
+        match spawnable_nodes_for_pool(&ctx.client, pool).await {
+            Some(spawnable) => {
+                let (gated, spawnable_intents): (Vec<SpawnIntent>, Vec<SpawnIntent>) =
+                    to_spawn_intents
+                        .into_iter()
+                        .partition(|i| no_eligible_source(i, &spawnable));
+                if !gated.is_empty() {
+                    let gated_refs: Vec<&SpawnIntent> = gated.iter().collect();
+                    report_no_eligible_source(ctx, &name, &gated_refs).await;
+                }
+                spawnable_intents
+            }
+            None => to_spawn_intents,
+        }
+    } else {
+        to_spawn_intents
+    };
 
     // r[impl sec.executor.identity-token+2]
     // Mint per-intent `RIO_EXECUTOR_TOKEN`s on a controller-only
@@ -1104,6 +1259,13 @@ fn apply_intent_resources(
             ..Default::default()
         });
     }
+
+    // r[impl sched.dispatch.fleet-exhaust+4]
+    // AD2: nodes that already failed this derivation (the intent's
+    // node-keyed exclusion set) are rendered as required anti-affinity,
+    // ANDed into the per-intent placement above. Applied AFTER the
+    // affinity block so the NotIn requirement lands inside every term.
+    pod::apply_excluded_nodes_anti_affinity(pod_spec, &i.excluded_nodes);
 
     // r[impl ctrl.pool.intent-tolerations]
     // §13d toleration axis (r31 bug_020): the intent's `node_affinity`
@@ -1998,6 +2160,98 @@ mod tests {
             "gate inactive → default kube-scheduler, not kube-build-scheduler"
         );
         assert_eq!(pod.priority_class_name, None);
+    }
+
+    // r[verify sched.dispatch.fleet-exhaust+4]
+    /// AD2 anti-affinity render: an intent carrying `excluded_nodes`
+    /// gets a `kubernetes.io/hostname NotIn […]` requirement ANDed
+    /// into EVERY required nodeAffinity term (terms are OR'd, so a
+    /// separate term would weaken the per-intent placement); an intent
+    /// with exclusions but no affinity gets a single term carrying
+    /// only the NotIn; an intent without exclusions renders exactly as
+    /// today (no affinity is invented).
+    #[test]
+    fn intent_excluded_nodes_render_required_anti_affinity() {
+        let pool = test_pool("p", ExecutorKind::Builder);
+        let hw = HwClassConfig::default();
+        let term = rio_proto::types::NodeSelectorTerm {
+            match_expressions: vec![rio_proto::types::NodeSelectorRequirement {
+                key: "rio.build/hw-band".into(),
+                operator: "In".into(),
+                values: vec!["mid".into()],
+            }],
+        };
+
+        // (a) affinity + exclusions: NotIn ANDed into the existing term.
+        let mut i = intent("ex-a");
+        i.node_affinity = vec![term.clone()];
+        i.excluded_nodes = vec!["node-bad-1".into(), "node-bad-2".into()];
+        let mut spec =
+            pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
+        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        let terms = spec
+            .affinity
+            .as_ref()
+            .and_then(|a| a.node_affinity.as_ref())
+            .and_then(|na| {
+                na.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            })
+            .map(|ns| ns.node_selector_terms.clone())
+            .expect("required nodeAffinity rendered");
+        assert_eq!(terms.len(), 1, "no extra OR'd term is appended");
+        let exprs = terms[0].match_expressions.as_ref().expect("expressions");
+        assert!(
+            exprs
+                .iter()
+                .any(|r| r.key == "rio.build/hw-band" && r.operator == "In"),
+            "the per-intent placement requirement survives"
+        );
+        let not_in = exprs
+            .iter()
+            .find(|r| r.key == "kubernetes.io/hostname" && r.operator == "NotIn")
+            .expect("excluded-nodes anti-affinity requirement present");
+        assert_eq!(
+            not_in.values.as_deref(),
+            Some(&["node-bad-1".to_string(), "node-bad-2".to_string()][..])
+        );
+
+        // (b) exclusions only: one term carrying only the NotIn.
+        let mut i = intent("ex-b");
+        i.excluded_nodes = vec!["node-bad-1".into()];
+        let mut spec =
+            pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
+        apply_intent_resources(&mut spec, &pool, &i, &hw);
+        let terms = spec
+            .affinity
+            .as_ref()
+            .and_then(|a| a.node_affinity.as_ref())
+            .and_then(|na| {
+                na.required_during_scheduling_ignored_during_execution
+                    .as_ref()
+            })
+            .map(|ns| ns.node_selector_terms.clone())
+            .expect("required nodeAffinity rendered for the exclusion alone");
+        assert_eq!(terms.len(), 1);
+        assert_eq!(
+            terms[0]
+                .match_expressions
+                .as_ref()
+                .map(|e| e.len())
+                .unwrap_or_default(),
+            1,
+            "only the NotIn requirement"
+        );
+
+        // (c) no exclusions: byte-identical to today (no affinity added).
+        let i = intent("ex-c");
+        let mut with_gate =
+            pod::build_executor_pod_spec(&pool, &test_sched_addrs(), &test_store_addrs(), &hw);
+        apply_intent_resources(&mut with_gate, &pool, &i, &hw);
+        assert!(
+            with_gate.affinity.is_none(),
+            "an intent without excluded_nodes renders identically to today"
+        );
     }
 
     // r[verify ctrl.nodeclaim.placeable-gate+5]

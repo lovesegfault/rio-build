@@ -282,7 +282,7 @@ fn effective_host_users(pool: &Pool) -> Option<bool> {
 /// is a permanently-Pending pod with an affinity no Node satisfies.
 // r[impl fetcher.node.dedicated+4]
 // r[impl ctrl.pool.fetcher-affinity-from-intent+5]
-fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
+pub(super) fn effective_node_selector(pool: &Pool) -> Option<BTreeMap<String, String>> {
     if is_fetcher(pool) {
         // r35 bug_044 (§Permissive-restrictive asymmetry): the
         // pool-static fetcher constraint is RESTRICTIVE and
@@ -486,6 +486,46 @@ pub(super) fn proto_term_to_k8s(t: &rio_proto::types::NodeSelectorTerm) -> NodeS
                 .collect(),
         ),
         match_fields: None,
+    }
+}
+
+/// AD2: render the intent's `excluded_nodes` (the scheduler's
+/// node-keyed exclusion set) as REQUIRED node anti-affinity — a
+/// `kubernetes.io/hostname NotIn [...]` requirement ANDed into every
+/// existing required `nodeSelectorTerm` (terms are OR'd, so appending a
+/// separate term would weaken the existing placement instead of
+/// constraining it), or a single new term when the intent carried no
+/// affinity. Empty `excluded_nodes` is a no-op, so intents without
+/// exclusions render byte-identical to today.
+// r[impl sched.dispatch.fleet-exhaust+4]
+pub(super) fn apply_excluded_nodes_anti_affinity(pod_spec: &mut PodSpec, excluded: &[String]) {
+    if excluded.is_empty() {
+        return;
+    }
+    let requirement = NodeSelectorRequirement {
+        key: "kubernetes.io/hostname".into(),
+        operator: "NotIn".into(),
+        values: Some(excluded.to_vec()),
+    };
+    let node_affinity = pod_spec
+        .affinity
+        .get_or_insert_with(Default::default)
+        .node_affinity
+        .get_or_insert_with(Default::default);
+    let required = node_affinity
+        .required_during_scheduling_ignored_during_execution
+        .get_or_insert_with(|| k8s_openapi::api::core::v1::NodeSelector {
+            node_selector_terms: Vec::new(),
+        });
+    if required.node_selector_terms.is_empty() {
+        required
+            .node_selector_terms
+            .push(NodeSelectorTerm::default());
+    }
+    for term in &mut required.node_selector_terms {
+        term.match_expressions
+            .get_or_insert_with(Vec::new)
+            .push(requirement.clone());
     }
 }
 

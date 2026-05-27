@@ -1180,3 +1180,91 @@ fn orphan_reap_gate_failclosed_on_young_leader() {
         "empty still gates regardless of leader age"
     );
 }
+
+// ───────────────────────────────────────────────────────────────────
+// AD2 spawn gate (NoEligibleSource)
+// ───────────────────────────────────────────────────────────────────
+
+// r[verify sched.dispatch.fleet-exhaust+4]
+/// The spawn-gate exhaustion predicate: fires exactly when a non-empty
+/// spawnable universe is fully covered by the intent's exclusions —
+/// including the single-node small-fleet case — and never on an empty
+/// universe (provisioning transient) or an intent without exclusions.
+#[test]
+fn no_eligible_source_predicate() {
+    use crate::reconcilers::pool::jobs::no_eligible_source;
+    use std::collections::BTreeSet;
+
+    let nodes =
+        |names: &[&str]| -> BTreeSet<String> { names.iter().map(|n| n.to_string()).collect() };
+    let intent_with = |excluded: &[&str]| -> SpawnIntent {
+        SpawnIntent {
+            intent_id: "drv-gated".into(),
+            excluded_nodes: excluded.iter().map(|n| n.to_string()).collect(),
+            ..Default::default()
+        }
+    };
+
+    // (b) every node the pool could use is excluded → gated.
+    assert!(no_eligible_source(
+        &intent_with(&["n1", "n2"]),
+        &nodes(&["n1", "n2"])
+    ));
+    // A non-excluded node exists → spawnable.
+    assert!(!no_eligible_source(
+        &intent_with(&["n1"]),
+        &nodes(&["n1", "n2"])
+    ));
+    // (c) the small-fleet clause: a single-node universe whose one node
+    // is excluded gates immediately.
+    assert!(no_eligible_source(&intent_with(&["n1"]), &nodes(&["n1"])));
+    // No exclusions → never gated.
+    assert!(!no_eligible_source(&intent_with(&[]), &nodes(&["n1"])));
+    // Empty universe → defer (autoscaling may mint a fresh node), never
+    // a NoEligibleSource report.
+    assert!(!no_eligible_source(&intent_with(&["n1"]), &nodes(&[])));
+}
+
+// r[verify sched.dispatch.fleet-exhaust+4]
+/// A gated intent produces exactly one acked `NoEligibleSource` report
+/// (one RPC per gated intent per tick); the gated intent is the one
+/// removed from the spawn set, so no Job is created for it. Cross-tick
+/// idempotency is scheduler-side: the acked report poisons the
+/// derivation, so it stops appearing as an intent at all.
+#[tokio::test]
+async fn gated_intent_reports_no_eligible_source_once() {
+    use crate::reconcilers::pool::jobs::{no_eligible_source, report_no_eligible_source};
+    use std::collections::BTreeSet;
+
+    let (client, _verifier) = ApiServerVerifier::new();
+    let (ctx, _admin_handle) = ctx_with_mock_admin(client).await;
+
+    let gated_intent = SpawnIntent {
+        intent_id: "drv-gated".into(),
+        excluded_nodes: vec!["n1".into()],
+        ..Default::default()
+    };
+    let open_intent = SpawnIntent {
+        intent_id: "drv-open".into(),
+        ..Default::default()
+    };
+    let spawnable: BTreeSet<String> = ["n1".to_string()].into_iter().collect();
+
+    // The partition the reconcile applies: gated intents leave the
+    // spawn set (no Job is built for them), open ones stay.
+    let to_spawn = [gated_intent.clone(), open_intent.clone()];
+    let (gated, spawnable_intents): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = to_spawn
+        .iter()
+        .partition(|i| no_eligible_source(i, &spawnable));
+    assert_eq!(gated.len(), 1);
+    assert_eq!(spawnable_intents.len(), 1);
+    assert_eq!(spawnable_intents[0].intent_id, "drv-open");
+
+    // Exactly one report goes out for the one gated intent, and it is
+    // acked by the (mock) scheduler.
+    let acked = report_no_eligible_source(&ctx, "p", &gated).await;
+    assert_eq!(
+        acked, 1,
+        "exactly one NoEligibleSource report per gated intent"
+    );
+}
