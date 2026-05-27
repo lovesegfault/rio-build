@@ -1412,6 +1412,32 @@ impl DagActor {
     ///    fix that outcome left the node Ready and dispatched it from
     ///    source — the doomed dispatch this arm exists to prevent.
     async fn fail_fast_topdown_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
+        // A prior iteration of the same dispatch pass may already have
+        // settled this node: `batch_probe_cached_ready` collects the
+        // whole `to_fail_fast` layer up front, and the first node's
+        // `cancel_build_derivations` transitions every other
+        // sole-interest not-yet-dispatched node of that build —
+        // including later entries of the list — to DependencyFailed,
+        // persists it, and strips the build's interest. Re-running the
+        // park here would resurrect that terminal verdict
+        // (DependencyFailed→Queued is a valid reprobe edge) and leave a
+        // non-terminal, zero-interest, dep-less orphan behind in memory
+        // and PG that no reap collects and every recovery reloads.
+        // Equally nothing to do when the node vanished or no build is
+        // interested any more — the verdicts are already settled. (The
+        // SubstituteComplete{ok=false} caller never trips this: it only
+        // reaches the helper for a node it just observed Substituting
+        // with live interest.)
+        let actionable = self
+            .dag
+            .node(drv_hash)
+            .is_some_and(|s| !s.status().is_terminal() && !s.interested_builds.is_empty());
+        if !actionable {
+            debug!(%drv_hash,
+                   "topdown fail-fast: node already terminal/orphaned (settled by an \
+                    earlier iteration of this pass); skipping");
+            return;
+        }
         warn!(%drv_hash, cause,
               "topdown-pruned root cannot complete via substitution; \
                deps were dropped from DAG — failing build (resubmit \
@@ -1423,7 +1449,7 @@ impl DagActor {
         // re-dispatch on the next Tick. cancel_build_derivations
         // strips interest below; with zero remaining interest the
         // node is reaped on the next sweep.
-        if let Some(s) = self.dag.node_mut(drv_hash) {
+        let parked = if let Some(s) = self.dag.node_mut(drv_hash) {
             s.substitute_tried = true;
             // The chain ends here (terminal fail-fast): drop the
             // chain-scoped spent-forgiveness bookkeeping so it
@@ -1448,15 +1474,24 @@ impl DagActor {
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
             }
-        }
-        self.persist_status(drv_hash, DerivationStatus::Queued, None)
-            .await;
-        // Best-effort PG counterpart of the in-memory clear above. A
-        // failure costs at most one more wrongful fail-fast cycle after
-        // a later failover — never fail the actor command over it.
-        if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
-            warn!(%drv_hash, error = %e,
-                  "failed to clear persisted topdown_pruned after fail-fast (continuing)");
+            true
+        } else {
+            false
+        };
+        // Persist + PG flag clear only for a node the block above
+        // actually parked — never for one the early return skipped or
+        // that vanished between the check and the mutation.
+        if parked {
+            self.persist_status(drv_hash, DerivationStatus::Queued, None)
+                .await;
+            // Best-effort PG counterpart of the in-memory clear above.
+            // A failure costs at most one more wrongful fail-fast cycle
+            // after a later failover — never fail the actor command
+            // over it.
+            if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
+                warn!(%drv_hash, error = %e,
+                      "failed to clear persisted topdown_pruned after fail-fast (continuing)");
+            }
         }
         for build_id in self.get_interested_builds(drv_hash) {
             if let Some(build) = self.builds.get_mut(&build_id) {

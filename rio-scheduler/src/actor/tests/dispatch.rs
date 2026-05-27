@@ -4869,6 +4869,113 @@ async fn topdown_pruned_childless_node_not_dispatched_when_probe_fails_open() ->
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+7]
+/// Two childless topdown-pruned roots, both sole-interest of the SAME
+/// build, both with a wanted output definitively missing and not
+/// substitutable, land in `to_fail_fast` together in one dispatch pass
+/// (the post-failover multi-target shape). The first iteration's
+/// `cancel_build_derivations` already terminalizes the second node
+/// (sole-interest, not yet dispatched ⇒ DependencyFailed, persisted,
+/// interest stripped). The second iteration must NOT resurrect it:
+/// pre-fix it re-parked the node to Queued (DependencyFailed→Queued is
+/// a valid reprobe edge) and overwrote the terminal PG row, leaving a
+/// non-terminal zero-interest dep-less orphan that no reap collects and
+/// every recovery reloads. The build must fail exactly once with the
+/// resubmit-directing error and both nodes must stay terminal.
+#[tokio::test]
+async fn topdown_fail_fast_does_not_resurrect_node_terminalized_by_prior_iteration() -> TestResult {
+    let recorder = CountingRecorder::default();
+    let _guard = metrics::set_default_local_recorder(&recorder);
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // One build, two dep-less targets. Nothing is substitutable, so the
+    // merge seeds both Ready (no prune: the submission has no edges).
+    let mk = |tag: &str| {
+        let mut n = make_node(tag);
+        n.expected_output_paths = vec![test_store_path(&format!("{tag}-out"))];
+        n
+    };
+    let build_id = Uuid::new_v4();
+    // Hold the event receiver: the test-build orphan watcher (zero
+    // grace) auto-cancels an unwatched Active build on the second Tick.
+    let _ev = merge_dag(
+        &handle,
+        build_id,
+        vec![mk("tdm-a"), mk("tdm-b")],
+        vec![],
+        false,
+    )
+    .await?;
+
+    // Stage the post-failover shape: both roots carry the restored
+    // pruned marker and are childless.
+    assert!(handle.debug_set_topdown_pruned("tdm-a", true).await?);
+    assert!(handle.debug_set_topdown_pruned("tdm-b", true).await?);
+
+    // A worker is connected so the pass exercises the same path as
+    // production. The connect-time inline dispatch runs at the current
+    // probe generation (no re-probe), so drive a fresh heartbeat+Tick:
+    // the Tick advances the probe generation and drains the dirty flag,
+    // and that batch probe finds both wanted outputs missing and
+    // unsubstitutable → both roots take the fail-fast in ONE pass.
+    let mut rx = connect_executor(&handle, "tdm-w", "x86_64-linux").await?;
+    send_heartbeat(&handle, "tdm-w", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    // The build fails exactly once, with the resubmit-directing error.
+    let s = query_status(&handle, build_id).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "build must fail fast; got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s.error_summary
+    );
+    assert_eq!(
+        recorder.get("rio_scheduler_topdown_substitute_fail_total{}"),
+        1,
+        "the fail-fast must run once for the build's first root and skip the \
+         node the cancel already terminalized"
+    );
+
+    // Neither node may be resurrected: both stay terminal in memory and
+    // in PG (the cancel's DependencyFailed verdict is the record of why
+    // the build failed). Pre-fix one of them ended Queued with zero
+    // interested builds — a permanent orphan.
+    for tag in ["tdm-a", "tdm-b"] {
+        let d = expect_drv(&handle, tag).await;
+        assert!(
+            d.status.is_terminal(),
+            "{tag} must stay terminal after the fail-fast pass; got {:?}",
+            d.status
+        );
+        let (pg_status,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+                .bind(tag)
+                .fetch_one(&db.pool)
+                .await?;
+        assert_eq!(
+            pg_status, "dependency_failed",
+            "{tag}'s PG row must keep the terminal verdict, not be overwritten \
+             back to a schedulable status"
+        );
+    }
+    // No spurious dispatch of either node happened along the way.
+    while let Ok(m) = rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "neither failed-fast root may be dispatched from source"
+        );
+    }
+    Ok(())
+}
+
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
