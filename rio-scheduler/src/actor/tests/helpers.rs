@@ -407,6 +407,7 @@ pub(crate) async fn connect_executor_with(
             stream_tx,
             stream_epoch: next_stream_epoch_for(executor_id),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;

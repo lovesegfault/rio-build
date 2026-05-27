@@ -335,6 +335,18 @@ pub struct DagActor {
     /// stale entries until the next non-empty Ack, unread (no matching
     /// executor once the pod is gone).
     pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
+    /// Kube-authoritative `executor_id (= pod metadata.name) →
+    /// spec.nodeName` from the same controller acks
+    /// (`BoundIntent.pod_name`, §P0590). Companion view of
+    /// `authoritative_binding` keyed by executor instead of intent so
+    /// the dispatch-time mountd-token node resolution also covers
+    /// executors whose spawn intent has already left the DAG
+    /// (fall-through / recovered). Same lifecycle: wholesale-rebuilt on
+    /// Acks that carry `bound_intents`, cleared on leader transition.
+    /// Entries with an empty `pod_name` (pre-P0590 controllers) are
+    /// simply absent — the resolution chain then falls back to the
+    /// intent-keyed map and the executor's own report.
+    pub(crate) binding_by_executor: HashMap<ExecutorId, String>,
     /// Executors that disconnected mid-build, awaiting the controller's
     /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason).
     /// `(drv_hash, inserted_at)` — captured before
@@ -512,7 +524,23 @@ pub struct DagActor {
     /// token); the builder presents it in the mountd `Mount{}` frame.
     /// SEPARATE key from `hmac_signer` — its verifier lives on every
     /// builder node. None = no mountd token (gid-only admission).
+    /// Consulted only when `mountd_ed25519_signer` is None; the
+    /// symmetric arm is deleted in the final ADR-022 §P0590 phase.
     mountd_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// Ed25519 signer for rio-mountd Mount-admission tokens (ADR-022
+    /// mount-admission credentials, §P0590). When Some, dispatch signs
+    /// a node-scoped `rmt2` token into `WorkAssignment.mountd_token`
+    /// instead of the legacy HMAC token; the target node resolves via
+    /// [`dispatch::DagActor::resolve_mountd_node`] and
+    /// `mountd_node_binding` decides what an unresolvable placement
+    /// does. The control plane is the only holder of this key —
+    /// builder nodes carry public trust roots only
+    /// (`r[builder.mountd.token-no-node-mint]`).
+    mountd_ed25519_signer: Option<Arc<rio_auth::mountd_token::MountdSigningKey>>,
+    /// `require | prefer` knob for the node claim when
+    /// `mountd_ed25519_signer` is set — see
+    /// [`DagActorConfig::mountd_node_binding`].
+    mountd_node_binding: crate::config::MountdNodeBinding,
     /// Cap (seconds) on the assignment-token TTL minted at dispatch —
     /// `r[common.hmac.expiry-cap]`. From
     /// [`DagActorConfig::assignment_token_ttl_cap_secs`].
@@ -759,6 +787,7 @@ impl DagActor {
             executors: HashMap::new(),
             hung_nodes: HashMap::new(),
             authoritative_binding: HashMap::new(),
+            binding_by_executor: HashMap::new(),
             recently_disconnected: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -787,6 +816,8 @@ impl DagActor {
             soft_features: cfg.soft_features,
             hmac_signer: plumbing.hmac_signer,
             mountd_signer: plumbing.mountd_signer,
+            mountd_ed25519_signer: plumbing.mountd_ed25519_signer,
+            mountd_node_binding: cfg.mountd_node_binding,
             assignment_token_ttl_cap_secs: cfg.assignment_token_ttl_cap_secs,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
@@ -848,6 +879,7 @@ impl DagActor {
             dispatched_cells,
             hung_nodes,
             authoritative_binding,
+            binding_by_executor,
             dag_authoritative,
             // Retained: rationale below.
             log_buffers: _,
@@ -875,8 +907,11 @@ impl DagActor {
             soft_features,
             hmac_signer: _,
             mountd_signer: _,
+            mountd_ed25519_signer: _,
             // Retained: deploy config, not persisted state — a leader
-            // transition doesn't change the operator's TTL cap.
+            // transition doesn't change the operator's TTL cap or the
+            // node-binding policy.
+            mountd_node_binding: _,
             assignment_token_ttl_cap_secs: _,
             service_signer: _,
             shutdown: _,
@@ -932,6 +967,10 @@ impl DagActor {
         // misattribute a re-dispatched drv to a previous-generation
         // node.
         authoritative_binding.clear();
+        // Same source and lifecycle as `authoritative_binding`, keyed
+        // by executor — a stale entry would scope a fresh dispatch's
+        // mountd token to a node from the previous generation.
+        binding_by_executor.clear();
         // The DAG this fn just emptied no longer reflects PG; only the
         // next successful recovery (handle_leader_acquired's Ok arm)
         // re-asserts authoritativeness. Clearing HERE covers all four
@@ -1106,6 +1145,7 @@ impl DagActor {
                     stream_tx,
                     stream_epoch,
                     auth_intent,
+                    reported_node,
                     reply,
                 } => {
                     let result = self.handle_worker_connected(
@@ -1113,6 +1153,7 @@ impl DagActor {
                         stream_tx,
                         stream_epoch,
                         auth_intent,
+                        reported_node,
                     );
                     let _ = reply.send(result);
                 }
@@ -1165,6 +1206,11 @@ impl DagActor {
                             &observed_instance_types,
                             &bound_intents,
                         );
+                        // §P0590 builder_nodes audit registry (M_069):
+                        // refresh first_seen/last_seen from the same
+                        // controller-attested set. Best-effort PG write,
+                        // never read at mint/verify time.
+                        self.upsert_builder_nodes_from_ack(&bound_intents).await;
                     }
                 }
                 ActorCommand::PrefetchComplete {

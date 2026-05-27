@@ -183,6 +183,17 @@ pub struct ExecutorState {
     /// disconnect ordering observed live during deploy churn). `0` =
     /// no stream connected yet.
     pub stream_epoch: u64,
+    /// The executor's own `spec.nodeName` report from
+    /// `ExecutorRegister.node_name` (downward API), §P0590. Fallback
+    /// source — after the controller-attested bindings — when dispatch
+    /// scopes THIS executor's mountd Mount-admission token to a node.
+    /// Untrusted for anything else: never written into
+    /// `authoritative_binding`, never read by hung-node detection
+    /// (`r[sched.admin.hung-node-detector+3]` threat model); a lying
+    /// executor can only mis-scope its own token to a node it is not
+    /// on, which then fails at Mount time. `None` = not reported
+    /// (non-k8s or pre-P0590 executor).
+    pub reported_node: Option<String>,
 }
 
 impl ExecutorState {
@@ -215,6 +226,7 @@ impl ExecutorState {
             intent_id: None,
             auth_intent: None,
             stream_epoch: 0,
+            reported_node: None,
         }
     }
 

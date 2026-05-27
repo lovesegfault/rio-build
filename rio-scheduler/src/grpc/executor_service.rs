@@ -200,7 +200,7 @@ impl ExecutorService for SchedulerGrpc {
             .message()
             .await?
             .ok_or_else(|| Status::invalid_argument("empty BuildExecution stream"))?;
-        let executor_id = match first.msg {
+        let (executor_id, reported_node) = match first.msg {
             Some(rio_proto::types::executor_message::Msg::Register(reg)) => {
                 if reg.executor_id.is_empty() {
                     return Err(Status::invalid_argument(
@@ -213,7 +213,15 @@ impl ExecutorService for SchedulerGrpc {
                     reg.executor_id.len(),
                     MAX_IDENT_LEN,
                 )?;
-                reg.executor_id
+                // §P0590: the executor's own spec.nodeName report — only
+                // ever used to scope ITS OWN mountd token (fallback when
+                // the controller-attested binding hasn't landed), so an
+                // oversized/forged value is dropped rather than rejected:
+                // worst case that executor's token minting falls back to
+                // `mountd_node_binding` handling.
+                let reported_node =
+                    Some(reg.node_name).filter(|n| !n.is_empty() && n.len() <= MAX_IDENT_LEN);
+                (reg.executor_id, reported_node)
             }
             _ => {
                 return Err(Status::invalid_argument(
@@ -259,6 +267,7 @@ impl ExecutorService for SchedulerGrpc {
                 stream_tx: actor_tx,
                 stream_epoch,
                 auth_intent,
+                reported_node,
                 reply: reply_tx,
             })
             .await

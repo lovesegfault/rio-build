@@ -90,12 +90,25 @@
         "default": null
       },
       "mountd_hmac_key_path": {
-        "description": "HMAC key file for signing rio-mountd Mount-admission tokens\n(ADR-022 §P0559). SEPARATE from `hmac_key_path`: the matching\nverifier key is mounted into the rio-mountd DaemonSet on every\nbuilder node, and a node compromise must not yield a key the\nstore trusts. When set, dispatch mints a `MountdClaims{aud,\nbuild_id, tenant, expiry}` token into\n`WorkAssignment.mountd_token` with the same TTL as the\nassignment token; the builder presents it in the mountd\n`Mount{}` frame so `hostUsers: false` executor pods (which\ncannot present the host rio-builder gid) are admitted. Unset =\nno mountd token minted (dev/standalone — mountd's gid gate is\nthe only admission path). Env: `RIO_MOUNTD_HMAC_KEY_PATH`.\nHelm: `mountdHmac.secretName`.",
+        "description": "HMAC key file for signing rio-mountd Mount-admission tokens\n(ADR-022 §P0559). SEPARATE from `hmac_key_path`: the matching\nverifier key is mounted into the rio-mountd DaemonSet on every\nbuilder node, and a node compromise must not yield a key the\nstore trusts. When set, dispatch mints a `MountdClaims{aud,\nbuild_id, tenant, expiry}` token into\n`WorkAssignment.mountd_token` with the same TTL as the\nassignment token; the builder presents it in the mountd\n`Mount{}` frame so `hostUsers: false` executor pods (which\ncannot present the host rio-builder gid) are admitted. Unset =\nno mountd token minted (dev/standalone — mountd's gid gate is\nthe only admission path). Env: `RIO_MOUNTD_HMAC_KEY_PATH`.\nHelm: `mountdHmac.secretName`. Superseded by\n`mountd_signing_key_path` (the never-provisioned symmetric arm\nis deleted in the final ADR-022 §P0590 phase); ignored with a\nwarning when both are set.",
         "type": [
           "string",
           "null"
         ],
         "default": null
+      },
+      "mountd_signing_key_path": {
+        "description": "Ed25519 signing key file for rio-mountd Mount-admission tokens\n(ADR-022 mount-admission credentials, §P0590). Format:\n`rio-mountd-<n>:base64(64-byte ed25519 keypair)` (32-byte seed\nalso accepted). The scheduler is the ONLY holder of this key;\nbuilder nodes hold public trust roots only, so node compromise\nyields no minting ability. When set, dispatch signs an\n`rmt2.<claims>.<signature>` token into\n`WorkAssignment.mountd_token` (same TTL as the assignment\ntoken) whose claims also name the target node — see\n`mountd_node_binding`. Takes precedence over\n`mountd_hmac_key_path`. Unset = no rmt2 minting (the legacy\nHMAC knob, if set, still mints; otherwise mountd admits by gid\nonly). Env: `RIO_MOUNTD_SIGNING_KEY_PATH`. Helm:\n`mountdSigning.privateKeySecretName`.",
+        "type": [
+          "string",
+          "null"
+        ],
+        "default": null
+      },
+      "mountd_node_binding": {
+        "description": "What dispatch does when the target node for an rmt2\nMount-admission token cannot be resolved (no controller-attested\nbinding for the executor, no executor-reported node):\n`require` (default) defers that derivation one dispatch pass —\nstrict mountds reject unbound tokens, so minting one would only\nconvert a transient knowledge gap into a build failure;\n`prefer` mints the token without a node claim (operational\nescape hatch — node-checking mountds will reject it). Only\nconsulted when `mountd_signing_key_path` is set. Env:\n`RIO_MOUNTD_NODE_BINDING`.",
+        "$ref": "#/$defs/MountdNodeBinding",
+        "default": "require"
       },
       "jwt": {
         "description": "JWT verification. `key_path` → ConfigMap mount at\n`/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).\nThe gateway signs with the matching seed; scheduler verifies.\nUnset = interceptor inert (dev mode / pre-key-rotation-infra).\nSIGHUP reloads from the same path — kubelet remounts the\nConfigMap on rotation, operator SIGHUPs the pod. Set via\n`RIO_JWT__KEY_PATH` (nested config key — double underscore).",
@@ -191,6 +204,21 @@
             "default": 0
           }
         }
+      },
+      "MountdNodeBinding": {
+        "description": "Dispatch behavior when the target node for an rmt2 Mount-admission\ntoken cannot be resolved (ADR-022 §P0590 node-scoped claims).\n`require` is the fail-closed default; `prefer` is the documented\noperational escape hatch that mints unbound tokens strict mountds\nreject.",
+        "oneOf": [
+          {
+            "description": "Defer the derivation one dispatch pass until placement resolves.",
+            "type": "string",
+            "const": "require"
+          },
+          {
+            "description": "Mint the token without a node claim.",
+            "type": "string",
+            "const": "prefer"
+          }
+        ]
       },
       "JwtConfig": {
         "description": "JWT dual-mode configuration. Nested in each binary's `Config` as\n`jwt: JwtConfig`. Env vars: `RIO_JWT__REQUIRED=true` etc.\n\nDual-mode is PERMANENT: both the JWT path and the SSH-comment\nfallback stay maintained forever. `jwt_required` is the operator's\nper-deployment switch — true = STRICT (reject on mint/verify\nfailure), false = PERMISSIVE (fall back to tenant_name on failure).\n\nGateway interpretation: `required=true` → if ResolveTenant fails or\ntimes out during SSH auth, reject the connection (no JWT can be\nminted → no tenant identity → unauthenticated). `required=false` →\ndegrade to tenant_name-only (jwt_token=None, downstream falls back).\n\nScheduler/store interpretation: handled at the HANDLER level (not\nthe interceptor — the interceptor stays permissive-on-absent-header\nfor workers/health probes regardless). A handler that needs strict\nJWT reads `required` from its own config and checks for Claims\nextension presence.",
@@ -324,6 +352,8 @@
     "assignment_token_ttl_cap_secs": 172800,
     "service_hmac_key_path": null,
     "mountd_hmac_key_path": null,
+    "mountd_signing_key_path": null,
+    "mountd_node_binding": "require",
     "jwt": {
       "required": false,
       "key_path": null

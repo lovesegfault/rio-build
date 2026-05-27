@@ -185,6 +185,23 @@ pub fn describe_metrics() {
          rio-controller nodeclaim_pool reconcile loop."
     );
     describe_counter!(
+        "rio_scheduler_node_binding_mismatch_total",
+        "Mountd-token node-resolution sources (controller-attested by pod name, \
+         controller-attested by intent, executor self-report) that disagreed with the \
+         resolved value at dispatch (ADR-022 §P0590). The controller-attested value \
+         wins; a sustained rate means stale acks or pod-name reuse — check the \
+         controller's pod informer."
+    );
+    describe_counter!(
+        "rio_scheduler_node_binding_unresolved_total",
+        "Dispatches where no source could resolve the target node for the rmt2 \
+         Mount-admission token (ADR-022 §P0590). Under mountd_node_binding=require the \
+         derivation was deferred one pass; under prefer an unbound token was minted \
+         (node-checking mountds reject it). Brief blips right after pod spawn are \
+         normal (controller-ack lag); sustained growth means executors are not \
+         reporting RIO_NODE_NAME and controller acks carry no pod_name."
+    );
+    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \

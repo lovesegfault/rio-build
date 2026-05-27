@@ -15,17 +15,24 @@ impl SchedulerDb {
     /// the scheduler re-dispatches after a worker-reported failure
     /// before the completion handler has transitioned the prior
     /// assignment to a terminal status — a race, not a logic bug.
+    ///
+    /// `node_name` is the §P0590 issuance audit (M_069): the kube node
+    /// the dispatch's Mount-admission token was scoped to. `None` when
+    /// no node was resolved (legacy/HMAC token, signing not configured,
+    /// or an unbound mint under `mountd_node_binding = "prefer"`).
+    /// Never read at mint or verify time.
     pub async fn insert_assignment(
         &self,
         derivation_id: Uuid,
         executor_id: &ExecutorId,
         generation: i64,
         exec_id: Uuid,
+        node_name: Option<&str>,
     ) -> Result<Uuid, sqlx::Error> {
         let row: (Uuid,) = sqlx::query_as(
             r#"
-            INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id)
-            VALUES ($1, $2, $3, 'pending', $4)
+            INSERT INTO assignments (derivation_id, builder_id, generation, status, exec_id, node_name)
+            VALUES ($1, $2, $3, 'pending', $4, $5)
             ON CONFLICT (derivation_id) WHERE status IN ('pending', 'acknowledged')
             DO UPDATE SET
                 builder_id = EXCLUDED.builder_id,
@@ -33,7 +40,8 @@ impl SchedulerDb {
                 status = 'pending',
                 assigned_at = now(),
                 completed_at = NULL,
-                exec_id = EXCLUDED.exec_id
+                exec_id = EXCLUDED.exec_id,
+                node_name = EXCLUDED.node_name
             RETURNING assignment_id
             "#,
         )
@@ -41,6 +49,7 @@ impl SchedulerDb {
         .bind(executor_id.as_str())
         .bind(generation)
         .bind(exec_id)
+        .bind(node_name)
         .fetch_one(&self.pool)
         .await?;
 

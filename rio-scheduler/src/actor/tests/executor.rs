@@ -58,6 +58,7 @@ async fn test_drain_sources_compose_across_reconnect() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("drain-auth"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -156,6 +157,7 @@ async fn test_heartbeat_adopts_inflight_from_reconnecting_worker() -> TestResult
             stream_tx: stream_tx_a,
             stream_epoch: next_stream_epoch_for("i066-a"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -2624,6 +2626,7 @@ async fn test_heartbeat_adopts_unknown_build_into_dag() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("hb-worker"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -3542,6 +3545,7 @@ async fn on_worker_registered_send_fail_flips_warm_anyway() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("fail-worker"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4302,6 +4306,7 @@ async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<(
             stream_tx: tx1,
             stream_epoch: next_stream_epoch_for("victim"),
             auth_intent: Some("intent-A".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4322,6 +4327,7 @@ async fn test_worker_connected_rejects_live_stream_replace() -> anyhow::Result<(
             stream_tx: tx2,
             stream_epoch: next_stream_epoch_for("victim"),
             auth_intent: Some("intent-X".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4364,6 +4370,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx1,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-A".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4379,6 +4386,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx2,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-X".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4396,6 +4404,7 @@ async fn test_worker_reconnect_rejects_intent_mismatch() -> anyhow::Result<()> {
             stream_tx: tx3,
             stream_epoch: next_stream_epoch_for("w"),
             auth_intent: Some("intent-A".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4429,6 +4438,7 @@ async fn test_heartbeat_intent_id_change_rejected() -> anyhow::Result<()> {
             stream_tx: tx,
             stream_epoch: next_stream_epoch_for("E"),
             auth_intent: Some("I_self".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4918,6 +4928,7 @@ async fn test_rejected_reconnect_does_not_corrupt_epoch() -> TestResult {
             stream_tx: tx2,
             stream_epoch: epoch2,
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -4980,6 +4991,7 @@ async fn test_heartbeat_cross_executor_spoof_rejected() -> TestResult {
             stream_tx: tx_v,
             stream_epoch: next_stream_epoch_for("spoof-victim"),
             auth_intent: Some("intent-Y".into()),
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;

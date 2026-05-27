@@ -119,6 +119,7 @@ impl DagActor {
         stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
         stream_epoch: u64,
         auth_intent: Option<String>,
+        reported_node: Option<String>,
     ) -> Result<(), &'static str> {
         info!(executor_id = %executor_id, stream_epoch, "worker stream connected");
 
@@ -191,6 +192,14 @@ impl DagActor {
         if auth_intent.is_some() {
             worker.auth_intent.clone_from(&auth_intent);
             worker.intent_id = auth_intent;
+        }
+        // §P0590: the executor's own node report, used only as the LAST
+        // fallback when scoping its own mountd token. Overwritten on
+        // every (re)connect — a re-registered stream re-asserts it; a
+        // pre-P0590 executor (None) keeps whatever an earlier register
+        // reported (no downgrade on reconnect races).
+        if reported_node.is_some() {
+            worker.reported_node = reported_node;
         }
 
         // I-056a: clear scheduler-side `draining` and `store_degraded`

@@ -230,11 +230,38 @@ async fn main() -> anyhow::Result<()> {
     // every builder node via the rio-mountd DaemonSet — node compromise
     // must not yield a store-trusted key) and the service key. None =
     // no mountd token minted; mountd then admits by gid only.
+    // Superseded by the Ed25519 signer below (§P0590); ignored with a
+    // warning when both are configured.
     let mountd_signer = rio_auth::hmac::HmacSigner::load(cfg.mountd_hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("mountd HMAC key load: {e}"))?
         .map(Arc::new);
     if mountd_signer.is_some() {
         info!("mountd token signing enabled (WorkAssignment.mountd_token)");
+    }
+    // Ed25519 mountd Mount-admission signer (ADR-022 mount-admission
+    // credentials, §P0590). The scheduler is the only holder of this
+    // key; every rio-mountd holds public trust roots only, so builder
+    // nodes carry no minting material. Configured-but-unloadable is a
+    // startup error (fail closed); takes precedence over the legacy
+    // symmetric knob above.
+    // r[impl builder.mountd.token-no-node-mint]
+    let mountd_ed25519_signer =
+        rio_auth::mountd_token::MountdSigningKey::load(cfg.mountd_signing_key_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("mountd Ed25519 signing key load: {e}"))?
+            .map(Arc::new);
+    if let Some(signer) = &mountd_ed25519_signer {
+        info!(
+            signing_key = signer.key_name(),
+            node_binding = ?cfg.mountd_node_binding,
+            "mountd rmt2 token signing enabled (WorkAssignment.mountd_token)"
+        );
+        if mountd_signer.is_some() {
+            tracing::warn!(
+                "both mountd_signing_key_path and mountd_hmac_key_path are set; the Ed25519 \
+                 signer wins and the legacy HMAC mountd key is ignored (the symmetric arm is \
+                 removed in the final ADR-022 §P0590 phase)"
+            );
+        }
     }
 
     // ADR-023 phase-13: hw-band cost table. PG-backed (sla_ema_state)
@@ -367,6 +394,7 @@ async fn main() -> anyhow::Result<()> {
             substitute_max_concurrent: cfg.substitute_max_concurrent,
             sla: cfg.sla,
             assignment_token_ttl_cap_secs: cfg.assignment_token_ttl_cap_secs,
+            mountd_node_binding: cfg.mountd_node_binding,
             ..Default::default()
         },
         rio_scheduler::actor::DagActorPlumbing {
@@ -376,6 +404,7 @@ async fn main() -> anyhow::Result<()> {
             event_persist_tx: Some(event_persist_tx),
             hmac_signer,
             mountd_signer,
+            mountd_ed25519_signer,
             service_signer: service_signer.map(Arc::new),
             leader: leader.clone(),
             cost_table: std::sync::Arc::clone(&cost_table),

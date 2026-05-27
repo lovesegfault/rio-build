@@ -44,6 +44,7 @@ async fn test_build_execution_stream_end_to_end() -> anyhow::Result<()> {
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "e2e-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -191,6 +192,7 @@ async fn test_log_pipeline_grpc_wire_end_to_end() -> anyhow::Result<()> {
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "log-e2e-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -348,6 +350,7 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "dup-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -364,6 +367,7 @@ async fn test_build_execution_duplicate_register_ignored() -> anyhow::Result<()>
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "dup-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -422,6 +426,7 @@ async fn test_log_buffer_survives_stream_close_before_actor_seal() -> anyhow::Re
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "seal-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -514,6 +519,7 @@ async fn test_log_batch_distinct_paths_capped_per_stream() -> anyhow::Result<()>
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "cap-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -623,6 +629,7 @@ async fn test_log_batch_rejected_paths_do_not_consume_cap() -> anyhow::Result<()
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "fix1-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -725,6 +732,7 @@ async fn test_log_batch_oversized_path_rejected_before_gate() -> anyhow::Result<
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "len-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -830,6 +838,7 @@ async fn test_executor_service_rejects_missing_or_mismatched_token() -> anyhow::
         msg: Some(rio_proto::types::executor_message::Msg::Register(
             rio_proto::types::ExecutorRegister {
                 executor_id: "victim".into(),
+                node_name: String::new(),
             },
         )),
     })
@@ -934,6 +943,7 @@ async fn test_build_execution_accept_gate_rejects_spoofed_executor_id() -> anyho
         msg: Some(rio_proto::types::executor_message::Msg::Register(
             rio_proto::types::ExecutorRegister {
                 executor_id: "victim".into(),
+                node_name: String::new(),
             },
         )),
     })
@@ -953,6 +963,7 @@ async fn test_build_execution_accept_gate_rejects_spoofed_executor_id() -> anyho
         msg: Some(rio_proto::types::executor_message::Msg::Register(
             rio_proto::types::ExecutorRegister {
                 executor_id: "victim".into(),
+                node_name: String::new(),
             },
         )),
     })
@@ -1004,6 +1015,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "none-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -1073,6 +1085,7 @@ async fn test_build_execution_completion_none_result_synthesizes_failure() -> an
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "none-worker-2".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -1194,6 +1207,7 @@ async fn test_phase_oversized_text_rejected_before_forward() -> anyhow::Result<(
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "phaselen-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -1304,6 +1318,7 @@ async fn test_completion_oversized_fields_bounded_not_dropped() -> anyhow::Resul
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "complen-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -1422,6 +1437,7 @@ async fn test_completion_oversized_path_rejected() -> anyhow::Result<()> {
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "cplen-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })
@@ -1597,6 +1613,7 @@ async fn test_log_batch_oversized_line_and_executor_id_bounded_before_forward() 
             msg: Some(rio_proto::types::executor_message::Msg::Register(
                 rio_proto::types::ExecutorRegister {
                     executor_id: "linelen-worker".into(),
+                    node_name: String::new(),
                 },
             )),
         })

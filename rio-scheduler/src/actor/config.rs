@@ -52,6 +52,13 @@ pub struct DagActorConfig {
     /// `assignment_token_ttl_cap_secs`. Default
     /// [`super::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS`] (48 h).
     pub assignment_token_ttl_cap_secs: u64,
+    /// What dispatch does when the target node for an rmt2
+    /// Mount-admission token cannot be resolved (ADR-022 §P0590):
+    /// `Require` (default) defers the derivation one pass, `Prefer`
+    /// mints unbound. Only consulted when
+    /// [`DagActorPlumbing::mountd_ed25519_signer`] is set. main.rs
+    /// loads from scheduler.toml `mountd_node_binding`.
+    pub mountd_node_binding: crate::config::MountdNodeBinding,
 }
 
 impl Default for DagActorConfig {
@@ -64,6 +71,7 @@ impl Default for DagActorConfig {
             soft_features: Vec::new(),
             sla: crate::sla::config::SlaConfig::test_default(),
             assignment_token_ttl_cap_secs: super::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
+            mountd_node_binding: crate::config::MountdNodeBinding::default(),
         }
     }
 }
@@ -95,8 +103,18 @@ pub struct DagActorPlumbing {
     /// §P0559). SEPARATE key from `hmac_signer` — its verifier is
     /// mounted into the rio-mountd DaemonSet on every builder node.
     /// `None` = `WorkAssignment.mountd_token` stays empty and mountd
-    /// admits by gid only.
+    /// admits by gid only. Superseded by `mountd_ed25519_signer`
+    /// (which wins when both are set); the symmetric arm is deleted in
+    /// the final ADR-022 §P0590 phase.
     pub mountd_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
+    /// Ed25519 signer for rio-mountd Mount-admission tokens (ADR-022
+    /// mount-admission credentials, §P0590). The control plane is the
+    /// only holder of this key — builder nodes carry public trust
+    /// roots only. When set, dispatch mints `rmt2` tokens (node-scoped
+    /// per [`DagActorConfig::mountd_node_binding`]) into
+    /// `WorkAssignment.mountd_token` and the legacy `mountd_signer` is
+    /// not consulted. `None` = no rmt2 minting.
+    pub mountd_ed25519_signer: Option<Arc<rio_auth::mountd_token::MountdSigningKey>>,
     /// HMAC signer for `x-rio-service-token` (SEPARATE key from
     /// `hmac_signer`). `None` = dispatch-time substitution probe
     /// degrades to local-presence-only —
@@ -150,6 +168,7 @@ impl Default for DagActorPlumbing {
             event_persist_tx: None,
             hmac_signer: None,
             mountd_signer: None,
+            mountd_ed25519_signer: None,
             service_signer: None,
             leader: LeaderState::default(),
             cost_table: Arc::default(),

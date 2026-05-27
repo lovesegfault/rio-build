@@ -885,6 +885,16 @@ impl DagActor {
         // `intent_id` while the pod lives.
         if !bound_intents.is_empty() {
             let prev = std::mem::take(&mut self.authoritative_binding);
+            // §P0590: companion executor-keyed view for the dispatch-time
+            // mountd-token node resolution. Same wholesale-rebuild
+            // lifecycle; entries without a pod_name (pre-P0590
+            // controller) simply don't appear and the resolution chain
+            // falls back to the intent-keyed map / executor report.
+            self.binding_by_executor = bound_intents
+                .iter()
+                .filter(|b| !b.pod_name.is_empty())
+                .map(|b| (ExecutorId::from(b.pod_name.as_str()), b.node_name.clone()))
+                .collect();
             for b in bound_intents {
                 let h: DrvHash = b.intent_id.as_str().into();
                 let tenant = self
@@ -965,6 +975,46 @@ impl DagActor {
                     ))
                 }),
             );
+        }
+    }
+
+    /// §P0590 `builder_nodes` registry (M_069): refresh
+    /// `first_seen`/`last_seen` (and clear `retired_at`) for every node
+    /// the controller's ack named. Companion of
+    /// [`Self::handle_ack_spawned_intents`], split out because the
+    /// in-memory ack handling stays synchronous; this is the only PG
+    /// write on the ack path. Best-effort with a timeout — an audit
+    /// table must never stall the actor mailbox; never read at mint or
+    /// verify time.
+    pub(super) async fn upsert_builder_nodes_from_ack(
+        &self,
+        bound_intents: &[rio_proto::types::BoundIntent],
+    ) {
+        if bound_intents.is_empty() {
+            return;
+        }
+        let mut nodes: Vec<String> = bound_intents
+            .iter()
+            .map(|b| b.node_name.clone())
+            .filter(|n| !n.is_empty())
+            .collect();
+        nodes.sort_unstable();
+        nodes.dedup();
+        if nodes.is_empty() {
+            return;
+        }
+        match tokio::time::timeout(self.grpc_timeout, self.db.upsert_builder_nodes(&nodes)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::debug!(error = %e, nodes = nodes.len(),
+                       "builder_nodes upsert failed (best-effort audit; will retry next ack)");
+            }
+            Err(_) => {
+                tracing::debug!(
+                    nodes = nodes.len(),
+                    "builder_nodes upsert timed out (best-effort audit; will retry next ack)"
+                );
+            }
         }
     }
 

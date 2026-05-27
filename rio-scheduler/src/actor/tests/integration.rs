@@ -303,6 +303,7 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
             stream_tx,
             stream_epoch: next_stream_epoch_for("tight-worker"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;

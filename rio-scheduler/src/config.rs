@@ -78,8 +78,37 @@ pub struct Config {
     /// cannot present the host rio-builder gid) are admitted. Unset =
     /// no mountd token minted (dev/standalone — mountd's gid gate is
     /// the only admission path). Env: `RIO_MOUNTD_HMAC_KEY_PATH`.
-    /// Helm: `mountdHmac.secretName`.
+    /// Helm: `mountdHmac.secretName`. Superseded by
+    /// `mountd_signing_key_path` (the never-provisioned symmetric arm
+    /// is deleted in the final ADR-022 §P0590 phase); ignored with a
+    /// warning when both are set.
     pub mountd_hmac_key_path: Option<std::path::PathBuf>,
+    /// Ed25519 signing key file for rio-mountd Mount-admission tokens
+    /// (ADR-022 mount-admission credentials, §P0590). Format:
+    /// `rio-mountd-<n>:base64(64-byte ed25519 keypair)` (32-byte seed
+    /// also accepted). The scheduler is the ONLY holder of this key;
+    /// builder nodes hold public trust roots only, so node compromise
+    /// yields no minting ability. When set, dispatch signs an
+    /// `rmt2.<claims>.<signature>` token into
+    /// `WorkAssignment.mountd_token` (same TTL as the assignment
+    /// token) whose claims also name the target node — see
+    /// `mountd_node_binding`. Takes precedence over
+    /// `mountd_hmac_key_path`. Unset = no rmt2 minting (the legacy
+    /// HMAC knob, if set, still mints; otherwise mountd admits by gid
+    /// only). Env: `RIO_MOUNTD_SIGNING_KEY_PATH`. Helm:
+    /// `mountdSigning.privateKeySecretName`.
+    pub mountd_signing_key_path: Option<std::path::PathBuf>,
+    /// What dispatch does when the target node for an rmt2
+    /// Mount-admission token cannot be resolved (no controller-attested
+    /// binding for the executor, no executor-reported node):
+    /// `require` (default) defers that derivation one dispatch pass —
+    /// strict mountds reject unbound tokens, so minting one would only
+    /// convert a transient knowledge gap into a build failure;
+    /// `prefer` mints the token without a node claim (operational
+    /// escape hatch — node-checking mountds will reject it). Only
+    /// consulted when `mountd_signing_key_path` is set. Env:
+    /// `RIO_MOUNTD_NODE_BINDING`.
+    pub mountd_node_binding: MountdNodeBinding,
     /// JWT verification. `key_path` → ConfigMap mount at
     /// `/etc/rio/jwt/ed25519_pubkey` (see helm jwt-pubkey-configmap.yaml).
     /// The gateway signs with the matching seed; scheduler verifies.
@@ -142,6 +171,24 @@ pub struct Config {
     pub allow_reference_change: bool,
 }
 
+/// Dispatch behavior when the target node for an rmt2 Mount-admission
+/// token cannot be resolved (ADR-022 §P0590 node-scoped claims).
+/// `require` is the fail-closed default; `prefer` is the documented
+/// operational escape hatch that mints unbound tokens strict mountds
+/// reject.
+// r[impl builder.mountd.token-node-scoped]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum MountdNodeBinding {
+    /// Defer the derivation one dispatch pass until placement resolves.
+    #[default]
+    Require,
+    /// Mint the token without a node claim.
+    Prefer,
+}
+
 /// Dashboard browser-facing settings. The scheduler serves gRPC-Web
 /// natively on its main port (D3) so the ingress is a plain HTTP
 /// router — CORS therefore lives here, not in a proxy CRD.
@@ -186,6 +233,8 @@ impl Default for Config {
             assignment_token_ttl_cap_secs: crate::DEFAULT_ASSIGNMENT_TOKEN_TTL_CAP_SECS,
             service_hmac_key_path: None,
             mountd_hmac_key_path: None,
+            mountd_signing_key_path: None,
+            mountd_node_binding: MountdNodeBinding::default(),
             jwt: rio_common::config::JwtConfig::default(),
             lease_name: None,
             lease_namespace: None,

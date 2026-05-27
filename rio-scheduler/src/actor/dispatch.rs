@@ -1482,6 +1482,63 @@ impl DagActor {
         crate::assignment::best_executor(&self.executors, drv_state)
     }
 
+    /// §P0590: resolve the kube node this executor's Mount-admission
+    /// token should be scoped to, in trust order (the ADR's M3 chain):
+    ///
+    /// 1. controller-attested binding keyed by executor id (= pod
+    ///    `metadata.name`, from `BoundIntent.pod_name`);
+    /// 2. controller-attested binding keyed by the executor's
+    ///    HMAC-attested spawn intent (the existing
+    ///    `authoritative_binding` map);
+    /// 3. the executor's own register-time `RIO_NODE_NAME` report —
+    ///    only ever scopes that executor's own token, so a forged value
+    ///    is self-defeating (the Mount then fails on the real node).
+    ///
+    /// `None` = no source knows the placement (controller-ack lag right
+    /// after spawn and a pre-P0590 executor that doesn't report);
+    /// `mountd_node_binding` decides what the caller does with that.
+    ///
+    /// When more than one source resolves and they disagree, the
+    /// controller-attested value wins and
+    /// `rio_scheduler_node_binding_mismatch_total` counts the
+    /// disagreement (kubelet rescheduling and stale acks make this
+    /// possible in the small window after a pod is replaced).
+    pub(super) fn resolve_mountd_node(&self, executor_id: &ExecutorId) -> Option<String> {
+        let worker = self.executors.get(executor_id);
+        let by_executor = self.binding_by_executor.get(executor_id).cloned();
+        let by_intent = worker
+            .and_then(|w| w.auth_intent.as_deref().or(w.intent_id.as_deref()))
+            .and_then(|intent| self.authoritative_binding.get(intent))
+            .map(|b| b.node.clone());
+        let reported = worker.and_then(|w| w.reported_node.clone());
+
+        let resolved = by_executor
+            .clone()
+            .or_else(|| by_intent.clone())
+            .or_else(|| reported.clone())?;
+
+        // Disagreement accounting: every resolved source that differs
+        // from the winner counts once. Controller wins by construction
+        // (it is first in the or-chain).
+        let mismatches = [&by_executor, &by_intent, &reported]
+            .into_iter()
+            .filter(|s| s.as_deref().is_some_and(|v| v != resolved))
+            .count();
+        if mismatches > 0 {
+            warn!(
+                executor_id = %executor_id,
+                resolved = %resolved,
+                by_executor = by_executor.as_deref().unwrap_or(""),
+                by_intent = by_intent.as_deref().unwrap_or(""),
+                reported = reported.as_deref().unwrap_or(""),
+                "mountd node-binding sources disagree; using the controller-attested value"
+            );
+            metrics::counter!("rio_scheduler_node_binding_mismatch_total")
+                .increment(mismatches as u64);
+        }
+        Some(resolved)
+    }
+
     /// Transition a derivation to Assigned and send it to the worker.
     /// Returns `true` if the assignment was sent, `false` if it failed
     /// (caller should defer the derivation, not retry immediately).
@@ -1494,6 +1551,38 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
     ) -> bool {
+        // §P0590: resolve the node the Mount-admission token will be
+        // scoped to BEFORE any state mutation, so the `require` policy
+        // can defer the derivation one dispatch pass without anything
+        // to roll back. Only consulted when the Ed25519 mountd signer
+        // is configured — the legacy/HMAC token carries no node claim
+        // and keyless deployments mint nothing.
+        // r[impl builder.mountd.token-node-scoped]
+        let mountd_node = self.resolve_mountd_node(executor_id);
+        if self.mountd_ed25519_signer.is_some() && mountd_node.is_none() {
+            metrics::counter!("rio_scheduler_node_binding_unresolved_total").increment(1);
+            match self.mountd_node_binding {
+                crate::config::MountdNodeBinding::Require => {
+                    warn!(
+                        drv_hash = %drv_hash,
+                        executor_id = %executor_id,
+                        "mountd node binding unresolved (no controller-attested binding or \
+                         executor report) and mountd_node_binding = require; deferring this \
+                         derivation one dispatch pass"
+                    );
+                    return false;
+                }
+                crate::config::MountdNodeBinding::Prefer => {
+                    warn!(
+                        drv_hash = %drv_hash,
+                        executor_id = %executor_id,
+                        "mountd node binding unresolved; minting an UNBOUND Mount-admission \
+                         token (mountd_node_binding = prefer) — node-checking mountds will \
+                         reject it"
+                    );
+                }
+            }
+        }
         if !self.transition_to_assigned(drv_hash, executor_id) {
             return false;
         }
@@ -1532,8 +1621,14 @@ impl DagActor {
         // (is_leader=true, which dispatch_ready checked at loop top).
         let generation = self.leader.generation();
 
-        self.record_assignment(drv_hash, executor_id, generation, exec_id)
-            .await;
+        self.record_assignment(
+            drv_hash,
+            executor_id,
+            generation,
+            exec_id,
+            mountd_node.as_deref(),
+        )
+        .await;
 
         // PrefetchHint BEFORE WorkAssignment: the worker starts
         // warming its FUSE cache while still parsing the .drv. A few
@@ -1547,7 +1642,7 @@ impl DagActor {
         // check and here (TOCTOU vs. concurrent cancel) — treat as
         // assignment failure so the caller defers.
         let Some(assignment) = self
-            .build_assignment_proto(drv_hash, executor_id, generation)
+            .build_assignment_proto(drv_hash, executor_id, generation, mountd_node.as_deref())
             .await
         else {
             return false;
@@ -1607,6 +1702,12 @@ impl DagActor {
     /// PG `assignments` row, in-mem `worker.running_build`, GC
     /// `scheduler_live_pins`. All best-effort (log+continue). Inverse
     /// is [`rollback_assignment`](Self::rollback_assignment).
+    ///
+    /// `mountd_node` is the §P0590 issuance audit: the node the
+    /// dispatch's Mount-admission token is scoped to (NULL when minted
+    /// unbound or not minted at all). Written to
+    /// `assignments.node_name` (M_069); never read at mint or verify
+    /// time.
     // r[impl sched.gc.live-pins]
     async fn record_assignment(
         &mut self,
@@ -1614,6 +1715,7 @@ impl DagActor {
         executor_id: &ExecutorId,
         generation: u64,
         exec_id: Uuid,
+        mountd_node: Option<&str>,
     ) {
         self.persist_status(drv_hash, DerivationStatus::Assigned, Some(executor_id))
             .await;
@@ -1624,7 +1726,7 @@ impl DagActor {
             && let Some(db_id) = state.db_id
             && let Err(e) = self
                 .db
-                .insert_assignment(db_id, executor_id, generation as i64, exec_id)
+                .insert_assignment(db_id, executor_id, generation as i64, exec_id, mountd_node)
                 .await
         {
             error!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
@@ -1786,6 +1888,10 @@ impl DagActor {
     /// node so `handle_success_completion` can write the realisation FK
     /// rows post-build.
     ///
+    /// `mountd_node` is the resolved target node for the Mount-admission
+    /// token's node claim (§P0590) — `None` mints unbound (legacy/HMAC
+    /// scheme, or `prefer` mode with no resolvable placement).
+    ///
     /// Returns `None` if the DAG node is gone (TOCTOU vs. concurrent
     /// cancel) — caller treats that as assignment failure.
     ///
@@ -1795,6 +1901,7 @@ impl DagActor {
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
         generation: u64,
+        mountd_node: Option<&str>,
     ) -> Option<rio_proto::types::WorkAssignment> {
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
@@ -1987,17 +2094,57 @@ impl DagActor {
             format!("{executor_id}-{drv_hash}-{generation}")
         };
 
-        // Mountd Mount-admission token (ADR-022 §P0559): minted only
-        // when the SEPARATE mountd key is configured. Same TTL as the
-        // assignment token — the builder's reconnect path re-issues
-        // Mount{} mid-build after a mountd restart, so the token must
-        // stay valid for the whole build window, not just the initial
+        // Mountd Mount-admission token: minted only when a SEPARATE
+        // mountd signer is configured. Same TTL as the assignment
+        // token — the builder's reconnect path re-issues Mount{}
+        // mid-build after a mountd restart, so the token must stay
+        // valid for the whole build window, not just the initial
         // mount. claims.build_id is the exact string the builder will
         // send in Mount{} (the sanitized drv_path basename); mountd
         // compares them, so a leaked token cannot claim another
         // build's id. Empty = no key configured = builder sends no
         // token and mountd's gid gate is the only admission path.
-        let mountd_token = if let Some(signer) = &self.mountd_signer {
+        //
+        // Two schemes (ADR-022 mount-admission credentials, §P0590):
+        // the Ed25519 signer mints an `rmt2` token carrying the
+        // resolved node claim (the cross-node-replay closure); only
+        // when it is absent does the legacy HMAC signer mint the old
+        // two-segment token (never provisioned in production; deleted
+        // in the final ADR phase). Skew rule: verifier-before-signer —
+        // nothing emits rmt2 until the operator configures the signing
+        // key, by which point the DaemonSet already carries the trust
+        // roots (helm ships them together in Phase 3).
+        // r[impl builder.mountd.token-node-scoped]
+        let mountd_token = if let Some(signer) = &self.mountd_ed25519_signer {
+            let ttl_secs = assignment_token_ttl_secs(
+                build_opts.build_timeout,
+                self.assignment_token_ttl_cap_secs,
+            );
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            let token = signer.sign(&rio_auth::mountd_token::MountdAdmissionClaims {
+                aud: rio_auth::hmac::MOUNTD_TOKEN_AUDIENCE.to_string(),
+                build_id: rio_auth::hmac::MountdClaims::build_id_for_drv_path(state.drv_path()),
+                tenant: state.attributed_tenant(&self.builds).map(|u| u.to_string()),
+                issued_unix: now_unix,
+                expiry_unix: now_unix.saturating_add(ttl_secs),
+                node: mountd_node.unwrap_or_default().to_string(),
+                node_fp: None,
+            });
+            // The signing-key name + resolved node next to each other:
+            // this line is the per-dispatch issuance audit the ADR
+            // pairs with the assignments.node_name column.
+            info!(
+                drv_hash = %drv_hash,
+                executor_id = %executor_id,
+                signing_key = signer.key_name(),
+                node = mountd_node.unwrap_or(""),
+                "minted rmt2 mountd Mount-admission token"
+            );
+            token
+        } else if let Some(signer) = &self.mountd_signer {
             let ttl_secs = assignment_token_ttl_secs(
                 build_opts.build_timeout,
                 self.assignment_token_ttl_cap_secs,

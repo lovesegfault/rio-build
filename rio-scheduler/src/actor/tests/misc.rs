@@ -396,7 +396,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
 /// useless against the store-facing assignment key (and vice versa).
 /// Without the key, the field stays empty (fail-closed keyless dev
 /// posture: no token minted, mountd admits by gid only).
-// r[verify builder.mountd.token-key-separate]
+// r[verify builder.mountd.token-key-separate+2]
 #[tokio::test]
 async fn test_mountd_token_minted_with_separate_key_and_bound_to_build_id() -> TestResult {
     use rio_auth::hmac::{HmacSigner, HmacVerifier, MountdClaims, MountdTokenError};
@@ -2193,6 +2193,7 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
             stream_tx: tx,
             stream_epoch: next_stream_epoch_for("w0"),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;

@@ -159,6 +159,7 @@ impl DagActor {
         // hung_nodes after it (or on-demand at the controller's 10s poll)
         // would always see zero stale entries.
         self.tick_hung_nodes(now);
+        self.tick_retire_builder_nodes().await;
         self.tick_check_heartbeats(now).await;
         self.tick_sweep_recently_disconnected(now);
 
@@ -285,6 +286,39 @@ impl DagActor {
         }
         self.hung_nodes
             .retain(|_, last| now.duration_since(*last) < HUNG_NODE_REPEAT_TTL);
+    }
+
+    /// §P0590 `builder_nodes` audit registry (M_069): stamp
+    /// `retired_at` on (a) nodes the dead-node sweep currently flags as
+    /// hung and (b) nodes whose `last_seen` is older than
+    /// [`BUILDER_NODE_STALE_TTL_SECS`] (drained/scaled-down nodes that
+    /// simply stop appearing in controller acks). The TTL pass is
+    /// rate-limited to once per [`BUILDER_NODE_STALE_SWEEP_EVERY`]
+    /// ticks. Best-effort — the registry is operator visibility only,
+    /// never read at mint or verify time, and a name that reappears in
+    /// a later ack un-retires itself via the upsert.
+    async fn tick_retire_builder_nodes(&mut self) {
+        const BUILDER_NODE_STALE_TTL_SECS: i64 = 24 * 3600;
+        // ~1h at the default 10s tick interval.
+        const BUILDER_NODE_STALE_SWEEP_EVERY: u64 = 360;
+
+        if !self.hung_nodes.is_empty() {
+            let hung: Vec<String> = self.hung_nodes.keys().cloned().collect();
+            if let Err(e) = self.db.retire_builder_nodes(&hung).await {
+                debug!(error = %e, nodes = hung.len(),
+                       "builder_nodes hung-retire failed (best-effort audit)");
+            }
+        }
+        if self
+            .tick_count
+            .is_multiple_of(BUILDER_NODE_STALE_SWEEP_EVERY)
+            && let Err(e) = self
+                .db
+                .retire_stale_builder_nodes(BUILDER_NODE_STALE_TTL_SECS)
+                .await
+        {
+            debug!(error = %e, "builder_nodes stale-retire failed (best-effort audit)");
+        }
     }
 
     /// Scan workers for heartbeat timeouts; disconnect any that have

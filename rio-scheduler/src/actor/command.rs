@@ -184,6 +184,13 @@ pub enum ActorCommand {
         /// doesn't match the stored `intent_id` (stream-hijack
         /// guard). `None` in dev mode (no HMAC key configured).
         auth_intent: Option<String>,
+        /// `ExecutorRegister.node_name` (downward-API `spec.nodeName`),
+        /// §P0590: fallback source for scoping THIS executor's own
+        /// mountd token when the controller-attested binding hasn't
+        /// landed. Never written into `authoritative_binding`, never
+        /// read by hung-node detection. `None` = not reported (non-k8s
+        /// or pre-P0590 executor).
+        reported_node: Option<String>,
         /// `r[sec.executor.identity-token]`: accept-gate. The gRPC
         /// handler awaits this BEFORE spawning the
         /// `worker-stream-reader` task; on `Err`, it returns

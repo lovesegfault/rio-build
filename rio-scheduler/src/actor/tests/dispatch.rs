@@ -1936,6 +1936,7 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
         tx,
         next_stream_epoch_for("w-d"),
         Some("d".into()),
+        None,
     );
     actor.handle_heartbeat(HeartbeatPayload {
         executor_id: "w-d".into(),
@@ -2462,7 +2463,7 @@ fn bare_connect_builder(
     id: &str,
 ) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
     let (tx, rx) = mpsc::channel(8);
-    let _ = actor.handle_worker_connected(&id.into(), tx, next_stream_epoch_for(id), None);
+    let _ = actor.handle_worker_connected(&id.into(), tx, next_stream_epoch_for(id), None, None);
     actor.handle_heartbeat(HeartbeatPayload {
         executor_id: id.into(),
         systems: vec!["x86_64-linux".into()],
@@ -2535,6 +2536,7 @@ async fn connect_executor_with_intent(
             stream_tx: tx,
             stream_epoch: next_stream_epoch_for(executor_id),
             auth_intent: None,
+            reported_node: None,
             reply: noop_connect_reply(),
         })
         .await?;
@@ -3980,4 +3982,193 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
         snap.ice_masked_cells
     );
     Ok(())
+}
+
+/// §P0590 mountd-token node resolution: the M3 chain resolves in trust
+/// order — controller-attested binding keyed by executor (pod name) →
+/// controller-attested binding keyed by the spawn intent → the
+/// executor's own register-time report — and yields nothing when no
+/// source knows the placement.
+// r[verify builder.mountd.token-node-scoped]
+#[tokio::test]
+async fn resolve_mountd_node_chain_precedence() {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone());
+
+    // Executor registers with an HMAC-attested intent and its own
+    // RIO_NODE_NAME report.
+    let (tx, _rx) = mpsc::channel(8);
+    let _ = actor.handle_worker_connected(
+        &"pod-a".into(),
+        tx,
+        next_stream_epoch_for("pod-a"),
+        Some("intent-x".into()),
+        Some("node-reg".into()),
+    );
+
+    // Only the register-time report is known → last link in the chain.
+    assert_eq!(
+        actor.resolve_mountd_node(&"pod-a".into()).as_deref(),
+        Some("node-reg"),
+        "executor self-report is the fallback source"
+    );
+
+    // Intent-keyed controller binding lands → it outranks the report.
+    actor.authoritative_binding.insert(
+        "intent-x".into(),
+        crate::actor::AuthBinding {
+            node: "node-intent".into(),
+            tenant: None,
+        },
+    );
+    assert_eq!(
+        actor.resolve_mountd_node(&"pod-a".into()).as_deref(),
+        Some("node-intent"),
+        "intent-keyed controller binding outranks the executor report"
+    );
+
+    // Pod-name-keyed controller binding lands → highest priority.
+    actor
+        .binding_by_executor
+        .insert("pod-a".into(), "node-pod".into());
+    assert_eq!(
+        actor.resolve_mountd_node(&"pod-a".into()).as_deref(),
+        Some("node-pod"),
+        "pod-name-keyed controller binding wins the chain"
+    );
+
+    // Unknown executor: nothing resolves.
+    assert_eq!(actor.resolve_mountd_node(&"ghost".into()), None);
+}
+
+/// §P0590 `mountd_node_binding = require` (the default): with the
+/// Ed25519 mountd signer configured and NO resolvable placement, the
+/// dispatch is deferred (no state mutated); once the controller-attested
+/// binding lands, the same dispatch mints an `rmt2` token whose node
+/// claim names that node, in preference to the legacy HMAC signer even
+/// when both are configured.
+// r[verify builder.mountd.token-node-scoped]
+// r[verify builder.mountd.token-admission+2]
+#[tokio::test]
+async fn mountd_rmt2_require_defers_then_mints_node_scoped_token() {
+    use std::sync::Arc;
+
+    use rio_auth::mountd_token::{MountdSigningKey, MountdTrustRoots, MountdVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let signer = Arc::new(MountdSigningKey::from_seed("rio-mountd-test", &[0x51; 32]).unwrap());
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig::default(), // mountd_node_binding defaults to Require
+        DagActorPlumbing {
+            mountd_ed25519_signer: Some(Arc::clone(&signer)),
+            // Legacy HMAC signer also configured: the Ed25519 arm must win.
+            mountd_signer: Some(Arc::new(rio_auth::hmac::HmacSigner::from_key(
+                b"legacy-mountd-hmac-key-32-bytes!".to_vec(),
+            ))),
+            ..Default::default()
+        },
+    );
+    let mut rx = bare_connect_builder(&mut actor, "pod-rmt2");
+    actor.test_inject_ready("rmt2drv", None, "x86_64-linux", false);
+
+    // No binding, no executor report → require defers without mutating
+    // the derivation.
+    assert!(
+        !actor
+            .assign_to_worker(&"rmt2drv".into(), &"pod-rmt2".into())
+            .await,
+        "unresolvable placement under require must defer"
+    );
+    assert_eq!(
+        actor.dag.node("rmt2drv").unwrap().status(),
+        crate::state::DerivationStatus::Ready,
+        "deferred derivation must stay Ready (nothing to roll back)"
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "no WorkAssignment may be sent for a deferred dispatch"
+    );
+
+    // Controller-attested binding (pod-name keyed) lands → dispatch
+    // proceeds and the token is node-scoped.
+    actor
+        .binding_by_executor
+        .insert("pod-rmt2".into(), "node-a".into());
+    assert!(
+        actor
+            .assign_to_worker(&"rmt2drv".into(), &"pod-rmt2".into())
+            .await,
+        "resolved placement must dispatch"
+    );
+    let assignment = recv_assignment(&mut rx).await;
+    assert!(
+        assignment.mountd_token.starts_with("rmt2."),
+        "Ed25519 signer must win over the legacy HMAC signer: {}",
+        assignment.mountd_token
+    );
+    let verifier = MountdVerifier::Ed25519(
+        MountdTrustRoots::parse(&signer.trust_root_entry()).expect("trust roots"),
+    );
+    let build_id = rio_auth::hmac::MountdClaims::build_id_for_drv_path(&assignment.drv_path);
+    let verified = verifier
+        .verify_for_build(&assignment.mountd_token, &build_id, Some("node-a"))
+        .expect("token verifies for the resolved node");
+    assert_eq!(verified.claims.node, "node-a");
+    // The audit column records the same node (best-effort PG write is
+    // skipped here because the injected drv has no db_id; the column
+    // write itself is covered by the db-level assignment test).
+}
+
+/// §P0590 `mountd_node_binding = prefer`: an unresolvable placement
+/// still dispatches, minting an UNBOUND `rmt2` token (no node claim) —
+/// the documented escape hatch that node-checking mountds reject.
+// r[verify builder.mountd.token-node-scoped]
+#[tokio::test]
+async fn mountd_rmt2_prefer_mints_unbound_token_when_unresolvable() {
+    use std::sync::Arc;
+
+    use rio_auth::mountd_token::{MountdSigningKey, MountdTrustRoots, MountdVerifier};
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let signer = Arc::new(MountdSigningKey::from_seed("rio-mountd-test", &[0x52; 32]).unwrap());
+    let mut actor = DagActor::new(
+        SchedulerDb::new(db.pool.clone()),
+        DagActorConfig {
+            mountd_node_binding: crate::config::MountdNodeBinding::Prefer,
+            ..Default::default()
+        },
+        DagActorPlumbing {
+            mountd_ed25519_signer: Some(Arc::clone(&signer)),
+            ..Default::default()
+        },
+    );
+    let mut rx = bare_connect_builder(&mut actor, "pod-prefer");
+    actor.test_inject_ready("preferdrv", None, "x86_64-linux", false);
+
+    assert!(
+        actor
+            .assign_to_worker(&"preferdrv".into(), &"pod-prefer".into())
+            .await,
+        "prefer must dispatch even when the placement is unresolvable"
+    );
+    let assignment = recv_assignment(&mut rx).await;
+    assert!(assignment.mountd_token.starts_with("rmt2."));
+    let verifier = MountdVerifier::Ed25519(
+        MountdTrustRoots::parse(&signer.trust_root_entry()).expect("trust roots"),
+    );
+    let build_id = rio_auth::hmac::MountdClaims::build_id_for_drv_path(&assignment.drv_path);
+    // A node-checking verifier rejects the unbound token…
+    assert!(matches!(
+        verifier.verify_for_build(&assignment.mountd_token, &build_id, Some("node-a")),
+        Err(rio_auth::mountd_token::MountdVerifyError::NodeMissing)
+    ));
+    // …a no-node-check verifier (standalone posture) accepts it.
+    let verified = verifier
+        .verify_for_build(&assignment.mountd_token, &build_id, None)
+        .expect("unbound token verifies when no node is enforced");
+    assert_eq!(
+        verified.claims.node, "",
+        "prefer mints without a node claim"
+    );
 }
