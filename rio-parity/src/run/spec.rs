@@ -11,6 +11,11 @@ use std::path::{Path, PathBuf};
 use anyhow::Context as _;
 use serde::{Deserialize, Serialize};
 
+/// Conventional warm-stage tenant name (leaf mode): the tenant whose
+/// upstreams point at the public binary cache so dependency warming
+/// substitutes instead of rebuilding.
+pub const WARM_TENANT: &str = "parity-warm";
+
 /// How the campaign builds: against upstream caches (leaf) or entirely
 /// from source inside the cluster (self-hosted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

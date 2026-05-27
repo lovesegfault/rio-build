@@ -12,6 +12,10 @@ use rio_nix::store_path::StorePath;
 /// Convert a narinfo `NarHash` value (`sha256:<52-char nixbase32>` as
 /// served by cache.nixos.org, or `sha256:<64-char hex>` as stored by
 /// rio-store) to lowercase hex. Anything else is an error.
+///
+/// Lives here rather than reusing [`rio_nix::hash::NixHash::parse_colon`]
+/// because that parser accepts only the nixbase32 digest form, while this
+/// helper also normalizes the already-hex form rio-store records.
 pub fn narhash_to_hex(nar_hash: &str) -> anyhow::Result<String> {
     let rest = nar_hash
         .strip_prefix("sha256:")
@@ -69,9 +73,11 @@ impl NixCacheClient {
             .context("join narinfo URL")
     }
 
-    /// Fetch and parse a narinfo. 404 ⇒ `Ok(None)` (path not upstream);
-    /// any other non-200 is an error.
-    pub async fn fetch_narinfo(&self, store_path: &str) -> anyhow::Result<Option<NarInfo>> {
+    /// Fetch a narinfo as raw text. 404 ⇒ `Ok(None)` (path not upstream);
+    /// any other non-200 is an error carrying a body snippet. The campaign
+    /// engine's hydra-truth sweep uses this form so it can decide how to
+    /// record a body that fails to parse.
+    pub async fn fetch_narinfo_text(&self, store_path: &str) -> anyhow::Result<Option<String>> {
         let url = self.narinfo_url(store_path)?;
         tracing::debug!(%url, "cache GET");
         let resp = self
@@ -82,19 +88,28 @@ impl NixCacheClient {
             .with_context(|| format!("GET {url}"))?;
         match resp.status() {
             reqwest::StatusCode::NOT_FOUND => Ok(None),
-            s if s.is_success() => {
-                let text = resp
-                    .text()
+            s if s.is_success() => Ok(Some(
+                resp.text()
                     .await
-                    .with_context(|| format!("read body from {url}"))?;
-                let info = NarInfo::parse(&text)
-                    .map_err(|e| anyhow::anyhow!("parse narinfo from {url}: {e}"))?;
-                Ok(Some(info))
-            }
+                    .with_context(|| format!("read body from {url}"))?,
+            )),
             s => anyhow::bail!(
                 "GET {url}: HTTP {s}: {}",
                 crate::body_snippet(&resp.text().await.unwrap_or_default())
             ),
+        }
+    }
+
+    /// Fetch and parse a narinfo. 404 ⇒ `Ok(None)` (path not upstream);
+    /// any other non-200 or an unparseable body is an error.
+    pub async fn fetch_narinfo(&self, store_path: &str) -> anyhow::Result<Option<NarInfo>> {
+        match self.fetch_narinfo_text(store_path).await? {
+            None => Ok(None),
+            Some(text) => {
+                Ok(Some(NarInfo::parse(&text).map_err(|e| {
+                    anyhow::anyhow!("parse narinfo for {store_path}: {e}")
+                })?))
+            }
         }
     }
 }

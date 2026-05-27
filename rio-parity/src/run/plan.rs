@@ -2,7 +2,7 @@
 //! plan-time validity snapshot, tenant-mode consistency checks, and the
 //! eval-set pin recorded in campaign.json.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::Path;
 
 use anyhow::{Context, Result, bail};
@@ -11,7 +11,7 @@ use super::evalset_input::{DepClosureEntry, ManifestEntry};
 use super::glob::glob_match;
 use super::grpc::StoreApi;
 use super::model::now_rfc3339;
-use super::spec::{CampaignSpec, EvalSetPin, Filters, Mode, PlanOutput};
+use super::spec::{CampaignSpec, EvalSetPin, Filters, Mode, PlanOutput, WARM_TENANT};
 
 /// Why a job was excluded at plan time (the values of [`ScopeResult::skipped`]).
 pub const SKIP_SYSTEM: &str = "system-filtered";
@@ -27,11 +27,21 @@ pub struct ScopeResult {
     pub in_scope: Vec<String>,
     /// job → skip reason for everything filtered out.
     pub skipped: BTreeMap<String, String>,
+    /// Jobs-file entries that match no manifest job name (operator typo or a
+    /// stale file), sorted. The plan stage refuses to run when non-empty.
+    pub unmatched_jobs_file: Vec<String>,
 }
 
-/// Apply the spec's scope filters (systems, include globs, excluded
-/// features, limit, explicit jobs file) to the manifest. Deterministic:
-/// jobs are sorted by name before the limit is applied.
+/// Apply the spec's scope filters to the manifest. Deterministic: jobs are
+/// sorted by name before the limit is applied.
+///
+/// Precedence: the explicit jobs-file allowlist is applied first (when
+/// present it replaces the include globs entirely), then the systems
+/// filter, then the excluded-features filter, then the include globs (only
+/// when there is no jobs file), and finally the limit. The systems and
+/// feature filters still apply to jobs named by the jobs file, so an
+/// explicit list cannot resurrect a job the spec's platform filters
+/// exclude.
 pub fn apply_filters(
     manifest: &[ManifestEntry],
     filters: &Filters,
@@ -44,6 +54,18 @@ pub fn apply_filters(
             .map(String::from)
             .collect()
     });
+    // Jobs-file entries that name nothing in the manifest must not vanish
+    // silently: surface them so the plan stage can refuse loudly.
+    let mut unmatched_jobs_file: Vec<String> = Vec::new();
+    if let Some(allow) = &explicit {
+        let manifest_jobs: HashSet<&str> = manifest.iter().map(|m| m.job.as_str()).collect();
+        unmatched_jobs_file = allow
+            .iter()
+            .filter(|j| !manifest_jobs.contains(j.as_str()))
+            .cloned()
+            .collect();
+        unmatched_jobs_file.sort();
+    }
     let mut in_scope = Vec::new();
     let mut skipped = BTreeMap::new();
     let mut sorted: Vec<&ManifestEntry> = manifest.iter().collect();
@@ -87,7 +109,11 @@ pub fn apply_filters(
             skipped.insert(job, SKIP_LIMIT.into());
         }
     }
-    ScopeResult { in_scope, skipped }
+    ScopeResult {
+        in_scope,
+        skipped,
+        unmatched_jobs_file,
+    }
 }
 
 /// Warm-set / not-attemptable membership computed from the dep closures of
@@ -106,6 +132,11 @@ pub struct WarmComputation {
 /// jobs: every dependency output of an in-scope target goes in the warm set,
 /// and an in-scope job whose own output sits inside another in-scope job's
 /// dependency closure is not attemptable (warming it would mask the build).
+///
+/// Memory posture: the warm set and producer map own their Strings, sized
+/// for the scoped (constituents / explicit job-list) eval sets the engine
+/// runs today. A full-evaluation campaign needs an interning or streaming
+/// pass before it is attempted.
 pub fn compute_warm_sets(
     manifest: &[ManifestEntry],
     dep_closure: &[DepClosureEntry],
@@ -119,10 +150,12 @@ pub fn compute_warm_sets(
     {
         for dep in &entry.deps {
             for path in &dep.output_paths {
-                comp.warm_set.insert(path.clone());
-                comp.producer
-                    .entry(path.clone())
-                    .or_insert_with(|| dep.drv_path.clone());
+                // First producer wins; membership is checked before cloning so
+                // re-encountered paths (shared deps) cost no allocation.
+                if !comp.warm_set.contains(path) {
+                    comp.warm_set.insert(path.clone());
+                    comp.producer.insert(path.clone(), dep.drv_path.clone());
+                }
             }
         }
     }
@@ -186,15 +219,15 @@ pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<
     let expected = spec.mode.expected_build_tenant();
     if spec.tenants.build_tenant != expected {
         bail!(
-            "mode {:?} requires build tenant '{}' but spec says '{}'",
-            spec.mode,
+            "mode {} requires build tenant '{}' but spec says '{}'",
+            spec.mode.as_str(),
             expected,
             spec.tenants.build_tenant
         );
     }
-    if spec.mode == Mode::Leaf && spec.tenants.warm_tenant != "parity-warm" {
+    if spec.mode == Mode::Leaf && spec.tenants.warm_tenant != WARM_TENANT {
         bail!(
-            "leaf mode requires warm tenant 'parity-warm', spec says '{}'",
+            "leaf mode requires warm tenant '{WARM_TENANT}', spec says '{}'",
             spec.tenants.warm_tenant
         );
     }
@@ -286,6 +319,32 @@ pub async fn run_plan(
         None => None,
     };
     let scope = apply_filters(&manifest, &spec.filters, jobs_file_contents.as_deref());
+    if !scope.unmatched_jobs_file.is_empty() {
+        let shown: Vec<&str> = scope
+            .unmatched_jobs_file
+            .iter()
+            .take(20)
+            .map(String::as_str)
+            .collect();
+        let more = scope.unmatched_jobs_file.len() - shown.len();
+        let suffix = if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        };
+        bail!(
+            "jobs file {} lists {} job(s) not present in the eval-set manifest \
+             (operator typo or stale file?): {}{}",
+            spec.filters
+                .jobs_file
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default(),
+            scope.unmatched_jobs_file.len(),
+            shown.join(", "),
+            suffix
+        );
+    }
 
     let warm = if spec.mode == Mode::Leaf {
         compute_warm_sets(&manifest, &dep_closure, &scope.in_scope)
@@ -346,8 +405,14 @@ pub fn verify_manifest_digest(eval_dir: &Path, recorded: &str) -> Result<()> {
 }
 
 /// Build the per-job dep-drv lookup used by batch assembly and closure
-/// re-attribution: job → (target drv, dep drv set).
-pub fn job_closures(dep_closure: &[DepClosureEntry]) -> HashMap<String, (String, HashSet<String>)> {
+/// re-attribution: job → (target drv, dep drv set). Returned as a `BTreeMap`
+/// so callers iterating it (batch assembly) stay deterministic.
+///
+/// Memory posture: owns one String per drv path, sized for scoped eval
+/// sets; a full-evaluation campaign needs interning or streaming first.
+pub fn job_closures(
+    dep_closure: &[DepClosureEntry],
+) -> BTreeMap<String, (String, HashSet<String>)> {
     dep_closure
         .iter()
         .map(|d| {
@@ -420,6 +485,18 @@ mod tests {
         let scope = apply_filters(&manifest, &filters, Some("libA.x86_64-linux\n# comment\n"));
         assert_eq!(scope.in_scope, vec!["libA.x86_64-linux"]);
         assert_eq!(scope.skipped["appB.x86_64-linux"], SKIP_JOBS_FILE);
+        assert!(scope.unmatched_jobs_file.is_empty());
+
+        // Jobs-file entries naming nothing in the manifest are surfaced.
+        let scope = apply_filters(
+            &manifest,
+            &filters,
+            Some("libA.x86_64-linux\nzzz.x86_64-linux\naaa.x86_64-linux\n"),
+        );
+        assert_eq!(
+            scope.unmatched_jobs_file,
+            vec!["aaa.x86_64-linux", "zzz.x86_64-linux"]
+        );
     }
 
     #[test]
@@ -479,6 +556,8 @@ mod tests {
         assert!(result.output.cached_prior_paths.contains(&lib_a_out));
         assert_eq!(result.output.cached_prior_jobs, vec!["libA.x86_64-linux"]);
         assert!(result.low_confidence.is_empty());
+        // The validity snapshot is one batched StoreApi query, not one per job.
+        assert_eq!(*store.calls.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -517,6 +596,81 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("eval set mismatch"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_jobs_file_entries_missing_from_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_eval_set(dir.path());
+        let store = FakeStoreApi::default();
+        let jobs_file = dir.path().join("jobs.txt");
+        std::fs::write(
+            &jobs_file,
+            "appB.x86_64-linux\nnoSuchJob.x86_64-linux\n# comment\n",
+        )
+        .unwrap();
+        let mut spec = leaf_spec();
+        spec.filters.jobs_file = Some(jobs_file.clone());
+
+        let err = run_plan(&spec, dir.path(), &store, false)
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("noSuchJob.x86_64-linux"), "{msg}");
+        assert!(msg.contains("jobs file"), "{msg}");
+        assert!(
+            !msg.contains("appB"),
+            "matched entries must not be listed as unmatched: {msg}"
+        );
+
+        // The same file with only real jobs plans normally.
+        std::fs::write(&jobs_file, "appB.x86_64-linux\n").unwrap();
+        let ok = run_plan(&spec, dir.path(), &store, false).await.unwrap();
+        assert_eq!(ok.output.in_scope, vec!["appB.x86_64-linux"]);
+    }
+
+    #[tokio::test]
+    async fn plan_refuses_recorded_digest_key_digest_and_missing_dep_closure() {
+        let store = FakeStoreApi::default();
+
+        // evalset.json records a manifest_sha256 that doesn't match the bytes
+        // on disk.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_eval_set(dir.path());
+        let meta_path = dir.path().join("evalset.json");
+        let mut meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
+        meta["manifest_sha256"] = serde_json::Value::String("0".repeat(64));
+        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
+        let err = run_plan(&leaf_spec(), dir.path(), &store, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("manifest.jsonl digest mismatch"),
+            "{err}"
+        );
+
+        // Spec pins a different eval-set key digest than evalset.json records.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_eval_set(dir.path());
+        let mut spec = leaf_spec();
+        spec.eval_set.key_digest = "feedface".into();
+        let err = run_plan(&spec, dir.path(), &store, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("key-digest mismatch"), "{err}");
+
+        // Leaf mode without dep-closure.jsonl cannot compute the warm set.
+        let dir = tempfile::tempdir().unwrap();
+        write_mini_eval_set(dir.path());
+        std::fs::remove_file(dir.path().join("dep-closure.jsonl")).unwrap();
+        let err = run_plan(&leaf_spec(), dir.path(), &store, false)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("requires dep-closure.jsonl"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

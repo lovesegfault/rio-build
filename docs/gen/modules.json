@@ -846,6 +846,11 @@
       "doc": "Thin trait facades over the rio gRPC surfaces the engine reads, so every"
     },
     {
+      "path": "run/hydra_truth.rs",
+      "depth": 1,
+      "doc": "Hydra-truth stage: per-path upstream ground truth from cache.nixos.org"
+    },
+    {
       "path": "run/model.rs",
       "depth": 1,
       "doc": "Shared campaign data model: per-job records (results.jsonl),"

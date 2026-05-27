@@ -5,9 +5,9 @@
 //! relative names the local state directory uses. The local-directory
 //! backend serves tests and `--no-s3` development runs; the S3 backend is
 //! a thin adapter over the shared `aws_sdk_s3` client. The sync uploads
-//! only files whose size changed since the previous tick, and the
-//! download restores a previously synced campaign onto an empty pod
-//! volume so resume can continue where the synced state left off.
+//! only files whose (length, mtime) signature changed since the previous
+//! tick, and the download restores a previously synced campaign onto an
+//! empty pod volume so resume can continue where the synced state left off.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

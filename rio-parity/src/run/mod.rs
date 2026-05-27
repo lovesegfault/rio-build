@@ -15,6 +15,7 @@ pub mod artifact;
 pub mod evalset_input;
 pub mod glob;
 pub mod grpc;
+pub mod hydra_truth;
 pub mod model;
 pub mod plan;
 pub mod spec;

@@ -106,6 +106,11 @@ pub fn load_manifest(dir: &Path) -> Result<Vec<ManifestEntry>> {
 /// Read every record of `<dir>/dep-closure.jsonl`; an absent file is an
 /// empty list. Self-hosted campaigns can run without it (no warm stage),
 /// but leaf mode requires it — the plan stage enforces that.
+///
+/// Memory posture: every record is materialized as owned Strings, sized for
+/// the scoped (constituents / explicit job-list) eval sets the engine runs
+/// today. A full-evaluation campaign (hundreds of thousands of jobs) needs
+/// an interning or streaming pass here before it is attempted.
 pub fn load_dep_closure(dir: &Path) -> Result<Vec<DepClosureEntry>> {
     let path = dir.join("dep-closure.jsonl");
     if !path.exists() {

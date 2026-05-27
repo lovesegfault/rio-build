@@ -254,6 +254,12 @@ pub struct HydraEntry {
     pub fetched_at: String,
 }
 
+/// [`WarmEntry::disposition`] value for a warm-set path with no upstream
+/// narinfo. Written by the hydra-truth sweep; the warm stage never submits
+/// paths carrying it (they cannot be substituted, and building them locally
+/// would mask what the campaign measures).
+pub const DISPOSITION_NOT_FOUND_UPSTREAM: &str = "not-found-upstream";
+
 /// One line of warm.jsonl — per-path warm-stage disposition.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
