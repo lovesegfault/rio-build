@@ -1,7 +1,7 @@
 # Spike: confirm a Nix-sandboxed build can use /dev/kvm when the device
 # is exposed via plain bind-mount (extra-sandbox-paths) — i.e., what a
 # k8s hostPath volume + nix.conf sandbox-paths gives you, with no
-# smarter-device-manager in the loop.
+# device plugin in the loop.
 #
 # Rio-stack-independent: 1 VM, stock Nix daemon, local build. The VM
 # gets nested KVM via `-cpu host` so /dev/kvm exists inside.
@@ -10,8 +10,8 @@
 # static probe that open()s /dev/kvm RDWR + ioctl(KVM_GET_API_VERSION),
 # and the build output contains the version (≥12).
 #
-# Supports the P0564 V2 decision to drop smarter-device-manager
-# (hostPath + nodeSelector replaces the device plugin for /dev/kvm).
+# Supports the P0564 V2 decision to drop the KVM device plugin
+# (hostPath + nodeSelector replaces it for /dev/kvm).
 { pkgs, common }:
 let
   # Static probe — host-compiled, store path lands in VM closure via

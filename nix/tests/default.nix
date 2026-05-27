@@ -1713,8 +1713,8 @@ in
   };
 }
 # Spike: P0564 — confirm /dev/kvm via extra-sandbox-paths (hostPath
-# analogue) reaches the Nix sandbox; supports dropping
-# smarter-device-manager. Rio-stack-independent → no profraws →
+# analogue) reaches the Nix sandbox; supports dropping the device-plugin
+# approach for /dev/kvm. Rio-stack-independent → no profraws →
 # excluded from coverage mode (keeps codecov after_n_builds stable).
 // pkgs.lib.optionalAttrs (!coverage) {
   vm-kvm-hostpath-spike = kvm-hostpath-spike { inherit pkgs common; };
