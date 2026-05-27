@@ -486,7 +486,7 @@ pub fn validate_dag(
         ));
     }
 
-    // r[impl gw.reject.unsupported-hash-algo+3]
+    // r[impl gw.reject.unsupported-hash-algo+4]
     // Outputs whose declared hash algorithm the builder cannot verify
     // are CLASSIFIED here and decided by the realization probe
     // (`reject_unrealized_fod_offenders`). For fixed-output derivations
@@ -609,7 +609,7 @@ pub(crate) const MAX_FOD_EXEMPTION_PROBE_PATHS: usize = 1024;
 /// probe): the node then dispatches and fails at the worker's
 /// fail-closed FOD gate — a node-level failure instead of a
 /// submission rejection, never an unverified build.
-// r[impl gw.reject.unsupported-hash-algo+3]
+// r[impl gw.reject.unsupported-hash-algo+4]
 pub(crate) async fn reject_unrealized_fod_offenders(
     offenders: &[UnverifiableFodOffender],
     store_client: &mut StoreServiceClient<Channel>,
@@ -1180,7 +1180,7 @@ pub(crate) const MAX_FALLBACK_INLINE_DRV_BYTES: usize = rio_common::limits::MAX_
 /// path cannot work any other way (the worker has nowhere to fetch the
 /// derivation from), so failing fast at submission is the only honest
 /// answer.
-// r[impl gw.hook.inline-drv-content+3]
+// r[impl gw.hook.inline-drv-content+4]
 pub fn build_fallback_node(
     drv_path: &str,
     basic: &rio_nix::derivation::BasicDerivation,
@@ -1965,7 +1965,7 @@ mod tests {
     /// algorithms (sha256, r:sha512) pass in both shapes with no
     /// offenders, and input-addressed outputs (no hash, no algo) are
     /// never classified.
-    // r[verify gw.reject.unsupported-hash-algo+3]
+    // r[verify gw.reject.unsupported-hash-algo+4]
     #[test]
     fn validate_dag_rejects_unverifiable_fod_algo() {
         let fod_drv_at = |algo: &str, hash: &str, path: &str| -> Derivation {
@@ -2103,7 +2103,7 @@ mod tests {
 
     /// The content-bound single-node fallback carries the serialized
     /// derivation; oversized derivations are rejected with remediation.
-    // r[verify gw.hook.inline-drv-content+3]
+    // r[verify gw.hook.inline-drv-content+4]
     #[test]
     fn build_fallback_node_inlines_the_basic_derivation() {
         use rio_nix::derivation::BasicDerivation;
@@ -2222,7 +2222,7 @@ mod tests {
 
     /// The realization probe: offenders are exempt iff every declared
     /// output is already present; everything uncertain rejects.
-    // r[verify gw.reject.unsupported-hash-algo+3]
+    // r[verify gw.reject.unsupported-hash-algo+4]
     #[tokio::test]
     async fn reject_unrealized_fod_offenders_decides_by_realization() -> anyhow::Result<()> {
         use rio_test_support::grpc::spawn_mock_store_with_client;

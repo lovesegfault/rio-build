@@ -1216,7 +1216,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         );
     }
 
-    // r[impl gw.reject.unsupported-hash-algo+3]
+    // r[impl gw.reject.unsupported-hash-algo+4]
     // Same treatment for unverifiable hash algorithms as validate_dag
     // applies to the cached DAG: the builder's FOD hash gate and
     // floating-CA finalization are both fail-closed, so an
@@ -1383,12 +1383,44 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     out.path()
                 );
             }
-            // r[impl gw.hook.inline-drv-content+3]
+            // r[impl gw.reject.unsupported-hash-algo+4]
+            // Realized unverifiable-algo offenders are still rejected on
+            // THIS path: with no resolvable .drv there is nothing that
+            // binds the inline claim (drv_path, output names, declared
+            // paths) to real derivation text, so forwarding it would
+            // mint an unvalidated node under a client-claimed drv_path —
+            // exactly the squat shape the scheduler's merge protections
+            // exist to prevent (sched.merge.authoritative-conflict). The
+            // realization exemption still applies on the cached-DAG path
+            // once the .drv is resolvable: uploading it first makes the
+            // node store-backed and it cache-cuts there.
+            if inline_offender_realized {
+                warn!(
+                    drv_path = %drv_path_str,
+                    "rejecting realized unverifiable-algo inline derivation: full .drv unavailable"
+                );
+                stderr_err!(
+                    stderr,
+                    "cannot build '{drv_path_str}': its declared outputs are already \
+                     available, but the full derivation is not in the store and its \
+                     outputHashAlgo cannot be verified, so the gateway cannot validate \
+                     the inline derivation — copy the outputs directly instead of \
+                     building, or upload the .drv first with `nix copy --derivation` \
+                     or by using --store ssh-ng:// (the realized outputs then \
+                     cache-cut at the scheduler)"
+                );
+            }
+            // r[impl gw.hook.inline-drv-content+4]
             // Content-bound fallback: the .drv exists in no store (the
             // client never uploaded it), so the worker can only execute
             // this build if the serialized derivation rides along in
             // the submission. Oversized derivations are rejected with
             // remediation — there is no other delivery path for them.
+            // The node is unconditionally marked as carrying the
+            // authoritative copy: every fallback that reaches this point
+            // passed (or was never subject to) the gates above, and the
+            // scheduler's authoritative-content ingress validation binds
+            // the bytes before they are persisted for recovery.
             debug!(
                 error = %e,
                 "full derivation not available, using single-node DAG with inline drv_content"
@@ -1401,20 +1433,6 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     // (it is trivially a structural root) but keeps the
                     // "client named it" marker consistent across opcodes.
                     node.explicitly_requested = true;
-                    if inline_offender_realized {
-                        // Unverifiable-algo realization exemption: these
-                        // bytes cannot pass — or be bound by — the
-                        // scheduler's authoritative-content ingress
-                        // validation (the declared algo is unparseable),
-                        // nothing is ever legitimately built or replayed
-                        // from this node (it cache-cuts at the
-                        // scheduler), and persisting unvalidatable bytes
-                        // is exactly what
-                        // sched.recovery.inline-drv-durability forbids.
-                        // Keep the content inlined as dispatch payload
-                        // but submit it non-authoritatively.
-                        node.drv_content_authoritative = false;
-                    }
                     (vec![node], Vec::new())
                 }
                 Err(reason) => {
@@ -1450,7 +1468,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             return Ok(());
         }
     };
-    // r[impl gw.reject.unsupported-hash-algo+3]
+    // r[impl gw.reject.unsupported-hash-algo+4]
     // Unverifiable-algo offenders are exempt only when every declared
     // output is already realized (the node cache-cuts and never
     // dispatches); otherwise the submission is rejected fail-closed,
@@ -1974,7 +1992,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
             return Ok(DagSubmitOutcome::Rejected(reason));
         }
     };
-    // r[impl gw.reject.unsupported-hash-algo+3]
+    // r[impl gw.reject.unsupported-hash-algo+4]
     // Unverifiable-algo offenders: exempt only when already realized
     // (single bounded FindMissingPaths probe, fail-closed).
     if let Err(reason) =

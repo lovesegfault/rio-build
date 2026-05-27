@@ -1006,7 +1006,7 @@ the handshake before the client will send any opcodes.
   determination (which nodes have outputs already in the store) happens in the
   scheduler, not here --- the one exception is the bounded tenant-scoped
   realization probe that decides unverifiable-hash-algo offenders
-  (#rref("gw.reject.unsupported-hash-algo+3")).
+  (#rref("gw.reject.unsupported-hash-algo+4")).
 + *Validation:* Malformed `.drv` files and missing `.drv`
   files (referenced by `inputDrvs` but not in the store) are rejected via
   `BuildResult::failure` delivered through `STDERR_LAST` --- the session stays
@@ -1024,7 +1024,7 @@ the handshake before the client will send any opcodes.
     verify or finalize, unless every declared output of that derivation is
     already realized for the submitting tenant or substitutable from its
     upstreams --- a single bounded tenant-scoped `FindMissingPaths` probe
-    decides, fail-closed (#rref("gw.reject.unsupported-hash-algo+3"));
+    decides, fail-closed (#rref("gw.reject.unsupported-hash-algo+4"));
   - any floating-CA-shaped output (`outputHashAlgo` set, `outputHash` empty)
     that nevertheless declares an output path — a shape CppNix refuses to
     parse (#rref("gw.reject.floating-ca-declared-path"));
@@ -1061,7 +1061,7 @@ target even when another target's closure swallows it as a non-root.
   gateway-only.
 ]
 
-#r("gw.reject.unsupported-hash-algo+3")[
+#r("gw.reject.unsupported-hash-algo+4")[
   The gateway MUST reject at submission any derivation output declaring an
   `outputHash` and/or `outputHashAlgo` that the builder cannot verify
   (fixed-output) or finalize (floating-CA) --- the supported set is `sha1`,
@@ -1076,10 +1076,15 @@ target even when another target's closure swallows it as a non-root.
   fail-closed: a floating-CA output with an unsupported algorithm (no
   declared path), an empty or unparseable declared path, an offender set
   larger than the probe cap, an indeterminate probe answer, a probe error,
-  or a probe timeout all reject the submission. The rejection (and the
-  probe-backed exemption) applies both in `validate_dag` over cached full
-  derivations (`BuildResult::failure` → `STDERR_LAST`) and inline on
-  `wopBuildDerivation`'s `BasicDerivation` (`STDERR_ERROR`).
+  or a probe timeout all reject the submission. The rejection applies both
+  in `validate_dag` over cached full derivations (`BuildResult::failure` →
+  `STDERR_LAST`) and inline on `wopBuildDerivation`'s `BasicDerivation`
+  (`STDERR_ERROR`); the probe-backed exemption applies only where a
+  resolvable `.drv` binds the claim — on the inline single-node fallback
+  (full `.drv` unresolvable) the gateway MUST reject an unverifiable-algo
+  offender even when its declared outputs are already realized, with
+  remediation naming both options (copy the outputs directly, or upload
+  the `.drv` first so the cached-DAG exemption applies).
 ]
 Both code paths are fail-closed on the worker side too, but only after the
 build has burned a pod; rejecting at submission lands the error on the
@@ -1098,11 +1103,15 @@ probe and dispatch makes the node dispatch and fail at the worker's
 fail-closed FOD gate (a node-level failure instead of a submission
 rejection); a substitute fetch that fails after a positive upstream probe
 ends the same way; and dual-mode sessions probe anonymously, which matches
-the scheduler's anonymous merge-time probe in that mode. When the exemption
-applies on the inline `wopBuildDerivation` path, the single-node fallback
-submits its inline content non-authoritatively
-(#rref("gw.hook.inline-drv-content+3")) so the scheduler's
-authoritative-content ingress validation does not undo the exemption.
+the scheduler's anonymous merge-time probe in that mode. The exemption
+deliberately does not extend to the inline single-node fallback: with no
+resolvable `.drv` nothing binds the claimed `drv_path`, output names, or
+declared paths to real derivation text, so forwarding the claim would mint
+an unvalidated node under a client-chosen `drv_path` — the squat shape the
+scheduler's merge protections (`sched.merge.authoritative-conflict`) exist
+to prevent — and the rejection's remediation (upload the `.drv`, or copy
+the already-realized outputs directly) restores the exemption on the
+cached-DAG path.
 
 #r("gw.reject.floating-ca-declared-path")[
   The gateway MUST reject at submission any derivation output that sets
@@ -1921,7 +1930,7 @@ untrusted handshake):*
   a missing or unrealized output is reported as a failure result, not an
   empty-`outPath` success
 
-#r("gw.hook.inline-drv-content+3")[
+#r("gw.hook.inline-drv-content+4")[
   When the gateway accepts a content-bound derivation through the inline
   `wopBuildDerivation` single-node fallback (the full `.drv` cannot be
   resolved from the session cache or the store), it MUST embed the
@@ -1932,13 +1941,7 @@ untrusted handshake):*
   guidance (upload the `.drv` first via `nix copy --derivation`, or use
   `--store ssh-ng://`). It MUST mark the node as carrying the authoritative
   copy (`drv_content_authoritative`) so the scheduler persists those bytes
-  for recovery (#rref("sched.recovery.inline-drv-durability")) --- except
-  when the unverifiable-algo realization exemption
-  (#rref("gw.reject.unsupported-hash-algo+3")) applied to this derivation,
-  in which case the gateway MUST submit the inline content
-  non-authoritatively: the bytes cannot pass the scheduler's
-  authoritative-content ingress validation and the node is expected to
-  cache-cut, never dispatch. The inlined
+  for recovery (#rref("sched.recovery.inline-drv-durability")). The inlined
   bytes are never written to the store or
   the session derivation cache: re-serialized content does not text-hash to
   the client's claimed `.drv` path, so persisting it would poison later

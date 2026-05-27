@@ -5,9 +5,9 @@
 // r[verify gw.dag.reconstruct+3]
 // r[verify gw.hook.single-node-dag+2]
 // r[verify gw.reject.output-path-mismatch]
-// r[verify gw.reject.unsupported-hash-algo+3]
+// r[verify gw.reject.unsupported-hash-algo+4]
 // r[verify gw.hook.ifd-detection+3]
-// r[verify gw.hook.inline-drv-content+3]
+// r[verify gw.hook.inline-drv-content+4]
 // r[verify gw.stderr.activity+2]
 
 use super::*;
@@ -724,7 +724,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
             1,
             "the content-bound inline fallback is submitted"
         );
-        // r[verify gw.hook.inline-drv-content+3]
+        // r[verify gw.hook.inline-drv-content+4]
         // The submitted node carries the serialized derivation (the .drv
         // exists in no store for the worker to fetch) and it parses back
         // to the same fixed-output derivation.
@@ -758,7 +758,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
 /// wopBuildDerivation (36): an inline floating-CA derivation (algo set,
 /// hash and path empty) with no uploaded .drv is accepted, and the
 /// submitted node carries parseable drv_content with needs_resolve set.
-/// r[verify gw.hook.inline-drv-content+3]
+/// r[verify gw.hook.inline-drv-content+4]
 #[tokio::test]
 async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
 -> anyhow::Result<()> {
@@ -905,7 +905,7 @@ async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs
 
 /// wopBuildDerivation (36): an inline content-bound derivation whose
 /// serialized form exceeds the 1 MiB fallback cap is rejected with
-/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+3]
+/// remediation, before SubmitBuild. r[verify gw.hook.inline-drv-content+4]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -955,7 +955,7 @@ async fn test_build_derivation_inline_fallback_oversized_rejected() -> anyhow::R
 /// submitted node carries the full drv_content — the producer cap and
 /// the SubmitBuild ingress bound are the same shared constant, so the
 /// (256 KiB, 1 MiB] window cannot be rejected downstream.
-/// r[verify gw.hook.inline-drv-content+3]
+/// r[verify gw.hook.inline-drv-content+4]
 #[tokio::test]
 async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1216,7 +1216,7 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
 /// outputHashAlgo the builder cannot verify (md5) is rejected at the
 /// gateway's inline check, before resolve/SubmitBuild — same rule the
 /// cached-DAG algo gate enforces — when the declared output is NOT already
-/// realized in the store. r[verify gw.reject.unsupported-hash-algo+3]
+/// realized in the store. r[verify gw.reject.unsupported-hash-algo+4]
 #[tokio::test]
 async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1259,14 +1259,17 @@ async fn test_build_derivation_inline_bad_hash_algo_rejected() -> anyhow::Result
     Ok(())
 }
 
-/// wopBuildDerivation (36): the same inline md5 FOD is ACCEPTED when its
-/// declared output path is already realized in the store — the node can
-/// only cache-cut, so the realization probe exempts it and the submission
-/// proceeds. r[verify gw.reject.unsupported-hash-algo+3]
+/// wopBuildDerivation (36): the same inline md5 FOD is REJECTED even when
+/// its declared output path is already realized in the store, as long as
+/// the full .drv is unresolvable — with no derivation text to bind the
+/// claim, forwarding it would mint an unvalidated node under a
+/// client-claimed drv_path. The rejection names both remediations and is
+/// distinguishable from the unrealized rejection (which talks about
+/// re-pinning the algo). r[verify gw.reject.unsupported-hash-algo+4]
 #[tokio::test]
-async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyhow::Result<()> {
+async fn test_build_derivation_inline_bad_hash_algo_realized_rejected_without_drv()
+-> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/0000000000000000000000000000000b-inline-md5-realized.drv";
     let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
@@ -1291,11 +1294,68 @@ async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyho
         u64: 0,                                  // build_mode
     );
 
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("already") && err.message.contains("nix copy --derivation"),
+        "rejection must say the outputs are already available and how to upload the .drv: {:?}",
+        err.message
+    );
+    assert!(
+        !err.message.contains("re-pin"),
+        "must be the realized-but-unbindable rejection, not the unrealized one: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "the unbindable inline claim must never reach SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the same realized md5 FOD IS submitted once the
+/// full .drv is resolvable (uploaded beforehand, exactly the rejection's
+/// remediation): the cached-DAG path classifies the offender, the
+/// realization probe exempts it, and the node is store-backed.
+/// r[verify gw.reject.unsupported-hash-algo+4]
+#[tokio::test]
+async fn test_build_derivation_md5_fod_realized_with_drv_cached_submitted() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    h.scheduler.set_submit_outcome(SubmitOutcome::completed());
+
+    let drv_path = "/nix/store/0000000000000000000000000000000b-inline-md5-realized.drv";
+    let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
+    // Both the .drv (the remediation step) and the declared output exist.
+    h.store
+        .seed_with_content(drv_path, MD5_FOD_DRV_ATERM.as_bytes());
+    h.store.seed_with_content(out_path, b"already realized");
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: out_path,
+        string: "md5",                           // unsupported algo
+        string: "deadbeefdeadbeefdeadbeefdeadbeef",
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: out_path,
+        u64: 0,                                  // build_mode
+    );
+
     drain_stderr_until_last(&mut h.stream).await?;
     let status = wire::read_u64(&mut h.stream).await?;
     assert_eq!(
         status, 0,
-        "realized md5 FOD must be accepted (Built=0), got {status}"
+        "realized md5 FOD with a resolvable .drv must be accepted (Built=0), got {status}"
     );
     let error_msg = wire::read_string(&mut h.stream).await?;
     assert!(error_msg.is_empty(), "no error: {error_msg:?}");
@@ -1306,44 +1366,20 @@ async fn test_build_derivation_inline_bad_hash_algo_realized_accepted() -> anyho
         assert_eq!(
             submits.len(),
             1,
-            "the realized offender is exempted and submitted (scheduler cache-cuts it)"
+            "the realized offender is exempted on the cached-DAG path and submitted"
         );
-        // r[verify gw.hook.inline-drv-content+3]
-        // The exempted offender's inline content rides along as dispatch
-        // payload but is submitted NON-authoritatively: the bytes cannot
-        // pass the scheduler's authoritative-content ingress validation,
-        // and the node cache-cuts instead of dispatching.
+        // The node is store-backed: the .drv is fetchable, so no
+        // authoritative inline copy is claimed.
         let node = &submits[0].nodes[0];
         assert!(
             !node.drv_content_authoritative,
-            "exempted offender's inline content must be non-authoritative"
+            "store-backed node must not claim the authoritative copy"
         );
-        assert!(
-            !node.drv_content.is_empty(),
-            "inline content still rides along as dispatch payload"
-        );
-        let reparsed =
-            rio_nix::derivation::Derivation::parse(std::str::from_utf8(&node.drv_content).unwrap())
-                .expect("inlined drv_content parses");
-        assert_eq!(reparsed.outputs()[0].hash_algo(), "md5");
-        assert_eq!(reparsed.outputs()[0].path(), out_path);
         assert!(node.is_fixed_output, "FOD flag preserved");
         assert_eq!(
             node.expected_output_paths,
             vec![out_path.to_string()],
-            "declared output path preserved"
-        );
-        let expected_hash = rio_nix::derivation::hash_derivation_modulo(
-            &reparsed,
-            drv_path,
-            &|_| None,
-            &mut std::collections::HashMap::new(),
-        )
-        .expect("modular hash over the inline fallback");
-        assert_eq!(
-            node.ca_modular_hash,
-            expected_hash.to_vec(),
-            "ca_modular_hash still populated for the exempted offender"
+            "declared output path comes from the real .drv"
         );
     }
 
@@ -1357,7 +1393,7 @@ const MD5_FOD_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffff
 /// wopBuildPaths (9): a cached legacy md5 FOD whose declared output is
 /// already realized in the store is submitted (the scheduler cache-cuts
 /// it) instead of rejecting the whole submission.
-/// r[verify gw.reject.unsupported-hash-algo+3]
+/// r[verify gw.reject.unsupported-hash-algo+4]
 #[tokio::test]
 async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1394,7 +1430,7 @@ async fn test_build_paths_md5_fod_realized_submitted() -> anyhow::Result<()> {
 /// wopBuildPaths (9): the unverifiable-algo exemption probe carries the
 /// session JWT — the answer must be the tenant-scoped one the scheduler
 /// will act on, not an anonymous one.
-/// r[verify gw.reject.unsupported-hash-algo+3]
+/// r[verify gw.reject.unsupported-hash-algo+4]
 /// r[verify gw.jwt.propagate]
 #[tokio::test]
 async fn test_build_paths_md5_fod_probe_carries_session_jwt() -> anyhow::Result<()> {
@@ -1436,7 +1472,7 @@ async fn test_build_paths_md5_fod_probe_carries_session_jwt() -> anyhow::Result<
 /// absent locally but substitutable from the tenant's upstreams is
 /// exempted and submitted — the scheduler's substitute lane completes it
 /// without dispatching, so rejecting it would over-reject a flow that
-/// works end-to-end. r[verify gw.reject.unsupported-hash-algo+3]
+/// works end-to-end. r[verify gw.reject.unsupported-hash-algo+4]
 #[tokio::test]
 async fn test_build_paths_md5_fod_substitutable_submitted() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
@@ -1475,7 +1511,7 @@ async fn test_build_paths_md5_fod_substitutable_submitted() -> anyhow::Result<()
 
 /// wopBuildPaths (9): the same cached legacy md5 FOD is REJECTED when its
 /// declared output is not already realized — the build could only fail
-/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+3]
+/// after burning a pod. r[verify gw.reject.unsupported-hash-algo+4]
 #[tokio::test]
 async fn test_build_paths_md5_fod_unrealized_rejected() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

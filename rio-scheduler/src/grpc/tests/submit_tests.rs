@@ -1090,12 +1090,14 @@ async fn test_submit_build_join_does_not_clear_authoritative_row() {
     );
 }
 
-/// The gateway's unverifiable-algo realization exemption submits the
-/// inline fallback NON-authoritatively (the bytes cannot pass — or be
-/// bound by — authoritative ingress validation, and the node is expected
-/// to cache-cut). The scheduler must accept that shape: non-authoritative
-/// drv_content is dispatch payload only and is not subject to the
-/// authoritative identity binding.
+/// Non-authoritative drv_content is dispatch payload only and is not
+/// subject to the authoritative identity binding; the scheduler must keep
+/// accepting it without binding. The surviving producers of this shape are
+/// the gateway's inline-.drv optimization on store-backed nodes (a small
+/// cached .drv inlined alongside a fetchable store copy) and direct
+/// submitters — the gateway's hook fallback always claims the
+/// authoritative copy, and an unverifiable-algo offender without a
+/// resolvable .drv is rejected at the gateway rather than forwarded.
 #[tokio::test]
 async fn test_submit_build_accepts_non_authoritative_md5_fod_content() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
