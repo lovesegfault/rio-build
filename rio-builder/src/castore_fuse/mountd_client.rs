@@ -29,10 +29,10 @@
 //! every connection, and a restarted daemon's per-connection state died
 //! with the old process — its EEXIST-tolerant staging setup re-adopts
 //! the surviving dir), and retry the failed request. Attempts are
-//! bounded and backoff-jittered ([`MOUNTD_RECONNECT_ATTEMPTS`],
-//! [`MOUNTD_RECONNECT_BACKOFF`], re-Mount capped at
-//! [`MOUNTD_RECONNECT_MOUNT_TIMEOUT`]); after an exhausted cycle a
-//! cooldown ([`MOUNTD_RECONNECT_COOLDOWN`]) makes further attempts fail
+//! bounded and backoff-jittered (`MOUNTD_RECONNECT_ATTEMPTS`,
+//! `MOUNTD_RECONNECT_BACKOFF`, re-Mount capped at
+//! `MOUNTD_RECONNECT_MOUNT_TIMEOUT`); after an exhausted cycle a
+//! cooldown (`MOUNTD_RECONNECT_COOLDOWN`) makes further attempts fail
 //! fast so a long outage degrades exactly like the pre-reconnect
 //! behavior instead of stalling every FUSE callback. A re-dial that
 //! reaches the daemon but has its re-`Mount` REJECTED build-fatally
@@ -42,7 +42,7 @@
 //! the stale connection loss.
 //!
 //! `BackingOpen`/`BackingClose` deliberately do NOT enter the cycle
-//! ([`OnConnLoss::FailFast`]): their callers already have a cheap
+//! (`OnConnLoss::FailFast`): their callers already have a cheap
 //! per-open degradation (keep-cache reads; a deferred close), and
 //! `open()` issues BackingOpen while holding the per-build
 //! backing-table lock — paying the backoff schedule there would stall
