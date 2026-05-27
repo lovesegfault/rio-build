@@ -292,13 +292,15 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
                 // Parents of the ORIGINAL submission's edges: the nodes
                 // whose dependency closure this prune is about to drop.
-                // Only these (∩ the kept set, ∩ childless-in-DAG) get
-                // the topdown_pruned marker — a dep-less demanded leaf
-                // never had a closure to drop, a from-source dispatch
-                // of it would succeed, and marking it would only turn a
-                // routine substitute failure into a wrongful terminal
-                // fail-fast. Resolved path→hash via the original node
-                // list (edges carry drv_paths on the wire).
+                // Only these (∩ the kept set, and only when their
+                // existing children are not already all produced — see
+                // children_all_produced) get the topdown_pruned marker
+                // — a dep-less demanded leaf never had a closure to
+                // drop, a from-source dispatch of it would succeed, and
+                // marking it would only turn a routine substitute
+                // failure into a wrongful terminal fail-fast. Resolved
+                // path→hash via the original node list (edges carry
+                // drv_paths on the wire).
                 let path_to_hash: HashMap<&str, &str> = nodes
                     .iter()
                     .map(|n| (n.drv_path.as_str(), n.drv_hash.as_str()))
@@ -468,18 +470,21 @@ impl DagActor {
         //
         // Only kept nodes whose dependency closure this prune actually
         // dropped — parents of the ORIGINAL submission's edges
-        // (`pruned_closure_parents`) — and that are CHILDLESS in the
-        // global DAG right now are stamped. A dep-less demanded leaf
-        // never had a closure to drop and a kept node that already has
-        // children from an earlier full merge has its deps in the DAG;
-        // neither needs the "must complete via substitution" guard, and
-        // stamping them would only manufacture the stale flag the
-        // fail-fast clear has to mop up. Mirrors the row-level bind in
+        // (`pruned_closure_parents`) — are stamped, and only when their
+        // existing DAG children (if any) are not already all produced.
+        // A dep-less demanded leaf never had a closure to drop, and a
+        // kept node whose children are all Completed/Skipped has its
+        // closure in the store; neither needs the "must complete via
+        // substitution" guard, and stamping them would only manufacture
+        // the stale flag the fail-fast clear has to mop up. Children
+        // that are present but UNBUILT do not exempt the node — see
+        // `children_all_produced` for the reap hazard and the
+        // deliberate trade. Mirrors the row-level bind in
         // persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
                 if pruned_closure_parents.contains(n.drv_hash.as_str())
-                    && self.dag.get_children(&n.drv_hash).is_empty()
+                    && !self.children_all_produced(&n.drv_hash)
                     && let Some(s) = self.dag.node_mut(&n.drv_hash)
                 {
                     s.topdown_pruned = true;
@@ -528,7 +533,8 @@ impl DagActor {
     /// Their rows get `topdown_pruned = true` inside the persist
     /// transaction (the failover-safe counterpart of the post-commit
     /// in-memory stamp in `validate_and_ingest`), additionally gated on
-    /// the node being childless in the DAG.
+    /// the node's existing children (if any) not being all produced
+    /// (`children_all_produced`).
     ///
     /// The PG side of Pending→Active rides the SAME transaction
     /// (`activate_build_tx`, the last statement before commit), so a
@@ -1686,6 +1692,36 @@ impl DagActor {
         reset
     }
 
+    /// True when `drv_hash` has at least one child in the DAG and every
+    /// one of them is already produced (Completed/Skipped) — the only
+    /// children shape that exempts a kept closure-dropped node from the
+    /// `topdown_pruned` stamp: its dependency closure exists in the
+    /// store, so a from-source dispatch is not doomed. Children that
+    /// are merely *present* but unbuilt do NOT exempt it — they can
+    /// belong to another build and be reaped unbuilt later (cancel →
+    /// cascade terminal → reap → `children` scrubbed), leaving the node
+    /// childless with a never-produced closure and, without the stamp,
+    /// eligible for the doomed from-source dispatch. Deliberate trade:
+    /// if a node stamped with unbuilt children later sees them complete
+    /// AND be reaped, one substitute failure can fail-fast where a
+    /// from-source dispatch would have worked — bounded (the fail-fast
+    /// clears the marker it consumes; a resubmit recovers) and strictly
+    /// preferable to the unbounded doomed-dispatch corner. Used by both
+    /// the in-memory stamping loop in `validate_and_ingest` and the
+    /// row-level bind in `persist_merge_to_db` so the two always agree.
+    fn children_all_produced(&self, drv_hash: &str) -> bool {
+        let children = self.dag.get_children(drv_hash);
+        !children.is_empty()
+            && children.iter().all(|c| {
+                self.dag.node(c).is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Completed | DerivationStatus::Skipped
+                    )
+                })
+            })
+    }
+
     /// Persist nodes and edges to the DB after a successful DAG merge,
     /// and flip the build to Active as the transaction's last statement.
     /// Extracted from handle_merge_dag so failures can be caught and
@@ -1694,8 +1730,9 @@ impl DagActor {
     /// `topdown_pruned_parents`: kept nodes whose dependency closure a
     /// fired prune dropped (empty otherwise) — only their rows are
     /// upserted with `topdown_pruned = true` (OR-on-conflict, see
-    /// `db/batch.rs`), additionally gated on being childless in the
-    /// DAG. Inside the same transaction so a rejected merge can never
+    /// `db/batch.rs`), additionally gated on their existing children
+    /// (if any) not being all produced (`children_all_produced`).
+    /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
     async fn persist_merge_to_db(
@@ -1741,17 +1778,19 @@ impl DagActor {
                     // Mark only kept nodes whose dependency closure the
                     // prune dropped (parents of the ORIGINAL
                     // submission's edges) so the guard survives leader
-                    // failover, and only when the node is CHILDLESS in
-                    // the global DAG right now: a dep-less demanded
-                    // leaf never had a closure to drop, and a kept node
-                    // with children from an earlier full merge has its
-                    // deps in the DAG — neither must carry the marker
-                    // (mirrors the in-memory stamp gate in
-                    // validate_and_ingest).
+                    // failover, and only when their existing DAG
+                    // children (if any) are not already all produced: a
+                    // dep-less demanded leaf never had a closure to
+                    // drop, and a node whose children are all
+                    // Completed/Skipped has its closure in the store —
+                    // neither must carry the marker. Unbuilt children
+                    // do NOT exempt the node (they can be reaped
+                    // unbuilt; see `children_all_produced`). Mirrors
+                    // the in-memory stamp gate in validate_and_ingest.
                     // OR-on-conflict upsert: a later non-pruned merge
                     // of the same drv (false here) never clears it.
                     topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
-                        && self.dag.get_children(&node.drv_hash).is_empty(),
+                        && !self.children_all_produced(&node.drv_hash),
                 }
             })
             .collect();

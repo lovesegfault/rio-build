@@ -1269,16 +1269,19 @@ async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -
 }
 
 // r[verify sched.merge.substitute-topdown+7]
-/// A kept (demanded) node that ALREADY has children in the global DAG
-/// at stamp time must NOT be stamped `topdown_pruned` — its dependency
-/// closure is in the DAG (an earlier full merge put it there), so a
-/// from-source dispatch is not doomed and the marker would only create
-/// the stale-flag inconsistency the fail-fast clear has to mop up.
+/// A kept (demanded) node whose existing DAG children are ALL already
+/// produced (Completed/Skipped) must NOT be stamped `topdown_pruned` —
+/// its dependency closure exists in the store, so a from-source
+/// dispatch is not doomed and the marker would only create the
+/// stale-flag inconsistency the fail-fast clear has to mop up. (A node
+/// whose children are still unbuilt IS stamped — see the sibling test
+/// below.)
 #[tokio::test]
-async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResult {
+async fn test_topdown_stamp_skips_kept_node_whose_children_are_already_produced() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     let r_out = test_store_path("tdc-r-out");
+    let d_out = test_store_path("tdc-d-out");
     let mk_r = || {
         let mut n = make_node("tdc-r");
         n.expected_output_paths = vec![r_out.clone()];
@@ -1286,11 +1289,19 @@ async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResu
     };
     let mk_d = || {
         let mut n = make_node("tdc-d");
-        n.expected_output_paths = vec![test_store_path("tdc-d-out")];
+        n.expected_output_paths = vec![d_out.clone()];
         n
     };
 
-    // B0: nothing substitutable → full merge → R has child D in the DAG.
+    // B0: only D's output is substitutable → full merge (R, the sole
+    // demanded node, is not available); D completes via the detached
+    // fetch, so R's existing child is PRODUCED by the time B1 prunes.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(d_out.clone());
     let b0 = Uuid::new_v4();
     merge_dag(
         &handle,
@@ -1300,9 +1311,15 @@ async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResu
         false,
     )
     .await?;
+    settle_substituting(&handle, &["tdc-d"]).await;
+    assert_eq!(
+        expect_drv(&handle, "tdc-d").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: R's existing child is already produced"
+    );
 
     // B1: same submission, but R's wanted output is now substitutable →
-    // the prune fires and keeps {R}. R already has child D from B0.
+    // the prune fires and keeps {R}. R's child D is Completed.
     store
         .state
         .substitutable
@@ -1324,11 +1341,11 @@ async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResu
         "fixture premise: B1 took the roots-only prune path"
     );
 
-    // R has children in the DAG → it must NOT carry the marker, neither
-    // in memory nor in PG.
+    // R's children are all produced → it must NOT carry the marker,
+    // neither in memory nor in PG.
     assert!(
         !expect_drv(&handle, "tdc-r").await.topdown_pruned,
-        "a kept node that already has DAG children must not be stamped in memory"
+        "a kept node whose DAG children are already produced must not be stamped in memory"
     );
     let (pg_pruned,): (bool,) =
         sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdc-r'")
@@ -1336,11 +1353,98 @@ async fn test_topdown_stamp_skips_kept_node_with_existing_children() -> TestResu
             .await?;
     assert!(
         !pg_pruned,
-        "a kept node that already has DAG children must not be persisted as pruned"
+        "a kept node whose DAG children are already produced must not be persisted as pruned"
     );
 
     // Let B1's detached fetch settle before teardown.
     settle_substituting(&handle, &["tdc-r"]).await;
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+7]
+/// A kept (demanded) node whose existing DAG children are still UNBUILT
+/// must keep the `topdown_pruned` stamp. Those children can belong to a
+/// different build and be reaped unbuilt later (that build cancelled →
+/// its sole-interest deps cascade terminal → reaped → `children[R]`
+/// scrubbed); an unstamped R would then be childless with a never-
+/// produced closure, and a substitute failure would take the generic
+/// revert instead of the fail-fast — handing R to a worker from source
+/// for the doomed ENOENT dispatch this machinery exists to prevent.
+/// While the unbuilt children remain in the DAG, the stamp is inert
+/// (every consumption site requires childlessness).
+#[tokio::test]
+async fn test_topdown_stamp_kept_when_existing_children_unbuilt() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tdu-r-out");
+    let mk_r = || {
+        let mut n = make_node("tdu-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_d = || {
+        let mut n = make_node("tdu-d");
+        n.expected_output_paths = vec![test_store_path("tdu-d-out")];
+        n
+    };
+
+    // B0: nothing substitutable → full merge → R has child D in the
+    // DAG, and D is UNBUILT (Ready, no worker connected).
+    let b0 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b0,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdu-r", "tdu-d")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        expect_drv(&handle, "tdu-d").await.status,
+        DerivationStatus::Ready,
+        "fixture premise: R's existing child is still unbuilt"
+    );
+
+    // B1: R's wanted output is now substitutable → the prune fires and
+    // keeps {R}, dropping its closure. R's existing child is unbuilt,
+    // so the stamp must be applied (in memory and in PG).
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let b1 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdu-r", "tdu-d")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+
+    assert!(
+        expect_drv(&handle, "tdu-r").await.topdown_pruned,
+        "a kept closure-dropped node whose existing children are unbuilt must \
+         keep the stamp in memory (the children can be reaped unbuilt later)"
+    );
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdu-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_pruned,
+        "the stamp for a node with unbuilt children must also be persisted"
+    );
+
+    // Let B1's detached fetch settle before teardown.
+    settle_substituting(&handle, &["tdu-r"]).await;
     Ok(())
 }
 
