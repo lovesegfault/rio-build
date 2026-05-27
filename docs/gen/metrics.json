@@ -6,10 +6,12 @@
     "rio_builder_castore_dag_prefetch_seconds",
     "rio_builder_castore_fuse_chunk_source_total",
     "rio_builder_castore_fuse_circuit_open",
+    "rio_builder_castore_fuse_degraded_serve_total",
     "rio_builder_castore_fuse_eio_total",
     "rio_builder_castore_fuse_fetch_bytes_total",
     "rio_builder_castore_fuse_fetch_retries_total",
     "rio_builder_castore_fuse_integrity_fail_total",
+    "rio_builder_castore_fuse_mountd_reconnect_total",
     "rio_builder_castore_fuse_open_case_total",
     "rio_builder_castore_fuse_open_mode_total",
     "rio_builder_castore_fuse_open_seconds",
@@ -285,6 +287,11 @@
         "help": "1.0 when the castore-FUSE fetch circuit breaker is open (rio-store unreachable or degraded). Opens after 5 consecutive fetch failures OR 720s since last successful fetch with at least one failure since. Half-open after 30s (one probe fetch allowed)."
       },
       {
+        "name": "rio_builder_castore_fuse_degraded_serve_total",
+        "kind": "counter",
+        "help": "Castore-FUSE opens served from the build's own digest-verified staged copy because Promote could not publish it into the node-shared cache (rio-mountd unreachable even after the bounded reconnect attempts). The build keeps running; only the node-cache publication is lost, so later opens of the same digest re-fetch. Sustained nonzero outside a mountd restart window means the broker is down on that node."
+      },
+      {
         "name": "rio_builder_castore_fuse_eio_total",
         "kind": "counter",
         "help": "EIO replies returned to the kernel from the castore-FUSE open()/read() path (fetch timeout, integrity failure, mountd error, open ceiling). Every one fails a build (as an infrastructure failure)."
@@ -305,6 +312,11 @@
         "help": "Castore-FUSE fetches whose bytes did not blake3-hash to the requested file_digest. The bytes are discarded and the open fails with EIO. Nonzero = corrupt store content or a transport integrity failure — investigate immediately."
       },
       {
+        "name": "rio_builder_castore_fuse_mountd_reconnect_total",
+        "kind": "counter",
+        "help": "rio-mountd session re-establishment attempts after a connection loss (daemon restart), labeled by outcome: ok = re-dial + re-Mount succeeded and the failed RPC was retried on the new connection; error = the re-dial or re-Mount itself failed (bounded attempts, then the RPC's original error surfaces). A burst during a DaemonSet rollout is expected; sustained errors mean rio-mountd is not coming back on this node."
+      },
+      {
         "name": "rio_builder_castore_fuse_open_case_total",
         "kind": "counter",
         "help": "Castore-FUSE open() dispatch decisions: hit (backing cache), miss_small (whole-file JIT fetch), miss_stream (above stream_threshold: open() returns after the first chunk while the fill streams in the background), wait_fetching (another open of the same digest was already filling)."
@@ -322,7 +334,7 @@
       {
         "name": "rio_builder_castore_fuse_promote_fail_total",
         "kind": "counter",
-        "help": "Promote round-trips that failed after a completed castore-FUSE fill (the RaceTimeout cache re-check and single retry already applied). On the whole-file path the open fails with EIO; on the streaming path the open handles keep reading from staging, but the digest is not published to the node cache so later opens re-fetch."
+        "help": "Promote round-trips that failed after a completed castore-FUSE fill (the RaceTimeout cache re-check, single retry, and bounded mountd reconnect already applied). The open handles keep reading the verified staged/streamed copy (a daemon-side rejection of the bytes still fails the whole-file open with EIO); the digest is not published to the node cache so later opens re-fetch."
       },
       {
         "name": "rio_builder_castore_fuse_upcalls_total",

@@ -367,10 +367,12 @@ fn run_fill(ctx: &FillContext, fill: &Arc<StreamFill>) {
             // landed: readers pread the renamed staging file through the
             // fd this StreamFill already holds. The Promote that follows
             // only matters for the NEXT open of this digest, so it must
-            // neither delay nor poison reads on handles already open —
-            // the deliberate asymmetry with the whole-file path, which
-            // has nothing to serve the kernel without the cache entry
-            // and therefore still treats a Promote failure as fatal.
+            // neither delay nor poison reads on handles already open.
+            // (The whole-file path mirrors this since the
+            // promote-degrade change: an unpublishable Promote there
+            // serves the open from the verified staged copy instead of
+            // EIO — only daemon-side rejections of the bytes stay
+            // fatal.)
             fill.finish(Ok(()));
             promote_streamed(ctx);
             // Deregister last: an open() racing the promote attaches to

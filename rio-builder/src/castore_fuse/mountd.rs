@@ -1237,6 +1237,14 @@ fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> a
     let cfg = &shared.cfg;
 
     // ── Staging: 0700, owned by the build's uid, kernel-quota'd.
+    //
+    // EEXIST is tolerated deliberately: after a daemon restart the
+    // surviving build's staging dir (spared by the startup orphan scan
+    // via its flock'd `.rio-live` sentinel) is re-adopted by the
+    // builder's re-`Mount{build_id}` on its new connection — existing
+    // staged content is left untouched, the dir is re-chowned to the
+    // same peer uid, and a fresh (survivor-disjoint) projid re-applies
+    // the quota. r[impl builder.fs.mountd-reconnect]
     match mkdirat(
         &shared.staging_base,
         build_id,
@@ -1260,8 +1268,13 @@ fn mount_build(shared: &Arc<Shared>, state: &mut ConnState, build_id: &str) -> a
         AtFlags::empty(),
     )
     .context("chown staging dir")?;
-    mkdirat(&staging_dirfd, "chunks", Mode::from_bits_truncate(0o700))
-        .context("mkdir staging/chunks")?;
+    // EEXIST tolerated for the same re-adoption reason as the parent
+    // dir above: a surviving build's staging already has its chunks
+    // subdir from the original Mount.
+    match mkdirat(&staging_dirfd, "chunks", Mode::from_bits_truncate(0o700)) {
+        Ok(()) | Err(nix::errno::Errno::EEXIST) => {}
+        Err(e) => return Err(e).context("mkdir staging/chunks"),
+    }
     fchownat(
         &staging_dirfd,
         "chunks",
@@ -1623,6 +1636,78 @@ mod tests {
                  (cannot open /dev/fuse: {e})"
             ),
         }
+    }
+
+    /// A restarted daemon accepting a re-`Mount{build_id}` for a build
+    /// that survived it: the staging dir already exists (spared by the
+    /// startup scan — the builder still holds the `.rio-live` flock)
+    /// and still holds a staged-but-not-yet-promoted file. The Mount
+    /// must succeed, must NOT wipe the staged content, and a Promote on
+    /// the new connection must publish that surviving file. This is the
+    /// daemon half of the client's reconnect-after-restart contract.
+    // r[verify builder.fs.mountd-reconnect]
+    #[test]
+    fn mount_build_readopts_a_surviving_staging_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let shared = test_shared(tmp.path());
+        let build_id = "restart-survivor_drv";
+
+        // What the previous incarnation (plus the builder) left behind:
+        // the staging dir, its chunks subdir, a verified staged file
+        // awaiting promote, and the flock-held live sentinel.
+        let staging = tmp.path().join("staging").join(build_id);
+        std::fs::create_dir_all(staging.join("chunks")).unwrap();
+        let content = b"staged before the daemon restarted".to_vec();
+        let digest = *blake3::hash(&content).as_bytes();
+        std::fs::write(staging.join(hex::encode(digest)), &content).unwrap();
+        let sentinel = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(staging.join(sweep::LIVE_SENTINEL))
+            .unwrap();
+        let _held = nix::fcntl::Flock::lock(sentinel, nix::fcntl::FlockArg::LockExclusiveNonblock)
+            .map_err(|(_, e)| e)
+            .unwrap();
+
+        // The re-Mount on the restarted daemon (fresh Shared, empty
+        // claims) must re-adopt the dir rather than fail or wipe it.
+        let mut state = test_conn_state();
+        let quota = mount_build(&shared, &mut state, build_id)
+            .expect("re-Mount over a surviving staging dir must succeed");
+        assert_eq!(quota, 0, "quota disabled in the test fixture");
+        assert_eq!(
+            std::fs::read(staging.join(hex::encode(digest))).unwrap(),
+            content,
+            "re-adoption must not touch the surviving staged content"
+        );
+        assert!(
+            staging.join(sweep::LIVE_SENTINEL).exists(),
+            "the live sentinel survives the re-Mount"
+        );
+
+        // And the surviving staged file is promotable through the new
+        // connection's staging dirfd.
+        let staging_dirfd = state.staging_dirfd.clone().expect("staging dirfd set");
+        let n = promote_one(
+            staging_dirfd.as_fd(),
+            shared.cache_base.as_fd(),
+            &digest,
+            DEFAULT_MAX_PROMOTE_BYTES,
+        )
+        .expect("promote of the surviving staged file");
+        assert_eq!(n, content.len() as u64);
+        assert_eq!(
+            std::fs::read(
+                tmp.path()
+                    .join("cache")
+                    .join(shard(&digest))
+                    .join(hex::encode(digest))
+            )
+            .unwrap(),
+            content,
+            "the pre-restart staged bytes are what lands in the shared cache"
+        );
     }
 
     // r[verify builder.mountd.build-id-validated]

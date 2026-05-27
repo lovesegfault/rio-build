@@ -17,19 +17,65 @@
 //! Every call takes an explicit timeout (`mountd_request_timeout` from
 //! config). A timed-out call deregisters its `seq` so a late reply is
 //! dropped instead of leaking a channel.
+//!
+//! # Reconnection (mountd restart resilience)
+//!
+//! The daemon is a per-node DaemonSet; a restart (upgrade, crash,
+//! force-delete) kills every UDS connection while the builds it served
+//! keep running. A client built by [`MountdClient::connect`] therefore
+//! re-establishes its session when an RPC fails because the connection
+//! is gone: re-dial the socket, re-issue `Mount{build_id}` (the daemon
+//! requires it as the first request on every connection, and a
+//! restarted daemon's per-connection state died with the old process —
+//! its EEXIST-tolerant staging setup re-adopts the surviving dir), and
+//! retry the failed request. Attempts are bounded and backoff-jittered
+//! ([`MOUNTD_RECONNECT_ATTEMPTS`], [`MOUNTD_RECONNECT_BACKOFF`]); after
+//! an exhausted cycle a cooldown ([`MOUNTD_RECONNECT_COOLDOWN`]) makes
+//! further RPCs fail fast so a long outage degrades exactly like the
+//! pre-reconnect behavior instead of stalling every FUSE callback.
+//! Test clients built by [`MountdClient::from_fd`] (socketpairs) have
+//! nothing to re-dial and keep the old fail-fast behavior.
+// r[impl builder.fs.mountd-reconnect]
 
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::path::Path;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
 
 use super::mountd_proto::{self as proto, ErrKind, Reply, Req, Request, Resp};
 use crate::IgnorePoison;
+
+/// Re-dial attempts per RPC after a connection-loss failure. Each
+/// attempt is one `connect(2)` (fails in microseconds while the daemon
+/// is away) plus, on success, one `Mount` round-trip bounded by the
+/// caller's own request timeout — so the whole cycle stays inside a
+/// couple of `mountd_request_timeout` budgets even in the worst case.
+const MOUNTD_RECONNECT_ATTEMPTS: u32 = 4;
+
+/// Backoff slept before each re-dial attempt: 500 ms → 1 s → 2 s → 2 s
+/// ceilings with ±25% jitter (≈5.5 s expected total) — sized to cover a
+/// systemd/DaemonSet restart of rio-mountd with margin while staying
+/// well inside the 30 s per-request budget the caller already holds.
+const MOUNTD_RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: Duration::from_millis(500),
+    mult: 2.0,
+    cap: Duration::from_secs(2),
+    jitter: rio_common::backoff::Jitter::Proportional(0.25),
+};
+
+/// After a reconnect cycle exhausts every attempt without reaching the
+/// daemon, further RPCs skip reconnection (failing fast with their
+/// original error, exactly like the pre-reconnect behavior) until this
+/// much time has passed — a long mountd outage must not turn every
+/// cache-hit open into a multi-second stall when the keep-cache
+/// fallback serves it just fine. The next RPC after the cooldown
+/// re-probes.
+const MOUNTD_RECONNECT_COOLDOWN: Duration = Duration::from_secs(15);
 
 /// A mountd request failure, classified for the build-vs-infra
 /// decision.
@@ -69,6 +115,18 @@ impl MountdError {
     }
 }
 
+/// `true` when the error means the connection itself is unusable (the
+/// daemon went away or the socket died) — the class of failure a
+/// re-dial can fix. Daemon-side rejections, unexpected replies, local
+/// encode errors, and timeouts (the request may still be executing
+/// daemon-side; re-sending could double-execute it) are NOT in it.
+fn is_connection_loss(err: &MountdError) -> bool {
+    matches!(
+        err,
+        MountdError::Disconnected(_) | MountdError::Send(proto::FrameError::Io(_))
+    )
+}
+
 /// One reply as delivered to a waiting caller: the decoded `Resp` plus
 /// any fds that arrived in the datagram's `SCM_RIGHTS` cmsg (no current
 /// reply carries one — fds only flow builder → daemon — but the demux
@@ -88,11 +146,14 @@ struct Inner {
     next_seq: AtomicU32,
 }
 
-/// The "is any client handle still alive?" sentinel.
+/// One established connection: the socket, its reply-demux reader
+/// thread, and the in-flight call registry. Connections are immutable
+/// once made — a reconnect builds a fresh `Conn` and swaps it into the
+/// client's shared slot rather than re-dialing in place.
 ///
-/// Client handles share an `Arc<Conn>`; the reader thread holds an
-/// `Arc<Inner>` directly. The two refcounts are deliberately separate:
-/// the reader must keep the socket and the pending map alive while it
+/// The reader thread holds an `Arc<Inner>` directly (NOT an
+/// `Arc<Conn>`). The two refcounts are deliberately separate: the
+/// reader must keep the socket and the pending map alive while it
 /// drains, but its own liveness must not keep the *connection* alive —
 /// otherwise dropping every client handle would leave the reader
 /// parked in `recvmsg` holding the last strong reference forever, the
@@ -107,7 +168,8 @@ struct Conn {
 }
 
 impl Drop for Conn {
-    /// Runs when the last client handle drops. Shuts the socket down —
+    /// Runs when the last reference drops (the last client handle, or a
+    /// reconnect swapping in a replacement). Shuts the socket down —
     /// the daemon's `recvmsg` returns EOF (its cue to tear the build
     /// down) and the reader thread's blocked `recvmsg` returns EOF
     /// (closing the fd alone does NOT reliably interrupt a thread
@@ -129,39 +191,10 @@ impl Drop for Conn {
     }
 }
 
-/// Handle to one mountd connection. Cheap to clone; the underlying
-/// socket and reader thread are shared.
-///
-/// Dropping the last handle disconnects: the socket is shut down, the
-/// reader thread is joined, and the daemon observes EOF — which is its
-/// signal to reap the build's staging dir and release its build_id/uid
-/// claims. There is deliberately no force-close that yanks the socket out
-/// from under live clones: the FUSE callbacks hold a clone for
-/// `BackingOpen`/`BackingClose`/`Promote`, and the connection must
-/// outlive the last of them.
-#[derive(Clone)]
-pub struct MountdClient {
-    conn: Arc<Conn>,
-}
-
-impl MountdClient {
-    /// Connect to the daemon's socket and start the reply-demux reader
-    /// thread.
-    pub fn connect(socket_path: &Path) -> std::io::Result<Self> {
-        let sock = socket(
-            AddressFamily::Unix,
-            SockType::SeqPacket,
-            SockFlag::SOCK_CLOEXEC,
-            None,
-        )?;
-        let addr = UnixAddr::new(socket_path)?;
-        connect(sock.as_raw_fd(), &addr)?;
-        Ok(Self::from_fd(sock))
-    }
-
-    /// Wrap an already-connected `SOCK_SEQPACKET` fd (tests use a
-    /// `socketpair` half).
-    pub fn from_fd(sock: OwnedFd) -> Self {
+impl Conn {
+    /// Wrap an already-connected `SOCK_SEQPACKET` fd and start its
+    /// reply-demux reader thread.
+    fn new(sock: OwnedFd) -> Self {
         let shared = Arc::new(Inner {
             sock,
             send: Mutex::new(()),
@@ -173,23 +206,16 @@ impl MountdClient {
         // so the socket and pending map outlive its drain path without
         // its liveness keeping the connection open. It exits when
         // recv_frame returns Eof/Err — on daemon-side close, or on the
-        // shutdown(2) issued by Conn::drop when the last client handle
-        // goes away.
+        // shutdown(2) issued by Conn::drop when the connection is
+        // released.
         let reader = std::thread::Builder::new()
             .name("mountd-reader".into())
             .spawn(move || reader_loop(&reader_shared))
             .expect("spawn mountd-reader thread");
         Self {
-            conn: Arc::new(Conn {
-                shared,
-                reader: Some(reader),
-            }),
+            shared,
+            reader: Some(reader),
         }
-    }
-
-    /// The connection state shared with the reader thread.
-    fn shared(&self) -> &Inner {
-        &self.conn.shared
     }
 
     /// Allocate a seq, register the reply slot, and send one frame.
@@ -203,17 +229,20 @@ impl MountdClient {
     /// if that ever shows up in practice.
     fn send_request(
         &self,
-        req: Req,
+        req: &Req,
         fds: &[RawFd],
     ) -> Result<(u32, Receiver<Delivery>), MountdError> {
-        let seq = self.shared().next_seq.fetch_add(1, Ordering::Relaxed);
-        let frame = proto::encode(&Request { seq, req })?;
+        let seq = self.shared.next_seq.fetch_add(1, Ordering::Relaxed);
+        let frame = proto::encode(&Request {
+            seq,
+            req: req.clone(),
+        })?;
         // Rendezvous capacity 1: the reader's send never blocks even if
         // the caller has already timed out and gone away (the buffered
         // slot absorbs the late reply, then the whole channel drops).
         let (tx, rx) = std::sync::mpsc::sync_channel::<Delivery>(1);
         {
-            let mut pending = self.shared().pending.lock().ignore_poison();
+            let mut pending = self.shared.pending.lock().ignore_poison();
             let Some(map) = pending.as_mut() else {
                 return Err(MountdError::Disconnected(
                     "connection already closed".into(),
@@ -221,10 +250,10 @@ impl MountdClient {
             };
             map.insert(seq, tx);
         }
-        let _send_guard = self.shared().send.lock().ignore_poison();
-        if let Err(e) = proto::send_frame(self.shared().sock.as_raw_fd(), &frame, fds) {
+        let _send_guard = self.shared.send.lock().ignore_poison();
+        if let Err(e) = proto::send_frame(self.shared.sock.as_raw_fd(), &frame, fds) {
             // Send failed — deregister so the slot doesn't leak.
-            if let Some(map) = self.shared().pending.lock().ignore_poison().as_mut() {
+            if let Some(map) = self.shared.pending.lock().ignore_poison().as_mut() {
                 map.remove(&seq);
             }
             return Err(e.into());
@@ -236,7 +265,7 @@ impl MountdClient {
     /// reply, at most `timeout`.
     fn call(
         &self,
-        req: Req,
+        req: &Req,
         fds: &[RawFd],
         timeout: Duration,
     ) -> Result<(Resp, Vec<OwnedFd>), MountdError> {
@@ -247,7 +276,7 @@ impl MountdClient {
                 // Timed out (or the reader dropped the sender without a
                 // drain message, which cannot happen — the drain always
                 // sends). Deregister so a late reply is dropped.
-                if let Some(map) = self.shared().pending.lock().ignore_poison().as_mut() {
+                if let Some(map) = self.shared.pending.lock().ignore_poison().as_mut() {
                     map.remove(&seq);
                 }
                 Err(MountdError::Timeout(timeout))
@@ -255,21 +284,11 @@ impl MountdClient {
         }
     }
 
-    /// `Mount{build_id}`: claim the build id, hand the daemon a dup of
-    /// `fuse_fd` (this build's own `/dev/fuse`, which the caller mounts
-    /// itself — see [`super::mount::mount_castore_background`]) so it
-    /// can broker `BackingOpen`/`BackingClose` against that connection,
-    /// and have the daemon set up this build's staging dir + quota.
-    /// Must be the first request on a connection; exactly one per
-    /// connection lifetime. Returns `staging_quota_bytes`.
-    pub fn mount(
-        &self,
-        build_id: &str,
-        fuse_fd: RawFd,
-        timeout: Duration,
-    ) -> Result<u64, MountdError> {
+    /// `Mount{build_id}` as the first request on this connection,
+    /// handing the daemon a dup of `fuse_fd` via `SCM_RIGHTS`.
+    fn mount(&self, build_id: &str, fuse_fd: RawFd, timeout: Duration) -> Result<u64, MountdError> {
         let (resp, _) = self.call(
-            Req::Mount {
+            &Req::Mount {
                 build_id: build_id.to_owned(),
             },
             &[fuse_fd],
@@ -283,12 +302,312 @@ impl MountdClient {
             other => Err(MountdError::UnexpectedReply(other)),
         }
     }
+}
+
+/// What a fresh connection needs to become usable again after a daemon
+/// restart: the protocol requires `Mount{build_id}` (carrying this
+/// build's `/dev/fuse` fd) as the first request on every connection.
+/// Captured by the first successful [`MountdClient::mount`].
+struct MountSession {
+    build_id: String,
+    /// A dup of the build's own `/dev/fuse` fd, held so a re-`Mount`
+    /// can hand the restarted daemon a fresh `SCM_RIGHTS` copy (its
+    /// previous dup died with the old process). Closing this dup at
+    /// client drop is inert — the fuse connection's lifetime is owned
+    /// by the fuser session and the mount, not by this fd.
+    fuse_fd: OwnedFd,
+    /// The per-request budget the original `Mount` used; the re-`Mount`
+    /// reuses it.
+    mount_timeout: Duration,
+}
+
+/// State shared by every clone of one [`MountdClient`].
+struct ClientShared {
+    /// The live connection. Swapped wholesale by a successful
+    /// reconnect; callers clone the `Arc` out and run their RPC on that
+    /// snapshot, so an in-flight call on the old connection and the
+    /// swap never race on the socket itself.
+    conn: Mutex<Arc<Conn>>,
+    /// Where [`MountdClient::connect`] dialed, for re-dialing. `None`
+    /// for [`MountdClient::from_fd`] clients (tests, socketpairs) —
+    /// they cannot reconnect.
+    socket_path: Option<PathBuf>,
+    /// Mount parameters for re-establishing the session on a fresh
+    /// connection. `None` until the first successful `mount()` (and
+    /// forever for clients that never mount — nothing to re-establish).
+    session: Mutex<Option<MountSession>>,
+    /// Set when a reconnect cycle exhausted every attempt; until it
+    /// expires, RPCs skip reconnection and fail fast with their
+    /// original error.
+    reconnect_cooldown_until: Mutex<Option<Instant>>,
+}
+
+/// Handle to one mountd connection. Cheap to clone; the underlying
+/// socket and reader thread are shared.
+///
+/// Dropping the last handle disconnects: the socket is shut down, the
+/// reader thread is joined, and the daemon observes EOF — which is its
+/// signal to reap the build's staging dir and release its build_id/uid
+/// claims. There is deliberately no force-close that yanks the socket out
+/// from under live clones: the FUSE callbacks hold a clone for
+/// `BackingOpen`/`BackingClose`/`Promote`, and the connection must
+/// outlive the last of them.
+#[derive(Clone)]
+pub struct MountdClient {
+    inner: Arc<ClientShared>,
+}
+
+impl MountdClient {
+    /// Connect to the daemon's socket and start the reply-demux reader
+    /// thread. The socket path is remembered so a later daemon restart
+    /// can be survived by re-dialing it (see the module docs).
+    pub fn connect(socket_path: &Path) -> std::io::Result<Self> {
+        let conn = Self::dial(socket_path)?;
+        Ok(Self {
+            inner: Arc::new(ClientShared {
+                conn: Mutex::new(Arc::new(conn)),
+                socket_path: Some(socket_path.to_path_buf()),
+                session: Mutex::new(None),
+                reconnect_cooldown_until: Mutex::new(None),
+            }),
+        })
+    }
+
+    /// Wrap an already-connected `SOCK_SEQPACKET` fd (tests use a
+    /// `socketpair` half). Such a client has no socket path to re-dial,
+    /// so a lost connection stays lost (the pre-reconnect fail-fast
+    /// behavior).
+    pub fn from_fd(sock: OwnedFd) -> Self {
+        Self {
+            inner: Arc::new(ClientShared {
+                conn: Mutex::new(Arc::new(Conn::new(sock))),
+                socket_path: None,
+                session: Mutex::new(None),
+                reconnect_cooldown_until: Mutex::new(None),
+            }),
+        }
+    }
+
+    /// One `connect(2)` to the daemon's `SOCK_SEQPACKET` socket.
+    fn dial(socket_path: &Path) -> std::io::Result<Conn> {
+        let sock = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )?;
+        let addr = UnixAddr::new(socket_path)?;
+        connect(sock.as_raw_fd(), &addr)?;
+        Ok(Conn::new(sock))
+    }
+
+    /// Snapshot the current connection.
+    fn current_conn(&self) -> Arc<Conn> {
+        Arc::clone(&self.inner.conn.lock().ignore_poison())
+    }
+
+    /// Whether a reconnect may be attempted right now: the client knows
+    /// where to re-dial, has a completed `Mount` to re-establish, and is
+    /// not inside the post-exhaustion cooldown.
+    fn reconnect_possible(&self) -> bool {
+        if self.inner.socket_path.is_none() {
+            return false;
+        }
+        if self.inner.session.lock().ignore_poison().is_none() {
+            return false;
+        }
+        let cooldown = self.inner.reconnect_cooldown_until.lock().ignore_poison();
+        match *cooldown {
+            Some(until) => Instant::now() >= until,
+            None => true,
+        }
+    }
+
+    /// Mark a fully-exhausted reconnect cycle so subsequent RPCs fail
+    /// fast (instead of each re-paying the backoff schedule) until the
+    /// cooldown expires.
+    fn begin_reconnect_cooldown(&self) {
+        *self.inner.reconnect_cooldown_until.lock().ignore_poison() =
+            Some(Instant::now() + MOUNTD_RECONNECT_COOLDOWN);
+    }
+
+    /// A reconnect succeeded — clear any cooldown so later failures get
+    /// a full retry budget again.
+    fn clear_reconnect_cooldown(&self) {
+        *self.inner.reconnect_cooldown_until.lock().ignore_poison() = None;
+    }
+
+    /// Re-establish the session after `failed` died: dial the socket,
+    /// issue `Mount{build_id}` (with the kept `/dev/fuse` dup) as the
+    /// new connection's first request, and swap it in. If another
+    /// thread already swapped a fresh connection in, adopt that one
+    /// without dialing.
+    ///
+    /// The restarted daemon accepts the re-`Mount` for the surviving
+    /// staging dir: its staging setup tolerates the existing directory
+    /// (EEXIST), re-chowns it to the same peer uid, and assigns a fresh
+    /// project id seeded above any survivor's, while the builder's
+    /// flock'd `.rio-live` sentinel keeps the startup orphan scan and
+    /// the disk-pressure sweep away from the dir in the meantime.
+    fn reconnect(&self, failed: &Arc<Conn>) -> Result<Arc<Conn>, MountdError> {
+        let Some(socket_path) = self.inner.socket_path.as_deref() else {
+            return Err(MountdError::Disconnected(
+                "client has no socket path to re-dial".into(),
+            ));
+        };
+        let session = self.inner.session.lock().ignore_poison();
+        let Some(session) = session.as_ref() else {
+            return Err(MountdError::Disconnected(
+                "no completed Mount to re-establish".into(),
+            ));
+        };
+        let mut current = self.inner.conn.lock().ignore_poison();
+        if !Arc::ptr_eq(&current, failed) {
+            // Someone else already reconnected; use their connection.
+            return Ok(Arc::clone(&current));
+        }
+        let outcome = (|| {
+            let conn = Self::dial(socket_path).map_err(|e| {
+                MountdError::Disconnected(format!("re-dial {} failed: {e}", socket_path.display()))
+            })?;
+            let conn = Arc::new(conn);
+            conn.mount(
+                &session.build_id,
+                session.fuse_fd.as_raw_fd(),
+                session.mount_timeout,
+            )?;
+            Ok(conn)
+        })();
+        match outcome {
+            Ok(conn) => {
+                metrics::counter!(
+                    "rio_builder_castore_fuse_mountd_reconnect_total",
+                    "outcome" => "ok"
+                )
+                .increment(1);
+                tracing::info!(
+                    build_id = %session.build_id,
+                    socket = %socket_path.display(),
+                    "re-established the rio-mountd session after a connection loss"
+                );
+                // The previous (dead) connection is released here: its
+                // Drop shuts the socket down so a still-living daemon
+                // observes EOF for it promptly.
+                *current = Arc::clone(&conn);
+                Ok(conn)
+            }
+            Err(e) => {
+                metrics::counter!(
+                    "rio_builder_castore_fuse_mountd_reconnect_total",
+                    "outcome" => "error"
+                )
+                .increment(1);
+                Err(e)
+            }
+        }
+    }
+
+    /// Send `req` and block for its reply, re-dialing and re-mounting
+    /// (bounded, backoff-jittered) when the connection turns out to be
+    /// gone. Non-connection failures (rejections, timeouts) surface
+    /// unchanged.
+    fn call(
+        &self,
+        req: &Req,
+        fds: &[RawFd],
+        timeout: Duration,
+    ) -> Result<(Resp, Vec<OwnedFd>), MountdError> {
+        let mut conn = self.current_conn();
+        let mut redials = 0u32;
+        loop {
+            let err = match conn.call(req, fds, timeout) {
+                Ok(ok) => return Ok(ok),
+                Err(e) => e,
+            };
+            if !is_connection_loss(&err) {
+                return Err(err);
+            }
+            if redials >= MOUNTD_RECONNECT_ATTEMPTS {
+                // A whole cycle of re-dials could not reach the daemon:
+                // remember that so concurrent/subsequent RPCs fail fast
+                // instead of each re-paying the backoff schedule.
+                self.begin_reconnect_cooldown();
+                return Err(err);
+            }
+            if !self.reconnect_possible() {
+                return Err(err);
+            }
+            std::thread::sleep(MOUNTD_RECONNECT_BACKOFF.duration(redials));
+            redials += 1;
+            match self.reconnect(&conn) {
+                Ok(fresh) => {
+                    self.clear_reconnect_cooldown();
+                    conn = fresh;
+                }
+                Err(re_err) => {
+                    tracing::warn!(
+                        error = %re_err,
+                        redials,
+                        max = MOUNTD_RECONNECT_ATTEMPTS,
+                        "rio-mountd re-dial failed; retrying within the bounded budget"
+                    );
+                    // Keep the dead connection: the next loop iteration
+                    // fails fast on it and lands back here until the
+                    // attempts run out.
+                }
+            }
+        }
+    }
+
+    /// `Mount{build_id}`: claim the build id, hand the daemon a dup of
+    /// `fuse_fd` (this build's own `/dev/fuse`, which the caller mounts
+    /// itself — see [`super::mount::mount_castore_background`]) so it
+    /// can broker `BackingOpen`/`BackingClose` against that connection,
+    /// and have the daemon set up this build's staging dir + quota.
+    /// Must be the first request on a connection; exactly one per
+    /// connection lifetime. Returns `staging_quota_bytes`.
+    ///
+    /// On success the client keeps `build_id` and a dup of `fuse_fd` so
+    /// a daemon restart can be survived by re-issuing the same `Mount`
+    /// on a fresh connection (see the module docs).
+    pub fn mount(
+        &self,
+        build_id: &str,
+        fuse_fd: RawFd,
+        timeout: Duration,
+    ) -> Result<u64, MountdError> {
+        let conn = self.current_conn();
+        let quota = conn.mount(build_id, fuse_fd, timeout)?;
+        // Keep what a re-Mount needs. Best-effort: if the dup fails the
+        // client simply cannot reconnect (the pre-reconnect behavior).
+        // SAFETY: `fuse_fd` is a live fd owned by the caller for the
+        // duration of this call; `try_clone_to_owned` dups it into an
+        // independently-owned descriptor before we return.
+        match unsafe { BorrowedFd::borrow_raw(fuse_fd) }.try_clone_to_owned() {
+            Ok(dup) => {
+                *self.inner.session.lock().ignore_poison() = Some(MountSession {
+                    build_id: build_id.to_owned(),
+                    fuse_fd: dup,
+                    mount_timeout: timeout,
+                });
+            }
+            Err(e) => {
+                tracing::warn!(
+                    build_id,
+                    error = %e,
+                    "could not dup the /dev/fuse fd; this build's mountd session will not \
+                     survive a daemon restart"
+                );
+            }
+        }
+        Ok(quota)
+    }
 
     /// `BackingOpen`: register `fd` as a FUSE passthrough backing file
     /// via the daemon's privileged `FUSE_DEV_IOC_BACKING_OPEN` ioctl.
     /// Returns the connection-scoped `backing_id`.
     pub fn backing_open(&self, fd: RawFd, timeout: Duration) -> Result<u32, MountdError> {
-        let (resp, _) = self.call(Req::BackingOpen, &[fd], timeout)?;
+        let (resp, _) = self.call(&Req::BackingOpen, &[fd], timeout)?;
         match resp {
             Resp::BackingId(id) => Ok(id),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -299,7 +618,7 @@ impl MountdClient {
     /// `BackingClose{id}`: release a backing id from a prior
     /// [`Self::backing_open`].
     pub fn backing_close(&self, backing_id: u32, timeout: Duration) -> Result<(), MountdError> {
-        let (resp, _) = self.call(Req::BackingClose { backing_id }, &[], timeout)?;
+        let (resp, _) = self.call(&Req::BackingClose { backing_id }, &[], timeout)?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -310,7 +629,7 @@ impl MountdClient {
     /// `Promote{digest}`: ask the daemon to verify-copy
     /// `staging/{build_id}/{hex(digest)}` into the shared backing cache.
     pub fn promote(&self, digest: [u8; 32], timeout: Duration) -> Result<(), MountdError> {
-        let (resp, _) = self.call(Req::Promote { digest }, &[], timeout)?;
+        let (resp, _) = self.call(&Req::Promote { digest }, &[], timeout)?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -328,7 +647,7 @@ impl MountdClient {
         chunk_digests: Vec<[u8; 32]>,
         timeout: Duration,
     ) -> Result<(), MountdError> {
-        let (resp, _) = self.call(Req::PromoteChunks { chunk_digests }, &[], timeout)?;
+        let (resp, _) = self.call(&Req::PromoteChunks { chunk_digests }, &[], timeout)?;
         match resp {
             Resp::Ok => Ok(()),
             Resp::Err(kind) => Err(MountdError::Rejected(kind)),
@@ -441,7 +760,7 @@ mod tests {
         // Observes the reader thread's exit: the reader holds the only
         // other strong `Arc<Inner>`, so a strong count of zero proves
         // it returned (and that the socket fd was released).
-        let inner = Arc::downgrade(&client.conn.shared);
+        let inner = Arc::downgrade(&client.current_conn().shared);
 
         // A live clone keeps the connection open after the original
         // handle drops.
@@ -575,6 +894,9 @@ mod tests {
 
     /// Daemon disconnect fails the in-flight call immediately (not
     /// after the full timeout) and every subsequent call fails fast.
+    /// `from_fd` clients have no socket path, so the reconnect machinery
+    /// never engages for them — this is the pre-reconnect contract,
+    /// unchanged.
     #[test]
     fn disconnect_drains_pending_and_fails_fast() {
         let (client, daemon) = pair();
@@ -596,5 +918,231 @@ mod tests {
             err,
             MountdError::Disconnected(_) | MountdError::Send(_)
         ));
+    }
+
+    // ─── Reconnect-after-restart coverage ──────────────────────────────
+    //
+    // These tests run a minimal scripted daemon on a real UDS path (the
+    // socketpair fakes above cannot be re-dialed), kill it, and assert
+    // the client's bounded re-dial + re-Mount + retry behavior.
+
+    /// Everything one scripted daemon incarnation observed.
+    #[derive(Default)]
+    struct DaemonLog {
+        /// Request names in arrival order ("mount:<build_id>",
+        /// "promote", ...).
+        requests: Mutex<Vec<String>>,
+        /// Whether each Mount frame carried at least one SCM_RIGHTS fd.
+        mount_had_fd: Mutex<Vec<bool>>,
+        /// The accepted connection, so the test can kill this
+        /// incarnation (shutdown → the client sees EOF, the serve
+        /// thread exits) the way a real daemon restart does.
+        conn: Mutex<Option<Arc<OwnedFd>>>,
+    }
+
+    impl DaemonLog {
+        /// Kill this daemon incarnation: the client observes EOF on its
+        /// connection and the serve thread exits.
+        fn kill(&self) {
+            if let Some(conn) = self.conn.lock().unwrap().as_ref() {
+                let _ =
+                    nix::sys::socket::shutdown(conn.as_raw_fd(), nix::sys::socket::Shutdown::Both);
+            }
+        }
+    }
+
+    /// Bind a `SOCK_SEQPACKET` listener at `path`.
+    fn bind_listener(path: &Path) -> OwnedFd {
+        use nix::sys::socket::{Backlog, bind, listen};
+        let _ = std::fs::remove_file(path);
+        let fd = socket(
+            AddressFamily::Unix,
+            SockType::SeqPacket,
+            SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .expect("listener socket");
+        bind(fd.as_raw_fd(), &UnixAddr::new(path).expect("addr")).expect("bind");
+        listen(&fd, Backlog::new(8).expect("backlog")).expect("listen");
+        fd
+    }
+
+    /// Accept ONE connection on `listener` and serve it until EOF:
+    /// `Mount` → `Mounted{0}`, `Promote`/`BackingClose` → `Ok`,
+    /// `BackingOpen` → `BackingId(1)`. Every request is recorded in
+    /// `log`.
+    fn serve_one_connection(listener: OwnedFd, log: Arc<DaemonLog>) -> std::thread::JoinHandle<()> {
+        use nix::sys::socket::accept4;
+        std::thread::spawn(move || {
+            let conn = match accept4(listener.as_raw_fd(), SockFlag::SOCK_CLOEXEC) {
+                // SAFETY: accept4 just returned a fresh fd owned by
+                // nobody else.
+                Ok(raw) => {
+                    Arc::new(unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(raw) })
+                }
+                Err(_) => return,
+            };
+            *log.conn.lock().unwrap() = Some(Arc::clone(&conn));
+            loop {
+                let frame = match proto::recv_frame(conn.as_raw_fd()) {
+                    Ok(f) => f,
+                    Err(_) => return,
+                };
+                let req: Request = match proto::decode(&frame.bytes) {
+                    Ok(r) => r,
+                    Err(_) => return,
+                };
+                let resp = match &req.req {
+                    Req::Mount { build_id } => {
+                        log.requests
+                            .lock()
+                            .unwrap()
+                            .push(format!("mount:{build_id}"));
+                        log.mount_had_fd.lock().unwrap().push(!frame.fds.is_empty());
+                        Resp::Mounted {
+                            staging_quota_bytes: 0,
+                        }
+                    }
+                    Req::Promote { .. } => {
+                        log.requests.lock().unwrap().push("promote".into());
+                        Resp::Ok
+                    }
+                    Req::BackingOpen => {
+                        log.requests.lock().unwrap().push("backing_open".into());
+                        Resp::BackingId(1)
+                    }
+                    Req::BackingClose { .. } => {
+                        log.requests.lock().unwrap().push("backing_close".into());
+                        Resp::Ok
+                    }
+                    Req::PromoteChunks { .. } => {
+                        log.requests.lock().unwrap().push("promote_chunks".into());
+                        Resp::Ok
+                    }
+                };
+                let bytes = proto::encode(&Reply { seq: req.seq, resp }).expect("encode");
+                if proto::send_frame(conn.as_raw_fd(), &bytes, &[]).is_err() {
+                    return;
+                }
+            }
+        })
+    }
+
+    /// The headline reconnect contract: an RPC that fails because the
+    /// daemon went away re-dials the socket, re-issues `Mount{build_id}`
+    /// (with the kept /dev/fuse dup) as the new connection's first
+    /// request, and then retries the original RPC — so a Promote issued
+    /// across a daemon restart succeeds instead of surfacing EIO.
+    // r[verify builder.fs.mountd-reconnect]
+    #[test]
+    fn promote_across_a_daemon_restart_redials_and_remounts() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+
+        // First incarnation: serve the initial Mount, then die.
+        let log1 = Arc::new(DaemonLog::default());
+        let daemon1 = serve_one_connection(bind_listener(&sock), Arc::clone(&log1));
+
+        let client = MountdClient::connect(&sock).expect("connect to incarnation 1");
+        let fuse_stub = tempfile::tempfile().unwrap();
+        client
+            .mount("b-restart", fuse_stub.as_raw_fd(), T)
+            .expect("initial mount");
+        assert_eq!(
+            log1.requests.lock().unwrap().as_slice(),
+            ["mount:b-restart"]
+        );
+
+        // Kill incarnation 1: unlink the socket so dials fail exactly
+        // like they do while the real daemon is restarting, and shut its
+        // accepted connection down so the client observes EOF and the
+        // serve thread exits.
+        std::fs::remove_file(&sock).unwrap();
+        log1.kill();
+        daemon1.join().unwrap();
+        // The second incarnation binds the same path immediately — the
+        // client's backoff (≥375 ms before the first re-dial) means it
+        // is listening well before the first reconnect attempt.
+        let log2 = Arc::new(DaemonLog::default());
+        let listener2 = bind_listener(&sock);
+        let daemon2 = serve_one_connection(listener2, Arc::clone(&log2));
+
+        let started = std::time::Instant::now();
+        client
+            .promote([0xCD; 32], T)
+            .expect("promote must survive the daemon restart via reconnect");
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "the reconnect cycle is bounded"
+        );
+
+        let seen = log2.requests.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            ["mount:b-restart", "promote"],
+            "the new connection must re-Mount the same build_id before retrying the RPC"
+        );
+        assert!(
+            log2.mount_had_fd.lock().unwrap().iter().all(|had| *had),
+            "the re-Mount must carry the kept /dev/fuse dup in SCM_RIGHTS"
+        );
+        drop(client);
+        daemon2.join().unwrap();
+    }
+
+    /// When the daemon never comes back the re-dial attempts are
+    /// bounded (the call returns an error rather than hanging), and a
+    /// fully-exhausted cycle starts the cooldown so the NEXT call fails
+    /// fast instead of re-paying the whole backoff schedule.
+    // r[verify builder.fs.mountd-reconnect]
+    #[test]
+    fn reconnect_attempts_are_bounded_and_cooldown_fails_fast() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sock = tmp.path().join("mountd.sock");
+        let log = Arc::new(DaemonLog::default());
+        let daemon = serve_one_connection(bind_listener(&sock), Arc::clone(&log));
+
+        let client = MountdClient::connect(&sock).expect("connect");
+        let fuse_stub = tempfile::tempfile().unwrap();
+        client
+            .mount("b-gone", fuse_stub.as_raw_fd(), T)
+            .expect("initial mount");
+
+        // The daemon dies and never returns.
+        std::fs::remove_file(&sock).unwrap();
+        log.kill();
+        daemon.join().unwrap();
+
+        let first_started = std::time::Instant::now();
+        let err = client
+            .promote([0x11; 32], T)
+            .expect_err("no daemon → the bounded cycle must give up");
+        let first_elapsed = first_started.elapsed();
+        assert!(matches!(err, MountdError::Disconnected(_)), "got {err:?}");
+        assert!(
+            !err.is_build_fatal(),
+            "connection loss stays an infra failure"
+        );
+        assert!(
+            first_elapsed < Duration::from_secs(30),
+            "the re-dial cycle must stay bounded (took {first_elapsed:?})"
+        );
+
+        // Second call inside the cooldown: no backoff schedule, fails
+        // fast. The full cycle sleeps ≥4 s even at the jitter floor, so
+        // a 2 s ceiling cleanly separates "skipped the schedule" from
+        // "paid it again" while leaving slack for a loaded builder.
+        let second_started = std::time::Instant::now();
+        let err = client.promote([0x22; 32], T).expect_err("still no daemon");
+        assert!(matches!(
+            err,
+            MountdError::Disconnected(_) | MountdError::Send(_)
+        ));
+        assert!(
+            second_started.elapsed() < Duration::from_secs(2),
+            "inside the cooldown the call must fail fast, not re-pay the backoff \
+             (took {:?})",
+            second_started.elapsed()
+        );
     }
 }

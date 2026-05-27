@@ -39,6 +39,7 @@ fn unwrap_streaming(readable: Readable) -> (Arc<StreamFill>, OpenCase) {
     match readable {
         Readable::Streaming { fill, case } => (fill, case),
         Readable::Backing(case) => panic!("expected a streaming open, got Backing({case:?})"),
+        Readable::Staged { case, .. } => panic!("expected a streaming open, got Staged({case:?})"),
     }
 }
 
@@ -47,6 +48,9 @@ fn unwrap_backing(readable: Readable) -> OpenCase {
         Readable::Backing(case) => case,
         Readable::Streaming { case, .. } => {
             panic!("expected a backing open, got Streaming({case:?})")
+        }
+        Readable::Staged { case, .. } => {
+            panic!("expected a backing open, got Staged({case:?})")
         }
     }
 }

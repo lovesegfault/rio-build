@@ -204,10 +204,29 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_castore_fuse_promote_fail_total",
         "Promote round-trips that failed after a completed castore-FUSE fill (the \
-         RaceTimeout cache re-check and single retry already applied). On the \
-         whole-file path the open fails with EIO; on the streaming path the open \
-         handles keep reading from staging, but the digest is not published to the \
-         node cache so later opens re-fetch."
+         RaceTimeout cache re-check, single retry, and bounded mountd reconnect \
+         already applied). The open handles keep reading the verified staged/streamed \
+         copy (a daemon-side rejection of the bytes still fails the whole-file open \
+         with EIO); the digest is not published to the node cache so later opens \
+         re-fetch."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_mountd_reconnect_total",
+        "rio-mountd session re-establishment attempts after a connection loss \
+         (daemon restart), labeled by outcome: ok = re-dial + re-Mount succeeded \
+         and the failed RPC was retried on the new connection; error = the re-dial \
+         or re-Mount itself failed (bounded attempts, then the RPC's original error \
+         surfaces). A burst during a DaemonSet rollout is expected; sustained \
+         errors mean rio-mountd is not coming back on this node."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_degraded_serve_total",
+        "Castore-FUSE opens served from the build's own digest-verified staged copy \
+         because Promote could not publish it into the node-shared cache (rio-mountd \
+         unreachable even after the bounded reconnect attempts). The build keeps \
+         running; only the node-cache publication is lost, so later opens of the \
+         same digest re-fetch. Sustained nonzero outside a mountd restart window \
+         means the broker is down on that node."
     );
     describe_gauge!(
         "rio_builder_castore_fuse_circuit_open",

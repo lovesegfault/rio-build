@@ -56,13 +56,15 @@ struct OpenEntry {
     /// `release()` decrements the [`BackingTable`] refcount and sends
     /// `BackingClose{id}` when it reaches zero.
     backing_digest: Option<[u8; 32]>,
-    /// The opened backing-cache file, kept only when the open replied
-    /// `FOPEN_KEEP_CACHE` (passthrough disabled or not negotiated) so
-    /// `read()` can serve from it. Passthrough opens drop their fd —
-    /// the kernel holds its own reference via the backing registration.
-    /// `Arc` so `read()` can clone the handle out and drop the `opens`
-    /// lock before the disk pread (positional `read_at`, no shared
-    /// cursor to race on).
+    /// The opened backing-cache file (or, on a degraded serve, the
+    /// build's own verified staged copy), kept only when the open
+    /// replied `FOPEN_KEEP_CACHE` (passthrough disabled or not
+    /// negotiated, a per-open BackingOpen failure, or a Promote that
+    /// could not publish) so `read()` can serve from it. Passthrough
+    /// opens drop their fd — the kernel holds its own reference via the
+    /// backing registration. `Arc` so `read()` can clone the handle out
+    /// and drop the `opens` lock before the disk pread (positional
+    /// `read_at`, no shared cursor to race on).
     file: Option<Arc<File>>,
     /// The in-flight P0575 streaming fill this fh reads from, when the
     /// open landed in the streaming window (cache miss above the
@@ -532,6 +534,29 @@ impl Filesystem for CastoreFs {
                 reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
                 (case, "keep_cache", "1")
             }
+            Readable::Staged { file, case } => {
+                // The fill fetched and digest-verified its bytes but
+                // Promote could not publish them into the shared cache
+                // (mountd unreachable even after the bounded reconnect
+                // attempts). Passthrough needs both the cache entry and
+                // a brokered backing id — neither is available — so
+                // serve this open from the verified staged copy via
+                // userspace reads instead of failing the build with
+                // EIO. The handle stays valid even if the staging file
+                // is later unlinked (reads go through the fd).
+                // r[impl builder.fs.promote-degrade-staged]
+                metrics::counter!("rio_builder_castore_fuse_degraded_serve_total").increment(1);
+                self.opens.write().ignore_poison().insert(
+                    fh,
+                    OpenEntry {
+                        backing_digest: None,
+                        file: Some(file),
+                        stream: None,
+                    },
+                );
+                reply.opened(FileHandle(fh), FopenFlags::FOPEN_KEEP_CACHE);
+                (case, "keep_cache", "0")
+            }
             Readable::Backing(case) => {
                 let backing = self.open_path.cache_path(&file_digest);
                 let file = match File::open(&backing) {
@@ -660,8 +685,9 @@ impl Filesystem for CastoreFs {
         Self::count_upcall("read");
         // Reachable only when an open replied FOPEN_KEEP_CACHE: the
         // P0575 streaming window, the RIO_DISABLE_PASSTHROUGH escape
-        // hatch, a kernel without FUSE_PASSTHROUGH, or a per-open
-        // BackingOpen failure. Passthrough opens never upcall read.
+        // hatch, a kernel without FUSE_PASSTHROUGH, a per-open
+        // BackingOpen failure, or a degraded staged serve (Promote
+        // unavailable). Passthrough opens never upcall read.
         let files = self.opens.read().ignore_poison();
 
         // Streaming window: serve from the shared partially-filled

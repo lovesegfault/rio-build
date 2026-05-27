@@ -84,6 +84,20 @@ impl OpenCase {
     }
 }
 
+/// How a completed whole-file fill is being served.
+#[derive(Clone)]
+enum FillOutcome {
+    /// `Promote` published the digest into the shared backing cache;
+    /// the entry at [`OpenPath::cache_path`] is complete.
+    Promoted,
+    /// `Promote` could not publish (rio-mountd unreachable even after
+    /// the client's bounded reconnect attempts, or a daemon-side
+    /// transient failure): the build's own digest-verified staged copy
+    /// serves its opens instead. The handle was opened by the winner;
+    /// waiters clone it (reads are positional, no shared cursor).
+    Staged(Arc<File>),
+}
+
 /// In-process coordination for concurrent `open()`s of the same
 /// `file_digest` within one build (e.g. `make -jN` both `dlopen`ing one
 /// `.so`). The first opener (the *winner*) performs the fetch; every
@@ -92,7 +106,7 @@ impl OpenCase {
 struct FillState {
     /// `None` while the fill is in progress; `Some(outcome)` once the
     /// winner has finished (either way).
-    done: Mutex<Option<Result<(), Errno>>>,
+    done: Mutex<Option<Result<FillOutcome, Errno>>>,
     cv: Condvar,
 }
 
@@ -105,7 +119,7 @@ impl FillState {
     }
 
     /// Publish the winner's outcome and wake every waiter.
-    fn finish(&self, outcome: Result<(), Errno>) {
+    fn finish(&self, outcome: Result<FillOutcome, Errno>) {
         *self.done.lock().ignore_poison() = Some(outcome);
         self.cv.notify_all();
     }
@@ -113,7 +127,7 @@ impl FillState {
     /// Block until the winner finishes, at most `deadline`. Returns the
     /// winner's outcome, or `Err(EIO)` if the wait itself timed out
     /// (the winner is wedged past its own fetch timeout).
-    fn wait(&self, deadline: Duration) -> Result<(), Errno> {
+    fn wait(&self, deadline: Duration) -> Result<FillOutcome, Errno> {
         let guard = self.done.lock().ignore_poison();
         let (guard, timeout) = self
             .cv
@@ -122,7 +136,7 @@ impl FillState {
         if timeout.timed_out() {
             return Err(Errno::EIO);
         }
-        guard.unwrap_or(Err(Errno::EIO))
+        guard.clone().unwrap_or(Err(Errno::EIO))
     }
 }
 
@@ -139,6 +153,13 @@ pub enum Readable {
         fill: Arc<StreamFill>,
         case: OpenCase,
     },
+    /// The whole-file fill fetched and digest-verified its bytes but
+    /// `Promote` could not publish them into the shared cache (mountd
+    /// unreachable even after the bounded reconnect attempts): reply
+    /// `FOPEN_KEEP_CACHE` and serve `read()` from the staged copy. Only
+    /// the node-cache publication is lost — later opens of this digest
+    /// re-fetch and re-attempt the promote.
+    Staged { file: Arc<File>, case: OpenCase },
 }
 
 impl std::fmt::Debug for Readable {
@@ -147,6 +168,45 @@ impl std::fmt::Debug for Readable {
             Readable::Backing(case) => f.debug_tuple("Backing").field(case).finish(),
             Readable::Streaming { case, .. } => f
                 .debug_struct("Streaming")
+                .field("case", case)
+                .finish_non_exhaustive(),
+            Readable::Staged { case, .. } => f
+                .debug_struct("Staged")
+                .field("case", case)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+/// What [`OpenPath::ensure_backing`] produced for a
+/// `size ≤ stream_threshold` open.
+pub enum Backed {
+    /// The complete entry at [`OpenPath::cache_path`] serves this open
+    /// (passthrough, or the keep-cache fallback).
+    Cache(OpenCase),
+    /// The shared-cache entry could not be published (see
+    /// [`Readable::Staged`]): serve this open from the build's own
+    /// digest-verified staged copy.
+    Staged { case: OpenCase, file: Arc<File> },
+}
+
+impl Backed {
+    /// The dispatch case taken, independent of how the bytes are served
+    /// (metrics label / test assertions).
+    pub fn case(&self) -> OpenCase {
+        match self {
+            Backed::Cache(case) => *case,
+            Backed::Staged { case, .. } => *case,
+        }
+    }
+}
+
+impl std::fmt::Debug for Backed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Backed::Cache(case) => f.debug_tuple("Cache").field(case).finish(),
+            Backed::Staged { case, .. } => f
+                .debug_struct("Staged")
                 .field("case", case)
                 .finish_non_exhaustive(),
         }
@@ -285,7 +345,9 @@ impl OpenPath {
     ///
     /// - cache hit, or miss at `size ≤ stream_threshold` (whole-file
     ///   fetch + promote) → [`Readable::Backing`]: the backing-cache
-    ///   entry is complete when this returns.
+    ///   entry is complete when this returns. If the promote could not
+    ///   be published, [`Readable::Staged`] instead — the verified
+    ///   staged copy serves the open.
     /// - miss at `size > stream_threshold` → [`Readable::Streaming`]:
     ///   a background fill is running and at least its first chunk is
     ///   servable when this returns.
@@ -294,7 +356,10 @@ impl OpenPath {
         if size <= self.cfg.stream_threshold {
             return self
                 .ensure_backing(file_digest, size)
-                .map(Readable::Backing);
+                .map(|backed| match backed {
+                    Backed::Cache(case) => Readable::Backing(case),
+                    Backed::Staged { case, file } => Readable::Staged { file, case },
+                });
         }
         if self.cache_hit(file_digest, size) {
             return Ok(Readable::Backing(OpenCase::Hit));
@@ -303,19 +368,21 @@ impl OpenPath {
         Ok(Readable::Streaming { fill, case })
     }
 
-    /// Ensure `file_digest` is present in the backing cache, fetching
-    /// and promoting it (whole-file) if necessary. On success the file
-    /// at [`Self::cache_path`] exists and is complete. Returns which
-    /// dispatch case was taken.
+    /// Ensure `file_digest` is readable for a whole-file (≤ threshold)
+    /// open, fetching and promoting it if necessary. On
+    /// [`Backed::Cache`] the file at [`Self::cache_path`] exists and is
+    /// complete; on [`Backed::Staged`] the promote could not be
+    /// published and the returned handle is the build's own verified
+    /// staged copy.
     ///
     /// Safe to call concurrently for the same digest from multiple
     /// fuser threads: exactly one performs the fetch, the rest wait.
     /// Files above the streaming threshold are dispatched to
     /// [`Self::ensure_readable`]'s streaming arm instead — this method
     /// always pays the whole transfer before returning.
-    pub fn ensure_backing(&self, file_digest: &[u8; 32], size: u64) -> Result<OpenCase, Errno> {
+    pub fn ensure_backing(&self, file_digest: &[u8; 32], size: u64) -> Result<Backed, Errno> {
         if self.cache_hit(file_digest, size) {
-            return Ok(OpenCase::Hit);
+            return Ok(Backed::Cache(OpenCase::Hit));
         }
 
         // Miss. Decide winner vs loser for this digest.
@@ -344,9 +411,18 @@ impl OpenPath {
             // promote landed must not fail an open whose backing file
             // is sitting right there.
             if self.cache_path(file_digest).exists() {
-                return Ok(OpenCase::WaitFetching);
+                return Ok(Backed::Cache(OpenCase::WaitFetching));
             }
-            return Err(outcome.err().unwrap_or(Errno::EIO));
+            return match outcome {
+                // The winner could not publish but staged verified
+                // bytes — they are this opener's bytes too.
+                Ok(FillOutcome::Staged(file)) => Ok(Backed::Staged {
+                    case: OpenCase::WaitFetching,
+                    file,
+                }),
+                Ok(FillOutcome::Promoted) => Err(Errno::EIO),
+                Err(errno) => Err(errno),
+            };
         }
 
         // Winner. Re-check the cache before paying the fetch: another
@@ -354,9 +430,9 @@ impl OpenPath {
         // between the miss check above and winning the fill lock
         // (mountd publishes entries node-wide, not per-build).
         if self.cache_hit(file_digest, size) {
-            state.finish(Ok(()));
+            state.finish(Ok(FillOutcome::Promoted));
             self.fills.lock().ignore_poison().remove(file_digest);
-            return Ok(OpenCase::Hit);
+            return Ok(Backed::Cache(OpenCase::Hit));
         }
 
         // Winner: fetch, verify, promote. Always publish an outcome and
@@ -377,9 +453,16 @@ impl OpenPath {
         });
         let outcome = self.fill_and_promote(file_digest, size);
         scopeguard::ScopeGuard::into_inner(unwind_guard);
-        state.finish(outcome);
+        state.finish(outcome.clone());
         self.fills.lock().ignore_poison().remove(file_digest);
-        outcome.map(|()| OpenCase::MissSmall)
+        match outcome {
+            Ok(FillOutcome::Promoted) => Ok(Backed::Cache(OpenCase::MissSmall)),
+            Ok(FillOutcome::Staged(file)) => Ok(Backed::Staged {
+                case: OpenCase::MissSmall,
+                file,
+            }),
+            Err(errno) => Err(errno),
+        }
     }
 
     /// Attach to (or start) the P0575 streaming fill for `file_digest`,
@@ -449,7 +532,7 @@ impl OpenPath {
 
     /// The winner's fill: `ReadBlob` → staging, blake3 verify, rename,
     /// `Promote`. Returns `Err(Errno)` ready to hand to the kernel.
-    fn fill_and_promote(&self, file_digest: &[u8; 32], size: u64) -> Result<(), Errno> {
+    fn fill_and_promote(&self, file_digest: &[u8; 32], size: u64) -> Result<FillOutcome, Errno> {
         // Fail fast if the store has been unreachable long enough to
         // trip the breaker — don't queue another doomed fetch behind
         // the ones already timing out.
@@ -587,7 +670,7 @@ impl OpenPath {
             &self.cache_path(file_digest),
             promote_timeout,
         ) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(FillOutcome::Promoted),
             Err(e) => {
                 metrics::counter!("rio_builder_castore_fuse_promote_fail_total").increment(1);
                 tracing::error!(
@@ -596,16 +679,50 @@ impl OpenPath {
                     build_fatal = e.is_build_fatal(),
                     "castore-fuse: Promote failed"
                 );
-                // Leave the staging file for post-mortem; mountd reaps
-                // the whole staging dir on connection close.
-                //
-                // Unlike the streaming fill (which keeps serving its
-                // readers from the staging fd and treats Promote as
-                // best-effort), the whole-file path has nothing to hand
-                // the kernel without the cache entry — this open replies
-                // passthrough from `cache_path`, so a failed Promote is
-                // fatal here.
-                Err(Errno::EIO)
+                // Leave the staging file in place; mountd reaps the
+                // whole staging dir on connection close (or, after a
+                // daemon restart, once the build's `.rio-live` flock is
+                // released and a later scan/sweep picks the dir up).
+                if e.is_build_fatal() {
+                    // The daemon actively rejected these bytes
+                    // (DigestMismatch, NotRegular, TooLarge, ...) —
+                    // re-staging the same content would fail the same
+                    // way, so the open must fail rather than serve
+                    // content the broker called wrong.
+                    return Err(Errno::EIO);
+                }
+                // Infrastructure-class failure (mountd unreachable even
+                // after the client's bounded reconnect attempts, a
+                // daemon-side transient error, or a concurrent promote
+                // still mid-copy): the staged bytes at `final_staging`
+                // were blake3-verified against `file_digest` by this
+                // very fill before the rename, so serve THIS build's
+                // opens from them instead of failing the read with EIO
+                // — the same trust the streaming fill already places in
+                // its staging fd. Only the shared-cache publication is
+                // lost; later opens of this digest re-fetch and
+                // re-attempt the promote.
+                // r[impl builder.fs.promote-degrade-staged]
+                match File::open(&final_staging) {
+                    Ok(staged) => {
+                        tracing::warn!(
+                            digest = %hex::encode(file_digest),
+                            staged = %final_staging.display(),
+                            "castore-fuse: serving the verified staged copy because Promote \
+                             could not publish it (degraded; node-cache publication lost)"
+                        );
+                        Ok(FillOutcome::Staged(Arc::new(staged)))
+                    }
+                    Err(open_err) => {
+                        tracing::error!(
+                            digest = %hex::encode(file_digest),
+                            staged = %final_staging.display(),
+                            error = %open_err,
+                            "castore-fuse: Promote failed and the staged copy cannot be opened"
+                        );
+                        Err(Errno::EIO)
+                    }
+                }
             }
         }
     }

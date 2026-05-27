@@ -30,7 +30,7 @@ use rio_proto::{ChunkService, ChunkServiceServer, DirectoryService, DirectorySer
 use rio_test_support::grpc::spawn_grpc_server;
 
 use super::mountd_proto::{self as proto, Reply, Req, Resp};
-use super::open::{OpenCase, OpenConfig, OpenPath};
+use super::open::{Backed, OpenCase, OpenConfig, OpenPath};
 use super::tree::{self, build_tree};
 use crate::store_fetch::StoreClients;
 
@@ -475,6 +475,9 @@ struct FakeMountdState {
     promote_requests: std::sync::Mutex<Vec<[u8; 32]>>,
     /// Scripted overrides for upcoming `Promote` requests.
     scripted_promotes: std::sync::Mutex<std::collections::VecDeque<ScriptedPromote>>,
+    /// The daemon's end of the socketpair, kept so a test can simulate
+    /// the daemon dying mid-build (see [`FakeMountdState::kill`]).
+    daemon_end: std::sync::Mutex<Option<Arc<std::os::fd::OwnedFd>>>,
 }
 
 impl FakeMountdState {
@@ -492,6 +495,17 @@ impl FakeMountdState {
 
     fn promoted_chunk_batches(&self) -> Vec<Vec<[u8; 32]>> {
         self.promoted_chunk_batches.lock().unwrap().clone()
+    }
+
+    /// Simulate the daemon process dying: shut the daemon's socket end
+    /// down so the client observes EOF on every in-flight and future
+    /// request (exactly what a real mountd restart looks like to the
+    /// builder), and the serve thread exits.
+    fn kill(&self) {
+        use std::os::fd::AsRawFd;
+        if let Some(fd) = self.daemon_end.lock().unwrap().as_ref() {
+            let _ = nix::sys::socket::shutdown(fd.as_raw_fd(), nix::sys::socket::Shutdown::Both);
+        }
     }
 }
 
@@ -526,6 +540,10 @@ fn spawn_fake_mountd(
     .expect("socketpair");
     let client = super::mountd_client::MountdClient::from_fd(client_end);
     let state = Arc::new(FakeMountdState::default());
+    // Shared with the serve thread so `FakeMountdState::kill` can shut
+    // the daemon side down from the test.
+    let daemon_end = Arc::new(daemon_end);
+    *state.daemon_end.lock().unwrap() = Some(Arc::clone(&daemon_end));
     let daemon_state = Arc::clone(&state);
 
     let handle = std::thread::spawn(move || {
@@ -627,6 +645,16 @@ struct Harness {
     _mountd: std::thread::JoinHandle<()>,
 }
 
+impl Harness {
+    /// Simulate rio-mountd dying mid-build: the client observes EOF on
+    /// every in-flight and future request. The harness client is a
+    /// socketpair (`from_fd`) one, so there is nothing to re-dial — the
+    /// degraded-serve behavior is what remains.
+    fn kill_mountd(&self) {
+        self.mountd_state.kill();
+    }
+}
+
 const FAST: Duration = Duration::from_secs(5);
 
 /// The assignment token the harness's `OpenPath` (and the token-aware
@@ -682,11 +710,25 @@ async fn harness_with(cfg: OpenConfig) -> Harness {
 /// `ensure_backing` bridges async with `Handle::block_on`, which
 /// panics if called from a runtime worker thread — call it the way
 /// production does: from a thread that is allowed to block.
+/// Returns just the dispatch case; tests that care about HOW the bytes
+/// are served (cache entry vs degraded staged copy) use
+/// [`ensure_blocking_backed`].
 async fn ensure_blocking(
     open_path: &Arc<OpenPath>,
     digest: [u8; 32],
     size: u64,
 ) -> Result<OpenCase, fuser::Errno> {
+    ensure_blocking_backed(open_path, digest, size)
+        .await
+        .map(|backed| backed.case())
+}
+
+/// [`ensure_blocking`] variant that keeps the full [`Backed`] outcome.
+async fn ensure_blocking_backed(
+    open_path: &Arc<OpenPath>,
+    digest: [u8; 32],
+    size: u64,
+) -> Result<Backed, fuser::Errno> {
     let op = Arc::clone(open_path);
     tokio::task::spawn_blocking(move || op.ensure_backing(&digest, size))
         .await
@@ -999,7 +1041,8 @@ async fn open_path_works_from_a_thread_without_runtime_context() {
         .await
         .expect("join task")
         .expect("the open path must not panic on a thread without a runtime context")
-        .expect("whole-file fetch from a bare thread succeeds");
+        .expect("whole-file fetch from a bare thread succeeds")
+        .case();
 
     assert_eq!(case, OpenCase::MissSmall);
     assert_eq!(
@@ -1063,7 +1106,7 @@ async fn concurrent_opens_of_one_digest_fetch_once() {
         let op = Arc::clone(&h.open_path);
         let len = content.len() as u64;
         tasks.push(tokio::task::spawn_blocking(move || {
-            op.ensure_backing(&digest, len)
+            op.ensure_backing(&digest, len).map(|b| b.case())
         }));
     }
     let mut cases = Vec::new();
@@ -1278,6 +1321,117 @@ async fn promote_fatal_rejection_still_fails_the_whole_file_open() {
         1,
         "fatal rejections are not retried"
     );
+}
+
+// ─── Promote unavailable → degraded staged serve ───────────────────────
+
+/// Read the staged handle a degraded open serves from, positionally,
+/// the same way `fs::read()` (the keep-cache fallback) does.
+fn read_all_via(file: &std::fs::File, len: usize) -> Vec<u8> {
+    let mut buf = vec![0u8; len + 16];
+    let n = super::fs::read_at_full(file, &mut buf, 0).expect("pread the staged copy");
+    buf.truncate(n);
+    buf
+}
+
+/// An infrastructure-class Promote failure (daemon-side transient
+/// error) after the bytes were fetched and digest-verified must NOT
+/// fail the open with EIO: the open is served from the staged copy
+/// (keep-cache), the staged file stays on disk for the handle's
+/// lifetime, and nothing is published to the shared cache.
+// r[verify builder.fs.promote-degrade-staged]
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_infra_failure_serves_the_verified_staged_copy() {
+    let h = harness().await;
+    let content = b"promote unavailable; serve my verified staging".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    h.mountd_state
+        .script_promote(proto::ErrKind::Retryable("daemon restarting".into()), false);
+
+    let backed = ensure_blocking_backed(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("an unpublishable promote must not fail the open");
+    let Backed::Staged { case, file } = backed else {
+        panic!("expected a degraded staged serve, got {backed:?}");
+    };
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(
+        read_all_via(&file, content.len()),
+        content,
+        "the degraded serve must hand out exactly the verified fetched bytes"
+    );
+    assert!(
+        !h.open_path.cache_path(&digest).exists(),
+        "nothing may appear in the shared cache without a successful Promote"
+    );
+    assert!(
+        h.staging.join(hex::encode(digest)).exists(),
+        "the staged copy must stay on disk (mountd reaps it with the staging dir later)"
+    );
+}
+
+/// The same degrade when the daemon is GONE (connection lost, no
+/// reconnect possible for a socketpair client): fetch + verify still
+/// succeed against the store, the Promote fails with `Disconnected`,
+/// and the open is served from the staged copy instead of EIO.
+// r[verify builder.fs.promote-degrade-staged]
+#[tokio::test(flavor = "multi_thread")]
+async fn promote_after_daemon_death_serves_the_staged_copy() {
+    let h = harness().await;
+    let content = b"daemon died before the promote".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+
+    // Kill the fake daemon: drop its end of the socketpair by asking the
+    // serve thread to exit (closing the client→daemon direction is not
+    // enough — send an undecodable frame so the thread returns and its
+    // OwnedFd drops, which the client observes as EOF).
+    h.kill_mountd();
+
+    let backed = ensure_blocking_backed(&h.open_path, digest, content.len() as u64)
+        .await
+        .expect("a dead mountd must not fail a verified whole-file open");
+    let Backed::Staged { case, file } = backed else {
+        panic!("expected a degraded staged serve, got {backed:?}");
+    };
+    assert_eq!(case, OpenCase::MissSmall);
+    assert_eq!(read_all_via(&file, content.len()), content);
+    assert!(!h.open_path.cache_path(&digest).exists());
+}
+
+/// Concurrent openers of one digest during a degraded fill: the winner
+/// stages and serves, every waiter gets the same staged handle (same
+/// verified bytes), and exactly one fetch happened.
+// r[verify builder.fs.promote-degrade-staged]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_openers_share_the_degraded_staged_copy() {
+    const N: usize = 4;
+    let h = harness().await;
+    let content = b"shared degraded serve".to_vec();
+    let digest = seeded_blob(&h.mock, &content);
+    h.mountd_state
+        .script_promote(proto::ErrKind::Retryable("daemon restarting".into()), false);
+
+    let mut tasks = Vec::new();
+    for _ in 0..N {
+        let op = Arc::clone(&h.open_path);
+        let len = content.len() as u64;
+        tasks.push(tokio::task::spawn_blocking(move || {
+            op.ensure_backing(&digest, len)
+        }));
+    }
+    let mut staged = 0usize;
+    for t in tasks {
+        match t.await.expect("join").expect("every opener succeeds") {
+            Backed::Staged { file, .. } => {
+                staged += 1;
+                assert_eq!(read_all_via(&file, content.len()), content);
+            }
+            other => panic!("expected every opener to be served from staging, got {other:?}"),
+        }
+    }
+    assert_eq!(staged, N);
+    assert_eq!(h.mock.read_blob_calls(), 1, "one fetch for {N} openers");
+    assert!(!h.open_path.cache_path(&digest).exists());
 }
 
 // ─── Promote → shared cache layout ─────────────────────────────────────
