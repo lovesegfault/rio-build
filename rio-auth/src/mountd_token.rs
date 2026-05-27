@@ -224,6 +224,13 @@ pub enum MountdKeyError {
     /// derived from the seed half — a corrupt or hand-spliced key file.
     #[error("mountd signing key: embedded public key does not match the seed")]
     SigningKeyMismatch,
+    /// The signing-key file contains more than one entry. Unlike the
+    /// trust-roots file (where multiple lines are the rotation-overlap
+    /// state), the signer is exactly one key — rotation swaps the file
+    /// content, it never appends. Most likely the trust-roots file (or a
+    /// rotation overlap) was pointed at the signing-key path.
+    #[error("mountd signing key file must contain exactly one 'rio-mountd-<n>:base64' entry")]
+    SigningKeyMultipleEntries,
     /// A trust-root entry does not decode to exactly 32 bytes.
     #[error("mountd trust root {name:?} must be a 32-byte ed25519 public key, got {got} bytes")]
     TrustRootLength {
@@ -391,6 +398,14 @@ impl MountdSigningKey {
         let content = trim_key_file(content);
         if content.is_empty() {
             return Err(MountdKeyError::Empty);
+        }
+        // More than one line here is almost always the trust-roots file
+        // (or a rotation overlap) misapplied to the signer half — say so,
+        // instead of failing on the embedded newline with a cryptic
+        // base64 "invalid byte 10" error. This is the file an operator
+        // edits during rotation; the error has to name the actual fix.
+        if content.lines().count() > 1 {
+            return Err(MountdKeyError::SigningKeyMultipleEntries);
         }
         let (name, b64) = split_named_entry(content)?;
         let bytes = base64::engine::general_purpose::STANDARD.decode(b64)?;
@@ -1548,6 +1563,19 @@ mod tests {
         assert!(matches!(
             MountdSigningKey::parse(&spliced),
             Err(MountdKeyError::SigningKeyMismatch)
+        ));
+
+        // A multi-entry file (a trust-roots file, or a misguided attempt
+        // at rotation overlap on the signer side) gets the dedicated
+        // actionable error, not a cryptic base64 failure on the newline.
+        let two_entries = format!(
+            "rio-mountd-1:{}\nrio-mountd-2:{}",
+            std_b64.encode(SEED_1),
+            std_b64.encode(SEED_2)
+        );
+        assert!(matches!(
+            MountdSigningKey::parse(&two_entries),
+            Err(MountdKeyError::SigningKeyMultipleEntries)
         ));
 
         // from_seed enforces the same name discipline.
