@@ -139,13 +139,18 @@ scope: with scope; ''
       # instead — the scheduler's infra-retry counter is in-memory
       # state, and the builder-side
       # rio_builder_input_materialization_failures_total counter dies
-      # with the one-shot worker pod.
+      # with the one-shot worker pod. The pipeline consumes the whole
+      # log dump (grep -c, never -q): an early-exit grep severs the
+      # kubectl stream mid-write, which both trips the driver shell's
+      # pipefail (the match is found yet the command "fails") and makes
+      # the kubelet churn on the closed log stream — both bit a previous
+      # wiring of this check.
       drv_base_eio = drv_eio.rsplit("/", 1)[-1]
       k3s_server.wait_until_succeeds(
-          "k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
+          "test \"$(k3s kubectl -n ${ns} logs -l app.kubernetes.io/name=rio-scheduler "
           "--tail=20000 2>/dev/null | "
           f"grep -aF '{drv_base_eio}' | "
-          "grep -aq 'input materialization failed'",
+          "grep -ac 'input materialization failed' || true)\" -ge 1",
           timeout=90,
       )
       print("eio-infra-retry: scheduler logged the input-materialization reclassification")
