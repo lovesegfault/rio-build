@@ -1392,6 +1392,41 @@ pub const M_068: () = ();
 /// is deliberate, not a missing file.
 pub const M_070: () = ();
 
+/// `migrations/071_drop_refcount_check_and_index.sql`
+///
+/// Release B of the refcount-formal campaign (lazy mark-and-collect
+/// chunk GC, design §4.5): drops the M_023
+/// `chunks_refcount_nonneg CHECK (refcount >= 0)` and the
+/// `idx_chunks_gc` partial index (`WHERE refcount = 0 AND deleted =
+/// FALSE`, migration 002). Both are metadata-only drops; `IF EXISTS`
+/// per the 035 style.
+///
+/// **Why the CHECK must go before the writer-deletion code rolls
+/// out:** this repo applies migrations at new-pod startup, so 071 runs
+/// at the first Release-B pod's boot while Release-A pods still serve.
+/// Release-B pods stop incrementing the counter (the upsert no longer
+/// names it); Release-A pods still decrement it (rollback DEC-1 and
+/// the reaper's write-only DEC-2). An A-pod decrement against a chunk
+/// first referenced by a B-pod upload would take the counter 0 → -1,
+/// and with the CHECK still in place that aborts the A pod's rollback
+/// or reap transaction mid-rollout. After Release A nothing reads the
+/// counter (collection eligibility is the manifest fold —
+/// `store.chunk.liveness-derived`), so the underflow is silent and
+/// harmless once the CHECK is gone; dropping the CHECK first turns a
+/// rolling-deploy failure mode into a no-op. The index existed solely
+/// for the retired `refcount = 0` GC-candidate scans and no statement
+/// references it (or the constraint) by name.
+///
+/// **Why the column is NOT dropped here:** Release-A pods' upsert,
+/// rollback, and reapers still name `chunks.refcount` in their SQL for
+/// the duration of the rollout; dropping the column at the first B
+/// pod's boot would break every A-pod chunked upload. The column drop
+/// is migration 072, a separate follow-up applied only after the
+/// Release-B rollout is complete everywhere that shares the database
+/// (the §4.5 (ii) ordering; see the deployment validation checklist in
+/// `docs/ops/gc-enablement.typ`).
+pub const M_071: () = ();
+
 /// `migrations/073_attempt_source_node.sql`
 ///
 /// Three additive columns for the executor-lifecycle campaign's
@@ -1424,9 +1459,9 @@ pub const M_070: () = ();
 /// because it is only populated when known for pull attempts and would
 /// fail unsafe by dropping pull attempts from the sweep/busy view.
 ///
-/// **Numbering:** 069/070 are claimed by the refcount campaign
+/// **Numbering:** 071/072 are claimed by the refcount campaign
 /// (Release B / post-rollout drop); the gap is deliberate, not missing
-/// files. 072 stays reserved for this campaign as the open-attempt-view
+/// files. 074 stays reserved for this campaign as the open-attempt-view
 /// escape hatch and is unused unless that view needs an extra column.
 pub const M_073: () = ();
 
