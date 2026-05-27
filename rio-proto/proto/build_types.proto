@@ -150,6 +150,18 @@ message ExecutorMessage {
 // Establishes the executor_id before any assignments are dispatched.
 message ExecutorRegister {
   string executor_id = 1;
+  // k8s spec.nodeName (downward API → RIO_NODE_NAME), reported once at
+  // stream open. Used ONLY as the fallback source when the scheduler
+  // scopes THIS executor's own Mount-admission token to a node (§P0590
+  // node-scoped mountd tokens) and the controller-attested binding has
+  // not arrived yet. It is never written into `authoritative_binding`
+  // and never read by hung-node detection — worker-supplied node
+  // identity stays untrusted for reaping
+  // (r[sched.admin.hung-node-detector+3] threat model). A lying
+  // executor can only mis-scope its own token to a node it is not on,
+  // which then fails at Mount time. Empty outside k8s; old executors
+  // omit the field (wire-default empty = unknown).
+  string node_name = 2;
 }
 
 // Scheduler -> Executor messages on the BuildExecution stream.

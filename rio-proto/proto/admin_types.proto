@@ -579,6 +579,15 @@ message AckSpawnedIntentsRequest {
 message BoundIntent {
   string intent_id = 1;
   string node_name = 2;
+  // Pod metadata.name of the bound builder/fetcher pod — the same string
+  // the pod registers with as its executor_id (RIO_EXECUTOR_ID is the
+  // downward-API metadata.name). Lets the scheduler key the
+  // controller-attested node binding by executor for the §P0590
+  // node-scoped mountd token, covering executors whose spawn intent has
+  // already left the DAG (fall-through / recovered) where the
+  // intent-keyed `authoritative_binding` lookup misses. Empty from
+  // pre-P0590 controllers (wire-compat: scheduler skips empty).
+  string pod_name = 3;
 }
 
 message ObservedInstanceType {
