@@ -12,6 +12,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use super::grpc::{AdminApi, GraphSnapshot};
+use super::model::STATUS_POISONED;
 
 /// Per-(build, drv) observation, normalized across both readers.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -74,7 +75,7 @@ pub fn observations_from_graph(
             Some((builders, age)) => (Some(builders.clone()), Some(*age)),
             // Poisoned but absent from ListPoisoned (TTL decay / cleared):
             // evidence unavailable, NOT "no failed builders".
-            None if node.status == "poisoned" => (None, None),
+            None if node.status == STATUS_POISONED => (None, None),
             None => (Some(Vec::new()), None),
         };
         by_path.insert(
@@ -229,11 +230,15 @@ pub(crate) mod test_support {
     /// Scripted [`ResultReader`] for collect-stage tests: observations are
     /// keyed by (build_id, drv_path); paths with no scripted observation
     /// come back as the default (empty-status) observation, mirroring the
-    /// real readers' missing-path behavior.
+    /// real readers' missing-path behavior. Setting `error` makes every
+    /// `read_build` call fail with that message instead (collect's
+    /// reader-failure paths).
     #[derive(Default)]
     pub struct FakeReader {
         /// build_id → drv_path → observation
         pub observations: Mutex<HashMap<String, HashMap<String, DrvObservation>>>,
+        /// When set, `read_build` fails with this message.
+        pub error: Mutex<Option<String>>,
     }
 
     impl FakeReader {
@@ -245,6 +250,11 @@ pub(crate) mod test_support {
                 .or_default()
                 .insert(obs.drv_path.clone(), obs);
         }
+
+        /// Make every subsequent `read_build` call fail with `message`.
+        pub fn fail_with(&self, message: &str) {
+            *self.error.lock().unwrap() = Some(message.to_string());
+        }
     }
 
     #[async_trait]
@@ -254,6 +264,9 @@ pub(crate) mod test_support {
             build_id: &str,
             drv_paths: &[String],
         ) -> Result<Vec<DrvObservation>> {
+            if let Some(message) = self.error.lock().unwrap().clone() {
+                anyhow::bail!("{message}");
+            }
             let map = self.observations.lock().unwrap();
             let by_build = map.get(build_id).cloned().unwrap_or_default();
             Ok(drv_paths
@@ -436,9 +449,10 @@ mod tests {
 
     /// Pin the [`test_support::FakeReader`] scripting contract the
     /// collect-stage tests rely on: scripted observations come back for
-    /// their (build_id, drv_path) key, and unscripted paths come back as
+    /// their (build_id, drv_path) key, unscripted paths come back as
     /// the default empty-status observation — the same missing-path shape
-    /// the real readers produce.
+    /// the real readers produce — and an injected error fails every read
+    /// until it is cleared.
     #[tokio::test]
     async fn fake_reader_returns_scripted_and_default_observations() {
         let target = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-app.drv".to_string();
@@ -472,5 +486,18 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(other[0].status, "");
+        // Injected errors fail every read until cleared.
+        fake.fail_with("scripted reader outage");
+        let err = fake
+            .read_build("b1", std::slice::from_ref(&target))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("scripted reader outage"), "{err}");
+        *fake.error.lock().unwrap() = None;
+        assert!(
+            fake.read_build("b1", std::slice::from_ref(&target))
+                .await
+                .is_ok()
+        );
     }
 }

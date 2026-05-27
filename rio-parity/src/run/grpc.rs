@@ -1,8 +1,10 @@
 //! Thin trait facades over the rio gRPC surfaces the engine reads, so every
 //! stage is unit-testable with in-memory fakes. The tonic-backed impls are
-//! deliberately dumb adapters (no logic beyond chunking and a reconnect
-//! retry on UNAVAILABLE) — they are exercised against a live cluster during
-//! the first smoke campaign, not in unit tests.
+//! deliberately dumb adapters (no logic beyond chunking, rolling log-tail
+//! truncation, and a reconnect retry on connect failures / UNAVAILABLE) —
+//! the RPC plumbing is exercised against a live cluster during the first
+//! smoke campaign, while the retry and truncation logic has offline unit
+//! tests below.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -175,6 +177,19 @@ type AdminClient = rio_proto::AdminServiceClient<
     >,
 >;
 
+/// Append one streamed log line (plus the newline the chunking strips) to
+/// `buf`, then trim `buf` from the FRONT so it never holds more than
+/// `max_bytes`. The rolling trim keeps memory bounded while streaming
+/// arbitrarily large logs — only the requested tail ever stays buffered.
+fn push_log_tail_line(buf: &mut Vec<u8>, line: &[u8], max_bytes: usize) {
+    buf.extend_from_slice(line);
+    buf.push(b'\n');
+    if buf.len() > max_bytes {
+        let excess = buf.len() - max_bytes;
+        buf.drain(..excess);
+    }
+}
+
 /// Tonic-backed AdminService facade with reconnect-on-not-leader retry:
 /// the leader-gated reads (ClusterStatus, GetSpawnIntents, GetBuildGraph)
 /// answer UNAVAILABLE from a standby replica, so every call runs against a
@@ -212,9 +227,11 @@ impl GrpcAdminApi {
         .max_encoding_message_size(rio_common::grpc::max_message_size()))
     }
 
-    /// Run `op` against a fresh client, retrying UNAVAILABLE (not-leader,
-    /// reconnect window) with backoff. Other statuses are returned to the
-    /// caller.
+    /// Run `op` against a fresh client, retrying connect failures
+    /// (scheduler restart, DNS blip) and UNAVAILABLE responses (not-leader,
+    /// reconnect window) with the same backoff and attempt budget. Other
+    /// statuses are returned to the caller; exhausted retries name the
+    /// scheduler address and the attempt count.
     async fn with_retry<T, F, Fut>(&self, what: &str, mut op: F) -> Result<T>
     where
         F: FnMut(AdminClient) -> Fut,
@@ -222,7 +239,26 @@ impl GrpcAdminApi {
     {
         let mut attempt = 0u32;
         loop {
-            let client = self.client().await?;
+            let client = match self.client().await {
+                Ok(client) => client,
+                Err(e) if attempt + 1 < self.max_attempts => {
+                    tracing::warn!(
+                        rpc = what,
+                        attempt,
+                        error = %format!("{e:#}"),
+                        "scheduler connect failed; retrying"
+                    );
+                    tokio::time::sleep(ADMIN_RETRY_BACKOFF.duration(attempt)).await;
+                    attempt += 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e.context(format!(
+                        "{what}: scheduler at {} unreachable after {} attempts",
+                        self.addr, self.max_attempts
+                    )));
+                }
+            };
             match op(client).await {
                 Ok(v) => return Ok(v),
                 Err(s)
@@ -237,7 +273,22 @@ impl GrpcAdminApi {
                     tokio::time::sleep(ADMIN_RETRY_BACKOFF.duration(attempt)).await;
                     attempt += 1;
                 }
-                Err(s) => return Err(anyhow::anyhow!("{what}: {} ({:?})", s.message(), s.code())),
+                Err(s) if s.code() == tonic::Code::Unavailable => {
+                    return Err(anyhow::anyhow!(
+                        "{what} against scheduler at {}: still UNAVAILABLE after {} attempts: {}",
+                        self.addr,
+                        self.max_attempts,
+                        s.message()
+                    ));
+                }
+                Err(s) => {
+                    return Err(anyhow::anyhow!(
+                        "{what} against scheduler at {}: {} ({:?})",
+                        self.addr,
+                        s.message(),
+                        s.code()
+                    ));
+                }
             }
         }
     }
@@ -311,16 +362,14 @@ impl AdminApi for GrpcAdminApi {
             .await
             .map_err(|s| anyhow::anyhow!("GetDerivationLogs stream for {drv_path}: {s}"))?
         {
+            // Trim rolling, per line, so the buffer never grows past the
+            // requested tail even when the full log is hundreds of MB.
             for line in chunk.lines {
-                buf.extend_from_slice(&line);
-                buf.push(b'\n');
+                push_log_tail_line(&mut buf, &line, max_bytes);
             }
             if chunk.is_complete {
                 break;
             }
-        }
-        if buf.len() > max_bytes {
-            buf = buf.split_off(buf.len() - max_bytes);
         }
         Ok(buf)
     }
@@ -343,10 +392,15 @@ impl AdminApi for GrpcAdminApi {
             .builds
             .into_iter()
             .map(|b| {
-                (
-                    b.build_id,
-                    b.submitted_at.map(|t| format!("{}.{}", t.seconds, t.nanos)),
-                )
+                // Render as RFC3339 for human correlation with batch start
+                // times; an out-of-range timestamp falls back to the raw
+                // seconds.nanos pair rather than dropping the row.
+                let submitted_at = b.submitted_at.map(|t| {
+                    jiff::Timestamp::new(t.seconds, t.nanos)
+                        .map(|ts| ts.to_string())
+                        .unwrap_or_else(|_| format!("{}.{}", t.seconds, t.nanos))
+                });
+                (b.build_id, submitted_at)
             })
             .collect())
     }
@@ -392,11 +446,22 @@ pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    /// In-memory StoreApi: paths present in the map are valid.
+    /// In-memory StoreApi: paths present in the map are valid. Setting
+    /// `error` makes every `query_valid` call fail with that message
+    /// (collect's store-failure paths).
     #[derive(Default)]
     pub struct FakeStoreApi {
         pub valid: HashMap<String, (String, u64)>,
         pub calls: Mutex<usize>,
+        /// When set, `query_valid` fails with this message.
+        pub error: Mutex<Option<String>>,
+    }
+
+    impl FakeStoreApi {
+        /// Make every subsequent `query_valid` call fail with `message`.
+        pub fn fail_with(&self, message: &str) {
+            *self.error.lock().unwrap() = Some(message.to_string());
+        }
     }
 
     #[async_trait]
@@ -406,10 +471,59 @@ pub(crate) mod test_support {
             paths: &[String],
         ) -> Result<HashMap<String, Option<(String, u64)>>> {
             *self.calls.lock().unwrap() += 1;
+            if let Some(message) = self.error.lock().unwrap().clone() {
+                anyhow::bail!("{message}");
+            }
             Ok(paths
                 .iter()
                 .map(|p| (p.clone(), self.valid.get(p).cloned()))
                 .collect())
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The rolling trim caps the log-tail buffer at `max_bytes` after every
+    /// appended line, so streaming a huge log never buffers more than the
+    /// requested tail.
+    #[test]
+    fn log_tail_buffer_is_trimmed_rolling_to_max_bytes() {
+        let mut buf = Vec::new();
+        for i in 0..1000 {
+            push_log_tail_line(&mut buf, format!("line {i:04}").as_bytes(), 100);
+            assert!(buf.len() <= 100, "buffer exceeded the cap after line {i}");
+        }
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.ends_with("line 0999\n"), "{text}");
+        assert!(!text.contains("line 0000"), "{text}");
+        // A single line longer than the cap keeps only its last max_bytes.
+        let mut big = Vec::new();
+        push_log_tail_line(&mut big, &[b'x'; 300], 100);
+        assert_eq!(big.len(), 100);
+        // A zero cap keeps nothing.
+        let mut none = Vec::new();
+        push_log_tail_line(&mut none, b"anything", 0);
+        assert!(none.is_empty());
+    }
+
+    /// Connect failures are retried with the same attempt budget as
+    /// UNAVAILABLE, and the exhausted-retry error names the scheduler
+    /// address and the attempt count. Port 1 on loopback has nothing
+    /// listening, so the eager connect fails immediately without touching
+    /// any real network.
+    #[tokio::test(start_paused = true)]
+    async fn with_retry_exhausts_connect_failures_naming_addr_and_attempts() {
+        let api = GrpcAdminApi {
+            addr: "127.0.0.1:1".to_string(),
+            signer: None,
+            max_attempts: 2,
+        };
+        let err = api.list_poisoned().await.unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("127.0.0.1:1"), "{msg}");
+        assert!(msg.contains("2 attempts"), "{msg}");
     }
 }

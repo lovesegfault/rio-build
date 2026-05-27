@@ -841,6 +841,11 @@
       "doc": "The bucket classifier: ONE pure function over (Hydra outcome × rio"
     },
     {
+      "path": "run/collect.rs",
+      "depth": 1,
+      "doc": "Collect stage: turn per-(build, drv) observations, captured stderr"
+    },
+    {
       "path": "run/evalset_input.rs",
       "depth": 1,
       "doc": "Readers for the eval-set artifacts the campaign consumes:"

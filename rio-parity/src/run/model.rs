@@ -34,6 +34,18 @@ pub enum HydraOutcome {
     Unknown,
 }
 
+impl HydraOutcome {
+    /// The [`HydraSide::outcome`] wire string — the same kebab-case name
+    /// this enum's serde form uses, so record writers never hand-type it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            HydraOutcome::Built => "built",
+            HydraOutcome::Failed => "failed",
+            HydraOutcome::Unknown => "unknown",
+        }
+    }
+}
+
 /// Rio-side outcome for one job after collect (input to the bucket
 /// classifier).
 ///
@@ -58,6 +70,52 @@ pub enum RioOutcome {
         failing_drv: String,
     },
 }
+
+impl RioOutcome {
+    /// The [`RioSide::outcome`] wire string for this outcome — the same
+    /// kebab-case name the serde `outcome` tag uses, so record writers
+    /// never hand-type it.
+    pub fn outcome_str(&self) -> &'static str {
+        match self {
+            RioOutcome::NotAttempted => "not-attempted",
+            RioOutcome::Built { .. } => "built",
+            RioOutcome::TargetFailed { .. } => "target-failed",
+            RioOutcome::DependencyFailed { .. } => "dependency-failed",
+        }
+    }
+}
+
+/// Scheduler `derivations.status` value for a derivation that completed
+/// successfully (built or substituted).
+///
+/// The `STATUS_*` constants mirror rio-scheduler's derivation state
+/// machine — `DerivationStatus` in `rio-scheduler/src/state/derivation.rs`
+/// is the source of truth for the wire strings. Only the statuses the
+/// engine explicitly branches on are mirrored here; every other status
+/// (created, queued, ready, assigned, running, substituting, and the
+/// retried `failed`) is treated as still in flight.
+pub const STATUS_COMPLETED: &str = "completed";
+
+/// Scheduler `derivations.status` value for a derivation skipped via CA
+/// early cutoff (a content-addressed dependency already produced
+/// byte-identical output). Terminal, completed-without-execution. See
+/// [`STATUS_COMPLETED`] for the source of truth.
+pub const STATUS_SKIPPED: &str = "skipped";
+
+/// Scheduler `derivations.status` value for a derivation that failed
+/// terminally after the scheduler's retries. See [`STATUS_COMPLETED`]
+/// for the source of truth.
+pub const STATUS_POISONED: &str = "poisoned";
+
+/// Scheduler `derivations.status` value for a derivation blocked by a
+/// failed/poisoned dependency. See [`STATUS_COMPLETED`] for the source
+/// of truth.
+pub const STATUS_DEPENDENCY_FAILED: &str = "dependency_failed";
+
+/// Scheduler `derivations.status` value for a derivation cancelled by an
+/// operator or scheduler decision (CancelBuild, forced drain). See
+/// [`STATUS_COMPLETED`] for the source of truth.
+pub const STATUS_CANCELLED: &str = "cancelled";
 
 /// How a failed target derivation is attributed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -388,6 +446,68 @@ mod tests {
             let back: Bucket = serde_json::from_str(&json).unwrap();
             assert_eq!(back, bucket);
         }
+    }
+
+    #[test]
+    fn outcome_strings_match_their_serde_forms() {
+        for hydra in [
+            HydraOutcome::Built,
+            HydraOutcome::Failed,
+            HydraOutcome::Unknown,
+        ] {
+            assert_eq!(
+                serde_json::to_string(&hydra).unwrap(),
+                format!("\"{}\"", hydra.as_str()),
+                "{hydra:?}"
+            );
+        }
+        for (rio, expected) in [
+            (RioOutcome::NotAttempted, "not-attempted"),
+            (RioOutcome::Built { executed: true }, "built"),
+            (
+                RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine,
+                },
+                "target-failed",
+            ),
+            (
+                RioOutcome::DependencyFailed {
+                    root: RootCauseKind::Infra,
+                    failing_drv: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-d.drv".into(),
+                },
+                "dependency-failed",
+            ),
+        ] {
+            assert_eq!(rio.outcome_str(), expected);
+            let value = serde_json::to_value(&rio).unwrap();
+            assert_eq!(value["outcome"], expected, "{rio:?}");
+        }
+    }
+
+    #[test]
+    fn scheduler_status_vocabulary_is_fixed_and_distinct() {
+        // The wire strings are owned by rio-scheduler's DerivationStatus
+        // (rio-scheduler/src/state/derivation.rs); these constants must
+        // track it exactly or collect would silently stop matching.
+        let all = [
+            STATUS_COMPLETED,
+            STATUS_SKIPPED,
+            STATUS_POISONED,
+            STATUS_DEPENDENCY_FAILED,
+            STATUS_CANCELLED,
+        ];
+        assert_eq!(
+            all,
+            [
+                "completed",
+                "skipped",
+                "poisoned",
+                "dependency_failed",
+                "cancelled",
+            ]
+        );
+        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
+        assert_eq!(unique.len(), all.len());
     }
 
     #[test]
