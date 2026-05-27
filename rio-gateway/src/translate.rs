@@ -407,9 +407,9 @@ fn populate_wanted_outputs(
     }
 }
 
-/// Validate a DAG before SubmitBuild. Returns `Err(reason)` if the
-/// DAG should be rejected — caller sends STDERR_ERROR with the
-/// reason. Returns `Ok(())` if valid.
+/// Validate a DAG before SubmitBuild — the CHEAP checks only. Returns
+/// `Err(reason)` if the DAG should be rejected — caller sends
+/// STDERR_ERROR with the reason. Returns `Ok(())` if valid.
 ///
 /// Checks:
 /// - `__noChroot=1` in any node's env → reject (sandbox escape)
@@ -418,6 +418,15 @@ fn populate_wanted_outputs(
 ///   builder cannot verify → reject (both the FOD hash gate and
 ///   floating-CA finalization are fail-closed; the build could only
 ///   ever fail after burning a pod)
+///
+/// The expensive declared-output-path binding (one
+/// `hashDerivationModulo`-shaped pass over every cached derivation)
+/// deliberately does NOT live here: it runs later in the pipeline via
+/// [`validate_output_path_bindings`], on the blocking pool, behind the
+/// rate-limit and quota gates — see the pipeline order in
+/// `handler/build.rs`. Keeping this function cheap means a
+/// rate-limited or over-quota client cannot make the gateway burn CPU
+/// hashing its closure first.
 ///
 /// The scheduler ALSO enforces MAX_DAG_NODES (grpc/mod.rs:298);
 /// this is an early reject to save the gRPC round-trip for obvious
@@ -489,95 +498,114 @@ pub fn validate_dag(
         }
     }
 
-    // Declared output paths must be the ones the derivation itself
-    // derives to. Workers are untrusted, so this is the trusted-plane
-    // enforcement (the builder-side fixed-output binding is defense in
-    // depth): without it, any tenant could declare another derivation's
-    // not-yet-built input-addressed output path on a crafted .drv and
-    // have arbitrary content built, signed and served at that path.
-    // Mirrors CppNix, which recomputes IA output paths from the
-    // derivation (hashDerivationModulo + makeOutputPath) and never
-    // trusts the declared ones.
-    //
-    // Scope: only outputs whose declared path parses as a store path
-    // are compared — a malformed declared path cannot alias any real
-    // store object (the store rejects it at PutPath), so it is not a
-    // squatting vector; legacy fixtures and degenerate clients keep
-    // failing later with their existing errors. Fixed-output outputs
-    // are bound to their declared hash by the FOD rules, and
-    // floating-CA / deferred outputs have no static path to check.
-    // Nodes without a cached full derivation (BasicDerivation
-    // fallback) are skipped like the checks above; closure-incomplete
-    // derivations are rejected fail-closed — an attacker must not be
-    // able to dodge the check by withholding an input drv.
-    {
-        let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
-        let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
-        for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
-            // Per-output classification: only plain input-addressed
-            // outputs (empty hash_algo) with a parseable declared path
-            // are bound by the derivation hash; content-bound outputs
-            // (fixed-output / floating-CA) are governed by the
-            // content-hash rules and deferred (empty) paths have
-            // nothing to validate. The derivation-level fast path
-            // therefore applies only when EVERY output is
-            // content-bound — neither a deferred output nor a
-            // floating-CA output may exempt a sibling static path
-            // from validation. Mixed shapes (which Nix itself never
-            // produces: "can't mix derivation output types") fall
-            // through to input_addressed_output_paths(), which
-            // refuses them, and the submission is rejected
-            // fail-closed rather than half-validated.
-            if drv.outputs().iter().all(|o| !o.hash_algo().is_empty()) {
-                continue;
-            }
-            if !drv
-                .outputs()
-                .iter()
-                .any(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
-            {
-                continue;
-            }
-            let derived = rio_nix::derivation::input_addressed_output_paths(
-                drv,
-                &node.drv_path,
-                &resolve,
-                &mut hash_cache,
+    Ok(())
+}
+
+/// Trusted-plane binding of declared output paths to the paths the
+/// derivation itself derives to. Returns `Err(reason)` when any cached
+/// derivation declares an input-addressed output path that does not
+/// match the derived one — the caller rejects the submission before
+/// `SubmitBuild` exactly like a [`validate_dag`] rejection.
+///
+/// Workers are untrusted, so this is the trusted-plane enforcement
+/// (the builder-side fixed-output binding is defense in depth):
+/// without it, any tenant could declare another derivation's
+/// not-yet-built input-addressed output path on a crafted .drv and
+/// have arbitrary content built, signed and served at that path.
+/// Mirrors CppNix, which recomputes IA output paths from the
+/// derivation (hashDerivationModulo + makeOutputPath) and never
+/// trusts the declared ones.
+///
+/// Scope: only outputs whose declared path parses as a store path
+/// are compared — a malformed declared path cannot alias any real
+/// store object (the store rejects it at PutPath), so it is not a
+/// squatting vector; legacy fixtures and degenerate clients keep
+/// failing later with their existing errors. Fixed-output outputs
+/// are bound to their declared hash by the declared-hash gate in
+/// [`validate_dag`], and floating-CA / deferred outputs have no
+/// static path to check. Nodes without a cached full derivation
+/// (BasicDerivation fallback) are skipped like the cheap checks;
+/// closure-incomplete derivations are rejected fail-closed — an
+/// attacker must not be able to dodge the check by withholding an
+/// input drv.
+///
+/// Cost: roughly two full ATerm serializations + SHA-256 per cached
+/// derivation (CppNix pays the same at instantiation). The pipeline
+/// therefore runs this AFTER the rate-limit and quota gates and on the
+/// blocking pool (`spawn_blocking`) — see
+/// `handler::build::enforce_output_path_bindings` — so a single
+/// adversarial closure cannot stall the session reactor or bypass the
+/// per-tenant limiter.
+pub(crate) fn validate_output_path_bindings(
+    nodes: &[types::DerivationNode],
+    drv_cache: &HashMap<StorePath, Derivation>,
+) -> Result<(), String> {
+    let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
+    let resolve = |p: &str| StorePath::parse(p).ok().and_then(|sp| drv_cache.get(&sp));
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_output_path_bindings") {
+        // Per-output classification: only plain input-addressed
+        // outputs (empty hash_algo) with a parseable declared path
+        // are bound by the derivation hash; content-bound outputs
+        // (fixed-output / floating-CA) are governed by the
+        // content-hash rules and deferred (empty) paths have
+        // nothing to validate. The derivation-level fast path
+        // therefore applies only when EVERY output is
+        // content-bound — neither a deferred output nor a
+        // floating-CA output may exempt a sibling static path
+        // from validation. Mixed shapes (which Nix itself never
+        // produces: "can't mix derivation output types") fall
+        // through to input_addressed_output_paths(), which
+        // refuses them, and the submission is rejected
+        // fail-closed rather than half-validated.
+        if drv.outputs().iter().all(|o| !o.hash_algo().is_empty()) {
+            continue;
+        }
+        if !drv
+            .outputs()
+            .iter()
+            .any(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
+        {
+            continue;
+        }
+        let derived = rio_nix::derivation::input_addressed_output_paths(
+            drv,
+            &node.drv_path,
+            &resolve,
+            &mut hash_cache,
+        )
+        .map_err(|e| {
+            format!(
+                "cannot derive output paths for {} (rejecting rather than trusting the \
+                 declared ones): {e}",
+                node.drv_path
             )
-            .map_err(|e| {
-                format!(
-                    "cannot derive output paths for {} (rejecting rather than trusting the \
-                     declared ones): {e}",
-                    node.drv_path
-                )
-            })?;
-            for output in drv.outputs() {
-                // Content-bound outputs are not derivation-path-derived.
-                if !output.hash_algo().is_empty() {
-                    continue;
+        })?;
+        for output in drv.outputs() {
+            // Content-bound outputs are not derivation-path-derived.
+            if !output.hash_algo().is_empty() {
+                continue;
+            }
+            if StorePath::parse(output.path()).is_err() {
+                continue;
+            }
+            match derived.get(output.name()) {
+                Some(expected) if expected.as_str() == output.path() => {}
+                Some(expected) => {
+                    return Err(format!(
+                        "derivation {} declares output '{}' at {} but the derivation \
+                         derives to {} — declared output paths must match the derivation",
+                        node.drv_path,
+                        output.name(),
+                        output.path(),
+                        expected.as_str(),
+                    ));
                 }
-                if StorePath::parse(output.path()).is_err() {
-                    continue;
-                }
-                match derived.get(output.name()) {
-                    Some(expected) if expected.as_str() == output.path() => {}
-                    Some(expected) => {
-                        return Err(format!(
-                            "derivation {} declares output '{}' at {} but the derivation \
-                             derives to {} — declared output paths must match the derivation",
-                            node.drv_path,
-                            output.name(),
-                            output.path(),
-                            expected.as_str(),
-                        ));
-                    }
-                    None => {
-                        return Err(format!(
-                            "derivation {} output '{}' has no derivable output path",
-                            node.drv_path,
-                            output.name(),
-                        ));
-                    }
+                None => {
+                    return Err(format!(
+                        "derivation {} output '{}' has no derivable output path",
+                        node.drv_path,
+                        output.name(),
+                    ));
                 }
             }
         }
@@ -1167,7 +1195,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(key.clone(), aterm_with(&honest));
         assert!(
-            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
             "consistent IA declaration must pass"
         );
 
@@ -1175,7 +1203,7 @@ mod tests {
         let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
         let mut cache = HashMap::new();
         cache.insert(key.clone(), aterm_with(victim));
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
         assert!(
             err.contains("must match the derivation"),
             "squatted path must be rejected: {err}"
@@ -1186,7 +1214,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(key.clone(), aterm_with("/nix/store/zzz-output"));
         assert!(
-            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
             "malformed declared paths are not this gate's concern"
         );
     }
@@ -1213,7 +1241,7 @@ mod tests {
         .expect("test ATerm parses");
         let mut cache = HashMap::new();
         cache.insert(key.clone(), mixed);
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
         assert!(
             err.contains("cannot derive output paths"),
             "mixed CA + static shape must be rejected fail-closed: {err}"
@@ -1227,7 +1255,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(key.clone(), all_ca);
         assert!(
-            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
             "all-floating-CA derivations keep the fast path"
         );
 
@@ -1239,7 +1267,7 @@ mod tests {
         let mut cache = HashMap::new();
         cache.insert(key, fod);
         assert!(
-            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
             "fixed-output derivations are unchanged"
         );
     }
@@ -1265,10 +1293,45 @@ mod tests {
 
         let mut cache = HashMap::new();
         cache.insert(key, drv);
-        let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
         assert!(
             err.contains("must match the derivation") || err.contains("derive"),
             "mixed deferred+squatted shape must be rejected: {err}"
+        );
+    }
+
+    /// Structural pin for the pipeline split: `validate_dag` performs
+    /// only the cheap checks and no longer runs the output-path binding
+    /// pass — a squatted IA path passes `validate_dag` but is caught by
+    /// `validate_output_path_bindings`. This is NOT a bypass: the
+    /// handler pipeline always runs the binding gate before
+    /// `SubmitBuild` (behind rate-limit/quota, on the blocking pool) —
+    /// see the wopBuildDerivation / wopBuildPathsWithResults squatting
+    /// wire tests in `tests/wire_opcodes/build.rs`, which assert the
+    /// rejection end-to-end.
+    #[test]
+    fn validate_dag_no_longer_runs_the_binding_pass() {
+        let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-split.drv";
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: "ccc".into(),
+            ..Default::default()
+        };
+        let key = StorePath::parse(drv_path).unwrap();
+        let victim = "/nix/store/ffffffffffffffffffffffffffffffff-victim";
+        let aterm = format!(
+            r#"Derive([("out","{victim}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{victim}")])"#
+        );
+        let mut cache = HashMap::new();
+        cache.insert(key, Derivation::parse(&aterm).expect("test ATerm parses"));
+
+        assert!(
+            validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+            "validate_dag holds only the cheap checks"
+        );
+        assert!(
+            validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_err(),
+            "the binding gate still rejects the squat"
         );
     }
 

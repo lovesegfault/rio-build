@@ -194,6 +194,34 @@ async fn quota_check<W: AsyncWrite + Unpin>(
     }
 }
 
+/// Run the declared-output-path binding gate
+/// ([`translate::validate_output_path_bindings`]) on the blocking
+/// pool. The gate is O(total .drv bytes) of ATerm serialization +
+/// SHA-256 — far too much to run on the session reactor task — so the
+/// drv cache is `mem::take`n (O(1), no clone of a potentially-GB map),
+/// moved into `spawn_blocking` together with the nodes, and restored
+/// afterwards.
+///
+/// On a blocking-pool panic (`JoinError`) the cache is left empty:
+/// degraded but correct — the session re-fetches .drvs from the store
+/// on demand. The verdict is returned separately from the transport
+/// error so both call sites keep their existing rejection delivery
+/// (BuildResult `InputRejected` for wopBuildDerivation /
+/// wopBuildPathsWithResults, `stderr_err!` for wopBuildPaths).
+async fn enforce_output_path_bindings(
+    nodes: Vec<types::DerivationNode>,
+    drv_cache: &mut HashMap<StorePath, Derivation>,
+) -> anyhow::Result<(Vec<types::DerivationNode>, Result<(), String>)> {
+    let cache = std::mem::take(drv_cache);
+    let (nodes, cache, verdict) = tokio::task::spawn_blocking(move || {
+        let verdict = translate::validate_output_path_bindings(&nodes, &cache);
+        (nodes, cache, verdict)
+    })
+    .await?;
+    *drv_cache = cache;
+    Ok((nodes, verdict))
+}
+
 /// STDERR-activity state that survives `process_build_events`
 /// reconnects. Hoisted to `submit_and_process_build` so a WatchBuild
 /// resume after scheduler failover keeps the activity-ID map intact —
@@ -1294,9 +1322,9 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let priority_class = if is_ifd_hint { "interactive" } else { "ci" };
 
-    // Validate BEFORE inlining (no point doing FindMissingPaths +
-    // inline for a DAG we're about to reject). __noChroot check +
-    // early MAX_DAG_NODES.
+    // Cheap validation BEFORE anything else (no point rate-limiting or
+    // hashing a DAG we can reject from the node list alone):
+    // __noChroot check + early MAX_DAG_NODES + unverifiable algos.
     if let Err(reason) = translate::validate_dag(&nodes, drv_cache) {
         warn!(reason = %reason, "rejecting build: DAG validation failed");
         // Do NOT send STDERR_ERROR here — it is a terminal frame.
@@ -1309,16 +1337,11 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         return Ok(());
     }
 
-    // Inline .drv content for will-dispatch nodes. Mutable because
-    // this fills node.drv_content in-place. On store error: skips
-    // silently (safe degrade; worker fetches).
-    let mut nodes = nodes;
-    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
-
-    // Rate limit + quota BEFORE SubmitBuild. Checked after wire reads
-    // + validation (those are cheap; the expensive part is the
-    // scheduler RPC + stream). A rate-limited / over-quota client
-    // gets STDERR_ERROR; the connection stays open.
+    // Rate limit + quota BEFORE the expensive work (output-path
+    // binding, FindMissingPaths/inline, the scheduler RPC + stream).
+    // A rate-limited / over-quota client gets STDERR_ERROR and must
+    // not be able to make the gateway hash its closure first; the
+    // connection stays open.
     if rate_limit_check(stderr, limiter, tenant_name.as_ref()).await? {
         return Ok(());
     }
@@ -1333,6 +1356,25 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     {
         return Ok(());
     }
+
+    // Declared-output-path binding gate: O(closure) hashing, so it runs
+    // on the blocking pool and only after the cheap gates above.
+    // Rejection delivery matches the validate_dag rejection: BuildResult
+    // InputRejected after STDERR_LAST.
+    let (nodes, binding_verdict) = enforce_output_path_bindings(nodes, drv_cache).await?;
+    if let Err(reason) = binding_verdict {
+        warn!(reason = %reason, "rejecting build: declared output paths do not bind");
+        let failure = BuildResult::failure(BuildStatus::InputRejected, reason);
+        stderr.finish().await?;
+        write_build_result(stderr.inner_mut(), &failure, negotiated_version).await?;
+        return Ok(());
+    }
+
+    // Inline .drv content for will-dispatch nodes. Mutable because
+    // this fills node.drv_content in-place. On store error: skips
+    // silently (safe degrade; worker fetches).
+    let mut nodes = nodes;
+    translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;
 
     let request =
         translate::build_submit_request(nodes, edges, priority_class, tenant_name.as_ref());
@@ -1724,10 +1766,11 @@ enum DagSubmitOutcome {
     /// Rate-limited or quota-exceeded. `STDERR_ERROR` already sent by
     /// the respective check; caller should `return Ok(())`.
     Gated,
-    /// `validate_dag` rejected the DAG before submission. No
-    /// `STDERR_ERROR` sent — caller decides whether to surface as
-    /// `stderr_err!` (wopBuildPaths) or as a per-path
-    /// `BuildResult::failure(InputRejected, …)` (wopBuildPathsWithResults).
+    /// `validate_dag` or the output-path binding gate rejected the DAG
+    /// before submission. No `STDERR_ERROR` sent — caller decides
+    /// whether to surface as `stderr_err!` (wopBuildPaths) or as a
+    /// per-path `BuildResult::failure(InputRejected, …)`
+    /// (wopBuildPathsWithResults).
     Rejected(String),
     /// Build was submitted and the scheduler returned a result
     /// (success OR failure — caller inspects `.status`).
@@ -1735,14 +1778,16 @@ enum DagSubmitOutcome {
 }
 
 /// Shared DAG-submit pipeline:
-/// `dedup → validate → rate-limit → quota → inline-drv → SubmitBuild`.
+/// `dedup → validate (cheap) → rate-limit → quota → output-path
+/// binding (blocking pool) → inline-drv → SubmitBuild`.
 ///
 /// Runs every gate between DAG reconstruction and the scheduler RPC.
 /// Gate ORDER is fixed here so the two build-paths opcodes cannot drift:
-/// validate first (cheap, no I/O), then rate/quota (may send
-/// `STDERR_ERROR`), then inline (store I/O), then submit. Prior to this
-/// extraction the two handlers ran inline at different points relative
-/// to rate/quota — harmless but inconsistent.
+/// cheap validation first (no I/O, no hashing), then rate/quota (may
+/// send `STDERR_ERROR`) so a limited client cannot trigger the
+/// expensive work, then the declared-output-path binding gate on the
+/// blocking pool, then inline (store I/O), then submit.
+/// `handle_build_derivation` follows the same order.
 ///
 /// Returns `Err` only when `submit_and_process_build` itself errors
 /// (scheduler transport/timeout); caller decides whether that is
@@ -1785,6 +1830,16 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     .await?
     {
         return Ok(DagSubmitOutcome::Gated);
+    }
+
+    // Declared-output-path binding: expensive (O(closure) hashing), so
+    // it sits behind rate-limit/quota and runs on the blocking pool.
+    let (returned_nodes, binding_verdict) =
+        enforce_output_path_bindings(std::mem::take(&mut nodes), drv_cache).await?;
+    nodes = returned_nodes;
+    if let Err(reason) = binding_verdict {
+        warn!(reason = %reason, "rejecting build: declared output paths do not bind");
+        return Ok(DagSubmitOutcome::Rejected(reason));
     }
 
     translate::filter_and_inline_drv(&mut nodes, drv_cache, store_client).await;

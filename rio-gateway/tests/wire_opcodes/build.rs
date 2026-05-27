@@ -713,6 +713,124 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
     Ok(())
 }
 
+/// ATerm whose declared output path is a well-formed store path that the
+/// derivation does NOT derive to — the canonical path-squatting shape the
+/// output-path binding gate rejects. Seeded into the mock store so
+/// `resolve_derivation` populates `drv_cache` and the full-DAG pipeline
+/// (not the inline fallback) handles it.
+const SQUATTED_IA_DRV_ATERM: &str = r#"Derive([("out","/nix/store/ffffffffffffffffffffffffffffffff-victim","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/ffffffffffffffffffffffffffffffff-victim")])"#;
+
+/// wopBuildDerivation (36): a cached derivation declaring a squatted
+/// (well-formed, non-derived) input-addressed output path is rejected by
+/// the output-path binding gate AFTER the rate/quota gates, still before
+/// SubmitBuild, and delivered as STDERR_LAST + failure BuildResult (same
+/// shape as a validate_dag rejection). Sending the opcode a second time
+/// proves the session drv_cache survived the spawn_blocking round-trip
+/// (`mem::take`/restore): the .drv is served from the cache, so the mock
+/// store's GetPath count does not grow.
+#[tokio::test]
+async fn test_build_derivation_squatted_path_rejected_and_cache_restored() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000006-squat.drv";
+    h.store
+        .seed_with_content(drv_path, SQUATTED_IA_DRV_ATERM.as_bytes());
+
+    for round in 1..=2u32 {
+        wire_send!(&mut h.stream;
+            u64: 36,                                 // wopBuildDerivation
+            string: drv_path,
+            u64: 1,                                  // 1 output
+            string: "out",
+            string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+            string: "",                              // hash_algo (input-addressed)
+            string: "",                              // hash
+            strings: wire::NO_STRINGS,               // input_srcs
+            string: "x86_64-linux",
+            string: "/bin/sh",
+            strings: &["-c", "echo hi"],
+            u64: 1,                                  // 1 env pair
+            string: "out",
+            string: "/nix/store/ffffffffffffffffffffffffffffffff-victim",
+            u64: 0,                                  // build_mode
+        );
+        drain_stderr_until_last(&mut h.stream).await?;
+        let status = wire::read_u64(&mut h.stream).await?;
+        assert_ne!(status, 0, "round {round}: must be a failure code");
+        let error_msg = wire::read_string(&mut h.stream).await?;
+        assert!(
+            error_msg.contains("must match the derivation"),
+            "round {round}: errorMsg should name the binding violation: {error_msg:?}"
+        );
+        drain_build_result_tail(&mut h.stream).await?;
+    }
+
+    // The squat never reaches the scheduler.
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "binding rejection happens BEFORE SubmitBuild"
+    );
+
+    // drv_cache restored after spawn_blocking: the second round resolved
+    // the .drv from the session cache, not the store.
+    assert_eq!(
+        h.store
+            .calls
+            .get_path_calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the .drv must be fetched exactly once — the session cache survives the binding gate"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildPathsWithResults (46): the same squatted-path rejection via the
+/// shared submit_dag pipeline — per-path failure BuildResult (InputRejected
+/// shape), scheduler never called. Covers the second call site of the moved
+/// binding gate.
+#[tokio::test]
+async fn test_build_paths_with_results_squatted_path_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000007-squat46.drv";
+    h.store
+        .seed_with_content(drv_path, SQUATTED_IA_DRV_ATERM.as_bytes());
+
+    let derived_path = format!("{drv_path}!out");
+    wire_send!(&mut h.stream;
+        u64: 46,                                 // wopBuildPathsWithResults
+        strings: std::slice::from_ref(&derived_path),
+        u64: 0,                                  // build_mode = Normal
+    );
+
+    drain_stderr_until_last(&mut h.stream).await?;
+
+    let count = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(count, 1, "one result for one input path");
+    let echoed_path = wire::read_string(&mut h.stream).await?;
+    assert_eq!(echoed_path, derived_path);
+    let status = wire::read_u64(&mut h.stream).await?;
+    assert_ne!(status, 0, "status must be a failure code (not Built=0)");
+    let error_msg = wire::read_string(&mut h.stream).await?;
+    assert!(
+        error_msg.contains("must match the derivation"),
+        "errorMsg should name the binding violation, got: {error_msg:?}"
+    );
+    drain_build_result_tail(&mut h.stream).await?;
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "binding rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
 /// BuildPathsWithResults (46) with an invalid build mode should still return
 /// results (not STDERR_ERROR) — the handler treats unknown modes as Normal.
 /// But invalid DerivedPath strings DO cause per-entry failures.
