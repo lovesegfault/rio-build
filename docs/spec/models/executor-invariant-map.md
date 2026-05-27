@@ -1363,6 +1363,266 @@ protocol's pre-Stage-C trigger.
   section below, citing the fix and the now-holding invariant rather
   than a re-derivation.
 
+## Stage-C verification runs (serial) and outcome summary (0d)
+
+Protocol: every override ran serially against the same TLC invocation
+the CI checks use (`quint verify --backend=tlc --main=<module>
+--step=calibStep --invariant=<predicted>`, 32 TLC workers); violation
+runs stop at the first counterexample, the two HOLDS probes and the
+two distinguishing exhaustive runs ran to exhaustion. Depths and state
+counts are in the calibration table below; wall-clocks live in the
+introducing commit messages and the run transcripts.
+
+- **Eleven of eleven falsifying overrides falsify on the first run.**
+  Ten falsify exactly the invariant the design's §3.5 table
+  pre-registered for them; the eleventh (`0127cf854`, the phantom
+  two-strike drain) falsifies the calibration-added
+  `confirmedPhantomIsDrained` rather than the pre-registered
+  `unresolvedClaimHasRepairArmed` — the recorded checked-prediction
+  correction below.
+- **The two analysis-predicted HOLDS rows hold non-vacuously.** The
+  `0127cf854` override holds `unresolvedClaimHasRepairArmed`
+  exhaustively (the slot-binding disjunct masks the drain's absence —
+  the reason the new invariant was needed), and the `be3ad068e`
+  no-adopt override holds `allInvariants` exhaustively while its
+  module-local `canReachOrphanedInflight` witness violates (the
+  contended state is reachable, so the HOLDS verdict is about the
+  guards, not vacuity).
+- **One invariant was added to the main model** as part of the
+  calibration (the retry-campaign precedent):
+  `confirmedPhantomIsDrained` (executorSession.qnt) — by construction
+  on the as-built encoding (the confirming heartbeat always clears the
+  binding), latched via `confirmedPhantomRetained`, falsified only by
+  the 0127cf854 override. The wired base and fault-stream-msg checks
+  re-verify green with the new conjunct at unchanged distinct-state
+  counts (figures in the introducing commit message), so the Stage-B
+  verdict table above stands.
+- **No new invariant falsified on the unmodified model** — no
+  stop-and-report event was raised by Stage C. The two regimes already
+  documented as over-budget (fault-stream-conn, fault-process) were
+  not re-attempted exhaustively; their overrides' baselines cite the
+  Stage-B deep-simulation + witness evidence per the campaign plan.
+- **Baselines.** Overrides at wired-regime constants (base, Model D
+  base / fault-stream) use the wired Stage-B checks as their as-built
+  baseline. Overrides at the documented-but-unwired regime constants
+  (fault-stream-conn, fault-process, fault-leader) cite the Stage-B
+  record's evidence for those regimes (deep simulation, wired
+  witnesses, the fault-leader bounded-exhaustive re-run). The one
+  override at non-regime constants (`be3ad068e`, fault-leader narrowed
+  to the failover budget alone) needed no falsification-attribution
+  baseline because it produced a HOLDS verdict.
+
+## Stage-C calibration: the historical-fix corpus replayed against Models S and D
+
+The 50-commit in-family slice of the 170-commit corpus pinned above,
+replayed against `executorSession.qnt` (Model S) and
+`executorDelivery.qnt` (Model D); the 21 retry-owned and 43
+controller-owned commits are cross-referenced (not re-run) and the 56
+out-of-scope commits carry their owning subsystem, per T-0d.4. Method
+per the prior campaigns: each override is a module in
+`docs/spec/models/calibration/executor-<family>-<slug>.qnt` (one file
+per representative — this campaign's layout variant, recorded in the
+calibration README) that instantiates the as-built model, replaces ONE
+action with a local PRE-FIX variant, and exposes it as a `calibStep`;
+the violation latches keep the as-built oracle. Verdict format:
+invariant @ step (counterexample depth in states, states
+generated / distinct).
+
+Classification legend: **ENC** — encodable, override written and run.
+**ENC-A** — encodable, dispositioned by analogy: the mechanism is
+encoded in the as-built model and the named sibling override (or wired
+check/witness) exercises the same machinery; not separately run.
+**NOT-ENC** — the model abstracts the mechanism away (missing
+dimension named, covering vehicle named). **N/A** — no modeled
+protocol content (docs/test/superseded). Splits noted in-row follow
+the 0a partition's one-row-per-commit rule.
+
+### G1 — session identity (8) → F1
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `db457374f` | stream_epoch written before the reconnect-rejection guards — a stale/rejected stream's disconnect evicted the legitimate worker (the I-056a class; the deadline/backstop accounting halves are retry-table rows, cross-referenced below) | ENC | `executorCalibF1StaleEpochApplies` (executor-f1-stale-epoch.qnt) | **FALSIFIES** staleStreamEventsAreInert @ calibStep (depth 5, 738/223) — as predicted |
+| `a6697c6b0` | the reader was spawned before the actor's accept/reject decision — a rejected (hijack/spoofed) connect still served the slot (controller G-F and log halves cross-referenced) | ENC | `executorCalibF1HijackAccepted` (executor-f1-hijack-accept.qnt) | **FALSIFIES** atMostOneLiveStreamPerExecutor @ calibStep (depth 3, 214/67) — as predicted |
+| `ea10e1d74` | ExecutorClaims HMAC chain + per-stream caps | NOT-ENC | token/claims plumbing and wire bounds below Model S's session resolution; coverage: token-mode/auth unit + VM tests, controller G-F row, G8 bounds tests | n/a |
+| `4f8f68ff8` | adopt-conflict + stream_epoch hardening (I-056 family) | ENC-A | the epoch-attribution machinery is what `executorCalibF1StaleEpochApplies` reverts; the adopt-conflict half is the same heartbeat-reconcile arm the F2 `be3ad068e` row covers | by analogy |
+| `3082598a3` | stale draining/degraded flags not cleared on reconnect (I-056a flag half) | ENC-A | the reconnect stale-flag clear is encoded in `connectAccept`; its loss is an eligibility/liveness regression below the safety set (the slot stays unofferable until the next heartbeat refresh) | by analogy (mechanism encoded; no safety latch) |
+| `451f2dc80` | I-048 zombie guards (heartbeats creating session state for unknown executors) | ENC-A | the I-048b entry-existence drop is the heartbeat's `present` precondition; its loss is exactly the `heartbeatCreatedEntry` latch of registrationRequiresBothHalves (by-construction list, Stage B) | by analogy (latch exists) |
+| `9a2dbc873` | SIGTERM-reconnect re-registered an idle slot (I-195 fast-path) | ENC-A | the idle fast-path is Model D's `streamOpenStart` drain-gate precondition and `gracefulExit` idle disjunct; its loss is reconnect churn, no safety latch | by analogy (mechanism encoded; no safety latch) |
+| `83e0b338f` | duplicate-Register handling (LogBuffers bound + step_down halves are log/lease content) | NOT-ENC | wire-level duplicate-message handling below the model's stream-open resolution; coverage: executor_service unit tests | n/a |
+
+### G2 — outcome delivery (11) → F2 (scheduler + builder halves)
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `0127cf854` | phantom running_builds never drained — the slot kept a binding the worker never reported and the claim never resolved (I-035) | ENC | `executorCalibF2PhantomNoDrain` (executor-f2-phantom-no-drain.qnt) | **FALSIFIES** confirmedPhantomIsDrained @ calibStep (depth 6, 6,177/921). **Checked-prediction correction:** the design predicted unresolvedClaimHasRepairArmed; that invariant HOLDS exhaustively over the same override (depth 25, 15,614,761/1,009,472) because its slot-binding disjunct counts the retained binding as an armed repair. Disposition: unstated property → `confirmedPhantomIsDrained` added to executorSession.qnt (by construction as-built, latch `confirmedPhantomRetained`), wired regimes re-verified green at unchanged state counts, falsified by this override. The new invariant is what makes the slot-binding disjunct of the armed-safety form a real arm. |
+| `be3ad068e` | a reconnecting worker's still-running build was not re-adopted into the DAG (I-066 lifecycle half; the I-062 FOD resource-fit half is SLA content, out of scope) | ENC (HOLDS probe) | `executorCalibF2NoAdopt` (executor-f2-no-adopt.qnt), fault-leader constants narrowed to the failover budget | **HOLDS** allInvariants @ calibStep, exhaustive (depth 33, 14,561,387/1,063,710); module-local witness canReachOrphanedInflight violated (depth 7, 1,115/224) so the orphaned-in-flight state is reachable. **Checked-prediction correction:** the design predicted unresolvedClaimHasRepairArmed / convergenceToGroundTruth; neither falsifies because the orphaned build's derivation is Ready (not a claim) and the first-to-resolve guards absorb the duplicate outcome. Disposition: redundant at model resolution — the adopt arm's protection is economy (the in-flight build is re-learned instead of re-run) and execution correlation, not a safety invariant; recorded as a Phase-1 / 0e-contract input (consistent with the replacement design's §4.2 deletion of the adopt mechanism). The pre-fix "recorded as phantom-failed" charging half is the retry campaign's attemptsChargedOnce surface (cross-campaign). |
+| `6b6cfcf10` | relay target swapped at request time, before the open confirmed (merged_bug_020) | ENC | `executorCalibF2dEagerSwap` (executor-f2d-eager-swap.qnt, Model D) | **FALSIFIES** reportSurvivesStreamChurn @ calibStep (depth 11, 2,496/1,125) — as predicted; relayOnlyIntoConfirmed falsifies on the same trace one step earlier |
+| `8201db59b` | completion_pending armed only at send_completion + no graceful half-close (bug_012 / bug_117) | ENC | `executorCalibF2dLateArmNoHalfClose` (executor-f2d-late-arm.qnt, Model D) | **FALSIFIES** noExitWithReportOwed @ calibStep (depth 8, 66/44) — as predicted |
+| `1353d3224` | drain not gated on completion-delivered | ENC-A | the drain gate is Model D's gracefulExit drain disjunct (¬completionPending) plus the noExitBlockedWhileOwed witness; same latch class as the `8201db59b` override | by analogy (sibling falsified exitWithReportOwed) |
+| `29222884e` | relay did not watch the target change (report stranded on a parked relay) | ENC-A | the relay park/swap/re-buffer machinery is the as-built relayTarget encoding; its loss is the same report-stranded-while-owed class the `6b6cfcf10` override falsifies | by analogy |
+| `aaa08721d` | dispatch coupled to heartbeat arrival (lost-assignment prevention; FUSE-warm bound + build_id sanitize halves out of scope) | NOT-ENC | the heartbeat-inline dispatch pacing is below the model's tick-granularity dispatch pass; coverage: `sched.actor.dispatch-decoupled` + dispatch pacing unit tests | n/a |
+| `41bc8dd97` | unsolicited-Cancelled completion left the drv stuck after the slot freed (batch-persist/event halves out of scope) | ENC-A | the completion-intake guards and the capacity-free hoist are the builderComplete encoding (accepted check before terminal transition); the Cancelled-classification content is the retry fold's | by analogy (mechanism encoded; verdict content retry-owned) |
+| `cc1ca02a7` | BuildSlot state not under one mutex (upload-scan half store-owned) | NOT-ENC | intra-process atomicity below Model D's atomic single slot; coverage: builder runtime unit tests | n/a |
+| `d653222cf` | early graceful-drain missing on the builder (gateway/FUSE halves out of scope) | ENC-A | the SIGTERM drain transition + drain gate are Model D's sigtermArrives/draining machinery; same latch class as `8201db59b` | by analogy |
+| `e4ed7b6a9` | builder DrainExecutor retry on not-leader | N/A | the mechanism was deleted by `fb3ea232d` (the builder no longer calls DrainExecutor — contradiction record C3); nothing to revert in the as-built protocol | n/a |
+
+### G3 — liveness calibration (12) → F3
+
+Per-executor sub-family (6):
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `5971778f8` | the reap applied the ×3 twice (per-tick increment gate + counter), so the observing tick never reaped a worker-time-stale slot (the handle_tick leader-gate half is the F6 gate family) | ENC | `executorCalibF3ReapCounterNotReached` (executor-f3-reap-strikes.qnt) | **FALSIFIES** silentSlotReapArmed @ calibStep (depth 6, 774/191) — the design row's enabled-implies-fires alternative; the leader-gate half is by analogy with the F6 override; the 30-vs-60 s numeric half is below bucketed-time resolution (covered by `sched.executor.liveness-window` + the lifecycle VM scenario) |
+| `1757790f2` | six of eight FMP stall sites uncredited — the reaper measured scheduler time, not worker time (I-178 family) | ENC | `executorCalibF3StallNoCredit` (executor-f3-stall-no-credit.qnt) | **FALSIFIES** noReapWhileFreshInWorkerTime @ calibStep (depth 6, 1,186/285) — as predicted |
+| `44a55a224` | stall-credit early-return removal | ENC-A | the same credit discipline the `1757790f2` override reverts (one more uncredited exit arm) | by analogy |
+| `e7b8ee91a` | heartbeat RPC timeout ≥ interval (bug_044) | NOT-ENC | builder-side RPC timeout arithmetic below the model's heartbeat-arrival abstraction; coverage: `builder.heartbeat.rpc-timeout` + heartbeat unit tests | n/a |
+| `d12b31027` | heartbeat task + DrainExecutor not aborted on ephemeral exit (I-142) | NOT-ENC | exit-mechanics hygiene outside the protocol state (the rule is in the Stage-A not-load-bearing list); coverage: builder shutdown tests | n/a |
+| `f9c89bb92` | no ephemeral idle-timeout exit (I-116) | ENC-A | the idle exit is folded into Model S's voluntary-exit path and Model D's gracefulExit idle disjunct; its loss is occupancy cost, no safety latch | by analogy (mechanism encoded; no safety latch) |
+
+Hung-node / node-aggregation sub-family (6): `99a17cd2f`,
+`468900350`, `9699ac8b2`, `6b152ee22`, `b9a131ded`, `b6d26c001` —
+**NOT-ENC**, exactly as pre-registered (the optional node regime was
+not attempted at 0c; the fallback was recorded there). Coverage: the
+`chaos` and `lifecycle/recovery` VM scenarios, the
+`detect_hung_nodes` unit tests, `sched.admin.hung-node-detector+3`;
+`99a17cd2f`'s controller-side touch is carried by the controller
+table's Remainder row; the signal's replacement-era successor is OA2.
+
+### G4 — death attribution (0 standalone) → F4: the hand-off rows
+
+The 0a partition records no standalone in-family G4 commit (the
+charging halves are retry-owned). F4's in-family content is the two
+dedup-lifecycle halves the retry close-out hands over, calibrated here
+as pre-registered (Model S, the exec_id-carrying map and the
+establishment action):
+
+| Hand-off half | Pre-fix behavior reverted | Class | Override | Verdict |
+|---|---|---|---|---|
+| the I-197 `last_completed` discriminator (and the late-disconnect-vs-reconnect race it closes) | a correlation entry minted for an already-classified death (race-ahead report) — the double-charge precondition | ENC | `executorCalibF4EntryNotMidBuild` (executor-f4-entry-not-mid-build.qnt) | **FALSIFIES** correlationEntryLifecycle @ calibStep (depth 7, 29,705/4,543) — as predicted |
+| the establishment-window guard (the 60 s TTL discipline of the establishment sweep) | establishment fired before the classifying report's window closed | ENC | `executorCalibF4EstablishBeforeWindow` (executor-f4-establish-early.qnt) | **FALSIFIES** establishmentOnlyAfterWindowCloses @ calibStep (depth 7, 15,114/2,454) — as predicted |
+
+### G5 — eligibility coherence (7) → F5
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `96d8092b8` | closed-stream executors stayed dispatchable until phantom detection (I-095) | ENC | `executorCalibF5OfferClosedStream` (executor-f5-offer-closed-stream.qnt) | **FALSIFIES** neverOfferUnrunnableWork @ calibStep (depth 5, 1,025/313) — as predicted |
+| `a62631c90` | fleet-exhaust verdict not system/feature-aware (the eligibility-content half handed over by the retry table's G7 row) | NOT-ENC | **checked-prediction correction:** the design's §3.5 table named this an F5 representative, but the 0a/0b encodability carve-out already pre-registers static-eligibility *content* (kind/system/feature arithmetic) as NOT-ENCODED — Model S carries the flags, not the arithmetic. Re-dispositioned to NOT-ENC naming that carve-out; coverage: `sched.dispatch.fleet-exhaust+3`, the placeable()/eligibility unit tests, the retry-table G7 cross-reference | n/a |
+| `20afe5154` | intent-matched pod resource-fit self-rejection (IceBackoff / solve_full halves are SLA content) | NOT-ENC | **checked-prediction correction:** same carve-out as above — resource-fit arithmetic is pre-registered NOT-ENCODED (the model's builder reject carries no resource dimension); coverage: `sched.assign.resource-fit`, assignment resource-fit unit tests, the freeze-detector observable | n/a |
+| `9ce1bcf1b` | PrefetchComplete not routed through the became-idle inline cap | NOT-ENC | inline-dispatch pacing below tick granularity (the model's deliberate latency carve-out); coverage: `sched.dispatch.became-idle-immediate` + pacing unit tests | n/a |
+| `c9382fd63` | became-idle inline dispatch uncapped per tick | NOT-ENC | same as above | n/a |
+| `a52c3ec80` | builder-side features derivation from executor_kind | NOT-ENC | eligibility content (features arithmetic); coverage: assignment/features unit tests | n/a |
+| `6fb244337` | PrefetchHint contents (inputSrcs) | NOT-ENC | warm-path content outside the session protocol; coverage: prefetch unit tests | n/a |
+
+### G6 — failover convergence (3) → F6
+
+| Commit | Pre-fix behavior reverted | Class | Override / coverage | Verdict |
+|---|---|---|---|---|
+| `c5c5ccd17` | reassign_derivations not leader-gated — a deposed leader requeued/poisoned from its stale DAG | ENC | `executorCalibF6DeposedReassign` (executor-f6-deposed-reassign.qnt) | **FALSIFIES** deposedLeaderSessionEventsAreInert @ calibStep (depth 7, 7,346/1,132) — as predicted |
+| `0ea9bd701` (design hash `5c47af5ad`) | heartbeat replies advertised the generation before recovery completed | NOT-ENC | **checked-prediction correction:** the design predicted DeposedLeaderSessionEventsAreInert / ConvergenceToGroundTruth, but the pre-fix ordering is not expressible at Model S's resolution — the model imports the leader environment as an abstract action whose re-acquire is atomically "generation moves ∧ recovery completes", and the harm (a worker fenced against the actual leader) is a multi-replica observable Model S deliberately does not carry. The advertise-before-recovery ordering is the rio-lease campaign's surface: `sched.lease.claim-before-advertise`, the leaderElection.qnt recovery-completion machinery (recovery keyed to the acquire epoch), and its wired checks own it. Recorded as a per-commit re-disposition, not a family-level encodability failure (F6's falsifying representative stands above) | n/a |
+| `374280877` | leader gates missing on ProcessCompletion / ReportExecutorTermination / Tick + per-generation map hygiene (breaker/gc-roots/log-seq halves out of scope) | ENC-A | the standby-drops-writes gate family is encoded as the believedLeader preconditions on completion intake, termination reports and the tick; the `c5c5ccd17` override falsifies the shared latch (durableWriteWhileDeposed) for the same gate class | by analogy (sibling falsified the shared latch) |
+
+### G7 — fleet-supply scheduler-side obligations (3) → F7
+
+`445928288` (ICE/ack arming), `461f6c661` (ICE clear semantics),
+`2c8abc9b6` (ICE-attempt orphan reap keyed on DAG state): **NOT-ENC**,
+exactly as pre-registered — F7 is not re-modeled; the
+`dispatched_cells` lifecycle Model S carries (armed at init, cleared
+at disconnect and the DAG-state sweep) is stated as a guarantee to
+Model J/N, not checked as an invariant here. Coverage: the F7
+obligations table (Stage A), `spawnCoherence.qnt` and the controller
+campaign's G-B calibration rows for the controller half, the §13a ICE
+unit tests and `sched.sla.hw-class.ice-mask` for the scheduler half.
+
+### G8 — input hardening (6) → F8
+
+`9917c384d`, `2143845d6`, `d40b3ee86`, `6b0de6e4e`, `7ffbf1415`,
+`496e6fb14`: **NOT-ENC by design** (the 0a/0b pre-registration) —
+bounds and binding gates at the gRPC boundary, no protocol state.
+Coverage: `sched.executor.input-bounds+2`,
+`sched.completion.output-membership`, `sched.log.phase-binding`,
+`sched.log.path-length+2`, `sec.executor.identity-token+2` and their
+unit tests at the boundary.
+
+### Known-defect cross-reference (outside the corpus, listed for checker honesty)
+
+The Stage-B falsification of `unresolvedClaimHasRepairArmed`
+(fault-leader / fault-persist) was adjudicated a real as-built defect
+and fixed by `1bbad1ee7` (outside the nine-path corpus; see the
+corpus-freeze section). Its calibration treatment is this
+cross-reference, not a re-derivation: the defect class (a
+post-recovery deferred claim never revisited) is exactly what the
+armed-safety invariant now checks on the fixed encoding — the
+fault-leader / fault-persist re-runs find no violation (Stage-B
+adjudication record above), and the F2/F6 calibration rows above
+exercise the same armed-safety and deposed-writes latches from the
+historical-fix direction. No override re-introduces the defect: the
+fix post-dates the corpus, so a revert module would calibrate the
+model against a defect the corpus never contained.
+
+### Cross-campaign-owned and out-of-scope rows (T-0d.4)
+
+- **Retry-owned (21):** the rows listed in the corpus pin above carry
+  their owning retry-table links unchanged; the 0d table does not
+  re-run them. The split halves of in-family rows (`db457374f`
+  deadline/backstop accounting, `a62631c90` exhaust verdict,
+  `c5c5ccd17` poison-branch content, `be3ad068e` phantom-failed
+  charging) stay with the retry table's G1/G5/G6/G7 rows as recorded
+  there.
+- **Controller-owned (43):** the controller Stage-C table exists and
+  is closed (verified at 0a), so the G7 controller half and the listed
+  G-A…G-G/FFD/Remainder rows are cross-referenced to it; none are
+  blocked-on-controller-Stage-C.
+- **Out-of-scope (56):** carried as OUTSIDE rows naming the owning
+  subsystem, exactly as partitioned at 0a (log relay/banner 13, SLA
+  solver 14, FUSE/overlay/store 7, controller pod-spec 4, auth 3,
+  build/DAG bookkeeping 3, builder execute-loop 2, pool
+  status/ComponentScaler 2, observability 2, test/spec hygiene 3, CA
+  chain 1, retry-config validation 1, lease machinery 1).
+
+### Closing tally vs the pre-registered denominators
+
+50 in-family rows above (8 G1 + 11 G2 + 12 G3 + 0 G4 + 7 G5 + 3 G6 +
+3 G7 + 6 G8) + 21 retry-owned + 43 controller-owned + 56 out-of-scope
+= **170 = the 0a/0b denominator**, with zero freeze delta. Per-family
+verdict shape: F1 2 falsifying representatives + 4 ENC-A + 2 NOT-ENC;
+F2 2 falsifying + 1 falsifying-after-property-addition + 1 HOLDS-probe
++ 4 ENC-A + 2 NOT-ENC + 1 N/A (Model D carries the builder half); F3 2
+falsifying + 2 ENC-A + 2 NOT-ENC + 6 NOT-ENC (hung-node, as
+pre-registered); F4 2 falsifying hand-off halves; F5 1 falsifying + 6
+NOT-ENC (2 of them recorded prediction corrections); F6 1 falsifying +
+1 ENC-A + 1 NOT-ENC (prediction correction); F7/G8 9 NOT-ENC as
+pre-registered. Every NOT-ENC row names its covering vehicle; every
+prediction-vs-verdict mismatch is recorded in-row as a
+checked-prediction correction (none silently).
+
+### Phase-1 / 0e-contract inputs from the dispositions
+
+- `confirmedPhantomIsDrained` is now part of the as-built contract the
+  replacement must preserve or consciously retire: under the pull
+  protocol the phantom class disappears with the push channel (no
+  scheduler-recorded binding the worker never saw), which the 0e
+  disposition table should state explicitly when it retires the
+  two-strike mechanism.
+- The `be3ad068e` HOLDS row is the calibration's evidence that the
+  heartbeat adopt arm is economy/correlation, not safety, at session
+  resolution — consistent with (and usable by) the §4.2 row that
+  deletes it; the 0e disposition table can cite this row instead of
+  asserting it.
+- The `0ea9bd701` re-disposition places the advertise-gating
+  obligation with the rio-lease campaign's claim-before-advertise
+  surface; the 0e lease-seam note (T-0e.2) should carry it as an
+  explicit dependency rather than an executor-map obligation.
+- The two F5 content re-dispositions keep the static-eligibility
+  arithmetic outside the model; the 0e contract's AD2 re-keying work
+  should treat the placeable()/eligibility unit-test suite as the
+  binding coverage for that content (no model backstop exists).
+- The over-budget regimes (fault-stream-conn, fault-process) remain
+  the open 0c stop-and-report; Stage C neither widened nor narrowed
+  that item — the calibration evidence for the families they carry
+  came from first-counterexample runs and wired witnesses, which is
+  the coverage the 0e regime-coverage input (plan T-0e.7 item 10)
+  must weigh.
+
 ## Open adjudications (0a tracking)
 
 Owner for every entry: B. Meurer (campaign owner; also the

@@ -22,10 +22,11 @@
 // has_capacity view of the chosen slot, which excludes closed streams).
 // PREDICTED: neverOfferUnrunnableWork falsifies — the counterexample is
 // a half-dead slot receiving a fresh assignment.
-// Constants are the wired fault-stream-conn regime's (the regime that
-// makes the half-dead binding reachable); its as-built baseline is the
-// Stage-B record's deep-simulation + witness evidence (the exhaustive
-// cfg is the open budget stop-and-report and is not re-attempted here).
+// Constants are the fault-stream-conn regime's (the regime that makes
+// the half-dead binding reachable; its witness checks are wired, its
+// exhaustive cfg is the open budget stop-and-report); the as-built
+// baseline is the Stage-B record's deep-simulation + witness evidence
+// (the exhaustive run is not re-attempted here).
 // =========================================================================
 module executorCalibF5OfferClosedStream {
   import executorSession(

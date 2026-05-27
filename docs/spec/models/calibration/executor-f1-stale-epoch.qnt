@@ -31,10 +31,11 @@
 // the I-056a interleaving (connection drop queues a disconnect at epoch
 // N, the worker reconnects at epoch N+1, the stale event then evicts the
 // re-bound entry).
-// Constants are the wired fault-stream-conn regime's (the regime that
-// carries F1's connection-fault content); its as-built baseline is the
-// Stage-B record's deep-simulation + witness evidence (the exhaustive
-// cfg is the open budget stop-and-report and is not re-attempted here).
+// Constants are the fault-stream-conn regime's (the regime that
+// carries F1's connection-fault content; its witness checks are wired,
+// its exhaustive cfg is the open budget stop-and-report); the as-built
+// baseline is the Stage-B record's deep-simulation + witness evidence
+// (the exhaustive run is not re-attempted here).
 // =========================================================================
 module executorCalibF1StaleEpochApplies {
   import executorSession(
