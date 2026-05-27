@@ -1168,6 +1168,35 @@ pub const M_067: () = ();
 /// backend changes its chunk-key format.
 pub const M_068: () = ();
 
+/// 069 — `assignments.node_name` + `builder_nodes`: §P0590 mountd
+/// node-scoping audit surfaces.
+///
+/// Both are written by the scheduler and **never read at mint or
+/// verify time** (ADR-022 mount-admission credentials, decision 3) —
+/// rio-mountd stays offline (no PG/kube/network) and the dispatch-time
+/// node resolution reads only in-memory state fed by the controller's
+/// acks.
+///
+/// - `assignments.node_name`: the kube `spec.nodeName` the dispatch's
+///   Mount-admission token was scoped to, recorded by
+///   `record_assignment` next to the rest of the per-dispatch audit
+///   row. NULL when no node was resolved (legacy/HMAC token, signing
+///   not configured, or an unbound mint under
+///   `mountd_node_binding = "prefer"`).
+/// - `builder_nodes`: node-lineage registry upserted from the
+///   controller's `AckSpawnedIntents.bound_intents` (first_seen on
+///   first appearance, last_seen refreshed each ack); `retired_at` is
+///   stamped by the scheduler's existing dead-node sweep
+///   (hung-node detection) plus a last_seen TTL, and cleared if the
+///   node name reappears. Operator/dashboard visibility only —
+///   structurally `cluster_key_history`-shaped (public facts), NOT
+///   `tenant_keys`-shaped (no secrets). The optional
+///   `mountd_signing_keys` audit table from the ADR stays skipped:
+///   issuance is auditable via the `assignments` row + the dispatch
+///   log line carrying the signing-key name, and key state via
+///   Secrets Manager + the trust-root gauge.
+pub const M_069: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

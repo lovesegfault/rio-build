@@ -213,6 +213,7 @@ fn migration_checksums_frozen() {
         (66, "5459af43b8db4d98215ca3dc7308e7f3b690b0e6b6fdf6e5f7a167c907e9113823e18330b865c918783107ca5b663571"),
         (67, "6ecbb5948c967cf98a6ee3ba727cc5f266f045d865f0dbc0d9b27e9a79899d22437844bf2ac6c83a689c6b1669de6501"),
         (68, "adb479dd655953bc3af90307bad572337826a4949d4c9e0c577ad94c375be0339b9d492a2bdac4daf631d197b7bf3c21"),
+        (69, "8ba43e7cc2c58b579890200105c12048cb6eaefe6cc5bf27cd233abde1b7fbd36670d0c7d4fca7a6480357ffcb65cb84"),
     ];
 
     let pinned: std::collections::HashMap<i64, &str> = PINNED.iter().copied().collect();
