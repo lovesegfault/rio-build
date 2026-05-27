@@ -71,6 +71,8 @@ export const adminMock = {
   mintExecutorTokens: vi.fn(),
   ackSpawnedIntents: vi.fn(),
   reportExecutorTermination: vi.fn(),
+  reportAttemptOutcome: vi.fn(),
+  listOpenAttempts: vi.fn(),
   injectBuildSample: vi.fn(),
   setSlaOverride: vi.fn(),
   listSlaOverrides: vi.fn(),
