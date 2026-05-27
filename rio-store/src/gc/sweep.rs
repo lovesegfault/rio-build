@@ -368,6 +368,21 @@ async fn delete_swept_path(
         .bind(store_path_hash)
         .execute(&mut **tx)
         .await?;
+
+    // Step 2c: re-DELETE path_tenants now that the narinfo row is gone.
+    // Defense in depth against the verified re-upload attribution race
+    // (`r[store.put.tenant-attribution+2]`): that flow share-locks the
+    // narinfo+manifests rows before upserting, so it normally serializes
+    // against this transaction — but an attribution that nevertheless
+    // committed between step 2a' and the narinfo DELETE (e.g. a future
+    // writer that skips the lock) would otherwise survive as a dangling
+    // `path_tenants` row pointing at a deleted narinfo and grant
+    // wrong-tenant visibility on a later re-upload of the same path.
+    sqlx::query("DELETE FROM path_tenants WHERE store_path_hash = $1")
+        .bind(store_path_hash)
+        .execute(&mut **tx)
+        .await?;
+
     Ok((deleted.rows_affected() > 0).then_some(castore_refs))
 }
 

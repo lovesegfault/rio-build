@@ -867,10 +867,19 @@ pub(in crate::grpc) async fn verify_existing_and_attribute_in_conn(
     computed_size: u64,
     ctx_label: &str,
 ) -> Result<(), Status> {
+    // FOR SHARE (both the narinfo row and its manifests row): a
+    // concurrent GC sweep first claims the manifests row FOR UPDATE and
+    // later DELETEs the narinfo row — both conflict with the share lock,
+    // so sweep-vs-attribution serializes instead of racing. Sweep-first:
+    // this SELECT waits, then sees no 'complete' row → `Aborted` below.
+    // Attribution-first: the sweep waits at its claim, then its
+    // re-check sees the just-committed `path_tenants` row (in-retention)
+    // and resurrects the path instead of stranding the new attribution.
     let existing: Option<(Vec<u8>, i64)> = sqlx::query_as(
         "SELECT n.nar_hash, n.nar_size \
            FROM narinfo n JOIN manifests m USING (store_path_hash) \
-          WHERE n.store_path_hash = $1 AND m.status = 'complete'",
+          WHERE n.store_path_hash = $1 AND m.status = 'complete' \
+            FOR SHARE",
     )
     .bind(store_path_hash)
     .fetch_optional(&mut *conn)
@@ -954,5 +963,206 @@ mod verify_nar_tests {
         let incremental: [u8; 32] = hasher.finalize().into();
         assert_eq!(incremental, digest(&buf));
         assert_eq!(buf, b"first second third");
+    }
+}
+
+/// PG-backed tests for the verified re-upload's transactional half
+/// ([`verify_existing_and_attribute_in_conn`]): the GC-raced `Aborted`
+/// arm, the mismatch rejection + its counter outcome, and the FOR SHARE
+/// serialization against a concurrent GC sweep.
+#[cfg(test)]
+mod repush_attribution_tests {
+    use super::*;
+    use crate::test_helpers::{StoreSeed, path_hash, seed_tenant};
+    use rio_test_support::TestDb;
+    use rio_test_support::fixtures::test_store_path;
+    use rio_test_support::metrics::CountingRecorder;
+
+    // r[verify store.put.tenant-attribution+2]
+    /// The narinfo lookup finding no `'complete'` row (GC or an abort
+    /// won the race after the placeholder claim said complete) maps to
+    /// `Aborted` — a retryable status, NOT `InvalidArgument` — so the
+    /// client's retry lands on the fresh-upload path. Both "rows gone"
+    /// and "manifest demoted to `'uploading'`" take that arm, and
+    /// neither attributes anything.
+    #[tokio::test]
+    async fn verify_aborts_when_path_no_longer_complete() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "repush-aborted").await;
+
+        // (a) No narinfo/manifests rows at all (GC sweep finished).
+        let gone_path = test_store_path("repush-aborted-gone");
+        let gone_hash = path_hash(&gone_path);
+        let mut tx = db.pool.begin().await.expect("begin");
+        let err = verify_existing_and_attribute_in_conn(
+            &mut tx, &gone_path, &gone_hash, tenant, [0xAA; 32], 16, "test",
+        )
+        .await
+        .expect_err("missing narinfo must not attribute");
+        assert_eq!(err.code(), tonic::Code::Aborted, "{err:?}");
+        drop(tx);
+
+        // (b) Rows exist but the manifest is no longer 'complete'.
+        let path = test_store_path("repush-aborted-uploading");
+        let hash = StoreSeed::raw_path(&path)
+            .with_manifest_status("uploading")
+            .with_nar_hash([0xAB; 32])
+            .with_nar_size(16)
+            .seed(&db.pool)
+            .await;
+        let mut tx = db.pool.begin().await.expect("begin");
+        let err = verify_existing_and_attribute_in_conn(
+            &mut tx, &path, &hash, tenant, [0xAB; 32], 16, "test",
+        )
+        .await
+        .expect_err("non-complete manifest must not attribute");
+        assert_eq!(err.code(), tonic::Code::Aborted, "{err:?}");
+        drop(tx);
+
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM path_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "neither Aborted arm may attribute");
+    }
+
+    // r[verify store.put.tenant-attribution+2]
+    /// Wrong content is rejected with `InvalidArgument` (echoing
+    /// neither stored hash nor size), attributes nothing, and counts
+    /// `rio_store_repush_attribution_total{outcome="mismatch"}` — the
+    /// label scheme described in `describe_metrics` /
+    /// docs/gen/metrics.json. The granted outcome stays at zero.
+    #[tokio::test]
+    async fn verify_mismatch_counts_and_grants_nothing() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "repush-mismatch").await;
+        let path = test_store_path("repush-mismatch");
+        let stored_hash = [0x11u8; 32];
+        let hash = StoreSeed::raw_path(&path)
+            .with_nar_hash(stored_hash)
+            .with_nar_size(64)
+            .seed(&db.pool)
+            .await;
+
+        // Thread-local recorder: #[tokio::test] runs a current-thread
+        // runtime, so the counter! below lands in this recorder.
+        let recorder = CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&recorder);
+
+        // Size matches, hash differs → mismatch arm.
+        let mut tx = db.pool.begin().await.expect("begin");
+        let err = verify_existing_and_attribute_in_conn(
+            &mut tx, &path, &hash, tenant, [0x22; 32], 64, "test",
+        )
+        .await
+        .expect_err("wrong content must be rejected");
+        assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+        assert!(
+            err.message()
+                .contains("does not match the already-stored path"),
+            "rejection should be loud: {err:?}"
+        );
+        assert!(
+            !err.message().contains(&hex::encode(stored_hash)),
+            "rejection must not echo the stored hash: {err:?}"
+        );
+        drop(tx);
+
+        assert_eq!(
+            recorder.get("rio_store_repush_attribution_total{outcome=mismatch}"),
+            1,
+            "mismatch outcome must be counted; saw: {:?}",
+            recorder.all_keys()
+        );
+        assert_eq!(
+            recorder.get("rio_store_repush_attribution_total{outcome=granted}"),
+            0,
+            "nothing may be granted on mismatch"
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM path_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 0, "a mismatching re-upload must not attribute");
+    }
+
+    // r[verify store.put.tenant-attribution+2]
+    // r[verify store.gc.sweep-path-tenants]
+    /// FOR SHARE serialization against the GC sweep: an attribution
+    /// transaction that verified (and share-locked) the path before the
+    /// sweep claims it makes the sweep wait; once the attribution
+    /// commits, the sweep's per-path re-check sees the new in-retention
+    /// `path_tenants` row and resurrects the path instead of deleting
+    /// the narinfo out from under the freshly granted attribution.
+    /// Whatever the interleaving, the end state must never be "narinfo
+    /// gone but path_tenants row present" — the dangling row
+    /// `delete_swept_path`'s post-narinfo re-delete guards against.
+    #[tokio::test]
+    async fn concurrent_sweep_serializes_with_attribution() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "repush-sweep-race").await;
+        let path = test_store_path("repush-sweep-race");
+        let nar_hash = [0x5E; 32];
+        let hash = StoreSeed::raw_path(&path)
+            .with_nar_hash(nar_hash)
+            .with_nar_size(128)
+            .seed(&db.pool)
+            .await;
+
+        // Attribution tx: verify + upsert, deliberately NOT yet
+        // committed — it holds the FOR SHARE locks the sweep must
+        // serialize behind.
+        let mut tx = db.pool.begin().await.expect("begin");
+        verify_existing_and_attribute_in_conn(&mut tx, &path, &hash, tenant, nar_hash, 128, "test")
+            .await
+            .expect("matching content verifies and attributes");
+
+        // Concurrent GC sweep of the same path on its own connection.
+        let pool = db.pool.clone();
+        let sweep_hash = hash.clone();
+        let sweeper = tokio::spawn(async move {
+            let shutdown = rio_common::signal::Token::new();
+            crate::gc::sweep::sweep(&pool, None, vec![sweep_hash], false, &shutdown).await
+        });
+        // Let the sweep reach its row locks (it must block on the open
+        // attribution tx). The sleep only widens the raced window — the
+        // assertions below hold for every legal interleaving, so a slow
+        // start cannot flip the test red.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        tx.commit().await.expect("attribution commit");
+
+        let stats = sweeper
+            .await
+            .expect("sweep task join")
+            .expect("sweep must not error");
+
+        let narinfo_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM narinfo WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .expect("narinfo count");
+        let tenant_rows: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM path_tenants WHERE store_path_hash = $1")
+                .bind(&hash)
+                .fetch_one(&db.pool)
+                .await
+                .expect("path_tenants count");
+
+        // Invariant for every interleaving: never a dangling junction row.
+        assert!(
+            !(narinfo_rows == 0 && tenant_rows > 0),
+            "a swept path must never leave a dangling path_tenants row"
+        );
+        // The committed attribution is inside the tenant's retention
+        // window, so the sweep's re-check resurrects the path rather
+        // than sweeping it.
+        assert_eq!(
+            stats.paths_resurrected, 1,
+            "sweep must resurrect, not delete"
+        );
+        assert_eq!(stats.paths_deleted, 0);
+        assert_eq!(narinfo_rows, 1, "path survives the sweep");
+        assert_eq!(tenant_rows, 1, "attribution survives the sweep");
     }
 }
