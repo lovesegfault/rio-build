@@ -1,15 +1,16 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
-  # NOT WIRED YET (P0560 round 3b finding): the in-flight build did
-  # not survive the broker force-restart — every attempt failed as an
-  # infrastructure failure right after its hold window and the build
-  # ended `dependency_failed` after the orphan watcher reaped it. The
-  # orphan-scan + cache-survival half of the subtest passed (the
-  # planted staging orphan was reaped, /var/rio/{cache,chunks}
-  # survived, the restarted daemon served new mounts). Wire it back
-  # into vm-castore-e2e-faults once the in-flight-build story is
-  # understood (builder.mountd.orphan-scan stays verified by
-  # vm-mountd in the meantime).
+  # P0560 round 3b finding (c), now fixed: the in-flight build DID
+  # survive the restart (its reads kept working) but every attempt then
+  # failed at output upload with "path not authorized by assignment
+  # token" — gRPC-direct submissions carry no expected_output_paths, so
+  # the HMAC claim authorized nothing; the scheduler now backfills them
+  # from the inlined drv (rio-scheduler/src/domain.rs). The restarted
+  # daemon's startup orphan scan was also reaping the LIVE build's
+  # staging dir; it now skips dirs whose builder still holds the
+  # .rio-live flock (castore_fuse/{mount,mountd,sweep}.rs) while still
+  # reaping genuinely orphaned ones — which this subtest asserts both
+  # ways (planted orphan reaped, live staging + caches intact).
   # ══════════════════════════════════════════════════════════════════
   # mountd-restart — broker restart is non-disruptive + orphan scan
   # ══════════════════════════════════════════════════════════════════
@@ -65,10 +66,16 @@ scope: with scope; ''
           f"test -n \"$p\" && test \"$p\" != \"{old_mountd}\"",
           timeout=180,
       )
-      # Orphan scan reaped the planted dir; the shared caches survived.
+      # Orphan scan reaped the planted dir; the in-flight build's own
+      # staging dir (its builder holds the .rio-live flock) and the
+      # shared caches survived.
       k3s_agent.wait_until_succeeds(
           "! test -e /var/rio/staging/castore-e2e-orphan", timeout=90
       )
+      build_id_mr = drv_mr.rsplit("/", 1)[-1].replace(".", "_")
+      k3s_agent.succeed(f"test -d /var/rio/staging/{build_id_mr}")
+      print(f"mountd-restart: live build's staging /var/rio/staging/{build_id_mr} "
+            "survived the restarted daemon's orphan scan")
       k3s_agent.succeed(f"test -e {cache_path(b3_small1m)}")
       k3s_agent.succeed(f"test -e {cache_path(b3_warm4k)}")
       k3s_agent.succeed("find /var/rio/chunks -type f -print -quit | grep -q .")

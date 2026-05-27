@@ -1671,29 +1671,37 @@ in
       #   integrity_fail_total == 1, the reader gets EIO, nothing is
       #   promoted, and the store layer never sees it.
       "integrity-fail"
-      # TODO: three further fault fragments exist under
-      # scenarios/castore-e2e/ but are NOT wired yet — each surfaced an
-      # unexpected end-to-end behavior that needs its own investigation
-      # before the subtest can hold its assertion (P0560 round 3b
-      # findings; evidence in the fragment headers and the round notes):
-      #   - eio-infra-retry: an input-read EIO (store chunk objects
-      #     offline) left the derivation terminally `poisoned` instead
-      #     of re-queued as an infrastructure failure
-      #     (builder.result.input-eio-is-infra).
-      #   - eio-circuit-breaker: with rio-store scaled to 0 mid-build
-      #     the fetch breaker did not open within several minutes of
-      #     consecutive failed opens (builder.fs.fetch-circuit), and the
-      #     client-less build was reaped by the orphan watcher first.
-      #   - mountd-restart: the in-flight build did not survive the
-      #     broker force-restart (every retry then failed as an
-      #     infrastructure failure and the build ended
-      #     `dependency_failed`), although the orphan scan + cache
-      #     survival half of the subtest passed.
-      # Their spec-coverage markers move back to the plan's coverage
-      # table until the behaviors are understood and the subtests can
-      # be wired green.
+      # r[verify builder.mountd.orphan-scan]
+      #   mountd-restart: a build holding a passthrough fd survives the
+      #   broker force-restart and completes; the restarted daemon's
+      #   startup scan reaps a planted orphan staging dir while leaving
+      #   the in-flight build's (live-sentinel-held) staging and the
+      #   shared /var/rio/{cache,chunks} trees alone; a fresh build then
+      #   does a full miss → fetch → Promote against the new daemon.
+      #   (Round 3b finding (c) was the empty expected_outputs HMAC
+      #   claim on gRPC-direct submissions failing every upload, plus
+      #   the orphan scan reaping the live build's staging — both fixed.)
+      "mountd-restart"
+      # r[verify builder.result.input-eio-is-infra]
+      #   eio-infra-retry: with the store's chunk objects offline the
+      #   daemon's execve of a castore-served builder fails; the
+      #   executor reclassifies the daemon's exit-code-1 wrap (the
+      #   `executing '<root>': Input/output error` log-tail shape) as
+      #   InfrastructureFailure, the scheduler re-queues without
+      #   poisoning, and the same derivation completes once the chunks
+      #   are restored. (Round 3b finding (a) was the MiscFailure-only
+      #   status gate missing the post-`\2` PermanentFailure wrap.)
+      "eio-infra-retry"
+      # r[verify builder.fs.fetch-circuit]
+      #   eio-circuit-breaker: rio-store scaled to 0 mid-build — six
+      #   concurrent never-cached opens fail within their fetch budgets,
+      #   the breaker opens (circuit_open=1), and the next open fails
+      #   fast against the open breaker. Last: the most disruptive fault
+      #   (whole-store outage), so a restoration hiccup cannot poison a
+      #   later subtest.
+      "eio-circuit-breaker"
     ];
-    globalTimeout = 1500;
+    globalTimeout = 1800;
   };
 }
 # Spike: P0564 — confirm /dev/kvm via extra-sandbox-paths (hostPath

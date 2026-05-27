@@ -1,13 +1,14 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
-  # NOT WIRED YET (P0560 round 3b finding): with rio-store scaled to
-  # 0 mid-build, the fetch breaker did not open within several
-  # minutes of consecutive failed opens (sequential or concurrent),
-  # and the client-less build was reaped by the scheduler's orphan
-  # watcher (300 s) before the gate could conclude. The subtest now
-  # prints a counters/pod-phase timeline while it waits; wire it back
-  # into vm-castore-e2e-faults once the breaker behavior under a real
-  # outage is understood (builder.fs.fetch-circuit).
+  # P0560 round 3b finding (b): the first two wirings (sequential
+  # reads, then a 300 s gate) never saw the breaker open before their
+  # deadline / the orphan watcher. This wiring reads the six inputs
+  # CONCURRENTLY (≈ one fetch budget of wall time even if every open
+  # rides its full 60 s jit_fetch_timeout), sizes the gate at 360 s,
+  # and prints a counters/pod-phase timeline every poll so a failure
+  # documents exactly how the fetch path behaved (opens reaching the
+  # fetch? eio counted? failures recorded but breaker closed?) instead
+  # of a bare timeout.
   # ══════════════════════════════════════════════════════════════════
   # eio-circuit-breaker — store outage mid-build: bounded EIO + breaker
   # ══════════════════════════════════════════════════════════════════
@@ -71,12 +72,15 @@ scope: with scope; ''
           m = parse_prometheus(raw_m) if rc_m == 0 else {}
           n_circuit = series(m, "rio_builder_castore_fuse_circuit_open")
           tl_opens = series(m, "rio_builder_castore_fuse_upcalls_total", must=('op="open"',))
+          tl_done = series(m, "rio_builder_castore_fuse_open_seconds_count")
+          tl_hits = series(m, "rio_builder_objects_cache_hit_total")
           tl_miss = series(m, "rio_builder_castore_fuse_open_case_total", must=('case="miss_small"',))
           tl_eio = series(m, "rio_builder_castore_fuse_eio_total")
           tl_retries = series(m, "rio_builder_castore_fuse_fetch_retries_total")
           print(
               "eio-circuit-breaker timeline: "
               f"t={int(time.time() - t_down)}s pod={phase} opens={tl_opens} "
+              f"opens_done={tl_done} hits={tl_hits} "
               f"miss_small={tl_miss} eio={tl_eio} retries={tl_retries} "
               f"circuit_open={n_circuit}"
           )

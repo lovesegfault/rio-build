@@ -817,9 +817,9 @@ let
         msg = "eio-circuit-breaker scales the store away — keep it after the mountd bounce";
       }
       {
-        before = "eio-circuit-breaker";
-        after = "eio-infra-retry";
-        msg = "eio-infra-retry needs the store healthy again — run it after the breaker subtest restored it";
+        before = "eio-infra-retry";
+        after = "eio-circuit-breaker";
+        msg = "eio-circuit-breaker takes the whole store down — keep the most disruptive fault last so a restoration hiccup cannot poison later subtests";
       }
     ];
   };

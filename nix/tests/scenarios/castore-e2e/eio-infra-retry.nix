@@ -1,13 +1,17 @@
 # castore-e2e subtest fragment — composed by scenarios/castore-e2e.nix mkTest.
 scope: with scope; ''
-  # NOT WIRED YET (P0560 round 3b finding): on the first run of this
-  # subtest the derivation went terminally `poisoned` after a single
-  # input-read-EIO attempt instead of being re-queued as an
-  # infrastructure failure (builder.result.input-eio-is-infra). The
-  # subtest now dumps the executor message and the scheduler's
-  # classification decision when that happens; wire it back into
-  # vm-castore-e2e-faults once the classification gap is understood
-  # and fixed.
+  # P0560 round 3b finding (a), now fixed: the first wiring of this
+  # subtest left the derivation terminally `poisoned` after a single
+  # attempt. Root cause: the daemon child writes its `\2` setup-done
+  # marker BEFORE execve, so an exec-time EIO surfaces as a non-zero
+  # builder exit (PermanentFailure, "builder failed with exit code 1")
+  # with the `executing '<root>': Input/output error` line only in the
+  # log-line tail — and the executor's reclassifier only accepted
+  # MiscFailure. The classifier now gates on
+  # {Misc,Permanent,Transient}Failure (executor/outputs.rs); the
+  # recovery half additionally needs the scheduler's expected-output
+  # backfill for gRPC-direct submissions (rio-scheduler/src/domain.rs)
+  # so the retry's upload is authorized by its assignment token.
   # ══════════════════════════════════════════════════════════════════
   # eio-infra-retry — EIO on an input read is infra, never a poison
   # ══════════════════════════════════════════════════════════════════
