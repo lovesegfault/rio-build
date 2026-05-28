@@ -1948,7 +1948,7 @@ impl DagActor {
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         let grpc_timeout = self.grpc_timeout;
-        let r = match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
+        match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
             Ok(Ok(resp)) => {
                 self.cache_breaker.record_success();
                 Some(resp.into_inner().missing_paths.into_iter().collect())
@@ -1965,8 +1965,7 @@ impl DagActor {
                       "reconcile: FindMissingPaths timed out, assuming all orphans incomplete");
                 None
             }
-        };
-        r
+        }
     }
 
     /// Reconcile path for an orphaned assignment whose outputs ARE in
