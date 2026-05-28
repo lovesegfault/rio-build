@@ -1,0 +1,2 @@
+{"session":0,"offset_s":0.0,"targets":[{"drv":"/nix/store/d2222222222222222222222222222222-app.drv","outputs":["*"]},{"drv":"/nix/store/d3333333333333333333333333333333-oom.drv","outputs":["*"]}]}
+{"session":1,"offset_s":0.0,"targets":[{"drv":"/nix/store/d1111111111111111111111111111111-dep.drv","outputs":["out"]}]}

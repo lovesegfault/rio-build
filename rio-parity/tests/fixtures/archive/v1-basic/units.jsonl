@@ -1,0 +1,3 @@
+{"drv":"/nix/store/d1111111111111111111111111111111-dep.drv","label":"pkgs.dep.x86_64-linux","system":"x86_64-linux","outputs":{"out":"/nix/store/f1111111111111111111111111111111-dep"},"identity_divergent":false}
+{"drv":"/nix/store/d2222222222222222222222222222222-app.drv","label":"pkgs.app.x86_64-linux","system":"x86_64-linux","outputs":{"out":"/nix/store/f2222222222222222222222222222222-app"},"identity_divergent":false}
+{"drv":"/nix/store/d3333333333333333333333333333333-oom.drv","label":"pkgs.oom.x86_64-linux","system":"x86_64-linux","outputs":{"out":"/nix/store/f3333333333333333333333333333333-oom"},"required_features":["big-parallel"],"identity_divergent":false}

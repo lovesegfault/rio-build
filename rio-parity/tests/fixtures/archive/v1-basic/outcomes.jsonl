@@ -1,0 +1,3 @@
+{"drv":"/nix/store/d1111111111111111111111111111111-dep.drv","outcome":"built","outputs":{"out":{"nar_hash_hex":"1111111111111111111111111111111111111111111111111111111111111111","nar_size":120}}}
+{"session":0,"drv":"/nix/store/d2222222222222222222222222222222-app.drv","outcome":"failed","detail":"status=1"}
+{"drv":"/nix/store/d3333333333333333333333333333333-oom.drv","outcome":"resource-exhausted","detail":"status=16"}

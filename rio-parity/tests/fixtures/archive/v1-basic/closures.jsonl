@@ -1,0 +1,3 @@
+{"drv":"/nix/store/d1111111111111111111111111111111-dep.drv","inputs":[],"srcs":["/nix/store/g1111111111111111111111111111111-src"],"outputs":{"out":"/nix/store/f1111111111111111111111111111111-dep"}}
+{"drv":"/nix/store/d2222222222222222222222222222222-app.drv","inputs":["/nix/store/d1111111111111111111111111111111-dep.drv"],"srcs":[],"outputs":{"out":"/nix/store/f2222222222222222222222222222222-app"}}
+{"drv":"/nix/store/d3333333333333333333333333333333-oom.drv","inputs":[],"srcs":[],"outputs":{"out":"/nix/store/f3333333333333333333333333333333-oom"}}

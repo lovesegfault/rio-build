@@ -84,7 +84,10 @@ impl ReplayArchive {
                 path.display()
             );
         }
+        // Every v1 validation failure names the archive being opened, so a
+        // caller juggling several archives can tell which one is bad.
         Self::open_v1(path, backend, manifest_bytes)
+            .with_context(|| format!("open replay archive {}", path.display()))
     }
 
     /// The v1 open path: parse the manifest, verify the integrity tables,
@@ -120,8 +123,26 @@ impl ReplayArchive {
             );
         }
         for (member, digest) in &manifest.files {
-            let Some(bytes) = staged.get(member.as_str()) else {
-                bail!("{member} is listed in manifest.files but absent from the archive");
+            // `files` keys are plain root-level member basenames (the v1
+            // layout never nests metadata members); refuse separators and
+            // traversal outright so a hostile manifest cannot point the
+            // digest check at arbitrary paths.
+            ensure!(
+                !member.is_empty() && !member.contains('/') && !member.contains(".."),
+                "manifest.files key {member:?} is not a plain root-level member name"
+            );
+            // Members this reader does not know about (optional members added
+            // by a later v1 minor) are read and digest-checked too: the
+            // `files` table is authoritative for everything it lists.
+            let unknown_member_bytes;
+            let bytes = match staged.get(member.as_str()) {
+                Some(bytes) => bytes.as_slice(),
+                None => {
+                    unknown_member_bytes = backend.read_file(member)?.ok_or_else(|| {
+                        anyhow!("{member} is listed in manifest.files but absent from the archive")
+                    })?;
+                    unknown_member_bytes.as_slice()
+                }
             };
             ensure!(
                 bytes.len() as u64 == digest.size,
@@ -229,9 +250,11 @@ impl ReplayArchive {
             None => Vec::new(),
         };
 
-        // narinfo sidecars: a sidecar that fails to parse is skipped with a
-        // warning — one bad sidecar shouldn't take down the whole campaign;
-        // the affected path simply won't be uploadable from the archive.
+        // narinfo sidecars: an unparseable sidecar is a hard error naming the
+        // offending file. Skipping it could never help a v1 archive anyway —
+        // a skipped sidecar is missing from the recomputed narinfo listing
+        // digest, so the aggregate check below would reject the archive with
+        // a far less actionable message.
         let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
         let mut narinfo_digests: Vec<(String, String)> = Vec::new();
         for entry in backend.list_dir(NARINFO_DIR)?.unwrap_or_default() {
@@ -245,20 +268,14 @@ impl ReplayArchive {
             let bytes = backend
                 .read_file(&rel)?
                 .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
-            let parsed = std::str::from_utf8(&bytes)
+            let narinfo = std::str::from_utf8(&bytes)
                 .map_err(anyhow::Error::from)
-                .and_then(|text| super::parse_narinfo_sidecar(text, stem));
-            match parsed {
-                Ok(narinfo) => {
-                    narinfo_digests
-                        .push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
-                    // Key by the hash part so `<hash>-<name>.narinfo` sidecar
-                    // naming resolves the same as the canonical
-                    // `<hash>.narinfo`.
-                    narinfos.insert(super::hash_part(stem).to_string(), narinfo);
-                }
-                Err(err) => tracing::warn!("skipping unparseable {rel}: {err:#}"),
-            }
+                .and_then(|text| super::parse_narinfo_sidecar(text, stem))
+                .with_context(|| format!("unparseable narinfo sidecar {rel}"))?;
+            narinfo_digests.push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
+            // Key by the hash part so `<hash>-<name>.narinfo` sidecar naming
+            // resolves the same as the canonical `<hash>.narinfo`.
+            narinfos.insert(super::hash_part(stem).to_string(), narinfo);
         }
 
         // nix/store/ entry index: hash part → entry. Drives the store-path
@@ -522,6 +539,11 @@ impl ReplayArchive {
     /// On the DwarFS backend all content reads serialize on an internal
     /// lock, so callers should not expect parallel-dump throughput.
     pub fn dump_nar(&self, store_path: &str) -> Result<Vec<u8>> {
+        // TODO: add a streaming variant (NAR bytes written into an
+        // `impl Write` while hashing) before the supply path starts uploading
+        // large embedded store paths; buffering the whole NAR in memory is
+        // fine for the fixture-sized paths handled today but not for
+        // multi-gigabyte toolchain closures.
         let entry = self
             .store_entries
             .get(super::hash_part(store_path))
@@ -596,6 +618,26 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains(from), "{member} does not contain {from:?}");
         std::fs::write(&path, text.replace(from, to)).unwrap();
+    }
+
+    /// Re-point `manifest.files[member]` at the member's current on-disk
+    /// bytes. The manifest itself is not digest-protected, so tests can edit
+    /// a member and then refresh its entry to get past the integrity gate
+    /// and reach the record-level validation behind it.
+    fn refresh_files_entry(root: &Path, member: &str) {
+        let bytes = std::fs::read(root.join(member)).unwrap();
+        let manifest_path = root.join(MANIFEST_MEMBER);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"][member] = serde_json::json!({
+            "sha256": identity::sha256_hex(&bytes),
+            "size": bytes.len(),
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -846,6 +888,129 @@ mod tests {
         assert!(
             err.contains("does not match its narinfo sidecar"),
             "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unknown_optional_member_listed_in_files_is_digest_checked() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // A later v1 minor may add an optional member this reader does not
+        // know about; listing it in manifest.files must not break open.
+        std::fs::write(root.join("fidelity.json"), "{\"checked\": true}\n").unwrap();
+        refresh_files_entry(&root, "fidelity.json");
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.format(), ArchiveFormat::V1);
+
+        // ... but the listed digest is still enforced for it.
+        std::fs::write(root.join("fidelity.json"), "{\"checked\": false}\n").unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("sha256 mismatch") || err.contains("size mismatch"),
+            "got: {err}"
+        );
+        assert!(err.contains("fidelity.json"), "got: {err}");
+    }
+
+    #[test]
+    fn files_keys_with_path_separators_are_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let manifest_path = root.join(MANIFEST_MEMBER);
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["files"]["notes/readme.txt"] = serde_json::json!({
+            "sha256": "0".repeat(64),
+            "size": 1,
+        });
+        std::fs::write(
+            &manifest_path,
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("not a plain root-level member name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn unparseable_narinfo_sidecar_is_an_open_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let sidecar_name = format!("{}.narinfo", hash_part(SRC_PATH));
+        let sidecar = root.join(NARINFO_DIR).join(&sidecar_name);
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let broken = text.replace("NarSize: ", "NarSize: not-a-number-");
+        assert_ne!(broken, text, "sidecar has a NarSize line to break");
+        std::fs::write(&sidecar, broken).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("unparseable narinfo sidecar"), "got: {err}");
+        assert!(err.contains(&sidecar_name), "got: {err}");
+    }
+
+    #[test]
+    fn cleartext_relay_substituter_is_rejected_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // The substituter lists live in the manifest, which is not covered by
+        // `files`, so the edit reaches the scheme check rather than a digest
+        // error.
+        rewrite_member(
+            &root,
+            MANIFEST_MEMBER,
+            "https://cache.example.org",
+            "http://cache.example.org",
+        );
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("only https:// and s3:// are allowed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn empty_request_targets_are_rejected_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let path = root.join(REQUESTS_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"session\":2,\"offset_s\":0.0,\"targets\":[]}\n");
+        std::fs::write(&path, text).unwrap();
+        refresh_files_entry(&root, REQUESTS_MEMBER);
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("non-empty targets"), "got: {err}");
+    }
+
+    #[test]
+    fn duplicate_outcome_records_keep_the_last() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // Re-record the session-less dep.drv truth as `failed`; the later
+        // record supersedes the Built one staged by the writer.
+        let path = root.join(OUTCOMES_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(&format!(
+            "{{\"drv\":\"{DEP_DRV}\",\"outcome\":\"failed\"}}\n"
+        ));
+        std::fs::write(&path, text).unwrap();
+        refresh_files_entry(&root, OUTCOMES_MEMBER);
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.outcomes().len(), 2, "duplicate keys collapse");
+        assert_eq!(
+            archive.expected_outcome(7, DEP_DRV).unwrap().outcome,
+            crate::archive::schema::ExpectedOutcome::Failed
         );
     }
 
