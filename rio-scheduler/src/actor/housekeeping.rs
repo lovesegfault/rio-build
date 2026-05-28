@@ -630,7 +630,10 @@ impl DagActor {
     /// ordering as `handle_clear_poison`: a PG blip here leaves in-mem
     /// still Poisoned, so the next tick's scan retries. Previous order
     /// meant a blip left in-mem gone → scan never finds it again →
-    /// PG clear deferred to next scheduler restart).
+    /// PG clear deferred to next scheduler restart). Failure evidence is
+    /// persisted before the clear, so the interested builds' outcome
+    /// survives a failover even though the cleared row reconstructs
+    /// nothing.
     async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
         // r[impl sched.merge.substitute-topdown+10]
         // Surviving parents of the removed children, collected across
@@ -644,6 +647,16 @@ impl DagActor {
         let mut holed_parents: Vec<DrvHash> = Vec::new();
         for drv_hash in expired_poisons {
             info!(drv_hash = %drv_hash, "poison TTL expired, removing from DAG");
+            // r[impl sched.poison.clear-failure-evidence]
+            // Evidence first: same rationale as handle_clear_poison. On
+            // error skip this hash — the node stays Poisoned in memory
+            // and PG, so the next tick's scan retries the whole sequence.
+            if let Err(e) = self.persist_interested_failure_evidence(&drv_hash).await {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "poison TTL: failed to persist sticky failure evidence; \
+                        deferring clear to next tick");
+                continue;
+            }
             if let Err(e) = self.db.clear_poison(&drv_hash).await {
                 error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
                 continue;

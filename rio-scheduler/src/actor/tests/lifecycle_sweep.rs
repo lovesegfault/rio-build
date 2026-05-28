@@ -533,6 +533,7 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 // r[verify sched.build.keep-going]
 // r[verify sched.poison.ttl-persist]
 // r[verify sched.admin.clear-poison]
+// r[verify sched.poison.clear-failure-evidence]
 /// keep_going=true build with 2 independent derivations. D1 poisoned,
 /// D2 keeps running. D1 is removed from the DAG (via TTL-expiry tick OR
 /// admin ClearPoison). D2 completes → build must reach terminal.
@@ -540,13 +541,15 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 /// Pre-fix: `remove_node` left D1 in `derivation_hashes` → total=2,
 /// completed=1, failed=0 (D1 gone from DAG so `build_summary` doesn't
 /// count it) → hang Active forever. Post-fix: prune drops D1 →
-/// total=1 → terminal.
+/// total=1 → terminal. The prune also persists the sticky failure
+/// evidence to `builds.error_summary` BEFORE clearing, so the Failed
+/// outcome would survive a failover too (structural assertion below).
 #[rstest::rstest]
 #[case::ttl_expiry(true)]
 #[case::admin_clear(false)]
 #[tokio::test]
 async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("pr-w", "x86_64-linux").await?;
+    let (db, handle, _task, mut rx) = setup_with_worker("pr-w", "x86_64-linux").await?;
     let mut rx2 = connect_executor(&handle, "pr-w2", "x86_64-linux").await?;
 
     let build_id = Uuid::new_v4();
@@ -600,6 +603,19 @@ async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> Test
     assert!(
         handle.debug_query_derivation("pr-d1").await?.is_none(),
         "D1 must be removed from the DAG"
+    );
+
+    // The prune persisted the sticky failure evidence BEFORE the PG clear
+    // reset D1's row to 'created' — without this the Failed outcome below
+    // would be failover-volatile (the cleared row reconstructs nothing).
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        evidence.is_some(),
+        "poison-clear prune must persist builds.error_summary before clearing"
     );
 
     // Complete D2. Pre-fix: spuriously Succeeded (failed_count derived from

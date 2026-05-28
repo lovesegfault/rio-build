@@ -109,8 +109,11 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
 }
 
 // r[verify sched.merge.displaced-failure-evidence]
+// r[verify sched.poison.clear-failure-evidence]
 /// `persist_build_error_summary_tx` records the first failure and never
-/// overwrites an already-persisted summary (COALESCE semantics).
+/// overwrites an already-persisted summary (COALESCE semantics) — and the
+/// pool-level wrapper the poison-clear paths use goes through the same
+/// statement, so it inherits the first-write-wins contract.
 #[tokio::test]
 async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -147,6 +150,17 @@ async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Res
         read().await?.as_deref(),
         Some("derivation a failed"),
         "first persisted failure wins"
+    );
+
+    // The pool-level wrapper (poison-clear paths) hits the same COALESCE:
+    // still the first failure.
+    drop(conn);
+    db.persist_build_error_summary(build_id, "derivation c failed")
+        .await?;
+    assert_eq!(
+        read().await?.as_deref(),
+        Some("derivation a failed"),
+        "pool-level wrapper preserves first-write-wins"
     );
     Ok(())
 }

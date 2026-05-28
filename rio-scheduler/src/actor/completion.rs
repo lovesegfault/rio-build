@@ -2106,6 +2106,46 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.poison.clear-failure-evidence]
+    /// Persist the sticky first-failure summary of every still-running
+    /// interested build BEFORE a poison-clear prune removes `drv_hash`.
+    ///
+    /// `db.clear_poison` resets the derivation row to `status='created'`
+    /// (poison fields NULLed), so the surviving `build_derivations` link
+    /// reconstructs nothing at recovery: the row loads back as a
+    /// non-failed node and contributes zero to `failed_count`. The
+    /// in-memory `error_summary` set by `handle_derivation_failure` is
+    /// therefore the only failure evidence left, and it dies with the
+    /// leader — `builds.error_summary` is the only failover-surviving
+    /// copy. Mirrors the displacement-path persist
+    /// (`sched.merge.displaced-failure-evidence`); not gated on
+    /// `keep_going` because a non-terminal `!keep_going` interested build
+    /// cannot exist at poison time, and the COALESCE write is an
+    /// idempotent no-op if it somehow did.
+    ///
+    /// First error aborts: callers run this evidence-first and refuse to
+    /// clear the poison if the persist failed.
+    pub(super) async fn persist_interested_failure_evidence(
+        &self,
+        drv_hash: &DrvHash,
+    ) -> Result<(), sqlx::Error> {
+        for build_id in self.get_interested_builds(drv_hash) {
+            let Some(build) = self.builds.get(&build_id) else {
+                continue;
+            };
+            if build.state().is_terminal() {
+                continue;
+            }
+            let Some(summary) = build.error_summary.as_deref() else {
+                continue;
+            };
+            self.db
+                .persist_build_error_summary(build_id, summary)
+                .await?;
+        }
+        Ok(())
+    }
+
     // r[impl sched.admin.clear-poison]
     /// Clear poison state for a derivation (admin-initiated via
     /// `AdminService.ClearPoison`). Returns `true` if cleared.
@@ -2126,6 +2166,17 @@ impl DagActor {
             Some(s) if s != DerivationStatus::Poisoned => return false,
             Some(_) => {}
         }
+        // r[impl sched.poison.clear-failure-evidence]
+        // Evidence first, fail closed: persist the interested builds'
+        // sticky failure BEFORE the PG clear resets the row to 'created'.
+        // On error nothing has been mutated — the operator's retry finds
+        // the node still Poisoned, same contract as a clear_poison failure.
+        if let Err(e) = self.persist_interested_failure_evidence(drv_hash).await {
+            error!(drv_hash = %drv_hash, error = %e,
+                   "ClearPoison: failed to persist sticky failure evidence \
+                    (poison NOT cleared; retry-safe)");
+            return false;
+        }
         if let Err(e) = self.db.clear_poison(drv_hash).await {
             error!(drv_hash = %drv_hash, error = %e,
                    "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
@@ -2141,7 +2192,10 @@ impl DagActor {
         // terminated); keep_going=true builds are pruned from
         // derivation_hashes here. The sticky `error_summary` set by
         // `handle_derivation_failure` keeps such builds on track to Fail
-        // even after the node (and its `failed_count` contribution) is gone.
+        // even after the node (and its `failed_count` contribution) is
+        // gone — and it survives a failover because it was persisted to
+        // `builds.error_summary` above, before the row reset erased the
+        // only other durable trace of the failure.
         //
         // r[impl sched.merge.substitute-topdown+10]
         // Capture the parents BEFORE `remove_node` scrubs the edge maps:

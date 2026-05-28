@@ -1924,8 +1924,33 @@ and the no-observed-failure clause keeps joining a later-displaced node
 from being treated as a failure (the displaced result, if already
 received, stays credited per
 #rref("sched.merge.authoritative-conflict")). The pre-existing
-administrative prune paths (poison clear, TTL expiry) keep the link and
-therefore keep the reconstruction path; they are unaffected.
+administrative prune paths (poison clear, TTL expiry) keep the
+`build_derivations` link but reset the derivation row to a non-failed
+state (`'created'`), so the link alone preserves nothing across a
+failover --- they carry the same hazard and persist the same evidence per
+#rref("sched.poison.clear-failure-evidence").
+
+#r("sched.poison.clear-failure-evidence")[
+  When the scheduler removes a poisoned derivation while interested
+  builds are resident --- via the administrative `ClearPoison` call or the
+  poison-TTL sweep --- it MUST persist the sticky first-failure summary of
+  every still-running interested build that has already observed a
+  failure (first write wins) BEFORE clearing the persisted poison state,
+  MUST NOT clear the poison if that persist fails, and MUST NOT mark a
+  build with no observed failure as failed.
+]
+The cleared row recovers as `'created'`: it contributes nothing to the
+failed-count reconstruction, so `builds.error_summary` is the only
+evidence of the failure that survives a leader failover, and recovery
+seeds the recovered build's sticky failure from it exactly as on the
+displacement path. Persisting evidence first preserves the PG-first retry
+contract of both prune paths: a failed persist leaves the node Poisoned
+in memory and in PG, so the operator retry (or the next sweep tick)
+re-runs the whole sequence; the COALESCE first-write-wins makes the
+retry idempotent. Out of scope: the recovery-time expired-at-load clear
+(the in-memory evidence already died with the old leader --- an accepted
+narrow gap) and the re-probe cache-hit `clear_poison` callers, which
+neither remove the node nor touch its links.
 
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from

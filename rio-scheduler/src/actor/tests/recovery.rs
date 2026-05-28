@@ -5618,6 +5618,136 @@ async fn test_recovery_keep_going_sticky_failure_survives_displacement() -> Test
     Ok(())
 }
 
+// r[verify sched.poison.clear-failure-evidence]
+/// Wrong-success regression, poison-clear edition: a keep_going build
+/// whose FAILED derivation has its poison cleared (admin ClearPoison or
+/// the poison-TTL sweep) BEFORE a leader failover must still end Failed.
+/// `clear_poison` resets the row to 'created', so the surviving link
+/// reconstructs nothing — the evidence persisted to
+/// `builds.error_summary` before the clear is the only thing that keeps
+/// the outcome from depending on whether a failover happened.
+///
+/// Post-failover the cleared drv is re-linked into the recovered build's
+/// interest set (the link survives the clear by design — accepted
+/// divergence from the pre-failover pruned state), so BOTH it and the
+/// untouched remaining drv must complete before the terminal check.
+#[rstest::rstest]
+#[case::admin_clear(false)]
+#[case::ttl_expiry(true)]
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_pre_failover_clear_poison(
+    #[case] via_ttl: bool,
+) -> TestResult {
+    let watcher = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build: an x86_64 node that fails for real
+        // (PermanentFailure → Poisoned → sticky in-memory failure), plus
+        // an aarch64 node still pending at failover time.
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("kgpf-clear"),
+                make_test_node("kgpf-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-kgpf", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("kgpf-clear"));
+        complete_failure(
+            &handle,
+            "w-kgpf",
+            &test_drv_path("kgpf-clear"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "kgpf-clear", DerivationStatus::Poisoned).await;
+
+        // Clear the poison BEFORE the failover — admin call or TTL sweep.
+        if via_ttl {
+            tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(50))
+                .await;
+            handle.send_unchecked(ActorCommand::Tick).await?;
+            barrier(&handle).await;
+        } else {
+            let (tx, rx_clear) = oneshot::channel();
+            handle
+                .send_unchecked(ActorCommand::ClearPoison {
+                    drv_hash: "kgpf-clear".into(),
+                    reply: tx,
+                })
+                .await?;
+            assert!(rx_clear.await?, "ClearPoison → cleared=true");
+        }
+
+        // Structural pin: the evidence was persisted before the clear.
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "poison-clear prune must persist failure evidence before the failover"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the watcher recovers Active with its sticky failure
+    // seeded from builds.error_summary; the cleared drv is back in its
+    // interest set as a fresh 'created' node. Complete both it and the
+    // remaining node successfully — the build must still end Failed.
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx_x86 = connect_executor(&handle, "w-kgpf-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx_x86).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("kgpf-clear"),
+        "cleared drv re-dispatches post-failover (re-linked at recovery)"
+    );
+    complete_success(
+        &handle,
+        "w-kgpf-r",
+        &assn.drv_path,
+        &test_store_path("kgpf-clear-out"),
+    )
+    .await?;
+    let mut rx_arm = connect_executor(&handle, "w-kgpf-r-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx_arm).await;
+    assert_eq!(assn.drv_path, test_drv_path("kgpf-fill"));
+    complete_success(
+        &handle,
+        "w-kgpf-r-arm",
+        &assn.drv_path,
+        &test_store_path("kgpf-fill-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build ends Failed post-failover (evidence survived the poison clear)"
+    );
+    assert!(
+        !status.error_summary.is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    Ok(())
+}
+
 // r[verify sched.persist.ca-modular-hash]
 // r[verify sched.merge.authoritative-claim-no-redefine]
 /// End-to-end bug_005 regression: a store-backed floating-CA node parked

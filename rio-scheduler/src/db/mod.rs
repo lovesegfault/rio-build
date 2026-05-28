@@ -197,13 +197,15 @@ pub(crate) struct RecoveryBuildRow {
     pub completed_drvs: i32,
     pub cached_drvs: i32,
     /// Sticky first-failure summary persisted while the build was still
-    /// running (`sched.merge.displaced-failure-evidence`): a keep_going
-    /// build whose failed derivation was displaced has no failed node
-    /// linked to it anymore, so the failed-count reconstruction cannot
-    /// rebuild the sticky flag — this column is the durable evidence.
-    /// `NULL` for builds that never observed a failure (terminal
-    /// transitions also write the column, but those rows aren't loaded
-    /// here).
+    /// running (`sched.merge.displaced-failure-evidence` for the
+    /// displacement prune, `sched.poison.clear-failure-evidence` for the
+    /// admin ClearPoison / poison-TTL prunes): a keep_going build whose
+    /// failed derivation was displaced has no failed node linked to it
+    /// anymore, and a poison-cleared row is reset to `'created'` so the
+    /// surviving link reconstructs nothing — this column is the durable
+    /// evidence either way. `NULL` for builds that never observed a
+    /// failure (terminal transitions also write the column, but those
+    /// rows aren't loaded here).
     pub error_summary: Option<String>,
     /// PG-side `now() - submitted_at` so the caller can reconstruct an
     /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds

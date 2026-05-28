@@ -248,7 +248,9 @@ impl SchedulerDb {
     /// this inside the merge transaction
     /// (`sched.merge.displaced-failure-evidence`) so the evidence commits
     /// or rolls back together with the link prune that would otherwise
-    /// erase the only recoverable trace of the failure. Plain runtime
+    /// erase the only recoverable trace of the failure; the poison-clear
+    /// prune paths reach the same statement through the pool-level
+    /// [`Self::persist_build_error_summary`] wrapper. Plain runtime
     /// query — no `.sqlx/` impact.
     // r[impl sched.merge.displaced-failure-evidence]
     pub(crate) async fn persist_build_error_summary_tx(
@@ -264,6 +266,22 @@ impl SchedulerDb {
         .execute(&mut *conn)
         .await?;
         Ok(())
+    }
+
+    /// Pool-level wrapper around [`Self::persist_build_error_summary_tx`]
+    /// for the prune paths that have no surrounding transaction
+    /// (`AdminService.ClearPoison` and the poison-TTL sweep): `clear_poison`
+    /// is a single pool UPDATE, so evidence-first ordering plus the
+    /// idempotent COALESCE write is what makes the sticky failure durable
+    /// across a failover — there is no joint transaction to ride.
+    // r[impl sched.poison.clear-failure-evidence]
+    pub(crate) async fn persist_build_error_summary(
+        &self,
+        build_id: Uuid,
+        error_summary: &str,
+    ) -> Result<(), sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::persist_build_error_summary_tx(&mut conn, build_id, error_summary).await
     }
 
     /// Update a build's status.
