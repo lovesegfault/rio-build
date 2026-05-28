@@ -272,6 +272,10 @@ fn build_campaign_spec(
             scheduler_addr: scheduler_addr(),
             store_addr: store_addr(),
             service_hmac_key_path: hmac_present.then(|| PathBuf::from(jobs::HMAC_KEY_MOUNT_PATH)),
+            // Gateway SSH host-key pin for the engine's transport. Launch does
+            // not derive it from the gateway host-key Secret yet, so it is
+            // left unset here.
+            gateway_host_key: None,
         },
         tenants: TenantBlock {
             build_tenant: mode.expected_build_tenant().to_owned(),
