@@ -1169,11 +1169,18 @@ pub const M_064: () = ();
 /// from). Supersedes `004_recovery.sql`'s "drv_content not persisted"
 /// note for authoritative nodes — 004 is frozen and stays as written.
 ///
-/// NULL for every non-fallback derivation. Re-upsert is last-write-wins:
-/// a later authoritative submission refreshes the bytes, and a later
-/// non-authoritative one clears them (the .drv is then fetchable from
-/// the store, so persistence is unnecessary — and clearing bounds how
-/// long any stale blob can outlive the submission that wrote it).
+/// NULL for every non-fallback derivation. The upsert that writes this
+/// column is reached only by submissions that (re)create the in-memory
+/// node (sched.persist.creation-scoped); submissions that merely join a
+/// live node never rewrite or clear it — that scoping is what protects
+/// a live node's authoritative inline bytes, and a conflicting
+/// authoritative claim is rejected by the merge gate
+/// (sched.merge.authoritative-conflict) before persistence is ever a
+/// question. On re-creation — resubmit-after-reset or displacement —
+/// last-write-wins applies to the creation-time snapshot
+/// (sched.persist.recreate-refresh): an authoritative re-creation
+/// refreshes the bytes, a store-backed one clears them (the .drv is
+/// then fetchable from the store, so a persisted copy is unnecessary).
 /// SubmitBuild ingress validates authoritative content against the
 /// node's claimed identity before it can ever reach this column. No
 /// size CHECK (the shared ingress bound in rio-common is authoritative;

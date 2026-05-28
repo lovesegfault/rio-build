@@ -989,6 +989,13 @@
     },
     {
       "enum": "DagError",
+      "name": "AuthoritativeClaimIdentityConflict",
+      "crate": "rio-scheduler",
+      "msg": "authoritative inline content for {drv_path} conflicts with the existing store-backed derivation definition",
+      "doc": "The inverse direction of [`Self::ConflictingInFlightContent`]: a submission claiming authoritative inline content landed on an existing STORE-BACKED node that is eligible for the resubmit-reset, and its verifiable identity does not match the existing node's. Admitting it would let the claim redefine a parked (failed / cancelled / poison-reset) store-backed definition through the reset, carrying the prior builds' interest onto bytes only the claimant can see. An identity-matching claim is admitted through the normal resubmit-reset instead, and an authoritative claim never displaces a store-backed node. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
+    },
+    {
+      "enum": "DagError",
       "name": "AuthoritativeContentMismatch",
       "crate": "rio-scheduler",
       "msg": "conflicting authoritative derivation content for {drv_path}: a node with different inline content already exists",
@@ -999,7 +1006,7 @@
       "name": "ConflictingInFlightContent",
       "crate": "rio-scheduler",
       "msg": "in-flight derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity",
-      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that either provably differs or cannot be shown to be the same. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead."
+      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that either provably differs or cannot be shown to be the same. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead. (An identity-MATCHING store-backed submission never sees this error: it joins the node, or displaces it without error when the node is poison-locked — terminal failure, no longer retriable on resubmit.)"
     },
     {
       "enum": "DagError",
