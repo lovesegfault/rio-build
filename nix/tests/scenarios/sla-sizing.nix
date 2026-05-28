@@ -67,6 +67,32 @@ let
   protoset = import ../lib/protoset.nix { inherit pkgs; };
   rioCli = "${common.rio-workspace}/bin/rio-cli";
 
+  # The fixture's defaultTenant (P0560 tenancy stopgap) implies HMAC
+  # keys, so the scheduler's ensure_service_caller() now gates the
+  # AdminService RPCs this scenario drives via grpcurl. Mint the same
+  # x-rio-service-token rio-cli / rio-controller would present
+  # (rio_auth::hmac::ServiceClaims, HmacSigner::sign format). Mirrors
+  # lifecycle.nix's signServiceToken, but reads the key file directly
+  # (the standalone fixture's hmacKeys store path) instead of a k8s
+  # Secret on stdin. argv: <key-path> <caller>.
+  signServiceToken = pkgs.writeScript "sign-service-token-sla-sizing" ''
+    #!${pkgs.python3}/bin/python3
+    import base64, hashlib, hmac, json, sys, time
+    key = open(sys.argv[1], "rb").read()
+    # Mirror rio-auth load_key() trailing-newline trim.
+    for suf in (b"\r\n", b"\n"):
+        if key.endswith(suf):
+            key = key[: -len(suf)]
+            break
+    claims = json.dumps(
+        {"caller": sys.argv[2], "expiry_unix": int(time.time()) + 7200},
+        separators=(",", ":"),
+    ).encode()
+    tag = hmac.new(key, claims, hashlib.sha256).digest()
+    b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
+    print(f"{b64(claims)}.{b64(tag)}")
+  '';
+
   # Scripted-telemetry drv. pname must match an [[entry]] in
   # sla-builder-script.toml; the body is irrelevant (fixture intercept
   # fires before nix-daemon spawn) but echoes a marker so a fixture
@@ -139,17 +165,51 @@ let
       dumpLogsExpr = "dump_all_logs([${gatewayHost}] + all_workers)";
     }}
 
+    # Service tokens for the AdminService gates (see signServiceToken
+    # comment): most RPCs this scenario uses accept caller=rio-cli;
+    # AckSpawnedIntents / AppendInterruptSample are controller-only,
+    # so impersonate rio-controller for those.
+    _svc_token_cli = ${gatewayHost}.succeed(
+        "${signServiceToken} ${fixture.hmacKeys}/service-hmac.key rio-cli"
+    ).strip()
+    _svc_token_controller = ${gatewayHost}.succeed(
+        "${signServiceToken} ${fixture.hmacKeys}/service-hmac.key rio-controller"
+    ).strip()
+    _CONTROLLER_ONLY_RPCS = {"AckSpawnedIntents", "AppendInterruptSample"}
+
+    # P0560 tenancy stopgap side-effect: every dispatched build is now
+    # attributed to the fixture's defaultTenant, so its build_samples /
+    # fit-cache key carries that tenant's UUID instead of the legacy ""
+    # single-tenant key. Resolve the UUID once and rewrite the
+    # empty-tenant fields the subtests pass, so injected samples and
+    # SlaStatus/SlaExplain queries land on the SAME key the real builds
+    # (and the dispatch-time solve) use.
+    SLA_TENANT = psql(${gatewayHost},
+        "SELECT tenant_id FROM tenants "
+        "WHERE tenant_name = '${fixture.defaultTenant or ""}'"
+    )
+    assert SLA_TENANT, "fixture defaultTenant row missing — rio-seed-tenant did not run?"
+
     def grpcurl_admin(method: str, payload: dict) -> str:
+        if payload.get("tenant", None) == "":
+            payload = {**payload, "tenant": SLA_TENANT}
+        token = (_svc_token_controller if method in _CONTROLLER_ONLY_RPCS
+                 else _svc_token_cli)
         return ${gatewayHost}.succeed(
             f"grpcurl -plaintext -protoset ${protoset}/rio.protoset "
+            f"-H 'x-rio-service-token: {token}' "
             f"-d '{json.dumps(payload)}' "
             f"localhost:9001 rio.admin.AdminService/{method}"
         )
 
     def cli(args: str) -> str:
+        # RIO_SERVICE_HMAC_KEY_PATH: rio-cli mints its own
+        # x-rio-service-token (caller=rio-cli) per request when the key
+        # is configured — required now that the fixture has HMAC keys.
         return ${gatewayHost}.succeed(
             "${common.covShellEnv}"
             "RIO_SCHEDULER_ADDR=localhost:9001 "
+            "RIO_SERVICE_HMAC_KEY_PATH=${fixture.hmacKeys}/service-hmac.key "
             f"${rioCli} {args} 2>&1"
         )
 
@@ -259,16 +319,22 @@ let
               "WHERE pname='synth-amdahl' AND outlier_excluded\") -ge 1",
               timeout=30,
           )
-          # Metric incremented (registered + emitted). The injected
-          # samples carry tenant="" so the counter is labelled tenant="".
+          # Metric incremented (registered + emitted). grpcurl_admin
+          # rewrites the injected samples onto the fixture tenant's key
+          # (see SLA_TENANT in the prelude), so the counter is labelled
+          # with that tenant UUID.
           assert_metric_ge(${gatewayHost}, 9091,
               "rio_scheduler_sla_outlier_rejected_total", 1.0,
-              labels='{tenant=""}')
+              labels=f'{{tenant="{SLA_TENANT}"}}')
     '';
 
     override-precedence = ''
       with subtest("override-precedence: forced cores short-circuits solve"):
           # SetSlaOverride goes to PG; resolved on the next refresh tick.
+          # No --tenant on purpose: an omitted tenant stores NULL, which
+          # the override resolver treats as a wildcard (most-specific
+          # match wins, sla/override.rs), so it applies to the fixture
+          # tenant's key without the SLA_TENANT rewrite.
           out = cli("sla override synth-amdahl --cores=12")
           print(out)
           assert "set for synth-amdahl" in out, out
@@ -285,7 +351,9 @@ let
           cands = ex.get("candidates", [])
           assert len(cands) == 1 and cands[0].get("cStar") == 12.0, cands
           # And SlaStatus surfaces the resolved row so an operator can
-          # see id/created_by.
+          # see id/created_by. grpcurl_admin rewrites tenant="" to the
+          # fixture tenant's UUID; the NULL-tenant override above still
+          # resolves for that key because NULL is a wildcard.
           st = json.loads(grpcurl_admin("SlaStatus", {
               "pname": "synth-amdahl", "system": "x86_64-linux", "tenant": "",
           }))
@@ -679,8 +747,10 @@ let
           assert "ref_hw_class" in parsed and "entries" in parsed, body
           n_exported = len(parsed["entries"])
           # Wipe synth-amdahl's samples + cached fit so the next refit
-          # has no per-key theta to lean on. --tenant defaults to "".
-          cli("sla reset synth-amdahl")
+          # has no per-key theta to lean on. The fit lives under the
+          # fixture defaultTenant's key (see SLA_TENANT in the prelude),
+          # so reset that key — the default "" would clear nothing.
+          cli(f"sla reset synth-amdahl --tenant {SLA_TENANT}")
           # Import the corpus; seed map now has synth-amdahl.
           out = cli("sla import-corpus /tmp/corpus.json")
           print(out)

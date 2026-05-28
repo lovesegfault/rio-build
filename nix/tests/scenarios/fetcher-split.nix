@@ -491,16 +491,17 @@ pkgs.testers.runNixOSTest {
         print(f"fod-dir PASS: {out.strip().splitlines()[-1]}")
 
     # ══════════════════════════════════════════════════════════════════
-    # fod-fail — failing FOD propagates without FUSE-lookup hang (P0308)
+    # fod-fail — failing FOD propagates without an input-lookup hang (P0308)
     # ══════════════════════════════════════════════════════════════════
     # Origin 404s, hashed-mirror has no entry → builtin:fetchurl exits
     # nonzero with $out absent. nix-daemon's post-build deletePath($out)
-    # stat falls through to FUSE lower; JitClass::NotInput → ENOENT
-    # without store contact. The property under test is "no FUSE-lookup
-    # hang" — a regression means lookup() fell through to gRPC and
-    # blocked, the daemon's post-build path never returns, the client's
-    # nix-build never sees a BuildResult, and the shell `timeout` is
-    # what terminates it (rc=124).
+    # stat falls through to the castore-FUSE lower; $out is outside the
+    # input tree → ENOENT from the in-memory DAG, no store round-trip.
+    # The property under test is "no FUSE-lookup hang" — a regression
+    # means a lookup of a non-input path blocked on a remote fetch
+    # instead of failing fast, the daemon's post-build path never
+    # returns, the client's nix-build never sees a BuildResult, and the
+    # shell `timeout` is what terminates it (rc=124).
     #
     # STRUCTURAL: rc != 0 (the build failed as designed) AND rc != 124
     # (the build process TERMINATED on its own — the daemon post-build
@@ -527,8 +528,8 @@ pkgs.testers.runNixOSTest {
         assert rc != 124, (
             f"fod-fail HUNG (rc=124, timeout 180s exceeded; "
             f"elapsed={elapsed:.1f}s) — daemon post-fail stat($out) "
-            f"blocked in FUSE lookup (JitClass::NotInput fast-path not "
-            f"firing; lookup fell through to gRPC). P0308 regression.\n"
+            f"blocked in the castore-FUSE lookup instead of getting a "
+            f"fast ENOENT for a non-input path. P0308 regression.\n"
             f"{out}"
         )
         print(f"fod-fail PASS: rc={rc} in {elapsed:.1f}s")

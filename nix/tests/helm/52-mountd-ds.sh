@@ -1,11 +1,12 @@
-# rio-mountd DaemonSet (ADR-022 P0567). mountd.enabled defaults to
-# false, so 01-lint-render's profile renders never validate this
-# template — render it explicitly here and pin the invariants that are
-# load-bearing for the privilege boundary rather than cosmetic.
+# rio-mountd DaemonSet (ADR-022 P0567/P0560). Every build mounts its
+# input closure through the castore-FUSE and the per-build mount
+# handshake starts at this DaemonSet's socket, so the chart default is
+# mountd.enabled=true. Render the default and pin the invariants that
+# are load-bearing for the privilege boundary rather than cosmetic.
 
 out=$TMPDIR/mountd.yaml
 helm template rio . \
-  --set mountd.enabled=true \
+  --set networkPolicy.enabled=true \
   --set global.image.tag=test \
   --set postgresql.enabled=false \
   >"$out"
@@ -73,23 +74,28 @@ test "$(ds '.spec.template.spec.automountServiceAccountToken')" = "false" || {
 # without a network policy. Cilium default-allows unpoliced endpoints,
 # so a missing CNP means unrestricted egress (IMDS, apiserver, world)
 # from a privileged root pod. mountd needs zero egress.
-np=$TMPDIR/mountd-np.yaml
-helm template rio . \
-  --set mountd.enabled=true \
-  --set networkPolicy.enabled=true \
-  --set global.image.tag=test \
-  --set postgresql.enabled=false \
-  >"$np"
-denied=$(yq -N 'select(.kind=="CiliumNetworkPolicy" and .metadata.name=="rio-mountd") | .spec.egressDeny[0].toEntities[0]' "$np")
+denied=$(yq -N 'select(.kind=="CiliumNetworkPolicy" and .metadata.name=="rio-mountd") | .spec.egressDeny[0].toEntities[0]' "$out")
 test "$denied" = "all" || {
   echo "FAIL: no CiliumNetworkPolicy denying all egress for rio-mountd — privileged pod with unrestricted network" >&2
   exit 1
 }
 
-# Default profile must NOT render the DS (nothing dials the socket
-# until P0559/P0560; an idle privileged DaemonSet is pure surface).
+# The group that owns the mountd UDS (socket created root:<gid> 0660 —
+# the file permission is mountd's only access control) must equal the
+# controller's EXECUTOR_RUN_AS_GROUP (990, rio-controller pod.rs). It
+# is hard-coded in the template — no values knob — because a drifting
+# pair fails every castore mount connect (total build outage).
+gid_arg=$(ds '.spec.template.spec.containers[0].command[] | select(. == "--allowed-gid=990")')
+test "$gid_arg" = "--allowed-gid=990" || {
+  echo "FAIL: rio-mountd --allowed-gid != 990 — must equal EXECUTOR_RUN_AS_GROUP in rio-controller" >&2
+  exit 1
+}
+
+# mountd.enabled=false must still suppress the DS (control-plane-only
+# installs that run no builds); NOTES.txt warns when pools are enabled
+# with mountd off.
 off=$TMPDIR/mountd-off.yaml
-helm template rio . --set global.image.tag=test --set postgresql.enabled=false >"$off"
+helm template rio . --set mountd.enabled=false --set global.image.tag=test --set postgresql.enabled=false >"$off"
 if yq -N -e 'select(.kind=="DaemonSet" and .metadata.name=="rio-mountd")' "$off" >/dev/null 2>&1; then
   echo "FAIL: rio-mountd DaemonSet renders with mountd.enabled=false" >&2
   exit 1

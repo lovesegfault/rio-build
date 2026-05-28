@@ -1,10 +1,13 @@
 # max_node_disk (controller.toml — `cover::sizing`'s per-claim
 # ephemeral-storage cap) MUST cover the largest single-pod request:
-#   disk_bytes × OVERLAY_HEADROOM + fuse_cache_bytes + LOG_BUDGET_BYTES
-# clamped at sla.maxDisk. kube-scheduler's NodeResourcesFit SUMS
-# ephemeral-storage across bound pods (same as cpu/mem); this check
-# guards only that ONE max-disk pod fits (the runtime 3-axis chunking
-# in `claim_count` handles the multi-pod case structurally).
+#   disk_bytes × OVERLAY_HEADROOM + LOG_BUDGET_BYTES
+# clamped at sla.maxDisk (jobs.rs::pod_ephemeral_request — the per-pod
+# FUSE cache is gone since P0560; the node-level castore caches are
+# mountd-owned hostPaths outside per-pod ephemeral-storage accounting).
+# kube-scheduler's NodeResourcesFit SUMS ephemeral-storage across bound
+# pods (same as cpu/mem); this check guards only that ONE max-disk pod
+# fits (the runtime 3-axis chunking in `claim_count` handles the
+# multi-pod case structurally).
 #
 # Single-source: assert against the helm-RENDERED `max_node_disk`
 # (= dataVolumeSize × 0.9 in templates/controller.yaml) instead of
@@ -23,26 +26,19 @@ OVERLAY_HEADROOM_PCT=195   # worst-case headroom(n_eff=1)
 LOG_BUDGET_BYTES=$((1 << 30))
 
 max_disk=$(yq '.scheduler.sla.maxDisk' values.yaml)
-fuse=$(yq '.poolDefaults.fuseCacheBytes' values.yaml)
 
-# Render controller.toml — single source for both fuse_cache_bytes and
-# max_node_disk (the values cover::sizing actually reads).
+# Render controller.toml — the max_node_disk value cover::sizing
+# actually reads.
 toml=$TMPDIR/ctrl.toml
 render_controller_toml >"$toml"
 
-got_fuse=$(toml_int_key fuse_cache_bytes <"$toml")
-test "$got_fuse" = "$fuse" || {
-  echo "FAIL: controller.toml fuse_cache_bytes=$got_fuse != poolDefaults.fuseCacheBytes=$fuse" >&2
-  exit 1
-}
-
 max_node_disk=$(toml_int_key max_node_disk <"$toml")
-need=$(( max_disk * OVERLAY_HEADROOM_PCT / 100 + fuse + LOG_BUDGET_BYTES ))
+need=$(( max_disk * OVERLAY_HEADROOM_PCT / 100 + LOG_BUDGET_BYTES ))
 
 test "$max_node_disk" -ge "$need" || {
   echo "FAIL: controller.toml max_node_disk=$max_node_disk B < required $need B" >&2
-  echo "  = sla.maxDisk × 1.95 + poolDefaults.fuseCacheBytes + 1Gi" >&2
-  echo "  = $max_disk × 1.95 + $fuse + $LOG_BUDGET_BYTES" >&2
+  echo "  = sla.maxDisk × 1.95 + 1Gi" >&2
+  echo "  = $max_disk × 1.95 + $LOG_BUDGET_BYTES" >&2
   echo "  raise karpenter.dataVolumeSize (max_node_disk = dataVolumeSize × 0.9)" >&2
   exit 1
 }

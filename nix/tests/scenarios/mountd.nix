@@ -6,32 +6,19 @@
 # in-process client exists). Carries the P0578 mountd-protocol subtests
 # (v-vii, x-xv) that were deferred to P0567:
 #
-#   fd-handoff        Mount → /dev/fuse fd over SCM_RIGHTS → unprivileged
-#                     client serves FUSE on it → mountpoint readable
-#   teardown          conn close → umount + staging removed + build_id
-#                     and uid released for reuse
-#   gid-gate          socket file perms reject non-group connect();
-#                     SO_PEERCRED rejects a wrong-gid peer that can
-#                     connect anyway (root)
+#   fd-handoff        Mount → fd over SCM_RIGHTS → unprivileged client serves FUSE
+#   teardown          conn close → umount + staging removed + ids released
+#   gid-gate          socket perms (0660 root:rio-builder) reject non-group connect
 #   traversal-reject  Mount{"../escape"} → BadBuildId, no fs trace
 #   one-mount         second Mount on one conn → AlreadyMounted
 #   uid-bound         second conn from a live uid → dropped
-#   build-id-unique   Mount{X} from uid B while uid A owns X →
-#                     DuplicateBuildId, A's staging untouched
-#   promote-verified  good content published 0444 root-owned with the
-#                     exact bytes; corrupted content rejected with
-#                     nothing visible in the cache
-#   bounded-copy      concurrent appender cannot grow the published
-#                     entry past the fstat-time size
-#   backing-broker    BackingOpen over the protocol returns a usable
-#                     backing_id against the daemon's kept /dev/fuse dup
-#   concurrency       BackingOpen replies arrive while a Promote is
-#                     still copying (spawn_blocking does not serialize
-#                     the inline ops)
-#   staging-quota     writes into staging stop at the kernel project
-#                     quota, no daemon involvement
-#   orphan-scan       daemon restart reaps leftover mountpoints,
-#                     staging trees, and .promoting placeholders
+#   build-id-unique   Mount{X} from uid B while uid A owns X → DuplicateBuildId
+#   promote-verified  good content published 0444 exact bytes; corrupt rejected
+#   bounded-copy      concurrent appender cannot grow the published entry
+#   backing-broker    BackingOpen returns a usable backing_id
+#   concurrency       BackingOpen replies arrive during a Promote copy
+#   staging-quota     writes stop at the kernel project quota
+#   orphan-scan       daemon restart reaps leftover mounts/staging/placeholders
 #
 # Perf numbers (BackingOpen RTT, Promote throughput — P0578 vi/vii/x)
 # are printed as `PERF` lines for humans reading the CI log but NOT
@@ -41,7 +28,6 @@
 # .claude/rules/ci-failure-patterns.md "Wall-clock gate under load").
 {
   pkgs,
-  rio-workspace,
   common,
 }:
 let
@@ -67,11 +53,11 @@ pkgs.testers.runNixOSTest {
       "loop"
     ];
     boot.supportedFilesystems = [ "xfs" ];
-    # SO_PEERCRED.gid is the peer's *primary* gid, so the builder uids
-    # get rio-builder as their primary group (matching the production
-    # pod fsGroup), not a supplementary one. `outsider` is not in
-    # rio-builder: it exercises the socket-file DAC layer of the gid
-    # gate.
+    # The builder uids get rio-builder (gid 990) as their primary
+    # group, mirroring the runAsGroup the controller stamps on executor
+    # pods; group membership is what lets connect(2) pass the socket's
+    # 0660 root:rio-builder permission check. `outsider` is not in
+    # rio-builder: it proves that DAC check rejects everyone else.
     users = {
       groups.rio-builder.gid = 990;
       users = {
@@ -93,7 +79,7 @@ pkgs.testers.runNixOSTest {
       };
     };
     environment.systemPackages = [
-      rio-workspace
+      common.rio-workspace
       pkgs.xfsprogs
       pkgs.util-linux
       pkgs.b3sum
@@ -125,7 +111,7 @@ pkgs.testers.runNixOSTest {
         machine.succeed("rm -f /run/rio-mountd.sock")
         machine.succeed(
             "${common.covShellEnv}"
-            "${rio-workspace}/bin/rio-mountd --socket /run/rio-mountd.sock"
+            "${common.rio-workspace}/bin/rio-mountd --socket /run/rio-mountd.sock"
             " --castore-dir /var/rio/castore --staging-dir /var/rio/staging"
             " --cache-dir /var/rio/cache --chunks-dir /var/rio/chunks"
             f" --staging-quota-bytes {quota_bytes} --allowed-gid 990"
@@ -144,7 +130,7 @@ pkgs.testers.runNixOSTest {
             "! kill -0 $(cat /run/rio-mountd.pid) 2>/dev/null", timeout=15
         )
 
-    CLIENT = "${clientCov}${rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd.sock"
+    CLIENT = "${clientCov}${common.rio-workspace}/bin/spike_mountd_client --socket /run/rio-mountd.sock"
 
     def client(user, args):
         return f"runuser -u {user} -- {CLIENT} {args}"
@@ -247,14 +233,13 @@ pkgs.testers.runNixOSTest {
         wait_idle()
 
     # ── gid gate ───────────────────────────────────────────────────────
-    with subtest("gid-gate: socket DAC + SO_PEERCRED both reject"):
+    with subtest("gid-gate: socket DAC rejects a non-group connect"):
         # outsider is not in rio-builder: connect() itself fails on the
-        # 0660 root:rio-builder socket inode.
+        # 0660 root:rio-builder socket inode. This file-permission check
+        # is mountd's only access control — there is no peer-credential
+        # check after connect.
         rc, out = machine.execute(client("outsider", "expect-rejected") + " 2>&1")
         assert rc != 0 and "ermission denied" in out, f"rc={rc} out={out!r}"
-        # root connects despite the file mode (DAC override) but its
-        # SO_PEERCRED.gid is 0, not 990 → dropped before the first frame.
-        machine.succeed(f"{CLIENT} expect-rejected")
 
     # ── build_id validation ────────────────────────────────────────────
     # The full rejection matrix lives in the build_id_validation unit

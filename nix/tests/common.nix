@@ -263,6 +263,85 @@ rec {
   # startup (sqlx migrate, advisory-lock serialized), so no separate oneshot.
   databaseUrl = "postgres://postgres@localhost/rio";
 
+  # ── P0560 fixture-tenancy stopgap (DELETED by P0593) ────────────────
+  # The castore read surface (DirectoryService GetDirectory / ReadBlob /
+  # StatBlob) is fail-closed tenant-scoped, but nothing in the production
+  # chain writes `path_tenants` rows for client-uploaded sources/.drvs
+  # yet (Phase 8, P0590-P0592). Until then, build-running VM fixtures
+  # seed one well-known tenant ("vmtest") and install triggers that
+  # attribute every registered path to every RETENTION-0 tenant. The
+  # narinfo trigger runs inside the manifest-complete transaction, so a
+  # path is tenant-visible the instant it becomes queryable — no polling
+  # race for the builder's mount-time DAG prefetch.
+  #
+  # gc_retention_hours = 0 does double duty: (1) retention-0
+  # attribution never extends the GC grace window (mark seed (f) is
+  # `first_referenced_at > now() - retention`, always false at 0), so
+  # the rows are invisible to every GC assertion; (2) it is the opt-in
+  # key for the triggers — a scenario whose mid-test tenant must read
+  # previously seeded inputs creates it with retention 0 (security's
+  # team-test, vm-lifecycle's prelude). Real-retention tenants are
+  # deliberately NOT auto-attributed; the SQL comments below carry the
+  # full rationale.
+  #
+  # Used by fixtures/standalone.nix (rio-seed-tenant oneshot, also
+  # reused by fixtures/toxiproxy.nix) and fixtures/k3s-full.nix
+  # (kubectl-exec psql in waitReady). Same tenant name and the same
+  # rio_vmtest_* function/trigger names everywhere so P0593 can find
+  # and delete all of it in one sweep.
+  tenantStopgapSeedSql =
+    tenantName:
+    pkgs.writeText "rio-vmtest-tenant-seed.sql" ''
+      INSERT INTO tenants (tenant_name, gc_retention_hours)
+      VALUES ('${tenantName}', 0)
+      ON CONFLICT (tenant_name) DO NOTHING;
+
+      -- Every path registered from now on belongs to every retention-0
+      -- tenant. Scoped (P0560 stopgap, deleted by P0593): retention-0
+      -- attribution never extends the GC grace window, and tenants with
+      -- a real retention window must keep the production completion-time
+      -- upsert (sched.gc.path-tenants-upsert) as the ONLY writer of
+      -- their rows so the lifecycle GC scenarios assert the real thing.
+      CREATE OR REPLACE FUNCTION rio_vmtest_path_tenant() RETURNS trigger AS $fn$
+      BEGIN
+        INSERT INTO path_tenants (store_path_hash, tenant_id)
+        SELECT NEW.store_path_hash, t.tenant_id FROM tenants t
+        WHERE t.gc_retention_hours = 0
+        ON CONFLICT DO NOTHING;
+        RETURN NEW;
+      END
+      $fn$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS rio_vmtest_path_tenant ON narinfo;
+      CREATE TRIGGER rio_vmtest_path_tenant AFTER INSERT ON narinfo
+        FOR EACH ROW EXECUTE FUNCTION rio_vmtest_path_tenant();
+
+      -- Retention-0 tenants created mid-test immediately own everything
+      -- already registered, so their builds can read previously seeded
+      -- inputs. Same retention-0 scoping rationale as above; the WHEN
+      -- clause is the opt-in gate.
+      CREATE OR REPLACE FUNCTION rio_vmtest_tenant_backfill() RETURNS trigger AS $fn$
+      BEGIN
+        INSERT INTO path_tenants (store_path_hash, tenant_id)
+        SELECT n.store_path_hash, NEW.tenant_id FROM narinfo n
+        ON CONFLICT DO NOTHING;
+        RETURN NEW;
+      END
+      $fn$ LANGUAGE plpgsql;
+
+      DROP TRIGGER IF EXISTS rio_vmtest_tenant_backfill ON tenants;
+      CREATE TRIGGER rio_vmtest_tenant_backfill AFTER INSERT ON tenants
+        FOR EACH ROW WHEN (NEW.gc_retention_hours = 0)
+        EXECUTE FUNCTION rio_vmtest_tenant_backfill();
+
+      -- Backfill anything registered before the triggers existed.
+      INSERT INTO path_tenants (store_path_hash, tenant_id)
+      SELECT n.store_path_hash, t.tenant_id
+        FROM narinfo n CROSS JOIN tenants t
+       WHERE t.gc_retention_hours = 0
+      ON CONFLICT DO NOTHING;
+    '';
+
   # Shared Python assertion helpers (scrape_metrics, assert_metric_exact,
   # assert_set_eq, psql, dump_all_logs, load_otel_spans). Scenarios prepend
   # `${common.assertions}` to their testScript. See lib/assertions.py.
@@ -291,7 +370,12 @@ rec {
       withSeed ? false,
     }:
     let
-      seedHost = if fixture ? sshKeySetup then "k3s-server" else gatewayHost;
+      # k3s fixtures (which export kubectlHelpers) seed via the k3s
+      # server's NodePort; everything else seeds the gateway directly.
+      # Keyed on kubectlHelpers, NOT sshKeySetup: the standalone fixture
+      # also exports sshKeySetup when defaultTenant is set, and it must
+      # keep seeding `gatewayHost`.
+      seedHost = if fixture ? kubectlHelpers then "k3s-server" else gatewayHost;
     in
     ''
       ${assertions}
@@ -428,6 +512,19 @@ rec {
         store = {
           enable = true;
           inherit databaseUrl;
+          # Builders upload outputs via PutPathChunked (ADR-022 §6),
+          # which the store only serves with a chunk backend configured
+          # — an inline-only store rejects every builder upload with
+          # FAILED_PRECONDITION ("requires a chunk backend"). Production
+          # uses S3; VM tests use the filesystem backend under the
+          # module's StateDirectory. This also gives payloads above
+          # INLINE_THRESHOLD a chunk list for StatBlob/GetChunks to
+          # serve (castore-FUSE / scheduling scenarios rely on that).
+          extraConfig = ''
+            [chunk_backend]
+            kind = "filesystem"
+            base_dir = "/var/lib/rio/store/chunks"
+          '';
         }
         // extraStoreConfig;
         scheduler = {
@@ -539,29 +636,39 @@ rec {
         };
       };
 
-      # OTel endpoint for the worker. Worker spans aren't strictly
-      # needed for the milestone (gateway→scheduler is the
-      # critical trace hop), but having them in Tempo makes the trace
-      # tree match the observability.typ spec diagram.
-      #
-      # Pull-mode delivery (T-1c.2b standalone re-point): ExecStart is
-      # the pull spawner above — it acquires a per-intent identity and
-      # token from the scheduler's admin surface (the controller's own
-      # path) and execs rio-builder for exactly that intent;
-      # Restart=always (worker module) brings the wrapper back for the
-      # next intent. (The former RIO_DISPATCH_MODE discriminator is
-      # retired: pull is the only delivery path.)
-      systemd.services.rio-builder = {
-        serviceConfig.ExecStart = lib.mkForce "${pullSpawner}/bin/rio-pull-spawner";
-        environment =
-          lib.optionalAttrs (otelEndpoint != null) {
-            RIO_OTEL_ENDPOINT = otelEndpoint;
-          }
-          // extraServiceEnv
-          // covEnv;
-      };
+      systemd = {
+        services = {
+          # OTel endpoint for the worker. Worker spans aren't strictly
+          # needed for the milestone (gateway→scheduler is the
+          # critical trace hop), but having them in Tempo makes the trace
+          # tree match the observability.typ spec diagram.
+          #
+          # Pull-mode delivery (T-1c.2b standalone re-point): ExecStart is
+          # the pull spawner above — it acquires a per-intent identity and
+          # token from the scheduler's admin surface (the controller's own
+          # path) and execs rio-builder for exactly that intent;
+          # Restart=always (worker module) brings the wrapper back for the
+          # next intent. (The former RIO_DISPATCH_MODE discriminator is
+          # retired: pull is the only delivery path.)
+          rio-builder = {
+            serviceConfig.ExecStart = lib.mkForce "${pullSpawner}/bin/rio-pull-spawner";
+            environment =
+              lib.optionalAttrs (otelEndpoint != null) {
+                RIO_OTEL_ENDPOINT = otelEndpoint;
+              }
+              // extraServiceEnv
+              // covEnv;
+          };
+          # The worker module also runs rio-mountd (the per-node castore
+          # broker rio-builder dials every build). Same coverage env as
+          # rio-builder — without it the long-lived daemon writes its
+          # profraw to its cwd as default.profraw (or nowhere at all)
+          # and the e2e scenarios contribute zero rio-mountd lines.
+          rio-mountd.environment = covEnv;
+        };
 
-      systemd.tmpfiles.rules = covTmpfiles;
+        tmpfiles.rules = covTmpfiles;
+      };
 
       # curl for metric scraping.
       environment.systemPackages = [ pkgs.curl ];
@@ -936,11 +1043,15 @@ rec {
                 n.execute("systemctl stop rio-builder 2>/dev/null || true")
             # Pass 2: control services + k3s + tar. Workers' bidi
             # streams are now closed — scheduler's serve_with_shutdown
-            # unblocks immediately.
+            # unblocks immediately. rio-mountd stops here too: by now
+            # every rio-builder is down, so nothing dials the broker
+            # socket anymore, and only a graceful stop flushes its
+            # profraw (Restart=always means it would otherwise still
+            # be running when the VM is killed).
             for n in _cov_nodes:
                 n.execute(
                     "systemctl stop rio-gateway rio-scheduler rio-store "
-                    "rio-controller 2>/dev/null || true"
+                    "rio-controller rio-mountd 2>/dev/null || true"
                 )
                 # k3s pods (k3s-full fixture — all components):
                 # delete by label → graceful SIGTERM → profraw flush via
@@ -955,6 +1066,12 @@ rec {
                 # builders (componentscaler/netpol) would otherwise
                 # leave them running and the wait-for-delete below
                 # times out without ever signalling them.
+                # DaemonSets included for the rio-mountd DS: its pods
+                # carry part-of=rio-build, so leaving the DS alive
+                # means no mountd profraw AND the wait-for-delete
+                # below can never succeed (the live DS pods always
+                # match the selector — every k3s coverage run burned
+                # the full 60s timeout).
                 #
                 # CRITICAL: `kubectl delete deploy,sts,job --wait=true`
                 # waits only for the DEPLOYMENT object to be gone.
@@ -969,7 +1086,7 @@ rec {
                 # test runs).
                 n.execute(
                     "[ -f /etc/rancher/k3s/k3s.yaml ] && {"
-                    "  k3s kubectl delete deploy,sts,job -A "
+                    "  k3s kubectl delete deploy,sts,ds,job -A "
                     "    -l 'app.kubernetes.io/part-of=rio-build' "
                     "    --wait=true --timeout=60s 2>/dev/null;"
                     "  k3s kubectl wait --for=delete pods -A "

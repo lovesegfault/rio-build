@@ -38,6 +38,23 @@ in
   # HMAC keys for assignment+service tokens (lib/hmac-keys.nix).
   withHmac ? false,
 
+  # Single-tenant wiring for build-running scenarios (P0560). The castore
+  # read surface (DirectoryService GetDirectory/ReadBlob/StatBlob) is
+  # tenant-scoped and refuses anonymous callers, so any scenario whose
+  # builds materialize inputs through the castore-FUSE lower needs:
+  # a tenant row, the client's authorized_keys comment naming it
+  # (gateway → scheduler build attribution → AssignmentClaims.tenant),
+  # HMAC keys (scheduler signs the assignment token, store verifies it),
+  # and a path_tenants row for every input path the builder will read.
+  # Nothing in the production chain writes path_tenants for
+  # client-uploaded sources/.drvs yet (only the scheduler's
+  # completion-time upsert covers built outputs), so the fixture installs
+  # a narinfo INSERT trigger attributing every registered path to this
+  # tenant — exactly the single-tenant semantics these scenarios model.
+  # Setting this to a tenant name (e.g. "vmtest") wires all of that;
+  # null keeps the legacy anonymous fixture.
+  defaultTenant ? null,
+
   # opentelemetry-collector on control (OTLP gRPC :4317, file exporter
   # to /var/lib/otelcol/traces.json). Sets RIO_OTEL_ENDPOINT on all
   # services. For scenarios/observability.nix.
@@ -63,7 +80,10 @@ in
   clientNixPackage ? pkgs.nix,
 }:
 let
-  hmacKeys = if withHmac then mkHmacKeys { } else null;
+  # defaultTenant implies HMAC: the assignment token is the only way the
+  # builder can present the tenant to the store's castore RPCs.
+  hmacEnabled = withHmac || defaultTenant != null;
+  hmacKeys = if hmacEnabled then mkHmacKeys { } else null;
 
   # ── Materialization env ──────────────────────────────────────────────
   # The store's executor spawn condition (PD-D2): the scheduler
@@ -74,20 +94,20 @@ let
     RIO_MATERIALIZATION__SCHEDULER_ADDR = "localhost:9001";
   };
 
-  # ── HMAC env (no-op {} when withHmac=false) ──────────────────────────
+  # ── HMAC env (no-op {} when HMAC is off) ─────────────────────────────
   # Scheduler+store share the assignment-token key; gateway+store share
   # the service-token key. Workers get neither (they receive assignment
   # tokens from the scheduler at dispatch, not from a key file).
-  controlHmacEnv = lib.optionalAttrs withHmac {
+  controlHmacEnv = lib.optionalAttrs hmacEnabled {
     RIO_HMAC_KEY_PATH = "${hmacKeys}/hmac.key";
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
-  gatewayHmacEnv = lib.optionalAttrs withHmac {
+  gatewayHmacEnv = lib.optionalAttrs hmacEnabled {
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
-  # Worker EnvironmentFile under withHmac. One credential:
+  # Worker EnvironmentFile under HMAC. One credential:
   #
   #   RIO_PULL_SPAWNER_SERVICE_TOKEN — controller-role ServiceClaims
   #     {caller="rio-controller", far-future expiry} signed with
@@ -234,7 +254,7 @@ let
     systemd.services = {
       rio-gateway = {
         environment =
-          (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
+          (lib.optionalAttrs hmacEnabled (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
         after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
       };
 
@@ -254,15 +274,51 @@ let
         environment = storeMaterializationEnv;
         after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
       };
+
+      # Seed the default tenant + the path-attribution triggers (P0560
+      # stopgap, P0593 deletes; SQL shared with the toxiproxy/k3s
+      # fixtures via common.tenantStopgapSeedSql — see the scoping
+      # rationale there). The gateway resolves the authorized_keys
+      # comment to this row at SSH auth time (unknown name → connection
+      # rejected), so it must exist before the testScript's first
+      # ssh-ng use; waitReady waits for this unit. Retry loop: the
+      # tenants/narinfo/path_tenants tables only exist once
+      # rio-store/rio-scheduler finish their startup migrations.
+      # Client reads stay anonymous (no JWT) and therefore unfiltered,
+      # exactly as in the legacy fixture.
+      rio-seed-tenant = lib.mkIf (defaultTenant != null) {
+        description = "Seed the '${toString defaultTenant}' tenant for VM-test builds";
+        wantedBy = [ "multi-user.target" ];
+        after = [
+          "postgresql.service"
+          "rio-store.service"
+          "rio-scheduler.service"
+        ];
+        path = [ pkgs.postgresql ];
+        serviceConfig = {
+          Type = "oneshot";
+          RemainAfterExit = true;
+        };
+        script = ''
+          for _ in $(seq 1 120); do
+            if psql -h /run/postgresql -U postgres -d rio -v ON_ERROR_STOP=1 -1 -f ${common.tenantStopgapSeedSql (toString defaultTenant)}; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "tenant seed never applied (migrations not finished?)" >&2
+          exit 1
+        '';
+      };
     };
   };
 
   # ── Worker nodes ────────────────────────────────────────────────────
   # mapAttrs' renames to the worker's hostName while passing through
-  # the scenario's per-worker args + fixture-level OTel. When
-  # withHmac, also mount the credentials EnvironmentFile so the pull
-  # spawner can present the controller-role service token on the
-  # spawn-intent admin calls.
+  # the scenario's per-worker args + fixture-level OTel. When HMAC is
+  # on, also mount the credentials EnvironmentFile so the pull spawner
+  # can present the controller-role service token on the spawn-intent
+  # admin calls.
   workerNodes = lib.mapAttrs (name: args: {
     imports = [
       (common.mkWorkerNode (
@@ -273,7 +329,7 @@ let
         }
       ))
     ];
-    systemd.services.rio-builder.serviceConfig.EnvironmentFile = lib.mkIf withHmac [
+    systemd.services.rio-builder.serviceConfig.EnvironmentFile = lib.mkIf hmacEnabled [
       "${executorTokenEnv}"
     ];
   }) workers;
@@ -309,6 +365,9 @@ in
   waitReady = ''
     ${common.waitForControlPlane "control"}
   ''
+  + lib.optionalString (defaultTenant != null) ''
+    control.wait_for_unit("rio-seed-tenant.service")
+  ''
   + lib.optionalString withOtel ''
     control.wait_for_unit("opentelemetry-collector.service")
     control.wait_for_open_port(4317)
@@ -321,6 +380,7 @@ in
   # things the old registration wait actually guarded). Work delivery
   # itself is asserted by the scenarios' own builds.
   + lib.concatMapStrings (w: ''
+    ${w}.wait_for_unit("rio-mountd.service")
     ${w}.wait_for_unit("rio-builder.service")
     ${w}.wait_until_succeeds(
         "journalctl -u rio-builder --no-pager | "
@@ -331,4 +391,24 @@ in
 
   # For `${common.collectCoverage pyNodeVars}`.
   pyNodeVars = lib.concatStringsSep ", " ([ "control" ] ++ workerNames ++ [ "client" ]);
+}
+// lib.optionalAttrs (defaultTenant != null) {
+  # Exposed so scenarios with grpcurl-direct submits (scheduling
+  # cancel-timing) can attribute the SubmitBuildRequest to the same
+  # tenant the SSH path resolves.
+  inherit defaultTenant;
+
+  # Drop-in for common.sshKeySetup (mkBootstrap prefers fixture.sshKeySetup
+  # when present): same keygen + authorized_keys + gateway restart, but
+  # the authorized_keys entry carries the tenant name as its comment, so
+  # the gateway attributes every ssh-ng session — uploads AND build
+  # submissions — to defaultTenant.
+  sshKeySetup = ''
+    client.succeed("mkdir -p /root/.ssh && ssh-keygen -t ed25519 -N ''' -C '${defaultTenant}' -f /root/.ssh/id_ed25519")
+    pubkey = client.succeed("cat /root/.ssh/id_ed25519.pub").strip()
+    control.succeed(f"echo '{pubkey}' > /var/lib/rio/gateway/authorized_keys")
+    control.succeed("systemctl restart rio-gateway.service")
+    control.wait_for_unit("rio-gateway.service")
+    control.wait_for_open_port(2222)
+  '';
 }

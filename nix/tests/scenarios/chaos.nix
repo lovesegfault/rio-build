@@ -8,7 +8,8 @@
 # | # | toxic       | proxy            | exercises                        |
 # |---|-------------|------------------|----------------------------------|
 # | 1 | latency     | scheduler_store  | cache-check RPC under slowness   |
-# | 2 | reset_peer  | worker_store     | upload retry loop (upload.rs)    |
+# | 2 | reset_peer  | worker_store     | prefetch RST → redispatch (or    |
+# |   |             |                  | upload retry if jitter is late)  |
 # | 3 | timeout     | scheduler_store  | cache-check breaker (merge.rs)   |
 # | 4 | bandwidth   | worker_store     | large-NAR streaming under cap    |
 #
@@ -146,25 +147,30 @@ pkgs.testers.runNixOSTest {
             control.succeed("toxiproxy-cli toxic remove -n lat scheduler_store")
 
     # ══════════════════════════════════════════════════════════════════
-    # Subtest 2: worker↔store reset mid-PutPath — upload retries succeed
+    # Subtest 2: worker↔store RST — castore prefetch fails, build recovers
     # ══════════════════════════════════════════════════════════════════
     # reset_peer sends RST after `timeout` ms of a connection existing.
-    # With timeout=500, each PutPath connection gets RST 500ms after
-    # open — long enough for the gRPC handshake + first few chunks, so
-    # the reset is genuinely mid-stream (not at-open, which would look
-    # like a connect failure to tonic).
+    # With timeout=500, each worker↔store connection gets RST 500ms
+    # after open — long enough for the gRPC handshake + first messages,
+    # so the reset is genuinely mid-stream (not at-open, which would
+    # look like a connect failure to tonic).
     #
-    # upload.rs:197 retry loop: 3 attempts, backoff 1s/2s.
+    # Recovery has two possible shapes (see the wait below): the usual
+    # one is the RST landing in the castore prefetch / metadata fetch →
+    # InfrastructureFailure → scheduler redispatch; the other is the
+    # RST landing during upload, where the upload retry loop iterates
+    # (3 attempts, backoff 1s/2s):
     #   attempt 0 @ t=0    → RST @ t≈0.5s
     #   attempt 1 @ t≈1.5s → RST @ t≈2.0s
     #   attempt 2 @ t≈4.0s → succeeds IF toxic removed by then
     #
-    # We don't time the heal blindly. Instead: poll worker journal for
-    # "upload attempt failed" (upload.rs:240), THEN heal. The 1s+2s
-    # backoff gives ~3s of slack between first-failure-logged and
-    # attempt-2-starts — enough for wait_until_succeeds (1s poll) +
-    # the heal SSH round-trip (~0.5s) to land.
-    with subtest("reset_peer on worker_store: upload retries succeed"):
+    # We don't time the heal blindly. Instead: poll the worker journal
+    # for the RST actually biting, THEN heal. The redispatch / 1s+2s
+    # upload backoff give a few seconds of slack between
+    # first-failure-logged and the next attempt — enough for
+    # wait_until_succeeds (1s poll) + the heal SSH round-trip (~0.5s)
+    # to land.
+    with subtest("reset_peer on worker_store: prefetch RST -> redispatch or upload retry succeeds"):
         # Timestamp mark: journal filter for this subtest only. Earlier
         # subtests don't touch worker_store, so there should be no prior
         # upload failures, but the mark makes that structural not hopeful.
@@ -185,18 +191,27 @@ pkgs.testers.runNixOSTest {
         )
 
         # Wait for the toxic to bite. The 500ms reset_peer fires during
-        # the worker's FIRST worker_store use — input-metadata-fetch
-        # (runtime.rs), not upload. "build execution failed" at ERROR
-        # with ConnectionReset in the error chain. The attempt is
-        # reported as an infrastructure failure, the scheduler requeues
-        # the drv charge-free, and a fresh one-shot pull picks it up
-        # again — so the overall retry path is the pull-mode re-pull,
-        # not the upload.rs internal loop. Grep both: if timing jitter
-        # lets metadata-fetch through, the upload-retry path fires
-        # instead.
+        # the worker's FIRST worker_store use — since P0560 that is the
+        # castore mount's DAG prefetch / metadata fetch (surfacing as
+        # "build execution failed" at ERROR, runtime/result.rs, with
+        # the tonic transport error in the error= field), not upload.
+        # The attempt is reported as an infrastructure failure, the
+        # scheduler requeues the drv charge-free, and a fresh one-shot
+        # pull picks it up again — so the overall retry path is the
+        # pull-mode re-pull, not the upload.rs internal loop. The
+        # "build execution failed" arm is anchored to the
+        # connection-reset / transport-error signature so an unrelated
+        # infra failure (mountd handshake, overlay, tenant-scope miss)
+        # cannot satisfy this gate — and therefore cannot carry the
+        # subtest. The upload arm stays for the case where timing
+        # jitter lets the small input prefetch through inside the
+        # 500ms window and the RST lands on PutPathChunked instead.
         worker.wait_until_succeeds(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -E 'upload attempt failed|input metadata fetch failed' >/dev/null",
+            "grep -E 'upload attempt failed"
+            "|build execution failed.*([Cc]onnection reset|transport error"
+            "|broken pipe|stream closed|connection error|h2 protocol error)' "
+            ">/dev/null",
             timeout=30,
         )
 
