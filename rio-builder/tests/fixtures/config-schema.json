@@ -161,9 +161,9 @@
         "default": 120
       },
       "dispatch_mode": {
-        "description": "Dispatch mode: `stream` (default — the session protocol) or\n`pull` (the additive `PullAssignment`/`ReportOutcome` unary\npath; the pod pulls the derivation it was spawned for and\nreports its outcome, with no registration, heartbeat, or\nstream). Env: `RIO_DISPATCH_MODE=stream|pull`. Selected per\npool by the controller; flipping a production pool is a\ndeployment-time operator action.",
+        "description": "Dispatch mode: `pull` (default since the 1c cutover — the\n`PullAssignment`/`ReportOutcome` unary path; the pod pulls the\nderivation it was spawned for and reports its outcome, with no\nregistration, heartbeat, or stream) or `stream` (the legacy\nsession protocol, selectable until its 1c'/1d deletion).\nEnv: `RIO_DISPATCH_MODE=pull|stream`. The controller renders\nthe value explicitly for every pool it spawns; standalone runs\nthat want the session protocol must set `stream` themselves.",
         "$ref": "#/$defs/DispatchMode",
-        "default": "stream"
+        "default": "pull"
       }
     },
     "$defs": {
@@ -195,15 +195,15 @@
         }
       },
       "DispatchMode": {
-        "description": "How this pod gets its work from the scheduler.\n\n`Stream` is the as-built session protocol (register, heartbeat,\nbidi `BuildExecution` stream) and stays the default everywhere.\n`Pull` is the additive unary path: the pod is born knowing its\nderivation (`RIO_INTENT_ID`) and asks for it with\n`ExecutorService.PullAssignment`, reporting the outcome with\n`ReportOutcome` — no registration, no heartbeat, no stream. Selected\nper pool (the controller renders the pod env); production pools stay\non `stream` until a pool template is flipped at deployment time.",
+        "description": "How this pod gets its work from the scheduler.\n\n`Pull` is the unary path and the default since the\nexecutor-lifecycle 1c cutover: the pod is born knowing its\nderivation (`RIO_INTENT_ID`) and asks for it with\n`ExecutorService.PullAssignment`, reporting the outcome with\n`ReportOutcome` — no registration, no heartbeat, no stream.\n`Stream` is the legacy session protocol (register, heartbeat, bidi\n`BuildExecution` stream); it stays selectable — the controller\nrenders `RIO_DISPATCH_MODE=stream` for `dispatchMode: Stream`\npools and standalone/systemd deployments set it explicitly — and\nfully functional until that path is deleted at the 1c'/1d slices.",
         "oneOf": [
           {
-            "description": "Session protocol (register/heartbeat/stream) — the default.",
+            "description": "Legacy session protocol (register/heartbeat/stream).",
             "type": "string",
             "const": "stream"
           },
           {
-            "description": "Pull-mode unaries (`PullAssignment` / `ReportOutcome`).",
+            "description": "Pull-mode unaries (`PullAssignment` / `ReportOutcome`) — the\ndefault.",
             "type": "string",
             "const": "pull"
           }
@@ -245,6 +245,6 @@
     "daemon_timeout_secs": 7200,
     "max_silent_time_secs": 0,
     "idle_secs": 120,
-    "dispatch_mode": "stream"
+    "dispatch_mode": "pull"
   }
 }

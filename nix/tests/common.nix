@@ -429,12 +429,22 @@ rec {
       # needed for the milestone (gateway→scheduler is the
       # critical trace hop), but having them in Tempo makes the trace
       # tree match the observability.typ spec diagram.
-      systemd.services.rio-builder.environment =
-        lib.optionalAttrs (otelEndpoint != null) {
-          RIO_OTEL_ENDPOINT = otelEndpoint;
-        }
-        // extraServiceEnv
-        // covEnv;
+      #
+      # RIO_DISPATCH_MODE=stream: the builder binary's compiled default
+      # flipped to pull at the executor-lifecycle 1c cutover, but the
+      # standalone (non-k3s) topology has no controller/Job spawner to
+      # inject RIO_INTENT_ID, so its workers stay on the legacy session
+      # protocol until the standalone-corpus re-point (T-1c.2b) gives
+      # the harness a per-intent spawn mechanism. extraServiceEnv can
+      # still override for targeted experiments.
+      systemd.services.rio-builder.environment = {
+        RIO_DISPATCH_MODE = "stream";
+      }
+      // lib.optionalAttrs (otelEndpoint != null) {
+        RIO_OTEL_ENDPOINT = otelEndpoint;
+      }
+      // extraServiceEnv
+      // covEnv;
 
       systemd.tmpfiles.rules = covTmpfiles;
 

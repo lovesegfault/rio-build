@@ -60,6 +60,11 @@ scope: with scope; ''
           "  namespace: ${nsBuilders}\n"
           "spec:\n"
           "  kind: Builder\n"
+          # Stream pin: this subtest's waits assert registration-era
+          # behavior (workers_active / heartbeat-reap); it is re-pointed
+          # onto the pull path by T-1c.2b, not by the 1c defaults flip
+          # (the CRD-absent default is Pull since that flip).
+          "  dispatchMode: Stream\n"
           "  maxConcurrent: 4\n"
           "  systems: [x86_64-linux]\n"
           # rio-builder:dev — MUST match the ref from nix/docker.nix

@@ -200,20 +200,23 @@ gone.
   check (applied to BOTH kinds since r35) as the safety net.
 ]
 
-#r("ctrl.pod.tgps-default+2")[
-  For stream-mode pools (`spec.dispatchMode` absent or `Stream`) the Job pod
-  spec MUST default `terminationGracePeriodSeconds` to `7200` (2h)
-  when `PoolSpec.terminationGracePeriodSeconds` is unset. SIGTERM → executor
-  drain (#rref("ctrl.drain.sigterm")) waits for the in-flight build to complete
-  before exit; nix builds can legitimately take 2h (LLVM, full NixOS closure
-  from cold cache). Clusters with known-shorter builds set this lower so pool
-  deletion doesn't stall on a stuck pod for 2h. For pull-mode pools
-  (`spec.dispatchMode: Pull`) the pod template MUST set the AD5 abort grace of
-  `45` seconds instead --- SIGTERM is an abort (cgroup-kill plus one bounded
-  report attempt plus log finalization), not a drain, so the grace is sized to
-  the abort-and-report bound and an explicit
-  `PoolSpec.terminationGracePeriodSeconds` is overridden for pull-mode pools
-  (the operator-owned value applies to stream pools only).
+#r("ctrl.pod.tgps-default+3")[
+  For pull-mode pools (`spec.dispatchMode` absent or `Pull` --- pull is the
+  default since the 1c cutover) the Job pod template MUST set the AD5 abort
+  grace of `45` seconds and MUST render `RIO_DISPATCH_MODE=pull` --- SIGTERM
+  is an abort (cgroup-kill plus one bounded report attempt plus log
+  finalization), not a drain, so the grace is sized to the abort-and-report
+  bound and an explicit `PoolSpec.terminationGracePeriodSeconds` is overridden
+  for pull-mode pools. For stream-mode pools (an explicit
+  `spec.dispatchMode: Stream`, selectable until that path's 1c'/1d deletion)
+  the Job pod spec MUST render `RIO_DISPATCH_MODE=stream` explicitly (the
+  builder image's compiled default is pull, so the opt-out must be carried by
+  the pod spec) and MUST default `terminationGracePeriodSeconds` to `7200`
+  (2h) when `PoolSpec.terminationGracePeriodSeconds` is unset --- SIGTERM →
+  executor drain (#rref("ctrl.drain.sigterm")) waits for the in-flight build
+  to complete before exit; nix builds can legitimately take 2h (LLVM, full
+  NixOS closure from cold cache), and the operator-owned grace value applies
+  to stream pools only.
 ]
 
 #r("ctrl.pool.kvm-device+2")[

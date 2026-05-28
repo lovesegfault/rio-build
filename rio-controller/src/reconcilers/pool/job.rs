@@ -80,10 +80,12 @@ pub(super) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 ///     mid-build eviction protection.
 ///
 /// `termination_grace_period_seconds` is left to
-/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default+2]`:
-/// 7200s builders, 600s fetchers, or `PoolSpec` override). The
-/// builder's SIGTERM handler blocks on its single in-flight build, so
-/// "ephemeral" ≠ "fast exit".
+/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default+3]`:
+/// the 45s AD5 abort grace for pull-mode pools — the default since the
+/// 1c cutover — or 7200s builders / 600s fetchers / the `PoolSpec`
+/// override for explicit-Stream pools). The stream builder's SIGTERM
+/// handler blocks on its single in-flight build, so "ephemeral" ≠
+/// "fast exit" there; pull-mode pods abort and report instead.
 ///
 /// Consolidated here so the Job-lifecycle invariants (karpenter
 /// annotation, deadline backstop) can't drift between callers —

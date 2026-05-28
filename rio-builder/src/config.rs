@@ -26,23 +26,26 @@ fn executor_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ExecutorKind,
 
 /// How this pod gets its work from the scheduler.
 ///
-/// `Stream` is the as-built session protocol (register, heartbeat,
-/// bidi `BuildExecution` stream) and stays the default everywhere.
-/// `Pull` is the additive unary path: the pod is born knowing its
+/// `Pull` is the unary path and the default since the
+/// executor-lifecycle 1c cutover: the pod is born knowing its
 /// derivation (`RIO_INTENT_ID`) and asks for it with
 /// `ExecutorService.PullAssignment`, reporting the outcome with
-/// `ReportOutcome` — no registration, no heartbeat, no stream. Selected
-/// per pool (the controller renders the pod env); production pools stay
-/// on `stream` until a pool template is flipped at deployment time.
+/// `ReportOutcome` — no registration, no heartbeat, no stream.
+/// `Stream` is the legacy session protocol (register, heartbeat, bidi
+/// `BuildExecution` stream); it stays selectable — the controller
+/// renders `RIO_DISPATCH_MODE=stream` for `dispatchMode: Stream`
+/// pools and standalone/systemd deployments set it explicitly — and
+/// fully functional until that path is deleted at the 1c'/1d slices.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
 )]
 #[serde(rename_all = "lowercase")]
 pub enum DispatchMode {
-    /// Session protocol (register/heartbeat/stream) — the default.
-    #[default]
+    /// Legacy session protocol (register/heartbeat/stream).
     Stream,
-    /// Pull-mode unaries (`PullAssignment` / `ReportOutcome`).
+    /// Pull-mode unaries (`PullAssignment` / `ReportOutcome`) — the
+    /// default.
+    #[default]
     Pull,
 }
 
@@ -218,13 +221,14 @@ pub struct Config {
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
-    /// Dispatch mode: `stream` (default — the session protocol) or
-    /// `pull` (the additive `PullAssignment`/`ReportOutcome` unary
-    /// path; the pod pulls the derivation it was spawned for and
-    /// reports its outcome, with no registration, heartbeat, or
-    /// stream). Env: `RIO_DISPATCH_MODE=stream|pull`. Selected per
-    /// pool by the controller; flipping a production pool is a
-    /// deployment-time operator action.
+    /// Dispatch mode: `pull` (default since the 1c cutover — the
+    /// `PullAssignment`/`ReportOutcome` unary path; the pod pulls the
+    /// derivation it was spawned for and reports its outcome, with no
+    /// registration, heartbeat, or stream) or `stream` (the legacy
+    /// session protocol, selectable until its 1c'/1d deletion).
+    /// Env: `RIO_DISPATCH_MODE=pull|stream`. The controller renders
+    /// the value explicitly for every pool it spawns; standalone runs
+    /// that want the session protocol must set `stream` themselves.
     pub dispatch_mode: DispatchMode,
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
@@ -263,7 +267,7 @@ impl Default for Config {
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
-            dispatch_mode: DispatchMode::Stream,
+            dispatch_mode: DispatchMode::Pull,
         }
     }
 }

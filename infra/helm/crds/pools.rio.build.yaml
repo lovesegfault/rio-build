@@ -52,14 +52,15 @@ spec:
               dispatchMode:
                 description: |-
                   Executor dispatch mode (the executor-lifecycle replacement's
-                  per-pool selector). `Stream` (the default when the field is absent)
-                  keeps today's register/heartbeat/bidi-stream session protocol;
-                  `Pull` spawns pods that speak the pull/report unaries instead
-                  (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort semantics
-                  (SIGTERM aborts the build; the pod template renders the small
-                  pull-mode terminationGracePeriodSeconds instead of the 2 h drain
-                  grace). Flipping a pool's template is an operator action executed
-                  at deployment time.
+                  per-pool selector). `Pull` (the default when the field is absent,
+                  since the 1c cutover) spawns pods that speak the pull/report
+                  unaries (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort
+                  semantics (SIGTERM aborts the build; the pod template renders the
+                  small pull-mode terminationGracePeriodSeconds instead of the 2 h
+                  drain grace). `Stream` keeps the legacy register/heartbeat/
+                  bidi-stream session protocol — selectable per pool until that path
+                  is deleted at the 1c'/1d slices. Flipping a deployed pool's
+                  template remains an operator action executed at deployment time.
                 enum:
                 - Stream
                 - Pull

@@ -907,15 +907,16 @@ fn disruption_filter_false_or_absent_returns_none() {
     assert_eq!(disruption::is_disruption_target(&healthy), None);
 }
 
-// r[verify ctrl.pod.tgps-default+2]
+// r[verify ctrl.pod.tgps-default+3]
 #[test]
 fn job_pod_termination_grace() {
     let wp = test_wp();
     let pod = test_pod_spec(&wp);
     assert_eq!(
         pod.termination_grace_period_seconds,
-        Some(7200),
-        "2h for long nix builds (worker drain sequence runs within this)"
+        Some(pod::PULL_MODE_TGPS_SECS),
+        "the absent-mode default is pull since the 1c cutover, so the AD5 abort \
+         grace applies (the 2h drain grace remains for explicit Stream pools)"
     );
     assert_eq!(
         pod.automount_service_account_token,
@@ -923,8 +924,8 @@ fn job_pod_termination_grace() {
         "workers use gRPC, not K8s API — no SA token needed"
     );
     // The Job wrapper must NOT overwrite the pod-spec value: previously
-    // ephemeral_job stamped a flat 30s, making the CRD field +
-    // 7200/600 defaults dead.
+    // ephemeral_job stamped a flat 30s, making the CRD field + the
+    // per-mode defaults dead.
     let job = job::ephemeral_job(
         "j".into(),
         None,
@@ -940,7 +941,7 @@ fn job_pod_termination_grace() {
             .spec
             .unwrap()
             .termination_grace_period_seconds,
-        Some(7200),
+        Some(pod::PULL_MODE_TGPS_SECS),
         "ephemeral_job preserves build_executor_pod_spec's TGPS"
     );
 }

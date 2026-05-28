@@ -3192,3 +3192,72 @@ plumbing for pool-kind dispatch-mode selection (the
 `templates/pool.yaml`) lands with the same task so values-driven
 fixtures and the deployment-time per-pool flip (row D0) have a
 first-class knob.
+
+### The 1c defaults flip (T-1c.3): pull is the default dispatch mode
+
+Landed development-time (no deployment happens during the workstream;
+the per-pool template flip of a *running* fleet remains the
+deployment-time operator action of checklist row D0). The flip changes
+defaults, not capabilities:
+
+- **Pool CRD** (`rio-crds/src/pool.rs`): an absent `spec.dispatchMode`
+  now means `Pull` (`DispatchMode::default()` flipped); the controller
+  reads the default through `unwrap_or_default()` so the CRD enum is
+  the single source. `dispatchMode: Stream` stays selectable and fully
+  functional until the stream path's 1c'/1d deletion.
+- **Controller rendering** (`reconcilers/pool/pod.rs`): the pod
+  template now renders `RIO_DISPATCH_MODE` explicitly for BOTH modes
+  (`pull` for absent/Pull pools — plus the AD5 45 s abort grace —
+  `stream` for explicit-Stream pools, which keep the per-kind/spec
+  drain grace). The explicit stream value is what keeps Stream pools
+  functional now that the builder image's compiled default is pull;
+  the pod-level discriminators keep reading the rendered value, so
+  pods spawned before a flip stay correctly keyed
+  (`ctrl.pod.tgps-default+3`, bumped with re-pointed impl/verify
+  sites).
+- **Builder Config** (`rio-builder/src/config.rs`): `dispatch_mode`
+  default `stream` → `pull` (config-schema fixture re-blessed;
+  `docs/gen/config.json` regenerated). A pull-mode builder without
+  `RIO_INTENT_ID` fails fast (the 1b hardening), so a mis-deployed
+  stream-era environment surfaces as a prompt failed Job, never a
+  silently-hung node.
+- **Rendered manifests** (`infra/helm/rio-build`): `templates/pool.yaml`
+  renders `dispatchMode` from `poolDefaults.dispatchMode`, whose chart
+  default is now `Pull`; per-pool overrides remain for a canary-first
+  deployment-time flip (row D0) or to keep a pool on the legacy
+  protocol while it exists.
+- **What stays pinned to Stream during development** (the not-yet-
+  re-pointed stream-era machinery, all carrying pointers at the pin
+  site): the VM-suite chart values (`values/vmtest-full.yaml`
+  `poolDefaults.dispatchMode: Stream`), the standalone fixture's
+  systemd workers (`nix/tests/common.nix` `RIO_DISPATCH_MODE=stream` —
+  the standalone topology has no controller to inject
+  `RIO_INTENT_ID`), and the two scenario-applied Pool CRs whose
+  subtests assert registration-era behavior (`ephemeral-pool`,
+  `netpol`). Their re-point (or disposition) is T-1c.2b, which is NOT
+  part of this batch; until it lands, the pull path's VM coverage is
+  the explicitly-Pull pools of the `pull-mode`, `pull-canary`, and
+  `pull-fetcher` subtests.
+
+### Development-time 1c gate evidence (T-1c.3, v3-rescoped gate)
+
+| Gate item (v3 1c slice header) | Artifact | Verdict at this batch |
+|---|---|---|
+| OA2 aggregation landed and test-covered (T-1c.1) | `nodeclaim_pool/wedge.rs` + the union consumption in `reconcile_once`; rule `ctrl.nodeclaim.wedge-cluster`; red-first unit battery (3 clustering tests run red against a stubbed tracker, then green); `rio_controller_node_wedge_marked_total`; controller-invariant-map 1c entry | GREEN (rio-controller suite 319/319 at the landing tree) |
+| Fetcher/pool-kind VM coverage on the pull path (T-1c.2; the pool kinds the canary did not cover) | `pull-fetcher` subtest in `vm-pull-canary-k3s` (kind=Fetcher, dispatchMode: Pull, network-free FOD, OA3 one-pull assertions) | WIRED + check built once green at this batch (wall-clock recorded in the close-out report); OA3 one-pull confirmation for fetcher pools is the campaign-owner sign-off row in the development-time owner table, evidenced by this subtest |
+| Deletion-gate horizon formula + recording rule recorded (T-1c.2) | The §4.5 instantiation above; `rio:scheduler_stream_registrations:max` recording rule | RECORDED (helm-lint green); arms only at deployment time (row D6) |
+| C3 busy-source statement recorded (T-1c.2) | The statement above (open-attempt view is the busy source at zero stream registrations; empty-list does not disable the reap; no I-165 coverage loss accepted) | RECORDED |
+| Pull-path VM suites green with every pool kind covered | Builder-kind: `pull-canary` (vm-pull-canary-k3s, re-exercised by this batch's single check build because the new fetcher subtest extends that check) and `pull-mode` (vm-lifecycle-autoscale-k3s, green since the 1a landing and re-run at the G4 full gate rather than rebuilt inside this batch); Fetcher-kind: `pull-fetcher` (this batch). The full "lifecycle/scheduling/chaos suites green fleet-wide on the pull path" criterion additionally requires the standalone/k3s stream-era corpus re-point — that is T-1c.2b and remains OPEN (not silently absorbed here) | PARTIAL BY CONSTRUCTION (T-1c.2b outstanding); everything in this batch's scope is green |
+| Full gate green at the landing | `/nixbuild --checks` at the 1c landing (G4) | Run at the landing by the integrator (per the gate plan); the per-task batteries, helm-lint, tracey-validate, crds/docs-data drift, and the touched VM check were run green inside the batch |
+
+### Deferral note (v3 directive; recorded with dates at this batch)
+
+The fleet-wide template flip of a running fleet is deployment-time row
+D0; the fleet-wide latency comparison and the OA2-signal observation
+are rows D2/D3; the deletion-gate gauge observation (armed only once a
+real fleet runs pull-mode) is row D6; rollback at that point is still
+a per-pool template flip back to `dispatchMode: Stream` (rows D0/D5) —
+the development-time defaults flip above does not remove that lever,
+because Stream remains selectable until the 1c'/1d deletions and the
+deletion-stage releases stay separate (row D0 ordering). Recorded
+2026-05-27 with the rest of this record.

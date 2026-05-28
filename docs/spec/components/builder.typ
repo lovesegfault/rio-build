@@ -1376,13 +1376,16 @@ implicit in six cooperating mechanisms.
   materialization failures.
 ]
 
-= Pull-Mode Client (additive)
+= Pull-Mode Client
 
-In pull mode (`dispatch_mode = pull`, selected per pool) the builder does not
+In pull mode (`dispatch_mode = pull`, the default since the
+executor-lifecycle 1c cutover; selected per pool) the builder does not
 register, heartbeat, or open the `BuildExecution` stream: it asks for its work
 with `ExecutorService.PullAssignment` and reports the outcome with
 `ExecutorService.ReportOutcome`, both retried until acked. The stream-mode
-client below is unchanged and remains the default.
+client below is unchanged and stays selectable (`dispatch_mode = stream`,
+rendered explicitly by the controller for `dispatchMode: Stream` pools) until
+that path is deleted at the 1c'/1d slices.
 
 #r("builder.pull.retry-loop+2")[
   In pull mode the builder MUST retry a retryably-unservable `PullAssignment`

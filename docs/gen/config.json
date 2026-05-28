@@ -670,8 +670,8 @@
       {
         "key": "dispatch_mode",
         "type": "DispatchMode",
-        "default": "stream",
-        "description": "Dispatch mode: `stream` (default — the session protocol) or `pull` (the additive `PullAssignment`/`ReportOutcome` unary path; the pod pulls the derivation it was spawned for and reports its outcome, with no registration, heartbeat, or stream)."
+        "default": "pull",
+        "description": "Dispatch mode: `pull` (default since the 1c cutover — the `PullAssignment`/`ReportOutcome` unary path; the pod pulls the derivation it was spawned for and reports its outcome, with no registration, heartbeat, or stream) or `stream` (the legacy session protocol, selectable until its 1c'/1d deletion)."
       }
     ],
     "controller": [

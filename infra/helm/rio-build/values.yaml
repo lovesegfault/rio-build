@@ -1193,12 +1193,15 @@ poolDefaults:
   features: []
   image: rio-builder
   # Executor dispatch protocol for every pool that doesn't override it:
-  # Stream = the as-built register/heartbeat/stream session protocol;
   # Pull = the pull/report unary protocol (the executor-lifecycle
-  # replacement; pods get RIO_DISPATCH_MODE=pull and the 45s abort
-  # grace). Rendered onto each Pool CR by templates/pool.yaml. Per-pool
-  # override on the pools[] entry for a staged (canary-first) flip.
-  dispatchMode: Stream
+  # replacement and the default since the 1c cutover; pods get
+  # RIO_DISPATCH_MODE=pull and the 45s abort grace); Stream = the
+  # legacy register/heartbeat/stream session protocol, selectable per
+  # pool until that path is deleted at the 1c'/1d slices. Rendered onto
+  # each Pool CR by templates/pool.yaml. Per-pool override on the
+  # pools[] entry for a staged (canary-first) flip or to keep one pool
+  # on the legacy protocol.
+  dispatchMode: Pull
   # 50Gi. Reconciler adds this verbatim to every BUILDER pod's
   # ephemeral-storage request/limit AND the fuse-cache emptyDir
   # sizeLimit. Single-sourced through controller.toml
