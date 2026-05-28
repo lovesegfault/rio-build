@@ -1304,8 +1304,8 @@ peer that wedges the transport itself by refusing to read.
   --- `session.rs` idle-timer fires after 600s with no opcode, runs the same
   cancel loop before returning. All three paths MUST complete the cancel loop
   before the protocol task exits; hard `abort()` on the task handle defeats
-  this. Builds not cancelled leak an executor slot until
-  #rref("sched.backstop.timeout").
+  this. Builds not cancelled run on with no watcher until the scheduler's
+  orphan-watcher auto-cancel (#rref("sched.backstop.orphan-watcher")).
 ]
 
 #r("gw.conn.channel-limit+4")[

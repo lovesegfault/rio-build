@@ -172,11 +172,11 @@ gone.
   `terminated.reason="Error"` for the grace window, but `Error` is
   non-promoting so `report_terminated_pods` skips it; the Job condition is
   observable for `JOB_TTL_SECS=600` (\~60 reconcile ticks). The scheduler
-  resolves a report that matches no open pull-mode attempt through the same
-  legacy path as before: it prefix-matches the Job name against its
-  `recently_disconnected` map
-  (#rref("sched.termination.deadline-exceeded")), so the classification,
-  dedup, and floor arithmetic are unchanged behind the new RPC. Iterates the
+  resolves the report against the open-attempt view: a matching open attempt
+  gets the idempotent `termination_reason` second-installment fill
+  (#rref("sched.executor.report-idempotent")), and a report that matches no
+  attempt is acknowledged charge-free
+  (#rref("sched.attempt.no-attempt-no-op")). Iterates the
   already-listed
   `jobs.items` --- no extra apiserver call. Best-effort (RPC error logged,
   reconcile continues). Defense-in-depth behind the worker-side `daemon_timeout`
@@ -1161,14 +1161,15 @@ fleet-wide learning.
   data the controller did not observe).
 ]
 
-This is the OA2 successor to the heartbeat-fed hung-node detector
-(#rref("sched.admin.hung-node-detector")) for pull-mode pools: pull-mode pods
+This is the OA2 successor to the retired heartbeat-fed scheduler-side
+hung-node detector: pull-mode pods
 never register or heartbeat, so a wedged-but-`Ready` node (EBS stall, kernel
 softlockup, D-state runtime) is visible only as its builds running out their
 attempt deadlines without any report. The clustering reads only ledger facts
-plus the spawn-ack node binding, so it keeps working after the session
-machinery is deleted; during coexistence the scheduler-reported `dead_nodes`
-keeps covering stream-mode pools and the controller consumes the union. The
+plus the spawn-ack node binding, so it survived the session-machinery
+deletion and is now the only node-wedge signal: the scheduler-side detector
+is gone and `GetSpawnIntents.dead_nodes` is always empty (the field stays in
+the proto, and the union arm stays a no-op, until the 1d sweep). The
 #(refs.metric)("rio_controller_node_wedge_marked_total") counter records each
 not-wedged→wedged transition; the `RioSchedulerAttemptEstablishmentCluster`
 alert and the manual-reap runbook remain the independent operator-facing

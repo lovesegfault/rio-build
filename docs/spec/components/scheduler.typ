@@ -1,8 +1,9 @@
 #import "/lib/rio.typ": *
 #show: rio.with(domains: ("sched", "scheduler", "admin"))
 
-Receives derivation build requests, analyzes the @dag, and publishes work to
-executors via a bidirectional streaming RPC.
+Receives derivation build requests, analyzes the @dag, and exposes the work
+as spawn intents; one-shot executor pods spawned for those intents pull their
+assignment and report their outcome over idempotent unaries.
 
 = Responsibilities
 
@@ -30,9 +31,11 @@ executors via a bidirectional streaming RPC.
 - CA early cutoff: per-edge tracking --- when a CA derivation output matches
   cached content, mark that edge as cutoff and skip downstream only when ALL
   input edges are resolved
-- Work reassignment: when an executor fails (stream closed, heartbeat timeout),
-  reassign its in-flight derivations to another executor. _Slow-executor
-  speculative reassignment (actual_time > estimated_time × 3) is not currently
+- Work requeue: when an executor pod dies or its attempt is closed without a
+  worker report, requeue the still-wanted derivation for a fresh pod (the
+  verdict arms, the synthesized-verdict close, and the establishment sweep all
+  converge on the same requeue chokepoint). _Slow-executor speculative
+  reassignment (actual_time > estimated_time × 3) is not currently
   implemented._
 - @poison-derivation tracking: mark derivations that fail on 3+ different
   executors; auto-expire after 24h (see the error taxonomy)
@@ -44,9 +47,10 @@ executors via a bidirectional streaming RPC.
   A single Tokio task owns the DAG and processes all mutations from an `mpsc`
   channel:
   - `SubmitBuild` → DAG merge command
-  - `ReportCompletion` → node completion + downstream release command
+  - `PullAssignment` → admission + fenced attempt mint command
+  - `ReportPullOutcome` / `ReportAttemptOutcome` → node completion +
+    downstream release / attempt-row fill command
   - `CancelBuild` → orphan derivations command
-  - Heartbeat → executor liveness + `running_build` reconcile
   - CA early cutoff → edge cutoff + potential cancellation command
 ]
 
@@ -102,13 +106,17 @@ critical-path value).
    a. Solve per-derivation (cores, mem, disk, deadline) via the SLA model
       (solve_intent_for; ADR-023). The controller spawns one-shot pods sized
       to the same SpawnIntent.
-   b. Hard-filter executors: required features present? executor idle (one build
-      per pod)? system match? Candidates that fail are excluded entirely.
-   c. Assign to the first eligible executor via the bidirectional BuildExecution stream.
-      The WorkAssignment carries an HMAC-SHA256-signed assignment token (Claims:
-      executor_id, drv_hash, expected_outputs, is_ca, expiry_unix). The store verifies
-      the token on PutPath and rejects uploads for paths not in expected_outputs.
-8. As builds complete (reported via BuildExecution stream):
+   b. Publish a SpawnIntent for the Ready derivation (kind from is_fixed_output,
+      features/systems filters server-side); the controller spawns one Job per
+      intent with a per-intent HMAC executor token and the solved resources.
+   c. The pod pulls its assignment (PullAssignment): one fenced transaction
+      validates the token-intent binding, mints exec_id, and returns the
+      WorkAssignment. The payload carries an HMAC-SHA256-signed assignment token
+      (Claims: executor_id, drv_hash, expected_outputs, is_ca, expiry_unix). The
+      store verifies the token on PutPath and rejects uploads for paths not in
+      expected_outputs.
+8. As builds complete (reported via ReportOutcome, with the controller folding
+   pod/Job terminal status through ReportAttemptOutcome):
    a. Upload output to rio-store (executor does this before reporting)
    b. For CA derivations: check if output content matches any existing CAS entry
       - If match -> mark that specific edge as "cutoff"
@@ -618,15 +626,17 @@ on the controller channel with the same Phase-1 collapse.
   backstop timer) observes the death and in which order their reports
   arrive.
 ]
-The enforcement is the signal-channel dedup state: `recently_disconnected`
-(insert on mid-build disconnect only, first-report-wins removal, 60 s TTL
-sweep), the `last_completed` discriminator (an expected one-shot exit
-records no entry; a race-ahead termination report sets it so the imminent
-disconnect does not re-insert), and the non-promoting-reason early return
-(a `Completed`/`Error` report must not consume the dedup entry that the
-real classification needs). Each of those mechanisms exists because its
-absence double-counted a death (the G5 fix family); the rule states the
-property they collectively enforce so the model can check the conjunction.
+The enforcement is the durable attempt row rather than in-memory dedup
+state: the fenced mint creates at most one open attempt per intent, the
+first classifying observation appends the classification exactly once
+(`exec_id`-keyed, the partial-unique index is the arbiter), the
+pod-terminal report only fills `termination_reason` on that row under the
+`WHERE termination_reason IS NULL` guard, a report for an identity with no
+attempt row charges nothing, and the establishment sweep only ever
+establishes an attempt that still has no terminal row. The stream-era
+in-memory dedup (`recently_disconnected`, `last_completed`) that previously
+enforced this retired with the session machinery; the property is unchanged
+and is what the re-targeted session model checks.
 
 #r("sched.retry.recovery-projection+2")[
   After a leader change, each recovered derivation's retry state MUST equal
@@ -2239,16 +2249,19 @@ What survives, re-keyed onto the durable open-attempt row, is the
   healthy gateways means the gateway-side cancel is not firing.
 ]
 
-= Pull-Mode Dispatch (additive)
+= Pull-Mode Dispatch
 
-The pull/report path replaces the session protocol for pools that opt in
-(`dispatchMode: Pull`): a pod born knowing its derivation speaks two
-idempotent unaries --- `ExecutorService.PullAssignment` and
-`ExecutorService.ReportOutcome` --- and the controller folds pod/Job terminal
-status through `AdminService.ReportAttemptOutcome`. The stream path above is
-untouched during coexistence; everything in this section applies only to
-attempts minted by the pull transaction (`drv_executions.dispatch_mode =
-'pull'`).
+The pull/report path is the work-delivery protocol: a pod born knowing its
+derivation speaks two idempotent unaries --- `ExecutorService.PullAssignment`
+and `ExecutorService.ReportOutcome` --- and the controller folds pod/Job
+terminal status through `AdminService.ReportAttemptOutcome`. The stream
+session protocol it replaced is deleted (its RPCs are unconditional error
+stubs until the 1d proto sweep), so every in-flight build is an attempt
+minted by the pull transaction (`drv_executions.dispatch_mode = 'pull'`):
+the durable open-attempt row is the scheduler's only per-executor state, the
+establishment sweep is its only time-based repair, and the operator surfaces
+project that row set (#rref("sched.admin.list-open-attempts"),
+#rref("sched.admin.list-executors")).
 
 #r("sched.executor.pull-transaction")[
   `PullAssignment(executor_token, intent_id)` MUST be leader-served and MUST
@@ -2393,10 +2406,11 @@ projection.
 
 The scheduler applies @backpressure at multiple layers to prevent overload:
 
-*gRPC flow control:* The `BuildExecution` streams use the default HTTP/2 flow
-control window (64 KiB initial, dynamically adjusted). The scheduler does not
-send new `WorkAssignment` messages to an executor whose send window is
-exhausted, naturally rate-limiting dispatch to slow consumers.
+*Pull admission:* work delivery is pod-initiated --- the scheduler pushes
+nothing, so there is no per-executor send window to manage. A pull or report
+that cannot be served (overload, failover, recovery) surfaces as a retried
+unary on the pod side; the actor never queues undelivered work for a slow
+consumer.
 
 #r("sched.backpressure.hysteresis")[
   *Actor queue depth limit:* The DAG actor's `mpsc` channel has a fixed
@@ -3427,18 +3441,18 @@ parent's own realisation lands (FK ordering).
     node((0, 0), [`SubmitBuild`], name: <sb>),
     node((1, 0), [DAG Merge], name: <merge>),
     node((2, 0), [Critical Path\ Computation], name: <cp>),
-    node((3, 0), [Dispatch Ready\ Nodes], name: <disp>),
-    node((4, 0), [Assign to\ Best Executor], name: <assign>),
-    node((4, 1), [Executor], name: <ex>, fill: accent.lighten(88%)),
+    node((3, 0), [Publish Ready\ Spawn Intents], name: <disp>),
+    node((4, 0), [Fenced Pull\ Mint], name: <assign>),
+    node((4, 1), [Executor pod], name: <ex>, fill: accent.lighten(88%)),
     node((3, 1), [Process\ Completion], name: <comp>),
     node((2, 1), [Release\ Downstream], name: <rel>),
     node((1, 1), [Update Duration\ Estimates (async)], name: <upd>),
     edge(<sb>, <merge>, "-|>"),
     edge(<merge>, <cp>, "-|>"),
     edge(<cp>, <disp>, "-|>"),
-    edge(<disp>, <assign>, "-|>"),
-    edge(<assign>, <ex>, "-|>", [BuildExecution\ stream], label-size: 0.75em),
-    edge(<ex>, <comp>, "-|>", [CompletionReport], label-size: 0.75em),
+    edge(<disp>, <assign>, "-|>", [pod's PullAssignment], label-size: 0.75em),
+    edge(<assign>, <ex>, "-|>", [WorkAssignment], label-size: 0.75em),
+    edge(<ex>, <comp>, "-|>", [ReportOutcome], label-size: 0.75em),
     edge(<comp>, <rel>, "-|>"),
     edge(<rel>, <disp>, "-|>", bend: 25deg),
     edge(<comp>, <upd>, "-|>", bend: -25deg),
@@ -3454,33 +3468,34 @@ parent's own realisation lands (FK ordering).
   [No new builds accepted; `SubmitBuild` returns `UNAVAILABLE`.],
 
   [*Cascading effects*],
-  [Executors' `BuildExecution` streams disconnect; executors go idle. Gateways
-    return errors to clients.],
+  [Executor pods cannot pull or report; in-flight builds keep running and the
+    pods retry their unaries with backoff. Gateways return errors to clients.],
 
   [*Recovery*],
   [New leader acquires the Kubernetes Lease → fire-and-forgets `LeaderAcquired`
-    → `recover_from_pg` rebuilds DAG from PG. Executors reconnect;
-    `ReconcileAssignments` (45s delayed) checks for orphan completions or
-    resets stale assignments. Gateways reconnect via `WatchBuild(build_id,
-    since_sequence=last_seen)`.],
+    → `recover_from_pg` rebuilds DAG from PG, including the open pull attempts
+    and their `exec_id`s, so retried pulls and reports stay idempotent.
+    Gateways reconnect via `WatchBuild(build_id, since_sequence=last_seen)`.],
 )
 
-Under network partition between scheduler and executors, executors detect via
-heartbeat-response timeout, stop accepting new work, finish current builds, and
-buffer completion reports. The scheduler calls `reset_to_ready()` on
-disconnected executors' running builds --- they go directly back to Ready
-(increment `retry_count`), no intermediate status classification. After
-partition heals, executors reconnect and replay buffered completions.
+Under a network partition between the scheduler and executors, in-flight pods
+keep building and retry `ReportOutcome` until acked (the report retry loop is
+bounded by the pod's budget, then by the Job deadline); not-yet-pulled pods
+retry `PullAssignment` for as long as they live. The scheduler does not reset
+anything on the partition itself --- an open attempt is resolved by the report
+that eventually lands, by the controller's pod-terminal report if the pod dies
+first, or by the establishment sweep at deadline + slack
+(#rref("sched.attempt.establishment-window")).
 
 For split-brain mitigation: the Kubernetes Lease prevents two active schedulers
 under normal conditions; dual-leader windows are closed by the self-fence/steal
 asymmetry (11s vs 19s; empty under bounded clock skew) and, for the clock-pause
-residual, bounded by executor-side generation rejection; the
-assignment-generation counter lets executors ignore
-assignments from a deposed leader. PG writes are idempotent upserts. Optional
-future hardening: a `scheduler_meta` row with a generation-guard WHERE clause
-for strict fencing (current: idempotent writes tolerate the dual-leader
-window).
+residual, bounded by the generation-fenced authority transactions: the pull
+mint, the establishment charge and the synthesized close all carry the serving
+replica's generation and abort when it is below the durable claims floor
+(#rref("sched.lease.generation-fence")), so a deposed leader can neither bind
+new work nor consume outcomes. Other PG writes remain idempotent upserts and
+tolerate the brief dual-writer window.
 
 = Rationale
 

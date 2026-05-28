@@ -13,8 +13,9 @@ boundary. See @fetcher-rationale-split for the full rationale.
 
 = Responsibilities
 
-- Receive FOD build assignments from the scheduler via gRPC (the scheduler
-  routes FODs here per #rref("sched.dispatch.fod-to-fetcher"))
+- Pull FOD build assignments from the scheduler (the spawn path routes FODs
+  to fetcher pools per #rref("sched.dispatch.fod-to-fetcher"); the pod pulls
+  the one FOD intent it was spawned for)
 - Execute the FOD fetch via `nix-daemon --stdio` with network access enabled in
   the sandbox
 - Verify the output hash before upload (#rref("builder.fod.verify-hash"))
@@ -169,8 +170,8 @@ The following markers defined in other chapters govern fetcher behaviour:
   of spec
 - #rref("ctrl.pool.fetcher-spawn-builtin") --- spawn signal counts `builtin`
   FODs
-- #rref("sched.dispatch.fod-to-fetcher") --- scheduler hard-filter routes FODs
-  here
+- #rref("sched.dispatch.fod-to-fetcher") --- the spawn-side kind boundary
+  routes FODs here
 - #rref("sched.dispatch.fod-builtin-any-arch") --- `system="builtin"` FOD
   eligible on any fetcher
 - #rref("sched.sla.reactive-floor") --- `resource_floor` doubled on explicit
