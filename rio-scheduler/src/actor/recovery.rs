@@ -340,11 +340,14 @@ impl DagActor {
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;
         // r[impl sched.recovery.failed-dep-cascade+2]
         // Parents with a terminal-FAILURE dep: edge_rows above drops
-        // edges to ALL terminal children, so compute_initial_states
-        // would see all_deps_completed()=true and wrongly promote
-        // these to Ready. Load the set here (uses id_to_hash, internal
-        // to this fn) and pass through RecoveryLoad for seed_ready_
-        // queue to short-circuit → DependencyFailed.
+        // edges to expired-at-load poisoned / dependency_failed /
+        // cancelled children (within-TTL poisoned children were
+        // re-inserted above and keep their edges), so for the dropped
+        // ones compute_initial_states would see
+        // all_deps_completed()=true and wrongly promote these to
+        // Ready. Load the set here (uses id_to_hash, internal to this
+        // fn) and pass through RecoveryLoad for seed_ready_queue to
+        // short-circuit → DependencyFailed.
         //
         // Evidence rule (shared with the produced-children gate below,
         // in the failing direction here): a child's terminal failure

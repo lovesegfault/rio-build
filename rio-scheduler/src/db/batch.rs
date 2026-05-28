@@ -128,8 +128,9 @@ impl SchedulerDb {
         //
         // closure_hole is OR-combined too, for the symmetric reason: the
         // merge bind is ALWAYS false (the upsert is never a stamping
-        // site — only the leader's reap hook sets the breadcrumb, via
-        // `set_closure_hole_by_hashes`), and a pruned / single-node
+        // site — the breadcrumb is set via `set_closure_hole_by_hashes`
+        // by the leader's reap hook and by the recovery-time stamp in
+        // `load_dag_from_rows`), and a pruned / single-node
         // re-merge of the same drv does not re-declare its edges, so it
         // must not launder the persisted truncation evidence through the
         // upsert. The only merge-side clear is the explicit heal in
@@ -178,8 +179,9 @@ impl SchedulerDb {
             -- produced) and by clear_topdown_pruned_by_hash (lazy
             -- walk-failure clear; fail-fast consumed it).
             --
-            -- closure_hole: OR — set by the leader's reap hook only
-            -- (merges always bind false); this upsert never clears it.
+            -- closure_hole: OR — set by the leader's reap hook and the
+            -- recovery-time stamp in load_dag_from_rows (merges always
+            -- bind false); this upsert never clears it.
             -- Cleared by the merge-time heal
             -- (clear_closure_hole_by_hashes) and alongside the mark by
             -- the clear_topdown_pruned_by_hash{,es} helpers.
@@ -325,8 +327,9 @@ impl SchedulerDb {
     /// `clear_topdown_pruned_for_produced_parents` in completion.rs
     /// (parents whose last child just became produced), and the
     /// recovery-time gate in `load_dag_from_rows` (restored marks whose
-    /// persisted children are all produced and vouched for by a
-    /// still-live build); each clears its batch in one statement.
+    /// persisted children are all produced and vouched for by a live
+    /// (`pending`/`active`) build that also owns the parent); each
+    /// clears its batch in one statement.
     /// Also resets the `closure_hole` breadcrumb (`migrations/064`):
     /// the breadcrumb only qualifies the mark, so it travels with it —
     /// and the widened WHERE additionally mops up a markless leftover

@@ -104,8 +104,10 @@ impl SchedulerDb {
     /// "ready" (compute_initial_states). This is correct for those
     /// two: a completed/skipped dependency IS satisfied.
     ///
-    /// Edges to `poisoned`/`dependency_failed`/`cancelled` children are
-    /// ALSO dropped here (they're terminal too) — parents whose failed
+    /// Edges to expired-at-load `poisoned`, `dependency_failed`, and
+    /// `cancelled` children are ALSO dropped here (terminal, so not in
+    /// the loaded id set; within-TTL `poisoned` children are reloaded
+    /// for TTL tracking and keep their edges) — parents whose failed
     /// child is vouched for by a live co-owning build are returned by
     /// [`Self::load_parents_with_failed_deps`] and short-circuited to
     /// `DependencyFailed` in `seed_ready_queue` BEFORE
@@ -145,10 +147,13 @@ impl SchedulerDb {
     /// child must carry a `build_derivations` link to a
     /// `'pending'`/`'active'` build that ALSO links the parent.
     ///
-    /// [`Self::load_edges_for_derivations`] drops edges to ALL terminal
-    /// children, so `any_dep_terminally_failed` walks an empty
-    /// `children` map for these parents and `all_deps_completed`
-    /// returns `true` → wrong Ready. This query lets `seed_ready_queue`
+    /// [`Self::load_edges_for_derivations`] drops edges to expired-at-load
+    /// `poisoned` / `dependency_failed` / `cancelled` children (within-TTL
+    /// `poisoned` children are reloaded for TTL tracking, keep their
+    /// edges, and are visible to the walk directly), so for the dropped
+    /// ones `any_dep_terminally_failed` finds no failed child in the
+    /// `children` map and `all_deps_completed` can return `true` →
+    /// wrong Ready. This query lets `seed_ready_queue`
     /// transition them directly to `DependencyFailed` without loading
     /// stub nodes for the failed children. `'skipped'` is NOT a
     /// failure (CA-cutoff — `all_deps_completed` treats it as
@@ -283,9 +288,11 @@ impl SchedulerDb {
 
     /// Recovered parents with at least one persisted child whose status
     /// is a non-produced terminal (`'poisoned'`/`'dependency_failed'`/
-    /// `'cancelled'`) — exactly the children whose edges
+    /// `'cancelled'`) — in the main the children whose edges
     /// [`Self::load_edges_for_derivations`] drops without the child ever
-    /// having been produced. That drop is the recovery-side analogue of
+    /// having been produced (within-TTL `'poisoned'` children are the
+    /// over-approximation: they keep their edges yet still match — see
+    /// below). That drop is the recovery-side analogue of
     /// a reap: the parent's recovered child set is silently truncated
     /// relative to its persisted (and originally declared) closure, so
     /// the caller stamps the `closure_hole` breadcrumb on these parents

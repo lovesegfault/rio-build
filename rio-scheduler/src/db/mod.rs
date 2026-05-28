@@ -258,8 +258,9 @@ pub(crate) struct RecoveryDerivationRow {
     /// verbatim by `from_recovery_row` — resetting it to false is what
     /// allowed the post-failover doomed from-source dispatch.
     /// `load_dag_from_rows` then drops the restored mark when the row's
-    /// persisted children are all produced and vouched for by a
-    /// still-live build (see `load_parents_with_all_children_produced`).
+    /// persisted children are all produced and vouched for by a live
+    /// (`pending`/`active`) build that also owns the parent (see
+    /// `load_parents_with_all_children_produced`).
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb (`migrations/064`): an un-produced child
     /// was reaped out from under the node by a terminal build's
@@ -401,8 +402,9 @@ pub(crate) struct DerivationRow {
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb (`migrations/064`). Merge-time rows
     /// always bind `false` — the upsert is never a stamping site for
-    /// the breadcrumb (the only setter is the leader-gated reap hook
-    /// via `set_closure_hole_by_hashes`) — and the OR-on-conflict SET
+    /// the breadcrumb (the setters are the leader-gated reap hook and
+    /// the recovery-time stamp in `load_dag_from_rows`, both via
+    /// `set_closure_hole_by_hashes`) — and the OR-on-conflict SET
     /// keeps any persisted hole, so a later merge of the same drv can
     /// never launder it away. Cleared together with `topdown_pruned`
     /// by the extended `clear_topdown_pruned_by_hash{,es}` helpers and

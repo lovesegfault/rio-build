@@ -420,8 +420,9 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
 }
 
 // r[verify sched.merge.substitute-topdown+10]
-/// `closure_hole` (`migrations/064`) column semantics: stamped only by
-/// the reap hook's `set_closure_hole_by_hashes` (merge upserts always
+/// `closure_hole` (`migrations/064`) column semantics: stamped only via
+/// `set_closure_hole_by_hashes` (the leader's reap hook and the
+/// recovery-time stamp in `load_dag_from_rows`; merge upserts always
 /// bind false), preserved across a later re-upsert by the
 /// OR-on-conflict SET (a non-edge-declaring merge must not launder the
 /// truncation evidence), carried by the recovery SELECT so a new leader
@@ -476,7 +477,8 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         "merge upserts must not stamp the breadcrumb"
     );
 
-    // 2. The reap hook's stamp helper sets it.
+    // 2. The stamp helper (shared by the reap hook and the recovery-time
+    //    stamp) sets it.
     assert_eq!(
         db.set_closure_hole_by_hashes(&hashes).await?,
         1,
