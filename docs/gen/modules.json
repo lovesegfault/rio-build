@@ -771,6 +771,11 @@
       "doc": "Reader for replay archives: open a directory or DwarFS image, validate"
     },
     {
+      "path": "archive/s3.rs",
+      "depth": 1,
+      "doc": "Write-once S3 layout for replay archives — publish, fetch, list."
+    },
+    {
       "path": "archive/schema.rs",
       "depth": 1,
       "doc": "Serde types for the v1 replay-archive members."

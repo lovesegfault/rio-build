@@ -13,6 +13,7 @@
 pub(crate) mod backend;
 pub mod identity;
 pub mod reader;
+pub mod s3;
 pub mod schema;
 pub(crate) mod v0;
 pub mod writer;
