@@ -17,20 +17,27 @@
 //! when every warm-set path has a terminal disposition; a path that
 //! cannot be warmed never wedges the campaign — its leaf job is still
 //! attempted and measured.
+//!
+//! Warm batches are deliberately outside the engine's stall/queued
+//! watchdog: nothing here registers warm roots with it. Each warm batch
+//! is bounded by the per-batch child timeout (`batch_timeout_hours`)
+//! instead, and every root receives a terminal disposition as soon as its
+//! batch settles, so a slow or wedged warm batch is cut off by that
+//! timeout rather than re-queued.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context as _, Result};
 
 use super::batch::{Batch, PendingJob, assemble_batches};
 use super::model::{
     BATCH_KIND_WARM, DISPOSITION_ALREADY_PRESENT, DISPOSITION_BUILT_FALLBACK,
-    DISPOSITION_FAILED_AFTER_RETRIES, DISPOSITION_NO_STATIC_PRODUCER, DISPOSITION_SUBSTITUTED,
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DEPENDENCY_FAILED, STATUS_POISONED, STATUS_SKIPPED,
-    WarmEntry, now_rfc3339,
+    DISPOSITION_FAILED_AFTER_RETRIES, DISPOSITION_NO_STATIC_PRODUCER,
+    DISPOSITION_NOT_FOUND_UPSTREAM, DISPOSITION_SUBSTITUTED, STATUS_CANCELLED, STATUS_COMPLETED,
+    STATUS_DEPENDENCY_FAILED, STATUS_POISONED, STATUS_SKIPPED, WarmEntry, now_rfc3339,
 };
 use super::reader::ResultReader;
 use super::spec::Knobs;
@@ -149,7 +156,8 @@ pub async fn run_warm(
 ) -> Result<()> {
     let work = warm_work(warm_set, producer, plan_valid_paths, &state)?;
     if work.to_warm.is_empty() {
-        tracing::info!("warm stage: nothing to warm");
+        tracing::info!("warm stage: nothing left to warm");
+        log_disposition_summary(&state)?;
         return Ok(());
     }
     tracing::info!(
@@ -186,10 +194,13 @@ pub async fn run_warm(
     // kills every child the moment it spawns.
     let timeout = Duration::from_secs((knobs.batch_timeout_hours * 3600.0).max(1.0) as u64);
 
-    for batch in batches {
+    let batches_total = batches.len();
+    for (batch_index, batch) in batches.into_iter().enumerate() {
         let batch_id = batch_seq.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         tracing::info!(
             batch_id,
+            batch_index = batch_index + 1,
+            batches_total,
             roots = batch.root_drvs.len(),
             "starting warm batch"
         );
@@ -209,7 +220,8 @@ pub async fn run_warm(
         let observations: HashMap<String, super::reader::DrvObservation> = match &record.build_id {
             Some(build_id) => reader
                 .read_build(build_id, &batch.root_drvs)
-                .await?
+                .await
+                .with_context(|| format!("read back warm batch {batch_id} (build {build_id})"))?
                 .into_iter()
                 .map(|o| (o.drv_path.clone(), o))
                 .collect(),
@@ -235,8 +247,12 @@ pub async fn run_warm(
                     );
                     DISPOSITION_FAILED_AFTER_RETRIES
                 }),
-                // No build id / no derivation rows for this root: the paths
-                // stay un-warmed and are recorded as failed so the stage can
+                // Only reachable when the batch settled without a build id
+                // (the read-back above was skipped): with a build id the
+                // reader returns an observation for every requested root, so
+                // a root with no derivation rows arrives as an empty-status
+                // observation and is handled by the arm above. The paths stay
+                // un-warmed and are recorded as failed so the stage can
                 // finish — the leaf jobs depending on them are still
                 // attempted.
                 None => DISPOSITION_FAILED_AFTER_RETRIES,
@@ -255,13 +271,37 @@ pub async fn run_warm(
             }
         }
     }
+    log_disposition_summary(&state)?;
+    Ok(())
+}
+
+/// End-of-stage summary: count every warm.jsonl disposition (including the
+/// pre-classified ones written by hydra-truth and the plan snapshot) so the
+/// log shows how the whole warm set settled.
+fn log_disposition_summary(state: &StateDir) -> Result<()> {
+    let entries: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm)?;
+    let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+    for entry in &entries {
+        *counts.entry(entry.disposition.as_str()).or_default() += 1;
+    }
+    let count = |d: &str| counts.get(d).copied().unwrap_or(0);
+    tracing::info!(
+        paths = entries.len(),
+        already_present = count(DISPOSITION_ALREADY_PRESENT),
+        not_found_upstream = count(DISPOSITION_NOT_FOUND_UPSTREAM),
+        no_static_producer = count(DISPOSITION_NO_STATIC_PRODUCER),
+        substituted = count(DISPOSITION_SUBSTITUTED),
+        built_fallback = count(DISPOSITION_BUILT_FALLBACK),
+        failed_after_retries = count(DISPOSITION_FAILED_AFTER_RETRIES),
+        "warm stage complete"
+    );
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{BatchRecord, DISPOSITION_NOT_FOUND_UPSTREAM};
+    use crate::run::model::BatchRecord;
     use crate::run::reader::DrvObservation;
     use crate::run::reader::test_support::FakeReader;
     use crate::run::submitter::BatchOutcome;
@@ -385,10 +425,16 @@ mod tests {
                 ..DrvObservation::default()
             },
         );
+        // d6 is deliberately NOT scripted: the read-back returns an
+        // empty-status observation for it (no derivation rows in the build).
 
-        let warm_set = vec![p("p1"), p("p4")];
-        let producer: BTreeMap<String, String> =
-            [(p("p1"), drv("d1")), (p("p4"), drv("d4"))].into();
+        let warm_set = vec![p("p1"), p("p4"), p("p6")];
+        let producer: BTreeMap<String, String> = [
+            (p("p1"), drv("d1")),
+            (p("p4"), drv("d4")),
+            (p("p6"), drv("d6")),
+        ]
+        .into();
         run_warm(
             state.clone(),
             submitter.clone(),
@@ -402,13 +448,17 @@ mod tests {
         )
         .await
         .unwrap();
-        // The warm submission went to the warm store URL as one batch of two
-        // roots; the batch record carries the warm kind and the seeded id.
+        // The warm submission went to the warm store URL as one batch of
+        // three roots; the batch record carries the warm kind and the
+        // seeded id.
         {
             let submitted = submitter.submitted.lock().unwrap();
             assert_eq!(submitted.len(), 1);
             assert_eq!(submitted[0].0, "ssh-ng://rio@gw:22?ssh-key=/warm");
-            assert_eq!(submitted[0].1.root_drvs, vec![drv("d1"), drv("d4")]);
+            assert_eq!(
+                submitted[0].1.root_drvs,
+                vec![drv("d1"), drv("d4"), drv("d6")]
+            );
         }
         let batches: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert_eq!(batches.len(), 1);
@@ -422,6 +472,9 @@ mod tests {
             .collect();
         assert_eq!(by_path[&p("p1")], DISPOSITION_SUBSTITUTED);
         assert_eq!(by_path[&p("p4")], DISPOSITION_FAILED_AFTER_RETRIES);
+        // The build id existed but the build recorded no rows for d6: the
+        // empty-status observation still lands a terminal disposition.
+        assert_eq!(by_path[&p("p6")], DISPOSITION_FAILED_AFTER_RETRIES);
         // Idempotent: a second pass finds nothing left to warm.
         let again = warm_work(&warm_set, &producer, &HashSet::new(), &state).unwrap();
         assert!(again.to_warm.is_empty());

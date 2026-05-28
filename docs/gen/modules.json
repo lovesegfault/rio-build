@@ -911,6 +911,11 @@
       "doc": "Warm stage (leaf mode): batched root submissions of the warm set's"
     },
     {
+      "path": "run/watchdog.rs",
+      "depth": 1,
+      "doc": "Suspension predicate and stall/queued watchdog for the campaign's"
+    },
+    {
       "path": "s3.rs",
       "depth": 0,
       "doc": "Write-once S3 layout writer for eval-set artifacts."

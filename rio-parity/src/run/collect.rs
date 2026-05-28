@@ -511,7 +511,13 @@ pub async fn process_settled_batch(
         } else {
             None
         };
-        let log_signal_text = log_signal_bytes.as_deref().map(lossy_log_text);
+        // An empty fetch carries no evidence: drop it here so an empty tail
+        // can never become a meaningless `log:` failure signature (or an
+        // empty captured tail) downstream.
+        let log_signal_text = log_signal_bytes
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+            .map(lossy_log_text);
         match decide(
             ctx,
             &target,
@@ -670,12 +676,21 @@ mod tests {
     const OTHER: &str = "/nix/store/cccccccccccccccccccccccccccccccc-other.drv";
 
     /// Scripted AdminApi for evidence capture: the build graph is never read
-    /// (the reader is faked), every log tail is the same short text, and the
-    /// log_tail calls are counted so the Signal-3 reuse (one fetch serving
-    /// both classification and evidence capture) can be asserted.
-    #[derive(Default)]
+    /// (the reader is faked), every log tail is the same configurable text
+    /// (a short gcc error by default), and the log_tail calls are counted so
+    /// the Signal-3 reuse (one fetch serving both classification and
+    /// evidence capture) can be asserted.
     struct LogAdmin {
         log_calls: std::sync::atomic::AtomicUsize,
+        tail: Vec<u8>,
+    }
+    impl Default for LogAdmin {
+        fn default() -> Self {
+            Self {
+                log_calls: std::sync::atomic::AtomicUsize::new(0),
+                tail: b"gcc: fatal error\n".to_vec(),
+            }
+        }
     }
     #[async_trait::async_trait]
     impl AdminApi for LogAdmin {
@@ -688,7 +703,7 @@ mod tests {
         async fn log_tail(&self, _d: &str, _e: Option<&str>, _m: usize) -> Result<Vec<u8>> {
             self.log_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(b"gcc: fatal error\n".to_vec())
+            Ok(self.tail.clone())
         }
         async fn list_builds(&self, _t: &str, _l: u32) -> Result<Vec<(String, Option<String>)>> {
             Ok(vec![])
@@ -1375,6 +1390,60 @@ mod tests {
         assert!(state.path("logs/bad.x86_64-linux.log.zst").exists());
         // The Signal-3 fetch doubled as the evidence capture: one call only.
         assert_eq!(admin.log_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// An EMPTY Signal-3 log tail is no evidence: the record must not carry
+    /// a meaningless `log:` signature or a log key (nothing was captured),
+    /// while the log-tail-only evidence flag still marks the degraded
+    /// evidence quality.
+    #[tokio::test]
+    async fn empty_log_tail_is_not_used_as_a_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let reader = FakeReader::default();
+        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
+        // Both signals lost, exactly like the log-tail-only case above — but
+        // the scheduler has no log bytes left either.
+        reader.set(build_id, obs(T, "poisoned", None, None));
+        let admin = LogAdmin {
+            tail: Vec::new(),
+            ..LogAdmin::default()
+        };
+        let contexts: HashMap<String, JobContext> = [(
+            "bad.x86_64-linux".to_string(),
+            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+        )]
+        .into();
+        let batch = BatchView {
+            build_id: Some(build_id.to_string()),
+            exit_code: Some(1),
+            ..BatchView::default()
+        };
+        process_settled_batch(
+            &state,
+            &reader,
+            &admin,
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["bad.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.bucket, "rio-only-failure");
+        assert_eq!(rec.evidence.as_deref(), Some("log-tail-only"));
+        assert_eq!(rec.signature, None, "empty tail must not become `log:`");
+        assert_eq!(rec.log_key, None);
+        assert!(!state.path("logs/bad.x86_64-linux.log.zst").exists());
     }
 
     /// A failed at-capture log upload still records the deterministic S3 key
