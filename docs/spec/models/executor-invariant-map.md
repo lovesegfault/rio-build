@@ -3476,7 +3476,7 @@ path and is recorded against the commit that retires the machinery
 it tests. Commit A may not land while unconverted harness-only tests
 remain, for the same P13 reason as the VM-corpus precondition.
 
-Status (this batch, partial): the pull delivery helper layer is in
+Status (helper batch): the pull delivery helper layer is in
 place in `actor/tests/helpers.rs` (`pull_attempt`/`try_pull_attempt`,
 `pull_complete_{success,success_empty,ca,failure}`, `pull_report*`,
 `bind_intent_node` + `pull_fail_on_nodes`, `report_attempt_terminal`,
@@ -3488,16 +3488,67 @@ distinct stream workers → distinct bound source nodes
 (`bind_intent_node`), same-worker repetition → same intent identity,
 fleet-exhaust padding workers drop out (an empty fleet is
 NoEligibleWorkers, never a poison), force-assign backoff shims drop
-out (pulls are not backoff-gated). Remaining to re-point (counts from
-the blocker's per-file scan): completion.rs ~49, misc/build/fault/
-integration/keep_going/lifecycle_sweep/wiring ~49, the 6 mixed
-pull.rs tests and establishment.rs's stream row, the affected admin
-tests; dispatch.rs's ~43 placement tests are expected to stay on the
-stream helpers and retire with commit B (their subject is the
-placement layer itself), with per-test dispositions recorded when
-that file is processed. This precondition is OPEN until the
-remaining conversions (or their explicit retire-with-machinery /
-covered-by-pull dispositions) are recorded here.
+out (pulls are not backoff-gated).
+
+Status (re-point batch, complete): the three follow-up re-point
+commits finish the corpus conversion. Per-file outcome, in test fns —
+conversions keep assertions unchanged and deliver through the
+production pull surfaces; every non-converted test carries an
+explicit disposition named in the converting commit's message:
+
+- completion.rs: 51 converted (the 10 retry/budget fns above + 41
+  more), 13 leave-stream — 5 retire with commit B
+  (test_transient_retry_different_worker's failed_builders placement
+  exclusion, and the four `last_intent`-coupled build-sample tests
+  whose cpu_limit_cores assertions need the dispatch-time intent
+  writer: hw_class_and_intent_cores, infinite_peak_cpu,
+  nonfinite_final_resources, out_of_domain_final_resources) and 8
+  retire with commit A (the stream CaFixture race meta-test, the
+  ProcessCompletion unknown-drv_key / non-running guards, the
+  post-cancel Cancelled-report log pin, the unsolicited-Cancelled
+  infra charge, the reportless-backstop line-count pin, and the two
+  stream-controller-channel tests phase1b_e2_d2/d3) — each naming its
+  pull-side replacement coverage
+  (report_outcome_unknown_exec_writes_nothing,
+  report_outcome_after_establishment_ignored, the AD5 abort/cancel
+  pair, the establishment-sweep and second-installment tests).
+- misc/build/fault/integration/keep_going/lifecycle_sweep/wiring: 26
+  converted, 21 leave-stream. Retire with commit A: fault.rs's seven
+  DB-fault-posture tests plus integration's
+  test_db_failure_during_completion_logged (under a PG fault the pull
+  report intake rejects at the attempt-resolution read and the pod
+  retries — the stream intake's in-memory-first / bounded-re-delivery
+  posture has no pull equivalent), and the registration / disconnect
+  / stale-report / starvation / workers_active / shutdown-drain /
+  inspect-stream-pool / cancel-signal tests. Retire with commit B:
+  the dispatch leader/recovery gate, the dispatch-wait metric, the
+  interactive front-of-queue ordering, and the assign-send-failure
+  rollback test.
+- pull.rs: pull_completed_drv_returns_gone re-pointed onto a
+  pull-completed terminal; the other five mixed tests are the
+  coexistence arm itself (a live stream attempt is their subject) and
+  retire with commit A. establishment.rs's
+  establishment_never_visits_stream_attempts likewise retires with A.
+- admin suite: the two ClearPoison tests converted.
+  cluster_status_counts_queued_and_running stays on the stream — its
+  queued_derivations assertion reads the dispatch-maintained
+  ready_queue length, which a pull mint does not dequeue (recorded in
+  the unit-repoint findings note as a pull-mode signal-accuracy
+  question for the operator-surface re-point) — and it, the
+  ListExecutors/executors-summary surface (workers_tests.rs,
+  cluster_status_counts_registered_workers) and the two DrainExecutor
+  tests are commit C's operator surface, re-pointed or retired there.
+- dispatch.rs (~43) is unchanged, as recorded above:
+  placement-layer subject, retires with commit B, per-test
+  dispositions recorded when commit B processes that file.
+
+The full rio-scheduler suite is green at every commit of the batch
+(1277 tests). This precondition is SATISFIED for deletion commit A:
+every harness-only test outside dispatch.rs is either re-pointed onto
+the production pull surfaces or carries an explicit
+retire-with-machinery / covered-by-pull disposition; commit A must
+carry those dispositions into its per-test deletion mapping (P13)
+when it deletes the leave-stream tests it owns.
 
 #### The deletion commit set and the revert-cleanliness contract
 
