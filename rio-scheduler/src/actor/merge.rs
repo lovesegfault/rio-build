@@ -152,6 +152,22 @@ impl DagActor {
         // `clear_topdown_pruned_for_produced_parents` drops it (with the
         // lazy clear in `handle_substitute_complete` as the walk-failure
         // backstop).
+        //
+        // Closure-hole healing comes FIRST: a full merge that
+        // re-declares a node's edges re-supplies its inputDrvs, so its
+        // child set is representative of its closure again — drop the
+        // reap-time `closure_hole` breadcrumb for every edge parent of
+        // this submission before judging the clear. A pruned merge has
+        // no edges (`edge_parent_hashes` is empty), so it never heals a
+        // hole. Candidates that are NOT edge parents of this submission
+        // (e.g. pre-existing DAG parents of a cache hit) keep their
+        // breadcrumb and are skipped below: their produced children are
+        // still a reap-truncated view.
+        for hash in &ingest.edge_parent_hashes {
+            if let Some(s) = self.dag.node_mut(hash) {
+                s.closure_hole = false;
+            }
+        }
         let mut clear_candidates: HashSet<DrvHash> =
             ingest.edge_parent_hashes.iter().cloned().collect();
         for child in ingest.cached_hits.keys() {
@@ -159,7 +175,10 @@ impl DagActor {
         }
         let mut cleared: Vec<String> = Vec::new();
         for hash in clear_candidates {
-            if self.dag.node(&hash).is_some_and(|s| s.topdown_pruned)
+            if self
+                .dag
+                .node(&hash)
+                .is_some_and(|s| s.topdown_pruned && !s.closure_hole)
                 && self.children_all_produced(&hash)
                 && let Some(s) = self.dag.node_mut(&hash)
             {
@@ -996,8 +1015,10 @@ impl DagActor {
                     // trigger-wanting build went terminal before the delta
                     // re-walk ran). The spent-forgiveness set is
                     // chain-scoped — clear it like every other completion
-                    // site does.
+                    // site does. The closure-hole breadcrumb is dropped
+                    // with the same completion hygiene.
                     state.never_forgive_paths.clear();
+                    state.closure_hole = false;
                     // I-099/I-094: re-probe hit on a previously-failed node
                     // — failure history is moot now we have the output.
                     if matches!(

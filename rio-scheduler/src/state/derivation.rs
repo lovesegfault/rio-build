@@ -894,7 +894,10 @@ pub struct DerivationState {
     /// fails every interested build instead of demoting to Ready
     /// (which would dispatch a doomed build); the dispatch-time probes
     /// take the same fail-fast arm for a childless flagged node whose
-    /// wanted outputs turn out missing and unsubstitutable.
+    /// wanted outputs turn out missing and unsubstitutable, and the
+    /// reap-time hook and the walk-failure children gate treat a
+    /// `closure_hole` survivor (an un-produced child reaped out from
+    /// under it — see that field) as childless-equivalent.
     /// r[sched.merge.substitute-topdown+9]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
     /// cleared once its children are all produced, or when the
@@ -902,6 +905,35 @@ pub struct DerivationState {
     /// `from_recovery_row` — unlike `substitute_tried`, losing it
     /// across failover re-arms the doomed from-source dispatch.
     pub topdown_pruned: bool,
+    /// Closure-hole breadcrumb: an un-produced child of this node
+    /// (status not Completed/Skipped at reap time) was reaped out from
+    /// under it by a terminal build's cleanup
+    /// (`remove_build_interest_and_reap`), so its current DAG children
+    /// no longer represent its pruned input closure. Every
+    /// children-keyed `topdown_pruned` verdict treats this as
+    /// childless-equivalent: the reap-hook fail-fast arm fires for a
+    /// holed survivor, and the walk-failure children gate, the
+    /// completion-time clear, and the merge-time clear pass all refuse
+    /// to trust (clear over) the truncated child set — erring toward
+    /// the bounded resubmit-directing fail-fast, never the doomed
+    /// from-source dispatch of a node whose closure may not be in the
+    /// store.
+    ///
+    /// In-mem only — never persisted; recovery and poison restore
+    /// default it false (PG still holds the un-produced child's
+    /// terminal row, so the recovery-time produced-children gate stays
+    /// conservative without it). Reset automatically on a
+    /// resubmit-rebuild (fresh `try_from_node` state) and on
+    /// `rollback_merge` (the removed node is restored wholesale) —
+    /// same lifecycle as `substitute_tried`/`never_forgive_paths` —
+    /// and cleared explicitly when a later full merge re-declares the
+    /// node's edges (its child set is representative again), when the
+    /// fail-fast consumes the node, and when the node itself completes
+    /// or is skipped. Known residual: the poison-TTL sweep and admin
+    /// ClearPoison delete children through `remove_node` without
+    /// setting this breadcrumb (same accepted class as the GC
+    /// residual).
+    pub closure_hole: bool,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node
     /// (`handle_substitute_complete`) **within the current substitution
@@ -1015,6 +1047,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
+            closure_hole: false,
             never_forgive_paths: HashSet::new(),
         })
     }
@@ -1145,6 +1178,10 @@ impl DerivationState {
             // inputDrvs were never merged, so a from-source dispatch on
             // the new leader would ENOENT just like on the old one.
             topdown_pruned: row.topdown_pruned,
+            // In-mem only: the un-produced child's terminal row is still
+            // in PG, so the recovery-time produced-children gate stays
+            // conservative without the breadcrumb.
+            closure_hole: false,
             never_forgive_paths: HashSet::new(),
         })
     }
@@ -1223,6 +1260,7 @@ impl DerivationState {
             probed_generation: 0,
             substitute_tried: false,
             topdown_pruned: false,
+            closure_hole: false,
             never_forgive_paths: HashSet::new(),
         })
     }

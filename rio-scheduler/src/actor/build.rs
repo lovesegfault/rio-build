@@ -795,10 +795,15 @@ impl DagActor {
         //    (`substitute_tried`) while another build's unbuilt children
         //    were attached: the walk-failure handler suppressed the
         //    fail-fast (children present) and parked it Queued; with those
-        //    children now reaped, nothing else will ever re-evaluate it
-        //    (`find_newly_ready` only fires on completions), so the
-        //    surviving build would hang Active forever. Take the
-        //    resubmit-directing fail-fast now. Two restrictions:
+        //    children now reaped — all of them (childless) or just an
+        //    un-produced subset (the reap stamped `closure_hole` on the
+        //    survivor) — the remaining child set no longer represents the
+        //    pruned input closure, so nothing children-keyed may settle
+        //    it: `find_newly_ready` only fires on completions, and the
+        //    promote arm below would lift a holed survivor Ready over the
+        //    vacuously-produced remainder for the doomed from-source
+        //    dispatch. Take the resubmit-directing fail-fast now. Two
+        //    restrictions:
         //    `substitute_tried` keeps never-walked nodes out (the next
         //    dispatch pass re-probes those, with its own carve-out and
         //    fail-fast arms), and the arm is skipped while the survivor is
@@ -808,10 +813,11 @@ impl DagActor {
         //    node), and a later build's merge re-probe (`existing_reprobe`)
         //    re-spawns a walk for an existing Queued node without
         //    resetting it. That in-flight walk's own SubstituteComplete
-        //    settles the now-childless root (ok=false → the established
-        //    fail-fast there, ok=true → completion); parking it here would
-        //    terminally fail its builds prematurely and the late verdict
-        //    would then be dropped by the not-Substituting guard.
+        //    settles the now-childless (or holed) root (ok=false → the
+        //    established fail-fast there, ok=true → completion); parking
+        //    it here would terminally fail its builds prematurely and the
+        //    late verdict would then be dropped by the not-Substituting
+        //    guard.
         //  - A Queued parent whose last unbuilt children were reaped: it is
         //    now vacuously all-deps-completed, but no completion will ever
         //    promote it. Promote it to Ready here so the next dispatch pass
@@ -844,10 +850,15 @@ impl DagActor {
                 let status = node.status();
                 let topdown_pruned = node.topdown_pruned;
                 let substitute_tried = node.substitute_tried;
+                let closure_hole = node.closure_hole;
+                // Childless OR holed: a closure hole means the surviving
+                // children are a reap-truncated view of the pruned
+                // closure, so they must not vouch for a from-source
+                // dispatch any more than an empty set would.
                 if topdown_pruned
                     && substitute_tried
                     && status != DerivationStatus::Substituting
-                    && self.dag.get_children(&parent).is_empty()
+                    && (closure_hole || self.dag.get_children(&parent).is_empty())
                 {
                     self.fail_fast_topdown_pruned_root(
                         &parent,

@@ -199,11 +199,15 @@ impl DagActor {
     /// produced later, by workers or by substitution. Without this
     /// clear the persisted column would survive into a leader failover
     /// and the restored mark would wrongly fail-fast a node whose
-    /// closure IS in the store. Per-parent work is flag-gated (one node
-    /// lookup) before the children scan; the PG write is one batched
-    /// best-effort statement (warn-and-continue, same posture as the
-    /// lazy and fail-fast clears — the in-memory clear never depends on
-    /// PG).
+    /// closure IS in the store. Parents carrying the `closure_hole`
+    /// breadcrumb are skipped: an un-produced child was reaped out from
+    /// under them, so their produced children are a truncated view of
+    /// the pruned closure — the fail-fast or a later full merge
+    /// re-declaring their edges resolves them instead. Per-parent work
+    /// is flag-gated (one node lookup) before the children scan; the PG
+    /// write is one batched best-effort statement (warn-and-continue,
+    /// same posture as the lazy and fail-fast clears — the in-memory
+    /// clear never depends on PG).
     pub(super) async fn clear_topdown_pruned_for_produced_parents(
         &mut self,
         completed: &[DrvHash],
@@ -214,7 +218,10 @@ impl DagActor {
         }
         let mut cleared: Vec<String> = Vec::new();
         for parent in candidates {
-            if self.dag.node(&parent).is_some_and(|s| s.topdown_pruned)
+            if self
+                .dag
+                .node(&parent)
+                .is_some_and(|s| s.topdown_pruned && !s.closure_hole)
                 && self.children_all_produced(&parent)
                 && let Some(s) = self.dag.node_mut(&parent)
             {
@@ -1000,6 +1007,13 @@ impl DagActor {
                     .increment(1);
                 return;
             }
+
+            // Completion hygiene: the closure-hole breadcrumb is scoped
+            // to the node's pre-completion lifetime (same as the
+            // chain-scoped spent-forgiveness set cleared by
+            // handle_completion above) — drop it with the terminal
+            // transition.
+            state.closure_hole = false;
 
             // Store output paths from built_outputs
             state.output_paths = result

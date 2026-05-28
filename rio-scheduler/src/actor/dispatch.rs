@@ -1105,6 +1105,7 @@ impl DagActor {
             return;
         }
         let topdown_pruned = state.topdown_pruned;
+        let closure_hole = state.closure_hole;
         // r[impl sched.merge.wanted-outputs+2]
         // The walk's forgiveness verdict was computed against the
         // wanted set as of SPAWN time. A build that merged during the
@@ -1220,6 +1221,16 @@ impl DagActor {
         // memory and, best-effort, in PG) once those children are all
         // produced.
         //
+        // Also gate on `!closure_hole`: a closure-holed node — the
+        // terminal-build reap removed an un-produced child out from
+        // under it — is excluded from this arm entirely. Its post-reap
+        // child set is not representative of the pruned input closure,
+        // so neither the lazy clear nor the suppression below may trust
+        // it; the node falls through to the fail-fast arm instead (the
+        // bounded resubmit-directing outcome, never the doomed
+        // from-source dispatch a Ready revert over the truncated set
+        // would produce).
+        //
         // Also gate on `!forgiven_now_wanted`: that downgrade means
         // the fetch did NOT definitively fail — it forgave a seed
         // that has since become wanted. Failing the build here would
@@ -1227,7 +1238,7 @@ impl DagActor {
         // which re-walks immediately with the corrected forgivable
         // set. A genuine failure on that second walk lands back here
         // with `forgiven_now_wanted = false` and fails the build then.
-        if topdown_pruned && !self.dag.get_children(drv_hash).is_empty() {
+        if topdown_pruned && !closure_hole && !self.dag.get_children(drv_hash).is_empty() {
             if self.children_all_produced(drv_hash) {
                 debug!(%drv_hash,
                        "topdown-pruned root's children are all produced; \
@@ -1271,8 +1282,13 @@ impl DagActor {
         let to = self.dag.revert_target_for(drv_hash);
         // Childlessness for the downgrade re-spawn's topdown leg below:
         // the flag now survives merges that add unbuilt children, so
-        // "flagged" no longer implies "childless" — only the childless
-        // shape is the hazardous doomed-from-source one.
+        // "flagged" no longer implies "childless" — the childless shape
+        // is the doomed-from-source one this leg must catch. A
+        // closure-holed survivor (un-produced child reaped — see
+        // `closure_hole`) is kept out of the lazy clear by the children
+        // gate above, and a genuine failure on it takes the fail-fast
+        // arm before reaching here; the immediate re-spawn below still
+        // keys on literal childlessness.
         let childless = self.dag.get_children(drv_hash).is_empty();
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
@@ -1506,6 +1522,10 @@ impl DagActor {
             // (re-stamped) or full-merges (children all produced ⇒
             // cleared).
             s.topdown_pruned = false;
+            // The closure-hole breadcrumb is consumed with the mark it
+            // qualifies: after the park nothing children-keyed is left
+            // to mislead, and a resubmit rebuilds the node fresh.
+            s.closure_hole = false;
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
             }
@@ -1780,8 +1800,10 @@ impl DagActor {
             // chain-scoped — clear it so a LATER chain (e.g. a stale-
             // Completed reset after GC) starts with a clean slate
             // instead of vetoing forgiveness of a path no live build
-            // wants any more.
+            // wants any more. The closure-hole breadcrumb is dropped
+            // with the same completion hygiene.
             state.never_forgive_paths.clear();
+            state.closure_hole = false;
             // IA-only convenience: `expected_output_paths` IS the
             // realised path. Non-destructive when a path is already
             // known — the floating-CA reprobe→re-substitute lane

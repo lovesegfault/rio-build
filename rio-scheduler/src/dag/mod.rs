@@ -1106,8 +1106,11 @@ impl DerivationDag {
                 // node parked Queued (a downgraded walk waiting on the
                 // dep this cascade just resolved), so drop the
                 // chain-scoped spent-forgiveness set — same as the
-                // other completion sites.
+                // other completion sites. The closure-hole breadcrumb
+                // is likewise scoped to the node's pre-completion
+                // lifetime — drop it with the same hygiene.
                 state.never_forgive_paths.clear();
+                state.closure_hole = false;
                 skipped.push(hash);
             }
         }
@@ -1143,6 +1146,17 @@ impl DerivationDag {
     /// reset the node for a fresh re-merge and must not trigger parent
     /// re-evaluation.
     ///
+    /// Survivors that lost at least one UN-PRODUCED child (status not
+    /// Completed/Skipped at reap time) additionally get the in-memory
+    /// `closure_hole` breadcrumb set: their remaining DAG children no
+    /// longer represent their pruned input closure, so the actor's
+    /// children-keyed `topdown_pruned` verdicts must not trust the
+    /// truncated set. The breadcrumb is set HERE (not in the leader-gated
+    /// survivor hook) so a standby's DAG — which loses the children all
+    /// the same — carries it too. Known residual: the poison-TTL sweep
+    /// and admin ClearPoison delete children via [`Self::remove_node`]
+    /// without setting the breadcrumb (see the field's doc).
+    ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for
     /// a different code path, though this shouldn't happen in practice).
@@ -1165,18 +1179,26 @@ impl DerivationDag {
                 && state.status().is_terminal()
                 && state.status() != DerivationStatus::Poisoned
             {
-                to_reap.push((hash.clone(), state.drv_path().to_string()));
+                let unproduced = !matches!(
+                    state.status(),
+                    DerivationStatus::Completed | DerivationStatus::Skipped
+                );
+                to_reap.push((hash.clone(), state.drv_path().to_string(), unproduced));
             }
         }
 
         let mut surviving_parents: BTreeSet<DrvHash> = BTreeSet::new();
+        let mut holed_parents: BTreeSet<DrvHash> = BTreeSet::new();
         let mut reaped_paths = Vec::with_capacity(to_reap.len());
-        for (hash, path) in to_reap {
+        for (hash, path, unproduced) in to_reap {
             // Capture the parents BEFORE `remove_node` scrubs the edge maps —
             // afterwards neither the reaped hash nor its former parents are
             // recoverable from the DAG.
             if let Some(ps) = self.parents.get(&hash) {
                 surviving_parents.extend(ps.iter().cloned());
+                if unproduced {
+                    holed_parents.extend(ps.iter().cloned());
+                }
             }
             self.remove_node(&hash);
             reaped_paths.push(path);
@@ -1184,6 +1206,15 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
+        // Breadcrumb the survivors whose reaped children include an
+        // un-produced one: their child set is no longer representative of
+        // their input closure (see `DerivationState::closure_hole`).
+        // Parents that were themselves reaped fall out via the get_mut.
+        for parent in &holed_parents {
+            if let Some(state) = self.nodes.get_mut(parent) {
+                state.closure_hole = true;
+            }
+        }
         ReapOutcome {
             reaped_paths,
             surviving_parents: surviving_parents.into_iter().collect(),
