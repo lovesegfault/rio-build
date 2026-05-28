@@ -864,6 +864,11 @@ in
       # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
+      # r[verify builder.fs.parity]
+      #   P0562 parity witness: the consumer build reads its dep through
+      #   the castore-FUSE lower and the dep's store path is scanned into
+      #   PG narinfo."references" exactly as the pre-ADR-022 lifecycle
+      #   suite asserted.
       "refs-end-to-end"
     ];
   };

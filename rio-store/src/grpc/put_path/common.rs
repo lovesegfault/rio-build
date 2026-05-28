@@ -229,6 +229,31 @@ pub(in crate::grpc) async fn read_first_metadata(
     }
 }
 
+/// Drain and discard the remaining frames of a client-streaming upload
+/// before returning early.
+///
+/// Must be called before an early return that would leave unconsumed
+/// frames on the gRPC transport — they stall the client's send loop
+/// until the RST propagates. Bounded by `DEFAULT_GRPC_TIMEOUT` to
+/// prevent a slow client from holding the handler indefinitely. `rpc`
+/// names the calling RPC in the timeout warning.
+pub(in crate::grpc) async fn drain_stream<T>(rpc: &'static str, stream: &mut Streaming<T>) {
+    let drain = async {
+        while let Ok(Some(_)) = stream.message().await {
+            // discard
+        }
+    };
+    if tokio::time::timeout(rio_common::grpc::DEFAULT_GRPC_TIMEOUT, drain)
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
+            "{rpc}: drain_stream timed out; client may be sending slowly"
+        );
+    }
+}
+
 // r[impl store.integrity.verify-on-put]
 // r[impl sec.drv.validate]
 /// Compare a server-computed NAR digest+size against the

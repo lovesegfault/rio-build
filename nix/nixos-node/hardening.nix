@@ -104,9 +104,9 @@
   ];
 
   # security.lockKernelModules left false until the builder-pod module
-  # set is final (ADR-021 §Security posture; ADR-022 dropped the riofs
-  # kmod and the EROFS+cachefiles symbols, but k3s/cilium still load
-  # modules on demand). Set deliberately so a future hardening import
-  # doesn't flip it under us.
+  # set is final (ADR-021 §Security posture; the ADR-022 castore-FUSE
+  # needs only the in-tree fuse/overlay modules, but k3s/cilium still
+  # load modules on demand). Set deliberately so a future hardening
+  # import doesn't flip it under us.
   security.lockKernelModules = lib.mkDefault false;
 }
