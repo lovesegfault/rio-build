@@ -4457,3 +4457,121 @@ design said would remain: the idempotent ledger guards, the
 establishment sweep, the transaction fence, the spawn-side eligibility
 gate, and the controller-side successors (wedge clustering,
 synthesize-on-delete, the open-attempt busy view).
+
+### Kani on the pull/report kernels: reasoned omission
+
+The design (§4.4, §6 row 2) named the replacement's decision kernels —
+`admit_pull(attempt_state, token_binding) → PullDecision` and
+`fold_report(attempt_state, report_or_terminal) → LedgerAction` — as
+the campaign's Kani targets, with four properties: idempotency (same
+inputs ⇒ same decision), at most one open attempt per (drv, pod), no
+transition out of a terminal row, and the claims-floor rejection (the
+§4.1 fence). The decision, made after reading the kernels as landed
+against the bounded-representation precedent (`rio-retry-kernel`, the
+gated `kani-rio-retry-kernel` check): **no executor-side harness is
+built.** Recorded here with the reasoning and the named carrier of
+every obligation, because a harness that re-proves what the type
+system, an exhaustive unit table, and a wired model check already pin
+would be exactly the vacuous-harness shape the campaign discipline
+rejects.
+
+What the kernels actually are as landed (decision P10 made them pure
+precisely so this evaluation could be made cheaply):
+
+- **The charging arithmetic is not on the executor side.** Budgets,
+  caps, exclusion sets, classification, placement/exhaustion — the
+  arithmetic the design's Kani bullet was really about — live in the
+  dependency-free `rio-retry-kernel` crate and are already
+  machine-checked on every merge (`kani-rio-retry-kernel`, seven
+  harnesses, harness-count tripwire pinned at 7). The pull path did
+  not add a second copy: `ReportOutcome` funnels into the same
+  classification/fold entry point the stream arm used, and the
+  establishment charge goes through the same fold. There is no new
+  counter arithmetic to prove.
+- **`fold_report` is a two-boolean truth table**
+  (`assignment_active × attempt_already_classified → Process |
+  AckIgnore`, rio-scheduler/src/actor/pull.rs). Its four cases are
+  enumerated by unit tests and by every idempotency battery that
+  exercises the intake; the load-bearing at-most-once guarantee is not
+  in this function at all but in the durable guard it fronts
+  (`WHERE termination_reason IS NULL`, the exec-keyed uniqueness, the
+  row-already-terminal early return), which no Rust-level proof
+  reaches. A CBMC proof over two booleans adds nothing.
+- **`admit_pull` is a single total match** over the derivation status
+  (11 variants + absent), the open-attempt identity (none / mine /
+  another's), the token binding, and the floor comparison — no loops,
+  no collections, no counters. The compiler's exhaustiveness check
+  carries totality; the kernel unit tests
+  (`admit_pull_status_table`, `admit_pull_open_attempt_identity`,
+  `admit_pull_rejections_dominate`) enumerate every status arm, the
+  identity split, and the dominance order, which is the entire
+  meaningful input partition apart from string content; and the
+  protocol consequences of the decision are what the wired re-targeted
+  Model S checks exhaustively (`AtMostOneOpenAttemptPerJob`,
+  `NotYetReadyIsInert`, `StaleAuthorityWritesAreInert`,
+  `attemptResolvesAtMostOnce`). The one genuinely numeric clause — the
+  i64 floor vs u64 serving-generation comparison behind the
+  `floor >= 0` guard — is three lines whose production-relevant cases
+  (floor absent, negative-sentinel, at, above, below) are unit-pinned,
+  and the *authoritative* fence is the in-transaction re-check the
+  advisory arm fronts, red-first tested at 1a (a below-floor pull
+  creates no row).
+- **The cost side is not hypothetical.** The retry campaign measured
+  it: contracts hosted inside rio-scheduler did not converge in the
+  gate budget, and getting them gated took both the extraction into a
+  dependency-free crate and the cfg(kani) bounded-representation swap.
+  Gating an `admit_pull` harness would mean either wiring rio-scheduler
+  itself as a kani member (the goto model and the kani build close
+  over a tokio/sqlx/kube dependency graph, for one guarded comparison's
+  worth of new assurance) or extracting the pull kernels into another
+  crate (a production restructuring this docs-only close-out should
+  not and does not take, and one the assurance delta does not justify).
+
+Carrier table — every obligation the earlier records assigned to a
+future Kani contract, and what carries it instead:
+
+| Obligation (where it was assigned) | Carrier as landed |
+|---|---|
+| `admit_pull` idempotency / "rollback restores exactly" (frozen-invariant row F5) | `admit_pull` is a pure function of its inputs (no clock, no IO, no `&self`); re-pulls return the identical payload/exec_id (`DeliverExisting`), checked by the double-pull red-first battery (actor/tests/pull.rs), the `quint-executor-session-witness-repull` witness, and `AtMostOneOpenAttemptPerJob` (wired); there is no half-recorded push state to roll back (the mint transaction commits or the pod retries) |
+| At most one open attempt per (drv, pod) (design §4.4) | `AtMostOneOpenAttemptPerJob` wired in both re-targeted regimes; the exec-keyed uniqueness + open-row check inside the mint transaction; the 1b canary VM fold-input assertion (a re-pull mints no second row); the actor pull battery |
+| No transition out of a terminal row (`fold_report` contract; frozen-invariant rows F2) | The durable fill guard (`WHERE termination_reason IS NULL`) + the row-already-terminal AckIgnore arm (`sched.executor.report-idempotent`, `sched.completion.idempotent` batteries); `attemptResolvesAtMostOnce` (wired) + the late-report-ignored witness; the retry-kernel contracts already prove the charging consequence of a duplicate row cannot double-count |
+| `admit_pull` rejects a serving generation below the durable claims floor (the §4.1 fence; T-0e.2 lease-seam note; risk register "Kani floor-check contract in Phase 2") | The advisory arm's unit tests (`admit_pull_rejections_dominate`) plus the authoritative in-transaction floor re-check, red-first tested at 1a (below-floor pull creates no row; a pull served at gen N after a claim at N+1 mints no second open attempt); `StaleAuthorityWritesAreInert` exhaustively checked in the wired fault-leader regime + `quint-executor-session-witness-stale-fenced`; `sched.lease.generation-fence+3` markers at the fenced mint and establishment charge. The dual-belief residual's checked successor is therefore the model invariant + the transaction fence, not a CBMC artifact |
+| The decision/charging arithmetic itself (design §4.4's "idempotency kernels") | `kani-rio-retry-kernel` (gated, 7 harnesses) — unchanged by this campaign; the pull path calls the same `decide()`/`classify()`/`placeable()` fold |
+
+Reconsideration triggers, recorded so this stays a decision rather
+than a default: build the harness (using the rio-retry-kernel
+cfg(kani) bounded-representation pattern and the exposed `mkKaniCheck`
+constructor) if `admit_pull`/`fold_report` ever grow loops, collection
+folds, or counter arithmetic (e.g. an OA3 multi-pull budget, or the
+establishment-window arithmetic moving into the admission kernel); if
+the pull kernels are extracted into a dependency-light crate for any
+other reason; or if the floor-comparison shape changes such that the
+unit table no longer covers its case split. Until then, nothing on the
+executor side is claimed as machine-proved; the machine-proved layer
+for this campaign's decision arithmetic remains the retry kernel's.
+
+### The frozen as-built model and the calibration evidence corpus: retained at this close-out
+
+The retry campaign's Phase 2 deleted its frozen as-built encoding and
+override corpus once its acceptance table existed; the refcount
+campaign deferred the same retirement until its deployment-time
+checklist validates the live replacement, because the previous release
+remains the deployable fallback until then. This campaign is in the
+refcount situation, and takes the same disposition: under the no-deploy
+directive nothing has shipped, the pre-deletion (1c) tree is the
+deployment-time fallback the staged rollout's template-flip path runs
+through (checklist rows D0–D5), and the deletion-stage reverts restore
+exactly the code `executorSessionAsBuilt.qnt` models. Therefore:
+
+- `executorSessionAsBuilt.qnt` stays frozen, unwired, and typechecking
+  (P14 unchanged), as the model of record for the still-deployable
+  stream-era stage and the kept revert path.
+- The ten as-built calibration evidence modules under
+  `docs/spec/models/calibration/` (plus the wired pull-era
+  `executor-f4-pull-establish-early.qnt` override) stay committed and
+  re-runnable per the calibration README; the historical falsification
+  evidence above remains valid statements about the frozen encoding.
+- Their retirement (and the model-of-record cleanup that goes with it)
+  is a deferred item in the campaign close-out below, conditioned on
+  the deployment-time validation checklist passing through row D7 —
+  the same condition and template the refcount close-out recorded.
