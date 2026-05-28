@@ -195,7 +195,7 @@ impl DagActor {
     /// and in-process clear site shares: at least one child, all of
     /// them produced, no closure hole; the recovery-time gate applies a
     /// strictly stronger per-child criterion: produced AND vouched for
-    /// by a still-live build —
+    /// by a still-live build that also owns the parent —
     /// `load_parents_with_all_children_produced`). This is the
     /// children-became-produced clearing
     /// site the merge-time post-reconciliation pass cannot see: that

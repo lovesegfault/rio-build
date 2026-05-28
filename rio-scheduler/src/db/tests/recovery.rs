@@ -138,7 +138,7 @@ async fn test_load_parents_with_all_children_produced_requires_live_build_link()
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 /// `load_parents_with_failed_deps` only counts a terminal-failure child
 /// when a LIVE (`pending`/`active`) build that also owns the parent
 /// vouches for it: parent P1's cancelled child is co-owned by a

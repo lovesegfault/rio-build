@@ -153,7 +153,7 @@ async fn test_recovery_skips_orphan_transitions() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 /// bug_341: crash mid-`cascade_dependency_failure` leaves PG with
 /// child=poisoned, parent=queued, build=active. `load_edges_for_
 /// derivations` drops the edge (child terminal → not in $1), so
@@ -216,7 +216,7 @@ async fn test_recovery_failed_dep_transitions_parent_not_ready() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 /// Transitive (depth ≥2) ancestors of a PG-terminal-failed child must
 /// ALSO be persisted as DependencyFailed, not just transitioned in-DAG.
 ///
@@ -4462,7 +4462,7 @@ async fn stage_parent_with_other_builds_cancelled_child(
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 /// bug_009, clearing harm: another build's cancelled, never-wanted
 /// child must not condemn a healthy pruning build's recovered parent.
 /// The failed-dep cascade only counts a terminal-failure child when a
@@ -4577,7 +4577,7 @@ async fn test_failover_pruned_build_completes_via_substitution_despite_other_bui
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 // r[verify sched.merge.substitute-topdown+10]
 /// bug_009, verdict harm: when the recovered parent's wanted set is
 /// genuinely unsatisfiable by substitution, the verdict and error must
@@ -4699,7 +4699,7 @@ async fn test_failover_pruned_build_gets_resubmit_error_not_dependency_failure_f
     Ok(())
 }
 
-// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.recovery.failed-dep-cascade+2]
 /// The unflagged variant of the two tests above (no `topdown_pruned`
 /// backdate — the gateway single-node-fallback shape: B1 submitted just
 /// the parent, no prune involved). Another build's cancelled child must

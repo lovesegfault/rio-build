@@ -65,7 +65,7 @@ struct RecoveryLoad {
     /// for. `seed_ready_queue` short-circuits these to
     /// `DependencyFailed` BEFORE `compute_initial_states` (which would
     /// otherwise see no edge → `all_deps_completed` → wrong Ready).
-    /// r[sched.recovery.failed-dep-cascade]
+    /// r[sched.recovery.failed-dep-cascade+2]
     failed_dep_parents: HashSet<DrvHash>,
 }
 
@@ -338,7 +338,7 @@ impl DagActor {
         // --- Load edges + add to DAG ---
         let drv_ids: Vec<Uuid> = id_to_hash.keys().copied().collect();
         let edge_rows = self.db.load_edges_for_derivations(&drv_ids).await?;
-        // r[impl sched.recovery.failed-dep-cascade]
+        // r[impl sched.recovery.failed-dep-cascade+2]
         // Parents with a terminal-FAILURE dep: edge_rows above drops
         // edges to ALL terminal children, so compute_initial_states
         // would see all_deps_completed()=true and wrongly promote
@@ -713,7 +713,7 @@ impl DagActor {
             })
             .map(|(h, _)| h.into())
             .collect();
-        // r[impl sched.recovery.failed-dep-cascade]
+        // r[impl sched.recovery.failed-dep-cascade+2]
         // Partition: parents whose dep is poisoned/dependency_failed/
         // cancelled in PG go directly to DependencyFailed and are
         // EXCLUDED from compute_initial_states. Without this, the

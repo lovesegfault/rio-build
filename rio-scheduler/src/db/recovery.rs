@@ -135,7 +135,7 @@ impl SchedulerDb {
         .await
     }
 
-    // r[impl sched.recovery.failed-dep-cascade]
+    // r[impl sched.recovery.failed-dep-cascade+2]
     /// Recovered parents with at least one terminal-**failure**
     /// dependency (`poisoned`/`dependency_failed`/`cancelled`) that is
     /// vouched for by a LIVE build co-owning the parent: the failed

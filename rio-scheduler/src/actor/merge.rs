@@ -1837,9 +1837,9 @@ impl DagActor {
     /// to the unbounded doomed-dispatch corner. The recovery-time gate
     /// evaluates a stricter SQL variant of the Vouched criterion over
     /// *persisted* children (`load_parents_with_all_children_produced`:
-    /// every child produced AND vouched for by a still-live build); the
-    /// dispatch-time and reap-time guards consume the inverse judgment
-    /// via [`Self::must_substitute`].
+    /// every child produced AND vouched for by a still-live build that
+    /// also owns the parent); the dispatch-time and reap-time guards
+    /// consume the inverse judgment via [`Self::must_substitute`].
     pub(super) fn closure_vouched(&self, drv_hash: &str) -> bool {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }

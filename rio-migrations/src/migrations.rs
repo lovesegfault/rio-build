@@ -1066,12 +1066,14 @@ pub const M_062: () = ();
 ///
 /// Written `true` — inside the same transaction that persists a pruned
 /// merge — for the kept nodes whose dependency closure the prune
-/// dropped and whose existing DAG children (if any) are not already
-/// all produced at stamp time (a dep-less demanded leaf never had a
-/// closure to drop and is not marked, and a kept node whose children
-/// are all Completed/Skipped has its closure in the store; childless
-/// kept nodes ARE marked, and present-but-unbuilt children do not
-/// exempt a node — see `closure_vouched` in `actor/merge.rs`);
+/// dropped and whose existing children the closure classifier does not
+/// vouch for at stamp time (a dep-less demanded leaf never had a
+/// closure to drop and is not marked, and a kept node whose child set
+/// is Vouched — at least one child, all of them Completed/Skipped, no
+/// closure hole — has its closure in the store; childless kept nodes
+/// ARE marked, present-but-unbuilt children do not exempt a node, and
+/// a closure-holed node is stamped even if its surviving children are
+/// all produced — see `closure_vouched` in `actor/merge.rs`);
 /// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared
@@ -1080,8 +1082,8 @@ pub const M_062: () = ();
 /// by the completion-time `clear_topdown_pruned_for_produced_parents`
 /// when children become produced later, by the recovery-time gate that
 /// drops a restored mark whose persisted children are all produced and
-/// vouched for by a still-live build, or by the lazy walk-failure
-/// backstop in `handle_substitute_complete`)
+/// vouched for by a still-live build that also owns the parent, or by
+/// the lazy walk-failure backstop in `handle_substitute_complete`)
 /// and by the topdown fail-fast when it consumes the marker.
 /// The header comment in the frozen `.sql` keeps the original
 /// childless-era wording — this doc-const is the corrected record. See

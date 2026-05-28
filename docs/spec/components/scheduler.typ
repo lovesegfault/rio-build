@@ -932,7 +932,7 @@ upsert, cleared --- by the post-reconciliation clear pass at merge time when
 those children are already produced and verified, by the completion-time
 clear when children become produced, by the recovery-time gate that
 drops a restored mark whose persisted children are all produced and vouched
-for by a still-live build, or by the
+for by a still-live build that also owns the parent, or by the
 lazy walk-failure clear when a failed detached fetch finds the node's
 children already produced ---
 otherwise the mark stays until they produce or the fail-fast consumes it)
@@ -1556,17 +1556,25 @@ tables) during state recovery.
   partially-loaded DAG from issuing assignments.
 ]
 
-#r("sched.recovery.failed-dep-cascade")[
+#r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to
   `completed`/`skipped` children are dropped (those dependencies are
   satisfied). A recovered parent with a
-  `poisoned`/`dependency_failed`/`cancelled` child --- the state left by a
-  crash mid-`cascade_dependency_failure` --- MUST be transitioned directly to
+  `poisoned`/`dependency_failed`/`cancelled` persisted child vouched for by a
+  live (`pending`/`active`) build that also owns the parent via
+  `build_derivations` --- the state left by a crash
+  mid-`cascade_dependency_failure` --- MUST be transitioned directly to
   `DependencyFailed` and persisted, BEFORE the `compute_initial_states`
-  recompute. Otherwise the dropped edge makes `all_deps_completed` true, the
-  parent is wrongly promoted to Ready, and dispatched against a missing input.
-  The set of such parents is loaded via a separate `derivation_edges JOIN
-  derivations` query restricted to terminal-failure child statuses.
+  recompute; without that short-circuit the dropped edge makes
+  `all_deps_completed` true, the parent is wrongly promoted to Ready, and
+  dispatched against a missing input. A parent whose only failed-child
+  evidence belongs to dead builds or to builds that never owned it MUST NOT
+  be condemned by the cascade --- it recovers normally (childless if the
+  edge was dropped) and any genuine problem is re-discovered at dispatch
+  time. The set of cascaded parents is loaded via a separate
+  `derivation_edges JOIN derivations` query restricted to terminal-failure
+  child statuses and to children carrying a `build_derivations` link to a
+  live build that also links the parent.
 ]
 
 #r("sched.recovery.log-buffer-sweep+2")[
