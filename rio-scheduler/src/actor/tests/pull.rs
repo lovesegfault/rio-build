@@ -669,11 +669,16 @@ async fn exec_charge_facts(
 }
 
 // r[verify sched.attempt.synthesized-verdict]
+// r[verify sched.reassign.no-promote-on-ephemeral-disconnect+5]
 /// A controller-synthesized Preempted verdict (intent-keyed, no exec_id
 /// — the disruption-watcher shape) for an open, never-worker-reported
 /// pull attempt closes it charge-free at this fold: exactly one
 /// uncharged terminal row, the assignment closed, the drv requeued, no
-/// budget or exclusion consumed — and a duplicate appends nothing.
+/// budget or exclusion consumed, the resource floor untouched — and a
+/// duplicate appends nothing. The requeue-because-executor-gone path
+/// never bumps `resource_floor` and never records into
+/// `failed_builders`/`failure_count`/`retry_count`; only the explicit
+/// resource-exhaustion classifications promote, at their own sites.
 #[tokio::test]
 async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -716,6 +721,15 @@ async fn attempt_outcome_synthesized_preempted_closes_uncharged_and_requeues() -
     assert!(
         info.retry.failed_builders.is_empty(),
         "charge-free (no exclusion entry)"
+    );
+    assert_eq!(
+        info.retry.count, 0,
+        "no retry budget consumed at the requeue site"
+    );
+    assert_eq!(
+        info.sched.resource_floor,
+        Default::default(),
+        "an executor-gone requeue never bumps the floor — loss is not a sizing signal"
     );
 
     // A duplicate synthesized report resolves as attempt-terminal and

@@ -1198,6 +1198,16 @@ in
   #   dispatch-fod+nonfod subtest: one nix-build, FOD routes to
   #   fetcher pod, consumer routes to builder pod. Wrong routing →
   #   queue-forever → timeout. kubectl-logs grep confirms placement.
+  # r[verify sched.dispatch.fod-builtin-any-arch+2]
+  #   dispatch-fod+nonfod subtest: the FOD half is builtin:fetchurl
+  #   (system="builtin") — its intent lands on the kind=Fetcher pool
+  #   (declared systems [x86_64-linux, builtin]) and the fetcher pod
+  #   executes it (the daemon runs builtin:fetchurl internally), so an
+  #   executor treating `builtin` as a supported system is exercised
+  #   end-to-end. The "regardless of arch" half (no kubernetes.io/arch
+  #   constraint derived from `builtin`; arch-typed pools pin theirs)
+  #   is unit-tested in `fetcher_pod_arch_selector_from_systems` /
+  #   `nix_systems_to_k8s_arch_mapping` (rio-controller pool/pod.rs).
   # r[verify builder.netpol.airgap]
   #   builder-airgap subtest: builder netns curl to upstream-v4 via
   #   NAT64 (64:ff9b::<v4>:80) → rc≠0. Positive control: scheduler

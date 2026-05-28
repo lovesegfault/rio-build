@@ -2046,6 +2046,7 @@ mod tests {
     /// `["builtin"]`-only Pool stays arch-agnostic (no pin) —
     /// `nix_systems_to_k8s_arch` skips `builtin`.
     // r[verify ctrl.pod.arch-selector+2]
+    // r[verify sched.dispatch.fod-builtin-any-arch+2]
     #[test]
     fn fetcher_pod_arch_selector_from_systems() {
         let hw = HwClassConfig::default();
