@@ -1079,8 +1079,9 @@ pub const M_062: () = ();
 /// post-reconciliation clear pass in `handle_merge_dag` at merge time,
 /// by the completion-time `clear_topdown_pruned_for_produced_parents`
 /// when children become produced later, by the recovery-time gate that
-/// drops a restored mark whose persisted children are all produced, or
-/// by the lazy walk-failure backstop in `handle_substitute_complete`)
+/// drops a restored mark whose persisted children are all produced and
+/// vouched for by a still-live build, or by the lazy walk-failure
+/// backstop in `handle_substitute_complete`)
 /// and by the topdown fail-fast when it consumes the marker.
 /// The header comment in the frozen `.sql` keeps the original
 /// childless-era wording — this doc-const is the corrected record. See

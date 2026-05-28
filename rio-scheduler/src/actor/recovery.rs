@@ -359,7 +359,8 @@ impl DagActor {
         // r[impl sched.merge.substitute-topdown+10]
         // Produced-children gate on restored `topdown_pruned` marks:
         // drop the mark from any flagged row whose persisted children
-        // are ALL produced (`completed`/`skipped`). The check MUST be
+        // are ALL produced (`completed`/`skipped`) and vouched for by
+        // a still-live build. The check MUST be
         // PG-side: produced children are excluded from
         // load_nonterminal_derivations and their edges were dropped
         // above, so in the recovered in-memory DAG such a parent is
@@ -407,7 +408,7 @@ impl DagActor {
             if !cleared.is_empty() {
                 info!(
                     count = cleared.len(),
-                    "recovery: dropped restored topdown_pruned marks (persisted children all produced)"
+                    "recovery: dropped restored topdown_pruned marks (persisted children all produced under live builds)"
                 );
                 // Best-effort persisted clear so later failovers don't
                 // re-evaluate the same rows; the in-memory clear above

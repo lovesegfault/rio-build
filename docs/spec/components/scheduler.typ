@@ -929,7 +929,8 @@ the fail-fast arm. The flag is persisted (migration 063, OR-on-conflict on
 upsert, cleared --- by the post-reconciliation clear pass at merge time when
 those children are already produced and verified, by the completion-time
 clear when children become produced, by the recovery-time gate that
-drops a restored mark whose persisted children are all produced, or by the
+drops a restored mark whose persisted children are all produced and vouched
+for by a still-live build, or by the
 lazy walk-failure clear when a failed detached fetch finds the node's
 children already produced ---
 otherwise the mark stays until they produce or the fail-fast consumes it)
