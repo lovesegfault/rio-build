@@ -907,7 +907,7 @@ async fn apply_soft_features_re_derives_effective_features() {
     );
 }
 
-// r[verify sched.sla.reactive-floor+2]
+// r[verify sched.sla.reactive-floor+3]
 /// D4: `solve_intent_for` clamps its solved (mem, disk) at
 /// `resource_floor`. A derivation with `floor.mem=32GiB` (from prior
 /// `bump_floor_or_count` cycles) gets a SpawnIntent with mem ≥ 32GiB
@@ -1023,7 +1023,7 @@ async fn solve_intent_for_clamps_at_ceil() {
         max_mem
     );
 
-    // r[verify sched.sla.reactive-floor+2]
+    // r[verify sched.sla.reactive-floor+3]
     // cores (a): forced_cores override above max_cores. The override path
     // emits raw `c.ceil()` with no `.min(max_cores)`; the chokepoint is
     // the only clamp.

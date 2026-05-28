@@ -171,7 +171,7 @@ impl SchedulerDb {
         Ok(updated)
     }
 
-    // r[impl sched.sla.reactive-floor+2]
+    // r[impl sched.sla.reactive-floor+3]
     /// Persist a derivation's reactive `resource_floor` (D4, `M_044`).
     ///
     /// Called from `bump_floor_or_count` right after the in-mem

@@ -749,7 +749,7 @@ pub struct CaState {
     pub output_unchanged: bool,
 }
 
-// r[impl sched.sla.reactive-floor+2]
+// r[impl sched.sla.reactive-floor+3]
 /// Per-dimension resource floor for the NEXT dispatch (D4).
 ///
 /// Reactive promotion: an explicit resource-exhaustion signal

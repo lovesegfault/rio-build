@@ -823,18 +823,25 @@ impl DagActor {
             .collect()
     }
 
-    // r[impl sched.sla.reactive-floor+2]
+    // r[impl sched.sla.reactive-floor+3]
     /// Double the relevant `resource_floor` dimension for `drv_hash`
     /// (D4). Thin wrapper around [`floor::bump_floor_or_count`] that
     /// handles the dag-node lookup, metric, log, and best-effort PG
     /// persist.
     ///
-    /// Called ONLY from explicit resource-exhaustion signals:
-    /// - `handle_executor_termination` (controller-reported k8s
-    ///   OOMKilled / Evicted-DiskPressure / DeadlineExceeded)
+    /// Called ONLY from explicit worker-reported resource-exhaustion
+    /// signals:
     /// - `handle_infrastructure_failure` (worker-reported `CgroupOom`
     ///   — build child hit cgroup memory.max while pod survived)
     /// - `handle_timeout_failure` (worker-reported `TimedOut`)
+    ///
+    /// The stream-era controller-reported arm
+    /// (`ReportExecutorTermination` → OOMKilled / DiskPressure /
+    /// DeadlineExceeded) retired with that RPC; the pod-terminal
+    /// `ReportAttemptOutcome` second installment deliberately does not
+    /// promote (no durable first-report dedup exists for it) — the
+    /// `sched.sla.reactive-floor+3` re-derivation records the accepted
+    /// residual.
     ///
     /// NOT called from bare disconnect / `TransientFailure` /
     /// non-OOM `InfrastructureFailure`. The previous
