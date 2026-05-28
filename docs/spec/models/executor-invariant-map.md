@@ -4111,3 +4111,101 @@ disruption-targeted pod (no DrainExecutor hop), the hung-node feed is
 the OA2 wedge clustering alone (`GetSpawnIntents.dead_nodes` reserved
 at the proto), and the dispatch payload no longer carries a
 generation. Models J/N unchanged; checks re-run green as above.
+
+### T-1d.5 — Phase-1 close-out prep (the Phase-2 boundary)
+
+Written with the 1d batch on the `executor-1d` branch; the landing
+itself (serial integration onto `formal-sprint` behind one full gate,
+G6) is the campaign owner's step and is not performed by this batch.
+
+#### The 1d net-diff record (and the combined 1c'+1d figure)
+
+`git diff --stat` across the 1d batch (base `ebb852268`, the 1c'
+spec-sweep tip): 104 files changed, +1209/−6865 — net −5656 lines for
+the whole tree; scoped to the production crates
+(rio-builder/controller/scheduler/proto/cli/dashboard): 69 files,
++669/−5030 — net −4361. Per-commit figures are in the commit messages
+(T-1d.1 −3143, T-1d.2 −347, T-1d.3 −1347, the reactive-floor
+re-derivation +23, T-1d.4 −842). Per-area: rio-builder/src −2789
+(the runtime collapse), rio-controller/src −341, rio-scheduler/src
+−584, rio-proto −229. Combined with the recorded 1c' deletion-wave
+figure (commits A–C: net −22636, scheduler session core −6784), the
+two deletion slices remove ≈28.3k lines net. Net-negative as required;
+no deviation to record under the §4.5 honesty rule.
+
+#### Dispositions and deviations recorded by this batch
+
+- **DrainButton / OA4:** the dashboard-owner ask (repoint vs removal)
+  was still open at T-1d.3, so the plan's recorded default was taken:
+  DrainButton (component, harness, tests, Executors-page column) is
+  removed with the RPC; the Executors page keeps the open-attempt
+  list. OA4's recorded recommendation (drop BuildPhase; derive the
+  phase column from attempt/derivation status) is followed on the
+  scheduler side: the dead ForwardPhase intake and the
+  phase-binding/path-length rules are retired; `BuildEvent.phase`
+  remains a producer-less display arm for a possible future carrier.
+- **sigint-graceful re-statement (deviation from the T-1c.2b note):**
+  the standalone fragment was retired with named carriers (the
+  pull-loop signal unit battery, every standalone scenario's one-shot
+  exit path, the killed-mid-build/cancel k3s arms) instead of being
+  re-stated as a VM subtest; rationale in the T-1d.1 commit message
+  (SIGINT and SIGTERM share one shutdown token; the VM-only delta was
+  systemd exit-code observation of the dev-environment path).
+- **Deletion-gate signal on 1d-era code:** the `workers_active` gauge,
+  the stream stub-call counter and their recording rules are gone with
+  the surfaces they read. Deployment-time rows D6/D7 are evaluated
+  against the release being upgraded FROM (which still emits them);
+  the 1d-stage D7 watch falls back to scheduler error rates and the
+  gateway's unknown-method observability rather than a dedicated
+  counter — recorded as the accepted shape of the second deletion
+  release's watch.
+- **Reactive-floor:** re-derived (+3) over the worker-reported signals
+  only; the controller-reported promote arm retired with
+  `ReportExecutorTermination` and the accepted residual (pod-level
+  resource kills no longer auto-promote) is recorded next to the rule.
+- **P12 / per-executor-budget:** NOT completed at 1d (deviation from
+  the plan's T-1c'.3/1d expectation). The fold still keys legacy
+  stream-era rows by their pod-name executor id; completing the drop
+  cleanly requires hoisting the retry kernel's placeholder identity to
+  a first-class optional identity (event alphabet + CBMC contracts,
+  retry-campaign owned). Blocker note:
+  `~/tmp/rio-formal-verification/executor-1d-blocker-p12.md`; the
+  `sched.retry.per-executor-budget+3` vehicle-list and key-clause
+  re-statement land with that work.
+
+#### Deferred items (Phase 2 / cross-campaign, restated)
+
+1. Kani on `admit_pull` / `fold_report` wired into the kani-checks set
+   (design §6 row 2); the fold_report contract is also the named
+   Phase-2 carrier in the Model D retirement record above.
+2. The full acceptance table over the 0b-partitioned corpus, one
+   disposition per in-family row (cross-campaign rows carried as
+   OUTSIDE), with the same honesty contract as the retry close-out.
+3. The as-built model freeze validation (executorSessionAsBuilt.qnt
+   stays typechecking; consider a periodic manual re-run recipe) and
+   the MBT revisit if the pull handlers' pure core warrants it.
+4. P12 completion + the per-executor-budget re-statement (the blocker
+   note above; co-owned with the retry campaign).
+5. Pool `dispatchMode: Stream` and the per-pod `RIO_DISPATCH_MODE`
+   discriminators: the CRD value and the controller-side gates remain
+   (out of the 1d plan's scope) even though the builder always pulls;
+   retiring the Stream value (CRD version bump + the pod.rs/job.rs
+   gates + helm knob) is a follow-up once a deprecation path for
+   existing CRs is chosen.
+6. The OA5 live-fleet confirmation, the deletion-gate evaluation and
+   the post-deletion watches remain deployment-time checklist rows
+   D0–D7; nothing in this batch changes them except the D6/D7 signal
+   note above.
+7. ExecutorMessage remains in the proto as the builder's internal
+   build-task envelope (completion + phase arms); re-homing it onto a
+   builder-local type is cosmetic and can ride any future
+   build_types.proto change.
+
+#### What G6 (the 1d landing gate) still needs from the owner
+
+The full gate run at integration time (`/nixbuild --checks`, rc 0,
+single-VM-retry rule), the controller-campaign counter-signature on
+the 1d delta entry, and the OA4/DrainButton removal acknowledged at
+the landing review (the recorded fallback was taken; reinstating a
+button against the documented evict procedure remains possible
+dashboard-side without proto changes).
