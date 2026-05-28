@@ -32,12 +32,14 @@
 #   - Preempt timing (T-1b.9): patching DisruptionTarget=True on a
 #     pull-mode pod makes the controller synthesize the preempted
 #     report and foreground-delete the owning Job; pod+Job gone and the
-#     attempt closed at the report fold within 90s, the preempted exec
-#     charged exactly once with a non-success disruption class, the
-#     requeued drv still delivers its store path, and no second row is
-#     ever minted for that exec (a reason-only fill may or may not land
-#     depending on watch-event timing — either way the row count for
-#     the exec stays 1).
+#     attempt closed at the report fold within 90s. Per AD5 a
+#     controller-initiated preempt of still-wanted work closes the
+#     attempt UNCHARGED: exactly one terminal row for the preempted
+#     exec, outcome class disconnected (the no-charge class), reason
+#     preempted (the synthesized verdict) or worker_abort (the pod's
+#     SIGTERM-abort report when the synthesized one loses the race),
+#     the requeued drv still delivers its store path, and no second row
+#     is ever minted for that exec.
 #   - Establishment window: a pull-mode pod whose builder process is
 #     SIGKILLed from the host produces a plain Error pod — no
 #     SIGTERM-abort report, nothing the controller classifies — so the
@@ -467,10 +469,16 @@ scope: with scope; ''
           f"the preemption must be closed by the report fold, not the "
           f"establishment sweep (window >= {PC_SLACK_SECS}s), took {preempt_elapsed:.1f}s"
       )
-      # Charge discipline: exactly one non-success disruption charge for
-      # the preempted exec (the SIGTERM-abort report), never a second
-      # row — the controller-synthesized preempted report is a
-      # reason-only fill on the same row when it lands at all.
+      # Charge discipline (AD5): a controller-initiated preempt of
+      # still-wanted work closes the attempt UNCHARGED — exactly one
+      # terminal row for the preempted exec, always the no-charge
+      # disconnected class, never an infra or executor_crash charge and
+      # never a second row. The reason names whichever closer won the
+      # race: "preempted" when the controller-synthesized verdict
+      # closed it (the normal order — the report is sent before the
+      # Job delete), "worker_abort" when the pod's own SIGTERM-abort
+      # report landed first (e.g. the synthesized report failed
+      # transiently and the abort beat its retry).
       preempt_rows = pc_count(
           f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{preempt_exec}'"
       )
@@ -481,28 +489,27 @@ scope: with scope; ''
           "SELECT coalesce(termination_reason, '<none>') FROM drv_attempts "
           f"WHERE exec_id = '{preempt_exec}'"
       ).strip()
-      assert preempt_rows == 1 and preempt_class in (
-          "infra",
-          "executor_crash",
-          "disconnected",
-      ), (
-          f"the preempted exec must be charged exactly once with a non-success "
-          f"disruption class, got {preempt_rows} row(s), class {preempt_class!r}"
+      assert preempt_rows == 1 and preempt_class == "disconnected", (
+          f"the preempted exec must be closed exactly once with the uncharged "
+          f"disconnected class, got {preempt_rows} row(s), class {preempt_class!r}"
       )
-      print(f"pull-canary preempt: exec {preempt_exec} charged once as "
-            f"{preempt_class}, termination_reason={preempt_reason!r} "
-            f"(reason-only second installment when the synthesized report lands "
-            f"after the abort row; never a new row)")
+      assert preempt_reason in ("preempted", "worker_abort"), (
+          f"the close must come from the synthesized verdict or the SIGTERM-abort "
+          f"report, got termination_reason {preempt_reason!r}"
+      )
+      print(f"pull-canary preempt: exec {preempt_exec} closed uncharged as "
+            f"{preempt_class}/{preempt_reason} (synthesized verdict or abort "
+            f"report; never a charge, never a second row)")
 
       # The derivation is not lost: the same client build completes on a
-      # fresh attempt, and the requeue itself added no further charge.
+      # fresh attempt, and the requeue itself added no further row.
       preempt_out = pc_bg_wait("pc-preempt", 300)
       assert "/nix/store/" in preempt_out, (
           f"the preempted drv should still produce a store path, got: {preempt_out!r}"
       )
       assert pc_attempt_rows("pc-preempt") == 1, (
-          f"the requeue after preemption must add no charge beyond the abort row, "
-          f"got {pc_attempt_rows('pc-preempt')} rows"
+          f"the requeue after preemption must add nothing beyond the uncharged "
+          f"close, got {pc_attempt_rows('pc-preempt')} rows"
       )
       print(f"pull-canary TIMING preempt: DisruptionTarget -> pod+job gone, "
             f"attempt closed in {preempt_elapsed:.1f}s (bound 90s); rebuilt to a "
@@ -607,7 +614,14 @@ scope: with scope; ''
           f"inside the report slack ({PC_SLACK_SECS}s) — it must only fire after "
           f"deadline + slack"
       )
-      assert pc_open("pc-estab") == 0, (
+      # Structural form: the ESTABLISHED exec must have left the open
+      # view (its terminal fill removes it). The requeued drv may
+      # already have been re-pulled by a fresh pod by the time this
+      # runs — that fresh attempt is the healthy respawn the arm later
+      # relies on, not a leftover of the established one — so the
+      # assertion keys on the established exec rather than demanding
+      # an empty view for the drv.
+      assert pc_open_exec("pc-estab") != estab_exec, (
           "the established attempt must have left the open-attempt view"
       )
       print(f"pull-canary TIMING establishment: charge landed at attempt age "

@@ -31,16 +31,17 @@ scope: with scope; ''
   #     report lands (the pod exits 0, the client gets its store path,
   #     the assignment closes, and no drv_attempts charge row exists —
   #     the ledger records failures, not successes);
-  #   - a pod killed mid-build is neither lost nor charge-free (the
-  #     charge-free rule covers only never-pulled pods): with the 1b
-  #     slice (T-1b.3 C4/C5 unified pod-terminal reporting plus the
-  #     AD5 SIGTERM-abort report) the killed attempt is closed with a
-  #     non-success outcome instead of waiting for the establishment
-  #     sweep, the derivation requeues, a fresh attempt (new exec_id)
-  #     rebuilds it, and the same client build still gets its store
-  #     path. The successful re-run appends nothing to the ledger; the
-  #     establishment sweep (deadline + report slack) remains the
-  #     out-of-budget backstop for attempts no observer reports.
+  #   - a pod killed mid-build is not lost and is not charged (AD5: a
+  #     platform termination of still-wanted work is an abort, not a
+  #     worker fault): the builder's SIGTERM-abort report closes the
+  #     attempt promptly with exactly one uncharged terminal row
+  #     (disconnected/worker_abort) instead of waiting for the
+  #     establishment sweep, the derivation requeues at that fold, a
+  #     fresh attempt (new exec_id) rebuilds it, and the same client
+  #     build still gets its store path. The successful re-run appends
+  #     nothing to the ledger; the establishment sweep (deadline +
+  #     report slack) remains the out-of-budget backstop — and the
+  #     only charging path — for attempts no observer reports.
   with subtest("pull-mode: pull/report path builds a drv; no-attempt and killed-mid-build arms"):
       import time
 
@@ -259,23 +260,23 @@ scope: with scope; ''
       )
       print("pull-mode arm 2: build complete, report landed, assignment closed, no charges")
 
-      # ── Arm 3: a pod killed mid-build is charged once + requeued ──
+      # ── Arm 3: a pod killed mid-build is closed once + requeued ──
       # Wave 1a wrote this arm against the interim state (nothing
       # reported pod-terminal outcomes for pull-mode pods, so a killed
       # attempt stayed open under the same exec_id until the
-      # establishment sweep). The 1b slice changed the designed
-      # behavior: a pod that has PULLED is not charge-free when it
-      # dies — the kill is observed promptly (in this fixture by the
-      # AD5 SIGTERM-abort report the builder fires as the force-kill
-      # lands; the T-1b.3 C4/C5 unified controller report and the
-      # establishment sweep are the other observers of the same
-      # contract), the attempt is closed with a non-success outcome,
-      # the derivation requeues, and the Job re-pulls under a fresh
-      # exec_id. This arm asserts the strongest in-budget form of that
-      # contract: original exec closed and charged exactly once, never
-      # a fabricated success, a fresh attempt appears, and the SAME
-      # client build still completes with a store path (one extra 45 s
-      # rebuild, well inside the group budget).
+      # establishment sweep). The pull-hardening batch aligned the
+      # in-budget closer with AD5: the builder's SIGTERM-abort report
+      # of still-wanted work (fired as the force-kill lands in this
+      # fixture) closes the attempt promptly and CHARGE-FREE — exactly
+      # one uncharged terminal row (disconnected/worker_abort), never
+      # an infrastructure-failure charge — and the derivation requeues
+      # at that fold. The establishment sweep remains the out-of-budget
+      # backstop (and the only path that charges) when no abort report
+      # lands. This arm asserts the strongest in-budget form of that
+      # contract: original exec closed with exactly one uncharged
+      # terminal row, never a fabricated success, a fresh attempt
+      # appears, and the SAME client build still completes with a store
+      # path (one extra 45 s rebuild, well inside the group budget).
       client.succeed(
           "nix-build --no-out-link --store 'ssh-ng://k3s-server' "
           "--arg busybox '(builtins.storePath ${common.busybox})' "
@@ -326,27 +327,33 @@ scope: with scope; ''
           f"ListOpenAttempts must show exactly the fresh attempt ({arm3_exec2}), "
           f"got: {rpc_attempts!r}"
       )
-      # The killed exec is charged exactly once with a non-success
-      # disruption class (the ledger has no success class at all, so a
-      # row here can never launder the kill into a completion). The
-      # in-budget closer today is the worker SIGTERM-abort report
-      # (classified infra); executor_crash is the establishment-sweep
-      # spelling and disconnected the stream-installment one — any of
-      # the three is the same contract: closed, charged, non-success.
+      # The killed exec is closed with exactly one terminal row and the
+      # row is the UNCHARGED abort class (the ledger has no success
+      # class at all, so a row here can never launder the kill into a
+      # completion). The in-budget closer is the worker SIGTERM-abort
+      # report of still-wanted work, which AD5 resolves charge-free as
+      # disconnected/worker_abort — never an infra charge; the
+      # establishment sweep's executor_crash spelling only appears when
+      # no abort report lands, which is structurally impossible inside
+      # this arm's 120 s poll budget (the window is deadline + 120 s
+      # slack).
       orig_rows = int(psql_k8s(k3s_server,
           f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{arm3_exec}'"
       ).strip() or "0")
       orig_class = psql_k8s(k3s_server,
           f"SELECT outcome_class FROM drv_attempts WHERE exec_id = '{arm3_exec}'"
       ).strip()
-      assert orig_rows == 1 and orig_class in (
-          "infra",
-          "executor_crash",
-          "disconnected",
-      ), (
-          f"the killed attempt must be charged exactly once with a "
-          f"non-success disruption class, got {orig_rows} row(s), "
-          f"class {orig_class!r}"
+      orig_reason = psql_k8s(k3s_server,
+          "SELECT coalesce(termination_reason, '<none>') FROM drv_attempts "
+          f"WHERE exec_id = '{arm3_exec}'"
+      ).strip()
+      assert orig_rows == 1 and orig_class == "disconnected", (
+          f"the killed attempt must be closed exactly once with the uncharged "
+          f"abort class, got {orig_rows} row(s), class {orig_class!r}"
+      )
+      assert orig_reason == "worker_abort", (
+          f"the in-budget closer is the AD5 SIGTERM-abort report, "
+          f"got termination_reason {orig_reason!r}"
       )
       # Never a fabricated success: a legitimate completion needs the
       # fresh attempt to run its full 45 s build, so the client must
@@ -357,7 +364,8 @@ scope: with scope; ''
           f"{still_running}); only a fabricated completion could land before "
           f"the re-attempt has built"
       )
-      print(f"pull-mode arm 3: killed exec charged ({orig_class}), fresh attempt {arm3_exec2}")
+      print(f"pull-mode arm 3: killed exec closed uncharged ({orig_class}/{orig_reason}), "
+            f"fresh attempt {arm3_exec2}")
 
       # The derivation is not lost: the fresh attempt builds it, the
       # report lands, and the same client nix-build exits with the
@@ -381,20 +389,21 @@ scope: with scope; ''
       assert active2 == 0, (
           f"no active assignment may remain for the rebuilt drv, got: {active2}"
       )
-      # … and at quiescence the ledger holds exactly the one
-      # disruption charge: the kill charged the killed exec once and
-      # the successful re-attempt appended nothing (the ledger records
-      # failures, never successes).
+      # … and at quiescence the ledger holds exactly the one uncharged
+      # abort row: the kill closed the killed exec once (charge-free)
+      # and the successful re-attempt appended nothing (the ledger
+      # records failures and closures, never successes).
       rows2 = attempt_rows("lifecycle-pull-mode-2")
       new_rows = int(psql_k8s(k3s_server,
           f"SELECT count(*) FROM drv_attempts WHERE exec_id = '{arm3_exec2}'"
       ).strip() or "0")
       assert rows2 == 1 and new_rows == 0, (
-          f"expected exactly one charge row (the killed attempt) and none for "
-          f"the successful re-attempt, got: drv-wide {rows2}, fresh-exec {new_rows}"
+          f"expected exactly one terminal row (the killed attempt's abort close) "
+          f"and none for the successful re-attempt, got: drv-wide {rows2}, "
+          f"fresh-exec {new_rows}"
       )
       print("pull-mode arm 3: requeued drv rebuilt under the fresh exec_id, "
-            "store path delivered, single charge in the ledger")
+            "store path delivered, single uncharged abort row in the ledger")
 
       # ── Cleanup ───────────────────────────────────────────────────
       # Both clients have exited and no open attempt remains. Delete
@@ -411,5 +420,5 @@ scope: with scope; ''
           timeout=120,
       )
       print("pull-mode PASS: no-attempt death charge-free, pull build + report "
-            "end-to-end, killed-mid-build charged once and rebuilt to success")
+            "end-to-end, killed-mid-build closed uncharged and rebuilt to success")
 ''
