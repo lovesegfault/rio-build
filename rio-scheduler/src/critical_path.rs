@@ -382,6 +382,13 @@ mod tests {
         // Second merge: b depends on c (new). c=30. Now b has a child
         // with priority 30. b was 20; now 20+30=50. a should propagate:
         // 10+50=60.
+        //
+        // A resident, non-re-created parent only accepts new dependency
+        // edges through the topdown-pruned carve-out
+        // (sched.merge.edge-creation-scoped) — the production flow where
+        // an existing node legitimately gains children later. Stage that
+        // flow so the priority-raise propagation under test still runs.
+        dag.node_mut("b").unwrap().topdown_pruned = true;
         let merge2 = dag
             .merge(Uuid::new_v4(), &[node("c")], &[edge("b", "c")], "")
             .unwrap();

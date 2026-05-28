@@ -158,6 +158,12 @@ pub fn describe_metrics() {
         "Total build duration"
     );
     describe_counter!(
+        "rio_scheduler_merge_foreign_edge_skipped_total",
+        "Submitted dependency edges skipped at merge because their parent is a resident \
+         node not (re)created by the submission (sched.merge.edge-creation-scoped). \
+         Sustained nonzero rate → hostile direct submitter or gateway DAG-construction bug."
+    );
+    describe_counter!(
         "rio_scheduler_cache_hits_total",
         "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
     );

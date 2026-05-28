@@ -233,6 +233,15 @@ pub struct MergeResult {
     /// durably by deleting the displaced rows' parent-side
     /// `derivation_edges` in the same transaction.
     pub displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
+    /// Submitted edges skipped by the creation-scoped edge gate
+    /// (`sched.merge.edge-creation-scoped`): their parent is a resident
+    /// node this submission did NOT (re)create and that is not a
+    /// topdown-pruned root awaiting its dependency top-up, and the edge
+    /// did not already exist. They never enter the in-memory DAG, are
+    /// never persisted (Batch 3 sources `derivation_edges` rows from
+    /// `new_edges`), and are not part of rollback. Surfaced so the
+    /// actor can count them (`rio_scheduler_merge_foreign_edge_skipped_total`).
+    pub foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
     /// clears it back to `""` so a rejected build's trace ID does not
@@ -530,6 +539,9 @@ impl DerivationDag {
         let mut displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)> = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
+        // Submitted edges skipped because their parent is a resident node
+        // this submission did not (re)create (sched.merge.edge-creation-scoped).
+        let mut foreign_parent_edges_skipped: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
         // rollback only removes interest from these (not from nodes where
         // build_id was already present from a prior successful merge).
@@ -981,6 +993,18 @@ impl DerivationDag {
         // or when merge() is driven by a non-gRPC caller. The warn-skip
         // stays as the last line of defense: an unresolved endpoint must
         // not attach edges to nodes the submission never declared.
+        //
+        // Ingress only constrains edges to THIS request's nodes; it cannot
+        // know which of them are resident. A node's dependency set is
+        // intrinsic to its `.drv`, so only the submission that (re)creates
+        // a node may define its children — a later submission that merely
+        // joins a resident node may re-declare the existing edges (silent
+        // no-ops) but must not extend them, or any submitter could attach
+        // a failing junk dependency to someone else's resident node. The
+        // one exception is a topdown-pruned root: its creating submission
+        // deliberately dropped the dependency edges, and a later full
+        // merge is expected to top them up while the node is resident
+        // (see handle_substitute_complete).
         for edge in edges {
             // Edges reference drv_path; resolve to drv_hash
             let Some(parent_hash) = self
@@ -1003,6 +1027,36 @@ impl DerivationDag {
                 continue;
             };
 
+            // r[impl sched.merge.edge-creation-scoped]
+            // Creation-scoped edge gate: attach the edge only when this
+            // submission (re)created the parent (plain insert,
+            // resubmit-reset, displacement, authority takeover — all of
+            // which land in `newly_inserted`) or the resident parent is a
+            // topdown-pruned root awaiting its dependency top-up.
+            // Re-declarations of an edge that already exists stay accepted
+            // as silent no-ops (the gateway re-emits each parent's full
+            // edge set on every full-closure join).
+            let already_present = self
+                .children
+                .get(&parent_hash)
+                .is_some_and(|cs| cs.contains(&child_hash));
+            let parent_creation_scoped = newly_inserted.contains(&parent_hash)
+                || self
+                    .nodes
+                    .get(&parent_hash)
+                    .is_some_and(|s| s.topdown_pruned);
+            if !parent_creation_scoped && !already_present {
+                tracing::warn!(
+                    parent_path = %edge.parent_drv_path,
+                    child_path = %edge.child_drv_path,
+                    %build_id,
+                    "edge parent is a resident node not (re)created by this \
+                     submission; skipping foreign dependency edge"
+                );
+                foreign_parent_edges_skipped.push((parent_hash, child_hash));
+                continue;
+            }
+
             let inserted_child = self
                 .children
                 .entry(parent_hash.clone())
@@ -1021,7 +1075,9 @@ impl DerivationDag {
         // Cycle check: DFS from each newly-inserted node AND from each parent
         // endpoint of new edges. The latter catches cycles formed by new edges
         // between two pre-existing nodes (no new nodes inserted, so the
-        // newly_inserted loop alone would miss them).
+        // newly_inserted loop alone would miss them) — under the
+        // creation-scoped edge gate above this is only reachable through
+        // the topdown-pruned carve-out, but the coverage stays.
         let mut color: HashMap<String, u8> = HashMap::new();
         let mut dfs_starts: Vec<&str> = newly_inserted.iter().map(|s| s.as_str()).collect();
         for (parent, _child) in &new_edges {
@@ -1058,6 +1114,7 @@ impl DerivationDag {
             interest_added,
             removed_retriable,
             displaced_scrubbed_edges,
+            foreign_parent_edges_skipped,
             traceparent_upgraded,
             wanted_grown,
             contributions_recorded,

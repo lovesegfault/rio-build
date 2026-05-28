@@ -5941,6 +5941,82 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
     Ok(())
 }
 
+
+// r[verify sched.merge.edge-creation-scoped]
+// r[verify sched.merge.substitute-topdown+10]
+/// Production-order variant of the topdown-pruned dependency top-up: B1's
+/// topdown prune leaves R resident (Substituting, `topdown_pruned`,
+/// no children) and B2's later full merge attaches R→glibc WITHOUT
+/// re-creating R — the creation-scoped edge gate's pruned-root carve-out.
+/// When the substitute then fails, R has children, so the fail-fast does
+/// NOT fire: B2 stays Active and R falls through to Queued.
+#[tokio::test]
+async fn test_topdown_pruned_root_dep_topup_production_order() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // B1: R resident alone (its deps were topdown-pruned), mid-fetch.
+    let mut r1 = make_node("tdpp-r");
+    r1.expected_output_paths = vec![test_store_path("tdpp-r-out")];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![r1], vec![], false).await?;
+    barrier(&handle).await;
+    handle
+        .debug_force_status("tdpp-r", DerivationStatus::Substituting)
+        .await?;
+    handle.debug_set_topdown_pruned("tdpp-r", true).await?;
+
+    // B2: full merge {app, R, glibc} with app→R, R→glibc. R is resident
+    // (Substituting → not retriable → joined, not re-created); the
+    // R→glibc edge is admitted via the topdown-pruned carve-out.
+    let mut app = make_node("tdpp-app");
+    app.expected_output_paths = vec![test_store_path("tdpp-app-out")];
+    let mut r2 = make_node("tdpp-r");
+    r2.expected_output_paths = vec![test_store_path("tdpp-r-out")];
+    let mut glibc = make_node("tdpp-glibc");
+    glibc.expected_output_paths = vec![test_store_path("tdpp-glibc-out")];
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![app, r2, glibc],
+        vec![
+            make_test_edge("tdpp-app", "tdpp-r"),
+            make_test_edge("tdpp-r", "tdpp-glibc"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // B1's deferred fetch fails.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdpp-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // B2 stays Active: R gained children from B2's top-up, so the
+    // "deps were dropped" fail-fast must not fire.
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(
+        s2.state,
+        rio_proto::types::BuildState::Active as i32,
+        "topdown-pruned root topped up by a later full merge → no fail-fast"
+    );
+    let post = expect_drv(&handle, "tdpp-r").await;
+    assert_eq!(
+        post.status,
+        DerivationStatus::Queued,
+        "R falls through to Queued behind its (incomplete) new dependency"
+    );
+    assert!(!post.topdown_pruned, "flag cleared once R gained children");
+    Ok(())
+}
+
+
 // r[verify sched.merge.substitute-topdown+10]
 /// Top-down negative: root NOT substitutable → fall through to
 /// full bottom-up check. All nodes merged, deps processed normally.
@@ -9383,6 +9459,114 @@ async fn test_displacement_scrubs_squatter_edges_and_unblocks_victim() -> TestRe
         query_status(&handle, victim).await?.state,
         rio_proto::types::BuildState::Succeeded as i32,
         "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// End-to-end foreign-edge skip: build B joins build A's resident node X
+/// and tries to attach its own junk child to it. The junk edge must not
+/// reach the in-memory DAG or `derivation_edges`, and X's lifecycle (and
+/// build A's outcome) must be decided by A's declared dependency set
+/// only — the junk node stays B's problem.
+#[tokio::test]
+async fn test_foreign_junk_edge_not_attached_or_persisted() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let x_path = test_drv_path("fje-x");
+    let d_path = test_drv_path("fje-d");
+    let x_out = test_store_path("fje-x-out");
+    let d_out = test_store_path("fje-d-out");
+
+    // Build A: X depends on D (the legitimate definition of X's deps).
+    let build_a = Uuid::new_v4();
+    let mut x = make_node("fje-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut d = make_node("fje-d");
+    d.expected_output_paths = vec![d_out.clone()];
+    merge_dag(
+        &handle,
+        build_a,
+        vec![x, d],
+        vec![make_test_edge("fje-x", "fje-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Build B: joins X and attaches a junk child that can never be
+    // dispatched here (kvm-gated) — the cross-tenant interference shape.
+    let build_b = Uuid::new_v4();
+    let mut junk = make_node("fje-junk");
+    junk.required_features = vec!["kvm".into()];
+    merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("fje-x"), junk],
+        vec![make_test_edge("fje-x", "fje-junk")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // PG: X→D persisted by build A; X→junk never persisted.
+    let count_edge = |parent: &'static str, child: &'static str| {
+        let pool = db.pool.clone();
+        async move {
+            let (n,): (i64,) = sqlx::query_as(
+                "SELECT count(*) FROM derivation_edges e
+                 JOIN derivations p ON p.derivation_id = e.parent_id
+                 JOIN derivations c ON c.derivation_id = e.child_id
+                 WHERE p.drv_hash = $1 AND c.drv_hash = $2",
+            )
+            .bind(parent)
+            .bind(child)
+            .fetch_one(&pool)
+            .await
+            .expect("edge count query");
+            n
+        }
+    };
+    assert_eq!(
+        count_edge("fje-x", "fje-d").await,
+        1,
+        "legitimate edge persisted"
+    );
+    assert_eq!(
+        count_edge("fje-x", "fje-junk").await,
+        0,
+        "foreign junk edge must not reach derivation_edges"
+    );
+
+    // X dispatches once D completes — not parked behind the junk node.
+    // (Fresh worker per assignment: the harness pattern for chained
+    // dispatches, mirroring the maybe_resolve_ca tests.)
+    let mut rx = connect_executor(&handle, "w-fje", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path, d_path,
+        "D (the real dependency) dispatches first"
+    );
+    complete_success(&handle, "w-fje", &d_path, &d_out).await?;
+    barrier(&handle).await;
+    let mut rx2 = connect_executor(&handle, "w-fje-2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(
+        assn.drv_path, x_path,
+        "X ready as soon as ITS dependency completed"
+    );
+    complete_success(&handle, "w-fje-2", &x_path, &x_out).await?;
+    barrier(&handle).await;
+
+    // Build A finishes; build B is still waiting on its own junk node.
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build A unaffected by build B's junk edge attempt"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build B keeps waiting on its own junk node"
     );
     Ok(())
 }

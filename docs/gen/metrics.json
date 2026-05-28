@@ -120,6 +120,7 @@
     "rio_scheduler_log_prefix_recovered_total",
     "rio_scheduler_log_unknown_drv_dropped_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_merge_foreign_edge_skipped_total",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phantom_assignments_drained_total",
@@ -816,6 +817,11 @@
         "name": "rio_scheduler_malformed_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_merge_foreign_edge_skipped_total",
+        "kind": "counter",
+        "help": "Submitted dependency edges skipped at merge because their parent is a resident node not (re)created by the submission (sched.merge.edge-creation-scoped). Sustained nonzero rate → hostile direct submitter or gateway DAG-construction bug."
       },
       {
         "name": "rio_scheduler_merge_phase_seconds",

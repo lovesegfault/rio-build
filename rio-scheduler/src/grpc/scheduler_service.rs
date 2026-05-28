@@ -189,18 +189,20 @@ impl SchedulerService for SchedulerGrpc {
             )?;
         }
         // r[impl sched.merge.ingress-edge-endpoints]
-        // Dependency edges may only relate nodes of THIS submission. The
-        // merge edge loop resolves endpoints through the global
-        // path_to_hash index, so without this gate a submitter could
-        // attach dependency edges to OTHER submitters' resident nodes
-        // (cross-tenant interference: a failing junk child seeds
-        // DependencyFailed onto someone else's queued node), and an edge
-        // whose child resolves nowhere only surfaces as an opaque
-        // Internal (MissingDbId) at persist time. Every legitimate
-        // producer already conforms: the gateway emits each edge
-        // alongside its parent node and includes every child as a node
-        // (BFS over inputDrvs; dedup_dag never drops referenced nodes),
-        // and the hook fallback submits a single node with no edges.
+        // Dependency edges may only relate nodes of THIS submission. This
+        // gate guarantees request-shape consistency (every endpoint is a
+        // declared node, so a typo'd or dangling endpoint is a clean
+        // INVALID_ARGUMENT instead of an opaque Internal MissingDbId at
+        // persist time). It deliberately does NOT decide whether the
+        // submitter may DEFINE dependencies for those nodes — a request
+        // can legitimately re-declare a resident node it merely joins.
+        // Protection of resident nodes' dependency sets lives at the
+        // merge edge loop (sched.merge.edge-creation-scoped): only the
+        // submission that (re)creates a node may extend its children.
+        // Every legitimate producer conforms to both: the gateway emits
+        // each edge alongside its parent node and includes every child
+        // as a node (BFS over inputDrvs; dedup_dag never drops referenced
+        // nodes), and the hook fallback submits a single node, no edges.
         let submitted_paths: std::collections::HashSet<&str> =
             req.nodes.iter().map(|n| n.drv_path.as_str()).collect();
         for edge in &req.edges {

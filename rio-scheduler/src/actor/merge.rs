@@ -470,6 +470,22 @@ impl DagActor {
                 return Err(ActorError::Dag(e));
             }
         };
+        // r[impl sched.merge.edge-creation-scoped]
+        // Surface foreign-parent edge skips: a submission tried to extend
+        // the dependency set of a resident node it did not (re)create.
+        // Legitimate full-closure joins only re-declare existing edges
+        // (silent no-ops), so a sustained nonzero rate is either a
+        // hostile direct submitter or a gateway DAG-construction bug.
+        if !merge_result.foreign_parent_edges_skipped.is_empty() {
+            let count = merge_result.foreign_parent_edges_skipped.len() as u64;
+            metrics::counter!("rio_scheduler_merge_foreign_edge_skipped_total").increment(count);
+            warn!(
+                build_id = %build_id,
+                count,
+                "skipped foreign-parent dependency edges at merge \
+                 (parents are resident nodes this submission did not (re)create)"
+            );
+        }
         let newly_inserted = &merge_result.newly_inserted;
         phase!("2-dag-merge-inmem");
 
@@ -562,13 +578,7 @@ impl DagActor {
         // returns Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
-            .persist_and_activate(
-                build_id,
-                &nodes,
-                &edges,
-                &merge_result,
-                &pruned_closure_parents,
-            )
+            .persist_and_activate(build_id, &nodes, &merge_result, &pruned_closure_parents)
             .await
         {
             self.cleanup_failed_merge(build_id, merge_result).await;
@@ -687,11 +697,10 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
-        edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
-        self.persist_merge_to_db(build_id, nodes, edges, merge_result, topdown_pruned_parents)
+        self.persist_merge_to_db(build_id, nodes, merge_result, topdown_pruned_parents)
             .await
             .inspect_err(
                 |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
@@ -2079,7 +2088,6 @@ impl DagActor {
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
-        edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
@@ -2170,13 +2178,6 @@ impl DagActor {
                     ca_modular_hash: node.ca_modular_hash,
                 }
             })
-            .collect();
-
-        // drv_path → drv_hash lookup for edge resolution below. Edges
-        // carry paths (proto wire format); id_map keys by hash.
-        let path_to_hash: HashMap<&str, &str> = node_rows
-            .iter()
-            .map(|r| (r.drv_path.as_str(), r.drv_hash.as_str()))
             .collect();
 
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
@@ -2308,33 +2309,47 @@ impl DagActor {
             );
         }
 
-        // Batch 3: insert edges. Resolve drv_path -> db_id via:
+        // Batch 3: insert edges.
+        // r[impl sched.merge.edge-creation-scoped]
+        // The rows come from `merge_result.new_edges` — exactly the edges
+        // the in-memory merge accepted — NOT from the raw request edge
+        // list, so an edge the creation-scoped gate skipped (foreign
+        // resident parent) can never reach `derivation_edges` and
+        // recovery cannot resurrect it; PG and memory cannot diverge.
+        // Re-declared duplicates of existing edges are absent from
+        // `new_edges` too: their rows were persisted by the merge that
+        // created them (ON CONFLICT DO NOTHING would make re-inserting
+        // them harmless, just pointless). Resolve drv_hash -> db_id via:
         //   1. this tx's id_map — exactly the rows this merge wrote,
         //      i.e. (re)created nodes (sched.persist.creation-scoped);
         //      ON CONFLICT RETURNING hands back the existing id when a
         //      re-created node's row already existed,
         //   2. fall back to self.dag for everything this merge did NOT
-        //      (re)create: live nodes this submission merely joins and
-        //      cross-batch edge endpoints merged by a PRIOR SubmitBuild
-        //      — their db_id was committed by their creating merge.
+        //      (re)create: live nodes this submission merely joins —
+        //      their db_id was committed by their creating merge.
         // A node (re)created by THIS merge is never resolved via
         // self.dag — its db_id isn't set until after commit() below.
-        let resolve = |drv_path: &str| -> Option<Uuid> {
-            path_to_hash
-                .get(drv_path)
-                .and_then(|h| id_map.get(*h).map(|(id, _)| *id))
-                .or_else(|| self.dag.db_id_for_path(drv_path))
+        let resolve = |drv_hash: &str| -> Option<Uuid> {
+            id_map
+                .get(drv_hash)
+                .map(|(id, _)| *id)
+                .or_else(|| self.dag.node(drv_hash).and_then(|s| s.db_id))
         };
-        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = edges
+        let edge_rows: Result<Vec<(Uuid, Uuid)>, ActorError> = merge_result
+            .new_edges
             .iter()
-            .map(|e| {
+            .map(|(parent_hash, child_hash)| {
+                let missing = |hash: &str| ActorError::MissingDbId {
+                    drv_path: self
+                        .dag
+                        .node(hash)
+                        .map(|s| s.drv_path().to_string())
+                        .unwrap_or_else(|| hash.to_string()),
+                };
                 let parent =
-                    resolve(&e.parent_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                        drv_path: e.parent_drv_path.clone(),
-                    })?;
-                let child = resolve(&e.child_drv_path).ok_or_else(|| ActorError::MissingDbId {
-                    drv_path: e.child_drv_path.clone(),
-                })?;
+                    resolve(parent_hash.as_str()).ok_or_else(|| missing(parent_hash.as_str()))?;
+                let child =
+                    resolve(child_hash.as_str()).ok_or_else(|| missing(child_hash.as_str()))?;
                 Ok((parent, child))
             })
             .collect();

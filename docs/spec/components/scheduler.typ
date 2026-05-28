@@ -788,14 +788,48 @@ omit it) and does NOT forbid it on non-CA nodes (deferred-IA nodes carry one).
   `child_drv_path` is not the `drv_path` of a node in the same request.
 ]
 
-The merge edge loop resolves endpoints through the global path index, so an
-unconstrained edge could attach dependencies to *other* submitters' resident
-nodes — a failing junk child would then seed `DependencyFailed` onto a node
-its owner never coupled to it — and an edge naming a path that resolves
-nowhere only surfaced as an opaque `Internal` at persist time. Every
-legitimate producer already satisfies the rule: the gateway emits each edge
-together with its parent node and includes every child as a node of the same
-request, and the hook fallback submits a single node with no edges.
+This gate is request-shape consistency: every endpoint must be a declared
+node, so a dangling or typo'd endpoint is a clean `INVALID_ARGUMENT` instead
+of an opaque `Internal` at persist time. It deliberately does not decide
+whether the submitter may *define* dependencies for those nodes — joining a
+resident node and re-declaring it (full-closure resubmission) is legitimate
+and routine. Protection of resident nodes' dependency sets is the merge-time
+rule #rref("sched.merge.edge-creation-scoped") below. Every legitimate
+producer satisfies both: the gateway emits each edge together with its parent
+node and includes every child as a node of the same request, and the hook
+fallback submits a single node with no edges.
+
+#r("sched.merge.edge-creation-scoped")[
+  The merge MUST attach a submitted dependency edge to its parent node only
+  when this submission (re)creates that parent (a newly inserted node, a
+  resubmit-reset re-creation, a displacement, or an authority takeover) or
+  the resident parent is a topdown-pruned root awaiting its dependency
+  top-up. Any other submitted edge that is not an exact re-declaration of an
+  existing edge MUST be skipped without failing the merge, MUST NOT enter the
+  in-memory DAG, and MUST NOT be persisted to `derivation_edges`.
+]
+
+A node's dependency set is intrinsic to its `.drv`, so only the submission
+that (re)creates a node may define it. Without this rule any authenticated
+submitter could *join* someone else's resident node (deduplication is by
+design — #rref("sched.merge.dedup")) and attach a junk child to it: when the
+junk fails, the dependency-failure cascade fails the victim's node, a
+cross-tenant denial of service the ingress endpoint gate cannot see because
+both endpoints are nodes of the attacker's own request. Exact re-declarations
+of existing edges stay accepted as silent no-ops — the gateway re-emits each
+parent's full edge set on every full-closure join — and skipped foreign
+edges are observable (a per-merge warning plus the
+`rio_scheduler_merge_foreign_edge_skipped_total` counter) rather than a
+rejection, matching the edge loop's existing unresolved-endpoint posture.
+The topdown-pruned carve-out exists because a pruned root's creating
+submission deliberately dropped its dependency edges; the later full merge
+that re-adds them joins the resident root rather than re-creating it.
+Residual exposure, accepted: the *first* submitter of a predictable
+store-backed path still fixes its dependency set (the scheduler never sees
+store-backed `.drv` bytes to validate edges against `inputDrvs` — a possible
+future gateway-consistency cross-check for nodes that carry inline content),
+and a topdown-pruned root accepts dependency top-ups from any submitter
+while the flag is set.
 
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a

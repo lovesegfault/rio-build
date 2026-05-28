@@ -902,6 +902,11 @@ fn test_cycle_via_new_edge_between_existing_nodes() -> anyhow::Result<()> {
 
     // Now merge the SAME nodes (no new inserts) with a B->A edge.
     // This creates a cycle via a new edge between two existing nodes.
+    // B is resident and not re-created, so the creation-scoped edge gate
+    // would skip the new edge; mark it topdown-pruned (the carve-out that
+    // legitimately admits dependency top-ups onto a resident parent) so
+    // the dfs-from-pre-existing-parent cycle coverage stays exercised.
+    dag.nodes.get_mut("hashB").unwrap().topdown_pruned = true;
     let build2 = Uuid::new_v4();
     let cycle_edge = vec![make_edge("hashB", "hashA")];
     let result = dag.merge(build2, &nodes, &cycle_edge, "");
@@ -946,19 +951,22 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
         "B1 interest in A should be set after successful merge"
     );
 
-    // Step 2: merge B1 again with nodes {A, C} and cycle A->C->A — fails.
+    // Step 2: merge B1 again with nodes {A, C, D} and a C->D->C cycle
+    // among the NEWLY-inserted nodes (A is resident and not re-created,
+    // so the creation-scoped edge gate would skip edges parented on it).
     // Regression guard: rollback must not clear B1 from A even though
     // B1 was already interested in A from step 1.
-    let nodes_ac = vec![
+    let nodes_acd = vec![
         make_node("hashA", "x86_64-linux"),
         make_node("hashC", "x86_64-linux"),
+        make_node("hashD", "x86_64-linux"),
     ];
-    let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
-    let result = dag.merge(b1, &nodes_ac, &cycle_edges, "");
+    let cycle_edges = vec![make_edge("hashC", "hashD"), make_edge("hashD", "hashC")];
+    let result = dag.merge(b1, &nodes_acd, &cycle_edges, "");
     assert!(result.is_err(), "cycle should be rejected");
 
     // Step 3: A should STILL have B1 interest (was present before the
-    // failed merge). C should be gone entirely (was newly inserted).
+    // failed merge). C and D should be gone entirely (newly inserted).
     assert!(
         dag.nodes
             .get("hashA")
@@ -970,6 +978,10 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
     assert!(
         !dag.nodes.contains_key("hashC"),
         "newly-inserted C should be rolled back"
+    );
+    assert!(
+        !dag.nodes.contains_key("hashD"),
+        "newly-inserted D should be rolled back"
     );
     Ok(())
 }
@@ -1143,12 +1155,17 @@ fn test_path_to_hash_consistency() -> anyhow::Result<()> {
     assert_eq!(dag.hash_for_path("/nix/store/nonexistent.drv"), None);
 
     // Cycle rollback: newly-inserted node's path entry must be removed.
+    // hashA is resident and not re-created, so its half of the cycle is
+    // only admissible through the topdown-pruned carve-out
+    // (sched.merge.edge-creation-scoped).
+    dag.nodes.get_mut("hashA").unwrap().topdown_pruned = true;
     let cycle_nodes = vec![
         make_node("hashA", "x86_64-linux"),
         make_node("hashC", "x86_64-linux"),
     ];
     let cycle_edges = vec![make_edge("hashA", "hashC"), make_edge("hashC", "hashA")];
     dag.merge(b1, &cycle_nodes, &cycle_edges, "").unwrap_err();
+    dag.nodes.get_mut("hashA").unwrap().topdown_pruned = false;
     assert_eq!(
         dag.hash_for_path(&p_c),
         None,
@@ -3644,6 +3661,170 @@ fn rollback_restores_displaced_dependency_edges() -> anyhow::Result<()> {
             .iter()
             .any(|h| h.as_str() == "edge-squat-rb"),
         "reverse direction restored too"
+    );
+    Ok(())
+}
+
+// ── sched.merge.edge-creation-scoped ────────────────────────────────────
+
+// r[verify sched.merge.edge-creation-scoped]
+/// A submission that merely JOINS a resident node may not extend its
+/// dependency set: the foreign edge is skipped (recorded, not inserted,
+/// not part of `new_edges`) and the resident node's readiness is decided
+/// by its own dependency set, not the joiner's junk child.
+#[test]
+fn test_foreign_parent_edge_skipped_on_resident_join() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates X (no dependencies).
+    dag.merge(b1, &[make_node("fps-x", "x86_64-linux")], &[], "")?;
+
+    // b2 joins X and tries to attach its own junk child Y to it.
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("fps-x", "x86_64-linux"),
+            make_node("fps-y", "x86_64-linux"),
+        ],
+        &[make_edge("fps-x", "fps-y")],
+        "",
+    )?;
+
+    assert!(res.new_edges.is_empty(), "foreign edge must not be added");
+    assert_eq!(
+        res.foreign_parent_edges_skipped.len(),
+        1,
+        "skip recorded for observability"
+    );
+    assert_eq!(res.foreign_parent_edges_skipped[0].0.as_str(), "fps-x");
+    assert_eq!(res.foreign_parent_edges_skipped[0].1.as_str(), "fps-y");
+    assert!(
+        res.newly_inserted.contains("fps-y"),
+        "the junk node itself is admitted (it is b2's own node)"
+    );
+    assert!(
+        res.interest_added.iter().any(|h| h.as_str() == "fps-x"),
+        "b2 still joins X"
+    );
+    assert!(
+        dag.get_children("fps-x").is_empty(),
+        "X's dependency set is unchanged"
+    );
+
+    // Even with the junk child terminally failed, X is unaffected — the
+    // edge never existed.
+    dag.nodes
+        .get_mut("fps-y")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Poisoned);
+    assert!(
+        !dag.any_dep_terminally_failed("fps-x"),
+        "X must not be poisoned-by-association with the skipped junk child"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// The topdown-pruned carve-out: a resident pruned root deliberately had
+/// its dependency edges dropped by its creating submission, so a later
+/// full merge MAY top them up without re-creating the root.
+#[test]
+fn test_topdown_pruned_resident_parent_accepts_dep_topup() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // b1 creates R alone (the topdown prune dropped its deps).
+    dag.merge(b1, &[make_node("tdp-r", "x86_64-linux")], &[], "")?;
+    dag.nodes.get_mut("tdp-r").unwrap().topdown_pruned = true;
+
+    // b2 full-merges {app, R, glibc} with app→R and R→glibc, without
+    // re-creating R (it is resident and live).
+    let res = dag.merge(
+        b2,
+        &[
+            make_node("tdp-app", "x86_64-linux"),
+            make_node("tdp-r", "x86_64-linux"),
+            make_node("tdp-glibc", "x86_64-linux"),
+        ],
+        &[
+            make_edge("tdp-app", "tdp-r"),
+            make_edge("tdp-r", "tdp-glibc"),
+        ],
+        "",
+    )?;
+
+    assert!(
+        res.foreign_parent_edges_skipped.is_empty(),
+        "pruned-root top-up must not be treated as a foreign edge"
+    );
+    assert_eq!(res.new_edges.len(), 2, "both edges accepted");
+    assert!(
+        dag.get_children("tdp-r")
+            .iter()
+            .any(|h| h.as_str() == "tdp-glibc"),
+        "R gained its dependency"
+    );
+    assert!(
+        dag.get_children("tdp-app")
+            .iter()
+            .any(|h| h.as_str() == "tdp-r"),
+        "app→R accepted (parent newly inserted)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.edge-creation-scoped]
+/// A displacing submission (re)creates the displaced hash, so its own
+/// dependency edges for that hash are attached — displacement is a
+/// re-creation, not a join.
+#[test]
+fn test_displacing_submission_attaches_own_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Authoritative squat parked in a terminal failure state.
+    dag.merge(
+        squatter,
+        &[authoritative_node("ecs-h", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("ecs-h")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    // Victim: conflicting store-backed identity displaces the squat and
+    // declares its own dependency H→D2 in the same submission.
+    let mut displacing = make_node("ecs-h", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let res = dag.merge(
+        victim,
+        &[displacing, make_node("ecs-d2", "aarch64-linux")],
+        &[make_edge("ecs-h", "ecs-d2")],
+        "",
+    )?;
+
+    assert!(res.displaced.iter().any(|h| h.as_str() == "ecs-h"));
+    assert!(
+        res.foreign_parent_edges_skipped.is_empty(),
+        "displacement is a re-creation: its own edges are not foreign"
+    );
+    assert!(
+        res.new_edges
+            .iter()
+            .any(|(p, c)| p.as_str() == "ecs-h" && c.as_str() == "ecs-d2"),
+        "displacing submission's own edge attached"
+    );
+    assert!(
+        dag.get_children("ecs-h")
+            .iter()
+            .any(|h| h.as_str() == "ecs-d2"),
+        "fresh node's dependency set is the displacing submission's"
     );
     Ok(())
 }
