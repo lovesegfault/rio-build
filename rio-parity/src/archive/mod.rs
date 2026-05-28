@@ -10,6 +10,7 @@
 //! reader (directory + DwarFS backends, with a v0 upgrade-on-open
 //! shim), the staging-directory writer, and the write-once S3 layout.
 
+pub mod identity;
 pub mod schema;
 
 /// Member paths inside an archive (identical in the directory and image forms).

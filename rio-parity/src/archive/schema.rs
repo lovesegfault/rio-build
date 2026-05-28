@@ -6,13 +6,18 @@
 //! per line. These types are shared by the reader, the writer, and the
 //! recorders; nothing outside `provenance` may carry source-specific
 //! vocabulary.
+//!
+//! Derive policy: types without `f64` fields also derive `Eq`; `Default`
+//! is derived only where an all-default value is meaningful (capability,
+//! count, presence, and substituter containers), not for records whose
+//! required fields have no sensible default.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 /// `manifest.json` — archive metadata, capabilities, provenance, integrity.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     /// `"MAJOR.MINOR"`; absence of this field identifies a v0 archive.
     pub format_version: String,
@@ -70,29 +75,38 @@ pub struct MemberPresence {
 }
 
 impl Capabilities {
-    /// Error when a flag is set but the member backing it is absent.
+    /// Error when a flag is set but the member backing it is absent; every
+    /// unbacked flag is reported in the one error message.
     /// (`timed` has no backing member; `output_hashes` requires the
     /// outcomes member because per-output hashes live there.)
     pub fn require_backing_members(&self, present: &MemberPresence) -> anyhow::Result<()> {
-        let missing: Option<(&str, &str)> = if self.expected_outcomes && !present.outcomes {
-            Some(("expected_outcomes", super::OUTCOMES_MEMBER))
-        } else if self.output_hashes && !present.outcomes {
-            Some(("output_hashes", super::OUTCOMES_MEMBER))
-        } else if self.impure_env && !present.impure_env {
-            Some(("impure_env", super::IMPURE_ENV_MEMBER))
-        } else if self.dependency_closures && !present.closures {
-            Some(("dependency_closures", super::CLOSURES_MEMBER))
-        } else if self.embedded_store_paths && !present.embedded_store_paths {
-            Some(("embedded_store_paths", "an embedded non-drv store path"))
-        } else {
-            None
-        };
-        match missing {
-            Some((flag, member)) => {
-                anyhow::bail!("capability `{flag}` is set but {member} is absent from the archive")
-            }
-            None => Ok(()),
+        let mut missing: Vec<(&str, &str)> = Vec::new();
+        if self.expected_outcomes && !present.outcomes {
+            missing.push(("expected_outcomes", super::OUTCOMES_MEMBER));
         }
+        if self.output_hashes && !present.outcomes {
+            missing.push(("output_hashes", super::OUTCOMES_MEMBER));
+        }
+        if self.impure_env && !present.impure_env {
+            missing.push(("impure_env", super::IMPURE_ENV_MEMBER));
+        }
+        if self.dependency_closures && !present.closures {
+            missing.push(("dependency_closures", super::CLOSURES_MEMBER));
+        }
+        if self.embedded_store_paths && !present.embedded_store_paths {
+            missing.push(("embedded_store_paths", "an embedded non-drv store path"));
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let detail = missing
+            .iter()
+            .map(|(flag, member)| {
+                format!("capability `{flag}` is set but {member} is absent from the archive")
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        anyhow::bail!("{detail}")
     }
 }
 
@@ -171,9 +185,10 @@ pub struct RequestTarget {
 }
 
 /// One `units.jsonl` record: display/filter metadata for a workload unit.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UnitRecord {
     pub drv: String,
+    /// Human-facing name (e.g. a Hydra job name), used by filters and reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +217,7 @@ pub struct OutcomeRecord {
     /// interpreted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// Wall-clock duration of the source attempt, in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_s: Option<f64>,
     /// Offset from `manifest.from` at which the source attempt stopped;
@@ -246,7 +262,7 @@ pub enum ExpectedOutcome {
 
 /// One `closures.jsonl` record: direct dependency adjacency for one
 /// derivation in the union requisite closure.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosureRecord {
     pub drv: String,
     /// Direct input derivations (`inputDrvs` keys). May be empty.
@@ -259,9 +275,13 @@ pub struct ClosureRecord {
     pub outputs: BTreeMap<String, Option<String>>,
 }
 
+/// The `impure-env.json` member: derivation store path → impure environment
+/// variable names the derivation declares.
+pub type ImpureEnv = BTreeMap<String, Vec<String>>;
+
 /// One `exclusions.jsonl` record: a scope item the recorder could not turn
 /// into a workload unit.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExclusionRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -470,6 +490,23 @@ mod tests {
                 "got: {err}"
             );
             capabilities.require_backing_members(&satisfying).unwrap();
+        }
+
+        // Several unbacked capabilities are reported together in one error.
+        let err = Capabilities {
+            expected_outcomes: true,
+            impure_env: true,
+            dependency_closures: true,
+            ..Default::default()
+        }
+        .require_backing_members(&MemberPresence::default())
+        .unwrap_err()
+        .to_string();
+        for flag in ["expected_outcomes", "impure_env", "dependency_closures"] {
+            assert!(
+                err.contains(&format!("capability `{flag}` is set")),
+                "got: {err}"
+            );
         }
 
         Capabilities::default()

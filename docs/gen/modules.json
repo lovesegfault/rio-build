@@ -756,6 +756,11 @@
       "doc": "Replay archives — the source-agnostic record/replay package consumed"
     },
     {
+      "path": "archive/identity.rs",
+      "depth": 1,
+      "doc": "Archive identity: `archive_id`, the short id, and the canonical listing"
+    },
+    {
       "path": "archive/schema.rs",
       "depth": 1,
       "doc": "Serde types for the v1 replay-archive members."
