@@ -988,8 +988,13 @@ pub const M_060: () = ();
 /// loop scans the full heap on every hourly tick. Same pattern as
 /// `idx_build_event_log_created` (003) and `build_samples_completed_at_idx`
 /// (013). `drv_hash` is the 32-char `drv_log_hash()` form of the `.drv` store
-/// path, NOT `derivations.drv_hash` (the polymorphic dedup identity: full path
-/// for IA, modular hash for CA — they cannot be joined directly).
+/// path, NOT `derivations.drv_hash` (the full declared `.drv` store path —
+/// always equal to `drv_path`, ingress-enforced for every node shape; CA
+/// content identity lives in the realisation layer, not in this key — the two
+/// columns cannot be joined directly). The frozen `001_initial_schema.sql` and
+/// `061_drv_logs.sql` header comments still carry the older "store path for
+/// IA, modular hash for CA" framing; like every shipped migration they are
+/// checksum-frozen, so read them under the ingress-enforced contract above.
 ///
 /// Adds `assignments.exec_id` (recovery carrier — the new leader reloads it
 /// for currently-dispatched derivations after failover so the flusher keys

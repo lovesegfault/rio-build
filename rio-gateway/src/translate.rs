@@ -1093,8 +1093,13 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
     let env = StructuredEnv::new(drv.env());
     types::DerivationNode {
         drv_path: drv_path.to_string(),
-        // Input-addressed derivations use the store path as the drv_hash.
-        // This ensures every node has a unique, non-empty key in the DAG.
+        // The DAG key is the declared .drv store path for EVERY node
+        // shape (IA, floating-CA, FOD, hook fallback) — SubmitBuild
+        // ingress rejects drv_hash != drv_path
+        // (sched.merge.ingress-identity-binding), so this assignment is
+        // load-bearing, not an IA-specific convention. CA content
+        // identity travels separately in ca_modular_hash and keys
+        // realisations, never the DAG.
         drv_hash: drv_path.to_string(),
         // pname → name fallback: stdenv's mkDerivation sets both;
         // raw derivation{} calls typically only set name. Without
