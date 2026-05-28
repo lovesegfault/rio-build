@@ -242,8 +242,8 @@ is the actor's inevitable unknown-derivation discard moved off the
 single-threaded event loop — no legitimate completion is lost. Phase
 rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
 with reason `phase_too_long`; the unresolvable-path completion drop
-increments #(refs.metric)("rio_scheduler_completions_rejected_total") with
-reason `path_too_long`.
+increments `rio_scheduler_completions_rejected_total` (retired with the
+stream completion intake) with reason `path_too_long`.
 
 `CompletionReport.final_line_count` is the motivating numeric field: the
 scheduler folds it into the `drv_executions` row that rio-store's log
@@ -884,7 +884,8 @@ keep-going build with a poisoned leaf otherwise hangs Active forever ---
   inflate a victim node's `occupancy` and suppress detection. Executors lacking
   an authoritative binding (controller-lag, ack channel down) are skipped ---
   fail-safe --- and counted in
-  #(refs.metric)("rio_scheduler_hung_detect_skipped_no_authoritative_total").
+  `rio_scheduler_hung_detect_skipped_no_authoritative_total` (retired with the
+  scheduler-side hung-node detector).
   The controller's `nodeclaim_pool::reap_unhealthy` consumes `dead_nodes` as
   `ReapReason::Dead` --- the only reap path for a `Registered=True` NodeClaim
   that is neither `Empty` nor in-flight.
@@ -2379,8 +2380,8 @@ isolation.
   `failure_count`, and adds the executor to `failed_builders`. This catches the
   "executor is heartbeating but daemon is wedged" case where no stream-close or
   heartbeat-timeout fires; the accounting bounds the loop at the poison
-  threshold. The #(refs.metric)("rio_scheduler_backstop_timeouts_total")
-  counter tracks these events.
+  threshold. The `rio_scheduler_backstop_timeouts_total` counter (retired with the
+  backstop) tracked these events.
 ]
 
 #r("sched.timeout.per-build")[
