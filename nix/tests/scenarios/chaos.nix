@@ -187,11 +187,13 @@ pkgs.testers.runNixOSTest {
         # Wait for the toxic to bite. The 500ms reset_peer fires during
         # the worker's FIRST worker_store use — input-metadata-fetch
         # (runtime.rs), not upload. "build execution failed" at ERROR
-        # with ConnectionReset in the error chain. The scheduler
-        # re-dispatches (generation stays 1, same drv re-assigned) so
-        # the overall retry path is scheduler→worker redispatch, not
-        # the upload.rs internal loop. Grep both: if timing jitter lets
-        # metadata-fetch through, the upload-retry path fires instead.
+        # with ConnectionReset in the error chain. The attempt is
+        # reported as an infrastructure failure, the scheduler requeues
+        # the drv charge-free, and a fresh one-shot pull picks it up
+        # again — so the overall retry path is the pull-mode re-pull,
+        # not the upload.rs internal loop. Grep both: if timing jitter
+        # lets metadata-fetch through, the upload-retry path fires
+        # instead.
         worker.wait_until_succeeds(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep -E 'upload attempt failed|input metadata fetch failed' >/dev/null",
@@ -227,16 +229,17 @@ pkgs.testers.runNixOSTest {
         )
 
         # Worker logged at least one retry. Two possible paths:
-        # - upload.rs:200-205 "retrying upload" if reset bit during upload
-        # - scheduler redispatch → ≥2 "received work assignment" for the
-        #   same drv (runtime.rs work loop) if reset bit during metadata
-        #   fetch and the scheduler re-assigned
+        # - upload.rs retry loop ("retrying upload") if reset bit during
+        #   upload
+        # - infra-failure requeue → ≥2 "pull accepted" for the same drv
+        #   (runtime/pull.rs) if reset bit during metadata fetch and the
+        #   requeued drv was pulled again
         # Either proves the retry mechanism iterated after the RST.
         worker.succeed(
             f"journalctl -u rio-builder --since=@{mark} --no-pager | "
             "grep 'retrying upload' >/dev/null || "
             f"[ $(journalctl -u rio-builder --since=@{mark} --no-pager | "
-            "grep -c 'received work assignment.*chaos-reset') -ge 2 ]"
+            "grep -c 'pull accepted.*chaos-reset') -ge 2 ]"
         )
 
         # NO exhausted uploads — UploadError::UploadExhausted's Display
