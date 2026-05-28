@@ -10,6 +10,7 @@
 //! image is a separate step.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
@@ -82,53 +83,77 @@ impl ArchiveWriter {
     /// Stage `requests.jsonl`. Every archive needs at least one request and
     /// every request must name at least one target; targets with empty
     /// `outputs` are normalized to `["*"]` (both spellings mean "all
-    /// outputs").
+    /// outputs"). A repeat call replaces the previously staged member.
     pub fn write_requests(&self, records: &[RequestRecord]) -> anyhow::Result<()> {
         anyhow::ensure!(
             !records.is_empty(),
             "{} needs at least one request record with non-empty targets",
             super::REQUESTS_MEMBER
         );
-        let mut normalized = records.to_vec();
-        for record in &mut normalized {
+        // Validate everything before touching the member file, so a rejected
+        // input cannot leave a partially staged requests.jsonl behind.
+        for (idx, record) in records.iter().enumerate() {
             anyhow::ensure!(
                 !record.targets.is_empty(),
-                "request record (session {}) must have non-empty targets",
+                "request record {idx} (session {}) must have non-empty targets",
                 record.session
             );
-            for target in &mut record.targets {
-                if target.outputs.is_empty() {
-                    target.outputs = vec!["*".to_string()];
-                }
-            }
         }
-        write_jsonl(&self.root.join(super::REQUESTS_MEMBER), &normalized)
+        let path = self.root.join(super::REQUESTS_MEMBER);
+        let file =
+            std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        for (idx, record) in records.iter().enumerate() {
+            // Normalize empty `outputs` to ["*"], cloning only the records
+            // that actually need rewriting.
+            let written = if record
+                .targets
+                .iter()
+                .any(|target| target.outputs.is_empty())
+            {
+                let mut normalized = record.clone();
+                for target in &mut normalized.targets {
+                    if target.outputs.is_empty() {
+                        target.outputs = vec!["*".to_string()];
+                    }
+                }
+                write_jsonl_line(&mut out, &normalized)
+            } else {
+                write_jsonl_line(&mut out, record)
+            };
+            written.with_context(|| format!("write request record {idx} to {}", path.display()))?;
+        }
+        out.flush()
+            .with_context(|| format!("flush {}", path.display()))
     }
 
-    /// Stage `outcomes.jsonl` (expected outcomes — the recorded truth).
+    /// Stage `outcomes.jsonl` (expected outcomes — the recorded truth). A
+    /// repeat call replaces the previously staged member.
     pub fn write_outcomes(&self, records: &[OutcomeRecord]) -> anyhow::Result<()> {
         write_jsonl(&self.root.join(super::OUTCOMES_MEMBER), records)
     }
 
-    /// Stage `units.jsonl` (per-unit display and filter metadata).
+    /// Stage `units.jsonl` (per-unit display and filter metadata). A repeat
+    /// call replaces the previously staged member.
     pub fn write_units(&self, records: &[UnitRecord]) -> anyhow::Result<()> {
         write_jsonl(&self.root.join(super::UNITS_MEMBER), records)
     }
 
-    /// Stage `closures.jsonl` (direct dependency adjacency).
+    /// Stage `closures.jsonl` (direct dependency adjacency). A repeat call
+    /// replaces the previously staged member.
     pub fn write_closures(&self, records: &[ClosureRecord]) -> anyhow::Result<()> {
         write_jsonl(&self.root.join(super::CLOSURES_MEMBER), records)
     }
 
     /// Stage `impure-env.json` (derivation → impure environment variable
-    /// names).
+    /// names). A repeat call replaces the previously staged member.
     pub fn write_impure_env(&self, map: &ImpureEnv) -> anyhow::Result<()> {
         write_json_pretty(&self.root.join(super::IMPURE_ENV_MEMBER), map)
     }
 
     /// Stage `exclusions.jsonl`. Each record must carry at least one of
     /// `label`/`drv`, otherwise completeness accounting could not name the
-    /// excluded item.
+    /// excluded item. A repeat call replaces the previously staged member.
     pub fn write_exclusions(&self, records: &[ExclusionRecord]) -> anyhow::Result<()> {
         for record in records {
             anyhow::ensure!(
@@ -143,37 +168,50 @@ impl ArchiveWriter {
     /// Stage one derivation member: `nix/store/<basename>` holding the ATerm
     /// text.
     pub fn add_drv(&self, store_path: &str, aterm: &str) -> anyhow::Result<()> {
-        let basename = store_basename(store_path)?;
+        let parsed = rio_nix::store_path::StorePath::parse(store_path)
+            .with_context(|| format!("invalid store path {store_path}"))?;
         anyhow::ensure!(
-            basename.ends_with(".drv"),
+            parsed.is_derivation(),
             "add_drv expects a .drv store path, got {store_path}"
         );
-        let dest = self.root.join(super::STORE_DIR).join(basename);
+        let dest = self.root.join(super::STORE_DIR).join(parsed.basename());
         std::fs::write(&dest, aterm).with_context(|| format!("write {}", dest.display()))
     }
 
     /// Stage one embedded (non-derivation) store path: copy the tree at
     /// `source` to `nix/store/<basename>` and write its narinfo sidecar to
-    /// `narinfo/<hash-part>.narinfo`.
+    /// `narinfo/<hash-part>.narinfo`. The sidecar text must describe
+    /// `store_path` (its `StorePath:` field is checked here, so a mix-up
+    /// fails at embed time rather than as a missing-sidecar error at
+    /// finalize).
     pub fn embed_store_path(
         &self,
         store_path: &str,
         source: &Path,
         narinfo_text: &str,
     ) -> anyhow::Result<()> {
-        let basename = store_basename(store_path)?;
+        let parsed = rio_nix::store_path::StorePath::parse(store_path)
+            .with_context(|| format!("invalid store path {store_path}"))?;
         anyhow::ensure!(
-            !basename.ends_with(".drv"),
+            !parsed.is_derivation(),
             "embed_store_path expects a non-drv store path, got {store_path} \
              (derivations go through add_drv)"
         );
-        let dest = self.root.join(super::STORE_DIR).join(basename);
+        let hash_part = super::hash_part(store_path);
+        let narinfo = super::parse_narinfo_sidecar(narinfo_text, hash_part)
+            .with_context(|| format!("narinfo sidecar for {store_path}"))?;
+        anyhow::ensure!(
+            narinfo.store_path == store_path,
+            "narinfo sidecar StorePath {} does not match the embedded path {store_path}",
+            narinfo.store_path
+        );
+        let dest = self.root.join(super::STORE_DIR).join(parsed.basename());
         copy_tree(source, &dest)
             .with_context(|| format!("embed {store_path} from {}", source.display()))?;
         let sidecar = self
             .root
             .join(super::NARINFO_DIR)
-            .join(format!("{}.narinfo", super::hash_part(store_path)));
+            .join(format!("{hash_part}.narinfo"));
         std::fs::write(&sidecar, narinfo_text)
             .with_context(|| format!("write {}", sidecar.display()))
     }
@@ -190,7 +228,11 @@ impl ArchiveWriter {
     ///   staged under `nix/store/`;
     /// - every embedded non-drv store path must have a narinfo sidecar that
     ///   agrees with the staged tree's NAR serialization.
-    pub fn finalize(&self, seed: ManifestSeed) -> anyhow::Result<FinalizedArchive> {
+    ///
+    /// Consumes the writer: once a root holds `manifest.json` nothing more
+    /// may be staged into it (and [`ArchiveWriter::create`] refuses to
+    /// reopen it).
+    pub fn finalize(self, seed: ManifestSeed) -> anyhow::Result<FinalizedArchive> {
         // requests.jsonl is the one member every archive must carry.
         let requests_path = self.root.join(super::REQUESTS_MEMBER);
         anyhow::ensure!(
@@ -302,15 +344,25 @@ impl ArchiveWriter {
             .iter()
             .flat_map(|record| record.targets.iter().map(|target| target.drv.as_str()))
             .collect();
-        let mut pending: Vec<String> = workload.iter().map(|drv| (*drv).to_string()).collect();
+        // Each pending entry carries the staged derivation that required it
+        // (None for the workload targets themselves) so a completeness error
+        // can name the dependent alongside the missing path.
+        let mut pending: Vec<(String, Option<String>)> = workload
+            .iter()
+            .map(|drv| ((*drv).to_string(), None))
+            .collect();
         let mut visited: BTreeSet<String> = BTreeSet::new();
-        while let Some(drv_path) = pending.pop() {
+        while let Some((drv_path, required_by)) = pending.pop() {
             if !visited.insert(drv_path.clone()) {
                 continue;
             }
             let Some(member_path) = drv_members.get(&drv_path) else {
+                let requirer = match &required_by {
+                    Some(parent) => format!("required by {parent}"),
+                    None => "requested by the workload".to_string(),
+                };
                 anyhow::bail!(
-                    "derivation {drv_path} is required by the workload closure but missing from {}",
+                    "derivation {drv_path} is {requirer} but missing from {}",
                     super::STORE_DIR
                 );
             };
@@ -320,7 +372,7 @@ impl ArchiveWriter {
                 .with_context(|| format!("parse {drv_path}"))?;
             for input in derivation.input_drvs().keys() {
                 if !visited.contains(input) {
-                    pending.push(input.clone());
+                    pending.push((input.clone(), Some(drv_path.clone())));
                 }
             }
         }
@@ -380,17 +432,22 @@ impl ArchiveWriter {
             embedded_store_paths: embedded_trees.len() as u64,
         };
 
-        // Per-member digests over the staged metadata members; the manifest
+        // Per-member digests over the staged metadata members, streamed
+        // through the hasher rather than read into memory; the manifest
         // itself is never listed.
         let mut files: BTreeMap<String, MemberDigest> = BTreeMap::new();
         for member in &staged_members {
             let path = self.root.join(member);
-            let bytes = std::fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+            let mut file =
+                std::fs::File::open(&path).with_context(|| format!("open {}", path.display()))?;
+            let mut hasher = Sha256Writer::default();
+            let size = std::io::copy(&mut file, &mut hasher)
+                .with_context(|| format!("read {}", path.display()))?;
             files.insert(
                 (*member).to_string(),
                 MemberDigest {
-                    sha256: identity::sha256_hex(&bytes),
-                    size: bytes.len() as u64,
+                    sha256: hasher.finish(),
+                    size,
                 },
             );
         }
@@ -433,9 +490,20 @@ impl ArchiveWriter {
         let mut manifest_bytes =
             serde_json::to_vec_pretty(&manifest).context("serialize manifest.json")?;
         manifest_bytes.push(b'\n');
+        // Write through a temp name and rename: manifest.json's presence is
+        // what marks a root as finalized (and what `create` refuses), so a
+        // half-written manifest must never be observable.
         let manifest_path = self.root.join(super::MANIFEST_MEMBER);
-        std::fs::write(&manifest_path, &manifest_bytes)
-            .with_context(|| format!("write {}", manifest_path.display()))?;
+        let tmp_path = self.root.join(format!("{}.tmp", super::MANIFEST_MEMBER));
+        std::fs::write(&tmp_path, &manifest_bytes)
+            .with_context(|| format!("write {}", tmp_path.display()))?;
+        std::fs::rename(&tmp_path, &manifest_path).with_context(|| {
+            format!(
+                "rename {} to {}",
+                tmp_path.display(),
+                manifest_path.display()
+            )
+        })?;
         Ok(FinalizedArchive {
             archive_id: identity::archive_id_from_manifest_bytes(&manifest_bytes),
             manifest,
@@ -444,28 +512,24 @@ impl ArchiveWriter {
     }
 }
 
-/// Validate a `/nix/store/...` path and return its basename.
-fn store_basename(store_path: &str) -> anyhow::Result<&str> {
-    let basename = store_path
-        .strip_prefix(rio_nix::store_path::STORE_PREFIX)
-        .ok_or_else(|| anyhow::anyhow!("not a /nix/store path: {store_path}"))?;
-    anyhow::ensure!(
-        !basename.is_empty() && !basename.contains('/'),
-        "expected a top-level store path (no nested components): {store_path}"
-    );
-    Ok(basename)
+/// Write one JSON record per line, each line terminated by `\n`, streamed
+/// through a buffered writer rather than assembled in memory.
+fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> anyhow::Result<()> {
+    let file = std::fs::File::create(path).with_context(|| format!("create {}", path.display()))?;
+    let mut out = std::io::BufWriter::new(file);
+    for record in records {
+        write_jsonl_line(&mut out, record)
+            .with_context(|| format!("write a record to {}", path.display()))?;
+    }
+    out.flush()
+        .with_context(|| format!("flush {}", path.display()))
 }
 
-/// Write one JSON record per line, each line terminated by `\n`.
-fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> anyhow::Result<()> {
-    let mut out = String::new();
-    for record in records {
-        let line = serde_json::to_string(record)
-            .with_context(|| format!("serialize a record for {}", path.display()))?;
-        out.push_str(&line);
-        out.push('\n');
-    }
-    std::fs::write(path, out).with_context(|| format!("write {}", path.display()))
+/// Serialize one record as a single JSONL line into `out`.
+fn write_jsonl_line<T: Serialize>(out: &mut impl std::io::Write, record: &T) -> anyhow::Result<()> {
+    serde_json::to_writer(&mut *out, record)?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 /// Write a single pretty-printed JSON value with a trailing newline (every
@@ -575,10 +639,21 @@ pub(crate) mod test_support {
         "\n"
     );
 
-    /// Populate `dir` with the embedded source tree (`content.txt`).
+    /// Populate `dir` with the embedded source tree: a plain file, an
+    /// executable file, and a relative symlink, so staging exercises the
+    /// full copy fidelity (mode bits and link targets) that the sidecar
+    /// agreement check in finalize then verifies.
     pub(crate) fn make_src_tree(dir: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+
         std::fs::create_dir_all(dir).unwrap();
         std::fs::write(dir.join("content.txt"), "hello replay v1\n").unwrap();
+        let script = dir.join("run.sh");
+        std::fs::write(&script, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        std::os::unix::fs::symlink("content.txt", dir.join("latest")).unwrap();
     }
 
     /// Narinfo sidecar text for the tree at `dir`, derived from its NAR
@@ -751,8 +826,8 @@ mod tests {
     use super::*;
     use crate::archive::schema::{EXCLUSION_REASON_UNSUPPORTED, ExpectedOutcome, RequestTarget};
     use crate::archive::{
-        CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, OUTCOMES_MEMBER,
-        REQUESTS_MEMBER, UNITS_MEMBER,
+        CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, NARINFO_DIR,
+        OUTCOMES_MEMBER, REQUESTS_MEMBER, UNITS_MEMBER,
     };
 
     #[test]
@@ -902,6 +977,8 @@ mod tests {
         let err = writer.finalize(seed).unwrap_err().to_string();
         assert!(err.contains("missing from nix/store"), "got: {err}");
         assert!(err.contains(DEP_DRV), "got: {err}");
+        // The dependent that pulled the missing path in is named too.
+        assert!(err.contains(APP_DRV), "got: {err}");
     }
 
     #[test]
@@ -971,5 +1048,79 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("label or drv"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_sidecar_is_rejected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ArchiveWriter::create(dir.path()).unwrap();
+        writer.add_drv(DEP_DRV, DEP_ATERM).unwrap();
+        writer.add_drv(APP_DRV, APP_ATERM).unwrap();
+        writer.write_requests(&tiny_requests()).unwrap();
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let tree = src_dir.path().join("src");
+        make_src_tree(&tree);
+        writer
+            .embed_store_path(SRC_PATH, &tree, &src_sidecar_text(&tree))
+            .unwrap();
+        // Drop the sidecar after staging so the embedded tree is orphaned.
+        std::fs::remove_file(
+            dir.path()
+                .join(NARINFO_DIR)
+                .join(format!("{}.narinfo", crate::archive::hash_part(SRC_PATH))),
+        )
+        .unwrap();
+
+        let mut seed = tiny_seed();
+        seed.capabilities = Capabilities {
+            embedded_store_paths: true,
+            ..Default::default()
+        };
+        let err = writer.finalize(seed).unwrap_err().to_string();
+        assert!(err.contains("has no narinfo sidecar"), "got: {err}");
+        assert!(err.contains(SRC_PATH), "got: {err}");
+    }
+
+    #[test]
+    fn add_drv_and_embed_store_path_reject_invalid_arguments() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let writer = ArchiveWriter::create(dir.path()).unwrap();
+        let src_dir = tempfile::TempDir::new().unwrap();
+        let tree = src_dir.path().join("src");
+        make_src_tree(&tree);
+
+        // add_drv refuses a non-derivation store path.
+        let err = writer.add_drv(SRC_PATH, DEP_ATERM).unwrap_err().to_string();
+        assert!(err.contains("expects a .drv store path"), "got: {err}");
+
+        // embed_store_path refuses a derivation store path.
+        let err = writer
+            .embed_store_path(DEP_DRV, &tree, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expects a non-drv store path"), "got: {err}");
+
+        // Both refuse paths that are not store paths at all.
+        let err = writer
+            .add_drv("/tmp/not-a-store-path.drv", DEP_ATERM)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid store path"), "got: {err}");
+        let err = writer
+            .embed_store_path("/tmp/not-a-store-path", &tree, "")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("invalid store path"), "got: {err}");
+
+        // embed_store_path refuses a sidecar describing a different path.
+        let other = "/nix/store/h1111111111111111111111111111111-other";
+        let err = writer
+            .embed_store_path(other, &tree, &src_sidecar_text(&tree))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("does not match the embedded path"),
+            "got: {err}"
+        );
     }
 }
