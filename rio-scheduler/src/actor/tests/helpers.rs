@@ -1002,8 +1002,9 @@ pub(crate) use rio_test_support::metrics::CountingRecorder;
 //
 // Identity convention (mirrors actor/pull.rs): a pull attempt's executor
 // identity IS the attested intent id (the drv hash). Exclusion/budget keys
-// for pull attempts come from the controller-authoritative node binding
-// ([`bind_intent_node`]) when present, falling back to the intent identity.
+// come from the controller-authoritative node binding
+// ([`bind_intent_node`]) ONLY (decision P12) -- an unbound attempt charges
+// flat counters but contributes no exclusion key.
 // ─────────────────────────────────────────────────────────────────────────
 
 pub(crate) use crate::actor::pull::{PullOutcome, PullRejection, PullReportPayload};

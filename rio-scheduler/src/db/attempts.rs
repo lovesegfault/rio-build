@@ -75,8 +75,8 @@ pub(crate) struct AttemptRow {
     /// AD2c). Stamped only for pull-mode attempts, from the spawn-ack
     /// binding / the execution row / the controller's report — never
     /// from worker-supplied identity. The exclusion fold keys the row
-    /// on this when present (the executor id otherwise), so legacy
-    /// stream rows keep their pod-name key.
+    /// on this and ONLY this (decision P12): a row without it charges
+    /// flat counters but contributes no exclusion key.
     pub source_node: Option<String>,
     /// Attempt event or reset event.
     pub event_kind: AttemptEventKind,

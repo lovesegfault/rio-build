@@ -128,26 +128,24 @@ pub(crate) fn decide(history: &[AttemptRecord], budget: &Budget, now: AbsTime) -
 /// Project one in-memory ledger record onto the kernel's row vocabulary.
 /// Field-for-field: the fields `decide()` ignores (UUIDs, error
 /// messages, `recorded_at_epoch_secs`, the `exempt` convenience flag —
-/// the class already carries the exemption) are dropped, the executor id
-/// becomes its `String` form, and the occurrence timestamp moves onto
+/// the class already carries the exemption) are dropped, and the
+/// occurrence timestamp moves onto
 /// the abstract whole-second clock with the same `as` cast the fold has
 /// always used.
 ///
-/// AD2 re-key: a row carrying `source_node` (a pull-mode attempt, 071)
-/// contributes the controller-authoritative *node* as its
-/// exclusion/budget identity; rows without it (every stream-mode /
-/// legacy row) keep contributing their executor (pod-name) key — so a
-/// mixed-era history yields an exclusion set carrying both key kinds
-/// (decision P12) and the fold's invariants are untouched.
-// r[impl sched.retry.per-executor-budget+3]
+/// AD2 / decision P12: the exclusion/budget identity is the
+/// controller-authoritative `source_node` ONLY. A row without one (a
+/// pull attempt whose binding ack never landed, or a pre-pull legacy
+/// row) folds with no identity: it charges its flat counters but
+/// contributes no exclusion key and no distinct-source slot — the
+/// executor id (the pod name / attested intent) is never used as a
+/// budget key.
+// r[impl sched.retry.per-executor-budget+4]
 fn record_to_row(record: &AttemptRecord) -> rio_retry_kernel::LedgerRow<String> {
     rio_retry_kernel::LedgerRow {
         event_kind: kernel_event_kind(record.event_kind),
         outcome_class: kernel_outcome_class(record.outcome_class),
-        executor: record
-            .source_node
-            .clone()
-            .or_else(|| record.executor_id.as_ref().map(|e| e.as_str().to_string())),
+        executor: record.source_node.clone(),
         reporting_party: kernel_reporting_party(record.reporting_party),
         floor_promoted: record.floor_promoted,
         floor_at_cap: record.floor_at_cap,
@@ -233,14 +231,14 @@ mod tests {
     fn t(at: AbsTime, ex: &str) -> AttemptEvent {
         AttemptEvent::Transient {
             at,
-            executor: ex.into(),
+            executor: Some(ex.into()),
         }
     }
 
     fn infra(at: AbsTime, ex: &str, exempt: bool, at_cap: bool) -> AttemptEvent {
         AttemptEvent::Infra {
             at,
-            executor: ex.into(),
+            executor: Some(ex.into()),
             exempt,
             at_cap,
         }
@@ -305,7 +303,7 @@ mod tests {
             t(100, "w1"),
             AttemptEvent::Dispatched {
                 at: 110,
-                executor: "w2".into(),
+                executor: Some("w2".into()),
             },
             t(200, "w2"),
             t(300, "w3"),
@@ -476,7 +474,7 @@ mod tests {
     fn worker_timeout_budget_four_retries_then_cancel() {
         let mk = |at| AttemptEvent::WorkerTimeout {
             at,
-            executor: "w1".into(),
+            executor: Some("w1".into()),
         };
         let h: Vec<AttemptEvent> = (0..5).map(|i| mk(100 + i)).collect();
         let (c, v) = fold(&h[..4], 200);
@@ -500,11 +498,11 @@ mod tests {
     fn controller_deadline_exceeded_matches_the_worker_timeout_verdict() {
         let wt = |at| AttemptEvent::WorkerTimeout {
             at,
-            executor: "w1".into(),
+            executor: Some("w1".into()),
         };
         let cd = |at| AttemptEvent::ControllerDeadlineExceeded {
             at,
-            executor: "w1".into(),
+            executor: Some("w1".into()),
         };
         // Four timeouts observed via either channel exhaust the budget;
         // the fifth observation produces Cancel regardless of channel.
@@ -530,7 +528,7 @@ mod tests {
     fn permanent_failure_poisons_and_the_ttl_expires_it() {
         let h = [AttemptEvent::Permanent {
             at: 1_000,
-            executor: "w1".into(),
+            executor: Some("w1".into()),
         }];
         let (c, v) = fold(&h, 1_000);
         assert_eq!(v, Verdict::Poison(PoisonReason::Permanent));
@@ -557,11 +555,11 @@ mod tests {
     fn disconnect_charges_nothing_and_backstop_bounds_the_wedge_loop() {
         let d = |at, ex: &str| AttemptEvent::Disconnect {
             at,
-            executor: ex.into(),
+            executor: Some(ex.into()),
         };
         let b = |at, ex: &str| AttemptEvent::BackstopTimeout {
             at,
-            executor: ex.into(),
+            executor: Some(ex.into()),
         };
         // Disconnects alone never accumulate anything (contradiction C2:
         // the spec says they count; the code and therefore the fold say
@@ -644,7 +642,7 @@ mod tests {
     fn controller_termination_charges_per_floor_outcome() {
         let ct = |at, promoted, at_cap| AttemptEvent::ControllerTermination {
             at,
-            executor: "w1".into(),
+            executor: Some("w1".into()),
             promoted,
             at_cap,
         };
@@ -675,7 +673,11 @@ mod tests {
     // -----------------------------------------------------------------
 
     /// Test-side `AttemptRecord` builder: the fields the fold consumes,
-    /// everything else defaulted. `at` is epoch seconds.
+    /// everything else defaulted. `at` is epoch seconds. The identity is
+    /// stamped as BOTH the executor id and the `source_node` (the
+    /// controller-authoritative binding a bound pull attempt carries) —
+    /// the fold keys exclusion on `source_node` only (decision P12);
+    /// tests that need an unbound row clear `source_node` explicitly.
     fn rec(class: OutcomeClass, party: ReportingParty, executor: &str, at: u64) -> AttemptRecord {
         AttemptRecord {
             attempt_id: uuid::Uuid::now_v7(),
@@ -683,7 +685,7 @@ mod tests {
             outcome_class: class,
             exec_id: None,
             executor_id: (!executor.is_empty()).then(|| ExecutorId::from(executor)),
-            source_node: None,
+            source_node: (!executor.is_empty()).then(|| executor.to_string()),
             termination_reason: None,
             reporting_party: party,
             exempt: class == OutcomeClass::ExemptInfra,
@@ -694,6 +696,16 @@ mod tests {
             resubmit_cycle: 0,
             occurred_at_epoch_secs: at as f64,
             recorded_at_epoch_secs: at as f64,
+        }
+    }
+
+    /// An UNBOUND attempt record: an executor identity but no
+    /// controller-authoritative `source_node` (the binding-ack race, or
+    /// a legacy row). Charges flat counters only (decision P12).
+    fn unbound_rec(class: OutcomeClass, executor: &str, at: u64) -> AttemptRecord {
+        AttemptRecord {
+            source_node: None,
+            ..rec(class, ReportingParty::Worker, executor, at)
         }
     }
 
@@ -901,7 +913,7 @@ mod tests {
         assert_eq!(d.exclusion.len(), 3);
     }
 
-    // r[verify sched.retry.per-executor-budget+3]
+    // r[verify sched.retry.per-executor-budget+4]
     /// C2 (T-1b.11): an `executor_crash` history charges the
     /// threshold/exclusion budget — each established crash joins
     /// `failed_builders` and increments `failure_count`, the placement
@@ -1077,36 +1089,68 @@ mod tests {
         );
     }
 
-    // r[verify sched.retry.per-executor-budget+3]
-    /// AD2 / decision P12: a mixed-era history (one legacy stream
-    /// failure keyed by pod name, one pull-mode failure carrying
-    /// `source_node`) folds into an exclusion set carrying BOTH keys —
-    /// the node key for the pull row (its executor identity, the
-    /// attested intent, never appears) and the pod-name key for the
-    /// legacy row.
+    // r[verify sched.retry.per-executor-budget+4]
+    /// Decision P12: the exclusion/budget key is the
+    /// controller-authoritative `source_node` ONLY. A row that carries
+    /// one contributes that node; a row that carries only an executor
+    /// identity (a legacy stream-era pod name, or a pull attempt whose
+    /// binding ack has not landed) contributes NO exclusion key — it
+    /// still charges the flat `failure_count`, but it cannot occupy a
+    /// distinct-source slot or leak a non-schedulable key into the
+    /// placement exclusion.
     #[test]
-    fn mixed_era_history_carries_both_exclusion_keys() {
-        let legacy = worker_rec(OutcomeClass::Transient, "pool-pod-1", 100);
-        let mut pull_row = worker_rec(OutcomeClass::Transient, "drv-hash-x", 200);
-        pull_row.source_node = Some("node-1".into());
-        let d = decide_default(&[legacy, pull_row], 300);
-        assert!(
-            d.exclusion.contains(&ExecutorId::from("pool-pod-1")),
-            "legacy row keeps its pod-name exclusion key"
-        );
+    fn exclusion_keys_are_source_nodes_only() {
+        let unbound = unbound_rec(OutcomeClass::Transient, "pool-pod-1", 100);
+        let mut bound = worker_rec(OutcomeClass::Transient, "drv-hash-x", 200);
+        bound.source_node = Some("node-1".into());
+        let d = decide_default(&[unbound.clone(), bound], 300);
         assert!(
             d.exclusion.contains(&ExecutorId::from("node-1")),
-            "pull-mode row contributes its source node"
+            "a bound row contributes its source node"
+        );
+        assert!(
+            !d.exclusion.contains(&ExecutorId::from("pool-pod-1")),
+            "an executor-only row contributes no exclusion key (P12: the \
+             pod-name fallback is gone)"
         );
         assert!(
             !d.exclusion.contains(&ExecutorId::from("drv-hash-x")),
-            "the pull identity (the intent) is not an exclusion key once the node is known"
+            "the pull identity (the intent) is never an exclusion key"
         );
-        assert_eq!(d.counters.failed_builders.len(), 2);
+        assert_eq!(
+            d.counters.failed_builders.len(),
+            1,
+            "only the node key occupies a distinct-source slot"
+        );
+        assert_eq!(
+            d.counters.failure_count, 2,
+            "the identity-less failure still charges the flat counter"
+        );
+
+        // The old fallback must not influence the verdict either: three
+        // unbound failures from three distinct pod names never cross the
+        // distinct-source threshold (only the per-cycle transient cap
+        // bounds them), where the pre-P12 fallback would have poisoned
+        // via three distinct pod-name keys.
+        let h = [
+            unbound_rec(OutcomeClass::Transient, "pod-a", 100),
+            unbound_rec(OutcomeClass::Transient, "pod-b", 200),
+            unbound_rec(OutcomeClass::Transient, "pod-c", 300),
+        ];
+        let d = decide_default(&h, 300);
+        assert!(
+            d.exclusion.is_empty(),
+            "unbound failures contribute no distinct-source keys"
+        );
+        assert_eq!(
+            d.verdict,
+            Verdict::Poison(PoisonReason::TransientBudget),
+            "the per-cycle transient cap still bounds an identity-less loop"
+        );
     }
 
     // r[verify sched.dispatch.fleet-exhaust+4]
-    // r[verify sched.retry.per-executor-budget+3]
+    // r[verify sched.retry.per-executor-budget+4]
     /// AD2 small-fleet clause over the re-keyed inputs: with a single
     /// spawnable source the exhaustion verdict is reachable after that
     /// one source fails (min(threshold, |sources|) = 1), and the empty

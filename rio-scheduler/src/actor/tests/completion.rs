@@ -1266,7 +1266,7 @@ async fn test_distinct_transient_poison_matrix(
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// InfrastructureFailure is a worker-local problem (FUSE EIO, cgroup
 /// setup fail, OOM-kill of the build process) — NOT the build's fault.
 /// 3× InfrastructureFailure on distinct workers → failed_builders stays
@@ -1761,9 +1761,11 @@ async fn test_same_worker_poison_threshold_distinct_mode(
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
-    // Three pull attempts on the same intent identity with NO node
-    // binding: every failure charges the same exclusion key — the
-    // pull-mode shape of "the same worker keeps failing".
+    // Three pull attempts bound to the SAME source node: every failure
+    // charges the same exclusion key (the controller-authoritative node
+    // — decision P12) — the pull-mode shape of "the same worker keeps
+    // failing".
+    bind_intent_node(&handle, drv_hash, "same-source-node").await?;
     for i in 0..3 {
         pull_complete_failure(
             &handle,
@@ -2965,7 +2967,7 @@ async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// `max_infra_retries` is a uniform bound: at-cap cgroup-OOM and
 /// non-floor infra (FUSE EIO) poison at the SAME attempt number.
 /// Previously `bump_floor_or_count` incremented BEFORE the cap check
@@ -3960,6 +3962,8 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
             false,
         )
         .await?;
+        let node = format!("e3-node-{i}");
+        bind_intent_node(&handle, &child, &node).await?;
         pull_complete_failure(&handle, &child, status, "deterministic boom").await?;
         barrier(&handle).await;
 
@@ -3974,8 +3978,9 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
             "{status:?}: poisoned_at stamped"
         );
         assert!(
-            trigger.retry.failed_builders.contains(child.as_str()),
-            "{status:?}: legacy RAM exclusion write stays in place (rule 1)"
+            trigger.retry.failed_builders.contains(node.as_str()),
+            "{status:?}: the diagnostics-only exclusion insert keys on the \
+             bound source node (rule 1, P12 key shape)"
         );
         assert_eq!(
             expect_drv(&handle, &parent).await.status,

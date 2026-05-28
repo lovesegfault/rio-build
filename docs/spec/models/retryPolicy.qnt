@@ -790,7 +790,7 @@ module retryPolicy {
   /// charges, is terminal, or was dropped by the status guard because
   /// the derivation had already left the poison-able statuses; and the
   /// bare disconnect observation never charges (its charge vehicle is
-  /// the establishment -- sched.retry.per-executor-budget+3's
+  /// the establishment -- sched.retry.per-executor-budget+4's
   /// established-crash clause -- so an uncharged disconnect is the spec'd
   /// behaviour, not a leak).
   val attemptsChargedOnce = and {
@@ -1384,7 +1384,7 @@ module retryPolicy {
 //     fold application at every charging site receives the live
 //     spawnable-source set (so a charge that completes the exclusion of
 //     the whole universe poisons in the same transaction — the
-//     small-fleet clause of sched.retry.per-executor-budget+3: the
+//     small-fleet clause of sched.retry.per-executor-budget+4: the
 //     threshold is effectively min(threshold, |sources|)), and the
 //     standalone spawnGateExhaust action covers the no-new-charge case
 //     where the spawnable universe shrinks under an existing exclusion

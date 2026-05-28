@@ -3883,6 +3883,10 @@ async fn phase1b_recovery_under_budget_history_poisons_nothing() -> TestResult {
                 crate::state::ReportingParty::Worker,
             );
             row.executor_id = Some(w.into());
+            // The exclusion/budget key is the source node (P12): seed
+            // the rows in the bound shape so the recovered fold carries
+            // two distinct source keys.
+            row.source_node = Some(w.to_string());
             crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
         }
         tx.commit().await?;

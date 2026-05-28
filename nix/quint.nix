@@ -2805,7 +2805,7 @@ in
     # this check also carries the model-checked markers the retired
     # regime checks held (the rules' unit-test and kani markers are
     # unchanged).
-    # r[verify sched.retry.per-executor-budget+3]
+    # r[verify sched.retry.per-executor-budget+4]
     # r[verify sched.dispatch.fleet-exhaust+4]
     # r[verify sched.retry.counters-refine-history+2]
     # r[verify sched.retry.no-double-count]

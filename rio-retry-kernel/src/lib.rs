@@ -33,7 +33,7 @@
 //! always used) and with its `Arc<str>`-backed `ExecutorId` for the
 //! placement predicate; the proof harnesses instantiate it with a small
 //! copy type so the solver never has to model heap-allocated string
-//! comparisons. The kernels only ever use `Ord`/`Eq`/`Clone`/`Default`
+//! comparisons. The kernels only ever use `Ord`/`Eq`/`Clone`
 //! of `Id`, so the choice of identity type cannot change a verdict.
 //!
 //! ## The exclusion-set representation is cfg(kani)-swapped
@@ -503,11 +503,19 @@ impl<Id> Default for FleetView<Id> {
 /// One observed accounting event. The variants are the nine entry points'
 /// triggers plus the reset events and the dispatch (which clears the
 /// backoff defer). Every variant carries its observation time `at`.
+///
+/// The executor identity is the attempt's exclusion/budget key — since
+/// decision P12 that is the controller-authoritative source node (or
+/// the equivalent attested identity), carried as `Option<Id>`: an event
+/// whose row has no recorded identity (a pull attempt whose binding ack
+/// never landed, or a legacy row) charges its flat counters exactly the
+/// same but contributes nothing to the per-executor exclusion set or
+/// the distinct-source poison threshold.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AttemptEvent<Id> {
     /// E1 — worker `CompletionReport{TransientFailure}` (the build ran
     /// and exited non-zero) or `Unspecified`.
-    Transient { at: AbsTime, executor: Id },
+    Transient { at: AbsTime, executor: Option<Id> },
     /// E2 — worker `CompletionReport{InfrastructureFailure}` (FUSE EIO,
     /// cgroup setup failure, CgroupOom) or an unsolicited `Cancelled`.
     ///
@@ -519,20 +527,20 @@ pub enum AttemptEvent<Id> {
     /// non-OOM infra failures and for the cold-start no-intent case.
     Infra {
         at: AbsTime,
-        executor: Id,
+        executor: Option<Id>,
         exempt: bool,
         at_cap: bool,
     },
     /// E3 — one of the seven permanent statuses (`PermanentFailure`,
     /// `CachedFailure`, `DependencyFailed`, `LogLimitExceeded`,
     /// `OutputRejected`, `NotDeterministic`, `InputRejected`).
-    Permanent { at: AbsTime, executor: Id },
+    Permanent { at: AbsTime, executor: Option<Id> },
     /// E4 — worker `CompletionReport{TimedOut}`.
-    WorkerTimeout { at: AbsTime, executor: Id },
+    WorkerTimeout { at: AbsTime, executor: Option<Id> },
     /// E5 — gRPC stream disconnect, heartbeat timeout, or force-drain.
     /// Charges nothing; re-checks the poison threshold over failures
     /// recorded by other events.
-    Disconnect { at: AbsTime, executor: Id },
+    Disconnect { at: AbsTime, executor: Option<Id> },
     /// E6 — controller `ReportExecutorTermination{OomKilled,
     /// EvictedDiskPressure}`, correlated back to this derivation through
     /// `recently_disconnected` (or the race-ahead live-executor lookup).
@@ -540,16 +548,16 @@ pub enum AttemptEvent<Id> {
     /// reported dimension.
     ControllerTermination {
         at: AbsTime,
-        executor: Id,
+        executor: Option<Id>,
         promoted: bool,
         at_cap: bool,
     },
     /// E7 — controller `ReportExecutorTermination{DeadlineExceeded}`,
     /// prefix-matched back to this derivation.
-    ControllerDeadlineExceeded { at: AbsTime, executor: Id },
+    ControllerDeadlineExceeded { at: AbsTime, executor: Option<Id> },
     /// E8 — the scheduler-side backstop timer: Running for longer than
     /// `max(est × 3, daemon_timeout + slack)` with no report.
-    BackstopTimeout { at: AbsTime, executor: Id },
+    BackstopTimeout { at: AbsTime, executor: Option<Id> },
     /// The correlation-TTL sweep established a released execution whose
     /// classifying report never arrived (`outcome_class='executor_crash'`,
     /// `termination_reason='unreported'`). Phase 1b (T-1b.11, the C2
@@ -560,10 +568,10 @@ pub enum AttemptEvent<Id> {
     /// `sched.retry.per-executor-budget` "executor disconnect DOES
     /// count" MUST names. A bare `Disconnect` (not yet established)
     /// stays uncharged.
-    EstablishedCrash { at: AbsTime, executor: Id },
+    EstablishedCrash { at: AbsTime, executor: Option<Id> },
     /// A successful dispatch. Clears `backoff_until`
     /// (`assign_to_worker`).
-    Dispatched { at: AbsTime, executor: Id },
+    Dispatched { at: AbsTime, executor: Option<Id> },
     /// The `dag::merge` resubmit reset of a retriable terminal node:
     /// fresh per-cycle state, `resubmit_cycles` incremented. The event is
     /// only legal when the node `is_retriable_on_resubmit()` —
@@ -817,7 +825,9 @@ fn apply<Id: Ord + Clone>(
         // check the per-cycle count cap, and only on the retry arm
         // increment `count` and arm the backoff.
         AttemptEvent::Transient { at, executor } => {
-            c.failed_builders.insert(executor.clone());
+            if let Some(executor) = executor {
+                c.failed_builders.insert(executor.clone());
+            }
             c.failure_count += 1;
             if c.poison_threshold_reached(budget) {
                 c.poisoned_at = Some(*at);
@@ -915,9 +925,10 @@ fn apply<Id: Ord + Clone>(
             // Diagnostics-only insert (I-209): `failed_builders` gates
             // nothing on the permanent path, but it IS a counter
             // mutation the fold must reproduce. `failure_count` is NOT
-            // incremented here (asymmetry A6: the recovery projection's
-            // `failed_builders.len()` will count this executor anyway).
-            c.failed_builders.insert(executor.clone());
+            // incremented here (asymmetry A6, kept as-built).
+            if let Some(executor) = executor {
+                c.failed_builders.insert(executor.clone());
+            }
             Verdict::Poison(PoisonReason::Permanent)
         }
 
@@ -1035,7 +1046,9 @@ fn apply<Id: Ord + Clone>(
         // keep reproducing the charge those rows carried (insert +
         // increment, then the threshold re-check sees it).
         AttemptEvent::BackstopTimeout { at, executor } => {
-            c.failed_builders.insert(executor.clone());
+            if let Some(executor) = executor {
+                c.failed_builders.insert(executor.clone());
+            }
             c.failure_count += 1;
             if c.poison_threshold_reached(budget) {
                 c.poisoned_at = Some(*at);
@@ -1046,7 +1059,7 @@ fn apply<Id: Ord + Clone>(
         }
 
         // ── The establishment sweep (C2, Phase 1b T-1b.11) ──────────
-        // r[impl sched.retry.per-executor-budget+3]
+        // r[impl sched.retry.per-executor-budget+4]
         // A released execution whose classifying report never arrived,
         // established by the correlation-TTL sweep (or recorded by the
         // backstop, which has its own arm above): charges the
@@ -1059,7 +1072,9 @@ fn apply<Id: Ord + Clone>(
         // stays uncharged (the classification window must stay open
         // for the controller's report).
         AttemptEvent::EstablishedCrash { at, executor } => {
-            c.failed_builders.insert(executor.clone());
+            if let Some(executor) = executor {
+                c.failed_builders.insert(executor.clone());
+            }
             c.failure_count += 1;
             if c.poison_threshold_reached(budget) {
                 c.poisoned_at = Some(*at);
@@ -1201,8 +1216,10 @@ pub struct LedgerRow<Id> {
     pub event_kind: AttemptEventKind,
     /// Outcome classification (the [`classify`] alphabet).
     pub outcome_class: OutcomeClass,
-    /// Executor that ran (or was assigned) the attempt, when one was
-    /// recorded on the row.
+    /// The attempt's exclusion/budget identity, when one was recorded
+    /// on the row: the controller-authoritative source node (decision
+    /// P12). `None` (an unbound attempt) charges flat counters only and
+    /// never contributes an exclusion key.
     pub executor: Option<Id>,
     /// Who observed the event.
     pub reporting_party: ReportingParty,
@@ -1408,7 +1425,7 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
     kani,
     kani::ensures(|d: &Decision<Id>| decide_exclusion_covers_charged_attempts(d, history))
 )]
-pub fn decide<Id: Ord + Clone + Default>(
+pub fn decide<Id: Ord + Clone>(
     history: &[LedgerRow<Id>],
     budget: &Budget,
     now: AbsTime,
@@ -1455,9 +1472,9 @@ pub fn decide<Id: Ord + Clone + Default>(
 /// the E9 `fleet_exhaust` verdict marker (the placement verdict is
 /// re-derived from the exclusion set and the live fleet by [`placeable`],
 /// never folded from history).
-fn row_to_event<Id: Clone + Default>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
+fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
     let at = row.at;
-    let executor = row.executor.clone().unwrap_or_default();
+    let executor = row.executor.clone();
     if row.event_kind == AttemptEventKind::Reset {
         return match row.outcome_class {
             OutcomeClass::ResubmitReset => Some(AttemptEvent::ResubmitReset { at }),
@@ -1777,21 +1794,21 @@ mod tests {
         let by_str = [
             AttemptEvent::Transient {
                 at: 100,
-                executor: "w1".to_string(),
+                executor: Some("w1".to_string()),
             },
             AttemptEvent::Transient {
                 at: 200,
-                executor: "w2".to_string(),
+                executor: Some("w2".to_string()),
             },
         ];
         let by_int = [
             AttemptEvent::Transient {
                 at: 100,
-                executor: 1u8,
+                executor: Some(1u8),
             },
             AttemptEvent::Transient {
                 at: 200,
-                executor: 2u8,
+                executor: Some(2u8),
             },
         ];
         let (cs, vs) = reference_fold(&by_str, 200, &Budget::default(), &FleetView::default());
@@ -1957,13 +1974,13 @@ mod proofs {
     //! the per-cycle suffix bound (≤ ~70 rows) excludes structurally.
     //!
     //! The executor-identity type is `u8` here: the kernels are generic
-    //! over `Id` and only ever use its `Ord`/`Eq`/`Clone`/`Default`
+    //! over `Id` and only ever use its `Ord`/`Eq`/`Clone`
     //! surface, so the verdict logic proven for `u8` identities is the
     //! same code production runs with `String` identities — and the
     //! solver never has to model heap allocation or string comparison.
-    //! `0u8` is the `Default` value the fold substitutes for a row with
-    //! no recorded executor, playing the role the empty string plays in
-    //! production; the named universe is {1, 2, 3}.
+    //! A row with no recorded executor identity folds as `None`
+    //! (charges flat counters, contributes no exclusion key — decision
+    //! P12); the named universe is {1, 2, 3}.
     //!
     //! Under `cfg(kani)` every executor-id set in the kernel and in
     //! these harnesses is [`BoundedIdSet`] (via the [`IdSet`] alias): a
@@ -1990,8 +2007,8 @@ mod proofs {
     /// One arbitrary executor id from the named universe {1, 2, 3}:
     /// enough to reach the distinct-worker threshold at its scaled
     /// bound (2) with one spare so exclusion ⊂ fleet and exclusion ⊇
-    /// fleet are both reachable in `check_placeable_contract`. 0 is
-    /// reserved for the "no executor recorded" default.
+    /// fleet are both reachable in `check_placeable_contract` (a row
+    /// with no identity is generated as `executor: None`).
     fn any_executor() -> u8 {
         let i: u8 = kani::any();
         kani::assume(i >= 1 && i <= 3);
@@ -2301,12 +2318,12 @@ mod proofs {
             if kani::any() {
                 AttemptEvent::Transient {
                     at,
-                    executor: any_executor(),
+                    executor: Some(any_executor()),
                 }
             } else {
                 AttemptEvent::Infra {
                     at,
-                    executor: any_executor(),
+                    executor: Some(any_executor()),
                     exempt: kani::any(),
                     at_cap: kani::any(),
                 }

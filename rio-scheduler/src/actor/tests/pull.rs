@@ -937,7 +937,7 @@ async fn spawn_intents(handle: &ActorHandle) -> Vec<rio_proto::types::SpawnInten
         .intents
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// (a) An attempt appended for a pull-mode pod carries `source_node`
 /// from the controller-authoritative spawn-ack binding, and the
 /// requeued intent advertises that node in `excluded_nodes` (the AD2
@@ -1031,7 +1031,7 @@ async fn report_attempt_outcome_with_node(
         .expect("actor alive")
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// Mint-before-binding: when the pull lost the race against the
 /// controller's binding ack, the controller's pod-terminal report
 /// delivers the node and the later establishment charge still carries
@@ -1095,7 +1095,7 @@ async fn establishment_charge_carries_node_from_pod_terminal_report() -> TestRes
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// A binding ack that arrives only after the mint still attributes the
 /// establishment charge: the sweep falls back to the in-memory
 /// controller-authoritative binding at establishment time.
@@ -1140,7 +1140,7 @@ async fn establishment_charge_falls_back_to_late_binding_ack() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// The crash→establish→respawn loop is bounded: three unreported
 /// crashes attributed to three distinct nodes reach Poison(Threshold)
 /// instead of collapsing onto one intent-keyed exclusion entry forever.

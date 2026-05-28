@@ -1139,7 +1139,7 @@ impl DagActor {
                     }
                 }
             }
-            // r[impl sched.retry.per-executor-budget+3]
+            // r[impl sched.retry.per-executor-budget+4]
             rio_proto::types::BuildResultStatus::InfrastructureFailure => {
                 // Worker-local problem (FUSE EIO, cgroup setup fail, OOM-
                 // kill of the build process). Not the build's fault. Retry

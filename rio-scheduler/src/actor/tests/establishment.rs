@@ -53,10 +53,12 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
 // r[verify sched.attempt.establishment-window+2]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
-/// charged to failed_builders + failure_count, and the drv requeues.
+/// charged to failure_count, and the drv requeues.
 /// No node attribution ever arrives here (no binding ack, no
-/// controller report), so the exclusion key is the documented
-/// intent-identity fallback; the node-keyed cases live in the AD2
+/// controller report), so the established charge carries NO exclusion
+/// key (decision P12: the budget key is the controller-authoritative
+/// source node only — an unattributed crash cannot occupy a
+/// distinct-source slot); the node-keyed cases live in the AD2
 /// battery (`establishment_charge_carries_node_*`).
 #[tokio::test]
 async fn establishment_charges_and_requeues_after_window() -> TestResult {
@@ -82,8 +84,9 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     );
     assert_eq!(info.retry.failure_count, 1, "charged once (C2)");
     assert!(
-        info.retry.failed_builders.contains("est-a"),
-        "the attempt's executor identity joins the exclusion set, got {:?}",
+        info.retry.failed_builders.is_empty(),
+        "an unattributed establishment contributes no exclusion key \
+         (P12: source-node keys only), got {:?}",
         info.retry.failed_builders
     );
     assert_eq!(

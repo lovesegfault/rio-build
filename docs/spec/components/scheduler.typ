@@ -356,7 +356,7 @@ epilogue in the success path).
   (now() - poisoned_at))`, so the 24h TTL check survives scheduler restart.
 ]
 
-#r("sched.retry.per-executor-budget+3")[
+#r("sched.retry.per-executor-budget+4")[
   `BuildResultStatus::InfrastructureFailure` does NOT count toward the poison
   threshold. It routes through a separate `handle_infrastructure_failure`
   handler: `reset_to_ready` + retry WITHOUT inserting into `failed_builders`.
@@ -365,17 +365,20 @@ epilogue in the success path).
   non-zero, might succeed elsewhere) DOES count. Executor disconnect DOES count
   --- a build that crashes the daemon 3× is poisoned: an executor crash whose
   classifying report never arrives, once its failure is established (the
-  correlation-TTL sweep, the backstop, or the pull-mode establishment sweep
-  fills `termination_reason='unreported'`), joins `failed_builders` and counts
-  toward the poison threshold; false-positives from
+  pull-mode establishment sweep
+  fills `termination_reason='unreported'`), charges the failure budget and
+  counts toward the poison threshold; false-positives from
   unrelated executor deaths are cleared by `rio-cli poison-clear`. The
-  budget's exclusion key is the attempt's _source_: an attempt row carrying
-  `drv_attempts.source_node` (a pull-mode attempt --- the column is written
+  budget's exclusion key is the attempt's _source node_, and ONLY that: an
+  attempt row carrying
+  `drv_attempts.source_node` (the column is written
   only from the controller-authoritative binding, never from worker-supplied
-  identity) contributes that node as its exclusion/budget key, and a row
-  without it (every stream-mode/legacy row) contributes its executor (pod
-  name) key --- a mixed-era history therefore carries both key kinds in the
-  exclusion set until the stream path retires. Small-fleet clause: when
+  identity) contributes that node as its exclusion/budget key; a row
+  without one (a pull attempt whose binding ack has not landed, or a
+  pre-pull legacy row) contributes NO exclusion key --- it still charges the
+  flat `failure_count`, but it MUST NOT occupy a distinct-source slot in the
+  poison threshold and MUST NOT leak a non-schedulable key (a pod name or
+  intent id) into the placement exclusion. Small-fleet clause: when
   `0 < |distinct eligible sources| < threshold`, the exhaustion verdict
   (#rref("sched.dispatch.fleet-exhaust")) MUST still be reachable once every
   existing source has failed --- the effective bound is
@@ -390,6 +393,16 @@ epilogue in the success path).
   (#rref("sched.retry.failover-budget")); a leader change does not refresh
   any retry budget.
 ]
+The `+4` revision (decision P12, the executor-lifecycle/retry cross-campaign
+close-out): the establishment-vehicle list shrinks to the establishment sweep
+--- the correlation-TTL sweep and the scheduler-side backstop retired with the
+stream dispatch path --- and the legacy pod-name fallback key is dropped: the
+`+3` text let a row without `source_node` contribute its executor (pod-name)
+key "until the stream path retires"; that path has retired, so identity-less
+rows now charge flat counters only. Bounding consequence, stated for clarity:
+a derivation whose attempts are never node-attributed is bounded by the
+per-cycle transient/infra/timeout caps and the flat `failure_count` mode, not
+by the distinct-source threshold.
 
 #r("sched.dispatch.fleet-exhaust+4")[
   The fleet-exhaust verdict is the structural, immediate "every source this

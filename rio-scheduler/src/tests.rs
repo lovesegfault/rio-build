@@ -52,7 +52,7 @@ fn config_defaults_are_stable() {
     assert_eq!(d.retry, rio_scheduler::RetryPolicy::default());
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// TOML → Config parse for `[poison]` and `[retry]` tables.
 /// Field names match PoisonConfig (`threshold`,
 /// `require_distinct_workers`) and RetryPolicy (`max_retries`,
@@ -264,7 +264,7 @@ fn test_valid_config() -> Config {
     cfg
 }
 
-// r[verify sched.retry.per-executor-budget+3]
+// r[verify sched.retry.per-executor-budget+4]
 /// Each case mutates one field of a known-valid `test_valid_config()`
 /// and asserts `validate()` fails with an error mentioning every
 /// `expected` substring (field name + bad value, so the operator can

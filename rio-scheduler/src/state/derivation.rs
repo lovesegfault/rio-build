@@ -640,9 +640,10 @@ pub struct AttemptRecord {
     /// Executor that ran (or was assigned) the attempt.
     pub executor_id: Option<ExecutorId>,
     /// Controller-authoritative source node (071, AD2c) — stamped only
-    /// for pull-mode attempts. When present the retry fold keys the
-    /// row's exclusion/budget contribution on it instead of the
-    /// executor id, so mixed-era histories carry both key kinds.
+    /// for pull-mode attempts. The retry fold keys the row's
+    /// exclusion/budget contribution on this and ONLY this (decision
+    /// P12): a row without it charges flat counters but contributes no
+    /// exclusion key.
     pub source_node: Option<String>,
     /// Second-installment classification detail (controller reason,
     /// `unreported`, `force_drain`, …). `None` until established.
@@ -1753,15 +1754,14 @@ impl DerivationState {
         &self.attempt_history
     }
 
-    /// The node-keyed subset of the exclusion set (AD2): every
+    /// The node-keyed exclusion set (AD2): every
     /// `source_node` carried by an attempt record in the current
     /// suffix that the fold actually excluded (it appears in the
-    /// cached `failed_builders` view, which is keyed by node for
-    /// pull-mode rows and by executor id for legacy rows). This is
-    /// what the spawn intent advertises as `excluded_nodes` — legacy
-    /// pod-name keys are never included (they are not schedulable
-    /// constraints), so stream-only histories yield an empty list and
-    /// the controller's pod render stays byte-identical to today.
+    /// cached `failed_builders` view — which since decision P12 is
+    /// keyed by source node only). This is
+    /// what the spawn intent advertises as `excluded_nodes`;
+    /// identity-less rows contribute nothing, so an unattributed
+    /// history yields an empty list.
     pub(crate) fn excluded_source_nodes(&self) -> Vec<String> {
         let mut nodes: Vec<String> = self
             .attempt_history
