@@ -67,3 +67,8 @@ output "karpenter_node_role_name" {
   description = "Node IAM role name for Karpenter-provisioned instances (goes into EC2NodeClass.spec.role — xtask passes as --set karpenter.nodeRoleName)"
   value       = module.karpenter.node_iam_role_name
 }
+
+output "parity_iam_role_arn" {
+  description = "IAM role ARN for the rio-parity campaign-engine IRSA (xtask parity launch/eval annotate the rio-parity ServiceAccount with it)"
+  value       = module.rio_parity_irsa.arn
+}
