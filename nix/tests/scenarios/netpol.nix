@@ -395,11 +395,10 @@ pkgs.testers.runNixOSTest {
             "metadata: {name: misplaced, namespace: ${fixture.nsFetchers}}\n"
             "spec:\n"
             "  kind: Builder\n"
-            # Stream pin until the T-1c.2b scenario re-point: the
-            # netns-probe pattern below was written against the stream
-            # dispatch timing (the 1c flip made the CRD-absent default
-            # Pull, so the legacy behavior now needs an explicit field).
-            "  dispatchMode: Stream\n"
+            # No dispatchMode: the CRD absent-means-Pull default (1c
+            # cutover) applies — the netns probes only need a Running
+            # build pod, which the pull path provides identically (the
+            # 300s sleeper keeps it alive through the probe sequence).
             "  image: rio-builder:dev\n"
             "  imagePullPolicy: IfNotPresent\n"
             "  systems: [x86_64-linux]\n"

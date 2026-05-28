@@ -69,11 +69,11 @@ scope: with scope; ''
           timeout=60,
       )
 
-      # PG snapshot BEFORE the kill. At kill time the worker's gRPC
-      # stream is dead — it CANNOT report completion until a scheduler
-      # is back. So the row is guaranteed non-terminal NOW. Checking
-      # after recovery races with the build finishing (worker
-      # reconnects → reports → status='completed' before the assert).
+      # PG snapshot BEFORE the kill. At kill time no scheduler leader
+      # is serving — the builder CANNOT land its ReportOutcome until
+      # one is back. So the row is guaranteed non-terminal NOW.
+      # Checking after recovery races with the build finishing (the
+      # report lands → status='completed' before the assert).
       # Same TERMINAL_STATUSES filter as load_nonterminal_derivations
       # (db/mod.rs:58 TERMINAL_STATUS_SQL).
       #
@@ -134,13 +134,26 @@ scope: with scope; ''
           timeout=180,
       )
 
-      # Worker re-registered with the new leader. Fresh scheduler
-      # process = metrics reset → workers_active climbs back to ≥1.
-      # ≥1 not ==1: the slow build's worker may have briefly
-      # disconnected/reconnected during failover.
-      sched_metric_wait(
-          "grep -E '^rio_scheduler_workers_active [1-9]'",
-          timeout=180,
+      # The in-flight slow build runs on the pull path (T-1c.2b
+      # re-point): its execution row was minted by the pull
+      # transaction before the kill, so assert it carries
+      # dispatch_mode='pull'. The stream era waited here for the
+      # worker to RE-REGISTER with the new leader; pull pods hold no
+      # session, so there is nothing to re-establish — the report is
+      # a unary against whichever pod is leader when the sleep ends,
+      # and the end-of-subtest drain below is what proves the new
+      # leader accepts it.
+      pull_execs = int(psql_k8s(k3s_server,
+          "SELECT COUNT(*) FROM drv_executions e "
+          "JOIN assignments a ON a.exec_id = e.exec_id "
+          "JOIN derivations d ON d.derivation_id = a.derivation_id "
+          "WHERE d.drv_path LIKE '%lifecycle-recovery-slow%' "
+          "AND e.dispatch_mode = 'pull'"
+      ))
+      assert pull_execs >= 1, (
+          f"the in-flight recovery build should have been dispatched "
+          f"on the pull path (>=1 dispatch_mode='pull' execution row), "
+          f"got {pull_execs}"
       )
 
       # Post-recovery build. DIFFERENT marker → different output path

@@ -188,13 +188,17 @@ let
   # backdate target for gc-sweep (unpinned, so sweep can delete it).
   recoveryDrv = drvs.mkTrivial { marker = "lifecycle-recovery"; };
 
-  # cancel-cgroup-kill in-flight build. 60s sleep: wait-for-running
-  # + find cgroup + assert it has procs + CancelBuild + wait for
-  # cgroup gone. Shorter than recoverySlowDrv because cancel is
-  # direct (gRPC→scheduler→worker RPC, no lease transition).
+  # cancel-cgroup-kill in-flight build. 180s sleep: wait-for-running
+  # + find cgroup + assert it has procs + ~20s of open-attempt
+  # observation evidence + CancelBuild + the AD5 composite cancel
+  # bound (90s). The sleep must comfortably exceed observation + the
+  # bound so "cgroup gone inside the bound" can only mean the cancel
+  # chain killed the build, never that the sleep finished on its own
+  # (the pre-pull 60s sleeper left no such margin once the controller
+  # Job-deletion hop replaced the stream cancel dispatch).
   cancelDrv = drvs.mkTrivial {
     marker = "lifecycle-cancel";
-    sleepSecs = 60;
+    sleepSecs = 180;
   };
 
   # build-timeout victim. sleepSecs=90 vs buildTimeout=45 — wide gap so
@@ -458,71 +462,12 @@ let
             )
             raise
 
-    # workers_active==0 wait, sized for the heartbeat-timeout FALLBACK
-    # path. The ephemeral-pool drain has flaked at this
-    # exact assertion four times (8cf70d94/d82a0046/69fc4ae0/e76c95b6,
-    # GHA 24046508263). Each prior fix tightened the producer side; this
-    # one bounds the consumer side from first principles.
-    #
-    # Mechanism (GHA 24046508263: pods-gone 1.24s, workers_active==0
-    # 57.38s, then next workers_active==0 blew 90s; local KVM 0.17s):
-    #
-    #   I-195 made idle-SIGTERM `break 'reconnect` WITHOUT opening a
-    #   second BuildExecution stream (the redundant ExecutorRegister
-    #   that cov_factor was masking). That fix is correct, but it also
-    #   removed the SECOND-CHANCE stream-EOF: pre-I-195, the worker
-    #   opened S2 then immediately broke, so the scheduler saw TWO
-    #   EOFs (S1-drop + S2-drop) — if one was lost under load, the
-    #   other still landed `ExecutorDisconnected`. Post-I-195 there's
-    #   only the S1-drop. Under GHA runner load the single RST_STREAM
-    #   can be lost (CNI veth-teardown vs FIN race, h2 frame congestion);
-    #   the scheduler's `worker-stream-reader` then never breaks, and
-    #   the entry sits in `self.executors` until `tick_check_heartbeats`
-    #   reaps it. When two pods' `last_heartbeat`s are staggered, the
-    #   gauge can dip to 0 on the first reap (event-driven `decrement` at
-    #   executor.rs:320) and be re-`set` to 1 by the next
-    #   `tick_publish_gauges` if the second entry is still
-    #   `is_registered()`. The first wait catches the dip; the next
-    #   precondition wait then sits out the second entry's full
-    #   fallback window.
-    #
-    # Budget derivation (rio-common/src/limits.rs constants):
-    #   HEARTBEAT_TIMEOUT_SECS (30) = ~30s last_heartbeat→reap
-    #   (tick_check_heartbeats), plus:
-    #   + tick alignment (≤10s)
-    #   + pod termination stagger: when two pods terminate ~20-30s apart,
-    #     the second reap lands ~20-30s after the first
-    #   + one in-flight heartbeat delayed under load (≤10s)
-    #   ≈ 80s worst-case from pods-gone to stable workers_active==0.
-    #   180s budget = 80s + ~125% GHA tail headroom. Stays under the
-    #   300s pods-gone budget so a real disconnect-detection regression
-    #   (e.g. heartbeat-reap broken) still trips before globalTimeout.
-    #
-    # Diagnostic dump on timeout: the prior three flakes were debugged
-    # from k3s kernel logs alone (no scheduler-side state). This one
-    # captures the live gauge value + scheduler's executor view +
-    # any straggler pods, so a fifth flake names the stuck executor.
-    def wait_workers_zero(ctx):
-        try:
-            sched_metric_wait(
-                "grep -qx 'rio_scheduler_workers_active 0'",
-                timeout=180,
-            )
-        except Exception:
-            k3s_server.execute(
-                f"echo '=== DIAG[{ctx}]: workers_active!=0 after 180s ===' >&2; "
-                "leader=$(k3s kubectl -n ${ns} get lease rio-scheduler-leader "
-                "  -o jsonpath='{.spec.holderIdentity}'); "
-                "k3s kubectl get --raw "
-                '  "/api/v1/namespaces/${ns}/pods/$leader:9091/proxy/metrics" '
-                "  2>/dev/null | grep -E "
-                "'^rio_scheduler_(workers_active|worker_disconnects_total) ' >&2; "
-                "k3s kubectl -n ${nsBuilders} get pods -o wide >&2 2>&1 || true; "
-                'k3s kubectl -n ${ns} logs "$leader" --since=4m '
-                "  | grep -iE 'executor|disconnect|heartbeat|worker' "
-                "  | grep -vE '\"level\":\"DEBUG\"' | tail -40 >&2 || true"
-            )
-            raise
+    # NOTE: the stream-era `wait_workers_zero` helper (the
+    # heartbeat-timeout-bounded workers_active==0 precondition) was
+    # removed at the T-1c.2b corpus re-point. Pull-mode pods never
+    # register, so subtests that need a clean-slate precondition wait
+    # for the builder pods themselves to be gone (the pod-level wait
+    # the pull-mode/ephemeral-pool fragments carry inline).
 
     # Negative-apply a deliberately-invalid Pool spec. CRD CEL rules
     # (rio-crds/src/pool.rs x_kube validations) are cross-field

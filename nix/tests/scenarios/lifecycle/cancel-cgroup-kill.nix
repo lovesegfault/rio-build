@@ -4,15 +4,22 @@ scope: with scope; ''
   # cancel-cgroup-kill — gRPC CancelBuild mid-exec → cgroup.kill="1"
   # ══════════════════════════════════════════════════════════════════
   # cgroup.rs:180 kill() writes "1" to cgroup.kill → kernel SIGKILLs
-  # every PID in the tree. NO prior test cancels a RUNNING build —
-  # recovery kills the scheduler (build keeps running on the worker).
+  # every PID in the tree. NO prior test in this group cancels a
+  # RUNNING build — recovery kills the scheduler (build keeps running
+  # on the worker).
   #
-  # P0294: the Build CR is gone. Cancel via gRPC CancelBuild
-  # directly (the SAME RPC the old CR finalizer called). Flow:
-  # CancelBuild RPC → scheduler dispatch Cancel to worker →
-  # runtime.rs try_cancel_build → cgroup::kill_cgroup →
-  # fs::write(cgroup.kill, "1"). Log signal: "build cancelled via
-  # cgroup.kill" at runtime.rs:197.
+  # Pull path (T-1c.2b re-point — the chart pool dispatches pull):
+  # CancelBuild RPC → scheduler closes the attempt + marks the drv
+  # cancelled → controller sees the closed-while-active edge on its
+  # next reconcile tick and foreground-deletes the owning Job →
+  # kubelet SIGTERMs the pod → builder's pull abort path
+  # (runtime/pull.rs build_phase_with_abort) calls try_cancel_build →
+  # cgroup::kill_cgroup → fs::write(cgroup.kill, "1"). Same builder
+  # kill mechanism as the stream era; the delivery hop changed from
+  # the in-stream Cancel dispatch to the controller Job deletion.
+  # Distinct from the pull-canary cancel arm: this runs under the
+  # default vmtest-full values (3600s probe deadline), proving the
+  # chain does not depend on the canary overlay's 180s deadline.
   #
   # Submission is ALSO via gRPC (SubmitBuild, not ssh-ng://) so we
   # get the build_id back for CancelBuild. The ssh-ng:// path goes
@@ -20,6 +27,7 @@ scope: with scope; ''
   # surfaced to the nix client. P0289's build-timeout port inherits
   # this gRPC-direct pattern.
   with subtest("cancel-cgroup-kill: gRPC CancelBuild mid-exec → cgroup.kill"):
+      import time
       drv_path, build_id = submit_single_drv("${cancelDrv}")
       print(f"cancel-cgroup-kill: submitted, build_id={build_id}")
 
@@ -61,6 +69,13 @@ scope: with scope; ''
       print(f"cancel-cgroup-kill: node={worker_node}, cgroup={cgroup_path}, "
             f"procs={procs_before}")
 
+      # The controller cancels only on the closed-while-active edge of
+      # an attempt it has previously OBSERVED open (ListOpenAttempts
+      # is read once per ~10s reconcile tick) — give it two ticks of
+      # open evidence before the verdict, same as the pull-canary
+      # cancel arm. The 180s sleeper leaves ample margin.
+      time.sleep(20)
+
       # CancelBuild via gRPC — the replacement for "delete Build CR →
       # finalizer → CancelBuild". sched_grpc handles port-forward +
       # protoset. Unary RPC, returns CancelBuildResponse.
@@ -70,12 +85,14 @@ scope: with scope; ''
       )
       print(f"cancel-cgroup-kill: CancelBuild → {cancel_resp.strip()!r}")
 
-      # PRIMARY assertion: cgroup REMOVED within 30s. The 60s sleep
-      # hasn't completed — so removal proves the cancel chain ran:
-      # scheduler dispatch Cancel → worker try_cancel_build →
-      # cgroup.kill="1" → kernel SIGKILLs procs → BuildCgroup::Drop
-      # rmdirs. Kernel rejects rmdir on non-empty cgroup, so gone ⇒
-      # procs emptied. Pre-P0294 observed: gone in <1.5s.
+      # PRIMARY assertion: cgroup REMOVED within the AD5 composite
+      # bound (90s = scheduler verdict + ≤1 controller tick +
+      # foreground Job delete + SIGTERM abort), the same bound the
+      # pull-canary cancel arm asserts. The sleeper is 180s and the
+      # observation pause above consumed ~22s, so a cgroup gone
+      # inside this window can only mean the cancel chain killed the
+      # build — the sleep cannot have finished on its own. Kernel
+      # rejects rmdir on non-empty cgroup, so gone ⇒ procs emptied.
       #
       # NOT checking `kubectl logs | grep 'cancelled via cgroup.kill'`:
       # the polling itself triggers kubelet "Failed when writing line
@@ -88,7 +105,7 @@ scope: with scope; ''
       try:
           worker_vm.wait_until_succeeds(
               f"! test -e {cgroup_path}",
-              timeout=30,
+              timeout=90,
           )
       except Exception:
           procs_after = worker_vm.succeed(
@@ -108,6 +125,20 @@ scope: with scope; ''
                 f"(was {procs_before}), build_id={build_id}")
           raise
 
-      print("cancel-cgroup-kill PASS: cgroup rmdir'd in <30s "
-            "(sleep was 60s ⇒ killed not completed)")
+      # Structural backstop for the timing argument above: the drv
+      # must have ended cancelled, never completed. If the cancel
+      # chain had silently failed and the sleep somehow finished, the
+      # report would have completed the drv and this trips loudly.
+      cancel_status = psql_k8s(k3s_server,
+          "SELECT status FROM derivations "
+          "WHERE drv_path LIKE '%lifecycle-cancel%'"
+      ).strip()
+      assert cancel_status == "cancelled", (
+          f"the cancelled build must end status='cancelled' "
+          f"(killed, not completed), got {cancel_status!r}"
+      )
+
+      print("cancel-cgroup-kill PASS: cgroup rmdir'd inside the 90s "
+            "composite bound and the drv ended cancelled "
+            "(sleep was 180s ⇒ killed not completed)")
 ''

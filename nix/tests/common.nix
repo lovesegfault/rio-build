@@ -433,10 +433,16 @@ rec {
       # RIO_DISPATCH_MODE=stream: the builder binary's compiled default
       # flipped to pull at the executor-lifecycle 1c cutover, but the
       # standalone (non-k3s) topology has no controller/Job spawner to
-      # inject RIO_INTENT_ID, so its workers stay on the legacy session
-      # protocol until the standalone-corpus re-point (T-1c.2b) gives
-      # the harness a per-intent spawn mechanism. extraServiceEnv can
-      # still override for targeted experiments.
+      # inject RIO_INTENT_ID + a per-intent executor token, so its
+      # workers stay on the legacy session protocol. Dispositioned
+      # KEEP-STREAM (pending-harness) by the T-1c.2b per-check
+      # disposition table (docs/spec/models/executor-invariant-map.md,
+      # Phase-1c record): resolving those rows — a per-intent spawn
+      # mechanism in this harness, a re-home onto a k3s fixture, or
+      # retirement with named replacement coverage — is the recorded
+      # precondition for the 1c' deletion commit that removes the
+      # stream session machinery. extraServiceEnv can still override
+      # for targeted experiments.
       systemd.services.rio-builder.environment = {
         RIO_DISPATCH_MODE = "stream";
       }

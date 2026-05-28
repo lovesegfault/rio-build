@@ -158,16 +158,12 @@ pools:
 poolDefaults:
   enabled: true
   image: rio-builder
-  # Keep the helm-rendered VM pools on the legacy stream protocol for
-  # now: the chart default flipped to Pull at the executor-lifecycle 1c
-  # cutover, but the stream-era k3s scenarios (lifecycle splits,
-  # leader-election, netpol, fetcher-split, ...) still assert
-  # registration/heartbeat-era behavior and are re-pointed onto the
-  # pull path by the standalone/scenario disposition task (T-1c.2b),
-  # not by the defaults flip. The pull path's VM coverage runs on the
-  # explicitly-Pull pools the pull-mode/pull-canary/pull-fetcher
-  # subtests create. Remove this pin when the corpus re-point lands.
-  dispatchMode: Stream
+  # No dispatchMode override: the chart default (Pull since the
+  # executor-lifecycle 1c cutover) reaches every helm-rendered VM pool.
+  # The T-1c.2b corpus re-point removed the temporary Stream pin that
+  # sat here; the one VM check that still needs a stream pool (the
+  # pull-canary stream-baseline arm, until the 1c' deletion retires
+  # it) pins it in values/vmtest-pull-canary.yaml instead.
   # 4Gi. values.yaml prod default is 50Gi → ≥51Gi ephemeral-storage
   # request floor → Unschedulable on the 24G k3s node disks (~21Gi
   # allocatable). Layered nonpriv overlay inherits via deep-merge.

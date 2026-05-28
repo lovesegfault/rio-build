@@ -232,10 +232,14 @@ let
   # but its own fixture instantiation — values/vmtest-pull-canary.yaml
   # pins scheduler.sla.probe.deadlineSecs to the 180s config floor so
   # the pull-mode establishment window (solved deadline + 120s report
-  # slack ≈ 300s) fits a VM-test budget. Kept OUT of the shared
-  # lifecycleMod fixture so the other lifecycle splits keep
-  # vmtest-full.yaml's 3600s probe deadline (their Jobs'
-  # activeDeadlineSeconds and worker timeouts are unchanged).
+  # slack ≈ 300s) fits a VM-test budget, and pins poolDefaults.
+  # dispatchMode back to Stream so the scenario's stream-baseline arm
+  # keeps a stream pool to compare against now that the corpus default
+  # is Pull (T-1c.2b; the pin retires with that arm at the 1c'
+  # deletion). Kept OUT of the shared lifecycleMod fixture so the
+  # other lifecycle splits keep vmtest-full.yaml's 3600s probe
+  # deadline (their Jobs' activeDeadlineSeconds and worker timeouts
+  # are unchanged) and the corpus-default Pull dispatch.
   lifecyclePullCanaryMod = lifecycle {
     inherit pkgs common;
     fixture = k3sFull {
@@ -789,7 +793,7 @@ in
       # r[verify ctrl.ephemeral.intent-deadline]
       # r[verify ctrl.crd.host-users-network-exclusive]
       # ~180s: two builds × (reconcile tick + pod schedule + FUSE +
-      # heartbeat + build + exit). Subtest deletes the default x86-64
+      # pull + build + exit). Subtest deletes the default x86-64
       # Pool first so it doesn't steal dispatch.
       "ephemeral-pool"
       # r[verify sched.executor.pull-transaction]
