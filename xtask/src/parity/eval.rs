@@ -47,7 +47,11 @@ pub struct EvalArgs {
     #[arg(long)]
     pub full_scale: bool,
     /// Tell the engine to write a new eval set even if one already
-    /// exists for this key.
+    /// exists for this key (the engine salts the key digest, so the new
+    /// set lands under a fresh S3 prefix). The Job name does NOT change:
+    /// re-running an identical request while the previous Job still
+    /// exists collides on it deliberately (delete that Job or wait for
+    /// its 24h TTL) so double-evaluations are always explicit.
     #[arg(long)]
     pub force: bool,
     /// RUST_LOG for the eval pod.
@@ -82,11 +86,19 @@ pub fn engine_args(a: &EvalArgs) -> Vec<String> {
 /// digest covers what the operator asked for (systems/scope/jobset) plus
 /// the image tag, so "same request" re-runs collide on the existing Job
 /// (409 → guidance) instead of silently double-evaluating, while a new
-/// scope or new engine build gets a fresh Job. K8s names cap at 63
-/// chars; this stays well under.
+/// scope or new engine build gets a fresh Job. Systems are sorted and
+/// deduplicated before hashing so flag order can't mint a second Job for
+/// the same request. `--force` deliberately does NOT change the name:
+/// a forced rebuild of the same request still collides with a leftover
+/// Job (the 409 guidance says what to delete; finished Jobs expire after
+/// 24h via ttlSecondsAfterFinished). K8s names cap at 63 chars; this
+/// stays well under.
 pub fn job_name(a: &EvalArgs, image_tag: &str) -> String {
+    let mut systems: Vec<&str> = a.systems.iter().map(String::as_str).collect();
+    systems.sort_unstable();
+    systems.dedup();
     let mut h = Sha256::new();
-    h.update(a.systems.join(","));
+    h.update(systems.join(","));
     h.update("\0");
     h.update(&a.scope);
     h.update("\0");
@@ -134,10 +146,16 @@ pub async fn run(a: EvalArgs) -> Result<()> {
     let ns = super::NS_PARITY;
     let prefix = super::s3::evals_prefix(a.eval);
     tracing::info!(
-        "eval Job applied.\n  follow logs:  kubectl -n {ns} logs -f job/{name}\n  \
+        "eval Job applied.\n  \
+         follow logs:     kubectl -n {ns} logs -f job/{name}\n  \
+         wait for it:     kubectl -n {ns} wait --for=condition=complete job/{name} --timeout=3h\n  \
          eval sets land under s3://{bucket}/{prefix}\n  \
-         full-scope evals need ~1-2h on an r8a.48xlarge-class node (~$15-31); \
-         scoped evals minutes"
+         find the digest: aws s3 ls s3://{bucket}/{prefix} — the <key-digest>/ prefix (written \
+         only once the set is complete) is what `parity launch --eval {} [--eval-digest …]` consumes\n  \
+         full-scope evals need ~1-2h on an r8a.48xlarge-class node (~$15-31), and with \
+         --full-scale the pod sits Pending for a few minutes while Karpenter provisions that \
+         node — that is normal; scoped evals take minutes",
+        a.eval
     );
     Ok(())
 }
@@ -206,5 +224,21 @@ mod tests {
         b.scope = "jobs:nixpkgs.hello.x86_64-linux".into();
         assert_ne!(job_name(&b, "abc123"), n1);
         assert_ne!(job_name(&a, "def456"), n1);
+        // Same request, different --system order/duplication ⇒ SAME Job
+        // name: the digest is over the system set, not the flag spelling.
+        let mut c = args();
+        c.systems = vec!["aarch64-linux".into(), "x86_64-linux".into()];
+        let mut d = args();
+        d.systems = vec![
+            "x86_64-linux".into(),
+            "aarch64-linux".into(),
+            "aarch64-linux".into(),
+        ];
+        assert_eq!(job_name(&c, "abc123"), job_name(&d, "abc123"));
+        assert_ne!(job_name(&c, "abc123"), n1);
+        // --force keeps the name (collide-and-instruct is deliberate).
+        let mut forced = args();
+        forced.force = true;
+        assert_eq!(job_name(&forced, "abc123"), n1);
     }
 }

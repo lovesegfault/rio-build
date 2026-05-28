@@ -2056,6 +2056,11 @@
       "doc": "rio-parity namespace/SA bootstrap and the campaign / eval Job builders."
     },
     {
+      "path": "parity/launch.rs",
+      "depth": 1,
+      "doc": "`cargo xtask parity launch` — provision the campaign tenants, keys and"
+    },
+    {
       "path": "parity/preflight.rs",
       "depth": 1,
       "doc": "Launch pre-flight checks for the nixpkgs-parity campaign."

@@ -13,15 +13,10 @@ use anyhow::{Context, Result};
 
 use super::S3_PREFIX;
 
-// The campaign-scoped helpers have no non-test users yet: the
-// status/report implementations that consume them are landing next.
-// Each `allow(dead_code)` comes off with its first user.
-
 /// Key of a campaign-scoped artifact, e.g. `progress.json` or
 /// `report/summary.md`. Matches the engine's campaign sync layout
 /// (`<prefix>/<campaign-id>/<rel>` with the engine's default prefix
 /// `parity/campaigns`).
-#[allow(dead_code)]
 pub fn campaign_key(campaign_id: &str, rel: &str) -> String {
     format!("{S3_PREFIX}/campaigns/{campaign_id}/{rel}")
 }
@@ -32,9 +27,37 @@ pub fn evals_prefix(hydra_eval_id: u64) -> String {
     format!("{S3_PREFIX}/evals/{hydra_eval_id}/")
 }
 
+/// List the immediate "subdirectory" segment names under `prefix` (which
+/// must end with `/`): one ListObjectsV2 delimiter walk, returning each
+/// CommonPrefix with the leading `prefix` and trailing `/` stripped.
+/// `parity launch` uses it to discover the per-eval-set `<key-digest>/`
+/// prefixes under [`evals_prefix`].
+pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Result<Vec<String>> {
+    let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
+    let mut out = Vec::new();
+    let mut pages = s3
+        .list_objects_v2()
+        .bucket(bucket)
+        .prefix(prefix)
+        .delimiter("/")
+        .into_paginator()
+        .send();
+    while let Some(page) = pages.next().await {
+        let page = page.with_context(|| format!("ListObjectsV2 s3://{bucket}/{prefix}"))?;
+        for cp in page.common_prefixes() {
+            let Some(p) = cp.prefix() else { continue };
+            let segment = p.strip_prefix(prefix).unwrap_or(p).trim_end_matches('/');
+            if !segment.is_empty() {
+                out.push(segment.to_string());
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Download an S3 object as UTF-8 text. `Ok(None)` when the key does not
 /// exist yet (campaign/stage not reached); other errors propagate.
-#[allow(dead_code)]
 pub async fn get_text(region: &str, bucket: &str, key: &str) -> Result<Option<String>> {
     let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
     let resp = match s3.get_object().bucket(bucket).key(key).send().await {

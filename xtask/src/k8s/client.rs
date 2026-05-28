@@ -151,9 +151,6 @@ pub async fn get_secret_key(
 /// Create/update a Secret whose values are raw bytes (e.g. a service-HMAC
 /// key — random bytes, NOT UTF-8). Sibling of [`apply_secret`], which only
 /// handles string data. Idempotent.
-// Consumed by `parity launch` (landing next); the allow comes off with its
-// first user.
-#[allow(dead_code)]
 pub async fn apply_secret_bytes(
     client: &Client,
     ns: &str,
@@ -171,6 +168,25 @@ pub async fn apply_secret_bytes(
     );
     let ssapply = PatchParams::apply("xtask").force();
     api.patch(name, &ssapply, &Patch::Apply(&secret)).await?;
+    Ok(())
+}
+
+/// Create/update a ConfigMap with string data (SSA, idempotent) — the
+/// `apply_secret` sibling for non-secret payloads such as the parity
+/// campaign-spec ConfigMap.
+pub async fn apply_configmap(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    data: BTreeMap<String, String>,
+) -> Result<()> {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
+    let mut cm = ConfigMap::default();
+    cm.metadata.name = Some(name.into());
+    cm.metadata.namespace = Some(ns.into());
+    cm.data = Some(data);
+    let ssapply = PatchParams::apply("xtask").force();
+    api.patch(name, &ssapply, &Patch::Apply(&cm)).await?;
     Ok(())
 }
 

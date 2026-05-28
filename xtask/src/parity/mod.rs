@@ -17,12 +17,9 @@ use clap::{Args, Subcommand};
 
 pub mod eval;
 pub mod jobs;
+pub mod launch;
 pub mod preflight;
 pub mod s3;
-
-// Some constants below (and some `s3` helpers) have no non-test users
-// yet: the launch/status/report implementations that consume them are
-// landing next. Each `allow(dead_code)` comes off with its first user.
 
 /// Campaign tenants (created by `parity launch` directly via rio-cli —
 /// never via `k8s grant`, which unconditionally adds cache.nixos.org).
@@ -31,12 +28,21 @@ pub mod s3;
 /// (infra/helm/rio-build/templates/gateway.yaml); the launch pre-flight
 /// cross-checks the deployed gateway config against these constants so a
 /// rename on either side fails loudly before anything is submitted.
-#[allow(dead_code)]
 pub const TENANT_LEAF: &str = "parity-leaf";
-#[allow(dead_code)]
 pub const TENANT_SELFHOSTED: &str = "parity-selfhosted";
-#[allow(dead_code)]
 pub const TENANT_WARM: &str = "parity-warm";
+
+/// Campaign-tenant matrix: (tenant, exact upstream URL set it must have,
+/// expected `force_build_roots` in the deployed gateway build-policy).
+/// The single source for tenant provisioning, the launch pre-flight, and
+/// the tests, so the three can never drift; `keep_going` is true for
+/// every campaign tenant and asserted separately by
+/// [`preflight::check_build_policy`].
+pub const TENANT_MATRIX: [(&str, &[&str], bool); 3] = [
+    (TENANT_LEAF, &[preflight::CACHE_NIXOS_ORG], true),
+    (TENANT_SELFHOSTED, &[], false),
+    (TENANT_WARM, &[preflight::CACHE_NIXOS_ORG], false),
+];
 
 /// Namespace + ServiceAccount the campaign Jobs run under (created by
 /// xtask, not the chart). Must stay in sync with the chart's
@@ -56,7 +62,6 @@ pub const S3_PREFIX: &str = "parity";
 
 /// GC retention (hours) for the campaign tenants — 30 days, passed to
 /// `rio-cli create-tenant --gc-retention-hours` by `parity launch`.
-#[allow(dead_code)]
 pub const TENANT_RETENTION_HOURS: u32 = 720;
 
 #[derive(Args)]
@@ -82,7 +87,7 @@ enum ParityCmd {
     /// tenants' build-policy defaults) and rolls the gateway. The
     /// launch-time pre-flight cannot protect against a redeploy that
     /// happens after launch.
-    Launch(LaunchArgs),
+    Launch(launch::LaunchArgs),
     /// Show campaign progress (progress.json from S3 + Job state).
     Status(StatusArgs),
     /// Download and render the campaign report (summary.md).
@@ -111,11 +116,9 @@ enum ParityCmd {
 }
 
 // Placeholder arg structs — swapped for the real ones as the
-// launch/status/report implementations land (each lands by replacing
-// exactly one of these and its `run` arm). Campaign-scoped commands
-// take the campaign id positionally.
-#[derive(Args)]
-pub struct LaunchArgs {}
+// status/report implementations land (each lands by replacing exactly
+// one of these and its `run` arm). Campaign-scoped commands take the
+// campaign id positionally.
 #[derive(Args)]
 pub struct StatusArgs {
     /// Campaign id.
@@ -130,9 +133,9 @@ pub struct ReportArgs {
 pub async fn run(args: ParityArgs) -> Result<()> {
     match args.cmd {
         ParityCmd::Eval(a) => eval::run(a).await,
+        ParityCmd::Launch(a) => launch::run(a).await,
         // Placeholder arms: the remaining campaign commands bail until
         // their implementations land and replace the arms.
-        ParityCmd::Launch(_) => bail!("`cargo xtask parity launch` is not implemented yet"),
         ParityCmd::Status(a) => bail!(
             "`cargo xtask parity status {}` is not implemented yet",
             a.campaign
@@ -166,12 +169,18 @@ mod tests {
 
     #[test]
     fn campaign_tenant_names_are_distinct_and_prefixed() {
-        let all = [
-            super::TENANT_LEAF,
-            super::TENANT_SELFHOSTED,
-            super::TENANT_WARM,
-        ];
-        for t in all {
+        // The matrix is the single source for provisioning and pre-flight;
+        // it must cover each campaign tenant exactly once.
+        let all: Vec<&str> = super::TENANT_MATRIX.iter().map(|(t, _, _)| *t).collect();
+        assert_eq!(
+            all,
+            [
+                super::TENANT_LEAF,
+                super::TENANT_SELFHOSTED,
+                super::TENANT_WARM,
+            ]
+        );
+        for t in &all {
             assert!(t.starts_with("parity-"), "{t}");
         }
         assert_eq!(

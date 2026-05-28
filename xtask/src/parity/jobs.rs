@@ -46,9 +46,6 @@ pub const SSH_KEY_MOUNT_DIR: &str = "/etc/rio/parity-ssh";
 /// [`SSH_SECRET_NAME`] data key for `tenant`, mounted under
 /// [`SSH_KEY_MOUNT_DIR`] — what the launch-written spec records in each
 /// store URL's `ssh-key=` query parameter.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub fn ssh_key_path(tenant: &str) -> String {
     format!("{SSH_KEY_MOUNT_DIR}/{tenant}")
 }
@@ -79,17 +76,11 @@ pub const HMAC_MOUNT_DIR: &str = hmac_mount_dir!();
 /// [`HMAC_MOUNT_DIR`]) — the same key the chart's serviceHmac mounts
 /// use; `parity launch` copies the rio-system Secret's value under this
 /// key.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub const HMAC_KEY_FILENAME: &str = hmac_key_filename!();
 
 /// HMAC key file path inside the campaign pod
 /// ([`HMAC_MOUNT_DIR`]/[`HMAC_KEY_FILENAME`]) — what the launch-written
 /// spec records in `cluster.service_hmac_key_path`.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub const HMAC_KEY_MOUNT_PATH: &str = concat!(hmac_mount_dir!(), "/", hmac_key_filename!());
 
 /// Scratch volume mount point; also HOME for the engine and its
@@ -100,16 +91,10 @@ pub const WORK_DIR: &str = "/work";
 pub const SPEC_MOUNT_DIR: &str = "/etc/rio/parity";
 
 /// ConfigMap key (and therefore file name) of the campaign spec.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub const SPEC_FILENAME: &str = "spec.json";
 
 /// In-pod path of the campaign spec — what `parity launch` passes to the
 /// engine as `run --spec <path>`.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub const SPEC_MOUNT_PATH: &str = "/etc/rio/parity/spec.json";
 
 /// ConfigMap holding `<campaign-id>`'s spec (created by `parity launch`
@@ -211,9 +196,6 @@ fn container_security() -> serde_json::Value {
 ///   from failing the Job outright.
 /// - `karpenter.sh/do-not-disrupt` + the general node role keep
 ///   Karpenter from consolidating the node under a multi-day pod.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> Result<Job> {
     let job = serde_json::from_value(json!({
         "apiVersion": "batch/v1",

@@ -18,14 +18,9 @@ use kube::api::Api;
 
 use crate::k8s::client as kclient;
 
-// No non-test users yet: `parity launch` (landing next) drives these
-// checks at launch time. Each `allow(dead_code)` comes off with its
-// first user.
-
 /// Upstream URL every substituting campaign tenant must have — and the
 /// only one (parity-leaf / parity-warm substitute from exactly
 /// cache.nixos.org; parity-selfhosted substitutes from nothing).
-#[allow(dead_code)]
 pub const CACHE_NIXOS_ORG: &str = crate::k8s::eks::smoke::UPSTREAM_URL;
 
 /// Tag suffix of an image ref, ignoring a registry port
@@ -37,7 +32,6 @@ pub fn tag_of_image_ref(image: &str) -> Option<&str> {
 
 /// Deployed image tags of the components the campaign depends on.
 /// Keys are Deployment names ("rio-gateway", "rio-scheduler").
-#[allow(dead_code)]
 pub async fn deployed_image_tags(client: &kclient::Client) -> Result<BTreeMap<String, String>> {
     let api: Api<Deployment> = Api::namespaced(client.clone(), crate::k8s::NS);
     let mut out = BTreeMap::new();
@@ -64,7 +58,6 @@ pub async fn deployed_image_tags(client: &kclient::Client) -> Result<BTreeMap<St
 /// top level is not an array or whose entries carry no `url` string: a
 /// pre-flight parser must never silently degrade to an empty set (that
 /// would pass the parity-selfhosted "no upstreams" check on garbage).
-#[allow(dead_code)]
 pub fn upstream_urls(json_out: &str) -> Result<BTreeSet<String>> {
     let v: serde_json::Value =
         serde_json::from_str(json_out.trim()).context("parse `upstream list --json` output")?;
@@ -83,7 +76,6 @@ pub fn upstream_urls(json_out: &str) -> Result<BTreeSet<String>> {
 }
 
 /// Assert a tenant's upstream set is exactly `expected`.
-#[allow(dead_code)]
 pub fn check_upstreams(tenant: &str, got: &BTreeSet<String>, expected: &[&str]) -> Result<()> {
     let want: BTreeSet<String> = expected.iter().map(|s| (*s).to_owned()).collect();
     if *got != want {
@@ -101,7 +93,6 @@ pub fn check_upstreams(tenant: &str, got: &BTreeSet<String>, expected: &[&str]) 
 /// `[build_policy."<tenant>"]` entry: `keep_going` is always true for
 /// campaign tenants; `force_build_roots` is per campaign mode.
 /// `policy_toml` is the ConfigMap's `gateway.toml` content.
-#[allow(dead_code)]
 pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bool) -> Result<()> {
     let v: toml::Table = policy_toml.parse().context(
         "parse gateway.toml from the rio-system/rio-gateway-config ConfigMap (key `gateway.toml`)",
@@ -135,9 +126,6 @@ pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bo
 /// engine image is pushed and pulled as). Pure so the message stays
 /// unit-tested; the launch pre-flight calls it for rio-gateway and
 /// rio-scheduler.
-// Consumed by `parity launch` (landing next); the allow comes off with
-// its first user.
-#[allow(dead_code)]
 pub fn check_image_tag(component: &str, got: &str, want: &str) -> Result<()> {
     if got == want {
         return Ok(());
@@ -154,7 +142,6 @@ pub fn check_image_tag(component: &str, got: &str, want: &str) -> Result<()> {
 /// (rendered by the chart's `rio.gatewayToml` named template; present
 /// whenever parity.enabled=true or any explicit gateway.buildPolicy
 /// entry is set). `None` ⇒ the chart was deployed without any of it.
-#[allow(dead_code)]
 pub async fn read_build_policy(client: &kclient::Client) -> Result<Option<String>> {
     kclient::get_configmap_key(client, crate::k8s::NS, "rio-gateway-config", "gateway.toml").await
 }
@@ -181,7 +168,6 @@ const PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// RPC without depending on its (not-yet-generated) message types: send
 /// an empty unary request to the full method path and classify the
 /// status. `sched_addr` is `host:port` of a port-forwarded scheduler.
-#[allow(dead_code)]
 pub async fn probe_query_derivation_statuses(sched_addr: &str) -> Result<bool> {
     probe_query_derivation_statuses_with(sched_addr, PROBE_CONNECT_TIMEOUT, PROBE_CALL_TIMEOUT)
         .await
@@ -290,9 +276,13 @@ force_build_roots = false
 keep_going = true
 force_build_roots = false
 "#;
-        check_build_policy(policy, "parity-leaf", true).unwrap();
-        check_build_policy(policy, "parity-selfhosted", false).unwrap();
-        check_build_policy(policy, "parity-warm", false).unwrap();
+        // Expectations come from the shared tenant matrix — the same table
+        // `parity launch` provisions from and pre-flights against — so the
+        // chart fixture above and the launch path cannot drift apart
+        // silently.
+        for (tenant, _, force_build_roots) in super::super::TENANT_MATRIX {
+            check_build_policy(policy, tenant, force_build_roots).unwrap();
+        }
         // Wrong flag and missing tenant both refuse, and both name the
         // fix (values override / redeploy with --deploy-parity).
         let err = check_build_policy(policy, "parity-leaf", false).unwrap_err();

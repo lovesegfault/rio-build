@@ -9214,6 +9214,7 @@ dependencies = [
  "reqwest",
  "rio-common",
  "rio-crds",
+ "rio-parity",
  "rio-proto",
  "rio-scheduler",
  "rio-test-support",
