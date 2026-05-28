@@ -811,6 +811,10 @@ impl DagActor {
         // build_derivations link as history). The durable half of this
         // prune — deleting the same builds' build_derivations links —
         // already committed inside persist_merge_to_db's transaction;
+        // accepted residual: if the leader dies after that commit but
+        // before this in-memory fan-out runs, a prior single-derivation
+        // build can be recovered as Active with zero remaining links and
+        // only completes via its per-build timeout.
         // both sides are driven by displaced_prior_interest so they
         // cannot diverge. Runs after the point of no return (the build
         // is already committed), so a later rollback can no longer occur.
