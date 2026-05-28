@@ -108,6 +108,9 @@ impl SchedulerDb {
     /// transaction committed and `Ok(false)` when the fence aborted it
     /// (nothing written).
     // r[impl sched.executor.pull-transaction]
+    // The argument list mirrors the row pair this single transaction
+    // writes (same precedent as the other multi-column writers).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn mint_pull_attempt_fenced(
         &self,
         derivation_id: Uuid,

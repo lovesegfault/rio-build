@@ -122,6 +122,8 @@
     "rio_scheduler_poison_fleet_exhausted_total",
     "rio_scheduler_prefetch_hints_sent_total",
     "rio_scheduler_prefetch_paths_sent_total",
+    "rio_scheduler_pull_establishments_total",
+    "rio_scheduler_pull_rejected_total",
     "rio_scheduler_queue_backpressure",
     "rio_scheduler_queue_depth",
     "rio_scheduler_reconcile_deferred_total",
@@ -619,7 +621,7 @@
       {
         "name": "rio_scheduler_attempt_requeue_seconds",
         "kind": "histogram",
-        "help": "OA1 interval (ii): scheduler-side terminal/death observation → the event that closes the released attempt and (re)queues the derivation, by cause. cause=worker-report: the worker's own failure report and the requeue, same actor turn (the sample is the in-turn processing latency). cause=pod-terminal: disconnect observation → the controller's classifying termination report consumed. cause=establishment: disconnect observation → the TTL-sweep establishment fill. In stream mode the requeue itself happens at the disconnect, so the pod-terminal/establishment samples measure how long the released attempt waited for its classification — the controller-report-slack input the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
+        "help": "OA1 interval (ii): scheduler-side terminal/death observation → the event that closes the released attempt and (re)queues the derivation, by cause. cause=worker-report: the worker's own failure report and the requeue, same actor turn (the sample is the in-turn processing latency). cause=pod-terminal: disconnect observation → the controller's classifying termination report consumed. cause=establishment: disconnect observation → the TTL-sweep establishment fill. cause=synthesized: a controller-synthesized cancelled/preempted/reaped verdict closed an open pull attempt charge-free (in-turn latency, AD5). cause=worker-abort: the builder's SIGTERM-abort report closed a still-wanted pull attempt charge-free (in-turn latency, AD5). In stream mode the requeue itself happens at the disconnect, so the pod-terminal/establishment samples measure how long the released attempt waited for its classification — the controller-report-slack input the executor-replacement establishment window is sized against (executor-lifecycle campaign, OA1)."
       },
       {
         "name": "rio_scheduler_backstop_timeouts_total",
@@ -845,6 +847,16 @@
         "name": "rio_scheduler_prefetch_paths_sent_total",
         "kind": "counter",
         "help": "Total paths in sent PrefetchHints. Divide by hints_sent for avg paths-per-hint."
+      },
+      {
+        "name": "rio_scheduler_pull_establishments_total",
+        "kind": "counter",
+        "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
+      },
+      {
+        "name": "rio_scheduler_pull_rejected_total",
+        "kind": "counter",
+        "help": "Pull-mode unaries rejected for identity reasons (labels: rpc = pull_assignment|report_outcome, reason = unauthenticated|token_mismatch). A sustained rate means a pod fleet holds mis-bound/expired executor tokens or an HMAC rotation skew — the rejected pods exit nonzero and their logs are ephemeral, so this counter is the alertable trace."
       },
       {
         "name": "rio_scheduler_queue_backpressure",

@@ -1308,21 +1308,19 @@ fn annotated_pod(intent_id: &str, pull_mode: bool) -> Pod {
 /// with the pull-mode container env.
 fn annotated_job(intent_id: &str, pull_mode: bool) -> Job {
     let mut j = running_job_for_intent("rio-builder-p-job1", intent_id);
-    if pull_mode {
-        if let Some(spec) = j.spec.as_mut() {
-            spec.template.spec = Some(k8s_openapi::api::core::v1::PodSpec {
-                containers: vec![k8s_openapi::api::core::v1::Container {
-                    name: "executor".into(),
-                    env: Some(vec![k8s_openapi::api::core::v1::EnvVar {
-                        name: "RIO_DISPATCH_MODE".into(),
-                        value: Some("pull".into()),
-                        ..Default::default()
-                    }]),
+    if pull_mode && let Some(spec) = j.spec.as_mut() {
+        spec.template.spec = Some(k8s_openapi::api::core::v1::PodSpec {
+            containers: vec![k8s_openapi::api::core::v1::Container {
+                name: "executor".into(),
+                env: Some(vec![k8s_openapi::api::core::v1::EnvVar {
+                    name: "RIO_DISPATCH_MODE".into(),
+                    value: Some("pull".into()),
                     ..Default::default()
-                }],
+                }]),
                 ..Default::default()
-            });
-        }
+            }],
+            ..Default::default()
+        });
     }
     j
 }
