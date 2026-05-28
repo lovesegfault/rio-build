@@ -773,8 +773,11 @@ let
         # pointing --workspace-remap at the copy gives nextest a
         # writable root to create target/nextest/<profile>/ under.
         # The copy is cheap (~5 MB of Cargo.toml + src/**.rs; no
-        # target/ or deps). cp --no-preserve=mode because store paths
-        # are r-xr-xr-x and we need to write into the tree.
+        # target/ or deps). Member sources are copied WITH their mode
+        # bits: committed test fixtures can carry executable bits that
+        # tests assert on (rio-parity's archive fixture run.sh), so
+        # writability comes from the explicit chmod below rather than
+        # cp --no-preserve=mode, which would strip the exec bits.
         ws=$TMPDIR/ws
         ${
           if member == null then
@@ -782,7 +785,7 @@ let
             # scan their own src/ at runtime (grep_emitted_names). Use
             # the full workspace source — per-crate cache isolation
             # doesn't apply to the aggregate anyway.
-            "cp -r --no-preserve=mode ${workspaceSrc} $ws"
+            "cp -r ${workspaceSrc} $ws"
           else
             # Per-member run: manifests-only base + overlay just the
             # target member's full src/. Other members stay manifests-
@@ -792,10 +795,13 @@ let
               cp -r --no-preserve=mode ${nextestRunSrc} $ws
               ${lib.optionalString (memberRuntimeSrcs ? ${member}) ''
                 rm -rf $ws/${member}
-                cp -r --no-preserve=mode ${memberRuntimeSrcs.${member}} $ws/${member}
+                cp -r ${memberRuntimeSrcs.${member}} $ws/${member}
               ''}
             ''
         }
+        # Store-path copies arrive read-only; nextest and the tests
+        # need a writable tree.
+        chmod -R u+w $ws
 
         # HOME stays /homeless-shelter — deliberately NOT set to a
         # writable dir. Several tests probe for a working nix-daemon/
