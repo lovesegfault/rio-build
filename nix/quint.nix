@@ -2857,60 +2857,54 @@ in
     # Executor-lifecycle campaign (#1), Phase 0 Stage B: the AS-BUILT
     # scheduler⇄executor session protocol.
     #
-    # Model S (executorSession.qnt) — the scheduler's session state
-    # machine: registration/dual-register, heartbeat reconcile
-    # (keep/adopt/two-strike phantom), the dispatch push and its
-    # rollback, completion intake (capacity hoist, one-shot drain,
-    # idempotency/staleness guards), disconnect with the I-056a
-    # stale-epoch filter, the worker-time reaper with stall credit, the
-    # recently_disconnected correlation/establishment lifecycle,
-    # draining flags, and the failover convergence machinery. Two
-    # executor slots, two derivations, bucketed time; budgets/charges
-    # are imported from retryPolicy.qnt (see the model header's
-    # assume-guarantee checklist), the controller's Job tick from
-    # spawnCoherence.qnt, the lease from leaderElection.qnt.
+    # Model S (executorSession.qnt) — RE-TARGETED at 1c' to the pull
+    # protocol as landed (T-1c'.5): the PullAssignment admission and
+    # fenced mint, the ReportOutcome intake (fold_report + the AD5
+    # abort arm), the controller's idempotent ReportAttemptOutcome
+    # (second installment / synthesized verdict / no-attempt no-op),
+    # the establishment sweep over the durable open-attempt view
+    # (store-probe adopt arm + the C2 charge arm), the claims-floor
+    # generation fence, and the pod's own bounded lifecycle around
+    # them (the OA6(a) NotYetReady wait state, the charge-free idle
+    # exit, death, replacement). One intent, bucketed time;
+    # budgets/charges are imported from retryPolicy.qnt's pull-mode
+    # regime, the spawn/Job lifecycle from spawnCoherence.qnt, the
+    # lease from leaderElection.qnt (see the model header's
+    # assume-guarantee checklist).
+    #
+    # The Stage-B AS-BUILT encoding of the stream session machinery is
+    # frozen, unwired, as executorSessionAsBuilt.qnt (P14); the
+    # deletion-wave revert would re-wire it. Its retired checks and the
+    # disposition of every retired witness/calibration check are
+    # recorded in the invariant map's Phase-1c' re-target record.
     #
     # Model D (executorDelivery.qnt) — the builder's delivery
     # choreography at await-point granularity: the permanent sink, the
     # relay swap-after-confirmed-open, the stream-local in-flight cell,
     # the half-close flush, the SIGTERM drain gate, the idle exit and
-    # the generation watermark. Discharges Model S's peer assumption
-    # (delivery-or-death, at-most-once).
+    # the generation watermark. Still the as-built (stream-era) builder
+    # — it retires with the 1d builder collapse, not with the 1c'
+    # scheduler deletion.
     #
-    # The invariant ↔ rule map and the Stage-B record (verdicts,
-    # bounds, encoding notes) are in
+    # The invariant ↔ rule map, the Stage-B record for the frozen
+    # as-built model, and the Phase-1c' re-target record (verdicts,
+    # bounds, retirements) are in
     # docs/spec/models/executor-invariant-map.md.
-    #
-    # NOTE (falsification adjudicated and fixed; held back on budget):
-    # the fault-leader and fault-persist regimes of Model S falsified
-    # unresolvedClaimHasRepairArmed on the AS-BUILT encoding (a
-    # post-failover deferred-then-unrevisited Assigned derivation).
-    # The campaign owner adjudicated it a real defect; the scheduler
-    # now re-arms the reconcile sweep whenever its collection pass
-    # defers a claim (rio-scheduler/src/actor/recovery.rs,
-    # handle_reconcile_assignments), the model encodes the fixed
-    # behavior (reconcileSweep keeps reconcilePending set while any
-    # claim was deferred), and the invariant no longer falsifies in
-    # either regime's re-run. Their exhaustive cfgs stay unwired on
-    # per-check cost grounds only: at the witness-preserving bounds
-    # they exceed the gate budget, the same stop-and-report class as
-    # fault-stream-conn / fault-process below (figures in the
-    # model-flip commit message), so they are documented manual
-    # targets in the invariant map's adjudication record, and their
-    # witness checks below stay wired so the contended states remain
-    # pinned reachable.
 
-    # The base regime: no faults — registration, dispatch, builder
-    # accept/reject, completion intake, the one-shot drain, SIGTERM /
-    # admin draining, voluntary exits and their disconnects (a
-    # one-shot exit goes stale and is reaped in worker time, so the
-    # reaper / liveness-window discipline and the repair-precedence
-    # idempotency guards are exercised here). Verifies the
-    # F1/F2/F3/F4/F5 invariant set plus the one-shot flag semantics on
-    # the happy-path interleavings.
+    # The base regime: the full pull lifecycle with no leader faults —
+    # forecast spawn before Ready, the bounded NotYetReady retry loop
+    # and its charge-free idle exit (OA6(a)), delivery and idempotent
+    # re-pull, the worker report (success / failure / abort), pod death
+    # with and without uploaded outputs, the controller's no-attempt
+    # no-op / second installment / synthesized verdict, and both
+    # establishment arms. Verifies the re-targeted invariant set:
+    # at-most-one-open-attempt, NotYetReady inertness, the re-based
+    # repair-armed property, no fabricated completion, the
+    # establishment-window discipline and the per-attempt
+    # classification dedup.
     # r[verify sched.executor.one-shot]
-    # r[verify sched.executor.liveness-window]
-    # r[verify sched.executor.repair-precedence]
+    # r[verify sched.executor.pull-not-ready]
+    # r[verify sched.attempt.establishment-window+2]
     quint-executor-session-base = mkQuintCheck {
       name = "executor-session-base";
       spec = "executorSession";
@@ -2918,32 +2912,20 @@ in
       invariants = [ "allInvariants" ];
     };
 
-    # fault-stream is split into two cfgs (the campaign plan's
-    # pre-registered demote-or-split fallback, taken for per-check
-    # cost; the design's per-class budgets are unchanged): message
-    # faults and connection faults.
-    #
-    # fault-stream-msg: assignment-message loss, duplicate assignment
-    # delivery and try_send failure (the rollback path).
-    quint-executor-session-fault-stream-msg = mkQuintCheck {
-      name = "executor-session-fault-stream-msg";
+    # The fault-leader regime: one leader failover (claim-before-serve
+    # floor ratchet) plus below-floor write attempts by a deposed
+    # believer. The durable open-attempt state must survive the
+    # failover untouched, the post-failover authority keeps serving
+    # pulls off the durable rows, and every stale-authority transaction
+    # is fenced to a no-op — StaleAuthorityWritesAreInert, the checked
+    # successor of the dual-belief residual the as-built model priced
+    # (T-0e.2 / the 1c' lease-checklist re-derivation).
+    quint-executor-session-fault-leader = mkQuintCheck {
+      name = "executor-session-fault-leader";
       spec = "executorSession";
-      main = "executorSessionFaultStreamMsg";
+      main = "executorSessionFaultLeader";
       invariants = [ "allInvariants" ];
     };
-
-    # fault-stream-conn (bridge half-death, connection drop, heartbeat
-    # loss) and fault-process (pod death, wedge, heartbeat silence)
-    # exist as regime modules and hold every invariant in deep random
-    # simulation, but their exhaustive runs do NOT converge within a
-    # gate-compatible budget at the recorded witness-preserving bounds
-    # (figures in the wiring commit message). Per the campaign plan's
-    # demotion floor that is a stop-and-report for the campaign owner,
-    # not a recorded fallback, so their exhaustive cfgs are not wired
-    # here yet; their witness checks below stay in the gate (the
-    # contended states remain pinned reachable), and the invariant
-    # map's Stage-B record carries the full account alongside the
-    # fault-leader/fault-persist adjudication record above.
 
     # Model D, base regime: the happy-path delivery choreography plus
     # the SIGTERM drain and idle-exit orderings.
@@ -2977,85 +2959,93 @@ in
       invariants = [ "allInvariants" ];
     };
 
-    # Non-vacuity witnesses for Model S (the §3.5 pre-registered list
-    # plus three establishment/rollback/race-ahead probes). Each check
+    # Non-vacuity witnesses for the re-targeted Model S. Each check
     # passes only when the contended state is still reachable in the
-    # named regime.
-    quint-executor-session-witness-phantom = mkQuintWitnessCheck {
-      name = "executor-session-witness-phantom";
+    # named regime. The first two are the OA6(a) reachability pair the
+    # 1c' plan names (the warm-start delivery after NotYetReady, and
+    # the never-Ready charge-free idle exit); the rest pin every
+    # closer/repair path of the open-attempt row plus the orphaned
+    # open attempt and the report-idempotency arms. The retired
+    # as-built witnesses (phantom, drain-pending, half-dead,
+    # stale-epoch, rollback, adopt, failover-inflight,
+    # deposed-believer, reap-after-stall, two-channel-death,
+    # establishment, race-ahead) are recorded with their dispositions
+    # in the invariant map's Phase-1c' re-target record.
+    quint-executor-session-witness-warm-start = mkQuintWitnessCheck {
+      name = "executor-session-witness-warm-start";
       spec = "executorSession";
       main = "executorSessionBase";
-      witness = "noPhantomDrain";
+      witness = "canReachWarmStartDeliver";
     };
-    quint-executor-session-witness-drain-pending = mkQuintWitnessCheck {
-      name = "executor-session-witness-drain-pending";
+    quint-executor-session-witness-idle-exit = mkQuintWitnessCheck {
+      name = "executor-session-witness-idle-exit";
       spec = "executorSession";
       main = "executorSessionBase";
-      witness = "noDrainWithPendingCompletion";
-    };
-    quint-executor-session-witness-half-dead = mkQuintWitnessCheck {
-      name = "executor-session-witness-half-dead";
-      spec = "executorSession";
-      main = "executorSessionFaultStreamConn";
-      witness = "noHalfDeadStream";
-    };
-    # The I-056a stale-epoch-behind-a-rebound state stays pinned
-    # reachable while the conn regime's exhaustive cfg awaits the
-    # budget adjudication.
-    # r[verify sched.executor.session-epoch]
-    quint-executor-session-witness-stale-epoch = mkQuintWitnessCheck {
-      name = "executor-session-witness-stale-epoch";
-      spec = "executorSession";
-      main = "executorSessionFaultStreamConn";
-      witness = "noStaleEpochDisconnect";
-    };
-    quint-executor-session-witness-rollback = mkQuintWitnessCheck {
-      name = "executor-session-witness-rollback";
-      spec = "executorSession";
-      main = "executorSessionFaultStreamMsg";
-      witness = "noRollback";
-    };
-    quint-executor-session-witness-adopt = mkQuintWitnessCheck {
-      name = "executor-session-witness-adopt";
-      spec = "executorSession";
-      main = "executorSessionFaultLeader";
-      witness = "noAdopt";
-    };
-    quint-executor-session-witness-failover-inflight = mkQuintWitnessCheck {
-      name = "executor-session-witness-failover-inflight";
-      spec = "executorSession";
-      main = "executorSessionFaultLeader";
-      witness = "noFailoverWithInflight";
-    };
-    quint-executor-session-witness-deposed-believer = mkQuintWitnessCheck {
-      name = "executor-session-witness-deposed-believer";
-      spec = "executorSession";
-      main = "executorSessionFaultLeader";
-      witness = "noDeposedBeliever";
-    };
-    quint-executor-session-witness-reap-after-stall = mkQuintWitnessCheck {
-      name = "executor-session-witness-reap-after-stall";
-      spec = "executorSession";
-      main = "executorSessionFaultProcess";
-      witness = "noReapAfterStall";
-    };
-    quint-executor-session-witness-two-channel-death = mkQuintWitnessCheck {
-      name = "executor-session-witness-two-channel-death";
-      spec = "executorSession";
-      main = "executorSessionFaultProcess";
-      witness = "noDeathByTwoChannels";
+      witness = "canReachNeverReadyIdleExit";
     };
     quint-executor-session-witness-establishment = mkQuintWitnessCheck {
       name = "executor-session-witness-establishment";
       spec = "executorSession";
-      main = "executorSessionFaultProcess";
-      witness = "noEstablishment";
+      main = "executorSessionBase";
+      witness = "canReachEstablishmentCharge";
     };
-    quint-executor-session-witness-race-ahead = mkQuintWitnessCheck {
-      name = "executor-session-witness-race-ahead";
+    quint-executor-session-witness-store-adopt = mkQuintWitnessCheck {
+      name = "executor-session-witness-store-adopt";
       spec = "executorSession";
-      main = "executorSessionFaultProcess";
-      witness = "noRaceAheadReport";
+      main = "executorSessionBase";
+      witness = "canReachStoreProbeAdopt";
+    };
+    quint-executor-session-witness-synthesized-close = mkQuintWitnessCheck {
+      name = "executor-session-witness-synthesized-close";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachSynthesizedClose";
+    };
+    quint-executor-session-witness-second-installment = mkQuintWitnessCheck {
+      name = "executor-session-witness-second-installment";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachSecondInstallment";
+    };
+    quint-executor-session-witness-repull = mkQuintWitnessCheck {
+      name = "executor-session-witness-repull";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachIdempotentRepull";
+    };
+    quint-executor-session-witness-orphaned-attempt = mkQuintWitnessCheck {
+      name = "executor-session-witness-orphaned-attempt";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachOrphanedOpenAttempt";
+    };
+    quint-executor-session-witness-late-report = mkQuintWitnessCheck {
+      name = "executor-session-witness-late-report";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachLateReportIgnored";
+    };
+    quint-executor-session-witness-no-attempt-noop = mkQuintWitnessCheck {
+      name = "executor-session-witness-no-attempt-noop";
+      spec = "executorSession";
+      main = "executorSessionBase";
+      witness = "canReachNoAttemptNoop";
+    };
+    # The two fault-leader probes: a below-floor authority actually
+    # attempts a write and is fenced (StaleAuthorityWritesAreInert is
+    # not vacuous), and the post-failover authority serves a pull off
+    # the durable rows.
+    quint-executor-session-witness-stale-fenced = mkQuintWitnessCheck {
+      name = "executor-session-witness-stale-fenced";
+      spec = "executorSession";
+      main = "executorSessionFaultLeader";
+      witness = "canReachStaleFenced";
+    };
+    quint-executor-session-witness-post-failover-deliver = mkQuintWitnessCheck {
+      name = "executor-session-witness-post-failover-deliver";
+      spec = "executorSession";
+      main = "executorSessionFaultLeader";
+      witness = "canReachPostFailoverDeliver";
     };
 
     # Non-vacuity witnesses for Model D.
@@ -3093,41 +3083,36 @@ in
     # ---- Executor-lifecycle Stage-C calibration witnesses -------------
     # The executor-lifecycle (campaign #1) historical-fix corpus replayed
     # against Models S and D (executor-invariant-map.md, the Stage-C
-    # calibration section). Each check instantiates the as-built model,
-    # swaps ONE action for its PRE-FIX behavior (the calibration module's
+    # calibration section). Each check instantiates a model, swaps ONE
+    # action for its PRE-FIX behavior (the calibration module's
     # `calibStep`) and passes only while the checker still falsifies the
     # invariant the corresponding historical fix protects — machine-
     # checked evidence that the model would re-find that bug class if it
     # were reintroduced, and that the invariant is not vacuous for it.
-    # One representative per falsifying family with a plausible
-    # regression path and a cheap counterexample (the refcount/controller
-    # precedent); the remaining override modules under
-    # docs/spec/models/calibration/executor-*.qnt are evidence modules,
-    # re-runnable with the README recipe. Deliberately no tracey markers
-    # (the spec rules are verified by the HOLD regime checks above, not
-    # by these pre-fix reproductions).
-
-    # F1 (db457374f): losing the stream-epoch attribution lets a stale
-    # disconnect evict the legitimately reconnected worker (I-056a).
-    quint-executor-calib-f1-stale-epoch = mkQuintWitnessCheck {
-      name = "executor-calib-f1-stale-epoch";
-      spec = "calibration/executor-f1-stale-epoch";
-      main = "executorCalibF1StaleEpochApplies";
-      extraSpecs = [ "executorSession" ];
-      step = "calibStep";
-      witness = "staleStreamEventsAreInert";
-    };
-
-    # F2 scheduler half (0127cf854): losing the two-strike phantom drain
-    # leaves a confirmed phantom bound to the slot forever (I-035).
-    quint-executor-calib-f2-phantom-drain = mkQuintWitnessCheck {
-      name = "executor-calib-f2-phantom-drain";
-      spec = "calibration/executor-f2-phantom-no-drain";
-      main = "executorCalibF2PhantomNoDrain";
-      extraSpecs = [ "executorSession" ];
-      step = "calibStep";
-      witness = "confirmedPhantomIsDrained";
-    };
+    #
+    # 1c' flip (T-1c'.5): the wired Model-S calibration checks tracked
+    # the AS-BUILT stream machinery, which the deletion commits removed
+    # — the states they pinned are unconstructible by design on the
+    # pull path, so they are retired with records (the per-family
+    # "cannot recur by construction" verdicts are pre-staged in the
+    # invariant map's Phase-1c' re-target record):
+    #   - quint-executor-calib-f1-stale-epoch (stream-epoch attribution
+    #     — no streams, no epochs; per-unary identity + the generation
+    #     fence are the successors),
+    #   - quint-executor-calib-f2-phantom-drain (phantom two-strike —
+    #     no push channel, so a phantom binding cannot form),
+    #   - quint-executor-calib-f3-stall-credit (worker-time reaper
+    #     stall credit — no scheduler-side liveness reaper exists; the
+    #     Job lifecycle and the establishment window own liveness),
+    #   - quint-executor-calib-f5-closed-stream (closed-stream dispatch
+    #     exclusion — no scheduler-side placement decision exists).
+    # Their override modules stay under calibration/ as evidence over
+    # the frozen executorSessionAsBuilt.qnt, re-runnable with the
+    # README recipe. F4 re-encodes against the re-targeted model below;
+    # F2d (Model D, builder half) is unchanged until the 1d builder
+    # collapse. Deliberately no tracey markers (the spec rules are
+    # verified by the HOLD regime checks above, not by these pre-fix
+    # reproductions).
 
     # F2 builder half (8201db59b / bug_012 / bug_117): arming
     # completion_pending late and dropping the half-close lets a
@@ -3141,39 +3126,19 @@ in
       witness = "noExitWithReportOwed";
     };
 
-    # F3 (1757790f2): an uncredited actor stall consumes the heartbeat
-    # window and the reaper removes workers that are fresh in worker
-    # time (the I-178 family).
-    quint-executor-calib-f3-stall-credit = mkQuintWitnessCheck {
-      name = "executor-calib-f3-stall-credit";
-      spec = "calibration/executor-f3-stall-no-credit";
-      main = "executorCalibF3StallNoCredit";
+    # F4 (death attribution / the I-197 double-charge precondition),
+    # re-encoded against the re-targeted model: losing the
+    # establishment-window gate lets the establishment sweep charge an
+    # open attempt while its classifying report still has its window —
+    # the pull-path analog of the correlation-entry/last_completed
+    # discriminator the as-built representative pinned.
+    quint-executor-calib-f4-establishment-window = mkQuintWitnessCheck {
+      name = "executor-calib-f4-establishment-window";
+      spec = "calibration/executor-f4-pull-establish-early";
+      main = "executorCalibF4PullEstablishEarly";
       extraSpecs = [ "executorSession" ];
       step = "calibStep";
-      witness = "noReapWhileFreshInWorkerTime";
-    };
-
-    # F4 (the I-197 discriminator): losing the last_completed gate mints
-    # a correlation entry for an already-classified death — the
-    # double-charge precondition.
-    quint-executor-calib-f4-correlation-entry = mkQuintWitnessCheck {
-      name = "executor-calib-f4-correlation-entry";
-      spec = "calibration/executor-f4-entry-not-mid-build";
-      main = "executorCalibF4EntryNotMidBuild";
-      extraSpecs = [ "executorSession" ];
-      step = "calibStep";
-      witness = "correlationEntryLifecycle";
-    };
-
-    # F5 (96d8092b8): losing the closed-stream exclusion offers fresh
-    # work to a half-dead binding (I-095).
-    quint-executor-calib-f5-closed-stream = mkQuintWitnessCheck {
-      name = "executor-calib-f5-closed-stream";
-      spec = "calibration/executor-f5-offer-closed-stream";
-      main = "executorCalibF5OfferClosedStream";
-      extraSpecs = [ "executorSession" ];
-      step = "calibStep";
-      witness = "neverOfferUnrunnableWork";
+      witness = "establishmentOnlyAfterWindowCloses";
     };
 
     # ------------------------------------------------------------------

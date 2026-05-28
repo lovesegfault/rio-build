@@ -27,7 +27,7 @@
 // quint-executor-session-base check is the as-built baseline.
 // =========================================================================
 module executorCalibF1HijackAccepted {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -47,7 +47,7 @@ module executorCalibF1HijackAccepted {
     FUSE_FLIPS = 2,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX connectAccept: the live-stream hijack guard is gone — a new
   /// stream is accepted even while the existing binding is still live

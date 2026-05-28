@@ -18,7 +18,7 @@
 // the armed-safety invariant HOLDS — the bug class lives one level
 // down, in the obligation that the binding-holding family actually
 // resolves what it binds. That obligation is the
-// `confirmedPhantomIsDrained` invariant added to executorSession.qnt at
+// `confirmedPhantomIsDrained` invariant added to the as-built Model S (now frozen as executorSessionAsBuilt.qnt) at
 // Stage C (by construction on the as-built model: the confirming
 // heartbeat always clears the binding); this override is what falsifies
 // it. The prediction-vs-verdict correction is recorded in the
@@ -45,7 +45,7 @@
 // quint-executor-session-base check is the as-built baseline.
 // =========================================================================
 module executorCalibF2PhantomNoDrain {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -65,7 +65,7 @@ module executorCalibF2PhantomNoDrain {
     FUSE_FLIPS = 2,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX heartbeat: the accepted-heartbeat path with the
   /// confirmed-phantom resolution removed — the suspect is still marked

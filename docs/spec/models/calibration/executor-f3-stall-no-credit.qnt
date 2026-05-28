@@ -31,7 +31,7 @@
 // baseline.
 // =========================================================================
 module executorCalibF3StallNoCredit {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -51,7 +51,7 @@ module executorCalibF3StallNoCredit {
     FUSE_FLIPS = 2,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX handle_tick: identical to the as-built tick except that
   /// when an actor stall has occurred in this behaviour (the credit for

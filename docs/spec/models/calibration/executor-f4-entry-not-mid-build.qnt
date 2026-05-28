@@ -35,7 +35,7 @@
 // cfg is the open budget stop-and-report and is not re-attempted here).
 // =========================================================================
 module executorCalibF4EntryNotMidBuild {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -55,7 +55,7 @@ module executorCalibF4EntryNotMidBuild {
     FUSE_FLIPS = 1,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX deliverDisconnect: identical to the as-built action (epoch
   /// staleness, entry removal, leader-gated requeue) except that the

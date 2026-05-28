@@ -3719,3 +3719,139 @@ record only — no production read is implied, and the deletion-stage
 release remains gated by row D6 at deployment time. Recorded
 2026-05-28 by the slice-1c' first batch executing the campaign
 owner's instruction.
+
+### T-1c'.5 — Model S re-target record (the pull-protocol model, the witness/calibration flips, the check re-wiring)
+
+Recorded by the slice-1c' model-and-spec batch (Phase-1 plan v3,
+T-1c'.5), after deletion commits A–C removed the stream session
+machinery the Stage-B Model S encoded.
+
+#### The re-target and the freeze (P14)
+
+The Stage-B as-built Model S is frozen as
+`docs/spec/models/executorSessionAsBuilt.qnt` — module names carry the
+`AsBuilt` prefix, the file is unwired (no nix/quint.nix check builds
+it), and it is kept typechecking as the oracle for the Stage-C
+calibration evidence modules (whose imports are re-pointed at it) and
+as the encoding a deletion-wave revert would re-wire. The re-targeted
+model takes the `executorSession.qnt` name: state = the per-intent DAG
+readiness (wanted-but-not-Ready vs Ready — the OA6(a) pre-attempt wait
+state) × the pod lifecycle (spawn, bounded NotYetReady retry,
+charge-free idle exit, delivery, death, replacement) × the durable
+open-attempt row and its closers (worker report first installment, the
+controller's second installment / synthesized verdict / no-attempt
+no-op, the establishment sweep's adopt and charge arms) × the claims
+floor and the per-transaction generation fence. The session/heartbeat/
+dispatch/disconnect/reap/correlation actions of the as-built encoding
+have no successor actions — the machinery is deleted; the pull/report/
+establishment/synthesized-verdict actions ARE the model. Every action
+cites the post-deletion production function it encodes (admit_pull,
+mint_and_deliver / mint_pull_attempt_fenced, fold_report,
+handle_report_outcome, close_pull_attempt_uncharged,
+report_attempt_outcome_inner, tick_sweep_open_pull_attempts,
+establish_open_pull_attempt, the claims-floor GREATEST fence).
+
+Invariants carried by the re-targeted model:
+`StaleAuthorityWritesAreInert`, `AtMostOneOpenAttemptPerJob`,
+`NotYetReadyIsInert`, the re-based `unresolvedClaimHasRepairArmed`
+(in-flight ⇔ open-row coupling, with the cancelled-with-open-row
+carve-out whose armed repair is the synthesized-verdict close),
+`noFabricatedCompletion`, `establishmentOnlyAfterWindowCloses`
+(re-keyed to the dispatch-deadline + report-slack window), and
+`attemptResolvesAtMostOnce` (the dedup-state half of
+one-charge-per-death; the budget arithmetic stays imported from
+retryPolicy.qnt's pull regime), plus `boundsOK`.
+
+#### Verdict table (exhaustive TLC, allInvariants per regime)
+
+Distinct/generated state counts and wall-clocks are in the introducing
+commit message (volatile-figures discipline); this table records the
+verdicts.
+
+| Model / regime | Wired as | Verdict |
+|---|---|---|
+| S′ base (pull) | `quint-executor-session-base` | HOLD (search depth 21) |
+| S′ fault-leader (pull) | `quint-executor-session-fault-leader` | HOLD (search depth 24) |
+| D base / fault-stream / fault-process | unchanged (`quint-executor-delivery-*`) | unchanged — Model D retires at 1d, not here |
+
+Both regimes are exhaustive within the per-check budget (single-digit
+seconds of TLC each); no demote-to-manual fallback was needed. The
+0c stop-and-report item about the as-built fault-stream-conn /
+fault-process budget non-convergence is closed by this re-target: those
+regimes modeled machinery that no longer exists, and their exhaustive
+cfgs retire with it (see the check disposition table below) rather
+than awaiting a budget adjudication.
+
+The unresolvedClaimHasRepairArmed adjudication record above remains
+the historical record of the as-built falsification and its fix; the
+re-based form of that invariant HOLDS in both wired regimes of the
+re-targeted model.
+
+#### OA6(a) Model-S pricing: discharged
+
+The OA6 DECIDED block's consequence "the unary signature carries the
+third protocol state, priced into §4.2 rows 13/B7 and the re-targeted
+Model S at 1c'" and obligation-table row 6's option-(a) leg are
+discharged by this record: the NotYetReady wait state is in the model
+state space (pod `PWaiting` with `podSawNyr`), `NotYetReadyIsInert`
+HOLDS in the base and fault-leader regimes, and both OA6 reachability
+witnesses violate (the warm-start NotYetReady→Ready→Deliver path and
+the never-Ready charge-free idle exit are reachable):
+`quint-executor-session-witness-warm-start`,
+`quint-executor-session-witness-idle-exit`.
+
+#### Wired witness set (all expect-violation, all violating)
+
+Base regime: warm-start (OA6 i), idle-exit (OA6 ii), establishment
+charge, store-probe adopt, synthesized close, second installment,
+idempotent re-pull, orphaned open attempt, late-report ignored,
+no-attempt no-op. Fault-leader regime: stale-authority fenced,
+post-failover deliver. Every safety invariant's contended state is
+pinned by at least one of these (the at-most-one-open-attempt and
+repair-armed contention by the re-pull and orphaned-attempt witnesses,
+the NotYetReady inertness by the OA6 pair, the window discipline and
+charge dedup by the establishment/adopt/synthesized/second-installment
+witnesses, the fence by the stale-fenced witness).
+
+#### Check disposition table (what was retired, replaced, kept)
+
+| As-built check (pre-1c'.5) | Disposition |
+|---|---|
+| `quint-executor-session-base` (as-built) | replaced — same attr name, now the re-targeted base regime |
+| `quint-executor-session-fault-stream-msg` | retired with the stream machinery (message faults on a deleted channel); no successor regime — the pull path has no scheduler-side in-flight message to lose or duplicate (the unary reply is the delivery) |
+| as-built fault-stream-conn / fault-process / fault-leader / fault-persist regime modules (unwired manual targets) | retired with the machinery; the budget stop-and-report they were awaiting is closed (see above). The fault-leader CONTENT (failover + stale authority) is re-targeted as `quint-executor-session-fault-leader`; pod death is part of the re-targeted base regime (it is normal pull-path lifecycle, not a fault class) |
+| 12 as-built session witnesses (phantom, drain-pending, half-dead, stale-epoch, rollback, adopt, failover-inflight, deposed-believer, reap-after-stall, two-channel-death, establishment, race-ahead) | retired; the contended states they pinned either no longer exist by construction (phantom, half-dead, stale-epoch, rollback, adopt, drain-pending, reap-after-stall, two-channel-death, race-ahead — all keyed to deleted machinery) or are re-pinned by the new witness set (establishment → witness-establishment; failover-inflight / deposed-believer → witness-stale-fenced + witness-post-failover-deliver + witness-orphaned-attempt) |
+| `quint-executor-delivery-*` (Model D) + its 5 witnesses + `quint-executor-calib-f2d-exit-owed` | kept unchanged — Model D is the builder's delivery choreography and retires at 1d (T-1d.4), not with the scheduler deletion |
+
+#### Calibration flips (the 6 `quint-executor-calib-*` expect-violation checks)
+
+| Check | Flip | Record |
+|---|---|---|
+| `quint-executor-calib-f1-stale-epoch` | (a) retired | Stream-epoch attribution: no streams, no epochs, no disconnect events to mis-attribute. Cannot recur by construction on the pull path; the per-unary token↔intent binding plus the transaction-side generation fence are the successor identity discipline. Acceptance-table verdict pre-staged: "cannot recur by construction". |
+| `quint-executor-calib-f2-phantom-drain` | (a) retired | Phantom two-strike drain: a phantom (scheduler-believed-running build the worker no longer holds) required the push channel; with pull-only delivery the scheduler never believes a pod holds work it did not pull, and the establishment sweep resolves any open attempt whose pod stopped reporting. Cannot recur by construction. |
+| `quint-executor-calib-f3-stall-credit` | (a) retired | Worker-time reaper stall credit: there is no scheduler-side liveness reaper to mis-measure; liveness is the Job's lifecycle plus the establishment window (anchored to the dispatch-time deadline, which never shrinks at sweep time). Cannot recur by construction. |
+| `quint-executor-calib-f5-closed-stream` | (a) retired | Closed-stream dispatch exclusion: there is no scheduler-side placement decision left to exclude anything from; a pod pulls only its own intent. Cannot recur by construction. |
+| `quint-executor-calib-f4-correlation-entry` | (b) re-encoded | → `quint-executor-calib-f4-establishment-window` over the re-targeted model (`calibration/executor-f4-pull-establish-early.qnt`): dropping the establishment-window gate lets the sweep charge an attempt whose classifying report still has its window — the pull-path analog of the I-197 double-charge precondition. Verified violating (the override falsifies `establishmentOnlyAfterWindowCloses`). |
+| `quint-executor-calib-f2d-exit-owed` | kept | Model D / builder half; flips with Model D's retirement at 1d. |
+
+The retired families' override modules stay under
+`docs/spec/models/calibration/` as evidence over the frozen as-built
+model (imports re-pointed to `executorSessionAsBuilt`), re-runnable
+with the README recipe; the Phase-2 acceptance table consolidates or
+retires them, exactly as the retry campaign's precedent did.
+
+#### Verify-marker re-points (the five 0b rules; spec-consequence item 6)
+
+| Rule | Marker before | Marker after T-1c'.5 |
+|---|---|---|
+| `sched.executor.one-shot` | `quint-executor-session-base` (as-built) | re-pointed to the re-targeted `quint-executor-session-base` (the per-intent single open attempt + the one-pull pod lifecycle is the pull-era form of one-shot); the builder-side impl markers are unchanged |
+| `sched.executor.liveness-window` | `quint-executor-session-base` (as-built) | dropped from the model wiring — the rule text describes the deleted heartbeat/correlation windows; its successor content is `sched.attempt.establishment-window+2` (now carrying a model verify marker). The rule itself is retired/re-stated by the 1c' spec sweep. |
+| `sched.executor.repair-precedence` | `quint-executor-session-base` (as-built) | dropped from the model wiring — the 22-mechanism precedence it normed is gone; the surviving precedence (first classifier wins the durable row) is carried by `sched.executor.report-idempotent` / the establishment rules. Retired/re-stated by the 1c' spec sweep. |
+| `sched.executor.session-epoch` | `quint-executor-session-witness-stale-epoch` | dropped with the retired witness — no impl markers remain (deleted with commit A); the rule is retired by the 1c' spec sweep. |
+| `builder.completion.exactly-once-or-death` | `quint-executor-delivery-fault-stream` / `-fault-process` | unchanged (Model D, 1d scope). |
+
+New markers carried by the re-targeted wiring:
+`sched.executor.pull-not-ready` and
+`sched.attempt.establishment-window+2` on
+`quint-executor-session-base` (the model now machine-checks the
+NotYetReady inertness clause and the establishment-window discipline).

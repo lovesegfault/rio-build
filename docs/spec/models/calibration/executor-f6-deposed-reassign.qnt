@@ -31,7 +31,7 @@
 // per-check cost grounds and is not re-attempted exhaustively here).
 // =========================================================================
 module executorCalibF6DeposedReassign {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -51,7 +51,7 @@ module executorCalibF6DeposedReassign {
     FUSE_FLIPS = 0,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX deliverDisconnect: identical to the as-built action (epoch
   /// staleness handling, entry removal, correlation insert) except that

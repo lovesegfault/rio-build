@@ -38,7 +38,7 @@
 // (the exhaustive run is not re-attempted here).
 // =========================================================================
 module executorCalibF1StaleEpochApplies {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -58,7 +58,7 @@ module executorCalibF1StaleEpochApplies {
     FUSE_FLIPS = 2,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX deliverDisconnect: the oldest queued disconnect is applied
   /// as if it were current — no epoch attribution. The latch keeps the

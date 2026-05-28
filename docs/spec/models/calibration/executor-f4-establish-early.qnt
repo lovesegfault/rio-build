@@ -33,7 +33,7 @@
 // budget stop-and-report and is not re-attempted here).
 // =========================================================================
 module executorCalibF4EstablishBeforeWindow {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -53,7 +53,7 @@ module executorCalibF4EstablishBeforeWindow {
     FUSE_FLIPS = 1,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX handle_tick: identical to the as-built tick except that the
   /// establishment sweep consumes every present correlation entry,

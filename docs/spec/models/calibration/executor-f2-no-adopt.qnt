@@ -50,7 +50,7 @@
 // fault-leader evidence (same alphabet, strictly smaller budgets).
 // =========================================================================
 module executorCalibF2NoAdopt {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -70,7 +70,7 @@ module executorCalibF2NoAdopt {
     FUSE_FLIPS = 0,
     ADMIN_DRAINS = 0,
     SIGTERMS = 0
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// The contended state the adopt arm exists for: a derivation the
   /// scheduler holds Ready while a live worker is still building it.

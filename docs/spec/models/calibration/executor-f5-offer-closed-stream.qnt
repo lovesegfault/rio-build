@@ -29,7 +29,7 @@
 // (the exhaustive run is not re-attempted here).
 // =========================================================================
 module executorCalibF5OfferClosedStream {
-  import executorSession(
+  import executorSessionAsBuilt(
     EXECS = Set("e1", "e2"),
     DRVS = Set("d1"),
     EPOCH_CEIL = 2,
@@ -49,7 +49,7 @@ module executorCalibF5OfferClosedStream {
     FUSE_FLIPS = 2,
     ADMIN_DRAINS = 1,
     SIGTERMS = 1
-  ).* from "../executorSession"
+  ).* from "../executorSessionAsBuilt"
 
   /// PRE-FIX eligibility: the as-built hard_filter without the I-095
   /// closed-stream exclusion — a half-dead (SClosedTx) binding is still
