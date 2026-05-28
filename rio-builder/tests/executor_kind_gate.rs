@@ -10,7 +10,7 @@ use std::sync::atomic::AtomicBool;
 
 use rio_builder::executor::{DEFAULT_DAEMON_TIMEOUT, ExecutorEnv, ExecutorError, execute_build};
 use rio_builder::log_stream::LogLimits;
-use rio_proto::StoreServiceClient;
+use rio_builder::store_fetch::StoreClients;
 use rio_proto::types::ExecutorKind;
 use rio_proto::types::WorkAssignment;
 
@@ -60,10 +60,10 @@ async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<()
     let env = make_env(kind, dir.path());
     let assignment = make_assignment(drv, assignment_flag);
     // dead_channel: never dials — the gate fires before any gRPC call.
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
     let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
     let (upload_tx, _upload_rx) = tokio::sync::mpsc::channel(1);
-    execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 0)
+    execute_build(&assignment, &env, &store, &log_tx, &upload_tx, 0)
         .await
         .result
         .map(|_| ())
@@ -190,14 +190,14 @@ async fn banner_header_gated_on_first_attempt() {
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(ExecutorKind::Builder, dir.path());
     let assignment = make_assignment(NON_FOD_DRV, false);
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
 
     // First attempt (`first_line == 0`): header at line 0. The banner
     // travels on the log-upload channel (to rio-store), not the
     // scheduler control channel.
     let (log_tx, _rx) = tokio::sync::mpsc::channel(8);
     let (upload_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 0).await;
+    let outcome = execute_build(&assignment, &env, &store, &log_tx, &upload_tx, 0).await;
     drop(upload_tx);
     assert!(
         outcome.result.is_err(),
@@ -231,7 +231,7 @@ async fn banner_header_gated_on_first_attempt() {
     // Retry attempt (`first_line > 0`): no header re-sent; offset held.
     let (log_tx, _rx) = tokio::sync::mpsc::channel(8);
     let (upload_tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let outcome = execute_build(&assignment, &env, &mut store, &log_tx, &upload_tx, 3).await;
+    let outcome = execute_build(&assignment, &env, &store, &log_tx, &upload_tx, 3).await;
     drop(upload_tx);
     assert!(outcome.result.is_err());
     assert_eq!(
@@ -258,20 +258,13 @@ async fn pre_header_error_carries_caller_offset() {
     let dir = tempfile::tempdir().unwrap();
     let env = make_env(ExecutorKind::Fetcher, dir.path()); // wrong kind for NON_FOD_DRV
     let assignment = make_assignment(NON_FOD_DRV, false);
-    let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
+    let store = StoreClients::from_channel(rio_test_support::grpc::dead_channel());
 
     for first_line in [0u64, 7u64] {
         let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
         let (upload_tx, mut rx) = tokio::sync::mpsc::channel(1);
-        let outcome = execute_build(
-            &assignment,
-            &env,
-            &mut store,
-            &log_tx,
-            &upload_tx,
-            first_line,
-        )
-        .await;
+        let outcome =
+            execute_build(&assignment, &env, &store, &log_tx, &upload_tx, first_line).await;
         drop(log_tx);
         drop(upload_tx);
         assert!(matches!(

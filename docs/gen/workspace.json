@@ -99,6 +99,8 @@
       ],
       "optional": [],
       "dev": [
+        "rio-auth",
+        "rio-store",
         "rio-test-support"
       ]
     },

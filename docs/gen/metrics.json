@@ -394,7 +394,7 @@
       {
         "name": "rio_builder_upload_bytes_total",
         "kind": "counter",
-        "help": "Bytes uploaded to store via PutPath (nar_size on success)"
+        "help": "Novel chunk bytes streamed to the store via PutPathChunked. Chunks the store already holds durably are deduplicated and never counted, so this measures actual upload data movement, not output nar_size."
       },
       {
         "name": "rio_builder_upload_references_count",
@@ -404,12 +404,12 @@
       {
         "name": "rio_builder_upload_skipped_idempotent_total",
         "kind": "counter",
-        "help": "Output uploads skipped by the FindMissingPaths pre-check (path already complete in store). High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). The store's PutPath idempotency would no-op these server-side anyway; this counter measures the worker-side disk-read + NAR-stream savings."
+        "help": "Outputs skipped as already present in the store: the FindMissingPaths pre-check found every output complete, or the store reported created = false at PutPathChunked commit. High sustained rate = scheduler dispatching already-built derivations (race or CA early-cutoff). This counter measures the worker-side disk-read + chunk-stream savings."
       },
       {
         "name": "rio_builder_uploads_total",
         "kind": "counter",
-        "help": "Output uploads (labeled by status: success/adopted/exhausted; adopted = concurrent uploader won, result polled via QueryPathInfo)"
+        "help": "Output uploads (labeled by status: success = output committed via PutPathChunked, exhausted = retry budget spent without a commit)"
       }
     ],
     "controller": [

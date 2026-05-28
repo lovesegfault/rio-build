@@ -3,20 +3,16 @@
   "root": null,
   "workspaceMembers": {
     "rio-auth": "rio-auth",
-    "rio-authz-kernel": "rio-authz-kernel",
     "rio-builder": "rio-builder",
     "rio-cli": "rio-cli",
     "rio-common": "rio-common",
     "rio-controller": "rio-controller",
     "rio-crds": "rio-crds",
-    "rio-evidence-kernel": "rio-evidence-kernel",
     "rio-gateway": "rio-gateway",
     "rio-lease": "rio-lease",
-    "rio-log-kernel": "rio-log-kernel",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
     "rio-proto": "rio-proto",
-    "rio-retry-kernel": "rio-retry-kernel",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
@@ -2307,7 +2303,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "pin-project-lite",
@@ -3712,8 +3708,7 @@
         "type": "crates-io"
       },
       "resolvedDefaultFeatures": [
-        "alloc",
-        "std"
+        "alloc"
       ],
       "libCrateTypes": [
         "lib"
@@ -4090,10 +4085,6 @@
           "packageId": "num-traits"
         },
         {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
           "name": "wasm-bindgen",
           "packageId": "wasm-bindgen",
           "target": "cfg(all(target_arch = \"wasm32\", not(any(target_os = \"emscripten\", target_os = \"wasi\"))))"
@@ -4112,7 +4103,6 @@
         "js-sys",
         "now",
         "oldtime",
-        "serde",
         "std",
         "wasm-bindgen",
         "wasmbind",
@@ -4472,28 +4462,6 @@
       },
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "colored": {
-      "crateName": "colored",
-      "version": "3.1.1",
-      "edition": "2021",
-      "sha256": "0d5cpbgvyvmmky199s885s6385ykd75q6qg3d2kcxjxq563ldygs",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "windows-sys",
-          "packageId": "windows-sys 0.61.2",
-          "target": "cfg(windows)"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Thomas Wickham <mackwic@gmail.com>"
       ]
     },
     "combine": {
@@ -5579,76 +5547,6 @@
         "Acrimon <joel.wejdenstal@gmail.com>"
       ]
     },
-    "dashu-base": {
-      "crateName": "dashu-base",
-      "version": "0.4.1",
-      "edition": "2021",
-      "sha256": "12gjivqax003blwg9g9zrr4k1509042dnbgazxc8r9jsp3v0pf60",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jacob Zhong <cmpute@gmail.com>"
-      ]
-    },
-    "dashu-int": {
-      "crateName": "dashu-int",
-      "version": "0.4.1",
-      "edition": "2021",
-      "sha256": "1gwzvgzm21kw324s30lcknxm934vzwfv5fzg8k8a8d6a660d16gf",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "cfg-if",
-          "packageId": "cfg-if"
-        },
-        {
-          "name": "dashu-base",
-          "packageId": "dashu-base"
-        },
-        {
-          "name": "num-modular",
-          "packageId": "num-modular"
-        },
-        {
-          "name": "num-order",
-          "packageId": "num-order"
-        },
-        {
-          "name": "rustversion",
-          "packageId": "rustversion"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "static_assertions",
-          "packageId": "static_assertions"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "default",
-        "num-order",
-        "serde",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jacob Zhong <cmpute@gmail.com>",
-        "Tomek Czajka <tczajka@gmail.com>"
-      ]
-    },
     "data-encoding": {
       "crateName": "data-encoding",
       "version": "2.11.0",
@@ -5781,16 +5679,11 @@
         {
           "name": "powerfmt",
           "packageId": "powerfmt"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
         }
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "powerfmt",
-        "serde"
+        "powerfmt"
       ],
       "libCrateTypes": [
         "lib"
@@ -11330,7 +11223,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "slab",
@@ -11392,7 +11285,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "slab",
@@ -11504,24 +11397,6 @@
       ],
       "authors": [
         "Jon Gjengset <jon@thesquareplanet.com>"
-      ]
-    },
-    "hashbrown 0.12.3": {
-      "crateName": "hashbrown",
-      "version": "0.12.3",
-      "edition": "2021",
-      "sha256": "1268ka4750pyg2pbgsr43f0289l5zah4arir2k4igx5a8c6fg7la",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "raw"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Amanieu d'Antras <amanieu@gmail.com>"
       ]
     },
     "hashbrown 0.14.5": {
@@ -13004,40 +12879,7 @@
         "The rust-url developers"
       ]
     },
-    "indexmap 1.9.3": {
-      "crateName": "indexmap",
-      "version": "1.9.3",
-      "edition": "2021",
-      "sha256": "16dxmy7yvk51wvnih3a3im6fp5lmx0wx76i03n06wyak6cwhw1xx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "hashbrown",
-          "packageId": "hashbrown 0.12.3"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "autocfg",
-          "packageId": "autocfg"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "serde",
-        "serde-1",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "indexmap 2.14.0": {
+    "indexmap": {
       "crateName": "indexmap",
       "version": "2.14.0",
       "edition": "2024",
@@ -13302,39 +13144,6 @@
       ],
       "authors": [
         "bluss"
-      ]
-    },
-    "itf": {
-      "crateName": "itf",
-      "version": "0.4.0",
-      "edition": "2021",
-      "sha256": "080wnz5b9fdxh9virzzc7pilxzxa1cjd224jva0har8p7mxhnqjx",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "dashu-int",
-          "packageId": "dashu-int"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "serde_with",
-          "packageId": "serde_with"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Informal Systems <hello@informal.sytems>"
       ]
     },
     "itoa": {
@@ -14208,7 +14017,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -15066,7 +14875,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "ipnet",
@@ -15142,7 +14951,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "metrics",
@@ -15866,36 +15675,6 @@
       ],
       "authors": [
         "The Rust Project Developers"
-      ]
-    },
-    "num-modular": {
-      "crateName": "num-modular",
-      "version": "0.6.1",
-      "edition": "2018",
-      "sha256": "0zv4miws3q1i93a0bd9wgc4njrr5j5786kr99hzxi9vgycdjdfqp",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ]
-    },
-    "num-order": {
-      "crateName": "num-order",
-      "version": "1.2.0",
-      "edition": "2018",
-      "sha256": "1dhvdncf91ljxh9sawnfxcbiqj1gnag08lyias0cy3y4jxmmjysk",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "num-modular",
-          "packageId": "num-modular"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
       ]
     },
     "num-rational": {
@@ -17235,7 +17014,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         }
       ],
       "resolvedDefaultFeatures": [
@@ -17904,8 +17683,7 @@
       ],
       "resolvedDefaultFeatures": [
         "default",
-        "proc-macro",
-        "span-locations"
+        "proc-macro"
       ],
       "libCrateTypes": [
         "lib"
@@ -18513,92 +18291,6 @@
       ],
       "libCrateTypes": [
         "lib"
-      ]
-    },
-    "quint-connect": {
-      "crateName": "quint-connect",
-      "version": "0.1.1",
-      "edition": "2024",
-      "sha256": "0lgm9bid674c72m3703mym7wg2m4454hdp1pf28xya74d9kdhrka",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "colored",
-          "packageId": "colored"
-        },
-        {
-          "name": "itf",
-          "packageId": "itf"
-        },
-        {
-          "name": "quint-connect-macros",
-          "packageId": "quint-connect-macros"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.9.4"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "similar",
-          "packageId": "similar"
-        },
-        {
-          "name": "tempfile",
-          "packageId": "tempfile"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "version_check",
-          "packageId": "version_check"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Informal Systems Inc. <hello@informal.systems>"
-      ]
-    },
-    "quint-connect-macros": {
-      "crateName": "quint-connect-macros",
-      "version": "0.1.1",
-      "edition": "2024",
-      "sha256": "1zzaa6sag1h9ck022sbf154bba44wawamdbilvhsd3b79650zjnz",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        }
-      ],
-      "procMacro": true,
-      "authors": [
-        "Informal Systems Inc. <hello@informal.systems>"
       ]
     },
     "quote": {
@@ -19511,10 +19203,6 @@
           "packageId": "jsonwebtoken"
         },
         {
-          "name": "metrics",
-          "packageId": "metrics"
-        },
-        {
           "name": "rio-common",
           "packageId": "rio-common"
         },
@@ -19561,37 +19249,14 @@
           "packageId": "libc"
         },
         {
-          "name": "metrics-util",
-          "packageId": "metrics-util"
-        },
-        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "tempfile",
           "packageId": "tempfile"
-        },
-        {
-          "name": "tracing-test",
-          "packageId": "tracing-test"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-authz-kernel": {
-      "crateName": "rio-authz-kernel",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-authz-kernel"
-      },
       "libCrateTypes": [
         "lib"
       ],
@@ -19623,6 +19288,10 @@
         {
           "name": "clap",
           "packageId": "clap"
+        },
+        {
+          "name": "fastcdc",
+          "packageId": "fastcdc"
         },
         {
           "name": "fuser",
@@ -19665,10 +19334,6 @@
           "packageId": "rio-common"
         },
         {
-          "name": "rio-log-kernel",
-          "packageId": "rio-log-kernel"
-        },
-        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -19678,7 +19343,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "scopeguard",
@@ -19703,10 +19368,6 @@
         {
           "name": "sqlx",
           "packageId": "sqlx"
-        },
-        {
-          "name": "strum",
-          "packageId": "strum"
         },
         {
           "name": "thiserror",
@@ -19739,12 +19400,16 @@
       ],
       "devDependencies": [
         {
-          "name": "proptest",
-          "packageId": "proptest"
+          "name": "rio-auth",
+          "packageId": "rio-auth"
         },
         {
           "name": "rio-nix",
           "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-store",
+          "packageId": "rio-store"
         },
         {
           "name": "rio-test-support",
@@ -19772,10 +19437,6 @@
         "test-fixtures"
       ],
       "crateBin": [
-        {
-          "name": "quota_probe",
-          "path": "src/bin/quota_probe.rs"
-        },
         {
           "name": "rio-builder",
           "path": "src/main.rs"
@@ -19836,10 +19497,6 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
-        },
-        {
-          "name": "rio-log-kernel",
-          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-proto",
@@ -19928,10 +19585,6 @@
           "packageId": "futures-util"
         },
         {
-          "name": "http",
-          "packageId": "http 1.4.0"
-        },
-        {
           "name": "metrics-exporter-prometheus",
           "packageId": "metrics-exporter-prometheus"
         },
@@ -19957,7 +19610,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -19988,16 +19641,8 @@
           "packageId": "tonic-health"
         },
         {
-          "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
           "name": "tracing",
           "packageId": "tracing"
-        },
-        {
-          "name": "tracing-appender",
-          "packageId": "tracing-appender"
         },
         {
           "name": "tracing-opentelemetry",
@@ -20062,10 +19707,6 @@
           "packageId": "anyhow"
         },
         {
-          "name": "axum",
-          "packageId": "axum"
-        },
-        {
           "name": "clap",
           "packageId": "clap"
         },
@@ -20098,10 +19739,6 @@
           "packageId": "rand 0.10.1"
         },
         {
-          "name": "reqwest",
-          "packageId": "reqwest"
-        },
-        {
           "name": "rio-auth",
           "packageId": "rio-auth"
         },
@@ -20123,7 +19760,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -20168,10 +19805,6 @@
           "packageId": "metrics-util"
         },
         {
-          "name": "proptest",
-          "packageId": "proptest"
-        },
-        {
           "name": "prost",
           "packageId": "prost"
         },
@@ -20186,10 +19819,6 @@
         {
           "name": "tokio",
           "packageId": "tokio"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
         }
       ],
       "crateBin": [
@@ -20224,7 +19853,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -20249,21 +19878,6 @@
           "path": "src/bin/crdgen.rs"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-evidence-kernel": {
-      "crateName": "rio-evidence-kernel",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-evidence-kernel"
-      },
       "libCrateTypes": [
         "lib"
       ],
@@ -20333,10 +19947,6 @@
           "packageId": "rio-common"
         },
         {
-          "name": "rio-log-kernel",
-          "packageId": "rio-log-kernel"
-        },
-        {
           "name": "rio-nix",
           "packageId": "rio-nix"
         },
@@ -20350,7 +19960,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -20398,10 +20008,6 @@
         }
       ],
       "devDependencies": [
-        {
-          "name": "metrics-util",
-          "packageId": "metrics-util"
-        },
         {
           "name": "rio-migrations",
           "packageId": "rio-migrations"
@@ -20462,14 +20068,6 @@
           "packageId": "kube"
         },
         {
-          "name": "libc",
-          "packageId": "libc"
-        },
-        {
-          "name": "metrics",
-          "packageId": "metrics"
-        },
-        {
           "name": "parking_lot",
           "packageId": "parking_lot"
         },
@@ -20500,57 +20098,14 @@
       ],
       "devDependencies": [
         {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
           "name": "http",
           "packageId": "http 1.4.0"
         },
         {
-          "name": "itf",
-          "packageId": "itf"
-        },
-        {
-          "name": "metrics-util",
-          "packageId": "metrics-util"
-        },
-        {
-          "name": "quint-connect",
-          "packageId": "quint-connect"
-        },
-        {
           "name": "rio-test-support",
           "packageId": "rio-test-support"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
         }
       ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-log-kernel": {
-      "crateName": "rio-log-kernel",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-log-kernel"
-      },
       "libCrateTypes": [
         "lib"
       ],
@@ -20669,20 +20224,12 @@
           "packageId": "anyhow"
         },
         {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
           "name": "proptest",
           "packageId": "proptest"
         },
         {
           "name": "rstest",
           "packageId": "rstest"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
         },
         {
           "name": "tempfile",
@@ -20820,21 +20367,6 @@
         "Rio Contributors"
       ]
     },
-    "rio-retry-kernel": {
-      "crateName": "rio-retry-kernel",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-retry-kernel"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
     "rio-scheduler": {
       "crateName": "rio-scheduler",
       "version": "0.1.0",
@@ -20857,8 +20389,8 @@
           "packageId": "aws-sdk-ec2"
         },
         {
-          "name": "axum",
-          "packageId": "axum"
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
         },
         {
           "name": "base64",
@@ -20929,10 +20461,6 @@
           "packageId": "rio-common"
         },
         {
-          "name": "rio-evidence-kernel",
-          "packageId": "rio-evidence-kernel"
-        },
-        {
           "name": "rio-lease",
           "packageId": "rio-lease"
         },
@@ -20949,16 +20477,12 @@
           "packageId": "rio-proto"
         },
         {
-          "name": "rio-retry-kernel",
-          "packageId": "rio-retry-kernel"
-        },
-        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "serde",
@@ -21023,12 +20547,20 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
         }
       ],
       "devDependencies": [
         {
           "name": "aws-sdk-ec2",
           "packageId": "aws-sdk-ec2"
+        },
+        {
+          "name": "aws-sdk-s3",
+          "packageId": "aws-sdk-s3"
         },
         {
           "name": "aws-smithy-mocks",
@@ -21041,10 +20573,6 @@
         {
           "name": "http",
           "packageId": "http 1.4.0"
-        },
-        {
-          "name": "itf",
-          "packageId": "itf"
         },
         {
           "name": "metrics-util",
@@ -21063,10 +20591,6 @@
           "packageId": "proptest"
         },
         {
-          "name": "quint-connect",
-          "packageId": "quint-connect"
-        },
-        {
           "name": "rio-store",
           "packageId": "rio-store"
         },
@@ -21077,10 +20601,6 @@
         {
           "name": "rstest",
           "packageId": "rstest"
-        },
-        {
-          "name": "serde-saphyr",
-          "packageId": "serde-saphyr"
         },
         {
           "name": "tokio",
@@ -21182,10 +20702,6 @@
           "packageId": "hex"
         },
         {
-          "name": "http",
-          "packageId": "http 1.4.0"
-        },
-        {
           "name": "httpdate",
           "packageId": "httpdate"
         },
@@ -21210,20 +20726,8 @@
           "packageId": "rio-auth"
         },
         {
-          "name": "rio-authz-kernel",
-          "packageId": "rio-authz-kernel"
-        },
-        {
           "name": "rio-common",
           "packageId": "rio-common"
-        },
-        {
-          "name": "rio-evidence-kernel",
-          "packageId": "rio-evidence-kernel"
-        },
-        {
-          "name": "rio-log-kernel",
-          "packageId": "rio-log-kernel"
         },
         {
           "name": "rio-migrations",
@@ -21243,7 +20747,7 @@
         },
         {
           "name": "schemars",
-          "packageId": "schemars 1.2.1"
+          "packageId": "schemars"
         },
         {
           "name": "scopeguard",
@@ -21290,18 +20794,6 @@
           "packageId": "tonic-health"
         },
         {
-          "name": "tonic-web",
-          "packageId": "tonic-web"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
           "name": "tracing",
           "packageId": "tracing"
         },
@@ -21312,10 +20804,6 @@
         {
           "name": "workspace-hack",
           "packageId": "workspace-hack"
-        },
-        {
-          "name": "zstd",
-          "packageId": "zstd"
         }
       ],
       "devDependencies": [
@@ -21328,10 +20816,6 @@
           "packageId": "aws-smithy-mocks"
         },
         {
-          "name": "aws-smithy-runtime-api",
-          "packageId": "aws-smithy-runtime-api"
-        },
-        {
           "name": "axum",
           "packageId": "axum"
         },
@@ -21340,28 +20824,8 @@
           "packageId": "config"
         },
         {
-          "name": "itf",
-          "packageId": "itf"
-        },
-        {
-          "name": "metrics-util",
-          "packageId": "metrics-util"
-        },
-        {
           "name": "proptest",
           "packageId": "proptest"
-        },
-        {
-          "name": "prost",
-          "packageId": "prost"
-        },
-        {
-          "name": "prost-types",
-          "packageId": "prost-types"
-        },
-        {
-          "name": "quint-connect",
-          "packageId": "quint-connect"
         },
         {
           "name": "rio-store",
@@ -22683,43 +22147,7 @@
         "Steffen Butzer <steffen.butzer@outlook.com>"
       ]
     },
-    "schemars 0.9.0": {
-      "crateName": "schemars",
-      "version": "0.9.0",
-      "edition": "2021",
-      "sha256": "0pqncln5hqbzbl2r3yayyr4a82jjf93h2cfxrn0xamvx77wr3lac",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "dyn-clone",
-          "packageId": "dyn-clone"
-        },
-        {
-          "name": "ref-cast",
-          "packageId": "ref-cast"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Graham Esau <gesau@hotmail.co.uk>"
-      ]
-    },
-    "schemars 1.2.1": {
+    "schemars": {
       "crateName": "schemars",
       "version": "1.2.1",
       "edition": "2021",
@@ -23320,7 +22748,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "itoa",
@@ -23446,69 +22874,6 @@
         "Anthony Ramine <n.oxyde@gmail.com>"
       ]
     },
-    "serde_with": {
-      "crateName": "serde_with",
-      "version": "3.20.0",
-      "edition": "2021",
-      "sha256": "1qnddis0nz2yg0dl06fnhf2q3hkim0vraq8ac3xzl8xjnwn1qb77",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
-        },
-        {
-          "name": "serde_with_macros",
-          "packageId": "serde_with_macros"
-        }
-      ],
-      "resolvedDefaultFeatures": [
-        "alloc",
-        "default",
-        "macros",
-        "std"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Jonas Bushart",
-        "Marcin Kaźmierczak"
-      ]
-    },
-    "serde_with_macros": {
-      "crateName": "serde_with_macros",
-      "version": "3.20.0",
-      "edition": "2021",
-      "sha256": "1b5z2zs1flszvyfk2i5pky6qdigg82y467zlc81gpd7c723lh35r",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "darling",
-          "packageId": "darling"
-        },
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        }
-      ],
-      "procMacro": true,
-      "authors": [
-        "Jonas Bushart"
-      ]
-    },
     "serde_yaml": {
       "crateName": "serde_yaml",
       "version": "0.9.34+deprecated",
@@ -23520,7 +22885,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "itoa",
@@ -24024,27 +23389,6 @@
         "Hans Kratz <hans@appfour.com>"
       ]
     },
-    "similar": {
-      "crateName": "similar",
-      "version": "2.7.0",
-      "edition": "2018",
-      "sha256": "1aidids7ymfr96s70232s6962v5g9l4zwhkvcjp4c5hlb6b5vfxv",
-      "source": {
-        "type": "crates-io"
-      },
-      "resolvedDefaultFeatures": [
-        "default",
-        "text"
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Armin Ronacher <armin.ronacher@active-4.com>",
-        "Pierre-Étienne Meunier <pe@pijul.org>",
-        "Brandon Williams <bwilliams.eng@gmail.com>"
-      ]
-    },
     "sketches-ddsketch": {
       "crateName": "sketches-ddsketch",
       "version": "0.3.1",
@@ -24418,7 +23762,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "log",
@@ -25394,21 +24738,6 @@
         "Henry de Valence <hdevalence@hdevalence.ca>"
       ]
     },
-    "symlink": {
-      "crateName": "symlink",
-      "version": "0.1.0",
-      "edition": "2015",
-      "sha256": "02h1i0b81mxb4vns4xrvrfibpcvs7jqqav8p3yilwik8cv73r5x7",
-      "source": {
-        "type": "crates-io"
-      },
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Chris Morgan <me@chrismorgan.info>"
-      ]
-    },
     "syn": {
       "crateName": "syn",
       "version": "2.0.117",
@@ -25710,20 +25039,12 @@
           "packageId": "deranged"
         },
         {
-          "name": "itoa",
-          "packageId": "itoa"
-        },
-        {
           "name": "num-conv",
           "packageId": "num-conv"
         },
         {
           "name": "powerfmt",
           "packageId": "powerfmt"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
         },
         {
           "name": "time-core",
@@ -25733,10 +25054,7 @@
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
-        "formatting",
         "parsing",
-        "serde",
-        "serde-well-known",
         "std"
       ],
       "libCrateTypes": [
@@ -25782,9 +25100,7 @@
         }
       ],
       "resolvedDefaultFeatures": [
-        "formatting",
-        "parsing",
-        "serde"
+        "parsing"
       ],
       "procMacro": true,
       "authors": [
@@ -25838,7 +25154,6 @@
         "alloc",
         "default",
         "grab_spare_slice",
-        "std",
         "tinyvec_macros"
       ],
       "libCrateTypes": [
@@ -26252,7 +25567,7 @@
       "dependencies": [
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "toml_datetime",
@@ -26684,7 +25999,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "pin-project-lite",
@@ -26943,44 +26258,6 @@
       ],
       "authors": [
         "Eliza Weisman <eliza@buoyant.io>",
-        "Tokio Contributors <team@tokio.rs>"
-      ]
-    },
-    "tracing-appender": {
-      "crateName": "tracing-appender",
-      "version": "0.2.5",
-      "edition": "2018",
-      "sha256": "0g4a6q5s3wafid5lqw1ljzvh1nhk3a4zmb627fxv96dr7qcqc1h5",
-      "source": {
-        "type": "crates-io"
-      },
-      "dependencies": [
-        {
-          "name": "crossbeam-channel",
-          "packageId": "crossbeam-channel"
-        },
-        {
-          "name": "symlink",
-          "packageId": "symlink"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        },
-        {
-          "name": "time",
-          "packageId": "time"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Zeki Sherif <zekshi@amazon.com>",
         "Tokio Contributors <team@tokio.rs>"
       ]
     },
@@ -28182,7 +27459,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "wasm-encoder",
@@ -28254,7 +27531,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "semver",
@@ -29392,7 +28669,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "prettyplease",
@@ -29487,7 +28764,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "log",
@@ -29548,7 +28825,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "log",
@@ -29602,9 +28879,584 @@
       },
       "dependencies": [
         {
-          "name": "aho-corasick",
-          "packageId": "aho-corasick"
+          "name": "anstyle",
+          "packageId": "anstyle"
         },
+        {
+          "name": "aws-lc-rs",
+          "packageId": "aws-lc-rs"
+        },
+        {
+          "name": "aws-smithy-types",
+          "packageId": "aws-smithy-types"
+        },
+        {
+          "name": "base16ct",
+          "packageId": "base16ct 1.0.0"
+        },
+        {
+          "name": "base64",
+          "packageId": "base64 0.22.1"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "bitflags",
+          "packageId": "bitflags",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "byteorder",
+          "packageId": "byteorder"
+        },
+        {
+          "name": "bytes",
+          "packageId": "bytes"
+        },
+        {
+          "name": "chacha20",
+          "packageId": "chacha20"
+        },
+        {
+          "name": "cipher",
+          "packageId": "cipher"
+        },
+        {
+          "name": "crossbeam-epoch",
+          "packageId": "crossbeam-epoch"
+        },
+        {
+          "name": "crossbeam-utils",
+          "packageId": "crossbeam-utils"
+        },
+        {
+          "name": "crypto-bigint",
+          "packageId": "crypto-bigint 0.7.3"
+        },
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.1.6",
+          "rename": "crypto_common_c65f7effa3be6d31"
+        },
+        {
+          "name": "crypto-common",
+          "packageId": "crypto-common 0.2.2",
+          "rename": "crypto_common_6f8ce4dd05d13bba"
+        },
+        {
+          "name": "ctutils",
+          "packageId": "ctutils"
+        },
+        {
+          "name": "curve25519-dalek",
+          "packageId": "curve25519-dalek"
+        },
+        {
+          "name": "der",
+          "packageId": "der 0.8.0"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.10.7",
+          "rename": "digest_93f6ce9d446188ac"
+        },
+        {
+          "name": "digest",
+          "packageId": "digest 0.11.3",
+          "rename": "digest_a6292c17cd707f01"
+        },
+        {
+          "name": "ecdsa",
+          "packageId": "ecdsa 0.17.0-rc.18"
+        },
+        {
+          "name": "ed25519",
+          "packageId": "ed25519"
+        },
+        {
+          "name": "ed25519-dalek",
+          "packageId": "ed25519-dalek"
+        },
+        {
+          "name": "either",
+          "packageId": "either"
+        },
+        {
+          "name": "elliptic-curve",
+          "packageId": "elliptic-curve 0.14.0-rc.32"
+        },
+        {
+          "name": "event-listener-strategy",
+          "packageId": "event-listener-strategy"
+        },
+        {
+          "name": "fastrand",
+          "packageId": "fastrand"
+        },
+        {
+          "name": "futures",
+          "packageId": "futures"
+        },
+        {
+          "name": "futures-channel",
+          "packageId": "futures-channel"
+        },
+        {
+          "name": "futures-io",
+          "packageId": "futures-io"
+        },
+        {
+          "name": "futures-sink",
+          "packageId": "futures-sink"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "generic-array",
+          "packageId": "generic-array 0.14.9"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.3.4",
+          "rename": "getrandom_468e82937335b1c9"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.4.2",
+          "rename": "getrandom_9fbad63c4bcf4a8f",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "getrandom",
+          "packageId": "getrandom 0.4.2",
+          "rename": "getrandom_9fbad63c4bcf4a8f",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.16.1",
+          "rename": "hashbrown_986da7b5efc2b80e"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.17.1",
+          "rename": "hashbrown_9067fe90e8c1f593"
+        },
+        {
+          "name": "hex",
+          "packageId": "hex"
+        },
+        {
+          "name": "hybrid-array",
+          "packageId": "hybrid-array"
+        },
+        {
+          "name": "hyper",
+          "packageId": "hyper 1.9.0"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-rustls",
+          "packageId": "hyper-rustls",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "hyper-util",
+          "packageId": "hyper-util",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "indexmap",
+          "packageId": "indexmap"
+        },
+        {
+          "name": "inout",
+          "packageId": "inout 0.2.2"
+        },
+        {
+          "name": "jiff",
+          "packageId": "jiff"
+        },
+        {
+          "name": "k8s-openapi",
+          "packageId": "k8s-openapi"
+        },
+        {
+          "name": "kube",
+          "packageId": "kube"
+        },
+        {
+          "name": "kube-client",
+          "packageId": "kube-client"
+        },
+        {
+          "name": "kube-core",
+          "packageId": "kube-core"
+        },
+        {
+          "name": "libc",
+          "packageId": "libc"
+        },
+        {
+          "name": "libsqlite3-sys",
+          "packageId": "libsqlite3-sys"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "memchr",
+          "packageId": "memchr"
+        },
+        {
+          "name": "metrics-util",
+          "packageId": "metrics-util"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "miniz_oxide",
+          "packageId": "miniz_oxide",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.3",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "nix",
+          "packageId": "nix 0.31.3",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "num-integer",
+          "packageId": "num-integer"
+        },
+        {
+          "name": "num-traits",
+          "packageId": "num-traits"
+        },
+        {
+          "name": "once_cell",
+          "packageId": "once_cell"
+        },
+        {
+          "name": "ordered-float",
+          "packageId": "ordered-float 5.3.0"
+        },
+        {
+          "name": "p256",
+          "packageId": "p256 0.14.0-rc.9"
+        },
+        {
+          "name": "p384",
+          "packageId": "p384"
+        },
+        {
+          "name": "p521",
+          "packageId": "p521"
+        },
+        {
+          "name": "percent-encoding",
+          "packageId": "percent-encoding"
+        },
+        {
+          "name": "pkcs8",
+          "packageId": "pkcs8 0.11.0"
+        },
+        {
+          "name": "portable-atomic",
+          "packageId": "portable-atomic"
+        },
+        {
+          "name": "ppv-lite86",
+          "packageId": "ppv-lite86"
+        },
+        {
+          "name": "primeorder",
+          "packageId": "primeorder 0.14.0-rc.9"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "quanta",
+          "packageId": "quanta"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.10.1",
+          "rename": "rand_93f6ce9d446188ac"
+        },
+        {
+          "name": "rand",
+          "packageId": "rand 0.9.4",
+          "rename": "rand_274715c4dabd11b0"
+        },
+        {
+          "name": "rand_chacha",
+          "packageId": "rand_chacha"
+        },
+        {
+          "name": "regex",
+          "packageId": "regex"
+        },
+        {
+          "name": "regex-automata",
+          "packageId": "regex-automata"
+        },
+        {
+          "name": "regex-syntax",
+          "packageId": "regex-syntax"
+        },
+        {
+          "name": "reqwest",
+          "packageId": "reqwest"
+        },
+        {
+          "name": "rsa",
+          "packageId": "rsa"
+        },
+        {
+          "name": "rustcrypto-ff",
+          "packageId": "rustcrypto-ff"
+        },
+        {
+          "name": "rustcrypto-group",
+          "packageId": "rustcrypto-group"
+        },
+        {
+          "name": "rustls",
+          "packageId": "rustls"
+        },
+        {
+          "name": "rustls-pki-types",
+          "packageId": "rustls-pki-types"
+        },
+        {
+          "name": "rustls-webpki",
+          "packageId": "rustls-webpki"
+        },
+        {
+          "name": "scopeguard",
+          "packageId": "scopeguard"
+        },
+        {
+          "name": "sec1",
+          "packageId": "sec1 0.8.1"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "serde_core",
+          "packageId": "serde_core"
+        },
+        {
+          "name": "serde_json",
+          "packageId": "serde_json"
+        },
+        {
+          "name": "serde_spanned",
+          "packageId": "serde_spanned"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.10.6",
+          "rename": "sha1_93f6ce9d446188ac"
+        },
+        {
+          "name": "sha1",
+          "packageId": "sha1 0.11.0",
+          "rename": "sha1_a6292c17cd707f01"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9",
+          "rename": "sha2_93f6ce9d446188ac"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.11.0",
+          "rename": "sha2_a6292c17cd707f01"
+        },
+        {
+          "name": "signature",
+          "packageId": "signature 3.0.0"
+        },
+        {
+          "name": "slab",
+          "packageId": "slab"
+        },
+        {
+          "name": "smallvec",
+          "packageId": "smallvec"
+        },
+        {
+          "name": "spki",
+          "packageId": "spki 0.8.0"
+        },
+        {
+          "name": "sqlx-core",
+          "packageId": "sqlx-core"
+        },
+        {
+          "name": "sqlx-sqlite",
+          "packageId": "sqlx-sqlite"
+        },
+        {
+          "name": "ssh-cipher",
+          "packageId": "ssh-cipher"
+        },
+        {
+          "name": "ssh-encoding",
+          "packageId": "ssh-encoding"
+        },
+        {
+          "name": "ssh-key",
+          "packageId": "ssh-key"
+        },
+        {
+          "name": "subtle",
+          "packageId": "subtle"
+        },
+        {
+          "name": "sync_wrapper",
+          "packageId": "sync_wrapper"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tokio-rustls",
+          "packageId": "tokio-rustls",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
+          "name": "toml",
+          "packageId": "toml"
+        },
+        {
+          "name": "toml_datetime",
+          "packageId": "toml_datetime"
+        },
+        {
+          "name": "toml_parser",
+          "packageId": "toml_parser"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower",
+          "packageId": "tower",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "aarch64-unknown-linux-gnu"
+        },
+        {
+          "name": "tower-http",
+          "packageId": "tower-http",
+          "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-core",
+          "packageId": "tracing-core"
+        },
+        {
+          "name": "tracing-subscriber",
+          "packageId": "tracing-subscriber"
+        },
+        {
+          "name": "uuid",
+          "packageId": "uuid"
+        },
+        {
+          "name": "winnow",
+          "packageId": "winnow"
+        },
+        {
+          "name": "zerocopy",
+          "packageId": "zerocopy"
+        },
+        {
+          "name": "zeroize",
+          "packageId": "zeroize"
+        },
+        {
+          "name": "zstd",
+          "packageId": "zstd"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        },
+        {
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
+        }
+      ],
+      "buildDependencies": [
         {
           "name": "anstyle",
           "packageId": "anstyle"
@@ -29816,7 +29668,7 @@
         },
         {
           "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
+          "packageId": "indexmap"
         },
         {
           "name": "inout",
@@ -29931,20 +29783,12 @@
           "packageId": "primeorder 0.14.0-rc.9"
         },
         {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
           "name": "prost",
           "packageId": "prost"
         },
         {
           "name": "quanta",
           "packageId": "quanta"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
         },
         {
           "name": "rand",
@@ -30097,10 +29941,6 @@
           "packageId": "thiserror"
         },
         {
-          "name": "time",
-          "packageId": "time"
-        },
-        {
           "name": "tokio",
           "packageId": "tokio"
         },
@@ -30189,593 +30029,18 @@
         {
           "name": "zeroize",
           "packageId": "zeroize"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "aho-corasick",
-          "packageId": "aho-corasick"
-        },
-        {
-          "name": "anstyle",
-          "packageId": "anstyle"
-        },
-        {
-          "name": "aws-lc-rs",
-          "packageId": "aws-lc-rs"
-        },
-        {
-          "name": "aws-smithy-types",
-          "packageId": "aws-smithy-types"
-        },
-        {
-          "name": "base16ct",
-          "packageId": "base16ct 1.0.0"
-        },
-        {
-          "name": "base64",
-          "packageId": "base64 0.22.1"
-        },
-        {
-          "name": "bitflags",
-          "packageId": "bitflags",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "bitflags",
-          "packageId": "bitflags",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "byteorder",
-          "packageId": "byteorder"
-        },
-        {
-          "name": "bytes",
-          "packageId": "bytes"
-        },
-        {
-          "name": "chacha20",
-          "packageId": "chacha20"
-        },
-        {
-          "name": "cipher",
-          "packageId": "cipher"
-        },
-        {
-          "name": "crossbeam-epoch",
-          "packageId": "crossbeam-epoch"
-        },
-        {
-          "name": "crossbeam-utils",
-          "packageId": "crossbeam-utils"
-        },
-        {
-          "name": "crypto-bigint",
-          "packageId": "crypto-bigint 0.7.3"
-        },
-        {
-          "name": "crypto-common",
-          "packageId": "crypto-common 0.1.6",
-          "rename": "crypto_common_c65f7effa3be6d31"
-        },
-        {
-          "name": "crypto-common",
-          "packageId": "crypto-common 0.2.2",
-          "rename": "crypto_common_6f8ce4dd05d13bba"
-        },
-        {
-          "name": "ctutils",
-          "packageId": "ctutils"
-        },
-        {
-          "name": "curve25519-dalek",
-          "packageId": "curve25519-dalek"
-        },
-        {
-          "name": "der",
-          "packageId": "der 0.8.0"
-        },
-        {
-          "name": "digest",
-          "packageId": "digest 0.10.7",
-          "rename": "digest_93f6ce9d446188ac"
-        },
-        {
-          "name": "digest",
-          "packageId": "digest 0.11.3",
-          "rename": "digest_a6292c17cd707f01"
-        },
-        {
-          "name": "ecdsa",
-          "packageId": "ecdsa 0.17.0-rc.18"
-        },
-        {
-          "name": "ed25519",
-          "packageId": "ed25519"
-        },
-        {
-          "name": "ed25519-dalek",
-          "packageId": "ed25519-dalek"
-        },
-        {
-          "name": "either",
-          "packageId": "either"
-        },
-        {
-          "name": "elliptic-curve",
-          "packageId": "elliptic-curve 0.14.0-rc.32"
-        },
-        {
-          "name": "event-listener-strategy",
-          "packageId": "event-listener-strategy"
-        },
-        {
-          "name": "fastrand",
-          "packageId": "fastrand"
-        },
-        {
-          "name": "futures",
-          "packageId": "futures"
-        },
-        {
-          "name": "futures-channel",
-          "packageId": "futures-channel"
-        },
-        {
-          "name": "futures-io",
-          "packageId": "futures-io"
-        },
-        {
-          "name": "futures-sink",
-          "packageId": "futures-sink"
-        },
-        {
-          "name": "futures-util",
-          "packageId": "futures-util"
-        },
-        {
-          "name": "generic-array",
-          "packageId": "generic-array 0.14.9"
-        },
-        {
-          "name": "getrandom",
-          "packageId": "getrandom 0.3.4",
-          "rename": "getrandom_468e82937335b1c9"
-        },
-        {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "getrandom",
-          "packageId": "getrandom 0.4.2",
-          "rename": "getrandom_9fbad63c4bcf4a8f",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "hashbrown",
-          "packageId": "hashbrown 0.16.1",
-          "rename": "hashbrown_986da7b5efc2b80e"
-        },
-        {
-          "name": "hashbrown",
-          "packageId": "hashbrown 0.17.1",
-          "rename": "hashbrown_9067fe90e8c1f593"
-        },
-        {
-          "name": "hex",
-          "packageId": "hex"
-        },
-        {
-          "name": "hybrid-array",
-          "packageId": "hybrid-array"
-        },
-        {
-          "name": "hyper",
-          "packageId": "hyper 1.9.0"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-rustls",
-          "packageId": "hyper-rustls",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "hyper-util",
-          "packageId": "hyper-util",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "indexmap",
-          "packageId": "indexmap 2.14.0"
-        },
-        {
-          "name": "inout",
-          "packageId": "inout 0.2.2"
-        },
-        {
-          "name": "jiff",
-          "packageId": "jiff"
-        },
-        {
-          "name": "k8s-openapi",
-          "packageId": "k8s-openapi"
-        },
-        {
-          "name": "kube",
-          "packageId": "kube"
-        },
-        {
-          "name": "kube-client",
-          "packageId": "kube-client"
-        },
-        {
-          "name": "kube-core",
-          "packageId": "kube-core"
-        },
-        {
-          "name": "libc",
-          "packageId": "libc"
-        },
-        {
-          "name": "libsqlite3-sys",
-          "packageId": "libsqlite3-sys"
-        },
-        {
-          "name": "log",
-          "packageId": "log"
-        },
-        {
-          "name": "memchr",
-          "packageId": "memchr"
-        },
-        {
-          "name": "metrics-util",
-          "packageId": "metrics-util"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "miniz_oxide",
-          "packageId": "miniz_oxide",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "nix",
-          "packageId": "nix 0.31.3",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "nix",
-          "packageId": "nix 0.31.3",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "num-integer",
-          "packageId": "num-integer"
-        },
-        {
-          "name": "num-traits",
-          "packageId": "num-traits"
-        },
-        {
-          "name": "once_cell",
-          "packageId": "once_cell"
-        },
-        {
-          "name": "ordered-float",
-          "packageId": "ordered-float 5.3.0"
-        },
-        {
-          "name": "p256",
-          "packageId": "p256 0.14.0-rc.9"
-        },
-        {
-          "name": "p384",
-          "packageId": "p384"
-        },
-        {
-          "name": "p521",
-          "packageId": "p521"
-        },
-        {
-          "name": "percent-encoding",
-          "packageId": "percent-encoding"
-        },
-        {
-          "name": "pkcs8",
-          "packageId": "pkcs8 0.11.0"
-        },
-        {
-          "name": "portable-atomic",
-          "packageId": "portable-atomic"
-        },
-        {
-          "name": "ppv-lite86",
-          "packageId": "ppv-lite86"
-        },
-        {
-          "name": "primeorder",
-          "packageId": "primeorder 0.14.0-rc.9"
-        },
-        {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "prost",
-          "packageId": "prost"
-        },
-        {
-          "name": "quanta",
-          "packageId": "quanta"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.10.1",
-          "rename": "rand_93f6ce9d446188ac"
-        },
-        {
-          "name": "rand",
-          "packageId": "rand 0.9.4",
-          "rename": "rand_274715c4dabd11b0"
-        },
-        {
-          "name": "rand_chacha",
-          "packageId": "rand_chacha"
-        },
-        {
-          "name": "regex",
-          "packageId": "regex"
-        },
-        {
-          "name": "regex-automata",
-          "packageId": "regex-automata"
-        },
-        {
-          "name": "regex-syntax",
-          "packageId": "regex-syntax"
-        },
-        {
-          "name": "reqwest",
-          "packageId": "reqwest"
-        },
-        {
-          "name": "rsa",
-          "packageId": "rsa"
-        },
-        {
-          "name": "rustcrypto-ff",
-          "packageId": "rustcrypto-ff"
-        },
-        {
-          "name": "rustcrypto-group",
-          "packageId": "rustcrypto-group"
-        },
-        {
-          "name": "rustls",
-          "packageId": "rustls"
-        },
-        {
-          "name": "rustls-pki-types",
-          "packageId": "rustls-pki-types"
-        },
-        {
-          "name": "rustls-webpki",
-          "packageId": "rustls-webpki"
-        },
-        {
-          "name": "scopeguard",
-          "packageId": "scopeguard"
-        },
-        {
-          "name": "sec1",
-          "packageId": "sec1 0.8.1"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "serde_core",
-          "packageId": "serde_core"
-        },
-        {
-          "name": "serde_json",
-          "packageId": "serde_json"
-        },
-        {
-          "name": "serde_spanned",
-          "packageId": "serde_spanned"
-        },
-        {
-          "name": "sha1",
-          "packageId": "sha1 0.10.6",
-          "rename": "sha1_93f6ce9d446188ac"
-        },
-        {
-          "name": "sha1",
-          "packageId": "sha1 0.11.0",
-          "rename": "sha1_a6292c17cd707f01"
-        },
-        {
-          "name": "sha2",
-          "packageId": "sha2 0.10.9",
-          "rename": "sha2_93f6ce9d446188ac"
-        },
-        {
-          "name": "sha2",
-          "packageId": "sha2 0.11.0",
-          "rename": "sha2_a6292c17cd707f01"
-        },
-        {
-          "name": "signature",
-          "packageId": "signature 3.0.0"
-        },
-        {
-          "name": "slab",
-          "packageId": "slab"
-        },
-        {
-          "name": "smallvec",
-          "packageId": "smallvec"
-        },
-        {
-          "name": "spki",
-          "packageId": "spki 0.8.0"
-        },
-        {
-          "name": "sqlx-core",
-          "packageId": "sqlx-core"
-        },
-        {
-          "name": "sqlx-sqlite",
-          "packageId": "sqlx-sqlite"
-        },
-        {
-          "name": "ssh-cipher",
-          "packageId": "ssh-cipher"
-        },
-        {
-          "name": "ssh-encoding",
-          "packageId": "ssh-encoding"
-        },
-        {
-          "name": "ssh-key",
-          "packageId": "ssh-key"
-        },
-        {
-          "name": "subtle",
-          "packageId": "subtle"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
-        },
-        {
-          "name": "sync_wrapper",
-          "packageId": "sync_wrapper"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        },
-        {
-          "name": "time",
-          "packageId": "time"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tokio-rustls",
-          "packageId": "tokio-rustls",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "tokio-rustls",
-          "packageId": "tokio-rustls",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
-        },
-        {
-          "name": "tokio-util",
-          "packageId": "tokio-util"
-        },
-        {
-          "name": "toml",
-          "packageId": "toml"
-        },
-        {
-          "name": "toml_datetime",
-          "packageId": "toml_datetime"
-        },
-        {
-          "name": "toml_parser",
-          "packageId": "toml_parser"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "tower",
-          "packageId": "tower",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
-          "target": "aarch64-unknown-linux-gnu"
-        },
-        {
-          "name": "tower-http",
-          "packageId": "tower-http",
-          "target": "x86_64-unknown-linux-gnu"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        },
-        {
-          "name": "tracing-core",
-          "packageId": "tracing-core"
-        },
-        {
-          "name": "tracing-subscriber",
-          "packageId": "tracing-subscriber"
-        },
-        {
-          "name": "uuid",
-          "packageId": "uuid"
         },
         {
-          "name": "winnow",
-          "packageId": "winnow"
+          "name": "zstd",
+          "packageId": "zstd"
         },
         {
-          "name": "zerocopy",
-          "packageId": "zerocopy"
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
         },
         {
-          "name": "zeroize",
-          "packageId": "zeroize"
+          "name": "zstd-sys",
+          "packageId": "zstd-sys"
         }
       ],
       "libCrateTypes": [
@@ -30964,14 +30229,6 @@
           "packageId": "nix 0.31.3"
         },
         {
-          "name": "proc-macro2",
-          "packageId": "proc-macro2"
-        },
-        {
-          "name": "quote",
-          "packageId": "quote"
-        },
-        {
           "name": "rand",
           "packageId": "rand 0.10.1"
         },
@@ -30990,10 +30247,6 @@
         {
           "name": "rio-crds",
           "packageId": "rio-crds"
-        },
-        {
-          "name": "rio-migrations",
-          "packageId": "rio-migrations"
         },
         {
           "name": "rio-proto",
@@ -31038,10 +30291,6 @@
         {
           "name": "ssh-key",
           "packageId": "ssh-key"
-        },
-        {
-          "name": "syn",
-          "packageId": "syn"
         },
         {
           "name": "tempfile",

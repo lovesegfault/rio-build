@@ -123,8 +123,8 @@ pub struct BuildSpawnContext {
     /// is then accepted by the x86_64 daemon.
     pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
-    /// the executor can `register_inputs` (JIT allowlist) and
-    /// `prefetch_manifests` (I-110c) before daemon spawn.
+    /// the executor can `register_inputs` (JIT allowlist) before
+    /// daemon spawn.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
     /// JIT lookup scales it per path via `jit_fetch_timeout(this,
@@ -457,7 +457,6 @@ pub async fn spawn_build_task(
         // and slot.cancel, and wakes wait_idle().
         let _slot_guard = guard;
 
-        let mut store_client = ctx.store_clients.store.clone();
         // Same Arc as the slot's cancel flag. execute_build polls it
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
@@ -552,7 +551,7 @@ pub async fn spawn_build_task(
             let o = executor::execute_build(
                 &assignment,
                 &build_env,
-                &mut store_client,
+                &ctx.store_clients,
                 &ctx.stream_tx,
                 &upload_tx,
                 prev_line_count,
