@@ -21,8 +21,6 @@
     "rio_builder_log_lines_suppressed_total",
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
-    "rio_builder_prefetch_filtered_total",
-    "rio_builder_prefetch_total",
     "rio_builder_stale_assignments_rejected_total",
     "rio_builder_upload_bytes_total",
     "rio_builder_upload_references_count",
@@ -316,16 +314,6 @@
         "name": "rio_builder_overlay_teardown_failures_total",
         "kind": "counter",
         "help": "Overlay unmount failures (leaked mount); alert if rate > 0"
-      },
-      {
-        "name": "rio_builder_prefetch_filtered_total",
-        "kind": "counter",
-        "help": "PrefetchHint paths skipped by the I-212 filter, by reason. reason=not_input: JIT allowlist armed and path is not a declared input (build can never read it). reason=size_cap: warm-gate batch (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); the build fetches it on-demand via JIT lookup if it turns out to be a real input."
-      },
-      {
-        "name": "rio_builder_prefetch_total",
-        "kind": "counter",
-        "help": "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. error = store fetch failed (debug-only log; build's own FUSE ops surface the real problem if store is flaky)."
       },
       {
         "name": "rio_builder_stale_assignments_rejected_total",

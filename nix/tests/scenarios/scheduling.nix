@@ -47,14 +47,6 @@
 #   the chunked path.
 #   Asserted end-to-end from /metrics scrapes via assert_metric_*: exact
 #   values (not grep '[1-9]') so CI logs show actual-vs-expected on failure.
-#
-# worker.shutdown.sigint — verify marker at default.nix:subtests[sigint-graceful]
-#   sigint-graceful sends SIGINT (not SIGTERM) to rio-builder on worker2
-#   and asserts ExecMainCode=1 + ExecMainStatus=0 → main() RETURNED
-#   (stack unwound, Drop ran) rather than death-by-signal. Also guards
-#   .#coverage: main() returning → atexit fires → profraw flushes.
-#   A main.rs refactor that breaks the select! cancellation arm would
-#   silently zero out worker VM coverage.
 {
   pkgs,
   common,

@@ -595,14 +595,17 @@ in
           # standalone re-point (delivery is pull now; neither can run
           # against a pull-mode fixture). The warm-gate fragment, rule
           # and mechanism retired with the 1c' placement-layer deletion
-          # (deletion commit B). Remaining carrier:
-          #   - builder.shutdown.sigint+3: the pull-loop SIGINT unit
-          #     test (rio-builder/src/runtime/pull.rs); the VM-level
-          #     re-statement (SIGTERM/SIGINT abort semantics on a live
-          #     pull build) lands with the builder runtime collapse
-          #     (T-1d.1) per the disposition table.
-          # The fragment files stay in scenarios/scheduling/ for those
-          # commits to re-state or delete.
+          # (deletion commit B); the sigint-graceful fragment retired
+          # with the 1d builder collapse (T-1d.1). Carriers:
+          #   - builder.shutdown.sigint+4 (SIGTERM/SIGINT = abort): the
+          #     pull-loop signal unit battery in
+          #     rio-builder/src/runtime/pull.rs (idle-shutdown exit and
+          #     the mid-build abort + bounded report attempt);
+          #   - the process-level teardown half (FUSE unmount, profraw
+          #     flush on return from main) is exercised by every
+          #     standalone scenario's normal one-shot exit path, and the
+          #     mid-build pod-termination abort is asserted end-to-end by
+          #     the lifecycle killed-mid-build / cancel arms (k3s).
         ];
         # Default 600s is tight: max-silent-time ~75-150s (I-200
         # retries × pull cycle) + setoptions ~5s + load-50drv

@@ -1,8 +1,8 @@
-//! I-032: relay pump loop didn't watch `target.changed()` → completion
-//! messages lost. The user-visible symptom is `nix build --store
-//! ssh-ng://…` hanging with no log output despite the builder having
-//! produced lines. Assert: a build that echoes a known marker actually
-//! surfaces that marker in scheduler-leader logs (the relay path).
+//! I-032 (historical): the stream-era relay pump could silently drop
+//! completion messages. The machinery is gone (pull-mode reports are
+//! retried unaries), but the user-visible property is delivery-mode
+//! independent and stays asserted: a build that echoes a known marker
+//! surfaces that marker in scheduler-leader dispatch/completion traces.
 
 use std::time::Duration;
 
@@ -40,9 +40,9 @@ impl Scenario for RelayLoop {
         // (`rio-smoke-<tag>-…`), so it appears in the scheduler
         // leader's dispatch/completion trace lines for the build. That
         // is the control-plane evidence I-032 actually protects: the
-        // relay pump delivering the WorkAssignmentAck/CompletionReport
-        // (the messages that were lost when the pump didn't watch
-        // `target.changed()`). The builder's log *content* no longer
+        // build's completion reaching the scheduler (pull-mode
+        // ReportOutcome; historically the relay-pumped report, which
+        // is what I-032 lost). The builder's log *content* no longer
         // transits the scheduler at all — it goes builder → rio-store
         // AppendLog and is read back via TailLog (asserted by the
         // vm-observability/log-service scenarios).
@@ -61,9 +61,8 @@ impl Scenario for RelayLoop {
             // (it did, or `?` above would've propagated).
             Ok(Verdict::Fail(format!(
                 "build completed but tag '{tag}' absent from scheduler-leader \
-                 logs — the relay pump may not be forwarding builder \
-                 control messages (the drv name appears in dispatch/\
-                 completion traces)"
+                 logs — the completion/dispatch trace lines should carry \
+                 the drv name"
             )))
         }
     }

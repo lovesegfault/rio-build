@@ -2638,9 +2638,10 @@ in
 
     # Model D, fault-stream: failed opens, confirmed streams dying
     # under the relay, and one generation move — the reconnect /
-    # park / re-buffer choreography and the B5 watermark fence carry
-    # the exactly-once-or-death obligation here.
-    # r[verify builder.completion.exactly-once-or-death]
+    # park / re-buffer choreography and the B5 watermark fence carried
+    # the stream-era exactly-once-or-death obligation here (the rule's
+    # verify markers moved to the pull report-loop tests with the 1d
+    # builder collapse; this model retires at T-1d.4).
     quint-executor-delivery-fault-stream = mkQuintCheck {
       name = "executor-delivery-fault-stream";
       spec = "executorDelivery";
@@ -2651,7 +2652,6 @@ in
     # Model D, fault-process: SIGKILL / OOM-kill at any point (the "or
     # death" arm) on top of one stream death — no graceful-exit latch
     # may fire even though the report can be lost with the pod.
-    # r[verify builder.completion.exactly-once-or-death]
     quint-executor-delivery-fault-process = mkQuintCheck {
       name = "executor-delivery-fault-process";
       spec = "executorDelivery";

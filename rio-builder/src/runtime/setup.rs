@@ -1,21 +1,19 @@
 //! Cold-start wiring: identity, host-arch validation, cgroup init,
-//! upstream connect, FUSE mount, relay/heartbeat spawn, build context.
+//! upstream connect, FUSE mount, build context.
 //!
-//! Everything `main()` did before the `'reconnect` loop. Produces a
+//! Everything `main()` does before the pull loop. Produces a
 //! [`BuilderRuntime`] consumed by [`run`](super::run).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 
-use tokio::sync::{Notify, Semaphore, mpsc, watch};
+use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use rio_proto::types::{ExecutorKind, ExecutorMessage};
 
-use super::heartbeat::{HeartbeatCtx, spawn_heartbeat};
-use super::prefetch::PrefetchDeps;
 use super::slot::BuildSlot;
-use super::{BuildSpawnContext, BuilderRuntime, relay_loop};
+use super::{BuildSpawnContext, BuilderRuntime};
 use crate::config::{Config, detect_system};
 use crate::fuse::StoreClients;
 
@@ -29,17 +27,16 @@ pub(super) type BalanceGuards = (
     Option<rio_proto::client::balance::BalancedChannel>,
 );
 
-/// Wire up cgroups, health server, gRPC clients, FUSE mount, relay,
-/// heartbeat, and the build context. Everything `main()` did before the
-/// `'reconnect` loop.
+/// Wire up cgroups, health server, gRPC clients, FUSE mount, and the
+/// build context. Everything `main()` does before the pull loop.
 ///
 /// Returns `None` if shutdown fired during cold-start connect — caller
-/// exits cleanly (nothing to drain, never connected).
+/// exits cleanly (nothing started, never connected).
 pub async fn setup(
     mut cfg: Config,
     shutdown: rio_common::signal::Token,
 ) -> anyhow::Result<Option<BuilderRuntime>> {
-    let (executor_id, systems, features) = resolve_executor_identity(
+    let (executor_id, systems, _features) = resolve_executor_identity(
         cfg.executor_kind,
         std::mem::take(&mut cfg.executor_id),
         std::mem::take(&mut cfg.systems),
@@ -56,8 +53,8 @@ pub async fn setup(
     // Readiness flag + HTTP health server. Spawned BEFORE gRPC connect
     // so liveness passes as soon as the process is up (connect may take
     // seconds if scheduler DNS is slow to resolve). Readiness stays
-    // false until the first heartbeat comes back accepted — that's the
-    // right gate: a worker that can't heartbeat is not useful capacity.
+    // false until the pull loop has an assignment in hand — a pod that
+    // is still asking for work is not useful capacity.
     let ready = Arc::new(AtomicBool::new(false));
     crate::health::spawn_health_server(cfg.health_addr, Arc::clone(&ready), shutdown.clone());
 
@@ -73,7 +70,6 @@ pub async fn setup(
         scheduler_addr = %cfg.scheduler.addr,
         store_addr = %cfg.store.addr,
         systems = ?systems,
-        features = ?features,
         "connected to gRPC services"
     );
 
@@ -85,7 +81,7 @@ pub async fn setup(
     // CPU-bound microbench in a blocking thread.
     //
     // The whole resolve→bench chain is SPAWNED so it runs concurrently
-    // with FUSE mount + first heartbeat below — `POLL_BOUND=30s` was
+    // with the FUSE mount below — `POLL_BOUND=30s` was
     // sized assuming overlap with the ~30s FUSE cold-start, so an
     // annotator outage adds 0s (not 30s) to startup. Both products
     // (`hw_class` string + bench `factor`) are consumed only at first
@@ -109,14 +105,10 @@ pub async fn setup(
         (hw_class, factor)
     });
 
-    // Set up FUSE cache and mount. Arc so we can clone for the
-    // prefetch handler before moving into mount_fuse_background.
+    // Set up FUSE cache and mount. Arc so the executor's manifest-prime
+    // / JIT-allowlist path can share it with the FUSE threads.
     let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
-    // Clone for prefetch. Cache methods use runtime.block_on
-    // internally (sync, designed for FUSE callbacks on dedicated
-    // threads). The prefetch handler will call them via
-    // spawn_blocking — async → nested-runtime panic.
-    let prefetch_cache = Arc::clone(&cache);
+    let executor_cache = Arc::clone(&cache);
     let runtime = tokio::runtime::Handle::current();
     // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
     // FUSE is the build-critical path; a stalled fetch blocks a fuser
@@ -172,11 +164,11 @@ pub async fn setup(
         }
     }
 
-    let (fuse_session, fuse_circuit) = crate::fuse::mount_fuse_background(
+    let (fuse_session, _fuse_circuit) = crate::fuse::mount_fuse_background(
         &cfg.fuse_mount_point,
         cache,
         store_clients.clone(),
-        runtime.clone(),
+        runtime,
         cfg.fuse_passthrough,
         cfg.fuse_threads,
         fuse_fetch_timeout,
@@ -187,126 +179,29 @@ pub async fn setup(
         "FUSE store mounted"
     );
 
-    // ---- BuildExecution stream with reconnect ----
+    // ---- The build-task sink ----
     //
-    // Architecture: a PERMANENT sink channel (sink_tx, sink_rx)
-    // lives for process lifetime. BuildSpawnContext holds sink_tx
-    // — running builds send CompletionReport/LogBatch here.
-    // sink_rx is drained by a relay task that pumps into whatever
-    // gRPC outbound channel is currently live (via watch::channel).
+    // A process-lifetime sink channel (sink_tx, sink_rx).
+    // BuildSpawnContext holds sink_tx — the build task sends its
+    // CompletionReport (and phase edges) here; the pull loop consumes
+    // sink_rx directly and forwards the report through `ReportOutcome`
+    // until acknowledged.
     //
-    // Why: stderr_loop.rs breaks the build with MiscFailure if
-    // its log send fails (channel closed). If we handed build
-    // tasks the gRPC channel directly, stream death on scheduler
-    // failover would kill every running build. With the permanent
-    // sink, the build tasks' channel NEVER closes — the relay
-    // just buffers (up to mpsc capacity) during the ~1s gap
-    // between old-stream-dead and new-stream-open.
-    //
-    // The relay recovers the one message lost on transition
-    // (mpsc::error::SendError<T> holds the unsent message) and
-    // blocks on watch.changed() until the reconnect loop swaps
-    // in a fresh gRPC channel.
-    // r[impl builder.relay.reconnect]
+    // Why a process-lifetime channel: stderr_loop.rs breaks the build
+    // with MiscFailure if its send fails (channel closed). The sink
+    // never closes while the build runs, so the build task's sends
+    // cannot fail regardless of scheduler availability — delivery
+    // retries live entirely in the pull loop's report phase.
     let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
 
-    // Relay target: Some(grpc_tx) while connected, None during
-    // the reconnect gap. Starts None — the reconnect loop sets
-    // it before opening the first stream.
-    let (relay_target_tx, relay_target_rx) =
-        watch::channel::<Option<mpsc::Sender<ExecutorMessage>>>(None);
-
-    // bug_472: drain/exit gates on completion-DELIVERED, not
-    // slot-idle. `send_completion` sets this; `relay_loop` clears it
-    // on grpc_tx.send() Ok and notifies. Same Arc threaded into
-    // BuildSpawnContext (set side), relay_loop (clear side), and
-    // BuilderRuntime (gate side).
-    let completion_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let completion_cleared = Arc::new(tokio::sync::Notify::new());
-
-    // Pull mode (`dispatch_mode = pull`): the pull loop consumes the
-    // sink directly — there is no gRPC stream to relay into, so the
-    // relay task is not started (and no heartbeat below). Stream mode
-    // is untouched.
-    let pull_mode = cfg.dispatch_mode == crate::config::DispatchMode::Pull;
-    let pull_sink_rx = if pull_mode {
-        drop(relay_target_rx);
-        Some(sink_rx)
-    } else {
-        rio_common::task::spawn_monitored(
-            "stream-relay",
-            relay_loop(
-                sink_rx,
-                relay_target_rx,
-                Arc::clone(&completion_pending),
-                Arc::clone(&completion_cleared),
-            ),
-        );
-        None
-    };
-
     // P0537: one build per pod. The slot tracks both occupancy and
-    // the running drv_path (heartbeat reads it). `try_claim` is
-    // non-blocking — see BuildSlot doc for why.
+    // the running drv_path. `try_claim` is non-blocking — see
+    // BuildSlot doc for why.
     let slot = Arc::new(BuildSlot::default());
 
-    // I-063: drain state. Set true on first SIGTERM. Heartbeat reports
-    // it (worker is authority); the assignment handler rejects while
-    // set; the reconnect loop KEEPS the stream alive (completions for
-    // in-flight builds reach whichever scheduler is leader) until
-    // `drain_done` fires (slot idle via wait_idle()).
-    let draining = Arc::new(AtomicBool::new(false));
-    let drain_done = Arc::new(Notify::new());
-
-    // Build-complete signal. Notified after the one build is spawned
-    // AND its permit returns (CompletionReport sent — spawn_build_task's
-    // scopeguard drops the permit after build_tx.send(completion).await).
-    // The select loop awaits this; one notification = exit.
-    //
-    // Notify not oneshot: Notify is cheaper (no channel allocation)
-    // and `notified()` is cancel-safe for select!.
-    let build_done = Arc::new(Notify::new());
-
-    // Latest generation observed in an accepted HeartbeatResponse.
-    // Starts at 0 — scheduler generation is always ≥1 (1 is the floor,
-    // kept as-is in non-K8s / always_leader mode; a K8s acquire derives
-    // it as fetch_max(leaseTransitions + 1) in rio-lease's
-    // LeaderState::on_acquire, and the recovery PG seed
-    // LeaderState::seed_generation_from only raises it), so 0 never
-    // rejects a real assignment. Relaxed ordering:
-    // this is a fence against a DIFFERENT process's stale writes, not a
-    // within-process happens-before. The value itself is the signal.
-    let latest_generation = Arc::new(AtomicU64::new(0));
-    // Shared with BuildSpawnContext below so the per-build daemon's
-    // `extra-platforms` matches what the heartbeat advertises.
+    // Per-build daemon's `extra-platforms` matches the resolved
+    // identity systems.
     let systems: std::sync::Arc<[String]> = systems.into();
-    let hb_ctx = HeartbeatCtx {
-        executor_id: executor_id.clone(),
-        executor_kind: cfg.executor_kind,
-        systems: systems.to_vec(),
-        // move: setup() has no further use for features.
-        features,
-        intent_id: cfg.intent_id.clone(),
-        executor_token: cfg.executor_token.clone(),
-        slot: Arc::clone(&slot),
-        ready: Arc::clone(&ready),
-        resources: Arc::clone(&resource_snapshot),
-        // FUSE circuit breaker: polled each tick. Shared with PrefetchDeps
-        // (prefetch is a singleflight owner and feeds the breaker).
-        circuit: Arc::clone(&fuse_circuit),
-        draining: Arc::clone(&draining),
-        generation: Arc::clone(&latest_generation),
-        client: scheduler_client.clone(),
-    };
-    // Pull mode: no registration, no heartbeat task — liveness is the
-    // Job's lifecycle and readiness flips when the pull lands
-    // (pull.rs). Stream mode keeps the heartbeat exactly as before.
-    let heartbeat_handle = if pull_mode {
-        drop(hb_ctx);
-        None
-    } else {
-        Some(spawn_heartbeat(hb_ctx))
-    };
 
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
@@ -328,12 +223,11 @@ pub async fn setup(
         cgroup_parent,
         executor_kind: cfg.executor_kind,
         systems,
-        // I-110c: same Arc as prefetch_cache / the FUSE mount —
-        // executor primes manifest hints + JIT allowlist, FUSE threads
-        // consume them.
-        fuse_cache: Arc::clone(&prefetch_cache),
+        // I-110c: same Arc as the FUSE mount — executor primes
+        // manifest hints + JIT allowlist, FUSE threads consume them.
+        fuse_cache: executor_cache,
         // Base per-path fetch timeout; JIT lookup scales it with
-        // nar_size (I-178). Same value the PrefetchHint handler uses.
+        // nar_size (I-178).
         fuse_fetch_timeout,
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
@@ -343,45 +237,22 @@ pub async fn setup(
         // task if the bench is still running). Before then, `None` —
         // the documented "unknown hw" semantics.
         hw_class: Arc::new(std::sync::Mutex::new(None)),
-        // Same Arc as the heartbeat loop (above) — completion reads
-        // the snapshot the cgroup poller has been maintaining.
+        // Completion reads the snapshot the cgroup poller has been
+        // maintaining.
         resources: resource_snapshot,
         hw_bench: Arc::new(std::sync::Mutex::new(Some(hw_bench))),
-        completion_pending: Arc::clone(&completion_pending),
     };
 
     Ok(Some(BuilderRuntime {
         scheduler_client,
         shutdown,
         fuse_session,
-        relay_target_tx,
         slot,
-        draining,
-        drain_done,
-        build_done,
-        completion_pending,
-        completion_cleared,
-        latest_generation,
-        heartbeat_handle,
         build_ctx,
-        dispatch_mode: cfg.dispatch_mode,
         intent_id: cfg.intent_id.clone(),
         ready,
-        pull_sink_rx,
+        pull_sink_rx: Some(sink_rx),
         executor_token: cfg.executor_token,
-        prefetch: PrefetchDeps {
-            cache: prefetch_cache,
-            clients: store_clients,
-            runtime,
-            // Prefetch concurrency limit. 8 is conservative: each holds a
-            // tokio blocking-pool thread (default pool is 512, so no
-            // starvation concern) AND pins an in-flight gRPC stream to the
-            // store (which is what we're bounding — don't DDoS the store with
-            // 100 parallel NARs when the scheduler sends a big hint list).
-            sem: Arc::new(Semaphore::new(8)),
-            fetch_timeout: fuse_fetch_timeout,
-            circuit: fuse_circuit,
-        },
         idle_timeout: cfg.idle_timeout,
         _balance_guard,
     }))
@@ -391,12 +262,13 @@ pub async fn setup(
 /// Consumes the config's owned fields (caller passes via `mem::take` —
 /// main() has no further use for them).
 ///
-/// Errors if executor_id is empty AND gethostname() fails — two workers
-/// with the same ID would steal each other's builds via heartbeat
-/// merging, so we fail hard rather than silently colliding on "unknown".
+/// Errors if executor_id is empty AND gethostname() fails — the
+/// executor identity keys log banners, per-execution log uploads, and
+/// the open-attempt row, so we fail hard rather than silently
+/// colliding on "unknown".
 ///
 /// `kind` enforces the §13e biconditional (`Fetcher ⟺ [fetcher]`) at
-/// the heartbeat boundary, mirroring the controller's
+/// identity resolution, mirroring the controller's
 /// `effective_features(spec)` chokepoint — see
 /// `rio-controller/src/reconcilers/pool/pod.rs` and
 /// `r[ctrl.crd.fetcher-no-features]`.
@@ -446,19 +318,18 @@ pub(super) fn resolve_executor_identity(
         systems.push("builtin".to_string());
     }
     // features: §13e biconditional `Fetcher ⟺ [fetcher]` enforced at
-    // the heartbeat boundary — the same `effective_features(spec)`
+    // identity resolution — the same `effective_features(spec)`
     // chokepoint the controller applies when injecting `RIO_FEATURES`
     // (rio-controller/src/reconcilers/pool/pod.rs). The controller's
     // injection covers k8s-spawned pods; this covers every OTHER
     // deployment path (NixOS module, manual env, future operators)
     // where `RIO_EXECUTOR_KIND=fetcher` is set without `RIO_FEATURES`.
-    // Without it the heartbeat advertises `supported_features=[]`,
-    // the scheduler's `rejection_reason` reads the FOD's derived
-    // `effective_features=[fetcher]`, `[fetcher] ⊄ []` → permanent
-    // `feature-missing` → cold builds stall silently at the FOD leaves.
+    // Feature matching itself happens at the spawn-intent filter (the
+    // pod is born for a specific drv), so the resolved set is a
+    // misconfiguration tripwire here, not an advertisement.
     //
     // The override is unconditional (matches the controller's): a
-    // fetcher declaring `[kvm]` would otherwise advertise a feature it
+    // fetcher declaring `[kvm]` would otherwise claim a feature it
     // can't honor (fetcher pods have no /dev/kvm) AND drop the routing
     // tag FODs match on. Warn so a misconfigured operator gets a log
     // line, not silence.
@@ -555,10 +426,11 @@ fn init_cgroup(
 
     // Background utilization reporter: polls parent cgroup cpu.stat +
     // memory.current/max every 10s → Prometheus gauges AND the shared
-    // snapshot the heartbeat loop reads for ResourceUsage. Single
-    // sampling site means Prometheus and ListExecutors always agree.
-    // Shutdown token lets the 10s sleep break immediately on SIGTERM
-    // so main() can return and profraw flush.
+    // snapshot `completion_stamp` reads for the report's
+    // `final_resources`. Single sampling site means Prometheus and the
+    // completion telemetry always agree. Shutdown token lets the 10s
+    // sleep break immediately on SIGTERM so main() can return and
+    // profraw flush.
     let resource_snapshot: crate::cgroup::ResourceSnapshotHandle = Default::default();
     rio_common::task::spawn_monitored(
         "cgroup-utilization-reporter",
@@ -579,17 +451,17 @@ fn init_cgroup(
 ///
 /// Cold-start race: store/scheduler Services may have no endpoints
 /// yet. /healthz stays 200 (process IS alive, restart won't help),
-/// /readyz stays 503 (ready flag won't flip until first heartbeat
-/// accepted, far past this loop).
+/// /readyz stays 503 (ready flag won't flip until the pull loop has
+/// an assignment in hand, far past this loop).
 ///
 /// Returns `None` if shutdown fires during retry — caller exits
-/// main() cleanly (nothing to drain, never connected).
+/// main() cleanly (nothing started, never connected).
 ///
 /// Scheduler has two modes:
 /// - Balanced (K8s, multi-replica): DNS-resolve headless Service,
-///   health-probe pod IPs, route to leader. Heartbeat routes through
-///   the same balanced channel — leadership flip detected within one
-///   probe tick (~3s).
+///   health-probe pod IPs, route to leader. The pull/report unaries
+///   route through the same balanced channel — leadership flip
+///   detected within one probe tick (~3s).
 /// - Single (non-K8s): plain connect. VM tests use this.
 async fn connect_upstreams(
     cfg: &crate::config::Config,

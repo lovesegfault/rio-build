@@ -1,16 +1,15 @@
 //! Build executor with FUSE store for rio-build.
 //!
-//! Receives build assignments from the scheduler, runs builds using
-//! nix-daemon within an overlayfs+FUSE environment, and uploads
-//! results to the store.
+//! Pulls the one assignment this pod was spawned for from the
+//! scheduler, runs the build using nix-daemon within an overlayfs+FUSE
+//! environment, uploads results to the store, and reports the outcome.
 //!
 //! # Architecture
 //!
 //! ```text
 //! rio-builder binary
 //! +-- gRPC clients
-//! |   +-- ExecutorService.BuildExecution (bidi stream to scheduler)
-//! |   +-- ExecutorService.Heartbeat (periodic to scheduler)
+//! |   +-- ExecutorService.PullAssignment / ReportOutcome (unaries)
 //! |   +-- StoreService (fetch inputs, upload outputs)
 //! +-- FUSE daemon (fuse/)
 //! |   +-- Mount /nix/store via fuser 0.17
@@ -22,7 +21,7 @@
 //! |   +-- Synthetic DB generation (synth_db.rs)
 //! |   +-- Log streaming (log_stream.rs)
 //! |   +-- Output upload (upload.rs)
-//! +-- Heartbeat loop (runtime.rs, 10s interval)
+//! +-- Pull loop (runtime/pull.rs: pull -> build -> report -> exit)
 //! ```
 
 pub(crate) mod banner;
@@ -168,22 +167,6 @@ pub fn describe_metrics() {
     describe_counter!(
         "rio_builder_overlay_teardown_failures_total",
         "Overlay unmount failures (leaked mount); alert if rate > 0"
-    );
-    describe_counter!(
-        "rio_builder_prefetch_total",
-        "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. \
-         error = store fetch failed (debug-only log; build's own FUSE ops surface \
-         the real problem if store is flaky)."
-    );
-    describe_counter!(
-        "rio_builder_prefetch_filtered_total",
-        "PrefetchHint paths skipped by the I-212 filter, by reason. \
-         reason=not_input: JIT allowlist armed and path is not a declared \
-         input (build can never read it). reason=size_cap: warm-gate batch \
-         (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — \
-         scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); \
-         the build fetches it on-demand via JIT lookup if it turns out to be \
-         a real input."
     );
     describe_counter!(
         "rio_builder_upload_bytes_total",

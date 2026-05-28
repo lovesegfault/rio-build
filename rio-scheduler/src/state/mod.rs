@@ -28,12 +28,6 @@ pub use derivation::*;
 pub use executor::*;
 pub use newtypes::{DrvHash, ExecutorId};
 
-/// Heartbeat timeout. Re-exported from rio-common so the scheduler's
-/// timeout check derives from the same source of truth as the executor's
-/// send interval. `timeout = interval × max_missed` is computed in
-/// rio-common; scheduler only consumes the derived timeout.
-pub use rio_common::limits::HEARTBEAT_TIMEOUT_SECS;
-
 db_str_enum! {
     /// Priority class for scheduling.
     ///

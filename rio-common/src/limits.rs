@@ -121,23 +121,6 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
 
-// r[impl builder.heartbeat.rpc-timeout]
-/// Worker heartbeat interval (stream-era; the scheduler-side staleness
-/// check is gone and the RPC is an error stub, but the builder's stream
-/// runtime still ticks at this cadence until the 1d collapse). The
-/// builder's per-RPC heartbeat timeout derives from this constant so the
-/// strictly-below-the-interval coupling holds by construction.
-pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
-
-/// How many missed heartbeats before a worker is considered dead.
-pub const MAX_MISSED_HEARTBEATS: u32 = 3;
-
-/// Heartbeat timeout. Derived as `interval × max_missed` so the coupling
-/// is explicit: a worker is declared dead after missing 3 heartbeats, not
-/// after an arbitrary 30s. If you tune the interval, the timeout moves
-/// with it automatically.
-pub const HEARTBEAT_TIMEOUT_SECS: u64 = MAX_MISSED_HEARTBEATS as u64 * HEARTBEAT_INTERVAL_SECS;
-
 #[cfg(test)]
 mod tests {
     use super::*;

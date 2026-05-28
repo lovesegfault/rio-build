@@ -1,15 +1,11 @@
 //! Fetch and materialize store paths into the local cache.
 //!
-//! Two entry points:
-//! - `NixStoreFs::ensure_cached`: called from FUSE callbacks
-//!   (lookup, getattr). Handles singleflight WAIT semantics — if
-//!   another thread is fetching, block on condvar until it finishes.
-//! - [`prefetch_path_blocking`]: called from the PrefetchHint
-//!   handler via spawn_blocking. Same singleflight but with
-//!   RETURN-EARLY on WaitFor — prefetch is a hint, not a dependency;
-//!   if FUSE already has it in flight, we're done.
-//!
-//! Both delegate to `fetch_extract_insert` for the actual work.
+//! The production entry point is `NixStoreFs::ensure_cached`: called
+//! from FUSE callbacks (lookup, getattr). Handles singleflight WAIT
+//! semantics — if another thread is fetching, block on condvar until
+//! it finishes. It delegates to `fetch_extract_insert` for the actual
+//! work; the test-only `prefetch_path_blocking` seam drives the same
+//! fetch with RETURN-EARLY singleflight semantics.
 
 mod client;
 
@@ -39,6 +35,7 @@ use tracing::instrument;
 
 use super::NixStoreFs;
 use super::cache::{Cache, FetchClaim, FetchGuard, InflightEntry};
+#[cfg(test)]
 use super::circuit::CircuitBreaker;
 
 /// `AsyncWrite` adapter over a sync `std::fs::File` — does BLOCKING disk
@@ -410,11 +407,14 @@ impl NixStoreFs {
     }
 }
 
-/// Why a prefetch returned without fetching. Not an error — both
-/// mean "somebody else is/has handling/handled it."
+/// Why a test-driven fetch returned without fetching. Not an error —
+/// both mean "somebody else is/has handling/handled it."
 ///
-/// Exposed so the prefetch metric can distinguish the cases (cache-hit
-/// vs in-flight). Both are "success" from prefetch's perspective.
+/// Test-only since the scheduler-pushed PrefetchHint handler was
+/// removed with the stream client (the JIT/ensure_cached path is the
+/// only production fetch entry); kept as the public seam the
+/// fetch_extract_insert battery drives.
+#[cfg(test)]
 #[derive(Debug, Clone, Copy)]
 pub enum PrefetchSkip {
     /// `cache.get_path()` returned Some — already on disk. Cheap
@@ -427,12 +427,16 @@ pub enum PrefetchSkip {
     AlreadyInFlight,
 }
 
-/// Prefetch a store path. SYNC — call via `spawn_blocking`.
+/// Fetch a store path outside the FUSE callback path. SYNC — call via
+/// `spawn_blocking`. Test-only since the scheduler-pushed PrefetchHint
+/// handler was removed with the stream client; the
+/// fetch_extract_insert tests drive the module-private fetch through
+/// this seam.
 ///
 /// Cache methods use `runtime.block_on` internally (designed for
 /// FUSE callbacks on dedicated blocking threads). Calling from an
 /// async context would panic with nested-runtime. So this fn is
-/// sync and the prefetch handler wraps it in spawn_blocking.
+/// sync and callers wrap it in spawn_blocking.
 ///
 /// Returns:
 /// - `Ok(None)`: fetched successfully, path is now in cache
@@ -449,6 +453,7 @@ pub enum PrefetchSkip {
 /// when FUSE arrives, FUSE waits on our guard — which is fine,
 /// we're in spawn_blocking so the wait doesn't starve the async
 /// executor.
+#[cfg(test)]
 pub fn prefetch_path_blocking(
     cache: &Cache,
     clients: &StoreClients,

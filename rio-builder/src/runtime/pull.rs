@@ -1,22 +1,20 @@
-//! Pull-mode client loop (`dispatch_mode = pull`).
+//! The pull client loop — the builder runtime's delivery path.
 //!
 //! The pod is born knowing its derivation (`RIO_INTENT_ID` + the HMAC
 //! executor token injected at Job spawn) and speaks exactly two
 //! unaries: `ExecutorService.PullAssignment` (three outcomes —
 //! `WorkAssignment` | `Gone` | `NotYetReady{retry_after}`) and
 //! `ExecutorService.ReportOutcome`. There is no registration, no
-//! heartbeat task, and no `BuildExecution` stream — the stream client
-//! code is simply not started (see `setup.rs`).
+//! heartbeat task, and no dispatch stream.
 //!
 //! Build execution is the existing machinery, unchanged:
 //! [`spawn_build_task`] runs the build and
-//! sends today's `CompletionReport` into the permanent sink; this loop
-//! consumes the sink directly (there is no relay) and forwards the
-//! report through `ReportOutcome` until it is acknowledged. The
-//! classification feed to the scheduler is therefore byte-identical to
-//! the stream path's. Input prefetch is the executor's own
-//! closure-compute + JIT/manifest warm path inside `execute_build`;
-//! scheduler-pushed `PrefetchHint`s do not exist on the pull path.
+//! sends the `CompletionReport` into the build-task sink; this loop
+//! consumes the sink directly and forwards the
+//! report through `ReportOutcome` until it is acknowledged. Input
+//! prefetch is the executor's own closure-compute + JIT/manifest warm
+//! path inside `execute_build`; there are no scheduler-pushed
+//! prefetch hints.
 //!
 //! Exit codes (`builder.pull.exit-codes`): 0 only for `Gone`, for an
 //! acknowledged `ReportOutcome`, and for the charge-free idle exit
@@ -131,9 +129,9 @@ pub(super) trait PullTransport {
     ) -> impl Future<Output = Result<(), tonic::Status>> + Send;
 }
 
-/// Wrap one unary request with the executor identity header, exactly
-/// as the stream open and every heartbeat do (no-op in dev mode where
-/// the token is empty and the scheduler is keyless/permissive).
+/// Wrap one unary request with the executor identity header (no-op in
+/// dev mode where the token is empty and the scheduler is
+/// keyless/permissive).
 fn authed_request<T>(req: T, executor_token: &str) -> tonic::Request<T> {
     let mut request = tonic::Request::new(req);
     if !executor_token.is_empty() {
@@ -345,11 +343,10 @@ pub(super) async fn report_until_acked<T: PullTransport>(
     }
 }
 
-/// Wait for the single build's `CompletionReport` on the permanent
-/// sink. Everything else the build machinery emits on the sink (the
-/// `WorkAssignmentAck`, log batches, prefetch ACKs) has no consumer in
-/// pull mode and is discarded; draining it here also keeps the build
-/// task from ever blocking on a full channel.
+/// Wait for the single build's `CompletionReport` on the build-task
+/// sink. Everything else the build machinery emits on the sink (phase
+/// edges) has no consumer here and is discarded; draining it also
+/// keeps the build task from ever blocking on a full channel.
 async fn wait_for_completion(
     sink_rx: &mut mpsc::Receiver<ExecutorMessage>,
 ) -> Option<CompletionReport> {
@@ -362,7 +359,7 @@ async fn wait_for_completion(
 }
 
 // r[impl builder.cancel.cgroup-kill+2]
-// r[impl builder.shutdown.sigint+3]
+// r[impl builder.shutdown.sigint+4]
 /// AD5 abort phase: wait for the single build's completion, aborting
 /// the build if SIGTERM arrives first. The abort is the same
 /// cancel-honor path `CancelSignal` uses (`try_cancel_build`: slot
@@ -391,15 +388,14 @@ async fn build_phase_with_abort(
     }
 }
 
-/// The pull-mode lifecycle: pull → build (existing machinery) → report
-/// → exit. Replaces the `'reconnect` stream loop when
-/// `dispatch_mode = pull`.
+/// The pull lifecycle: pull → build (existing machinery) → report →
+/// exit. The builder runtime's only delivery path.
 // r[impl builder.pull.exit-codes]
 // r[impl sched.executor.one-shot+2]
 pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     anyhow::ensure!(
         !rt.intent_id.is_empty(),
-        "dispatch_mode=pull requires RIO_INTENT_ID (the controller injects it at Job spawn)"
+        "the pull runtime requires RIO_INTENT_ID (the controller injects it at Job spawn)"
     );
     let executor_token = rt.executor_token.clone();
     let mut transport = AuthedPullTransport {
@@ -480,9 +476,6 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         // builder bug and let the pod-terminal path classify it.
         anyhow::bail!("completion channel closed before the build reported");
     };
-    // The sink has been consumed (no relay in pull mode): the
-    // completion is now owned by the report loop below.
-    rt.completion_pending.store(false, Ordering::Release);
 
     let acked = report_until_acked(
         &mut transport,
@@ -711,6 +704,7 @@ mod tests {
     /// stops (exit 0 follows at the caller).
     // r[verify builder.pull.retry-loop+2]
     // r[verify builder.pull.exit-codes]
+    // r[verify builder.completion.exactly-once-or-death+2]
     #[tokio::test(start_paused = true)]
     async fn report_retries_until_acked() {
         let mut t = ScriptedTransport::new(
@@ -738,6 +732,7 @@ mod tests {
     /// up with `false` — the caller exits nonzero so the Job goes
     /// Failed and the pod-terminal path classifies it.
     // r[verify builder.pull.exit-codes]
+    // r[verify builder.completion.exactly-once-or-death+2]
     #[tokio::test(start_paused = true)]
     async fn report_budget_exhausted_is_nonzero_exit() {
         let mut t = ScriptedTransport::new(
@@ -938,7 +933,7 @@ mod abort_tests {
     }
 
     // r[verify builder.cancel.cgroup-kill+2]
-    // r[verify builder.shutdown.sigint+3]
+    // r[verify builder.shutdown.sigint+4]
     /// SIGTERM with a build in flight: the abort fires through the
     /// cancel-honor path (the slot's cancel flag is set — the same flag
     /// the cgroup-kill path keys on), the build task's `Cancelled`

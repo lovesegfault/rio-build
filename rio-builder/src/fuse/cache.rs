@@ -256,10 +256,9 @@ impl Cache {
     }
 
     /// Classify `basename` against the JIT allowlist. See [`JitClass`].
-    /// `None` → not armed (warm-gate prefetch window). Armed + present →
+    /// `None` → not armed (before `register_inputs`). Armed + present →
     /// block-and-fetch with size-aware timeout. Armed + absent → fast
     /// ENOENT.
-    // r[impl builder.warmgate.filter]
     pub fn jit_classify(&self, basename: &str) -> JitClass {
         match &*self.known_inputs.read().ignore_poison() {
             None => JitClass::NotArmed,

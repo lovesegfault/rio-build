@@ -175,27 +175,12 @@
     {
       "path": "runtime/",
       "depth": 0,
-      "doc": "Worker runtime: the `'reconnect` event loop and build-task spawning."
-    },
-    {
-      "path": "runtime/drain.rs",
-      "depth": 1,
-      "doc": "Drain-on-SIGTERM machinery: the top-of-reconnect gate that flips"
-    },
-    {
-      "path": "runtime/heartbeat.rs",
-      "depth": 1,
-      "doc": "Heartbeat construction and the background heartbeat loop."
-    },
-    {
-      "path": "runtime/prefetch.rs",
-      "depth": 1,
-      "doc": "PrefetchHint handling: warm the FUSE cache and ACK the scheduler."
+      "doc": "Worker runtime: the pull-mode lifecycle and build-task spawning."
     },
     {
       "path": "runtime/pull.rs",
       "depth": 1,
-      "doc": "Pull-mode client loop (`dispatch_mode = pull`)."
+      "doc": "The pull client loop — the builder runtime's delivery path."
     },
     {
       "path": "runtime/result.rs",
@@ -1693,7 +1678,7 @@
     {
       "path": "k8s/qa/scenarios/i032_relay_loop.rs",
       "depth": 3,
-      "doc": "I-032: relay pump loop didn't watch `target.changed()` → completion"
+      "doc": "I-032 (historical): the stream-era relay pump could silently drop"
     },
     {
       "path": "k8s/qa/scenarios/i033_zombie_executors.rs",

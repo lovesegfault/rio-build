@@ -800,9 +800,9 @@ pub async fn utilization_reporter_loop_with_shutdown(
     snapshot: ResourceSnapshotHandle,
     shutdown: rio_common::signal::Token,
 ) {
-    // 10s: matches HEARTBEAT_INTERVAL. The heartbeat reads the shared
-    // snapshot; a 15s poll would mean every third heartbeat sees stale
-    // data. 10s keeps Prometheus gauges and ListExecutors in lockstep.
+    // 10s cadence. The completion stamp and the Prometheus gauges read
+    // the same shared snapshot, so a single sampling site keeps them in
+    // lockstep.
     const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
     let cpu_stat_path = root.join("cpu.stat");
     let mem_current_path = root.join("memory.current");

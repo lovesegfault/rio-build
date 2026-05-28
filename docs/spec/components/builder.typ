@@ -17,8 +17,8 @@ distinguished by `RIO_EXECUTOR_KIND`.
 
 = Responsibilities
 
-- Receive a single build assignment from the scheduler via gRPC (one
-  derivation per pod, then exit)
+- Pull the single assignment this pod was spawned for from the scheduler
+  (`PullAssignment`; one derivation per pod, then exit)
 - Run the @fuse store daemon (the `fuse` module) that mounts at
   `/var/rio/fuse-store` (configurable) with lazy on-demand fetching from
   rio-store
@@ -27,9 +27,10 @@ distinguished by `RIO_EXECUTOR_KIND`.
   inside the build's mount namespace
 - Execute build: invoke `nix-daemon --stdio` locally for sandboxed build
   execution
-- Stream build logs back to scheduler via gRPC bidirectional streaming
-- After build: upload output @nar to rio-store (chunked), report completion
-- Heartbeat / health checking to scheduler
+- Stream build logs to rio-store's `LogService.AppendLog` (the log data
+  plane; the scheduler never relays log bytes)
+- After build: upload output @nar to rio-store (chunked), report the outcome
+  with `ReportOutcome` (retried until acknowledged)
 - Resource usage reporting (CPU, memory, disk, build duration)
 
 = FUSE Store (`rio-builder::fuse`)
@@ -116,9 +117,9 @@ to lazily fetch @store-path content on demand.
 - *Perfect caching*: Store paths are immutable and content-addressed. Once
   cached, data never needs invalidation or re-fetching. The SSD cache is
   purely additive with LRU eviction under disk pressure.
-- *Predictive prefetch*: The scheduler sends #glspl("prefetch-hint") via the build
-  execution stream before assigning work. The FUSE daemon warms its cache with
-  the build's input closure paths before the build starts.
+- *Predictive warm-up*: the executor computes the input closure itself and
+  primes the FUSE cache's manifest hints (#rref("builder.warmgate.manifest-prime"))
+  before daemon spawn; paths are then materialized on demand by JIT lookup.
 
 == FUSE Cache
 
@@ -136,8 +137,8 @@ to lazily fetch @store-path content on demand.
 #r("builder.platform.i686")[
   The per-build daemon's `nix.conf` MUST set `extra-platforms` to the worker's
   resolved `RIO_SYSTEMS` (minus the `builtin` pseudo-system). This keeps
-  daemon acceptance consistent with what the heartbeat advertises to the
-  scheduler: an x86_64 Pool with `systems: [x86_64-linux, i686-linux]` routes
+  daemon acceptance consistent with the pod's resolved identity systems: an
+  x86_64 Pool with `systems: [x86_64-linux, i686-linux]` routes
   i686 derivations to its pods, and the daemon accepts them because
   `extra-platforms = x86_64-linux i686-linux`. The host system appearing in
   `extra-platforms` is a no-op; on aarch64 builders the line contains only
@@ -210,36 +211,23 @@ This does not reintroduce the writable-mode concern --- Linux ignores symlink
 permission bits for access control (`man 7 path_resolution`), so the perm
 value carries no semantics beyond cross-builder parity.
 
-== Prefetch Warm-Gate
+== Input Warm-up & Manifest Prime
 
-#r("builder.warmgate.handshake")[
-  On receipt of a `PrefetchHint` from the scheduler, the builder spawns one
-  fire-and-forget fetch task per hinted path (bounded by a semaphore), then a
-  joiner task that awaits ALL of them and sends
-  `PrefetchComplete{paths_fetched, paths_cached}` on the BuildExecution
-  stream. (The scheduler-side warm-gate that consumed this ACK retired with
-  the stream placement layer; the prefetch itself still warms the cache
-  before the build starts.) An
-  empty hint sends the ACK immediately. The hint handler MUST NOT block the
-  BuildExecution event loop --- per-path tasks queue in tokio's scheduler and
-  only enter the blocking pool once a permit is acquired. Per-path outcomes
-  are recorded in #(refs.metric)("rio_builder_prefetch_total")`{result}`.
-]
-
-#r("builder.warmgate.filter")[
-  Each `PrefetchHint` path is classified BEFORE entering the blocking pool:
-  (a) JIT allowlist armed AND path NOT a declared input → skip
-  (`reason=not_input`; FUSE lookup would ENOENT it anyway); (b) JIT allowlist
-  NOT armed (initial warm-gate batch, before any assignment) AND
-  `QueryPathInfo.nar_size > 256 MiB` → skip (`reason=size_cap`); (c) declared
-  input OR under cap → fetch. The size cap stops the warm-gate from
-  speculatively pulling multi-GB sibling outputs the scheduler over-includes
-  (I-212: `approx_input_closure` sends ALL outputs of each input drv, e.g., a
-  2.9 GB `clang-debug` alongside the `clang-out` the build actually needs).
-  Declared inputs that exceed the cap are still fetched on-demand by JIT
-  lookup, so the filter never blocks a correct build. Filtered paths increment
-  #(refs.metric)("rio_builder_prefetch_filtered_total")`{reason}`.
-]
+*Retired (1d builder collapse — scheduler-pushed prefetch):*
+`builder.warmgate.handshake` and `builder.warmgate.filter` described the
+scheduler-pushed `PrefetchHint` → `PrefetchComplete` warm-gate handshake and
+its I-212 path filter. The handshake's scheduler half retired with the stream
+placement layer (1c' deletion commit B); the builder half — the hint handler,
+its semaphore-bounded fetch tasks, and the
+`rio_builder_prefetch_total` / `rio_builder_prefetch_filtered_total` counters
+— is deleted with the stream client, and those two metrics are retired with
+it (no replacement series: the warm path they measured no longer exists).
+Surviving carriers of the load-bearing content: the input-closure warm-up is
+the executor's own manifest prime (#rref("builder.warmgate.manifest-prime"))
+plus JIT lookup, and the "never materialize a path the build cannot read"
+property is owned by the JIT allowlist
+(#rref("builder.fuse.jit-register"), #rref("builder.fuse.jit-lookup")), whose
+classification helper (`jit_classify`) is unchanged.
 
 #r("builder.warmgate.manifest-prime")[
   After computing the input closure and before daemon spawn, the executor
@@ -340,33 +328,25 @@ value carries no semantics beyond cross-builder parity.
   `parking_lot::Mutex`; zero `tokio::sync`, zero `.await`.
 ]
 
-#r("builder.heartbeat.rpc-timeout")[
-  Each heartbeat RPC MUST be bounded by a timeout strictly less than
-  `HEARTBEAT_INTERVAL`. The interval loop is sequential (`tick → await RPC →
-  apply`); without a per-RPC bound, one RPC stalled past
-  `HEARTBEAT_TIMEOUT_SECS` (scheduler actor mpsc backpressure at
-  `send_unchecked`, or asymmetric network delay on a live connection --- h2
-  keepalive detects dead transports, not slow application handlers) consumes
-  all `MAX_MISSED_HEARTBEATS` budgets and `tick_check_heartbeats` reaps a
-  healthy worker (bug_044). On elapse, `apply_heartbeat_response`'s `Err` arm
-  sets `ready=false` and the next tick fires on schedule
-  (`MissedTickBehavior::Delay`, not `Burst`).
-]
-
-#r("builder.heartbeat.store-degraded")[
-  `HeartbeatRequest.store_degraded` (proto bool, field 9) reflects
-  `CircuitBreaker::is_open()`. Scheduler treats it like `draining`:
-  `has_capacity()` returns false, builder is excluded from assignment.
-  Wire-compatible: old workers don't send it, scheduler reads default `false`.
-  Cleared when the breaker closes or half-opens.
-]
+*Retired (1d builder collapse — the heartbeat task):*
+`builder.heartbeat.rpc-timeout` and `builder.heartbeat.store-degraded`
+described the periodic heartbeat loop (per-RPC timeout strictly below the
+interval; the `store_degraded` capacity flag). The heartbeat task, its
+constants, and the `HeartbeatRequest`/`HeartbeatResponse` wire surface are
+deleted with the stream session: pod liveness belongs to the kubelet/Job
+lifecycle, attempt liveness to the durable open-attempt row plus the
+establishment sweep (#rref("sched.attempt.establishment-window")), and there
+is no scheduler-side capacity state left for a degraded-store flag to gate —
+the FUSE circuit breaker (#rref("builder.fuse.circuit-breaker+3")) still
+fails the affected build fast, and the resulting infra-classed outcome
+reaches the scheduler through the normal report/retry path.
 
 - `open`: Open the already-materialized local file (fast path, since `lookup`
   fetched the tree). Falls back to `ensure_cached()` on ENOENT. With
   passthrough enabled, hands the kernel a backing fd via `open_backing()` so
-  subsequent `read()` calls bypass userspace. *Prefetch is separate* --- it's
-  scheduler-driven via `PrefetchHint` messages on the assignment stream, not
-  triggered by `open()`.
+  subsequent `read()` calls bypass userspace. *Warm-up is separate* --- the
+  executor primes manifest hints for the input closure before daemon spawn
+  (#rref("builder.warmgate.manifest-prime")), not triggered by `open()`.
 
 == FUSE Design Notes
 
@@ -449,8 +429,10 @@ attempt to delegate or substitute externally.
 
 == Builder Capabilities
 
-Each builder advertises two capability lists in its heartbeat so the scheduler
-can route derivations:
+Each builder resolves two capability lists at startup; the scheduler applies
+the same vocabulary server-side when it filters spawn intents per pool
+(`GetSpawnIntentsRequest.{kind, systems, filter_features}`), so the pod that
+pulls a derivation was spawned from a pool whose capabilities already match:
 
 - *`systems`* (`Vec<String>`): Nix system identifiers this builder can build
   for (e.g., `x86_64-linux`, `aarch64-linux`). The scheduler's `hard_filter()`
@@ -548,9 +530,9 @@ can route derivations:
 Before the build process starts, the worker writes a 3-line `rio:` header
 (`exec`, `builder`, `started`) as a direct `BuildLogBatch` at line 0; after the
 process exits it writes a 2-line footer (`exec`, `result`) at the final line
-offset. Both are sent on the same `BuildExecution` stream as build output, *not*
-through the `LogBatcher` (which is created and consumed inside the daemon
-lifecycle). The `LogBatcher` is seeded with the header line count so the
+offset. Both go to the same per-execution rio-store log uploader as build
+output, *not* through the `LogBatcher` (which is created and consumed inside
+the daemon lifecycle). The `LogBatcher` is seeded with the header line count so the
 build's real output numbers after the header. The header carries the
 `WorkAssignment.exec_id`, the system + `hw_class`, and the assigned resource
 triple --- never pod or node identity. The banner is per-execution, not
@@ -1232,21 +1214,17 @@ is stable (post Phase 3).
   to the target build's `cgroup.kill`
   (SIGKILLs the entire cgroup tree). The build's executor task detects the
   daemon exit, releases the semaphore permit, tears down the overlay, and
-  sends `CompletionReport{status: Cancelled}`. The abort trigger is
-  mode-specific: in stream mode it is the scheduler's `CancelSignal` on the
-  BuildExecution stream (pod-preemption handling --- the scheduler cancels
-  builds on an evicting node before the SIGTERM grace period wastes
-  `terminationGracePeriodSeconds`); in pull mode it is SIGTERM itself (AD5:
-  any pod termination aborts the in-flight build through this same path, the
-  resulting `Cancelled` completion gets one bounded best-effort
-  `ReportOutcome` attempt, and the process exits inside the pull-mode
-  45 s grace --- there is no finish-if-you-can mode for pull pods).
+  sends `CompletionReport{status: Cancelled}`. The abort trigger is SIGTERM
+  itself (AD5: any pod termination --- cancel, preemption, node drain ---
+  aborts the in-flight build through this same path, the resulting
+  `Cancelled` completion gets one bounded best-effort `ReportOutcome`
+  attempt, and the process exits inside the pull-mode 45 s grace --- there is
+  no finish-if-you-can mode).
 ]
 
 #r("builder.cancel.pre-cgroup-deferred+2")[
-  A cancel --- a stream-mode `CancelSignal` or a pull-mode SIGTERM-abort ---
-  that arrives before the per-build cgroup exists (`cgroup.kill` →
-  ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
+  A cancel (the SIGTERM-abort) that arrives before the per-build cgroup
+  exists (`cgroup.kill` → ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
   before the prefetch/register phase and abort with `Cancelled` status without
   spawning nix-daemon. The pre-cgroup window is overlay setup → resolve →
   prepare_sandbox → register_inputs + prefetch_manifests --- sub-second since
@@ -1282,84 +1260,49 @@ is stable (post Phase 3).
   paths outside their declared input closure (hermeticity).
 ]
 
-= Stream Relay & Reconnect
+= Completion Delivery
 
-#r("builder.completion.exactly-once-or-death")[
+#r("builder.completion.exactly-once-or-death+2")[
   Every assignment the builder accepts MUST produce exactly one
   `CompletionReport` delivered to the scheduler (whichever replica is leader
   when delivery succeeds), or the process MUST die without having delivered
   one --- never neither, and never two reports with different outcomes for
   the same build. Every terminal path (success, failure, cancellation,
   panic) funnels through the single `send_completion` chokepoint into the
-  permanent sink; the queued report survives stream churn and scheduler
-  failover via the parked-relay machinery (#rref("builder.relay.reconnect"))
-  and is flushed before the stream is dropped on exit
-  (#rref("builder.relay.graceful-exit-close")); and no graceful exit path
-  (drain, idle fast-path, build-complete) may run while `completion_pending`
-  is set (#rref("builder.completion.pending-armed-early"),
-  #rref("builder.shutdown.idle-no-reregister")). The builder MUST NOT
-  fabricate a report for an assignment it did not accept. A pod that dies
-  before delivery is the accepted residual: its death is observed and
-  classified by the controller/scheduler side
-  (#rref("sched.reassign.no-promote-on-ephemeral-disconnect")), never by a
-  second worker-side report.
+  build-task sink; the pull loop forwards the queued report through the
+  idempotent `ReportOutcome` unary, retried until the scheduler acknowledges
+  it (#rref("builder.pull.retry-loop")), and exit code 0 is reserved for the
+  acknowledged/charge-free outcomes (#rref("builder.pull.exit-codes")) so a
+  pod can never exit "successfully" with the report still owed. The builder
+  MUST NOT fabricate a report for an assignment it did not accept. A pod that
+  dies before delivery is the accepted residual: its death is observed and
+  classified by the controller/scheduler side (the pod-terminal
+  `ReportAttemptOutcome` second installment or the establishment sweep),
+  never by a second worker-side report; idempotency on re-delivery is the
+  scheduler's exec_id-keyed report fill
+  (#rref("sched.executor.report-idempotent")).
 ]
 
-This is the delivery obligation the reconnect loop, permanent sink,
-half-close flush, drain gate, generation fence, and slot rejection jointly
-implement, and the assumption the scheduler-side session machinery makes
+This is the delivery obligation the pull loop's report phase and the exit-code
+discipline jointly implement, and the assumption the scheduler side makes
 about its peer: a started build's report is eventually delivered to some
 leader unless the pod dies first, and is never delivered twice as two
-different outcomes. Stating it as one rule gives the builder's delivery
-choreography a top-level normative anchor rather than leaving the property
-implicit in six cooperating mechanisms.
+different outcomes.
 
-#r("builder.completion.pending-armed-early")[
-  `completion_pending` MUST be armed `true` at the start of `executor_future`,
-  before the first `.await`. The flag means "completion owed, not yet flushed"
-  (NOT "completion queued"): on panic, `_slot_guard` drops during
-  `catch_unwind`'s unwind BEFORE the panic-catcher's `handle.await` resolves
-  and calls `send_completion`, so the bug_472 invariant ("`_slot_guard` drops
-  AFTER `send_completion`") inverts. With the flag armed early,
-  `wait_build_flushed` parks the done-watcher across that gap and the
-  panic-catcher's `InfrastructureFailure` reaches the wire instead of a dead
-  stream (bug_012). The redundant store inside `send_completion` stays for any
-  future caller outside `executor_future`.
-]
-
-#r("builder.relay.graceful-exit-close")[
-  On terminal exit (`BuildComplete` / `drain_done`), the builder MUST park the
-  relay target to `None` and drain the response stream to server-close
-  (bounded 2s) before dropping `build_stream`. `relay_loop` clears
-  `completion_pending` on `grpc_tx.send()` Ok, which only means "in the
-  256-cap mpsc buffer between relay and tonic's body driver"; a raw
-  `build_stream` drop is h2 `RST_STREAM(CANCEL)` → hyper drops the
-  request-body driver → buffered `Completion` discarded (bug_117). Parking
-  drops all `grpc_tx` senders so `ReceiverStream` yields `None` → tonic
-  flushes buffered frames + END_STREAM; draining the response side then lets
-  `build_stream` drop after server half-close instead of RST. Best-effort: on
-  2s elapse the scheduler observes `ExecutorDisconnected` and re-dispatches
-  anyway.
-]
-
-#r("builder.relay.reconnect")[
-  Running builds send `CompletionReport`/`BuildLogBatch`/`PrefetchComplete` to
-  a process-lifetime `mpsc::channel(256)` (the permanent sink), NOT to the
-  gRPC outbound channel directly. A `relay_loop` task pumps the sink into
-  whichever gRPC outbound channel is currently live, tracked via
-  `watch::channel<Option<Sender>>`. On `BuildExecution` stream close/error the
-  reconnect loop swaps the watch to `None` (relay blocks on `changed()`, sink
-  buffers in its 256-slot backlog --- \~25s at typical 100ms-batch log rates),
-  sleeps \~1s, opens a fresh stream, and swaps the new gRPC channel in. The
-  relay recovers the one in-transit message lost on transition
-  (`mpsc::error::SendError<T>` holds it). The pump loop MUST `select!`
-  `biased;` on `target.changed()` BEFORE `sink_rx.recv()` --- `grpc_tx.send()`
-  may keep succeeding into a zombie tonic `ReceiverStream` that outlived its
-  network stream (I-032: completions silently lost for \~20min after scheduler
-  failover). Why a permanent sink: `stderr_loop` breaks the build with
-  `MiscFailure` if its log send fails; handing build tasks the gRPC channel
-  directly would kill every running build on scheduler failover.
-]
+*Retired (1d builder collapse — the stream relay):*
+`builder.completion.pending-armed-early`, `builder.relay.graceful-exit-close`
+and `builder.relay.reconnect` described the stream-era delivery machinery
+(the `completion_pending` drain gate, the half-close flush before dropping
+the bidi stream, and the parked-relay/permanent-sink reconnect choreography).
+That machinery is deleted with the `BuildExecution` stream client: there is
+no relay, no drain gate, and no stream to half-close. The delivery obligation
+they served is carried by the re-stated
+#rref("builder.completion.exactly-once-or-death") above — the report-retry
+loop (#rref("builder.pull.retry-loop")), the exit-code discipline
+(#rref("builder.pull.exit-codes")), and the scheduler-side classification of
+a pod that dies before its report (second installment / establishment). The
+build-task sink itself remains (build tasks never lose a send because the
+scheduler is unreachable; delivery retries live in the report loop).
 
 #r("builder.result.input-enoent-is-infra+2")[
   When the nix-daemon returns `MiscFailure` with an error message indicating a
@@ -1377,16 +1320,14 @@ implicit in six cooperating mechanisms.
   materialization failures.
 ]
 
-= Pull-Mode Client
+= Pull Client
 
-In pull mode (`dispatch_mode = pull`, the default since the
-executor-lifecycle 1c cutover; selected per pool) the builder does not
-register, heartbeat, or open the `BuildExecution` stream: it asks for its work
-with `ExecutorService.PullAssignment` and reports the outcome with
-`ExecutorService.ReportOutcome`, both retried until acked. The stream-mode
-client below is unchanged and stays selectable (`dispatch_mode = stream`,
-rendered explicitly by the controller for `dispatchMode: Stream` pools) until
-that path is deleted at the 1c'/1d slices.
+The builder does not register, heartbeat, or open a dispatch stream: it asks
+for its work with `ExecutorService.PullAssignment` and reports the outcome
+with `ExecutorService.ReportOutcome`, both retried until acked. This is the
+only delivery path — the stream session client was deleted with the
+executor-lifecycle 1d collapse (a pool-level `dispatchMode: Stream` value
+still renders, but the builder ignores the env and always pulls).
 
 #r("builder.pull.retry-loop+2")[
   In pull mode the builder MUST retry a retryably-unservable `PullAssignment`
@@ -1419,67 +1360,32 @@ with a clear log line instead of a node silently held until
 
 = Shutdown
 
-#r("builder.idle-exit+2")[
-  The reconnect loop's `select!` has a `tokio::time::sleep_until(last_activity
-  + idle_timeout)` arm guarded by `!slot.is_busy()`. `last_activity` is bumped
-  on every received scheduler message (Assignment, Cancel, Prefetch). If
-  `idle_timeout` elapses with the slot still idle, the builder logs `"idle
-  timeout (no assignment); exiting"` and breaks the loop with the same
-  `BuildComplete` exit path as a finished build (heartbeat abort → FUSE abort
-  → return from `main()`). The arm is `biased;` after the build-done arm so a
-  coinciding completion wins. I-116: a Karpenter-scaled pod that the scheduler
-  never dispatches to (intent mismatch, drained pool) exits cleanly instead of
-  idling to `activeDeadlineSeconds`.
-]
+*Retired (1d builder collapse — the stream shutdown machinery):*
+`builder.idle-exit`, `builder.shutdown.idle-no-reregister` and
+`builder.ephemeral.exit-aborts-heartbeat` described the stream-era exit
+paths: the reconnect loop's I-116 idle-timeout arm, the SIGTERM
+drain-without-re-registering fast path, and the heartbeat-abort-before-FUSE
+teardown ordering. The reconnect loop, drain gate, registration and heartbeat
+no longer exist. Successors of the load-bearing content: the I-116
+"surplus pod exits cleanly instead of idling to `activeDeadlineSeconds`"
+property is the charge-free `NotYetReady` idle exit and the `Gone` outcome
+(#rref("builder.pull.exit-codes")); SIGTERM handling is the abort semantics
+of #rref("builder.shutdown.sigint") below; and teardown ordering is
+#rref("builder.shutdown.fuse-abort") (there is no heartbeat task left to
+abort first).
 
-#r("builder.shutdown.sigint+3")[
-  The builder handles both SIGTERM and SIGINT by leaving its dispatch loop,
-  running teardown (heartbeat abort → FUSE abort), and returning
-  from `main()`. Local development (`cargo run` → Ctrl+C) and Kubernetes pod
-  deletion (kubelet → SIGTERM) share the same exit path. Returning from
-  `main()` lets `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit
-  handlers fire (LLVM profraw flush). In stream mode the signal breaks the
-  BuildExecution select loop after the drain semantics of
-  #rref("builder.shutdown.idle-no-reregister") run their course; in pull mode
-  the semantics invert --- the signal is an abort, not a drain: an in-flight
-  build is cgroup-killed (#rref("builder.cancel.cgroup-kill")), the
+#r("builder.shutdown.sigint+4")[
+  The builder handles both SIGTERM and SIGINT by leaving the pull loop,
+  running teardown (FUSE abort), and returning from `main()`. Local
+  development (`cargo run` → Ctrl+C) and Kubernetes pod deletion (kubelet →
+  SIGTERM) share the same exit path. Returning from `main()` lets
+  `fuse_session`'s `Mount` drop (`fusermount -u`) and atexit handlers fire
+  (LLVM profraw flush). The signal is an abort, not a drain (AD5): an
+  in-flight build is cgroup-killed (#rref("builder.cancel.cgroup-kill")), the
   `Cancelled` completion gets exactly one bounded best-effort `ReportOutcome`
   attempt, the pull/report retry loops stop waiting, and the process exits
-  within the pull-mode grace.
-]
-
-#r("builder.shutdown.idle-no-reregister+3")[
-  On SIGTERM with an idle build slot AND no `CompletionReport` pending in the
-  permanent sink, the builder MUST break the reconnect loop without sending a
-  fresh `ExecutorRegister`. The reconnect-under-drain machinery exists so an
-  in-flight build's `CompletionReport` reaches the (possibly new) leader; an
-  idle slot with no pending completion has nothing to report. If a completion
-  IS buffered in the sink (build finished during a stream-retry sleep with
-  `relay_target=None`), the loop MUST reconnect once to flush before exiting
-  --- `_slot_guard` drops AFTER `send_completion` queues the report, so
-  slot-idle alone does not imply delivered (bug_472). Re-registering bumps the
-  scheduler's `workers_active`, and the heartbeat task (aborted only after the
-  loop exits) keeps `last_heartbeat` fresh until the process actually exits
-  --- under coverage instrumentation the profraw atexit write delays that by
-  \~80s (I-195, GHA 24018216226). The same fast-path applies on any subsequent
-  `'reconnect` iteration where `draining=true`, the slot has since gone idle,
-  and `completion_pending` is clear. This rule's subject is the stream-mode
-  reconnect loop only: a pull-mode builder has no registration, heartbeat, or
-  reconnect machinery at all, so on SIGTERM there is nothing to suppress ---
-  it simply stops pulling (or aborts per
-  #rref("builder.shutdown.sigint")) and exits.
-]
-
-#r("builder.ephemeral.exit-aborts-heartbeat+2")[
-  On exit from the reconnect loop (single-shot build done, idle timeout, or
-  drain complete), the builder MUST abort the heartbeat task before
-  `drop(fuse_session)`. A live heartbeat with a closed BuildExecution stream
-  presents to the scheduler as an undispatchable zombie executor (I-142). The
-  builder does NOT call `AdminService.DrainExecutor` --- the service-token
-  gate (#rref("sec.authz.service-token")) allowlists controller and rio-cli
-  only, and the builder is intentionally excluded from the `serviceHmac`
-  mount; deregistration is via stream-close → `ExecutorDisconnected`
-  (heartbeat already reported `draining=true`).
+  within the pull-mode grace; a signal while still waiting for work exits 0
+  without building (nothing started, nothing owed).
 ]
 
 #r("builder.shutdown.fuse-abort")[
@@ -1550,7 +1456,7 @@ with a clear log line instead of a node silently held until
     [Chunk and upload build outputs (streaming NAR → rio-store PutPath)],
 
     src("rio-builder/src/log_stream.rs"),
-    [Build log batching (64-line/100ms) and streaming via gRPC],
+    [Build log batching (64-line/100ms) for the rio-store log uploader],
 
     src("rio-builder/src/cgroup.rs"),
     [cgroup v2 per-build subtree: memory.peak + polled cpu.stat for tracking;
@@ -1559,11 +1465,12 @@ with a clear log line instead of a node silently held until
 
     src("rio-builder/src/health.rs"),
     [axum `/healthz` + `/readyz` (builder has no gRPC server; K8s probes hit
-      HTTP). Readiness tracks heartbeat-accepted.],
+      HTTP). Readiness tracks "assignment pulled, build in progress".],
 
-    src("rio-builder/src/runtime.rs"),
-    [Heartbeat request builder + build-spawn context + prefetch-hint handler.
-      Extracted glue between `main.rs` and the subsystems.],
+    src("rio-builder/src/runtime/"),
+    [Pull loop (`pull.rs`), build-spawn context, completion construction and
+      cold-start wiring. Extracted glue between `main.rs` and the
+      subsystems.],
   ),
 )
 
@@ -1575,10 +1482,10 @@ with a clear log line instead of a node silently held until
     align: (left, left),
     [*Immediate effect*], [Running build on that pod is orphaned],
     [*Cascading effect*],
-    [Scheduler detects via missed heartbeats (\~50--60s wall-clock), calls
-      `reset_to_ready()` on the affected derivation --- it goes straight back
-      to Ready (increments `retry_count`) and re-queues, no intermediate
-      `InfrastructureFailure` classification],
+    [The pod's death reaches the scheduler as the controller's pod-terminal
+      `ReportAttemptOutcome` (or, if the controller never observes it, the
+      establishment sweep classifies the silent attempt) --- the derivation
+      goes back to Ready through the retry fold and re-queues],
 
     [*Recovery*],
     [Controller spawns a fresh Job for the re-queued derivation. New pod
@@ -1591,9 +1498,10 @@ When rio-store is degraded (slow but not down), builder FUSE cache misses
 queue up: read operations block, build sandboxes stall, and after 5
 consecutive `ensure_cached` failures the FUSE circuit breaker
 (#rref("builder.fuse.circuit-breaker+3")) opens and `check()` returns `EIO`
-immediately (fail-fast). The breaker state is reported to the scheduler via
-#rref("builder.heartbeat.store-degraded") so the builder is excluded from
-assignment.
+immediately (fail-fast). The affected build then fails with an infra-classed
+outcome and requeues through the scheduler's retry fold; there is no
+scheduler-side capacity state to exclude the pod from (it is one-shot and
+exits with its build).
 
 = Rationale
 
@@ -1656,46 +1564,38 @@ SQLite database in the upper layer. This avoids shared mutable state,
 eliminates shared PV infrastructure, and provides local-disk performance via
 SSD caching.
 
-== Streaming builder model // supersedes ADR-011
+== Pull-based delivery model // supersedes ADR-011 and the stream session
 <sec-rationale-streaming>
 
 The communication model between scheduler and workers determines latency,
-failure handling, and operational characteristics; the scheduler must be able
-to send control signals (cancel, prefetch hints) to the active build.
+failure handling, and operational characteristics. The original design (ADR-011
+and its successors) used a bidirectional `BuildExecution` stream per worker
+plus a periodic `Heartbeat` unary; the executor-lifecycle campaign replaced it,
+and the stream session client was deleted at the 1d collapse.
 
-Workers connect to the scheduler via a bidirectional `BuildExecution`
-streaming RPC. Builder pods are now one-build-per-pod (one-shot Jobs), so each
-stream's lifetime spans exactly one derivation. A single stream per worker
-carries: scheduler → worker --- build assignments (derivation + input closure
-metadata), prefetch hints for cache warming, cancel signals; worker →
-scheduler --- build log batches (streamed incrementally), build completion
-reports (success/failure, output paths, timing), acknowledgments. Heartbeats
-are a *separate unary RPC* (`Worker.Heartbeat`), not carried on the
-`BuildExecution` stream --- the heartbeat loop runs independently of stream
-lifecycle so liveness reporting survives stream reconnection. The stream
-provides natural #gls("backpressure"): if a worker is overwhelmed, gRPC flow control
-slows the scheduler's assignment rate. Connection drops are detected via gRPC
-keepalives, enabling fast failure detection and rescheduling.
+As built, a builder pod is born knowing its derivation (`RIO_INTENT_ID` + the
+HMAC executor token injected at Job spawn) and speaks exactly two idempotent
+unaries: `PullAssignment` (three outcomes — the dispatch payload, `Gone`, or
+`NotYetReady{retry_after}`) and `ReportOutcome`, both retried until
+acknowledged. Build logs do not transit the scheduler at all — they stream to
+rio-store's `LogService.AppendLog` (the log data plane), and the dashboard /
+`nix build -L` tail them from rio-store. Cancellation and preemption are pod
+terminations: the controller deletes the Job and the SIGTERM-abort path
+(#rref("builder.shutdown.sigint")) cgroup-kills the in-flight build and makes
+one bounded report attempt. Liveness is the Job's lifecycle — there is no
+registration or heartbeat, and a pod that dies silently is classified by the
+controller's pod-terminal report or the scheduler's establishment sweep.
 
-*Alternatives considered.* Unary RPC polling (worker pulls jobs) is simple but
-adds polling latency, generates unnecessary traffic when idle, and requires
-separate mechanisms for cancel signals and log streaming. A message queue
-(NATS, RabbitMQ, Kafka) decouples scheduler and workers but adds
-infrastructure complexity and another failure domain; build log streaming over
-a message queue is awkward, and ordered delivery of cancel signals is harder
-to guarantee. Server-sent events + REST has no bidirectional streaming, so log
-streaming and cancel signals require separate channels. Separate gRPC unary
-RPCs with server streaming for logs is more granular but requires correlating
-multiple streams per build and managing their lifecycles independently.
-
-*Consequences.* A single stream per worker simplifies connection management
-and multiplexes all communication; natural backpressure prevents worker
-overload without explicit rate limiting; incremental log streaming gives
-dashboard users real-time build output. On the negative side: long-lived
-streams are sensitive to network instability and require robust reconnection
-logic with state reconciliation (#rref("builder.relay.reconnect")), and
-debugging stream-level issues is harder than debugging individual
-request/response RPCs.
+*Consequences.* Work delivery is pod-initiated, so there is no per-executor
+send window or scheduler-side backpressure state — an unservable pull surfaces
+as a retried unary on the pod side. The polling latency the original ADR
+worried about is bounded by the `NotYetReady` retry hint (seconds) and applies
+only to forecast-spawned pods whose dependencies are not yet Ready; a pod
+spawned for Ready work pulls exactly once. The trade-off accepted with AD4 is
+that the scheduler learns of pod death only through the controller or the
+establishment window rather than a dropped TCP stream; the deadline-bounded
+establishment sweep is the backstop that keeps a silent loss from stranding an
+attempt forever.
 
 == `/dev/fuse` device injection and `cgroup_writable` // supersedes ADR-012 §Phase-1a
 <sec-rationale-device-inject>

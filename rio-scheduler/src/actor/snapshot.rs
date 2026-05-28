@@ -1084,8 +1084,8 @@ impl DagActor {
         // raw strings are tenant-controlled (`requiredSystemFeatures`,
         // already clamped at translate.rs's `strings_clamped` — this
         // is a defense-in-depth second line behind the gateway trust
-        // boundary); 64 entries × 32 chars matches executor_service.rs's
-        // `MAX_HEARTBEAT_FEATURES`; collisions dedup at ASCII-truncate,
+        // boundary); 64 entries × 32 chars; collisions dedup at
+        // ASCII-truncate,
         // which only over-debounces (fail-safe). The entry COUNT is
         // bounded by the LRU cap on the set itself (mb_001) — the
         // clamp alone leaves the doc's own threat case `["x-${uuid}"]`

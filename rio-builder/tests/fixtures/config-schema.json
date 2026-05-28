@@ -154,16 +154,11 @@
         "default": 0
       },
       "idle_secs": {
-        "description": "I-116 idle timeout: exit if no assignment arrives for this\nlong. Controller spawns N Jobs based on queue depth; if the\nqueue drains before all Jobs receive work, the unlucky ones\nwould otherwise idle until activeDeadlineSeconds. Env:\n`RIO_IDLE_SECS`. Default 120.",
+        "description": "I-116 idle timeout: exit if no assignment arrives for this\nlong. Controller spawns N Jobs based on queue depth; if the\nqueue drains before all Jobs receive work, the unlucky ones\nwould otherwise idle until activeDeadlineSeconds. Env:\n`RIO_IDLE_SECS`. Default 120. In pull mode this is the\nNotYetReady bound: a pod that has only ever received\n`NotYetReady` for this long exits 0, charge-free.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,
         "default": 120
-      },
-      "dispatch_mode": {
-        "description": "Dispatch mode: `pull` (default since the 1c cutover — the\n`PullAssignment`/`ReportOutcome` unary path; the pod pulls the\nderivation it was spawned for and reports its outcome, with no\nregistration, heartbeat, or stream) or `stream` (the legacy\nsession protocol, selectable until its 1c'/1d deletion).\nEnv: `RIO_DISPATCH_MODE=pull|stream`. The controller renders\nthe value explicitly for every pool it spawns; standalone runs\nthat want the session protocol must set `stream` themselves.",
-        "$ref": "#/$defs/DispatchMode",
-        "default": "pull"
       }
     },
     "$defs": {
@@ -193,21 +188,6 @@
             "default": 0
           }
         }
-      },
-      "DispatchMode": {
-        "description": "How this pod gets its work from the scheduler.\n\n`Pull` is the unary path and the default since the\nexecutor-lifecycle 1c cutover: the pod is born knowing its\nderivation (`RIO_INTENT_ID`) and asks for it with\n`ExecutorService.PullAssignment`, reporting the outcome with\n`ReportOutcome` — no registration, no heartbeat, no stream.\n`Stream` is the legacy session protocol (register, heartbeat, bidi\n`BuildExecution` stream); it stays selectable — the controller\nrenders `RIO_DISPATCH_MODE=stream` for `dispatchMode: Stream`\npools and standalone/systemd deployments set it explicitly — and\nfully functional until that path is deleted at the 1c'/1d slices.",
-        "oneOf": [
-          {
-            "description": "Legacy session protocol (register/heartbeat/stream).",
-            "type": "string",
-            "const": "stream"
-          },
-          {
-            "description": "Pull-mode unaries (`PullAssignment` / `ReportOutcome`) — the\ndefault.",
-            "type": "string",
-            "const": "pull"
-          }
-        ]
       }
     }
   },
@@ -244,7 +224,6 @@
     "executor_token": "",
     "daemon_timeout_secs": 7200,
     "max_silent_time_secs": 0,
-    "idle_secs": 120,
-    "dispatch_mode": "pull"
+    "idle_secs": 120
   }
 }

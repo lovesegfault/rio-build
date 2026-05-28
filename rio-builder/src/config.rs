@@ -24,31 +24,6 @@ fn executor_kind<'de, D: serde::Deserializer<'de>>(d: D) -> Result<ExecutorKind,
     }
 }
 
-/// How this pod gets its work from the scheduler.
-///
-/// `Pull` is the unary path and the default since the
-/// executor-lifecycle 1c cutover: the pod is born knowing its
-/// derivation (`RIO_INTENT_ID`) and asks for it with
-/// `ExecutorService.PullAssignment`, reporting the outcome with
-/// `ReportOutcome` — no registration, no heartbeat, no stream.
-/// `Stream` is the legacy session protocol (register, heartbeat, bidi
-/// `BuildExecution` stream); it stays selectable — the controller
-/// renders `RIO_DISPATCH_MODE=stream` for `dispatchMode: Stream`
-/// pools and standalone/systemd deployments set it explicitly — and
-/// fully functional until that path is deleted at the 1c'/1d slices.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema,
-)]
-#[serde(rename_all = "lowercase")]
-pub enum DispatchMode {
-    /// Legacy session protocol (register/heartbeat/stream).
-    Stream,
-    /// Pull-mode unaries (`PullAssignment` / `ReportOutcome`) — the
-    /// default.
-    #[default]
-    Pull,
-}
-
 /// Serde serializer for ExecutorKind as string. Needed for the
 /// compiled-defaults base layer of the config loader.
 fn executor_kind_ser<S: serde::Serializer>(k: &ExecutorKind, s: S) -> Result<S::Ok, S::Error> {
@@ -217,19 +192,16 @@ pub struct Config {
     /// long. Controller spawns N Jobs based on queue depth; if the
     /// queue drains before all Jobs receive work, the unlucky ones
     /// would otherwise idle until activeDeadlineSeconds. Env:
-    /// `RIO_IDLE_SECS`. Default 120.
+    /// `RIO_IDLE_SECS`. Default 120. In pull mode this is the
+    /// NotYetReady bound: a pod that has only ever received
+    /// `NotYetReady` for this long exits 0, charge-free.
     #[serde(rename = "idle_secs", with = "rio_common::config::secs")]
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
-    /// Dispatch mode: `pull` (default since the 1c cutover — the
-    /// `PullAssignment`/`ReportOutcome` unary path; the pod pulls the
-    /// derivation it was spawned for and reports its outcome, with no
-    /// registration, heartbeat, or stream) or `stream` (the legacy
-    /// session protocol, selectable until its 1c'/1d deletion).
-    /// Env: `RIO_DISPATCH_MODE=pull|stream`. The controller renders
-    /// the value explicitly for every pool it spawns; standalone runs
-    /// that want the session protocol must set `stream` themselves.
-    pub dispatch_mode: DispatchMode,
+    // dispatch_mode removed with the stream client (executor-lifecycle
+    // 1d collapse): pull is the only delivery path. A stray
+    // `RIO_DISPATCH_MODE` env (older pod templates render it) is
+    // ignored by the config loader.
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
@@ -267,7 +239,6 @@ impl Default for Config {
             daemon_timeout: crate::executor::DEFAULT_DAEMON_TIMEOUT,
             max_silent_time: std::time::Duration::ZERO,
             idle_timeout: std::time::Duration::from_secs(120),
-            dispatch_mode: DispatchMode::Pull,
         }
     }
 }

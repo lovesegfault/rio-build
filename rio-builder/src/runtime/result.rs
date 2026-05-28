@@ -4,8 +4,6 @@
 //! infrastructure status decision and the SLI outcome label live next to
 //! each other instead of inline in a 300-line spawned async block.
 
-use std::sync::atomic::{AtomicBool, Ordering};
-
 use tokio::sync::mpsc;
 
 use rio_proto::types::{
@@ -216,33 +214,23 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 }
 
 /// Single chokepoint for delivering a `CompletionReport` to the
-/// permanent sink. Every terminal build outcome (success, error,
-/// cancel, panic) MUST go through here so:
+/// build-task sink. Every terminal build outcome (success, error,
+/// cancel, panic) MUST go through here so
+/// `rio_builder_builds_total{outcome}` increments exactly once per
+/// build (observability.typ SLI). bug_174: the panic-catcher
+/// previously open-coded the send and skipped the counter, so a
+/// worker that panicked on 1/100 builds reported the same success
+/// rate as a healthy one.
 ///
-/// - `rio_builder_builds_total{outcome}` increments exactly once per
-///   build (observability.typ SLI). bug_174: the panic-catcher
-///   previously open-coded the send and skipped the counter, so a
-///   worker that panicked on 1/100 builds reported the same success
-///   rate as a healthy one.
-/// - `completion_pending` is set BEFORE the message enters `sink_rx`.
-///   The drain machinery (`reconnect_drain_gate`, `wait_build_flushed`)
-///   keys off this — NOT `slot.is_busy()` — to decide whether the
-///   reconnect loop may exit. The flag is ALSO armed at the start of
-///   `executor_future` (before any await) so it means "completion
-///   owed" rather than "completion queued" — bug_012: on panic,
-///   `_slot_guard` drops during unwind BEFORE the panic-catcher's
-///   `handle.await` lets it call this; the early arm makes the store
-///   here redundant on the normal path but load-bearing for any
-///   future caller outside `executor_future`. `relay_loop` clears the
-///   flag only after a successful `grpc_tx.send()` into a confirmed-
-///   open stream.
-// r[impl builder.completion.exactly-once-or-death]
+/// The sink's consumer is the pull loop, which forwards the report
+/// through `ReportOutcome` until the scheduler acknowledges it
+/// (`r[builder.pull.retry-loop+2]`); the pod's exit code is the only
+/// other delivery signal (`r[builder.pull.exit-codes]`).
+// r[impl builder.completion.exactly-once-or-death+2]
 pub(super) async fn send_completion(
     stream_tx: &mpsc::Sender<ExecutorMessage>,
-    completion_pending: &AtomicBool,
     completion: CompletionReport,
 ) {
-    completion_pending.store(true, Ordering::Release);
     metrics::counter!("rio_builder_builds_total", "outcome" => outcome_label(&completion))
         .increment(1);
     let msg = ExecutorMessage {
@@ -340,10 +328,9 @@ mod tests {
         let _guard = metrics::set_default_local_recorder(&rec);
 
         let (tx, mut rx) = mpsc::channel(4);
-        let pending = AtomicBool::new(false);
         let completion = panic_completion("/nix/store/aaa-x.drv".into(), "tok".into(), stamp());
 
-        send_completion(&tx, &pending, completion).await;
+        send_completion(&tx, completion).await;
 
         assert_eq!(
             rec.get("rio_builder_builds_total{outcome=infra_failure}"),
@@ -351,10 +338,6 @@ mod tests {
             "panic-path completion must increment the SLI counter \
              (saw keys: {:?})",
             rec.all_keys()
-        );
-        assert!(
-            pending.load(Ordering::Acquire),
-            "completion_pending set before sink send (drain-gate hook)"
         );
         // Message actually landed in the sink.
         let msg = rx.recv().await.unwrap();

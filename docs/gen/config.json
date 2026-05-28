@@ -666,12 +666,6 @@
         "type": "uint64",
         "default": "120",
         "description": "I-116 idle timeout: exit if no assignment arrives for this long."
-      },
-      {
-        "key": "dispatch_mode",
-        "type": "DispatchMode",
-        "default": "pull",
-        "description": "Dispatch mode: `pull` (default since the 1c cutover — the `PullAssignment`/`ReportOutcome` unary path; the pod pulls the derivation it was spawned for and reports its outcome, with no registration, heartbeat, or stream) or `stream` (the legacy session protocol, selectable until its 1c'/1d deletion)."
       }
     ],
     "controller": [

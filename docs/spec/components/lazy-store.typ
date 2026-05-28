@@ -859,10 +859,11 @@ them — both A and B funnel cold misses through the same userspace fetch path
 - *Scheduler #gls("backpressure").* Actor-queue-depth hysteresis (80% activate, 60%
   deactivate) refuses new submissions when the actor is overloaded.
 - *Executor circuit breaker.* The executor tracks consecutive store-fetch
-  failures; when the breaker opens, `HeartbeatRequest.store_degraded` is set
-  and the scheduler excludes the executor from assignment. See
-  #rref("builder.fuse.circuit-breaker") and
-  #rref("builder.heartbeat.store-degraded").
+  failures; when the breaker opens, FUSE lookups fail fast with `EIO` and the
+  build surfaces an infra-classed outcome instead of stalling on a degraded
+  store (the stream-era `store_degraded` heartbeat flag retired with the
+  heartbeat at the 1d builder collapse). See
+  #rref("builder.fuse.circuit-breaker").
 
 A's daemon-crash failover (@a-6) is strictly better than the FUSE baseline here:
 mounts survive a daemon restart, so a transient rio-store blip that crashes the
