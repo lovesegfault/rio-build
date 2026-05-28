@@ -4209,3 +4209,251 @@ the 1d delta entry, and the OA4/DrainButton removal acknowledged at
 the landing review (the recorded fallback was taken; reinstating a
 button against the documented evict procedure remains possible
 dashboard-side without proto changes).
+
+## Phase-2 assurance layer
+
+The Phase-1 records above end at the 1d landing: the pull protocol is
+the only dispatch path, the stream machinery is deleted, and the
+re-targeted models are the wired verification stack. This section
+records the Phase-2 deliverables (design §6 row 2): the acceptance
+table over the full 0a/0b-partitioned corpus, the Kani decision on the
+pull/report kernels, and the disposition of the frozen as-built model
+and the calibration evidence corpus. The campaign close-out is the
+final section of this document.
+
+### The acceptance table: the 0a corpus against the replacement architecture
+
+Design §6 row 2: every family of the partitioned corpus gets a
+disposition against the architecture the code now runs on. The Stage-C
+calibration table above proved the *as-built* models would re-find each
+encodable bug in the *stream-era* code; this table records, for the
+same corpus, what holds each bug class down in the *pull-only* code —
+the architecture every row below now runs on: the controller spawns one
+Job per SpawnIntent (unchanged, Model J's subject); the pod pulls its
+own derivation through the fenced, idempotent pull transaction
+(`admit_pull` + `mint_and_deliver`, one transaction, claims-floor
+fence); it reports through the idempotent `ReportOutcome` intake
+(`fold_report`, row-already-terminal wins); the controller folds Job/pod
+terminal status as the idempotent second installment
+(`ReportAttemptOutcome`, no-attempt no-op, synthesize-on-delete); the
+establishment sweep is the single time-based repair (deadline +
+report-slack, store-probe adopt arm); and there are no streams,
+heartbeats, placement decisions, session maps, or scheduler-side
+liveness verdicts left.
+
+Verdict legend, following the retry and refcount precedents:
+**CONSTRUCTION** — the state or code path the bug lived in does not
+exist in the replacement; the cited mechanism is what carries the
+family's invariant instead (the residual risk for every such row is a
+defect in the shared pull/report/establishment path itself, owned
+jointly by the re-targeted Model S checks, the unit batteries, and the
+VM suites). **CHECKED(...)** — the mechanism (or a renamed successor)
+is still live; the named wired check, model invariant, spec rule, or
+test battery holds the hazard down. **OUTSIDE** — owned by another
+campaign or subsystem, unchanged by this campaign; the owning vehicle
+is linked. **N/A** — the mechanism was already gone before this
+campaign (nothing to disposition). Rows whose historical fix had split
+halves keep the 0a partition's one-row-per-commit rule; the
+non-lifecycle halves stay with the owners named in the corpus pin.
+
+#### F1 — session identity (G1, 8 rows)
+
+Family-level verdict: CONSTRUCTION. There are no streams, epochs,
+registrations, or reconnects; identity is the per-unary token↔intent
+binding (`sec.executor.identity-token+2`, checked at
+`pull_assignment_inner` / `report_outcome_inner`) plus `exec_id`-keyed
+attempt rows (`AtMostOneOpenAttemptPerJob`, wired in
+`quint-executor-session-base`), and reports never create state
+(`sched.attempt.no-attempt-no-op`).
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `db457374f` (stream_epoch atomicity + heartbeat auth_intent binding) | CONSTRUCTION | No epochs and no disconnect events to mis-attribute (calibration flip record, T-1c'.5: `quint-executor-calib-f1-stale-epoch` retired). Attribution survives as `exec_id` keying: a stale pod's report can only fill its own attempt row (`sched.executor.report-idempotent`, `fold_report` AckIgnore arm, actor/tests/pull.rs idempotency battery). The deadline/backstop accounting halves remain retry-table rows (OUTSIDE link unchanged). |
+| `a6697c6b0` (reader spawned before the accept/reject decision — hijacked reconnect) | CONSTRUCTION | No accept decision and no reader to spawn early; the binding check survives transformed (#6): the token↔intent check runs inside each unary before any state is read (`admit_pull` RejectToken arm, `sec.executor.identity-token+2` impl at pull/report), red-first tested in the kernel table tests and the actor pull battery. Controller G-F and log halves stay with their owners. |
+| `ea10e1d74` (ExecutorClaims HMAC chain + per-stream caps) | CHECKED | The token chain is unchanged by design (non-goal); its verification call sites moved to the unaries. Caps re-base onto the per-unary bounds: `sched.executor.input-bounds+2` (re-stated over the pull surface at the 1c' sweep) + the executor_service bounds tests; controller G-F half OUTSIDE (controller table). |
+| `4f8f68ff8` (adopt-conflict + stream_epoch hardening, I-056) | CONSTRUCTION | Neither the adopt arm nor epochs exist; the binding is durable from the fenced mint and is never re-learned from a worker (frozen-invariant rows 1–3). |
+| `3082598a3` (stale draining/degraded flags not cleared on reconnect, I-056a) | CONSTRUCTION | No reconnect and no per-slot flags (the 0d row already recorded the loss as economy, not safety); a replacement pod is a fresh identity by construction. |
+| `451f2dc80` (I-048 zombie guards — heartbeats creating session state) | CONSTRUCTION | Reports never create state: the no-attempt no-op rule (`sched.attempt.no-attempt-no-op`), checked by the `canReachNoAttemptNoop` witness (`quint-executor-session-witness-no-attempt-noop`), the retry pull regime's `noNoAttemptReportNoop`, and the 1a red-first no-attempt battery (actor/tests/pull.rs). |
+| `9a2dbc873` (skip re-register on SIGTERM-reconnect when idle, I-195) | CONSTRUCTION | No registration to skip; SIGTERM is an abort (AD5) and an idle pull-mode pod exits charge-free on its bounded NotYetReady budget (`builder.pull.exit-codes`). |
+| `83e0b338f` (duplicate-Register handling) | CONSTRUCTION | No Register message. The duplicate-arrival analog is the idempotent re-pull: `DeliverExisting` returns the identical payload/exec_id (`sched.executor.pull-transaction`, `quint-executor-session-witness-repull`, the double-pull red-first test). LogBuffers/step_down halves stay log/lease content. |
+
+#### F2 — outcome delivery (G2, 11 rows; scheduler + builder halves)
+
+Family-level verdict: CONSTRUCTION for the delivery choreography (no
+push channel, no relay, no drain gate — the binding exists only because
+the worker pulled it, and exit 0 is structurally tied to an acked
+report or a charge-free outcome), CHECKED for the intake guards that
+deliberately survive as ledger idempotency. The armed-safety form is
+re-based and wired: `unresolvedClaimHasRepairArmed` (re-targeted Model
+S) — pod alive ⇒ report retry loop armed; pod dead ⇒ pod-terminal
+report path armed; nothing arrives ⇒ establishment sweep armed at
+deadline + slack.
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `0127cf854` (phantom running_builds never drained, I-035) | CONSTRUCTION | The phantom class (scheduler-recorded binding the worker never saw) cannot form without a push channel; `confirmedPhantomIsDrained` is by-construction in the replacement (calibration flip record: `quint-executor-calib-f2-phantom-drain` retired). The lost-completion half is CHECKED: `unresolvedClaimHasRepairArmed` + `establishmentOnlyAfterWindowCloses` (wired), the establishment sweep batteries (actor/tests/establishment.rs), and the no-report-death arm of the `pull-canary` VM scenario. |
+| `be3ad068e` (reconnecting worker's running build not re-adopted, I-066) | CONSTRUCTION | The adopt arm is deleted with the heartbeat (disposition row #9; the 0d HOLDS probe is the evidence it was economy, not safety). The surviving economy arm is the establishment sweep's store-probe adopt (`quint-executor-session-witness-store-adopt`, recovery/establishment tests): a leader that loses the in-memory view re-runs or adopts from durable evidence, and never double-charges (first terminal row wins). Charging half stays retry-owned. |
+| `6b6cfcf10` (relay target swapped before the open confirmed) | CONSTRUCTION | No relay and no swap; report delivery is `report_until_acked` (unbounded-until-acked, nonzero exit on budget exhaustion), unit-tested in rio-builder/src/runtime/pull.rs (`builder.pull.retry-loop+2`, `builder.completion.exactly-once-or-death+2`); died-before-ack is closed by the pod-terminal second installment + establishment (Model D retirement record carriers). |
+| `8201db59b` (completion_pending armed late + no graceful half-close, bug_012/bug_117) | CONSTRUCTION | No completion_pending latch and no half-close; exit code 0 is structurally reserved for an acked report or a charge-free outcome (`builder.pull.exit-codes` battery — the regression tripwire named in the Model D retirement record). |
+| `1353d3224` (drain not gated on completion-delivered) | CONSTRUCTION | No drain mode: SIGTERM is an abort with one bounded best-effort report (AD5); a report that does not land is classified by the pod-terminal path or establishment, charge-free (`sched.attempt.synthesized-verdict`, the killed-mid-build/cancel VM arms re-pointed at 1b). |
+| `29222884e` (relay did not watch the target change) | CONSTRUCTION | No relay target to watch; same carriers as `6b6cfcf10`. |
+| `aaa08721d` (dispatch coupled to heartbeat arrival) | CONSTRUCTION | No dispatch pass and no heartbeat; delivery is initiated by the pod's own pull (`sched.executor.pull-transaction`). |
+| `41bc8dd97` (unsolicited-Cancelled completion left the drv stuck after the slot freed) | CHECKED | The completion-intake guards survive as ledger idempotency (#12): `fold_report` Process/AckIgnore + the row-already-terminal guard (`sched.executor.report-idempotent`, `sched.completion.idempotent` batteries); the cancel-vs-completion race itself is closed by the synthesized-verdict close (`sched.attempt.synthesized-verdict`, `quint-executor-session-witness-synthesized-close`) — a cancelled drv's pull returns `Gone` and a late report is acknowledged-and-ignored. |
+| `cc1ca02a7` (BuildSlot state not under one mutex) | CHECKED | `BuildSlot` survives unchanged (single-build occupancy is still the builder's own invariant); builder runtime unit tests own it, exactly as the 0d NOT-ENC row recorded. |
+| `d653222cf` (early graceful-drain missing on the builder) | CONSTRUCTION | The graceful-drain mode is gone (AD5 inversion: SIGTERM = cgroup-kill + one bounded report attempt + exit); the charge-free abort semantics are CHECKED by the AD5 batteries and the preempt/cancel VM assertions (T-1b.9 record). |
+| `e4ed7b6a9` (builder DrainExecutor retry on not-leader) | N/A | The mechanism was deleted before this campaign (`fb3ea232d`); the `DrainExecutor` surface itself is now retired (1c' commit C / 1d proto sweep). |
+
+#### F3 — liveness calibration (G3, 12 rows)
+
+Per-executor sub-family (6) family-level verdict: CONSTRUCTION — there
+is no scheduler-side liveness verdict left to get wrong (no reaper, no
+stall credit, no heartbeat RPC); real-death detection belongs to the
+kubelet/Job controller and `activeDeadlineSeconds`, and the only
+time-based action left (the establishment sweep) acts only on open
+attempts past deadline + report-slack.
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `5971778f8` (reap strike-counting double-applied the ×3) | CONSTRUCTION | No reaper and no strike counter (calibration flip record: f3 checks retired). The real-death bound is the platform's: Job deadline + pod-terminal report + establishment sweep (`silentSlotReapArmed`'s successor obligation in the frozen-invariant list). |
+| `1757790f2` (stall credit missing at six of eight FMP sites, I-178) | CONSTRUCTION | Nothing measures worker silence on the scheduler's clock any more. The analogue obligation — never establish while the worker is still inside its budget — is CHECKED: `establishmentOnlyAfterWindowCloses` (wired, re-keyed to the dispatch-time deadline + slack; the sweep-time re-solve may widen, never shrink — `sched.attempt.establishment-window+2`, anchored by the 1b fix `1c0af4892`), the establishment batteries, and the in-window assertion in the canary VM scenario. |
+| `44a55a224` (stall-credit early-return removal) | CONSTRUCTION | Same as above — no credit arithmetic exists. |
+| `e7b8ee91a` (heartbeat RPC timeout ≥ interval, bug_044) | CONSTRUCTION | No heartbeat RPC. Per-unary timeouts are B8's trivial successor (the pull/report clients use bounded per-call timeouts inside the retry loops — `builder.pull.retry-loop+2`). |
+| `d12b31027` (heartbeat task + DrainExecutor not aborted on ephemeral exit, I-142) | CONSTRUCTION | Neither call exists in the pull runtime; process exit is the one-shot exit path (`sched.executor.one-shot+2` impl at the builder pull loop). |
+| `f9c89bb92` (ephemeral idle-timeout exit, I-116) | CHECKED | The idle exit survives transformed as the bounded NotYetReady retry → charge-free exit 0, reusing the same `idle_timeout` value (OA6 consequence 2): `NotYetReadyIsInert` + `quint-executor-session-witness-idle-exit` (wired), the builder pull-loop idle tests, and `sched.executor.pull-not-ready`. |
+| `99a17cd2f` (authoritative_binding map for detect_hung_nodes) | CHECKED (successor) | The heartbeat-fed detector and its in-memory binding map are deleted (commit A); node attribution for the successor comes from the durable `source_node` column written from the spawn-ack binding (AD2c, migration 071) with the controller's own bound-intent map as fallback — `ctrl.nodeclaim.wedge-cluster` (rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs) + its unit battery. |
+| `468900350` (tenant_of keyed on auth_intent) | CHECKED (successor) | Per-tenant keying is no longer part of the wedge signal: the successor clusters per source node over attempt-deadline expiries for ≥2 distinct derivations, so a single tenant's mis-keying cannot hide a wedge; wedge.rs tests + the T-1a.12 establishment-cluster alert (per-node, tenant-agnostic). |
+| `9699ac8b2` (key on auth_intent, floor 2, TTL-only retain) | CHECKED (successor) | The ≥2-distinct-derivations floor and the 30-minute clustering window are the successor's analogues, unit-tested in wedge.rs; the per-tick dead-reap cap bounds the blast radius exactly as before (the consumption shape through `reap_unhealthy`'s Dead arm is unchanged — Model N untouched). |
+| `6b152ee22` (repeats across ticks; clear_persisted_state half) | CHECKED (successor) | The successor recomputes the cluster from the open-attempt ledger every reconcile pass (no in-memory accumulation to clear or repeat); an open-attempt RPC failure only skips the wedge pass for that tick (fail-closed), per the wedge.rs tests. |
+| `b9a131ded` (group by controller-authoritative node binding) | CHECKED (successor) | The successor's attribution IS the controller-authoritative binding (spawn-ack `bound_intents` → `source_node`), the same key AD2 persists for exclusion; covered by the wedge.rs attribution tests and the AD2 source-node batteries (T-1b.1). |
+| `b6d26c001` (computed before stale-reap in handle_tick) | CHECKED (successor) | Ordering inside the controller reconcile is explicit: the wedge set is computed from the ledger view and consumed by `reap_unhealthy` in the same pass (nodeclaim_pool/mod.rs step order), with no scheduler-side tick to race against. |
+
+#### F4 — death attribution (the hand-off halves)
+
+The 0a partition records no standalone in-family G4 commit (charging is
+retry-owned). The two hand-off halves calibrated at 0d:
+
+| Hand-off half | Verdict | Mechanism / checker |
+|---|---|---|
+| the I-197 `last_completed` discriminator (and the late-disconnect-vs-reconnect race) | CONSTRUCTION | The correlation map is gone; the correlation IS the attempt row keyed by `exec_id` (durable, no TTL race). A post-completion death creates nothing: the no-attempt no-op rule (`sched.attempt.no-attempt-no-op`) is the discriminator's successor, checked by the wired no-attempt witness, the retry pull regime's `noNoAttemptReportNoop`, and the red-first no-attempt battery; a late report for a terminal row is acknowledged-and-ignored (`fold_report`). |
+| the establishment-window guard (the 60 s TTL discipline) | CHECKED(`establishmentOnlyAfterWindowCloses`) | Same invariant, re-keyed window: deadline + `establishment_report_slack` from the dispatch-time deadline (072 `deadline_secs`), never earlier, non-terminal reports do not establish. Wired exhaustively in both re-targeted regimes, falsified by the one wired calibration flip (`quint-executor-calib-f4-establishment-window`), spec'd as `sched.attempt.establishment-window+2`, and asserted in the canary VM scenario's no-report-death arm. |
+
+#### F5 — eligibility coherence (G5, 7 rows)
+
+Family-level verdict: CONSTRUCTION for everything that was a property
+of the placement/offer path (there is no offer); CHECKED for the
+eligibility content that moved to the spawn side (AD2).
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `96d8092b8` (closed-stream executors stayed dispatchable, I-095) | CONSTRUCTION | No placement decision and no slot state to mis-track (calibration flip record: f5 check retired); a pod pulls only its own intent. |
+| `a62631c90` (fleet-exhaust verdict not system/feature-aware) | CHECKED | Exhaustion survives re-keyed and relocated (AD2a): the controller detects excluded-sources ⊇ spawnable-sources at the spawn gate and reports `NoEligibleSource` through `ReportAttemptOutcome`, which the fold maps to Poison(FleetExhausted) (`sched.dispatch.fleet-exhaust+4`, `handle_no_eligible_source`); the predicate is Kani-contracted in the retry kernel (`check_placeable_contract`, `check_fold_fleet_exhaust_arm`), the small-fleet clause is exercised by the 1b deterministic-crash poison VM arm, and the eligibility *content* keeps its pre-registered coverage (the placeable()/eligibility unit suites — no model backstop, exactly as the 0d carve-out records). |
+| `20afe5154` (intent-matched pod resource-fit self-rejection) | CONSTRUCTION | No placement decision, no intent-match override, no dispatch-time resource-fit re-check: the pod is sized from its own solved intent (the `sched.assign.resource-fit` retirement record at the 1c' sweep names this rationale). |
+| `9ce1bcf1b` (PrefetchComplete not routed through the became-idle cap) | CONSTRUCTION | No became-idle inline dispatch and no PrefetchComplete message; warm-up is pod-side after the pull. |
+| `c9382fd63` (became-idle inline dispatch uncapped) | CONSTRUCTION | Same — the pacing surface does not exist. |
+| `a52c3ec80` (builder-side features derivation from executor_kind) | CHECKED | The kind/features boundary is enforced at spawn: `kind_for_drv` + the pool kind filter + the per-intent token (`sched.dispatch.fod-to-fetcher+2`, `sched.dispatch.soft-features+2`, re-stated at the 1c' sweep), exercised end-to-end by the `pull-fetcher` VM subtest. |
+| `6fb244337` (PrefetchHint contents) | CONSTRUCTION | No PrefetchHint; the pod prefetches its own input closure immediately after the pull (builder pull loop), so there is no scheduler-composed hint to get wrong. |
+
+#### F6 — failover convergence (G6, 3 rows)
+
+Family-level verdict: CHECKED. The leader gates survive, and the
+deposed-but-unaware residual — the half the worker-side fence used to
+carry — is closed at the transaction fence and is now exhaustively
+model-checked rather than asserted.
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `c5c5ccd17` (reassign_derivations not leader-gated) | CHECKED | Observed-deposed inertness: the surviving write paths (report intake, attempt-outcome intake, establishment sweep, requeue) remain leader-gated (`sched.lease.standby-drops-writes`, unchanged). Deposed-but-unaware inertness: `StaleAuthorityWritesAreInert` wired in the fault-leader regime + `quint-executor-session-witness-stale-fenced`, the `admit_pull` floor arm and the in-transaction floor re-check (`sched.lease.generation-fence+3`), and the 1a red-first stale-generation batteries. |
+| `0ea9bd701` (heartbeat replies advertised the generation before recovery completed; design hash `5c47af5ad`) | OUTSIDE (rio-lease) / CHECKED (successor statement) | The advertise channel is gone; the obligation's successor is claim-before-serve — pulls are served only after the acquired generation's claim row is durable (`sched.lease.claim-before-advertise+2`, impl at the recovery claim-target site, verify on the fault-leader regime check; the recovery ordering is encoded in the re-targeted model's failover action). The underlying recovery-completion machinery remains the rio-lease campaign's surface (leaderElection.qnt), exactly as the 0d re-disposition recorded. |
+| `374280877` (leader gates on ProcessCompletion / ReportExecutorTermination / Tick + per-generation map hygiene) | CHECKED | The surviving intakes are the same gate class (leader-gated + fenced); the per-generation session maps no longer exist to need clearing (CONSTRUCTION half). Covered by the standby-drops-writes batteries, the fault-leader regime, and `quint-executor-session-witness-post-failover-deliver` (a post-failover pull is served by the new holder). |
+
+#### F7 — fleet-supply scheduler-side obligations (G7, 3 rows)
+
+Family-level verdict: CHECKED. F7 was never re-modeled here; the
+scheduler-side obligations Model J/N import are the 0e obligation
+table, re-derived against the pull-only world at 1c'/1d (rows 1–7 of
+that record) with the wired spawnCoherence/nodeclaimLifecycle checks
+re-run green.
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `445928288` (ICE/ack arming + DAG sweep + single edge-reload owner) | CHECKED | Arming on `AckSpawnedIntents` and the DAG-state sweep are untouched (obligation rows 2–3); `quint-spawn-coherence-*` (ackSoundness/ackCoversPending) re-run green at 1c'/1d; the §13a ICE unit batteries. |
+| `461f6c661` (ICE clear semantics — registered_cells/heartbeat, not pending ack) | CHECKED | The clear edge is the first successful pull under the same single-cell discipline (`pull_mint_ice_clear_only_at_single_cell`, actor/tests/dispatch.rs; obligation row 2); the heartbeat clear edge died with the heartbeat intake. |
+| `2c8abc9b6` (ICE-attempt orphan reap keyed on DAG state) | CHECKED | The DAG-state sweep half of #22 is unchanged; covered by the ICE sweep batteries and `sched.sla.hw-class.ice-mask`. |
+
+#### F8 — input hardening (G8, 6 rows)
+
+Family-level verdict: CHECKED for the bounds that re-base onto the pull
+surface, CONSTRUCTION for the surfaces that no longer exist. The
+binding obligations follow the surfaces: `sched.executor.input-bounds+2`
+is re-stated over `PullAssignment`/`ReportOutcome`, and the
+stream-carried BuildPhase/log surfaces are gone.
+
+| Corpus row | Verdict | Mechanism / checker |
+|---|---|---|
+| `9917c384d` (bound every worker-supplied string at the boundary) | CHECKED | `sched.executor.input-bounds+2` re-stated over the pull surface (intent_id/token rejected past bounds; CompletionReport label fields nulled/truncated rather than rejected), with the bounds-constant block and its tests at executor_service.rs / the actor intake. |
+| `2143845d6` (bound derivation_path length at ingestion) | CHECKED | `ReportOutcome` drops `drv_path` before the actor entirely (`exec_id` names the attempt — no path-resolution step left to abuse); remaining fields bounded per the same rule. |
+| `d40b3ee86` (worker-supplied float validation) | CHECKED | The resource-telemetry fields still flow into `build_samples` through the same validation (`try_from`/finite checks, NULL on out-of-range), unchanged by the campaign; completion-intake unit tests. |
+| `6b0de6e4e` (worker log line-number ordering + span totality) | CONSTRUCTION (scheduler half) / OUTSIDE (rio-store) | `BuildLogBatch` no longer transits the scheduler; `final_line_count` is bounded at the bind site (`try_from`, NULL on out-of-range/zero). The surviving ordering/magnitude bounds live at rio-store's ingest path (`store.log.ingest-bounds`). |
+| `7ffbf1415` (BuildPhase ingestion gated on (executor, drv) binding) | CONSTRUCTION | The phase-ingestion surface is deleted (1d proto sweep; `sched.log.phase-binding` retired with the threat recorded as unrepresentable without the intake); any future phase carrier must re-introduce a binding gate per the retirement record. |
+| `496e6fb14` ((executor, drv) binding check in the recv task) | CONSTRUCTION | No recv task and no stream-carried per-message binding to check; the per-unary token↔intent binding plus `exec_id` keying are the successor binding discipline. |
+
+#### Cross-campaign-owned rows (21 retry + 43 controller): OUTSIDE
+
+Carried exactly as partitioned at 0a and cross-referenced at 0d; this
+campaign neither re-ran nor re-dispositioned them.
+
+- **Retry-owned (21):** the charging/budget/establishment-arithmetic
+  rows listed in the corpus pin keep their owning retry-table rows and
+  their post-collapse acceptance verdicts in
+  `retry-invariant-map.md`'s own Phase-2 acceptance table; the
+  pull-mode re-derivation of that model's environment (the
+  `quint-retry-policy-pull` regime and witnesses, this campaign's
+  T-1b.7/T-1c'.6 work) is recorded in that map's cross-campaign
+  addenda. The split halves of in-family rows (`db457374f`
+  deadline/backstop accounting, `a62631c90` exhaust verdict content,
+  `c5c5ccd17` poison-branch content, `be3ad068e` phantom-failed
+  charging) stay with the retry table.
+- **Controller-owned (43):** the G-A…G-G/FFD/Remainder rows keep their
+  controller Stage-C table ownership (`controller-invariant-map.md`);
+  the peer-behavior changes this campaign made on those files are the
+  1b re-audit and 1d delta-pass entries recorded there (busy view,
+  synthesize-on-delete, anti-affinity/NoEligibleSource, dispatchMode
+  rendering, wedge clustering), with Models J/N byte-unchanged and
+  their checks re-run green.
+
+#### Out-of-scope rows (56): OUTSIDE
+
+Unchanged disposition from the 0a partition: log relay/banner 13, SLA
+solver 14, FUSE/overlay/store 7, controller pod-spec 4, auth 3,
+build/DAG bookkeeping 3, builder execute-loop 2, pool
+status/ComponentScaler 2, observability 2, test/spec hygiene 3, CA
+chain 1, retry-config validation 1, lease machinery 1 — each owned by
+the named subsystem's own tests/campaigns, untouched by the
+replacement except where a deleted scheduler surface removed a caller
+(recorded in the 1c'/1d records).
+
+#### Summary
+
+Of the 50 in-family rows: **27 CONSTRUCTION** (the session-identity,
+delivery-choreography, liveness-verdict, placement-path, and
+stream-surface rows — the machinery their bugs lived in does not exist
+in the pull protocol), **20 CHECKED** (the deliberately surviving
+mechanisms: ledger/report idempotency, BuildSlot, the idle exit, the
+establishment window, the spawn-side eligibility/exhaustion path, the
+leader gates and the transaction fence, the ICE arming/clear/sweep
+obligations, the input bounds, and the OA2 wedge-clustering successor
+for the hung-node sub-family), **2 OUTSIDE** (the lease-owned
+advertise-ordering row; the rio-store half of the log-bounds row), and
+**1 N/A** (the pre-deleted DrainExecutor retry). The two F4 hand-off
+halves are 1 CONSTRUCTION + 1 CHECKED. The 21 retry-owned, 43
+controller-owned, and 56 out-of-scope rows are OUTSIDE with their
+owners linked above, completing the 170-commit denominator with no
+unaccounted row. The two dominant as-built repair families — the
+divergence between the in-memory fleet model and reality (F1/F2/F3),
+and the redundant re-binding hop's defenses (F5) — are closed by
+construction because the in-memory fleet model and the re-binding hop
+are gone; what remains live and checked is exactly the short list the
+design said would remain: the idempotent ledger guards, the
+establishment sweep, the transaction fence, the spawn-side eligibility
+gate, and the controller-side successors (wedge clustering,
+synthesize-on-delete, the open-attempt busy view).
