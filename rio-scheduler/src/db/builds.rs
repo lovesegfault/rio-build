@@ -248,6 +248,23 @@ impl SchedulerDb {
         status: BuildState,
         error_summary: Option<&str>,
     ) -> Result<(), sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
+        Self::update_build_status_tx(&mut conn, build_id, status, error_summary).await
+    }
+
+    /// Executor-scoped variant of [`Self::update_build_status`], used by the
+    /// merge path so the owning build's Pending→Active update commits in
+    /// the same transaction as the (re)created derivation rows, links, and
+    /// edges — `sched.persist.atomic-activation`: "the build was accepted"
+    /// and "its rows are durable" are one commit point. Plain runtime
+    /// queries (no `query!`) so `.sqlx/` is unaffected.
+    // r[impl sched.persist.atomic-activation]
+    pub(crate) async fn update_build_status_tx(
+        conn: &mut sqlx::PgConnection,
+        build_id: Uuid,
+        status: BuildState,
+        error_summary: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
         let now_col = match status {
             BuildState::Active => "started_at",
             BuildState::Succeeded | BuildState::Failed | BuildState::Cancelled => "finished_at",
@@ -258,13 +275,13 @@ impl SchedulerDb {
             sqlx::query("UPDATE builds SET status = $2 WHERE build_id = $1")
                 .bind(build_id)
                 .bind(status.as_str())
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
         } else if now_col == "started_at" {
             sqlx::query("UPDATE builds SET status = $2, started_at = now() WHERE build_id = $1")
                 .bind(build_id)
                 .bind(status.as_str())
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
         } else {
             sqlx::query(
@@ -273,7 +290,7 @@ impl SchedulerDb {
             .bind(build_id)
             .bind(status.as_str())
             .bind(error_summary)
-            .execute(&self.pool)
+            .execute(&mut *conn)
             .await?;
         }
 

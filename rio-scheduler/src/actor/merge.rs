@@ -537,10 +537,13 @@ impl DagActor {
         phase!("4-check-cached-outputs");
 
         // === Step 5: PG persist + → Active ============================
-        // All remaining error-returning PG writes. On any error, roll
-        // back the merge AND the map inserts AND delete the DB build row
-        // so in-memory and DB state stay consistent. After this returns
-        // Ok the build is committed (Active); later DB writes are
+        // The single error-returning PG write: one transaction carrying
+        // the (re)created derivation rows, build links, edges, and the
+        // build's Pending→Active update (sched.persist.atomic-activation).
+        // On any error, roll back the merge AND the map inserts AND
+        // delete the DB build row so in-memory and DB state stay
+        // consistent — nothing of the merge was committed. After this
+        // returns Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         if let Err(e) = self
             .persist_and_activate(
@@ -659,6 +662,11 @@ impl DagActor {
     /// succeeds. (The topdown fail-fast still clears the marker it
     /// consumes, as defense-in-depth for stale-flag shapes that do not
     /// involve this path at all.)
+    ///
+    /// Best-effort accounting resets (poison clears, displaced-row resets)
+    /// run strictly AFTER that commit, so a rejected submission can never
+    /// clear accounting for a re-creation that was rolled back
+    /// (sched.persist.atomic-activation).
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
@@ -679,6 +687,21 @@ impl DagActor {
             |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
         )?;
 
+        // In-memory Pending→Active, strictly after the commit
+        // (sched.db.tx-commit-before-mutate). Always a valid transition
+        // for a fresh Pending build; debug_assert rather than branch
+        // (a rejection here would be a BuildInfo::transition bug, not a
+        // recoverable error). No events or metrics fire on Active, so
+        // this is exactly what `transition_build` did minus the separate
+        // pool-based DB write that used to race the committed merge.
+        if let Some(build) = self.builds.get_mut(&build_id) {
+            let outcome = build.transition(BuildState::Active);
+            debug_assert!(
+                outcome.is_ok(),
+                "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
+            );
+        }
+
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
         // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
@@ -689,7 +712,9 @@ impl DagActor {
         // resurrect it; this is about keeping failed_builders/poisoned_at
         // consistent for the NEXT poison cycle. resubmit_cycles is
         // INCREMENTED in PG here so the bound survives leader failover.
-        // Best-effort.
+        // Best-effort, and strictly post-commit
+        // (sched.persist.atomic-activation): a merge that failed above
+        // never reaches these.
         // r[impl sched.db.clear-poison-batch]
         if let Err(e) = self
             .db
@@ -1940,6 +1965,13 @@ impl DagActor {
     /// (`newly_inserted`); submissions that merely join a live node never
     /// rewrite or clear its persisted recovery columns — see
     /// `sched.persist.creation-scoped`.
+    ///
+    /// The build's Pending→Active update rides the same transaction
+    /// (`sched.persist.atomic-activation`): a merge that fails at any
+    /// point leaves every pre-existing derivation row (including
+    /// displaced / resubmit-reset nodes' recreate-refresh) untouched and
+    /// the build row still `pending`, so cleanup_failed_merge's
+    /// memory-rollback + Pending-row delete fully undoes it.
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
@@ -2130,6 +2162,15 @@ impl DagActor {
             }
         }
 
+        // r[impl sched.persist.atomic-activation]
+        // The owning build's Pending→Active joins the same commit: if the
+        // tx fails or the leader dies here, recovery sees either nothing
+        // (plus a pending build row that orphan handling covers) or the
+        // fully-committed Active build — never a half-committed
+        // recreate-refresh for a build that was never activated.
+        crate::db::SchedulerDb::update_build_status_tx(&mut tx, build_id, BuildState::Active, None)
+            .await?;
+
         tx.commit().await?;
 
         // I-102: a large merge (e.g. 5800 rows for hello-mixed-32x) leaves
@@ -2186,9 +2227,13 @@ impl DagActor {
     }
 
     /// Undo all in-memory state from a failed handle_merge_dag AFTER the
-    /// merge succeeded but DB persistence or transition_build failed.
-    /// Rolls back the DAG merge, removes map entries, and best-effort
-    /// deletes the orphan DB build row.
+    /// in-memory merge succeeded but persistence (the single
+    /// derivations + links + edges + Pending→Active transaction, or the
+    /// store cache-check before it) failed. Nothing was committed
+    /// (sched.persist.atomic-activation), so rolling back the DAG merge,
+    /// removing map entries, and best-effort deleting the orphan
+    /// still-`pending` DB build row restores the pre-submission state
+    /// exactly.
     ///
     /// Takes `merge_result` by value: `removed_retriable` carries owned
     /// `DerivationState`s that `rollback_merge` re-inserts into the DAG.

@@ -785,3 +785,139 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     assert_eq!(floor_mem, 4096, "floor columns untouched");
     Ok(())
 }
+
+// r[verify sched.persist.atomic-activation]
+/// The merge-time persist transaction (derivation upsert + build links +
+/// the build's Pending→Active update) is one commit point: dropping the
+/// transaction before commit leaves a pre-existing row's recreate-refresh
+/// non-durable and the builds row still `pending`/`started_at IS NULL`;
+/// committing the same statements makes the refresh and the activation
+/// durable together.
+#[tokio::test]
+async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Pre-existing terminal authoritative squat row (a prior creation's
+    // snapshot that a displacing merge would recreate-refresh).
+    let squat = DerivationRow {
+        drv_hash: "atomic-squat".into(),
+        drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
+        pname: Some("squat".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Completed,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: Some(b"Derive-squat".to_vec()),
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&squat)).await?;
+    tx.commit().await?;
+
+    // Pending build that will perform the displacing merge.
+    let build_id = Uuid::new_v4();
+    db.insert_build(
+        build_id,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        false,
+        &crate::state::BuildOptions::default(),
+        None,
+    )
+    .await?;
+
+    let displacer = DerivationRow {
+        drv_hash: "atomic-squat".into(),
+        drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
+        pname: Some("victim".into()),
+        system: "aarch64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: None,
+    };
+
+    // Run the merge-persist statement set in one tx, then DROP it
+    // (simulated failure before the single commit point).
+    {
+        let mut tx = db.pool().begin().await?;
+        let id_map =
+            SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&displacer))
+                .await?;
+        let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+        SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
+        SchedulerDb::update_build_status_tx(
+            &mut tx,
+            build_id,
+            crate::state::BuildState::Active,
+            None,
+        )
+        .await?;
+        drop(tx);
+    }
+
+    let (system, status, content): (String, String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT system, status, drv_content FROM derivations WHERE drv_hash = 'atomic-squat'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(system, "x86_64-linux", "squat identity untouched on drop");
+    assert_eq!(status, "completed", "squat status untouched on drop");
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-squat".as_slice()),
+        "authoritative bytes untouched on drop"
+    );
+    let (b_status, started): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM started_at)::float8 FROM builds WHERE build_id = $1",
+    )
+    .bind(build_id)
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(b_status, "pending", "build not activated by a dropped tx");
+    assert!(started.is_none(), "started_at not set by a dropped tx");
+    let (links,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM build_derivations WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(links, 0, "no links survive a dropped tx");
+
+    // Same statements, committed → recreate-refresh, links, and the
+    // activation become durable together.
+    let mut tx = db.pool().begin().await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[displacer]).await?;
+    let db_ids: Vec<Uuid> = id_map.values().map(|(id, _)| *id).collect();
+    SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
+    SchedulerDb::update_build_status_tx(&mut tx, build_id, crate::state::BuildState::Active, None)
+        .await?;
+    tx.commit().await?;
+
+    let (system, b_status, started): (String, String, Option<f64>) = sqlx::query_as(
+        "SELECT d.system, b.status, EXTRACT(EPOCH FROM b.started_at)::float8
+         FROM derivations d, builds b
+         WHERE d.drv_hash = 'atomic-squat' AND b.build_id = $1",
+    )
+    .bind(build_id)
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(system, "aarch64-linux", "recreate-refresh committed");
+    assert_eq!(b_status, "active", "build activated in the same commit");
+    assert!(
+        started.is_some(),
+        "started_at set by the in-tx Active update"
+    );
+    let (links,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM build_derivations WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(links, 1, "link committed with the activation");
+    Ok(())
+}

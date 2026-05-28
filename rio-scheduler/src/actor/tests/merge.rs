@@ -8870,6 +8870,22 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "row no longer claims the squatter's terminal status (got {status})"
     );
 
+    // r[verify sched.persist.atomic-activation]
+    // The displacer's Pending→Active update committed in the same
+    // transaction as the recreate-refresh — there is no window where the
+    // row is refreshed but the displacing build is still pending.
+    let (b_status, started): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM started_at)::float8 FROM builds WHERE build_id = $1",
+    )
+    .bind(displacer)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(b_status, "active", "displacer build active in PG");
+    assert!(
+        started.is_some(),
+        "started_at set by the in-tx Active update"
+    );
+
     // The joiner's accounting no longer includes the displaced hash:
     // completing fillerB is enough to finish the build (no Active hang).
     // Executors are one-shot (drain after their completion), so a second
