@@ -2169,12 +2169,15 @@ impl DagActor {
                     drv_content: node
                         .drv_content_authoritative
                         .then(|| node.drv_content.clone()),
-                    // r[impl sched.persist.ca-modular-hash]
-                    // Content-bound identity evidence for CA nodes:
-                    // persisting it keeps the merge gate's evidence
-                    // (and the realisation key) across failover for
-                    // store-backed CA rows, whose bytes are never
-                    // persisted.
+                    // r[impl sched.persist.ca-modular-hash+2]
+                    // Content-bound identity evidence and realisation
+                    // key: persisting it keeps the merge gate's
+                    // evidence and post-failover realisation
+                    // registration working for store-backed CA rows
+                    // (whose bytes are never persisted) and for
+                    // deferred-IA rows (is_ca=false, but the gateway
+                    // populates the hash because their output paths
+                    // resolve only at dispatch time).
                     ca_modular_hash: node.ca_modular_hash,
                 }
             })

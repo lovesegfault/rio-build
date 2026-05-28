@@ -531,16 +531,19 @@ impl RetryState {
 
 /// Content-addressed-derivation sub-state of a [`DerivationState`].
 ///
-/// All fields except `is_ca` and `modular_hash` are **in-memory only**:
-/// recovered CA-on-CA chains dispatch unresolved (collect_ca_inputs
-/// skips None) → worker fails on placeholder → retry. The gateway
-/// recomputes on the NEXT SubmitBuild that references the derivation.
-/// `modular_hash` survives failover two ways: authoritative
+/// All fields except `is_ca`, `modular_hash`, and `needs_resolve` are
+/// **in-memory only**: recovered CA-on-CA chains dispatch unresolved
+/// (collect_ca_inputs skips None) → worker fails on placeholder → retry.
+/// The gateway recomputes on the NEXT SubmitBuild that references the
+/// derivation. `modular_hash` survives failover two ways: authoritative
 /// hook-fallback nodes recompute it from the persisted inline content
-/// (`sched.recovery.inline-drv-ca-hash`), and every other CA node
-/// restores the ingress-provided value persisted with its row
-/// (`sched.persist.ca-modular-hash`) — so the merge gate's content-bound
-/// evidence and post-failover realisation registration keep working.
+/// (`sched.recovery.inline-drv-ca-hash`), and any other node that
+/// persisted one — store-backed CA and deferred-IA alike — restores the
+/// ingress-provided value from its row (`sched.persist.ca-modular-hash`).
+/// `needs_resolve` is re-derived at recovery from the persisted expected
+/// output paths (`sched.recovery.deferred-resolve`) — so the merge
+/// gate's content-bound evidence, post-failover placeholder resolution,
+/// and post-failover realisation registration keep working.
 #[derive(Debug, Clone, Default)]
 pub struct CaState {
     /// Whether this derivation is content-addressed (fixed-output OR
@@ -566,17 +569,28 @@ pub struct CaState {
     /// needs resolve to rewrite it, even though the IA drv itself
     /// has a known output path. `is_ca` gates cutoff-compare;
     /// `needs_resolve` gates `maybe_resolve_ca`.
+    ///
+    /// Survives failover by re-derivation, not persistence: recovery
+    /// sets it when any persisted expected output path is empty
+    /// (`sched.recovery.deferred-resolve`), which reproduces the
+    /// gateway's value for floating-CA and deferred-IA nodes (the
+    /// FOD-with-floating-CA-input case is under-approximated and keeps
+    /// the documented dispatch-unresolved degrade).
     pub needs_resolve: bool,
-    /// For CA derivations: the modular derivation hash
-    /// (`hashDerivationModulo` SHA-256). Realisations table PK half.
-    /// Set at DAG merge from proto `DerivationNode.ca_modular_hash`
-    /// (the gateway computes it post-BFS from the full drv_cache, and
-    /// for the single-node `BasicDerivation` hook fallback from the
-    /// lifted inline derivation). `None` for IA derivations. After a
+    /// The modular derivation hash (`hashDerivationModulo` SHA-256).
+    /// Realisations table PK half. Set at DAG merge from proto
+    /// `DerivationNode.ca_modular_hash` (the gateway computes it
+    /// post-BFS from the full drv_cache, and for the single-node
+    /// `BasicDerivation` hook fallback from the lifted inline
+    /// derivation). Carried by CA derivations AND by deferred
+    /// input-addressed derivations (IA with a floating-CA input —
+    /// their realisation row is how `wopQueryDerivationOutputMap`
+    /// learns the post-resolve output path); `None` for plain IA
+    /// derivations with statically-known output paths. After a
     /// scheduler failover it is recomputed from the persisted
     /// authoritative inline content for hook-fallback nodes
-    /// (`sched.recovery.inline-drv-ca-hash`); every other CA node
-    /// restores the ingress-provided value persisted with its row
+    /// (`sched.recovery.inline-drv-ca-hash`); any other row that
+    /// persisted one restores the ingress-provided value
     /// (`sched.persist.ca-modular-hash`), staying `None` only when the
     /// creating submission never carried a hash.
     ///
@@ -1093,11 +1107,11 @@ impl DerivationState {
                 is_ca: node.is_content_addressed,
                 needs_resolve: node.needs_resolve,
                 // Decoded once at the proto→domain boundary. Gateway
-                // sends 32 bytes for CA nodes it could compute the
-                // modular hash for; `domain::DerivationNode::from`
-                // maps non-32-byte (including empty) → None.
-                // Belt-and-suspenders vs the gateway's own IA gate
-                // (populate_ca_modular_hashes skips non-CA).
+                // sends 32 bytes for the nodes it could compute the
+                // modular hash for (CA nodes and deferred-IA nodes —
+                // populate_ca_modular_hashes covers both);
+                // `domain::DerivationNode::from` maps non-32-byte
+                // (including empty) → None.
                 modular_hash: node.ca_modular_hash,
                 pending_realisation_deps: Vec::new(),
                 output_unchanged: false,
@@ -1157,7 +1171,11 @@ impl DerivationState {
     /// path, still supported in executor). When such a node is
     /// content-addressed, its CA modular hash is recomputed from the
     /// restored bytes so post-failover completion still registers the
-    /// realisation (`sched.recovery.inline-drv-ca-hash`).
+    /// realisation (`sched.recovery.inline-drv-ca-hash`); rows without
+    /// authoritative bytes restore the persisted `ca_modular_hash`
+    /// column instead (CA and deferred-IA rows carry one), and the
+    /// dispatch-time resolve flag is re-derived from the persisted
+    /// expected output paths (`sched.recovery.deferred-resolve`).
     ///
     /// Errors: `drv_path` doesn't parse as StorePath. Shouldn't
     /// happen (it was validated at merge time before persist) but
@@ -1186,7 +1204,7 @@ impl DerivationState {
             .as_deref()
             .and_then(|c| std::str::from_utf8(c).ok())
             .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok());
-        // r[impl sched.recovery.inline-drv-ca-hash+2]
+        // r[impl sched.recovery.inline-drv-ca-hash+3]
         // A recovered content-addressed hook-fallback node must regain
         // its CA modular hash, or its post-failover completion would
         // silently skip realisation registration (the consumable-result
@@ -1200,13 +1218,18 @@ impl DerivationState {
         // never fails and the build still completes, only realisation
         // registration is lost (now visibly).
         //
-        // r[impl sched.persist.ca-modular-hash]
-        // Every other CA row — store-backed nodes whose bytes are never
-        // persisted — restores the ingress-provided hash persisted with
-        // the row (M_066), so the merge gate's content-bound identity
-        // evidence (sched.merge.authoritative-claim-no-redefine) and
-        // realisation registration survive failover too. Wrong-length
-        // values degrade to unset.
+        // r[impl sched.persist.ca-modular-hash+2]
+        // Every other row that persisted a hash restores it (M_066):
+        // store-backed CA nodes whose bytes are never persisted AND
+        // deferred input-addressed nodes (is_ca=false but the gateway
+        // populates the hash because their output paths are unknown
+        // until a floating-CA input resolves — it keys the realisation
+        // row wopQueryDerivationOutputMap serves). Restoring is what
+        // keeps the merge gate's content-bound identity evidence
+        // (sched.merge.authoritative-claim-no-redefine) and
+        // post-failover realisation registration working. Wrong-length
+        // values degrade to unset; a row that never persisted one stays
+        // unset.
         let modular_hash = if row.is_ca && row.drv_content.is_some() {
             match parsed_content.as_ref() {
                 Some(drv) => rio_nix::derivation::hash_derivation_modulo(
@@ -1231,13 +1254,25 @@ impl DerivationState {
                     None
                 }
             }
-        } else if row.is_ca {
+        } else {
             row.ca_modular_hash
                 .as_deref()
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
-        } else {
-            None
         };
+        // r[impl sched.recovery.deferred-resolve]
+        // Re-derive the dispatch-time resolve flag from the persisted
+        // creation snapshot: an empty expected output path means the
+        // path is unknown until placeholder resolution (floating-CA
+        // self, or deferred-IA whose floating-CA input hasn't resolved)
+        // — exactly the population the gateway stamps `needs_resolve`
+        // for. Without this the flag was lost to `..Default::default()`
+        // and a post-failover completion of a deferred-IA node skipped
+        // realisation registration even though its hash was persisted.
+        // FOD-with-floating-CA-input is under-approximated (its expected
+        // path is known), which keeps the documented dispatch-unresolved
+        // degrade and is already covered by `is_ca` at the realisation
+        // gate.
+        let needs_resolve = row.expected_output_paths.iter().any(|p| p.is_empty());
         let recovered_input_srcs: Vec<String> = parsed_content
             .as_ref()
             .map(|d| d.input_srcs().iter().cloned().collect())
@@ -1261,9 +1296,13 @@ impl DerivationState {
             ca: CaState {
                 is_ca: row.is_ca,
                 // Recomputed above for authoritative hook-fallback rows,
-                // restored from the persisted column for other CA rows;
-                // None only when neither source exists.
+                // restored from the persisted column for any other row
+                // that carried one (CA or deferred-IA); None only when
+                // neither source exists.
                 modular_hash,
+                // Re-derived above from expected-output-path emptiness
+                // (sched.recovery.deferred-resolve).
+                needs_resolve,
                 // Remaining CA fields lossy on recovery — see CaState doc.
                 ..Default::default()
             },
@@ -2653,9 +2692,9 @@ mod tests {
 
     /// A recovered CA node carrying authoritative inline content regains
     /// its modular hash (recomputed from the bytes — identical to what
-    /// ingress validated); rows without content, non-CA rows, and
-    /// unparseable content stay `None`.
-    // r[verify sched.recovery.inline-drv-ca-hash+2]
+    /// ingress validated); rows that persisted neither bytes nor a
+    /// column value, and unparseable content, stay `None`.
+    // r[verify sched.recovery.inline-drv-ca-hash+3]
     #[test]
     fn from_recovery_row_recomputes_ca_modular_hash_for_authoritative_content() {
         let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
@@ -2719,8 +2758,8 @@ mod tests {
     /// A store-backed CA row (no persisted bytes) restores the modular
     /// hash persisted with the row; the recompute-from-bytes branch keeps
     /// precedence when bytes exist; wrong-length values degrade to unset;
-    /// non-CA rows ignore the column.
-    // r[verify sched.persist.ca-modular-hash]
+    /// non-CA rows that persisted a hash (deferred-IA) restore it too.
+    // r[verify sched.persist.ca-modular-hash+2]
     #[test]
     fn from_recovery_row_restores_persisted_ca_modular_hash_for_store_backed_rows() {
         let persisted = [7u8; 32];
@@ -2779,7 +2818,10 @@ mod tests {
         .expect("hydrates");
         assert_eq!(short.ca.modular_hash, None, "wrong length degrades to None");
 
-        // Non-CA rows never restore a hash, even if the column is set.
+        // Non-CA rows that persisted a hash restore it too — the gateway
+        // populates the column for deferred-IA nodes (is_ca=false), and
+        // dropping it on recovery is exactly the failover gap this
+        // restore closes.
         let ia = DerivationState::from_recovery_row(
             crate::db::RecoveryDerivationRow {
                 is_ca: false,
@@ -2789,7 +2831,92 @@ mod tests {
             DerivationStatus::Ready,
         )
         .expect("hydrates");
-        assert_eq!(ia.ca.modular_hash, None, "non-CA rows ignore the column");
+        assert_eq!(
+            ia.ca.modular_hash,
+            Some(persisted),
+            "a non-CA row carrying a persisted hash restores it"
+        );
+    }
+
+    /// Deferred-IA failover regression (merged_bug_003): a deferred
+    /// input-addressed row (is_ca=false, empty expected output path,
+    /// persisted hash) must come back with BOTH the modular hash and the
+    /// dispatch-time resolve flag, so its post-failover completion still
+    /// registers the realisation `wopQueryDerivationOutputMap` serves.
+    /// Plain-IA rows stay hash-less with the flag clear; floating-CA
+    /// store-backed rows regain the flag; wrong-length values on non-CA
+    /// rows still degrade to unset.
+    // r[verify sched.recovery.inline-drv-ca-hash+3]
+    // r[verify sched.recovery.deferred-resolve]
+    #[test]
+    fn from_recovery_row_restores_deferred_ia_hash_and_needs_resolve() {
+        let persisted = [9u8; 32];
+
+        // Deferred-IA: hash restored, needs_resolve re-derived.
+        let deferred = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: false,
+                ca_modular_hash: Some(persisted.to_vec()),
+                expected_output_paths: vec![String::new()],
+                ..crate::db::RecoveryDerivationRow::test_default("ia-deferred", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(
+            deferred.ca.modular_hash,
+            Some(persisted),
+            "deferred-IA row restores the persisted hash"
+        );
+        assert!(
+            deferred.ca.needs_resolve,
+            "empty expected output path → resolve flag restored"
+        );
+        assert!(!deferred.ca.is_ca, "deferred-IA stays non-CA");
+
+        // Plain IA with a statically-known output path: nothing restored.
+        let plain = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                expected_output_paths: vec![
+                    "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-out".to_string(),
+                ],
+                ..crate::db::RecoveryDerivationRow::test_default("ia-plain", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(plain.ca.modular_hash, None);
+        assert!(!plain.ca.needs_resolve, "known output path → no resolve");
+
+        // Store-backed floating-CA: flag re-derived alongside the hash
+        // restore (the pre-existing behavior, now via the same leg).
+        let floating = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                ca_modular_hash: Some(persisted.to_vec()),
+                expected_output_paths: vec![String::new()],
+                ..crate::db::RecoveryDerivationRow::test_default("ca-float", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert!(floating.ca.needs_resolve, "floating-CA regains the flag");
+        assert_eq!(floating.ca.modular_hash, Some(persisted));
+
+        // Wrong-length value on a non-CA row: degrades to unset (same
+        // posture as the CA case pinned above).
+        let short = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: false,
+                ca_modular_hash: Some(vec![1, 2, 3, 4]),
+                expected_output_paths: vec![String::new()],
+                ..crate::db::RecoveryDerivationRow::test_default("ia-short", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(short.ca.modular_hash, None, "wrong length degrades to None");
+        assert!(short.ca.needs_resolve, "flag re-derivation is independent");
     }
 }
 

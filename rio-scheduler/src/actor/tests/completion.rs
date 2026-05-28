@@ -4797,3 +4797,51 @@ async fn test_terminal_build_outcome_not_mutated_by_late_shared_failure() -> Tes
     assert_eq!(after.failed_derivations, frozen.failed_derivations);
     Ok(())
 }
+
+/// Live-path pin for the deferred-IA realisation contract: a
+/// non-recovered deferred-IA completion (is_ca=false, needs_resolve set
+/// on the submitted node, gateway-provided modular hash) writes the
+/// realisation row that `wopQueryDerivationOutputMap` serves. The
+/// recovery-path counterpart
+/// (`test_recovery_registers_realisation_for_deferred_ia_node`) asserts
+/// the same outcome post-failover; this baseline keeps a regression
+/// there from hiding behind a regression here.
+#[tokio::test]
+async fn test_live_deferred_ia_completion_registers_realisation() -> TestResult {
+    let (db, handle, _task, mut wrx) = setup_with_worker("dia-w", "x86_64-linux").await?;
+    let build_id = Uuid::new_v4();
+    let modular_hash = [0x6bu8; 32];
+    let mut node = make_node("dia-live");
+    node.is_content_addressed = false;
+    node.needs_resolve = true;
+    node.expected_output_paths = vec![String::new()];
+    node.ca_modular_hash = modular_hash.to_vec();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, test_drv_path("dia-live"));
+    complete_ca(
+        &handle,
+        "dia-w",
+        &test_drv_path("dia-live"),
+        &[(
+            "out",
+            "/nix/store/dddddddddddddddddddddddddddddddd-dia-live-out",
+            vec![0x11u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(modular_hash.as_slice())
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/dddddddddddddddddddddddddddddddd-dia-live-out",
+        "live deferred-IA completion registers the realisation row"
+    );
+    Ok(())
+}

@@ -1705,25 +1705,46 @@ bytes, authoritative flag, identity, and recomputed CA modular hash it held
 while live, so the authoritative-conflict gate keeps holding across a leader
 failover instead of being silently disabled for poisoned nodes.
 
-#r("sched.recovery.inline-drv-ca-hash+2")[
+#r("sched.recovery.inline-drv-ca-hash+3")[
   A recovered derivation carrying authoritative inline content that is
   content-addressed MUST have its CA modular hash rederived from the restored
   bytes during recovery (`hashDerivationModulo` over the parsed content with
   no input resolution --- the same computation `SubmitBuild` ingress
   validated), so a post-failover completion still registers its realisation
   under the key returned to the hook client and merge-time realisation cache
-  hits still apply. Every other recovered content-addressed derivation MUST
-  restore the modular hash persisted with its row
-  (#rref("sched.persist.ca-modular-hash")) when one is present;
-  non-content-addressed derivations keep an unset modular hash.
+  hits still apply. Every other recovered derivation MUST restore the
+  modular hash persisted with its row
+  (#rref("sched.persist.ca-modular-hash")) when one is present ---
+  content-addressed or not (deferred input-addressed rows carry one); a
+  row that persisted none keeps it unset.
 ]
 Recompute-from-bytes stays the source of truth wherever bytes exist: it
 keeps the realisation key inseparable from the content actually persisted
 (the two cannot drift), and a row whose bytes fail to parse degrades to an
 unset hash (the build still completes; only realisation registration is
-lost, with a warning). The persisted-column restore covers the rows that
-have no bytes to recompute from --- store-backed CA nodes --- whose
-content-bound identity evidence would otherwise vanish on failover.
+lost, with a warning). The recompute leg stays scoped to authoritative
+content-addressed rows because the no-input-resolution recompute is only
+valid for the lifted single-node fallback shape; everything else ---
+store-backed CA nodes and deferred input-addressed nodes alike --- has no
+bytes to recompute from, so the persisted ingress value is the only
+faithful source of the evidence and of the realisation key.
+
+#r("sched.recovery.deferred-resolve")[
+  A recovered derivation whose persisted expected output paths contain an
+  empty entry MUST be restored with its dispatch-time resolve flag set, so
+  post-failover dispatch re-attempts placeholder resolution and a
+  post-failover completion still registers its realisation row --- for
+  deferred input-addressed derivations exactly as for floating-CA ones.
+]
+The flag is re-derived from the persisted creation snapshot (an empty
+expected output path is precisely "unknown until placeholder resolution"),
+so no schema change is needed. A fixed-output derivation whose only
+floating-CA involvement is an input keeps a statically-known output path
+and is therefore under-approximated by this re-derivation; that preserves
+the documented dispatch-unresolved degrade and its realisation
+registration is already covered by the content-addressed flag. This
+supersedes the earlier posture that the resolve flag was wholly lossy on
+recovery.
 
 #r("sched.merge.authoritative-conflict+4")[
   A node whose in-memory state carries authoritative inline derivation
@@ -2006,8 +2027,9 @@ handling already covers, never a half-committed displacement, a cleared
 authoritative blob, or a wiped failure history for a build that was never
 activated, and recovery needs no compensating logic.
 
-#r("sched.persist.ca-modular-hash")[
-  A content-addressed derivation's ingress-provided CA modular hash MUST be
+#r("sched.persist.ca-modular-hash+2")[
+  A derivation's ingress-provided CA modular hash --- carried by
+  content-addressed nodes and by deferred input-addressed nodes --- MUST be
   persisted with its derivation row by the creation-scoped upsert and
   refreshed on every (re)creation like the rest of the creation-time
   snapshot. The persisted value is declared identity evidence only: it
@@ -2023,12 +2045,16 @@ its persisted bytes; a store-backed CA row has no persisted bytes, so
 without this column its evidence was simply lost on failover and a
 byte-identical authoritative resubmission of the same derivation could
 never again be adopted (#rref("sched.merge.authoritative-claim-no-redefine")).
-The hash also keys realisation registration, so restoring it keeps
-post-failover completions registering under the key clients were given.
-Stored as part of the identity snapshot --- never inside the
-definition-change accumulator reset --- and absent (`NULL`) when the
-creating submission carried none, which keeps the fail-closed posture for
-evidence-less rows.
+The hash also keys realisation registration --- for deferred
+input-addressed nodes it is what lets `wopQueryDerivationOutputMap` answer
+with the post-resolve output path, which is why the gateway populates it
+for them even though they are not content-addressed --- so persisting and
+restoring it keeps post-failover completions registering under the key
+clients were given. Scoping the column to `is_ca` rows would silently
+regress exactly that failover guarantee. Stored as part of the identity
+snapshot --- never inside the definition-change accumulator reset --- and
+absent (`NULL`) when the creating submission carried none, which keeps the
+fail-closed posture for evidence-less rows.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

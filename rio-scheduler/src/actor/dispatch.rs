@@ -2663,10 +2663,12 @@ impl DagActor {
         // `resolve_ca_inputs` can parse `inputDrvs` and serialize
         // the resolved `BasicDerivation` form.
         //
-        // The same lossy-on-recovery pattern still applies to
-        // `ca_modular_hash` (see `collect_ca_inputs`'s skip-on-None)
-        // and `pending_realisation_deps` (best-effort cache,
-        // reconstituted here on each resolve).
+        // The lossy-on-recovery pattern still applies to
+        // `pending_realisation_deps` (best-effort cache, reconstituted
+        // here on each resolve); `ca_modular_hash` and `needs_resolve`
+        // are no longer lossy — recovery restores the persisted hash
+        // and re-derives the resolve flag
+        // (sched.persist.ca-modular-hash, sched.recovery.deferred-resolve).
         //
         // r[impl sched.ca.resolve+3]
         let drv_content = if state.drv_content.is_empty() {

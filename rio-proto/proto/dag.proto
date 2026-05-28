@@ -48,20 +48,24 @@ message DerivationNode {
   // this to gate the hash-compare branch in completion.rs.
   bool is_content_addressed = 11;
 
-  // For CA derivations: the modular derivation hash (hashDerivationModulo
-  // SHA-256). This is the `drv_hash` half of the realisations table
-  // composite PK — the same value Nix sends as the `sha256:<hex>` prefix
-  // of wopRegisterDrvOutput's `id` field. Populated by the gateway after
+  // The modular derivation hash (hashDerivationModulo SHA-256). This is
+  // the `drv_hash` half of the realisations table composite PK — the
+  // same value Nix sends as the `sha256:<hex>` prefix of
+  // wopRegisterDrvOutput's `id` field. Populated by the gateway after
   // DAG BFS from the same drv_cache that resolves inputDrvs (so the full
-  // transitive closure is available). Empty (zero-length) for
-  // input-addressed derivations. For the single-node BasicDerivation
-  // fallback, build_fallback_node populates it when the inline
-  // derivation is content-addressed (CppNix staticOutputHashes:
-  // hashDerivationModulo over the lifted derivation, which has no
-  // inputDrvs); the scheduler's authoritative-content validation
-  // requires it to match the inline drv_content whenever a floating-CA
-  // output is present (FOD-only fallbacks may leave it empty, but a
-  // present value must still match).
+  // transitive closure is available) for content-addressed nodes AND for
+  // deferred input-addressed nodes (is_content_addressed=false but the
+  // output path is unknown until a floating-CA input resolves — the
+  // realisation row keyed by this hash is how the scheduler answers
+  // wopQueryDerivationOutputMap for them). Empty (zero-length) for
+  // input-addressed derivations with statically-known output paths. For
+  // the single-node BasicDerivation fallback, build_fallback_node
+  // populates it when the inline derivation is content-addressed
+  // (CppNix staticOutputHashes: hashDerivationModulo over the lifted
+  // derivation, which has no inputDrvs); the scheduler's
+  // authoritative-content validation requires it to match the inline
+  // drv_content whenever a floating-CA output is present (FOD-only
+  // fallbacks may leave it empty, but a present value must still match).
   bytes ca_modular_hash = 12;
 
   // ADR-018 Appendix B `shouldResolve`: true if this derivation needs

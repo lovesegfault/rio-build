@@ -5049,7 +5049,7 @@ async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
 /// is recomputed from the persisted authoritative bytes, so the
 /// consumable-result guarantee of the inline fallback survives scheduler
 /// failover.
-// r[verify sched.recovery.inline-drv-ca-hash+2]
+// r[verify sched.recovery.inline-drv-ca-hash+3]
 #[tokio::test]
 async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> TestResult {
     let build_id = Uuid::new_v4();
@@ -5105,6 +5105,71 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
     assert_eq!(
         path, "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-hook-ca-out",
         "post-failover CA completion must register the realisation under the recomputed key"
+    );
+    Ok(())
+}
+
+/// Deferred-IA failover regression (merged_bug_003): a store-backed
+/// input-addressed derivation whose output path is deferred (floating-CA
+/// input ⇒ empty expected output path) carries a gateway-computed
+/// modular hash precisely so its completion can register the realisation
+/// `wopQueryDerivationOutputMap` serves. Both the hash (persisted column)
+/// and the resolve flag (re-derived from the persisted empty expected
+/// output path) must survive a leader failover, or the post-failover
+/// completion silently skips the realisation insert and the client can
+/// never learn the deferred output's path.
+// r[verify sched.recovery.deferred-resolve]
+// r[verify sched.recovery.inline-drv-ca-hash+3]
+// r[verify sched.persist.ca-modular-hash+2]
+#[tokio::test]
+async fn test_recovery_registers_realisation_for_deferred_ia_node() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let drv_path = rio_test_support::fixtures::test_drv_path("deferred-ia-realise");
+    let modular_hash = [0x5au8; 32];
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Store-backed deferred-IA node: NOT content-addressed, no inline
+        // bytes, but an unknown output path and a gateway-computed
+        // modular hash (mirrors populate_ca_modular_hashes' deferred-IA
+        // arm in rio-gateway translate).
+        let mut node = make_node("deferred-ia-realise");
+        node.is_content_addressed = false;
+        node.needs_resolve = true;
+        node.expected_output_paths = vec![String::new()];
+        node.ca_modular_hash = modular_hash.to_vec();
+        merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: dispatch and complete with the realized output. The
+    // recovered node must have restored the persisted hash and re-derived
+    // needs_resolve, or the completion gate skips the realisation insert.
+    let mut rx = connect_executor(&handle, "deferred-ia-w", "x86_64-linux").await?;
+    let _assignment = recv_assignment(&mut rx).await;
+    complete_ca(
+        &handle,
+        "deferred-ia-w",
+        &drv_path,
+        &[(
+            "out",
+            "/nix/store/cccccccccccccccccccccccccccccccc-deferred-ia-out",
+            vec![0x24u8; 32],
+        )],
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (path,): (String,) = sqlx::query_as(
+        "SELECT output_path FROM realisations WHERE drv_hash = $1 AND output_name = 'out'",
+    )
+    .bind(modular_hash.as_slice())
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert_eq!(
+        path, "/nix/store/cccccccccccccccccccccccccccccccc-deferred-ia-out",
+        "post-failover deferred-IA completion must register the realisation under the persisted key"
     );
     Ok(())
 }
@@ -5748,7 +5813,7 @@ async fn test_recovery_keep_going_sticky_failure_survives_pre_failover_clear_poi
     Ok(())
 }
 
-// r[verify sched.persist.ca-modular-hash]
+// r[verify sched.persist.ca-modular-hash+2]
 // r[verify sched.merge.authoritative-claim-no-redefine]
 /// End-to-end bug_005 regression: a store-backed floating-CA node parked
 /// retriable, recovered after a leader failover, must still accept a

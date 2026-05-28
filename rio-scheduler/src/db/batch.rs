@@ -270,12 +270,13 @@ impl SchedulerDb {
                 -- ingress validation plus node lifecycle, not by this
                 -- clear.
                 drv_content = EXCLUDED.drv_content,
-                -- r[impl sched.persist.ca-modular-hash]
+                -- r[impl sched.persist.ca-modular-hash+2]
                 -- The CA modular hash is snapshot identity (the
-                -- content-bound evidence the merge gate compares), so it
-                -- rides the same unconditional creation-snapshot refresh
-                -- as the columns above — NOT the definition-change
-                -- accumulator reset below.
+                -- content-bound evidence the merge gate compares, and
+                -- the realisation key for CA and deferred-IA rows), so
+                -- it rides the same unconditional creation-snapshot
+                -- refresh as the columns above — NOT the
+                -- definition-change accumulator reset below.
                 ca_modular_hash = EXCLUDED.ca_modular_hash,
                 -- r[impl sched.merge.displaced-failure-reset+2]
                 -- Definition-change reset: the prior creation was

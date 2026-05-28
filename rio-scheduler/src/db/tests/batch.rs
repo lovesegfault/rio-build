@@ -1295,11 +1295,11 @@ async fn test_delete_displaced_build_links_adjusts_total_only_when_requested() -
     Ok(())
 }
 
-// r[verify sched.persist.ca-modular-hash]
+// r[verify sched.persist.ca-modular-hash+2]
 /// The CA modular hash rides the creation-time snapshot: persisted on
-/// insert, refreshed by a later (re)creation, cleared when the
-/// (re)creating submission carries none, and returned by both recovery
-/// queries.
+/// insert (for CA and deferred-IA rows alike), refreshed by a later
+/// (re)creation, cleared when the (re)creating submission carries none,
+/// and returned by both recovery queries.
 #[tokio::test]
 async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -1376,5 +1376,33 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
     SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", None)]).await?;
     tx.commit().await?;
     assert_eq!(fetch("ca-evi").await?, None, "cleared when absent");
+
+    // Deferred-IA shape (is_ca=false, unknown output path, hash present —
+    // the gateway populates it for these too): persisted and returned by
+    // the recovery query exactly like a CA row.
+    let deferred = DerivationRow {
+        is_ca: false,
+        expected_output_paths: vec![String::new()],
+        ..row("ia-deferred-evi", Some([3u8; 32]))
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[deferred]).await?;
+    tx.commit().await?;
+    assert_eq!(
+        fetch("ia-deferred-evi").await?,
+        Some(vec![3u8; 32]),
+        "deferred-IA rows persist the hash"
+    );
+    let recovered = db.load_nonterminal_derivations().await?;
+    let deferred_row = recovered
+        .iter()
+        .find(|r| r.drv_hash == "ia-deferred-evi")
+        .expect("deferred-IA row loaded");
+    assert_eq!(
+        deferred_row.ca_modular_hash.as_deref(),
+        Some([3u8; 32].as_slice()),
+        "recovery query returns the deferred-IA hash"
+    );
+    assert!(!deferred_row.is_ca);
     Ok(())
 }

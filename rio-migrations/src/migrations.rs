@@ -1194,8 +1194,15 @@ pub const M_064: () = ();
 pub const M_065: () = ();
 
 /// 066: `derivations.ca_modular_hash` — persist the ingress-provided CA
-/// modular hash so a store-backed CA node's content-bound identity
-/// evidence (and its realisation key) survives leader failover.
+/// modular hash so a store-backed node's content-bound identity
+/// evidence (and its realisation key) survives leader failover. The
+/// column is populated for content-addressed rows AND for deferred
+/// input-addressed rows (`is_ca = false` but the gateway computes the
+/// hash because their output paths are unknown until a floating-CA
+/// input resolves; the realisation row keyed by it is how
+/// `wopQueryDerivationOutputMap` answers). The frozen `066_*.sql`
+/// header comment predates that clarification and reads "CA nodes"
+/// only — read it under this contract.
 ///
 /// The merge gate's identity comparison
 /// (sched.merge.authoritative-conflict /
@@ -1217,15 +1224,17 @@ pub const M_065: () = ();
 /// or cleared on every (re)creation like the rest of the snapshot
 /// (sched.persist.recreate-refresh); never inside the definition-change
 /// accumulator reset (it is identity, not an accumulator). Read back by
-/// both recovery loaders; `from_recovery_row` restores it only when the
-/// recompute-from-bytes branch does not apply, and a wrong-length value
+/// both recovery loaders; `from_recovery_row` restores it for ANY row
+/// carrying one whenever the recompute-from-bytes branch does not apply
+/// (sched.recovery.inline-drv-ca-hash), and a wrong-length value
 /// degrades to unset. Trust posture: the value is submitter/gateway-
 /// declared, ingress-validated evidence — it never relaxes
 /// `validate_authoritative_drv_content`, the byte-equality arm, or any
 /// displacement predicate (sched.persist.ca-modular-hash). NULL for
-/// non-CA rows and pre-migration rows (those keep the pre-fix
-/// over-rejection for one window). 32 bytes, no index, no size CHECK
-/// (the Rust side length-validates on read and write).
+/// plain input-addressed rows with statically-known output paths,
+/// submissions that carried no hash, and pre-migration rows (those keep
+/// the pre-fix over-rejection for one window). 32 bytes, no index, no
+/// size CHECK (the Rust side length-validates on read and write).
 pub const M_066: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.

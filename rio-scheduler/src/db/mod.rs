@@ -451,12 +451,14 @@ pub(crate) struct DerivationRow {
     /// submissions that join a live node never reach the upsert.
     pub drv_content: Option<Vec<u8>>,
     /// Ingress-provided CA modular hash (`M_066`) — content-bound
-    /// identity evidence for CA derivations, persisted so it survives
+    /// identity evidence and realisation key, persisted so it survives
     /// failover for store-backed CA rows (whose bytes are never
-    /// persisted). `None` for non-CA nodes or submissions that carried
-    /// no hash. Snapshot identity: refreshed unconditionally on
+    /// persisted) and for deferred-IA rows (is_ca=false but the
+    /// gateway populates the hash). `None` for plain-IA nodes with
+    /// statically-known output paths or submissions that carried no
+    /// hash. Snapshot identity: refreshed unconditionally on
     /// (re)creation, never part of the definition-change accumulator
-    /// reset. r[impl sched.persist.ca-modular-hash]
+    /// reset. r[impl sched.persist.ca-modular-hash+2]
     pub ca_modular_hash: Option<[u8; 32]>,
 }
 

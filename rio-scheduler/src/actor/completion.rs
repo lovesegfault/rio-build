@@ -1195,7 +1195,12 @@ impl DagActor {
         // `needs_resolve=true`) ALSO needs a realisation row — the
         // .drv on disk has `path=""`, so the gateway's
         // `wopQueryDerivationOutputMap` realisation-lookup is the only
-        // way the client learns the post-resolve output path.
+        // way the client learns the post-resolve output path. Both
+        // conjuncts survive failover: the hash is restored from the
+        // persisted column and `needs_resolve` is re-derived from the
+        // persisted expected output paths
+        // (sched.recovery.deferred-resolve), so a post-failover
+        // completion registers the realisation exactly like a live one.
         if let Some(state) = self.dag.node(drv_hash)
             && (state.ca.is_ca || state.ca.needs_resolve)
             && let Some(modular_hash) = state.ca.modular_hash
