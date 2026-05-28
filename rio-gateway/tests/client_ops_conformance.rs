@@ -377,12 +377,22 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
     );
     assert_eq!(results[0].result.built_outputs.len(), 1);
     assert_eq!(results[0].result.built_outputs[0].out_path, CONF_DRV_OUT);
+    assert!(
+        results[0].result.error_msg.is_empty(),
+        "completed root must not carry an error message, got: {}",
+        results[0].result.error_msg
+    );
     // The failing root carries its own status and error message.
     assert_eq!(results[1].result.status, BuildStatus::PermanentFailure);
     assert!(
         results[1].result.error_msg.contains(fail_msg),
         "failing root must carry the scheduler's error text, got: {}",
         results[1].result.error_msg
+    );
+    assert!(
+        results[1].result.built_outputs.is_empty(),
+        "failing root must not report built outputs, got: {:?}",
+        results[1].result.built_outputs
     );
 
     finish(&mut sess, rd, wr).await;

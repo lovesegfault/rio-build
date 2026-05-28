@@ -440,13 +440,11 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
         types::DerivationEventKind::Completed => {
             // Record this drv's own terminal so multi-root opcodes can
             // report it per root. First terminal wins — a duplicate
-            // (re-dispatch replay) cannot overwrite it.
+            // (re-dispatch replay) cannot overwrite it. `success()` sets
+            // timesBuilt = 1, matching what an executed build reports.
             act.terminal
                 .entry(drv_event.derivation_path.clone())
-                .or_insert_with(|| BuildResult {
-                    status: BuildStatus::Built,
-                    ..Default::default()
-                });
+                .or_insert_with(BuildResult::success);
             // Terminal: close any dangling actSubstitute + actCopyPath.
             // Substituting → Completed shouldn't happen via the normal
             // scheduler FSM, but terminal-arm symmetry costs nothing

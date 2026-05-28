@@ -103,6 +103,11 @@ pub struct ClusterEndpoints {
     pub store_addr: String,
     /// Path to the HMAC key for `x-rio-service-token` (None = no token, dev mode).
     pub service_hmac_key_path: Option<PathBuf>,
+    /// Gateway SSH host key to pin: an OpenSSH public-key line
+    /// (`ssh-ed25519 AAAA… comment`) or a `SHA256:…` fingerprint. When set
+    /// the engine's transport accepts only this key; when absent it accepts
+    /// the first key offered and records the observed fingerprint for audit.
+    pub gateway_host_key: Option<String>,
 }
 
 /// Tenant names plus the launch-time upstream-set assertion.
@@ -191,6 +196,19 @@ pub struct Knobs {
     pub infra_low_confidence_pct: f64,
     pub hydra_unknown_threshold_pct: f64,
     pub report_top_n: usize,
+    /// SSH connections the gateway transport pool dials. `None` derives the
+    /// count from the in-flight channel budget as
+    /// ceil(`submit_concurrency` / 4), minimum 1 (the gateway caps channels
+    /// per connection at 4).
+    pub connections: Option<usize>,
+    /// Deadline in seconds for each probe / upload / path-info client op on
+    /// a gateway channel (build submissions use the batch timeout instead).
+    pub op_timeout_secs: u64,
+    /// Store paths per `QueryValidPaths` probe call.
+    pub probe_chunk: usize,
+    /// Channels held for validity probing. Reserved for the supply planner;
+    /// nothing reads it yet — the submitter probes on its own channel.
+    pub probe_concurrency: usize,
 }
 
 impl Default for Knobs {
@@ -221,6 +239,10 @@ impl Default for Knobs {
             infra_low_confidence_pct: 5.0,
             hydra_unknown_threshold_pct: 5.0,
             report_top_n: 20,
+            connections: None,
+            op_timeout_secs: 120,
+            probe_chunk: 2000,
+            probe_concurrency: 3,
         }
     }
 }
@@ -308,10 +330,22 @@ impl CampaignSpec {
             ("knobs.batch_max_nodes", self.knobs.batch_max_nodes),
             ("knobs.submit_concurrency", self.knobs.submit_concurrency),
             ("knobs.narinfo_concurrency", self.knobs.narinfo_concurrency),
+            ("knobs.probe_chunk", self.knobs.probe_chunk),
+            ("knobs.probe_concurrency", self.knobs.probe_concurrency),
         ];
         for (field, value) in nonzero_knobs {
             anyhow::ensure!(value != 0, "campaign spec field {field} must be nonzero");
         }
+        anyhow::ensure!(
+            self.knobs.op_timeout_secs != 0,
+            "campaign spec field knobs.op_timeout_secs must be nonzero"
+        );
+        // `None` means "derive from submit_concurrency"; an explicit zero
+        // would leave the transport with no connections at all.
+        anyhow::ensure!(
+            self.knobs.connections != Some(0),
+            "campaign spec field knobs.connections must be nonzero"
+        );
         // The batch timeout becomes the per-child kill deadline; zero, NaN,
         // or a negative value would kill every `nix build` child the moment
         // it spawns.
@@ -501,6 +535,51 @@ mod tests {
         let re: CampaignSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(re.eval_set.key_digest, "ab12cd34");
+    }
+
+    #[test]
+    fn client_ops_knob_defaults_and_validation() {
+        let k = Knobs::default();
+        assert_eq!(k.connections, None);
+        assert_eq!(k.op_timeout_secs, 120);
+        assert_eq!(k.probe_chunk, 2000);
+        assert_eq!(k.probe_concurrency, 3);
+        // Explicit zero overrides are rejected, naming the knob.
+        let json = r#"{
+            "mode": "leaf",
+            "eval_set": {"hydra_eval_id": 1, "key_digest": "ab12cd34"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"},
+            "knobs": {"connections": 0}
+        }"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("knobs.connections")
+        );
+    }
+
+    #[test]
+    fn cluster_gateway_host_key_is_optional_and_round_trips() {
+        let spec: CampaignSpec = serde_json::from_str(
+            r#"{"cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                            "scheduler_addr": "s:9001", "store_addr": "st:9002",
+                            "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}}"#,
+        )
+        .unwrap();
+        assert!(
+            spec.cluster
+                .gateway_host_key
+                .as_deref()
+                .unwrap()
+                .starts_with("ssh-ed25519")
+        );
+        let re: CampaignSpec =
+            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(re.cluster.gateway_host_key, spec.cluster.gateway_host_key);
     }
 
     #[test]
