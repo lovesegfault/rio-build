@@ -110,9 +110,12 @@ impl SchedulerDb {
     /// [`Self::load_parents_with_failed_deps`] and short-circuited to
     /// `DependencyFailed` in `seed_ready_queue` BEFORE
     /// `compute_initial_states` runs, so the missing edge can't cause a
-    /// wrong `all_deps_completed() == true` promotion; the rest
-    /// deliberately recover childless and are re-discovered at dispatch
-    /// time (see that query's doc for the evidence rule).
+    /// wrong `all_deps_completed() == true` promotion; the rest are not
+    /// condemned — they keep whatever non-terminal children survive this
+    /// load (possibly none) and are re-discovered at dispatch time (see
+    /// that query's doc for the evidence rule), and recovery records the
+    /// truncation as a closure hole via
+    /// [`Self::load_parents_with_unproduced_terminal_children`].
     ///
     /// ANY($1): PG unnest-style array comparison. Scales to ~100k
     /// IDs before the planner starts preferring a temp table; recovery
@@ -271,6 +274,52 @@ impl SchedulerDb {
                             WHERE bd.derivation_id = c.derivation_id
                               AND b.status IN ('pending', 'active'))
             )
+            "#,
+        )
+        .bind(derivation_ids)
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Recovered parents with at least one persisted child whose status
+    /// is a non-produced terminal (`'poisoned'`/`'dependency_failed'`/
+    /// `'cancelled'`) — exactly the children whose edges
+    /// [`Self::load_edges_for_derivations`] drops without the child ever
+    /// having been produced. That drop is the recovery-side analogue of
+    /// a reap: the parent's recovered child set is silently truncated
+    /// relative to its persisted (and originally declared) closure, so
+    /// the caller stamps the `closure_hole` breadcrumb on these parents
+    /// (in memory, best-effort in PG) and children-keyed `topdown_pruned`
+    /// verdicts never trust the truncated set. `'failed'` is not in the
+    /// set: it is a transient retry status, not terminal — such a child
+    /// is loaded by [`Self::load_nonterminal_derivations`] and keeps its
+    /// edge. `'completed'`/`'skipped'` children are produced — their
+    /// dropped edge is the satisfied case, not a truncation.
+    ///
+    /// Deliberately NO live-build / co-ownership scoping, unlike
+    /// [`Self::load_parents_with_failed_deps`]: that query CONDEMNS the
+    /// parent, so it demands a live co-owning voucher for the failure;
+    /// this one only records that the recovered child set under-states
+    /// the declared closure — a fact about the rows themselves, true
+    /// regardless of which build demanded the dropped child. The
+    /// breadcrumb is inert for unmarked parents and at worst routes a
+    /// marked parent to the bounded resubmit-directing fail-fast, so
+    /// over-recording errs conservative; failing to record it is what
+    /// let a surviving sibling's later completion launder the mark.
+    pub(crate) async fn load_parents_with_unproduced_terminal_children(
+        &self,
+        derivation_ids: &[Uuid],
+    ) -> Result<Vec<Uuid>, sqlx::Error> {
+        if derivation_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT e.parent_id
+            FROM derivation_edges e
+            JOIN derivations c ON c.derivation_id = e.child_id
+            WHERE e.parent_id = ANY($1)
+              AND c.status IN ('poisoned', 'dependency_failed', 'cancelled')
             "#,
         )
         .bind(derivation_ids)

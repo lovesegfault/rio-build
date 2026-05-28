@@ -4770,3 +4770,229 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+10]
+/// bug_006 regression (the recovery-time stamp): when recovery drops the
+/// edge to an un-produced terminal child of a restored marked parent, it
+/// must record the closure hole — in memory and best-effort in PG —
+/// exactly as the in-process reap does for the same removal. Without the
+/// breadcrumb the parent recovers marked with a silently truncated child
+/// set (NOT childless: the other child survives), and when that surviving
+/// sibling later completes, `clear_topdown_pruned_for_produced_parents`
+/// judges the truncated set Vouched, clears the mark in memory and PG,
+/// and the node is dispatched from source against a closure that was
+/// never produced — the doomed ENOENT dispatch the mark exists to
+/// prevent.
+///
+/// Staged shape (phase 1): B2 full-merges P→{C1, C2} (both edges
+/// persisted); a separate live build keeps the surviving sibling C1
+/// alive; B1 is the pruned re-request that links only P. Backdates:
+/// C2 → `cancelled` (the row B2's cancel sweep persisted for its
+/// sole-interest unbuilt child), P → `substituting` + `topdown_pruned =
+/// true` (the post-prune persisted shape for B1), B2 → `cancelled`; B1
+/// and the sibling's build stay live. `closure_hole` is deliberately NOT
+/// staged: no reap ran before the failover — that is the premise.
+///
+/// Phase 2: P recovers marked with in-memory children {C1} (the P→C2
+/// edge is dropped; the failed-dep cascade correctly does not condemn P
+/// because no live build co-owns P and C2, and the produced-children
+/// gate correctly refuses to clear — but its refusal alone never reaches
+/// the in-memory model). The recovery-time stamp must record the
+/// truncation. C1 is then built by a worker under its own build; the
+/// recovery-recorded hole vetoes the completion-time clear, so P is
+/// never dispatched from source and B1 takes the bounded
+/// resubmit-directing fail-fast (its recovered all-declared wanted set
+/// has `debug` missing upstream and not substitutable). "Mark still set
+/// after the sibling completed" is asserted structurally, the same way
+/// the keep tests above do: the fail-fast consumes the mark in the same
+/// dispatch pass, and its "topdown … resubmit" build error is only
+/// reachable for a node whose mark survived C1's completion.
+///
+/// Pre-fix red: nothing set the hole at recovery (the persisted-
+/// breadcrumb SELECT below fails), and C1's completion judged the
+/// truncated set Vouched and cleared the mark — P came back to a
+/// from-source-dispatchable Ready (assigned as soon as worker capacity
+/// frees) and B1 stayed Active instead of failing with the
+/// resubmit-directing error.
+#[tokio::test]
+async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_terminal_child()
+-> TestResult {
+    let out = test_store_path("bug6t3-root-out");
+    let dbg = test_store_path("bug6t3-root-debug");
+    let keep_out = test_store_path("bug6t3-keep-out");
+
+    // Phase-2 store: P's `out` is substitutable upstream, `debug` is
+    // missing and NOT substitutable (substitution cannot satisfy P's
+    // recovered all-declared wanted set, so a kept mark must route P to
+    // the fail-fast arm). C1's output is missing and not substitutable,
+    // so the surviving sibling completes via the worker — keeping the
+    // post-recovery world frozen until this test drives it.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let b2 = Uuid::new_v4(); // full-merge owner of P, C1, C2 — cancelled at failover
+    let b_keep = Uuid::new_v4(); // live build keeping the surviving sibling C1 alive
+    let b1 = Uuid::new_v4(); // pruning build under test — owns only P
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        let mk_parent = || {
+            let mut n = make_node("bug6t3-root");
+            n.output_names = vec!["out".into(), "debug".into()];
+            n.expected_output_paths = vec![out.clone(), dbg.clone()];
+            n.wanted_output_names = vec![];
+            n
+        };
+        let mk_keep = || {
+            let mut n = make_node("bug6t3-keep");
+            n.expected_output_paths = vec![keep_out.clone()];
+            n
+        };
+        // B2: full merge P→{C1, C2} with both edges persisted.
+        merge_dag(
+            &handle,
+            b2,
+            vec![mk_parent(), mk_keep(), make_node("bug6t3-gone")],
+            vec![
+                make_test_edge("bug6t3-root", "bug6t3-keep"),
+                make_test_edge("bug6t3-root", "bug6t3-gone"),
+            ],
+            false,
+        )
+        .await?;
+        // The sibling's own build: keeps C1 alive across B2's cancellation.
+        merge_dag(&handle, b_keep, vec![mk_keep()], vec![], false).await?;
+        // B1: the pruned re-request — links only P, no edges.
+        merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate AFTER the merges (a later merge re-upserts the rows):
+        // C2 went cancelled when B2 was cancelled, P is the post-prune
+        // persisted shape for B1, C1 stays non-terminal under its live
+        // build. closure_hole is NOT touched — no reap ran before the
+        // failover, so recovery must create the breadcrumb itself.
+        sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE drv_hash = 'bug6t3-gone'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'bug6t3-root'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
+            .bind(b2)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // The restored mark survived recovery (the produced-children gate
+    // cannot clear it: C2 is cancelled, C1 unbuilt)...
+    assert!(
+        expect_drv(&handle, "bug6t3-root").await.topdown_pruned,
+        "fixture premise: the restored topdown_pruned mark survives recovery"
+    );
+    // ...and recovery recorded the truncation durably: the persisted
+    // closure_hole went true even though the fixture never staged it —
+    // the recovery-side analogue of the reap-time breadcrumb. (The
+    // in-memory half is pinned behaviorally below: only the in-memory
+    // breadcrumb can veto the completion-time clear this tenure.)
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'bug6t3-root'",
+    )
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert!(
+        pg_pruned,
+        "fixture premise: the persisted topdown_pruned mark is still set after recovery"
+    );
+    assert!(
+        pg_hole,
+        "recovery must persist the closure-hole breadcrumb for a parent whose \
+         un-produced terminal child's edge it dropped"
+    );
+
+    // A worker is available: C1 builds from source under its own build,
+    // and a wrongful from-source dispatch of P would have somewhere to
+    // land.
+    let mut worker_rx = connect_executor(&handle, "bug6t3-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+    let a = recv_assignment(&mut worker_rx).await;
+    assert_eq!(
+        a.drv_path,
+        test_drv_path("bug6t3-keep"),
+        "the surviving sibling (not P) is the only dispatchable node after failover"
+    );
+
+    // The sibling completes → the completion-time clear re-judges P over
+    // its truncated in-memory child set {C1}. The recovery-recorded hole
+    // must veto that clear. The completion handler ends with an inline
+    // dispatch pass, so P's fate (fail-fast vs from-source assignment) is
+    // settled once the barrier returns — deliberately no second Tick (a
+    // second Tick would trip the cfg(test) zero-grace orphan-watcher
+    // sweep on these unwatched recovered builds and cancel B1 for an
+    // unrelated reason).
+    complete_success(
+        &handle,
+        "bug6t3-w",
+        &test_drv_path("bug6t3-keep"),
+        &keep_out,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "bug6t3-keep").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: the surviving sibling completed under its live build"
+    );
+
+    // No from-source WorkAssignment is ever sent for P: its pruned
+    // closure was truncated at recovery, so a from-source dispatch would
+    // ENOENT on the never-produced subtree.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "the surviving sibling's completion must not launder the mark of a \
+             parent whose un-produced terminal child was dropped at recovery"
+        );
+    }
+    let p = expect_drv(&handle, "bug6t3-root").await;
+    assert!(
+        !matches!(
+            p.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "P must never become dispatchable from source after the sibling completes; \
+         got {:?}",
+        p.status
+    );
+    // B1's terminal outcome is the bounded resubmit-directing fail-fast —
+    // only reachable when the mark survived the sibling's completion —
+    // not a from-source dispatch.
+    let s = query_status(&handle, b1).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "with `debug` unsatisfiable the pruning build must take the bounded \
+         fail-fast; got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s.error_summary
+    );
+    // The sibling's own build is untouched by P's verdict.
+    let sk = query_status(&handle, b_keep).await?;
+    assert_eq!(
+        sk.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the build owning the surviving sibling completes normally; error={:?}",
+        sk.error_summary
+    );
+    Ok(())
+}

@@ -351,8 +351,12 @@ impl DagActor {
         // counts against a recovered parent only when a LIVE build that
         // also owns the parent vouches for that child — another build's
         // dead/cancelled, never-wanted child must not condemn a healthy
-        // build's parent (bug_009). Parents excluded by the rule
-        // recover childless and are re-discovered at dispatch time.
+        // build's parent (bug_009). Parents excluded by the rule are not
+        // condemned: they keep whatever non-terminal children survive
+        // the edge load (possibly none) and are re-discovered at
+        // dispatch time; the closure-hole stamp below records the
+        // dropped un-produced children so later children-keyed verdicts
+        // never trust the truncated set.
         let failed_dep_parents: HashSet<DrvHash> = self
             .db
             .load_parents_with_failed_deps(&drv_ids)
@@ -450,6 +454,59 @@ impl DagActor {
                           "failed to clear persisted topdown_pruned at recovery (best-effort; \
                            next failover re-evaluates)");
                 }
+            }
+        }
+
+        // r[impl sched.merge.substitute-topdown+10]
+        // Closure-hole stamp for the edges this load dropped to
+        // UN-PRODUCED terminal children (`poisoned`/`dependency_failed`/
+        // `cancelled`): the recovery-side analogue of the reap, which
+        // breadcrumbs every removal of an un-produced child from a
+        // parent's child set. The edge load above dropped those edges,
+        // so the parent recovers with a silently truncated child set
+        // (NOT necessarily childless — non-terminal siblings keep their
+        // edges). The produced-children gate's refusal above is not
+        // enough on its own: its evidence never reaches the in-memory
+        // model, so when a surviving sibling later completes, the
+        // completion-time clear would judge the truncated set Vouched
+        // and launder the restored mark into a doomed from-source
+        // dispatch (the un-produced child's subtree was never built).
+        // Setting the breadcrumb keeps every children-keyed verdict at
+        // Broken instead — inert for unmarked nodes, exactly like the
+        // reap-time stamp. Disjoint from the gate's clear set by
+        // construction: a parent with ≥1 non-produced terminal child can
+        // never satisfy the gate's bool_and.
+        let unproduced_dropped = self
+            .db
+            .load_parents_with_unproduced_terminal_children(&drv_ids)
+            .await?;
+        let mut holed: Vec<String> = Vec::new();
+        for parent_id in unproduced_dropped {
+            let Some(hash) = id_to_hash.get(&parent_id) else {
+                continue;
+            };
+            if let Some(state) = self.dag.node_mut(hash) {
+                state.closure_hole = true;
+                holed.push(hash.to_string());
+            }
+        }
+        if !holed.is_empty() {
+            info!(
+                count = holed.len(),
+                "recovery: recorded closure holes for parents whose un-produced terminal children were dropped"
+            );
+            // Best-effort durable counterpart (this fn runs only on the
+            // just-acquired leader) so the breadcrumb survives later
+            // failovers even after the orphan-terminal GC deletes the
+            // dropped child's row; the in-memory stamp above is what
+            // this tenure's correctness relies on. A lost write means
+            // the next failover re-derives the hole from the same
+            // persisted children — or misses it if those rows are GC'd
+            // first, the already-accepted best-effort window.
+            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+                warn!(count = holed.len(), error = %e,
+                      "failed to persist closure holes at recovery (best-effort; \
+                       in-memory breadcrumb covers this tenure)");
             }
         }
 

@@ -239,3 +239,73 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+10]
+/// `load_parents_with_unproduced_terminal_children` returns exactly the
+/// recovered parents with ≥1 persisted child in a non-produced terminal
+/// status (`cancelled`/`dependency_failed`/`poisoned`) — the children
+/// whose edges recovery drops without the child having been produced,
+/// i.e. the parents whose recovered child set is silently truncated and
+/// must carry the closure-hole breadcrumb. Produced (`completed`) and
+/// still-unbuilt (`queued`) children do not qualify on their own, and —
+/// unlike the failed-dep cascade — no build-liveness/co-ownership
+/// evidence is required: the truncation is recorded regardless of which
+/// build demanded the dropped child (parent A here has no build links at
+/// all and is still returned).
+#[tokio::test]
+async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_and_unbuilt()
+-> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Parent A: one cancelled child (qualifies) plus one completed and
+    // one queued child (do not qualify on their own).
+    let a = insert_test_derivation(&db, "uptc-holed-parent").await?;
+    let a_cancelled = insert_test_derivation(&db, "uptc-cancelled-child").await?;
+    let a_completed = insert_test_derivation(&db, "uptc-completed-child").await?;
+    let a_queued = insert_test_derivation(&db, "uptc-queued-child").await?;
+    // Parent B: children are produced or unbuilt only — never returned.
+    let b = insert_test_derivation(&db, "uptc-clean-parent").await?;
+    let b_completed = insert_test_derivation(&db, "uptc-clean-completed").await?;
+    let b_queued = insert_test_derivation(&db, "uptc-clean-queued").await?;
+
+    sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE derivation_id = $1")
+        .bind(a_cancelled)
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query("UPDATE derivations SET status = 'completed' WHERE derivation_id = ANY($1)")
+        .bind(vec![a_completed, b_completed])
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query("UPDATE derivations SET status = 'queued' WHERE derivation_id = ANY($1)")
+        .bind(vec![a_queued, b_queued])
+        .execute(&test_db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO derivation_edges (parent_id, child_id) \
+         VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10)",
+    )
+    .bind(a)
+    .bind(a_cancelled)
+    .bind(a)
+    .bind(a_completed)
+    .bind(a)
+    .bind(a_queued)
+    .bind(b)
+    .bind(b_completed)
+    .bind(b)
+    .bind(b_queued)
+    .execute(&test_db.pool)
+    .await?;
+
+    let holed = db
+        .load_parents_with_unproduced_terminal_children(&[a, b])
+        .await?;
+    assert_eq!(
+        holed,
+        vec![a],
+        "only parents with ≥1 non-produced terminal child are returned; produced \
+         and unbuilt children alone never mark a truncation"
+    );
+    Ok(())
+}
