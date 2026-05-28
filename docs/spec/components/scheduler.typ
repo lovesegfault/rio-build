@@ -1612,21 +1612,25 @@ bytes, authoritative flag, identity, and recomputed CA modular hash it held
 while live, so the authoritative-conflict gate keeps holding across a leader
 failover instead of being silently disabled for poisoned nodes.
 
-#r("sched.recovery.inline-drv-ca-hash")[
+#r("sched.recovery.inline-drv-ca-hash+2")[
   A recovered derivation carrying authoritative inline content that is
   content-addressed MUST have its CA modular hash rederived from the restored
   bytes during recovery (`hashDerivationModulo` over the parsed content with
   no input resolution --- the same computation `SubmitBuild` ingress
   validated), so a post-failover completion still registers its realisation
   under the key returned to the hook client and merge-time realisation cache
-  hits still apply. All other recovered derivations keep an unset modular
-  hash.
+  hits still apply. Every other recovered content-addressed derivation MUST
+  restore the modular hash persisted with its row
+  (#rref("sched.persist.ca-modular-hash")) when one is present;
+  non-content-addressed derivations keep an unset modular hash.
 ]
-Recompute-from-bytes rather than a persisted hash column keeps the
-realisation key inseparable from the content actually persisted: the two
-cannot drift, no migration is needed, and a row whose bytes fail to parse
-degrades to an unset hash (the build still completes; only realisation
-registration is lost, with a warning).
+Recompute-from-bytes stays the source of truth wherever bytes exist: it
+keeps the realisation key inseparable from the content actually persisted
+(the two cannot drift), and a row whose bytes fail to parse degrades to an
+unset hash (the build still completes; only realisation registration is
+lost, with a warning). The persisted-column restore covers the rows that
+have no bytes to recompute from --- store-backed CA nodes --- whose
+content-bound identity evidence would otherwise vanish on failover.
 
 #r("sched.merge.authoritative-conflict+4")[
   A node whose in-memory state carries authoritative inline derivation
@@ -1729,7 +1733,17 @@ a parked (failed, cancelled, or poison-reset) store-backed definition could
 be silently redefined by an attacker's claim through the resubmit-reset,
 carrying the prior builds' interest onto attacker-chosen content; with it,
 an authoritative claim can only ever adopt a definition it can prove it
-shares.
+shares. The evidence the gate compares survives leader failover --- the
+store-backed node's CA modular hash is persisted with its row
+(#rref("sched.persist.ca-modular-hash")) and restored at recovery --- so
+the legitimate producer's identical resubmission keeps being adopted after
+a failover. The remaining fail-closed residual is a store-backed node
+whose creating submission never carried any content-bound evidence at
+all: an authoritative claim landing on it while it is parked is still
+rejected (admitting it would reopen the redefinition attack), and the
+rejection's error text points at the remediations (resubmit store-backed
+by re-uploading the `.drv`, an administrative poison clear, or waiting
+out the retention window).
 
 #r("sched.merge.displaced-failure-reset+2")[
   Any (re)creation of a derivation row whose previously persisted content
@@ -1862,6 +1876,30 @@ mid-merge) leaves either nothing or a `pending` build row that orphan
 handling already covers, never a half-committed displacement, a cleared
 authoritative blob, or a wiped failure history for a build that was never
 activated, and recovery needs no compensating logic.
+
+#r("sched.persist.ca-modular-hash")[
+  A content-addressed derivation's ingress-provided CA modular hash MUST be
+  persisted with its derivation row by the creation-scoped upsert and
+  refreshed on every (re)creation like the rest of the creation-time
+  snapshot. The persisted value is declared identity evidence only: it
+  MUST NOT relax authoritative-content ingress validation, the
+  byte-equality arm, or any displacement predicate of
+  #rref("sched.merge.authoritative-conflict").
+]
+The merge gate accepts a CA modular hash as content-bound identity
+evidence, and for a floating-CA derivation it is the only possible
+evidence (expected output paths are empty by construction). An
+authoritative row regains its hash after failover by recomputing it from
+its persisted bytes; a store-backed CA row has no persisted bytes, so
+without this column its evidence was simply lost on failover and a
+byte-identical authoritative resubmission of the same derivation could
+never again be adopted (#rref("sched.merge.authoritative-claim-no-redefine")).
+The hash also keys realisation registration, so restoring it keeps
+post-failover completions registering under the key clients were given.
+Stored as part of the identity snapshot --- never inside the
+definition-change accumulator reset --- and absent (`NULL`) when the
+creating submission carried none, which keeps the fail-closed posture for
+evidence-less rows.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

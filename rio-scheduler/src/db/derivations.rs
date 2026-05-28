@@ -479,7 +479,7 @@ impl SchedulerDb {
                    is_ca,
                    failed_builders,
                    floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
-                   drv_content,
+                   drv_content, ca_modular_hash,
                    NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,

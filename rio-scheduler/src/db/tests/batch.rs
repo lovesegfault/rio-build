@@ -114,6 +114,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             topdown_pruned: false,
             closure_hole: false,
             drv_content: None,
+            ca_modular_hash: None,
         })
         .collect();
 
@@ -196,6 +197,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             topdown_pruned: false,
             closure_hole: false,
             drv_content: None,
+            ca_modular_hash: None,
         })
         .collect();
 
@@ -582,6 +584,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             topdown_pruned: false,
             closure_hole: false,
             drv_content: None,
+            ca_modular_hash: None,
         })
         .collect();
     let mut tx = db.pool().begin().await?;
@@ -631,6 +634,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
         is_fixed_output: false,
         is_ca: true,
         drv_content: content,
+        ca_modular_hash: None,
     };
     let aterm = b"Derive([(\"out\",\"\",\"r:sha256\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[\"-c\",\"echo hi\"],[(\"out\",\"\")])".to_vec();
 
@@ -757,6 +761,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_fixed_output: false,
         is_ca: true,
         drv_content: None,
+        ca_modular_hash: None,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, &[first]).await?;
@@ -778,6 +783,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_fixed_output: false,
         is_ca: true,
         drv_content: None,
+        ca_modular_hash: None,
     };
     let mut tx = db.pool().begin().await?;
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreator]).await?;
@@ -839,6 +845,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_fixed_output: false,
         is_ca: true,
         drv_content: Some(b"Derive-same".to_vec()),
+        ca_modular_hash: None,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Failed)]).await?;
@@ -891,6 +898,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_fixed_output: false,
         is_ca: true,
         drv_content: Some(content.to_vec()),
+        ca_modular_hash: None,
     };
 
     // ── (a) authoritative squat → store-backed re-creation ────────────
@@ -913,6 +921,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_fixed_output: false,
         is_ca: true,
         drv_content: None,
+        ca_modular_hash: None,
     };
     let mut tx = db.pool().begin().await?;
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[store_backed]).await?;
@@ -1006,6 +1015,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_fixed_output: false,
         is_ca: true,
         drv_content: Some(b"Derive-squat".to_vec()),
+        ca_modular_hash: None,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&squat)).await?;
@@ -1035,6 +1045,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_fixed_output: false,
         is_ca: true,
         drv_content: None,
+        ca_modular_hash: None,
     };
 
     // Run the merge-persist statement set in one tx, then DROP it
@@ -1281,5 +1292,89 @@ async fn test_delete_displaced_build_links_adjusts_total_only_when_requested() -
             .fetch_all(&test_db.pool)
             .await?;
     assert_eq!(other_links, vec![pruned_pending]);
+    Ok(())
+}
+
+// r[verify sched.persist.ca-modular-hash]
+/// The CA modular hash rides the creation-time snapshot: persisted on
+/// insert, refreshed by a later (re)creation, cleared when the
+/// (re)creating submission carries none, and returned by both recovery
+/// queries.
+#[tokio::test]
+async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let row = |hash: &str, ca_hash: Option<[u8; 32]>| DerivationRow {
+        drv_hash: hash.into(),
+        drv_path: format!("/nix/store/{}-{hash}.drv", "d".repeat(32)),
+        pname: Some("ca-evidence".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: None,
+        ca_modular_hash: ca_hash,
+    };
+    let fetch = |hash: &'static str| {
+        let pool = test_db.pool.clone();
+        async move {
+            let (h,): (Option<Vec<u8>>,) =
+                sqlx::query_as("SELECT ca_modular_hash FROM derivations WHERE drv_hash = $1")
+                    .bind(hash)
+                    .fetch_one(&pool)
+                    .await?;
+            anyhow::Ok(h)
+        }
+    };
+
+    // Insert: one with evidence, one without.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        &[row("ca-evi", Some([7u8; 32])), row("ca-bare", None)],
+    )
+    .await?;
+    tx.commit().await?;
+    assert_eq!(fetch("ca-evi").await?, Some(vec![7u8; 32]), "persisted");
+    assert_eq!(fetch("ca-bare").await?, None, "no evidence stays NULL");
+
+    // A later (re)creation refreshes the value.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", Some([9u8; 32]))]).await?;
+    tx.commit().await?;
+    assert_eq!(fetch("ca-evi").await?, Some(vec![9u8; 32]), "refreshed");
+
+    // Both recovery queries return it.
+    let recovered = db.load_nonterminal_derivations().await?;
+    let evi = recovered
+        .iter()
+        .find(|r| r.drv_hash == "ca-evi")
+        .expect("ca-evi loaded");
+    assert_eq!(evi.ca_modular_hash.as_deref(), Some([9u8; 32].as_slice()));
+    sqlx::query(
+        "UPDATE derivations SET status = 'poisoned', poisoned_at = now() WHERE drv_hash = 'ca-evi'",
+    )
+    .execute(&test_db.pool)
+    .await?;
+    let poisoned = db.load_poisoned_derivations().await?;
+    let evi = poisoned
+        .iter()
+        .find(|r| r.base.drv_hash == "ca-evi")
+        .expect("ca-evi loaded poisoned");
+    assert_eq!(
+        evi.base.ca_modular_hash.as_deref(),
+        Some([9u8; 32].as_slice())
+    );
+
+    // A (re)creation without evidence clears it (last write wins, same
+    // as the rest of the snapshot).
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[row("ca-evi", None)]).await?;
+    tx.commit().await?;
+    assert_eq!(fetch("ca-evi").await?, None, "cleared when absent");
     Ok(())
 }

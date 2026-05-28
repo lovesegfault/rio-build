@@ -294,6 +294,14 @@ pub(crate) struct RecoveryDerivationRow {
     /// `DerivationState::drv_content` so post-failover dispatch still
     /// carries the only copy of the derivation.
     pub drv_content: Option<Vec<u8>>,
+    /// Persisted ingress-provided CA modular hash (`M_066`) — the
+    /// content-bound identity evidence for CA rows. Restored into
+    /// `CaState::modular_hash` when the recompute-from-bytes branch does
+    /// not apply (store-backed CA rows have no persisted bytes), so the
+    /// merge gate's evidence survives failover. `NULL` for non-CA rows
+    /// and rows whose creating submission carried no hash; wrong-length
+    /// values degrade to unset at hydration.
+    pub ca_modular_hash: Option<Vec<u8>>,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -333,6 +341,7 @@ impl RecoveryDerivationRow {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             drv_content: None,
+            ca_modular_hash: None,
             exec_id: None,
         }
     }
@@ -439,6 +448,14 @@ pub(crate) struct DerivationRow {
     /// (re)creates the node (sched.persist.creation-scoped);
     /// submissions that join a live node never reach the upsert.
     pub drv_content: Option<Vec<u8>>,
+    /// Ingress-provided CA modular hash (`M_066`) — content-bound
+    /// identity evidence for CA derivations, persisted so it survives
+    /// failover for store-backed CA rows (whose bytes are never
+    /// persisted). `None` for non-CA nodes or submissions that carried
+    /// no hash. Snapshot identity: refreshed unconditionally on
+    /// (re)creation, never part of the definition-change accumulator
+    /// reset. r[impl sched.persist.ca-modular-hash]
+    pub ca_modular_hash: Option<[u8; 32]>,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

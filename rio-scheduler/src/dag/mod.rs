@@ -78,7 +78,11 @@ pub enum DagError {
     /// internal invariant breach).
     #[error(
         "authoritative inline content for {drv_path} conflicts with the \
-         existing store-backed derivation definition"
+         existing store-backed derivation definition (no matching \
+         content-bound identity evidence); if this is your own \
+         derivation, re-upload the .drv and resubmit store-backed, ask \
+         an operator to clear the parked definition, or wait for its \
+         retention window to expire"
     )]
     AuthoritativeClaimIdentityConflict { drv_path: String },
 }

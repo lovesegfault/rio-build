@@ -528,14 +528,16 @@ impl RetryState {
 
 /// Content-addressed-derivation sub-state of a [`DerivationState`].
 ///
-/// All fields except `is_ca` are **in-memory only**: recovered CA-on-CA
-/// chains dispatch unresolved (collect_ca_inputs skips None) → worker
-/// fails on placeholder → retry. The gateway recomputes on the NEXT
-/// SubmitBuild that references the derivation. The one exception is
-/// `modular_hash` for authoritative hook-fallback nodes: recovery
-/// recomputes it from the persisted inline content
-/// (`sched.recovery.inline-drv-ca-hash`) so post-failover completion
-/// still registers the realisation.
+/// All fields except `is_ca` and `modular_hash` are **in-memory only**:
+/// recovered CA-on-CA chains dispatch unresolved (collect_ca_inputs
+/// skips None) → worker fails on placeholder → retry. The gateway
+/// recomputes on the NEXT SubmitBuild that references the derivation.
+/// `modular_hash` survives failover two ways: authoritative
+/// hook-fallback nodes recompute it from the persisted inline content
+/// (`sched.recovery.inline-drv-ca-hash`), and every other CA node
+/// restores the ingress-provided value persisted with its row
+/// (`sched.persist.ca-modular-hash`) — so the merge gate's content-bound
+/// evidence and post-failover realisation registration keep working.
 #[derive(Debug, Clone, Default)]
 pub struct CaState {
     /// Whether this derivation is content-addressed (fixed-output OR
@@ -570,8 +572,10 @@ pub struct CaState {
     /// lifted inline derivation). `None` for IA derivations. After a
     /// scheduler failover it is recomputed from the persisted
     /// authoritative inline content for hook-fallback nodes
-    /// (`sched.recovery.inline-drv-ca-hash`); ordinary DAG-path CA
-    /// nodes recover with `None` (lossy, see struct doc).
+    /// (`sched.recovery.inline-drv-ca-hash`); every other CA node
+    /// restores the ingress-provided value persisted with its row
+    /// (`sched.persist.ca-modular-hash`), staying `None` only when the
+    /// creating submission never carried a hash.
     ///
     /// Consumed by:
     /// - `collect_ca_inputs` ([`crate::actor`] dispatch) — this node
@@ -1177,18 +1181,27 @@ impl DerivationState {
             .as_deref()
             .and_then(|c| std::str::from_utf8(c).ok())
             .and_then(|s| rio_nix::derivation::Derivation::parse(s).ok());
-        // r[impl sched.recovery.inline-drv-ca-hash]
+        // r[impl sched.recovery.inline-drv-ca-hash+2]
         // A recovered content-addressed hook-fallback node must regain
         // its CA modular hash, or its post-failover completion would
         // silently skip realisation registration (the consumable-result
         // guarantee of gw.hook.fallback-built-outputs). Recompute it
         // from the restored bytes — the same
         // `hash_derivation_modulo(…, |_| None)` computation SubmitBuild
-        // ingress validated at admission — rather than persisting a
-        // second column that could drift from the content. Failure
-        // (pre-validation rows, manual edits) degrades to `None` with a
-        // warning: recovery never fails and the build still completes,
-        // only realisation registration is lost (now visibly).
+        // ingress validated at admission — so content and key cannot
+        // drift; the recompute keeps precedence over the persisted
+        // column whenever bytes exist. Failure (pre-validation rows,
+        // manual edits) degrades to `None` with a warning: recovery
+        // never fails and the build still completes, only realisation
+        // registration is lost (now visibly).
+        //
+        // r[impl sched.persist.ca-modular-hash]
+        // Every other CA row — store-backed nodes whose bytes are never
+        // persisted — restores the ingress-provided hash persisted with
+        // the row (M_066), so the merge gate's content-bound identity
+        // evidence (sched.merge.authoritative-claim-no-redefine) and
+        // realisation registration survive failover too. Wrong-length
+        // values degrade to unset.
         let modular_hash = if row.is_ca && row.drv_content.is_some() {
             match parsed_content.as_ref() {
                 Some(drv) => rio_nix::derivation::hash_derivation_modulo(
@@ -1213,6 +1226,10 @@ impl DerivationState {
                     None
                 }
             }
+        } else if row.is_ca {
+            row.ca_modular_hash
+                .as_deref()
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
         } else {
             None
         };
@@ -1238,8 +1255,9 @@ impl DerivationState {
             is_fixed_output: row.is_fixed_output,
             ca: CaState {
                 is_ca: row.is_ca,
-                // Recomputed above for authoritative hook-fallback rows;
-                // None for everything else.
+                // Recomputed above for authoritative hook-fallback rows,
+                // restored from the persisted column for other CA rows;
+                // None only when neither source exists.
                 modular_hash,
                 // Remaining CA fields lossy on recovery — see CaState doc.
                 ..Default::default()
@@ -2365,6 +2383,7 @@ mod tests {
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
             drv_content: None,
+            ca_modular_hash: None,
             exec_id: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
@@ -2631,7 +2650,7 @@ mod tests {
     /// its modular hash (recomputed from the bytes — identical to what
     /// ingress validated); rows without content, non-CA rows, and
     /// unparseable content stay `None`.
-    // r[verify sched.recovery.inline-drv-ca-hash]
+    // r[verify sched.recovery.inline-drv-ca-hash+2]
     #[test]
     fn from_recovery_row_recomputes_ca_modular_hash_for_authoritative_content() {
         let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
@@ -2690,6 +2709,82 @@ mod tests {
         )
         .expect("hydrates");
         assert_eq!(broken.ca.modular_hash, None);
+    }
+
+    /// A store-backed CA row (no persisted bytes) restores the modular
+    /// hash persisted with the row; the recompute-from-bytes branch keeps
+    /// precedence when bytes exist; wrong-length values degrade to unset;
+    /// non-CA rows ignore the column.
+    // r[verify sched.persist.ca-modular-hash]
+    #[test]
+    fn from_recovery_row_restores_persisted_ca_modular_hash_for_store_backed_rows() {
+        let persisted = [7u8; 32];
+
+        // Store-backed CA row: restored from the column.
+        let store_backed = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                ca_modular_hash: Some(persisted.to_vec()),
+                ..crate::db::RecoveryDerivationRow::test_default("ca-store", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(
+            store_backed.ca.modular_hash,
+            Some(persisted),
+            "store-backed CA row restores the persisted hash"
+        );
+
+        // Authoritative bytes present: recompute keeps precedence over a
+        // (deliberately different) persisted value.
+        let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+        let row = crate::db::RecoveryDerivationRow {
+            drv_content: Some(aterm.as_bytes().to_vec()),
+            is_ca: true,
+            ca_modular_hash: Some(persisted.to_vec()),
+            expected_output_paths: vec![String::new()],
+            ..crate::db::RecoveryDerivationRow::test_default("ca-both", "x86_64-linux")
+        };
+        let recomputed = rio_nix::derivation::hash_derivation_modulo(
+            &rio_nix::derivation::Derivation::parse(aterm).unwrap(),
+            &row.drv_path,
+            &|_| None,
+            &mut std::collections::HashMap::new(),
+        )
+        .unwrap();
+        assert_ne!(recomputed, persisted, "test setup: the two sources differ");
+        let both =
+            DerivationState::from_recovery_row(row, DerivationStatus::Ready).expect("hydrates");
+        assert_eq!(
+            both.ca.modular_hash,
+            Some(recomputed),
+            "recompute-from-bytes keeps precedence over the persisted column"
+        );
+
+        // Wrong-length persisted value degrades to unset.
+        let short = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: true,
+                ca_modular_hash: Some(vec![1, 2, 3]),
+                ..crate::db::RecoveryDerivationRow::test_default("ca-short", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(short.ca.modular_hash, None, "wrong length degrades to None");
+
+        // Non-CA rows never restore a hash, even if the column is set.
+        let ia = DerivationState::from_recovery_row(
+            crate::db::RecoveryDerivationRow {
+                is_ca: false,
+                ca_modular_hash: Some(persisted.to_vec()),
+                ..crate::db::RecoveryDerivationRow::test_default("ia-col", "x86_64-linux")
+            },
+            DerivationStatus::Ready,
+        )
+        .expect("hydrates");
+        assert_eq!(ia.ca.modular_hash, None, "non-CA rows ignore the column");
     }
 }
 

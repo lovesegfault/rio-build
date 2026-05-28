@@ -5047,7 +5047,7 @@ async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
 /// is recomputed from the persisted authoritative bytes, so the
 /// consumable-result guarantee of the inline fallback survives scheduler
 /// failover.
-// r[verify sched.recovery.inline-drv-ca-hash]
+// r[verify sched.recovery.inline-drv-ca-hash+2]
 #[tokio::test]
 async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> TestResult {
     let build_id = Uuid::new_v4();
@@ -5539,6 +5539,75 @@ async fn test_recovery_keep_going_sticky_failure_survives_displacement() -> Test
     assert!(
         !status.error_summary.is_empty(),
         "recovered build serves the persisted failure summary"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.ca-modular-hash]
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// End-to-end bug_005 regression: a store-backed floating-CA node parked
+/// retriable, recovered after a leader failover, must still accept a
+/// byte-carrying authoritative resubmission of the SAME derivation — the
+/// node's only content-bound evidence is its CA modular hash, which now
+/// survives failover via the persisted column. Pre-fix the recovered
+/// node had no evidence and the claim was rejected with
+/// AuthoritativeClaimIdentityConflict.
+#[tokio::test]
+async fn test_recovered_store_backed_ca_node_accepts_identical_authoritative_claim() -> TestResult {
+    let ca_hash = [7u8; 32];
+    let producer = Uuid::new_v4();
+    let resubmit = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Store-backed floating-CA submission: no expected output paths,
+        // hash evidence only. It fails once on a real worker and parks
+        // Poisoned-under-budget (retriable on resubmit).
+        let mut node = make_node("ca-resub");
+        node.is_content_addressed = true;
+        node.ca_modular_hash = ca_hash.to_vec();
+        merge_dag(&handle, producer, vec![node], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-ca-r", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("ca-resub"));
+        complete_failure(
+            &handle,
+            "w-ca-r",
+            &test_drv_path("ca-resub"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "transient build break",
+        )
+        .await?;
+        wait_for_status(&handle, "ca-resub", DerivationStatus::Poisoned).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the same tenant rebuilds via the hook fallback —
+    // an authoritative claim carrying the byte content and the SAME
+    // modular hash. The recovered store-backed node must present its
+    // persisted evidence and adopt the claim through the resubmit-reset
+    // instead of rejecting it.
+    let mut claim = make_node("ca-resub");
+    claim.is_content_addressed = true;
+    claim.ca_modular_hash = ca_hash.to_vec();
+    claim.drv_content = b"Derive-ca-resub".to_vec();
+    claim.drv_content_authoritative = true;
+    merge_dag(&handle, resubmit, vec![claim], vec![], false)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!("identical authoritative resubmission rejected post-failover: {e}")
+        })?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, resubmit).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "resubmitted build is live on the adopted claim"
+    );
+    let info = expect_drv(&handle, "ca-resub").await;
+    assert_ne!(
+        info.status,
+        DerivationStatus::Poisoned,
+        "node reset through the normal resubmit path"
     );
     Ok(())
 }

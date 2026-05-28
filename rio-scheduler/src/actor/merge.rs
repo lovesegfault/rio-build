@@ -2161,6 +2161,13 @@ impl DagActor {
                     drv_content: node
                         .drv_content_authoritative
                         .then(|| node.drv_content.clone()),
+                    // r[impl sched.persist.ca-modular-hash]
+                    // Content-bound identity evidence for CA nodes:
+                    // persisting it keeps the merge gate's evidence
+                    // (and the realisation key) across failover for
+                    // store-backed CA rows, whose bytes are never
+                    // persisted.
+                    ca_modular_hash: node.ca_modular_hash,
                 }
             })
             .collect();

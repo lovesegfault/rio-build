@@ -1193,6 +1193,41 @@ pub const M_064: () = ();
 /// crosses a failover during that window keeps the old failure mode.
 pub const M_065: () = ();
 
+/// 066: `derivations.ca_modular_hash` — persist the ingress-provided CA
+/// modular hash so a store-backed CA node's content-bound identity
+/// evidence (and its realisation key) survives leader failover.
+///
+/// The merge gate's identity comparison
+/// (sched.merge.authoritative-conflict /
+/// sched.merge.authoritative-claim-no-redefine) accepts a CA modular
+/// hash as content-bound evidence, and for a floating-CA derivation it
+/// is the only possible evidence (expected output paths are empty by
+/// construction). An authoritative row regains the hash after failover
+/// by recomputing it from its persisted `drv_content`
+/// (sched.recovery.inline-drv-ca-hash — recompute keeps content and key
+/// inseparable and stays the source of truth when bytes exist); a
+/// store-backed CA row has no persisted bytes, so before this column
+/// its hash was simply lost on failover and a byte-identical
+/// authoritative resubmission of the same derivation was rejected with
+/// `AuthoritativeClaimIdentityConflict` — the legitimate producer could
+/// never present evidence the gate would accept.
+///
+/// Written only by the creation-scoped upsert
+/// (sched.persist.creation-scoped → batch_upsert_derivations), refreshed
+/// or cleared on every (re)creation like the rest of the snapshot
+/// (sched.persist.recreate-refresh); never inside the definition-change
+/// accumulator reset (it is identity, not an accumulator). Read back by
+/// both recovery loaders; `from_recovery_row` restores it only when the
+/// recompute-from-bytes branch does not apply, and a wrong-length value
+/// degrades to unset. Trust posture: the value is submitter/gateway-
+/// declared, ingress-validated evidence — it never relaxes
+/// `validate_authoritative_drv_content`, the byte-equality arm, or any
+/// displacement predicate (sched.persist.ca-modular-hash). NULL for
+/// non-CA rows and pre-migration rows (those keep the pre-fix
+/// over-rejection for one window). 32 bytes, no index, no size CHECK
+/// (the Rust side length-validates on read and write).
+pub const M_066: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 13 bind params total regardless of
-    /// row count (vs `push_values`' 13×N, which hits PG's 65535-param
-    /// limit at ~5041 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 15 bind params total regardless of
+    /// row count (vs `push_values`' 15×N, which hits PG's 65535-param
+    /// limit at ~4369 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,7 +54,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Thirteen parallel
+        // Decompose struct-of-rows into row-of-arrays. Fifteen parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -77,15 +77,17 @@ impl SchedulerDb {
         let mut wanted_output_names = Vec::with_capacity(rows.len());
         let mut topdown_pruned = Vec::with_capacity(rows.len());
         let mut closure_hole = Vec::with_capacity(rows.len());
-        // bytea[] bind: sqlx's array encoder wants a homogeneous
+        // bytea[] binds: sqlx's array encoder wants a homogeneous
         // element type, so None is encoded as an EMPTY bytea and
-        // converted back to NULL SQL-side via NULLIF — the column
-        // must be NULL (not '') for nodes without authoritative bytes.
+        // converted back to NULL SQL-side via NULLIF — the columns
+        // must be NULL (not '') for nodes without authoritative bytes
+        // or without a CA modular hash.
         // The statement itself is last-write-wins for the rows it
         // receives; its only production caller is creation-scoped
         // (sched.persist.creation-scoped), so live-node joins never
         // reach it.
         let mut drv_content = Vec::with_capacity(rows.len());
+        let mut ca_modular_hash = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -101,6 +103,7 @@ impl SchedulerDb {
             topdown_pruned.push(r.topdown_pruned);
             closure_hole.push(r.closure_hole);
             drv_content.push(r.drv_content.clone().unwrap_or_default());
+            ca_modular_hash.push(r.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default());
         }
 
         // r[impl sched.persist.recreate-refresh+2]
@@ -182,7 +185,8 @@ impl SchedulerDb {
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names, topdown_pruned, closure_hole, drv_content)
+                 wanted_output_names, topdown_pruned, closure_hole, drv_content,
+                 ca_modular_hash)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
@@ -191,15 +195,16 @@ impl SchedulerDb {
                 is_fixed_output, is_ca,
                 wanted_output_names::text[],
                 topdown_pruned, closure_hole,
-                NULLIF(drv_content, ''::bytea)
+                NULLIF(drv_content, ''::bytea),
+                NULLIF(ca_modular_hash, ''::bytea)
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[], $12::bool[], $13::bool[], $14::bytea[]
+                $11::text[], $12::bool[], $13::bool[], $14::bytea[], $15::bytea[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
-                   closure_hole, drv_content)
+                   closure_hole, drv_content, ca_modular_hash)
             -- is_ca rides the same creation-snapshot refresh as the
             -- other identity columns: rows are written only by
             -- submissions that (re)create the node, and a displacing
@@ -265,6 +270,13 @@ impl SchedulerDb {
                 -- ingress validation plus node lifecycle, not by this
                 -- clear.
                 drv_content = EXCLUDED.drv_content,
+                -- r[impl sched.persist.ca-modular-hash]
+                -- The CA modular hash is snapshot identity (the
+                -- content-bound evidence the merge gate compares), so it
+                -- rides the same unconditional creation-snapshot refresh
+                -- as the columns above — NOT the definition-change
+                -- accumulator reset below.
+                ca_modular_hash = EXCLUDED.ca_modular_hash,
                 -- r[impl sched.merge.displaced-failure-reset+2]
                 -- Definition-change reset: the prior creation was
                 -- authoritative (bytes persisted) and the incoming
@@ -320,6 +332,7 @@ impl SchedulerDb {
         .bind(&topdown_pruned)
         .bind(&closure_hole)
         .bind(&drv_content)
+        .bind(&ca_modular_hash)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result
