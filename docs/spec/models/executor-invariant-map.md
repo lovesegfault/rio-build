@@ -3449,6 +3449,56 @@ executed and rebuilt green. Any row the harness genuinely cannot
 reproduce gets a named replacement-coverage disposition in the same
 update — never a silent drop.
 
+#### The actor unit-test corpus precondition for deletion commit A
+
+Discovered while mapping commit A (executor-deletion-a blocker,
+2026-05-28; the unit-test analogue of the standalone-corpus
+precondition above): the rio-scheduler actor unit-test corpus
+delivers work through the stream session as its only vehicle
+(`connect_executor`/`setup_with_worker` → `recv_assignment` →
+`ProcessCompletion`), so deleting the connect/heartbeat/completion
+intake at commit A would break ~258 actor tests, of which only ~111
+live in the session-machinery files commit A retires
+(tests/executor.rs, recovery.rs's and merge.rs's session parts,
+grpc/stream_tests.rs). The other ~159 (completion.rs ~59,
+dispatch.rs ~43, misc/build/fault/integration/keep_going/
+lifecycle_sweep/wiring, the mixed pull.rs/establishment.rs tests,
+plus admin-suite stragglers) test surviving pull-shared behavior —
+above all the `handle_completion` classification path the pull
+report intake itself calls — and use the session only as a harness.
+Adjudicated direction: blocker path (A) — add pull-mode delivery
+helpers and re-point those tests so their assertions are unchanged
+while delivery goes through the production pull surfaces
+(`PullAssignment` admit + fenced mint, `ReportPullOutcome`,
+`ReportAttemptOutcome`, the establishment sweep); a test whose
+property genuinely requires stream semantics stays on the stream
+path and is recorded against the commit that retires the machinery
+it tests. Commit A may not land while unconverted harness-only tests
+remain, for the same P13 reason as the VM-corpus precondition.
+
+Status (this batch, partial): the pull delivery helper layer is in
+place in `actor/tests/helpers.rs` (`pull_attempt`/`try_pull_attempt`,
+`pull_complete_{success,success_empty,ca,failure}`, `pull_report*`,
+`bind_intent_node` + `pull_fail_on_nodes`, `report_attempt_terminal`,
+`backdate_pull_attempt`, `setup_pull_ca_fixture`), and the
+completion.rs retry/budget/poison block (10 test fns / 13 cases) is
+converted and green alongside the untouched stream corpus.
+Conversion conventions recorded in the helper-batch commit message:
+distinct stream workers → distinct bound source nodes
+(`bind_intent_node`), same-worker repetition → same intent identity,
+fleet-exhaust padding workers drop out (an empty fleet is
+NoEligibleWorkers, never a poison), force-assign backoff shims drop
+out (pulls are not backoff-gated). Remaining to re-point (counts from
+the blocker's per-file scan): completion.rs ~49, misc/build/fault/
+integration/keep_going/lifecycle_sweep/wiring ~49, the 6 mixed
+pull.rs tests and establishment.rs's stream row, the affected admin
+tests; dispatch.rs's ~43 placement tests are expected to stay on the
+stream helpers and retire with commit B (their subject is the
+placement layer itself), with per-test dispositions recorded when
+that file is processed. This precondition is OPEN until the
+remaining conversions (or their explicit retire-with-machinery /
+covered-by-pull dispositions) are recorded here.
+
 #### The deletion commit set and the revert-cleanliness contract
 
 Deletion wave 1 lands as three named, individually revert-clean
