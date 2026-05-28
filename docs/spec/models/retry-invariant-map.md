@@ -2263,3 +2263,93 @@ coexistence window. Their retirement is scheduled with the stream
 path's own retirement (executor campaign slice 1c', plan T-1c'.6) and
 will be recorded here by the campaign that performs it, exactly as the
 `retryPolicyAsBuilt` retirement above was.
+
+## Cross-campaign addendum — the as-built-channel regime retirement (executor-lifecycle campaign, slice 1c', T-1c'.6)
+
+Performed by the executor-lifecycle campaign (Phase-1 plan v3,
+T-1c'.6), as the addendum above scheduled, after the 1c' deletion
+commits removed the stream dispatch/session machinery the
+as-built-channel regimes modeled. Recorded here by that campaign;
+the fold, the invariants, the witness vals and this map's
+authority over them are unchanged.
+
+What retired in `retryPolicy.qnt`:
+
+- The four as-built-channel regime modules and their named runs:
+  `retryPolicyWorker`, `retryPolicyDual`, `retryPolicyCrash`,
+  `retryPolicyFailover`. Their HOLD lists are carried by the
+  pull-mode regime check (`quint-retry-policy-pull`), whose invariant
+  list is the same set over the live event-arrival environment (plus
+  `recoveryPreservesPoisonStatus`); the one regime-specific invariant
+  not in the pull list, `attemptsBoundedGlobal` (crash regime), keeps
+  its bound through `boundsOK` in the pull HOLD list and the
+  `sched.retry.attempts-bounded+2` kani harness + fold unit tests.
+  The named runs were stream-channel narratives (the documented
+  divergence shapes D1–D4/C2 and the dedup walkthroughs); the
+  adjudications they replayed stay recorded in this map's divergence
+  catalog and are enforced by the same invariants in the pull HOLD
+  list. No pull-mode named runs exist (none were added at 1b).
+- The as-built-channel environment actions of the core module, now
+  unreachable from any wired check and describing deleted code: the
+  stream dispatch (`dispatchTo`), the dispatch-time fleet-exhaust arm
+  (E9, `dispatchFleetExhaust`), the stream completion-intake wrappers
+  (E1–E4, `processReport`/`processReportStale` — their classification
+  content lives on in `specApply`, which the pull regime's
+  `pullReportOutcome` applies), the disconnect entry point (E5,
+  `processDisconnect`), the correlated controller reports (E6/E7,
+  `ctrlDeliverOomLate`/`ctrlDeliverOomRaceAhead`/`ctrlDeliverDeadline`),
+  the correlation-TTL establishment (`establishUnreportedCrash` — the
+  pull regime's `pullEstablish` is the successor), the backstop (E8,
+  `backstopFires`), the wedge (`buildWedges`), the executor respawn
+  (`respawnExecutor`), the as-built failover action (`leaderFailover`
+  — `pullLeaderFailover` is the successor) and the as-built `step`.
+  Kept: the clock, the physical attempt-end events, the lost
+  controller report, the resets, the shared infra-classification arm
+  (`infraArm`) and the appending-transaction fault (`attemptTxFails`,
+  disabled at TX_FAULTS = 0 in the pull regime, retained as a
+  documented manual/evidence action) — exactly the environment
+  `pullStep` composes plus the fold/type/invariant infrastructure.
+
+What retired in `nix/quint.nix` (and what carries each pin now):
+
+| Retired check | What it pinned | Carrier after T-1c'.6 |
+|---|---|---|
+| `quint-retry-policy-worker` (exhaustive) | the fold over the full worker alphabet | `quint-retry-policy-pull` (same invariants, pull alphabet); fold unit tests + kani unchanged |
+| `quint-retry-policy-dual` (exhaustive) | the dedup/terminal discipline over the mixed channels | `quint-retry-policy-pull` (worker + controller-fill + establishment alphabet) |
+| `quint-retry-policy-crash` (exhaustive) | the C2 established-crash loop boundedness | `quint-retry-policy-pull` (`pullEstablish` + `boundsOK`); the crash-terminal pin re-wired (below) |
+| `quint-retry-policy-failover` (exhaustive) | failover/recovery off the durable fold | `quint-retry-policy-pull` (`pullLeaderFailover`, `failoverPreservesHistory`, `recoveryPreservesPoisonStatus`) |
+| `quint-retry-policy-runs-{worker,dual,crash,failover}` | deterministic divergence-reproducer narratives | retired with their regimes; the adjudications stay in the divergence catalog, enforced by the pull HOLD list |
+| witness `threshold` | Poison(Threshold) reachable | re-wired: `quint-retry-policy-pull-witness-threshold` |
+| witness `infra-cap` / `exempt-cap` | infra / exempt cap poisons reachable | the infra/exempt charge arms are in the pull alphabet (`pullAttemptOutcomeOom`, `pullReportOutcome` infra classes, nondet promoted/atCap); the cap arithmetic keeps its fold unit tests + kani; poison reachability is re-pinned by the threshold witness |
+| witness `timeout-cancel` | worker timeout cap ends Cancelled | the Timeout class is in the pull alphabet; `verdictMatchesFold` (D1 adjudication) HOLDs on the pull regime; fold unit tests |
+| witness `window-reset` / `exempt-fallthrough` | the I-127 window reset and its exempt fall-through | fold-internal (`specApply` unchanged by the environment swap); fold unit tests + `countersRefineHistory` HOLD on the pull regime |
+| witness `cache-hit` | the cache-hit poison clear reachable | re-wired: `quint-retry-policy-pull-witness-cache-hit` |
+| witness `ttl-expiry` | the poison-TTL expiry clear reachable | verified violating on the pull regime (exhaustive TLC, figures in the introducing commit message) but demoted to a documented manual target instead of a wired check: its derivation repeatedly hit the documented cold-server conversion flake while identically-shaped siblings built green. Manual recipe: `quint verify --backend=tlc --main=retryPolicyPull --step=pullStep --invariant=noTtlExpiry docs/spec/models/retryPolicy.qnt`. The TTL-clear lifecycle additionally keeps its scheduler unit/VM coverage (`poisonIsTerminalUntilCleared` + `clearedPoison*` HOLD in the wired pull check). Re-wire alongside the siblings when the conversion flake is addressed. |
+| witness `controller-cap` | controller deadline cap ends Cancelled | `pullAttemptOutcomeDeadline` (OE7) is in the pull alphabet; `verdictMatchesFold` HOLD + fold unit tests |
+| witness `promoted-termination` | promoted controller termination | `pullAttemptOutcomeOom(promoted)` in the pull alphabet; floor arithmetic stays with floor.rs unit tests (G6 NOT-ENCODED stands) |
+| witness `atcap-termination` | at-cap controller termination charges | already pinned: `quint-retry-policy-pull-witness-fill-charge` (same witness val) |
+| witness `late-installment` | report correlated after the disconnect already requeued | the correlation channel is deleted; the pull-path analog (the reason-only second installment on a recorded row) is pinned by the re-targeted Model S witness `canReachSecondInstallment` and explored by the pull regime |
+| witness `race-ahead` | controller report racing the disconnect | the disconnect channel is deleted; the analogous pull-path interleaving (controller fill on a still-open, unrecorded attempt) is in the pull alphabet; the never-opened side is pinned by `quint-retry-policy-pull-witness-no-attempt-noop` |
+| witness `fleet-exhaust` | FleetExhausted poison reachable | already pinned: `quint-retry-policy-pull-witness-fleet-exhaust` |
+| witness `crash-charge` | establishment charge reachable | already pinned: `quint-retry-policy-pull-witness-establishment` |
+| witness `crash-terminal` | the established-crash loop reaches a terminal | re-wired: `quint-retry-policy-pull-witness-crash-terminal` |
+| witness `failover-history` | failover on a non-empty under-budget history | re-wired: `quint-retry-policy-pull-witness-failover-history` |
+| witness `tx-failure` | a failed appending transaction charges nothing | retired without a wired successor: TX_FAULTS = 0 in the pull regime, so the inversion has no wired producer; the post-066 single-transaction property keeps its code-level coverage (the `append_and_decide_in_tx` error-arm unit tests), and `attemptTxFails` stays in the core module as the documented manual target should a pull fault regime be wired later. Recorded, not silently dropped. |
+| witness `failover-poisoned` | failover on a live poisoned durable row | verified violating on the pull regime (exhaustive TLC, figures in the introducing commit message) but demoted to a documented manual target for the same conversion-flake reason as the ttl-expiry pin. Manual recipe: `quint verify --backend=tlc --main=retryPolicyPull --step=pullStep --invariant=noFailoverOnPoisonedRow docs/spec/models/retryPolicy.qnt`. `recoveryPreservesPoisonStatus` itself stays exhaustively HOLD in the wired pull check, and the failover-with-history pin is wired. |
+
+Verify-marker re-points: the model-checked markers held by the
+retired regime checks move to `quint-retry-policy-pull`
+(`sched.retry.counters-refine-history+2`, `sched.retry.no-double-count`,
+`sched.retry.verdict-channel-invariant`,
+`sched.poison.cascade-dependents`, `sched.retry.failover-budget`,
+`sched.retry.recovery-projection+2`).
+`sched.retry.transient-budget` and `sched.retry.attempts-bounded+2`
+drop their model markers (their kani harnesses and fold unit-test
+markers are unchanged); the rules stay covered.
+
+Bit-identical gate: `retryPolicyPull` itself was not edited (its
+actions, constants and `pullStep` are untouched; the deletions are
+all in code unreachable from it), and the re-built
+`quint-retry-policy-pull` check reports the same distinct-state count
+and depth as the pre-retirement build (figures in the introducing
+commit message and the check transcripts).

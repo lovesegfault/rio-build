@@ -955,379 +955,77 @@ in
     # it exists after the Phase-1b nine-site collapse -- every entry
     # point's verdict is the reference fold (decide()) over the durable
     # attempt ledger, evaluated and persisted in the appending
-    # transaction. Checks come in two flavours:
-    #   - the per-regime HOLD checks below (exhaustive TLC), now
-    #     including the invariants whose as-built falsifications were
-    #     pre-registered at Stage B and fixed by Phase 1b: the D1
-    #     verdict-channel divergence, the D2/D3 controller-channel
-    #     counter divergences, the D4 unmirrored backstop charge and the
-    #     C2 unbounded no-report crash loop (their former
-    #     expect-violation checks are retired -- the flip is the Phase-1
-    #     acceptance evidence, not a silent edit);
-    #   - the witness checks (non-vacuity: every cap, reset, channel
-    #     race, establishment and fault the invariants quantify over is
-    #     reachable).
-    # The Stage-B as-built encoding (retryPolicyAsBuilt.qnt), its Stage-C
-    # calibration corpus (calibration/retry-*.qnt) and the six
-    # quint-retry-calib-* checks were retired in Phase 2 once the
-    # acceptance table consolidated their evidence -- see
-    # docs/spec/models/retry-invariant-map.md (the calibration table is
-    # the per-override record; the acceptance table records what holds
-    # each bug family down post-collapse).
-    # The named-run checks replay the deterministic reproducer runs (one
-    # per formerly-documented divergence, now ending in the adjudicated
-    # outcomes) so the precise documented shape stays pinned even though
-    # TLC's BFS may report a different counterexample first. State
-    # counts, depths and wall-clocks live in the introducing commits'
-    # messages and the checks' transcripts.
+    # transaction.
     #
-    # Marker scope: the sched.retry.* rules whose verification the
-    # invariant map defers to this model are marked on the regime that
-    # makes each load-bearing; counters-refine-history / attempts-bounded
-    # / transient-budget gain the model-checked form here on top of the
-    # reference fold's unit-test markers. sched.retry.verdict-channel-
-    # invariant is marked on the dual regime, the regime whose
-    # mixed-channel alphabet exercises it (it moved here from the retired
-    # expect-violation D1 check when Phase 1b landed the adjudicated fix
-    # and Phase 1c flipped the check).
-    # ------------------------------------------------------------------
+    # Executor-campaign 1c' (T-1c'.6): the as-built-CHANNEL regimes
+    # (worker / dual / crash / failover) and their named-run and witness
+    # checks are retired with the stream machinery they modeled -- the
+    # attempt-opening dispatch push, the disconnect channel (E5), the
+    # recently_disconnected-correlated controller reports (E6/E7), the
+    # correlation-TTL establishment, the backstop (E8) and the
+    # dispatch-time fleet-exhaust arm (E9) no longer exist in the code.
+    # The pull-mode environment regime (retryPolicyPull, wired at 1b as
+    # quint-retry-policy-pull in the executor-campaign block below) is
+    # the wired proof of the same fold invariants over the live
+    # event-arrival environment; it now also carries the model-checked
+    # markers the retired regime checks held. The retirement record --
+    # including the disposition of every retired non-vacuity pin and
+    # what carries it now -- is in
+    # docs/spec/models/retry-invariant-map.md (the executor-campaign
+    # 1c' retirement section); the witness vals stay defined in the
+    # core module, and the load-bearing ones are re-pinned on the pull
+    # regime here.
+    #
+    # The Stage-B as-built encoding (retryPolicyAsBuilt.qnt), its
+    # Stage-C calibration corpus (calibration/retry-*.qnt) and the six
+    # quint-retry-calib-* checks were retired in the retry campaign's
+    # Phase 2 once the acceptance table consolidated their evidence --
+    # see docs/spec/models/retry-invariant-map.md.
 
-    # The worker-channel regime: every failure is worker-reported, two
-    # executor slots, resets enabled. This is the exhaustive re-proof of
-    # the fold-backed entry points over the full worker alphabet
-    # (fencepost conventions, the I-127 window reset and its exempt
-    # fall-through, the backoff arming, the threshold/fleet/cap
-    # ordering), of the refinement tripwires (the cached view, the
-    # durable ledger fold and the reference fold advance together), and
-    # of the placement/threshold scenarios that need a second slot.
-    # r[verify sched.retry.counters-refine-history+2]
-    # r[verify sched.retry.transient-budget]
-    # r[verify sched.retry.attempts-bounded+2]
-    quint-retry-policy-worker = mkQuintCheck {
-      name = "retry-policy-worker";
+    # Non-vacuity witnesses re-pinned on the pull regime (T-1c'.6): the
+    # contended states the retired regimes' witnesses pinned that are
+    # still constructible -- and load-bearing for the pull check's HOLD
+    # list -- are re-proven reachable in the pull regime's explored
+    # space (threshold poison, the cache-hit poison clear, the
+    # established-crash loop reaching a terminal, a failover landing on
+    # a non-empty history). Two further re-pins (the poison-TTL expiry
+    # clear and the failover-on-a-live-poisoned-row state) are verified
+    # violating on this regime but are demoted to documented manual
+    # targets instead of wired checks: their derivations repeatedly hit
+    # the cold-server conversion failure documented above while four
+    # identically-shaped siblings built green, so the demotion is a
+    # tooling-budget call, recorded in the retry map, not a
+    # reachability gap. The pins whose producers were deleted with the
+    # stream machinery (the appending-tx fault at TX_FAULTS = 0, the
+    # as-built channel-ordering shapes) are likewise recorded as
+    # retired in the retry map rather than silently dropped.
+    quint-retry-policy-pull-witness-threshold = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-threshold";
       spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      invariants = [
-        "boundsOK"
-        "countersRefineHistory"
-        "verdictMatchesFold"
-        "attemptsChargedOnce"
-        "noDoubleCount"
-        "poisonIsTerminalUntilCleared"
-        "cascadeReachesExactlyTheDependents"
-        "recoveryNeverFabricatesFailures"
-        "durableMirrorsCharges"
-        "placementSound"
-        "clearedPoisonClearsDurably"
-        "clearedPoisonScrubsExclusions"
-      ];
-    };
-
-    # The dual-channel regime: pod deaths, the controller report channel
-    # (race-ahead / late-installment / loss), the establishment of
-    # never-classified deaths, the wedge backstop and the no-report crash
-    # on one slot. The HOLD set here is the dedup and terminal-state
-    # discipline (one physical death counts at most once across every
-    # observation subset and order, poison stays terminal, the cascade
-    # reaches exactly the dependent, nothing fabricates failures) PLUS
-    # the refinement invariants whose falsification on this regime was
-    # pre-registered against the as-built code and fixed by Phase 1b:
-    # verdictMatchesFold (D1 -- the controller-observed timeout cap now
-    # ends Cancelled), countersRefineHistory (D2/D3 -- the at-cap anchor
-    # stamp and the promoted exempt charge on the controller channel) and
-    # durableMirrorsCharges (D4 -- the backstop charge is a durable
-    # ledger row). Their former expect-violation checks
-    # (quint-retry-policy-divergence-*) are retired by this flip.
-    # r[verify sched.retry.no-double-count]
-    # r[verify sched.poison.cascade-dependents]
-    # r[verify sched.retry.verdict-channel-invariant]
-    quint-retry-policy-dual = mkQuintCheck {
-      name = "retry-policy-dual";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      invariants = [
-        "boundsOK"
-        "attemptsChargedOnce"
-        "countersRefineHistory"
-        "verdictMatchesFold"
-        "durableMirrorsCharges"
-        "noDoubleCount"
-        "poisonIsTerminalUntilCleared"
-        "cascadeReachesExactlyTheDependents"
-        "recoveryNeverFabricatesFailures"
-        "placementSound"
-        "clearedPoisonClearsDurably"
-        "clearedPoisonScrubsExclusions"
-      ];
-    };
-
-    # The crash regime: the C2 no-report hard-crash loop in isolation,
-    # now with the establishment charge (Phase 1b T-1b.11). Every crash
-    # is established and charged, so the loop terminates and the
-    # boundedness clause HOLDS: attemptsBoundedGlobal joins this regime's
-    # invariant list (the former expect-violation
-    # quint-retry-policy-crash-unbounded check is retired by the flip;
-    # the establishment-charge and crash-terminal witnesses below keep
-    # the regime's reachability evidence).
-    quint-retry-policy-crash = mkQuintCheck {
-      name = "retry-policy-crash";
-      spec = "retryPolicy";
-      main = "retryPolicyCrash";
-      invariants = [
-        "boundsOK"
-        "attemptsChargedOnce"
-        "attemptsBoundedGlobal"
-        "countersRefineHistory"
-        "verdictMatchesFold"
-        "noDoubleCount"
-        "poisonIsTerminalUntilCleared"
-        "cascadeReachesExactlyTheDependents"
-        "recoveryNeverFabricatesFailures"
-        "durableMirrorsCharges"
-        "placementSound"
-      ];
-    };
-
-    # The fault / failover regime: the dual-channel alphabet plus one
-    # leader failover and one appending-transaction failure. The
-    # post-collapse recovery contract is load-bearing here: the recovered
-    # retry view is the fold over the durable attempt ledger -- budgets,
-    # the window anchor, the exclusion set and the poison set all survive
-    # a leader change (failoverPreservesHistory, the Phase-1 acceptance
-    # property of sched.retry.failover-budget), nothing is forgiven and
-    # nothing is fabricated, the recovered view never diverges from the
-    # durable fold (the seeded-fold recovery contract of
-    # sched.retry.recovery-projection+2; the transitional pre-066 legacy
-    # seed is code-level and covered by the rio-scheduler recovery
-    # tests), and a failed appending transaction charges nothing at all
-    # (the event is re-delivered) instead of leaving the durable view
-    # behind the in-memory one. Reset events stay enabled in this regime
-    # and the failover-with-history witness below keeps the contended
-    # state's reachability machine-checked.
-    # r[verify sched.retry.failover-budget]
-    # r[verify sched.retry.recovery-projection+2]
-    quint-retry-policy-failover = mkQuintCheck {
-      name = "retry-policy-failover";
-      spec = "retryPolicy";
-      main = "retryPolicyFailover";
-      invariants = [
-        "boundsOK"
-        "attemptsChargedOnce"
-        "countersRefineHistory"
-        "verdictMatchesFold"
-        "durableMirrorsCharges"
-        "noDoubleCount"
-        "poisonIsTerminalUntilCleared"
-        "cascadeReachesExactlyTheDependents"
-        "failoverPreservesHistory"
-        "recoveryNeverFabricatesFailures"
-        "placementSound"
-        "clearedPoisonClearsDurably"
-        "clearedPoisonScrubsExclusions"
-        "recoveryPreservesPoisonStatus"
-      ];
-    };
-
-    # The deterministic reproducer runs, one check per regime: the
-    # documented-divergence shapes (D1/D2/D3/D4/C2), the dedup scenarios,
-    # the selective-forgiveness failover and the budget walkthroughs are
-    # replayed step by step and their expectations re-asserted.
-    quint-retry-policy-runs-worker = mkQuintRunCheck {
-      name = "retry-policy-runs-worker";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-    };
-    quint-retry-policy-runs-dual = mkQuintRunCheck {
-      name = "retry-policy-runs-dual";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-    };
-    quint-retry-policy-runs-crash = mkQuintRunCheck {
-      name = "retry-policy-runs-crash";
-      spec = "retryPolicy";
-      main = "retryPolicyCrash";
-    };
-    quint-retry-policy-runs-failover = mkQuintRunCheck {
-      name = "retry-policy-runs-failover";
-      spec = "retryPolicy";
-      main = "retryPolicyFailover";
-    };
-
-    # The pre-registered Stage-B falsification checks
-    # (quint-retry-policy-divergence-{verdict,counters,durable} and
-    # quint-retry-policy-crash-unbounded) are retired: Phase 1b fixed the
-    # documented defects they reproduced (D1/D2/D3/D4/C2) and the
-    # corresponding invariants joined the dual and crash regime HOLD
-    # lists above -- the flip the invariant map's Stage-B section
-    # pre-registered as the Phase-1 acceptance criterion. The
-    # deterministic reproducer runs survive in the named-run checks with
-    # their post-collapse (adjudicated) outcomes, and the establishment /
-    # crash-terminal / tx-failure witnesses below replace the retired
-    # checks' reachability evidence.
-
-    # Non-vacuity witnesses for the retryPolicy regimes. Each check
-    # passes only when the checker violates its witness -- machine-checked
-    # evidence that the scenario a regime's invariants constrain is
-    # actually reachable in that regime's explored space. Deliberately no
-    # tracey markers here (same policy as the other models' witnesses).
-
-    # Every budget terminal is reachable in the worker regime: the
-    # distinct-worker threshold, the non-exempt infra cap, the exempt
-    # infra cap, and the worker-reported timeout cap's Cancelled. (The
-    # per-cycle transient cap is deliberately NOT witnessed: under the
-    # production distinct-workers threshold and hard_filter's exclusion
-    # the same worker never fails the same derivation twice in a cycle,
-    # so the threshold always fires first -- recorded in the invariant
-    # map's Stage-B section.)
-    quint-retry-policy-witness-threshold = mkQuintWitnessCheck {
-      name = "retry-policy-witness-threshold";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
+      main = "retryPolicyPull";
+      step = "pullStep";
       witness = "noThresholdPoison";
     };
-    quint-retry-policy-witness-infra-cap = mkQuintWitnessCheck {
-      name = "retry-policy-witness-infra-cap";
+    quint-retry-policy-pull-witness-cache-hit = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-cache-hit";
       spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noInfraCapPoison";
-    };
-    quint-retry-policy-witness-exempt-cap = mkQuintWitnessCheck {
-      name = "retry-policy-witness-exempt-cap";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noExemptCapPoison";
-    };
-    quint-retry-policy-witness-timeout-cancel = mkQuintWitnessCheck {
-      name = "retry-policy-witness-timeout-cancel";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noTimeoutCapCancel";
-    };
-
-    # The I-127 window reset fires, and fires on an exempt under-cap
-    # event (the as-built fall-through the corrected fold reproduces).
-    quint-retry-policy-witness-window-reset = mkQuintWitnessCheck {
-      name = "retry-policy-witness-window-reset";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noWindowReset";
-    };
-    quint-retry-policy-witness-exempt-fallthrough = mkQuintWitnessCheck {
-      name = "retry-policy-witness-exempt-fallthrough";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noExemptFallthroughReset";
-    };
-
-    # The poison lifecycle's clears are reachable: the TTL expiry and the
-    # cache-hit clear (the resubmit reset is pinned by the named runs).
-    quint-retry-policy-witness-ttl-expiry = mkQuintWitnessCheck {
-      name = "retry-policy-witness-ttl-expiry";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
-      witness = "noTtlExpiry";
-    };
-    quint-retry-policy-witness-cache-hit = mkQuintWitnessCheck {
-      name = "retry-policy-witness-cache-hit";
-      spec = "retryPolicy";
-      main = "retryPolicyWorker";
+      main = "retryPolicyPull";
+      step = "pullStep";
       witness = "noCacheHitClear";
     };
-
-    # The controller channel's interesting interleavings are reachable in
-    # the dual regime: the controller-observed timeout cap ending
-    # terminal Cancelled (the post-collapse D1 shape -- the as-built
-    # poison witness has no producer any more, so this witness was
-    # re-pointed at the Cancelled terminal with the Phase-1c flip), the
-    # promoted and at-cap controller terminations (the D3 / D2 arms), the
-    # late installment (a report correlated through recently_disconnected
-    # after the disconnect already requeued the derivation), the
-    # race-ahead report, and the dispatch-time fleet-exhaust poison.
-    quint-retry-policy-witness-controller-cap = mkQuintWitnessCheck {
-      name = "retry-policy-witness-controller-cap";
+    quint-retry-policy-pull-witness-crash-terminal = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-crash-terminal";
       spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noControllerCapCancelled";
-    };
-    quint-retry-policy-witness-promoted-termination = mkQuintWitnessCheck {
-      name = "retry-policy-witness-promoted-termination";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noPromotedTermination";
-    };
-    quint-retry-policy-witness-atcap-termination = mkQuintWitnessCheck {
-      name = "retry-policy-witness-atcap-termination";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noAtCapTermination";
-    };
-    quint-retry-policy-witness-late-installment = mkQuintWitnessCheck {
-      name = "retry-policy-witness-late-installment";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noLateInstallment";
-    };
-    quint-retry-policy-witness-race-ahead = mkQuintWitnessCheck {
-      name = "retry-policy-witness-race-ahead";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noRaceAheadReport";
-    };
-    quint-retry-policy-witness-fleet-exhaust = mkQuintWitnessCheck {
-      name = "retry-policy-witness-fleet-exhaust";
-      spec = "retryPolicy";
-      main = "retryPolicyDual";
-      witness = "noFleetExhaustPoison";
-    };
-
-    # The establishment charge is reachable and the crash loop now
-    # terminates: the C2 fix's two non-vacuity probes in the crash
-    # regime, replacing the retired quint-retry-policy-crash-unbounded
-    # expect-violation check's reachability role (that check's
-    # boundedness claim itself is now the attemptsBoundedGlobal HOLD in
-    # the crash regime above).
-    quint-retry-policy-witness-crash-charge = mkQuintWitnessCheck {
-      name = "retry-policy-witness-crash-charge";
-      spec = "retryPolicy";
-      main = "retryPolicyCrash";
-      witness = "noEstablishedCrashCharge";
-    };
-    quint-retry-policy-witness-crash-terminal = mkQuintWitnessCheck {
-      name = "retry-policy-witness-crash-terminal";
-      spec = "retryPolicy";
-      main = "retryPolicyCrash";
+      main = "retryPolicyPull";
+      step = "pullStep";
       witness = "noCrashLoopTerminal";
     };
-
-    # The failover / fault regime's contended states are reachable: a
-    # failover lands on a non-empty under-budget history, and an
-    # appending transaction actually fails (the bounded re-delivery
-    # path). The latter replaces the as-built lost-mirror-write witness
-    # (quint-retry-policy-witness-pg-write-lost, retired): post-066 the
-    # charge, the verdict and the status persist commit or fail as one
-    # transaction, so the independently-lost mirror write it probed is
-    # structurally impossible.
-    quint-retry-policy-witness-failover-history = mkQuintWitnessCheck {
-      name = "retry-policy-witness-failover-history";
+    quint-retry-policy-pull-witness-failover-history = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-failover-history";
       spec = "retryPolicy";
-      main = "retryPolicyFailover";
+      main = "retryPolicyPull";
+      step = "pullStep";
       witness = "noFailoverWithHistory";
-    };
-    quint-retry-policy-witness-tx-failure = mkQuintWitnessCheck {
-      name = "retry-policy-witness-tx-failure";
-      spec = "retryPolicy";
-      main = "retryPolicyFailover";
-      witness = "noAttemptTxFailure";
-    };
-    # The recoveryPreservesPoisonStatus contention (a still-poisoned,
-    # unexpired durable row at the moment of failover) stays pinned
-    # reachable after the Stage-C corpus retirement -- the retired G8
-    # calibration check was its only other wired pin.
-    quint-retry-policy-witness-failover-poisoned = mkQuintWitnessCheck {
-      name = "retry-policy-witness-failover-poisoned";
-      spec = "retryPolicy";
-      main = "retryPolicyFailover";
-      witness = "noFailoverOnPoisonedRow";
     };
 
     # ------------------------------------------------------------------
@@ -3142,25 +2840,21 @@ in
     };
 
     # ------------------------------------------------------------------
-    # Executor-lifecycle campaign, slice 1b: the retryPolicy PULL-MODE
-    # environment regime (the T-0e.3 re-derivation, executed at 1b).
-    # Same fold, same invariants as the as-built channel regimes above —
-    # what changes is the event-arrival environment: the attempt opens at
-    # PullAssignment, the worker classes arrive over the ReportOutcome
-    # unary, the controller's pod-terminal classification is the
-    # idempotent ReportAttemptOutcome row fill (with the no-attempt
-    # no-op), the establishment sweep is the only time-based repair, and
-    # the exclusion/fleet-exhaust inputs are re-keyed to source nodes
-    # with the AD2 small-fleet clause (the spawn-intent gate's
-    # NoEligibleSource arm). The as-built regimes stay wired and
-    # authoritative for the stream path until the executor campaign's
-    # 1c' retires it; this block is additive (Phase-1 plan T-1b.7,
-    # gate-plan check-budget row "1b adds the pull-mode retryPolicy
-    # cfg(s) + ~4 witnesses").
+    # Executor-lifecycle campaign: the retryPolicy PULL-MODE environment
+    # regime (the T-0e.3 re-derivation, wired at 1b as an additional
+    # regime; the wired set since the 1c' retirement of the
+    # as-built-channel regimes, T-1c'.6). Same fold, same invariants as
+    # the retired channel regimes — what changes is the event-arrival
+    # environment: the attempt opens at PullAssignment, the worker
+    # classes arrive over the ReportOutcome unary, the controller's
+    # pod-terminal classification is the idempotent ReportAttemptOutcome
+    # row fill (with the no-attempt no-op), the establishment sweep is
+    # the only time-based repair, and the exclusion/fleet-exhaust inputs
+    # are re-keyed to source nodes with the AD2 small-fleet clause (the
+    # spawn-intent gate's NoEligibleSource arm).
     #
     # The regime module is retryPolicyPull in retryPolicy.qnt; its
-    # transition relation is `pullStep` (the as-built `step` and its
-    # stream channels are not reachable from it), selected via --step.
+    # transition relation is `pullStep`, selected via --step.
     # ------------------------------------------------------------------
 
     # The exhaustive pull-mode regime check: two source nodes, the full
@@ -3170,12 +2864,21 @@ in
     # resets) plus one leader failover with the open-attempt carve-out
     # (the pull attempt and the durable budgets survive; nothing is
     # forgiven or fabricated). The HOLD list is the same invariant set
-    # the as-built regimes prove — the refinement tripwires, the
+    # the as-built regimes proved — the refinement tripwires, the
     # charge-once/no-double-count discipline, the poison/clear
     # lifecycle, and the failover-budget acceptance property — now over
-    # the pull-path event-arrival environment.
+    # the pull-path event-arrival environment. Since the 1c' retirement
+    # this check also carries the model-checked markers the retired
+    # regime checks held (the rules' unit-test and kani markers are
+    # unchanged).
     # r[verify sched.retry.per-executor-budget+3]
     # r[verify sched.dispatch.fleet-exhaust+4]
+    # r[verify sched.retry.counters-refine-history+2]
+    # r[verify sched.retry.no-double-count]
+    # r[verify sched.retry.verdict-channel-invariant]
+    # r[verify sched.poison.cascade-dependents]
+    # r[verify sched.retry.failover-budget]
+    # r[verify sched.retry.recovery-projection+2]
     quint-retry-policy-pull = mkQuintCheck {
       name = "retry-policy-pull";
       spec = "retryPolicy";
