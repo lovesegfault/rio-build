@@ -104,6 +104,23 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
             0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
         ],
     ),
+    (
+        // Same five-decade spread as rio_mountd_request_seconds: a
+        // cache-hit open is one UDS round-trip (sub-ms), a cold open
+        // is a whole-file fetch + Promote (seconds to minutes for the
+        // jit_fetch_timeout-scaled tail).
+        "rio_builder_castore_fuse_open_seconds",
+        &[
+            0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0,
+        ],
+    ),
+    (
+        // One GetDirectory(recursive) stream per build at mount time.
+        // Chromium-scale (8.2k dirs) is ~5 MiB / low seconds; the
+        // dag_prefetch_timeout default (30 s) is the ceiling.
+        "rio_builder_castore_dag_prefetch_seconds",
+        &[0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0],
+    ),
 ];
 
 /// Registers prometheus metric descriptions. The help strings here are
@@ -131,8 +148,8 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_uploads_total",
-        "Output uploads (labeled by status: success/adopted/exhausted; \
-         adopted = concurrent uploader won, result polled via QueryPathInfo)"
+        "Output uploads (labeled by status: success = output committed via \
+         PutPathChunked, exhausted = retry budget spent without a commit)"
     );
     describe_histogram!(
         "rio_builder_build_duration_seconds",
@@ -207,16 +224,19 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_builder_upload_bytes_total",
-        "Bytes uploaded to store via PutPath (nar_size on success)"
+        "Novel chunk bytes streamed to the store via PutPathChunked. \
+         Chunks the store already holds durably are deduplicated and \
+         never counted, so this measures actual upload data movement, \
+         not output nar_size."
     );
     describe_counter!(
         "rio_builder_upload_skipped_idempotent_total",
-        "Output uploads skipped by the FindMissingPaths pre-check \
-         (path already complete in store). High sustained rate = \
-         scheduler dispatching already-built derivations (race or \
-         CA early-cutoff). The store's PutPath idempotency would \
-         no-op these server-side anyway; this counter measures the \
-         worker-side disk-read + NAR-stream savings."
+        "Outputs skipped as already present in the store: the \
+         FindMissingPaths pre-check found every output complete, or the \
+         store reported created = false at PutPathChunked commit. High \
+         sustained rate = scheduler dispatching already-built \
+         derivations (race or CA early-cutoff). This counter measures \
+         the worker-side disk-read + chunk-stream savings."
     );
     describe_counter!(
         "rio_builder_fuse_fetch_bytes_total",
@@ -265,6 +285,58 @@ pub fn describe_metrics() {
         "Assignments rejected due to stale generation (from a deposed \
          scheduler leader). Nonzero during leader transitions is expected; \
          sustained = scheduler lease flapping."
+    );
+    // r[impl obs.metric.castore-fuse]
+    describe_counter!(
+        "rio_builder_castore_fuse_upcalls_total",
+        "Castore-FUSE upcalls by op (lookup/getattr/readdir/readlink/open/read). \
+         Cold-path only by design: infinite cache TTLs mean the kernel answers \
+         repeats from dcache/icache. A high steady-state rate = the caches are \
+         not absorbing (TTL regression or memory-pressure eviction)."
+    );
+    describe_histogram!(
+        "rio_builder_castore_fuse_open_seconds",
+        "Wall-clock from open() upcall to reply, labeled hit=node_ssd|remote and \
+         streamed=0|1. The streamed=0 remote tail is a whole-file fetch + \
+         Promote; streamed=1 replies at the first chunk and fills in the \
+         background."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_open_case_total",
+        "open() decision by case: hit (backing cache), miss_small (whole-file \
+         fetch), miss_stream (above the streaming threshold; replies at the \
+         first chunk and fills in the background), wait_fetching (joined a \
+         concurrent open's in-flight fetch of the same digest)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_open_mode_total",
+        "open() reply mode: passthrough (kernel reads the backing file directly) \
+         or keep_cache (userspace read() fallback). passthrough=0 in steady state \
+         means FUSE_PASSTHROUGH negotiation failed — a 10-100x data-path \
+         regression that is otherwise invisible."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_fetch_bytes_total",
+        "Bytes sourced by castore-FUSE open() to materialize a file, labeled by \
+         tier: remote (rio-store ReadBlob/GetChunks) or node_ssd (the \
+         mountd-owned node chunk cache)."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_integrity_fail_total",
+        "Fetched content whose blake3 did not match the requested file_digest. \
+         The bytes are discarded and the open fails EIO. Nonzero = store-side \
+         corruption or a chunk-reassembly bug; investigate immediately."
+    );
+    describe_counter!(
+        "rio_builder_castore_fuse_eio_total",
+        "castore-FUSE open()s that returned an error to the kernel (fetch \
+         failure, integrity mismatch, mountd rejection, backing-id ceiling). \
+         Every one of these fails a build."
+    );
+    describe_histogram!(
+        "rio_builder_castore_dag_prefetch_seconds",
+        "GetDirectory(recursive) wall-clock per build at mount time (one \
+         multi-root call for the whole input closure)."
     );
     describe_counter!(
         "rio_builder_cgroup_leak_total",

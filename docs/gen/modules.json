@@ -73,6 +73,11 @@
       "doc": "The castore-FUSE `open()` data path (ADR-022 §2.6–2.7)."
     },
     {
+      "path": "castore_fuse/session.rs",
+      "depth": 1,
+      "doc": "Client-side mount/serve assembly for the castore-FUSE (ADR-022 §2.5,"
+    },
+    {
       "path": "castore_fuse/stream.rs",
       "depth": 1,
       "doc": "Streaming `open()` for large files (ADR-022 §2.8)."
@@ -273,19 +278,19 @@
       "doc": "Output upload to rio-store after build completion."
     },
     {
-      "path": "upload/batch.rs",
+      "path": "upload/agreement_tests.rs",
       "depth": 1,
-      "doc": "Atomic multi-output upload via `PutPathBatch`."
+      "doc": "Walk ↔ store agreement tests (P0586)."
+    },
+    {
+      "path": "upload/chunked.rs",
+      "depth": 1,
+      "doc": "`PutPathChunked` client: walk every output once, probe the store"
     },
     {
       "path": "upload/common.rs",
       "depth": 1,
-      "doc": "Mechanics shared by [`single`](super::single) and [`batch`](super::batch):"
-    },
-    {
-      "path": "upload/single.rs",
-      "depth": 1,
-      "doc": "Per-output `PutPath` upload with retry + concurrent-put adoption."
+      "doc": "Mechanics shared across the upload pipeline (and a few callers"
     },
     {
       "path": "upload/walk.rs",

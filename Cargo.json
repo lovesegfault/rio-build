@@ -19290,6 +19290,10 @@
           "packageId": "clap"
         },
         {
+          "name": "fastcdc",
+          "packageId": "fastcdc"
+        },
+        {
           "name": "fuser",
           "packageId": "fuser"
         },
@@ -19396,8 +19400,16 @@
       ],
       "devDependencies": [
         {
+          "name": "rio-auth",
+          "packageId": "rio-auth"
+        },
+        {
           "name": "rio-nix",
           "packageId": "rio-nix"
+        },
+        {
+          "name": "rio-store",
+          "packageId": "rio-store"
         },
         {
           "name": "rio-test-support",
