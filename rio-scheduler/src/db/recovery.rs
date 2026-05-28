@@ -169,12 +169,16 @@ impl SchedulerDb {
     /// reads later in recovery — a build flipping terminal in between
     /// makes the two views disagree (read skew). Both directions err
     /// conservatively: a parent cascaded on a voucher that died moments
-    /// later is just a terminal row no live build is interested in
-    /// (reaped/GC'd as usual), and an under-cascaded parent recovers
-    /// childless and is re-discovered at dispatch time — the
-    /// must-substitute guards keep a marked node off the doomed
-    /// from-source path, and an unmarked node's from-source dispatch is
-    /// exactly what its own live builds submitted it for.
+    /// later is usually just a terminal row no live build is interested
+    /// in (reaped/GC'd as usual; a second live build co-owning the
+    /// parent does inherit the verdict, but it is the same
+    /// `DependencyFailed` the live in-memory cascade would have handed
+    /// it when the vouched child terminally failed), and an
+    /// under-cascaded parent recovers childless and is re-discovered at
+    /// dispatch time — the must-substitute guards keep a marked node
+    /// off the doomed from-source path, and an unmarked node's
+    /// from-source dispatch is exactly what its own live builds
+    /// submitted it for.
     pub(crate) async fn load_parents_with_failed_deps(
         &self,
         derivation_ids: &[Uuid],

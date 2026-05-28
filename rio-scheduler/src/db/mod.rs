@@ -384,10 +384,11 @@ pub(crate) struct DerivationRow {
     /// Roots-only-prune marker (`migrations/063`): true for kept
     /// (demanded) nodes of a topdown-fired merge whose dependency
     /// closure the prune dropped and whose existing DAG children (if
-    /// any) are not already all produced at stamp time (see
-    /// `children_all_produced`); false otherwise (including dep-less
-    /// demanded leaves, which never had a closure to drop, and nodes
-    /// whose children are all Completed/Skipped). Childless kept
+    /// any) the closure classifier does not vouch for at stamp time
+    /// (`DerivationDag::closure_evidence` via `closure_vouched`);
+    /// false otherwise (including dep-less demanded leaves, which
+    /// never had a closure to drop, and nodes whose children are all
+    /// Completed/Skipped with no closure hole). Childless kept
     /// nodes ARE stamped; present-but-unbuilt children do not exempt
     /// the node. OR-combined on conflict so an unrelated non-pruned
     /// merge of the same drv never clears it; cleared only once its

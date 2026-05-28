@@ -1812,10 +1812,13 @@ impl DagActor {
     /// `persist_merge_to_db` — a kept closure-dropped node is exempted
     /// from the `topdown_pruned` stamp only when its closure is
     /// vouched) and by the in-process clear sites (the
-    /// post-reconciliation pass in `handle_merge_dag`, the
-    /// completion-time `clear_topdown_pruned_for_produced_parents`, and
-    /// the lazy clear in `handle_substitute_complete`), so the stamps
-    /// and the clears always judge the same criterion. Children that
+    /// post-reconciliation pass in `handle_merge_dag` and the
+    /// completion-time `clear_topdown_pruned_for_produced_parents`;
+    /// the lazy clear in `handle_substitute_complete` reads
+    /// [`ClosureEvidence::Vouched`] off
+    /// [`crate::dag::DerivationDag::closure_evidence`] directly rather
+    /// than through this helper), so the stamps and the clears always
+    /// judge the same criterion. Children that
     /// are merely *present* but unbuilt do NOT vouch
     /// ([`ClosureEvidence::Pending`]) — they can belong to another
     /// build and be reaped unbuilt later (cancel → cascade terminal →

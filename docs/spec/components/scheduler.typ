@@ -882,7 +882,8 @@ submitted after the failover record contributions as usual).
   restored at leader-failover recovery, and MUST be cleared (in PG and in
   memory) only once the node's children are all already produced in the
   DAG and no un-produced child has been reaped out from under it since
-  (the closure-hole breadcrumb is in-memory only and is dropped when the
+  (the closure-hole breadcrumb is recorded in memory and persisted
+  alongside the mark, and is dropped when the
   fail-fast consumes the node, when the node completes or is skipped, when
   it is reset for resubmission, or when a later full merge re-declares its
   edges), or

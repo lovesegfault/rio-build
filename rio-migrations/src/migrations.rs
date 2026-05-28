@@ -1071,7 +1071,7 @@ pub const M_062: () = ();
 /// closure to drop and is not marked, and a kept node whose children
 /// are all Completed/Skipped has its closure in the store; childless
 /// kept nodes ARE marked, and present-but-unbuilt children do not
-/// exempt a node — see `children_all_produced` in `actor/merge.rs`);
+/// exempt a node — see `closure_vouched` in `actor/merge.rs`);
 /// **OR-combined on conflict**
 /// (`derivations.topdown_pruned OR EXCLUDED.topdown_pruned`) so an
 /// unrelated non-pruned merge of the same drv never clears it; cleared
@@ -1114,6 +1114,11 @@ pub const M_063: () = ();
 /// false via the extended clear). A crash or lease loss between the
 /// reap and the stamp loses the persisted breadcrumb — same accepted
 /// best-effort posture as every `topdown_pruned` clear.
+/// The hook does not filter on `topdown_pruned`, so the column may
+/// also be set for surviving parents that are not (yet) marked; it is
+/// inert there because every consumer requires the mark (a hole on an
+/// unmarked node only ever matters by keeping the conservative stamp
+/// when a later pruned merge would otherwise have exempted that node).
 /// **OR-combined on conflict**
 /// (`derivations.closure_hole OR EXCLUDED.closure_hole`); the merge-time
 /// upsert always binds `false`, so a later non-edge-declaring merge of
