@@ -665,7 +665,7 @@ async fn spawn_intents_excludes_unprobed_ready() -> TestResult {
 /// for ≤1s. Combined with `r[sched.admin.spawn-intents.probed-gate]`,
 /// that's correct but adds 1 Tick latency per cascade layer; this
 /// keeps cold-start cascades tight.
-// r[verify sched.dispatch.substitute-complete-inline]
+// r[verify sched.dispatch.substitute-complete-inline+2]
 #[tokio::test]
 async fn substitute_complete_inline_probes_dependents() -> TestResult {
     use std::sync::atomic::Ordering;

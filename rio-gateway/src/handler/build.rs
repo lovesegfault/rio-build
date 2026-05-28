@@ -1143,8 +1143,9 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     //      channel_close → ChannelSession::Drop → proto_task.abort(),
     //      no cancel logic anywhere.
     //
-    // Result: build leaks until r[sched.backstop.timeout+3]. For a 6h
-    // nixpkgs build, that's a 6h worker-slot leak per dropped client.
+    // Result: build leaks until the orphan-watcher auto-cancel
+    // (r[sched.backstop.orphan-watcher], 5 min with no attached
+    // watcher). Before that backstop the leak ran for the whole build.
     //
     // Fix is two-part (both needed — step 3 and step 6 compound):
     //   - Guard this remove on !Wire error (keep build_id in map)

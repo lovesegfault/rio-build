@@ -1106,14 +1106,13 @@ fn apply<Id: Ord + Clone>(
             Verdict::Requeue
         }
 
-        // ── E8: tick_process_backstop_timeouts ──────────────────────
-        // r[impl sched.backstop.timeout+3]
-        // The no-report path: completion.rs will never account this
-        // attempt, so the backstop records it (insert + increment) and
-        // then delegates to E5's reassign, whose threshold re-check now
-        // sees the increment. The PG mirror of this insert is missing
-        // (divergence D4) — that is a property of the durable view, not
-        // of these in-memory counters.
+        // ── E8: backstop-timeout rows (historical) ───────────────────
+        // The stream-era scheduler backstop (tick_process_backstop_timeouts)
+        // was deleted with the session machinery; no production site
+        // constructs this event anymore. The arm stays so folds over a
+        // durable attempt history that contains pre-deletion backstop rows
+        // keep reproducing the charge those rows carried (insert +
+        // increment, then the threshold re-check sees it).
         AttemptEvent::BackstopTimeout { at, executor } => {
             c.failed_builders.insert(executor.clone());
             c.failure_count += 1;

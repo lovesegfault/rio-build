@@ -434,14 +434,14 @@ pub(super) fn resolve_executor_identity(
     } else {
         systems
     };
-    // r[impl sched.dispatch.fod-builtin-any-arch]
+    // r[impl sched.dispatch.fod-builtin-any-arch+2]
     // Every nix-daemon supports builtin:fetchurl — it's handled
     // internally, no real process forked. Bootstrap derivations
     // (busybox, bootstrap-tools) have system="builtin"; without
     // this, a cold store permanently stalls at the DAG leaves.
-    // With per-arch fetcher Pools, this is what makes a `builtin`
-    // FOD eligible on either arch's fetchers (hard_filter matches
-    // on the union; best_executor scores across both).
+    // The executor therefore always treats `builtin` as a supported
+    // system, on either arch's fetchers (the spawn path adds no arch
+    // constraint for builtin intents).
     if !systems.iter().any(|s| s == "builtin") {
         systems.push("builtin".to_string());
     }

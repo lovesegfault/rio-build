@@ -395,6 +395,7 @@ async fn build_phase_with_abort(
 /// → exit. Replaces the `'reconnect` stream loop when
 /// `dispatch_mode = pull`.
 // r[impl builder.pull.exit-codes]
+// r[impl sched.executor.one-shot+2]
 pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
     anyhow::ensure!(
         !rt.intent_id.is_empty(),

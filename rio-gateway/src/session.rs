@@ -37,7 +37,7 @@ use crate::ratelimit::TenantLimiter;
 ///    The opcode-read `select!` picks it up and routes here. Without the
 ///    token, `channel_close → Drop → abort()` could fire before path 1
 ///    or 2 reached the cancel loop — the abort drops the future, no
-///    cleanup runs, build leaks until `r[sched.backstop.timeout]`.
+///    cleanup runs, build leaks until `r[sched.backstop.orphan-watcher]`.
 /// 4. **Mid-opcode shutdown** — same token as (3), but firing while
 ///    `handle_opcode` is awaiting (e.g. inside `process_build_events`
 ///    on the scheduler stream). The opcode-read `select!` is past at

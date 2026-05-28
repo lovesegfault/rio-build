@@ -85,7 +85,7 @@ pub(super) struct ChannelSession {
     /// EOF-detection path: `channel_close → Drop → abort()` could fire
     /// before `session.rs` saw `UnexpectedEof` from the dropped mpsc
     /// sender. Aborted futures get no cleanup — `CancelBuild` never
-    /// sent, worker slot leaked until `r[sched.backstop.timeout]`.
+    /// sent, the build leaked until `r[sched.backstop.orphan-watcher]`.
     shutdown: CancellationToken,
 }
 

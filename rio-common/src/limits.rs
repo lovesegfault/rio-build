@@ -121,11 +121,12 @@ pub const MAX_DAG_NODES: usize = 1_048_576;
 /// pathological submission (1M nodes = 10^12 edges).
 pub const MAX_DAG_EDGES: usize = 5_242_880;
 
-// r[impl sched.executor.liveness-window]
-/// Worker heartbeat interval. The worker sends a HeartbeatRequest to the
-/// scheduler at this cadence; the scheduler's staleness check uses the
-/// derived timeout below. Changing this one constant moves both sides
-/// in lockstep.
+// r[impl builder.heartbeat.rpc-timeout]
+/// Worker heartbeat interval (stream-era; the scheduler-side staleness
+/// check is gone and the RPC is an error stub, but the builder's stream
+/// runtime still ticks at this cadence until the 1d collapse). The
+/// builder's per-RPC heartbeat timeout derives from this constant so the
+/// strictly-below-the-interval coupling holds by construction.
 pub const HEARTBEAT_INTERVAL_SECS: u64 = 10;
 
 /// How many missed heartbeats before a worker is considered dead.

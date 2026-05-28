@@ -1022,7 +1022,7 @@ impl DagActor {
         });
         let current_status = state.status();
 
-        // r[impl sched.executor.repair-precedence]
+        // r[impl sched.completion.idempotent]
         // Idempotency: completed -> completed is a no-op
         if current_status == DerivationStatus::Completed {
             debug!(drv_hash = %drv_hash, "duplicate completion report, ignoring");

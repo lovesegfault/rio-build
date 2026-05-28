@@ -1191,7 +1191,7 @@ in
   # hard_filter(). nodeSelector/tolerations left
   # at reconciler defaults — scenario labels k3s-agent at runtime.
   #
-  # r[verify sched.dispatch.fod-to-fetcher]
+  # r[verify sched.dispatch.fod-to-fetcher+2]
   #   dispatch-fod+nonfod subtest: one nix-build, FOD routes to
   #   fetcher pod, consumer routes to builder pod. Wrong routing →
   #   queue-forever → timeout. kubectl-logs grep confirms placement.

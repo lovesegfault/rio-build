@@ -11,6 +11,7 @@ use rio_proto::types::ExecutorKind;
 /// FOD ⇔ Fetcher airgap boundary (ADR-019). Every site that derives
 /// `ExecutorKind` from a derivation's `is_fixed_output` goes through
 /// this so adding a third kind doesn't miss one.
+// r[impl sched.dispatch.fod-to-fetcher+2]
 pub fn kind_for_drv(is_fixed_output: bool) -> ExecutorKind {
     if is_fixed_output {
         ExecutorKind::Fetcher

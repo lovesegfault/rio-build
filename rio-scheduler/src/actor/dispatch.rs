@@ -685,7 +685,7 @@ impl DagActor {
             // promote_newly_ready, per-build events + completion check).
             self.complete_ready_from_store_batch(std::slice::from_ref(drv_hash))
                 .await;
-            // r[impl sched.dispatch.substitute-complete-inline]
+            // r[impl sched.dispatch.substitute-complete-inline+2]
             // promote_newly_ready pushed dependents to ready_queue at
             // probed_generation=0. Probe inline so a fully-substitutable
             // cascade doesn't wait one Tick per layer.

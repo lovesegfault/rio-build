@@ -60,7 +60,7 @@ impl BuildSlot {
     ///
     /// The returned guard owns the cancel flag for this build; callers
     /// reach it via [`BuildSlotGuard::cancelled`].
-    // r[impl sched.executor.one-shot]
+    // r[impl sched.executor.one-shot+2]
     pub fn try_claim(self: &Arc<Self>, drv_path: &str) -> Option<BuildSlotGuard> {
         let mut inner = self.inner.lock().ignore_poison();
         if inner.is_some() {

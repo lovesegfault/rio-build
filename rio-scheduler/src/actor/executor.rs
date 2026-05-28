@@ -113,7 +113,7 @@ impl DagActor {
     /// `lost_worker`: kept for the existing-poison-state check (3 prior
     /// REAL failures + 1 loss → poison instead of dispatching a 4th
     /// time) and for logging.
-    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+4]
+    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+5]
     pub(super) async fn reassign_derivations(
         &mut self,
         drv_hashes: &[DrvHash],

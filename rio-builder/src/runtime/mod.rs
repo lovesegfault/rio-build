@@ -1080,7 +1080,7 @@ pub async fn run(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         };
 
         match stream_end {
-            // r[impl sched.executor.one-shot]
+            // r[impl sched.executor.one-shot+2]
             // Single-shot exit: the build-done arm leaves the reconnect
             // loop for good — the process never returns to the
             // assignment-accepting select state after its one build.

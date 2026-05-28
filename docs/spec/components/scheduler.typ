@@ -55,34 +55,19 @@ eliminates lock contention, makes operation ordering deterministic, and
 simplifies reasoning about correctness. PostgreSQL writes are batched and
 performed asynchronously by the actor.
 
-#r("sched.actor.dispatch-decoupled")[
-  `dispatch_ready` runs from state-change events (`MergeDag`,
-  `ProcessCompletion`, `PrefetchComplete`) and from `Tick` when the
-  `dispatch_dirty` flag is set. `Heartbeat` sets `dispatch_dirty` instead of
-  dispatching inline --- at N executors / 10s heartbeat interval that is N/10
-  dispatch passes per second, and each pass costs one full-DAG batch-FOD scan
-  plus a `ready_queue` drain. At 290 executors and a 27k-node DAG (I-163) the
-  inline path generated \~5× actor capacity and pushed `actor_mailbox_depth` to
-  9.5k. Coalescing to once per Tick bounds the heartbeat-driven dispatch rate
-  at 1/s regardless of fleet size.
-]
-
-#r("sched.dispatch.became-idle-immediate")[
-  A `Heartbeat` that transitions an executor's capacity 0→1 (fresh
-  registration, `store_degraded` clear, `draining` clear, phantom drain)
-  dispatches inline instead of deferring to `Tick`. This is the carve-out from
-  #rref("sched.actor.dispatch-decoupled"): the 0→1 transition is at most once
-  per executor per degrade/spawn cycle (not N/10 per second), and deferring it
-  adds up to one full tick interval of idle time to every freshly-spawned
-  ephemeral builder --- the controller spawned the pod _because_ work is
-  queued, so the slot is immediately useful. Steady-state heartbeats from
-  already-idle or already-busy executors still only set `dispatch_dirty`.
-  Inline dispatches from this carve-out are capped at `BECAME_IDLE_INLINE_CAP`
-  (4) per Tick: leader-failover or fleet-wide degrade-clear makes every
-  executor's heartbeat a 0→1 edge at once, which would otherwise reintroduce
-  the I-163 storm via the back door; past the cap, further 0→1 heartbeats set
-  `dispatch_dirty` and coalesce to the next Tick.
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commits A/B):*
+`sched.actor.dispatch-decoupled`, `sched.dispatch.became-idle-immediate`.
+Both rules paced the stream-era `dispatch_ready` pass against heartbeat
+volume (the I-163 mailbox storm: coalesce heartbeat-driven dispatch to one
+pass per Tick, with a capped inline carve-out for 0→1 capacity edges so a
+freshly-spawned builder did not idle a full tick). There is no scheduler-side
+dispatch pass and no heartbeat intake left to pace: work delivery is the
+pod-initiated `PullAssignment` unary, and the surviving Ready-set store
+short-circuit (`sweep_ready_cached`) runs from the same state-change events
+plus once per Tick, bounded by `probed_generation` rather than by a dispatch
+cap. The actor-mailbox protection that motivated the pacing is carried by the
+unary admission shape itself --- a pull is one bounded actor turn, and
+backpressure surfaces as retried pulls (#rref("sched.executor.pull-transaction")).
 
 #r("sched.admin.snapshot-cached")[
   `AdminService.ClusterStatus` reads a `watch::channel` snapshot that the actor
@@ -225,26 +210,19 @@ plane --- #rref("store.log.ingest-bounds").)
   such at the bounds-constant block in `executor_service.rs`.
 ]
 
-The round-8 `derivation_path` bound (#rref("sched.log.path-length")) fixed one
-of two worker-supplied strings in the `BuildPhase` message; the sibling
-`phase` field had the larger blast radius (a `Phase` event is not
-display-only: it is prost-encoded into `build_event_log`, pinned in the
-per-build state ring, and rendered as `SetPhase` into every interested
-tenant's terminal — multiplied by the derivation's interested-build count).
-Bounding per field rather than lowering the global decode limit preserves the
-per-field semantics: advisory messages are rejected whole, a
-`CompletionReport` whose `drv_path` could name a live assignment is never
-rejected (a lost completion strands the derivation in `Running`) so its
-oversized payload fields are truncated or nulled instead, and a rejected
-heartbeat reaps the worker by design. The one completion-side rejection is
-the `drv_path` bound itself: a path longer than any valid store path can
-never name a live assignment, so dropping the report whole at the recv arm
-is the actor's inevitable unknown-derivation discard moved off the
-single-threaded event loop — no legitimate completion is lost. Phase
-rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
-with reason `phase_too_long`; the unresolvable-path completion drop
-increments the rio_scheduler_completions_rejected_total counter (retired with
-the stream completion intake) with reason `path_too_long`.
+The enumerated surface is the pull-mode pair: `PullAssignment` carries
+`intent_id` and (for clients that cannot set per-call metadata) the HMAC
+`executor_token`, both rejected whole past their bounds — an over-long
+intent id can never name a real intent, and the token bound only caps how
+much input the verifier hashes before rejecting garbage. `ReportOutcome`
+carries the `CompletionReport`; its identifier/label fields are nulled and
+its `error_msg` truncated rather than the report being rejected, because a
+lost completion strands the derivation in `Running`, and its `drv_path` is
+dropped before the actor entirely — `exec_id` names the attempt, so there is
+no path-resolution step left for an oversized path to abuse. (The stream-era
+`BuildExecution`/`Heartbeat` RPCs are unconditional error stubs until the 1d
+proto sweep; no field of theirs reaches the actor, and the per-message
+rejection counters that intake carried were retired with it.)
 
 `CompletionReport.final_line_count` is the motivating numeric field: the
 scheduler folds it into the `drv_executions` row that rio-store's log
@@ -271,9 +249,7 @@ bound rejects out-of-order or >30-day timestamps. The bounds reject the
 structurally impossible, not the merely implausible — an in-domain reading is
 still self-reported telemetry. The remaining `final_resources` counters are
 decoded and dropped without being folded into the row and are enumerated as
-`n/a` in the bounds table. Heartbeat resource numerics and `PrefetchComplete`
-counters stay enumerated as `n/a`: they are not folded into row metadata or
-ordering state.
+`n/a` in the bounds table.
 
 #r("sched.merge.exec-correlation+7")[
   The scheduler MUST set `build_derivations.exec_id` for every interested
@@ -616,8 +592,8 @@ reported the deadline overrun first --- the two reports describe one
 physical fact and which arrives first is a race. The rule was added
 marker-first so the model run that falsified it was confirming a documented
 defect, and adding it marker-first also surfaced a rule-vs-rule tension:
-#rref("sched.termination.deadline-exceeded") as then written assigned
-terminal ownership at the timeout cap exclusively to the worker-side
+the (since-retired) stream-era deadline-exceeded rule as then written
+assigned terminal ownership at the timeout cap exclusively to the worker-side
 `TimedOut` path (the controller path "only promotes and counts"), so on the
 reachable wedged-worker history where only the controller ever observes the
 deadline overrun, no implementation could satisfy both rules --- honoring
@@ -625,10 +601,10 @@ the deadline-exceeded clause made the verdict channel-dependent (no
 terminal on the controller-observed run, `Cancelled` on the worker-observed
 run of the same physical history); the invariant map records this as
 rule-vs-rule contradiction C4. Phase 1 resolved both as the design
-pre-committed: the deadline-exceeded rule's `+3` revision requires terminal
-`Cancelled` at the cap on the controller path and the collapsed verdict
-path produces it, so the exhausted timeout budget converges on `Cancelled`
-regardless of the observing channel. The related
+pre-committed: the timeout cap's terminal `Cancelled` is owned by the
+collapsed verdict fold regardless of the observing channel (today the
+worker-side `TimedOut` path and the establishment sweep are the observers
+that reach it). The related
 which-counter-does-a-promoted-OOM-charge inconsistency (divergence D3) is
 *not* a channel race --- a cgroup-level OOM and a pod-level OOM are
 physically distinct events --- and is recorded as a contradiction of
@@ -858,38 +834,24 @@ registration, draining, degraded, or connecting state left to report.
   the ComponentScaler's predictive signal.
 ]
 
-#r("sched.admin.hung-node-detector+3")[
-  `GetSpawnIntents.dead_nodes` is populated from the executor heartbeat table:
-  a Node is reported dead when ≥`max(2, ⌈0.5·occupancy⌉)` of its busy executors
-  have stale heartbeats AND those executors span ≥2 distinct tenants. The
-  two-tenant floor distinguishes a hung Node (kernel softlockup, EBS stall,
-  OOM-killed kubelet) from one tenant's misbehaving build. The `2`-floor (was
-  `3`) is calibrated for busy-only `occupancy` --- idle executors are skipped
-  (no drv to attribute), so a node with ≤2 busy pods would otherwise be
-  undetectable; the trade-off (a 2-pod node with a correlated >30s heartbeat
-  blip is also flagged) is bounded by `dead_reap_cap`. Executors are grouped by
-  `authoritative_binding[auth_intent]`: the *controller-reported*
-  kube-authoritative `spec.nodeName` binding (`AckSpawnedIntents.bound_intents`,
-  sourced from the controller's pod informer) keyed on the executor's
-  HMAC-attested `auth_intent` (the pod's spawn-time `INTENT_ID_ANNOTATION`, set
-  once at connect, never mutated by heartbeat) --- NOT any worker-supplied or
-  worker-influenceable value. Keying on `running_build` would be wrong: it
-  diverges from `auth_intent` under dispatch fall-through and is set
-  unconditionally from the heartbeat, so a compromised worker could forge it to
-  inflate a victim node's `occupancy` and suppress detection. Executors lacking
-  an authoritative binding (controller-lag, ack channel down) are skipped ---
-  fail-safe --- and counted in
-  rio_scheduler_hung_detect_skipped_no_authoritative_total (retired with the
-  scheduler-side hung-node detector).
-  The controller's `nodeclaim_pool::reap_unhealthy` consumes `dead_nodes` as
-  `ReapReason::Dead` --- the only reap path for a `Registered=True` NodeClaim
-  that is neither `Empty` nor in-flight.
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commit A):*
+`sched.admin.hung-node-detector`. The scheduler-side hung-node detector
+aggregated stale *heartbeats* per node (≥`max(2, ⌈0.5·occupancy⌉)` busy
+executors across ≥2 tenants, keyed by the controller-authoritative
+`AckSpawnedIntents.bound_intents` binding) and reported the result as
+`GetSpawnIntents.dead_nodes`. There are no heartbeats and no scheduler-side
+per-pod liveness state left to aggregate: the field is now always empty (it
+stays in the proto until the 1d sweep), and node-wedge detection moved to the
+controller --- #rref("ctrl.nodeclaim.wedge-cluster") clusters expired
+open attempts by their controller-authoritative source node, with the same
+two-tenant floor, the per-tick reap cap, and a fail-closed skip when the
+open-attempt view cannot be read. `nodeclaim_pool::reap_unhealthy` consumes
+that signal as `ReapReason::Dead` exactly as it consumed `dead_nodes`.
 
-#r("sched.dispatch.soft-features")[
+#r("sched.dispatch.soft-features+2")[
   The scheduler MUST strip every feature listed in `soft_features`
   (scheduler.toml) from each derivation's `requiredSystemFeatures` at
-  DAG-insertion time, before any spawn-snapshot or dispatch decision reads it.
+  DAG-insertion time, before any spawn-snapshot decision reads it.
   nixpkgs convention treats `big-parallel` and `benchmark` as capability hints
   --- any builder qualifies --- unlike `kvm` / `nixos-test` which are hardware
   gates. Without stripping, a `{big-parallel}`-only derivation passes the
@@ -952,21 +914,21 @@ view) and the controller's Job/pod census.
   uploaded.
 ]
 
-#r("sched.heartbeat.adopt")[
-  A heartbeat-reported running build the scheduler doesn't have on record for
-  that executor is adopted into BOTH `executor.running_build` (so dispatch sees
-  at-capacity) AND the DAG node (so `dispatch_ready` won't re-pop it). Expected
-  after scheduler restart: recovery's reconcile may have reset the assignment
-  to Ready while the executor still has it in-flight.
-]
-
-#r("sched.heartbeat.phantom-drain+2")[
-  If the scheduler-kept running build assigned to that executor is missing from
-  the executor's heartbeat report across two consecutive heartbeats (past the
-  \~10s race window), the scheduler drains the phantom assignment: the
-  derivation is reset to Ready and re-queued. A derivation assigned to a
-  different executor is never drained from this executor's heartbeat.
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commit A):*
+`sched.heartbeat.adopt`, `sched.heartbeat.phantom-drain`. Both rules
+reconciled the scheduler's session belief against the worker's heartbeat
+report --- adopting a worker-reported build the scheduler had reset, and
+draining (after two consecutive misses) a build the scheduler believed
+running that the worker no longer held. With pull-only delivery neither
+divergence can form: the binding is durable from the fenced pull mint, the
+scheduler never believes a pod holds work it did not pull, and a pod cannot
+hold work the scheduler does not have a row for. The lost-completion half of
+the phantom case (work pulled, report never arrives) is carried by the
+establishment sweep (#rref("sched.attempt.establishment-window")) and the
+controller's pod-terminal report (#rref("sched.attempt.no-attempt-no-op"),
+#rref("sched.attempt.synthesized-verdict")); post-failover adoption of
+already-completed work is carried by recovery's store-probe arm and the
+sweep's adopt arm.
 
 #r("sched.breaker.cache-check+3")[
   The merge-time `FindMissingPaths` cache check goes through a circuit breaker
@@ -982,28 +944,23 @@ view) and the controller's Job/pod census.
   transient store outage.
 ]
 
-#r("sched.freeze-detector")[
-  `dispatch_ready` WARNs once per minute when `kind_deferred[k] > 0 &&
-  registered_streams[k] == 0` holds for ≥60s, for each `ExecutorKind k`
-  (Builder, Fetcher). The scheduler already surfaces the freeze via gauges, but
-  a WARN lands in `kubectl logs` without a port-forward.
-]
-
-#r("sched.dispatch.unroutable-system+2")[
-  When a Ready derivation's `system` is advertised by zero registered executors
-  of the matching kind, dispatch defers it (same as no-capacity) but
-  additionally counts it under
-  the rio_scheduler_unroutable_ready gauge (retired with the placement layer,
-  labeled by system) and WARNs once
-  when the system first becomes unroutable. The WARN re-arms after the system
-  has been observed routable. This distinguishes "no capacity right now"
-  (autoscaler resolves) from "no pool exists" (operator action: add the system
-  to a `Pool`'s `systems` list, e.g. `i686-linux` on an x86_64 pool per
-  #rref("builder.platform.i686")). The `system` label is normalized: values not
-  matching `[a-z0-9_-]{1,32}` are bucketed as `unknown` (the string is
-  tenant-supplied via `drv.platform()`; without bucketing, label cardinality
-  would be unbounded).
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commit B):*
+`sched.freeze-detector`, `sched.dispatch.unroutable-system`. Both were
+dispatch-side operator alarms over the registered-stream fleet: the freeze
+detector WARNed when work of a kind was deferred while zero streams of that
+kind were registered, and the unroutable-system arm WARNed (and gauged) a
+Ready derivation whose `system` no registered executor advertised. There is
+no registered fleet and no dispatch pass left to evaluate either condition
+against. The operator questions they answered are now answered one layer
+earlier, where the capacity decision actually lives: a system or kind no
+pool covers never produces a spawnable intent (the controller's pool
+`systems`/kind matching --- "no pool exists" remains an operator action, e.g.
+adding `i686-linux` to an x86_64 pool per #rref("builder.platform.i686")),
+the AD2 spawn gate reports `NoEligibleSource` when every eligible source is
+excluded (#rref("sched.dispatch.fleet-exhaust")), and queued-but-unspawned
+demand is visible in `queued_by_system` /
+#rref("sched.admin.spawn-intents") and the controller's Job census rather
+than in a scheduler-side stream count.
 
 = Multi-Build DAG Merging
 
@@ -1351,16 +1308,17 @@ doomed dispatch.
   gate is moot and disabled.
 ]
 
-#r("sched.dispatch.substitute-complete-inline")[
-  `handle_substitute_complete{ok=true}` MUST call `dispatch_ready` inline under
-  the `BECAME_IDLE_INLINE_CAP` budget so cascade-promoted dependents are probed
-  in the same handler instead of waiting one Tick per layer. Past the cap it
-  falls through to `dispatch_dirty=true`;
-  #rref("sched.admin.spawn-intents.probed-gate") keeps that path correct (no
-  spurious spawn), just one Tick slower. The cap is shared with the Heartbeat
-  `became_idle` and `PrefetchComplete` carve-outs --- fresh-cluster
-  substitution can post thousands of `SubstituteComplete` in a burst, and
-  uncapped inline dispatch is the I-163 storm shape.
+#r("sched.dispatch.substitute-complete-inline+2")[
+  `handle_substitute_complete{ok=true}` MUST run the Ready-set store
+  short-circuit (`sweep_ready_cached` → `batch_probe_cached_ready`) inline in
+  the same handler, so dependents promoted Queued→Ready by the completed
+  substitution are probed for substitutability immediately instead of waiting
+  one Tick per cascade layer. The inline sweep MUST stay bounded:
+  `probed_generation` stamping skips nodes already probed this Tick, so a
+  fresh-cluster substitution burst re-probes only newly-promoted dependents,
+  and #rref("sched.admin.spawn-intents.probed-gate") keeps the spawn-intent
+  path correct (no spurious spawn) for any not-yet-probed tail that defers to
+  the next Tick.
 ]
 
 #r("sched.substitute.leader-gate")[
@@ -2048,65 +2006,53 @@ protocol --- work binds only at a successful `PullAssignment` (the pull is
 both halves), and the never-create half survives as the no-attempt no-op
 rule on the report path (#rref("ctrl.report.attempt-outcome")).
 
-#r("sched.executor.session-epoch")[
-  Every executor-session event is attributed to exactly the stream that
-  produced it, and events from a superseded stream are inert. Each accepted
-  `BuildExecution` stream is assigned a process-monotonic `stream_epoch`,
-  recorded on the executor entry when the actor accepts the stream (the
-  accept-gated path of #rref("sec.executor.identity-token")); an accepted
-  reconnect replaces `stream_tx` and `stream_epoch` together. An
-  `ExecutorDisconnected` event MUST carry the epoch of the stream that ended
-  --- the reader task sends the epoch it was spawned with, and the
-  heartbeat-timeout reaper synthesizes its disconnect at the entry's
-  *current* epoch (the actor itself declaring the worker dead, not a late
-  stream signal). The scheduler MUST treat a disconnect whose epoch differs
-  from the entry's current `stream_epoch` as inert: it removes no entry,
-  reassigns nothing, and decrements no gauge. A heartbeat for an
-  `executor_id` with no live entry MUST NOT create session state --- only an
-  accepted `BuildExecution` stream creates entries, so no session event ever
-  lacks a stream to be attributed to.
+*Retired (1c' spec sweep; machinery deleted by deletion commit A):*
+`sched.executor.session-epoch`. The rule made session-event attribution
+normative: every connect/disconnect/heartbeat was attributed to exactly the
+stream epoch that produced it, so a late disconnect from a superseded stream
+(the I-056 connect-before-disconnect ordering) could not evict a
+freshly-reconnected executor, and a heartbeat could not create session state.
+There are no streams, no epochs, and no session events left to attribute ---
+the entire event class the rule disciplined cannot occur. The surviving
+identity discipline is per-request rather than per-session: every pull and
+report is bound to its intent by the HMAC-attested token
+(#rref("sec.executor.identity-token") applied per-unary), attempts are keyed
+by `exec_id`, and a stale or duplicate report finds the attempt row already
+terminal (#rref("sched.executor.report-idempotent")). The retired
+stale-epoch calibration witness remains re-runnable against the frozen
+as-built model (`executorSessionAsBuilt.qnt`) as historical evidence.
+
+#r("sched.dispatch.fod-to-fetcher+2")[
+  Per ADR-019, fixed-output derivations route ONLY to fetcher-kind executors
+  and non-FODs ONLY to builder-kind executors. The kind boundary is enforced
+  at spawn rather than at a dispatch decision: every spawn intent's
+  `ExecutorKind` derives from the derivation's `is_fixed_output` through the
+  single `kind_for_drv` chokepoint, the controller requests intents only for
+  the kind its pool declares (the `GetSpawnIntents` kind filter,
+  #rref("sched.admin.spawn-intents")), and the spawned pod can pull only the
+  one intent its executor token is bound to
+  (#rref("sec.executor.identity-token"),
+  #rref("sched.executor.pull-transaction")) --- so no scheduler code path can
+  hand a FOD to a builder pod or a non-FOD to a fetcher pod.
 ]
 
-The I-056 family is why attribution is normative rather than best-effort:
-connect-before-disconnect ordering happens in production (the old reader
-task is still in its TCP/h2 close handshake when the new stream's connect
-arrives), and without the epoch comparison the late disconnect from the old
-stream evicts the freshly-reconnected executor --- its `running_build` is
-spuriously reassigned and the disconnect counter over-counts. The same
-attribution discipline is what keeps a heartbeat-only zombie (I-048b) from
-existing: an entry created by a heartbeat would sit with `stream_tx: None`,
-permanently undispatchable, absorbing the executor's identity until the real
-stream lands. Heartbeats themselves are not epoch-stamped --- they are bound
-to the entry by the token-attested `auth_intent`
-(#rref("sec.executor.identity-token")) and by entry existence, which this
-rule makes a precondition.
-
-#r("sched.dispatch.fod-to-fetcher")[
-  Per ADR-019, `hard_filter()` rejects any derivation-executor pairing where
-  `drv.is_fixed_output != (executor.kind == Fetcher)`. Fixed-output derivations
-  route ONLY to fetcher-kind executors; non-FODs route ONLY to builder-kind
-  executors. The `ExecutorKind` is reported via `HeartbeatRequest.kind` and
-  stored on `ExecutorState`.
+#r("sched.dispatch.fod-builtin-any-arch+2")[
+  A FOD with `system="builtin"` is eligible on any fetcher pool regardless of
+  arch: the spawn path derives no architecture constraint from `"builtin"`
+  (#rref("ctrl.pod.arch-selector")), so the intent lands on whichever arch's
+  fetcher pool has capacity, and every executor treats `builtin` as a
+  supported system (the nix-daemon executes `builtin:fetchurl` internally ---
+  no real build process is forked). Arch-specific FODs
+  (`system="x86_64-linux"` inherited from stdenv) spawn only on pools
+  declaring that system.
 ]
 
-#r("sched.dispatch.fod-builtin-any-arch")[
-  A FOD with `system="builtin"` is eligible on any registered fetcher
-  regardless of arch. Every executor appends `"builtin"` to its advertised
-  `systems` unconditionally at startup (before the first heartbeat), so
-  `hard_filter()`'s `system-mismatch` clause matches on the union.
-  `best_executor()` scores across the flat `executors` map (keyed by
-  `ExecutorId`, not pool), so a `builtin` FOD overflows to whichever arch's
-  fetchers have capacity. Arch-specific FODs (`system="x86_64-linux"` inherited
-  from stdenv) match only fetchers advertising that system.
-]
-
-FODs and non-FODs share the same `find_executor()` path: intent-match (ADR-023)
-first, else `best_executor()` over the kind-matching pool. The `kind=fetcher`
-hard-filter in #rref("sched.dispatch.fod-to-fetcher") is the absolute boundary
---- if no fetcher is available the @fod queues; the scheduler NEVER sends a FOD
-to a builder under pressure. A queued FOD is preferable to a builder with
-internet access. The rio_scheduler_queue_depth gauge (retired with the
-placement layer) tracked queued derivations per kind.
+The kind boundary is absolute: if no fetcher pool covers a FOD's system the
+intent stays queued and the @fod waits --- the scheduler NEVER hands a FOD to
+a builder under pressure. A queued FOD is preferable to a builder with
+internet access. Queued-by-kind visibility comes from `queued_by_system`
+(#rref("sched.admin.spawn-intents")) and the controller's Job census rather
+than a scheduler-side dispatch queue gauge.
 
 #r("sched.timeout.promote-on-exceed+3")[
   A `BuildResultStatus::TimedOut` completion MUST double
@@ -2126,107 +2072,77 @@ placement layer) tracked queued derivations per kind.
   executor-side `daemon_timeout_secs` → clean `TimedOut` report path.
 ]
 
-#r("sched.reassign.no-promote-on-ephemeral-disconnect+4")[
-  Reassigning a derivation after an executor disconnects MUST NOT bump
-  `resource_floor`. Disconnect is ambiguous --- pod-kill, store-replica-restart,
-  node failure, deadline kill are all NOT inherently sizing signals (live QA:
-  cmake medium→large→xlarge from a pod-kill + store-replica-restart with zero
-  builds run; floor is sticky per M_044). The disconnect path re-queues at the
-  current floor and records `(executor_id → drv_hash)` into a
-  `recently_disconnected` map (60s TTL). The CONTROLLER is authoritative on
-  termination reason via `AdminService.ReportExecutorTermination`:
-  `OomKilled`/`EvictedDiskPressure`/`DeadlineExceeded` → `bump_floor_or_count`
-  (#rref("sched.sla.reactive-floor")); other reasons → no-op. A disconnect
-  AFTER `CompletionReport` for the running drv (`last_completed ==
-  running_build`) records NO `recently_disconnected` entry --- expected
-  one-shot exit (I-188 race). Defense-in-depth with
-  #rref("sched.ephemeral.no-redispatch-after-completion"): that closes the
-  I-188 race at the source.
+#r("sched.reassign.no-promote-on-ephemeral-disconnect+5")[
+  Requeueing a derivation because the executor that held it is gone MUST NOT
+  bump `resource_floor` and MUST NOT record into
+  `failed_builders`/`failure_count`/`retry_count` at the requeue site. An
+  executor loss is ambiguous --- pod kill, node scale-down, preemption,
+  store-replica restart and deadline kill are not inherently sizing signals
+  (live QA: cmake medium→large→xlarge from a pod-kill +
+  store-replica-restart with zero builds run; floor is sticky per M_044) ---
+  so the requeue chokepoint (`reassign_derivations`, shared by the
+  pull-attempt verdict arms, the synthesized-verdict closes and the
+  establishment sweep) re-queues at the current floor, and any charge for the
+  loss is appended by the observing classifier at its own site. Only explicit
+  resource-exhaustion classifications promote the floor, at their own call
+  sites (worker-reported `CgroupOom` and `TimedOut` ---
+  #rref("sched.sla.reactive-floor"), #rref("sched.timeout.promote-on-exceed")).
 ]
 
-#r("sched.termination.deadline-exceeded+3")[
-  A `ReportExecutorTermination(DeadlineExceeded)` MUST double
-  `resource_floor.deadline_secs` (or increment `timeout_retry_count` if already
-  at the 24h cap, #rref("sched.sla.reactive-floor")) for the derivation that
-  was running on the disconnected executor. The report carries the JOB name
-  (the k8s Job controller deletes the Pod when `activeDeadlineSeconds` fires,
-  so the controller observes the Job condition `Failed/DeadlineExceeded`
-  instead, #rref("ctrl.terminated.deadline-exceeded")); the scheduler
-  prefix-matches `recently_disconnected` keys (pod name = `{job}-{5char}`).
-  This is defense-in-depth behind the worker-side `daemon_timeout` →
-  `BuildResultStatus::TimedOut` primary path
-  (#rref("sched.timeout.promote-on-exceed")): with
-  #rref("ctrl.ephemeral.intent-deadline") the scheduler-computed
-  `SpawnIntent.deadline_secs` carries 5× headroom over the predicted p99 wall
-  time, so this only fires when the worker is too wedged (FUSE deadlock, kernel
-  hang) to time itself out. Below the cap the disconnect path already
-  re-queued, so this does NOT `reset_to_ready` --- it promotes (so the next
-  dispatch goes larger) and counts (so the ladder is bounded). At
-  `max_timeout_retries` the controller-observed path MUST take the same
-  terminal `Cancelled` transition the worker-side `TimedOut` path takes for the
-  exhausted budget (#rref("sched.timeout.promote-on-exceed")) --- immediately
-  retriable on explicit resubmit, no poison TTL: the backstop exists precisely
-  for the worker that is too wedged to ever send the report that would
-  otherwise own that transition, so the cap's terminal state must not depend on
-  which channel observed the overrun
-  (#rref("sched.retry.verdict-channel-invariant")).
-]
-The `+3` revision of this rule landed with the Phase-1 collapse of the
-controller-observed timeout verdict onto the shared fold. The previous
-revision assigned terminal ownership at the cap exclusively to the
-worker-side path, which made it jointly unsatisfiable with
-#rref("sched.retry.verdict-channel-invariant") on the wedged-worker history
-(rule-vs-rule contradiction C4 in the invariant map) and left the as-built
-off-spec `Poisoned`-at-cap escape hatch as the only loop-breaker (C1/D1).
-The amendment dissolves C4 and resolves C1: both observers of an exhausted
-timeout budget converge on terminal `Cancelled`, and the cap still always
-produces a terminal state (never "no action at the cap").
+*Retired (1c' spec sweep; machinery deleted by deletion commits A/C):*
+`sched.termination.deadline-exceeded`. The rule normed the legacy
+controller→scheduler `ReportExecutorTermination(DeadlineExceeded)` path:
+prefix-match the Job name against the `recently_disconnected` correlation
+map, double `resource_floor.deadline_secs` (or charge `timeout_retry_count`
+at the cap), and converge on the same terminal `Cancelled` as the
+worker-side path so the verdict stayed channel-independent (the C4
+resolution). The correlation map and the floor-bumping termination intake
+are deleted; the legacy RPC is acknowledged as a no-op until the 1d proto
+sweep. As-built, a deadline overrun is classified by the worker's own
+`daemon_timeout` → `TimedOut` report when the worker can still report
+(#rref("sched.timeout.promote-on-exceed") owns promotion, budget and the
+terminal at the cap), and by the controller's
+#rref("ctrl.terminated.deadline-exceeded") →
+`ReportAttemptOutcome(DEADLINE_EXCEEDED)` second installment when it cannot
+--- a reason fill on the attempt row that charges no budget and bumps no
+floor (#rref("sched.executor.report-idempotent"),
+#rref("sched.attempt.no-attempt-no-op")); a pod too wedged to report at all
+is classified by the establishment sweep
+(#rref("sched.attempt.establishment-window")). The
+#rref("sched.retry.verdict-channel-invariant") obligation is unchanged.
 
-#r("sched.ephemeral.no-redispatch-after-completion")[
-  When an executor completes a build and its `running_build` slot becomes
-  empty, the scheduler MUST mark it `draining=true` immediately --- before the
-  same actor turn's `dispatch_ready` runs. `has_capacity()` then rejects it.
-  Closes the I-188 race at the source: every executor exits after its one
-  build, so re-dispatching to its freed slot guarantees an
-  Assigned-never-Running reassign.
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commits A/B):*
+`sched.ephemeral.no-redispatch-after-completion`,
+`sched.assign.resource-fit`. The first closed the I-188 race (re-dispatching
+into a just-freed slot whose process is about to exit) by marking the
+executor draining before the same actor turn's dispatch pass; with no
+dispatch pass and no slot to re-dispatch into, the race cannot form --- a
+pod reports its one attempt and exits, and the next attempt is a fresh pod.
+The second rejected pairings whose solved memory exceeded the worker's
+actual cgroup limit; there is no pairing decision left --- the pod is sized
+*from* the solved intent (`SpawnIntent.{cores,mem_bytes,disk_bytes}`,
+#rref("sched.admin.spawn-intents")), so by construction the executor a
+derivation runs on was provisioned for that derivation's solved shape.
 
-#r("sched.executor.one-shot")[
-  Executor pods are single-build: an executor MUST run at most one build over
-  its process lifetime. The builder accepts at most one assignment --- the
-  single `BuildSlot` rejects a second assignment while one is claimed, and
-  the run loop's build-done arm exits the process once the completion is
-  flushed (#rref("builder.relay.graceful-exit-close")) instead of returning
-  to accept further work. The scheduler MUST stop offering work to an
-  executor that has produced a completion --- the executor is marked draining
-  in the same actor turn, before any dispatch
-  (#rref("sched.ephemeral.no-redispatch-after-completion")). A surplus pod
-  that never receives an assignment exits on the idle timeout
-  (#rref("builder.idle-exit")) rather than lingering until the Job deadline.
+#r("sched.executor.one-shot+2")[
+  Executor pods are single-attempt: an executor MUST run at most one build
+  over its process lifetime, and the scheduler MUST NOT bind more than one
+  open attempt to one pod. The pod pulls exactly the intent it was spawned
+  for; a re-pull while its attempt is open returns the identical payload and
+  `exec_id` rather than new work (#rref("sched.executor.pull-transaction"));
+  after its report is acknowledged (or on `Gone`) the pod exits instead of
+  asking for more work (#rref("sched.executor.pull-gone"),
+  #rref("builder.pull.exit-codes")); and the builder-side `BuildSlot` rejects
+  a second concurrent claim while one build is in flight.
 ]
 
 One-shot is what makes the pod the natural attempt boundary: fresh identity
 per attempt and zero cross-build state on the executor
-(#rref("ctrl.pool.ephemeral")), and the I-188 race class --- re-dispatching
-into a freed slot whose process is about to exit --- can only ever produce an
-Assigned-never-Running reassign, which the draining mark closes at the
-source. Until this rule the property existed as the I-188 comment at the
-completion handler plus the builder's exit choreography; stating it makes
-the single-build assumption checkable wherever capacity, placement, or
-attempt accounting relies on it.
-
-#r("sched.assign.resource-fit")[
-  `hard_filter()` rejects any executor whose `memory_total_bytes <
-  drv.sched.last_intent.mem_bytes` as a hard filter, same position as
-  `has_capacity()`. `last_intent` is the dispatch-time `solve_intent_for()`
-  output (mem clamped at `resource_floor`). An executor reporting
-  `memory_total_bytes == 0` (cgroup `memory.max=max`, no k8s limit set ---
-  #src("rio-builder/src/cgroup.rs") sends 0 for `None`) is treated as
-  unlimited-fit. A derivation with `last_intent == None` (never dispatched:
-  cold start / recovery) fits any executor. This rejects a derivation whose
-  solved memory exceeds the worker's actual cgroup limit before assignment
-  rather than OOM-killing mid-build.
-]
+(#rref("ctrl.pool.ephemeral")). The stream-era corollaries (the post-completion
+draining mark and the dispatch-side capacity bookkeeping) retired with the
+placement layer; what remains checkable is the pull-side shape --- one
+intent, one open attempt, one report, one exit --- which is exactly the form
+the re-targeted session model checks.
 
 *Retired (1c' deletion commit B — the placement layer):* the warm-gate
 (initial `PrefetchHint` → `PrefetchComplete` → `ExecutorState.warm` →
@@ -2238,134 +2154,50 @@ a warm gate to order; the per-assignment input-closure prefetch the
 builder performs before building is unchanged and is bounded by the same
 build it serves.
 
-#r("sched.executor.deregister-reassign")[
-  *Deregistration:* An executor is removed from the scheduler's state when:
-  - The `BuildExecution` stream is closed (graceful shutdown or network
-    failure)
-  - Heartbeat timeout: the actor's tick (configurable, default 10s) finds
-    `last_heartbeat` older than `HEARTBEAT_TIMEOUT_SECS` (=
-    `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` = 30s). Effective
-    wall-clock timeout: \~30--40s depending on tick phase alignment.
-  On deregistration, all derivations in `assigned` state for that executor are
-  transitioned back to `ready` for reassignment.
-]
+*Retired (1c' spec sweep; machinery deleted by deletion commit A):*
+`sched.executor.deregister-reassign`, `sched.executor.liveness-window`,
+`sched.executor.repair-precedence`, `sched.backstop.timeout`. These four
+rules normed the stream session's repair lattice --- when an executor was
+deregistered (stream close or 30 s heartbeat timeout, with stall credit so
+scheduler congestion never reaped a live fleet), how its in-flight work was
+reassigned, the windows the repairs observed (the two-strike phantom
+confirmation, the 60 s termination-report correlation TTL, the 45 s
+post-failover reconcile delay), the precedence between the many observers of
+one divergence (worker report vs heartbeat vs disconnect vs controller
+report vs backstop --- exactly one classifier wins, every later observer is
+a no-op), and the est×3 backstop timer that caught a wedged-but-heartbeating
+daemon. The session state, the heartbeat intake, the correlation map, the
+reconcile special case and the backstop timer are all deleted; none of the
+windows exist to be composed. This also resolves contradiction C2 (the
+deregister rule's unqualified stream-close clause vs the epoch-qualified
+code): the rule retires with the machinery, and the contradiction record in
+the invariant map stays as history.
 
-#r("sched.executor.liveness-window")[
-  The session's liveness and repair windows are normative values, and worker
-  silence is measured in *worker time*:
-  - *Heartbeat timeout:* an executor is reaped (synthetic disconnect at its
-    current epoch) when its last accepted heartbeat is older than
-    `HEARTBEAT_TIMEOUT_SECS` = `MAX_MISSED_HEARTBEATS` (3) ×
-    `HEARTBEAT_INTERVAL_SECS` (10s) = 30s. The reaper MUST measure worker
-    silence, not scheduler congestion: when the actor itself stalls (the
-    inline `FindMissingPaths` await sites), every executor's `last_heartbeat`
-    is credited by the stall duration before the comparison, so a
-    scheduler-side stall never reaps a live fleet. The builder bounds each
-    heartbeat RPC strictly below the interval
-    (#rref("builder.heartbeat.rpc-timeout")) so one slow RPC cannot consume
-    the whole missed-heartbeat budget.
-  - *Phantom confirmation is two-strike:* a scheduler-known running build
-    missing from the executor's heartbeat report MUST be observed missing
-    across two consecutive heartbeats (clearing the \~10s assignment race
-    window) before #rref("sched.heartbeat.phantom-drain") drains it.
-  - *Termination-report correlation window:* a mid-build disconnect's
-    `recently_disconnected` entry is retained for `TERMINATION_REPORT_TTL` =
-    60s --- long enough to cover the controller's 10s reconcile cadence plus
-    report latency. The controller's classifying report consumes the entry
-    inside the window; establishment of an unreported executor crash
-    (#rref("sched.retry.per-executor-budget")) MUST fire only when the window
-    closes with no classifying report, never earlier.
-  - *Post-failover reconcile delay:* the new leader's assignment reconcile
-    sweep (#rref("sched.reconcile.leader-gate")) runs 45s after acquisition
-    (3 × heartbeat interval + slack), giving live workers the
-    reconnect-and-heartbeat window before any Assigned/Running derivation is
-    adopted or reset.
-  - *Controller reap graces:* a Pending Job is reapable only after a 10s
-    creation-age grace (#rref("ctrl.ephemeral.reap-excess-pending")); a
-    Running Job is orphan-reapable only after a 300s grace that exceeds the
-    builder's 120s idle exit (#rref("ctrl.ephemeral.reap-orphan-running")),
-    so the process-level exit always gets first chance.
-]
+What survives, re-keyed onto the durable open-attempt row, is the
+*one-classifier-wins* discipline the precedence table existed to guarantee:
 
-These numbers were previously code constants cited by incident comments
-(reap-at-30s-not-60s, the eight-site stall credit, bug_044's heartbeat RPC
-bound); what makes them spec-worthy is the composition --- the heartbeat
-timeout sits below the backstop, the correlation TTL covers the controller's
-re-poll, the reconcile delay covers the post-failover reconnect spread, the
-orphan grace covers the idle exit --- which is exactly what the session
-model checks. Phase 0 makes the values normative without renegotiating any
-of them; changing one is a spec change, not a tuning knob.
-
-#r("sched.executor.repair-precedence")[
-  When several repair mechanisms can observe the same divergence between the
-  scheduler's session model and reality, exactly one resolves it and every
-  other observer MUST be a no-op. Per divergence class:
-  - *Unresolved claim* (an accepted assignment that is neither completed nor
-    returned to Ready): the worker's own `CompletionReport` on a live or
-    reconnected stream is the preferred resolution; while it has not
-    arrived, at least one repair MUST remain armed for the claim --- the
-    builder still owes the report
-    (#rref("builder.completion.exactly-once-or-death")), or the slot is
-    heartbeat-monitored (#rref("sched.heartbeat.phantom-drain")), or the
-    disconnect path (#rref("sched.executor.deregister-reassign")) or the
-    backstop (#rref("sched.backstop.timeout")) is armed for it. Whichever
-    fires first resolves the claim exactly once; afterwards a late report or
-    a second repair MUST find a terminal status, a non-Assigned/Running
-    state, or a stale-executor mismatch and change nothing
-    (#rref("sched.completion.idempotent")).
-  - *One pod death observed by several channels* (stream close, heartbeat
-    timeout, controller pod report, controller Job report, backstop): the
-    first *classifying* observation wins --- it consumes the
-    `recently_disconnected` entry or fills the released attempt row's
-    termination columns --- and every later observation of the same death
-    MUST be a no-op (#rref("sched.retry.no-double-count")). A non-promoting
-    report MUST NOT consume the dedup entry the real classification needs,
-    and the establishment sweep fires only after the correlation window
-    closes (#rref("sched.executor.liveness-window")).
-  - *Scheduler/worker view divergence at heartbeat:* the scheduler keeps its
-    assignment over a one-heartbeat-stale report (the TOCTOU keep); a
-    worker-reported build the scheduler does not know is adopted
-    (#rref("sched.heartbeat.adopt")); only a build missing from two
-    consecutive heartbeats is drained as a phantom, and the phantom drain
-    MUST NOT charge the worker's failure budget.
-  - *Failed push:* a `WorkAssignment` whose stream send fails MUST be rolled
-    back in the same actor turn --- status back to Ready, the assignment and
-    execution rows deleted, pins released, `running_build` cleared ---
-    leaving no half-recorded assignment and charging no attempt.
-  - *Post-failover unknowns* (PG says Assigned/Running, worker state
-    unknown): live reconnection plus heartbeat adopt win over the timed
-    reconcile; the 45s sweep defers workers that have a stream but no
-    heartbeat yet, and the store probe then decides adopt-as-completed
-    versus reset-to-Ready --- it MUST NOT fabricate a completion or charge
-    an attempt for a derivation it merely resets.
-  Stale-epoch and deposed-leader observers are inert losers in every class
-  (#rref("sched.executor.session-epoch"),
-  #rref("sched.lease.standby-drops-writes")).
-]
-
-This is the table the incident comments encode one cell at a time (I-032,
-I-035, I-042, I-056, I-066, I-188, I-197): each repair mechanism exists
-because its divergence class once had no winner or had two. Stating the
-precedence makes the conjunction checkable --- a claimed slot resolves at
-most once, a pod death charges at most once, an unresolved claim always has
-a repair armed --- instead of each mechanism's correctness being argued in
-isolation.
-
-#r("sched.backstop.timeout+3")[
-  *Backstop timeout:* Separately from executor deregistration, `handle_tick`
-  checks each `running` derivation's `running_since` timestamp. If elapsed time
-  exceeds `max(est_duration × 3, daemon_timeout + 10min)` --- where
-  `est_duration` is reference-seconds denormalized to wall-clock via the
-  slowest fleet `hw_factor` per #rref("sched.sla.hw-ref-seconds") --- the
-  scheduler sends a CancelSignal to the executor, marks the executor draining
-  (its task is wedged; dispatch must not feed it new work that would sit
-  Assigned forever), resets the derivation to `ready`, increments
-  `failure_count`, and adds the executor to `failed_builders`. This catches the
-  "executor is heartbeating but daemon is wedged" case where no stream-close or
-  heartbeat-timeout fires; the accounting bounds the loop at the poison
-  threshold. The rio_scheduler_backstop_timeouts_total counter (retired with
-  the backstop) tracked these events.
-]
+- An open attempt always has a repair armed --- the pod's own report retry
+  loop while it lives, the controller's pod/Job-terminal
+  `ReportAttemptOutcome` when it dies, and the establishment sweep at
+  deadline + slack if nothing else arrives
+  (#rref("sched.attempt.establishment-window")).
+- The first classifying observation wins the row exactly once; duplicates,
+  late reports and post-establishment reports find the row terminal and
+  change nothing (#rref("sched.executor.report-idempotent"),
+  #rref("sched.completion.idempotent"), #rref("sched.retry.no-double-count")).
+- A report for an identity with no attempt row charges nothing
+  (#rref("sched.attempt.no-attempt-no-op")), and controller-synthesized
+  closes of still-wanted work are charge-free
+  (#rref("sched.attempt.synthesized-verdict")).
+- Liveness bounds come from the platform rather than a scheduler-side
+  reaper: the Job's `activeDeadlineSeconds`
+  (#rref("ctrl.ephemeral.intent-deadline")) bounds a wedged pod, the
+  controller reap graces (#rref("ctrl.ephemeral.reap-excess-pending"),
+  #rref("ctrl.ephemeral.reap-orphan-running")) bound Pending and orphaned
+  Jobs, and the establishment window bounds an unreported attempt.
+- Deposed-leader observers stay inert losers
+  (#rref("sched.lease.standby-drops-writes"),
+  #rref("sched.lease.generation-fence")).
 
 #r("sched.timeout.per-build")[
   `BuildOptions.build_timeout` (proto field, seconds) is a wall-clock limit on
@@ -2373,8 +2205,10 @@ isolation.
   with `submitted_at.elapsed() > build_timeout` has its non-terminal
   derivations cancelled and transitions to `Failed`, with `error_summary` set
   to `"build_timeout {N}s exceeded (wall-clock since submission)"`. This is
-  distinct from #rref("sched.backstop.timeout") (per-derivation heuristic:
-  est×3) and distinct from the executor-side daemon floor (which also receives
+  distinct from the per-attempt bounds (the Job's `activeDeadlineSeconds`
+  plus the establishment window,
+  #rref("sched.attempt.establishment-window")) and distinct from the
+  executor-side daemon floor (which also receives
   `build_timeout` as a per-derivation `min_nonzero` --- defense-in-depth, NOT
   the primary semantics). Zero means no overall timeout.
 ]
@@ -3782,7 +3616,7 @@ concerns.
 Mitigations: profile memory and throughput against a 60K-node DAG target
 (\<500MB, actor processes >1000 ops/sec); offload compute-heavy operations
 (critical-path recomputation) via dirty-flag coalescing
-(#rref("sched.actor.dispatch-decoupled")); bound individual submissions at
+(#rref("sched.critical-path.incremental")); bound individual submissions at
 `MAX_DAG_NODES = 1,048,576` / `MAX_DAG_EDGES = 5,242,880` --- global
 compile-time constants in #src("rio-common/src/limits.rs"), not per-tenant
 (SubmitBuild rejects DAGs exceeding either limit before merge).

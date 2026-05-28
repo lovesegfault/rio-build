@@ -135,8 +135,9 @@ let
         # scheduler_builds_total is per-SubmitBuild RPC: one submit,
         # one count — the whole DAG succeeded. builder_builds_total is
         # per-derivation-dispatched. P0452 hard-split routes the FOD
-        # to the fetcher and the consumer to the builder — 1 each.
-        # r[verify sched.dispatch.fod-to-fetcher]
+        # to the fetcher and the consumer to the builder — 1 each
+        # (the fod-to-fetcher kind boundary; the verify marker for it
+        # lives at this scenario's wiring entry in default.nix).
         assert_metric_exact(
             ${gatewayHost}, 9091,
             "rio_scheduler_builds_total", 1.0,

@@ -2600,7 +2600,7 @@ in
     # repair-armed property, no fabricated completion, the
     # establishment-window discipline and the per-attempt
     # classification dedup.
-    # r[verify sched.executor.one-shot]
+    # r[verify sched.executor.one-shot+2]
     # r[verify sched.executor.pull-not-ready]
     # r[verify sched.attempt.establishment-window+2]
     quint-executor-session-base = mkQuintCheck {
