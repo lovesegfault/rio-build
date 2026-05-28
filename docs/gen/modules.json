@@ -736,7 +736,7 @@
     {
       "path": "protocol/wire/framed.rs",
       "depth": 2,
-      "doc": "Streaming framed reader for Nix framed byte streams."
+      "doc": "Streaming framed reader and writer for Nix framed byte streams."
     },
     {
       "path": "refscan.rs",
