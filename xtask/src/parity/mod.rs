@@ -19,6 +19,7 @@ pub mod eval;
 pub mod jobs;
 pub mod launch;
 pub mod preflight;
+pub mod report;
 pub mod s3;
 pub mod status;
 
@@ -91,8 +92,9 @@ enum ParityCmd {
     Launch(launch::LaunchArgs),
     /// Show campaign progress (progress.json from S3 + Job state).
     Status(status::StatusArgs),
-    /// Download and render the campaign report (summary.md).
-    Report(ReportArgs),
+    /// Download the campaign report (summary.md, plus progress.json for
+    /// context) into a local directory and print the summary.
+    Report(report::ReportArgs),
     /// Print (or run) the recorded repro command for one job. M2.
     Repro {
         /// Campaign id.
@@ -116,27 +118,12 @@ enum ParityCmd {
     },
 }
 
-// Placeholder arg struct — swapped for the real one when the report
-// implementation lands (it lands by replacing exactly this and its
-// `run` arm). Campaign-scoped commands take the campaign id
-// positionally.
-#[derive(Args)]
-pub struct ReportArgs {
-    /// Campaign id.
-    pub campaign: String,
-}
-
 pub async fn run(args: ParityArgs) -> Result<()> {
     match args.cmd {
         ParityCmd::Eval(a) => eval::run(a).await,
         ParityCmd::Launch(a) => launch::run(a).await,
         ParityCmd::Status(a) => status::run(a).await,
-        // Placeholder arm: report bails until its implementation lands
-        // and replaces it.
-        ParityCmd::Report(a) => bail!(
-            "`cargo xtask parity report {}` is not implemented yet",
-            a.campaign
-        ),
+        ParityCmd::Report(a) => report::run(a).await,
         ParityCmd::Repro { .. } => not_yet("repro"),
         ParityCmd::Abort { .. } => not_yet("abort"),
         ParityCmd::Cleanup { .. } => not_yet("cleanup"),

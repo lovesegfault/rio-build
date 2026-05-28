@@ -70,3 +70,6 @@ mutants.out*/
 *.qcow2
 .stress-test/
 docs/dist/
+
+# `cargo xtask parity report` downloads campaign summaries here by default
+.parity-reports/

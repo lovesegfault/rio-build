@@ -12,6 +12,8 @@
 use anyhow::{Context, Result};
 
 use super::S3_PREFIX;
+use crate::k8s::eks::TF_DIR;
+use crate::tofu;
 
 /// Key of a campaign-scoped artifact, e.g. `progress.json` or
 /// `report/summary.md`. Matches the engine's campaign sync layout
@@ -54,6 +56,39 @@ pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Resul
     }
     out.sort();
     Ok(out)
+}
+
+/// Where the campaign artifacts live: chunk bucket + region, resolved
+/// once from the EKS tofu outputs (one `tofu output -json` spawn) so
+/// `status --watch` and `report` share the same
+/// tofu-outputs → bucket → [`campaign_key`] → [`get_text`] sequence and
+/// a watch loop never re-shells-out to tofu per poll.
+pub struct CampaignStore {
+    region: String,
+    bucket: String,
+}
+
+impl CampaignStore {
+    /// Resolve the region and chunk bucket from the EKS tofu outputs.
+    pub fn discover() -> Result<Self> {
+        let tf = tofu::outputs(TF_DIR)?;
+        Ok(Self {
+            region: tf.get("region")?,
+            bucket: tf.get("chunk_bucket_name")?,
+        })
+    }
+
+    /// `s3://…` URI of one campaign-scoped artifact, for messages.
+    pub fn uri(&self, campaign_id: &str, rel: &str) -> String {
+        format!("s3://{}/{}", self.bucket, campaign_key(campaign_id, rel))
+    }
+
+    /// Download one campaign-scoped artifact (`rel` as in
+    /// [`campaign_key`]) as text. `Ok(None)` when the engine has not
+    /// written it yet.
+    pub async fn fetch_campaign_doc(&self, campaign_id: &str, rel: &str) -> Result<Option<String>> {
+        get_text(&self.region, &self.bucket, &campaign_key(campaign_id, rel)).await
+    }
 }
 
 /// Download an S3 object as UTF-8 text. `Ok(None)` when the key does not
