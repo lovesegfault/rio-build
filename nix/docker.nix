@@ -541,6 +541,66 @@ rec {
     extraCommands = builderExtraCommands;
   };
 
+  # ── nixpkgs-parity campaign engine ─────────────────────────────────────
+  # Engine binary plus the external tools it shells out to: `nix`
+  # (drv import from the eval-set archive + ssh-ng submission through
+  # rio-gateway), `nix-eval-jobs` (eval-set production), and the OpenSSH
+  # client (`nix … --store ssh-ng://` spawns `ssh`). GNU tar + zstd are
+  # REQUIRED: the engine runs `tar --zstd -xf` on the drvs.tar.zst
+  # eval-set archive (and a plain `tar -cf` when packing one — the
+  # compression side is in-process); gzip covers the `tar -xzf` unpack
+  # of the nixpkgs source tarball during eval-set production;
+  # coreutils/bash cover the rest of the pack/unpack plumbing.
+  # cacert/tzdata come from baseContents (Hydra and cache.nixos.org are
+  # HTTPS); RIO_LOG_FORMAT=json + SSL_CERT_FILE from baseEnv. git is NOT
+  # needed (the codeload tarball is NAR-identical to Hydra's git
+  # export). Runs as nonroot (65532) like the other control-plane
+  # images; the parity Jobs provide a writable /work emptyDir and the
+  # single-user-store env (HOME/XDG/TMPDIR), so the image itself only
+  # needs /tmp as a fallback scratch dir.
+  #
+  # nixForBuilder (not pkgs.nix): same derivation the builder/bootstrap
+  # images already pull in, so the layers dedup; the EXDEV patch is
+  # inert outside the builder's overlayfs setup.
+  parity = mkImage {
+    name = "parity";
+    bins = [ rio-crates.rio-parity ];
+    user = nonrootUser;
+    extraContents = nonrootEtc ++ [
+      nixForBuilder
+      pkgs.nix-eval-jobs
+      pkgs.openssh
+      pkgs.bash
+      pkgs.coreutils
+      pkgs.gnutar
+      pkgs.gzip
+      pkgs.zstd
+      # New-style `nix` CLI needs the experimental flag; the engine and
+      # operators exec `nix` inside this image, never nix-daemon.
+      (pkgs.writeTextDir "etc/nix/nix.conf" ''
+        experimental-features = nix-command
+      '')
+    ];
+    extraEnv = [
+      "PATH=${
+        lib.makeBinPath [
+          nixForBuilder
+          pkgs.nix-eval-jobs
+          pkgs.openssh
+          pkgs.bash
+          pkgs.coreutils
+          pkgs.gnutar
+          pkgs.gzip
+          pkgs.zstd
+        ]
+      }"
+    ];
+    extraCommands = ''
+      mkdir -p tmp
+      chmod 1777 tmp
+    '';
+  };
+
   # ── AMI layer-cache warm: builder image as an OCI archive ─────────────
   # r[impl infra.node.prebake-layer-warm]
   #
