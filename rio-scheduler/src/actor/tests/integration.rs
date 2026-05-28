@@ -101,61 +101,6 @@ async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
 // DB fault injection
 // -----------------------------------------------------------------------
 
-/// Verify that DB failures during completion are logged but do not block
-/// the in-memory state machine. DB writes are best-effort; the actor
-/// must not stall on DB unavailability.
-#[tracing_test::traced_test]
-#[tokio::test]
-async fn test_db_failure_during_completion_logged() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
-    let build_id = Uuid::new_v4();
-    let drv_hash = "db-fault-hash";
-    let drv_path = test_drv_path(drv_hash);
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    // Sanity check: derivation was dispatched.
-    let pre = expect_drv(&handle, drv_hash).await;
-    assert_eq!(pre.status, DerivationStatus::Assigned);
-
-    // Close the DB pool — subsequent DB writes will fail.
-    db.pool.close().await;
-
-    // Send successful completion. DB write will fail but in-memory
-    // transition should succeed.
-    complete_success(
-        &handle,
-        "test-worker",
-        &drv_path,
-        &test_store_path("fake-output"),
-    )
-    .await?;
-
-    // In-memory state should have transitioned despite DB failure.
-    let post = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        post.status,
-        DerivationStatus::Completed,
-        "in-memory transition should succeed despite DB unavailability"
-    );
-
-    // DB failure should have been logged at error level — both for the
-    // derivation status update AND for the build completion transition.
-    assert!(
-        logs_contain("failed to update derivation status in DB")
-            || logs_contain("failed to persist"),
-        "DB failure during derivation completion should be logged"
-    );
-    assert!(
-        logs_contain("failed to persist build completion"),
-        "DB failure in complete_build (transition_build) should be logged, not silently discarded"
-    );
-
-    // TestDb::drop uses a separate admin connection, so closing the test
-    // pool here doesn't prevent database cleanup.
-    Ok(())
-}
-
 /// A cyclic DAG submission must not leak into the actor's in-memory maps.
 /// Regression test for the reorder fix: merge() now runs BEFORE the map
 /// inserts, so a CycleDetected error leaves no trace in

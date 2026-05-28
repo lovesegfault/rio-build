@@ -73,65 +73,6 @@ async fn test_attempt_append_load_roundtrip() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The second installment is idempotent: first fill wins, the second
-/// reports it lost and changes nothing.
-#[tokio::test]
-async fn test_attempt_fill_termination_first_writer_wins() -> anyhow::Result<()> {
-    let (_test_db, db, drv_id) = setup("attempt-fill-hash").await?;
-
-    let exec_id = Uuid::now_v7();
-    let mut row = AttemptRow::new(
-        drv_id,
-        OutcomeClass::Disconnected,
-        ReportingParty::Scheduler,
-    );
-    row.exec_id = Some(exec_id);
-    row.executor_id = Some(ExecutorId::from("builder-2"));
-
-    let mut tx = db.pool().begin().await?;
-    assert!(SchedulerDb::append_attempt(&mut tx, &row).await?);
-    tx.commit().await?;
-
-    // First installment-2 writer classifies the row.
-    let mut tx = db.pool().begin().await?;
-    let won = SchedulerDb::fill_termination(
-        &mut tx,
-        drv_id,
-        exec_id,
-        "deadline_exceeded",
-        OutcomeClass::Timeout,
-        (false, false, false),
-    )
-    .await?;
-    tx.commit().await?;
-    assert!(won, "first fill must win");
-
-    // Second writer (e.g. the establishment sweep racing a late report)
-    // must lose against the WHERE termination_reason IS NULL guard.
-    let mut tx = db.pool().begin().await?;
-    let won = SchedulerDb::fill_termination(
-        &mut tx,
-        drv_id,
-        exec_id,
-        "unreported",
-        OutcomeClass::ExecutorCrash,
-        (false, false, false),
-    )
-    .await?;
-    tx.commit().await?;
-    assert!(!won, "second fill must lose (first writer wins)");
-
-    let loaded = db.load_attempt_suffix(&[drv_id]).await?;
-    let rows = loaded.get(&drv_id).expect("derivation has rows");
-    assert_eq!(rows.len(), 1, "fill never inserts a second row");
-    assert_eq!(
-        rows[0].termination_reason.as_deref(),
-        Some("deadline_exceeded")
-    );
-    assert_eq!(rows[0].outcome_class, OutcomeClass::Timeout);
-    Ok(())
-}
-
 /// A second append bearing an already-recorded exec_id is rejected by
 /// the partial unique index (the schema property), not by caller
 /// discipline.

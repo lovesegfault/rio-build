@@ -86,7 +86,7 @@ use std::time::Duration;
 
 use super::*;
 use crate::db::RecoveryBuildRow;
-use crate::state::{DerivationState, verifiable_wanted_paths};
+use crate::state::DerivationState;
 
 /// How long a recovery whose claim target the durable floor cannot
 /// vouch for (a bump target, or a retained entry generation over a
@@ -919,8 +919,8 @@ impl DagActor {
     /// (T-1b.12a); a legacy-columns-only history with no ledger rows
     /// folds to `Requeue` (no decision-bearing event), so pre-066
     /// at-threshold state still converges at its next observation, not
-    /// here. The orphan reconcile (`reset_orphan_to_ready` /
-    /// `adopt_orphan_completion`) is unchanged.
+    /// here. The establishment sweep's store-probe adopt arm
+    /// (`adopt_orphan_completion`) is unchanged.
     async fn enforce_recovered_verdicts(&mut self) {
         let budget = self.decision_budget();
         let now_epoch = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
@@ -1928,236 +1928,13 @@ impl DagActor {
         }
     }
 
-    /// Post-recovery worker reconciliation (spec step 6).
-    ///
-    /// Scheduled via WeakSender delay (~45s = 3× heartbeat + slack)
-    /// AFTER recovery. For each Assigned/Running derivation: if
-    /// `assigned_executor` NOT in `self.executors` (worker didn't
-    /// reconnect after scheduler restart) → query store for output
-    /// existence → if all present: Completed (orphan completion
-    /// while scheduler was down), else reset_to_ready + retry++.
-    ///
-    /// Workers ARE in self.executors (survived): they'll send
-    /// CompletionReport or heartbeat showing the build still
-    /// running — normal handling resumes.
-    // r[impl sched.executor.repair-precedence]
-    #[instrument(skip(self))]
-    pub(super) async fn handle_reconcile_assignments(&mut self) {
-        // r[impl sched.reconcile.leader-gate]
-        // Mirror dispatch_ready: the 45s timer is fire-and-forget and
-        // on_lose doesn't cancel it or clear self.dag, so an ex-leader's
-        // timer would otherwise write to PG against a stale DAG.
-        if !self.leader.is_leader() {
-            debug!("reconcile: not leader, skipping");
-            return;
-        }
-        let (mut orphaned, deferred) = self.collect_orphaned_assignments();
-
-        // Pull-mode carve-out (executor campaign, coexistence): a
-        // pull-mode pod never registers on the stream, so its
-        // Assigned/Running drv always looks orphaned to the
-        // executor-liveness check above — but the attempt is durable
-        // (`drv_executions.dispatch_mode = 'pull'`) and owned by the
-        // establishment sweep (deadline + report-slack), not by this
-        // reconcile. Filter those out by the dispatch_mode
-        // discriminator; on a view-read error keep ONLY the orphans we
-        // can prove are not pull-mode (i.e. none) and re-arm the sweep —
-        // resetting a mid-build pull attempt here would strand the pod's
-        // report against a closed assignment.
-        if !orphaned.is_empty() {
-            match self.db.list_open_pull_attempts().await {
-                Ok(open) => {
-                    let pull_open: std::collections::HashSet<&str> =
-                        open.iter().map(|a| a.drv_hash.as_str()).collect();
-                    orphaned.retain(|o| !pull_open.contains(o.drv_hash.as_str()));
-                }
-                Err(e) => {
-                    warn!(error = %e,
-                          "reconcile: open pull-attempt view unavailable; deferring the orphan \
-                           pass (cannot distinguish pull-mode attempts) and re-arming the sweep");
-                    self.schedule_reconcile_timer();
-                    return;
-                }
-            }
-        }
-
-        // r[impl sched.executor.repair-precedence]
-        // A deferred claim (its worker has a stream entry but no
-        // accepted heartbeat yet) is not resolved by this pass, and no
-        // other mechanism revisits a DAG/PG-Assigned binding that the
-        // worker's fresh entry doesn't carry: the heartbeat reconcile
-        // and the two-strike phantom key off the entry's running_build,
-        // the reaper/disconnect requeue only the entry's running_build,
-        // and the backstop scans Running only. Re-arm the sweep so the
-        // deferral is a delay, not a terminal state — the next pass
-        // sees the worker either registered (the cross-check resolves
-        // the claim) or gone (the orphan arm resolves it), or defers
-        // and re-arms again. Without this, a claim deferred once stayed
-        // Assigned until the next leader transition.
-        if deferred > 0 {
-            info!(
-                deferred,
-                "reconcile: deferred not-yet-heartbeated workers; re-arming the sweep"
-            );
-            metrics::counter!("rio_scheduler_reconcile_deferred_total").increment(deferred as u64);
-            self.schedule_reconcile_timer();
-        }
-
-        if orphaned.is_empty() {
-            debug!("reconcile: all assigned/running derivations have live workers");
-            return;
-        }
-        info!(
-            count = orphaned.len(),
-            "reconciling orphaned assignments (worker didn't reconnect)"
-        );
-
-        // Batch-probe ALL orphans' outputs in ONE FindMissingPaths
-        // before the loop. Per-orphan calls were N×grpc_timeout against
-        // a dead store (every orphan paid the full 30s); the per-orphan
-        // decision below is then a hashset lookup. Floating-CA `[""]`
-        // placeholders filtered (translate.rs convention) so they don't
-        // trip FMP's InvalidArgument.
-        let all_outputs: Vec<String> = orphaned
-            .iter()
-            .flat_map(|o| o.expected_output_paths.iter())
-            .filter(|p| !p.is_empty())
-            .cloned()
-            .collect();
-        let missing = self.batch_probe_orphan_outputs(all_outputs).await;
-
-        for o in orphaned {
-            // r[impl sched.merge.wanted-outputs+2]
-            // Did the build complete while the scheduler was down
-            // (orphan completion)? All WANTED outputs present = none in
-            // `missing` (the probe set stays all expected paths; an
-            // absent output nothing wants must not force the orphan
-            // back to a from-source re-dispatch). Conservative reset
-            // for: no verifiable wanted path (CA pre-completion, or a
-            // wanted set that resolves to nothing), or no missing-set
-            // (RPC failed/timed out).
-            let present = verifiable_wanted_paths(
-                &o.output_names,
-                &o.expected_output_paths,
-                &o.wanted_output_names,
-            )
-            .is_some_and(|verifiable| {
-                missing
-                    .as_ref()
-                    .is_some_and(|m| verifiable.iter().all(|p| !m.contains(*p)))
-            });
-            if present {
-                self.adopt_orphan_completion(&o.drv_hash, &o.executor, o.expected_output_paths)
-                    .await;
-            } else {
-                self.reset_orphan_to_ready(&o.drv_hash, &o.executor).await;
-            }
-        }
-
-        // After reconcile, dispatch anything newly Ready.
-        self.dispatch_ready().await;
-    }
-
-    /// Collect an [`OrphanedAssignment`] for every Assigned/Running
-    /// derivation whose worker is no longer live — the liveness-check
-    /// input set for
-    /// [`handle_reconcile_assignments`](Self::handle_reconcile_assignments)
-    /// — plus the count of claims it DEFERRED (worker stream-connected
-    /// but not yet heartbeated). The caller re-arms the sweep when any
-    /// deferral remains, so a deferred claim is revisited rather than
-    /// left Assigned until the next leader transition.
-    ///
-    /// Cloned out of the DAG before any mutation (the per-row
-    /// reset/adopt path takes `node_mut`).
-    ///
-    /// `executor` is `Option`: Assigned/Running with
-    /// `assigned_executor=None` is inconsistent state (shouldn't
-    /// happen, but recovery loads from PG which could have drifted).
-    /// We still reconcile it (check store for outputs → Completed,
-    /// else Ready) rather than silently skipping and leaving it stuck
-    /// forever.
-    fn collect_orphaned_assignments(&self) -> (Vec<OrphanedAssignment>, usize) {
-        let orphan = |h: &str, s: &DerivationState, w: Option<&ExecutorId>| OrphanedAssignment {
-            drv_hash: h.into(),
-            executor: w.cloned(),
-            expected_output_paths: s.expected_output_paths.clone(),
-            output_names: s.output_names.clone(),
-            wanted_output_names: s.wanted_output_names.clone(),
-        };
-        let mut deferred = 0usize;
-        let orphans = self
-            .dag
-            .iter_nodes()
-            .filter(|(_, s)| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Assigned | DerivationStatus::Running
-                )
-            })
-            .filter_map(|(h, s)| match s.assigned_executor.as_ref() {
-                Some(w) if self.executors.get(w).is_some_and(|ws| ws.is_registered()) => {
-                    // Worker reconnected AND heartbeated — running_build
-                    // is authoritative. Cross-check: if the worker's
-                    // heartbeat doesn't include this drv_hash, the
-                    // assignment is phantom — PG says Assigned+worker
-                    // but the worker never got the message (scheduler
-                    // crashed between persist_status and try_send). No
-                    // running_since → backstop won't fire → stuck
-                    // forever without this check.
-                    let hash: DrvHash = h.into();
-                    if self
-                        .executors
-                        .get(w)
-                        .is_some_and(|ws| ws.running_build.as_ref() == Some(&hash))
-                    {
-                        // Real assignment — worker has it. Leave it,
-                        // completion report will arrive normally.
-                        None
-                    } else {
-                        warn!(drv_hash = %hash, executor_id = %w,
-                              "reconcile: worker reconnected but phantom Assigned (not in worker.running_build) — reconciling");
-                        Some(orphan(h, s, Some(w)))
-                    }
-                }
-                // Stream connected but no heartbeat yet — running_build
-                // is NOT authoritative (None until executor.rs writes it
-                // from the first accepted heartbeat; I-048b drops
-                // pre-stream heartbeats), so neither the keep nor the
-                // phantom cross-check can run yet. Defer rather than
-                // reset (the worker may be about to report this very
-                // build), but COUNT the deferral so the caller re-arms
-                // the sweep: a fresh entry's running_build stays None
-                // even after the heartbeat lands when the worker never
-                // received the assignment (the post-failover shape),
-                // and neither the heartbeat path, the reaper, the
-                // disconnect requeue nor the backstop consults the
-                // DAG-side binding — without the follow-up sweep the
-                // claim would leak until the next leader transition.
-                Some(w) if self.executors.contains_key(w) => {
-                    debug!(drv_hash = ?h, executor_id = %w,
-                           "reconcile: worker stream-connected but not yet heartbeated — deferring");
-                    deferred += 1;
-                    None
-                }
-                Some(w) => Some(orphan(h, s, Some(w))),
-                None => {
-                    warn!(drv_hash = ?h, status = ?s.status(),
-                          "reconcile: Assigned/Running drv with NULL worker — reconciling anyway");
-                    Some(orphan(h, s, None))
-                }
-            })
-            .collect();
-        (orphans, deferred)
-    }
-
     /// One `FindMissingPaths` over the union of all orphans' expected
     /// outputs. `Some(missing_set)` on success; `None` on no-client
     /// (tests) / RPC error / timeout — caller treats `None` as "all
     /// orphans incomplete" (conservative reset_to_ready). Wrapped in
-    /// `grpc_timeout` + `credit_heartbeats_for_stall` so a dead store
-    /// stalls reconcile at most ONCE (not N×) and doesn't reap
-    /// executors that DID reconnect; feeds `cache_breaker` like the
-    /// merge-time FMP path so a 30s stall here counts toward opening.
+    /// `grpc_timeout` so a dead store stalls the sweep at most ONCE
+    /// (not N×); feeds `cache_breaker` like the merge-time FMP path so
+    /// a 30s stall here counts toward opening.
     pub(super) async fn batch_probe_orphan_outputs(
         &mut self,
         store_paths: Vec<String>,
@@ -2171,7 +1948,6 @@ impl DagActor {
         let mut req = tonic::Request::new(FindMissingPathsRequest { store_paths });
         rio_proto::interceptor::inject_current(req.metadata_mut());
         let grpc_timeout = self.grpc_timeout;
-        let fmp_start = Instant::now();
         let r = match tokio::time::timeout(grpc_timeout, client.find_missing_paths(req)).await {
             Ok(Ok(resp)) => {
                 self.cache_breaker.record_success();
@@ -2190,7 +1966,6 @@ impl DagActor {
                 None
             }
         };
-        self.credit_heartbeats_for_stall(fmp_start.elapsed());
         r
     }
 
@@ -2266,127 +2041,4 @@ impl DagActor {
         self.release_downstream(drv_hash, &interested, HashSet::new(), Some(completed_event))
             .await;
     }
-
-    /// Reconcile path for an orphaned assignment whose outputs are NOT
-    /// in the store: worker died mid-build (or phantom: never received
-    /// the assignment). Same semantics as
-    /// [`reassign_derivations`](Self::reassign_derivations): an
-    /// orphaned assignment is an infrastructure event, not a derivation
-    /// failure — re-read existing poison state only, do NOT record a
-    /// failure or bump `retry.count`. `executor_id` is kept for logging
-    /// parity with `reassign_derivations(.., lost_worker)`.
-    ///
-    /// Deliberately appends NO attempt-ledger row (Phase 1a): the
-    /// orphan reconcile is an adjacent decider over already-recorded
-    /// history, not a new attempt observation — the prior leader's
-    /// disconnect/backstop/report sites own whatever rows that attempt
-    /// earned before the failover.
-    // r[impl sched.reassign.no-promote-on-ephemeral-disconnect+4]
-    async fn reset_orphan_to_ready(
-        &mut self,
-        drv_hash: &DrvHash,
-        executor_id: &Option<ExecutorId>,
-    ) {
-        // Re-read existing poison state so 3 prior REAL failures
-        // (recorded by handle_transient_failure) + this disconnect
-        // → poison instead of dispatching a 4th time. The orphan
-        // event itself never increments the count.
-        let should_poison = self
-            .dag
-            .node(drv_hash)
-            .map(|s| self.poison_config.is_poisoned(s))
-            .unwrap_or(false);
-        if should_poison {
-            info!(drv_hash = %drv_hash, executor_id = ?executor_id,
-                  "reconcile: poison threshold reached, poisoning");
-            self.poison_and_cascade(
-                drv_hash,
-                "poison threshold reached on recovery (orphan worker did not reconnect)",
-                None,
-                None,
-            )
-            .await;
-            return;
-        }
-
-        info!(drv_hash = %drv_hash, executor_id = ?executor_id,
-              "reconcile: worker didn't reconnect, resetting to Ready");
-        if let Some(state) = self.dag.node_mut(drv_hash) {
-            if let Err(e) = state.reset_to_ready() {
-                warn!(drv_hash = %drv_hash, error = %e, "reset_to_ready failed");
-                return;
-            }
-            self.push_ready(drv_hash.clone());
-        }
-        self.persist_status(drv_hash, DerivationStatus::Ready, None)
-            .await;
-    }
-
-    /// Schedule reconciliation ~45s out via WeakSender. Same pattern as
-    /// `schedule_terminal_cleanup`. Workers have ~45s (3× heartbeat +
-    /// slack) to reconnect after scheduler restart. Any
-    /// Assigned/Running derivation whose worker DIDN'T reconnect by
-    /// then gets reconciled (Completed if outputs in store, else reset).
-    ///
-    /// Two callers: the `LeaderAcquired` arm (the post-recovery
-    /// one-shot) and `handle_reconcile_assignments` itself when its
-    /// collection pass deferred at least one claim — each deferral
-    /// grants the worker one more full window to land its first
-    /// heartbeat before the claim is cross-checked or reset.
-    pub(super) fn schedule_reconcile_timer(&self) {
-        let Some(weak_tx) = self.self_tx.clone() else {
-            return;
-        };
-        rio_common::task::spawn_monitored("reconcile-timer", async move {
-            tokio::time::sleep(RECONCILE_DELAY).await;
-            if let Some(tx) = weak_tx.upgrade()
-                && tx.try_send(ActorCommand::ReconcileAssignments).is_err()
-            {
-                tracing::warn!("reconcile command dropped (channel full)");
-                metrics::counter!("rio_scheduler_reconcile_dropped_total").increment(1);
-            }
-        });
-    }
 }
-
-/// One orphaned (worker-gone) Assigned/Running derivation collected by
-/// [`DagActor::collect_orphaned_assignments`] for the reconcile pass.
-///
-/// A named struct rather than a tuple: the output-path/output-name
-/// fields are adjacent same-typed `Vec<String>`s, and a positional
-/// swap would silently flip the adoption criterion from "all wanted
-/// outputs present" to something nonsensical without a type error.
-struct OrphanedAssignment {
-    drv_hash: DrvHash,
-    /// `None` = Assigned/Running with no recorded worker (PG drift) —
-    /// still reconciled rather than left stuck forever.
-    executor: Option<ExecutorId>,
-    /// ALL declared output paths: the `FindMissingPaths` probe set and
-    /// the adopted node's recorded `output_paths`. Probing an unwanted
-    /// path is harmless; only the adopt-vs-reset DECISION filters by
-    /// wanted.
-    expected_output_paths: Vec<String>,
-    /// Declared output names, index-paired with `expected_output_paths`.
-    /// Together with `wanted_output_names` these feed
-    /// [`crate::state::verifiable_wanted_paths`] for the adopt-vs-reset
-    /// decision.
-    output_names: Vec<String>,
-    /// The recovered row's wanted set (empty = all declared wanted).
-    wanted_output_names: Vec<String>,
-}
-
-// r[impl sched.executor.liveness-window]
-/// Delay before post-recovery worker reconciliation. Workers have
-/// this long to reconnect after scheduler restart; after that, any
-/// Assigned/Running derivation with an unknown worker is reconciled
-/// (Completed if outputs in store, else reset to Ready). A sweep that
-/// deferred a stream-connected-but-not-yet-heartbeated worker re-arms
-/// itself for another window of the same length.
-///
-/// 45s = 3× HEARTBEAT_INTERVAL (10s) + 15s slack. A worker that's
-/// alive should reconnect within one heartbeat; 3× covers network
-/// blips. Same cfg(test) shadow pattern as POISON_TTL.
-#[cfg(not(test))]
-const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_secs(45);
-#[cfg(test)]
-const RECONCILE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);

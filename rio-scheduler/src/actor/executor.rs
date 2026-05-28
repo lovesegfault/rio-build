@@ -1,14 +1,17 @@
-//! Executor lifecycle: connect/disconnect/register, heartbeat
-//! reconcile, phantom-drain. Periodic `tick_*` housekeeping lives in
-//! [`super::housekeeping`].
+//! Stream-era executor session plumbing: connect/disconnect/register,
+//! heartbeat reconcile, drain. Production traffic no longer reaches it
+//! (the `BuildExecution`/`Heartbeat` RPCs are unconditional error
+//! stubs); it remains because the placement layer and the admin
+//! surfaces — owned by the next deletion commits — still read the
+//! `executors` map and their tests still drive these arms. Periodic
+//! `tick_*` housekeeping lives in [`super::housekeeping`].
 // r[impl sched.executor.dual-register]
-// r[impl sched.executor.deregister-reassign]
 
 use std::collections::HashMap;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use crate::dag::DerivationDag;
@@ -20,16 +23,6 @@ use crate::state::{DerivationStatus, DrvHash, ExecutorId, ExecutorState};
 ///
 /// [`on_worker_registered`]: DagActor::on_worker_registered
 use super::{DagActor, DrainResult, HeartbeatPayload, MAX_PREFETCH_PATHS};
-
-// r[impl sched.executor.liveness-window]
-/// How long a `recently_disconnected` entry waits for the controller's
-/// `ReportExecutorTermination` before being swept. The controller
-/// observes Pod-status + reconciles ~1-3s after the gRPC stream drops;
-/// `JOB_TTL_SECS=600` keeps the Pod around that long. 60s covers
-/// apiserver lag + one missed reconcile tick (~10s) with margin. Past
-/// this, a missed report degrades to "one OOM doesn't promote" — the
-/// next OOM on the same drv will (the floor is sticky).
-pub(super) const TERMINATION_REPORT_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Initial-hint scan budget: max Ready derivations to consider. Don't
 /// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40
@@ -394,58 +387,14 @@ impl DagActor {
         // Reassign whatever was on this worker. The worker is gone;
         // whether it was draining or not doesn't matter now.
         //
-        // Disconnect does NOT bump `resource_floor` — the
-        // controller is authoritative on termination reason
-        // (`ReportExecutorTermination` with k8s OOMKilled/DiskPressure
-        // → promote; anything else → no-op). A bare disconnect is
-        // ambiguous: pod-kill, store-replica-restart, node failure are
-        // all NOT sizing signals. Live QA: cmake went medium→large→
-        // xlarge from a pod-kill + store-replica-restart with zero
-        // builds run; floor is sticky (M_032). I-197's
-        // `last_completed` discriminator is kept ONLY to decide
-        // whether to record a `recently_disconnected` entry (expected
-        // one-shot exit → no entry; the controller will report
-        // `Completed` and we'd ignore it anyway, so skip the map
-        // churn).
-        let lost_last_completed = worker.last_completed.clone();
+        // Disconnect does NOT bump `resource_floor` and does not append
+        // an attempt row: the stream-era disconnect/termination
+        // correlation (the `recently_disconnected` second-installment
+        // path) is gone with the session machinery. Pull-mode attempts
+        // are durable rows owned by the establishment sweep; this arm
+        // only services the (production-unreachable) stream test
+        // plumbing that remains until the placement layer retires.
         let to_reassign: Vec<DrvHash> = worker.running_build.into_iter().collect();
-        // r[impl sched.retry.no-double-count]
-        // r[impl sched.executor.repair-precedence]
-        // Record for the controller's follow-up report. Only when the
-        // worker died MID-BUILD (last_completed != running_build) — an
-        // expected one-shot exit needs no entry, and a promoting report
-        // that raced ahead already owns the attempt's row (it set
-        // last_completed so this guard skips).
-        if let Some(drv) = to_reassign.first()
-            && lost_last_completed.as_ref() != Some(drv)
-        {
-            // 1a, installment 1: the released execution's `disconnected`
-            // row, appended BEFORE `reassign_derivations` clears the
-            // exec_id carrier. Classification (`termination_reason`)
-            // stays NULL here; the controller's report (E6/E7) or the
-            // establishment sweep fills it on this same row later. The
-            // grown entry carries the released (derivation_id, exec_id)
-            // so those fills never need a DAG lookup.
-            let row = self
-                .attempt_row_for(
-                    drv,
-                    crate::state::OutcomeClass::Disconnected,
-                    crate::state::ReportingParty::Scheduler,
-                )
-                .map(|mut r| {
-                    r.executor_id = Some(executor_id.clone());
-                    r
-                });
-            let entry = super::DisconnectedAttempt {
-                drv_hash: drv.clone(),
-                derivation_id: row.as_ref().map(|r| r.derivation_id),
-                exec_id: row.as_ref().and_then(|r| r.exec_id),
-                at: Instant::now(),
-            };
-            self.append_attempt_standalone(drv, row).await;
-            self.recently_disconnected
-                .insert(executor_id.clone(), entry);
-        }
         self.reassign_derivations(&to_reassign, Some(executor_id))
             .await;
 
@@ -658,652 +607,6 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.sla.reactive-floor+2]
-    /// Controller-reported Pod termination reason. `OomKilled` /
-    /// `EvictedDiskPressure` / `DeadlineExceeded` → bump the relevant
-    /// `resource_floor` dimension (D4). Other reasons → no-op (log
-    /// only).
-    ///
-    /// Resolves `executor_id → drv_hash` via `recently_disconnected`
-    /// (populated by `handle_executor_disconnected` when the worker died
-    /// mid-build). The entry is `remove()`d on first report — the
-    /// controller's reconcile loop re-reports the same Pod every ~10s
-    /// for `JOB_TTL_SECS=600`; subsequent reports miss the map and
-    /// no-op. If the report races AHEAD of the disconnect (controller
-    /// observed Pod-status before the gRPC stream broke at the
-    /// scheduler — rare), fall back to the still-live executor's
-    /// `running_build` and set its `last_completed` so the imminent
-    /// `handle_executor_disconnected` skips the `recently_disconnected`
-    /// insert (otherwise the controller's ~10s re-report would find the
-    /// entry and double-bump).
-    pub(super) async fn handle_executor_termination(
-        &mut self,
-        executor_id: &ExecutorId,
-        reason: rio_proto::types::TerminationReason,
-    ) -> bool {
-        use rio_proto::types::TerminationReason as R;
-
-        // r[impl sched.termination.deadline-exceeded+3]
-        // DeadlineExceeded is reported by JOB name (the Job controller
-        // deletes the Pod when activeDeadlineSeconds fires, so the
-        // controller never sees a terminated container). Prefix-match
-        // recently_disconnected: pod name = `{job}-{5char}`.
-        if reason == R::DeadlineExceeded {
-            return self.handle_deadline_exceeded(executor_id).await;
-        }
-
-        // r[impl sched.executor.repair-precedence]
-        // Non-promoting reason → return BEFORE touching
-        // `recently_disconnected` or the race-ahead `executors`
-        // lookup. Without this gate a `Completed`/`Error`/
-        // `EvictedOther` report consumes the dedup entry then no-ops
-        // — the same-tick `report_deadline_exceeded_jobs` prefix-match
-        // (or a later promoting report) finds nothing, so the
-        // `r[ctrl.terminated.deadline-exceeded]` backstop is
-        // structurally defeated and a deterministically-wedging drv
-        // loops at `activeDeadlineSeconds` instead of climbing the
-        // floor ladder. Same hazard for the race-ahead arm: a non-
-        // promoting report would set `last_completed` and suppress
-        // the imminent disconnect's `recently_disconnected` insert.
-        let Some(label) = super::floor::reason_label(reason) else {
-            debug!(executor_id = %executor_id, ?reason,
-                   "termination report: non-resource reason, no promotion");
-            return false;
-        };
-
-        // r[impl sched.retry.no-double-count]
-        // Resolve drv. remove() = first-report-wins dedup. The entry
-        // (when present) carries the RELEASED (derivation_id, exec_id)
-        // so the second-installment fill below targets the disconnect's
-        // row directly — even if the node has already been re-dispatched
-        // with a new exec_id (the late-installment shape).
-        let mut released: Option<(uuid::Uuid, uuid::Uuid)> = None;
-        let mut race_ahead = false;
-        let drv_hash = match self.recently_disconnected.remove(executor_id) {
-            Some(entry) => {
-                // OA1 interval (ii), pod-terminal cause: disconnect
-                // observation → the controller's classifying report
-                // consumed. First-report-wins (the entry is removed),
-                // so each released attempt is sampled at most once on
-                // this cause.
-                metrics::histogram!(
-                    "rio_scheduler_attempt_requeue_seconds",
-                    "cause" => "pod-terminal"
-                )
-                .record(entry.at.elapsed().as_secs_f64());
-                released = entry.derivation_id.zip(entry.exec_id);
-                entry.drv_hash
-            }
-            // Race-ahead: report landed before ExecutorDisconnected.
-            // Look at the still-live executor.
-            None => match self.executors.get_mut(executor_id) {
-                Some(w) => match w.running_build.clone() {
-                    Some(drv) => {
-                        // Mark as termination-handled so the imminent
-                        // ExecutorDisconnected's `last_completed !=
-                        // running_build` guard skips the
-                        // recently_disconnected insert. Otherwise the
-                        // controller's ~10s re-report finds the entry
-                        // and double-bumps (4× provisioning, or
-                        // infra_count+=2 at ceiling → premature poison).
-                        w.last_completed = Some(drv.clone());
-                        race_ahead = true;
-                        drv
-                    }
-                    None => {
-                        debug!(executor_id = %executor_id, ?reason,
-                               "termination report: executor live but idle, ignoring");
-                        return false;
-                    }
-                },
-                None => {
-                    debug!(executor_id = %executor_id, ?reason,
-                           "termination report: no recently_disconnected entry \
-                            (already handled, swept, or expected one-shot exit)");
-                    return false;
-                }
-            },
-        };
-
-        let outcome = self.bump_resource_floor(&drv_hash, reason, label).await;
-
-        // E6, collapsed onto decide()/classify() (Phase 1b, T-1b.9): the
-        // second installment classifies the released attempt's row
-        // through `classify()` — the single append-time owner of the
-        // exemption predicate — and the same transaction re-runs
-        // `decide()` over the updated suffix, acting on the verdict at
-        // this site. The floor bump above stays at the site; only its
-        // outcome feeds the classifier. The class follows the floor
-        // outcome — exempt when the report promoted the floor, plain
-        // infra otherwise — mirroring the worker-reported E2 split. A
-        // correlated report fills the row the disconnect appended
-        // (first writer wins); a race-ahead report appends the row
-        // itself, already classified, and the later disconnect appends
-        // nothing (last_completed guard plus the exec_id unique index).
-        let class = crate::retry_policy::classify(
-            &crate::retry_policy::ObservedFailure::ControllerResourceTermination,
-            crate::retry_policy::FloorOutcomeView {
-                promoted: outcome.promoted,
-                at_cap: outcome.at_cap,
-            },
-        );
-        let floor_flags = (outcome.promoted, outcome.promoted, outcome.at_cap);
-        // The late-installment-after-redispatch guard (unchanged from
-        // the as-built m044 arm): a terminal verdict is acted on only
-        // while the derivation is still in a poison-able status; the
-        // installment itself always lands. The disconnect already
-        // re-queued (Ready), but a dispatch tick may have raced
-        // (Assigned/Running); any other state (Completed elsewhere,
-        // already Poisoned, reaped) → record only, never act.
-        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
-            matches!(
-                s.status(),
-                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-            )
-        });
-
-        // The installment transaction: fill (or race-ahead append) +
-        // suffix/seed read + decide(), plus the Poisoned persist when a
-        // poison verdict will be acted on, committed together.
-        // Leader-gated like the 1a writes it replaces. A failed
-        // transaction performs no installment and produces no verdict —
-        // the legacy RAM bookkeeping below still runs, the budget is
-        // re-driven by the next counted failure (or the establishment
-        // sweep / backstop for a row that stayed unclassified), and the
-        // consumed `recently_disconnected` entry is NOT re-inserted
-        // (re-inserting would let the controller's ~10s re-report
-        // double-bump the floor).
-        let mut decision: Option<crate::retry_policy::Decision> = None;
-        if !self.leader.is_leader() {
-            // Standby replicas must neither write attempt rows nor
-            // decide from them (same gate as the 1a fill/append).
-        } else if let Some((derivation_id, exec_id)) = released {
-            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                let (won, decision) = self
-                    .fill_and_decide_in_tx(
-                        &mut tx,
-                        derivation_id,
-                        exec_id,
-                        label,
-                        class,
-                        floor_flags,
-                    )
-                    .await?;
-                if verdict_eligible
-                    && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
-                {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
-                }
-                tx.commit().await?;
-                Ok((won, decision))
-            }
-            .await;
-            match result {
-                Ok((won, d)) => {
-                    if won {
-                        if let Some(state) = self.dag.node_mut(&drv_hash) {
-                            state.classify_attempt_record(exec_id, label, class, floor_flags);
-                        }
-                        self.refresh_retry_view(&drv_hash);
-                    }
-                    decision = Some(d);
-                }
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                          "controller termination: installment transaction failed; no verdict \
-                           taken (the next counted failure or the establishment sweep re-drives \
-                           the budget)");
-                }
-            }
-        } else if race_ahead {
-            let row = self
-                .attempt_row_for(&drv_hash, class, crate::state::ReportingParty::Controller)
-                .map(|mut r| {
-                    r.executor_id = Some(executor_id.clone());
-                    r.termination_reason = Some(label.to_string());
-                    r.exempt = outcome.promoted;
-                    r.floor_promoted = outcome.promoted;
-                    r.floor_at_cap = outcome.at_cap;
-                    r
-                });
-            if let Some(row) = row {
-                let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
-                    let mut tx = self.db.pool().begin().await?;
-                    let (inserted, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
-                    if verdict_eligible
-                        && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
-                    {
-                        crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, &drv_hash).await?;
-                    }
-                    tx.commit().await?;
-                    Ok((inserted, decision))
-                }
-                .await;
-                match result {
-                    Ok((inserted, d)) => {
-                        if inserted {
-                            if let Some(state) = self.dag.node_mut(&drv_hash) {
-                                state.push_attempt_record(row.to_record());
-                            }
-                            self.refresh_retry_view(&drv_hash);
-                        }
-                        decision = Some(d);
-                    }
-                    Err(e) => {
-                        warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                              "controller termination (race-ahead): appending transaction \
-                               failed; no verdict taken");
-                    }
-                }
-            }
-        }
-
-        // m044, restructured: at the ceiling (`at_cap=true`) this path
-        // still owns the accounting — kubelet-level OOMKilled /
-        // EvictedDiskPressure means the pod died and no worker
-        // CompletionReport will ever arrive — but the cap check is the
-        // fold's verdict above and the charge is the classified
-        // installment row (the cached view picks it up at the refresh).
-        let max = self.retry_policy.max_infra_retries;
-
-        // Act on the verdict. Requeue verdicts are a no-op — the
-        // disconnect already re-queued the derivation (or the race-ahead
-        // node is still live on its worker); poison verdicts persist
-        // happened inside the transaction, so only the in-memory
-        // transition + cascade remain.
-        if verdict_eligible
-            && let Some(d) = decision
-            && let crate::retry_policy::Verdict::Poison(poison_reason) = d.verdict
-        {
-            match poison_reason {
-                crate::retry_policy::PoisonReason::ExemptInfraBudget => {
-                    // DIVERGENCE D3 / contradiction C3, adjudicated: a
-                    // floor-promoted controller-reported termination
-                    // charges the exemption budget
-                    // (`sched.retry.exempt-infra-cap`'s "every exempt
-                    // attempt"), so the controller channel is bounded by
-                    // `max_exempt_infra_retries` exactly as the worker
-                    // channel is — as-built it charged nothing here.
-                    let max_exempt = self.retry_policy.max_exempt_infra_retries;
-                    warn!(
-                        drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
-                        exempt_infra_count = d.counters.exempt_infra_count,
-                        max = max_exempt,
-                        resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
-                        "controller-reported termination: exempt infra-retry cap exceeded, \
-                         poisoning (likely leaked store lock / stuck floor-promote)"
-                    );
-                    self.poison_already_recorded(
-                        &drv_hash,
-                        &format!("max_exempt_infra_retries={max_exempt} exceeded ({reason:?})"),
-                        None,
-                    )
-                    .await;
-                }
-                other => {
-                    if !matches!(other, crate::retry_policy::PoisonReason::InfraBudget) {
-                        error!(drv_hash = %drv_hash, ?other,
-                               "decide() returned an unexpected poison reason for a controller \
-                                termination; poisoning with the infra-budget message (investigate)");
-                    }
-                    warn!(
-                        drv_hash = %drv_hash, executor_id = %executor_id, ?reason,
-                        infra_retry_count = d.counters.infra_count, max,
-                        resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
-                        "controller-reported termination: max_infra_retries \
-                         exhausted at ceiling, poisoning"
-                    );
-                    self.poison_already_recorded(
-                        &drv_hash,
-                        &format!(
-                            "max_infra_retries={max} exhausted at resource ceiling ({reason:?})"
-                        ),
-                        None,
-                    )
-                    .await;
-                }
-            }
-            return outcome.promoted;
-        }
-
-        outcome.promoted
-    }
-
-    /// `activeDeadlineSeconds` backstop fired — worker was too wedged
-    /// to fire its own `daemon_timeout`. Bump `resource_floor.
-    /// deadline_secs` (D4) and count the timeout
-    /// UNCONDITIONALLY (`r[sched.timeout.promote-on-exceed+3]`, same
-    /// I-200 semantics as `handle_timeout_failure`): every timeout
-    /// consumes budget regardless of promotion, so
-    /// `max_timeout_retries` bounds TOTAL attempts. NOT gated on
-    /// `at_cap` — that's the OOM/DiskPressure shape above (infra IS
-    /// promotion-exempt; timeout is not). With the gate, a
-    /// deterministically-wedging drv climbed ~9 free ladder rungs
-    /// (180s→…→86400s) before the counter moved.
-    ///
-    /// `job_name` is the JOB name; the Pod is already deleted.
-    /// Prefix-match `recently_disconnected` (pod name = `{job}-{5}`).
-    /// remove() = first-report-wins dedup, same as the exact-match
-    /// path. Unlike `handle_timeout_failure`, this does NOT
-    /// `reset_to_ready` — `handle_executor_disconnected` already re-
-    /// queued, and the drv may already be re-dispatched.
-    ///
-    /// E7, collapsed onto `decide()` (Phase 1b, T-1b.10 — divergence
-    /// D1): the verdict comes from the fold over the suffix updated by
-    /// the second installment, in the same transaction. At
-    /// `max_timeout_retries` the verdict is `Cancel` and this path
-    /// takes the SAME terminal `Cancelled` transition as the
-    /// worker-reported `TimedOut` path (immediately resubmit-retriable,
-    /// no `poisoned_at`, no 24 h TTL) — the backstop fires precisely
-    /// when the worker is too wedged (FUSE/kernel hang) to send
-    /// `CompletionReport{TimedOut}`, so this site owns the terminal
-    /// transition for the controller-observed run of that history.
-    /// The as-built `Poisoned`-at-cap escape hatch (172776b1b) is
-    /// retired with the `sched.termination.deadline-exceeded+3`
-    /// amendment; the cap still produces a terminal state — never "no
-    /// action at the cap" — so the loop the poison was added to break
-    /// stays broken.
-    // r[impl sched.termination.deadline-exceeded+3]
-    async fn handle_deadline_exceeded(&mut self, job_name: &ExecutorId) -> bool {
-        use rio_proto::types::TerminationReason as R;
-        let prefix = format!("{job_name}-");
-        let Some(pod_name) = self
-            .recently_disconnected
-            .keys()
-            .find(|k| k.starts_with(&prefix))
-            .cloned()
-        else {
-            debug!(job_name = %job_name,
-                   "DeadlineExceeded report: no recently_disconnected entry \
-                    with prefix (already handled, swept, or worker reported \
-                    TimedOut first)");
-            return false;
-        };
-        let entry = self
-            .recently_disconnected
-            .remove(&pod_name)
-            .expect("key found above");
-        // OA1 interval (ii), pod-terminal cause: disconnect observation
-        // → the controller's DeadlineExceeded report consumed (the Job
-        // controller deleted the pod, so this is the prefix-matched
-        // classifying report for the released attempt).
-        metrics::histogram!(
-            "rio_scheduler_attempt_requeue_seconds",
-            "cause" => "pod-terminal"
-        )
-        .record(entry.at.elapsed().as_secs_f64());
-        let drv_hash = entry.drv_hash.clone();
-
-        let outcome = self
-            .bump_resource_floor(&drv_hash, R::DeadlineExceeded, "deadline_exceeded")
-            .await;
-
-        // The late-installment-after-redispatch guard, unchanged: a
-        // terminal verdict is acted on only while the derivation is
-        // still in a cancel-able status; the installment always lands.
-        let verdict_eligible = self.dag.node(&drv_hash).is_some_and(|s| {
-            matches!(
-                s.status(),
-                DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-            )
-        });
-        let max = self.retry_policy.max_timeout_retries;
-
-        // Installment 2 + the verdict, one transaction: the
-        // DeadlineExceeded report classifies the released attempt's row
-        // as a timeout (first writer wins; the fill is keyed by the
-        // entry's released exec_id so it lands on the OLD attempt even
-        // after a re-dispatch), the fold re-runs over the updated
-        // suffix, and a Cancel verdict persists Cancelled on the same
-        // connection. Leader-gated like the 1a fill it replaces; a
-        // failed transaction performs no installment and produces no
-        // verdict (the consumed entry is not re-inserted — a re-report
-        // would double-bump the floor; the worker-side report or the
-        // next deadline overrun re-drives the budget).
-        let mut decision: Option<crate::retry_policy::Decision> = None;
-        if self.leader.is_leader()
-            && let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id)
-        {
-            let floor_flags = (false, outcome.promoted, outcome.at_cap);
-            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                let (won, decision) = self
-                    .fill_and_decide_in_tx(
-                        &mut tx,
-                        derivation_id,
-                        exec_id,
-                        "deadline_exceeded",
-                        crate::state::OutcomeClass::Timeout,
-                        floor_flags,
-                    )
-                    .await?;
-                if verdict_eligible
-                    && matches!(decision.verdict, crate::retry_policy::Verdict::Cancel)
-                {
-                    crate::db::SchedulerDb::update_derivation_status_in_tx(
-                        &mut tx,
-                        &drv_hash,
-                        DerivationStatus::Cancelled,
-                        None,
-                    )
-                    .await?;
-                }
-                tx.commit().await?;
-                Ok((won, decision))
-            }
-            .await;
-            match result {
-                Ok((won, d)) => {
-                    if won {
-                        if let Some(state) = self.dag.node_mut(&drv_hash) {
-                            state.classify_attempt_record(
-                                exec_id,
-                                "deadline_exceeded",
-                                crate::state::OutcomeClass::Timeout,
-                                floor_flags,
-                            );
-                        }
-                        self.refresh_retry_view(&drv_hash);
-                    }
-                    decision = Some(d);
-                }
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, job_name = %job_name, error = %e,
-                          "DeadlineExceeded backstop: installment transaction failed; no verdict \
-                           taken (the worker-side report or the next deadline overrun re-drives \
-                           the budget)");
-                }
-            }
-        }
-
-        // Act on the verdict: Cancel reuses the worker-reported timeout
-        // path's terminal `Cancelled` (epilogue, no `poisoned_at`, no
-        // 24 h TTL — D1's adjudicated side); Requeue is a no-op (the
-        // disconnect already re-queued the derivation).
-        if verdict_eligible
-            && let Some(d) = decision
-            && d.verdict == crate::retry_policy::Verdict::Cancel
-        {
-            warn!(
-                drv_hash = %drv_hash, job_name = %job_name,
-                timeout_retry_count = d.counters.timeout_count, max,
-                resource_floor = ?self.dag.node(&drv_hash).map(|s| s.sched.resource_floor),
-                "DeadlineExceeded backstop: max_timeout_retries exhausted, transitioning to \
-                 Cancelled"
-            );
-            if let Some(state) = self.dag.node_mut(&drv_hash) {
-                state.ensure_running();
-                if let Err(e) = state.transition(DerivationStatus::Cancelled) {
-                    warn!(drv_hash = %drv_hash, error = %e, current = ?state.status(),
-                          "handle_deadline_exceeded: ->Cancelled transition rejected, skipping");
-                    return outcome.promoted;
-                }
-            }
-            self.unpin_best_effort(&drv_hash).await;
-            self.terminal_failure_epilogue(
-                &drv_hash,
-                &format!("max_timeout_retries={max} exhausted (DeadlineExceeded backstop)"),
-                rio_proto::types::BuildResultStatus::TimedOut,
-                None,
-            )
-            .await;
-            return outcome.promoted;
-        }
-
-        if let Some(state) = self.dag.node(&drv_hash) {
-            info!(
-                drv_hash = %drv_hash, job_name = %job_name,
-                pod_name = %pod_name, promoted = outcome.promoted,
-                timeout_retry_count = state.retry.timeout_count, max,
-                "DeadlineExceeded backstop fired"
-            );
-        }
-        outcome.promoted
-    }
-
-    /// Sweep `recently_disconnected` entries older than
-    /// [`TERMINATION_REPORT_TTL`]. Called from `handle_tick`. A swept
-    /// entry means the controller's report never arrived (controller
-    /// down, Pod deleted before reconcile observed it) — for the floor
-    /// that still degrades to "this one OOM didn't promote", and the
-    /// released attempt's ledger row is ESTABLISHED as an unreported
-    /// executor crash (`termination_reason='unreported'`,
-    /// `outcome_class='executor_crash'`) so no row sits
-    /// `disconnected/NULL` forever (the C2 data half). The fill is
-    /// keyed by the entry's carried (derivation_id, exec_id) — no DAG
-    /// lookup, so establishment still lands if the node was reaped
-    /// during the window.
-    ///
-    /// Phase 1b (T-1b.11, the C2 adjudication): the establishment is
-    /// also the charge — the same transaction re-runs `decide()` over
-    /// the updated suffix (the established crash joins the
-    /// threshold/exclusion budget, decision P1) and the sweep acts on
-    /// the verdict at this site, so a derivation that deterministically
-    /// kills its workers with no report, no classifying reason, and no
-    /// backstop-visible wedge is bounded by the poison threshold. The
-    /// E8 backstop — the other establishment vehicle — already charges
-    /// and decides at its own site; the controller's non-promoting
-    /// report deliberately establishes nothing (the classification
-    /// window for a promoting or DeadlineExceeded report stays open
-    /// until this sweep).
-    // r[impl sched.retry.per-executor-budget+3]
-    pub(super) async fn tick_sweep_recently_disconnected(&mut self, now: Instant) {
-        let expired: Vec<super::DisconnectedAttempt> = self
-            .recently_disconnected
-            .values()
-            .filter(|e| now.duration_since(e.at) >= TERMINATION_REPORT_TTL)
-            .cloned()
-            .collect();
-        self.recently_disconnected
-            .retain(|_, e| now.duration_since(e.at) < TERMINATION_REPORT_TTL);
-        for entry in expired {
-            let Some((derivation_id, exec_id)) = entry.derivation_id.zip(entry.exec_id) else {
-                continue;
-            };
-            // Standby replicas must neither write attempt rows nor
-            // decide from them (the same gate the 1a fill carried).
-            if !self.leader.is_leader() {
-                continue;
-            }
-            let drv_hash = &entry.drv_hash;
-            // A terminal verdict is acted on only while the derivation
-            // is still in a poison-able status (it may have been
-            // re-dispatched, completed elsewhere, or reaped during the
-            // 60 s window); the establishment fill itself always lands.
-            let verdict_eligible = self.dag.node(drv_hash).is_some_and(|s| {
-                matches!(
-                    s.status(),
-                    DerivationStatus::Ready
-                        | DerivationStatus::Assigned
-                        | DerivationStatus::Running
-                )
-            });
-            let result: Result<(bool, crate::retry_policy::Decision), sqlx::Error> = async {
-                let mut tx = self.db.pool().begin().await?;
-                let (won, decision) = self
-                    .fill_and_decide_in_tx(
-                        &mut tx,
-                        derivation_id,
-                        exec_id,
-                        "unreported",
-                        crate::state::OutcomeClass::ExecutorCrash,
-                        (false, false, false),
-                    )
-                    .await?;
-                if verdict_eligible
-                    && matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
-                {
-                    crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
-                }
-                tx.commit().await?;
-                Ok((won, decision))
-            }
-            .await;
-            let decision = match result {
-                Ok((won, decision)) => {
-                    if won {
-                        // OA1 interval (ii), establishment cause:
-                        // disconnect observation → the establishment
-                        // fill. Recorded only when this sweep's fill
-                        // won the row (a row another party already
-                        // classified is not re-sampled), so the cause
-                        // labels partition released attempts.
-                        metrics::histogram!(
-                            "rio_scheduler_attempt_requeue_seconds",
-                            "cause" => "establishment"
-                        )
-                        .record(now.duration_since(entry.at).as_secs_f64());
-                        if let Some(state) = self.dag.node_mut(drv_hash) {
-                            state.classify_attempt_record(
-                                exec_id,
-                                "unreported",
-                                crate::state::OutcomeClass::ExecutorCrash,
-                                (false, false, false),
-                            );
-                        }
-                        // The established crash joins the fold-backed
-                        // exclusion the dispatch-time readers consume
-                        // (`hard_filter`'s failed-on clause), so the
-                        // crashing executor is not re-offered the same
-                        // derivation within this leader tenure.
-                        self.refresh_retry_view(drv_hash);
-                    }
-                    decision
-                }
-                Err(e) => {
-                    warn!(drv_hash = %drv_hash, exec_id = %exec_id, error = %e,
-                          "establishment sweep: installment transaction failed; the row stays \
-                           unestablished for this pass (no charge, no verdict)");
-                    continue;
-                }
-            };
-            if verdict_eligible
-                && let crate::retry_policy::Verdict::Poison(reason) = decision.verdict
-            {
-                if !matches!(reason, crate::retry_policy::PoisonReason::Threshold) {
-                    error!(drv_hash = %drv_hash, ?reason,
-                           "decide() returned an unexpected poison reason for an established \
-                            crash; poisoning with the threshold message (investigate)");
-                }
-                warn!(
-                    drv_hash = %drv_hash,
-                    exec_id = %exec_id,
-                    failure_count = decision.counters.failure_count,
-                    failed_builders = decision.counters.failed_builders.len(),
-                    "establishment sweep: unreported executor crashes reached the poison \
-                     threshold, poisoning"
-                );
-                self.poison_already_recorded(
-                    drv_hash,
-                    "poison threshold reached after unreported executor crashes",
-                    None,
-                )
-                .await;
-            }
-        }
-    }
-
     /// Mark a worker draining. In-flight builds continue; no new
     /// assignments. `force=true` additionally reassigns in-flight.
     ///
@@ -1423,8 +726,7 @@ impl DagActor {
 
             // 1a: the taken in-flight execution's ledger row, complete
             // in ONE installment (`termination_reason='force_drain'`):
-            // no `recently_disconnected` entry is inserted for a drain
-            // and no controller crash report will correlate to it, so
+            // a force-drain has no follow-up classification path, so
             // it must never sit unclassified, and nothing later charges
             // it (as-built force-drain charges nothing). Appended
             // before the reassign clears the exec_id carrier; the
@@ -1470,12 +772,10 @@ impl DagActor {
         }
     }
 
-    /// Returns confirmed-phantom drv hashes for the caller to reassign,
-    /// and the `became_idle` (capacity 0→1) edge-detect for inline
-    /// dispatch. Kept sync — the async PG write for the reassign lives
-    /// in the caller (mod.rs Heartbeat arm) which already `.await`s
-    /// `dispatch_ready`.
-    pub(super) fn handle_heartbeat(&mut self, hb: HeartbeatPayload) -> (Vec<DrvHash>, bool) {
+    /// Returns the `became_idle` (capacity 0→1) edge-detect for inline
+    /// dispatch. Kept sync — the caller (mod.rs Heartbeat arm) already
+    /// `.await`s `dispatch_ready`.
+    pub(super) fn handle_heartbeat(&mut self, hb: HeartbeatPayload) -> bool {
         let executor_id = &hb.executor_id;
         // r[impl sched.executor.session-epoch]
         // I-048b: heartbeat for an executor without a stream entry is
@@ -1498,7 +798,7 @@ impl DagActor {
                 "heartbeat for unknown executor; dropping \
                  (stream not yet connected — scheduler restart race?)"
             );
-            return (Vec::new(), false);
+            return false;
         }
         // r[impl sec.executor.identity-token+2]
         // Bind the heartbeat to the executor entry: `hb.intent_id` is
@@ -1509,7 +809,7 @@ impl DagActor {
         // None on either side = dev-mode / Static-sized → permissive.
         // Runs BEFORE any mutation (reconcile_running_build, intent_id
         // overwrite, draining_hb/store_degraded) so a spoof cannot
-        // phantom-drain or flag-flip the victim.
+        // clear the victim's slot or flag-flip it.
         if let Some(worker) = self.executors.get(executor_id.as_str())
             && let Some(stored) = &worker.auth_intent
             && let Some(presented) = &hb.intent_id
@@ -1523,7 +823,7 @@ impl DagActor {
             metrics::counter!("rio_scheduler_heartbeat_rejected_total",
                               "reason" => "intent_mismatch")
             .increment(1);
-            return (Vec::new(), false);
+            return false;
         }
 
         // TOCTOU fix: a stale heartbeat must not clobber a fresh assignment.
@@ -1536,15 +836,14 @@ impl DagActor {
         //     Assigned/Running (completion already processed).
         // I-163: capture pre-heartbeat capacity for the 0→1 edge-detect
         // (`r[sched.dispatch.became-idle-immediate]`). Read here, before
-        // adopt_heartbeat_build / field updates below — same "before any
-        // mutation" snapshot as `prev_running`.
+        // the field updates below — same "before any mutation" snapshot
+        // as `prev_running`.
         let had_capacity = self
             .executors
             .get(executor_id.as_str())
             .is_some_and(|w| w.has_capacity());
 
-        let (reconciled, suspect, confirmed_phantoms) =
-            self.reconcile_running_build(executor_id, hb.running_build);
+        let reconciled = self.reconcile_running_build(executor_id, hb.running_build);
 
         // intent_id: DOWNGRADE to None if it doesn't point at a
         // currently-Ready drv. Computed here (before `get_mut`) so the
@@ -1639,20 +938,10 @@ impl DagActor {
             info!(executor_id = %executor_id, "draining cleared (heartbeat-reported)");
         }
 
-        // Missed-once → carry to next heartbeat. Missed-twice (confirmed)
-        // → already cleared from `reconciled` above so it's gone from
-        // `running_build`; drop the suspect too (re-detection would need
-        // a fresh dispatch first).
-        worker.phantom_suspect = if confirmed_phantoms.is_empty() {
-            suspect
-        } else {
-            None
-        };
-
         // r[impl sched.dispatch.became-idle-immediate]
         // Capacity 0→1 edge: fresh registration (is_registered flip),
         // store_degraded clear, draining_hb clear, or running_build
-        // cleared via reconcile/phantom. Computed AFTER all field
+        // cleared via reconcile. Computed AFTER all field
         // writes above (running_build, store_degraded, draining_hb)
         // and BEFORE on_worker_registered borrows &mut self. The
         // caller (mod.rs Heartbeat arm) dispatches inline on this
@@ -1690,54 +979,42 @@ impl DagActor {
             }
         }
 
-        (confirmed_phantoms, became_idle)
+        became_idle
     }
 
     /// TOCTOU reconcile: a stale heartbeat must not clobber a fresh
     /// assignment. The scheduler is authoritative for what it assigned.
     ///   - Keep the scheduler-known build if it is still
-    ///     Assigned/Running in the DAG (heartbeat may predate the
-    ///     assignment).
-    ///   - Adopt a heartbeat-reported build we don't know about
-    ///     (`r[sched.heartbeat.adopt]`).
+    ///     Assigned/Running in the DAG on this executor (the heartbeat
+    ///     may predate the assignment).
+    ///   - Otherwise mirror the worker's own claim of being busy
+    ///     (worker-side capacity bookkeeping only — no DAG mutation).
     ///   - Clear if absent from heartbeat AND DAG state is no longer
     ///     Assigned/Running (completion already processed).
-    ///   - Phantom-detect (`r[sched.heartbeat.phantom-drain]`, I-035):
-    ///     two consecutive heartbeats where the scheduler-kept build is
-    ///     missing from the worker's report → past the ~10s race window
-    ///     → lost completion à la I-032, or assignment sent into a
-    ///     stream that died right after.
     ///
-    /// Returns `(reconciled_running_build, suspect_for_next_hb,
-    /// confirmed_phantoms_to_drain)`.
-    // r[impl sched.heartbeat.adopt]
-    // r[impl sched.heartbeat.phantom-drain+2]
-    // r[impl sched.executor.repair-precedence]
+    /// The stream-era heartbeat repair arms that used to live here
+    /// (DAG-side adoption of unknown builds, the two-strike phantom
+    /// drain) are gone with the session machinery: pull-mode attempts
+    /// are durable rows owned by the report intake and the
+    /// establishment sweep, not by heartbeat reconciliation.
     fn reconcile_running_build(
         &mut self,
         executor_id: &ExecutorId,
         running_build: Option<String>,
-    ) -> (Option<DrvHash>, Option<DrvHash>, Vec<DrvHash>) {
+    ) -> Option<DrvHash> {
         // Worker reports a drv_path; resolve to a drv_hash via the DAG
         // index. The gRPC layer already rejected >1 entry (P0537).
         let heartbeat_hash: Option<DrvHash> =
             running_build.and_then(|path| self.dag.hash_for_path(&path).cloned());
 
-        // Compute the reconciled value before borrowing worker mutably,
-        // so we can read self.dag for derivation state checks.
-        let (prev_running, admin_draining) = self
+        let prev_running = self
             .executors
             .get(executor_id.as_str())
-            .map(|w| (w.running_build.clone(), w.draining))
-            .unwrap_or((None, false));
+            .and_then(|w| w.running_build.clone());
 
         // Keep the scheduler-assigned build if still in-flight ON THIS
-        // EXECUTOR. The ownership check matters for the adopt-conflict
-        // path (W1 reports D, DAG has D Assigned→W2): without it, W1's
-        // `running_build=D` survives as `prev_kept=Some(D)`, two empty
-        // W1 heartbeats turn D into a confirmed phantom, and
-        // `drain_phantoms` resets D to Ready while W2 is mid-build —
-        // W2's eventual completion is then dropped on the floor.
+        // EXECUTOR. The ownership check keeps a stale entry from
+        // surviving after the DAG re-assigned the derivation elsewhere.
         let prev_kept: Option<DrvHash> = prev_running.as_ref().and_then(|h| {
             self.dag
                 .node(h)
@@ -1749,218 +1026,12 @@ impl DagActor {
                 })
                 .then(|| h.clone())
         });
-        // Adopt a heartbeat-reported build the scheduler doesn't have on
-        // record for this executor. Expected after a scheduler restart:
-        // recovery's reconcile may have reset the assignment to Ready
-        // (worker not yet reconnected) and re-dispatched, while the
-        // worker still has it in-flight (I-063 keeps the stream alive
-        // during drain). The worker is authoritative for what it's
-        // running — adopt into BOTH `worker.running_build` (so dispatch
-        // sees at-capacity) AND the DAG node (so dispatch_ready won't
-        // re-pop it; reconcile's cross-check matches). I-066: without
-        // the DAG-side adoption, openssl was re-dispatched while two
-        // draining workers were already running it → both ended up in
-        // failed_builders → I-065 poisoned a passing build.
-        //
-        // Whenever the worker reports `Some(hb)` and we have nothing
-        // else for it, `running_build = Some(hb)` — matching the
-        // worker's authoritative claim of being busy. The
-        // `adopt_heartbeat_build` SIDE-EFFECT (DAG adoption + log/
-        // metric) is gated separately on `prev_running != Some(hb)` so
-        // it fires once on the first transition, not every heartbeat.
-        // Without the split, an adopt-conflict worker whose DAG[D] is
-        // terminal (W2 completed first) would oscillate None↔Some(D)
-        // every heartbeat: prev_kept=None, guard false → fall through
-        // to kept.clone()=None → spurious became_idle → inline
-        // dispatch_ready to a worker that's actually busy.
-        let mut reconciled: Option<DrvHash> = match (&prev_kept, &heartbeat_hash) {
-            (None, Some(hb)) => {
-                // Skip DAG-side adoption for an admin-draining worker:
-                // force-drain just reset this drv to Ready and the
-                // worker's CompletionReport{Cancelled} must find it
-                // Ready to no-op (handle_drain_executor :821-825).
-                // `draining` (admin-set), NOT `is_draining()` — the
-                // I-066 post-restart adopt path relies on this firing
-                // while `draining_hb` is true (worker.draining is
-                // cleared on reconnect).
-                if prev_running.as_ref() != Some(hb) && !admin_draining {
-                    self.adopt_heartbeat_build(executor_id, hb);
-                }
-                Some(hb.clone())
-            }
+        // No scheduler-side record: mirror the worker's claim so
+        // dispatch sees the slot as occupied. Worker-side bookkeeping
+        // only — the DAG is never mutated from a heartbeat.
+        match (&prev_kept, &heartbeat_hash) {
+            (None, Some(hb)) => Some(hb.clone()),
             (kept, _) => kept.clone(),
-        };
-
-        // Phantom detection: compute against PRIOR phantom_suspect.
-        let suspect: Option<DrvHash> = reconciled
-            .as_ref()
-            .filter(|r| heartbeat_hash.as_ref() != Some(r))
-            .cloned();
-        let prior_suspect: Option<DrvHash> = self
-            .executors
-            .get(executor_id.as_str())
-            .and_then(|w| w.phantom_suspect.clone());
-        let confirmed_phantoms: Vec<DrvHash> = match (&suspect, &prior_suspect) {
-            (Some(s), Some(p)) if s == p => {
-                warn!(
-                    executor_id = %executor_id,
-                    drv_hash = %s,
-                    "phantom running_build entry: scheduler tracked this assignment \
-                     across two heartbeats but worker reports nothing — draining \
-                     (lost completion?)"
-                );
-                metrics::counter!("rio_scheduler_phantom_assignments_drained_total").increment(1);
-                reconciled = None;
-                vec![s.clone()]
-            }
-            _ => Vec::new(),
-        };
-
-        (reconciled, suspect, confirmed_phantoms)
-    }
-
-    /// Reset confirmed-phantom derivations to Ready and re-queue.
-    /// Called from the Heartbeat arm in mod.rs after `handle_heartbeat`
-    /// returns — split out because the PG write is async and
-    /// `handle_heartbeat` stays sync.
-    ///
-    /// NOT via `reassign_derivations`: that path adds to
-    /// `failed_builders` + checks poison, but a phantom is NOT a worker
-    /// failure. The worker may have completed successfully and we just
-    /// never heard about it (I-032). Penalizing the executor_id would
-    /// recreate the very dead-capacity problem this drain exists to
-    /// fix.
-    ///
-    /// `executor_id`: the heartbeating worker. Guarded so a phantom
-    /// assigned to a DIFFERENT worker is never reset — defense-in-
-    /// depth for the adopt-conflict case (`prev_kept`'s ownership
-    /// check is the primary guard; this makes the clobber impossible
-    /// even if that regresses).
-    pub(super) async fn drain_phantoms(
-        &mut self,
-        executor_id: &ExecutorId,
-        phantoms: Vec<DrvHash>,
-    ) {
-        let mut affected: std::collections::HashSet<Uuid> = Default::default();
-        for phantom in phantoms {
-            let Some(state) = self.dag.node_mut(&phantom) else {
-                continue;
-            };
-            if state
-                .assigned_executor
-                .as_ref()
-                .is_some_and(|a| a != executor_id)
-            {
-                // Adopt-conflict residue: W1's stale running_build
-                // entry pointed at a drv now owned by W2. prev_kept's
-                // ownership check should have dropped it before it
-                // became a phantom; if it didn't, refuse the reset
-                // here so W2's in-flight build isn't yanked.
-                debug!(drv_hash = %phantom, owner = ?state.assigned_executor,
-                       reporter = %executor_id,
-                       "phantom drain: assigned to a different executor; skipping");
-                continue;
-            }
-            if let Err(e) = state.reset_to_ready() {
-                // State changed under us (completion arrived between
-                // heartbeat and here, or another build cancelled it).
-                // The phantom is moot — skip.
-                debug!(drv_hash = %phantom, error = %e,
-                       "phantom drain: reset_to_ready rejected (state moved)");
-                continue;
-            }
-            self.persist_status(&phantom, DerivationStatus::Ready, None)
-                .await;
-            affected.extend(self.get_interested_builds(&phantom));
-            self.push_ready(phantom);
-        }
-        // Dashboard: running count dropped; assigned_executors lost
-        // this worker. Emit so a quiet build doesn't show stale
-        // Running until the next unrelated dispatch/completion. Same
-        // chokepoint rationale as `reassign_derivations`.
-        for build_id in affected {
-            self.emit_progress(build_id);
-        }
-    }
-
-    /// DAG-side adoption of a heartbeat-reported build the scheduler
-    /// has no record of for this executor. The worker is authoritative
-    /// for what it's running — recovery's reconcile may have already
-    /// reset to Ready and re-dispatched elsewhere by the time the
-    /// worker's first post-restart heartbeat arrives.
-    ///
-    /// In-mem only (no PG persist): `handle_heartbeat` stays sync. The
-    /// next status change (completion/failure) persists; if the
-    /// scheduler crashes again before that, the next adoption is
-    /// idempotent.
-    fn adopt_heartbeat_build(&mut self, executor_id: &ExecutorId, hb: &DrvHash) {
-        let Some(state) = self.dag.node_mut(hb) else {
-            // hash_for_path resolved it, so the node existed a moment
-            // ago — concurrent removal would need another command in
-            // between, but the actor is single-threaded. Unreachable
-            // in practice; warn for visibility.
-            warn!(executor_id = %executor_id, drv_hash = %hb,
-                  "heartbeat-adopt: node vanished after hash_for_path");
-            return;
-        };
-        match state.status() {
-            DerivationStatus::Ready => {
-                // Recovery's reconcile reset it. Re-claim for this
-                // worker so dispatch_ready won't re-pop and the
-                // ~45s-later reconcile cross-check matches.
-                if let Err(e) = state.transition(DerivationStatus::Assigned) {
-                    warn!(executor_id = %executor_id, drv_hash = %hb, error = %e,
-                          "heartbeat-adopt: Ready→Assigned rejected");
-                    return;
-                }
-                state.assigned_executor = Some(executor_id.clone());
-                info!(executor_id = %executor_id, drv_hash = %hb,
-                      "adopted in-flight build from reconnecting worker (was Ready)");
-                metrics::counter!("rio_scheduler_heartbeat_adoptions_total").increment(1);
-            }
-            DerivationStatus::Assigned | DerivationStatus::Running => {
-                match state.assigned_executor.as_ref() {
-                    Some(a) if a == executor_id => {
-                        // Already correct — recovery loaded it Assigned
-                        // to this worker, worker reconnected before
-                        // reconcile reset it. Just the worker.running_
-                        // build side was stale (handle_worker_connected
-                        // creates a fresh entry with running_build=None).
-                        info!(executor_id = %executor_id, drv_hash = %hb,
-                              "re-adopted in-flight build (DAG already Assigned to this worker)");
-                    }
-                    other => {
-                        // Conflict: reconcile already re-dispatched to
-                        // someone else. Both will run; first to complete
-                        // uploads, second finds output-already-in-store.
-                        // Don't steal the DAG assignment (the other
-                        // worker's stream got a real WorkAssignment;
-                        // this one's relying on its old local state).
-                        // The caller still sets worker.running_build so
-                        // this worker is at-capacity.
-                        warn!(executor_id = %executor_id, drv_hash = %hb,
-                              dag_assigned_to = ?other,
-                              "heartbeat-adopt: DAG already Assigned elsewhere; \
-                               both will run (first-to-complete wins)");
-                        metrics::counter!("rio_scheduler_heartbeat_adopt_conflicts_total")
-                            .increment(1);
-                    }
-                }
-            }
-            other => {
-                // Terminal (Completed/Poisoned/DepFailed/Cancelled/
-                // Skipped) or pre-Ready (Created/Queued/Failed). Either
-                // way the DAG can't accept the worker's claim — the
-                // worker's local build is stale or split-brain. Its
-                // eventual completion report will no-op (handle_
-                // completion guards on status). Caller still sets
-                // worker.running_build = Some(hb) — one heartbeat
-                // cycle of false at-capacity, cleared once the worker's
-                // local build exits and next heartbeat omits it.
-                warn!(executor_id = %executor_id, drv_hash = %hb, status = ?other,
-                      "heartbeat-adopt: DAG node not adoptable; \
-                       worker's in-flight build is stale");
-            }
         }
     }
 }

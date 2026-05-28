@@ -401,7 +401,6 @@ async fn main() -> anyhow::Result<()> {
         actor.clone(),
         db,
         Arc::clone(&is_leader_for_grpc),
-        Arc::clone(&generation),
         // jwt_mode from config (not from `jwt_pubkey.is_some()` —
         // that's loaded below the server-builder for hot-reload
         // wiring; the path being set is what determines mode).

@@ -15,7 +15,7 @@ mod executor_service;
 mod scheduler_service;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::AtomicBool;
 
 use futures_util::StreamExt;
 use tokio::sync::broadcast;
@@ -55,12 +55,6 @@ pub struct SchedulerGrpc {
     /// a health-aware balanced channel route to the leader
     /// instead. Tests default to `true` (always-leader).
     is_leader: Arc<AtomicBool>,
-    /// Shared with the lease loop. The `worker-stream-reader` loop
-    /// captures this at stream-open and breaks if it changes —
-    /// generation-fences open worker streams so an ex-leader doesn't
-    /// forward `ProcessCompletion` for a generation it no longer owns
-    /// (r[sched.lease.standby-drops-writes]). Tests default to `1`.
-    pub(super) generation: Arc<AtomicU64>,
     /// True when a JWT pubkey is configured. The interceptor is
     /// permissive-on-absent-header (worker/health/admin callers
     /// don't carry tenant tokens), so SchedulerService handlers
@@ -85,7 +79,6 @@ impl SchedulerGrpc {
             actor,
             db: None,
             is_leader: Arc::new(AtomicBool::new(true)),
-            generation: Arc::new(AtomicU64::new(1)),
             jwt_mode: false,
             hmac_key: None,
         }
@@ -99,7 +92,6 @@ impl SchedulerGrpc {
             actor,
             db: Some(SchedulerDb::new(pool)),
             is_leader: Arc::new(AtomicBool::new(true)),
-            generation: Arc::new(AtomicU64::new(1)),
             jwt_mode: false,
             hmac_key: None,
         }
@@ -117,7 +109,6 @@ impl SchedulerGrpc {
         actor: ActorHandle,
         db: SchedulerDb,
         is_leader: Arc<AtomicBool>,
-        generation: Arc<AtomicU64>,
         jwt_mode: bool,
         hmac_key: Option<Arc<HmacKey>>,
     ) -> Self {
@@ -125,7 +116,6 @@ impl SchedulerGrpc {
             actor,
             db: Some(db),
             is_leader,
-            generation,
             jwt_mode,
             hmac_key,
         }

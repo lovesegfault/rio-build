@@ -2,7 +2,7 @@
 # top of vmtest-full.yaml by nix/tests/fixtures/k3s-full.nix via
 # `extraValuesFiles` (Helm -f last-wins, maps deep-merge per key).
 #
-# Knob 1: pin the SLA probe deadline to the config floor (180 s —
+# Pin the SLA probe deadline to the config floor (180 s —
 # rio-scheduler/src/sla/config.rs rejects anything lower). The base
 # vmtest-full.yaml uses 3600 s, which makes the pull-mode establishment
 # window (solved intent deadline + establishment_report_slack, slack
@@ -21,17 +21,3 @@ scheduler:
   sla:
     probe:
       deadlineSecs: 180
-
-# Knob 2: keep THIS fixture's helm-rendered default pool (x86-64) on
-# the legacy stream protocol. The pull-canary scenario's
-# stream-baseline arm runs the scripted success+failure sequence on
-# that pool and asserts dispatch_mode=stream, so the retry-feed
-# equivalence has a stream leg to compare against. The corpus default
-# went Pull at the T-1c.2b re-point (vmtest-full.yaml no longer sets
-# dispatchMode), so the stream leg needs this explicit per-check pin.
-# Retired together with the baseline arm by the 1c' deletion wave
-# (deletion commit A, T-1c'.2) when the stream session machinery
-# goes; the scenario's own pull pools set dispatchMode: Pull
-# explicitly and are unaffected by this default.
-poolDefaults:
-  dispatchMode: Stream

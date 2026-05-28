@@ -91,26 +91,6 @@ pub struct ExecutorState {
     /// anyway, but in the gap the new scheduler would mis-dispatch.
     /// Heartbeat is the only writer.
     pub draining_hb: bool,
-    /// Last derivation this executor sent a `CompletionReport` for
-    /// (any terminal status). Set in `handle_completion` alongside the
-    /// `running_build = None` clear. In-memory only.
-    ///
-    /// I-197: discriminates expected one-shot exit from mid-build pod
-    /// death. Disconnect with `running_build == Some(X)` and
-    /// `last_completed != Some(X)` means X was mid-build when the pod
-    /// died → record into `recently_disconnected` so the controller's
-    /// follow-up `ReportExecutorTermination` (k8s OOMKilled/Evicted
-    /// reason) can resolve `executor_id → drv_hash` and promote
-    /// `resource_floor` IFF the reason was OOMKilled/DiskPressure.
-    /// When `last_completed == running_build` the disconnect is the
-    /// expected post-completion one-shot exit → no entry (controller
-    /// would report `Completed` and we'd ignore it; skip the churn).
-    ///
-    /// The scheduler no longer infers OOM from bare disconnect — that
-    /// over-fired on pod-kill / store-replica-restart / node failure
-    /// (live QA: cmake medium→large→xlarge with zero builds run). The
-    /// controller is authoritative on termination reason.
-    pub last_completed: Option<DrvHash>,
     /// FUSE circuit breaker open on the executor — it can't fetch inputs
     /// from rio-store. Treated like `draining`: `has_capacity()` returns
     /// false, `best_executor()` excludes it. Unlike `draining` this is
@@ -143,21 +123,6 @@ pub struct ExecutorState {
     /// warm before dispatching — adds ~prefetch-time to time-to-
     /// first-dispatch, but the build itself runs at warm speed.
     pub warm: bool,
-    /// Prior heartbeat's reconcile KEPT `running_build` (still
-    /// Assigned/Running in DAG) but the worker did NOT report it.
-    /// One miss = TOCTOU race (assignment landed between worker
-    /// snapshot and heartbeat arrival, ~10s). Two consecutive misses
-    /// = phantom: assignment over 10s old, worker still doesn't know.
-    /// Either the completion was lost in transit (I-032 pre-d11245b4)
-    /// or the send succeeded into a stream that died right after.
-    /// The slot is dead capacity until cleared.
-    ///
-    /// `handle_heartbeat` checks this against the current miss; on
-    /// second hit, resets the drv to Ready + clears `running_build`.
-    /// In-memory only — restart clears all executor state, and
-    /// post-recovery `handle_reconcile_assignments` is the cold-start
-    /// equivalent.
-    pub phantom_suspect: Option<DrvHash>,
     /// ADR-023 SpawnIntent match key from the pod's `rio.build/
     /// intent-id` annotation (downward-API → `RIO_INTENT_ID` →
     /// HeartbeatRequest.intent_id). `None` = pod spawned without an
@@ -204,14 +169,12 @@ impl ExecutorState {
             last_heartbeat: Instant::now(),
             draining: false,
             draining_hb: false,
-            last_completed: None,
             store_degraded: false,
             connected_since: Instant::now(),
             last_resources: None,
             // Warm-gate: cold until PrefetchComplete (or until the
             // registration hook flips it for an empty ready-queue).
             warm: false,
-            phantom_suspect: None,
             intent_id: None,
             auth_intent: None,
             stream_epoch: 0,

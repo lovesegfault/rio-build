@@ -250,53 +250,6 @@ impl DagActor {
         ))
     }
 
-    /// The two-installment re-decide (E6/E7, Phase 1b): perform the
-    /// second installment on the released attempt's row (first writer
-    /// wins, keyed by the carried `(derivation_id, exec_id)` — never a
-    /// DAG lookup) and re-run `decide()` over the updated suffix plus
-    /// the transitional legacy seed on the same connection. The caller
-    /// persists the verdict's terminal status via the `_in_tx` variants
-    /// on the same transaction (when it is going to act on it) and
-    /// commits; the in-memory record mirror
-    /// (`classify_attempt_record`) happens after the commit, exactly as
-    /// the appends do.
-    ///
-    /// Returns whether THIS call performed the fill alongside the
-    /// decision.
-    pub(super) async fn fill_and_decide_in_tx(
-        &self,
-        tx: &mut sqlx::PgConnection,
-        derivation_id: Uuid,
-        exec_id: Uuid,
-        termination_reason: &str,
-        outcome_class: OutcomeClass,
-        floor: (bool, bool, bool),
-    ) -> Result<(bool, crate::retry_policy::Decision), sqlx::Error> {
-        let won = crate::db::SchedulerDb::fill_termination(
-            tx,
-            derivation_id,
-            exec_id,
-            termination_reason,
-            outcome_class,
-            floor,
-        )
-        .await?;
-        let suffix =
-            crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(tx, derivation_id).await?;
-        let seed = crate::db::SchedulerDb::load_retry_seed_in_tx(tx, derivation_id).await?;
-        let history: Vec<crate::state::AttemptRecord> =
-            suffix.iter().map(AttemptRow::to_record).collect();
-        Ok((
-            won,
-            crate::retry_policy::decide(
-                &history,
-                &self.decision_budget(),
-                crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-                seed.as_ref(),
-            ),
-        ))
-    }
-
     /// Append one attempt row with NO accompanying status persist — the
     /// no-report observation sites (disconnect, force-drain, backstop)
     /// whose own status writes happen elsewhere (inside
@@ -887,7 +840,6 @@ impl DagActor {
             store_paths: check_paths,
         });
         rio_proto::interceptor::inject_current(req.metadata_mut());
-        let fmp_start = Instant::now();
         let missing: HashSet<String> = match tokio::time::timeout(
             self.grpc_timeout,
             store_client.clone().find_missing_paths(req),
@@ -896,17 +848,14 @@ impl DagActor {
         {
             Ok(Ok(r)) => r.into_inner().missing_paths.into_iter().collect(),
             Ok(Err(e)) => {
-                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!(error = %e, "CA cutoff verify: FindMissingPaths failed; skipping cascade");
                 return HashMap::new();
             }
             Err(_elapsed) => {
-                self.credit_heartbeats_for_stall(fmp_start.elapsed());
                 debug!("CA cutoff verify: FindMissingPaths timed out; skipping cascade");
                 return HashMap::new();
             }
         };
-        self.credit_heartbeats_for_stall(fmp_start.elapsed());
 
         // Verified = candidates where ALL prior outputs are present.
         cand_to_prior
@@ -1085,14 +1034,6 @@ impl DagActor {
             && worker.running_build.as_ref() == Some(drv_hash)
         {
             worker.running_build = None;
-            // r[impl sched.retry.no-double-count]
-            // I-197: record that THIS drv terminated on THIS executor.
-            // `reassign_derivations` reads it on disconnect to tell
-            // OOMKilled-mid-build (last_completed != running) from the
-            // I-188 post-completion race (last_completed == running).
-            // Any terminal report counts — success, failure, infra,
-            // cancelled — the build is no longer "in flight" either way.
-            worker.last_completed = Some(drv_hash.clone());
             // r[impl sched.ephemeral.no-redispatch-after-completion]
             // r[impl sched.executor.one-shot]
             // I-188: every executor is one-shot — it exits after this

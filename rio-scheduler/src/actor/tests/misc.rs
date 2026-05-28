@@ -267,70 +267,6 @@ async fn test_ex_leader_housekeeping_is_noop_after_lose() -> TestResult {
     Ok(())
 }
 
-// r[verify obs.metric.scheduler-leader-gate+2]
-/// `handle_leader_lost` must NOT zero `rio_scheduler_workers_active`:
-/// `executors` is retained (live connections, not persisted) and
-/// `ExecutorDisconnected` is not leader-gated. Zeroing it desyncs from
-/// N retained entries; each worker rebalancing away then decrements
-/// from the zeroed baseline → −1…−N. The inc/dec path maintains it
-/// correctly on standby; workers leaving drain it naturally to 0.
-#[tokio::test]
-async fn test_leader_lost_workers_active_stays_nonneg() -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task, leader) = spawn_actor_with_leader(db.pool.clone(), true, true);
-
-    // Connect+register 2 workers as leader. inc/dec at executor.rs
-    // sets workers_active=2.
-    let _rx1 = connect_executor(&handle, "wa-w1", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "wa-w2", "x86_64-linux").await?;
-    barrier(&handle).await;
-    assert_eq!(
-        recorder.gauge_value("rio_scheduler_workers_active{}"),
-        Some(2.0),
-        "precondition: 2 workers registered"
-    );
-
-    // Lose the lease. handle_leader_lost must NOT zero workers_active
-    // (executors map still has 2 entries).
-    leader.on_lose();
-    handle.send_unchecked(ActorCommand::LeaderLost).await?;
-    barrier(&handle).await;
-    assert_eq!(
-        recorder.gauge_value("rio_scheduler_workers_active{}"),
-        Some(2.0),
-        "LeaderLost must NOT zero workers_active (executors retained)"
-    );
-
-    // Workers rebalance to the new leader → streams to this pod drop
-    // → ExecutorDisconnected (NOT leader-gated) → decrement.
-    for w in ["wa-w1", "wa-w2"] {
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: w.into(),
-                stream_epoch: stream_epoch_for(w),
-            })
-            .await?;
-    }
-    barrier(&handle).await;
-
-    // Gauge must be 0, NOT −2. Before the fix: set(0.0) on LeaderLost
-    // followed by 2× decrement → −2.0.
-    assert_eq!(
-        recorder.gauge_value("rio_scheduler_workers_active{}"),
-        Some(0.0),
-        "workers_active must drain to 0 (not go negative) after \
-         LeaderLost + disconnects"
-    );
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// HMAC assignment token signing
-// ---------------------------------------------------------------------------
-
 // r[verify sec.boundary.grpc-hmac]
 /// When `with_hmac_signer` is set, dispatched assignments carry a
 /// signed token that the store can verify. Token must contain the
@@ -716,62 +652,6 @@ async fn test_backpressure_hysteresis() -> TestResult {
 // ---------------------------------------------------------------------------
 // Token-aware shutdown
 // ---------------------------------------------------------------------------
-
-/// Cancelling the shutdown token drains `workers` and exits the actor
-/// loop. The worker's `stream_rx` closes (receives None), proving the
-/// `stream_tx` senders were dropped. This is the cascade that unblocks
-/// tonic's `serve_with_shutdown` — without it, open bidi streams keep
-/// the server waiting past `systemctl stop`'s timeout → SIGKILL →
-/// no atexit → no LLVM profraw.
-#[tokio::test]
-async fn test_shutdown_token_drains_workers() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let token = rio_common::signal::Token::new();
-    let (handle, task) = setup_actor_configured(db.pool.clone(), None, {
-        let token = token.clone();
-        |_, p| p.shutdown = token
-    });
-
-    // Connect a worker — gives the actor a stream_tx to drop. Then
-    // query workers: the reply arrives AFTER ExecutorConnected is
-    // processed (same mpsc queue, FIFO), so the stream_tx is in
-    // self.executors when we cancel — the test exercises workers.clear()
-    // specifically, not just "rx drops when the loop breaks".
-    let mut stream_rx = connect_executor(&handle, "sd-worker", "x86_64-linux").await?;
-    let workers = handle.debug_query_workers().await?;
-    assert_eq!(workers.len(), 1, "worker should be registered");
-
-    // Cancel. biased select! sees this first; workers.clear() drops
-    // stream_tx.
-    token.cancel();
-
-    // stream_rx.recv() returns None once all senders (just the actor's
-    // stream_tx) drop. Timeout: if the actor didn't drain, this hangs.
-    let closed = tokio::time::timeout(Duration::from_secs(5), stream_rx.recv())
-        .await
-        .expect("stream should close within 5s of token cancel");
-    assert!(
-        closed.is_none(),
-        "stream_rx should close (None) after drain"
-    );
-
-    // Actor loop broke → task joinable. Drop the handle so the
-    // mpsc::Sender drops → rx.recv() also returns None if the select!
-    // happens to poll the rx arm first (race, but biased mitigates).
-    drop(handle);
-    tokio::time::timeout(Duration::from_secs(5), task)
-        .await
-        .expect("actor task should join within 5s")
-        .expect("actor task should not panic");
-
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Spawn-intent snapshot (D5)
-// ---------------------------------------------------------------------------
-
-use crate::actor::SpawnIntentsRequest;
 
 fn req_features(f: Option<&[&str]>) -> SpawnIntentsRequest {
     SpawnIntentsRequest {
@@ -1397,58 +1277,6 @@ async fn solve_intent_for_feature_probe_deadline() {
 }
 
 // ---------------------------------------------------------------------------
-
-/// `handle_inspect_build_dag` cross-references derivation state
-/// against the live executor stream pool. The I-025 signal:
-/// `executor_has_stream` is true iff the assigned executor's gRPC
-/// bidi stream is present in `self.executors`.
-// r[verify sched.admin.inspect-dag]
-#[tokio::test]
-async fn inspect_build_dag_cross_references_stream_pool() -> TestResult {
-    let (_db, handle, _task, mut stream_rx) = setup_with_worker("w-idiag", "x86_64-linux").await?;
-
-    let build_id = Uuid::new_v4();
-    let node = make_node("idiag-drv");
-    let _events = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // dispatch_ready ran inside merge → drain the assignment so the
-    // worker stream stays unblocked.
-    let _ = stream_rx.try_recv();
-
-    let (diags, live) = handle
-        .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
-        })
-        .await?;
-    assert_eq!(diags.len(), 1, "one derivation in build");
-    let d = &diags[0];
-    assert_eq!(d.assigned_executor, "w-idiag");
-    assert!(
-        d.executor_has_stream,
-        "live worker → executor_has_stream=true"
-    );
-    assert!(live.contains(&"w-idiag".to_string()));
-
-    // Drop the executor entry (simulates dead bidi-stream;
-    // ExecutorDisconnected also resets the drv but here we only care
-    // that the cross-ref turns false for the snapshot taken BEFORE
-    // any reconciliation reassigns it).
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "w-idiag".into(),
-            stream_epoch: stream_epoch_for("w-idiag"),
-        })
-        .await?;
-    let (_, live_after) = handle
-        .query_unchecked(|reply| {
-            ActorCommand::Admin(AdminQuery::InspectBuildDag { build_id, reply })
-        })
-        .await?;
-    assert!(
-        !live_after.contains(&"w-idiag".to_string()),
-        "executor map dropped after disconnect"
-    );
-    Ok(())
-}
 
 /// I-107: `queued_by_system` is a per-system breakdown of
 /// `queued_derivations` — Ready-only, sum across keys equals the
@@ -2104,18 +1932,6 @@ async fn clear_persisted_state_clears_per_generation_maps() {
     let db = TestDb::new(&MIGRATOR).await;
     let mut actor = bare_actor(db.pool.clone());
 
-    actor.recently_disconnected.insert(
-        "stale-exec".into(),
-        crate::actor::DisconnectedAttempt {
-            drv_hash: "stale".into(),
-            derivation_id: None,
-            exec_id: None,
-            at: std::time::Instant::now(),
-        },
-    );
-    actor
-        .hung_nodes
-        .insert("nA".into(), std::time::Instant::now());
     actor.authoritative_binding.insert(
         "stale-drv".into(),
         crate::actor::AuthBinding {
@@ -2126,14 +1942,6 @@ async fn clear_persisted_state_clears_per_generation_maps() {
 
     actor.clear_persisted_state();
 
-    assert!(
-        actor.recently_disconnected.is_empty(),
-        "recently_disconnected must be cleared on leader transition"
-    );
-    assert!(
-        actor.hung_nodes.is_empty(),
-        "hung_nodes (tick-derived) must be cleared on leader transition"
-    );
     assert!(
         actor.authoritative_binding.is_empty(),
         "authoritative_binding (controller-reported per-generation) must be cleared"

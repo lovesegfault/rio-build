@@ -3,101 +3,16 @@
 //! RPCs (ClusterStatus, GetSpawnIntents, InspectBuildDag,
 //! DebugListExecutors).
 
-use std::collections::{HashMap, HashSet};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use crate::state::{
-    BuildState, DerivationStatus, DrvHash, ExecutorId, ExecutorState, HEARTBEAT_TIMEOUT_SECS,
-    SolvedIntent,
-};
+use crate::state::{BuildState, DerivationStatus, DrvHash, SolvedIntent};
 
 use super::{
     AdminQuery, AuthBinding, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
     SpawnIntentsSnapshot, command,
 };
-
-/// §13b hung-node detector (`r[sched.admin.hung-node-detector]`).
-///
-/// Groups executors by node; flags a node when `stale ≥ max(2,
-/// ⌈0.5·occ⌉)` AND those stale executors span ≥2 tenants. The tenant
-/// criterion discriminates a hung NODE (kubelet/EBS/kernel — every
-/// tenant's builds stall) from a single tenant's pathological build
-/// hanging its own pods. Idle executors (`running_build = None`) are
-/// skipped by policy (no work is stuck there; §Threat-model opt-in —
-/// forging `Some` opts the attacker IN to scrutiny). They CAN be
-/// node-attributed (`auth_intent` is set at connect, never cleared on
-/// idle); the explicit early-return below is what excludes them.
-///
-/// Both `node` AND `tenant` are read off the SAME `bindings` entry
-/// (`AuthBinding{node, tenant}` keyed on the executor's HMAC-attested
-/// **`auth_intent`** — the pod's spawn-time `INTENT_ID_ANNOTATION`,
-/// set once at connect, never mutated by heartbeat). They
-/// structurally cannot diverge: `tenant.is_some() ⟺ node-attributed`
-/// modulo the first-Ack-after-spawn window where the spawn-drv was
-/// already DAG-absent (mb_012). Keying on `running_build` would be
-/// wrong: it diverges from `auth_intent` under dispatch fall-through,
-/// and `reconcile_running_build`'s `(None, Some(hb))` arm sets it
-/// from the heartbeat unconditionally, so a compromised worker could
-/// heartbeat `running_build=D` for a victim node's drv to inflate
-/// `occ` (suppress detection) or for other tenants' drvs to forge
-/// `|tenants|≥2` (cause detection). `running_build` is read ONLY as
-/// `.is_none()` for the idle opt-out; the value itself is never read.
-/// Executors lacking an `authoritative_binding` entry (controller-lag,
-/// Ack channel down) are skipped — fail-safe — and counted in
-/// `rio_scheduler_hung_detect_skipped_no_authoritative_total`.
-// r[impl sched.admin.hung-node-detector+3]
-pub(super) fn detect_hung_nodes(
-    executors: &HashMap<ExecutorId, ExecutorState>,
-    bindings: &HashMap<DrvHash, AuthBinding>,
-    now: Instant,
-) -> Vec<String> {
-    #[derive(Default)]
-    struct Agg {
-        occ: u32,
-        stale: u32,
-        tenants: HashSet<Uuid>,
-    }
-    let timeout = Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
-    let mut by_node: HashMap<String, Agg> = HashMap::new();
-    let mut skipped_no_node = 0u64;
-    for w in executors.values() {
-        if w.running_build.is_none() {
-            // Idle — no contribution. This check stays FIRST so an
-            // idle executor with a binding doesn't inflate `occ`.
-            continue;
-        }
-        let Some(auth) = w.auth_intent.as_deref() else {
-            // Recovery-reconciled / pre-ADR-023 pod with no
-            // intent annotation — same fail-safe skip as no-binding.
-            continue;
-        };
-        let Some(b) = bindings.get(auth) else {
-            skipped_no_node += 1;
-            continue;
-        };
-        let agg = by_node.entry(b.node.clone()).or_default();
-        agg.occ += 1;
-        if now.duration_since(w.last_heartbeat) > timeout {
-            agg.stale += 1;
-            if let Some(t) = b.tenant {
-                agg.tenants.insert(t);
-            }
-        }
-    }
-    if skipped_no_node > 0 {
-        ::metrics::counter!("rio_scheduler_hung_detect_skipped_no_authoritative_total")
-            .increment(skipped_no_node);
-    }
-    let mut hung: Vec<String> = by_node
-        .into_iter()
-        .filter(|(_, a)| a.stale >= 2.max(a.occ.div_ceil(2)) && a.tenants.len() >= 2)
-        .map(|(n, _)| n)
-        .collect();
-    hung.sort();
-    hung
-}
 
 /// §13e + r35: thin accessor for the drv's stored
 /// [`DerivationState::effective_features`] field. The derivation moved
@@ -789,7 +704,13 @@ impl DagActor {
                 .iter()
                 .map(crate::sla::config::cell_label)
                 .collect(),
-            dead_nodes: self.hung_nodes.keys().cloned().collect(),
+            // OA2: the scheduler-side hung-node detector is gone with
+            // the stream session machinery (heartbeats no longer
+            // exist to derive staleness from). The controller-side
+            // node-wedge aggregation (`nodeclaim_pool/wedge.rs`,
+            // landed at 1c) is the successor signal; this field stays
+            // explicitly empty until the 1d proto sweep retires it.
+            dead_nodes: Vec::new(),
         }
     }
 

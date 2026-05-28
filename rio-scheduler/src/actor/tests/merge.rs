@@ -7,92 +7,6 @@ use super::*;
 // Shared-node priority bump on higher-priority merge
 // ===========================================================================
 
-/// When a higher-priority (Interactive) build merges a DAG node already
-/// present from a lower-priority (Scheduled) build, the shared node's
-/// effective priority bumps to max(old, new). Dispatch order observes
-/// the bump: the shared node jumps ahead of Scheduled-only siblings.
-///
-/// Mechanism: merge adds the new build_id to the node's
-/// `interested_builds`. The merge's trailing `dispatch_ready()` pops the
-/// queue, finds no worker, defers, and re-pushes via `push_ready` —
-/// which recomputes `queue_priority` and now sees an Interactive
-/// interested build → adds `INTERACTIVE_BOOST`. So when a worker
-/// connects, the shared node is at the top of the heap.
-///
-// r[verify sched.merge.shared-priority-max]
-#[tokio::test]
-async fn test_shared_node_priority_bumps_on_higher_pri_merge() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Build 1: Scheduled. shared-x is a leaf; filler-y → filler-y-dep
-    // gives filler-y critical-path = 2×DEFAULT_DURATION_SECS vs
-    // shared-x's 1×, so WITHOUT the Interactive boost filler-y-dep and
-    // filler-y deterministically outrank shared-x. (Two equal-priority
-    // leaves would tiebreak on seq from compute_initial_states
-    // iterating a HashSet — ~50% false-pass on regression.) No worker
-    // connected yet, so all push into the ready queue and stay.
-    let build_lo = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_lo,
-        vec![
-            make_node("shared-x"),
-            make_node("filler-y"),
-            make_node("filler-y-dep"),
-        ],
-        vec![make_test_edge("filler-y", "filler-y-dep")],
-        false,
-    )
-    .await?;
-
-    // Build 2: Interactive, ONLY the shared node. Merge dedup keys on
-    // drv_hash (= tag), so "shared-x" maps to the SAME DAG node. Merge
-    // adds build_hi to its interested_builds; dispatch_ready re-pushes
-    // it with INTERACTIVE_BOOST. "filler-y" is NOT in this build, so it
-    // stays at Scheduled priority.
-    let build_hi = Uuid::new_v4();
-    merge_dag_req(
-        &handle,
-        MergeDagRequest {
-            build_id: build_hi,
-            tenant_id: None,
-            priority_class: PriorityClass::Interactive,
-            nodes: vec![make_node("shared-x")],
-            edges: vec![],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-        },
-    )
-    .await?;
-
-    // Connect a 1-slot worker. Heartbeat/PrefetchComplete triggers
-    // dispatch_ready, which pops the highest-priority node.
-    let mut rx = connect_executor(&handle, "prio-w", "x86_64-linux").await?;
-
-    // First assignment MUST be shared-x: it carries INTERACTIVE_BOOST
-    // (via build_hi's interest), filler-y/filler-y-dep do not. Without
-    // the bump, filler-y-dep (critical-path 2×) deterministically pops
-    // first; with the +1e9 boost shared-x wins (dominates any
-    // critical-path base — a 100k-node chain at 1h each is 3.6e8; 1e9
-    // still wins).
-    let first = recv_assignment(&mut rx).await;
-    assert_eq!(
-        first.drv_path,
-        test_drv_path("shared-x"),
-        "shared node with Interactive interest should dispatch before \
-         Scheduled-only filler — priority bump to max(interested builds)"
-    );
-
-    Ok(())
-}
-
-// ===========================================================================
-// actor/merge.rs cleanup + cache-check error paths
-// ===========================================================================
-
 /// When DB persistence fails mid-merge, cleanup_failed_merge rolls back
 /// all in-memory state. The build_id should be unknown afterward.
 #[tokio::test]
@@ -455,79 +369,6 @@ async fn test_ca_cache_miss(#[case] seed_stale: bool) -> TestResult {
         "must NOT cache-hit (seed_stale={seed_stale})"
     );
     assert_eq!(status.cached_derivations, 0);
-    Ok(())
-}
-
-// r[verify sched.merge.ca-fod-substitute]
-/// Fixed-CA FOD: `ca_modular_hash` is 32 bytes (every FOD per
-/// translate.rs:343) AND `expected_output_paths` is non-empty (the
-/// content-addressed path computed from outputHash). No realisation row.
-///
-/// - **substitutable**: output not in rio-store but IS substitutable
-///   upstream → MUST cache-hit via path-based lane. I-203 regression:
-///   filtering on `ca_modular_hash.len() != 32` excluded these →
-///   dispatched to fetcher → hit dead origin URL.
-/// - **missing**: plain-missing → proceeds to Ready, dispatches to fetcher.
-#[rstest::rstest]
-#[case::substitutable(true, rio_proto::types::BuildState::Succeeded, 1)]
-#[case::missing(false, rio_proto::types::BuildState::Active, 0)]
-#[tokio::test]
-async fn test_fixed_ca_fod_path_based_lane(
-    #[case] substitutable: bool,
-    #[case] expect_state: rio_proto::types::BuildState,
-    #[case] expect_cached: u32,
-) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut fetcher_rx = connect_executor_kind(
-        &handle,
-        "f-ca-fod",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-
-    let fod_out = test_store_path("ca-fod-out");
-    if substitutable {
-        store
-            .state
-            .substitutable
-            .write()
-            .unwrap()
-            .push(fod_out.clone());
-    }
-
-    // Production shape: FOD ⇒ is_content_addressed + 32-byte modular
-    // hash + known expected_output_path. NO realisation row in PG.
-    let mut node = make_node("ca-fod");
-    node.is_content_addressed = true;
-    node.is_fixed_output = true;
-    node.ca_modular_hash = [0x42u8; 32].to_vec();
-    node.expected_output_paths = vec![fod_out.clone()];
-
-    let build_id = Uuid::new_v4();
-    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    // r[sched.substitute.detached+5]: substitutable lane spawns the fetch;
-    // SubstituteComplete arrives via mailbox. barrier() alone races it.
-    if substitutable {
-        settle_substituting(&handle, &["ca-fod"]).await;
-    } else {
-        barrier(&handle).await;
-    }
-
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(status.state, expect_state as i32);
-    assert_eq!(status.cached_derivations, expect_cached);
-
-    if substitutable {
-        let qpi = store.calls.qpi_calls.read().unwrap();
-        assert!(qpi.contains(&fod_out), "path-based lane eager-fetches");
-    } else {
-        let assn = recv_assignment(&mut fetcher_rx).await;
-        assert!(
-            assn.drv_path.ends_with("ca-fod.drv"),
-            "missing → dispatches"
-        );
-    }
     Ok(())
 }
 
@@ -6450,391 +6291,6 @@ async fn test_cache_hit_gates_on_inputdrv_completion() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
-/// Top-down: deps pruned from this build are NOT in the global DAG,
-/// so a later build that needs them triggers its own cache-check.
-///
-/// Guards against the shared-DAG correctness bug where marking
-/// deps as Completed without fetching would poison later builds
-/// that actually need the dep NAR.
-#[tokio::test]
-async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let hello_out = test_store_path("hello-shared");
-    let glibc_out = test_store_path("glibc-shared");
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(hello_out.clone());
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(glibc_out.clone());
-
-    // Build A: hello → glibc. hello substitutable → glibc pruned.
-    let mut hello = make_node("hello-a");
-    hello.expected_output_paths = vec![hello_out.clone()];
-    let mut glibc_a = make_node("glibc-a");
-    glibc_a.expected_output_paths = vec![glibc_out.clone()];
-
-    let build_a = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_a,
-        vec![hello, glibc_a],
-        vec![make_test_edge("hello-a", "glibc-a")],
-        false,
-    )
-    .await?;
-    settle_substituting(&handle, &["hello-a"]).await;
-
-    let status_a = query_status(&handle, build_a).await?;
-    assert_eq!(
-        status_a.state,
-        rio_proto::types::BuildState::Succeeded as i32
-    );
-
-    // Clear QPI tracking between builds.
-    store.calls.qpi_calls.write().unwrap().clear();
-
-    // Build B: app → glibc. app NOT substitutable → falls through
-    // → full merge → glibc is newly_inserted (NOT pre-existing from
-    // A, because A pruned it) → check_cached_outputs fetches glibc.
-    let mut app = make_node("app-b");
-    app.expected_output_paths = vec![test_store_path("app-b-out")];
-    let mut glibc_b = make_node("glibc-a");
-    glibc_b.expected_output_paths = vec![glibc_out.clone()];
-
-    let build_b = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_b,
-        vec![app, glibc_b],
-        vec![make_test_edge("app-b", "glibc-a")],
-        false,
-    )
-    .await?;
-    settle_substituting(&handle, &["glibc-a"]).await;
-
-    // glibc fetched by Build B's bottom-up — proves it wasn't
-    // stuck as phantom-Completed from Build A's prune.
-    let qpi = store.calls.qpi_calls.read().unwrap();
-    assert!(
-        qpi.contains(&glibc_out),
-        "Build B should fetch glibc (pruned from A, newly-inserted in B); \
-         qpi_calls={qpi:?}"
-    );
-
-    Ok(())
-}
-
-// ===========================================================================
-// I-047: pre-existing Completed with GC'd output → reset to Ready
-// ===========================================================================
-
-/// Store/substitution state of a pre-existing `Completed` output when
-/// Build B re-merges it. See [`test_preexisting_completed_gc_matrix`].
-enum GcState {
-    /// Output GC'd, not substitutable → reset to Ready (I-047).
-    Gone,
-    /// Output GC'd but substitutable upstream → detached fetch spawned
-    /// (Completed→Ready→Substituting), comes back to Completed (I-202).
-    Substitutable,
-    /// Output GC'd, substitutable, but QPI fails → SubstituteComplete
-    /// {ok=false} → reverts to Ready, re-dispatches.
-    SubFetchFail,
-    /// FindMissingPaths itself fails → fail-open, stays Completed.
-    StoreUnreachable,
-}
-
-// r[verify sched.merge.stale-completed-verify+5]
-// r[verify sched.merge.stale-substitutable]
-/// Pre-existing `Completed` node verification at merge time.
-///
-/// Common setup: Build A merges `app-a → fod-dep`, fod-dep completes
-/// (`Completed` in DAG), app-a held Running so Build A stays Active and
-/// fod-dep stays in the global DAG. Then mutate store state per `gc`
-/// and merge Build B (`app-b → fod-dep`). The spare worker receives
-/// either `fod-dep` (reset) or `app-b` (stayed Completed).
-///
-/// Production scenario (I-047): FOD outputs are content-addressed and
-/// shared across builds. GC may delete a FOD output under one tenant's
-/// retention while a later build's DAG still has the node `Completed`.
-/// Without verify, the worker fails on `isValidPath` building the
-/// dependent. I-202: but if upstream HAS it, eager-fetch instead of
-/// re-dispatching the whole subtree (FOD sources may have dead URLs).
-#[rstest::rstest]
-// I-047: GC'd, not substitutable → reset → fod-dep re-dispatches, cached=0
-#[case::gcd_resets(GcState::Gone, "fod-dep", 0)]
-// I-202: GC'd but substitutable → eager-fetch → app-b dispatches, cached=1
-#[case::substitutable_stays(GcState::Substitutable, "app-b", 1)]
-// substitutable but QPI fails → falls through to reset
-#[case::sub_fetch_fail_resets(GcState::SubFetchFail, "fod-dep", 0)]
-// FindMissingPaths fails → fail-open → stays Completed, cached=1
-#[case::store_unreachable_fail_open(GcState::StoreUnreachable, "app-b", 1)]
-#[tokio::test]
-async fn test_preexisting_completed_gc_matrix(
-    #[case] gc: GcState,
-    #[case] expect_spare_drv: &str,
-    #[case] expect_cached: u32,
-) -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut worker_rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
-
-    // Build A: app-a → fod-dep. fod-dep dispatches first (leaf).
-    let fod_out = test_store_path("preexist-fod-out");
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("app-a"), make_node("fod-dep")],
-        vec![make_test_edge("app-a", "fod-dep")],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut worker_rx).await;
-    assert!(assn.drv_path.ends_with("fod-dep.drv"));
-    store.seed_with_content(&fod_out, b"fod-contents");
-    complete_success(&handle, "w1", &assn.drv_path, &fod_out).await?;
-    barrier(&handle).await;
-
-    // Hold app-a Running so Build A stays Active and fod-dep stays in DAG.
-    let mut _w2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
-    let _ = recv_assignment(&mut _w2).await;
-
-    // Mutate store per case.
-    match gc {
-        GcState::Gone => {
-            store.state.paths.write().unwrap().remove(&fod_out);
-        }
-        GcState::Substitutable => {
-            store.state.paths.write().unwrap().remove(&fod_out);
-            store
-                .state
-                .substitutable
-                .write()
-                .unwrap()
-                .push(fod_out.clone());
-        }
-        GcState::SubFetchFail => {
-            store.state.paths.write().unwrap().remove(&fod_out);
-            store
-                .state
-                .substitutable
-                .write()
-                .unwrap()
-                .push(fod_out.clone());
-            store
-                .faults
-                .fail_query_path_info_permanent
-                .store(true, Ordering::SeqCst);
-        }
-        GcState::StoreUnreachable => {
-            store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-        }
-    }
-
-    // Spare worker for Build B's dispatch.
-    let mut spare = connect_executor(&handle, "spare", "x86_64-linux").await?;
-
-    // Build B: app-b → fod-dep (pre-existing Completed).
-    let build_b = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_b,
-        vec![make_node("app-b"), make_node("fod-dep")],
-        vec![make_test_edge("app-b", "fod-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    // r[sched.substitute.detached+5] — the fetch is spawned, not awaited.
-    // Let the spawned task post SubstituteComplete before checking.
-    if matches!(gc, GcState::Substitutable | GcState::SubFetchFail) {
-        let fod_hash = make_node("fod-dep").drv_hash;
-        settle_substituting(&handle, &[&fod_hash]).await;
-        // SubstituteComplete{ok=true} → Completed → app-b Ready, OR
-        // {ok=false} → Ready → fod-dep dispatches. Either way the
-        // spare worker gets an assignment now; tick to drain dirty.
-        tick(&handle).await?;
-    }
-
-    if matches!(gc, GcState::Substitutable) {
-        let qpi = store.calls.qpi_calls.read().unwrap().clone();
-        assert!(
-            qpi.contains(&fod_out),
-            "stale-completed verify should fetch substitutable output (detached); qpi_calls={qpi:?}"
-        );
-    }
-
-    let got = recv_assignment(&mut spare).await;
-    assert!(
-        got.drv_path.ends_with(&format!("{expect_spare_drv}.drv")),
-        "spare worker should receive {expect_spare_drv}; got {}",
-        got.drv_path
-    );
-
-    let status_b = query_status(&handle, build_b).await?;
-    assert_eq!(
-        status_b.cached_derivations, expect_cached,
-        "cached_derivations for Build B"
-    );
-
-    Ok(())
-}
-
-// r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.merge.stale-completed-verify+5]
-/// `verify_preexisting_completed` × the LIVE effective wanted set: a
-/// missing recorded output of a pre-existing Completed node is forgiven
-/// (no Completed→Ready reset) only when NO live interested build wants
-/// it. Build A merges first wanting ALL outputs (the empty sentinel);
-/// build B re-merges with a per-case wanted set while the recorded
-/// P_debug is missing from the store:
-///
-/// - A LIVE: A's all-outputs contribution keeps P_debug in the
-///   effective wanted set, so even a build-B-only-wants-`out` re-merge
-///   must reset the node (the re-open that lets A's delta be
-///   substituted or rebuilt).
-/// - A TERMINAL (a failed keep_going build inside the ≤60 s pre-cleanup
-///   window — interest and BuildInfo still present): only B's {out}
-///   counts → P_debug is unwanted by every live build → forgiven →
-///   stays Completed (it was legitimately never substituted; resetting
-///   it on every re-merge would ping-pong Completed↔Ready forever).
-///
-/// Setup: Build A merges `app-a → dep` where dep declares {out, debug};
-/// the worker reports both outputs but only P_out is ever uploaded to
-/// the store (P_debug is recorded in `output_paths` yet missing). Build
-/// B re-merges dep with a per-case wanted set.
-#[rstest::rstest]
-// P_debug missing, build B only wants {out}, but build A is LIVE and
-// wants ALL outputs → the live effective set still wants P_debug → reset.
-#[case::missing_unwanted_but_live_build_wants_resets(false, &["out"], DerivationStatus::Ready, 0)]
-// Same shape but build A is TERMINAL: no live build wants P_debug →
-// forgiven → stays Completed.
-#[case::missing_unwanted_no_live_build_wants_forgiven(true, &["out"], DerivationStatus::Completed, 1)]
-// P_debug missing and build B wants everything (empty sentinel) → reset.
-#[case::missing_wanted_resets(false, &[], DerivationStatus::Ready, 0)]
-// P_debug missing and build B's wanted set resolves to no declared
-// output (a `drv^bogus` root) → nothing is POSITIVELY identifiable as
-// unwanted, so nothing is forgiven → reset. The complement of an
-// unresolvable wanted subset must be empty, not every declared path —
-// otherwise a GC'd output is never re-opened.
-#[case::missing_unresolvable_wanted_resets(false, &["bogus"], DerivationStatus::Ready, 0)]
-#[tokio::test]
-async fn test_preexisting_completed_missing_unwanted_output_not_reset(
-    #[case] a_terminal: bool,
-    #[case] wanted: &[&str],
-    #[case] expect_dep_status: DerivationStatus,
-    #[case] expect_cached: u32,
-) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut w1 = connect_executor(&handle, "vw-w1", "x86_64-linux").await?;
-
-    let out = test_store_path("vw-dep-out");
-    let dbg = test_store_path("vw-dep-debug");
-    let mk_dep = |wanted: &[&str]| {
-        let mut d = make_node("vw-dep");
-        d.output_names = vec!["out".into(), "debug".into()];
-        d.expected_output_paths = vec![out.clone(), dbg.clone()];
-        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
-        d
-    };
-
-    // Build A: app-a → dep. dep dispatches first (leaf). The worker
-    // reports BOTH outputs so output_paths records both, but only
-    // P_out is uploaded to the store — P_debug stays missing.
-    // keep_going=true in the terminal case so app-a's permanent failure
-    // routes through check_build_completion (no cancel sweep) — A's DAG
-    // interest and terminal BuildInfo linger, the window under test.
-    let build_a = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_a,
-        vec![make_node("vw-app-a"), mk_dep(&[])],
-        vec![make_test_edge("vw-app-a", "vw-dep")],
-        a_terminal,
-    )
-    .await?;
-    let assn = recv_assignment(&mut w1).await;
-    assert!(assn.drv_path.ends_with("vw-dep.drv"));
-    store.seed_with_content(&out, b"out");
-    complete_ca(
-        &handle,
-        "vw-w1",
-        &assn.drv_path,
-        &[("out", &out, vec![0u8; 32]), ("debug", &dbg, vec![0u8; 32])],
-    )
-    .await?;
-    barrier(&handle).await;
-    // app-a dispatches next. Live case: hold it Running so Build A stays
-    // Active and dep stays in DAG. Terminal case: fail it permanently so
-    // Build A goes Failed while its interest + BuildInfo linger.
-    let mut w2 = connect_executor(&handle, "vw-w2", "x86_64-linux").await?;
-    let assn_app = recv_assignment(&mut w2).await;
-    if a_terminal {
-        assert!(assn_app.drv_path.ends_with("vw-app-a.drv"));
-        complete_failure(
-            &handle,
-            "vw-w2",
-            &assn_app.drv_path,
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
-        assert_eq!(
-            query_status(&handle, build_a).await?.state,
-            rio_proto::types::BuildState::Failed as i32,
-            "precondition: A is terminal but not yet cleaned up"
-        );
-    }
-    let pre = expect_drv(&handle, "vw-dep").await;
-    assert_eq!(pre.status, DerivationStatus::Completed, "precondition");
-    assert_eq!(
-        pre.output_paths,
-        vec![out.clone(), dbg.clone()],
-        "precondition: both outputs recorded, only P_out in store"
-    );
-
-    // Build B: app-b → dep (pre-existing Completed). The stale-verify
-    // probe finds P_debug missing; whether that triggers the reset
-    // depends on whether any LIVE build (A if still live, B's new
-    // contribution) wants `debug`.
-    let build_b = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_b,
-        vec![make_node("vw-app-b"), mk_dep(wanted)],
-        vec![make_test_edge("vw-app-b", "vw-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        expect_drv(&handle, "vw-dep").await.status,
-        expect_dep_status,
-        "a_terminal={a_terminal} wanted={wanted:?}: a missing recorded \
-         output triggers the Completed→Ready reset iff some LIVE \
-         interested build wants it"
-    );
-    assert_eq!(
-        query_status(&handle, build_b).await?.cached_derivations,
-        expect_cached,
-        "a_terminal={a_terminal} wanted={wanted:?}"
-    );
-
-    Ok(())
-}
-
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.merge.stale-completed-verify+5]
 /// `verify_preexisting_completed` × an UNAVAILABLE effective wanted set:
@@ -6950,238 +6406,6 @@ async fn test_preexisting_completed_unknown_contribution_falls_back_to_stored_un
     Ok(())
 }
 
-// r[verify sched.merge.wanted-outputs+2]
-/// `check_cached_outputs` × the LIVE effective wanted set: the merge-time
-/// cache-hit classification must be evaluated against the union of the
-/// wanted contributions of LIVE interested builds, not the never-shrinking
-/// stored node-level union. Build A wants ALL outputs (the empty sentinel)
-/// and saturates the stored union; build B wants only `out`. P_out is in
-/// the store, P_debug is missing and not substitutable.
-///
-/// - A TERMINAL (a failed keep_going build whose interest and BuildInfo
-///   are still around — the ≤60 s pre-cleanup window): only B's
-///   contribution counts → all wanted outputs present → cache hit → B
-///   completes all-cached.
-/// - A LIVE: its all-outputs contribution still counts → P_debug missing
-///   → NOT a hit → the node stays pending and B stays Active.
-#[rstest::rstest]
-// A terminal → only B's {out} is effectively wanted → hit.
-#[case::interested_build_terminal(true, "x86_64-linux", DerivationStatus::Completed)]
-// A live → its all-wanted contribution keeps P_debug wanted → no hit.
-#[case::interested_build_live(false, "aarch64-linux", DerivationStatus::Ready)]
-#[tokio::test]
-async fn merge_cache_hit_classified_against_live_builds_effective_wanted(
-    #[case] a_terminal: bool,
-    #[case] system: &str,
-    #[case] expect_status: DerivationStatus,
-) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut w1 = connect_executor(&handle, "lew-w1", "x86_64-linux").await?;
-
-    let out = test_store_path("lew-dep-out");
-    let dbg = test_store_path("lew-dep-debug");
-    let mk = |wanted: &[&str]| {
-        let mut d = make_node("lew-dep");
-        d.system = system.into();
-        d.output_names = vec!["out".into(), "debug".into()];
-        d.expected_output_paths = vec![out.clone(), dbg.clone()];
-        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
-        d
-    };
-    // P_out is in the store from the start; P_debug never is (and is not
-    // substitutable). With an all-outputs wanted set the node can never
-    // be a cache hit; with {out} it always is.
-    store.seed_with_content(&out, b"out");
-
-    // Build A wants ALL declared outputs (empty sentinel) — saturates the
-    // stored union for everyone. keep_going so a derivation failure
-    // routes through check_build_completion (no cancel sweep).
-    let build_a = Uuid::new_v4();
-    let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
-
-    if a_terminal {
-        // Drive A terminal WITHOUT losing its DAG interest: the node is
-        // dispatched (x86_64 in this case) and fails permanently;
-        // keep_going=true means the build fails via
-        // check_build_completion, which does NOT strip interest — A's
-        // membership and terminal BuildInfo linger for
-        // TERMINAL_CLEANUP_DELAY, exactly the window under test.
-        let assn = recv_assignment(&mut w1).await;
-        assert!(assn.drv_path.ends_with("lew-dep.drv"));
-        complete_failure(
-            &handle,
-            "lew-w1",
-            &assn.drv_path,
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
-        assert_eq!(
-            expect_drv(&handle, "lew-dep").await.status,
-            DerivationStatus::Poisoned,
-            "precondition: A's permanent failure poisons the node"
-        );
-        assert_eq!(
-            query_status(&handle, build_a).await?.state,
-            rio_proto::types::BuildState::Failed as i32,
-            "precondition: A is terminal but not yet cleaned up"
-        );
-    }
-
-    // Build B re-merges the node wanting only {out}.
-    let build_b = Uuid::new_v4();
-    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        expect_drv(&handle, "lew-dep").await.status,
-        expect_status,
-        "a_terminal={a_terminal}: the merge-time cache-hit verdict must \
-         follow the live builds' effective wanted set, not the stored \
-         union"
-    );
-    let status_b = query_status(&handle, build_b).await?;
-    if a_terminal {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Succeeded as i32,
-            "all of B's wanted outputs are present → all-cached build"
-        );
-        assert_eq!(status_b.cached_derivations, 1);
-    } else {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Active as i32,
-            "A (live) still wants P_debug → no hit → B keeps building"
-        );
-    }
-    Ok(())
-}
-
-// r[verify sched.merge.stale-substitutable]
-// r[verify sched.merge.wanted-outputs+2]
-/// `verify_preexisting_completed` ROUTING × wanted outputs: once the
-/// reset HAS fired (a wanted recorded output is missing), the choice
-/// between the detached re-substitution (`to_spawn`) and the ready
-/// queue must be made over the same wanted-aware view as the reset
-/// decision. A recorded-but-UNWANTED output that was never present and
-/// is not substitutable — the steady state the demand-driven cache-hit
-/// criterion leaves behind — must not disqualify the node from the
-/// substitution lane when the wanted output IS substitutable. Routed to
-/// the ready queue instead, the node only re-substitutes if the
-/// dispatch-time batch probe rescues it (cap-truncatable, fail-open),
-/// and `rio_scheduler_stale_completed_substituted_total` never moves.
-///
-/// Setup mirrors the reset-decision test above: dep declares
-/// {out, debug}, every consumer only wants `out`, the worker reports
-/// both outputs but only P_out is uploaded. Then P_out is GC'd but
-/// substitutable upstream; P_debug stays missing and NOT substitutable.
-/// Build B re-merges dep wanting only `out`.
-#[tokio::test]
-async fn test_preexisting_completed_unwanted_missing_output_routes_to_substitution() -> TestResult {
-    // Thread-local recorder: #[tokio::test]'s current-thread runtime
-    // means the actor task sees it at .await points (same mechanism as
-    // misc.rs's gauge tests). Installed before the actor spawns so the
-    // merge-time increment is captured.
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut w1 = connect_executor(&handle, "vr-w1", "x86_64-linux").await?;
-
-    let out = test_store_path("vr-dep-out");
-    let dbg = test_store_path("vr-dep-debug");
-    let mk_dep = || {
-        let mut d = make_node("vr-dep");
-        d.output_names = vec!["out".into(), "debug".into()];
-        d.expected_output_paths = vec![out.clone(), dbg.clone()];
-        d.wanted_output_names = vec!["out".into()];
-        d
-    };
-
-    // Build A: app-a → dep; nothing ever wants `debug`. The worker
-    // reports BOTH outputs so output_paths records both, but only P_out
-    // is uploaded to the store — P_debug stays missing.
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("vr-app-a"), mk_dep()],
-        vec![make_test_edge("vr-app-a", "vr-dep")],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut w1).await;
-    assert!(assn.drv_path.ends_with("vr-dep.drv"));
-    store.seed_with_content(&out, b"out");
-    complete_ca(
-        &handle,
-        "vr-w1",
-        &assn.drv_path,
-        &[("out", &out, vec![0u8; 32]), ("debug", &dbg, vec![0u8; 32])],
-    )
-    .await?;
-    barrier(&handle).await;
-    // Hold app-a Running so Build A stays Active and dep stays in DAG.
-    let mut _w2 = connect_executor(&handle, "vr-w2", "x86_64-linux").await?;
-    let _ = recv_assignment(&mut _w2).await;
-    assert_eq!(
-        expect_drv(&handle, "vr-dep").await.status,
-        DerivationStatus::Completed,
-        "precondition"
-    );
-
-    // GC P_out but leave it substitutable upstream; P_debug stays
-    // missing AND not substitutable.
-    store.state.paths.write().unwrap().remove(&out);
-    store.state.substitutable.write().unwrap().push(out.clone());
-
-    // Build B: app-b → dep, wanting only `out`. The reset fires (P_out
-    // is missing and wanted); the routing must take the detached
-    // substitution lane because the only non-substitutable missing path
-    // is the unwanted P_debug.
-    let build_b = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_b,
-        vec![make_node("vr-app-b"), mk_dep()],
-        vec![make_test_edge("vr-app-b", "vr-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    // The discriminator: the verify-time routing took the detached
-    // substitution. With a routing computed over ALL recorded paths
-    // (ignoring `unwanted`), dep lands in the ready queue instead and
-    // this counter never moves — even if the dispatch-time batch probe
-    // later rescues the node.
-    assert_eq!(
-        recorder.get("rio_scheduler_stale_completed_substituted_total{}"),
-        1,
-        "a missing-but-substitutable WANTED output plus a missing-and-\
-         unsubstitutable UNWANTED output must route to the detached \
-         substitution at verify time, not the ready queue; counters \
-         seen: {:?}",
-        recorder.all_keys()
-    );
-
-    // And the detached fetch settles the node back to Completed (the
-    // walk forgives the unwanted P_debug), so build B never re-builds.
-    settle_substituting(&handle, &["vr-dep"]).await;
-    assert_eq!(
-        expect_drv(&handle, "vr-dep").await.status,
-        DerivationStatus::Completed,
-        "SubstituteComplete{{ok=true}} returns the reset node to Completed"
-    );
-
-    Ok(())
-}
-
-// ===========================================================================
-// I-099/I-094: re-probe existing not-done nodes at merge
-// ===========================================================================
-
 /// Build #1 inserts node A (not in store, not substitutable) → A is
 /// Ready. Upstream cache config is then added (seed substitutable).
 /// Build #2 references A → re-probe finds it → A transitions to
@@ -7239,89 +6463,6 @@ async fn test_reprobe_existing_ready_caches_on_second_merge() -> TestResult {
     Ok(())
 }
 
-/// I-094 fold-in: a Poisoned node whose output later appears in the
-/// upstream cache is unpoisoned + completed at the next merge that
-/// references it. Prior failure history is moot — we have the output.
-///
-/// Sensitivity: without the fix, build #2 sees A is Poisoned → sets
-/// first_dep_failed → build #2 fails fast.
-#[tokio::test]
-async fn test_reprobe_existing_poisoned_unpoisons_on_cache_hit() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let path = test_store_path("reprobe-poison");
-    let mut node = make_node("reprobe-poison");
-    node.expected_output_paths = vec![path.clone()];
-
-    // Build #1 + worker: assign → PermanentFailure → Poisoned.
-    let mut worker_rx = connect_executor(&handle, "rp-worker", "x86_64-linux").await?;
-    let build1 = Uuid::new_v4();
-    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
-    let _ = worker_rx.recv().await.expect("assignment");
-    complete_failure(
-        &handle,
-        "rp-worker",
-        &test_drv_path("reprobe-poison"),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "permanent",
-    )
-    .await?;
-    barrier(&handle).await;
-    let info = expect_drv(&handle, "reprobe-poison").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "precondition: A is Poisoned after PermanentFailure"
-    );
-    let status1 = query_status(&handle, build1).await?;
-    assert_eq!(
-        status1.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "precondition: build #1 failed"
-    );
-
-    // Upstream cache now has the path.
-    store
-        .state
-        .substitutable
-        .write()
-        .unwrap()
-        .push(path.clone());
-
-    // Build #2: re-probe should find A in upstream → unpoisoned + Completed.
-    let build2 = Uuid::new_v4();
-    merge_dag(&handle, build2, vec![node], vec![], false).await?;
-    settle_substituting(&handle, &["reprobe-poison"]).await;
-
-    let info = expect_drv(&handle, "reprobe-poison").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Completed,
-        "I-094: Poisoned node re-probed, found in upstream → Completed \
-         (was: stayed Poisoned, build #2 failed fast)"
-    );
-    let status2 = query_status(&handle, build2).await?;
-    assert_eq!(
-        status2.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "build #2 should succeed via re-probe unpoisoning"
-    );
-
-    Ok(())
-}
-
-// ===========================================================================
-// I-169: Poisoned resubmit bound
-// ===========================================================================
-
-/// I-169: `Poisoned` resubmit bound. Under `POISON_RESUBMIT_RETRY_LIMIT`,
-/// resubmit resets to Ready (build #2 Active); at the limit, stays
-/// Poisoned (build #2 fail-fasts).
-///
-/// Sensitivity: before the fix, build #2 sees A is Poisoned →
-/// `first_dep_failed` set → fail-fasts. With the fix, A is reset in
-/// `dag.merge` → in `newly_inserted` → skipped by pre-existing loop.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
 #[rstest::rstest]
 #[case::under_limit(1, DerivationStatus::Ready, rio_proto::types::BuildState::Active)]
 #[case::at_limit(
@@ -7698,102 +6839,6 @@ async fn test_large_dag_completion_dispatch_perf_bound() -> TestResult {
     Ok(())
 }
 
-/// I-140: many-worker churn on a large DAG. The single-completion test
-/// above is fast because `build_summary` (O(N) full-DAG scan) is only
-/// called a handful of times. The production stall was COMPOUNDED:
-/// `emit_progress` and `update_build_counts` each call `build_summary`
-/// per-assignment + per-completion + per-disconnect, and ephemeral
-/// builders churn at scale (controller spawns up to `replicas.max`
-/// pods when `queued_derivations` is large).
-///
-/// This test connects 30 workers, dispatches 30, completes 30,
-/// disconnects 30 — one full ephemeral-churn wave. Before the fix, each
-/// of the ~90 per-event `build_summary` calls walks the full 50k-node
-/// DAG (~25ms debug each ≈ 2.2s total); after the fix the per-event
-/// cost is O(1) counts + debounced O(N) progress.
-#[tokio::test]
-async fn test_large_dag_ephemeral_churn_perf_bound() -> TestResult {
-    const N: usize = 50_000;
-    const W: usize = 30;
-
-    let (_db, handle, _task) = setup().await;
-
-    // Flat DAG: W independent leaves + (N-W) chained-on-top. The W
-    // leaves are all Ready post-merge, so W workers each get one.
-    let path = |i: usize| format!("/nix/store/{i:032}-n{i}.drv");
-    let nodes: Vec<_> = (0..N)
-        .map(|i| rio_proto::types::DerivationNode {
-            drv_hash: format!("h{i:08}"),
-            drv_path: path(i),
-            ..make_node("x")
-        })
-        .collect();
-    let edges: Vec<_> = (W..N)
-        .map(|i| rio_proto::types::DerivationEdge {
-            parent_drv_path: path(i),
-            child_drv_path: path(i - W),
-        })
-        .collect();
-
-    let build_id = Uuid::new_v4();
-    let _rx = merge_dag(&handle, build_id, nodes, edges, false).await?;
-    barrier(&handle).await;
-
-    let t = std::time::Instant::now();
-    // --- wave: connect W → dispatch W → complete W → disconnect W ----
-    let mut rxs = Vec::with_capacity(W);
-    for w in 0..W {
-        rxs.push(connect_executor(&handle, &format!("w{w}"), "x86_64-linux").await?);
-    }
-    // Connects past BECAME_IDLE_INLINE_CAP coalesce to dispatch_dirty
-    // — drain via one Tick (one dispatch_ready instead of W; tighter
-    // than the pre-cap behavior this test bounded).
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    let mut assigned = Vec::with_capacity(W);
-    for rx in &mut rxs {
-        assigned.push(recv_assignment(rx).await.drv_path);
-    }
-    for (w, drv) in assigned.iter().enumerate() {
-        complete_success(&handle, &format!("w{w}"), drv, "/nix/store/out").await?;
-    }
-    for w in 0..W {
-        handle
-            .send_unchecked(ActorCommand::ExecutorDisconnected {
-                executor_id: format!("w{w}").into(),
-                stream_epoch: stream_epoch_for(&format!("w{w}")),
-            })
-            .await?;
-    }
-    barrier(&handle).await;
-    let wave_elapsed = t.elapsed();
-    eprintln!(
-        "I-140 churn bench: {N} nodes, {W} workers — connect+assign+complete+disconnect \
-         wave {wave_elapsed:?} ({:.1}ms/event)",
-        wave_elapsed.as_secs_f64() * 1000.0 / (4 * W) as f64
-    );
-
-    // 1.5s bound: 4×W=120 events. Pre-fix ≈ 90 build_summary scans
-    // (per-assign + 2×per-complete + per-disconnect) × ~20ms each ≈
-    // 1.8s debug. Post-fix: per-assign/disconnect emit_progress is
-    // debounced (→ ~2 scans total), per-complete shares ONE summary
-    // between counts+progress (→ 30 scans) = ~32×20ms ≈ 0.6s. Loose
-    // 1.5s bound for CI variance — the point is "doesn't degrade
-    // super-linearly with N×W".
-    assert!(
-        wave_elapsed.as_millis() < 1500,
-        "I-140: {W}-worker churn wave on {N}-node DAG took {wave_elapsed:?} (>1.5s); \
-         per-event O(N) build_summary scan compounds with ephemeral-builder \
-         churn rate — actor mailbox grows unboundedly under load"
-    );
-
-    // Correctness: completed_count must reflect the W completions
-    // exactly (incremental count must not drift from ground truth).
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(status.completed_derivations, W as u32);
-    assert_eq!(status.state, rio_proto::types::BuildState::Active as i32);
-    Ok(())
-}
-
 /// I-208 (D4 form): a FOD whose DB row pre-exists with
 /// `floor_mem_bytes=8GiB` (promoted by a prior run's failures, then
 /// the build terminated and the node left memory) MUST come back at
@@ -7849,167 +6894,6 @@ async fn merge_hydrates_resource_floor_from_db() -> TestResult {
 // deferred re-probe on Poisoned-at-limit
 // ===========================================================================
 
-// r[verify sched.merge.stale-completed-verify+5]
-/// I-047 dep-gating: when GC sweeps a chain {A→B}, both reset; A goes
-/// to `Queued` (NOT `Ready`) so it cannot dispatch ahead of B. Without
-/// the two-pass reset, A and B both reset to `Ready` and A can dispatch
-/// while B is still Ready/Substituting → worker ENOENT on B's output.
-#[tokio::test]
-async fn test_stale_reset_chain_gates_parent_at_queued() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut w1 = connect_executor(&handle, "sr-w1", "x86_64-linux").await?;
-
-    // Build 1: C → A → B. Complete B (worker, real output_paths), then
-    // force A to Completed with output_paths set (avoids the one-shot-
-    // worker dance for a 3-level chain). Hold C so build 1 stays Active
-    // and A/B stay in DAG.
-    let a_out = test_store_path("sr-a-out");
-    let b_out = test_store_path("sr-b-out");
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("sr-c"), make_node("sr-a"), make_node("sr-b")],
-        vec![
-            make_test_edge("sr-c", "sr-a"),
-            make_test_edge("sr-a", "sr-b"),
-        ],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut w1).await;
-    assert!(assn.drv_path.ends_with("sr-b.drv"));
-    store.seed_with_content(&b_out, b"b");
-    complete_success(&handle, "sr-w1", &assn.drv_path, &b_out).await?;
-    barrier(&handle).await;
-    // A is now Ready (B completed). Force it to Completed with
-    // output_paths so it's a verify_preexisting_completed candidate.
-    store.seed_with_content(&a_out, b"a");
-    handle
-        .debug_force_status("sr-a", DerivationStatus::Completed)
-        .await?;
-    handle
-        .debug_set_output_paths("sr-a", vec![a_out.clone()])
-        .await?;
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, "sr-a").await.status,
-        DerivationStatus::Completed
-    );
-    assert_eq!(
-        expect_drv(&handle, "sr-b").await.status,
-        DerivationStatus::Completed
-    );
-
-    // GC both A and B's outputs (NOT substitutable).
-    store.state.paths.write().unwrap().remove(&a_out);
-    store.state.paths.write().unwrap().remove(&b_out);
-
-    // Build 2 references C, A, B (all pre-existing). Stale-verify finds
-    // both outputs gone → two-pass: B→Ready (leaf), A→Queued (dep B is
-    // in reset_set).
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("sr-c"), make_node("sr-a"), make_node("sr-b")],
-        vec![
-            make_test_edge("sr-c", "sr-a"),
-            make_test_edge("sr-a", "sr-b"),
-        ],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    let a = expect_drv(&handle, "sr-a").await;
-    let b = expect_drv(&handle, "sr-b").await;
-    assert_eq!(
-        b.status,
-        DerivationStatus::Ready,
-        "leaf B (no deps in reset_set) → Ready"
-    );
-    assert_eq!(
-        a.status,
-        DerivationStatus::Queued,
-        "A's dep B was also reset → A gates at Queued (NOT Ready); was: A \
-         reset to Ready, could dispatch ahead of B → worker ENOENT"
-    );
-    assert!(a.output_paths.is_empty(), "reset clears output_paths");
-    Ok(())
-}
-
-// r[verify sched.merge.stale-completed-verify+5]
-/// I-047 covers `Skipped` too: a pre-existing `Skipped` node with GC'd
-/// output_paths resets the same as `Completed`. Skipped carries real
-/// output_paths and unlocks dependents via `all_deps_completed`; before
-/// the fix, the candidate filter skipped Skipped → dependents unlocked
-/// against a gone output.
-#[tokio::test]
-async fn test_stale_skipped_output_reset() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    // Build 1: app → dep. Complete dep so it's Completed with output_paths.
-    let dep_out = test_store_path("sk-dep-out");
-    let mut w1 = connect_executor(&handle, "sk-w1", "x86_64-linux").await?;
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("sk-app"), make_node("sk-dep")],
-        vec![make_test_edge("sk-app", "sk-dep")],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut w1).await;
-    assert!(assn.drv_path.ends_with("sk-dep.drv"));
-    store.seed_with_content(&dep_out, b"d");
-    complete_success(&handle, "sk-w1", &assn.drv_path, &dep_out).await?;
-    let mut w2 = connect_executor(&handle, "sk-w2", "x86_64-linux").await?;
-    let _hold_app = recv_assignment(&mut w2).await;
-    barrier(&handle).await;
-
-    // Force dep to Skipped (CA-cutoff equivalent). The transition table
-    // doesn't allow Completed→Skipped directly; debug_force_status sets
-    // it without validation (test-only).
-    handle
-        .debug_force_status("sk-dep", DerivationStatus::Skipped)
-        .await?;
-    let pre = expect_drv(&handle, "sk-dep").await;
-    assert_eq!(pre.status, DerivationStatus::Skipped, "precondition");
-    assert!(!pre.output_paths.is_empty(), "Skipped carries output_paths");
-
-    // GC dep's output.
-    store.state.paths.write().unwrap().remove(&dep_out);
-
-    // Build 2: app2 → dep (pre-existing Skipped). Stale-verify must
-    // reset dep.
-    merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("sk-app2"), make_node("sk-dep")],
-        vec![make_test_edge("sk-app2", "sk-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    let dep = expect_drv(&handle, "sk-dep").await;
-    assert!(
-        matches!(
-            dep.status,
-            DerivationStatus::Ready | DerivationStatus::Queued
-        ),
-        "GC'd Skipped output → reset (Ready/Queued); was: filter skipped \
-         Skipped, status stayed Skipped → app2 unlocked against gone output. \
-         got {:?}",
-        dep.status
-    );
-    assert!(
-        dep.output_paths.is_empty(),
-        "reset clears output_paths; got {:?}",
-        dep.output_paths
-    );
-    Ok(())
-}
-
 // r[verify sched.merge.dedup]
 /// Re-probe completion fan-out: B1 merges {X} (Ready, no worker). X's
 /// output is then seeded locally. B2 merges {X}: re-probe finds X in
@@ -8055,195 +6939,6 @@ async fn test_reprobe_completion_fans_out_to_earlier_build() -> TestResult {
         rio_proto::types::BuildState::Succeeded as i32,
         "r[sched.merge.dedup]: re-probe completion of shared X must fan out \
          to B1 (was: B1 stayed Active, completed_count=0, hung)"
-    );
-    Ok(())
-}
-
-/// Re-probe chain both-cached: pre-existing {X→Y} both Queued; X.out
-/// and Y.out then seeded locally. Build B merges {X,Y}: re-probe
-/// fixed-point completes Y then X. The post-loop `reprobe_unlocked`
-/// handler captured X (find_newly_ready(Y) saw X Queued) — without the
-/// explicit Queued re-check it would reset X Completed→Ready via the
-/// I-047 carve-out and push_ready it.
-#[tokio::test]
-async fn test_reprobe_chain_both_cached_no_ready_reset() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut rx = connect_executor(&handle, "rc-w", "x86_64-linux").await?;
-
-    let x_out = test_store_path("rc-x-out");
-    let y_out = test_store_path("rc-y-out");
-    let mut x = make_node("rc-x");
-    x.expected_output_paths = vec![x_out.clone()];
-    let mut y = make_node("rc-y");
-    y.expected_output_paths = vec![y_out.clone()];
-    let mut ydep = make_node("rc-ydep");
-    ydep.expected_output_paths = vec![test_store_path("rc-ydep-out")];
-
-    // Build A: X→Y→ydep. ydep dispatches; complete it so Y is Queued→
-    // Ready; X stays Queued (Y not yet completed). Actually we want
-    // both X and Y in pre-dispatch states for the re-probe set: ydep
-    // assigned but NOT completed → Y stays Queued, X stays Queued.
-    let ba = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        ba,
-        vec![x.clone(), y.clone(), ydep.clone()],
-        vec![
-            make_test_edge("rc-x", "rc-y"),
-            make_test_edge("rc-y", "rc-ydep"),
-        ],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut rx).await;
-    assert!(assn.drv_path.ends_with("rc-ydep.drv"));
-    // Complete ydep → rc-w drains (one-shot). Y promotes to Ready but
-    // stays unassigned (no idle worker). X stays Queued (Y not
-    // Completed). Both Y(Ready) and X(Queued) are in existing_reprobe
-    // for build B.
-    store.seed_with_content(&test_store_path("rc-ydep-out"), b"yd");
-    complete_success(
-        &handle,
-        "rc-w",
-        &assn.drv_path,
-        &test_store_path("rc-ydep-out"),
-    )
-    .await?;
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, "rc-y").await.status,
-        DerivationStatus::Ready
-    );
-    assert_eq!(
-        expect_drv(&handle, "rc-x").await.status,
-        DerivationStatus::Queued
-    );
-
-    // Seed X.out and Y.out locally → both in cached_hits on build B.
-    store.seed_with_content(&x_out, b"x");
-    store.seed_with_content(&y_out, b"y");
-
-    // Uncached sibling root Z so check_roots_topdown's all-or-nothing
-    // falls through (X.out is locally present; without Z the prune
-    // would reduce build B to {X} only and X would defer on Y).
-    let mut z = make_node("rc-z");
-    z.expected_output_paths = vec![test_store_path("rc-z-out")];
-
-    let bb = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        bb,
-        vec![x.clone(), y.clone(), ydep, z],
-        vec![
-            make_test_edge("rc-x", "rc-y"),
-            make_test_edge("rc-y", "rc-ydep"),
-        ],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    let xs = expect_drv(&handle, "rc-x").await;
-    assert_eq!(
-        xs.status,
-        DerivationStatus::Completed,
-        "re-probe fixed-point: X (Queued) and Y (Ready) both cached → both \
-         Completed; X must NOT be reset to Ready by reprobe_unlocked (was: \
-         find_newly_ready(Y) captured X Queued → post-loop transition(Ready) \
-         on now-Completed X succeeded via I-047 carve-out → push_ready)"
-    );
-    assert_eq!(
-        expect_drv(&handle, "rc-y").await.status,
-        DerivationStatus::Completed
-    );
-    Ok(())
-}
-
-/// I-094 deferred lane: pre-existing Poisoned-at-limit X whose output
-/// is now locally present but inputDrv Y is in-flight. X ∈ cached_hits
-/// → fixed-point defers (all_deps_completed(X)=false). X is NOT
-/// newly_inserted (at-limit ⇒ is_retriable_on_resubmit=false).
-/// seed_initial_states skips it; reconcile_preexisting skips
-/// cached_hits keys. When Y completes, find_newly_ready only walks
-/// Queued. Net: X stuck Poisoned forever despite output present.
-/// Fix: deferred-reprobe stanza resets X →Queued.
-#[tokio::test]
-async fn test_deferred_reprobe_hit_on_poisoned_at_limit_unsticks() -> TestResult {
-    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut rx = connect_executor(&handle, "dr-w", "x86_64-linux").await?;
-
-    let x_out = test_store_path("dr-x-out");
-    let y_out = test_store_path("dr-y-out");
-    let mut x = make_node("dr-x");
-    x.expected_output_paths = vec![x_out.clone()];
-    let mut y = make_node("dr-y");
-    y.expected_output_paths = vec![y_out.clone()];
-
-    // Build 1: X→Y. Y dispatches (leaf). Hold Y running.
-    let b1 = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        b1,
-        vec![x.clone(), y.clone()],
-        vec![make_test_edge("dr-x", "dr-y")],
-        false,
-    )
-    .await?;
-    let assn = recv_assignment(&mut rx).await;
-    assert!(assn.drv_path.ends_with("dr-y.drv"));
-
-    // Force X to Poisoned at the resubmit limit so dag.merge does NOT
-    // reset it on resubmit (is_retriable_on_resubmit=false).
-    handle
-        .debug_force_poisoned("dr-x", POISON_RESUBMIT_RETRY_LIMIT)
-        .await?;
-    let pre = expect_drv(&handle, "dr-x").await;
-    assert_eq!(pre.status, DerivationStatus::Poisoned);
-    assert_eq!(pre.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
-
-    // X's output now locally present (cached_hits lane).
-    store.seed_with_content(&x_out, b"x");
-
-    // Build 2: {X,Y}. X ∈ existing_reprobe (Poisoned), X ∈ cached_hits
-    // (output present), all_deps_completed(X)=false (Y Running) →
-    // deferred. Stanza resets X →Queued.
-    let b2 = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        b2,
-        vec![x, y],
-        vec![make_test_edge("dr-x", "dr-y")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    let xs = expect_drv(&handle, "dr-x").await;
-    assert_eq!(
-        xs.status,
-        DerivationStatus::Queued,
-        "deferred re-probe on Poisoned-at-limit with output present + dep \
-         in-flight → reset to Queued (was: stayed Poisoned forever; \
-         find_newly_ready never picks up Poisoned)"
-    );
-    assert_eq!(
-        xs.retry.resubmit_cycles, 0,
-        "failure history cleared (output present)"
-    );
-
-    // Complete Y → X promotes via find_newly_ready (now that it's Queued).
-    store.seed_with_content(&y_out, b"y");
-    complete_success(&handle, "dr-w", &assn.drv_path, &y_out).await?;
-    barrier(&handle).await;
-    let xs2 = expect_drv(&handle, "dr-x").await;
-    assert!(
-        matches!(
-            xs2.status,
-            DerivationStatus::Ready | DerivationStatus::Completed
-        ),
-        "after dep completes, X (Queued) promotes; got {:?}",
-        xs2.status
     );
     Ok(())
 }
@@ -8806,160 +7501,104 @@ async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str
         .unwrap_or_default()
 }
 
-/// A resubmit of a retriable Poisoned node writes a `resubmit_reset`
-/// row carrying the incremented cycle, and the suffix loader cuts the
-/// pre-reset history at it.
+// r[verify sched.merge.substitute-topdown+4]
+/// Top-down: deps pruned from this build are NOT in the global DAG,
+/// so a later build that needs them triggers its own cache-check.
+///
+/// Guards against the shared-DAG correctness bug where marking
+/// deps as Completed without fetching would poison later builds
+/// that actually need the dep NAR.
 #[tokio::test]
-async fn attempt_ledger_resubmit_reset_row_cuts_suffix() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("rsr-w", "x86_64-linux").await?;
-    let drv_hash = "rsr-d";
-    let drv_path = test_drv_path(drv_hash);
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    let _a = recv_assignment(&mut rx).await;
-    complete_failure(
-        &handle,
-        "rsr-w",
-        &drv_path,
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "header missing",
-    )
-    .await?;
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Poisoned
-    );
-    assert_eq!(ledger_classes(&db.pool, drv_hash).await, vec!["permanent"]);
+async fn test_topdown_pruned_deps_not_in_global_dag() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
 
-    // Resubmit: a new build referencing the same node resets it
-    // (poisoned + under the resubmit limit → retriable) and the reset
-    // itself becomes a durable row.
-    let _ev2 =
-        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    barrier(&handle).await;
-
-    let rows = ledger_rows(&db.pool, drv_hash).await;
-    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
-    assert_eq!(classes, vec!["permanent", "resubmit_reset"], "{rows:?}");
-    let reset = rows.last().expect("reset row");
-    assert_eq!(reset.event_kind, "reset");
-    assert_eq!(
-        reset.resubmit_cycle, 1,
-        "the reset row carries the incremented cycle"
-    );
-
-    assert_eq!(
-        suffix_classes(&db.pool, drv_hash).await,
-        vec!["resubmit_reset"],
-        "the suffix loader cuts the pre-reset history"
-    );
-    Ok(())
-}
-
-/// An admin ClearPoison writes a `poison_cleared` reset row in the same
-/// transaction as the PG-first clear; the suffix starts at it.
-#[tokio::test]
-async fn attempt_ledger_admin_clear_poison_reset_row() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("acp-w", "x86_64-linux").await?;
-    let drv_hash = "acp-d";
-    let drv_path = test_drv_path(drv_hash);
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    let _a = recv_assignment(&mut rx).await;
-    complete_failure(
-        &handle,
-        "acp-w",
-        &drv_path,
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "header missing",
-    )
-    .await?;
-    barrier(&handle).await;
-
-    let (reply_tx, reply_rx) = oneshot::channel();
-    handle
-        .send_unchecked(ActorCommand::ClearPoison {
-            drv_hash: drv_hash.into(),
-            reply: reply_tx,
-        })
-        .await?;
-    assert!(reply_rx.await?, "ClearPoison must succeed");
-    barrier(&handle).await;
-
-    let rows = ledger_rows(&db.pool, drv_hash).await;
-    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
-    assert_eq!(classes, vec!["permanent", "poison_cleared"], "{rows:?}");
-    assert_eq!(rows.last().expect("reset row").event_kind, "reset");
-    assert_eq!(
-        suffix_classes(&db.pool, drv_hash).await,
-        vec!["poison_cleared"],
-        "the suffix loader cuts the pre-clear history"
-    );
-    Ok(())
-}
-
-/// A re-probe cache hit on a still-poisoned node (at the resubmit
-/// limit, so the resubmit reset cannot fire first) writes a
-/// `cache_hit_clear` reset row in the same transaction as the poison
-/// clear; the suffix starts at it.
-#[tokio::test]
-async fn attempt_ledger_cache_hit_clear_reset_row() -> TestResult {
-    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut worker_rx = connect_executor(&handle, "chc-w", "x86_64-linux").await?;
-    let drv_hash = "chc-d";
-    let out = test_store_path("chc-d-out");
-    let mut node = make_node(drv_hash);
-    node.expected_output_paths = vec![out.clone()];
-    // Not in the store yet: build #1 must dispatch and fail.
-    store.state.paths.write().unwrap().remove(&out);
-
-    let build1 = Uuid::new_v4();
-    merge_dag(&handle, build1, vec![node.clone()], vec![], false).await?;
-    let _ = worker_rx.recv().await.expect("assignment");
-    complete_failure(
-        &handle,
-        "chc-w",
-        &test_drv_path(drv_hash),
-        rio_proto::types::BuildResultStatus::PermanentFailure,
-        "permanent",
-    )
-    .await?;
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Poisoned
-    );
-
-    // Pin at the resubmit limit so the next merge does NOT reset it
-    // (that would be the resubmit_reset kind); the re-probe cache hit
-    // is then what clears the poison.
-    assert!(handle.debug_force_poisoned(drv_hash, 2).await?);
-    // The output now exists in the store.
+    let hello_out = test_store_path("hello-shared");
+    let glibc_out = test_store_path("glibc-shared");
     store
         .state
-        .paths
+        .substitutable
         .write()
         .unwrap()
-        .insert(out.clone(), Default::default());
+        .push(hello_out.clone());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(glibc_out.clone());
 
-    let build2 = Uuid::new_v4();
-    merge_dag(&handle, build2, vec![node], vec![], false).await?;
-    barrier(&handle).await;
+    // Build A: hello → glibc. hello substitutable → glibc pruned.
+    let mut hello = make_node("hello-a");
+    hello.expected_output_paths = vec![hello_out.clone()];
+    let mut glibc_a = make_node("glibc-a");
+    glibc_a.expected_output_paths = vec![glibc_out.clone()];
+
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![hello, glibc_a],
+        vec![make_test_edge("hello-a", "glibc-a")],
+        false,
+    )
+    .await?;
+    settle_substituting(&handle, &["hello-a"]).await;
+
+    let status_a = query_status(&handle, build_a).await?;
     assert_eq!(
-        expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Completed,
-        "re-probe cache hit completes the still-poisoned node"
+        status_a.state,
+        rio_proto::types::BuildState::Succeeded as i32
     );
 
-    let rows = ledger_rows(&db.pool, drv_hash).await;
-    let classes: Vec<&str> = rows.iter().map(|r| r.outcome_class.as_str()).collect();
-    assert_eq!(classes, vec!["permanent", "cache_hit_clear"], "{rows:?}");
-    assert_eq!(rows.last().expect("reset row").event_kind, "reset");
-    assert_eq!(
-        suffix_classes(&db.pool, drv_hash).await,
-        vec!["cache_hit_clear"],
-        "the suffix loader cuts the pre-clear history"
+    // Clear QPI tracking between builds.
+    store.calls.qpi_calls.write().unwrap().clear();
+
+    // Build B: app → glibc. app NOT substitutable → falls through
+    // → full merge → glibc is newly_inserted (NOT pre-existing from
+    // A, because A pruned it) → check_cached_outputs fetches glibc.
+    let mut app = make_node("app-b");
+    app.expected_output_paths = vec![test_store_path("app-b-out")];
+    let mut glibc_b = make_node("glibc-a");
+    glibc_b.expected_output_paths = vec![glibc_out.clone()];
+
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![app, glibc_b],
+        vec![make_test_edge("app-b", "glibc-a")],
+        false,
+    )
+    .await?;
+    settle_substituting(&handle, &["glibc-a"]).await;
+
+    // glibc fetched by Build B's bottom-up — proves it wasn't
+    // stuck as phantom-Completed from Build A's prune.
+    let qpi = store.calls.qpi_calls.read().unwrap();
+    assert!(
+        qpi.contains(&glibc_out),
+        "Build B should fetch glibc (pruned from A, newly-inserted in B); \
+         qpi_calls={qpi:?}"
     );
+
     Ok(())
+}
+
+// ===========================================================================
+// I-047: pre-existing Completed with GC'd output → reset to Ready
+// ===========================================================================
+
+/// Store/substitution state of a pre-existing `Completed` output when
+/// Build B re-merges it. See [`test_preexisting_completed_gc_matrix`].
+enum GcState {
+    /// Output GC'd, not substitutable → reset to Ready (I-047).
+    Gone,
+    /// Output GC'd but substitutable upstream → detached fetch spawned
+    /// (Completed→Ready→Substituting), comes back to Completed (I-202).
+    Substitutable,
+    /// Output GC'd, substitutable, but QPI fails → SubstituteComplete
+    /// {ok=false} → reverts to Ready, re-dispatches.
+    SubFetchFail,
+    /// FindMissingPaths itself fails → fail-open, stays Completed.
+    StoreUnreachable,
 }

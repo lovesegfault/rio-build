@@ -8,21 +8,22 @@
 #
 # What the fragment proves (the T-1b.8/T-1b.9 slice of the 1b gate):
 #
-#   - Retry-feed equivalence over the fold input: the SAME scripted
-#     {success, deterministic-failure} sequence is driven through the
-#     stream pool (the fixture default x86-64) and then through a
-#     dispatchMode:Pull pool. Both failure legs are classified by the
-#     same worker-report path: same outcome_class, one charge row each
-#     (never a double charge — exec_id is schema-unique), successes
-#     charge nothing, both derivations end poisoned and both clients
-#     see the failure. Exclusion keying per AD2: the stream row is
-#     executor(pod)-keyed (source_node NULL), the pull row is keyed by
-#     the attested intent identity with source_node as the node key
-#     when the controller-authoritative binding is reported. In this
-#     fixture the per-pool reconciler ships no bound_intents, so
-#     source_node stays NULL — printed, not asserted; the node-keyed
-#     exclusion half of AD2 is covered by the T-1b.1/T-1b.2 unit and
-#     contract batteries, not by this scenario.
+#   - Pull retry-feed (fold input): a scripted {success,
+#     deterministic-failure} sequence on a dispatchMode:Pull pool. The
+#     failure leg is classified by the worker-report path as exactly
+#     one `permanent` worker-reported attempt row (never a double
+#     charge — exec_id is schema-unique), the success leg charges
+#     nothing, the failed derivation ends poisoned and the client sees
+#     the failure. (The stream-baseline leg this used to be compared
+#     against retired with the stream session machinery — 1c' deletion
+#     commit A; these are now absolute assertions on the pull leg.)
+#     Exclusion keying per AD2: the pull row is keyed by the attested
+#     intent identity with source_node as the node key when the
+#     controller-authoritative binding is reported. In this fixture
+#     the per-pool reconciler ships no bound_intents, so source_node
+#     stays NULL — printed, not asserted; the node-keyed exclusion
+#     half of AD2 is covered by the T-1b.1/T-1b.2 unit and contract
+#     batteries, not by this scenario.
 #   - Cancel timing (T-1b.9): CancelBuild on a running pull-mode build
 #     closes the attempt, ends the drv Cancelled, and the controller
 #     foreground-deletes the Job on the closed-while-active edge; the
@@ -206,62 +207,18 @@ scope: with scope; ''
       return client.succeed(f"cat /tmp/{tag}.out").strip()
 
   # ══════════════════════════════════════════════════════════════════
-  # Arm 1 — stream baseline: the scripted {success, failure} sequence
-  # on the fixture default x86-64 (stream) pool.
+  # Arm 1 — pull retry-feed: the scripted {success, failure} sequence
+  # on a dispatchMode:Pull pool; assert the fold input directly.
   # ══════════════════════════════════════════════════════════════════
-  with subtest("pull-canary: stream baseline runs the scripted success+failure sequence"):
-      ok_out = build("${pcStreamOk}", timeout_wrap=420)
-      assert "/nix/store/" in ok_out, (
-          f"stream success leg must deliver a store path, got: {ok_out!r}"
-      )
-      fail_out = build("${pcStreamFail}", expect_fail=True, timeout_wrap=420)
-      print(f"pull-canary stream-fail client tail: {fail_out[-300:]!r}")
-
-      assert pc_attempt_rows("pc-stream-ok") == 0, (
-          "a clean stream build must charge nothing (the ledger records "
-          "failures, never successes)"
-      )
-      assert pc_drv_status("pc-stream-ok") == "completed", (
-          f"stream success leg should end completed, got {pc_drv_status('pc-stream-ok')!r}"
-      )
-      stream_facts = pc_charge_facts("pc-stream-fail")
-      s_class, s_reason, s_party, s_exec, s_node, s_is_intent, s_kind = stream_facts[:7]
-      assert s_kind == "attempt" and s_party == "worker", (
-          f"the stream failure must be one worker-reported attempt row, got: {stream_facts!r}"
-      )
-      assert s_class == "permanent", (
-          f"a deterministic build failure classifies permanent on the stream path, "
-          f"got {s_class!r}"
-      )
-      assert s_is_intent == "false" and s_exec != "<none>", (
-          f"stream rows are executor(pod)-keyed, got executor_id={s_exec!r}"
-      )
-      assert s_node == "<none>", (
-          f"stream rows carry no source_node (executor-keyed exclusion), got {s_node!r}"
-      )
-      assert pc_dispatch_modes("pc-stream-fail") == "stream", (
-          f"the stream leg must execute with dispatch_mode=stream, "
-          f"got {pc_dispatch_modes('pc-stream-fail')!r}"
-      )
-      assert pc_drv_status("pc-stream-fail") == "poisoned", (
-          f"the permanent stream failure must poison the drv, "
-          f"got {pc_drv_status('pc-stream-fail')!r}"
-      )
-      print(f"pull-canary stream baseline: success uncharged, failure charged once "
-            f"as {s_class} by {s_exec}")
-
-  # ══════════════════════════════════════════════════════════════════
-  # Arm 2 — pull equivalence: the same scripted sequence on a
-  # dispatchMode:Pull pool; assert the retry-feed (fold input) matches.
-  # ══════════════════════════════════════════════════════════════════
-  with subtest("pull-canary: pull-mode pool runs the same sequence (retry-feed equivalence)"):
+  with subtest("pull-canary: pull-mode pool runs the scripted sequence (retry-feed)"):
       kubectl(
           "delete pool x86-64 --ignore-not-found --wait=true",
           ns="${nsBuilders}",
       )
       # Pod-level precondition only — same reasoning as the pull-mode
-      # fragment banner: pull pods never register, so only a LIVE
-      # stream worker pod could steal the dispatch.
+      # fragment banner: pull pods never register, so a leftover pod
+      # from the fixture default pool is the only thing that could
+      # steal the dispatch.
       k3s_server.wait_until_succeeds(
           "! k3s kubectl -n ${nsBuilders} get pods --no-headers 2>/dev/null | grep -q .",
           timeout=120,
@@ -301,18 +258,16 @@ scope: with scope; ''
       )
       pull_facts = pc_charge_facts("pc-pull-fail")
       p_class, p_reason, p_party, p_exec, p_node, p_is_intent, p_kind = pull_facts[:7]
-      # The equivalence assertions over the fold input: same outcome
-      # class, same (absent) termination_reason, same reporting party,
-      # one charge per failure leg, zero per success leg, and the same
-      # client-visible verdict — only the exclusion KEY differs by
-      # design (executor for stream rows, intent identity + node key
-      # for pull rows).
-      assert p_class == s_class, (
-          f"pull/stream outcome class diverged for the same scripted failure: "
-          f"{p_class!r} vs {s_class!r}"
-      )
-      assert p_reason == s_reason, (
-          f"pull/stream termination_reason diverged: {p_reason!r} vs {s_reason!r}"
+      # The fold-input assertions on the pull leg: a deterministic
+      # build failure is exactly one `permanent` worker-reported
+      # attempt row, one charge per failure leg, zero per success leg,
+      # and the client-visible verdict matches. The exclusion KEY is
+      # the attested intent identity (+ node key when the binding is
+      # reported), per AD2.
+      assert p_class == "permanent", (
+          f"a deterministic pull-leg build failure must classify as a "
+          f"permanent worker-reported attempt, got class {p_class!r} "
+          f"(facts: {pull_facts!r})"
       )
       assert p_kind == "attempt" and p_party == "worker", (
           f"the pull failure must be one worker-reported attempt row, got: {pull_facts!r}"
@@ -333,21 +288,18 @@ scope: with scope; ''
       # reconciler ships no bound_intents in this fixture, so the
       # column stays NULL here. The node-keyed exclusion is covered by
       # the T-1b.1/T-1b.2 unit/contract batteries.
-      print(f"pull-canary equivalence: class {p_class} == {s_class}, "
-            f"stream key={s_exec!r} (executor), pull key=intent identity, "
-            f"stream source_node={s_node!r}, pull source_node={p_node!r}")
+      print(f"pull-canary retry-feed: class {p_class}, reason {p_reason!r}, "
+            f"pull key=intent identity, source_node={p_node!r}")
       total_rows = (
-          pc_attempt_rows("pc-stream-ok")
-          + pc_attempt_rows("pc-stream-fail")
-          + pc_attempt_rows("pc-pull-ok")
+          pc_attempt_rows("pc-pull-ok")
           + pc_attempt_rows("pc-pull-fail")
       )
-      assert total_rows == 2, (
-          f"the scripted sequence must charge exactly once per failure leg and "
+      assert total_rows == 1, (
+          f"the scripted sequence must charge exactly once for the failure leg and "
           f"never double-charge, got {total_rows} rows total"
       )
-      print("pull-canary equivalence PASS: same outcome class, one charge per "
-            "failure, no double charges, successes charge-free on both pools")
+      print("pull-canary retry-feed PASS: one permanent charge for the failure, "
+            "no double charges, the success charge-free")
 
   # ══════════════════════════════════════════════════════════════════
   # Arm 3 — cancel timing (T-1b.9): CancelBuild on a running pull build.

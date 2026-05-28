@@ -9,10 +9,9 @@
 //! transaction — append the attempt row(s), move the site's existing
 //! status persist onto the `_in_tx` variants in `db/derivations.rs`,
 //! commit — and pushes the in-memory [`AttemptRecord`] mirror only
-//! after the commit. Controller-reported attempts are two-installment:
-//! the disconnect appends the row (`outcome_class = 'disconnected'`,
-//! `termination_reason` NULL) and the later classifying report fills
-//! it via [`SchedulerDb::fill_termination`] — an UPDATE guarded
+//! after the commit. The controller's pod-terminal report is a
+//! reason-only second installment on the worker-reported row
+//! ([`SchedulerDb::fill_termination_reason_only`]) — an UPDATE guarded
 //! `WHERE termination_reason IS NULL`, never a second INSERT. The
 //! partial unique index on `exec_id` makes one-row-per-execution a
 //! schema property regardless of arrival order.
@@ -392,49 +391,13 @@ impl SchedulerDb {
     /// `termination_reason` (and reclassify `outcome_class`) on the
     /// row identified by `(derivation_id, exec_id)`.
     ///
-    /// Idempotent first-writer-wins via `WHERE termination_reason IS
-    /// NULL`; returns whether THIS call performed the fill. Keyed on
-    /// the released `(derivation_id, exec_id)` pair carried by the
-    /// `recently_disconnected` entry so the establishment fill never
-    /// needs a DAG lookup (the node may already be reaped or carry the
-    /// next attempt's exec_id).
-    pub(crate) async fn fill_termination(
-        tx: &mut PgConnection,
-        derivation_id: Uuid,
-        exec_id: Uuid,
-        termination_reason: &str,
-        outcome_class: OutcomeClass,
-        // The classifying report's floor outcome `(exempt, promoted,
-        // at_cap)`: the discriminators the fold reads for the
-        // controller-classified infra family (all false for
-        // non-classifying fills such as the establishment sweep).
-        (exempt, floor_promoted, floor_at_cap): (bool, bool, bool),
-    ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query(
-            "UPDATE drv_attempts \
-             SET termination_reason = $3, outcome_class = $4, \
-                 exempt = $5, floor_promoted = $6, floor_at_cap = $7 \
-             WHERE derivation_id = $1 AND exec_id = $2 \
-               AND termination_reason IS NULL",
-        )
-        .bind(derivation_id)
-        .bind(exec_id)
-        .bind(termination_reason)
-        .bind(outcome_class.as_str())
-        .bind(exempt)
-        .bind(floor_promoted)
-        .bind(floor_at_cap)
-        .execute(&mut *tx)
-        .await?;
-        Ok(result.rows_affected() == 1)
-    }
-
     /// Reason-only second installment: fill `termination_reason` on the
     /// row identified by `(derivation_id, exec_id)` WITHOUT touching its
     /// `outcome_class` or floor flags — the unified pod-terminal report
     /// (`ReportAttemptOutcome`) enriches an already-classified row, it
-    /// never reclassifies it. Same first-writer-wins guard as
-    /// [`Self::fill_termination`]; returns whether THIS call filled it.
+    /// never reclassifies it. First-writer-wins via the same
+    /// `WHERE termination_reason IS NULL` guard; returns whether THIS
+    /// call filled it.
     /// `source_node` (the controller-reported kube-authoritative node,
     /// AD2c) is stamped only when the row does not already carry one —
     /// the pull-mint / worker-report attribution wins when present.

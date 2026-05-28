@@ -18,7 +18,7 @@ use std::time::Instant;
 #[allow(unused_imports)]
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tonic::transport::Channel;
-use tracing::{debug, error, info, instrument, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use rio_proto::StoreServiceClient;
@@ -31,7 +31,7 @@ use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
-    HEARTBEAT_TIMEOUT_SECS, POISON_TTL, PoisonConfig, RetryPolicy,
+    POISON_TTL, PoisonConfig, RetryPolicy,
 };
 
 // `impl DagActor` is sharded across these submodules by concern.
@@ -270,36 +270,12 @@ pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 /// Entry in [`DagActor::authoritative_binding`]: kube-authoritative
 /// `spec.nodeName` from the controller's pod informer, plus the
 /// scheduler-side tenant attribution captured at Ack time. Bundled so
-/// `detect_hung_nodes` reads both off ONE map entry — `node` and
-/// `tenant` structurally cannot diverge (mb_012).
+/// every reader sees both off ONE map entry — `node` and `tenant`
+/// structurally cannot diverge (mb_012).
 #[derive(Debug, Clone)]
 pub(crate) struct AuthBinding {
     pub node: String,
     pub tenant: Option<Uuid>,
-}
-
-/// One executor that disconnected mid-build, awaiting the controller's
-/// classifying `ReportExecutorTermination` (or, failing that, the
-/// establishment sweep). Carries the RELEASED execution's identity —
-/// `(derivation_id, exec_id)` as they were at disconnect time — so the
-/// second installment and the establishment fill key the ledger row
-/// directly, with no DAG lookup: by the time the report (or the sweep)
-/// runs, the node may already carry the next attempt's exec_id or be
-/// reaped entirely.
-///
-/// `derivation_id`/`exec_id` are `None` only when the disconnect could
-/// not build a ledger row (node unknown / merge not yet committed / no
-/// execution minted) — then there is nothing to fill either.
-#[derive(Debug, Clone)]
-pub(crate) struct DisconnectedAttempt {
-    /// The derivation the released execution belonged to.
-    pub(crate) drv_hash: DrvHash,
-    /// `derivations.derivation_id` of that node at disconnect time.
-    pub(crate) derivation_id: Option<Uuid>,
-    /// The released execution's id (the ledger row's key).
-    pub(crate) exec_id: Option<Uuid>,
-    /// When the disconnect was observed (drives the TTL sweep).
-    pub(crate) at: Instant,
 }
 
 /// The DAG actor state.
@@ -315,32 +291,16 @@ pub struct DagActor {
     events: BuildEventBus,
     /// Connected workers.
     executors: HashMap<ExecutorId, ExecutorState>,
-    /// Hung-node names → last-detected-at, populated in `handle_tick`
-    /// BEFORE `tick_check_heartbeats` (which removes stale executors
-    /// using the same predicate). The controller's `dead_reap_cap`
-    /// rate-limits reaps, so a node must repeat across polls until the
-    /// controller gets to it — `tick_check_heartbeats` removes the
-    /// stale executors after detection, so a `Vec` recomputed each
-    /// tick would be a one-shot signal that drops N−cap nodes on AZ
-    /// outage. `handle_tick` `.insert(n, now)`s each (re-)detection
-    /// (refreshing the timestamp) and prunes entries older than
-    /// [`housekeeping::HUNG_NODE_REPEAT_TTL`] since last detected.
-    /// `compute_spawn_intents` reads `keys()`.
-    pub(crate) hung_nodes: HashMap<String, Instant>,
     /// Kube-authoritative `drv_hash → (spec.nodeName, tenant)` from
     /// the controller's pod informer (`AckSpawnedIntents.bound_intents`).
-    /// `detect_hung_nodes` reads BOTH `node` and `tenant` from this —
-    /// they structurally cannot diverge (mb_012; previously `tenant_of`
-    /// read `dag.node(auth)?..` which is `None` permanently once the
-    /// spawn-drv leaves the DAG, while `node_of` read this map → a
-    /// fall-through executor was counted in `occ`/`stale` but never
-    /// `tenants`). `node` is controller-authoritative; worker is NOT
-    /// trusted (a forged node_name in the heartbeat would let two
-    /// colluding tenants reap an arbitrary NodeClaim,
-    /// `r[sched.admin.hung-node-detector+3]`). `tenant` is captured
+    /// Read by the pull mint (AD2c `source_node` attribution) and the
+    /// establishment sweep's charge row; `node` is
+    /// controller-authoritative — worker-supplied identity is never
+    /// trusted for node attribution. `tenant` is captured
     /// scheduler-side at Ack time from `dag.node(h)?.attributed_tenant()`
     /// when DAG-present, else carried forward — once DAG-absent the
-    /// last DAG-present value sticks.
+    /// last DAG-present value sticks (mb_012: both projections come off
+    /// one entry so they structurally cannot diverge).
     ///
     /// Wholesale-rebuilt on Acks THAT CARRY `bound_intents` (~10s; the
     /// nodeclaim_pool reconciler ships the full set) — entries for
@@ -353,17 +313,6 @@ pub struct DagActor {
     /// stale entries until the next non-empty Ack, unread (no matching
     /// executor once the pod is gone).
     pub(crate) authoritative_binding: HashMap<DrvHash, AuthBinding>,
-    /// Executors that disconnected mid-build, awaiting the controller's
-    /// `ReportExecutorTermination` (k8s OOMKilled/Evicted reason) or, if
-    /// no classifying report ever arrives, the establishment sweep.
-    /// Captured before `self.executors.remove()`. The controller's
-    /// report arrives ~1-3s after disconnect; entries are swept on Tick
-    /// after [`executor::TERMINATION_REPORT_TTL`], at which point the
-    /// released attempt's ledger row is established as an unreported
-    /// executor crash. In-memory only: a lost entry (scheduler restart)
-    /// degrades to "one OOM doesn't promote" — same as pre-I-197
-    /// behavior for one cycle.
-    pub(crate) recently_disconnected: HashMap<ExecutorId, DisconnectedAttempt>,
     /// Phase 1b: per-derivation count of re-deliveries of a failure
     /// completion whose appending transaction (attempt row, `decide()`,
     /// status persist) failed. Bounded by
@@ -799,9 +748,7 @@ impl DagActor {
             builds: HashMap::new(),
             events: BuildEventBus::new(plumbing.event_persist_tx),
             executors: HashMap::new(),
-            hung_nodes: HashMap::new(),
             authoritative_binding: HashMap::new(),
-            recently_disconnected: HashMap::new(),
             attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
@@ -891,10 +838,8 @@ impl DagActor {
             ready_queue,
             builds,
             events,
-            recently_disconnected,
             attempt_record_retries,
             dispatched_cells,
-            hung_nodes,
             authoritative_binding,
             dag_authoritative,
             // Retained: rationale below.
@@ -962,11 +907,6 @@ impl DagActor {
         ready_queue.clear();
         builds.clear();
         events.clear();
-        // `recently_disconnected` is keyed by executor IDs from the
-        // previous generation — a stale entry would let a
-        // `ReportExecutorTermination` from the previous gen spuriously
-        // bump `resource_floor` on a drv this generation never assigned.
-        recently_disconnected.clear();
         // `attempt_record_retries` tracks re-deliveries for the previous
         // generation's pre-report derivations; after the wipe those are
         // recovered from PG and re-driven by the backstop, so the
@@ -976,17 +916,10 @@ impl DagActor {
         // hashes; a stale entry would let a heartbeat for a re-spawned
         // pod clear the wrong cell.
         dispatched_cells.clear();
-        // `hung_nodes` is a tick-derived snapshot of `executors`; stale
-        // once `executors` evolves. On lose→reacquire, a controller
-        // poll that lands before the first post-reacquire Tick would
-        // otherwise return the pre-lose set and `health::reap_unhealthy`
-        // could delete a recovered node. Empty `dead_nodes` is
-        // fail-closed (no reap).
-        hung_nodes.clear();
         // Snapshot of THIS generation's pod bindings (controller-
-        // reported). Stale entries would let `detect_hung_nodes`
-        // misattribute a re-dispatched drv to a previous-generation
-        // node.
+        // reported). Stale entries would let the pull mint or the
+        // establishment sweep attribute a re-dispatched drv to a
+        // previous-generation node.
         authoritative_binding.clear();
         // The DAG this fn just emptied no longer reflects PG; only the
         // next successful recovery (handle_leader_acquired's Ok arm)
@@ -1303,15 +1236,19 @@ impl DagActor {
                     reason,
                     reply,
                 } => {
-                    // r[impl sched.lease.standby-drops-writes] —
-                    // would bump `resource_floor` from a previous
-                    // generation's assignment.
-                    let promoted = if self.leader.is_leader() {
-                        self.handle_executor_termination(&executor_id, reason).await
-                    } else {
-                        false
-                    };
-                    let _ = reply.send(promoted);
+                    // The stream-era second-installment correlation
+                    // (`recently_disconnected` → floor bump → fill) is
+                    // gone with the session machinery. The RPC stays
+                    // until the 1d proto sweep so existing controller
+                    // deployments keep getting an ack; pod-terminal
+                    // classification for pull attempts arrives via
+                    // `ReportAttemptOutcome` and the establishment
+                    // sweep. Always `promoted=false`.
+                    debug!(executor_id = %executor_id, ?reason,
+                           "ReportExecutorTermination acknowledged as a no-op \
+                            (stream-era correlation removed; pull attempts are \
+                            classified via ReportAttemptOutcome/establishment)");
+                    let _ = reply.send(false);
                 }
                 ActorCommand::AckSpawnedIntents {
                     spawned,
@@ -1361,20 +1298,12 @@ impl DagActor {
                     }
                 }
                 ActorCommand::Heartbeat(hb) => {
-                    let executor_id = hb.executor_id.clone();
-                    let (phantoms, became_idle) = self.handle_heartbeat(hb);
-                    // I-035: drain phantom assignments BEFORE the next
-                    // dispatch so the freed slot + re-queued derivation
-                    // are both visible to it.
-                    // r[impl sched.lease.standby-drops-writes] —
-                    // `drain_phantoms` persists Ready to PG; the arm
-                    // itself stays ungated (`handle_heartbeat` keeps
-                    // `self.executors` accurate for reconnect-after-
-                    // reacquire and doesn't write PG). `dispatch_ready`
-                    // below self-gates (dispatch.rs).
-                    if !phantoms.is_empty() && self.leader.is_leader() {
-                        self.drain_phantoms(&executor_id, phantoms).await;
-                    }
+                    // r[sched.lease.standby-drops-writes]: arm stays
+                    // ungated (`handle_heartbeat` keeps `self.executors`
+                    // accurate for reconnect-after-reacquire and doesn't
+                    // write PG). `dispatch_ready` below self-gates
+                    // (dispatch.rs).
+                    let became_idle = self.handle_heartbeat(hb);
                     // I-163: mark dirty instead of dispatching inline.
                     // 290 workers × 10s heartbeat × 169ms dispatch_ready
                     // = ~5× actor capacity → mailbox_depth=9.5k → admin
@@ -1451,7 +1380,6 @@ impl DagActor {
                 }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;
-                    self.schedule_reconcile_timer();
                     // Immediate dispatch attempt after recovery. If
                     // workers haven't reconnected yet, dispatch finds
                     // no candidates → no-op. If they HAVE (workers
@@ -1460,12 +1388,6 @@ impl DagActor {
                     // immediately instead of waiting ~10s for the
                     // first heartbeat to trigger it.
                     self.dispatch_ready().await;
-                }
-                ActorCommand::ReconcileAssignments => {
-                    // r[impl sched.lease.standby-drops-writes]
-                    if self.leader.is_leader() {
-                        self.handle_reconcile_assignments().await;
-                    }
                 }
                 ActorCommand::SubstituteComplete {
                     drv_hash,

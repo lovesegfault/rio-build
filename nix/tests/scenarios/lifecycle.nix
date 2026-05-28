@@ -239,31 +239,19 @@ let
     sleepSecs = 45;
   };
 
-  # pull-canary (vm-pull-canary-k3s only): the retry-feed equivalence
-  # script plus the cancel/preempt/establishment arms. Distinct pname
-  # per drv keeps every one unfitted for the SLA estimator (per-pname
-  # estimates), so each Job's activeDeadlineSeconds stays at the
-  # overlay's 180s probe-deadline floor and the establishment window
-  # stays ~300s. The ok/fail pairs are the "same scripted sequence"
-  # driven through the stream pool and then the pull pool — only the
-  # marker (and therefore the pname) differs between the two pools'
-  # copies. The 60s sleepers leave a comfortable margin under the
-  # overlay's ~90s worker timeout while staying observable mid-build.
-  pcStreamOk = drvs.mkTrivial {
-    marker = "pc-stream-ok";
-    sleepSecs = 5;
-  };
+  # pull-canary (vm-pull-canary-k3s only): the scripted pull-pool
+  # {success, failure} sequence plus the cancel/preempt/establishment
+  # arms. Distinct pname per drv keeps every one unfitted for the SLA
+  # estimator (per-pname estimates), so each Job's
+  # activeDeadlineSeconds stays at the overlay's 180s probe-deadline
+  # floor and the establishment window stays ~300s. The 60s sleepers
+  # leave a comfortable margin under the overlay's ~90s worker timeout
+  # while staying observable mid-build. (The stream-baseline copies of
+  # the ok/fail pair retired with the stream session machinery — 1c'
+  # deletion commit A.)
   pcPullOk = drvs.mkTrivial {
     marker = "pc-pull-ok";
     sleepSecs = 5;
-  };
-  pcStreamFail = drvs.mkCustom {
-    name = "rio-test-pc-stream-fail";
-    script = ''
-      ''${busybox}/bin/busybox sleep 5
-      ''${busybox}/bin/busybox echo "pull-canary deterministic failure (stream leg)" >&2
-      exit 1
-    '';
   };
   pcPullFail = drvs.mkCustom {
     name = "rio-test-pc-pull-fail";
@@ -653,9 +641,7 @@ let
       ephemeralDrv2
       pullDrv1
       pullDrv2
-      pcStreamOk
       pcPullOk
-      pcStreamFail
       pcPullFail
       pcCancelDrv
       pcPreemptDrv

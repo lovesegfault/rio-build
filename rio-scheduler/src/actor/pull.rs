@@ -808,29 +808,6 @@ pub struct AttemptIdentity {
     pub exec_id: Option<Uuid>,
 }
 
-/// Map the unified pod-terminal reason onto the legacy
-/// `TerminationReason` vocabulary for identities that resolve to a
-/// stream-mode executor (the C4/C5 unification keeps the stream
-/// classification path bit-identical — same handler, same dedup, same
-/// floor arithmetic). The controller-synthesized verdicts (cancelled /
-/// preempted / reaped) and the spawn-gate NoEligibleSource have no
-/// legacy equivalent and never route there.
-pub(crate) fn legacy_termination_reason(
-    reason: rio_proto::types::AttemptTerminalReason,
-) -> Option<rio_proto::types::TerminationReason> {
-    use rio_proto::types::{AttemptTerminalReason as A, TerminationReason as T};
-    match reason {
-        A::Unspecified => Some(T::Unknown),
-        A::OomKilled => Some(T::OomKilled),
-        A::EvictedDiskPressure => Some(T::EvictedDiskPressure),
-        A::EvictedOther => Some(T::EvictedOther),
-        A::Completed => Some(T::Completed),
-        A::Error => Some(T::Error),
-        A::DeadlineExceeded => Some(T::DeadlineExceeded),
-        A::Cancelled | A::Preempted | A::Reaped | A::NoEligibleSource => None,
-    }
-}
-
 /// Map the wire reason to the `termination_reason` label the second
 /// installment records.
 pub(crate) fn attempt_terminal_reason_label(
@@ -898,49 +875,17 @@ impl DagActor {
         if reason == rio_proto::types::AttemptTerminalReason::NoEligibleSource {
             return self.handle_no_eligible_source(&identity).await;
         }
-        // Defense in depth for the unified intake's routing during
-        // coexistence: a report whose job/pod name the scheduler knows
-        // as a STREAM identity (currently registered, or recently
-        // disconnected mid-build) belongs to the as-built stream
-        // classification path even when the sender also attached an
-        // intent id — the same intent can simultaneously carry another
-        // pod's open pull attempt (the documented double-spawn
-        // overlap), and that attempt must never absorb a stream pod's
-        // classification or node attribution. The controller gates
-        // intent_id population to pull-mode pods at the source; this
-        // guard covers any sender that does not. Residual: a stream
-        // pod the scheduler no longer remembers (entry expired) with a
-        // both-keys report still resolves by intent, where the legacy
-        // arm would have been a no-op anyway.
-        let job_is_stream_identity = identity
-            .job_name
-            .as_deref()
-            .filter(|s| !s.is_empty())
-            .is_some_and(|job| {
-                let as_executor = ExecutorId::from(job);
-                let prefix = format!("{job}-");
-                self.executors.contains_key(&as_executor)
-                    || self.recently_disconnected.contains_key(&as_executor)
-                    || self
-                        .executors
-                        .keys()
-                        .chain(self.recently_disconnected.keys())
-                        .any(|k| k.as_str().starts_with(&prefix))
-            });
         // Resolve the attempt: exec_id first, then the intent's open
-        // pull-mode attempt (never for a stream identity). A
-        // Job-name-only report cannot be resolved here yet (the
-        // deterministic name embeds only a derived suffix); the
-        // controller-side callers always know the exec/intent from
-        // ListOpenAttempts.
+        // pull-mode attempt. A Job-name-only report cannot be resolved
+        // here yet (the deterministic name embeds only a derived
+        // suffix); the controller-side callers always know the
+        // exec/intent from ListOpenAttempts.
         let resolved = if let Some(exec_id) = identity.exec_id {
             self.db
                 .find_attempt_by_exec_id(exec_id)
                 .await
                 .map_err(|e| PullRejection::Internal(format!("attempt lookup failed: {e}")))?
                 .map(|row| (exec_id, row))
-        } else if job_is_stream_identity {
-            None
         } else if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
             self.db
                 .find_open_pull_attempt_by_drv_hash(intent)
@@ -959,24 +904,6 @@ impl DagActor {
             if let Some(intent) = identity.intent_id.as_deref().filter(|s| !s.is_empty()) {
                 self.dispatched_cells.remove(intent);
             }
-            // C4/C5 unification: an identity with no pull-mode attempt
-            // but a Job/pod name and a k8s pod-terminal classification
-            // is a stream-mode report — route it through the SAME
-            // internal path `ReportExecutorTermination` serves
-            // (recently_disconnected dedup, floor arithmetic,
-            // second-installment fill on the disconnect's row), so the
-            // re-pointed controller produces bit-identical stream
-            // behavior. The synthesized verdicts (cancelled / preempted
-            // / reaped) never take this arm — for a stream Job they are
-            // never sent (the synthesize arm is pull-filtered), and for
-            // a never-pulled pull pod there is nothing to classify.
-            if let Some(job_name) = identity.job_name.as_deref().filter(|s| !s.is_empty())
-                && let Some(legacy) = legacy_termination_reason(reason)
-            {
-                let executor_id = ExecutorId::from(job_name);
-                self.handle_executor_termination(&executor_id, legacy).await;
-                return Ok(());
-            }
             // The no-attempt no-op arm: acknowledge, charge nothing,
             // and leave the (still-wanted) drv exactly as it is so the
             // spawn intent re-arms on the next controller poll.
@@ -990,11 +917,13 @@ impl DagActor {
             return Ok(());
         };
 
-        // Stream-mode attempts stay owned by the as-built report paths
-        // (ReportExecutorTermination / the deadline-exceeded Job
-        // report) during coexistence — never classified from here.
+        // A non-pull attempt row can only come from the legacy stream
+        // dispatch plumbing (production-unreachable since the session
+        // machinery was deleted; the placement layer that can still
+        // mint such rows in tests retires with the next deletion
+        // commit). This intake never classifies those rows.
         if attempt.dispatch_mode != "pull" {
-            debug!(%exec_id, "ReportAttemptOutcome for a stream-mode attempt ignored (as-built paths own it)");
+            debug!(%exec_id, "ReportAttemptOutcome for a non-pull attempt ignored");
             return Ok(());
         }
         if attempt.attempt_terminal {

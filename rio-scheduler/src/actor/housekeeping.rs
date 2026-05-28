@@ -1,12 +1,12 @@
-//! Periodic Tick housekeeping: heartbeat-timeout reap, backstop
-//! timeouts, orphan-watcher sweep, poison-TTL expiry, event-log GC,
-//! derivation-row GC, gauge publish, SLA estimator refresh.
+//! Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL
+//! expiry, per-build timeouts, event-log GC, derivation-row GC, gauge
+//! publish, SLA estimator refresh, and the open pull-attempt
+//! establishment sweep — the single scheduler-side time-based repair
+//! the pull path keeps.
 //!
 //! Split from `executor.rs` — that module is the executor lifecycle
-//! (connect/disconnect/heartbeat); the eight `tick_*` fns here are
-//! periodic maintenance that happens to run from the same actor loop.
-//! Keeping them separate makes "what runs every Tick" discoverable
-//! without scrolling past 1000 lines of heartbeat-reconcile.
+//! (connect/disconnect/heartbeat); the `tick_*` fns here are periodic
+//! maintenance that happens to run from the same actor loop.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -15,42 +15,11 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::state::{
-    BuildState, DerivationStatus, DrvHash, ExecutorId, HEARTBEAT_TIMEOUT_SECS, OutcomeClass,
-    POISON_TTL, ReportingParty, verifiable_wanted_paths,
+    BuildState, DerivationStatus, DrvHash, ExecutorId, OutcomeClass, POISON_TTL, ReportingParty,
+    verifiable_wanted_paths,
 };
 
-use super::{DagActor, snapshot};
-
-/// How long a hung-node entry stays in [`DagActor::hung_nodes`] after
-/// its last (re-)detection. The controller's `dead_reap_cap` is
-/// `min(3, ⌈5%·|live|⌉).max(1)` per 10s tick, so 120s gives ≥12
-/// controller ticks ≥ 4×cap drain time at cap=3. After
-/// `tick_check_heartbeats` the source executors are removed, so the
-/// entry won't be re-detected — this TTL is the repeat window.
-pub(super) const HUNG_NODE_REPEAT_TTL: std::time::Duration = std::time::Duration::from_secs(120);
-
-/// Backstop timeout floor: DEFAULT_DAEMON_TIMEOUT (the worker-side
-/// timeout). A build can't legitimately run longer than this — the
-/// worker would have killed the daemon already. The scheduler-side
-/// check at this floor is belt-and-suspenders for "worker heartbeating
-/// but not enforcing its own timeout" (worker bug or clock skew).
-///
-/// Same cfg(test) shadow pattern as POISON_TTL: 7200s in prod (matches
-/// worker's daemon_timeout default), short in tests so backstop can be
-/// observed without waiting 2h.
-#[cfg(not(test))]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 7200;
-#[cfg(test)]
-const BACKSTOP_DAEMON_TIMEOUT_SECS: u64 = 0; // tests control via est_duration
-
-/// Slack on top of BACKSTOP_DAEMON_TIMEOUT_SECS. The worker's timeout
-/// fires → daemon killed → CompletionReport sent → scheduler receives
-/// → completion handler runs. 10 minutes covers that round-trip plus
-/// gRPC retry/reconnect slack.
-#[cfg(not(test))]
-const BACKSTOP_SLACK_SECS: u64 = 600;
-#[cfg(test)]
-const BACKSTOP_SLACK_SECS: u64 = 0;
+use super::DagActor;
 
 /// Grace period for an Active build with zero `build_events` receivers
 /// before the orphan-watcher sweep auto-cancels it. The gateway's
@@ -61,8 +30,8 @@ const BACKSTOP_SLACK_SECS: u64 = 0;
 /// WatchBuild reconnect path retries for ~111s (10 attempts, backoff
 /// capped at 16s — see `gw.reconnect.backoff`), so 5min gives ample
 /// room for a gateway blip without false-cancelling. Same cfg(test)
-/// shadow as BACKSTOP_*: tests backdate `orphaned_since` instead of
-/// waiting 5 minutes.
+/// shadow pattern as POISON_TTL: tests backdate `orphaned_since`
+/// instead of waiting 5 minutes.
 #[cfg(not(test))]
 const ORPHAN_BUILD_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 // CAUTION: with zero grace, the orphan sweep cancels ANY Active build whose
@@ -134,7 +103,7 @@ impl DagActor {
         // r[impl sched.lease.standby-tick-noop+2]
         // Standby keeps stale self.builds/dag until LeaderLost lands;
         // every tick_* below either writes PG (orphan-cancel, build-
-        // timeout, backstop-reassign, poison-clear, derivations-gc,
+        // timeout, establishment, poison-clear, derivations-gc,
         // event-log sweep) or reads stale state. dispatch_ready (:108)
         // and gRPC (r[sched.grpc.leader-guard]) already gate; this
         // closes the Tick path. A 2-replica deploy with one lease flap
@@ -154,24 +123,10 @@ impl DagActor {
         self.maybe_refresh_estimator().await;
 
         let now = Instant::now();
-        // detect_hung_nodes BEFORE tick_check_heartbeats: both use the
-        // same `now − last_heartbeat > HEARTBEAT_TIMEOUT_SECS` predicate;
-        // tick_check_heartbeats removes stale executors, so computing
-        // hung_nodes after it (or on-demand at the controller's 10s poll)
-        // would always see zero stale entries.
-        self.tick_hung_nodes(now);
-        self.tick_check_heartbeats(now).await;
-        self.tick_sweep_recently_disconnected(now).await;
-
-        // Ordering is load-bearing: backstop-process runs before the
-        // per-build-timeout check, poison-expire runs last — matches
-        // the pre-refactor code sequence. Backstop reassigns stuck
-        // derivations (transient retry); per-build-timeout cancels
-        // whole builds (permanent failure); poison-expire removes
-        // DAG nodes after both have had their say.
-        let (expired_poisons, backstop_timeouts) = self.tick_scan_dag(now);
-        self.tick_process_backstop_timeouts(&backstop_timeouts)
-            .await;
+        // Ordering is load-bearing: per-build-timeout cancels whole
+        // builds (permanent failure) before poison-expire removes DAG
+        // nodes.
+        let expired_poisons = self.tick_scan_dag(now);
         self.tick_check_build_timeouts().await;
         self.tick_recheck_stuck_completions().await;
         self.tick_check_orphaned_builds().await;
@@ -212,140 +167,13 @@ impl DagActor {
     // handle_tick helpers — one per periodic check
     // -----------------------------------------------------------------------
 
-    /// Credit every executor's `last_heartbeat` for an actor-side
-    /// stall. The merge-time `FindMissingPaths` runs inside the actor
-    /// loop and can legitimately take up to `MERGE_FMP_TIMEOUT` (90s)
-    /// for a 153k-node submission; during that window heartbeats and
-    /// Ticks queue up. The first queued Tick after the stall would
-    /// otherwise compute `now - last_heartbeat > 30s` against
-    /// PRE-stall timestamps and reap the entire fleet.
-    ///
-    /// Shifting `last_heartbeat` forward by the stall duration (capped
-    /// at `now`) makes `tick_check_heartbeats` measure only WORKER
-    /// silence, not actor unresponsiveness. A worker that was already
-    /// stale before the stall stays stale (its shifted timestamp is
-    /// still > `HEARTBEAT_TIMEOUT_SECS` behind `now`); detection is
-    /// merely delayed by ≤ `stall`. Live workers' queued heartbeats
-    /// then overwrite with `Instant::now()` as they drain.
-    ///
-    /// No `stall ≤ HEARTBEAT_TIMEOUT_SECS` early-return: Tick and
-    /// Heartbeat queue independently in the FIFO mailbox, so a Tick
-    /// enqueued BEFORE the next heartbeat lands first and reaps a live
-    /// worker after a 25–29s stall. Worse, the actor has eight inline
-    /// `FindMissingPaths` await sites (four in MergeDag alone, plus
-    /// dispatch/completion/recovery), several of which run
-    /// sequentially per message; with a per-call early-return,
-    /// sub-threshold stalls compound and the cumulative actor silence
-    /// reaps the fleet. Shifting unconditionally is O(N_workers), already
-    /// `.min(now)`-capped, and per-call shifts compound to the same
-    /// result a single cumulative credit would.
-    // r[impl sched.executor.liveness-window]
-    pub(super) fn credit_heartbeats_for_stall(&mut self, stall: std::time::Duration) {
-        if stall.is_zero() {
-            return;
-        }
-        let now = Instant::now();
-        for w in self.executors.values_mut() {
-            w.last_heartbeat = (w.last_heartbeat + stall).min(now);
-        }
-    }
-
-    /// Populate + prune `self.hung_nodes`. Called from `handle_tick`
-    /// BEFORE [`Self::tick_check_heartbeats`] (which removes the stale
-    /// executors the detector reads).
-    ///
-    /// The signal must REPEAT across controller polls until the
-    /// controller has reaped each node — `dead_reap_cap` rate-limits
-    /// reaps, so a one-shot signal drops N−cap nodes (mb_001a). The
-    /// executors are gone after `tick_check_heartbeats` so re-detect
-    /// alone won't repeat; instead, `.insert(n, now)` (refreshing on
-    /// re-detect, not `.entry().or_insert()` which would freeze at
-    /// first-detect) and retain entries within [`HUNG_NODE_REPEAT_TTL`]
-    /// of last detect.
-    ///
-    /// TTL is the SOLE retain mechanism. The K>12×cap simultaneously-
-    /// hung tail is accepted: kubelet-dead → Karpenter's NotReady drift
-    /// reaps within ~5min anyway; kubelet-alive at that scale ⇒ a
-    /// shared-service failure (control plane, EBS region) where reaping
-    /// NodeClaims won't help. The previous `live.contains(n)` arm
-    /// (r25-A8) covered that tail but never released a RECOVERED node
-    /// — a transient stall past `HEARTBEAT_TIMEOUT_SECS` would leave
-    /// `n` in `dead_nodes` indefinitely (executors removed → no
-    /// re-detect → `last` frozen; bound pods on a healthy `n` keep
-    /// `live.contains(n)` true forever) and the controller would reap a
-    /// healthy mid-build node. The recovered-node false-positive is
-    /// destructive; the K>12×cap false-negative is bounded and
-    /// backstopped.
-    pub(crate) fn tick_hung_nodes(&mut self, now: Instant) {
-        // Both `node` and `tenant` are projections off the SAME
-        // `authoritative_binding` entry — structurally same source,
-        // single lifecycle (Ack-time wholesale-rebuild). `tenant=None`
-        // ⇔ the spawn-drv was already DAG-absent at FIRST Ack
-        // (controller-lag at spawn) — fail-safe, bounded to the first
-        // ~10s of pod life.
-        for n in snapshot::detect_hung_nodes(&self.executors, &self.authoritative_binding, now) {
-            self.hung_nodes.insert(n, now);
-        }
-        self.hung_nodes
-            .retain(|_, last| now.duration_since(*last) < HUNG_NODE_REPEAT_TTL);
-    }
-
-    // r[impl sched.executor.liveness-window]
-    /// Scan workers for heartbeat timeouts; disconnect any that have
-    /// been silent past `HEARTBEAT_TIMEOUT_SECS`. The constant is
-    /// `MAX_MISSED_HEARTBEATS × HEARTBEAT_INTERVAL_SECS` (limits.rs:63)
-    /// — the ×3 is already baked in. The previous implementation used
-    /// 30s as a per-tick increment gate AND required a counter to reach
-    /// 3, applying the ×3 twice → reap at ~60s not 30s.
-    async fn tick_check_heartbeats(&mut self, now: Instant) {
-        let timeout = std::time::Duration::from_secs(HEARTBEAT_TIMEOUT_SECS);
-        let timed_out: Vec<_> = self
-            .executors
-            .iter()
-            .filter(|(_, w)| now.duration_since(w.last_heartbeat) > timeout)
-            .map(|(id, w)| (id.clone(), w.stream_epoch))
-            .collect();
-        for (executor_id, stream_epoch) in timed_out {
-            warn!(executor_id = %executor_id, silence_secs = HEARTBEAT_TIMEOUT_SECS,
-                  "worker heartbeat timeout; disconnecting");
-            // r[impl sched.executor.session-epoch]
-            // Current epoch — this is the actor itself deciding the
-            // worker is dead, not a late reader-task signal.
-            self.handle_executor_disconnected(&executor_id, stream_epoch)
-                .await;
-        }
-    }
-
-    /// Single DAG pass collecting both poison-TTL expiries and backstop-
-    /// timeout candidates. Coupled because the two checks share the
-    /// per-node iteration; splitting would double `iter_nodes()` passes
-    /// for no behavioral gain.
-    ///
-    /// Returns `(expired_poisons, backstop_timeouts)` — backstop tuple is
-    /// `(drv_hash, drv_path, executor_id)`.
-    // r[impl sched.backstop.timeout+3]
-    fn tick_scan_dag(&self, now: Instant) -> (Vec<DrvHash>, Vec<(DrvHash, String, ExecutorId)>) {
+    /// Single DAG pass collecting poison-TTL expiries. The stream-era
+    /// backstop-timeout scan that used to share this pass is gone with
+    /// the session machinery — a stuck pull-mode attempt is bounded by
+    /// the Job's `activeDeadlineSeconds` and resolved by the
+    /// establishment sweep ([`Self::tick_sweep_open_pull_attempts`]).
+    fn tick_scan_dag(&self, now: Instant) -> Vec<DrvHash> {
         let mut expired_poisons: Vec<DrvHash> = Vec::new();
-        // (drv_hash, drv_path, executor_id) for backstop-timed-out builds
-        let mut backstop_timeouts: Vec<(DrvHash, String, ExecutorId)> = Vec::new();
-
-        // r[impl sched.sla.hw-ref-seconds]
-        // est_duration is REF-seconds (sla.ref_estimate → t_min); elapsed
-        // is wall. Worker hw_class is unknown here (only CompletionReport
-        // carries it) → divide by slowest factor so the backstop never
-        // fires before worst-case wall completion. Same pattern as
-        // snapshot.rs deadline derivation. min_factor_any_alpha() is
-        // clamped at HW_FACTOR_SANITY_FLOOR (sla/hw.rs) so division is
-        // safe; one read-lock per tick (hoisted out of the per-node
-        // loop). α is per-pname, but this loop covers all nodes;
-        // simplex-minimum (vertex) worst-case: `min_α dot(α,f) =
-        // min_d f[d]` so any pname's `min_factor(α) ≥
-        // min_factor_any_alpha()`. Anti-conservative centroid
-        // (bug_012) under-budgets vertex-α builds on anisotropic hw →
-        // premature cancel → poison. (Task A9: per-key α once
-        // est_duration carries the fitted α alongside t_min.)
-        let min_hw = self.sla_estimator.hw_table().min_factor_any_alpha();
-
         for (drv_hash, state) in self.dag.iter_nodes() {
             if state.status() == DerivationStatus::Poisoned
                 && let Some(poisoned_at) = state.retry.poisoned_at
@@ -353,200 +181,13 @@ impl DagActor {
             {
                 expired_poisons.push(drv_hash.into());
             }
-
-            // Backstop timeout: a build that's been Running far
-            // longer than expected is likely stuck (worker still
-            // heartbeating but daemon wedged, or the worker's
-            // clock jumped). Send CancelSignal + reset to Ready.
-            //
-            // Threshold: max(est_duration × 3, 7200s + 600s). The
-            // first term catches builds that exceed their estimate
-            // by 3×; the second is a floor at daemon_timeout + 10
-            // minutes slack (even with no estimate, a build can't
-            // legitimately run longer than the daemon timeout
-            // plus some grace for reporting). 7200 = DEFAULT_
-            // DAEMON_TIMEOUT; 600 = arbitrary slack.
-            if state.status() == DerivationStatus::Running
-                && let Some(running_since) = state.running_since
-            {
-                let elapsed = now.duration_since(running_since);
-                // est_duration is REF-seconds (f64) — denormalized to
-                // wall above the loop via `/ min_hw`. 0.0 = no estimate
-                // (fresh derivation, estimator had no history) → floor
-                // applies.
-                //
-                // is_finite() guard: NaN/inf propagate through max()
-                // (NaN.max(x)=NaN, inf.max(x)=inf) → `elapsed > NaN`
-                // is always false → backstop never fires. Treat
-                // non-finite est as "no estimate" (0.0 → floor wins).
-                let est_3x_secs =
-                    if state.sched.est_duration.is_finite() && state.sched.est_duration > 0.0 {
-                        (state.sched.est_duration / min_hw) * 3.0
-                    } else {
-                        0.0
-                    };
-                let floor_secs = (BACKSTOP_DAEMON_TIMEOUT_SECS + BACKSTOP_SLACK_SECS) as f64;
-                let backstop_secs = est_3x_secs.max(floor_secs);
-
-                if elapsed.as_secs_f64() > backstop_secs
-                    && let Some(executor_id) = &state.assigned_executor
-                {
-                    backstop_timeouts.push((
-                        drv_hash.into(),
-                        state.drv_path().to_string(),
-                        executor_id.clone(),
-                    ));
-                }
-            }
         }
-
-        (expired_poisons, backstop_timeouts)
-    }
-
-    /// Process backstop timeouts: send CancelSignal, quarantine the
-    /// wedged worker, record into `failed_builders`/`failure_count`,
-    /// reset to Ready for retry. This is a TRANSIENT failure (the
-    /// build may work fine on another worker) so we go through retry
-    /// not poison — but the attempt IS accounted, so
-    /// `reassign_derivations`'s poison check bounds the loop at
-    /// `threshold` iterations.
-    async fn tick_process_backstop_timeouts(&mut self, timeouts: &[(DrvHash, String, ExecutorId)]) {
-        for (drv_hash, drv_path, executor_id) in timeouts {
-            warn!(
-                drv_hash = %drv_hash,
-                executor_id = %executor_id,
-                "backstop timeout: build running far longer than expected, cancelling + retrying"
-            );
-            metrics::counter!("rio_scheduler_backstop_timeouts_total").increment(1);
-
-            // CancelSignal: worker's cgroup.kill. Best-effort
-            // try_send — if the worker is truly wedged its stream
-            // may be full; reset_to_ready below still progresses.
-            if let Some(worker) = self.executors.get(executor_id)
-                && let Some(tx) = &worker.stream_tx
-            {
-                // Only count the signal if it actually landed on the stream.
-                // try_send Err = channel full or closed — no signal was sent.
-                // This keeps cancel_signals_total semantically "signals delivered",
-                // which makes the gap vs backstop_timeouts_total explainable:
-                // backstop fires for silent workers; silent workers often have
-                // no stream_tx (disconnected) → no increment here. That's correct.
-                match tx.try_send(rio_proto::types::SchedulerMessage {
-                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
-                        rio_proto::types::CancelSignal {
-                            drv_path: drv_path.clone(),
-                            reason: "backstop timeout (stuck build)".into(),
-                        },
-                    )),
-                }) {
-                    Ok(()) => {
-                        metrics::counter!("rio_scheduler_cancel_signals_total").increment(1);
-                    }
-                    Err(_) => {
-                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
-                    }
-                }
-            }
-            // Clear worker's running build (we're taking it back). With
-            // P0537's single-slot model the equality check is belt-and-
-            // suspenders — `drv_hash` came from this worker's slot.
-            if let Some(worker) = self.executors.get_mut(executor_id)
-                && worker.running_build.as_ref() == Some(drv_hash)
-            {
-                worker.running_build = None;
-                // Backstop fired while heartbeats continue → executor
-                // task is wedged but pod alive. Mark draining so
-                // dispatch doesn't feed it new work that would sit
-                // Assigned forever (`tick_scan_dag` only scans
-                // Running). Same shape as completion.rs's one-shot
-                // post-completion drain.
-                worker.draining = true;
-            }
-            // r[impl sched.backstop.timeout+3]
-            // Backstop is the no-CompletionReport path — completion.rs
-            // will never account this attempt, so the backstop records
-            // it: the appended `backstop` row charges
-            // `failed_builders`/`failure_count` through the fold (the
-            // cached view picks it up at the post-commit refresh), and
-            // the verdict comes from decide() over the appended suffix
-            // at THIS charging site (Phase 1b), so the backstop's poison
-            // decision no longer depends on E5's re-check in
-            // `reassign_derivations`. NOT a sizing signal —
-            // `handle_timeout_failure` (worker-reported TimedOut) does
-            // the floor promotion; this scheduler-side backstop is
-            // "worker hung, never reported."
-            // The appending transaction: the backstop observation's row
-            // (captured before the reassign clears the exec_id carrier)
-            // plus the fold; a threshold verdict persists Poisoned in
-            // the same transaction and the poison runs here directly.
-            // The delegation to `reassign_derivations` below stays the
-            // reassignment mechanics only (requeue + its status persist)
-            // and appends nothing further, so this stays the attempt's
-            // only row. Leader-gated like the 1a append it replaces — a
-            // standby must neither write rows nor decide.
-            let row = self
-                .attempt_row_for(
-                    drv_hash,
-                    crate::state::OutcomeClass::Backstop,
-                    crate::state::ReportingParty::Scheduler,
-                )
-                .map(|mut r| {
-                    r.executor_id = Some(executor_id.clone());
-                    r
-                });
-            if self.leader.is_leader()
-                && let Some(row) = row
-            {
-                let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
-                    let mut tx = self.db.pool().begin().await?;
-                    let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
-                    if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                        crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
-                    }
-                    tx.commit().await?;
-                    Ok(decision)
-                }
-                .await;
-                match result {
-                    Ok(decision) => {
-                        if let Some(state) = self.dag.node_mut(drv_hash) {
-                            state.push_attempt_record(row.to_record());
-                        }
-                        self.refresh_retry_view(drv_hash);
-                        if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
-                            // The backstop-recorded charge crossed the
-                            // poison threshold: poison at this site (the
-                            // status already persisted in the appending
-                            // transaction) and skip the reassign-side
-                            // requeue — exactly what the as-built E5
-                            // re-check produced for the same history,
-                            // including the reason string (A8: strings
-                            // unchanged).
-                            self.poison_already_recorded(
-                                drv_hash,
-                                "poison threshold reached on worker disconnect after prior failures",
-                                None,
-                            )
-                            .await;
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
-                              "backstop: appending transaction failed; leaving the build Running \
-                               so the next housekeeping tick re-drives it");
-                        continue;
-                    }
-                }
-            }
-            self.reassign_derivations(std::slice::from_ref(drv_hash), Some(executor_id))
-                .await;
-        }
+        expired_poisons
     }
 
     /// Wall-clock limit on the ENTIRE build from submission. Distinct from:
-    ///   - `sched.backstop.timeout` spec marker in [`Self::tick_scan_dag`] (per-derivation
-    ///     heuristic: est×3)
+    ///   - the per-attempt establishment window (deadline + report
+    ///     slack) owned by [`Self::tick_sweep_open_pull_attempts`]
     ///   - worker-side daemon floor at `actor/build.rs` `build_options_for_derivation`
     ///     (also receives `build_timeout` as `min_nonzero` per-derivation —
     ///     defense-in-depth, NOT the primary semantics)

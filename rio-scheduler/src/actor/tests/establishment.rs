@@ -315,36 +315,3 @@ async fn establishment_skips_synthesized_closed_attempt() -> TestResult {
     );
     Ok(())
 }
-
-// r[verify sched.attempt.establishment-window+2]
-/// (e) Mixed fleet: an active assignment+execution pair written exactly
-/// as the as-built stream dispatch writes them, past any window, is
-/// NEVER visited or established by the new sweep.
-#[tokio::test]
-async fn establishment_never_visits_stream_attempts() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-est", "x86_64-linux").await?;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "est-e", PriorityClass::Scheduled).await?;
-    let stream_assignment = recv_assignment(&mut rx).await;
-    let stream_exec: uuid::Uuid = stream_assignment.exec_id.parse()?;
-    backdate_assignment(&db.pool, stream_exec).await?;
-
-    tick(&handle).await?;
-    tick(&handle).await?;
-
-    assert!(
-        attempt_rows_for(&db.pool, "est-e").await.is_empty(),
-        "the pull-mode sweep never establishes stream attempts"
-    );
-    let info = expect_drv(&handle, "est-e").await;
-    assert_eq!(
-        info.status,
-        crate::state::DerivationStatus::Assigned,
-        "the stream attempt is untouched (its own machinery owns it)"
-    );
-    assert_eq!(
-        assignment_statuses(&db.pool, "est-e").await,
-        vec!["pending"],
-        "the stream assignment row stays open"
-    );
-    Ok(())
-}

@@ -132,9 +132,8 @@ let
   schedulingFixture = standalone {
     workers = {
       # maxSilentTime enforcement on ALL scheduling workers. Every drv
-      # that lands here MUST stay non-silent for ≥10s — cancelDrv echoes
-      # every 5s (scheduling.nix); reassignDrv echoes every 5s; the rest
-      # sleep ≤3s or echo immediately.
+      # that lands here MUST stay non-silent for ≥10s — the seeded
+      # builds either sleep ≤3s or echo every ≤5s.
       #
       # Worker-side config because the Nix ssh-ng client does NOT send
       # wopSetOptions (protocol 1.38) — client --max-silent-time cannot
@@ -200,12 +199,8 @@ let
         base_dir = "/var/lib/rio/store/chunks"
       '';
     };
-    # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
-    # (no withHmac). ssh-ng:// doesn't surface build_id to the
-    # client, and client-disconnect mid-wopBuildDerivation doesn't fire
-    # session.rs's EOF-cancel path (handler/build.rs:462 removes the
-    # build_id before bubbling). gRPC SubmitBuild + CancelBuild is the
-    # only deterministic cancel-a-running-build path in this fixture.
+    # grpcurl: kept for the plaintext gRPC :9001 admin/scheduler
+    # probes the remaining subtests use (no withHmac).
     extraPackages = [
       pkgs.postgresql_18
       pkgs.grpcurl
@@ -232,14 +227,12 @@ let
   # but its own fixture instantiation — values/vmtest-pull-canary.yaml
   # pins scheduler.sla.probe.deadlineSecs to the 180s config floor so
   # the pull-mode establishment window (solved deadline + 120s report
-  # slack ≈ 300s) fits a VM-test budget, and pins poolDefaults.
-  # dispatchMode back to Stream so the scenario's stream-baseline arm
-  # keeps a stream pool to compare against now that the corpus default
-  # is Pull (T-1c.2b; the pin retires with that arm at the 1c'
-  # deletion). Kept OUT of the shared lifecycleMod fixture so the
-  # other lifecycle splits keep vmtest-full.yaml's 3600s probe
-  # deadline (their Jobs' activeDeadlineSeconds and worker timeouts
-  # are unchanged) and the corpus-default Pull dispatch.
+  # slack ≈ 300s) fits a VM-test budget. (The overlay's former
+  # poolDefaults.dispatchMode=Stream pin retired with the scenario's
+  # stream-baseline arm at the 1c' session-machinery deletion.) Kept
+  # OUT of the shared lifecycleMod fixture so the other lifecycle
+  # splits keep vmtest-full.yaml's 3600s probe deadline (their Jobs'
+  # activeDeadlineSeconds and worker timeouts are unchanged).
   lifecyclePullCanaryMod = lifecycle {
     inherit pkgs common;
     fixture = k3sFull {
@@ -539,8 +532,8 @@ in
   # ── scheduling splits (2 tests, standalone fixture) ──────────────────
   # Same 3-worker fixture (worker1/worker2/worker3) for both — the
   # fragment architecture changes what RUNS, not what's BOOTED.
-  # fanout→fuse-direct cache-state chain stays in core; reassign is
-  # disruptive (SIGKILL) → own test.
+  # fanout→fuse-direct cache-state chain stays in core; the disrupt
+  # split holds the long/disruptive subtests.
   vm-scheduling-core-standalone =
     (scheduling {
       inherit pkgs common;
@@ -586,9 +579,14 @@ in
           # sessions (no --option passed, but the handshake's virtual
           # setOptions() call runs regardless).
           "setoptions-unreachable"
-          "cancel-timing"
-          # r[verify sched.sla.reactive-floor+2]
-          "reassign"
+          # cancel-timing and reassign retired with the stream session
+          # machinery (1c' deletion commit A): the stream cancel-dispatch
+          # budget and the disconnect→reassign detection they timed no
+          # longer exist. Pull-path successors: the pull-canary cancel
+          # arm (AD5 composite cancel bound) and the killed-mid-build /
+          # establishment pull arms; the lifecycle cancel-cgroup-kill
+          # subtest carries the cgroup-kill assertion under default
+          # values.
           # r[verify obs.metric.scheduler]
           # r[verify obs.metric.builder]
           # r[verify obs.metric.store]
@@ -610,10 +608,10 @@ in
           # commits to re-state or delete.
         ];
         # Default 600s is tight: max-silent-time ~75-150s (I-200
-        # retries × pull cycle) + setoptions ~5s + cancel-timing ~40s
-        # + reassign ~60s + load-50drv ~60-130s (pull is one attempt
-        # per worker at a time) + ~120s boot. 900s keeps headroom
-        # without being an open-ended escape hatch.
+        # retries × pull cycle) + setoptions ~5s + load-50drv
+        # ~60-130s (pull is one attempt per worker at a time) +
+        # ~120s boot. 900s keeps headroom without being an
+        # open-ended escape hatch.
         globalTimeout = 900;
       };
 
@@ -622,10 +620,13 @@ in
   # r[verify gw.reject.nochroot]
   # r[verify gw.rate.per-tenant]
   # r[verify store.gc.tenant-quota-enforce]
-  # r[verify sec.executor.identity-token+2]
   #   Single-test scenario (no subtests list). Markers at the wiring
   #   point per P0341 convention — scenario header prose explains which
-  #   subtest proves each rule.
+  #   subtest proves each rule. The stream-era executor-kind-spoof
+  #   probe retired with the session machinery (1c' deletion commit A);
+  #   sec.executor.identity-token's per-unary token↔intent binding is
+  #   carried by the scheduler unit batteries and the pull-canary VM
+  #   arms.
   vm-security-standalone = security.standalone {
     fixture = standalone {
       withHmac = true;
@@ -857,13 +858,13 @@ in
       #   session. Runs after pull-canary's cleanup (no Pools left).
       "pull-fetcher"
     ];
-    # Budget: ~240s k3s bring-up + ~80s prelude + stream baseline ~160s
-    # + pool swap & pull equivalence ~175s + cancel arm ~150s + preempt
-    # arm ~200s + establishment arm ~400-470s (the ~300s window
-    # dominates) + fetcher pull arm ~150-220s (pool create + Job spawn +
-    # 15s FOD build + report + pod-completion wait + cleanup) + cleanup
-    # ~30s ≈ 1450-1700s expected on a loaded KVM runner; 2400s leaves
-    # tail headroom without being open-ended.
+    # Budget: ~240s k3s bring-up + ~80s prelude + pool swap & pull
+    # retry-feed ~175s + cancel arm ~150s + preempt arm ~200s +
+    # establishment arm ~400-470s (the ~300s window dominates) +
+    # fetcher pull arm ~150-220s (pool create + Job spawn + 15s FOD
+    # build + report + pod-completion wait + cleanup) + cleanup ~30s
+    # ≈ 1300-1550s expected on a loaded KVM runner; 2400s leaves tail
+    # headroom without being open-ended.
     globalTimeout = 2400;
   };
 

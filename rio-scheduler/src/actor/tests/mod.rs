@@ -17,7 +17,6 @@ mod completion;
 mod dispatch;
 mod establishment;
 mod executor;
-mod fault;
 mod integration;
 mod keep_going;
 mod lifecycle_sweep;

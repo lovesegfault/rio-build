@@ -124,18 +124,6 @@ fn bump_dim(floor: &mut u64, last: u64, cap: u64) -> FloorOutcome {
     }
 }
 
-/// Metric-label form of `reason` for the cases that bump. `None` for
-/// non-resource reasons (counter not emitted).
-pub(super) fn reason_label(reason: TerminationReason) -> Option<&'static str> {
-    use TerminationReason as R;
-    match reason {
-        R::OomKilled => Some("oom_killed"),
-        R::EvictedDiskPressure => Some("disk_pressure"),
-        R::DeadlineExceeded => Some("deadline_exceeded"),
-        R::EvictedOther | R::Completed | R::Error | R::Unknown => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

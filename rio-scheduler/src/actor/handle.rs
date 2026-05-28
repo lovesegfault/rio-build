@@ -315,14 +315,6 @@ impl ActorHandle {
         .await
     }
 
-    /// Force the `recently_disconnected` establishment sweep as if the
-    /// correlation TTL had elapsed for every entry. Returns how many
-    /// entries were swept. For the no-report establishment tests.
-    pub async fn debug_force_disconnect_sweep(&self) -> Result<usize, ActorError> {
-        self.debug(|reply| DebugCmd::ForceDisconnectSweep { reply })
-            .await
-    }
-
     /// Read a derivation's in-memory attempt history (the committed
     /// ledger-suffix mirror). For the 1a acceptance battery.
     pub async fn debug_query_attempt_history(
@@ -332,22 +324,6 @@ impl ActorHandle {
         let drv_hash = drv_hash.to_string();
         self.debug(|reply| DebugCmd::QueryAttemptHistory { drv_hash, reply })
             .await
-    }
-
-    /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
-    /// tests. Returns `false` if executor not found.
-    pub async fn debug_backdate_heartbeat(
-        &self,
-        executor_id: &str,
-        secs_ago: u64,
-    ) -> Result<bool, ActorError> {
-        let executor_id = executor_id.into();
-        self.debug(|reply| DebugCmd::BackdateHeartbeat {
-            executor_id,
-            secs_ago,
-            reply,
-        })
-        .await
     }
 
     /// Seed the SLA estimator's hw_table for ref→wall tests.

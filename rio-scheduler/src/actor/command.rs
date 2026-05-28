@@ -465,12 +465,6 @@ pub enum ActorCommand {
     /// gauge values.
     LeaderLost,
 
-    /// Post-recovery worker reconciliation (spec step 6). Scheduled
-    /// ~45s after recovery via WeakSender. For each Assigned/Running
-    /// derivation: if assigned_executor NOT in self.executors →
-    /// query store → Completed (orphan) or reset to Ready.
-    ReconcileAssignments,
-
     /// `cfg(test)` debug command. See [`DebugCmd`].
     #[cfg(test)]
     Debug(DebugCmd),
@@ -678,22 +672,6 @@ pub enum DebugCmd {
         n: u32,
         reply: oneshot::Sender<bool>,
     },
-    /// Backdate an executor's `last_heartbeat`. For heartbeat-timeout
-    /// tests: `tokio::time::pause` interferes with PG pool timeouts so
-    /// real-time can't be advanced. With this, one Tick at
-    /// `secs_ago > HEARTBEAT_TIMEOUT_SECS` proves the reap fires
-    /// without the pre-fix double-multiply.
-    BackdateHeartbeat {
-        executor_id: ExecutorId,
-        secs_ago: u64,
-        reply: oneshot::Sender<bool>,
-    },
-    /// Run the `recently_disconnected` establishment sweep as if
-    /// `TERMINATION_REPORT_TTL` had already elapsed for every entry.
-    /// For the no-report establishment tests — the 60 s TTL must never
-    /// sit on a test's critical path. Replies with the number of
-    /// entries swept.
-    ForceDisconnectSweep { reply: oneshot::Sender<usize> },
     /// Read a derivation's in-memory attempt history (the committed
     /// ledger-suffix mirror). `None` when the node is not in the DAG.
     /// For the 1a acceptance battery (failover reload comparison).
@@ -787,7 +765,6 @@ impl ActorCommand {
             Self::ClearPoison { .. } => "ClearPoison",
             Self::LeaderAcquired => "LeaderAcquired",
             Self::LeaderLost => "LeaderLost",
-            Self::ReconcileAssignments => "ReconcileAssignments",
             #[cfg(test)]
             Self::Debug(_) => "Debug",
         }

@@ -78,7 +78,7 @@ let
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
-  # Worker EnvironmentFile under withHmac. Two credentials:
+  # Worker EnvironmentFile under withHmac. One credential:
   #
   #   RIO_PULL_SPAWNER_SERVICE_TOKEN — controller-role ServiceClaims
   #     {caller="rio-controller", far-future expiry} signed with
@@ -90,14 +90,10 @@ let
   #     so the real signing/verification path is exercised end to end.
   #     r[sec.authz.service-token].
   #
-  #   RIO_EXECUTOR_TOKEN — the legacy static stream-session executor
-  #     token (intent_id="", kind=0, far-future expiry, signed with
-  #     hmac.key). Only the stream-era surfaces still read it (the
-  #     security scenario's executor-kind-spoof Heartbeat probe); the
-  #     pull spawner always overrides this variable with the
-  #     scheduler-minted per-intent token before exec'ing rio-builder.
-  #     Retires with the stream session machinery (1c' deletion commit
-  #     A) together with that probe. r[sec.executor.identity-token].
+  # (The legacy static stream-session executor token that used to sit
+  # alongside it retired with the stream session machinery — 1c'
+  # deletion commit A — together with the executor-kind-spoof probe
+  # that read it.)
   #
   # Written as a systemd EnvironmentFile (KEY=value) — NOT
   # readFile-into-env: eval-time readFile of a derivation output is
@@ -109,7 +105,7 @@ let
         nativeBuildInputs = [ pkgs.python3 ];
       }
       ''
-        python3 - ${hmacKeys}/hmac.key ${hmacKeys}/service-hmac.key > $out <<'EOF'
+        python3 - ${hmacKeys}/service-hmac.key > $out <<'EOF'
         import base64, hashlib, hmac, json, sys
 
         def load_key(path):
@@ -128,10 +124,7 @@ let
             sig = hmac.new(key, claims, hashlib.sha256).digest()
             return f"{b64(claims)}.{b64(sig)}"
 
-        exec_key = load_key(sys.argv[1])
-        svc_key = load_key(sys.argv[2])
-        print("RIO_EXECUTOR_TOKEN=" + sign(
-            exec_key, {"intent_id": "", "kind": 0, "expiry_unix": 9999999999}))
+        svc_key = load_key(sys.argv[1])
         print("RIO_PULL_SPAWNER_SERVICE_TOKEN=" + sign(
             svc_key, {"caller": "rio-controller", "expiry_unix": 9999999999}))
         EOF
@@ -253,8 +246,7 @@ let
   # the scenario's per-worker args + fixture-level OTel. When
   # withHmac, also mount the credentials EnvironmentFile so the pull
   # spawner can present the controller-role service token on the
-  # spawn-intent admin calls (and the legacy static executor token
-  # stays available for the stream-era probes until the 1c' deletion).
+  # spawn-intent admin calls.
   workerNodes = lib.mapAttrs (name: args: {
     imports = [
       (common.mkWorkerNode (

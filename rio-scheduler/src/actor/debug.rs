@@ -106,25 +106,6 @@ impl DagActor {
             DebugCmd::TripBreaker { n, reply } => {
                 let _ = reply.send(self.handle_debug_trip_breaker(n));
             }
-            DebugCmd::BackdateHeartbeat {
-                executor_id,
-                secs_ago,
-                reply,
-            } => {
-                let ok = self.executors.get_mut(&executor_id).is_some_and(|w| {
-                    w.last_heartbeat = backdate(secs_ago);
-                    true
-                });
-                let _ = reply.send(ok);
-            }
-            DebugCmd::ForceDisconnectSweep { reply } => {
-                let n = self.recently_disconnected.len();
-                // "now" advanced past the TTL: every current entry is
-                // expired, so the establishment fill runs for each.
-                let advanced = Instant::now() + super::executor::TERMINATION_REPORT_TTL;
-                self.tick_sweep_recently_disconnected(advanced).await;
-                let _ = reply.send(n);
-            }
             DebugCmd::QueryAttemptHistory { drv_hash, reply } => {
                 let history = self
                     .dag

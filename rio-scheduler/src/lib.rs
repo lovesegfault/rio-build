@@ -198,13 +198,6 @@ pub fn describe_metrics() {
         "Orphan-terminal derivations rows deleted by the periodic Tick sweep (I-169.2)"
     );
     describe_counter!(
-        "rio_scheduler_hung_detect_skipped_no_authoritative_total",
-        "Busy executors skipped by detect_hung_nodes because no controller-reported \
-         spec.nodeName binding exists yet (controller-lag or AckSpawnedIntents \
-         channel down). Sustained nonzero with hung nodes un-reaped → check \
-         rio-controller nodeclaim_pool reconcile loop."
-    );
-    describe_counter!(
         "rio_scheduler_resource_floor_bumps_total",
         "resource_floor doublings on explicit resource-exhaustion signals (D4, labeled \
          reason=oom_killed|disk_pressure|cgroup_oom|timeout|deadline_exceeded). Reactive \
@@ -316,19 +309,6 @@ pub fn describe_metrics() {
         "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
     );
     describe_counter!(
-        "rio_scheduler_reconcile_dropped_total",
-        "Post-recovery ReconcileAssignments command dropped (actor channel full). \
-         Assigned-but-worker-gone derivations leak until NEXT recovery. Rare (channel \
-         is 1024 deep); alert if > 0."
-    );
-    describe_counter!(
-        "rio_scheduler_reconcile_deferred_total",
-        "Assigned/Running derivations the post-recovery reconcile sweep deferred \
-         because their worker had a stream but no accepted heartbeat yet. Each \
-         deferral re-arms the sweep for another reconcile window; sustained growth \
-         means a worker keeps reconnecting its stream without ever heartbeating."
-    );
-    describe_counter!(
         "rio_scheduler_transition_rejected_total",
         "State-machine transition rejections (labeled by target state); alert if rate > 0"
     );
@@ -343,29 +323,11 @@ pub fn describe_metrics() {
          (dropped at handle_completion membership filter); alert if rate > 0"
     );
     describe_counter!(
-        "rio_scheduler_completions_rejected_total",
-        "CompletionReport dropped at the recv arm before reaching the actor. \
-         A real store path is ≤259 bytes, so path_too_long can only fire for a \
-         report that could never have matched a live assignment — the drop \
-         moves the actor's inevitable \"unknown derivation\" discard off the \
-         single-threaded event loop. Labeled by reason: path_too_long."
-    );
-    describe_counter!(
         "rio_scheduler_phases_rejected_total",
-        "BuildPhase dropped by the actor-side (status, executor) binding check \
-         or the recv-side length bounds. \
-         Either the named derivation has no active (Assigned|Running) assignment, \
-         the calling stream is not the assigned executor, the path exceeds \
-         MAX_DERIVATION_PATH_LEN, or the phase text exceeds MAX_PHASE_LEN. \
-         Labeled by reason: not_active | no_assignment | executor_mismatch | \
-         path_too_long | phase_too_long."
-    );
-    describe_counter!(
-        "rio_scheduler_phase_forward_dropped_total",
-        "BuildPhase updates dropped because the actor mailbox was full at the \
-         recv arm's try_send. A dropped phase update is cosmetic (nom misses \
-         one phase-column refresh); a sustained rate is an actor-saturation \
-         signal — correlate with rio_scheduler_actor_cmd_seconds."
+        "BuildPhase dropped by the actor-side (status, executor) binding check: \
+         the named derivation has no active (Assigned|Running) assignment or the \
+         caller is not the assigned executor. Labeled by reason: not_active | \
+         no_assignment | executor_mismatch."
     );
     describe_counter!(
         "rio_scheduler_executor_reconnect_rejected_total",
@@ -425,35 +387,9 @@ pub fn describe_metrics() {
     );
     // The following metrics are emitted from actor internals.
     describe_counter!(
-        "rio_scheduler_backstop_timeouts_total",
-        "Derivations reset to Ready after running-since exceeded backstop (worker went silent)"
-    );
-    describe_counter!(
-        "rio_scheduler_phantom_assignments_drained_total",
-        "running_build entries drained after two consecutive heartbeats reported \
-         empty (lost completion / dead-stream-post-send). The slot was dead capacity \
-         until drained. Nonzero is the signal to look for I-032-class bugs upstream — \
-         the drain is the safety net, not the fix."
-    );
-    describe_counter!(
-        "rio_scheduler_heartbeat_adoptions_total",
-        "Builds re-claimed in the DAG from a reconnecting worker's heartbeat. \
-         Expected after scheduler restart: recovery's reconcile may have reset \
-         to Ready before the worker reconnected (I-063 keeps the stream alive \
-         during drain). Adoption prevents re-dispatch of work already in flight."
-    );
-    describe_counter!(
-        "rio_scheduler_heartbeat_adopt_conflicts_total",
-        "Heartbeat-adoption found the DAG already Assigned to a DIFFERENT worker \
-         (reconcile re-dispatched before this worker reconnected). Both run; first \
-         to complete wins. Nonzero suggests reconcile delay is too short for the \
-         observed worker-reconnect time."
-    );
-    describe_counter!(
         "rio_scheduler_build_timeouts_total",
         "Builds failed by per-build wall-clock timeout (BuildOptions.build_timeout \
-         seconds since submission). Distinct from backstop_timeouts_total \
-         (per-derivation heuristic — worker went silent)."
+         seconds since submission)."
     );
     describe_counter!(
         "rio_scheduler_orphan_builds_cancelled_total",

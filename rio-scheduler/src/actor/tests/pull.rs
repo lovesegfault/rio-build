@@ -218,108 +218,6 @@ async fn pull_token_intent_mismatch_rejected() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.executor.pull-not-ready]
-/// (f) A pull for a drv whose open attempt belongs to a DIFFERENT
-/// executor (a stream-dispatched build during coexistence) answers
-/// NotYetReady, never re-points the existing assignment, and never
-/// writes; after that attempt completes a re-pull answers Gone. (g) The
-/// stream-dispatched execution row keeps the 'stream' default.
-#[tokio::test]
-async fn pull_open_attempt_on_other_executor_waits_then_gone() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-stream", "x86_64-linux").await?;
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), "pull-f", PriorityClass::Scheduled).await?;
-    let stream_assignment = recv_assignment(&mut rx).await;
-    let stream_exec: uuid::Uuid = stream_assignment.exec_id.parse().expect("exec uuid");
-
-    // The stream attempt is open on w-stream; a pull-mode pod for the
-    // same intent must wait, not steal and not duplicate.
-    let outcome = pull(&handle, "pull-f", Some("pull-f")).await;
-    assert!(
-        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
-        "open-on-another-executor must answer NotYetReady, got {outcome:?}"
-    );
-    let (assignments, executions) = row_counts(&db.pool, "pull-f").await;
-    assert_eq!(
-        (assignments, executions),
-        (1, 1),
-        "no second attempt is minted"
-    );
-    let builder: String = sqlx::query_scalar(
-        "SELECT a.builder_id FROM assignments a \
-         JOIN derivations d ON d.derivation_id = a.derivation_id \
-         WHERE d.drv_hash = $1 AND a.status IN ('pending', 'acknowledged')",
-    )
-    .bind("pull-f")
-    .fetch_one(&db.pool)
-    .await?;
-    assert_eq!(
-        builder, "w-stream",
-        "the existing assignment is never re-pointed"
-    );
-    assert_eq!(
-        dispatch_mode_of(&db.pool, stream_exec).await,
-        "stream",
-        "the as-built dispatch path keeps the column default"
-    );
-
-    // After the stream attempt completes, the drv is no longer wanted.
-    complete_success(
-        &handle,
-        "w-stream",
-        &stream_assignment.drv_path,
-        &rio_test_support::fixtures::test_store_path("pull-f-out"),
-    )
-    .await?;
-    barrier(&handle).await;
-    let outcome = pull(&handle, "pull-f", Some("pull-f")).await;
-    assert!(matches!(outcome, Ok(PullOutcome::Gone)), "got {outcome:?}");
-    Ok(())
-}
-
-// r[verify sched.executor.pull-not-ready]
-/// (f, second half) After the open attempt fails and the drv requeues
-/// to Ready, a re-pull Delivers a fresh attempt.
-#[tokio::test]
-async fn pull_after_failed_attempt_requeues_then_delivers() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-fail", "x86_64-linux").await?;
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), "pull-g", PriorityClass::Scheduled).await?;
-    let stream_assignment = recv_assignment(&mut rx).await;
-
-    // While open on the stream worker: wait.
-    let outcome = pull(&handle, "pull-g", Some("pull-g")).await;
-    assert!(matches!(outcome, Ok(PullOutcome::NotYetReady { .. })));
-
-    // The worker reports a transient failure → the drv requeues.
-    complete_failure(
-        &handle,
-        "w-fail",
-        &stream_assignment.drv_path,
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        "transient",
-    )
-    .await?;
-    barrier(&handle).await;
-    let info = expect_drv(&handle, "pull-g").await;
-    assert_eq!(
-        info.status,
-        crate::state::DerivationStatus::Ready,
-        "transient failure requeues the drv"
-    );
-
-    let delivered = expect_deliver(pull(&handle, "pull-g", Some("pull-g")).await);
-    assert_ne!(
-        delivered.exec_id, stream_assignment.exec_id,
-        "a fresh attempt gets a fresh exec_id"
-    );
-    let exec_id: uuid::Uuid = delivered.exec_id.parse().expect("uuid");
-    assert_eq!(dispatch_mode_of(&db.pool, exec_id).await, "pull");
-    Ok(())
-}
-
-// ─── ReportOutcome (the idempotent completion intake) ───────────────────
-
 /// Send one `ReportOutcome` through the actor and return the reply.
 async fn report(
     handle: &ActorHandle,
@@ -754,40 +652,6 @@ async fn attempt_outcome_requeues_still_inflight_attempt() -> TestResult {
     );
     Ok(())
 }
-
-// r[verify sched.attempt.no-attempt-no-op]
-/// A stream-mode attempt identity is never classified from this RPC
-/// during coexistence (the as-built report paths own it).
-#[tokio::test]
-async fn attempt_outcome_ignores_stream_attempts() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-rao", "x86_64-linux").await?;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rao-d", PriorityClass::Scheduled).await?;
-    let stream_assignment = recv_assignment(&mut rx).await;
-    let stream_exec: uuid::Uuid = stream_assignment.exec_id.parse()?;
-
-    report_attempt_outcome(
-        &handle,
-        None,
-        Some(stream_exec),
-        rio_proto::types::AttemptTerminalReason::Reaped,
-    )
-    .await
-    .expect("stream-attempt report acked");
-
-    assert!(
-        ledger_rows(&db.pool, "rao-d").await.is_empty(),
-        "nothing recorded"
-    );
-    let info = expect_drv(&handle, "rao-d").await;
-    assert_eq!(
-        info.status,
-        crate::state::DerivationStatus::Assigned,
-        "the stream attempt is untouched"
-    );
-    Ok(())
-}
-
-// ─── AD5 synthesized verdicts and the SIGTERM-abort charge class ─────────
 
 /// (outcome_class, termination_reason, reporting_party, source_node) of
 /// every drv_attempts row for one exec_id.
@@ -1391,42 +1255,6 @@ async fn attempt_outcome_no_eligible_source_poisons_ready_drv() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
-/// Coexistence: the post-failover orphan reconcile never resets an
-/// open pull-mode attempt — the establishment sweep owns pull
-/// attempts, keyed by the durable `dispatch_mode = 'pull'`
-/// discriminator (the 1a-A hand-off item).
-#[tokio::test]
-async fn reconcile_assignments_skips_open_pull_attempts() -> TestResult {
-    let (db, handle, _task) = setup().await;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "rcl-a", PriorityClass::Scheduled).await?;
-    let _assignment = expect_deliver(pull(&handle, "rcl-a", Some("rcl-a")).await);
-
-    // The pod never registers on the stream, so the liveness check sees
-    // no executor for it; the reconcile must still leave it alone.
-    handle
-        .send_unchecked(ActorCommand::ReconcileAssignments)
-        .await?;
-    barrier(&handle).await;
-
-    let info = expect_drv(&handle, "rcl-a").await;
-    assert_eq!(
-        info.status,
-        crate::state::DerivationStatus::Running,
-        "an open pull-mode attempt is not an orphan"
-    );
-    assert_eq!(
-        assignment_status_of(&db.pool, "rcl-a").await,
-        vec!["pending"],
-        "the assignment row stays open for the establishment sweep / the report"
-    );
-    assert!(
-        ledger_rows(&db.pool, "rcl-a").await.is_empty(),
-        "the reconcile charges nothing for the in-flight pull attempt"
-    );
-    Ok(())
-}
-
 // ─── C4/C5 unification: stream identities behind the unified RPC ────────
 
 /// Send one `ReportAttemptOutcome` keyed by Job/pod name only (the
@@ -1451,67 +1279,6 @@ async fn report_attempt_outcome_job(
         .expect("actor alive")
 }
 
-// r[verify ctrl.report.attempt-outcome]
-// r[verify ctrl.terminated.deadline-exceeded+3]
-/// C4/C5 unification: a unified pod-terminal report whose identity is a
-/// stream-mode executor routes through the same classification path
-/// `ReportExecutorTermination` serves — the fill lands as the second
-/// installment on the disconnect's row (the same row, never a new one)
-/// and a duplicate report is a no-op (the dedup entry was consumed).
-#[tokio::test]
-async fn attempt_outcome_stream_identity_routes_through_legacy_path() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-uni", "x86_64-linux").await?;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "uni-a", PriorityClass::Scheduled).await?;
-    let _assignment = recv_assignment(&mut rx).await;
-    disconnect(&handle, "w-uni").await?;
-    drop(rx);
-
-    // The stream disconnect appended the first installment.
-    let rows = ledger_rows(&db.pool, "uni-a").await;
-    assert_eq!(rows.len(), 1, "the disconnect row exists");
-    assert_eq!(rows[0].outcome_class, "disconnected");
-    assert!(rows[0].termination_reason.is_none());
-
-    // The re-pointed controller reports the classification through the
-    // unified RPC, keyed by the pod name.
-    report_attempt_outcome_job(
-        &handle,
-        "w-uni",
-        rio_proto::types::AttemptTerminalReason::OomKilled,
-    )
-    .await
-    .expect("unified stream-mode report acked");
-    let rows = ledger_rows(&db.pool, "uni-a").await;
-    assert_eq!(
-        rows.len(),
-        1,
-        "the fill lands on the same row, never a new one"
-    );
-    assert_eq!(
-        rows[0].termination_reason.as_deref(),
-        Some("oom_killed"),
-        "the second installment carries the controller classification"
-    );
-    assert_ne!(
-        rows[0].outcome_class, "disconnected",
-        "the row is reclassified exactly as the legacy path does"
-    );
-    let classified_as = rows[0].outcome_class.clone();
-
-    // Duplicate report: acknowledged, nothing changes (first-report-wins).
-    report_attempt_outcome_job(
-        &handle,
-        "w-uni",
-        rio_proto::types::AttemptTerminalReason::OomKilled,
-    )
-    .await
-    .expect("duplicate unified report acked");
-    let rows = ledger_rows(&db.pool, "uni-a").await;
-    assert_eq!(rows.len(), 1, "no second row");
-    assert_eq!(rows[0].outcome_class, classified_as, "no reclassification");
-    Ok(())
-}
-
 /// Send one `ReportAttemptOutcome` carrying BOTH an intent id and a
 /// job/pod name (the controller's pod-terminal shape).
 async fn report_attempt_outcome_both(
@@ -1534,71 +1301,6 @@ async fn report_attempt_outcome_both(
         })
         .await
         .expect("actor alive")
-}
-
-// r[verify ctrl.report.attempt-outcome]
-/// Coexistence: a STREAM pod's pod-terminal report (both keys present —
-/// the controller attaches the intent annotation) is never swallowed by
-/// another pod's open pull attempt on the same intent. The report
-/// routes through the legacy stream classification (the disconnect's
-/// row gets the second installment) and the pull attempt is untouched.
-#[tokio::test]
-async fn attempt_outcome_stream_report_not_swallowed_by_open_pull_attempt() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-uni2", "x86_64-linux").await?;
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "uni-b", PriorityClass::Scheduled).await?;
-    let _stream_assignment = recv_assignment(&mut rx).await;
-    disconnect(&handle, "w-uni2").await?;
-    drop(rx);
-
-    // The stream disconnect appended its first installment and the drv
-    // requeued; a pull-mode pod for the SAME intent now opens an
-    // attempt (the documented coexistence double-spawn shape).
-    let rows = ledger_rows(&db.pool, "uni-b").await;
-    assert_eq!(rows.len(), 1, "the disconnect row exists");
-    assert_eq!(rows[0].outcome_class, "disconnected");
-    let stream_exec = rows[0].exec_id.expect("disconnect row carries its exec");
-    let pull_assignment = expect_deliver(pull(&handle, "uni-b", Some("uni-b")).await);
-    let pull_exec: uuid::Uuid = pull_assignment.exec_id.parse()?;
-    assert_ne!(stream_exec, pull_exec);
-
-    // The controller reports the STREAM pod's OOM kill (both keys).
-    report_attempt_outcome_both(
-        &handle,
-        "uni-b",
-        "w-uni2",
-        rio_proto::types::AttemptTerminalReason::OomKilled,
-        "node-stream-1",
-    )
-    .await
-    .expect("stream pod-terminal report acked");
-
-    // The stream attempt's row got the classification…
-    let rows = ledger_rows(&db.pool, "uni-b").await;
-    let stream_row = rows
-        .iter()
-        .find(|r| r.exec_id == Some(stream_exec))
-        .expect("the disconnect row is still there");
-    assert_eq!(
-        stream_row.termination_reason.as_deref(),
-        Some("oom_killed"),
-        "the stream pod's report must reach the legacy classification path"
-    );
-    assert_ne!(
-        stream_row.outcome_class, "disconnected",
-        "the disconnect row is reclassified exactly as the legacy path does"
-    );
-    // …and the pull attempt is untouched: still open, no row, no fill.
-    assert!(
-        !rows.iter().any(|r| r.exec_id == Some(pull_exec)),
-        "the open pull attempt must not absorb the stream pod's report"
-    );
-    let info = expect_drv(&handle, "uni-b").await;
-    assert_eq!(
-        info.status,
-        crate::state::DerivationStatus::Running,
-        "the pull attempt keeps building"
-    );
-    Ok(())
 }
 
 // r[verify sched.attempt.synthesized-verdict]

@@ -872,7 +872,7 @@
     {
       "path": "actor/executor.rs",
       "depth": 1,
-      "doc": "Executor lifecycle: connect/disconnect/register, heartbeat"
+      "doc": "Stream-era executor session plumbing: connect/disconnect/register,"
     },
     {
       "path": "actor/floor.rs",
@@ -887,7 +887,7 @@
     {
       "path": "actor/housekeeping.rs",
       "depth": 1,
-      "doc": "Periodic Tick housekeeping: heartbeat-timeout reap, backstop"
+      "doc": "Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL"
     },
     {
       "path": "actor/merge.rs",

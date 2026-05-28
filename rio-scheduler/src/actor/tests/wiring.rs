@@ -5,24 +5,6 @@ use tracing_test::traced_test;
 // Worker-Scheduler wiring
 // -----------------------------------------------------------------------
 
-/// Baseline: when a worker connects (stream) and sends a heartbeat with
-/// the SAME executor_id, the actor should see it as fully registered.
-/// Validates that stream + heartbeat with the same executor_id registers correctly.
-#[tokio::test]
-async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("test-worker-1", "x86_64-linux").await?;
-
-    let workers = handle.debug_query_workers().await?;
-    assert_eq!(workers.len(), 1);
-    assert_eq!(workers[0].executor_id, "test-worker-1");
-    assert!(
-        workers[0].is_registered,
-        "worker should be fully registered after stream + heartbeat"
-    );
-    Ok(())
-}
-
 /// Bug reproduction: handle_completion uses drv_hash as the lookup key,
 /// but grpc.rs passes drv_path. The completion should be resolved via
 /// either key. This test sends ProcessCompletion with a drv_PATH and
@@ -59,71 +41,6 @@ async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
 
 // -----------------------------------------------------------------------
 // State machine integrity
-// -----------------------------------------------------------------------
-
-/// When a worker disconnects while a derivation is Running, the derivation
-/// should transition Running -> Failed -> Ready (through the state machine),
-/// and retry_count should be incremented.
-///
-/// Regression guard: a direct `state.status = Ready` assignment would
-/// bypass the state machine (Running -> Ready is not a valid transition)
-/// and NOT increment retry_count.
-#[tokio::test]
-async fn test_worker_disconnect_running_derivation() -> TestResult {
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("test-worker", "x86_64-linux").await?;
-
-    // Merge a single-node DAG (worker will get it assigned)
-    let build_id = Uuid::new_v4();
-    let drv_hash = "disconnect-test-hash";
-    let _event_rx =
-        merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
-
-    // Worker should have received an assignment (recv_assignment panics if not).
-    let _ = recv_assignment(&mut stream_rx).await;
-
-    // Derivation should now be Assigned. Simulate worker sending an Ack
-    // to transition to Running via a completion with a sentinel... actually
-    // the actor doesn't have an Ack handler that transitions state. Looking
-    // at the code, Assigned -> Running happens implicitly in handle_completion
-    // when needed. For this test, we need to directly check the disconnect
-    // path from BOTH Assigned AND Running states. The current code's
-    // handle_executor_disconnected matches on (Assigned | Running) and resets
-    // to Ready. The bug is that Running -> Ready is invalid.
-
-    // Check current status: should be Assigned
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(info.status, DerivationStatus::Assigned);
-    assert_eq!(info.retry.count, 0);
-
-    // Disconnect the worker
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: "test-worker".into(),
-            stream_epoch: stream_epoch_for("test-worker"),
-        })
-        .await?;
-
-    // Derivation should be back in Ready state. retry_count should
-    // NOT be incremented — the drv was only Assigned (never Running),
-    // so the worker disconnected before starting it. No retry budget
-    // consumed. Only was-Running disconnects count as attempts.
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Ready,
-        "derivation should return to Ready after worker disconnect"
-    );
-    assert_eq!(
-        info.retry.count, 0,
-        "disconnect during Assigned-only must NOT count as a retry attempt"
-    );
-    assert!(info.assigned_executor.is_none());
-    Ok(())
-}
-
-// -----------------------------------------------------------------------
-// Silent failures
 // -----------------------------------------------------------------------
 
 /// A completion with InfrastructureFailure status must reach

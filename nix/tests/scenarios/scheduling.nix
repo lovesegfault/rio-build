@@ -1,5 +1,5 @@
 # Scheduling scenario: fanout distribution, chunked PutPath,
-# worker-disconnect reassignment, cgroup-tracking.
+# cgroup-tracking, load.
 #
 # Ports phase2a + phase2c + phase3a(cgroup) to the fixture architecture.
 # Needs the standalone fixture with 3 workers and chunk-backend TOML:
@@ -64,45 +64,6 @@ let
   inherit (fixture) gatewayHost;
   drvs = import ../lib/derivations.nix { inherit pkgs; };
   protoset = import ../lib/protoset.nix { inherit pkgs; };
-
-  # reassign: slow build, no pname → estimator default. 25s gives the
-  # test ~20s to find+kill the assigned worker before the build would
-  # naturally finish.
-  #
-  # All workers have RIO_MAX_SILENT_TIME_SECS=10 (for the silence
-  # subtest). mkTrivial's single-sleep would TimedOut there, so this
-  # drv echoes every 5s to keep the silence watchdog fed.
-  reassignDrv = drvs.mkCustom {
-    name = "rio-test-sched-reassign";
-    script = ''
-      i=0
-      while [ $i -lt 5 ]; do
-        echo sched-reassign-tick-$i
-        ''${busybox}/bin/busybox sleep 5
-        i=$((i+1))
-      done
-      echo sched-reassign > $out
-    '';
-  };
-
-  # cancel-timing: 60×5s echo loop (300s total) — cancelled long
-  # before natural end. 300s >> 5s budget: if cgroup-gone passes, the
-  # kill DID it (not loop end). Echoes every 5s to feed
-  # RIO_MAX_SILENT_TIME_SECS=10 (set on ALL scheduling workers); a
-  # single 300s silent sleep would TimedOut at ~10s and the cgroup-gone
-  # assertion would be vacuous (worker reaped it, not CancelBuild).
-  cancelDrv = drvs.mkCustom {
-    name = "rio-test-sched-cancel-timing";
-    script = ''
-      i=0
-      while [ $i -lt 60 ]; do
-        echo sched-cancel-timing-tick-$i
-        ''${busybox}/bin/busybox sleep 5
-        i=$((i+1))
-      done
-      echo sched-cancel-timing > $out
-    '';
-  };
 
   # max-silent-time: echoes ONCE then sleeps 60s. ALL scheduling
   # workers have RIO_MAX_SILENT_TIME_SECS=10 (default.nix fixture). The
@@ -175,8 +136,6 @@ let
       drvs
       gatewayHost
       protoset
-      reassignDrv
-      cancelDrv
       silenceDrv
       cgroupDrv
       ;

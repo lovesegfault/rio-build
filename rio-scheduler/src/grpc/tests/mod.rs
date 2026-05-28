@@ -4,7 +4,6 @@
 //! the `grpc/{scheduler_service,worker_service,actor_guards}.rs`
 //! submodule seams (P0356). Each submodule covers one prod file:
 //!   - `submit_tests` → `scheduler_service.rs` (SubmitBuild chain)
-//!   - `stream_tests` → `worker_service.rs` (BuildExecution stream)
 //!   - `bridge_tests` → `bridge_build_events` (replay + dedup)
 //!   - `guards_tests` → `actor_guards.rs` (error-map + leader-gate)
 //!
@@ -13,7 +12,7 @@
 
 use super::*;
 use crate::MIGRATOR;
-use crate::actor::tests::{make_node, setup_actor, setup_actor_configured};
+use crate::actor::tests::{make_node, setup_actor};
 // P0356: the trait impls moved to scheduler_service.rs / worker_service.rs.
 // `use super::*` no longer pulls in `SchedulerService` / `ExecutorService` /
 // `Request` as a side effect; tests call the trait methods on
@@ -30,7 +29,7 @@ use tonic::Request;
 ///
 /// Returns the [`ActorHandle`] separately for tests that drive the
 /// actor directly alongside the gRPC surface (e.g. in-process server
-/// setups in `stream_tests`).
+/// setups in `pull_tests`).
 pub(super) async fn setup_grpc() -> (
     TestDb,
     SchedulerGrpc,
@@ -60,5 +59,4 @@ pub(super) async fn setup_grpc_with_pool() -> (
 mod bridge_tests;
 mod guards_tests;
 mod pull_tests;
-mod stream_tests;
 mod submit_tests;

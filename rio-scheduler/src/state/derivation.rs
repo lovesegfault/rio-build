@@ -1760,34 +1760,6 @@ impl DerivationState {
         self.attempt_history = history;
     }
 
-    /// Mirror a successful `fill_termination` (the second installment
-    /// of a two-installment attempt) onto the in-memory record for
-    /// `exec_id`. No-op when no record carries that execution (the
-    /// suffix was reloaded post-fill, or the row predates this
-    /// leader's history). Returns whether a record was updated.
-    pub(crate) fn classify_attempt_record(
-        &mut self,
-        exec_id: Uuid,
-        termination_reason: &str,
-        outcome_class: OutcomeClass,
-        (exempt, floor_promoted, floor_at_cap): (bool, bool, bool),
-    ) -> bool {
-        for record in self.attempt_history.iter_mut().rev() {
-            if record.exec_id == Some(exec_id) {
-                if record.termination_reason.is_none() {
-                    record.termination_reason = Some(termination_reason.to_string());
-                    record.outcome_class = outcome_class;
-                    record.exempt = exempt;
-                    record.floor_promoted = floor_promoted;
-                    record.floor_at_cap = floor_at_cap;
-                    return true;
-                }
-                return false;
-            }
-        }
-        false
-    }
-
     /// Mirror a successful reason-only fill (the unified pod-terminal
     /// report's second installment) onto the in-memory record for
     /// `exec_id`: sets `termination_reason` if it is still empty and

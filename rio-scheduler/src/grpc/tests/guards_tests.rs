@@ -6,7 +6,7 @@
 //! plus the leader-guard RPC-rejection end-to-end.
 
 use super::*;
-use rio_proto::{ExecutorService, ExecutorServiceClient, SchedulerService};
+use rio_proto::{ExecutorService, SchedulerService};
 
 /// Compile-time exhaustiveness pin for the `cases` array below:
 /// `ActorError` is `thiserror`, no macro-generated `ALL`, so a no-
@@ -154,29 +154,17 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
         .expect_err("standby should reject cancel_build");
     assert_eq!(s.code(), tonic::Code::Unavailable);
 
-    // ExecutorService handlers.
+    // ExecutorService: the live work-delivery surface is the pull
+    // unaries, whose leader gate is actor-side (PullRejection::
+    // NotLeader, covered by the actor pull tests). BuildExecution/
+    // Heartbeat are unconditional `Unimplemented` stubs since the
+    // session-machinery deletion, so they are no longer part of the
+    // leader-guard surface.
     let s = grpc
         .heartbeat(tonic::Request::new(Default::default()))
         .await
-        .expect_err("standby should reject heartbeat");
-    assert_eq!(s.code(), tonic::Code::Unavailable);
-
-    // BuildExecution: the request is a Streaming<ExecutorMessage>. We
-    // can't easily construct one synthetically outside a real gRPC
-    // call. Spin up a server for this one.
-    let router = tonic::transport::Server::builder()
-        .add_service(rio_proto::ExecutorServiceServer::new(grpc));
-    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
-    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
-        .connect()
-        .await?;
-    let mut worker_client = ExecutorServiceClient::new(channel);
-    let (_tx, rx) = mpsc::channel::<rio_proto::types::ExecutorMessage>(1);
-    let s = worker_client
-        .build_execution(tokio_stream::wrappers::ReceiverStream::new(rx))
-        .await
-        .expect_err("standby should reject build_execution");
-    assert_eq!(s.code(), tonic::Code::Unavailable);
+        .expect_err("stubbed heartbeat always errors");
+    assert_eq!(s.code(), tonic::Code::Unimplemented);
 
     Ok(())
 }
