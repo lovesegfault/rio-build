@@ -2426,7 +2426,7 @@ witness.
 | `noReapWhileFreshInWorkerTime` (F3) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f3-stall-credit`; witness noReapAfterStall; `sched.executor.liveness-window` | No scheduler-side liveness verdict exists to get wrong: nothing in the scheduler kills or deregisters a working pod on its own clock. The only time-based action left (establishment sweep) acts only on attempts past deadline+report-slack with no terminal row — the analogue obligation "never establish while the worker is still inside its budget" is carried by the OA1-sized window and checked in the re-targeted model |
 | `silentSlotReapArmed` (F3) | Model S checked (enabled-implies-fires); wired cfgs; calib evidence module f3-reap-strikes | Real death is detected within a bound: kubelet/Job controller observe the pod, `activeDeadlineSeconds` bounds wedges, the pod-terminal report + establishment sweep close the attempt. The bound is the AD5/OA1 budget — signed when OA1 resolves; the 1b VM gate asserts a no-report death is charged exactly once and only after the window |
 | `correlationEntryLifecycle` (F4) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f4-correlation-entry`; `sched.reassign.no-promote-on-ephemeral-disconnect+4` | The correlation map is deleted; the correlation IS the attempt row keyed by `exec_id` (no TTL race, durable). Owed: the second installment fills only the matching open row; a post-completion death creates nothing (no-attempt rule = the `last_completed` discriminator's successor); first-classifier-wins becomes row-already-terminal |
-| `establishmentOnlyAfterWindowCloses` (F4) | Model S checked; wired cfgs; witness noEstablishment; calib evidence module f4-establish-early | Establishment fires only when deadline + report-slack passes with no terminal row, never earlier, and a non-terminal/no-op report does not establish. Same invariant, re-keyed window (OA1 number); checked in the re-targeted model and asserted in the 1b VM gate |
+| `establishmentOnlyAfterWindowCloses` (F4) | Model S checked; wired cfgs; witness noEstablishment; calib evidence module f4-establish-early | Establishment fires only when deadline + report-slack passes with no terminal row, never earlier, and a non-terminal/no-op report does not establish. Same invariant, re-keyed window (OA1 number) anchored to the deadline the attempt was dispatched with (072 `deadline_secs`; the sweep-time re-solve may widen, never shrink — `sched.attempt.establishment-window+2`, review fix P4); checked in the re-targeted model and asserted in the 1b VM gate |
 | `neverOfferUnrunnableWork` (F5) | Model S checked; wired cfgs; **wired calib witness** `quint-executor-calib-f5-closed-stream` | There is no offer. The surviving obligation is never-spawn/never-admit-unrunnable: kind/system/feature eligibility and the exclusion set move to the spawn-intent gate (AD2); the closed-stream/capacity/draining clauses are structural (no slot state). Static-eligibility content keeps its NOT-ENCODED status — the placeable()/eligibility unit suite is the binding coverage (0d input), re-stated over (excluded_sources, spawnable_sources) per AD2 |
 | `eligibleWorkOfferedWithinBound` (F5) | Model S checked (STARVE_BOUND form); wired cfgs | Bounded progress re-bases onto: Ready intent ⇒ spawn intent emitted (Model J ceiling/headroom + queue, already verified) ⇒ pod pulls or the pull-retry/`activeDeadlineSeconds` policy bounds the wait; starvation-by-bookkeeping has no bookkeeping left to starve on. The freeze-detector observable survives re-keyed to open-attempts/queue age |
 | `rollbackRestoresExactly` (F5) | Model S checked; wired cfgs; witness noRollback | No half-recorded push can exist: the pull transaction commits atomically or the pod retries; nothing to roll back. Kani `admit_pull` idempotency + the 1a double-pull red-first test carry it |
@@ -2992,6 +2992,94 @@ remain the constants the plan names — 10 s controller reconcile tick
 all unit-covered; no production claim is made from any of these
 numbers.
 
+**Code-review pass over the 1a+1b pull-path code (T-1b.11) — review
+pass recorded + fixes landed (2026-05-27).** The three-reviewer
+adversarial pass (protocol/fence, lifecycle/coexistence,
+builder/operability) over the 1a+1b pull-path code is recorded in the
+campaign workspace (`pull-path-review.md`): 7 confirmed findings (P1
+blocking, P2–P7 important), 1 refuted (the "SIGTERM-abort charged as
+infra is a blocking contract violation" claim — refuted as *blocking*
+against the then-frozen text, but the charge class itself was adopted
+with P1 below), and 6 minors. Every confirmed finding was fixed
+(red-first where behavior changed) in the pre-cutover hardening batch
+on this branch; dispositions:
+
+- **P1 (blocking) + the AD5 abort charge class — fixed.**
+  Controller-synthesized cancelled/preempted/reaped verdicts for an
+  open, never-worker-reported pull attempt now close it charge-free
+  in one fenced appending transaction (uncharged `disconnected`
+  terminal row, assignment closed) and requeue the still-wanted
+  derivation at that fold — never the establishment sweep; the
+  builder's SIGTERM-abort report of still-wanted work resolves the
+  same way instead of an infrastructure charge. Genuinely-cancelled
+  (no-longer-wanted) work keeps the cancel arm's exact shape. New
+  rule `sched.attempt.synthesized-verdict`; the ReportAttemptOutcome
+  bullet in the frozen contract above now names the close.
+- **P2 — fixed (smallest AD2c-consistent shape).**
+  `ReportAttemptOutcome` backfills the open execution row's
+  `source_node` (NULL-only) for pull attempts, and the establishment
+  charge falls back to the in-memory spawn-ack binding at sweep time,
+  so the AD2 node key on establishment charges no longer depends on
+  winning the mint-time binding race; a bounded-poison battery proves
+  the crash→establish→respawn loop reaches Poison(Threshold) under
+  node keys. Adjudication: the review's ack-time execution-row
+  backfill (item 2) was NOT taken — the ack handler is synchronous
+  and the two writers above already restore the gate property; the
+  residual is cosmetic (ListOpenAttempts node display when the
+  pod-terminal report is lost), accepted here.
+- **P3 — fixed on both sides.** The controller populates `intent_id`
+  only for pull-mode pods/Jobs (per-pod `RIO_DISPATCH_MODE`
+  discriminator), and the scheduler's unified intake refuses to
+  resolve an intent-keyed report against an open pull attempt when
+  the reporting job/pod name is a known stream identity — a stream
+  pod's report can never be swallowed by another pod's open pull
+  attempt during coexistence.
+- **P4 — fixed.** Migration 072 persists the dispatched deadline on
+  the execution row; the establishment window is now
+  `max(persisted, re-solved) + slack`
+  (`sched.attempt.establishment-window+2`) so it can widen but never
+  shrink while the attempt is open.
+- **P5 — fixed.** The AD5 cancel-arm evidence map is keyed and pruned
+  per `{ns}/{pool}/` scope, so co-namespaced pull pools no longer
+  erase each other's closed→active evidence (dash-prefixed pool names
+  covered).
+- **P6 — fixed.** Permanent pull/report rejections (Unauthenticated,
+  PermissionDenied, Unimplemented, InvalidArgument) terminate the
+  builder loops promptly with a nonzero exit and warn/error logs
+  (`builder.pull.retry-loop+2`); `rio_scheduler_pull_rejected_total`
+  added for alertability.
+- **P7 — fixed.** The production pull transport presents the executor
+  identity token as call metadata on both unaries
+  (`AuthedPullTransport`); scheduler-side wire tests pin the enforced
+  HMAC posture (report without header rejected, with header accepted,
+  body-only pull accepted). Adjudication: the VM-level HMAC-enabled
+  pull/report arm is NOT added in this batch — the posture is pinned
+  at the gRPC wire level instead, and the VM arm stays on the 1c-prep
+  list with the existing canary carve-outs.
+- **Minors.** Taken: the never-pulled ICE-clear ordering in the
+  no-attempt arm; the OA2 interim alert re-keyed to a dedicated
+  summed pull-establishment counter
+  (`rio_scheduler_pull_establishments_total`); the report-loop
+  SIGTERM race hardening (in-flight RPC raced against shutdown).
+  Adjudicated, not taken: the pull-mode relaxation of the
+  orphan-reap empty-list gate (coexistence posture unchanged this
+  slice — the all-pull-fleet C3 source is already a named 1c gate
+  item); the controller synthesize-on-delete comments needed no
+  change (P1 makes them true as written).
+
+Scenario reconciliation: the `pull-mode` killed-mid-build arm and the
+`pull-canary` preempt arm now assert the AD5 uncharged close
+(`disconnected` / `worker_abort`|`preempted`) instead of the previous
+non-success-charge set, and the establishment arm's left-the-view
+assertion is keyed to the established exec (structural against the
+healthy respawn); the cancel and establishment-window arms stand
+unchanged. Both hosting checks were re-run green on the hardened
+tree (single re-runs; the canary needed one assertion-hardening
+retry). The retryPolicy pull-regime quint models are untouched by
+this batch — the synthesized-verdict and abort paths are documented
+model carve-outs that carry no retry charge — so no model re-runs
+were owed.
+
 ### Phase-1b gate evidence table (assembled by the verification batch; close-out input)
 
 Each row is one item of the v3-rescoped 1b gate (Phase-1 plan, slice-1b
@@ -3010,7 +3098,7 @@ rows D0–D5.
 | Model J / Model N re-runs (T-1b.10) | Wired `quint-spawn-coherence-*` and `quint-nodeclaim-*` exhaustive checks at this tree | GREEN, counts bit-identical to the recorded baselines (models unchanged at 1b) |
 | Controller-map re-audit (T-1b.10) | `controller-invariant-map.md` "Executor-campaign 1b re-audit" entry | RECORDED; controller-campaign owner counter-signature PENDING at the close-out review |
 | Unit/integration red-first batteries (T-1b.1–T-1b.6) | Per-crate batteries landed with the code batch (exclusion re-key, anti-affinity/NoEligibleSource, C4/C5 re-point, AD5 SIGTERM-abort + cancel/disruption arms, ICE re-trigger, dispatchMode rendering) | GREEN at the code-batch landing (their gates ran with T-1b.1–T-1b.6; re-confirmed by the per-crate checks at this tree) |
-| Code-review pass over the 1a+1b pull-path code (T-1b.11) | Review record (date, scope, finding dispositions) to be added to this map | **PENDING (orchestrator-run)** — placeholder row; not performed by the verification batch |
+| Code-review pass over the 1a+1b pull-path code (T-1b.11) | `pull-path-review.md` (campaign workspace) + the "Code-review pass … review pass recorded + fixes landed" subsection in the Phase-1b record above | **RECORDED + FIXES LANDED (2026-05-27)**: 7 confirmed findings (P1–P7) fixed on this branch with red-first batteries, 1 refuted, minors taken or explicitly adjudicated; the two affected VM arms moved to the AD5 uncharged-close semantics and both hosting checks re-run green on the hardened tree |
 | OA5 surface review + OA4 call | Owner review against `ListOpenAttempts` + the VM-demonstrated fleet view (no running canary) | PENDING (owner action at the close-out review; surface notes in the Phase-1b record above) |
 | AD5 numeric budget / OA1 latency comparison / establishment-slack re-baseline / production rollback drill | Deployment-time validation checklist rows D1/D2/D5 | DEFERRED BY DESIGN (v3 directive); explicitly NOT development-time gate items |
 
