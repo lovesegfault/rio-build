@@ -1374,7 +1374,9 @@ async fn test_recovery_expired_poison_cleared_not_reloaded() -> TestResult {
 ///
 /// Before the fix, `reset_from_poison` left the node in Created with stub
 /// fields from `from_poisoned_row` (`output_names: []`,
-/// `expected_output_paths: []`). `dag.merge()` on an existing node only
+/// `expected_output_paths: []` — at the time a stub constructor; it now
+/// restores the full creation-time snapshot). `dag.merge()` on an existing
+/// node only
 /// touches `interested_builds` + `traceparent`, and `compute_initial_states`
 /// only iterates `newly_inserted` — so the resubmit's node never progressed
 /// past Created. Build counters stuck at `completed=0, failed=0, total=1`;

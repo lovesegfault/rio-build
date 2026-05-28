@@ -2117,9 +2117,11 @@ impl DagActor {
             return false;
         }
         // Remove from DAG so next merge treats it as newly-inserted.
-        // Resetting status in-place would strand stub fields from
-        // `from_poisoned_row` and `compute_initial_states` only iterates
-        // `newly_inserted` — node would sit in Created forever. Poisoned
+        // Resetting status in-place would leave the node stuck: a merge
+        // onto a pre-existing non-retriable node only touches
+        // `interested_builds` + `traceparent`, and
+        // `compute_initial_states` only iterates `newly_inserted` — the
+        // node would sit in Created forever. Poisoned
         // nodes have no interested keep_going=false builds (build already
         // terminated); keep_going=true builds are pruned from
         // derivation_hashes here. The sticky `error_summary` set by

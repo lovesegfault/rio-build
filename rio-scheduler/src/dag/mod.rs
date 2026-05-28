@@ -1797,10 +1797,10 @@ impl DerivationDag {
     /// Used by poison-clear paths (admin ClearPoison, TTL expiry) so the
     /// next merge treats the derivation as newly-inserted: it receives full
     /// proto fields and flows through `compute_initial_states`. Resetting
-    /// status in-place instead would leave stub fields from
-    /// `from_poisoned_row` (empty `output_names`, empty
-    /// `expected_output_paths`) and `compute_initial_states` only iterates
-    /// `newly_inserted` — the node would sit in Created forever.
+    /// status in-place instead would leave the node stuck — `merge()` on a
+    /// pre-existing non-retriable node only touches `interested_builds` +
+    /// `traceparent`, and `compute_initial_states` only iterates
+    /// `newly_inserted` — so it would sit in Created forever.
     pub fn remove_node(&mut self, hash: &DrvHash) {
         if let Some(state) = self.nodes.remove(hash) {
             self.path_to_hash.remove(state.drv_path().as_str());

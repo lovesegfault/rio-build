@@ -111,9 +111,12 @@ impl EffectiveFeatures {
         // spec-correct `requiredSystemFeatures: []` derives to
         // `[fetcher]`; `out != raw` would warn on EVERY correctly
         // configured FOD (the common case), and the metric named for
-        // a strip would count an addition. Same for `from_poisoned_row`
-        // (always passes `raw=[]`): a recovered Poisoned FOD must not
-        // count as a tenant misconfig.
+        // a strip would count an addition. Recovery passes the
+        // persisted declared features through this same chokepoint, so
+        // a correctly configured recovered FOD (declared `[]`) still
+        // doesn't fire; one whose declaration genuinely needed the
+        // strip warns again after a failover — a true positive, just
+        // re-debounced per process.
         if raw.iter().any(|f| !out.contains(f)) {
             let reason: &'static str = if is_fixed_output {
                 "fod_declared_features"
