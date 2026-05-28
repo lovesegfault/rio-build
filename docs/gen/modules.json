@@ -2071,6 +2071,11 @@
       "doc": "S3 layout + small read helpers for campaign artifacts."
     },
     {
+      "path": "parity/status.rs",
+      "depth": 1,
+      "doc": "`cargo xtask parity status` — render campaign progress and Job state."
+    },
+    {
       "path": "regen/",
       "depth": 0,
       "doc": "Regenerate derived/checked-in files."

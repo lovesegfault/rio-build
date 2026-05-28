@@ -142,16 +142,20 @@ fn common_env(c: &EngineJobCommon) -> serde_json::Value {
     ])
 }
 
-/// Labels for the Job and its pod template. The pod-level
-/// `app.kubernetes.io/name: rio-parity` is what the chart's
+/// Labels for the Jobs, their pod templates, and the campaign-spec
+/// ConfigMap `parity launch` applies next to the campaign Job. The
+/// pod-level `app.kubernetes.io/name: rio-parity` is what the chart's
 /// CiliumNetworkPolicies match (see the module doc).
-fn labels(component: &str) -> serde_json::Value {
-    json!({
-        "app.kubernetes.io/name": "rio-parity",
-        "app.kubernetes.io/component": component,
-        "app.kubernetes.io/part-of": "rio-build",
-        "app.kubernetes.io/managed-by": "xtask",
-    })
+pub fn labels(component: &str) -> BTreeMap<String, String> {
+    BTreeMap::from(
+        [
+            ("app.kubernetes.io/name", "rio-parity"),
+            ("app.kubernetes.io/component", component),
+            ("app.kubernetes.io/part-of", "rio-build"),
+            ("app.kubernetes.io/managed-by", "xtask"),
+        ]
+        .map(|(k, v)| (k.to_string(), v.to_string())),
+    )
 }
 
 /// Pod-level security context: nonroot (the image's 65532 user) with the
@@ -661,6 +665,20 @@ mod tests {
         // IRSA injects its own projected token; the default SA token
         // must stay off.
         assert_eq!(sa.automount_service_account_token, Some(false));
+    }
+
+    #[test]
+    fn labels_carry_the_full_app_kubernetes_io_set() {
+        // launch reuses this exact set on the campaign-spec ConfigMap, so
+        // the engine's k8s objects all answer the same label selectors.
+        let l = labels("parity-campaign");
+        assert_eq!(l.get("app.kubernetes.io/name").unwrap(), "rio-parity");
+        assert_eq!(
+            l.get("app.kubernetes.io/component").unwrap(),
+            "parity-campaign"
+        );
+        assert_eq!(l.get("app.kubernetes.io/part-of").unwrap(), "rio-build");
+        assert_eq!(l.get("app.kubernetes.io/managed-by").unwrap(), "xtask");
     }
 
     #[test]

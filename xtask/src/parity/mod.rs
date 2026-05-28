@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod launch;
 pub mod preflight;
 pub mod s3;
+pub mod status;
 
 /// Campaign tenants (created by `parity launch` directly via rio-cli —
 /// never via `k8s grant`, which unconditionally adds cache.nixos.org).
@@ -89,7 +90,7 @@ enum ParityCmd {
     /// happens after launch.
     Launch(launch::LaunchArgs),
     /// Show campaign progress (progress.json from S3 + Job state).
-    Status(StatusArgs),
+    Status(status::StatusArgs),
     /// Download and render the campaign report (summary.md).
     Report(ReportArgs),
     /// Print (or run) the recorded repro command for one job. M2.
@@ -115,15 +116,10 @@ enum ParityCmd {
     },
 }
 
-// Placeholder arg structs — swapped for the real ones as the
-// status/report implementations land (each lands by replacing exactly
-// one of these and its `run` arm). Campaign-scoped commands take the
-// campaign id positionally.
-#[derive(Args)]
-pub struct StatusArgs {
-    /// Campaign id.
-    pub campaign: String,
-}
+// Placeholder arg struct — swapped for the real one when the report
+// implementation lands (it lands by replacing exactly this and its
+// `run` arm). Campaign-scoped commands take the campaign id
+// positionally.
 #[derive(Args)]
 pub struct ReportArgs {
     /// Campaign id.
@@ -134,12 +130,9 @@ pub async fn run(args: ParityArgs) -> Result<()> {
     match args.cmd {
         ParityCmd::Eval(a) => eval::run(a).await,
         ParityCmd::Launch(a) => launch::run(a).await,
-        // Placeholder arms: the remaining campaign commands bail until
-        // their implementations land and replace the arms.
-        ParityCmd::Status(a) => bail!(
-            "`cargo xtask parity status {}` is not implemented yet",
-            a.campaign
-        ),
+        ParityCmd::Status(a) => status::run(a).await,
+        // Placeholder arm: report bails until its implementation lands
+        // and replaces it.
         ParityCmd::Report(a) => bail!(
             "`cargo xtask parity report {}` is not implemented yet",
             a.campaign

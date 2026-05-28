@@ -23,6 +23,8 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
+use k8s_openapi::api::batch::v1::Job;
+use kube::api::Api;
 use rio_parity::run::evalset_input::EvalSetMeta;
 use rio_parity::run::spec::{
     CampaignSpec, ClusterEndpoints, EvalSetRef, Filters, S3Target, TenantBlock,
@@ -136,9 +138,12 @@ pub fn default_campaign_id(mode: Mode, now: jiff::Zoned, nonce: u16) -> String {
     )
 }
 
-/// Campaign ids become the Job name, the spec-ConfigMap name
+/// Campaign ids become the Job name (which the Job controller also
+/// stamps onto the campaign pods as the `job-name` label, so it must fit
+/// the 63-char label-value limit), the spec-ConfigMap name
 /// (`<id>-spec`), and the S3 prefix segment — they must be lowercase
-/// RFC-1123 labels with room for the `-spec` suffix.
+/// RFC-1123 labels. The cap leaves room for the `-spec` suffix inside
+/// the same 63-char budget so every derived name stays label-safe.
 fn validate_campaign_id(id: &str) -> Result<()> {
     let max = 63 - jobs::spec_configmap_name("").len();
     let charset_ok = id
@@ -149,8 +154,9 @@ fn validate_campaign_id(id: &str) -> Result<()> {
     ensure!(
         !id.is_empty() && charset_ok && ends_ok && id.len() <= max,
         "campaign id {id:?} must be a lowercase RFC-1123 label (a-z, 0-9, '-', \
-         alphanumeric first/last character) of at most {max} characters — it names the \
-         campaign Job and the `{}` ConfigMap",
+         alphanumeric first/last character) of at most {max} characters — it becomes the \
+         campaign Job name (and so its pods' 63-char-capped `job-name` label) and the `{}` \
+         ConfigMap name",
         jobs::spec_configmap_name("<id>")
     );
     Ok(())
@@ -379,9 +385,38 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         .context("constructed campaign spec failed engine validation (launch bug)")?;
     let spec_json = serde_json::to_string_pretty(&spec)?;
     let cm_name = jobs::spec_configmap_name(&campaign_id);
+
+    // A re-used campaign id must never swap the spec mounted by an
+    // existing campaign: refuse before touching the ConfigMap when the
+    // Job already exists, or when a leftover spec ConfigMap differs from
+    // what this launch would write.
+    ui::step(
+        &format!("campaign id {campaign_id} not already in use"),
+        || async {
+            let jobs_api: Api<Job> = Api::namespaced(client.clone(), NS_PARITY);
+            let job_exists = jobs_api.get_opt(&campaign_id).await?.is_some();
+            let existing_spec =
+                kclient::get_configmap_key(&client, NS_PARITY, &cm_name, jobs::SPEC_FILENAME)
+                    .await?;
+            guard_existing_campaign(
+                &campaign_id,
+                job_exists,
+                existing_spec.as_deref(),
+                &spec_json,
+            )
+        },
+    )
+    .await?;
+
     let spec_data = BTreeMap::from([(jobs::SPEC_FILENAME.to_string(), spec_json)]);
     ui::step(&format!("apply spec ConfigMap {cm_name}"), || {
-        kclient::apply_configmap(&client, NS_PARITY, &cm_name, spec_data)
+        kclient::apply_configmap(
+            &client,
+            NS_PARITY,
+            &cm_name,
+            spec_data,
+            jobs::labels("parity-campaign"),
+        )
     })
     .await?;
 
@@ -435,24 +470,8 @@ async fn resolve_eval_set(
              --eval {eval} …` first and wait for its Job to complete"
         );
     }
-    let chosen = match requested_digest {
-        Some(want) => digests
-            .iter()
-            .find(|d| d.starts_with(want) || want.starts_with(d.as_str()))
-            .with_context(|| {
-                format!(
-                    "--eval-digest {want} matches none of the eval sets under \
-                     s3://{bucket}/{prefix} (found: {})",
-                    digests.join(", ")
-                )
-            })?,
-        None if digests.len() == 1 => &digests[0],
-        None => bail!(
-            "{} eval sets exist under s3://{bucket}/{prefix} ({}) — pass --eval-digest to pick one",
-            digests.len(),
-            digests.join(", ")
-        ),
-    };
+    let chosen = choose_digest(&digests, requested_digest)
+        .with_context(|| format!("choose an eval set under s3://{bucket}/{prefix}"))?;
     let set_prefix = format!("{prefix}{chosen}");
     let meta_key = format!("{set_prefix}/evalset.json");
     let text = s3::get_text(region, bucket, &meta_key)
@@ -476,9 +495,85 @@ async fn resolve_eval_set(
     );
     Ok(EvalSetLocation {
         key_digest: meta.key_digest,
-        short_digest: chosen.clone(),
+        short_digest: chosen.to_owned(),
         s3_prefix: set_prefix,
     })
+}
+
+/// Pick which eval-set `<key-digest>/` prefix to use out of the ones
+/// found in S3. `requested` may be the full key digest recorded in
+/// evalset.json or any prefix of the short (16-char) digest segment; it
+/// must match exactly one candidate — an ambiguous prefix is an error,
+/// never a silent first-match. Without `requested`, a single candidate
+/// is picked automatically and several candidates ask the operator to
+/// disambiguate with `--eval-digest`.
+fn choose_digest<'a>(candidates: &'a [String], requested: Option<&str>) -> Result<&'a str> {
+    match requested {
+        Some(want) => {
+            let matches: Vec<&str> = candidates
+                .iter()
+                .map(String::as_str)
+                .filter(|d| d.starts_with(want) || want.starts_with(d))
+                .collect();
+            match matches.as_slice() {
+                [one] => Ok(*one),
+                [] => bail!(
+                    "--eval-digest {want} matches none of the eval sets (found: {})",
+                    candidates.join(", ")
+                ),
+                more => bail!(
+                    "--eval-digest {want} is ambiguous — it matches {} eval sets ({}); pass more \
+                     of the digest",
+                    more.len(),
+                    more.join(", ")
+                ),
+            }
+        }
+        None => match candidates {
+            [one] => Ok(one.as_str()),
+            [] => bail!("no eval sets found"),
+            more => bail!(
+                "{} eval sets exist ({}) — pass --eval-digest to pick one",
+                more.len(),
+                more.join(", ")
+            ),
+        },
+    }
+}
+
+/// Refuse to (re)write the `<campaign-id>-spec` ConfigMap when the
+/// campaign id is already in use: a campaign Job with that name exists
+/// (its pod mounts the ConfigMap and re-reads it on container restart),
+/// or a leftover spec ConfigMap holds a different spec than this launch
+/// would apply. Pure so the refusal logic is unit-testable; the caller
+/// supplies the cluster facts.
+fn guard_existing_campaign(
+    campaign_id: &str,
+    job_exists: bool,
+    existing_spec: Option<&str>,
+    new_spec: &str,
+) -> Result<()> {
+    let cm = jobs::spec_configmap_name(campaign_id);
+    if job_exists {
+        bail!(
+            "campaign Job {NS_PARITY}/{campaign_id} already exists — re-using its campaign id \
+             would overwrite ConfigMap {NS_PARITY}/{cm}, the spec that campaign mounts. Pick a \
+             different --campaign-id, or — only if you mean to relaunch/resume THIS campaign — \
+             delete the Job first (`kubectl -n {NS_PARITY} delete job {campaign_id}`) and re-run \
+             launch."
+        );
+    }
+    if existing_spec.is_some_and(|old| old != new_spec) {
+        bail!(
+            "ConfigMap {NS_PARITY}/{cm} already exists with a different campaign spec (campaign \
+             id {campaign_id} was launched before). Refusing to overwrite it: pick a fresh \
+             --campaign-id, or — if you are deliberately relaunching this campaign after deleting \
+             its Job — delete the stale ConfigMap too (`kubectl -n {NS_PARITY} delete configmap \
+             {cm}`) and re-run; resume state lives under the campaign's S3 prefix, not in the old \
+             ConfigMap."
+        );
+    }
+    Ok(())
 }
 
 /// `rio-cli create-tenant` (with the campaign GC retention) for every
@@ -528,7 +623,6 @@ async fn create_tenant(cli: &CliCtx, tenant: &str) -> Result<()> {
 /// keys.
 async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> Result<()> {
     use k8s_openapi::api::core::v1::Secret;
-    use kube::api::Api;
 
     let api: Api<Secret> = Api::namespaced(client.clone(), NS_PARITY);
     let existing: BTreeMap<String, String> = api
@@ -545,15 +639,25 @@ async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> 
     let mut secret_data = BTreeMap::new();
     let mut pub_lines = Vec::new();
     for (tenant, _, _) in TENANT_MATRIX {
-        let private = match existing.get(tenant) {
-            Some(p) => p.clone(),
-            None => ssh::generate(tenant)?.0,
+        let (private, reused) = match existing.get(tenant) {
+            Some(p) => (p.clone(), true),
+            None => (ssh::generate(tenant)?.0, false),
         };
         // Re-derive the public half from whichever private key we ended up
         // with (fresh or reused) and force comment = tenant — the comment
         // is the gateway's tenant-routing key.
-        let parsed = ssh_key::PrivateKey::from_openssh(&private)
-            .with_context(|| format!("parse private key for {tenant}"))?;
+        let parsed = ssh_key::PrivateKey::from_openssh(&private).with_context(|| {
+            if reused {
+                format!(
+                    "parse the existing private key for tenant {tenant} (data key {tenant:?} of \
+                     Secret {NS_PARITY}/{}) — delete that key from the Secret to have launch mint \
+                     a fresh one",
+                    jobs::SSH_SECRET_NAME
+                )
+            } else {
+                format!("parse the freshly generated private key for {tenant}")
+            }
+        })?;
         let mut public = parsed.public_key().clone();
         public.set_comment(tenant);
         pub_lines.push(public.to_openssh()? + "\n");
@@ -821,8 +925,9 @@ mod tests {
             "ends-with-dash-",
             "-starts-with-dash",
             "under_score",
-            // 59 chars: valid label on its own, but `<id>-spec` would
-            // exceed the 63-char ConfigMap name limit.
+            // 59 chars: a valid label on its own, but the 63-char budget
+            // (Job name → `job-name` label value) leaves no room for the
+            // derived `-spec` suffix we keep label-safe as well.
             &"a".repeat(59),
         ] {
             assert!(
@@ -988,5 +1093,89 @@ mod tests {
                 .unwrap(),
             "self-hosted"
         );
+    }
+
+    #[test]
+    fn choose_digest_unrequested_needs_exactly_one_candidate() {
+        let one = vec!["8b919129046e0f60".to_string()];
+        assert_eq!(choose_digest(&one, None).unwrap(), "8b919129046e0f60");
+
+        let two = vec![
+            "8b919129046e0f60".to_string(),
+            "9c02aabbccddeeff".to_string(),
+        ];
+        let err = choose_digest(&two, None).unwrap_err().to_string();
+        assert!(err.contains("--eval-digest"), "{err}");
+        assert!(err.contains("8b919129046e0f60"), "{err}");
+
+        assert!(choose_digest(&[], None).is_err());
+    }
+
+    #[test]
+    fn choose_digest_prefix_full_digest_and_ambiguity() {
+        let candidates = vec![
+            "8b919129046e0f60".to_string(),
+            "8b02aabbccddeeff".to_string(),
+        ];
+        // Unambiguous short prefix.
+        assert_eq!(
+            choose_digest(&candidates, Some("8b91")).unwrap(),
+            "8b919129046e0f60"
+        );
+        // Full 64-char key digest matches the candidate that is its
+        // 16-char prefix.
+        let full = format!("8b919129046e0f60{}", "ab".repeat(24));
+        assert_eq!(
+            choose_digest(&candidates, Some(&full)).unwrap(),
+            "8b919129046e0f60"
+        );
+        // Ambiguous prefix → error naming every match, never first-match.
+        let err = choose_digest(&candidates, Some("8b"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(
+            err.contains("8b919129046e0f60") && err.contains("8b02aabbccddeeff"),
+            "{err}"
+        );
+        // No match → error listing what exists.
+        let err = choose_digest(&candidates, Some("ffff"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("matches none"), "{err}");
+        assert!(err.contains("8b02aabbccddeeff"), "{err}");
+    }
+
+    #[test]
+    fn guard_refuses_existing_job_or_differing_spec() {
+        let id = "parity-leaf-20260601-ab12";
+        let spec = r#"{"campaignId":"parity-leaf-20260601-ab12"}"#;
+
+        // Existing Job: refuse regardless of ConfigMap state, with the
+        // delete-Job escape hatch spelled out.
+        let err = guard_existing_campaign(id, true, None, spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(
+            err.contains("delete job parity-leaf-20260601-ab12"),
+            "{err}"
+        );
+
+        // Leftover ConfigMap with a different spec: refuse and name the
+        // ConfigMap to delete.
+        let err = guard_existing_campaign(id, false, Some(r#"{"campaignId":"other"}"#), spec)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("different campaign spec"), "{err}");
+        assert!(
+            err.contains("delete configmap parity-leaf-20260601-ab12-spec"),
+            "{err}"
+        );
+
+        // Identical leftover spec (e.g. a launch that failed after the
+        // ConfigMap apply) and the fresh-id case are both fine.
+        guard_existing_campaign(id, false, Some(spec), spec).unwrap();
+        guard_existing_campaign(id, false, None, spec).unwrap();
     }
 }

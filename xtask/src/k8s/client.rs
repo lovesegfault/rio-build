@@ -171,19 +171,22 @@ pub async fn apply_secret_bytes(
     Ok(())
 }
 
-/// Create/update a ConfigMap with string data (SSA, idempotent) — the
-/// `apply_secret` sibling for non-secret payloads such as the parity
-/// campaign-spec ConfigMap.
+/// Create/update a ConfigMap with string data and labels (SSA,
+/// idempotent) — the `apply_secret` sibling for non-secret payloads such
+/// as the parity campaign-spec ConfigMap. An empty `labels` map applies
+/// no labels.
 pub async fn apply_configmap(
     client: &Client,
     ns: &str,
     name: &str,
     data: BTreeMap<String, String>,
+    labels: BTreeMap<String, String>,
 ) -> Result<()> {
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
     let mut cm = ConfigMap::default();
     cm.metadata.name = Some(name.into());
     cm.metadata.namespace = Some(ns.into());
+    cm.metadata.labels = (!labels.is_empty()).then_some(labels);
     cm.data = Some(data);
     let ssapply = PatchParams::apply("xtask").force();
     api.patch(name, &ssapply, &Patch::Apply(&cm)).await?;
