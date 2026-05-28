@@ -164,10 +164,30 @@ impl DagActor {
         // (e.g. pre-existing DAG parents of a cache hit) keep their
         // breadcrumb and are skipped below: the classifier judges their
         // reap-truncated child set Broken, never Vouched.
+        //
+        // The persisted breadcrumb (`migrations/064`) is cleared here
+        // too, best-effort, for exactly the parents whose IN-MEMORY
+        // value was set before this loop flipped it: the upsert above
+        // never clears the column (OR-on-conflict, merge binds false),
+        // and the heal must also fire when the `topdown_pruned` mark
+        // stays (unbuilt children), so it cannot ride the mark-clear
+        // statement below. Keying on the pre-clear value keeps this a
+        // no-op for the overwhelming majority of merges instead of an
+        // UPDATE per edge parent.
+        let mut healed_holes: Vec<String> = Vec::new();
         for hash in &ingest.edge_parent_hashes {
             if let Some(s) = self.dag.node_mut(hash) {
+                if s.closure_hole {
+                    healed_holes.push(hash.to_string());
+                }
                 s.closure_hole = false;
             }
+        }
+        if !healed_holes.is_empty()
+            && let Err(e) = self.db.clear_closure_hole_by_hashes(&healed_holes).await
+        {
+            warn!(build_id = %build_id, count = healed_holes.len(), error = %e,
+                  "failed to clear persisted closure_hole after merge heal (continuing)");
         }
         let mut clear_candidates: HashSet<DrvHash> =
             ingest.edge_parent_hashes.iter().cloned().collect();
@@ -1913,6 +1933,14 @@ impl DagActor {
                     // (false here) never clears it.
                     topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
                         && !self.closure_vouched(&node.drv_hash),
+                    // Always false: a merge never creates a closure hole
+                    // (holes are reap-time only, stamped in PG by the
+                    // leader's reap hook), and binding the in-memory
+                    // value here would turn the upsert into a second
+                    // stamping site. The OR-on-conflict SET keeps any
+                    // existing persisted hole; the only merge-side clear
+                    // is the explicit heal in `handle_merge_dag`.
+                    closure_hole: false,
                 }
             })
             .collect();

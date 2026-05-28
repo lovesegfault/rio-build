@@ -97,6 +97,16 @@ pub struct ReapOutcome {
     /// promote a now-ready Queued parent) — nothing else would, because
     /// `find_newly_ready` only fires on completions, never on removals.
     pub surviving_parents: Vec<DrvHash>,
+    /// The subset of `surviving_parents` that lost at least one
+    /// UN-PRODUCED child to this reap — exactly the nodes whose
+    /// in-memory `closure_hole` breadcrumb this reap just set. Reported
+    /// separately so the leader-gated survivor hook can persist the
+    /// breadcrumb (`migrations/064`, `set_closure_hole_by_hashes`)
+    /// without re-deriving "holed by THIS reap" from node state (which
+    /// would also re-fire for holes set by earlier reaps and miss
+    /// survivors the hook's verdict loop skips as terminal /
+    /// zero-interest).
+    pub holed_parents: Vec<DrvHash>,
 }
 
 /// Trust classification of a node's current DAG child set as evidence
@@ -1220,14 +1230,18 @@ impl DerivationDag {
     ///
     /// Survivors that lost at least one UN-PRODUCED child (status not
     /// Completed/Skipped at reap time) additionally get the in-memory
-    /// `closure_hole` breadcrumb set: their remaining DAG children no
+    /// `closure_hole` breadcrumb set, and are reported back as
+    /// [`ReapOutcome::holed_parents`]: their remaining DAG children no
     /// longer represent their pruned input closure, so the actor's
     /// children-keyed `topdown_pruned` verdicts must not trust the
-    /// truncated set. The breadcrumb is set HERE (not in the leader-gated
-    /// survivor hook) so a standby's DAG — which loses the children all
-    /// the same — carries it too. Known residual: the poison-TTL sweep
-    /// and admin ClearPoison delete children via [`Self::remove_node`]
-    /// without setting the breadcrumb (see the field's doc).
+    /// truncated set. The IN-MEMORY breadcrumb is set HERE (not in the
+    /// leader-gated survivor hook) so a standby's DAG — which loses the
+    /// children all the same — carries it too; the PG persistence of
+    /// the breadcrumb (`migrations/064`) is leader-class and lives in
+    /// the hook, fed by `holed_parents`. Known residual: the poison-TTL
+    /// sweep and admin ClearPoison delete children via
+    /// [`Self::remove_node`] without setting the breadcrumb (see the
+    /// field's doc).
     ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for
@@ -1278,10 +1292,10 @@ impl DerivationDag {
         // Drop entries that were themselves reaped (or otherwise no longer
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
+        holed_parents.retain(|p| self.nodes.contains_key(p));
         // Breadcrumb the survivors whose reaped children include an
         // un-produced one: their child set is no longer representative of
         // their input closure (see `DerivationState::closure_hole`).
-        // Parents that were themselves reaped fall out via the get_mut.
         for parent in &holed_parents {
             if let Some(state) = self.nodes.get_mut(parent) {
                 state.closure_hole = true;
@@ -1290,6 +1304,7 @@ impl DerivationDag {
         ReapOutcome {
             reaped_paths,
             surviving_parents: surviving_parents.into_iter().collect(),
+            holed_parents: holed_parents.into_iter().collect(),
         }
     }
 

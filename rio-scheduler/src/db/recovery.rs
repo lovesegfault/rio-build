@@ -83,7 +83,7 @@ impl SchedulerDb {
                    d.retry_count, d.resubmit_cycles,
                    d.expected_output_paths, d.output_names,
                    d.wanted_output_names, d.is_fixed_output,
-                   d.is_ca, d.topdown_pruned,
+                   d.is_ca, d.topdown_pruned, d.closure_hole,
                    d.failed_builders,
                    d.floor_mem_bytes, d.floor_disk_bytes, d.floor_deadline_secs,
                    a.exec_id

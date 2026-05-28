@@ -2250,11 +2250,17 @@ async fn test_topdown_pruned_survivor_not_fail_fasted_when_cleanup_drains_on_ex_
         rio_proto::types::BuildState::Active as i32,
         "ex-leader must not terminally fail B1 from a stale DAG"
     );
-    let (pg_pruned, pg_status): (bool, String) =
-        sqlx::query_as("SELECT topdown_pruned, status FROM derivations WHERE drv_hash = 'tdsl-r'")
-            .fetch_one(&db.pool)
-            .await?;
+    let (pg_pruned, pg_hole, pg_status): (bool, bool, String) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole, status FROM derivations WHERE drv_hash = 'tdsl-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
     assert!(pg_pruned, "ex-leader must not clear the persisted mark");
+    assert!(
+        !pg_hole,
+        "ex-leader must not stamp the persisted closure_hole breadcrumb (the in-memory \
+         reap holes the survivor on standbys too, but the PG write is leader-class)"
+    );
     assert_eq!(
         pg_status,
         DerivationStatus::Queued.as_str(),
@@ -2686,7 +2692,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
 #[tokio::test]
 async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_produced_child_survives_reversed()
 -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
 
     // Park B1's detached fetch on the QPI gate (never released) so R
     // stays Substituting through the cancel + cleanup.
@@ -2828,6 +2834,21 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         rio_proto::types::BuildState::Active as i32,
         "fixture premise: B1 is not failed while R's walk is still in flight"
     );
+    // The leader-gated reap hook persists the breadcrumb the reap just
+    // set (`migrations/064`), and the deferred verdict loop leaves the
+    // in-flight survivor alone — so the persisted column is observable
+    // here, exactly the durable evidence a failover in this window
+    // would restore (without it, the produced survivor dep2 would
+    // launder the recovery-time clear and re-arm the doomed dispatch).
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'tdmr-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_hole,
+        "the leader's reap hook must persist closure_hole for a survivor that lost an \
+         un-produced child"
+    );
 
     // The walk now genuinely fails. R's surviving children ({dep2}) are
     // all produced, but they are a reap-truncated view of the pruned
@@ -2866,6 +2887,19 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     assert!(
         !r.topdown_pruned,
         "the fail-fast consumes (clears) the mark it acted on"
+    );
+    // The fail-fast's persisted clear drops the breadcrumb together with
+    // the mark it qualifies — a stale persisted hole would otherwise
+    // re-arm the conservative arm after every later failover.
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdmr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !pg_pruned && !pg_hole,
+        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+         closure_hole={pg_hole})"
     );
     Ok(())
 }

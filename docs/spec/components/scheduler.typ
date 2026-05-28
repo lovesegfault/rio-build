@@ -942,7 +942,15 @@ empty = all declared) ---
 routinely wider than the prune-time criterion --- so an output the prune
 never vouched for can be definitively missing at dispatch time; without the
 restored flag the node would be left Ready and handed a doomed from-source
-dispatch whose `inputDrvs` were never merged.
+dispatch whose `inputDrvs` were never merged. The closure-hole breadcrumb is
+persisted alongside the mark (migration 064, OR-on-conflict, written
+best-effort by the leader's terminal-build reap hook, restored at recovery,
+and cleared with the mark or by the merge-time heal) so the recovery-time
+gate keeps refusing to treat a reap-truncated persisted child set as
+produced-closure evidence: the reaped un-produced child's own row and edge
+can be GC'd before the failover, and without the durable breadcrumb the
+surviving produced siblings would launder the clear and re-arm exactly that
+doomed dispatch.
 
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the

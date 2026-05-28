@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 12 bind params total regardless of
-    /// row count (vs `push_values`' 12×N, which hits PG's 65535-param
-    /// limit at ~5461 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 13 bind params total regardless of
+    /// row count (vs `push_values`' 13×N, which hits PG's 65535-param
+    /// limit at ~5041 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,7 +54,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Twelve parallel
+        // Decompose struct-of-rows into row-of-arrays. Thirteen parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -76,6 +76,7 @@ impl SchedulerDb {
         let mut is_ca = Vec::with_capacity(rows.len());
         let mut wanted_output_names = Vec::with_capacity(rows.len());
         let mut topdown_pruned = Vec::with_capacity(rows.len());
+        let mut closure_hole = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -89,6 +90,7 @@ impl SchedulerDb {
             is_ca.push(r.is_ca);
             wanted_output_names.push(encode_pg_text_array(&r.wanted_output_names));
             topdown_pruned.push(r.topdown_pruned);
+            closure_hole.push(r.closure_hole);
         }
 
         // ON CONFLICT: update the recovery columns too. For
@@ -123,12 +125,23 @@ impl SchedulerDb {
         // doc), and `clear_topdown_pruned_by_hash` for the lazy
         // walk-failure clear and when the topdown fail-fast consumes
         // the marker.
+        //
+        // closure_hole is OR-combined too, for the symmetric reason: the
+        // merge bind is ALWAYS false (the upsert is never a stamping
+        // site — only the leader's reap hook sets the breadcrumb, via
+        // `set_closure_hole_by_hashes`), and a pruned / single-node
+        // re-merge of the same drv does not re-declare its edges, so it
+        // must not launder the persisted truncation evidence through the
+        // upsert. The only merge-side clear is the explicit heal in
+        // `handle_merge_dag` (`clear_closure_hole_by_hashes`, edge
+        // parents of a full merge); the mark-clear helpers below drop it
+        // together with `topdown_pruned`.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
-                 wanted_output_names, topdown_pruned)
+                 wanted_output_names, topdown_pruned, closure_hole)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
@@ -136,14 +149,15 @@ impl SchedulerDb {
                 output_names::text[],
                 is_fixed_output, is_ca,
                 wanted_output_names::text[],
-                topdown_pruned
+                topdown_pruned, closure_hole
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[], $12::bool[]
+                $11::text[], $12::bool[], $13::bool[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
-                   is_fixed_output, is_ca, wanted_output_names, topdown_pruned)
+                   is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
+                   closure_hole)
             -- is_ca UPDATE is idempotent-by-construction: drv_hash is
             -- deterministic (input-addressed=store path; CA=modular hash
             -- per rio-nix hashDerivationModulo). Same drv_hash → same
@@ -163,6 +177,12 @@ impl SchedulerDb {
             -- recovery-time gate — once the node's children are
             -- produced) and by clear_topdown_pruned_by_hash (lazy
             -- walk-failure clear; fail-fast consumed it).
+            --
+            -- closure_hole: OR — set by the leader's reap hook only
+            -- (merges always bind false); this upsert never clears it.
+            -- Cleared by the merge-time heal
+            -- (clear_closure_hole_by_hashes) and alongside the mark by
+            -- the clear_topdown_pruned_by_hash{,es} helpers.
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -180,7 +200,8 @@ impl SchedulerDb {
                         ) ORDER BY 1
                     )
                 END,
-                topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned
+                topdown_pruned = derivations.topdown_pruned OR EXCLUDED.topdown_pruned,
+                closure_hole = derivations.closure_hole OR EXCLUDED.closure_hole
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,
@@ -197,6 +218,7 @@ impl SchedulerDb {
         .bind(&is_ca)
         .bind(&wanted_output_names)
         .bind(&topdown_pruned)
+        .bind(&closure_hole)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result
@@ -305,7 +327,12 @@ impl SchedulerDb {
     /// recovery-time gate in `load_dag_from_rows` (restored marks whose
     /// persisted children are all produced and vouched for by a
     /// still-live build); each clears its batch in one statement.
-    /// Returns the number of rows actually cleared.
+    /// Also resets the `closure_hole` breadcrumb (`migrations/064`):
+    /// the breadcrumb only qualifies the mark, so it travels with it —
+    /// and the widened WHERE additionally mops up a markless leftover
+    /// hole (a heal whose best-effort PG write was lost after the mark
+    /// itself had already been cleared).
+    /// Returns the number of rows actually touched.
     /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
     /// warns and continues — the in-memory clear already happened and
     /// the merge outcome must not depend on this write.
@@ -318,8 +345,9 @@ impl SchedulerDb {
         }
         let result = sqlx::query(
             r#"
-            UPDATE derivations SET topdown_pruned = false, updated_at = now()
-            WHERE drv_hash = ANY($1) AND topdown_pruned
+            UPDATE derivations
+            SET topdown_pruned = false, closure_hole = false, updated_at = now()
+            WHERE drv_hash = ANY($1) AND (topdown_pruned OR closure_hole)
             "#,
         )
         .bind(drv_hashes)
@@ -335,6 +363,9 @@ impl SchedulerDb {
     /// childless node and the fail-fast re-arms after every failover),
     /// and the lazy clear in `handle_substitute_complete` when the
     /// node's children are all already produced at walk-failure time.
+    /// Resets `closure_hole` together with the mark, mirroring the
+    /// in-memory consumption (the fail-fast drops both bits) — see
+    /// `clear_topdown_pruned_by_hashes` for the widened WHERE.
     /// Callers treat an error as warn-and-continue — the in-memory
     /// clear already happened and the build verdict must not depend on
     /// this write.
@@ -344,13 +375,75 @@ impl SchedulerDb {
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
-            UPDATE derivations SET topdown_pruned = false, updated_at = now()
-            WHERE drv_hash = $1 AND topdown_pruned
+            UPDATE derivations
+            SET topdown_pruned = false, closure_hole = false, updated_at = now()
+            WHERE drv_hash = $1 AND (topdown_pruned OR closure_hole)
             "#,
         )
         .bind(drv_hash)
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, on
+    /// the pool (outside any transaction). Sole caller: the leader-gated
+    /// survivor hook in `handle_cleanup_terminal_build`, for the parents
+    /// the terminal-build reap just holed (`ReapOutcome::holed_parents`)
+    /// — run BEFORE the per-parent verdict loop so a survivor that loop
+    /// immediately fail-fasts converges back to false via
+    /// [`Self::clear_topdown_pruned_by_hash`]. The in-memory breadcrumb
+    /// is set by the reap itself on leaders and standbys alike; only the
+    /// leader persists it (`r[sched.lease.standby-drops-writes]`).
+    /// Returns the number of rows actually stamped. The caller warns and
+    /// continues on error — losing the write costs durability of the
+    /// breadcrumb across a failover (the already-accepted best-effort
+    /// window), never this tenure's correctness.
+    pub(crate) async fn set_closure_hole_by_hashes(
+        &self,
+        drv_hashes: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE derivations SET closure_hole = true, updated_at = now()
+            WHERE drv_hash = ANY($1) AND NOT closure_hole
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, on
+    /// the pool (outside any transaction). Sole caller: the merge-time
+    /// heal in `handle_merge_dag`, for the edge parents of a full merge
+    /// whose IN-MEMORY node carried the breadcrumb before the heal
+    /// flipped it (the heal clears the hole even when the
+    /// `topdown_pruned` mark stays, so it cannot ride the mark-clear
+    /// helpers above). Returns the number of rows actually cleared. The
+    /// caller warns and continues on error — a stale persisted hole errs
+    /// toward the bounded fail-fast after a later failover, never the
+    /// doomed from-source dispatch.
+    pub(crate) async fn clear_closure_hole_by_hashes(
+        &self,
+        drv_hashes: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE derivations SET closure_hole = false, updated_at = now()
+            WHERE drv_hash = ANY($1) AND closure_hole
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 }

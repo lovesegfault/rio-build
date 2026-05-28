@@ -338,8 +338,14 @@ impl SchedulerDb {
     /// rows are never re-read (recovery filters via
     /// `TERMINAL_STATUS_SQL`); once the owning build is deleted
     /// (008's `ON DELETE CASCADE` drops the `build_derivations` link)
-    /// nothing references them. Subselect-LIMIT — PG has no
-    /// `DELETE ... LIMIT` — so a 1M-row backlog drains over many
+    /// nothing references them. One caveat to "never re-read": the
+    /// recovery-time `topdown_pruned` gate joins terminal CHILD rows
+    /// through `derivation_edges` as produced-closure evidence — but a
+    /// parent whose un-produced child this GC deletes carries the
+    /// persisted `closure_hole` breadcrumb (`migrations/064`), which
+    /// vetoes that gate, so the deletion can no longer launder a clear
+    /// out of the surviving produced siblings. Subselect-LIMIT — PG has
+    /// no `DELETE ... LIMIT` — so a 1M-row backlog drains over many
     /// ticks instead of one long table lock.
     ///
     /// `NOT EXISTS … pending|acknowledged`: an ACTIVE assignment row

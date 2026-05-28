@@ -4166,6 +4166,226 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+10]
+/// The closure-hole breadcrumb is persisted (`migrations/064`) and must
+/// be restored by `from_recovery_row` — not reset to false the way the
+/// pre-064 code did. Restoring it is what lets the recovery-time gate
+/// and the merge-time heal keep honoring "an un-produced child was
+/// reaped out from under this node" across a leader failover.
+///
+/// The restore is asserted through the merge-time heal, because the
+/// debug surface does not expose the breadcrumb directly: the heal's
+/// best-effort PG clear is keyed on the IN-MEMORY breadcrumb value
+/// captured before the heal flips it, so the persisted column flipping
+/// true→false after a post-failover full merge re-declares the node's
+/// edges proves both halves at once — the new leader restored the
+/// breadcrumb from PG, and the heal cleared the persisted copy for
+/// exactly the nodes that carried it (had recovery reset it to false,
+/// the heal would have had nothing to clear and the column would have
+/// stayed true).
+#[tokio::test]
+async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrumb() -> TestResult {
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // A plain single-node merge stages the build / link / derivation
+        // rows; the reap that sets the breadcrumb in production has its
+        // own tests (the mixed-shape reap tests in merge.rs) — backdate
+        // the persisted shape directly, like the topdown_pruned restore
+        // test above.
+        merge_dag(
+            &handle,
+            Uuid::new_v4(),
+            vec![make_node("chrec-root")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
+             closure_hole = true WHERE drv_hash = 'chrec-root'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // The mark itself is restored and kept (childless ⇒ the
+    // produced-children gate has no edges to judge; the holed-parent
+    // veto is pinned by the closure-hole keep test below).
+    assert!(
+        expect_drv(&handle, "chrec-root").await.topdown_pruned,
+        "fixture premise: the restored topdown_pruned mark survives recovery"
+    );
+    // Nothing between the backdate and the heal may clear the persisted
+    // breadcrumb: recovery only restores it.
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'chrec-root'",
+    )
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "fixture premise: the backdated mark + breadcrumb are still persisted after recovery"
+    );
+
+    // A post-failover FULL merge re-declares the node's edges: its child
+    // set is representative of its closure again, so the heal drops the
+    // breadcrumb in memory and pushes the clear to PG for the nodes
+    // whose restored state carried it.
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("chrec-root"), make_node("chrec-dep")],
+        vec![make_test_edge("chrec-root", "chrec-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'chrec-root'",
+    )
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert!(
+        !pg_hole,
+        "a full merge re-declaring the node's edges must clear the persisted closure_hole \
+         restored at recovery (restore + heal keying)"
+    );
+    assert!(
+        pg_pruned,
+        "the heal must not clear the topdown_pruned mark itself — the new child is unbuilt \
+         (Pending, not Vouched)"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// bug_006 regression (the recovery-time veto): a restored
+/// `topdown_pruned` mark whose row also carries the persisted
+/// `closure_hole` breadcrumb must be KEPT at recovery even when every
+/// surviving persisted child is produced and vouched for by a live
+/// build that co-owns the parent — the breadcrumb records that an
+/// un-produced child was reaped out from under the node, so whatever
+/// children remain in PG are a truncated view of its pruned input
+/// closure (the orphan-terminal GC may have deleted the un-produced
+/// child's row and edge entirely, which is exactly why the breadcrumb
+/// is persisted rather than re-derived from the children).
+///
+/// Staged shape: identical to
+/// `test_failover_clears_topdown_pruned_when_children_all_produced`
+/// above (full merge parent→child with the edge persisted, child
+/// backdated `completed`, parent backdated `substituting` +
+/// `topdown_pruned = true`, the owning build still live) plus
+/// `closure_hole = true` on the parent row. Pre-064 the gate cleared
+/// the mark on the strength of the produced survivor and the parent
+/// was dispatched from source (the doomed ENOENT dispatch). Post-064
+/// the holed parent is never enrolled as a clear candidate, so the
+/// kept mark routes it to the bounded resubmit-directing fail-fast
+/// instead — asserted behaviorally, the same way the
+/// terminal-build keep test above does (the post-recovery dispatch
+/// pass consumes the kept mark, so "mark still set" is not directly
+/// observable).
+#[tokio::test]
+async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> TestResult {
+    let out = test_store_path("tdvh-root-out");
+    let dbg = test_store_path("tdvh-root-debug");
+
+    // Phase-2 store: `out` substitutable upstream; `debug` missing and
+    // NOT substitutable — substitution cannot satisfy the recovered
+    // all-declared wanted set, so the kept mark must route the node to
+    // the fail-fast arm, not to a from-source dispatch.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let build_id = Uuid::new_v4();
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        // Full merge: the parent depends on the child and the edge IS
+        // persisted, and the SAME live build owns both rows — the
+        // strongest possible produced-children evidence, defeated only
+        // by the breadcrumb.
+        let mut parent = make_node("tdvh-root");
+        parent.output_names = vec!["out".into(), "debug".into()];
+        parent.expected_output_paths = vec![out.clone(), dbg.clone()];
+        parent.wanted_output_names = vec![];
+        merge_dag(
+            &handle,
+            build_id,
+            vec![parent, make_node("tdvh-dep")],
+            vec![make_test_edge("tdvh-root", "tdvh-dep")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate: the child finished under the old leader, but a
+        // SECOND (un-produced) child had been reaped out from under the
+        // parent before the crash — its row may since have been GC'd,
+        // so all that survives is the breadcrumb the leader persisted
+        // at reap time alongside the mark.
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'tdvh-dep'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true, \
+             closure_hole = true WHERE drv_hash = 'tdvh-root'",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the produced survivor launders the clear.
+    let mut worker_rx = connect_executor(&handle, "tdvh-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // No WorkAssignment is ever sent for the parent: its pruned closure
+    // was truncated by the reap, so a from-source dispatch would ENOENT.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a closure-holed pruned root must not be dispatched from source after \
+             failover, however produced its surviving persisted children look"
+        );
+    }
+    let d = expect_drv(&handle, "tdvh-root").await;
+    assert!(
+        !matches!(
+            d.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "the kept mark must route the holed node to the fail-fast arm, not leave it \
+         dispatchable from source; got {:?}",
+        d.status
+    );
+    // The live build terminates with the bounded resubmit-directing
+    // error (same assertions as the childless and terminal-build keep
+    // tests above) instead of staying hostage to a doomed dispatch.
+    let s = query_status(&handle, build_id).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the build must fail fast (resubmit re-probes or full-merges); \
+         got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s.error_summary
+    );
+    Ok(())
+}
+
 /// Phase-1 staging shared by the three bug_009 regression tests below:
 /// build `b2` full-merges parent→child (the `derivation_edges` row and
 /// B2's `build_derivations` links to BOTH rows are persisted), build

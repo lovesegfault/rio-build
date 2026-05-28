@@ -1090,6 +1090,50 @@ pub const M_062: () = ();
 /// Read/written by **rio-scheduler** only.
 pub const M_063: () = ();
 
+/// `migrations/064_derivation_closure_hole.sql`
+///
+/// Failover-safe persistence of the scheduler's `closure_hole`
+/// breadcrumb — the qualifier that travels with the `topdown_pruned`
+/// marker (`M_063`). It records that a terminal build's cleanup reaped
+/// an un-produced child out from under the node, so the node's
+/// surviving (persisted and in-memory) children are a truncated view of
+/// its pruned input closure and must not vouch for a from-source
+/// dispatch or launder a mark clear. The breadcrumb was previously
+/// in-memory only, justified by "PG still holds the un-produced child's
+/// terminal row" — but the orphan-terminal GC
+/// (`gc_orphan_terminal_derivations`) deletes exactly that row and its
+/// edges, after which a leader failover saw only the produced
+/// survivors, cleared the restored mark, and re-armed the doomed
+/// from-source dispatch the mark exists to prevent.
+///
+/// Written `true` **best-effort** by the leader-gated survivor hook in
+/// `actor/build.rs::handle_cleanup_terminal_build` (the in-memory hole
+/// is set by `remove_build_interest_and_reap` on leaders and standbys
+/// alike; only the leader persists it, before the per-parent verdict
+/// loop, so a survivor that same loop fail-fasts converges back to
+/// false via the extended clear). A crash or lease loss between the
+/// reap and the stamp loses the persisted breadcrumb — same accepted
+/// best-effort posture as every `topdown_pruned` clear.
+/// **OR-combined on conflict**
+/// (`derivations.closure_hole OR EXCLUDED.closure_hole`); the merge-time
+/// upsert always binds `false`, so a later non-edge-declaring merge of
+/// the same drv can never clear it through the upsert. Cleared by the
+/// merge-time heal (`clear_closure_hole_by_hashes` — a full merge
+/// re-declares the node's edges, so its child set is representative
+/// again), by every `clear_topdown_pruned_by_hash{,es}` site (the
+/// breadcrumb travels with the mark it qualifies, including when the
+/// fail-fast consumes it). Restored by `from_recovery_row`
+/// (`from_poisoned_row` keeps `false`) and consulted by the
+/// recovery-time produced-children gate: a holed flagged parent is
+/// never enrolled as a clear candidate, so it keeps the restored mark
+/// and at worst takes the bounded resubmit-directing fail-fast. A stale
+/// `true` left by a lost best-effort clear errs the same conservative
+/// direction. `DEFAULT false` means no backfill and old binaries'
+/// column-naming INSERTs keep working during a rolling deploy.
+///
+/// Read/written by **rio-scheduler** only.
+pub const M_064: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

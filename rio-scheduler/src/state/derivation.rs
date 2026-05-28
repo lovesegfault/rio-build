@@ -919,20 +919,32 @@ pub struct DerivationState {
     /// from-source dispatch of a node whose closure may not be in the
     /// store.
     ///
-    /// In-mem only — never persisted; recovery and poison restore
-    /// default it false (PG still holds the un-produced child's
-    /// terminal row, so the recovery-time produced-children gate stays
-    /// conservative without it). Reset automatically on a
-    /// resubmit-rebuild (fresh `try_from_node` state) and on
+    /// Persisted (`migrations/064`, OR-on-conflict — the merge-time row
+    /// bind is always `false`, so only the explicit clears below ever
+    /// drop the column): the in-memory breadcrumb is set by the reap on
+    /// leaders and standbys alike, and the leader's survivor hook then
+    /// writes it to PG best-effort (a crash or lease loss between the
+    /// reap and that write loses the persisted copy — the accepted
+    /// best-effort window). `from_recovery_row` restores it so the
+    /// recovery-time produced-children gate never clears a holed
+    /// flagged parent on the strength of the surviving produced
+    /// children (the un-produced child's own row and edge may have been
+    /// GC'd by `gc_orphan_terminal_derivations`, so the persisted
+    /// breadcrumb is the only durable record of the truncation);
+    /// `from_poisoned_row` keeps it false (poisoned restores are
+    /// TTL-tracking stubs, never children-judged). Reset automatically
+    /// on a resubmit-rebuild (fresh `try_from_node` state) and on
     /// `rollback_merge` (the removed node is restored wholesale) —
     /// same lifecycle as `substitute_tried`/`never_forgive_paths` —
     /// and cleared explicitly when a later full merge re-declares the
-    /// node's edges (its child set is representative again), when the
-    /// fail-fast consumes the node, and when the node itself completes
-    /// or is skipped. Known residual: the poison-TTL sweep and admin
-    /// ClearPoison delete children through `remove_node` without
-    /// setting this breadcrumb (same accepted class as the GC
-    /// residual).
+    /// node's edges (its child set is representative again; the heal
+    /// also pushes the clear to PG for the nodes that carried it), when
+    /// the fail-fast consumes the node (the PG mark-clear drops both
+    /// bits), and when the node itself completes or is skipped (no PG
+    /// counterpart needed: terminal rows are never recovered). Known
+    /// residual: the poison-TTL sweep and admin ClearPoison delete
+    /// children through `remove_node` without setting this breadcrumb
+    /// (same accepted class as the GC residual).
     pub closure_hole: bool,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node
@@ -1178,10 +1190,12 @@ impl DerivationState {
             // inputDrvs were never merged, so a from-source dispatch on
             // the new leader would ENOENT just like on the old one.
             topdown_pruned: row.topdown_pruned,
-            // In-mem only: the un-produced child's terminal row is still
-            // in PG, so the recovery-time produced-children gate stays
-            // conservative without the breadcrumb.
-            closure_hole: false,
+            // Persisted (`migrations/064`) for the same reason: the
+            // un-produced child whose reap set the breadcrumb may have
+            // been GC'd from PG since, so the surviving produced
+            // children would otherwise launder the recovery-time clear
+            // and re-arm the doomed from-source dispatch.
+            closure_hole: row.closure_hole,
             never_forgive_paths: HashSet::new(),
         })
     }
@@ -2211,6 +2225,7 @@ mod tests {
             // regardless.
             is_ca: true,
             topdown_pruned: false,
+            closure_hole: false,
             failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,

@@ -195,10 +195,11 @@ impl DagActor {
         // Build db_id → drv_hash map for edge + build_derivation
         // resolution below. Also build DerivationState nodes.
         let mut id_to_hash: HashMap<Uuid, DrvHash> = HashMap::with_capacity(drv_rows.len());
-        // Rows restored with `topdown_pruned = true`: candidates for the
-        // produced-children gate run after the edge load below (the
-        // recovered in-memory DAG alone cannot decide it — see that
-        // block's comment).
+        // Rows restored with `topdown_pruned = true` and NO restored
+        // closure-hole breadcrumb: candidates for the produced-children
+        // gate run after the edge load below (the recovered in-memory
+        // DAG alone cannot decide it — see that block's comment). Holed
+        // rows are never enrolled — see the push site.
         let mut flagged: Vec<Uuid> = Vec::new();
         let mut restamped_buffers = 0usize;
         for row in drv_rows {
@@ -227,7 +228,19 @@ impl DagActor {
                 ) => Some((exec_id, executor_id)),
                 _ => None,
             };
-            if state.topdown_pruned {
+            // r[impl sched.merge.substitute-topdown+10]
+            // The recovery-time consult of the persisted closure-hole
+            // breadcrumb (`migrations/064`): a holed flagged parent is
+            // never enrolled as a clear candidate, however produced its
+            // surviving persisted children look — an un-produced child
+            // was reaped out from under it (and its row may since have
+            // been GC'd), so that evidence is a truncated view of the
+            // pruned closure. Mirrors the in-memory predicate every
+            // other clear site judges through the closure classifier
+            // (a holed node is never Vouched). The kept mark routes the
+            // node to the dispatch-time carve-out / resubmit-directing
+            // fail-fast instead.
+            if state.topdown_pruned && !state.closure_hole {
                 flagged.push(derivation_id);
             }
             id_to_hash.insert(derivation_id, hash.clone());
@@ -404,7 +417,11 @@ impl DagActor {
         // produced children are linked to the still-live build that
         // owns the parent too; parents whose only produced evidence is
         // historical or cross-build keep the restored mark and the
-        // bounded fail-fast handles them instead.
+        // bounded fail-fast handles them instead. Rows restored with
+        // the closure-hole breadcrumb never reach this gate at all
+        // (vetoed at candidate collection above): their persisted child
+        // set is reap-truncated, so even live-vouched produced
+        // survivors must not clear the mark.
         if !flagged.is_empty() {
             let produced_parents = self
                 .db

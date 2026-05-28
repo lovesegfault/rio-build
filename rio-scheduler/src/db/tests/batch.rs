@@ -112,6 +112,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             is_ca: i % 11 == 0,
             wanted_output_names: vec![],
             topdown_pruned: false,
+            closure_hole: false,
         })
         .collect();
 
@@ -192,6 +193,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             is_ca: false,
             wanted_output_names: vec![],
             topdown_pruned: false,
+            closure_hole: false,
         })
         .collect();
 
@@ -269,6 +271,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             is_ca: false,
             wanted_output_names: wanted.iter().map(|s| s.to_string()).collect(),
             topdown_pruned: false,
+            closure_hole: false,
         };
         let mut tx = db.pool().begin().await?;
         SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
@@ -362,6 +365,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         is_ca: false,
         wanted_output_names: vec![],
         topdown_pruned: pruned,
+        closure_hole: false,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
         let mut tx = db.pool().begin().await?;
@@ -415,6 +419,123 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+10]
+/// `closure_hole` (`migrations/064`) column semantics: stamped only by
+/// the reap hook's `set_closure_hole_by_hashes` (merge upserts always
+/// bind false), preserved across a later re-upsert by the
+/// OR-on-conflict SET (a non-edge-declaring merge must not launder the
+/// truncation evidence), carried by the recovery SELECT so a new leader
+/// can restore it, cleared on its own by the merge-heal helper
+/// `clear_closure_hole_by_hashes`, and dropped together with the mark
+/// by both extended `clear_topdown_pruned_by_hash{,es}` helpers
+/// (including a markless leftover hole, via the widened WHERE).
+#[tokio::test]
+async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let drv_hash = "closure-hole-test";
+    let mk = |pruned: bool| DerivationRow {
+        drv_hash: drv_hash.into(),
+        drv_path: rio_test_support::fixtures::test_drv_path(drv_hash),
+        pname: Some("test-pkg".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-out", "b".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        wanted_output_names: vec![],
+        topdown_pruned: pruned,
+        // What every production merge binds — the upsert is never a
+        // stamping site for the breadcrumb.
+        closure_hole: false,
+    };
+    let upsert = async |row: DerivationRow| -> anyhow::Result<()> {
+        let mut tx = db.pool().begin().await?;
+        SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
+        tx.commit().await?;
+        Ok(())
+    };
+    let read = async || -> anyhow::Result<(bool, bool)> {
+        Ok(sqlx::query_as(
+            "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .fetch_one(&test_db.pool)
+        .await?)
+    };
+    let hashes = vec![drv_hash.to_string()];
+
+    // 1. A pruned merge sets the mark but never the breadcrumb.
+    upsert(mk(true)).await?;
+    assert_eq!(
+        read().await?,
+        (true, false),
+        "merge upserts must not stamp the breadcrumb"
+    );
+
+    // 2. The reap hook's stamp helper sets it.
+    assert_eq!(
+        db.set_closure_hole_by_hashes(&hashes).await?,
+        1,
+        "stamp helper must report the row it stamped"
+    );
+    assert_eq!(read().await?, (true, true));
+
+    // 3. A later re-upsert of the same drv (breadcrumb bound false, the
+    //    merge-time bind) must clear neither bit: OR-on-conflict.
+    upsert(mk(false)).await?;
+    assert_eq!(
+        read().await?,
+        (true, true),
+        "a re-upsert must not launder the breadcrumb or the mark (OR-on-conflict)"
+    );
+
+    // 4. Recovery SELECT carries it (the restore half lives in
+    //    `from_recovery_row`).
+    let recovered = db.load_nonterminal_derivations().await?;
+    let row = recovered
+        .iter()
+        .find(|r| r.drv_hash == drv_hash)
+        .expect("non-terminal row must be recovered");
+    assert!(
+        row.closure_hole && row.topdown_pruned,
+        "recovery SELECT must carry closure_hole alongside topdown_pruned"
+    );
+
+    // 5. The merge-heal helper clears the breadcrumb but not the mark.
+    assert_eq!(db.clear_closure_hole_by_hashes(&hashes).await?, 1);
+    assert_eq!(
+        read().await?,
+        (true, false),
+        "the heal clears only the breadcrumb"
+    );
+
+    // 6. The extended batched mark clear drops both bits.
+    db.set_closure_hole_by_hashes(&hashes).await?;
+    assert_eq!(db.clear_topdown_pruned_by_hashes(&hashes).await?, 1);
+    assert_eq!(
+        read().await?,
+        (false, false),
+        "clearing the mark must drop the breadcrumb that qualifies it"
+    );
+
+    // 7. The extended single-row clear also resets a markless leftover
+    //    hole (lost-heal residue) — the widened WHERE.
+    db.set_closure_hole_by_hashes(&hashes).await?;
+    assert_eq!(read().await?, (false, true));
+    db.clear_topdown_pruned_by_hash(drv_hash).await?;
+    assert_eq!(
+        read().await?,
+        (false, false),
+        "the single-row clear must reset a leftover hole even when the mark is already gone"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.db.batch-unnest]
 /// Edges: 40k rows. Old limit was 32767 (2 cols). Build a
 /// dense DAG over 10k nodes (fresh DB, so re-insert).
@@ -440,6 +561,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             is_ca: false,
             wanted_output_names: vec![],
             topdown_pruned: false,
+            closure_hole: false,
         })
         .collect();
     let mut tx = db.pool().begin().await?;

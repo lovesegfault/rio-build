@@ -836,13 +836,30 @@ impl DagActor {
         // arm: the rest of this handler stays ungated (in-memory build/
         // event-map removal, the DAG reap, and log-buffer bookkeeping run
         // on standby as before; the event-log GC below is its own
-        // fire-and-forget), but this loop performs leader-class writes —
-        // `persist_status`, the fail-fast's PG mark clear, and terminal
-        // build failure — and `CleanupTerminalBuild` can be drained by an
-        // ex-leader (the delayed cleanup timer posts it via `self_tx`
-        // after lease loss). The new leader's recovery owns these
-        // survivors.
+        // fire-and-forget), but this block performs leader-class writes —
+        // the closure-hole stamp, `persist_status`, the fail-fast's PG
+        // mark clear, and terminal build failure — and
+        // `CleanupTerminalBuild` can be drained by an ex-leader (the
+        // delayed cleanup timer posts it via `self_tx` after lease loss).
+        // The new leader's recovery owns these survivors.
         if self.leader.is_leader() {
+            // Persist the closure-hole breadcrumbs this reap just set
+            // (`migrations/064`), BEFORE the per-parent verdict loop: a
+            // survivor that loop immediately fail-fasts has the stamp
+            // superseded by the fail-fast's mark clear (which drops both
+            // bits), so stamp-then-clear converges to false; stamping
+            // after the loop would resurrect a persisted hole for a node
+            // already parked. Best-effort: a lost write only costs the
+            // breadcrumb's durability across a failover (the in-memory
+            // hole — set by the reap above on leader and standby alike —
+            // still guards this tenure), never the cleanup itself.
+            if !reap.holed_parents.is_empty() {
+                let holed: Vec<String> = reap.holed_parents.iter().map(|h| h.to_string()).collect();
+                if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+                    warn!(build_id = %build_id, count = holed.len(), error = %e,
+                          "failed to persist closure_hole for reap survivors (continuing)");
+                }
+            }
             for parent in reap.surviving_parents {
                 let Some(node) = self.dag.node(&parent) else {
                     continue;

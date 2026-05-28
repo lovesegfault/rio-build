@@ -261,6 +261,17 @@ pub(crate) struct RecoveryDerivationRow {
     /// persisted children are all produced and vouched for by a
     /// still-live build (see `load_parents_with_all_children_produced`).
     pub topdown_pruned: bool,
+    /// Closure-hole breadcrumb (`migrations/064`): an un-produced child
+    /// was reaped out from under the node by a terminal build's
+    /// cleanup, so its persisted children are a truncated view of its
+    /// pruned input closure. Written best-effort by the leader's reap
+    /// hook, restored verbatim by `from_recovery_row`
+    /// (`from_poisoned_row` keeps `false`), and consulted by the
+    /// recovery-time gate: a flagged row that also carries the
+    /// breadcrumb is never enrolled as a clear candidate, so the
+    /// produced survivors cannot launder the mark away after a failover
+    /// (the un-produced child's own row may have been GC'd by then).
+    pub closure_hole: bool,
     pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
     /// (`i64`) — saturating-cast to `u64`/`u32` at hydration.
@@ -300,6 +311,7 @@ impl RecoveryDerivationRow {
             is_fixed_output: false,
             is_ca: false,
             topdown_pruned: false,
+            closure_hole: false,
             failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
@@ -386,6 +398,15 @@ pub(crate) struct DerivationRow {
     /// walk-failure clear in `handle_substitute_complete`) and when
     /// the topdown fail-fast consumes it.
     pub topdown_pruned: bool,
+    /// Closure-hole breadcrumb (`migrations/064`). Merge-time rows
+    /// always bind `false` — the upsert is never a stamping site for
+    /// the breadcrumb (the only setter is the leader-gated reap hook
+    /// via `set_closure_hole_by_hashes`) — and the OR-on-conflict SET
+    /// keeps any persisted hole, so a later merge of the same drv can
+    /// never launder it away. Cleared together with `topdown_pruned`
+    /// by the extended `clear_topdown_pruned_by_hash{,es}` helpers and
+    /// on its own by the merge-time heal (`clear_closure_hole_by_hashes`).
+    pub closure_hole: bool,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and
