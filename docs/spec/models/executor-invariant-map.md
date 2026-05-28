@@ -3333,6 +3333,35 @@ onto a k3s fixture, or (c) retire with named replacement coverage
 (P13). This is the same precondition the Phase-1 plan states for
 T-1c'.1/T-1c'.2; this table makes it per-check instead of implicit.
 
+#### T-1c.2b verification record (the re-point batch)
+
+- Every k3s check whose inputs changed at this batch (all seventeen —
+  the values default reaches every k3s fixture) was rebuilt once,
+  serially, and is green on the re-pointed configuration:
+  `vm-lifecycle-{core,gc,recovery,autoscale,prod-parity}-k3s`,
+  `vm-pull-canary-k3s` (stream-baseline arm still executing
+  dispatch_mode=stream via the overlay pin; every pull arm green),
+  `vm-netpol-k3s`, `vm-le-{stability,build}-k3s`, `vm-cli-k3s`,
+  `vm-dashboard-k3s`, `vm-ingress-v4v6-k3s`, `vm-fetcher-split-k3s`,
+  `vm-security-nonpriv-k3s`, `vm-componentscaler-k3s`,
+  `vm-substitute-scale-k3s`, `vm-sla-sizing-kwok`. No
+  PENDING-REBUILD rows. Wall-clocks are recorded in the re-point
+  batch's close-out report, not here.
+- The KEEP-STREAM standalone corpus was not rebuilt because its
+  derivations are unchanged: the only standalone-side edit is a Nix
+  comment at the `common.nix` pin site, and the worktree/base
+  `drvPath`s of representative standalone checks
+  (`vm-scheduling-core-standalone`, `vm-chaos-standalone`) were
+  compared and are bit-identical, so the slice-1c gate's green status
+  carries over.
+- `driverInteractive` (mypy + pyflakes on the testScript) was built
+  for every check whose testScript changed (the five lifecycle
+  splits, pull-canary, netpol) before the VM rebuilds.
+- `tracey-validate`, `docs-lint`, and treefmt are green at this
+  batch; no spec rule text changed and no verify markers moved (the
+  re-pointed subtests still demonstrate the rules their wiring
+  entries carry).
+
 ### Development-time 1c gate evidence (T-1c.3, v3-rescoped gate)
 
 | Gate item (v3 1c slice header) | Artifact | Verdict at this batch |
