@@ -147,6 +147,80 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify sched.merge.displaced-failure-reset]
+/// Column-set contrast between the two scalar resets: `clear_poison`
+/// (admin/TTL/same-definition) PRESERVES the reactive resource floors —
+/// sticky sizing memory for the same definition — while
+/// `reset_displaced_derivation` (displacement: a DIFFERENT definition
+/// takes over the row) zeroes the floors along with the rest of the
+/// failure history, in one statement.
+#[tokio::test]
+async fn test_displaced_reset_zeroes_floors_clear_poison_preserves_them() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let drv_hash: DrvHash = "displaced-floor-hash".into();
+    insert_test_derivation(&db, drv_hash.as_str()).await?;
+
+    // Failure history + floors as left behind by a poisoned definition.
+    let poison_with_floors = "UPDATE derivations
+         SET poisoned_at = now(), failed_builders = ARRAY['w1','w2'],
+             retry_count = 3, resubmit_cycles = 7, status = 'poisoned',
+             floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400
+         WHERE drv_hash = $1";
+    sqlx::query(poison_with_floors)
+        .bind(drv_hash.as_str())
+        .execute(&test_db.pool)
+        .await?;
+
+    // Admin/TTL clear: poison + counters reset, floors PRESERVED.
+    db.clear_poison(&drv_hash).await?;
+    let row: (String, bool, Vec<String>, i32, i32, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, failed_builders,
+                retry_count, resubmit_cycles,
+                floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(row.0, "created");
+    assert!(!row.1, "poisoned_at cleared");
+    assert!(row.2.is_empty(), "failed_builders cleared");
+    assert_eq!((row.3, row.4), (0, 0), "counters zeroed");
+    assert_eq!(
+        (row.5, row.6, row.7),
+        (8589934592, 34359738368, 86400),
+        "clear_poison keeps the same-definition sizing floors"
+    );
+
+    // Re-poison, then take the displacement reset: floors go too.
+    sqlx::query(poison_with_floors)
+        .bind(drv_hash.as_str())
+        .execute(&test_db.pool)
+        .await?;
+    db.reset_displaced_derivation(&drv_hash).await?;
+    let row: (String, bool, Vec<String>, i32, i32, i64, i64, i64) = sqlx::query_as(
+        "SELECT status, poisoned_at IS NOT NULL, failed_builders,
+                retry_count, resubmit_cycles,
+                floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(row.0, "created");
+    assert!(!row.1, "poisoned_at cleared");
+    assert!(row.2.is_empty(), "failed_builders cleared");
+    assert_eq!((row.3, row.4), (0, 0), "counters zeroed");
+    assert_eq!(
+        (row.5, row.6, row.7),
+        (0, 0, 0),
+        "displacement reset zeroes the floors as well"
+    );
+    Ok(())
+}
+
 // r[verify sched.db.derivations-gc+2]
 /// I-169.2: orphan-terminal rows are deleted; rows with a live
 /// `build_derivations` link, an `assignments` row, or non-terminal

@@ -278,6 +278,13 @@ impl SchedulerDb {
     /// override and TTL expiry are full resets (unlike
     /// [`Self::clear_poison_batch`], which preserves+increments
     /// `resubmit_cycles` for the resubmit-bound).
+    ///
+    /// Deliberately FLOOR-PRESERVING: the reactive resource floors
+    /// (`floor_mem_bytes`/`floor_disk_bytes`/`floor_deadline_secs`) are
+    /// same-definition sizing memory (M_044) and survive an admin/TTL
+    /// poison clear. A *displacement* replaces the definition itself, so
+    /// it uses [`Self::reset_displaced_derivation`] instead, which also
+    /// zeroes the floors.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
@@ -327,6 +334,32 @@ impl SchedulerDb {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
+    }
+
+    // r[impl sched.merge.displaced-failure-reset]
+    /// Full failure-history reset for a DISPLACED derivation row
+    /// (`sched.merge.authoritative-conflict`): the displacing submission
+    /// is a different derivation definition, so nothing learned from the
+    /// displaced definition's failures may carry over. One statement so
+    /// there is no partial state where poison is cleared but the floors
+    /// survive: NULL `poisoned_at`, empty `failed_builders`, zero
+    /// `retry_count`/`resubmit_cycles`, status='created', AND zero the
+    /// reactive resource floors (`floor_*`) that
+    /// [`Self::clear_poison`]/[`Self::clear_poison_batch`] deliberately
+    /// preserve for same-definition resets.
+    pub async fn reset_displaced_derivation(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+        sqlx::query!(
+            "UPDATE derivations
+             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
+                 resubmit_cycles = 0, status = 'created',
+                 floor_mem_bytes = 0, floor_disk_bytes = 0,
+                 floor_deadline_secs = 0, updated_at = now()
+             WHERE drv_hash = $1",
+            drv_hash.as_str(),
+        )
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
     }
 
     // r[impl sched.db.derivations-gc+2]

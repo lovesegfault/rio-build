@@ -8959,3 +8959,103 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     );
     Ok(())
 }
+
+/// Displacement must not let the displacing definition inherit the
+/// squat's reactive resource floors (bug_011): a squatter that
+/// deliberately OOM'd/timed out ratchets `floor_*` to ceiling sizes, and
+/// without the reset the victim's definition would be dispatched on the
+/// largest node class with a 24h deadline forever (floors never decay
+/// and survive failover). Asserts BOTH halves: the in-memory fresh node
+/// keeps zeros (the I-208 hydration skips displaced hashes) and the
+/// persisted row's floors are zeroed (`reset_displaced_derivation`,
+/// not the floor-preserving `clear_poison`).
+// r[verify sched.merge.displaced-failure-reset]
+#[tokio::test]
+async fn test_displacement_resets_resource_floor() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    // The squatter: an authoritative content-bound node.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatF");
+    squat.drv_content = b"Derive-squatF".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Its failures ratcheted the persisted floors (and left poison/retry
+    // history) — simulate the end state directly in PG, and park the
+    // in-memory node terminal and over budget so the next conflicting
+    // store-backed submission displaces it rather than resetting it.
+    sqlx::query(
+        "UPDATE derivations
+         SET floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400, poisoned_at = now(),
+             failed_builders = ARRAY['w1','w2','w3'], retry_count = 3,
+             resubmit_cycles = 7, status = 'poisoned'
+         WHERE drv_hash = $1",
+    )
+    .bind("squatF")
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        handle
+            .debug_force_poisoned("squatF", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: a store-backed submission with a conflicting verifiable
+    // identity (different system) → displaces the terminal squat.
+    let victim = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        victim,
+        vec![make_test_node("squatF", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // In-memory: the displacing fresh node keeps try_from_node's zero
+    // floors — the pre-existing row's promoted floors are NOT hydrated
+    // onto it.
+    let info = expect_drv(&handle, "squatF").await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "displacing node must not inherit the squat's mem floor"
+    );
+    assert_eq!(info.sched.resource_floor.disk_bytes, 0);
+    assert_eq!(info.sched.resource_floor.deadline_secs, 0);
+
+    // Persisted row: floors and the rest of the failure history are
+    // zeroed, so a leader failover cannot resurrect the squat's sizing.
+    let (mem, disk, deadline, cycles, retries, poisoned, builders): (
+        i64,
+        i64,
+        i64,
+        i32,
+        i32,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                resubmit_cycles, retry_count, poisoned_at IS NOT NULL,
+                failed_builders
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatF")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        (mem, disk, deadline),
+        (0, 0, 0),
+        "persisted floors reset on displacement"
+    );
+    assert_eq!(cycles, 0, "poison-resubmit budget starts fresh");
+    assert_eq!(retries, 0);
+    assert!(!poisoned, "poisoned_at cleared");
+    assert!(builders.is_empty(), "failed_builders cleared");
+    Ok(())
+}

@@ -722,19 +722,24 @@ impl DagActor {
             );
         }
 
+        // r[impl sched.merge.displaced-failure-reset]
         // Displaced authoritative squats (sched.merge.authoritative-conflict)
-        // get the FULL reset (`clear_poison`, which zeroes
-        // `resubmit_cycles`), not `clear_poison_batch`: the fresh node is a
-        // different derivation definition, not a retry of the squat, so it
-        // must not inherit the squat's failure history or consume its
-        // poison-resubmit budget. Per-hash is fine — displacement is a
-        // rare, adversarial-only path. Best-effort like the batch above.
+        // get the FULL failure-history reset (`reset_displaced_derivation`,
+        // which zeroes `resubmit_cycles` AND the reactive resource floors),
+        // not `clear_poison_batch`: the fresh node is a different
+        // derivation definition, not a retry of the squat, so it must not
+        // inherit the squat's failure history, consume its poison-resubmit
+        // budget, or be dispatched at the ceiling sizes the squat's
+        // deliberate failures ratcheted the floors up to (the
+        // same-definition resets above stay floor-preserving by design).
+        // Per-hash is fine — displacement is a rare, adversarial-only
+        // path. Best-effort like the batch above.
         for drv_hash in &merge_result.displaced {
-            if let Err(e) = self.db.clear_poison(drv_hash).await {
+            if let Err(e) = self.db.reset_displaced_derivation(drv_hash).await {
                 warn!(
                     drv_hash = %drv_hash,
                     error = %e,
-                    "failed to reset poison/failure accounting for displaced node"
+                    "failed to reset failure accounting for displaced node"
                 );
             }
         }
@@ -2275,10 +2280,22 @@ impl DagActor {
         // since then wrote both in-mem and DB), so overwriting would
         // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
+        //
+        // r[impl sched.merge.displaced-failure-reset]
+        // DISPLACED hashes are excluded: the row's floors were ratcheted
+        // by the displaced definition's failures, and the displacing
+        // submission is a different definition, so its fresh node keeps
+        // try_from_node's zeros regardless of whether the best-effort PG
+        // floor reset (post-commit, persist_and_activate) succeeds.
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
-                if newly_inserted.contains(hash.as_str()) {
+                if newly_inserted.contains(hash.as_str())
+                    && !merge_result
+                        .displaced
+                        .iter()
+                        .any(|d| d.as_str() == hash.as_str())
+                {
                     let f = &mut state.sched.resource_floor;
                     f.mem_bytes = f.mem_bytes.max(floor.mem_bytes);
                     f.disk_bytes = f.disk_bytes.max(floor.disk_bytes);
