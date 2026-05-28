@@ -9250,6 +9250,111 @@ async fn test_matching_retriable_takeover_resets_row_accounting() -> TestResult 
     Ok(())
 }
 
+// r[verify sched.merge.displaced-edge-scrub]
+/// End-to-end displaced-edge scrub: a poison-locked authoritative squat
+/// carries an attacker-attached dependency edge onto a junk node that can
+/// never complete. The victim's identity-matching store-backed submission
+/// match-displaces the squat; the fresh node must NOT inherit the
+/// squatter's dependency set — in memory (the victim build stays live and
+/// its node dispatches) or in PG (the parent-side `derivation_edges` row
+/// is deleted in the merge transaction, while the child-side row of a
+/// node that depends ON the displaced hash is preserved).
+#[tokio::test]
+async fn test_displacement_scrubs_squatter_edges_and_unblocks_victim() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("edgeSquatA");
+    let squat_out = test_store_path("edgeSquatA-out");
+
+    // Squatter build: dependent → squat → junk. The squat carries
+    // authoritative bytes; the junk is the attacker's never-completing
+    // child; the dependent is a node that legitimately depends on the
+    // squatted hash (its edge must survive the scrub).
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("edgeSquatA");
+    squat.drv_content = b"Derive-edgeSquatA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("edgeJunkA"), make_node("edgeDependentA")],
+        vec![
+            make_test_edge("edgeSquatA", "edgeJunkA"),
+            make_test_edge("edgeDependentA", "edgeSquatA"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Park the junk in a terminal failure state and the squat
+    // poison-locked (budget exhausted): the shape in which the squat is
+    // match-displaceable and its inherited edge would otherwise seed the
+    // fresh node DependencyFailed.
+    assert!(
+        handle
+            .debug_force_status("edgeJunkA", DerivationStatus::Poisoned)
+            .await?
+    );
+    assert!(
+        handle
+            .debug_force_poisoned("edgeSquatA", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+
+    // Victim: store-backed submission with the SAME verifiable identity
+    // (shared expected output path) → match-displaces the locked squat.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("edgeSquatA");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The victim build is live (pre-fix the inherited squat→junk edge
+    // seeded its node DependencyFailed and the build failed fast).
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not inherit the squatter's dependency set"
+    );
+
+    // PG: the displaced derivation's parent-side edge is gone; the
+    // child-side edge (dependent → displaced hash) is preserved.
+    let (parent_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.parent_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parent_side, 0, "squat→junk edge row deleted in-tx");
+    let (child_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.child_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(child_side, 1, "dependent→squat edge row preserved");
+
+    // The fresh node dispatches and completes — the hash is usable again
+    // and the victim build finishes.
+    let mut rx = connect_executor(&handle, "w-edge", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "displaced node dispatched");
+    complete_success(&handle, "w-edge", &squat_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.displaced-failure-reset+2]
 /// The reaped-row variant of the authority takeover: the authoritative
 /// squat's in-memory node is long gone (reaped with its terminal build),

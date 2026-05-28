@@ -1722,6 +1722,28 @@ cost: a hook-fallback definition later resubmitted store-backed re-learns
 its resource floor once (one extra failure-and-resize cycle); same-content
 authoritative resubmits and store-origin rows are unaffected.
 
+#r("sched.merge.displaced-edge-scrub")[
+  Displacement MUST scrub the displaced node's dependency (children)
+  edges: the in-memory children edges are dropped when the node is
+  displaced, and the persisted `derivation_edges` rows whose parent is
+  the displaced derivation MUST be deleted in the same transaction as
+  its recreate-refresh, before the displacing submission's own edges are
+  inserted. Edges in the dependent (parents) direction MUST be
+  preserved, and a merge that fails after displacing a node MUST restore
+  the scrubbed edges together with the node.
+]
+The displacing submission is a different definition: evaluating its
+initial state against dependency edges earlier submissions attached to the
+hash would hand the squatter a denial-of-service handle that survives the
+displacement --- a failing or never-completing attacker child seeds the
+fresh node `DependencyFailed` (or parks it `Queued` forever), resubmits
+repeat the failure because the resubmit-reset deliberately keeps edges,
+and the persisted rows would resurrect the inherited dependency set after
+a leader failover. Same-definition resubmit-resets keep their
+edge-preserving semantics, and nodes that depend ON the displaced hash
+keep their edges --- they want its output whichever definition produces
+it.
+
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from
   the submission that (re)creates its in-memory node. Submissions that join

@@ -215,6 +215,13 @@ pub struct MergeResult {
     /// `{retriable-X, cycle}` submission would wipe X and reset its
     /// `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
     pub removed_retriable: Vec<(DrvHash, DerivationState)>,
+    /// Dependency (children) edges scrubbed from displaced nodes
+    /// (`sched.merge.displaced-edge-scrub`), keyed by the displaced
+    /// hash. `rollback_merge` re-attaches them when restoring the
+    /// displaced node, and `persist_merge_to_db` mirrors the scrub
+    /// durably by deleting the displaced rows' parent-side
+    /// `derivation_edges` in the same transaction.
+    pub displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
     /// Hashes of pre-existing nodes whose empty `traceparent` was
     /// upgraded to `submitter_traceparent` by this merge. Rollback
     /// clears it back to `""` so a rejected build's trace ID does not
@@ -507,6 +514,9 @@ impl DerivationDag {
         let mut reset_on_resubmit = Vec::new();
         let mut authority_takeovers: Vec<DrvHash> = Vec::new();
         let mut displaced: Vec<DrvHash> = Vec::new();
+        // Children edges scrubbed from displaced nodes, for rollback
+        // restoration and the durable parent-side edge delete.
+        let mut displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)> = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
         // Track pre-existing nodes that gained interest in this merge, so
@@ -595,6 +605,7 @@ impl DerivationDag {
                             &traceparent_upgraded,
                             build_id,
                             removed_retriable,
+                            displaced_scrubbed_edges,
                         );
                         return Err(DagError::AuthoritativeContentMismatch {
                             drv_path: node.drv_path.clone(),
@@ -629,6 +640,16 @@ impl DerivationDag {
                             // this same submission fails the merge.
                             let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
                             removed_retriable.push((drv_hash.clone(), old));
+                            // r[impl sched.merge.displaced-edge-scrub]
+                            // The displacing submission is a different
+                            // definition: drop the dependency edges earlier
+                            // submissions attached to this hash so the fresh
+                            // node's dep set is exactly this submission's
+                            // edge list (recorded for rollback restoration).
+                            let scrubbed = self.scrub_dependency_edges(&drv_hash);
+                            if !scrubbed.is_empty() {
+                                displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
+                            }
                             displaced.push(drv_hash.clone());
                         } else {
                             // Only reachable on an identity conflict — a
@@ -642,6 +663,7 @@ impl DerivationDag {
                                 &traceparent_upgraded,
                                 build_id,
                                 removed_retriable,
+                                displaced_scrubbed_edges,
                             );
                             return Err(DagError::ConflictingInFlightContent {
                                 drv_path: node.drv_path.clone(),
@@ -674,6 +696,7 @@ impl DerivationDag {
                         &traceparent_upgraded,
                         build_id,
                         removed_retriable,
+                        displaced_scrubbed_edges,
                     );
                     return Err(DagError::AuthoritativeClaimIdentityConflict {
                         drv_path: node.drv_path.clone(),
@@ -826,6 +849,7 @@ impl DerivationDag {
                             &contributions_recorded,
                             build_id,
                             removed_retriable,
+                            displaced_scrubbed_edges,
                         );
                         return Err(DagError::InvalidDrvPath {
                             path: node.drv_path.clone(),
@@ -967,6 +991,7 @@ impl DerivationDag {
                     &contributions_recorded,
                     build_id,
                     removed_retriable,
+                    displaced_scrubbed_edges,
                 );
                 return Err(DagError::CycleDetected);
             }
@@ -980,6 +1005,7 @@ impl DerivationDag {
             new_edges,
             interest_added,
             removed_retriable,
+            displaced_scrubbed_edges,
             traceparent_upgraded,
             wanted_grown,
             contributions_recorded,
@@ -1060,7 +1086,8 @@ impl DerivationDag {
     /// remove build interest from pre-existing nodes that gained it during
     /// this merge (but not from nodes where build_id was already present),
     /// and restore every node the merge destructively removed
-    /// (resubmit-reset and displacement alike).
+    /// (resubmit-reset and displacement alike), re-attaching the
+    /// dependency edges the displacement arms scrubbed.
     // The parameters mirror `MergeResult`'s fields one-to-one (the two
     // inline callers in `merge()` hold them as locals, not as a
     // `MergeResult`); a struct param would just rename the args.
@@ -1075,6 +1102,7 @@ impl DerivationDag {
         contributions_recorded: &[(DrvHash, Option<Vec<String>>)],
         build_id: Uuid,
         removed_retriable: Vec<(DrvHash, DerivationState)>,
+        displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
     ) {
         // Remove newly-inserted edges
         for (parent, child) in new_edges {
@@ -1093,10 +1121,12 @@ impl DerivationDag {
         }
 
         // Hashes being restored below — their children[X]/parents[X]
-        // entries are pre-existing (the destructive-removal paths,
-        // resubmit-reset and displacement, remove only nodes[X], never
-        // edges) and must NOT be scrubbed. The new_edges loop above
-        // already reverted any edges THIS merge added to them.
+        // entries are pre-existing and must NOT be scrubbed: the
+        // resubmit-reset removes only nodes[X] (never edges), and the
+        // displacement arms remove nodes[X] plus the children direction,
+        // which is re-attached from `displaced_scrubbed_edges` at the end
+        // of this rollback. The new_edges loop above already reverted any
+        // edges THIS merge added to them.
         // Owned (not borrowed) because the per-field restore loops at the
         // bottom also consult it, after `removed_retriable` is consumed.
         let restoring: HashSet<DrvHash> =
@@ -1127,6 +1157,22 @@ impl DerivationDag {
             self.path_to_hash
                 .insert(state.drv_path().to_string(), hash.clone());
             self.nodes.insert(hash, state);
+        }
+
+        // r[impl sched.merge.displaced-edge-scrub]
+        // Re-attach the dependency edges scrubbed by the displacement
+        // arms, so a failed merge restores the displaced node together
+        // with its (possibly squatter-attached) children edges — exactly
+        // the pre-merge DAG. Runs after the node restore so both
+        // endpoints exist again.
+        for (hash, children) in displaced_scrubbed_edges {
+            for c in &children {
+                self.parents
+                    .entry(c.clone())
+                    .or_default()
+                    .insert(hash.clone());
+            }
+            self.children.entry(hash).or_default().extend(children);
         }
 
         // Remove build interest only from pre-existing nodes that gained it
@@ -1673,6 +1719,35 @@ impl DerivationDag {
             surviving_parents: surviving_parents.into_iter().collect(),
             holed_parents: holed_parents.into_iter().collect(),
         }
+    }
+
+    /// Scrub the DEPENDENCY (children) direction of a node's edges:
+    /// remove `children[hash]` and drop `hash` from `parents[c]` for each
+    /// former child `c`. Returns the scrubbed child set so the caller can
+    /// record it for rollback restoration.
+    ///
+    /// Used by the displacement arms of `merge()`
+    /// (`sched.merge.displaced-edge-scrub`): the displacing submission is
+    /// a DIFFERENT definition, so the dependency edges earlier
+    /// submissions attached to the hash must not constrain the fresh node
+    /// — `compute_initial_states` would otherwise seed it
+    /// `DependencyFailed` (or park it `Queued` forever) from a dependency
+    /// set the displacing submission never declared. The PARENTS
+    /// direction is deliberately preserved: nodes that depend on this
+    /// hash still want its output, whichever definition produces it.
+    /// Same-definition resubmit-resets keep their edge-preserving
+    /// semantics (same definition ⇒ same dependency set).
+    fn scrub_dependency_edges(&mut self, hash: &DrvHash) -> HashSet<DrvHash> {
+        let children = self.children.remove(hash).unwrap_or_default();
+        for c in &children {
+            if let Some(ps) = self.parents.get_mut(c) {
+                ps.remove(hash);
+                if ps.is_empty() {
+                    self.parents.remove(c);
+                }
+            }
+        }
+        children
     }
 
     /// Remove a single node and scrub all edge references to it.

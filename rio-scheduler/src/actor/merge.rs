@@ -2190,6 +2190,32 @@ impl DagActor {
             debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");
         }
 
+        // Batch 2c: durable half of the displaced-edge scrub
+        // (sched.merge.displaced-edge-scrub). dag.merge() already dropped
+        // the displaced nodes' in-memory children edges; deleting the
+        // persisted parent-side rows in the SAME transaction — and
+        // strictly BEFORE batch_insert_edges re-inserts the displacing
+        // submission's own edges for the same parent id — keeps a leader
+        // failover from rebuilding the squatter's dependency set onto the
+        // displacing definition. Child-side rows (other nodes depending
+        // on the displaced hash) are preserved, mirroring the in-memory
+        // parents-direction preservation.
+        // r[impl sched.merge.displaced-edge-scrub]
+        let displaced_ids: Vec<Uuid> = merge_result
+            .displaced
+            .iter()
+            .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
+            .collect();
+        if !displaced_ids.is_empty() {
+            let scrubbed =
+                crate::db::SchedulerDb::delete_displaced_parent_edges(&mut tx, &displaced_ids)
+                    .await?;
+            debug!(
+                count = scrubbed,
+                "scrubbed displaced nodes' persisted dependency edges"
+            );
+        }
+
         // Batch 3: insert edges. Resolve drv_path -> db_id via:
         //   1. this tx's id_map — exactly the rows this merge wrote,
         //      i.e. (re)created nodes (sched.persist.creation-scoped);
@@ -2364,6 +2390,7 @@ impl DagActor {
             &merge_result.contributions_recorded,
             build_id,
             merge_result.removed_retriable,
+            merge_result.displaced_scrubbed_edges,
         );
         self.events.remove(build_id);
         self.builds.remove(&build_id);

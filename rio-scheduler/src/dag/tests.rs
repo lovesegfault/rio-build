@@ -3320,6 +3320,197 @@ fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
+// ── sched.merge.displaced-edge-scrub ────────────────────────────────────
+
+// r[verify sched.merge.displaced-edge-scrub]
+/// Displacement scrubs the squatter's dependency (children) edges: the
+/// displacing fresh node's initial state is computed against ITS OWN
+/// declared dependency set (none here), not the squatter's — whether the
+/// squatter-attached child is terminally failed (which would otherwise
+/// seed the fresh node `DependencyFailed`) or merely incomplete (which
+/// would park it `Queued` forever).
+#[rstest]
+#[case::terminal_failed_child(DerivationStatus::Poisoned)]
+#[case::incomplete_child(DerivationStatus::Queued)]
+fn displacement_scrubs_inherited_dependency_edges(
+    #[case] junk_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Squatter: authoritative squat plus its own junk node, with an
+    // attacker-attached dependency edge squat → junk.
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("edge-squat", b"Derive-squat"),
+            make_node("edge-junk", "x86_64-linux"),
+        ],
+        &[make_edge("edge-squat", "edge-junk")],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("edge-junk")
+        .unwrap()
+        .set_status_for_test(junk_status);
+    dag.nodes
+        .get_mut("edge-squat")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    // Victim: conflicting store-backed identity (different system)
+    // displaces the parked terminal squat.
+    let mut victim_node = make_node("edge-squat", "aarch64-linux");
+    victim_node.is_content_addressed = true;
+    let res = dag.merge(victim, &[victim_node], &[], "")?;
+    assert!(res.displaced.iter().any(|h| h.as_str() == "edge-squat"));
+
+    // The fresh node's dependency set is exactly the displacing
+    // submission's (none): the squatter's edge is gone in BOTH directions.
+    assert!(
+        dag.get_children("edge-squat").is_empty(),
+        "squatter's squat→junk edge scrubbed"
+    );
+    assert!(
+        !dag.get_parents("edge-junk")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat"),
+        "junk child no longer lists the displaced hash as a dependent"
+    );
+    // And the initial-state seed reflects that: Ready, not
+    // DependencyFailed (terminal junk) or Queued (incomplete junk).
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        states["edge-squat"],
+        DerivationStatus::Ready,
+        "displacing node seeds from its own (empty) dependency set"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub]
+/// The scrub is children-direction only: nodes that DEPEND ON the
+/// displaced hash keep their edges (they want its output, whichever
+/// definition produces it), while the displaced node's own dependency
+/// edges are dropped.
+#[test]
+fn displacement_preserves_dependent_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // dependent → squat → junk
+    dag.merge(
+        squatter,
+        &[
+            make_node("edge-dependent", "x86_64-linux"),
+            authoritative_node("edge-squat-p", b"Derive-squat"),
+            make_node("edge-junk-p", "x86_64-linux"),
+        ],
+        &[
+            make_edge("edge-dependent", "edge-squat-p"),
+            make_edge("edge-squat-p", "edge-junk-p"),
+        ],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("edge-squat-p")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::DependencyFailed);
+
+    let mut victim_node = make_node("edge-squat-p", "aarch64-linux");
+    victim_node.is_content_addressed = true;
+    let res = dag.merge(victim, &[victim_node], &[], "")?;
+    assert!(res.displaced.iter().any(|h| h.as_str() == "edge-squat-p"));
+
+    // Children direction scrubbed…
+    assert!(
+        dag.get_children("edge-squat-p").is_empty(),
+        "squat→junk scrubbed"
+    );
+    assert!(
+        !dag.get_parents("edge-junk-p")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-p")
+    );
+    // …parents direction preserved.
+    assert!(
+        dag.get_children("edge-dependent")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-p"),
+        "dependent→squat edge preserved"
+    );
+    assert!(
+        dag.get_parents("edge-squat-p")
+            .iter()
+            .any(|h| h.as_str() == "edge-dependent"),
+        "displaced hash still lists its dependent"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub]
+/// A merge that displaces a squat (scrubbing its dependency edges) but
+/// fails on a LATER node in the same submission must restore the squat
+/// WITH its scrubbed edges — the pre-merge DAG exactly.
+#[test]
+fn rollback_restores_displaced_dependency_edges() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("edge-squat-rb", b"Derive-squat"),
+            make_node("edge-junk-rb", "x86_64-linux"),
+        ],
+        &[make_edge("edge-squat-rb", "edge-junk-rb")],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("edge-squat-rb").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("edge-squat-rb", "aarch64-linux");
+    displacing.is_content_addressed = true;
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    // The squat is restored together with its dependency edge.
+    let n = dag.node("edge-squat-rb").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert!(n.drv_content_authoritative);
+    assert!(
+        dag.get_children("edge-squat-rb")
+            .iter()
+            .any(|h| h.as_str() == "edge-junk-rb"),
+        "scrubbed squat→junk edge restored on rollback"
+    );
+    assert!(
+        dag.get_parents("edge-junk-rb")
+            .iter()
+            .any(|h| h.as_str() == "edge-squat-rb"),
+        "reverse direction restored too"
+    );
+    Ok(())
+}
+
 // r[verify sched.merge.authoritative-conflict+3]
 /// Floating-CA squat scenario: public attributes (system, output names,
 /// flags) are copyable from the victim's public derivation and floating-CA
