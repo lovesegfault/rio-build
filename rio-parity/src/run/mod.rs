@@ -27,6 +27,7 @@ pub mod state;
 pub mod stderrparse;
 pub mod submit;
 pub mod submitter;
+pub mod warm;
 
 use std::path::PathBuf;
 

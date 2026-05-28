@@ -145,10 +145,12 @@ impl ArtifactStore for S3ArtifactStore {
 }
 
 /// Files synced from the state dir to the store on every sync tick. The
-/// per-bucket JSONL written by the report stage is picked up by the
-/// `buckets/*.jsonl` enumeration in [`sync_state`] (so the uploaded
-/// campaign prefix carries the complete artifact set); log tails are
-/// uploaded by their producer at capture time.
+/// per-bucket JSONL written by the report stage and the per-job
+/// `logs/*.log.zst` tails written by collect are picked up by the dynamic
+/// enumerations in [`sync_state`] (so the uploaded campaign prefix carries
+/// the complete artifact set). Log tails are uploaded by collect at capture
+/// time already; re-enumerating them here retries any upload that failed at
+/// capture.
 const SYNCED_FILES: &[&str] = &[
     "campaign.json",
     "progress.json",
@@ -198,6 +200,20 @@ pub async fn sync_state(
             }
         }
     }
+    // logs/<job>.log.zst are uploaded by collect at capture time; enumerating
+    // them here means an upload that failed at capture is retried by the next
+    // sync tick instead of stranding the evidence the job record points at.
+    if let Ok(entries) = std::fs::read_dir(state.path("logs")) {
+        for entry in entries.flatten() {
+            // Log tails are engine-written `<job>.log.zst` names (always
+            // valid UTF-8); anything else in the directory is not ours to sync.
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            if name.ends_with(".log.zst") {
+                rels.push(format!("logs/{name}"));
+            }
+        }
+    }
     // Upload data files first and `markers/*` last: a stage's done-marker
     // must never be visible in the store before the data it certifies (a
     // crash mid-tick would otherwise let a restored campaign trust a marker
@@ -228,9 +244,11 @@ pub async fn sync_state(
 /// Resume support: if the local state dir has no campaign.json but the
 /// store does, download the synced state files so resume can proceed
 /// after a pod reschedule wiped the local volume. Returns true when a
-/// campaign was restored from the store. `buckets/*.jsonl` are uploaded
-/// by [`sync_state`] but not restored here — the report stage regenerates
-/// them from results.jsonl.
+/// campaign was restored from the store. `buckets/*.jsonl` and
+/// `logs/*.log.zst` are uploaded by [`sync_state`] but not restored here —
+/// the report stage regenerates the bucket files from results.jsonl, and
+/// the job records already carry their log keys (the local log copies are
+/// only an upload staging area).
 pub async fn download_state_if_missing(
     state: &StateDir,
     store: &dyn ArtifactStore,
@@ -353,10 +371,21 @@ mod tests {
             .write_json_atomic("campaign.json", &serde_json::json!({"campaignId": "c1"}))
             .unwrap();
         state.append_jsonl(StateFile::Results, &rec("a")).unwrap();
+        // A log tail whose at-capture upload failed sits locally and is
+        // picked up by the sync's logs/*.log.zst enumeration.
+        state
+            .write_bytes("logs/a.x86_64-linux.log.zst", b"zstd-bytes")
+            .unwrap();
         let n1 = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
-        assert_eq!(n1, 2, "campaign.json + results.jsonl");
+        assert_eq!(n1, 3, "campaign.json + results.jsonl + log tail");
+        assert!(
+            store
+                .exists("parity/campaigns/c1/logs/a.x86_64-linux.log.zst")
+                .await
+                .unwrap()
+        );
 
         // No change → nothing uploaded.
         let n2 = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)

@@ -906,6 +906,11 @@
       "doc": "Batch submission to the rio gateway over ssh-ng."
     },
     {
+      "path": "run/warm.rs",
+      "depth": 1,
+      "doc": "Warm stage (leaf mode): batched root submissions of the warm set's"
+    },
+    {
       "path": "s3.rs",
       "depth": 0,
       "doc": "Write-once S3 layout writer for eval-set artifacts."

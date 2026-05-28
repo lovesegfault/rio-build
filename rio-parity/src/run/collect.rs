@@ -147,12 +147,20 @@ pub struct BatchView {
 
 /// Decide the verdict for one job given its target-drv observation and the
 /// observations of every drv in the batch (for root-cause lookup).
+///
+/// `prior_requeues` is the engine's TOTAL resubmission count for this job so
+/// far — every requeue reason (fail-fast batch-mate, engine-cancelled batch,
+/// stall requeue, …) increments it, not just infra retries. Any prior
+/// requeue therefore consumes the single infra auto-retry budget
+/// (`knobs.max_auto_retries`). Conservative by design: a job that already
+/// burned an engine re-offer is not granted an extra infra retry on top, so
+/// the budget can never multiply across requeue reasons.
 pub fn decide(
     ctx: &JobContext,
     target: &DrvObservation,
     all_observations: &HashMap<String, DrvObservation>,
     batch: &BatchView,
-    auto_retries_used: u32,
+    prior_requeues: u32,
     knobs: &Knobs,
     log_tail: Option<&str>,
 ) -> Verdict {
@@ -175,7 +183,7 @@ pub fn decide(
                 target.is_fixed_output,
                 log_tail,
             );
-            if kind == FailureKind::Infra && auto_retries_used < knobs.max_auto_retries {
+            if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
                 return Verdict::Requeue {
                     why: "infra-auto-retry",
                 };
@@ -195,13 +203,21 @@ pub fn decide(
                     _ => None,
                 })
                 .or_else(|| {
+                    // Fallback closure scan when no relayed reason names the
+                    // trigger. Tie-break: with several poisoned deps in the
+                    // closure, the lexicographically smallest drv path wins —
+                    // an arbitrary but deterministic rule, so re-running
+                    // collect over the same observations always attributes
+                    // the same trigger (set iteration order must never pick
+                    // it).
                     ctx.dep_drvs
                         .iter()
-                        .find(|d| {
+                        .filter(|d| {
                             all_observations
                                 .get(*d)
                                 .is_some_and(|o| o.status == STATUS_POISONED)
                         })
+                        .min()
                         .cloned()
                 });
             let Some(trigger) = trigger else {
@@ -264,7 +280,7 @@ pub fn decide(
         // the reader): one auto-retry, then an infra failure — the build
         // never even recorded the drv, which is not the target's fault.
         "" => {
-            if auto_retries_used < knobs.max_auto_retries {
+            if prior_requeues < knobs.max_auto_retries {
                 Verdict::Requeue {
                     why: "no-derivation-rows",
                 }
@@ -284,6 +300,10 @@ pub fn decide(
 }
 
 /// Assemble the final [`JobRecord`] for a terminal verdict.
+///
+/// `log_tail` is the captured failure-log text (when any was fetched); it
+/// only feeds the failure-signature fallback, so failures whose relayed
+/// reason was lost can still be grouped by their log evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
     ctx: &JobContext,
@@ -297,6 +317,7 @@ pub fn build_record(
     attempts: u32,
     log_key: Option<String>,
     first_active_at: Option<String>,
+    log_tail: Option<&str>,
 ) -> JobRecord {
     let aux = AuxFlags {
         skipped: None,
@@ -369,7 +390,7 @@ pub fn build_record(
         cascaded: classification.cascaded,
         signature: match rio_outcome {
             RioOutcome::Built { .. } => None,
-            _ => signature_for(reason.as_deref(), None),
+            _ => signature_for(reason.as_deref(), log_tail),
         },
         log_key,
         repro: repro_command(store_url, &ctx.drv_path),
@@ -391,6 +412,11 @@ fn lossy_log_text(bytes: &[u8]) -> String {
 /// Process one settled batch end-to-end: read observations, decide each job,
 /// capture evidence (log tails for failures, NAR hashes for successes),
 /// append terminal records, and return the jobs that must be re-queued.
+///
+/// `prior_requeues` carries each job's TOTAL engine resubmission count so
+/// far (every requeue reason counts, not just infra retries) — see
+/// [`decide`] for why any prior requeue consumes the infra auto-retry
+/// budget.
 #[allow(clippy::too_many_arguments)]
 pub async fn process_settled_batch(
     state: &StateDir,
@@ -401,7 +427,7 @@ pub async fn process_settled_batch(
     contexts: &HashMap<String, JobContext>,
     batch_jobs: &[String],
     batch: &BatchView,
-    auto_retries: &HashMap<String, u32>,
+    prior_requeues: &HashMap<String, u32>,
     knobs: &Knobs,
     mode: &str,
     store_url: &str,
@@ -410,17 +436,19 @@ pub async fn process_settled_batch(
     let mut requeue = Vec::new();
     let Some(build_id) = &batch.build_id else {
         // No build id was ever observed for this batch. The structured
-        // batch fields tell the two cases apart (never the stderr text): an
-        // engine-side submission failure (ssh/spawn/import) leaves BOTH
-        // build_id and exit_code unset, while a lost `rio: build` line
-        // still records the child's exit code. Either way the engine cannot
-        // read per-drv observations without a build id, so every member job
-        // is re-offered to the submit loop.
+        // batch fields tell the cases apart (never the stderr text): an
+        // engine-side submission failure (ssh/spawn/import) or a child that
+        // was killed by a signal (including the engine's own batch deadline)
+        // leaves BOTH build_id and exit_code unset, while a lost
+        // `rio: build` line still records the child's exit code. Either way
+        // the engine cannot read per-drv observations without a build id,
+        // so every member job is re-offered to the submit loop.
         if batch.exit_code.is_none() {
             tracing::info!(
                 jobs = batch_jobs.len(),
-                "batch has no build id and no exit code (engine-side submission failure); \
-                 re-offering its jobs"
+                engine_cancelled = batch.engine_cancelled,
+                "batch has no build id and no exit code (engine-side submission failure or a \
+                 signal-killed child, e.g. at the engine's batch deadline); re-offering its jobs"
             );
         } else {
             tracing::warn!(
@@ -461,7 +489,7 @@ pub async fn process_settled_batch(
                 drv_path: ctx.drv_path.clone(),
                 ..DrvObservation::default()
             });
-        let used = auto_retries.get(job).copied().unwrap_or(0);
+        let prior = prior_requeues.get(job).copied().unwrap_or(0);
         // Evidence-age gate: when a poisoned drv has neither a relayed
         // reason (Signal 1) nor failed-builder evidence (Signal 2 — the
         // scheduler's poison rows decay with its evidence TTL, mirrored by
@@ -471,7 +499,7 @@ pub async fn process_settled_batch(
         let needs_log_signal = target.status == STATUS_POISONED
             && !batch.reasons.contains_key(&ctx.drv_path)
             && target.failed_builders.is_none();
-        let log_signal = if needs_log_signal {
+        let mut log_signal_bytes = if needs_log_signal {
             admin
                 .log_tail(
                     &ctx.drv_path,
@@ -480,18 +508,18 @@ pub async fn process_settled_batch(
                 )
                 .await
                 .ok()
-                .map(|b| lossy_log_text(&b))
         } else {
             None
         };
+        let log_signal_text = log_signal_bytes.as_deref().map(lossy_log_text);
         match decide(
             ctx,
             &target,
             &observations,
             batch,
-            used,
+            prior,
             knobs,
-            log_signal.as_deref(),
+            log_signal_text.as_deref(),
         ) {
             Verdict::StillRunning => {}
             Verdict::Requeue { why } => {
@@ -502,6 +530,7 @@ pub async fn process_settled_batch(
                 // Evidence capture: NAR hashes for successes, log tail for
                 // failures.
                 let mut log_key = None;
+                let mut captured_tail = log_signal_text.clone();
                 let rio_paths = if matches!(rio, RioOutcome::Built { .. }) {
                     let paths: Vec<String> = ctx.outputs.values().cloned().collect();
                     match store.query_valid(&paths).await {
@@ -519,39 +548,56 @@ pub async fn process_settled_batch(
                 } else {
                     // Failure: capture the log tail while the scheduler still
                     // has it and upload it next to the campaign artifacts.
-                    match admin
-                        .log_tail(
-                            &ctx.drv_path,
-                            target.exec_id.as_deref(),
-                            knobs.log_tail_bytes,
-                        )
-                        .await
-                    {
-                        Ok(tail) if !tail.is_empty() => {
-                            let compressed = zstd::encode_all(tail.as_slice(), 3).unwrap_or(tail);
-                            let rel = format!("logs/{}.log.zst", ctx.job.replace('/', "_"));
-                            state.write_bytes(&rel, &compressed)?;
-                            if let Some((art, prefix)) = &artifacts {
-                                let key = format!("{prefix}/{rel}");
-                                match art.put_bytes(&key, compressed).await {
-                                    Ok(()) => log_key = Some(key),
-                                    Err(e) => tracing::warn!(
-                                        job,
-                                        key,
-                                        error = %format!("{e:#}"),
-                                        "log tail upload failed; kept locally only"
-                                    ),
-                                }
-                            } else {
-                                log_key = Some(rel);
+                    // Reuse the Signal-3 fetch when it already happened — a
+                    // second fetch would race the scheduler's log retention
+                    // for the same bytes.
+                    let tail = match log_signal_bytes.take() {
+                        Some(bytes) => Some(bytes),
+                        None => match admin
+                            .log_tail(
+                                &ctx.drv_path,
+                                target.exec_id.as_deref(),
+                                knobs.log_tail_bytes,
+                            )
+                            .await
+                        {
+                            Ok(tail) => Some(tail),
+                            Err(e) => {
+                                tracing::warn!(
+                                    job,
+                                    error = %format!("{e:#}"),
+                                    "log tail fetch failed; recording the failure without a log"
+                                );
+                                None
                             }
+                        },
+                    };
+                    if let Some(tail) = tail.filter(|t| !t.is_empty()) {
+                        if captured_tail.is_none() {
+                            captured_tail = Some(lossy_log_text(&tail));
                         }
-                        Ok(_) => {}
-                        Err(e) => tracing::warn!(
-                            job,
-                            error = %format!("{e:#}"),
-                            "log tail fetch failed; recording the failure without a log"
-                        ),
+                        let compressed = zstd::encode_all(tail.as_slice(), 3).unwrap_or(tail);
+                        let rel = format!("logs/{}.log.zst", ctx.job.replace('/', "_"));
+                        state.write_bytes(&rel, &compressed)?;
+                        if let Some((art, prefix)) = &artifacts {
+                            // The S3 key is deterministic and the periodic
+                            // state sync re-enumerates logs/*.log.zst, so the
+                            // record carries the key even when this immediate
+                            // upload fails — the sync retries it from the
+                            // local copy.
+                            let key = format!("{prefix}/{rel}");
+                            if let Err(e) = art.put_bytes(&key, compressed).await {
+                                tracing::warn!(
+                                    job,
+                                    key,
+                                    error = %format!("{e:#}"),
+                                    "log tail upload failed; the periodic state sync will retry it"
+                                );
+                            }
+                            log_key = Some(key);
+                        } else {
+                            log_key = Some(rel);
+                        }
                     }
                     HashMap::new()
                 };
@@ -564,9 +610,10 @@ pub async fn process_settled_batch(
                     &rio_paths,
                     mode,
                     store_url,
-                    used + 1,
+                    prior + 1,
                     log_key,
                     first_active.get(job).cloned(),
+                    captured_tail.as_deref(),
                 );
                 state.append_jsonl(StateFile::Results, &record)?;
             }
@@ -623,8 +670,13 @@ mod tests {
     const OTHER: &str = "/nix/store/cccccccccccccccccccccccccccccccc-other.drv";
 
     /// Scripted AdminApi for evidence capture: the build graph is never read
-    /// (the reader is faked) and every log tail is the same short text.
-    struct LogAdmin;
+    /// (the reader is faked), every log tail is the same short text, and the
+    /// log_tail calls are counted so the Signal-3 reuse (one fetch serving
+    /// both classification and evidence capture) can be asserted.
+    #[derive(Default)]
+    struct LogAdmin {
+        log_calls: std::sync::atomic::AtomicUsize,
+    }
     #[async_trait::async_trait]
     impl AdminApi for LogAdmin {
         async fn get_build_graph(&self, _b: &str) -> Result<GraphSnapshot> {
@@ -634,10 +686,29 @@ mod tests {
             Ok(vec![])
         }
         async fn log_tail(&self, _d: &str, _e: Option<&str>, _m: usize) -> Result<Vec<u8>> {
+            self.log_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(b"gcc: fatal error\n".to_vec())
         }
         async fn list_builds(&self, _t: &str, _l: u32) -> Result<Vec<(String, Option<String>)>> {
             Ok(vec![])
+        }
+    }
+
+    /// Artifact store whose uploads always fail — at-capture upload failures
+    /// must not strand the evidence pointer (see
+    /// `failed_log_upload_still_records_the_log_key`).
+    struct FailingArtifacts;
+    #[async_trait::async_trait]
+    impl ArtifactStore for FailingArtifacts {
+        async fn put_bytes(&self, _key: &str, _bytes: Vec<u8>) -> Result<()> {
+            anyhow::bail!("simulated S3 outage")
+        }
+        async fn get_bytes(&self, _key: &str) -> Result<Option<Vec<u8>>> {
+            Ok(None)
+        }
+        async fn exists(&self, _key: &str) -> Result<bool> {
+            Ok(false)
         }
     }
 
@@ -754,6 +825,22 @@ mod tests {
             decide(
                 &c,
                 &obs(T, "completed", None, None),
+                &none,
+                &batch,
+                0,
+                &knobs,
+                None
+            ),
+            Verdict::Terminal {
+                rio: RioOutcome::Built { executed: false },
+                evidence: None
+            }
+        );
+        // Skipped (CA early cutoff) is terminal completed-without-execution.
+        assert_eq!(
+            decide(
+                &c,
+                &obs(T, "skipped", None, None),
                 &none,
                 &batch,
                 0,
@@ -957,6 +1044,66 @@ mod tests {
         );
     }
 
+    /// With no relayed reason the trigger comes from the closure scan; with
+    /// several poisoned deps the lexicographically smallest drv path is the
+    /// documented deterministic tie-break. With no poisoned dep at all the
+    /// job is re-queued instead of being charged a dependency failure.
+    #[test]
+    fn dependency_failed_fallback_scans_closure_deterministically() {
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[DEP, OTHER], HydraOutcome::Built);
+        let batch = BatchView::default();
+
+        // Two poisoned deps in the closure, no relayed reason: the
+        // lexicographically smallest drv path (DEP < OTHER) is the trigger.
+        let mut all = HashMap::new();
+        all.insert(
+            DEP.to_string(),
+            obs(DEP, "poisoned", None, Some(vec!["b1".into()])),
+        );
+        all.insert(
+            OTHER.to_string(),
+            obs(OTHER, "poisoned", None, Some(vec!["b2".into()])),
+        );
+        let v = decide(
+            &c,
+            &obs(T, "dependency_failed", None, None),
+            &all,
+            &batch,
+            0,
+            &knobs,
+            None,
+        );
+        match v {
+            Verdict::Terminal {
+                rio: RioOutcome::DependencyFailed { failing_drv, root },
+                ..
+            } => {
+                assert_eq!(failing_drv, DEP, "smallest candidate drv path wins");
+                assert_eq!(root, RootCauseKind::Genuine);
+            }
+            other => panic!("expected a terminal dependency failure, got {other:?}"),
+        }
+
+        // No poisoned dep in the closure and no relayed reason → no
+        // identifiable trigger → re-queued.
+        let v = decide(
+            &c,
+            &obs(T, "dependency_failed", None, None),
+            &HashMap::new(),
+            &batch,
+            0,
+            &knobs,
+            None,
+        );
+        assert_eq!(
+            v,
+            Verdict::Requeue {
+                why: "dependency-failed-no-trigger"
+            }
+        );
+    }
+
     /// End-to-end through process_settled_batch with fakes: one success (NAR
     /// hash captured), one genuine failure (log tail uploaded), one batch-mate
     /// requeued.
@@ -1009,7 +1156,7 @@ mod tests {
         let requeue = process_settled_batch(
             &state,
             &reader,
-            &LogAdmin,
+            &LogAdmin::default(),
             &store,
             Some((&artifacts, "parity/campaigns/c1".to_string())),
             &contexts,
@@ -1061,7 +1208,7 @@ mod tests {
         let r = process_settled_batch(
             &state,
             &reader,
-            &LogAdmin,
+            &LogAdmin::default(),
             &store,
             None,
             &contexts,
@@ -1099,7 +1246,7 @@ mod tests {
         let err = process_settled_batch(
             &state,
             &reader,
-            &LogAdmin,
+            &LogAdmin::default(),
             &FakeStoreApi::default(),
             None,
             &contexts,
@@ -1149,7 +1296,7 @@ mod tests {
         let requeue = process_settled_batch(
             &state,
             &reader,
-            &LogAdmin,
+            &LogAdmin::default(),
             &store,
             None,
             &contexts,
@@ -1169,5 +1316,120 @@ mod tests {
         assert_eq!(records[0].bucket, "match-built");
         assert_eq!(records[0].rio.outputs["out"].nar_hash, None);
         assert_eq!(records[0].nar_compare["out"], "not-comparable");
+    }
+
+    /// A poisoned target with no relayed reason and no failed-builder
+    /// evidence (both signals lost) pulls the log tail as the third signal.
+    /// The same fetch is reused for evidence capture (one log_tail call, not
+    /// two), the record carries the log-tail-only flag, and the signature is
+    /// derived from the tail so these failures still group.
+    #[tokio::test]
+    async fn log_tail_only_failure_reuses_one_fetch_and_groups_by_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let reader = FakeReader::default();
+        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
+        // failed_builders None = the poison evidence already decayed; the
+        // batch carries no relayed reason for this drv either.
+        reader.set(build_id, obs(T, "poisoned", None, None));
+        let admin = LogAdmin::default();
+        let contexts: HashMap<String, JobContext> = [(
+            "bad.x86_64-linux".to_string(),
+            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+        )]
+        .into();
+        let batch = BatchView {
+            build_id: Some(build_id.to_string()),
+            exit_code: Some(1),
+            ..BatchView::default()
+        };
+        let requeue = process_settled_batch(
+            &state,
+            &reader,
+            &admin,
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["bad.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(requeue.is_empty());
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        let rec = &records[0];
+        assert_eq!(rec.bucket, "rio-only-failure");
+        assert_eq!(rec.evidence.as_deref(), Some("log-tail-only"));
+        // No relayed reason: the signature falls back to the captured tail.
+        assert_eq!(rec.signature.as_deref(), Some("log:gcc--fatal-error"));
+        assert_eq!(
+            rec.log_key.as_deref(),
+            Some("logs/bad.x86_64-linux.log.zst")
+        );
+        assert!(state.path("logs/bad.x86_64-linux.log.zst").exists());
+        // The Signal-3 fetch doubled as the evidence capture: one call only.
+        assert_eq!(admin.log_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A failed at-capture log upload still records the deterministic S3 key
+    /// (the periodic state sync re-enumerates logs/*.log.zst and retries the
+    /// upload from the local copy, which is kept).
+    #[tokio::test]
+    async fn failed_log_upload_still_records_the_log_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let reader = FakeReader::default();
+        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
+        reader.set(
+            build_id,
+            obs(T, "poisoned", Some("e2"), Some(vec!["b1".into()])),
+        );
+        let contexts: HashMap<String, JobContext> = [(
+            "bad.x86_64-linux".to_string(),
+            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+        )]
+        .into();
+        let batch = BatchView {
+            build_id: Some(build_id.to_string()),
+            exit_code: Some(1),
+            reasons: BTreeMap::from([(
+                T.to_string(),
+                "failed on every eligible worker".to_string(),
+            )]),
+            ..BatchView::default()
+        };
+        process_settled_batch(
+            &state,
+            &reader,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            Some((&FailingArtifacts, "parity/campaigns/c1".to_string())),
+            &contexts,
+            &["bad.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].log_key.as_deref(),
+            Some("parity/campaigns/c1/logs/bad.x86_64-linux.log.zst")
+        );
+        assert!(
+            state.path("logs/bad.x86_64-linux.log.zst").exists(),
+            "local copy stays for the sync retry"
+        );
     }
 }
