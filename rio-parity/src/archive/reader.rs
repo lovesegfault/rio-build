@@ -1,0 +1,870 @@
+//! Reader for replay archives: open a directory or DwarFS image, validate
+//! its integrity, and expose the v1 in-memory model.
+//!
+//! Metadata (manifest, requests, outcomes, units, closures, impure-env,
+//! exclusions, narinfo sidecars, the `nix/store/` entry index) is parsed
+//! eagerly at [`ReplayArchive::open`], which also verifies the manifest's
+//! `files` digests and the narinfo listing digest (see
+//! `docs/dev/2026-05-28-build-replay-design.md`, "Identity, integrity, and
+//! content addressing"). Derivation text and NAR payloads are read lazily;
+//! embedded store paths are verified against their narinfo sidecars when
+//! they are NAR-serialized ([`ReplayArchive::dump_nar`]), not at open time.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::Path;
+
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use rio_nix::narinfo::NarInfo;
+
+use super::backend::{Backend, EntryKind, WalkEntry};
+use super::schema::{
+    Capabilities, ClosureRecord, Counts, ExclusionRecord, ImpureEnv, Manifest, MemberPresence,
+    OutcomeRecord, RequestRecord, UnitRecord,
+};
+use super::{
+    CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
+    NARINFO_DIR, OUTCOMES_MEMBER, REQUESTS_MEMBER, STORE_DIR, UNITS_MEMBER,
+};
+use super::{identity, schema};
+
+/// Which on-disk contract an opened archive was written to. The in-memory
+/// model is always v1; v0 archives are upgraded on open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    V0,
+    V1,
+}
+
+/// An opened replay archive: backend handle plus eagerly parsed metadata.
+/// Derivation text and NAR payloads are read lazily.
+///
+/// `open` is synchronous (file I/O, plus decompression on the DwarFS
+/// backend); async callers wrap it in `tokio::task::spawn_blocking`.
+#[derive(Debug)]
+pub struct ReplayArchive {
+    format: ArchiveFormat,
+    backend: Backend,
+    manifest: Manifest,
+    /// `Some` for v1 archives; `None` for v0 archives (no content address).
+    archive_id: Option<String>,
+    requests: Vec<RequestRecord>,
+    workload_units: BTreeSet<String>,
+    outcomes: HashMap<(Option<i64>, String), OutcomeRecord>,
+    units: HashMap<String, UnitRecord>,
+    closures: Vec<ClosureRecord>,
+    impure_env: ImpureEnv,
+    exclusions: Vec<ExclusionRecord>,
+    /// Store-path hash part → parsed narinfo sidecar.
+    narinfos: HashMap<String, NarInfo>,
+    /// Store-path hash part → `nix/store/` entry (basename, kind, exec bit).
+    store_entries: HashMap<String, WalkEntry>,
+}
+
+impl ReplayArchive {
+    /// Open a `.dwarfs` image or an archive directory, validating the
+    /// manifest's integrity tables along the way.
+    pub fn open(path: &Path) -> Result<Self> {
+        let backend = Backend::open(path)?;
+
+        let manifest_bytes = backend.read_file(MANIFEST_MEMBER)?.ok_or_else(|| {
+            anyhow!(
+                "{}: no {MANIFEST_MEMBER} — not a replay archive?",
+                path.display()
+            )
+        })?;
+
+        // A manifest without `format_version` is a v0 archive (the contract
+        // predating the versioned format).
+        let probe: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
+        if probe.get("format_version").is_none() {
+            bail!(
+                "{}: {MANIFEST_MEMBER} carries no format_version (a v0 archive); \
+                 v0 archives are not yet supported by this reader",
+                path.display()
+            );
+        }
+        Self::open_v1(path, backend, manifest_bytes)
+    }
+
+    /// The v1 open path: parse the manifest, verify the integrity tables,
+    /// and eagerly load the metadata members.
+    fn open_v1(path: &Path, backend: Backend, manifest_bytes: Vec<u8>) -> Result<Self> {
+        let manifest: Manifest = serde_json::from_slice(&manifest_bytes)
+            .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
+        schema::parse_format_version(&manifest.format_version)
+            .with_context(|| format!("{}: {MANIFEST_MEMBER}", path.display()))?;
+
+        // Relay substituters are campaign-time fetch sources; refuse plain
+        // http:// (the engine never relays over cleartext).
+        for relay in &manifest.substituters.relay {
+            ensure!(
+                relay.starts_with("https://") || relay.starts_with("s3://"),
+                "relay substituter {relay:?}: only https:// and s3:// are allowed"
+            );
+        }
+
+        // The staged metadata members and the manifest's `files` table must
+        // describe the same set, and every listed member's bytes must match
+        // its recorded digest. The manifest itself is never listed.
+        let mut staged: BTreeMap<&str, Vec<u8>> = BTreeMap::new();
+        for member in METADATA_MEMBERS {
+            if let Some(bytes) = backend.read_file(member)? {
+                staged.insert(member, bytes);
+            }
+        }
+        for member in staged.keys() {
+            ensure!(
+                manifest.files.contains_key(*member),
+                "{member} is staged in the archive but not listed in manifest.files"
+            );
+        }
+        for (member, digest) in &manifest.files {
+            let Some(bytes) = staged.get(member.as_str()) else {
+                bail!("{member} is listed in manifest.files but absent from the archive");
+            };
+            ensure!(
+                bytes.len() as u64 == digest.size,
+                "{member}: size mismatch (manifest.files records {} bytes, the archive member \
+                 has {})",
+                digest.size,
+                bytes.len()
+            );
+            let actual = identity::sha256_hex(bytes);
+            ensure!(
+                actual == digest.sha256,
+                "{member}: sha256 mismatch (manifest.files records {}, the archive member \
+                 hashes to {actual})",
+                digest.sha256
+            );
+        }
+
+        // requests.jsonl is the one member every archive must carry: without
+        // it there is no workload to replay.
+        let requests_bytes = staged
+            .get(REQUESTS_MEMBER)
+            .ok_or_else(|| anyhow!("{}: no {REQUESTS_MEMBER}", path.display()))?;
+        let mut requests: Vec<RequestRecord> = super::parse_jsonl(requests_bytes, REQUESTS_MEMBER)?;
+        for record in &mut requests {
+            ensure!(
+                !record.targets.is_empty(),
+                "{REQUESTS_MEMBER}: request record (session {}) must have non-empty targets",
+                record.session
+            );
+            // Clock skew at capture time can produce slightly negative
+            // offsets; clamp instead of rejecting the whole archive.
+            record.offset_s = record.offset_s.max(0.0);
+            for target in &mut record.targets {
+                // `[]` and `["*"]` both mean "all outputs"; normalize so
+                // downstream consumers see one spelling.
+                if target.outputs.is_empty() {
+                    target.outputs = vec!["*".to_string()];
+                }
+            }
+        }
+        // Recorded lines are not guaranteed globally ordered (per-session
+        // buffers get flushed independently); the replay timeline wants
+        // ascending offsets.
+        requests.sort_by(|a, b| a.offset_s.total_cmp(&b.offset_s));
+        let workload_units: BTreeSet<String> = requests
+            .iter()
+            .flat_map(|record| record.targets.iter().map(|target| target.drv.clone()))
+            .collect();
+
+        // Expected outcomes keyed by (session, drv); duplicate keys keep the
+        // last record (a re-recorded outcome supersedes the earlier one).
+        let mut outcomes: HashMap<(Option<i64>, String), OutcomeRecord> = HashMap::new();
+        let mut outcome_records: u64 = 0;
+        if let Some(bytes) = staged.get(OUTCOMES_MEMBER) {
+            for record in super::parse_jsonl::<OutcomeRecord>(bytes, OUTCOMES_MEMBER)? {
+                outcome_records += 1;
+                outcomes.insert((record.session, record.drv.clone()), record);
+            }
+        }
+
+        // Per-unit metadata; records for derivations outside the workload are
+        // dropped with a warning (they cannot be scheduled, so keeping them
+        // would only mislead filters and reports).
+        let mut units: HashMap<String, UnitRecord> = HashMap::new();
+        if let Some(bytes) = staged.get(UNITS_MEMBER) {
+            for record in super::parse_jsonl::<UnitRecord>(bytes, UNITS_MEMBER)? {
+                if !workload_units.contains(&record.drv) {
+                    tracing::warn!(
+                        drv = %record.drv,
+                        "ignoring {UNITS_MEMBER} record for a derivation that is not a \
+                         workload unit"
+                    );
+                    continue;
+                }
+                units.insert(record.drv.clone(), record);
+            }
+        }
+
+        let closures: Vec<ClosureRecord> = match staged.get(CLOSURES_MEMBER) {
+            Some(bytes) => super::parse_jsonl(bytes, CLOSURES_MEMBER)?,
+            None => Vec::new(),
+        };
+
+        let impure_env: ImpureEnv = match staged.get(IMPURE_ENV_MEMBER) {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .with_context(|| format!("malformed {IMPURE_ENV_MEMBER}"))?,
+            None => ImpureEnv::new(),
+        };
+
+        let exclusions: Vec<ExclusionRecord> = match staged.get(EXCLUSIONS_MEMBER) {
+            Some(bytes) => {
+                let records: Vec<ExclusionRecord> = super::parse_jsonl(bytes, EXCLUSIONS_MEMBER)?;
+                for record in &records {
+                    // An exclusion that names nothing cannot enter the
+                    // completeness accounting.
+                    ensure!(
+                        record.label.is_some() || record.drv.is_some(),
+                        "{EXCLUSIONS_MEMBER}: exclusion record (reason {:?}) must carry a \
+                         label or drv",
+                        record.reason
+                    );
+                }
+                records
+            }
+            None => Vec::new(),
+        };
+
+        // narinfo sidecars: a sidecar that fails to parse is skipped with a
+        // warning — one bad sidecar shouldn't take down the whole campaign;
+        // the affected path simply won't be uploadable from the archive.
+        let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
+        let mut narinfo_digests: Vec<(String, String)> = Vec::new();
+        for entry in backend.list_dir(NARINFO_DIR)?.unwrap_or_default() {
+            if entry.kind != EntryKind::Regular {
+                continue;
+            }
+            let Some(stem) = entry.name.strip_suffix(".narinfo") else {
+                continue;
+            };
+            let rel = format!("{NARINFO_DIR}/{}", entry.name);
+            let bytes = backend
+                .read_file(&rel)?
+                .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
+            let parsed = std::str::from_utf8(&bytes)
+                .map_err(anyhow::Error::from)
+                .and_then(|text| super::parse_narinfo_sidecar(text, stem));
+            match parsed {
+                Ok(narinfo) => {
+                    narinfo_digests
+                        .push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
+                    // Key by the hash part so `<hash>-<name>.narinfo` sidecar
+                    // naming resolves the same as the canonical
+                    // `<hash>.narinfo`.
+                    narinfos.insert(super::hash_part(stem).to_string(), narinfo);
+                }
+                Err(err) => tracing::warn!("skipping unparseable {rel}: {err:#}"),
+            }
+        }
+
+        // nix/store/ entry index: hash part → entry. Drives the store-path
+        // keyed lookups; contents stay in the backend until asked for.
+        let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
+        for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
+            store_entries.insert(super::hash_part(&entry.name).to_string(), entry);
+        }
+
+        // The narinfo listing digest covers the sidecars' load-bearing
+        // References lines; verify it at open time (sidecars are small).
+        // The drvs digest is not verified here (an input-addressed .drv path
+        // commits to its ATerm, so corruption surfaces at import time) and
+        // embedded store paths are verified against their sidecars when they
+        // are NAR-serialized for upload.
+        let recomputed_narinfo_digest = identity::listing_digest(&narinfo_digests);
+        ensure!(
+            recomputed_narinfo_digest == manifest.content_digests.narinfo,
+            "narinfo listing digest mismatch (manifest records {}, the archive's sidecars hash \
+             to {recomputed_narinfo_digest})",
+            manifest.content_digests.narinfo
+        );
+
+        // Capability flags must be backed by the data they claim. The
+        // reverse direction (member present, flag false) is only a warning:
+        // the data is loaded, but the engine will gate on the flags.
+        let presence = MemberPresence {
+            outcomes: staged.contains_key(OUTCOMES_MEMBER),
+            units: staged.contains_key(UNITS_MEMBER),
+            closures: staged.contains_key(CLOSURES_MEMBER),
+            impure_env: staged.contains_key(IMPURE_ENV_MEMBER),
+            exclusions: staged.contains_key(EXCLUSIONS_MEMBER),
+            embedded_store_paths: store_entries
+                .values()
+                .any(|entry| !entry.name.ends_with(".drv")),
+        };
+        manifest.capabilities.require_backing_members(&presence)?;
+        for (member_present, flag_set, staged_what, flag) in [
+            (
+                presence.outcomes,
+                manifest.capabilities.expected_outcomes,
+                OUTCOMES_MEMBER,
+                "expected_outcomes",
+            ),
+            (
+                presence.impure_env,
+                manifest.capabilities.impure_env,
+                IMPURE_ENV_MEMBER,
+                "impure_env",
+            ),
+            (
+                presence.closures,
+                manifest.capabilities.dependency_closures,
+                CLOSURES_MEMBER,
+                "dependency_closures",
+            ),
+            (
+                presence.embedded_store_paths,
+                manifest.capabilities.embedded_store_paths,
+                "embedded non-drv store paths",
+                "embedded_store_paths",
+            ),
+        ] {
+            if member_present && !flag_set {
+                tracing::warn!(
+                    "archive carries {staged_what} but capability `{flag}` is not set; the \
+                     engine will gate on the flag"
+                );
+            }
+        }
+
+        // v1 requires a sidecar for every embedded non-drv store path: the
+        // sidecar carries the NarHash/NarSize/References the supply path
+        // depends on.
+        for entry in store_entries.values() {
+            if entry.name.ends_with(".drv") {
+                continue;
+            }
+            ensure!(
+                narinfos.contains_key(super::hash_part(&entry.name)),
+                "embedded store path {}{} has no narinfo sidecar",
+                rio_nix::store_path::STORE_PREFIX,
+                entry.name
+            );
+        }
+
+        // Counts are informational; disagreement is logged, never fatal.
+        let recomputed_counts = Counts {
+            requests: requests.len() as u64,
+            workload_units: workload_units.len() as u64,
+            expected_outcomes: outcome_records,
+            embedded_drvs: store_entries
+                .values()
+                .filter(|entry| entry.name.ends_with(".drv"))
+                .count() as u64,
+            embedded_store_paths: store_entries
+                .values()
+                .filter(|entry| !entry.name.ends_with(".drv"))
+                .count() as u64,
+        };
+        if recomputed_counts != manifest.counts {
+            tracing::warn!(
+                manifest_counts = ?manifest.counts,
+                ?recomputed_counts,
+                "manifest.counts disagrees with the archive contents (informational only)"
+            );
+        }
+
+        // The archive id is the digest of the manifest member's bytes exactly
+        // as stored — never of a re-serialization of the parsed manifest.
+        let archive_id = identity::archive_id_from_manifest_bytes(&manifest_bytes);
+
+        Ok(Self {
+            format: ArchiveFormat::V1,
+            backend,
+            manifest,
+            archive_id: Some(archive_id),
+            requests,
+            workload_units,
+            outcomes,
+            units,
+            closures,
+            impure_env,
+            exclusions,
+            narinfos,
+            store_entries,
+        })
+    }
+
+    /// Which on-disk contract the opened archive was written to.
+    pub fn format(&self) -> ArchiveFormat {
+        self.format
+    }
+
+    /// The archive manifest (v0 manifests are mapped into this model on open).
+    pub fn manifest(&self) -> &Manifest {
+        &self.manifest
+    }
+
+    /// Capability flags: what the archive contains and what the engine may
+    /// gate on.
+    pub fn capabilities(&self) -> &Capabilities {
+        &self.manifest.capabilities
+    }
+
+    /// `Some` for v1 archives (SHA-256 of the manifest member bytes);
+    /// `None` for v0 archives, which have no content-addressed identity.
+    pub fn archive_id(&self) -> Option<&str> {
+        self.archive_id.as_deref()
+    }
+
+    /// The short id (first 16 hex characters of [`Self::archive_id`]).
+    pub fn archive_id_short(&self) -> Option<String> {
+        self.archive_id.as_deref().map(identity::short_id)
+    }
+
+    /// Recorded requests, sorted by `offset_s` ascending, negative offsets
+    /// clamped to 0, output lists normalized so `[]` becomes `["*"]`.
+    pub fn requests(&self) -> &[RequestRecord] {
+        &self.requests
+    }
+
+    /// Distinct workload-unit drv paths (the union of all targets).
+    pub fn workload_units(&self) -> &BTreeSet<String> {
+        &self.workload_units
+    }
+
+    /// Expected outcomes keyed by `(session, drv)`; duplicate keys keep the
+    /// last record. Empty when the archive has no truth member.
+    pub fn outcomes(&self) -> &HashMap<(Option<i64>, String), OutcomeRecord> {
+        &self.outcomes
+    }
+
+    /// Lookup order: exact `(Some(session), drv)`, then `(None, drv)`.
+    pub fn expected_outcome(&self, session: i64, drv: &str) -> Option<&OutcomeRecord> {
+        self.outcomes
+            .get(&(Some(session), drv.to_string()))
+            .or_else(|| self.outcomes.get(&(None, drv.to_string())))
+    }
+
+    /// Per-unit metadata keyed by drv path (empty when units.jsonl absent).
+    pub fn units(&self) -> &HashMap<String, UnitRecord> {
+        &self.units
+    }
+
+    /// Direct dependency adjacency records (empty when closures.jsonl absent).
+    pub fn closures(&self) -> &[ClosureRecord] {
+        &self.closures
+    }
+
+    /// drv path → impure environment variable names. Empty when the member
+    /// is absent.
+    pub fn impure_env(&self) -> &ImpureEnv {
+        &self.impure_env
+    }
+
+    /// Scope items the recorder could not turn into workload units (empty
+    /// when exclusions.jsonl absent).
+    pub fn exclusions(&self) -> &[ExclusionRecord] {
+        &self.exclusions
+    }
+
+    /// Narinfo sidecar by store-path hash part (full path or basename also
+    /// accepted).
+    pub fn narinfo(&self, hash_part_or_path: &str) -> Option<&NarInfo> {
+        self.narinfos.get(super::hash_part(hash_part_or_path))
+    }
+
+    /// True if the archive embeds this store path's contents (a non-drv tree).
+    pub fn has_embedded(&self, store_path: &str) -> bool {
+        self.store_entries
+            .get(super::hash_part(store_path))
+            .is_some_and(|entry| !entry.name.ends_with(".drv"))
+    }
+
+    /// Embedded non-drv store paths (full /nix/store/... paths, sorted).
+    pub fn embedded_store_paths(&self) -> Vec<String> {
+        self.collect_store_paths(|name| !name.ends_with(".drv"))
+    }
+
+    /// Embedded derivation store paths (full /nix/store/... paths, sorted).
+    pub fn embedded_drvs(&self) -> Vec<String> {
+        self.collect_store_paths(|name| name.ends_with(".drv"))
+    }
+
+    /// Full store paths of the `nix/store/` entries whose basename satisfies
+    /// `keep`, sorted.
+    fn collect_store_paths(&self, keep: impl Fn(&str) -> bool) -> Vec<String> {
+        let mut paths: Vec<String> = self
+            .store_entries
+            .values()
+            .filter(|entry| keep(&entry.name))
+            .map(|entry| format!("{}{}", rio_nix::store_path::STORE_PREFIX, entry.name))
+            .collect();
+        paths.sort();
+        paths
+    }
+
+    /// Read a `.drv` member's ATerm text (full store path or basename).
+    pub fn read_drv(&self, drv_path: &str) -> Result<String> {
+        let entry = self
+            .store_entries
+            .get(super::hash_part(drv_path))
+            .ok_or_else(|| anyhow!("derivation {drv_path} is not present in the archive"))?;
+        ensure!(
+            entry.name.ends_with(".drv"),
+            "{drv_path} resolves to {} in the archive, which is not a .drv",
+            entry.name
+        );
+        let rel = format!("{STORE_DIR}/{}", entry.name);
+        let bytes = self
+            .backend
+            .read_file(&rel)?
+            .ok_or_else(|| anyhow!("{rel}: listed in the archive index but unreadable"))?;
+        String::from_utf8(bytes).with_context(|| format!("{rel}: derivation text is not UTF-8"))
+    }
+
+    /// NAR-serialize an embedded store path and verify it against its
+    /// narinfo sidecar's NarHash/NarSize. Blocking; see `open`.
+    ///
+    /// On the DwarFS backend all content reads serialize on an internal
+    /// lock, so callers should not expect parallel-dump throughput.
+    pub fn dump_nar(&self, store_path: &str) -> Result<Vec<u8>> {
+        let entry = self
+            .store_entries
+            .get(super::hash_part(store_path))
+            .ok_or_else(|| anyhow!("store path {store_path} is not embedded in the archive"))?;
+        let rel = format!("{STORE_DIR}/{}", entry.name);
+        let nar = match &self.backend {
+            Backend::Dir { root } => {
+                let mut nar = Vec::new();
+                rio_nix::nar::dump_path_streaming(&root.join(&rel), &mut nar)
+                    .with_context(|| format!("NAR-serialize {rel}"))?;
+                nar
+            }
+            Backend::Dwarfs(_) => {
+                let node = self
+                    .backend
+                    .nar_node(&rel, entry)
+                    .with_context(|| format!("NAR-serialize {rel} from the DwarFS image"))?;
+                let mut nar = Vec::new();
+                rio_nix::nar::serialize(&mut nar, &node)
+                    .with_context(|| format!("NAR-serialize {rel} from the DwarFS image"))?;
+                nar
+            }
+        };
+
+        // Use-time integrity: the produced NAR must agree with the sidecar
+        // that describes it. v0 archives may legitimately lack a sidecar, in
+        // which case the NAR is returned unverified; for v1 a missing sidecar
+        // cannot happen if open succeeded.
+        match self.narinfo(store_path) {
+            Some(narinfo) => {
+                let sidecar_hex = crate::nixcache::narhash_to_hex(&narinfo.nar_hash)
+                    .with_context(|| format!("narinfo sidecar for {store_path}"))?;
+                let nar_hex = identity::sha256_hex(&nar);
+                ensure!(
+                    nar_hex == sidecar_hex && nar.len() as u64 == narinfo.nar_size,
+                    "{store_path}: the archived tree does not match its narinfo sidecar \
+                     (sidecar NarHash {sidecar_hex} NarSize {}, archive NAR sha256 {nar_hex} \
+                     size {})",
+                    narinfo.nar_size,
+                    nar.len()
+                );
+            }
+            None => ensure!(
+                self.format == ArchiveFormat::V0,
+                "{store_path}: embedded store path has no narinfo sidecar to verify against"
+            ),
+        }
+        Ok(nar)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::PathBuf;
+
+    use super::*;
+    use crate::archive::writer::pack_with_mkdwarfs;
+    use crate::archive::writer::test_support::{APP_DRV, DEP_DRV, SRC_PATH, tiny_archive};
+    use crate::archive::{FORMAT_VERSION, hash_part};
+
+    /// Stage and finalize the tiny archive in `dir`, returning the staged
+    /// root and the writer's view of the identity.
+    fn staged_tiny_archive(dir: &Path) -> (PathBuf, crate::archive::writer::FinalizedArchive) {
+        let root = dir.join("archive");
+        let finalized = tiny_archive(&root);
+        (root, finalized)
+    }
+
+    /// Rewrite one textual occurrence inside a staged member file.
+    fn rewrite_member(root: &Path, member: &str, from: &str, to: &str) {
+        let path = root.join(member);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains(from), "{member} does not contain {from:?}");
+        std::fs::write(&path, text.replace(from, to)).unwrap();
+    }
+
+    #[test]
+    fn opens_a_v1_directory_archive_and_exposes_the_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, finalized) = staged_tiny_archive(dir.path());
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.format(), ArchiveFormat::V1);
+        assert_eq!(archive.archive_id(), Some(finalized.archive_id.as_str()));
+        assert_eq!(
+            archive.archive_id_short(),
+            Some(finalized.archive_id[..16].to_string())
+        );
+        assert!(archive.capabilities().expected_outcomes);
+
+        assert_eq!(archive.requests().len(), 2);
+        assert!(
+            archive
+                .requests()
+                .windows(2)
+                .all(|pair| pair[0].offset_s <= pair[1].offset_s),
+            "requests are sorted by offset"
+        );
+        assert_eq!(
+            archive.workload_units().iter().collect::<Vec<_>>(),
+            vec![DEP_DRV, APP_DRV],
+        );
+
+        // Session 7 recorded nothing for dep.drv: the lookup falls back to
+        // the session-less truth record.
+        let dep = archive.expected_outcome(7, DEP_DRV).unwrap();
+        assert_eq!(dep.outcome, crate::archive::schema::ExpectedOutcome::Built);
+        // Session 0's app.drv expectation is session-scoped.
+        let app = archive.expected_outcome(0, APP_DRV).unwrap();
+        assert_eq!(app.outcome, crate::archive::schema::ExpectedOutcome::Failed);
+        assert_eq!(app.session, Some(0));
+
+        assert_eq!(archive.units().len(), 2);
+        assert!(
+            archive.units().values().all(|unit| unit.label.is_some()),
+            "got: {:?}",
+            archive.units()
+        );
+        assert_eq!(archive.closures().len(), 2);
+        assert_eq!(archive.exclusions().len(), 1);
+        assert!(archive.impure_env().is_empty());
+
+        assert!(archive.has_embedded(SRC_PATH));
+        assert_eq!(archive.embedded_store_paths(), vec![SRC_PATH.to_string()]);
+        assert_eq!(
+            archive.embedded_drvs(),
+            vec![DEP_DRV.to_string(), APP_DRV.to_string()]
+        );
+
+        let aterm = archive.read_drv(DEP_DRV).unwrap();
+        let derivation = rio_nix::derivation::Derivation::parse(&aterm).unwrap();
+        assert_eq!(derivation.outputs().len(), 1);
+
+        let nar = archive.dump_nar(SRC_PATH).unwrap();
+        let sidecar = archive.narinfo(SRC_PATH).unwrap();
+        assert_eq!(nar.len() as u64, sidecar.nar_size);
+    }
+
+    #[test]
+    fn image_and_directory_forms_have_the_same_identity_and_model() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+        let image = dir.path().join("archive.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+
+        let from_dir = ReplayArchive::open(&root).unwrap();
+        let from_image = ReplayArchive::open(&image).unwrap();
+
+        // Container independence: the identity and the parsed model are the
+        // same whichever form the same archive takes.
+        assert_eq!(from_image.format(), ArchiveFormat::V1);
+        assert_eq!(from_dir.archive_id(), from_image.archive_id());
+        assert_eq!(from_dir.requests().len(), from_image.requests().len());
+        assert_eq!(from_dir.outcomes().len(), from_image.outcomes().len());
+        assert_eq!(from_dir.units().len(), from_image.units().len());
+        assert_eq!(from_dir.closures().len(), from_image.closures().len());
+        assert_eq!(
+            from_dir.dump_nar(SRC_PATH).unwrap(),
+            from_image.dump_nar(SRC_PATH).unwrap()
+        );
+    }
+
+    #[test]
+    fn unknown_format_major_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let pinned = format!("\"format_version\": \"{FORMAT_VERSION}\"");
+        rewrite_member(
+            &root,
+            MANIFEST_MEMBER,
+            &pinned,
+            "\"format_version\": \"2.0\"",
+        );
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("unsupported archive format_version 2.0"),
+            "got: {err}"
+        );
+
+        // Any minor of the supported major is accepted (additive evolution);
+        // the manifest is never listed in `files`, so rewriting it cannot
+        // trip the member digest checks.
+        rewrite_member(
+            &root,
+            MANIFEST_MEMBER,
+            "\"format_version\": \"2.0\"",
+            "\"format_version\": \"1.9\"",
+        );
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.manifest().format_version, "1.9");
+    }
+
+    #[test]
+    fn metadata_member_corruption_is_detected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let path = root.join(REQUESTS_MEMBER);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("sha256 mismatch") || err.contains("size mismatch"),
+            "got: {err}"
+        );
+        assert!(err.contains(REQUESTS_MEMBER), "got: {err}");
+    }
+
+    #[test]
+    fn unlisted_metadata_member_is_detected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // Bytes that differ from the digests recorded in `files` are refused.
+        let units_path = root.join(UNITS_MEMBER);
+        let mut units_text = std::fs::read_to_string(&units_path).unwrap();
+        units_text
+            .push_str("{\"drv\":\"/nix/store/d3333333333333333333333333333333-extra.drv\"}\n");
+        std::fs::write(&units_path, &units_text).unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("sha256 mismatch") || err.contains("size mismatch"),
+            "got: {err}"
+        );
+        assert!(err.contains(UNITS_MEMBER), "got: {err}");
+
+        // A staged metadata member the manifest does not list is refused.
+        std::fs::write(root.join(IMPURE_ENV_MEMBER), "{}\n").unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("not listed in manifest.files"), "got: {err}");
+        std::fs::remove_file(root.join(IMPURE_ENV_MEMBER)).unwrap();
+
+        // A listed member that is gone from the archive is refused.
+        std::fs::remove_file(units_path).unwrap();
+        std::fs::remove_file(root.join(EXCLUSIONS_MEMBER)).unwrap();
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("listed in manifest.files but absent"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn narinfo_listing_digest_mismatch_is_detected() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        let sidecar = root
+            .join(NARINFO_DIR)
+            .join(format!("{}.narinfo", hash_part(SRC_PATH)));
+        let mut text = std::fs::read_to_string(&sidecar).unwrap();
+        text.push_str("Sig: example.org:0000000000000000000000000000000000000000000000000000\n");
+        std::fs::write(&sidecar, text).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("narinfo listing digest mismatch"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn capability_without_member_is_rejected_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // The capabilities object is not covered by `files`, so a manifest
+        // edit here reaches the capability check rather than a digest error.
+        rewrite_member(
+            &root,
+            MANIFEST_MEMBER,
+            "\"impure_env\": false",
+            "\"impure_env\": true",
+        );
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("capability `impure_env`"), "got: {err}");
+    }
+
+    #[test]
+    fn missing_manifest_is_an_error() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+        std::fs::remove_file(root.join(MANIFEST_MEMBER)).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("no manifest.json"), "got: {err}");
+        assert!(err.contains("not a replay archive"), "got: {err}");
+    }
+
+    #[test]
+    fn unknown_extra_members_are_ignored() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, finalized) = staged_tiny_archive(dir.path());
+
+        // Recorders may keep their own QA artifacts next to the spec'd
+        // members; they are outside the identity and ignored on open.
+        std::fs::write(root.join("fidelity.json"), "{\"checked\": true}\n").unwrap();
+        std::fs::create_dir_all(root.join("notes")).unwrap();
+        std::fs::write(root.join("notes/readme.txt"), "extra member\n").unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.archive_id(), Some(finalized.archive_id.as_str()));
+    }
+
+    #[test]
+    fn dump_nar_detects_sidecar_disagreement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (root, _) = staged_tiny_archive(dir.path());
+
+        // Embedded trees are not hashed at open time (that is dump-time
+        // integrity), so the open succeeds and the dump fails.
+        let embedded = root
+            .join(STORE_DIR)
+            .join(SRC_PATH.rsplit('/').next().unwrap());
+        std::fs::write(embedded.join("content.txt"), "tampered after finalize\n").unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        let err = format!("{:#}", archive.dump_nar(SRC_PATH).unwrap_err());
+        assert!(
+            err.contains("does not match its narinfo sidecar"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn v0_manifest_is_recognized_but_unsupported_until_the_shim_lands() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join(MANIFEST_MEMBER),
+            concat!(
+                "{\"from\":\"2026-05-01T00:00:00Z\",\"to\":\"2026-05-01T01:00:00Z\",",
+                "\"created_at\":\"2026-05-01T01:00:00Z\",\"requests\":4}\n"
+            ),
+        )
+        .unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(err.contains("v0"), "got: {err}");
+        assert!(err.contains("not yet supported"), "got: {err}");
+    }
+}

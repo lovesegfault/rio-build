@@ -516,26 +516,55 @@ impl ArchiveWriter {
 /// external `mkdwarfs` tool (the published, at-rest form of an archive).
 /// The image's contents — not its filename or compression parameters —
 /// carry the archive identity, so no determinism flags are required.
+///
+/// The image is first written to a temporary `<image>.tmp` sibling and only
+/// renamed to `image` after `mkdwarfs` exits successfully, so a failed pack
+/// can neither leave nor clobber a truncated image at the final path; an
+/// existing file at `image` is replaced (atomically) on success only.
 /// Blocking; call via `spawn_blocking` from async contexts.
 pub fn pack_with_mkdwarfs(staging: &Path, image: &Path) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        staging.is_dir(),
+        "mkdwarfs input {} is not a directory (expected a staged archive root)",
+        staging.display()
+    );
+    let image_name = image
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("image path {} has no file name", image.display()))?;
+    let mut tmp_name = image_name.to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_image = image.with_file_name(tmp_name);
+    // --log-level=warn keeps stderr down to actual problems, so the clipped
+    // snippet below carries the real failure rather than progress noise.
     let out = std::process::Command::new("mkdwarfs")
         .arg("-i")
         .arg(staging)
         .arg("-o")
-        .arg(image)
+        .arg(&tmp_image)
         .arg("--no-progress")
+        .arg("--log-level=warn")
         .arg("--force")
         .output()
         .context("spawn mkdwarfs (is the dwarfs package in the environment?)")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "mkdwarfs -i {} -o {} failed ({}): {}",
-        staging.display(),
-        image.display(),
-        out.status,
-        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
-    );
-    Ok(())
+    if !out.status.success() {
+        // Best effort: a failed pack should not leave its temporary output
+        // behind either.
+        let _ = std::fs::remove_file(&tmp_image);
+        anyhow::bail!(
+            "mkdwarfs -i {} -o {} failed ({}): {}",
+            staging.display(),
+            tmp_image.display(),
+            out.status,
+            crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
+        );
+    }
+    std::fs::rename(&tmp_image, image).with_context(|| {
+        format!(
+            "rename packed image {} to {}",
+            tmp_image.display(),
+            image.display()
+        )
+    })
 }
 
 /// Write one JSON record per line, each line terminated by `\n`, streamed
@@ -1162,7 +1191,6 @@ mod tests {
         let image = dir.path().join("basic.dwarfs");
         pack_with_mkdwarfs(&root, &image).unwrap();
         let meta = std::fs::metadata(&image).unwrap();
-        assert!(!meta.is_dir(), "expected a file, found a directory");
         assert!(meta.is_file(), "expected a regular image file");
         assert!(meta.len() > 0, "image file is empty");
     }

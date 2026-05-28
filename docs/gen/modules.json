@@ -756,9 +756,19 @@
       "doc": "Replay archives — the source-agnostic record/replay package consumed"
     },
     {
+      "path": "archive/backend.rs",
+      "depth": 1,
+      "doc": "Storage backends for replay archives: a plain directory or a DwarFS"
+    },
+    {
       "path": "archive/identity.rs",
       "depth": 1,
       "doc": "Archive identity: `archive_id`, the short id, and the canonical listing"
+    },
+    {
+      "path": "archive/reader.rs",
+      "depth": 1,
+      "doc": "Reader for replay archives: open a directory or DwarFS image, validate"
     },
     {
       "path": "archive/schema.rs",

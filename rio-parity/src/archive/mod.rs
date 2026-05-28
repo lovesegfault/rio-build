@@ -10,7 +10,9 @@
 //! reader (directory + DwarFS backends, with a v0 upgrade-on-open
 //! shim), the staging-directory writer, and the write-once S3 layout.
 
+pub(crate) mod backend;
 pub mod identity;
+pub mod reader;
 pub mod schema;
 pub mod writer;
 
