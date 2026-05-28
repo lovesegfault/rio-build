@@ -727,7 +727,9 @@ pub struct SchedHint {
 /// In-memory state for a single derivation node in the global DAG.
 #[derive(Debug, Clone)]
 pub struct DerivationState {
-    /// Unique hash identifying this derivation (store path for input-addressed, modular hash for CA).
+    /// Unique hash identifying this derivation. SubmitBuild ingress binds it
+    /// to the declared `.drv` store path (`== drv_path`); CA content identity
+    /// lives in `ca.modular_hash`, not here.
     pub drv_hash: DrvHash,
     /// Store path of the .drv file. Private because the DAG maintains a
     /// `path_to_hash` reverse index keyed on this field — mutating it

@@ -127,6 +127,46 @@ impl SchedulerService for SchedulerGrpc {
                     )));
                 }
             }
+            // r[impl sched.merge.ingress-identity-binding]
+            // The DAG (and the derivations table, the HMAC assignment
+            // claims, the conflict/identity gates) is keyed by drv_hash,
+            // while edges, dispatch, and recovery resolve the declared
+            // drv_path. The gateway always submits drv_hash == drv_path;
+            // an untrusted direct submitter must not be able to register
+            // a node under someone else's DAG key (a predictable .drv
+            // path) while pointing drv_path at an unrelated decoy that
+            // workers would then fetch — or alias two nodes with one
+            // path, corrupting the path_to_hash reverse index. Bind the
+            // two at the door.
+            if node.drv_hash != node.drv_path {
+                return Err(Status::invalid_argument(format!(
+                    "node {} drv_hash must equal the declared drv_path {:?} (the DAG key is the .drv store path)",
+                    node.drv_hash, node.drv_path
+                )));
+            }
+            // ca_modular_hash is identity evidence (merge-gate identity
+            // matching, realisation keying, persisted for recovery). The
+            // domain boundary coerces any non-32-byte value to None;
+            // keep that coercion as defense in depth, but reject
+            // malformed lengths here so bad evidence is named to the
+            // submitter instead of silently dropped.
+            if !node.ca_modular_hash.is_empty() && node.ca_modular_hash.len() != 32 {
+                return Err(Status::invalid_argument(format!(
+                    "node {} ca_modular_hash must be empty or exactly 32 bytes, got {} bytes",
+                    node.drv_hash,
+                    node.ca_modular_hash.len()
+                )));
+            }
+            // The gateway derives is_content_addressed as
+            // has_ca_floating_outputs() || is_fixed_output(); a node
+            // claiming is_fixed_output without is_content_addressed is
+            // never legitimate and would skip the CA gates downstream.
+            if node.is_fixed_output && !node.is_content_addressed {
+                return Err(Status::invalid_argument(format!(
+                    "node {} sets is_fixed_output without is_content_addressed",
+                    node.drv_hash
+                )));
+            }
             if node.system.is_empty() {
                 return Err(Status::invalid_argument(format!(
                     "node {} system must be non-empty",
@@ -147,6 +187,35 @@ impl SchedulerService for SchedulerGrpc {
                 node.drv_content.len(),
                 rio_common::limits::MAX_DRV_CONTENT_BYTES,
             )?;
+        }
+        // r[impl sched.merge.ingress-edge-endpoints]
+        // Dependency edges may only relate nodes of THIS submission. The
+        // merge edge loop resolves endpoints through the global
+        // path_to_hash index, so without this gate a submitter could
+        // attach dependency edges to OTHER submitters' resident nodes
+        // (cross-tenant interference: a failing junk child seeds
+        // DependencyFailed onto someone else's queued node), and an edge
+        // whose child resolves nowhere only surfaces as an opaque
+        // Internal (MissingDbId) at persist time. Every legitimate
+        // producer already conforms: the gateway emits each edge
+        // alongside its parent node and includes every child as a node
+        // (BFS over inputDrvs; dedup_dag never drops referenced nodes),
+        // and the hook fallback submits a single node with no edges.
+        let submitted_paths: std::collections::HashSet<&str> =
+            req.nodes.iter().map(|n| n.drv_path.as_str()).collect();
+        for edge in &req.edges {
+            if !submitted_paths.contains(edge.parent_drv_path.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "edge parent {:?} is not a node of this submission",
+                    edge.parent_drv_path
+                )));
+            }
+            if !submitted_paths.contains(edge.child_drv_path.as_str()) {
+                return Err(Status::invalid_argument(format!(
+                    "edge child {:?} is not a node of this submission",
+                    edge.child_drv_path
+                )));
+            }
         }
         // r[impl sched.recovery.inline-drv-durability+2]
         // Authoritative inline derivations are persisted and rebuilt

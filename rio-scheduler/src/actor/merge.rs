@@ -1,5 +1,5 @@
 //! DAG merge handling: SubmitBuild → merge client DAG into global DAG.
-// r[impl sched.merge.dedup]
+// r[impl sched.merge.dedup+2]
 // r[impl sched.merge.shared-priority-max]
 // r[impl sched.merge.toctou-serial]
 
@@ -74,7 +74,7 @@ pub(super) struct MergeReconcile {
     /// that a re-probe transitioned →Completed. Caller fans out
     /// `update_build_counts` + `check_build_completion` so a
     /// shared-node completion doesn't leave the earlier build hung
-    /// Active. r[sched.merge.dedup]
+    /// Active. r[sched.merge.dedup+2]
     pub other_builds: HashSet<Uuid>,
 }
 
@@ -239,7 +239,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.merge.dedup]
+        // r[impl sched.merge.dedup+2]
         // Re-probe completed a node that other builds were waiting on:
         // fan out the count-update + completion-check to them. Mirrors
         // complete_ready_from_store / release_downstream.
@@ -1114,7 +1114,7 @@ impl DagActor {
         // B2's re-probe — completed_count stays 0, dispatch_ready
         // silently drops the now-Completed entry,
         // check_build_completion(B1) never fires → B1 hangs Active.
-        // r[sched.merge.dedup]: "all interested builds are notified".
+        // r[sched.merge.dedup+2]: "all interested builds are notified".
         let mut reprobe_completed: Vec<DrvHash> = Vec::new();
         // I-139: collect for batched Completed-status + path_tenants
         // updates after the loop instead of N sequential round-trips.

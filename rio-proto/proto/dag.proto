@@ -17,7 +17,11 @@ import "types.proto"; // DerivationEvent.failure_status → BuildResultStatus
 // A node in the derivation DAG submitted by the gateway.
 message DerivationNode {
   string drv_path = 1;                      // Store path of the .drv file
-  string drv_hash = 2;                      // Input-addressed: store path; CA: modular hash
+  // Scheduler DAG key. The gateway sets this to the declared .drv store
+  // path for every node shape, and SubmitBuild ingress rejects nodes
+  // where the two differ — CA content identity is carried separately in
+  // ca_modular_hash (field 12), which keys realisations, not the DAG.
+  string drv_hash = 2;
   string pname = 3;                         // Package name (for duration estimation)
   string system = 4;                        // e.g. "x86_64-linux"
   repeated string required_features = 5;    // requiredSystemFeatures

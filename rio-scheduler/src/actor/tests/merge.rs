@@ -8011,7 +8011,7 @@ async fn test_stale_skipped_output_reset() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.dedup]
+// r[verify sched.merge.dedup+2]
 /// Re-probe completion fan-out: B1 merges {X} (Ready, no worker). X's
 /// output is then seeded locally. B2 merges {X}: re-probe finds X in
 /// store → X transitions →Completed. B1 must ALSO be notified
@@ -8054,7 +8054,7 @@ async fn test_reprobe_completion_fans_out_to_earlier_build() -> TestResult {
     assert_eq!(
         s1.state,
         rio_proto::types::BuildState::Succeeded as i32,
-        "r[sched.merge.dedup]: re-probe completion of shared X must fan out \
+        "r[sched.merge.dedup+2]: re-probe completion of shared X must fan out \
          to B1 (was: B1 stayed Active, completed_count=0, hung)"
     );
     Ok(())

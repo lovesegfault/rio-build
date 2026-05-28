@@ -2107,7 +2107,7 @@ fn cascade_rejected_parent_promoted_not_stuck() {
     );
 }
 
-// r[verify sched.merge.dedup]
+// r[verify sched.merge.dedup+2]
 /// H2 regression (P0399): merge a new node X depending on
 /// pre-existing Skipped Y. compute_initial_states must return X as
 /// Ready, not Queued.

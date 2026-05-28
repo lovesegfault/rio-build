@@ -743,15 +743,59 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
 
 = Multi-Build DAG Merging
 
-#r("sched.merge.dedup")[
+#r("sched.merge.dedup+2")[
   The scheduler maintains a single global DAG across all concurrent build
-  requests. When a new derivation DAG arrives from the gateway, it is merged
-  into the global graph:
-  - *Input-addressed derivations*: deduplicated by store path
-  - *#gls("ca", display: "Content-addressed") derivations*: deduplicated by @modular-hash
-    (as computed by `hashDerivationModulo` --- excludes output paths, depends
-    only on the derivation's fixed attributes)
+  requests. When a new derivation DAG arrives, it is merged into the global
+  graph: nodes are deduplicated by `drv_hash`, which ingress binds to the
+  declared `.drv` store path
+  (#rref("sched.merge.ingress-identity-binding")), so submissions of the same
+  `.drv` share one node regardless of submitter.
 ]
+
+The DAG key is the `.drv` store path for every node shape — including
+#gls("ca", display: "content-addressed") derivations. Equivalent CA content
+built from textually different `.drv`s is not collapsed at the DAG: that
+dedup happens through realisations keyed by the 32-byte @modular-hash
+(`ca_modular_hash`, as computed by `hashDerivationModulo` --- excludes output
+paths, depends only on the derivation's fixed attributes), which drives the
+CA early-cutoff rules. Earlier revisions of this rule described the CA case
+as "deduplicated by modular hash"; that described the realisation layer, not
+the DAG key.
+
+#r("sched.merge.ingress-identity-binding")[
+  `SubmitBuild` ingress MUST reject any node whose `drv_hash` is not exactly
+  the declared `drv_path`, whose `ca_modular_hash` is neither empty nor 32
+  bytes, or which sets `is_fixed_output` without `is_content_addressed`.
+]
+
+The DAG, the persisted `derivations` row, the HMAC assignment claims, and the
+authoritative-content / identity conflict gates are all keyed by `drv_hash`,
+while edges, dispatch, and recovery resolve the declared `drv_path`. The
+gateway always submits the two equal; only a hostile or buggy direct
+submitter can split them — registering a node under someone else's
+predictable DAG key while pointing `drv_path` at a decoy the workers would
+fetch, or aliasing one path onto two keys to corrupt the reverse index.
+Binding them at ingress makes every downstream gate reason about one
+identity. The two flag checks are declaration consistency: a malformed-length
+`ca_modular_hash` would otherwise be silently dropped at the domain boundary,
+and `is_fixed_output` without `is_content_addressed` would skip the CA gates.
+Ingress deliberately does NOT require `ca_modular_hash` to be present for CA
+nodes (the gateway's hash population is best-effort and FOD-only fallbacks may
+omit it) and does NOT forbid it on non-CA nodes (deferred-IA nodes carry one).
+
+#r("sched.merge.ingress-edge-endpoints")[
+  `SubmitBuild` ingress MUST reject any edge whose `parent_drv_path` or
+  `child_drv_path` is not the `drv_path` of a node in the same request.
+]
+
+The merge edge loop resolves endpoints through the global path index, so an
+unconstrained edge could attach dependencies to *other* submitters' resident
+nodes — a failing junk child would then seed `DependencyFailed` onto a node
+its owner never coupled to it — and an edge naming a path that resolves
+nowhere only surfaced as an opaque `Internal` at persist time. Every
+legitimate producer already satisfies the rule: the gateway emits each edge
+together with its parent node and includes every child as a node of the same
+request, and the hook fallback submits a single node with no edges.
 
 #r("sched.merge.dep-failed-transitive")[
   When a newly-merged node transitively depends on a node already in a
@@ -2353,7 +2397,7 @@ CREATE INDEX builds_status_idx ON builds (status) WHERE status IN ('pending', 'a
 CREATE TABLE derivations (
     derivation_id       UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id           UUID REFERENCES tenants(tenant_id) ON DELETE SET NULL,  -- nullable; single-tenant mode leaves NULL
-    drv_hash            TEXT NOT NULL,          -- input-addressed: store path; CA: modular derivation hash
+    drv_hash            TEXT NOT NULL,          -- the declared .drv store path (== drv_path, ingress-enforced); CA identity lives in realisations
     drv_path            TEXT NOT NULL,          -- full /nix/store/...-foo.drv path
     pname               TEXT,
     system              TEXT NOT NULL,

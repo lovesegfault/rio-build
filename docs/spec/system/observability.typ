@@ -32,7 +32,7 @@ pagination, and TTL retention.
   how many builds are interested in the derivation.
 ]
 
-A derivation is built once even if N builds want it (`sched.merge.dedup`), so
+A derivation is built once even if N builds want it (`sched.merge.dedup+2`), so
 keying by `(build_id, drv_hash)` would write N PG rows pointing at one blob ---
 or, in the prior model, N copies of the blob under N keys. Keying by
 `(drv_hash, exec_id)` stores the log once and lets `build_derivations.exec_id`

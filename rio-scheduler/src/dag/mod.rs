@@ -1,9 +1,11 @@
 //! In-memory derivation DAG.
 //!
 //! The DAG tracks all derivation nodes and their dependency edges across all
-//! concurrent builds. Nodes are deduplicated by `drv_hash` (input-addressed:
-//! store path; CA: modular derivation hash). Each node tracks which builds
-//! are interested in it.
+//! concurrent builds. Nodes are deduplicated by `drv_hash`, which SubmitBuild
+//! ingress binds to the declared `.drv` store path (`drv_path`); CA content
+//! identity is tracked separately via the 32-byte modular hash
+//! (`ca_modular_hash`), which keys realisations, not the DAG. Each node
+//! tracks which builds are interested in it.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -971,6 +973,14 @@ impl DerivationDag {
         }
 
         // Insert edges
+        //
+        // SubmitBuild ingress guarantees both endpoints of every edge name
+        // nodes of the same request (sched.merge.ingress-edge-endpoints),
+        // so in production these lookups only miss on path aliasing (a
+        // node joined under a different drv_path than the resident one)
+        // or when merge() is driven by a non-gRPC caller. The warn-skip
+        // stays as the last line of defense: an unresolved endpoint must
+        // not attach edges to nodes the submission never declared.
         for edge in edges {
             // Edges reference drv_path; resolve to drv_hash
             let Some(parent_hash) = self

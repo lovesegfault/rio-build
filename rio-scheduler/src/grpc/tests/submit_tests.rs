@@ -66,6 +66,168 @@ async fn test_submit_build_rejects(#[case] mutate: fn(&mut Req), #[case] expecte
     );
 }
 
+// r[verify sched.merge.ingress-identity-binding]
+/// The DAG (and every conflict/identity gate, the persisted row, the HMAC
+/// claims) is keyed by drv_hash while edges, dispatch, and recovery resolve
+/// the declared drv_path. A direct submitter must not be able to park a node
+/// under someone else's predictable DAG key while pointing drv_path at an
+/// unrelated decoy — ingress requires the two to be equal.
+#[tokio::test]
+async fn test_submit_build_rejects_drv_hash_path_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("hash-path-mismatch");
+    // Key the node under a DIFFERENT (well-formed) .drv path than the one
+    // it declares for fetching — the squat-with-decoy-path shape.
+    node.drv_hash = make_node("victim-key").drv_path;
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status
+            .message()
+            .contains("drv_hash must equal the declared drv_path"),
+        "error should name the hash/path binding: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-identity-binding]
+/// ca_modular_hash is identity evidence (merge-gate identity matching,
+/// realisation keying, persisted for recovery). A non-empty value that is
+/// not exactly 32 bytes is malformed — reject it at ingress instead of
+/// silently coercing it to "no evidence" at the domain boundary.
+#[tokio::test]
+async fn test_submit_build_rejects_malformed_ca_modular_hash_length() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("bad-ca-hash-len");
+    node.is_content_addressed = true;
+    node.ca_modular_hash = vec![0xAB; 16];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("ca_modular_hash"),
+        "error should name ca_modular_hash: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-identity-binding]
+/// is_content_addressed is derived as floating-CA OR fixed-output by the
+/// gateway; a FOD that claims not to be content-addressed would skip the CA
+/// gates downstream and is never a legitimate submission.
+#[tokio::test]
+async fn test_submit_build_rejects_fod_without_ca_flag() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let mut node = make_node("fod-flag-mismatch");
+    node.is_fixed_output = true;
+    node.is_content_addressed = false;
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("is_content_addressed"),
+        "error should name the missing flag: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-edge-endpoints]
+/// An edge whose parent is not a node of this request would attach a
+/// dependency to ANOTHER submitter's resident node via the global path
+/// index (cross-tenant interference). Reject at ingress.
+#[tokio::test]
+async fn test_submit_build_rejects_edge_with_foreign_parent() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let node = make_node("edge-own-child");
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: make_node("someone-elses-node").drv_path,
+        child_drv_path: node.drv_path.clone(),
+    };
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![edge],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("edge parent"),
+        "error should name the foreign parent: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-edge-endpoints]
+/// An edge whose child is not a node of this request either couples this
+/// submission to a foreign resident node or names a path that resolves
+/// nowhere (which previously surfaced as an opaque Internal at persist
+/// time). Reject at ingress.
+#[tokio::test]
+async fn test_submit_build_rejects_edge_with_foreign_child() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let node = make_node("edge-own-parent");
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: node.drv_path.clone(),
+        child_drv_path: make_node("not-submitted-dep").drv_path,
+    };
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![edge],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("edge child"),
+        "error should name the foreign child: {}",
+        status.message()
+    );
+}
+
+// r[verify sched.merge.ingress-edge-endpoints]
+/// Positive case: a request whose edge relates two of its own nodes (the
+/// only shape the gateway produces) passes ingress and reaches the actor.
+#[tokio::test]
+async fn test_submit_build_accepts_in_request_edge() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let parent = make_node("edge-ok-parent");
+    let child = make_node("edge-ok-child");
+    let edge = rio_proto::types::DerivationEdge {
+        parent_drv_path: parent.drv_path.clone(),
+        child_drv_path: child.drv_path.clone(),
+    };
+    grpc.submit_build(Request::new(Req {
+        nodes: vec![parent, child],
+        edges: vec![edge],
+        ..Default::default()
+    }))
+    .await
+    .expect("in-request edge must pass ingress");
+}
+
 // r[verify sched.tenant.resolve+2]
 /// SubmitBuild with a tenant name not in the tenants table → InvalidArgument.
 /// Proto field carries tenant NAME (from gateway's authorized_keys comment);

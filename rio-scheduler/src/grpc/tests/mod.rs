@@ -13,7 +13,7 @@
 
 use super::*;
 use crate::MIGRATOR;
-use crate::actor::tests::{make_node, setup_actor};
+use crate::actor::tests::setup_actor;
 // P0356: the trait impls moved to scheduler_service.rs / worker_service.rs.
 // `use super::*` no longer pulls in `SchedulerService` / `ExecutorService` /
 // `Request` as a side effect; tests call the trait methods on
@@ -21,6 +21,20 @@ use crate::actor::tests::{make_node, setup_actor};
 use rio_proto::SchedulerService;
 use rio_test_support::TestDb;
 use tonic::Request;
+
+/// Ingress-conforming node builder for the gRPC-layer test suite.
+///
+/// SubmitBuild ingress requires `drv_hash == drv_path`
+/// (sched.merge.ingress-identity-binding), so these submodules use this
+/// builder instead of the actor-level `make_node` — whose tag-style
+/// `drv_hash` is convenient for DAG-level assertions but never reaches
+/// ingress validation. Same tag-derived `drv_path` as the shared fixture;
+/// only the DAG key differs (it equals the path, as the gateway submits it).
+pub(super) fn make_node(tag: &str) -> rio_proto::types::DerivationNode {
+    let mut node = crate::actor::tests::make_node(tag);
+    node.drv_hash = node.drv_path.clone();
+    node
+}
 
 /// Bootstrap PG + actor + pool-less [`SchedulerGrpc`]. Absorbs the
 /// `TestDb::new` → `setup_actor` → `SchedulerGrpc::new_for_tests`

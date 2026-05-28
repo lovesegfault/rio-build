@@ -425,7 +425,8 @@ message SubmitBuildRequest {
 
 message DerivationNode {
   string drv_path = 1;             // Store path of the .drv file
-  string drv_hash = 2;             // Input-addressed: store path; CA: modular hash
+  string drv_hash = 2;             // Scheduler DAG key == the declared .drv store path (ingress-enforced);
+                                   //   CA content identity lives in ca_modular_hash, which keys realisations.
   string pname = 3;                // Package name (for duration estimation)
   string system = 4;               // e.g. "x86_64-linux"
   repeated string required_features = 5;
