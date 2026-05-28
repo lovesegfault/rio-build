@@ -174,7 +174,7 @@ service StoreService {
   rpc GetPath(GetPathRequest) returns (stream GetPathResponse);
   rpc QueryPathInfo(QueryPathInfoRequest) returns (PathInfo);
   rpc BatchQueryPathInfo(BatchQueryPathInfoRequest) returns (BatchQueryPathInfoResponse);  // I-110 batch: one ANY(...) PG query per BFS layer
-  rpc BatchGetManifest(BatchGetManifestRequest) returns (BatchGetManifestResponse);        // I-110c batch: prime FUSE-warm hint cache
+  rpc BatchGetManifest(BatchGetManifestRequest) returns (BatchGetManifestResponse);        // batch narinfo + manifest-availability lookup
   rpc FindMissingPaths(FindMissingPathsRequest) returns (FindMissingPathsResponse);
   rpc QueryPathFromHashPart(QueryPathFromHashPartRequest) returns (PathInfo);  // wopQueryPathFromHashPart (29)
   rpc AddSignatures(AddSignaturesRequest) returns (AddSignaturesResponse);     // wopAddSignatures (37)
@@ -211,8 +211,27 @@ ANY($1)` reduced it \~130×.
 // callers fan out GetChunk to reassemble NARs from their manifests.
 service ChunkService {
   rpc GetChunk(GetChunkRequest) returns (stream GetChunkResponse);
+  rpc GetChunks(stream GetChunksRequest) returns (stream ChunkData);   // P0568 batched bidi
 }
+```
 
+#r("proto.chunk.batch-bidi")[
+  `GetChunks` is a bidi stream so the castore-FUSE fill task can pipeline
+  local-cache misses to the server as it discovers them, instead of
+  front-loading a full chunk-list `stat()` scan before the first request. The
+  server fans out concurrent backend reads and yields each `ChunkData` in
+  *completion order*, not request order; `ChunkData.digest` keys the response
+  --- clients MUST match by content address, never by position. Any chunk error
+  aborts the whole stream with a gRPC status (`INVALID_ARGUMENT` for a
+  malformed digest, `NOT_FOUND` for a missing chunk, `DATA_LOSS` for a chunk
+  that fails BLAKE3 verification, `UNAVAILABLE` for a transient backend error);
+  the client retries only the digests it didn't receive. A `NOT_FOUND` for a
+  manifest-listed chunk MUST be treated as an integrity failure on the consumer
+  side --- the file cannot be assembled, and the build fails infrastructure-side
+  rather than retrying indefinitely.
+]
+
+```protobuf
 // store.proto — administrative RPCs. Separate service from StoreService
 // so it can have distinct RBAC/TLS (admin ops are more privileged than
 // PutPath/GetPath). The scheduler's AdminService.TriggerGC proxies to

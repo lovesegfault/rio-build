@@ -5,10 +5,18 @@
   paper: (
     title: [Lazy Store Filesystem],
     supertitle: "ARCHITECTURE DECISION RECORD",
-    status: "Accepted (Path A — EROFS + fscache)",
+    status: "Superseded — see ADR-022 Design Overview (castore-FUSE)",
     date: "2026-02",
   ),
 )
+
+#info(title: [Status])[
+  Superseded: the spike work surfaced a third candidate (Path C,
+  composefs-style — castore-FUSE metadata + passthrough-fd data) that won on
+  owned-code and operational simplicity. The accepted design lives in the
+  ADR-022 Design Overview (markdown, predates the typst migration). This
+  document is kept as the original A-vs-B comparison record.
+]
 
 #info(title: [Scope])[
   Deep technical comparison of the two phase-2 candidates from
@@ -166,8 +174,8 @@ is the Apache-2.0 Rust reference.
 
 == Builder mount sequence
 
-Replacing #(refs.gh)("rio-builder/src/fuse/mod.rs:494")
-`mount_fuse_background()`:
+Replacing the JIT-FUSE `mount_fuse_background()` (deleted with
+`rio-builder/src/fuse/` in the castore cutover):
 
 ```rust
 pub fn mount_erofs_background(mount_point: &Path, cache_dir: &Path,
@@ -260,7 +268,7 @@ struct cachefiles_read {    // OP_READ payload
 )
 
 *rio-builder daemon* (`tokio::io::unix::AsyncFd`, not `mio` like Nydus, to
-share the runtime with #(refs.gh)("rio-builder/src/fuse/fetch/")):
+share the runtime with #(refs.gh)("rio-builder/src/store_fetch.rs")):
 
 ```rust
 async fn fscache_upcall_loop(dev: File, clients: StoreClients,
@@ -830,7 +838,7 @@ _correct about runtime simplicity_ but undersells three things:
   file in 2 wk with no KASAN splats, B's risk estimate drops and the week-4
   decision has real data on both sides.
 + *Keep FUSE as the fallback* behind the existing flag throughout — all three
-  share #(refs.gh)("rio-builder/src/fuse/fetch/").
+  share the store-fetch core, #(refs.gh)("rio-builder/src/store_fetch.rs").
 
 = Rationale
 
@@ -845,7 +853,7 @@ load.
 
 The mitigations are layered, and the kernel-filesystem choice doesn't change
 them — both A and B funnel cold misses through the same userspace fetch path
-(#(refs.gh)("rio-builder/src/fuse/fetch/")):
+(#(refs.gh)("rio-builder/src/store_fetch.rs")):
 
 - *Fetch timeout.* `fetch_extract_insert` wraps the entire
   gRPC-fetch-plus-stream-drain in `GRPC_STREAM_TIMEOUT` (300 s). A stalled
@@ -935,9 +943,8 @@ Our code:
 - #(refs.gh)("rio-store/src/grpc/put_path/"), #(refs.gh)("rio-store/src/cas.rs"),
   #(refs.gh)("rio-store/src/chunker.rs"), #(refs.gh)("rio-store/src/manifest.rs")
 - #(refs.gh)("rio-proto/proto/types.proto")
-- #(refs.gh)("rio-builder/src/fuse/mod.rs"),
-  #(refs.gh)("rio-builder/src/fuse/ops.rs"),
-  #(refs.gh)("rio-builder/src/fuse/fetch/"),
+- #(refs.gh)("rio-builder/src/castore_fuse/"),
+  #(refs.gh)("rio-builder/src/store_fetch.rs"),
   #(refs.gh)("rio-builder/src/overlay.rs")
 
 Background:

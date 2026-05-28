@@ -106,6 +106,45 @@ narinfo.
     verify-on-put and PostgreSQL's own storage guarantees).
 ]
 
+= Ingest Tree Bounds (castore validation boundary)
+
+#r("store.ingest.tree-bounds+2")[
+  Every NAR/castore ingest entry point --- `PutPath`, `PutPathBatch`, the
+  substituter, and `PutPathChunked` --- MUST enforce one shared set of
+  tree-shape bounds before any side effect: directory nesting depth
+  (`MAX_NAR_DEPTH`), whole-archive entry count (`MAX_NAR_ENTRIES`),
+  cumulative materialized index bytes --- joined entry paths plus symlink
+  targets --- (`MAX_NAR_INDEX_BYTES`), entry-name and symlink-target
+  lengths, and per-directory entry counts; buffered NAR input that the
+  parser does not consume entirely MUST be rejected; and the serving-side
+  caps named here --- `GetPath`'s regeneration-walk node cap and the
+  chunk-count cap `MAX_CHUNKS` --- MUST be derived from --- and be at
+  least as permissive as --- the same constants, so that "ingest accepts
+  ⇒ the committed path can be regenerated through `GetPath` and
+  re-ingested" holds structurally.
+]
+
+The constants live in `rio_nix::nar` (the NAR reader is the definitional
+consumer: anything it would reject must never be committable) and are
+enforced at the two chokepoints every ingest path goes through ---
+`nar_ls` for NAR-byte ingest and the castore `TreeWalk` for Directory-DAG
+ingest --- rather than per-RPC. Without the whole-archive bounds the
+per-axis limits compose badly: a few-hundred-MB NAR can legally expand to
+tens of GB of materialized index (\~350× amplification), a node count the
+serving walk refuses commits paths that read as `DATA_LOSS` forever, and
+a nesting depth the readers reject can never be substituted or imported
+again. Trailing bytes after the root node are rejected for the same
+reason: the claimed `nar_hash` covers them, the persisted castore content
+does not, so the regenerated NAR could never hash back to its narinfo.
+
+The recursive `GetDirectory` result cap is deliberately outside this
+contract: that walk serves a builder's whole input closure in one call
+(the FUSE mount-time prefetch), so its bound is per-walk rather than
+per-path and no relation to the per-path ingest constants would make
+"accepted ⇒ mountable" structural --- see the `TODO` at
+`GET_DIRECTORY_MAX_RESULTS` in `rio-store/src/grpc/directory.rs` for what
+closing that gap would take (paging the walk, not raising the cap).
+
 = Chunk Manifest Format
 
 #r("store.manifest.format")[
@@ -389,7 +428,7 @@ treats the live set as a presence signal: presence remains keyed on
   [Batch narinfo lookup, one PG round-trip (#rref("store.api.batch-query"))],
 
   [`BatchGetManifest(paths)`],
-  [Batch (narinfo, manifest) lookup, 1 PG round-trip
+  [Batch narinfo + manifest-availability lookup, 1 PG round-trip
     (#rref("store.api.batch-manifest"))],
 
   [`FindMissingPaths(paths)`],
@@ -424,15 +463,14 @@ treats the live set as a presence signal: presence remains keyed on
   per-path → batch swap was the 130× scale unlock.
 ]
 
-#r("store.api.batch-manifest+2")[
+#r("store.api.batch-manifest+3")[
   `BatchGetManifest` returns `(store_path, Option<ManifestHint>)` for many
-  paths in ONE PostgreSQL round-trip (`LEFT JOIN manifest_data`). A
-  `ManifestHint` carries the full `PathInfo` plus either `inline_blob` or the
-  `(blake3_hash, size)` chunk list. Same local-only / DoS-bound / validation /
-  end-user-tenant-rejection rules as #rref("store.api.batch-query"). I-110c:
-  the builder issues this once per build (#rref("builder.warmgate.manifest-prime"))
-  so each subsequent `GetPath` can supply `manifest_hint` and skip both PG
-  lookups.
+  paths in ONE PostgreSQL round-trip. A `ManifestHint` carries the path's
+  `PathInfo`; it is present only for paths with a complete manifest and never
+  carries manifest content (a per-file chunk list cannot reassemble a NAR
+  without the Directory DAG --- clients that want the NAR call `GetPath`).
+  Same local-only / DoS-bound / validation / end-user-tenant-rejection rules
+  as #rref("store.api.batch-query").
 ]
 
 #r("store.api.hash-part+2")[
@@ -855,8 +893,11 @@ its admitting floor; the derivation owns the repair --- no new rejection.
   `upgrade_manifest_to_chunked` deletes the staged placeholder rows, leaving
   the staged chunks unreferenced for the collect cycle. I-125a: a
   phantom-drained builder used to leak the placeholder until the orphan scanner
-  reaped it (15 min); the builder side polls for that case per
-  #rref("builder.upload.aborted-poll").
+  reaped it (15 min); the builder treats that `Aborted` as a transient error
+  inside its normal upload retry budget --- by the next attempt this drop-path
+  cleanup has released the placeholder, or the concurrent upload finished and
+  the retry lands as an idempotent skip
+  (#rref("builder.upload.aborted-poll")).
 ]
 
 = NAR Reassembly
@@ -872,23 +913,6 @@ its admitting floor; the derivation owns the repair --- no new rejection.
     above)
   - Stream the reassembled NAR to the client without materializing the full NAR
     in memory
-]
-
-#r("store.get.manifest-hint+2")[
-  When `GetPathRequest.manifest_hint` is set with a non-null `info`, `GetPath`
-  bypasses BOTH PG lookups (`query_path_info` and `get_manifest`) and streams
-  directly from the supplied `(PathInfo, chunk-list-or-inline-blob)`. The hint
-  MUST be for the requested path (`hint.info.store_path == req.store_path`,
-  else `INVALID_ARGUMENT`), structurally well-formed (32-byte chunk hashes,
-  valid `PathInfo`), and bounded by `MAX_CHUNKS` and `MAX_NAR_SIZE`
-  (`INVALID_ARGUMENT` if exceeded); a hint with `info=None` falls through to
-  PG. Safety: the post-stream whole-NAR SHA-256 verify checks the reassembled
-  bytes against `hint.info.nar_hash`, so a stale or forged hint surfaces as
-  `DATA_LOSS` exactly like a corrupt `manifest_data` row would; chunks are
-  content-addressed and BLAKE3-verified in `get_verified`, so a hint cannot
-  read chunks the client doesn't already know the hash of. I-110c: with
-  #rref("store.api.batch-manifest") priming the builder, this collapses \~2 PG
-  hits/input to zero on the JIT-fetch hot path.
 ]
 
 #r("store.get.size-sanity-check")[
@@ -1057,6 +1081,46 @@ unique chunks.
 CA `Realisation` objects carry their own ed25519 signatures over the tuple
 `(drv_hash, output_name, output_path, nar_hash)`. This provides integrity for
 content-addressed output mappings independently of narinfo signatures.
+
+= Castore RPC Surface (ADR-022)
+
+snix-compatible Directory/Blob surface backed by `directories`/`file_blobs`
+(populated by `metadata::set_nar_index_in_conn` inside the manifest-complete
+transaction); serves the castore-FUSE builder.
+
+#r("store.castore.blob-stat")[
+  `StatBlob(file_digest, send_chunks=true)` returns the `ChunkMeta[]` (digest,
+  size) list spanning that file's bytes, resolved server-side via `file_blobs`
+  → manifest chunk-cumsum. snix `BlobService.Stat` wire-compatible. The
+  builder's castore-FUSE `open()` calls this for files above the streaming
+  threshold.
+]
+
+#r("store.castore.tenant-scope")[
+  `GetDirectory`/`HasDirectories`/`HasBlobs`/`ReadBlob`/`StatBlob` MUST be
+  tenant-scoped: queries resolve a digest to its containing store path(s)
+  (`directory_paths` / `file_blobs.store_path_hash`) and join `path_tenants`
+  on the caller's `tenant_id` (from JWT `Claims.sub` or HMAC
+  `AssignmentClaims.tenant`, #rref("common.hmac.claims")). `path_tenants` is
+  the single source of tenancy truth at read time. Return NotFound for
+  digests the caller's tenant cannot reach via any owned path. Directory
+  bodies
+  leak child names/digests --- cross-tenant exposure here is a confidentiality
+  issue, unlike the chunk-level surface (see "Cross-Tenant Chunk Probing" in
+  the security spec). `GetChunks` is *not* tenant-scoped: a 32-byte BLAKE3
+  chunk digest is unguessable and is only disclosed via tenant-scoped
+  `StatBlob`/`ReadBlob` or by self-computing it from bytes the caller already
+  holds --- knowing the digest is the read capability. Adding a `chunk_tenants`
+  JOIN would cost dedup-hot-path PG round-trips for no confidentiality gain.
+]
+
+#r("store.castore.gc")[
+  `directories` rows are refcounted (one increment per referencing manifest).
+  `file_blobs` and `directory_paths` are `(digest, store_path_hash)` junctions
+  with `ON DELETE CASCADE` from `manifests` --- GC of one referrer
+  cascade-deletes its rows, surviving referrers' rows remain, so
+  `ReadBlob`/`StatBlob` never resolve to a dead manifest.
+]
 
 = Upstream Cache Substitution
 

@@ -145,12 +145,6 @@ to lazily fetch @store-path content on demand.
   `aarch64-linux` so the setting is inert.
 ]
 
-#r("builder.fuse.cache-ephemeral-memory")[
-  The SQLite cache index is `:memory:` --- the pod's filesystem is discarded
-  after the single build, so persistence is pointless, and on tiny-class node
-  storage on-disk writes cost >1s each (I-141).
-]
-
 #r("builder.nar.entry-name-safety")[
   NAR directory entry names MUST be rejected at parse time if empty, equal to
   `.` or `..`, or containing `/` or NUL. This matches the Nix C++ reference
@@ -266,7 +260,7 @@ classification helper (`jit_classify`) is unchanged.
   retry loop is not abandoned.
 ]
 
-#r("builder.fuse.retry-jitter")[
+#r("builder.fuse.retry-jitter+2")[
   The JIT fetch retry loop MUST apply per-attempt full jitter (`delay ×
   U(0.5, 1.5)`) to the `RETRY_BACKOFF` schedule, and MUST treat
   `tonic::Code::Aborted` as transient (retry) alongside
@@ -276,24 +270,8 @@ classification helper (`jit_classify`) is unchanged.
   and then retries at the same instant --- without jitter the retry IS the
   herd, and a fixed 7.6 s budget exhausts. The store returns `Aborted` for
   retryable PG conflicts (Serialization, Deadlock) with explicit retry intent;
-  without it in the transient set the no-manifest-hint fallback path EIOs
-  immediately on PG contention.
-]
-
-#r("builder.fuse.lookup-caches+2")[
-  The FUSE daemon is implemented using the `fuser` crate and runs as part of
-  the builder process (not a sidecar). It handles:
-  - `lookup`: *Top-level lookups* (direct children of the FUSE root, i.e.,
-    store basenames like `abc...-hello`) consult the per-build JIT allowlist
-    (see #rref("builder.fuse.jit-lookup")). Names that ARE registered inputs
-    MUST be materialized (whole store-path tree on disk) before returning ---
-    the kernel caches the lookup attr with 1h TTL and never calls `getattr`,
-    so child lookups (`lookup(busybox_ino, "bin")`) would hit an empty cache →
-    ENOENT otherwise. *Child lookups* (inside an already-materialized tree)
-    hit local disk directly with `symlink_metadata` --- no gRPC.
-  - `getattr`: Return file metadata from cached path info
-  - `read`/`readlink`/`readdir`: Serve content from local SSD cache, fetching
-    from rio-store on cache miss
+  without it in the transient set the JIT fetch path EIOs immediately on PG
+  contention.
 ]
 
 #r("builder.fuse.listxattr-empty")[
@@ -406,11 +384,24 @@ affect the FUSE daemon implementation:
 - Mount configuration uses a `Config` struct with `mount_options:
   Vec<MountOption>`, `acl: SessionACL` (replaces `MountOption::AllowOther`
   with `SessionACL::All`), `n_threads`, and `clone_fd`.
-- Passthrough API: `KernelConfig::set_max_stack_depth(1)` in `init()`,
+- Passthrough API: `KernelConfig::add_capabilities(InitFlags::FUSE_PASSTHROUGH)`
+  *and* `KernelConfig::set_max_stack_depth(1)` in `init()` --- *both* are
+  required; `set_max_stack_depth` does not imply the capability flag, and
+  without it the kernel never sets `fc->passthrough` so `BACKING_OPEN` is
+  unconditionally `EPERM` (P0578 spike finding, `vm-composefs-spike-priv` Q8).
   `ReplyOpen::open_backing(impl AsFd) -> Result<BackingId>`,
   `ReplyOpen::opened_passthrough(FileHandle, FopenFlags, &BackingId)`.
-  `BackingId` must be kept alive (via a map keyed by file handle) until
-  `release()`.
+  *One* `BackingId` per inode, refcounted across all open `fh`s and dropped
+  on the last `release()` --- a second concurrent passthrough open whose
+  `fuse_backing` differs from the inode's recorded `fi->fb` is rejected with
+  `-EBUSY` → user-visible `EIO`, and overlay copy-up issues several lower
+  opens in one syscall (P0578 spike finding, `vm-composefs-spike-priv` Q10).
+  The `FopenFlags` passed to `opened_passthrough()` MUST be a subset of the
+  kernel's `FOPEN_PASSTHROUGH_MASK` (`{PASSTHROUGH, DIRECT_IO,
+  PARALLEL_DIRECT_WRITES, NOFLUSH}`); in particular `FOPEN_KEEP_CACHE` is
+  rejected with user-visible `EIO` (P0578 spike finding, `vm-composefs-spike-priv`
+  Q7) --- passthrough bypasses the FUSE inode page cache, so KEEP_CACHE is a
+  contradiction.
 
 #info(title: [Fallback architecture])[
   If the FUSE+overlay spike (Phase 1a) fails, the fallback is a bind-mount
@@ -728,10 +719,12 @@ seeds it), so the two surfaces partition the loss exactly.
 After build completes:
 
 + Read new paths from upper layer
-+ Chunk and upload to rio-store (@cas). Each `PutPath` request carries the
-  scheduler-issued HMAC @assignment-token in the `x-rio-assignment-token` gRPC
-  metadata header; the store verifies the token and rejects uploads for paths
-  not in `claims.expected_outputs` (see #rref("common.hmac.claims+3"))
++ Walk each output once (NAR SHA-256, reference scan, castore Directory DAG,
+  FastCDC chunk manifest) and upload all outputs in one `PutPathChunked`
+  client stream (@cas). The request carries the scheduler-issued HMAC
+  @assignment-token in the `x-rio-assignment-token` gRPC metadata header; the
+  store verifies the token and rejects uploads for paths not in
+  `claims.expected_outputs` (see #rref("common.hmac.claims+3"))
 + Register path metadata (@narinfo, references)
 + Discard upper layer
 
@@ -744,18 +737,21 @@ pod's emptyDir.
 
 == Multi-Output Derivation Upload
 
-#r("builder.upload.idempotent-precheck")[
-  Before uploading, the builder batch-checks all scanned outputs via
-  `FindMissingPaths`. Outputs already present in the store (`'complete'`
-  manifest exists) are skipped --- `QueryPathInfo` fetches the existing
-  `nar_hash`/`nar_size` instead of re-reading disk + re-streaming the NAR. The
-  skip is *best-effort*: if `FindMissingPaths` errors (store transient), all
+#r("builder.upload.idempotent-precheck+2")[
+  Before walking or uploading anything, the builder batch-checks all scanned
+  outputs via `FindMissingPaths`. When EVERY output is already present in the
+  store (`'complete'` manifest exists), the walk and the upload are skipped
+  entirely --- `QueryPathInfo` fetches the existing `nar_hash`/`nar_size`
+  instead of re-reading disk. When only SOME outputs are present, all outputs
+  still travel in the one `PutPathChunked` `Begin` frame (a missing output may
+  reference a present sibling, and the store only accepts references inside
+  `input_closure ∪ Begin.outputs`); the present outputs cost no chunk bytes
+  because their chunks are already durable and never enter `novel`. The skip
+  is *best-effort*: if `FindMissingPaths` errors (store transient), all
   outputs fall back to the upload path and #rref("store.put.idempotent")
-  catches duplicates server-side. The skip saves the pre-scan disk read, the
-  NAR-stream disk read, and the gRPC stream setup --- NOT a correctness
-  requirement. Emits
+  catches duplicates server-side --- NOT a correctness requirement. Emits
   #(refs.metric)("rio_builder_upload_skipped_idempotent_total") per skipped
-  output.
+  output (pre-check skip or server-side `created = false`).
 ]
 
 #r("builder.upload.multi-output")[
@@ -764,90 +760,78 @@ pod's emptyDir.
   + *Detect outputs*: Scan the overlay upper layer for all new store paths. A
     multi-output derivation produces one path per output (e.g.,
     `/nix/store/abc...-hello`, `/nix/store/def...-hello-dev`).
-  + *NAR each output*: Serialize each output path independently into a NAR
-    archive.
-  + *Chunk*: Split each NAR into content-addressed chunks (matching
-    rio-store's chunk size).
-  + *Upload*: Upload chunks to rio-store in parallel across outputs.
-    Deduplicate against existing chunks (CAS).
-  + *Register*: Register each output path's NAR hash, NAR size, references,
-    and deriver with rio-store. Signatures are sent empty --- output signing
-    is done store-side.
+  + *Walk each output*: one fused pass per output computes the NAR SHA-256,
+    the reference scan, the castore Directory DAG, and the per-file FastCDC
+    chunk manifest (matching rio-store's chunk parameters).
+  + *Upload*: send every output in one `PutPathChunked` stream. Deduplicate
+    against existing chunks (CAS) --- only `HasChunks`-missing chunk bodies go
+    on the wire.
+  + *Register*: the `Begin` frame carries each output path's NAR hash, NAR
+    size, references, and deriver. Signatures are sent empty --- output
+    signing is done store-side.
 ]
 
-#r("builder.upload.references-scanned")[
-  Before the retry loop, `upload_output` performs a *pre-scan pass*: a single
-  extra disk read through `RefScanSink` only (no hash, no network). The NAR is
-  dumped via `dump_path_streaming` into the scanner, which finds every
-  candidate hash part embedded anywhere in the stream (including inside
-  binaries, RPATH strings, symlink targets, directory names). The candidate
-  set is the *transitive input closure* ∪ `drv.outputs()`: every path
-  reachable via BFS over store references from the derivation's inputs, plus
-  all of this derivation's own outputs (for self-references and cross-output
-  references). This matches Nix's `computeFSClosure`
-  (`derivation-building-goal.cc:444,450` / `derivation-builder.cc:1335-1344`).
-  A build can legitimately embed any transitively-reachable path --- e.g.
-  `hello-2.12.2` references `glibc`, which is not a direct input but arrives
-  via `closure(stdenv)`. The resolved reference list is *sorted* (affects the
-  narinfo signature fingerprint --- must be deterministic).
+#r("builder.upload.references-scanned+2")[
+  The reference scan is fused into the output walk: the full canonical NAR
+  byte sequence (file contents AND framing --- entry names, symlink targets)
+  feeds `RefScanSink`, which finds every candidate hash part embedded anywhere
+  in the stream (including inside binaries, RPATH strings, symlink targets,
+  directory names). The candidate set is the *transitive input closure* ∪ the
+  derivation's own output paths: every path reachable via BFS over store
+  references from the derivation's inputs, plus the sibling outputs (for
+  self-references and cross-output references). This matches Nix's
+  `computeFSClosure` (`derivation-building-goal.cc:444,450` /
+  `derivation-builder.cc:1335-1344`) and is exactly the candidate set the
+  store's verify task re-scans with (#rref("store.put.refs-sync")) --- the
+  closure half is the `Begin.input_closure` echo, preferred from
+  `WorkAssignment.input_closure` (the attested list behind the token's
+  `input_closure_digest`), falling back to the locally-computed closure when
+  the assignment carries none. A build can legitimately embed any
+  transitively-reachable path --- e.g. `hello-2.12.2` references `glibc`,
+  which is not a direct input but arrives via `closure(stdenv)`. The resolved
+  reference list is *sorted* (affects the narinfo signature fingerprint ---
+  must be deterministic).
 ]
 
 #r("builder.upload.deriver-populated")[
-  `PathInfo.deriver` is set to the `.drv` store path of the derivation that
-  produced this output. The deriver is the same for all outputs of a
-  multi-output derivation.
+  `Begin.deriver` is set to the `.drv` store path of the derivation that
+  produced these outputs; the store records it as each output's narinfo
+  deriver. The deriver is the same for all outputs of a multi-output
+  derivation.
 ]
 
-#info(title: [Pre-scan cost])[
-  The scan is a separate disk read before the first upload attempt. Retries do
-  NOT re-scan (the scan result is deterministic). The Boyer-Moore skip-scan
-  over the restricted @nixbase32 alphabet does \~memcpy speed on binary
-  sections (skips \~31/32 bytes); a 4 GiB output adds \~4s wall time on NVMe.
-  If this becomes measurable, the escape hatch is a trailer-refs protocol
-  extension (send refs in `PutPathTrailer` instead of the first `PathInfo`
-  message) --- deferred to a later phase.
+#r("builder.upload.batch+3")[
+  ALL of a derivation's outputs travel in ONE `PutPathChunked` client stream
+  and the store commits them in ONE database transaction. If any output fails
+  validation or verification, zero outputs are registered --- atomic per
+  #rref("store.atomic.multi-output"). Every output is walked (path parse,
+  reference scan, chunking) BEFORE the first byte is sent, so a local prep
+  failure on output $k$ cannot leave outputs $0..k-1$ committed. The stream
+  timeout scales with output count (`GRPC_STREAM_TIMEOUT × N`, capped at
+  `MAX_BATCH_OUTPUTS`). The upload retries up to `MAX_UPLOAD_RETRIES` on
+  transient errors --- a failed `PutPathChunked` commits nothing, so each
+  retry restarts from scratch: re-probe `HasChunks` and re-stream the novel
+  chunk bodies (the walk results are reused). Deterministic rejections
+  (`InvalidArgument`, `FailedPrecondition`, `PermissionDenied`) fail
+  immediately without burning the retry budget.
 ]
 
-#r("builder.upload.batch+2")[
-  For *multi-output derivations (≥2 outputs)*, the builder uses
-  `PutPathBatch`: all outputs stream serially on one RPC, the store commits
-  them in ONE database transaction. If any output fails validation, zero
-  outputs are registered --- atomic per #rref("store.atomic.multi-output").
-  All per-output prep (path parse, reference scan) is done BEFORE the first
-  byte is sent, so a local prep failure on output $k$ cannot leave outputs
-  $0..k-1$ committed. The batch RPC's stream timeout scales with output count
-  (`GRPC_STREAM_TIMEOUT × N`, capped at `MAX_BATCH_OUTPUTS`). Batch retries up
-  to `MAX_UPLOAD_RETRIES` on transient errors; on `FailedPrecondition` it
-  falls through to independent `PutPath` calls (pre-P0267 behavior:
-  `buffer_unordered(MAX_PARALLEL_UPLOADS)`, no cross-output atomicity).
-]
-
-For *single-output derivations*, the builder uses independent `PutPath`
-directly (atomicity is vacuous for one output).
+Single-output derivations use the same `PutPathChunked` flow (atomicity is
+simply vacuous for one output).
 
 *Upload failure handling:* If the upload to rio-store fails (S3 unavailable,
 network timeout), the builder retries the upload with exponential backoff (up
-to `MAX_UPLOAD_RETRIES` (8) attempts). If all upload retries are exhausted,
-the builder reports an `InfrastructureFailure` to the scheduler. The scheduler
+to `MAX_UPLOAD_RETRIES` (8) attempts). `Aborted: concurrent PutPath`
+(placeholder contention with another uploader of the same path) is treated as
+one of these transient errors: the store's drop-path cleanup
+(#rref("store.put.drop-cleanup+2")) releases a stale placeholder well within
+the retry window, and a finished concurrent upload turns the retry into an
+idempotent `created = false` skip. If all upload retries are exhausted, the
+builder reports an `InfrastructureFailure` to the scheduler. The scheduler
 may reassign the derivation to a different builder, which must rebuild from
 scratch --- there is no mechanism to transfer the completed output from the
 original builder's local overlay. This is a known limitation; the completed
 output on the original builder is lost when the overlay is discarded.
-
-#r("builder.upload.aborted-poll")[
-  When `PutPath` returns `Aborted` with message containing `"concurrent
-  PutPath"`, the builder polls `QueryPathInfo` with backoff (1s, 2s, 4s, 8s,
-  16s ≈ 31s total) before falling back to a fresh upload attempt. If the path
-  appears, the builder adopts the store's `PathInfo` as its upload result
-  (#(refs.metric)("rio_builder_uploads_total")`{status="adopted"}`) --- output
-  paths are derivation-addressed, so the contending uploader's content is
-  identical. If the poll exhausts, the contending placeholder has likely been
-  released by the store's drop-path cleanup (#rref("store.put.drop-cleanup+3"))
-  and the next upload attempt succeeds. `QueryPathInfo` errors during the poll
-  are treated as not-found (logged, keep polling). Other `Aborted` reasons (GC
-  mark serialization, admin cancel) keep the plain retry without polling.
-  I-125b.
-]
 
 = Store Database Management
 
@@ -1248,13 +1232,13 @@ builder will fail to start.
 
 = FUSE Passthrough Mode (Linux 6.9+)
 
-#r("builder.fuse.passthrough")[
-  Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which
-  allows the FUSE daemon to hand off file descriptors to backing files. For
-  cached store paths on local SSD, passthrough mode bypasses the
-  kernel-userspace context switch entirely, providing near-native I/O
-  performance.
-]
+Linux 6.9 introduced FUSE passthrough mode (`FUSE_PASSTHROUGH`), which allows
+the FUSE daemon to hand off file descriptors to backing files. For cached
+store paths on local SSD, passthrough mode bypasses the kernel-userspace
+context switch entirely, providing near-native I/O performance. The normative
+castore-FUSE passthrough requirements live in ADR-022
+(`builder.fs.passthrough-on-hit`, `builder.fs.passthrough-stack-depth`); this
+section keeps the kernel background and the spike findings.
 
 This is relevant to the FUSE daemon because the warm-cache path (store paths
 already fetched to local SSD) is the most performance-critical. With
@@ -1297,9 +1281,10 @@ findings:
   files once will not.
 
 *Implications for the FUSE daemon design:*
-- The FUSE cache (`fuse/cache.rs`) should maintain open file handles for
-  cached paths, not just the path data. When a file is opened via `open()`,
-  register a passthrough backing fd and keep it alive until eviction.
+- The FUSE cache (the `castore_fuse/open.rs` Opener over the mountd-owned
+  backing cache) should maintain open file handles for cached paths, not just
+  the path data. When a file is opened via `open()`, register a passthrough
+  backing fd and keep it alive until eviction.
 - `max_stack_depth` must be set to 1 in `init()`. Setting it to 2 allows the
   FUSE mount itself to be used as the lower layer of an overlayfs (which is
   the production layout: FUSE lower + SSD upper).
@@ -1391,42 +1376,18 @@ is stable (post Phase 3).
   no finish-if-you-can mode).
 ]
 
-#r("builder.cancel.pre-cgroup-deferred+2")[
+#r("builder.cancel.pre-cgroup-deferred+3")[
   A cancel (the SIGTERM-abort) that arrives before the per-build cgroup
-  exists (`cgroup.kill` → ENOENT) MUST leave the cancelled flag set. The executor MUST check the flag
-  before the prefetch/register phase and abort with `Cancelled` status without
-  spawning nix-daemon. The pre-cgroup window is overlay setup → resolve →
-  prepare_sandbox → register_inputs + prefetch_manifests --- sub-second since
-  the I-043 redesign deleted the warm phase (which I-165 showed could stall
-  for tens of minutes). The misclassification risk (a later unrelated `Err`
-  reported as `Cancelled`) is the lesser evil vs. an unkillable builder
-  burning `activeDeadlineSeconds` of compute.
-]
-
-= Just-in-time Input Fetch
-
-#r("builder.fuse.jit-register")[
-  The executor MUST register the build's input closure (basename → nar_size,
-  the projection of `compute_input_closure`'s result) on the FUSE cache via
-  `register_inputs()` after `compute_input_closure` and before daemon spawn.
-  This arms the FUSE `lookup()` allowlist and is the ONLY signal `lookup()`
-  uses to decide whether a top-level name may trigger a store fetch.
-]
-
-#r("builder.fuse.jit-lookup")[
-  Top-level FUSE `lookup` for a name in the registered input set MUST block on
-  `ensure_cached` with a per-path timeout of at least `nar_size /
-  JIT_MIN_THROUGHPUT_BPS` (size-scaled, floored at `fuse_fetch_timeout`;
-  I-178: a flat 60 s aborted a 1.9 GB input mid-fetch). On any fetch failure
-  it MUST return `EIO` (NEVER `ENOENT`) --- overlayfs `ovl_lookup` propagates
-  a lower's non-ENOENT error to the caller without caching a negative dentry;
-  an `ENOENT` would be negative-cached and the daemon's retry would never
-  re-ask FUSE → `MiscFailure` → `PermanentFailure` poison (the I-043 failure
-  mode). For a name NOT in the registered set (and not already on local disk),
-  `lookup` MUST return `ENOENT` immediately without contacting the store ---
-  daemon `.lock`/`.chroot`/`.check` probes, output-path pre-checks, and
-  `.links` all land here. This is a pure allowlist: builds cannot read store
-  paths outside their declared input closure (hermeticity).
+  exists (`cgroup.kill` → ENOENT) MUST leave the cancelled flag set. The
+  executor MUST check the flag before committing to the castore mount and
+  abort with `Cancelled` status without spawning nix-daemon. The pre-cgroup
+  window is resolve → castore mount (mountd handshake + Directory-DAG
+  prefetch, bounded by `dag_prefetch_timeout`) → overlay setup →
+  prepare_sandbox --- normally a few seconds, but the DAG prefetch can run
+  up to its full budget under a slow store, which is why the flag check
+  sits before the mount. The misclassification risk (a later unrelated
+  `Err` reported as `Cancelled`) is the lesser evil vs. an unkillable
+  builder burning `activeDeadlineSeconds` of compute.
 ]
 
 = Completion Delivery
@@ -1473,21 +1434,24 @@ a pod that dies before its report (second installment / establishment). The
 build-task sink itself remains (build tasks never lose a send because the
 scheduler is unreachable; delivery retries live in the report loop).
 
-#r("builder.result.input-enoent-is-infra+2")[
-  When the nix-daemon returns `MiscFailure` with an error message indicating a
-  missing input path (`getting attributes of path '<p>'`) and `<p>`'s basename
-  matches an entry in the build's computed input closure, the builder MUST
-  report `BuildResultStatus::InfrastructureFailure` (not `PermanentFailure`).
-  The input was verified present in rio-store by `compute_input_closure`; its
-  absence at sandbox-setup time is a worker-local materialization failure (JIT
-  fetch EIO, overlay negative-dentry race), not a build defect. I-178b: the
-  matcher MUST strip ANSI SGR escapes before parsing (the daemon colors the
-  path) and MUST match by basename only --- the daemon reports the overlay
-  path (`/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), not the bare
-  store path the closure holds. The errno suffix is NOT load-bearing: both `No
-  such file or directory` and `Input/output error` (I-179) are
-  materialization failures.
-]
+Input-materialization failures are normatively governed by
+`r[builder.result.input-eio-is-infra]` (ADR-022 design overview §13): any
+`EIO` the build sandbox sees on a closure input from the castore-FUSE lower
+(fetch failure, integrity mismatch, tripped fetch circuit breaker, mountd
+rejection) --- and equally an `ENOENT` for a path that is in the computed
+input closure --- is reported as `BuildResultStatus::InfrastructureFailure`
+(not `PermanentFailure`): the input was verified present in rio-store by
+`compute_input_closure`, so its unreadability at sandbox-setup time is
+worker-local state, not a build defect. Implementation notes for the
+daemon-message matcher: nix-daemon phrases the failure as `getting
+attributes of path '<p>'` / `getting status of '<p>'` / `reading directory
+'<p>'` / `opening file '<p>'`; the matcher strips ANSI SGR escapes before
+parsing (the daemon colors the path) and matches `<p>` by basename only ---
+the daemon reports the overlay path
+(`/var/rio/overlays/<build_id>/nix/store/<hash>-<name>`), not the bare store
+path the closure holds (I-178b). The errno suffix is not load-bearing: both
+`No such file or directory` and `Input/output error` (I-179) are
+materialization failures.
 
 = Pull Client
 
@@ -1601,27 +1565,28 @@ abort first).
 the sigint abort law amended in lockstep with the exit-code law's fourth
 case and confirm path.*
 
-#r("builder.shutdown.fuse-abort")[
-  On the shutdown path, the builder MUST abort the FUSE connection (write `1`
-  to `/sys/fs/fuse/connections/<dev_minor>/abort`) BEFORE dropping the
-  `BackgroundSession`. The builder serves the FUSE mount (fuser threads) while
-  nix-daemon consumes it (overlay→FUSE `lstat` during JIT input fetch); if the
-  runtime tears down while the daemon's threads are parked in the kernel's
-  FUSE request queue, those threads enter uninterruptible D-state waiting for
-  a userspace reply that will never come (I-165: main thread zombie, 4×
-  D-state stat threads). Aborting the connection makes the kernel return
-  `ECONNABORTED`/`ENOTCONN` to all pending requests, unblocking the D-state
-  threads so the process can fully exit. fuser's `Mount::Drop` (via
-  `AutoUnmount` socket close → `fusermount -u` → lazy `MNT_DETACH`) does NOT
-  abort pending requests, and dropping `BackgroundSession` does NOT close
-  `/dev/fuse` (the fd is `Arc`-shared with the detached bg thread). The device
-  minor is captured at mount time --- statting the mountpoint at abort time
-  would itself queue a FUSE `getattr(ROOT)` behind the stuck requests. The
-  builder mounts `fusectl` itself if `/sys/fs/fuse/connections` is unpopulated
-  (I-165b: Bottlerocket + `hostUsers:false` containers don't inherit the
-  host's systemd-mounted fusectl, so the abort path was silently `None` and
-  the deadlock recurred); the mount is best-effort under the same
-  `CAP_SYS_ADMIN` the FUSE mount already requires.
+#r("builder.shutdown.fuse-abort+2")[
+  On per-build castore-FUSE teardown (and therefore on every shutdown path
+  that drops a live `CastoreSession`), the builder MUST abort the FUSE
+  connection (write `1` to `/sys/fs/fuse/connections/<dev_minor>/abort`)
+  BEFORE dropping the `BackgroundSession`. The builder serves the FUSE mount
+  (fuser threads) while nix-daemon consumes it through the overlay lower; if
+  the session tears down while the daemon's threads are parked in the
+  kernel's FUSE request queue, those threads enter uninterruptible D-state
+  waiting for a userspace reply that will never come (I-165: main thread
+  zombie, 4× D-state stat threads). Aborting the connection makes the kernel
+  return `ECONNABORTED`/`ENOTCONN` to all pending requests, unblocking the
+  D-state threads. rio-mountd's conn-close `MNT_DETACH` of the per-build
+  mountpoint is lazy and does NOT abort pending requests, and dropping
+  `BackgroundSession` does NOT close the handed-off `/dev/fuse` fd (mountd
+  keeps its own dup). The fusectl abort path is captured at mount time ---
+  statting the mountpoint at abort time would itself queue a FUSE
+  `getattr(ROOT)` behind the stuck requests. The builder mounts `fusectl`
+  itself if `/sys/fs/fuse/connections` is unpopulated (I-165b: Bottlerocket +
+  `hostUsers:false` containers don't inherit the host's systemd-mounted
+  fusectl, so the abort path was silently `None` and the deadlock recurred);
+  the mount is best-effort under the same `CAP_SYS_ADMIN` the overlay mount
+  already requires.
 ]
 
 = Key Files
@@ -1638,35 +1603,51 @@ case and confirm path.*
     [Build execution (spawns nix-daemon in mount namespace, drives protocol)],
 
     src("rio-builder/src/overlay.rs"), [overlayfs setup and teardown],
-    src("rio-builder/src/fuse/mod.rs"),
-    [FUSE daemon lifecycle, mount management, `NixStoreFs` struct],
+    src("rio-builder/src/castore_fuse/mod.rs"),
+    [Castore-FUSE lazy `/nix/store` lower: read-only `Filesystem` impl over
+      one build's input-closure Directory DAG],
 
-    src("rio-builder/src/fuse/ops.rs"),
-    [`Filesystem` trait implementation (all kernel callbacks: `lookup`,
-      `getattr`, `open`, `read`, `readlink`, `readdir`, `forget`, `init`,
-      `destroy`)],
+    src("rio-builder/src/castore_fuse/tree.rs"),
+    [Mount-time Directory-DAG prefetch + content-addressed inode table],
 
-    src("rio-builder/src/fuse/inode.rs"),
-    [Bidirectional inode↔path map with kernel `nlookup` refcounting],
+    src("rio-builder/src/castore_fuse/open.rs"),
+    [`open()` data path: backing-cache broker (whole-file ReadBlob fill,
+      passthrough on hit)],
 
-    src("rio-builder/src/fuse/lookup.rs"),
-    [Attribute helpers: `stat_to_attr`, `ATTR_TTL`, `BLOCK_SIZE`],
+    src("rio-builder/src/castore_fuse/stream.rs"),
+    [Streaming `open()` for large files (StatBlob + GetChunks during-fill)],
 
-    src("rio-builder/src/fuse/read.rs"),
-    [File-range read helper (`pread`) + `io::Error` → `Errno` translation],
+    src("rio-builder/src/castore_fuse/session.rs"),
+    [Client-side mount/serve assembly (`mount_and_serve`): mountd handshake,
+      DAG prefetch, fuser session lifecycle],
 
-    src("rio-builder/src/fuse/cache.rs"),
-    [LRU cache management (SQLite-indexed, SSD-backed)],
+    src("rio-builder/src/castore_fuse/circuit.rs"),
+    [Store-fetch circuit breaker for FUSE callbacks (`std::sync` only)],
 
-    src("rio-builder/src/fuse/fetch/"),
-    [`ensure_cached`: NAR fetch + extract from rio-store (prefetch +
-      on-demand)],
+    src("rio-builder/src/castore_fuse/sweep.rs"),
+    [Disk-pressure LRU sweep over the mountd-owned shared caches],
+
+    src("rio-builder/src/castore_fuse/mountd.rs"),
+    [`rio-mountd`: privileged per-node broker (FUSE mount + fd handoff,
+      BackingOpen/Promote, staging quotas)],
+
+    src("rio-builder/src/castore_fuse/mountd_client.rs"),
+    [Synchronous in-process client for the rio-mountd UDS protocol],
+
+    src("rio-builder/src/castore_fuse/mountd_proto.rs"),
+    [`SOCK_SEQPACKET` wire protocol (postcard `Request`/`Reply` + fd
+      passing)],
+
+    src("rio-builder/src/store_fetch.rs"),
+    [`StoreClients` + FUSE-independent store-fetch primitives shared by the
+      executor and the castore-FUSE],
 
     src("rio-builder/src/synth_db.rs"),
     [Synthetic SQLite DB generation for nix-daemon],
 
-    src("rio-builder/src/upload.rs"),
-    [Chunk and upload build outputs (streaming NAR → rio-store PutPath)],
+    src("rio-builder/src/upload/"),
+    [Walk, chunk, and upload build outputs (fused walk → rio-store
+      PutPathChunked)],
 
     src("rio-builder/src/log_stream.rs"),
     [Build log batching (64-line/100ms) for the rio-store log uploader],
@@ -1922,7 +1903,7 @@ accumulates.
 Mitigations: benchmark FUSE read latency (p50, p99) under concurrent load and
 compare against direct filesystem reads; the `fuser` crate supports
 multi-threaded FUSE dispatch; FUSE passthrough mode (Linux 6.9+,
-#rref("builder.fuse.passthrough")) eliminates the `read()` context switch by
+`builder.fs.passthrough-on-hit`) eliminates the `read()` context switch by
 handing off file descriptors to backing files for cached paths on local SSD;
 file handle caching keeps backing file handles open across reads --- builds
 that open many small files once won't benefit from passthrough alone, they

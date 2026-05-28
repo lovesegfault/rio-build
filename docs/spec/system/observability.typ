@@ -389,18 +389,21 @@ frozen with the CR gone.
 #r("obs.metric.input-materialization-failures")[
   #(refs.metric)("rio_builder_input_materialization_failures_total")
   (counter): incremented each time a daemon `MiscFailure` is reclassified as
-  `InfrastructureFailure` under #rref("builder.result.input-enoent-is-infra").
-  Sustained nonzero rate indicates `JIT_MIN_THROUGHPUT_BPS` is set above
-  actual store→builder throughput.
+  `InfrastructureFailure` under `r[builder.result.input-eio-is-infra]`
+  (ADR-022 design overview §13). Sustained nonzero rate means closure inputs
+  are failing to materialize from the castore-FUSE lower (store fetch
+  errors, integrity failures, or a tripped fetch circuit breaker) ---
+  correlate with #(refs.metric)("rio_builder_castore_fuse_eio_total") and
+  rio-store health.
 ]
 
 #r("obs.metric.transfer-volume")[
   Transfer-volume byte counters (`*_bytes_total`) are emitted at each hop:
   gateway (#(refs.metric)("rio_gateway_bytes_total")`{direction}`), store
   (`rio_store_{put,get}_path_bytes_total`), executor
-  (`rio_builder_{upload,fuse_fetch}_bytes_total`). Summing these across the
-  topology gives a full picture of data movement --- e.g.,
-  `rate(rio_builder_fuse_fetch_bytes_total[5m])` vs
+  (`rio_builder_{upload,castore_fuse_fetch}_bytes_total`). Summing these
+  across the topology gives a full picture of data movement --- e.g.,
+  `rate(rio_builder_castore_fuse_fetch_bytes_total[5m])` vs
   `rate(rio_builder_upload_bytes_total[5m])` shows whether an executor is
   input-bound or output-bound.
 ]
@@ -466,11 +469,10 @@ for HTTP request latencies. Build durations span seconds to hours, so
   (refs.metric)("rio_builder_upload_references_count"),
   [`[1, 5, 10, 25, 50, 100, 250, 500]` (count)],
 
-  [#(refs.metric)("rio_builder_fuse_fetch_duration_seconds"),
-    #(refs.metric)("rio_store_substitute_duration_seconds"),
+  [#(refs.metric)("rio_store_substitute_duration_seconds"),
     #(refs.metric)("rio_store_check_available_duration_seconds")],
-  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (@nar fetch + drain;
-    GB-scale paths via I-212 JIT span 60-127s)],
+  [`[0.01, 0.05, 0.1, 0.5, 1, 2.5, 5, 10, 30, 60, 120]` (@nar download +
+    ingest; GB-scale substitutions span 60s+)],
 )
 
 Histograms not listed here (e.g.,
