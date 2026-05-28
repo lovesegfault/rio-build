@@ -181,6 +181,40 @@ scope: with scope; ''
       )
       k3s_server.log(f"path_tenants: seeded tenant gc-tenant-test = {tenant_uuid}")
 
+      # P0560 stopgap (P0593 deletes): production code attributes only
+      # build OUTPUTS at completion time — exactly the upsert this
+      # subtest proves — and the fixture's rio_vmtest_* triggers
+      # (common.nix tenantStopgapSeedSql) deliberately skip tenants
+      # with a real retention window like this one (auto-attribution
+      # would vacuously satisfy the path_tenants assertion below and
+      # shield refs-end-to-end's backdated victims from sweep). So,
+      # in order:
+      #   1. Pre-upload the tenantDrv derivation closure (default key;
+      #      only the fresh .drv transfers — busybox is already
+      #      registered). Without this the .drv would be uploaded
+      #      DURING the nix-build below, after the one-shot INSERT, and
+      #      the builder's tenant-scoped castore read of its own .drv
+      #      EIOs → MiscFailure → max_infra_retries exhausted.
+      #   2. Hand gc-tenant-test everything registered at this point
+      #      (busybox seed, the .drv just copied, earlier .drvs) in one
+      #      explicit INSERT, so the build transfers nothing new and
+      #      the prefetch sees its whole input set.
+      # out_tenant still does not exist, so its (path, gc-tenant-test)
+      # row can only come from the completion-time upsert under test.
+      tenant_drv_path = client.succeed(
+          "nix-instantiate "
+          "--arg busybox '(builtins.storePath ${common.busybox})' "
+          "${tenantDrv} 2>/dev/null"
+      ).strip()
+      client.succeed(
+          f"nix copy --derivation --to 'ssh-ng://k3s-server' {tenant_drv_path}"
+      )
+      psql_k8s(k3s_server,
+          f"INSERT INTO path_tenants (store_path_hash, tenant_id) "
+          f"SELECT store_path_hash, '{tenant_uuid}' FROM narinfo "
+          f"ON CONFLICT DO NOTHING"
+      )
+
       # SSH Host alias for the tenant key. common.nix:362: ?ssh-key=
       # URL param is unreliable across Nix versions; the Host alias
       # in /root/.ssh/config overrides IdentityFile while inheriting

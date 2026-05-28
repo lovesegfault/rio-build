@@ -27,6 +27,9 @@
 # store-path string) for every mounted path, and mints an HMAC
 # assignment token (claims.tenant = that tenant) signed with the
 # fixture's hmac.key — the same header the production builder sends.
+# That explicit 'castore-vm' tenant only authorizes the serve-castore
+# sessions; the in-VM seed builds dispatched to the worker ride the
+# fixture's defaultTenant stopgap (see the wiring in default.nix).
 {
   pkgs,
   common,

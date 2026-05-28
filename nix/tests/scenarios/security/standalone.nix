@@ -91,11 +91,15 @@ pkgs.testers.runNixOSTest {
     # ══════════════════════════════════════════════════════════════════
     # SSH + tenant key setup
     # ══════════════════════════════════════════════════════════════════
-    # sshKeySetup creates id_ed25519 with -C "" (empty comment =
-    # single-tenant mode, tenant_id NULL — no rejection). seedBusybox
-    # and the HMAC build use this default key via ~/.ssh/config.
+    # The default id_ed25519 comes from the fixture's sshKeySetup
+    # (P0560 tenancy stopgap: comment = the fixture defaultTenant, so
+    # the hmac-positive build below is attributed to a real tenant and
+    # its tenant-scoped castore reads succeed). seedBusybox and the
+    # HMAC build use this default key via ~/.ssh/config. The
+    # empty-comment / NULL-tenant boundary is still covered by the
+    # id_anon key in tenant-resolve case 3.
 
-    ${common.sshKeySetup gatewayHost}
+    ${fixture.sshKeySetup or (common.sshKeySetup gatewayHost)}
 
     # ── THREE additional SSH keys with different comments ─────────────
     # For tenant resolution. Gateway matches by key_data, reads the
@@ -257,14 +261,22 @@ pkgs.testers.runNixOSTest {
         # ── Pre-seed the tenants table ────────────────────────────────
         # INSERT…RETURNING via psql() helper (-qtA: suppress status,
         # tuples-only, unaligned).
+        # gc_retention_hours = 0 opts team-test into the P0560 stopgap
+        # triggers (common.nix tenantStopgapSeedSql): the backfill
+        # trigger hands it the already-seeded inputs (busybox, .drvs)
+        # and the narinfo trigger keeps attributing new paths, so the
+        # team-test builds below can read their inputs through the
+        # tenant-scoped castore. This scenario never exercises GC
+        # retention, so 0 is semantically inert here.
         tenant_uuid = psql(
             ${gatewayHost},
-            "INSERT INTO tenants (tenant_name) VALUES ('team-test') RETURNING tenant_id",
+            "INSERT INTO tenants (tenant_name, gc_retention_hours) "
+            "VALUES ('team-test', 0) RETURNING tenant_id",
         )
         ${gatewayHost}.log(f"seeded tenant team-test = {tenant_uuid}")
 
         # hmac-positive above ran one build via the default id_ed25519
-        # (empty comment → NULL tenant). Capture the count NOW so case
+        # (fixture defaultTenant comment). Capture the count NOW so case
         # deltas are relative to this baseline.
         initial_count = build_count()
         ${gatewayHost}.log(f"initial builds count: {initial_count}")
@@ -302,15 +314,28 @@ pkgs.testers.runNixOSTest {
         print("tenant case 2 PASS: unknown tenant rejected pre-insert")
 
         # ── Case 3: empty comment → tenant_id IS NULL ─────────────────
-        out = build_drv("/root/.ssh/id_anon", "${tenantAnonDrv}")
-        assert out.startswith("/nix/store/"), (
-            f"anon build should succeed: {out!r}"
+        # P0560: a NULL-tenant build can no longer COMPLETE — the
+        # builder's castore reads (GetDirectory/ReadBlob/StatBlob) are
+        # fail-closed tenant-scoped and the assignment token of an
+        # unattributed build carries no tenant claim. The attribution
+        # boundary is still the thing under test, so this case asserts
+        # SUBMISSION semantics only: the gateway accepts the anon key,
+        # the scheduler inserts the build with tenant_id NULL, and we
+        # cancel it so the doomed dispatch doesn't occupy the worker
+        # for the remaining subtests. Phase 8 (P0590) retires the
+        # NULL-tenant mode; this case then changes to "empty comment
+        # resolves to the `default` tenant".
+        client.execute(
+            "nohup nix-build --no-out-link "
+            "--store 'ssh-ng://root@${gatewayHost}?ssh-key=/root/.ssh/id_anon' "
+            "--arg busybox '(builtins.storePath ${common.busybox})' "
+            "${tenantAnonDrv} > /tmp/anon-submit.log 2>&1 < /dev/null &"
         )
-        assert "rio-test-sec-tenant-anon" in out, (
-            f"output path should contain drv marker: {out!r}"
-        )
+        # Poll via the psql()-backed build_count() helper (driver retry)
+        # instead of a raw `sudo -u postgres psql` shell pipeline.
+        retry(lambda _: build_count() >= initial_count + 2, timeout_seconds=120)
         assert build_count() == initial_count + 2, (
-            "case 3 should insert one more build"
+            "case 3 should insert exactly one more build"
         )
         db_tenant = psql(
             ${gatewayHost},
@@ -320,7 +345,38 @@ pkgs.testers.runNixOSTest {
         assert db_tenant == "NULL", (
             f"empty-comment key → tenant_id IS NULL, got {db_tenant!r}"
         )
-        print("tenant case 3 PASS: empty comment = single-tenant mode (NULL)")
+        # Clean up: cancel the un-runnable NULL-tenant build and reap
+        # the backgrounded client process. The cancel must actually
+        # land (succeed, not best-effort): the doomed dispatch is
+        # infra-retrying on the single worker and would keep it
+        # occupied for the remaining subtests. CancelBuild on an
+        # already-terminal build still returns OK (Ok(false) in
+        # handle_cancel_build), so this cannot flake on a race with a
+        # terminal failure.
+        anon_build_id = psql(
+            ${gatewayHost},
+            "SELECT build_id FROM builds ORDER BY submitted_at DESC LIMIT 1",
+        )
+        ${gatewayHost}.succeed(
+            "grpcurl -plaintext -max-time 10 "
+            "-protoset ${protoset}/rio.protoset "
+            f"-d '{{\"buildId\": \"{anon_build_id}\", \"reason\": \"vm-test-anon-cleanup\"}}' "
+            "localhost:9001 rio.scheduler.SchedulerService/CancelBuild"
+        )
+        client.execute("pkill -f 'ssh-key=/root/.ssh/id_anon' || true")
+        # Don't hand the worker to the next subtest until the scheduler
+        # has nothing dispatched any more — otherwise the cancelled
+        # NULL-tenant derivation can still hold the slot when the
+        # __noChroot / rate-limit builds arrive (occupied-worker flake).
+        retry(
+            lambda _: psql(
+                ${gatewayHost},
+                "SELECT COUNT(*) FROM derivations "
+                "WHERE status IN ('assigned', 'running')",
+            ) == "0",
+            timeout_seconds=120,
+        )
+        print("tenant case 3 PASS: empty comment = single-tenant mode (NULL) at submission")
 
     # ══════════════════════════════════════════════════════════════════
     # Section: gateway validation
