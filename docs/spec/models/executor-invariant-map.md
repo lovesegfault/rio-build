@@ -3937,3 +3937,108 @@ lines. Scoped to `rio-scheduler/src`: 52 files, +1791/−23526 — net
 +763/−7547 — net −6784. Net-negative as required; no deviation.
 Per-commit figures are in the deletion commits' messages
 (A: −14771, B: −5886, C: −1982).
+
+### T-1c'.8 — the 1c' scheduler.typ spec sweep (the deferred retire/re-state batch)
+
+Recorded by the slice-1c' spec-sweep batch. This is the scheduler.typ
+retirement/re-statement work the deletion commits A–C deferred (commit
+A's recorded deviation), plus the AD4 lease amendments
+(spec-consequence item 1), the C2 resolution (item 2), the C4
+sla-sizing fix (item 4), and the as-built protocol/operator-surface
+prose. Spec-consequence checklist status after this batch: item 1
+(AD4) — done here; item 2 (C2) — done here (the deregister rule
+retired with the machinery; the contradiction record stays as
+history); item 3 (C3) — done at deletion commit C; item 4 (C4) — done
+here; item 5 (warm-gate / intent-match retirements) — done at
+deletion commit B; item 6 (the 0b verify-marker re-points) — done at
+T-1c'.5. The checklist is fully discharged.
+
+#### Per-rule disposition table
+
+Retired with retirement records in place of the rule blocks (15 — the
+records name the surviving carrier of each rule's load-bearing
+content):
+
+| Rule | Carrier named in the retirement record |
+|---|---|
+| `sched.actor.dispatch-decoupled`, `sched.dispatch.became-idle-immediate` | no dispatch pass / heartbeat intake left to pace; pull admission shape + `sweep_ready_cached`'s probed-generation bound |
+| `sched.heartbeat.adopt`, `sched.heartbeat.phantom-drain` | binding durable from the fenced mint; establishment sweep + pod-terminal report for the lost-completion half; recovery/sweep store-probe adopt arms |
+| `sched.freeze-detector`, `sched.dispatch.unroutable-system` | spawn-side visibility (`queued_by_system`, the AD2 `NoEligibleSource` arm, the controller's Job census) |
+| `sched.admin.hung-node-detector` | `ctrl.nodeclaim.wedge-cluster` (OA2); `dead_nodes` empty until the 1d sweep |
+| `sched.executor.session-epoch` | per-unary token↔intent binding + `exec_id`-keyed attempt rows + report idempotency |
+| `sched.executor.deregister-reassign` (C2), `sched.executor.liveness-window`, `sched.executor.repair-precedence`, `sched.backstop.timeout` | the re-keyed one-classifier-wins discipline: report retry loop / pod-terminal report / establishment sweep arming, report+completion idempotency, no-attempt no-op, synthesized-verdict closes, platform liveness bounds (Job deadline, controller reap graces, establishment window), standby/fence inertness |
+| `sched.termination.deadline-exceeded` | worker `TimedOut` path owns promotion/budget/terminal; controller deadline reports are charge-free second-installment fills; establishment sweep classifies the silent case |
+| `sched.ephemeral.no-redispatch-after-completion`, `sched.assign.resource-fit` | the race/fit problems cannot form: no dispatch pass, pod sized from its own solved intent |
+
+Re-stated (tracey bump; every impl/verify marker re-pointed in the
+same commit): `sched.dispatch.soft-features+2`,
+`sched.dispatch.fod-to-fetcher+2` (kind boundary at spawn:
+`kind_for_drv` + pool kind filter + per-intent token),
+`sched.dispatch.fod-builtin-any-arch+2`,
+`sched.dispatch.substitute-complete-inline+2` (inline ready-set store
+probe), `sched.executor.one-shot+2` (one intent / one open attempt /
+one report / one exit; new impl marker at the builder pull loop),
+`sched.reassign.no-promote-on-ephemeral-disconnect+5` (the requeue
+chokepoint never bumps the floor), `sched.lease.generation-fence+3`
+(AD4: the transaction-side fence — impl markers at the fenced mint,
+the establishment charge and the admit_pull advisory check; the
+builder latch markers removed; verify on the fault-leader regime
+check), `sched.lease.claim-before-advertise+2` (AD4: claim-before-serve
+— impl at the recovery claim-target site, verify on the fault-leader
+regime check). Unchanged with prose touch-ups only (no bump):
+`sched.executor.input-bounds+2` (the bounds-table prose now describes
+the pull surface), `sched.timeout.per-build`,
+`sched.actor.single-owner`, `sched.lease.standby-drops-writes`,
+`ctrl.terminated.deadline-exceeded+3`, `gw.conn.cancel-on-disconnect+2`
+(each judged not a bump — normative content unchanged — and recorded
+in the introducing commit messages).
+
+Marker re-points executed outside the rules above:
+`sched.executor.liveness-window`'s three impl markers moved to the
+rules that own the constants they sit on
+(`ctrl.ephemeral.reap-orphan-running+3`,
+`ctrl.ephemeral.reap-excess-pending+3`, `builder.heartbeat.rpc-timeout`);
+`sched.executor.repair-precedence`'s impl on the completed→completed
+guard moved to `sched.completion.idempotent`; the retry-kernel
+BackstopTimeout fold arm keeps its behaviour as the historical-row arm
+but no longer carries the retired rule's marker; gateway/xtask comment
+references to retired rules re-pointed at their surviving bounds.
+
+#### Prose brought to the as-built protocol
+
+scheduler.typ's intro/responsibilities/algorithm walkthrough, the
+actor message-flow figure, the failure-modes table and partition
+prose, the Pull-Mode section (re-titled, coexistence framing dropped),
+the backpressure intro, the no-double-count enforcement note, the
+Leader Transition Protocol and recovery-sequence steps, and the
+split-brain pricing now describe pull-only delivery, the durable
+open-attempt row, the establishment sweep, and the transaction-side
+fence; failure-modes.typ (system) and controller.typ/fetcher.typ/
+gateway.typ cross-references likewise. sla-sizing.typ's `@alg-pool`
+unhealthy-node arm cites `ctrl.nodeclaim.wedge-cluster` instead of the
+retired `dead_nodes` aggregation (C4 closed).
+
+#### Known leftovers (deliberately not taken by this batch)
+
+- `sched.backpressure.hysteresis` still enumerates the
+  BuildExecution/LogBatch intake arms; those surfaces formally leave
+  at the 1d proto sweep and the rule should be re-stated there.
+- `sched.retry.per-executor-budget+3` (retry campaign) still lists the
+  correlation-TTL sweep and the backstop among its establishment
+  vehicles; only the establishment sweep exists. Owner: the retry
+  campaign's next touch of that rule.
+- `sched.log.phase-binding` / `sched.log.path-length+2` still describe
+  the stream-carried BuildPhase surface (their impl markers survive on
+  the actor-side gate); 1d owns the surface's fate.
+- builder.typ's stream-runtime rules (relay/drain/heartbeat family)
+  are 1d scope (T-1d.1), untouched here.
+- Observed spec↔code divergence flagged for the owner: the
+  `sched.sla.reactive-floor+2` clause "controller-reported
+  OomKilled/EvictedDiskPressure/DeadlineExceeded MUST call
+  bump_floor_or_count" currently has no production caller — the legacy
+  `ReportExecutorTermination` intake is a no-op stub and the
+  `ReportAttemptOutcome` second-installment fill deliberately changes
+  no floor or budget, so a pod-level OOM/eviction/deadline kill no
+  longer promotes the floor (the worker-reported `CgroupOom`/`TimedOut`
+  arms still do). Either the second-installment path gains the promote
+  arms or the rule is re-derived; not adjudicated by this batch.
