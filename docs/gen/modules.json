@@ -766,6 +766,11 @@
       "doc": "Serde types for the v1 replay-archive members."
     },
     {
+      "path": "archive/writer.rs",
+      "depth": 1,
+      "doc": "Staging-directory writer for v1 replay archives."
+    },
+    {
       "path": "cmd/",
       "depth": 0,
       "doc": "Subcommand implementations live here, one submodule per subcommand."

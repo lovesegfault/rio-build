@@ -27,15 +27,22 @@ pub fn archive_id_from_manifest_bytes(manifest_bytes: &[u8]) -> String {
 }
 
 /// The short id: the first 16 hex characters of a full archive id (used in
-/// S3 prefixes, campaign pins, and operator output).
+/// S3 prefixes, campaign pins, and operator output). The input must be a
+/// full 64-hex archive id, never an already-shortened one.
 pub fn short_id(archive_id: &str) -> String {
+    debug_assert!(
+        archive_id.len() == 64 && archive_id.bytes().all(|b| b.is_ascii_hexdigit()),
+        "short_id expects a full 64-hex archive id, got {archive_id:?}"
+    );
     archive_id.chars().take(16).collect()
 }
 
 /// Canonical listing digest: one line per entry, `"<store path> <digest>"`,
 /// sorted lexicographically by store path, joined with `"\n"`, with a
 /// trailing newline; the digest of an empty listing is the SHA-256 of the
-/// empty string. Entry order in the input does not matter.
+/// empty string. Entry order in the input does not matter. The line format
+/// needs no escaping because entries are store paths and lowercase hex
+/// digests, neither of which can contain a space or a newline.
 pub fn listing_digest(entries: &[(String, String)]) -> String {
     if entries.is_empty() {
         return EMPTY_LISTING_DIGEST.to_string();
@@ -78,6 +85,12 @@ mod tests {
         let forward = listing_digest(&[a.clone(), b.clone()]);
         let reversed = listing_digest(&[b.clone(), a.clone()]);
         assert_eq!(forward, reversed);
+
+        // Format pinning: the digest is the SHA-256 of the literal
+        // "<path> <digest>\n" line per entry in sorted order, so the
+        // canonical encoding cannot drift silently.
+        let pinned = sha256_hex(format!("{} {}\n{} {}\n", a.0, a.1, b.0, b.1).as_bytes());
+        assert_eq!(forward, pinned);
 
         // Changing a single character of one per-entry digest changes the
         // listing digest.
