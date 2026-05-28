@@ -3119,7 +3119,9 @@ else in the v3 gate list is green in CI-wired form at this tree.
 
 Recorded by the slice-1c batch (Phase-1 plan v3, T-1c.1–T-1c.3;
 T-1c.2b is a separate task and is explicitly NOT covered by this
-record — see the open-items note at the end of the record). Under the
+record — see the open-items note at the end of the record; the
+T-1c.2b batch later added its own record as the per-check disposition
+table subsection below). Under the
 2026-05-27 directive the production fleet flip and every observation
 read from it are deployment-time checklist rows (D0/D2/D3/D6); this
 record carries the development-time artifacts the deployment-time
@@ -3237,7 +3239,99 @@ defaults, not capabilities:
   `netpol`). Their re-point (or disposition) is T-1c.2b, which is NOT
   part of this batch; until it lands, the pull path's VM coverage is
   the explicitly-Pull pools of the `pull-mode`, `pull-canary`, and
-  `pull-fetcher` subtests.
+  `pull-fetcher` subtests. (Executed: the T-1c.2b record below carries
+  the per-check disposition table and which of these pins were
+  removed.)
+
+### The T-1c.2b VM-corpus disposition table (per-check; the deletion-wave contract)
+
+Recorded by the T-1c.2b batch. Every VM check in `nix/tests/default.nix`
+is dispositioned below. The table is the contract the 1c' deletion wave
+executes against (AD6 both directions, P13): deletion commit A
+(T-1c'.2) may not land while any KEEP-STREAM row marked
+*pending-harness* remains unresolved, and every KEEP-STREAM row marked
+*retires-with-machinery* names the deletion commit that takes the
+subtest (and its stream pin) out with it.
+
+Dispositions:
+
+- **RE-POINT** — the check's builder executors run the pull path after
+  this task (the Stream pin it relied on is removed); assertions that
+  read stream observables were re-pointed to their pull equivalents.
+- **KEEP-STREAM** — the check (or the named arm/subtest) deliberately
+  keeps exercising the stream path until the deletion wave removes that
+  machinery. Two flavors, named per row: *retires-with-machinery* (the
+  subtest is itself stream-machinery coverage and is deleted/re-stated
+  by the named deletion commit, replacement coverage named) and
+  *pending-harness* (the assertions are dispatch-mode-independent but
+  the standalone harness cannot deliver work over the pull protocol
+  yet — see the standalone-corpus note below the table).
+- **MODE-INDEPENDENT** — the check exercises no builder executors (or
+  none exist in its fixture), so the dispatch protocol is not part of
+  what it verifies; unaffected by the cutover.
+- **ALREADY-PULL** — was already exercising the pull path before this
+  task (the 1a/1b/1c additions).
+
+| Check | What it exercises (dispatch-relevant) | Disposition | Notes |
+|---|---|---|---|
+| `vm-lifecycle-core-k3s` | jwt-mount-present / health-shared / pool-lifecycle (no builds); cancel-cgroup-kill + build-timeout build via the chart pool | RE-POINT | Chart default pool is Pull once the `vmtest-full.yaml` pin is gone. cancel-cgroup-kill re-pointed at the AD5 cancel chain (attempt closed → controller foreground-deletes the Job → SIGTERM abort → cgroup.kill): open-attempt observation guard before the cancel, 90 s composite bound, structural `status='cancelled'` assertion, and a longer cancel sleeper so the bound stays below the sleep. build-timeout is unchanged (the worker-side per-drv deadline is mode-independent). Overlaps the pull-canary cancel arm by design — this one runs under the default (3600 s probe-deadline) values. |
+| `vm-lifecycle-gc-k3s` | gc-dry-run / gc-sweep / refs-end-to-end build via the chart pool; assertions are PG/store-side | RE-POINT | Delivery flips with the values default; no assertion changes. |
+| `vm-lifecycle-recovery-k3s` | recovery (leader kill mid-build), store-rollout | RE-POINT | The post-failover "worker re-registered" wait (`rio_scheduler_workers_active >= 1`) is replaced by a structural pull-path assertion: the in-flight slow build's execution row carries `dispatch_mode='pull'`. Re-registration has no pull analogue (reports are unary and need no session); report acceptance after failover is covered by the existing end-of-subtest drain plus the post-recovery build. |
+| `vm-lifecycle-autoscale-k3s` | ephemeral-pool (Pool CR, Job-per-build, runaway guard), pull-mode | RE-POINT (ephemeral-pool) + ALREADY-PULL (pull-mode) | The ephemeral Pool CR's Stream pin is removed — the CR now omits `dispatchMode`, exercising the CRD absent-means-Pull default end-to-end. The `wait_workers_zero` precondition is replaced by the pod-level precondition the pull-mode fragment already uses (pull pods never register). |
+| `vm-pull-canary-k3s` | stream-baseline arm; pull equivalence / cancel / preempt / establishment arms; pull-fetcher | ALREADY-PULL (pull arms) + KEEP-STREAM, retires-with-machinery (stream-baseline arm) | The stream-vs-pull retry-feed equivalence needs a stream pool until the stream path is deleted. The pin moves from the corpus default to `values/vmtest-pull-canary.yaml` (`poolDefaults.dispatchMode: Stream`, that check only). Retired by deletion commit A (T-1c'.2) together with the baseline arm itself; the pull arms are the surviving coverage. |
+| `vm-lifecycle-prod-parity-k3s` | bootstrap Job, leader guard; no builder pods | MODE-INDEPENDENT | — |
+| `vm-le-stability-k3s` | lease lifecycle (anti-affinity, acquire, stability, graceful release, failover, lease deletion); no builds | MODE-INDEPENDENT | — |
+| `vm-le-build-k3s` | build-during-failover, sigkill-mid-build via the chart pool | RE-POINT | Assertions are lease/ledger-side; delivery flips with the values default. |
+| `vm-cli-k3s` | AdminService round-trips (status incl. the executors summary, tenants, sla); no builds | MODE-INDEPENDENT | The `executors: N total` assertion is shape-only (>= 0) and stays valid when T-1c'.4 re-implements `ListExecutors` over the open-attempt view. |
+| `vm-dashboard-k3s` | gRPC-Web framing via the Cilium Gateway; no builds | MODE-INDEPENDENT | — |
+| `vm-netpol-k3s` | builder/store egress probes against build pods from the chart pool plus a scenario-applied cross-ns Pool | RE-POINT | Both pools now run Pull (values default; the `misplaced` Pool CR pin removed). The netns-probe pattern only needs a Running build pod, which the pull path provides identically (the 300 s sleepers). |
+| `vm-ingress-v4v6-k3s` | v4/v6 ingress + NAT64 egress; two trivial builds via the chart pool | RE-POINT | Delivery-only; no assertion changes. |
+| `vm-fetcher-split-k3s` | FOD→fetcher routing, builder airgap, fetcher egress + node dedication; pools inherit poolDefaults | RE-POINT | Builder and fetcher pools now run Pull; routing/netpol/pod-shape assertions are dispatch-mode-independent. |
+| `vm-security-nonpriv-k3s` | nonpriv pod admission, seccomp profile, cgroup remount, one e2e build | RE-POINT | Delivery-only; securityContext rendering is mode-independent. |
+| `vm-componentscaler-k3s` | store ComponentScaler closed loop driven by a 30-leaf fanout via the chart pool | RE-POINT | Delivery-only; no assertion changes. |
+| `vm-substitute-scale-k3s` | substitution cascade + scaler signal; leaves substituted (no builder pods), the unsubstitutable roots build via the chart pool | RE-POINT | Delivery-only for the roots; substitution/scaler assertions unaffected. |
+| `vm-sla-sizing-kwok` | nodeclaim_pool forecast provisioning under KWOK fake nodes; builder Jobs never run on a real kubelet | MODE-INDEPENDENT | The executor protocol is never exercised (KWOK Stages fake the nodes), so the rendered dispatch mode is inert here. |
+| `vm-nixos-node` | AMI boot path; no rio services | MODE-INDEPENDENT | — |
+| `vm-protocol-warm-standalone` | gateway ssh-ng opcodes, exit-status, connection grace; builds delivered by the standalone systemd stream workers | KEEP-STREAM, pending-harness | Assertions are gateway-side; only the delivery is stream. Blocks T-1c'.2 until the standalone-corpus re-point (see note). |
+| `vm-protocol-warm-lix-standalone` | the same against a Lix (protocol 1.35) client | KEEP-STREAM, pending-harness | As above. |
+| `vm-protocol-cold-standalone` | cold-bootstrap DAG incl. the FOD→fetcher-kind worker split | KEEP-STREAM, pending-harness | As above. |
+| `vm-ca-cutoff-standalone` | CA chain builds, cutoff saves, IA-on-CA resolution | KEEP-STREAM, pending-harness | As above. |
+| `vm-substitute-standalone` | store-side substitution, tenant gating, ssh-ng read opcodes; zero workers | MODE-INDEPENDENT | No executors in the fixture. |
+| `vm-log-service-standalone` | store LogService ingest/tail/dedup; zero workers | MODE-INDEPENDENT | No executors in the fixture. |
+| `vm-sla-sizing-standalone` | SLA estimator/explore/cost-solve fed by a scripted-telemetry stream worker (incl. `workers_active` boot waits) | KEEP-STREAM, pending-harness | Sample delivery and the boot gate are stream-era; re-point follows the standalone-corpus decision. |
+| `vm-scheduling-core-standalone` | FUSE/overlay/chunks/cgroup builder mechanics on 3 stream workers | KEEP-STREAM, pending-harness | Assertions are builder-mechanics; only the delivery is stream. |
+| `vm-scheduling-disrupt-standalone` | max-silent-time, setoptions-unreachable, cancel-timing (stream 5 s budget), reassign (disconnect→reassign), load-50drv, warm-gate, sigint-graceful (drain + re-register) | KEEP-STREAM, mixed | The stream-machinery subtests retire with their mechanisms: `reassign` (mechanism #3) and the stream cancel budget at T-1c'.2 (pull successors: the pull-canary cancel arm and the killed-mid-build pull-mode arm), `warm-gate` at T-1c'.3 (`sched.assign.warm-gate` retired), `sigint-graceful` re-stated at T-1d.1 (builder stream collapse). max-silent-time / setoptions-unreachable / load-50drv are delivery-only (pending-harness). |
+| `vm-security-standalone` | HMAC/JWT boundaries, tenant resolve, rate limit, quota, executor identity token + kind-spoof heartbeat | KEEP-STREAM, mixed | `executor-kind-spoof` and the static stream executor token are session machinery — they retire with T-1c'.2; the pull side's per-unary token↔intent binding (mechanism #6) is carried by the 1a/1b unit batteries and the pull VM arms. The remaining subtests are delivery-only (pending-harness). |
+| `vm-observability-standalone` | metric presence (incl. `rio_scheduler_workers_active`), log pipeline, trace export and traceparent propagation over stream dispatch | KEEP-STREAM, pending-harness | EXPECTED_METRICS and the trace-propagation assertions read stream-era observables; their pull equivalents (`rio_scheduler_open_attempts`, spans over the pull unaries) land with the standalone re-point or a re-home. |
+| `vm-chaos-standalone` | store-RPC fault injection (latency / reset / partition / bandwidth) under live builds on a stream worker | KEEP-STREAM, pending-harness | Assertions are store-client resilience (mode-independent). Named Model-D carrier for T-1d.1/T-1d.4 — per the plan it must be re-pointed, not retired, before the builder stream collapse. |
+
+**What RE-POINT concretely changed at this task.** The
+`values/vmtest-full.yaml` `poolDefaults.dispatchMode: Stream` pin is
+removed (the chart default — Pull since the 1c flip — now reaches every
+helm-rendered VM pool); the `ephemeral-pool` and `netpol` scenario Pool
+CRs lost their Stream pins; the stream-observable assertions in the
+re-pointed k3s scenarios were replaced by pull-path equivalents
+(pod-census preconditions instead of `workers_active`, an execution-row
+`dispatch_mode='pull'` assertion instead of the re-registration wait,
+the AD5 composite cancel bound instead of the stream cancel dispatch
+timing). The standalone fixture (`nix/tests/common.nix`
+`RIO_DISPATCH_MODE=stream`) keeps its pin, now annotated with this
+table's disposition.
+
+**The standalone-corpus note (the open half of T-1c.2b).** The pull
+protocol binds work to an intent-scoped executor (`RIO_INTENT_ID` plus
+a per-intent token minted at spawn); the standalone topology has no
+controller or Job spawner, so its long-lived systemd workers cannot
+exercise the pull path by a configuration flip — `run_pull` refuses to
+start without an intent id by design. The KEEP-STREAM *pending-harness*
+rows above therefore stay on the stream path at this task. Before
+deletion commit A (T-1c'.2) can land, one of the recorded options must
+be executed per row: (a) a minimal per-intent spawn mechanism in the
+standalone harness (poll `GetSpawnIntents`, mint the per-intent token,
+spawn a one-shot builder), (b) re-home the build-delivering scenarios
+onto a k3s fixture, or (c) retire with named replacement coverage
+(P13). This is the same precondition the Phase-1 plan states for
+T-1c'.1/T-1c'.2; this table makes it per-check instead of implicit.
 
 ### Development-time 1c gate evidence (T-1c.3, v3-rescoped gate)
 
@@ -3247,7 +3341,7 @@ defaults, not capabilities:
 | Fetcher/pool-kind VM coverage on the pull path (T-1c.2; the pool kinds the canary did not cover) | `pull-fetcher` subtest in `vm-pull-canary-k3s` (kind=Fetcher, dispatchMode: Pull, network-free FOD, OA3 one-pull assertions) | WIRED + check built once green at this batch (wall-clock recorded in the close-out report); OA3 one-pull confirmation for fetcher pools is the campaign-owner sign-off row in the development-time owner table, evidenced by this subtest |
 | Deletion-gate horizon formula + recording rule recorded (T-1c.2) | The §4.5 instantiation above; `rio:scheduler_stream_registrations:max` recording rule | RECORDED (helm-lint green); arms only at deployment time (row D6) |
 | C3 busy-source statement recorded (T-1c.2) | The statement above (open-attempt view is the busy source at zero stream registrations; empty-list does not disable the reap; no I-165 coverage loss accepted) | RECORDED |
-| Pull-path VM suites green with every pool kind covered | Builder-kind: `pull-canary` (vm-pull-canary-k3s, re-exercised by this batch's single check build because the new fetcher subtest extends that check) and `pull-mode` (vm-lifecycle-autoscale-k3s, green since the 1a landing and re-run at the G4 full gate rather than rebuilt inside this batch); Fetcher-kind: `pull-fetcher` (this batch). The full "lifecycle/scheduling/chaos suites green fleet-wide on the pull path" criterion additionally requires the standalone/k3s stream-era corpus re-point — that is T-1c.2b and remains OPEN (not silently absorbed here) | PARTIAL BY CONSTRUCTION (T-1c.2b outstanding); everything in this batch's scope is green |
+| Pull-path VM suites green with every pool kind covered | Builder-kind: `pull-canary` (vm-pull-canary-k3s, re-exercised by this batch's single check build because the new fetcher subtest extends that check) and `pull-mode` (vm-lifecycle-autoscale-k3s, green since the 1a landing and re-run at the G4 full gate rather than rebuilt inside this batch); Fetcher-kind: `pull-fetcher` (this batch). The full "lifecycle/scheduling/chaos suites green fleet-wide on the pull path" criterion additionally requires the standalone/k3s stream-era corpus re-point — that is T-1c.2b and remains OPEN (not silently absorbed here) | PARTIAL BY CONSTRUCTION (T-1c.2b outstanding); everything in this batch's scope is green. (Later batch: T-1c.2b executed the k3s-corpus half and dispositioned the standalone half — see the disposition table above and its verification record.) |
 | Full gate green at the landing | `/nixbuild --checks` at the 1c landing (G4) | Run at the landing by the integrator (per the gate plan); the per-task batteries, helm-lint, tracey-validate, crds/docs-data drift, and the touched VM check were run green inside the batch |
 
 ### Deferral note (v3 directive; recorded with dates at this batch)
