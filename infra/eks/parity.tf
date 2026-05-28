@@ -2,7 +2,8 @@
 # namespace). The engine reads/writes ONLY the parity/ prefix of the
 # chunk bucket: eval sets (parity/evals/...) and campaign state/reports
 # (parity/campaigns/...). Narrower than the store policy: object actions
-# are prefix-scoped, ListBucket is condition-scoped to the same prefix.
+# are prefix-scoped. s3:DeleteObject is forward-provisioning — the engine
+# has no deletion path today.
 #
 # The ServiceAccount itself is created by `cargo xtask parity launch`
 # (the rio-parity namespace is not a chart namespace); xtask reads
@@ -17,15 +18,16 @@ data "aws_iam_policy_document" "rio_parity_s3" {
     ]
     resources = ["${aws_s3_bucket.chunks.arn}/parity/*"]
   }
+  # Unconditional ListBucket on the bucket (rio-scheduler precedent): the
+  # engine never lists objects; the grant exists so HEAD/GET of
+  # nonexistent parity/ keys return 404 (NoSuchKey/NotFound) instead of
+  # 403 — which the engine's first-run probes (evalset_exists,
+  # download_state_if_missing) depend on — and a prefix-conditioned grant
+  # is not documented to provide that.
   statement {
     effect    = "Allow"
     actions   = ["s3:ListBucket"]
     resources = [aws_s3_bucket.chunks.arn]
-    condition {
-      test     = "StringLike"
-      variable = "s3:prefix"
-      values   = ["parity/*"]
-    }
   }
 }
 
