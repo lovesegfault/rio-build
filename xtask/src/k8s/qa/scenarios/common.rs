@@ -6,7 +6,7 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 
 use crate::k8s::qa::QaCtx;
-use crate::k8s::status::{BUILDER_METRICS_PORT, STORE_METRICS_PORT, Scrape, scrape_pod};
+use crate::k8s::status::{STORE_METRICS_PORT, Scrape, scrape_pod};
 use crate::k8s::{NS_BUILDERS, NS_STORE};
 
 /// `DebugListExecutors` row, via `rio-cli workers --actor`. The actor's
@@ -62,15 +62,6 @@ pub async fn scrape_all_stores(ctx: &QaCtx) -> Result<Vec<(String, Scrape)>> {
         out.push((p, s));
     }
     Ok(out)
-}
-
-/// Scrape one builder pod's `/metrics`. Builders are ephemeral — call
-/// this WHILE the build runs (the pod begins idle-exit ~120s after
-/// completion, I-116). Covers `rio_builder_*` (FUSE jit_lookup, uploads,
-/// cgroup pressure, build duration).
-pub async fn scrape_builder(ctx: &QaCtx, pod: &str) -> Result<Scrape> {
-    let body = scrape_pod(&ctx.kube, NS_BUILDERS, pod, BUILDER_METRICS_PORT).await?;
-    Ok(Scrape::parse(&body))
 }
 
 /// First running builder pod's name, or None.

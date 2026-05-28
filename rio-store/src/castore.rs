@@ -10,6 +10,7 @@ use rio_nix::nar::{NarEntryKind, NarLsEntry};
 use rio_proto::castore::{Directory, DirectoryEntry, FileEntry, RootNode, SymlinkEntry, root_node};
 
 /// Output of [`build`]: directory DAG state for `set_nar_index_in_conn`.
+#[derive(Default)]
 pub struct DirectoryDag {
     /// Distinct `(dir_digest, encoded Directory body)`, sorted so the
     /// UPSERT and GC decrement take row locks in the same order
