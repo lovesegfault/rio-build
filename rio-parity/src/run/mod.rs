@@ -111,6 +111,12 @@ const INFRA_RATE_WINDOW: usize = 100;
 /// campaign on its first unlucky batch.
 const INFRA_RATE_MIN_SAMPLE: usize = 20;
 
+/// Emit the poller's progress heartbeat every this many ticks (with the
+/// default 60-second poll cadence: roughly every ten minutes), so a long
+/// but healthy quiet stretch is distinguishable from a wedged campaign in
+/// the logs.
+const HEARTBEAT_EVERY_TICKS: u64 = 10;
+
 /// Every external surface the engine touches, behind traits so the whole
 /// run can execute against fakes (see the `mini_campaign_end_to_end_and_resume`
 /// test).
@@ -127,6 +133,39 @@ pub struct Backends {
 /// Entry point for `rio-parity run`: load and validate the spec,
 /// materialize the eval set on local disk, build the production backends,
 /// and hand off to [`run_with_backends`].
+///
+/// # Operational contract
+///
+/// - **Pause:** touching `<state-dir>/PAUSE` pauses new submissions
+///   (batches already running keep going); removing the file resumes. The
+///   file is polled once per watchdog tick
+///   (`knobs.cluster_status_poll_secs`, default 60s), so a pause or
+///   unpause takes up to one tick to take effect.
+/// - **Exit code:** `0` both when the campaign drained completely and when
+///   it stopped at the deadline with an explicitly-partial report —
+///   consumers must read the `partial` flag in progress.json / summary.md,
+///   not the exit code. Non-zero means an error (invalid spec or eval set,
+///   unreachable backends, state-dir I/O failure, or a dead background
+///   task).
+/// - **Deadline:** `--deadline` (or `spec.deadline`) stops *new*
+///   submissions once reached; batches already in flight still drain,
+///   which can take up to `knobs.batch_timeout_hours`. Do not set a
+///   Kubernetes `activeDeadlineSeconds` close to the campaign deadline —
+///   it would kill the pod mid-drain instead of letting the partial report
+///   render. A supplied deadline that does not parse as RFC3339 is a
+///   startup error.
+/// - **Image requirements:** GNU `tar` + `zstd` (drv-archive unpack),
+///   `nix` and an `ssh` client (the submitter shells out to `nix build`
+///   against the gateway's ssh-ng URL), and the per-tenant SSH keys /
+///   service HMAC key mounted at the paths named in the spec.
+/// - **Resume:** re-running with the same state dir skips completed stages
+///   and already-terminal jobs. Resuming on a *fresh* pod volume
+///   additionally requires `spec.campaign_id` to be pinned (it names the
+///   S3 prefix the synced state is restored from) and S3 to be configured.
+/// - **S3 layout:** the eval set is read from
+///   `<eval_set.s3_bucket or s3.bucket>/<eval_set.s3_prefix>/…`; campaign
+///   artifacts are synced to `<s3.bucket>/<s3.prefix>/<campaign-id>/…`
+///   (default prefix `parity/campaigns`).
 pub async fn run(args: RunArgs) -> Result<()> {
     let spec = CampaignSpec::load(&args.spec)?;
     let state = StateDir::new(&args.state_dir)?;
@@ -379,6 +418,51 @@ fn terminal_set(records: &BTreeMap<String, JobRecord>) -> HashSet<String> {
         .collect()
 }
 
+/// Build the submit loop's terminal-set view over the shared results map.
+///
+/// The submit loop polls this between waves; the view must never *shrink*
+/// just because the collect loop happens to hold the results lock at that
+/// instant — a transiently empty set would re-offer already-terminal jobs
+/// and submit duplicate batches in the late-campaign tail. On lock
+/// contention the view returns the last successfully computed snapshot
+/// (initially `seed`) instead.
+fn terminal_view(
+    results: Arc<tokio::sync::Mutex<BTreeMap<String, JobRecord>>>,
+    seed: HashSet<String>,
+) -> impl Fn() -> HashSet<String> + Send + Sync + 'static {
+    let cache = std::sync::Mutex::new(seed);
+    move || match results.try_lock() {
+        Ok(map) => {
+            let fresh = terminal_set(&map);
+            *cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = fresh.clone();
+            fresh
+        }
+        Err(_) => cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone(),
+    }
+}
+
+/// Parse the resolved deadline string (the CLI flag wins over the spec
+/// value at the call site). A supplied-but-unparsable deadline is a hard
+/// error: the alternative — silently running with no deadline at all —
+/// would let a campaign the operator meant to bound overrun its window.
+fn parse_deadline(deadline: Option<&str>) -> Result<Option<i64>> {
+    match deadline {
+        None => Ok(None),
+        Some(raw) => match rfc3339_to_unix(raw) {
+            Some(unix) => Ok(Some(unix)),
+            None => bail!(
+                "deadline {raw:?} is not a parseable RFC3339 timestamp \
+                 (expected e.g. 2026-06-01T18:00:00Z)"
+            ),
+        },
+    }
+}
+
 /// Build the terminal stall record for one job (watchdog escalation →
 /// rio-infra-failure with the "stalled-active" / "stalled-queued"
 /// signature).
@@ -562,8 +646,14 @@ pub async fn run_with_backends(
     if let Some(limit) = args.limit {
         spec.filters.limit = Some(limit);
     }
-    let deadline = args.deadline.clone().or_else(|| spec.deadline.clone());
-    let deadline_unix = deadline.as_deref().and_then(rfc3339_to_unix);
+    // The CLI deadline wins over the spec's; a supplied-but-unparsable value
+    // is a startup error rather than a silently unbounded campaign.
+    let deadline_raw = args.deadline.clone().or_else(|| spec.deadline.clone());
+    let deadline_unix = parse_deadline(deadline_raw.as_deref())?;
+    match &deadline_raw {
+        Some(raw) => tracing::info!(deadline = %raw, "campaign deadline set"),
+        None => tracing::info!("no campaign deadline set; the campaign runs until drained"),
+    }
     // Copy-able closure (captures only an Option<i64>) shared by the submit
     // loop and the drain loop.
     let deadline_reached = move || {
@@ -769,6 +859,10 @@ pub async fn run_with_backends(
         }
     }
     attemptable.sort_by(|a, b| a.job.cmp(&b.job));
+    // Owned in-scope membership for the poller's heartbeat (the borrowed
+    // `in_scope` set above cannot move into the spawned task).
+    let in_scope_jobs: Arc<HashSet<String>> =
+        Arc::new(plan_output.in_scope.iter().cloned().collect());
 
     let pause = Arc::new(PauseState::default());
     let tracker = Arc::new(SubmitTracker::default());
@@ -805,6 +899,7 @@ pub async fn run_with_backends(
         let prefix = spec.s3.prefix.clone();
         let campaign_id = campaign_id.clone();
         let contexts = contexts.clone();
+        let in_scope_jobs = in_scope_jobs.clone();
         let mode = spec.mode.as_str().to_string();
         let store_url = spec.cluster.gateway_store_url.clone();
         let mut stop_rx = stop_rx.clone();
@@ -856,11 +951,11 @@ pub async fn run_with_backends(
                 };
                 // Backpressure: dispatch-gap pause, queue-depth threshold,
                 // rolling infra-failure rate.
-                let mut backpressure = outcome.dispatch_pause;
-                if let (Some(limit), Some(c)) = (knobs.pause_queue_depth, cluster_counts.as_ref()) {
-                    backpressure |= c.queued_derivations > limit;
-                }
-                {
+                let queue_depth_pause = match (knobs.pause_queue_depth, cluster_counts.as_ref()) {
+                    (Some(limit), Some(c)) => c.queued_derivations > limit,
+                    _ => false,
+                };
+                let (terminal_in_scope, infra_rate_pct) = {
                     let res = results.lock().await;
                     let mut terminal: Vec<&JobRecord> = res
                         .values()
@@ -874,16 +969,44 @@ pub async fn run_with_backends(
                     });
                     let window: Vec<&&JobRecord> =
                         terminal.iter().take(INFRA_RATE_WINDOW).collect();
-                    if window.len() >= INFRA_RATE_MIN_SAMPLE {
+                    let infra_rate_pct = if window.len() >= INFRA_RATE_MIN_SAMPLE {
                         let infra = window
                             .iter()
                             .filter(|r| r.bucket == Bucket::RioInfraFailure.as_str())
                             .count();
-                        backpressure |=
-                            (infra as f64 / window.len() as f64) * 100.0 > knobs.infra_pause_pct;
-                    }
-                }
+                        Some((infra as f64 / window.len() as f64) * 100.0)
+                    } else {
+                        None
+                    };
+                    let terminal_in_scope = res
+                        .iter()
+                        .filter(|(job, r)| {
+                            in_scope_jobs.contains(job.as_str())
+                                && model::is_terminal_bucket(&r.bucket)
+                        })
+                        .count();
+                    (terminal_in_scope, infra_rate_pct)
+                };
+                let infra_pause = infra_rate_pct.is_some_and(|rate| rate > knobs.infra_pause_pct);
+                let backpressure = outcome.dispatch_pause || queue_depth_pause || infra_pause;
                 pause.set_backpressure(backpressure);
+                // Heartbeat: one info! line on a fixed cadence so a long but
+                // healthy quiet stretch is distinguishable from a wedge.
+                if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
+                    let in_flight_count = tracker.in_flight.lock().await.len();
+                    tracing::info!(
+                        terminal_in_scope,
+                        in_scope = in_scope_jobs.len(),
+                        in_flight = in_flight_count,
+                        paused = pause.paused(),
+                        manual_pause,
+                        dispatch_pause = outcome.dispatch_pause,
+                        queue_depth_pause,
+                        infra_pause,
+                        infra_rate_pct,
+                        "campaign heartbeat"
+                    );
+                }
                 if !outcome.stalled.is_empty()
                     && let Err(e) = apply_stall_actions(
                         &state,
@@ -1010,63 +1133,88 @@ pub async fn run_with_backends(
 
     // Outer drain loop: submit until drained, run a final synchronous collect
     // pass to catch the tail, and repeat while that pass re-queued work and
-    // the deadline has not fired.
-    let mut partial = false;
-    loop {
-        let results_for_terminal = results.clone();
-        run_submit_loop(
-            state.clone(),
-            backends.submitter.clone(),
-            tracker.clone(),
-            pause.clone(),
-            attemptable.clone(),
-            move || match results_for_terminal.try_lock() {
-                Ok(map) => terminal_set(&map),
-                Err(_) => HashSet::new(),
-            },
-            deadline_reached,
-            spec.cluster.gateway_store_url.clone(),
-            spec.knobs.clone(),
-            batch_seq.clone(),
-        )
-        .await?;
-        // Final synchronous pass to catch the tail (and any requeues).
-        let final_backends = CollectBackends {
-            reader: backends.reader.clone(),
-            admin: backends.admin.clone(),
-            store: backends.store.clone(),
-            artifacts: backends.artifacts.clone(),
-        };
-        let requeued = {
-            let mut processed_guard = processed.lock().await;
-            collect_pass_with(
-                &state,
-                &final_backends,
-                &contexts,
-                &tracker,
-                &mut processed_guard,
-                &spec.knobs,
-                spec.mode.as_str(),
-                &spec.cluster.gateway_store_url,
-                Some(&artifact_prefix),
+    // the deadline has not fired. The body is wrapped so the stop signal and
+    // the background-task joins below run on EVERY exit path — success,
+    // deadline, or an error mid-loop.
+    let drain_result: Result<bool> = async {
+        let mut partial = false;
+        loop {
+            // A background task that stopped on its own can only have
+            // panicked (they exit solely on the stop signal): abort the
+            // campaign instead of running on with no evidence capture or no
+            // watchdog. The join below logs the panic itself.
+            if collector.is_finished() {
+                bail!(
+                    "the background collect task stopped before the campaign finished \
+                     (its join error is logged below); aborting the run"
+                );
+            }
+            if poller.is_finished() {
+                bail!(
+                    "the watchdog/sync poller task stopped before the campaign finished \
+                     (its join error is logged below); aborting the run"
+                );
+            }
+            let terminal_seed = terminal_set(&*results.lock().await);
+            run_submit_loop(
+                state.clone(),
+                backends.submitter.clone(),
+                tracker.clone(),
+                pause.clone(),
+                attemptable.clone(),
+                terminal_view(results.clone(), terminal_seed),
+                deadline_reached,
+                spec.cluster.gateway_store_url.clone(),
+                spec.knobs.clone(),
+                batch_seq.clone(),
             )
-            .await?
-        };
-        {
-            let mut res = results.lock().await;
-            *res = latest_per_job(state.load_jsonl(StateFile::Results)?);
+            .await?;
+            // Final synchronous pass to catch the tail (and any requeues).
+            let final_backends = CollectBackends {
+                reader: backends.reader.clone(),
+                admin: backends.admin.clone(),
+                store: backends.store.clone(),
+                artifacts: backends.artifacts.clone(),
+            };
+            let requeued = {
+                let mut processed_guard = processed.lock().await;
+                collect_pass_with(
+                    &state,
+                    &final_backends,
+                    &contexts,
+                    &tracker,
+                    &mut processed_guard,
+                    &spec.knobs,
+                    spec.mode.as_str(),
+                    &spec.cluster.gateway_store_url,
+                    Some(&artifact_prefix),
+                )
+                .await?
+            };
+            {
+                let mut res = results.lock().await;
+                *res = latest_per_job(state.load_jsonl(StateFile::Results)?);
+            }
+            if deadline_reached() {
+                partial = true;
+                break;
+            }
+            if requeued == 0 {
+                break;
+            }
         }
-        if deadline_reached() {
-            partial = true;
-            break;
-        }
-        if requeued == 0 {
-            break;
+        Ok(partial)
+    }
+    .await;
+    // Stop and join the background tasks regardless of how the drain ended;
+    // a panicked task is logged here instead of being silently discarded.
+    let _ = stop_tx.send(true);
+    for (name, handle) in [("collect", collector), ("watchdog/sync poller", poller)] {
+        if let Err(e) = handle.await {
+            tracing::error!(task = name, error = %e, "background task failed");
         }
     }
-    let _ = stop_tx.send(true);
-    let _ = collector.await;
-    let _ = poller.await;
+    let partial = drain_result?;
 
     // ── Stage: report ───────────────────────────────────────────────────────
     // Partial run (deadline/abort): backfill explicit not-attempted records
@@ -1335,6 +1483,63 @@ mod tests {
             allow_unverified_tenants: false,
             no_s3: true,
         }
+    }
+
+    /// Minimal terminal (match-built) record for tests that only need a
+    /// terminal bucket, not full evidence.
+    fn terminal_record(job: &str) -> JobRecord {
+        JobRecord {
+            job: job.into(),
+            system: "x86_64-linux".into(),
+            drv_path: format!("/nix/store/{}-x.drv", "a".repeat(32)),
+            mode: "leaf".into(),
+            attempts: 1,
+            build_ids: vec![],
+            rio: model::RioSide::default(),
+            hydra: model::HydraSide::default(),
+            nar_compare: BTreeMap::new(),
+            bucket: Bucket::MatchBuilt.as_str().into(),
+            cascaded: false,
+            signature: None,
+            log_key: None,
+            repro: String::new(),
+            evidence: None,
+            updated_at: now_rfc3339(),
+        }
+    }
+
+    #[test]
+    fn malformed_deadline_is_rejected_naming_the_value() {
+        assert_eq!(parse_deadline(None).unwrap(), None);
+        assert!(
+            parse_deadline(Some("2026-06-01T18:00:00Z"))
+                .unwrap()
+                .is_some()
+        );
+        let err = parse_deadline(Some("tomorrow-ish")).unwrap_err();
+        assert!(err.to_string().contains("tomorrow-ish"), "{err}");
+    }
+
+    /// The submit loop's terminal view must never shrink to empty just
+    /// because the results lock is momentarily held by the collect loop:
+    /// under contention it returns the last computed snapshot instead.
+    #[tokio::test]
+    async fn terminal_view_returns_last_snapshot_under_lock_contention() {
+        let mut map = BTreeMap::new();
+        map.insert(
+            "done.x86_64-linux".to_string(),
+            terminal_record("done.x86_64-linux"),
+        );
+        let results = Arc::new(tokio::sync::Mutex::new(map));
+        // Seeded empty: the first uncontended call computes and caches the
+        // live set.
+        let view = terminal_view(results.clone(), HashSet::new());
+        let live: HashSet<String> = ["done.x86_64-linux".to_string()].into();
+        assert_eq!(view(), live);
+        // Contended: another task holds the results lock — the view must
+        // return the cached snapshot, not an empty set.
+        let _guard = results.lock().await;
+        assert_eq!(view(), live);
     }
 
     /// The synthetic stdenv dependency output of `job` from the mini eval
