@@ -4010,3 +4010,153 @@ async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> Tes
     );
     Ok(())
 }
+
+// r[verify sched.merge.substitute-topdown+10]
+/// Live-build scoping of the recovery-time gate: a restored
+/// `topdown_pruned` mark must be KEPT when the parent's produced
+/// children are vouched for only by TERMINAL builds.
+///
+/// The previous-generation shape: build B0 fully merged parent→child
+/// long ago and went `succeeded` — its `derivation_edges` row, the
+/// child's `completed` row, and B0's `build_derivations` links persist
+/// in PG indefinitely (terminal builds are never deleted), while the
+/// store may have GC'd the actual outputs since. A later build B1
+/// re-requests the parent and the topdown prune fires: B1 links only
+/// the parent, merges no edges, and the post-prune persisted shape is
+/// `substituting` + `topdown_pruned = true`. On failover the gate sees
+/// the historical child row; if it trusted bare `completed` it would
+/// clear the restored mark (in memory and best-effort PG) and the
+/// parent would dispatch from source against a closure that was never
+/// merged for B1 — the doomed dispatch the mark exists to prevent
+/// (pre-fix red of this test: an Assignment reaches the worker and B1
+/// stays Active). With the gate scoped to live builds the stale
+/// evidence is ignored and the node takes the bounded fail-fast arm
+/// instead: no WorkAssignment is ever sent and B1 fails with the
+/// resubmit-directing error — the mirror of the childless fail-fast
+/// test above, with the historical edge present.
+///
+/// Why the assertions are behavioral rather than "the mark is still
+/// set": the LeaderAcquired arm runs an immediate dispatch pass after
+/// recovery, so the (correctly kept) mark is consumed by the
+/// resubmit-directing fail-fast inside that same command — there is no
+/// post-fixture point where the kept mark itself is observable
+/// (`fail_fast_topdown_pruned_root` consumes the marker; that
+/// consumption is pinned by
+/// `test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_source`).
+/// The mark's survival through the gate is therefore proven
+/// structurally — the fail-fast's "topdown … resubmit" build error is
+/// only reachable for a node whose mark was still set after the gate
+/// ran — and the SQL-level live-vs-terminal discrimination is pinned
+/// directly by the db-level test
+/// (`db::tests::recovery::test_load_parents_with_all_children_produced_requires_live_build_link`).
+///
+/// Staged shape (phase 1): `merge_dag(B0, [parent, child], [edge])`
+/// then `merge_dag(B1, [parent only], [])` — B1 owns no link to the
+/// child. After `drop(handle)`: backdate child→`completed`,
+/// parent→`substituting` + `topdown_pruned = true`, B0→`succeeded`;
+/// B1 stays `active`. Phase 2's store has `out` substitutable and
+/// `debug` missing / not substitutable.
+#[tokio::test]
+async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_terminal_build()
+-> TestResult {
+    let out = test_store_path("tdhist-root-out");
+    let dbg = test_store_path("tdhist-root-debug");
+
+    // Phase-2 store: `out` substitutable upstream; `debug` missing and
+    // NOT substitutable — substitution cannot satisfy the recovered
+    // all-declared wanted set, so the kept mark must route the node to
+    // the fail-fast arm, not to a from-source dispatch.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let b0 = Uuid::new_v4(); // historical build — terminal at failover
+    let b1 = Uuid::new_v4(); // live re-request — owns only the parent
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        let mk_parent = || {
+            let mut n = make_node("tdhist-root");
+            n.output_names = vec!["out".into(), "debug".into()];
+            n.expected_output_paths = vec![out.clone(), dbg.clone()];
+            n.wanted_output_names = vec![];
+            n
+        };
+        // B0: full merge parent→child WITH the edge persisted — the
+        // previous generation that actually built the closure.
+        merge_dag(
+            &handle,
+            b0,
+            vec![mk_parent(), make_node("tdhist-dep")],
+            vec![make_test_edge("tdhist-root", "tdhist-dep")],
+            false,
+        )
+        .await?;
+        // B1: the re-request — parent only, no edges, so
+        // batch_insert_build_derivations links B1 to the parent only.
+        merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
+        barrier(&handle).await;
+        drop(handle);
+        // Backdate AFTER the last merge (a later merge re-upserts the
+        // derivation row): the child finished under B0, B0 went
+        // terminal, and the parent is left mid-substitution with the
+        // mark set — the post-prune persisted shape for B1.
+        sqlx::query("UPDATE derivations SET status = 'completed' WHERE drv_hash = 'tdhist-dep'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'tdhist-root'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE builds SET status = 'succeeded' WHERE build_id = $1")
+            .bind(b0)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the kept mark fails to gate it.
+    let mut worker_rx = connect_executor(&handle, "tdhist-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // No WorkAssignment is ever sent for the parent: its closure was
+    // never merged for B1, so a from-source dispatch would ENOENT.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a pruned root whose produced children belong to a terminal build \
+             must not be dispatched from source after failover"
+        );
+    }
+    let d = expect_drv(&handle, "tdhist-root").await;
+    assert!(
+        !matches!(
+            d.status,
+            DerivationStatus::Assigned | DerivationStatus::Running | DerivationStatus::Ready
+        ),
+        "the kept mark must route the node to the fail-fast arm, not leave it \
+         dispatchable from source; got {:?}",
+        d.status
+    );
+    // The live build terminates with the bounded resubmit-directing
+    // error (same assertions as the childless fail-fast test).
+    let s = query_status(&handle, b1).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the live build must fail fast (resubmit re-probes or full-merges); \
+         got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary should direct resubmit; got {:?}",
+        s.error_summary
+    );
+    Ok(())
+}

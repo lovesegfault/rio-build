@@ -14,6 +14,7 @@ mod batch;
 mod builds;
 mod derivations;
 mod history;
+mod recovery;
 mod tenants;
 mod transactions;
 

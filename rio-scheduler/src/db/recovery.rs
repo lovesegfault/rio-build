@@ -166,10 +166,14 @@ impl SchedulerDb {
         .await
     }
 
-    /// Recovered parents whose persisted children are ALL produced —
-    /// produced = `'completed' | 'skipped'` only, the PG mirror of the
+    /// Recovered parents whose persisted children are ALL produced
+    /// (`'completed' | 'skipped'`) AND vouched for by a build that is
+    /// still live: each child must carry a `build_derivations` link to
+    /// a `'pending'`/`'active'` build. This is the PG mirror of the
     /// in-memory `children_all_produced` criterion every other
-    /// `topdown_pruned` clear site uses.
+    /// `topdown_pruned` clear site uses — that criterion is computed
+    /// over the live graph, so its PG mirror must not accept produced
+    /// rows whose only evidence is a long-terminal build.
     ///
     /// Consumed by the recovery-time `topdown_pruned` gate in
     /// `load_dag_from_rows`: produced children are excluded from
@@ -177,9 +181,20 @@ impl SchedulerDb {
     /// dropped by [`Self::load_edges_for_derivations`], so this check
     /// can only be answered against the persisted graph. Childless rows
     /// are never returned (no `derivation_edges` rows → no GROUP BY
-    /// group), so a genuine childless pruned root keeps its restored
-    /// flag; any unbuilt / `failed` / `cancelled` / `poisoned` /
-    /// `dependency_failed` child fails the `bool_and`, so the
+    /// group), so a genuine never-merged pruned root keeps its restored
+    /// flag. The live-build scoping exists for the previous-generation
+    /// case: a drv fully built by an old build keeps its edges, its
+    /// `completed` children and that build's `build_derivations` links
+    /// in PG indefinitely after the build goes terminal, while the
+    /// store may GC the actual outputs at any point — when a later
+    /// build re-requests the drv via the prune (no new edges, mark
+    /// stamped), those historical rows are stale evidence and must NOT
+    /// clear the restored mark. Such parents keep the flag and at worst
+    /// take the bounded resubmit-directing fail-fast — never the doomed
+    /// from-source dispatch of a closure that was never merged. Any
+    /// unbuilt / `failed` / `cancelled` / `poisoned` /
+    /// `dependency_failed` child — and any produced child linked only
+    /// to terminal builds — fails the `bool_and`, so the
     /// must-substitute guard is kept for those parents too.
     pub(crate) async fn load_parents_with_all_children_produced(
         &self,
@@ -195,7 +210,13 @@ impl SchedulerDb {
             JOIN derivations c ON c.derivation_id = e.child_id
             WHERE e.parent_id = ANY($1)
             GROUP BY e.parent_id
-            HAVING bool_and(c.status IN ('completed', 'skipped'))
+            HAVING bool_and(
+                c.status IN ('completed', 'skipped')
+                AND EXISTS (SELECT 1 FROM build_derivations bd
+                            JOIN builds b ON b.build_id = bd.build_id
+                            WHERE bd.derivation_id = c.derivation_id
+                              AND b.status IN ('pending', 'active'))
+            )
             "#,
         )
         .bind(derivation_ids)

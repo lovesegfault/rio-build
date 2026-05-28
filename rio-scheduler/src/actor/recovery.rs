@@ -376,6 +376,19 @@ impl DagActor {
         // best-effort clear (merge-, completion-, or fail-fast-time)
         // lost its PG write: the next failover lands here and the row
         // is re-evaluated against the same produced-children criterion.
+        //
+        // The produced evidence is additionally scoped to children
+        // linked to a LIVE ('pending'/'active') build — the recovery
+        // mirror of the merge-time decision to clear only after
+        // verify_preexisting_completed: a PG 'completed' row vouched
+        // for only by long-terminal builds is stale evidence (the
+        // previous-generation re-request shape — the store may have
+        // GC'd those outputs long ago) and must not launder a clear.
+        // The gate's purpose is absorbing live-flow skew (the lost
+        // best-effort clears above), and in those flows the produced
+        // children are linked to a still-live build; parents whose only
+        // produced evidence is historical keep the restored mark and
+        // the bounded fail-fast handles them instead.
         if !flagged.is_empty() {
             let produced_parents = self
                 .db
