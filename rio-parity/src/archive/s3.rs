@@ -121,6 +121,20 @@ impl ArchiveStore {
         }
     }
 
+    /// The refusal raised when an archive prefix has already claimed
+    /// completeness. Shared by the HEAD pre-check and the 412 mapping on the
+    /// final conditional PUT so both ways of losing the prefix read the same.
+    fn write_once_refusal(&self, archive_id_short: &str) -> String {
+        format!(
+            "archive prefix s3://{}/{} already has {ARCHIVE_COMPLETE_OBJECT} and archive \
+             prefixes are write-once; an identical archive id means this content is already \
+             published (probe is_complete before publishing) — only a re-record, which gets a \
+             new archive id, needs a new prefix",
+            self.bucket,
+            self.prefix(archive_id_short)
+        )
+    }
+
     /// Publish a packed archive: upload `archive.dwarfs`, the standalone
     /// `manifest.json` (the exact bytes passed in), and finally
     /// `complete.json` with `If-None-Match: *` so two racing uploads cannot
@@ -132,7 +146,10 @@ impl ArchiveStore {
     /// standalone manifest can never disagree with the image it stands for.
     /// v0 archives have no `archive_id` and cannot live in the digest-keyed
     /// layout; they are refused. A prefix that already carries
-    /// `complete.json` is write-once and refused.
+    /// `complete.json` is write-once and refused: the HEAD pre-check is only
+    /// the cheap early refusal (it avoids uploading a multi-gigabyte image
+    /// just to lose the claim), while the conditional PUT of `complete.json`
+    /// is the authoritative write-once claim.
     ///
     /// A failure mid-upload leaves partial objects WITHOUT `complete.json`
     /// at the prefix — the prefix never looks complete, and a retry of the
@@ -185,12 +202,7 @@ impl ArchiveStore {
         // Write-once: a prefix that already claimed completeness is never
         // overwritten; re-recording produces a new id and a new prefix.
         if self.is_complete(client, &archive_id_short).await? {
-            anyhow::bail!(
-                "archive prefix s3://{}/{} already has {ARCHIVE_COMPLETE_OBJECT} and archive \
-                 prefixes are write-once; a re-record gets a new archive id and prefix",
-                self.bucket,
-                self.prefix(&archive_id_short)
-            );
+            anyhow::bail!(self.write_once_refusal(&archive_id_short));
         }
 
         // Data first: the image, then the standalone manifest.
@@ -245,7 +257,7 @@ impl ArchiveStore {
             serde_json::to_vec_pretty(&marker).context("serialize complete.json")?;
         marker_bytes.push(b'\n');
         let complete_key = self.object_key(&archive_id_short, ARCHIVE_COMPLETE_OBJECT);
-        client
+        match client
             .put_object()
             .bucket(&self.bucket)
             .key(&complete_key)
@@ -254,7 +266,20 @@ impl ArchiveStore {
             .body(ByteStream::from(marker_bytes))
             .send()
             .await
-            .with_context(|| format!("PUT s3://{}/{complete_key}", self.bucket))?;
+        {
+            Ok(_) => {}
+            // The conditional PUT lost: another publisher claimed the prefix
+            // between the HEAD pre-check and this final upload. Surface the
+            // same actionable refusal as the pre-check — the raw 412 carries
+            // nothing the message does not already say.
+            Err(e) if put_is_precondition_failed(&e) => {
+                anyhow::bail!(self.write_once_refusal(&archive_id_short));
+            }
+            Err(e) => {
+                return Err(anyhow::Error::new(e)
+                    .context(format!("PUT s3://{}/{complete_key}", self.bucket)));
+            }
+        }
         tracing::info!(
             key = %complete_key,
             archive_id = %marker.archive_id,
@@ -268,6 +293,11 @@ impl ArchiveStore {
     /// size against the marker), and verify that the downloaded standalone
     /// `manifest.json` hashes to the marker's `archive_id`. The image is
     /// downloaded as-is and opened in place — there is no unpack step.
+    ///
+    /// A failed download or digest check can leave partial files behind in
+    /// `dest_dir`; a retry overwrites them in place. Treat the destination
+    /// directory of a failed fetch as scratch — nothing in it has been
+    /// verified.
     pub async fn fetch(
         &self,
         client: &aws_sdk_s3::Client,
@@ -381,8 +411,9 @@ impl ArchiveStore {
 
     /// List every complete archive under `<root>/archives/`. Archives are
     /// discovered through their `complete.json` objects only, so incomplete
-    /// or in-flight uploads are invisible. Returns `(archive_id_short,
-    /// marker)` pairs sorted by short id.
+    /// or in-flight uploads are invisible. Each marker's `archive_id_short`
+    /// is cross-checked against the prefix segment it was found under.
+    /// Returns `(archive_id_short, marker)` pairs sorted by short id.
     pub async fn list(
         &self,
         client: &aws_sdk_s3::Client,
@@ -441,6 +472,18 @@ impl ArchiveStore {
                 .into_bytes();
             let marker: CompleteMarker = serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse s3://{}/{key}", self.bucket))?;
+            // Publishing always writes the marker under its own short id, so
+            // a mismatch means the prefix was hand-copied or the marker was
+            // edited; surface that instead of returning an entry whose fetch
+            // would fail anyway.
+            anyhow::ensure!(
+                marker.archive_id_short == short,
+                "{ARCHIVE_COMPLETE_OBJECT} at s3://{}/{key} says archive_id_short {} but it \
+                 lives under the {short}/ prefix; the archive was copied to the wrong prefix \
+                 or the marker was edited",
+                self.bucket,
+                marker.archive_id_short
+            );
             archives.push((short, marker));
         }
         archives.sort_by(|a, b| a.0.cmp(&b.0));
@@ -504,6 +547,21 @@ impl ArchiveStore {
     }
 }
 
+/// Did this PUT lose an `If-None-Match: *` conditional write — an HTTP 412
+/// `PreconditionFailed` rejection because the object already exists? Generic
+/// over the response type so we don't have to name aws-smithy-runtime-api
+/// types (not a direct dependency).
+fn put_is_precondition_failed<R>(
+    err: &SdkError<aws_sdk_s3::operation::put_object::PutObjectError, R>,
+) -> bool {
+    use aws_sdk_s3::error::ProvideErrorMetadata as _;
+
+    match err {
+        SdkError::ServiceError(se) => se.err().code() == Some("PreconditionFailed"),
+        _ => false,
+    }
+}
+
 /// Streaming SHA-256 + size of a local file (the image of a fat archive can
 /// be large, so it is hashed in chunks rather than read into memory).
 fn file_member_digest(path: &Path) -> anyhow::Result<MemberDigest> {
@@ -532,10 +590,11 @@ fn file_member_digest(path: &Path) -> anyhow::Result<MemberDigest> {
 
 #[cfg(test)]
 mod tests {
+    use aws_sdk_s3::error::ErrorMetadata;
     use aws_sdk_s3::operation::get_object::GetObjectOutput;
     use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
     use aws_sdk_s3::operation::list_objects_v2::ListObjectsV2Output;
-    use aws_sdk_s3::operation::put_object::PutObjectOutput;
+    use aws_sdk_s3::operation::put_object::{PutObjectError, PutObjectOutput};
     use aws_sdk_s3::types::Object;
     use aws_sdk_s3::types::error::NotFound;
     use aws_smithy_mocks::{Rule, RuleMode, mock, mock_client};
@@ -704,6 +763,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn publish_maps_a_lost_conditional_put_to_the_write_once_refusal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (image, manifest_bytes) = packed_tiny_archive(dir.path());
+
+        // The HEAD pre-check sees no marker and the data uploads succeed,
+        // but the final conditional PUT comes back 412: another publisher
+        // claimed the prefix in between. The surfaced error must be the same
+        // actionable write-once refusal as the pre-check, not the raw SDK
+        // error.
+        let head_404 = mock!(aws_sdk_s3::Client::head_object)
+            .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
+        let put_data = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(|req| req.if_none_match().is_none())
+            .then_output(|| PutObjectOutput::builder().build());
+        let put_complete_412 = mock!(aws_sdk_s3::Client::put_object)
+            .match_requests(|req| req.if_none_match() == Some("*"))
+            .then_error(|| {
+                PutObjectError::generic(ErrorMetadata::builder().code("PreconditionFailed").build())
+            });
+        let client = mock_client!(
+            aws_sdk_s3,
+            RuleMode::MatchAny,
+            &[&head_404, &put_data, &put_complete_412]
+        );
+
+        let store = ArchiveStore::new("rio-chunks", "parity");
+        let err = store
+            .publish(&client, &image, &manifest_bytes, "rio-parity/test")
+            .await
+            .unwrap_err();
+        let message = format!("{err:#}");
+        assert!(
+            message.contains("write-once"),
+            "expected the write-once refusal, got: {message}"
+        );
+        assert!(
+            !message.contains("PreconditionFailed"),
+            "the raw SDK error must not surface: {message}"
+        );
+        assert_eq!(put_complete_412.num_calls(), 1);
+    }
+
+    #[tokio::test]
     async fn publish_refuses_a_mismatched_manifest() {
         let dir = tempfile::TempDir::new().unwrap();
         let (image, mut manifest_bytes) = packed_tiny_archive(dir.path());
@@ -855,6 +957,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_refuses_a_marker_listing_a_non_basename_object() {
+        // The completion marker is remote input: an object name with a path
+        // separator must be refused before any further GET is issued.
+        let short = "aaaaaaaaaaaaaaaa";
+        let marker = CompleteMarker {
+            archive_id: "a".repeat(64),
+            archive_id_short: short.to_string(),
+            objects: BTreeMap::from([(
+                "a/b".to_string(),
+                MemberDigest {
+                    sha256: "0".repeat(64),
+                    size: 1,
+                },
+            )]),
+            uploaded_at: test_stamp(),
+            uploader: "rio-parity/test".to_string(),
+        };
+        let get_complete = get_rule(
+            format!("parity/archives/{short}/complete.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        );
+        // Catch-all for any other GET; the guard must keep it at zero calls.
+        let get_other = mock!(aws_sdk_s3::Client::get_object)
+            .then_output(|| GetObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_complete, &get_other]);
+
+        let store = ArchiveStore::new("rio-chunks", "parity");
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = store
+            .fetch(&client, short, &dir.path().join("fetched"))
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("non-basename"), "got: {err:#}");
+        assert_eq!(get_complete.num_calls(), 1);
+        assert_eq!(
+            get_other.num_calls(),
+            0,
+            "no further GET may follow the refusal"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_refuses_a_short_id_mismatch() {
+        // complete.json names a different short id than the prefix it was
+        // fetched from: refuse before downloading anything.
+        let short = "aaaaaaaaaaaaaaaa";
+        let marker = CompleteMarker {
+            archive_id: "b".repeat(64),
+            archive_id_short: "bbbbbbbbbbbbbbbb".to_string(),
+            objects: BTreeMap::new(),
+            uploaded_at: test_stamp(),
+            uploader: "rio-parity/test".to_string(),
+        };
+        let get_complete = get_rule(
+            format!("parity/archives/{short}/complete.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        );
+        let get_other = mock!(aws_sdk_s3::Client::get_object)
+            .then_output(|| GetObjectOutput::builder().build());
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_complete, &get_other]);
+
+        let store = ArchiveStore::new("rio-chunks", "parity");
+        let dir = tempfile::TempDir::new().unwrap();
+        let err = store
+            .fetch(&client, short, &dir.path().join("fetched"))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("short id mismatch"),
+            "got: {err:#}"
+        );
+        assert_eq!(
+            get_other.num_calls(),
+            0,
+            "nothing may be downloaded after the refusal"
+        );
+    }
+
+    #[tokio::test]
     async fn list_returns_only_complete_prefixes() {
         let short_a = "aaaaaaaaaaaaaaaa";
         let short_b = "bbbbbbbbbbbbbbbb";
@@ -914,5 +1095,40 @@ mod tests {
         assert_eq!(archives[1].1.archive_id, "b".repeat(64));
         assert_eq!(get_a.num_calls(), 1);
         assert_eq!(get_b.num_calls(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_cross_checks_the_marker_against_its_prefix() {
+        // A marker that names a different short id than the prefix it lives
+        // under is surfaced as an error rather than returned as an entry
+        // whose fetch would fail anyway.
+        let short = "aaaaaaaaaaaaaaaa";
+        let marker = CompleteMarker {
+            archive_id: "b".repeat(64),
+            archive_id_short: "bbbbbbbbbbbbbbbb".to_string(),
+            objects: BTreeMap::new(),
+            uploaded_at: test_stamp(),
+            uploader: "rio-parity/test".to_string(),
+        };
+        let list_page = mock!(aws_sdk_s3::Client::list_objects_v2)
+            .match_requests(|req| req.prefix() == Some("parity/archives/"))
+            .then_output(move || {
+                ListObjectsV2Output::builder()
+                    .contents(
+                        Object::builder()
+                            .key(format!("parity/archives/{short}/complete.json"))
+                            .build(),
+                    )
+                    .build()
+            });
+        let get_marker = get_rule(
+            format!("parity/archives/{short}/complete.json"),
+            serde_json::to_vec(&marker).unwrap(),
+        );
+        let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list_page, &get_marker]);
+
+        let store = ArchiveStore::new("rio-chunks", "parity");
+        let err = store.list(&client).await.unwrap_err();
+        assert!(format!("{err:#}").contains("lives under"), "got: {err:#}");
     }
 }
