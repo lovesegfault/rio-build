@@ -13,9 +13,9 @@ use anyhow::{Context, Result};
 
 use super::S3_PREFIX;
 
-// No non-test users yet: the eval/status/report implementations that
-// consume these helpers are landing next. Each `allow(dead_code)` comes
-// off with its first user.
+// The campaign-scoped helpers have no non-test users yet: the
+// status/report implementations that consume them are landing next.
+// Each `allow(dead_code)` comes off with its first user.
 
 /// Key of a campaign-scoped artifact, e.g. `progress.json` or
 /// `report/summary.md`. Matches the engine's campaign sync layout
@@ -28,7 +28,6 @@ pub fn campaign_key(campaign_id: &str, rel: &str) -> String {
 
 /// Prefix all eval sets for one Hydra eval live under (the eval CLI
 /// appends its own `<key-digest>/` segment per eval set).
-#[allow(dead_code)]
 pub fn evals_prefix(hydra_eval_id: u64) -> String {
     format!("{S3_PREFIX}/evals/{hydra_eval_id}/")
 }

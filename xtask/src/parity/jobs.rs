@@ -211,9 +211,8 @@ fn container_security() -> serde_json::Value {
 ///   from failing the Job outright.
 /// - `karpenter.sh/do-not-disrupt` + the general node role keep
 ///   Karpenter from consolidating the node under a multi-day pod.
-// The four builders below have no non-test users yet: `parity eval` and
-// `parity launch` (landing next) consume them. Each `allow(dead_code)`
-// comes off with its first user.
+// Consumed by `parity launch` (landing next); the allow comes off with
+// its first user.
 #[allow(dead_code)]
 pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> Result<Job> {
     let job = serde_json::from_value(json!({
@@ -291,7 +290,6 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
 /// read the logs). The eval engine only talks to Hydra, the nixpkgs
 /// tarball host, cache.nixos.org and S3 — it mounts no campaign
 /// Secrets.
-#[allow(dead_code)] // consumed by `parity eval` (landing next)
 pub fn eval_job(
     c: &EngineJobCommon,
     job_name: &str,
@@ -385,7 +383,6 @@ fn parity_service_account(role_arn: &str) -> ServiceAccount {
 
 /// Ensure namespace + IRSA-annotated ServiceAccount exist (idempotent,
 /// SSA). Both `parity eval` and `parity launch` call this first.
-#[allow(dead_code)] // consumed by `parity eval`/`parity launch` (landing next)
 pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
     kube::ensure_namespace(client, NS_PARITY, false).await?;
     let sa = parity_service_account(role_arn);
@@ -400,7 +397,6 @@ pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
 /// pins its metadata there). A 409 (already exists) is turned into
 /// actionable guidance instead of an SSA overwrite (Job templates are
 /// immutable).
-#[allow(dead_code)] // consumed by `parity eval`/`parity launch` (landing next)
 pub async fn create_job(client: &kube::Client, job: &Job) -> Result<()> {
     let name = job.metadata.name.clone().unwrap_or_default();
     let api: Api<Job> = Api::namespaced(client.clone(), NS_PARITY);

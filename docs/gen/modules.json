@@ -2046,6 +2046,11 @@
       "doc": "`cargo xtask parity` — operator surface for the nixpkgs-parity campaign."
     },
     {
+      "path": "parity/eval.rs",
+      "depth": 1,
+      "doc": "`cargo xtask parity eval` — apply the eval-set Job for one Hydra evaluation."
+    },
+    {
       "path": "parity/jobs.rs",
       "depth": 1,
       "doc": "rio-parity namespace/SA bootstrap and the campaign / eval Job builders."

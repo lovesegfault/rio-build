@@ -15,12 +15,13 @@
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
+pub mod eval;
 pub mod jobs;
 pub mod preflight;
 pub mod s3;
 
-// Some constants below (and the `s3` helpers) have no non-test users yet:
-// the eval/launch/status/report implementations that consume them are
+// Some constants below (and some `s3` helpers) have no non-test users
+// yet: the launch/status/report implementations that consume them are
 // landing next. Each `allow(dead_code)` comes off with its first user.
 
 /// Campaign tenants (created by `parity launch` directly via rio-cli —
@@ -51,7 +52,6 @@ pub const SA_PARITY: &str = "rio-parity";
 /// engine's layout — the eval CLI's default `--s3-prefix` and the
 /// campaign spec's default `parity/campaigns` artifact prefix both live
 /// under it.
-#[allow(dead_code)]
 pub const S3_PREFIX: &str = "parity";
 
 /// GC retention (hours) for the campaign tenants — 30 days, passed to
@@ -69,7 +69,7 @@ pub struct ParityArgs {
 enum ParityCmd {
     /// Build (or reuse) an eval set: apply the parity-eval Job for one
     /// Hydra evaluation (writes under `parity/evals/<id>/…` in S3).
-    Eval(EvalArgs),
+    Eval(eval::EvalArgs),
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
     /// and apply the campaign Job.
     ///
@@ -111,11 +111,9 @@ enum ParityCmd {
 }
 
 // Placeholder arg structs — swapped for the real ones as the
-// eval/launch/status/report implementations land (each lands by
-// replacing exactly one of these and its `run` arm). Campaign-scoped
-// commands take the campaign id positionally.
-#[derive(Args)]
-pub struct EvalArgs {}
+// launch/status/report implementations land (each lands by replacing
+// exactly one of these and its `run` arm). Campaign-scoped commands
+// take the campaign id positionally.
 #[derive(Args)]
 pub struct LaunchArgs {}
 #[derive(Args)]
@@ -131,9 +129,9 @@ pub struct ReportArgs {
 
 pub async fn run(args: ParityArgs) -> Result<()> {
     match args.cmd {
-        // Placeholder arms: each of the four campaign commands bails
-        // until its implementation lands and replaces the arm.
-        ParityCmd::Eval(_) => bail!("`cargo xtask parity eval` is not implemented yet"),
+        ParityCmd::Eval(a) => eval::run(a).await,
+        // Placeholder arms: the remaining campaign commands bail until
+        // their implementations land and replace the arms.
         ParityCmd::Launch(_) => bail!("`cargo xtask parity launch` is not implemented yet"),
         ParityCmd::Status(a) => bail!(
             "`cargo xtask parity status {}` is not implemented yet",
