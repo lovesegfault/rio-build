@@ -819,7 +819,7 @@ both endpoints are nodes of the attacker's own request. Exact re-declarations
 of existing edges stay accepted as silent no-ops — the gateway re-emits each
 parent's full edge set on every full-closure join — and skipped foreign
 edges are observable (a per-merge warning plus the
-`rio_scheduler_merge_foreign_edge_skipped_total` counter) rather than a
+#(refs.metric)("rio_scheduler_merge_foreign_edge_skipped_total") counter) rather than a
 rejection, matching the edge loop's existing unresolved-endpoint posture.
 The topdown-pruned carve-out exists because a pruned root's creating
 submission deliberately dropped its dependency edges; the later full merge
