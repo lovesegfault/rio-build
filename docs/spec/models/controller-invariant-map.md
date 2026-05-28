@@ -1182,9 +1182,30 @@ re-runs that license "no transition change needed".
   scheduled with the 1c'/1d re-derivation as already recorded above.
 
 Controller-campaign owner counter-signature for this re-audit entry:
-PENDING (to be collected at the executor campaign's 1b close-out
-review; the executor-campaign records reference this entry from
-`docs/spec/models/executor-invariant-map.md`'s Phase-1b record).
+SIGNED 2026-05-28 (collected at the executor campaign's close-out, as
+the Phase-1b record's reference to this entry anticipated). Checked at
+signing: J11's selection and once-per-terminal-object sampling are
+intact in `pool/job.rs::report_terminated_pods` /
+`report_deadline_exceeded_jobs` (the seen-map sample gate), now
+speaking `ReportAttemptOutcome`, and the pull-mode second-installment /
+no-attempt semantics the entry relies on are pinned by the scheduler's
+report-idempotency and no-attempt batteries; the AD5 cancel arm
+(`cancel_closed_attempt_jobs`, gated on the Pool CR's pull dispatch
+mode, closed-edge evidence, fail-closed view read) and the
+DisruptionTarget preemption branch are as recorded and stay out of
+Model J, their pricing carried by the 1c'/1d re-derivation exactly as
+this entry promised; `AckSpawnedIntents` arming and the modeled tick
+order are untouched (the ICE clear edge moved scheduler-side only, to
+the fenced pull mint's single-cell clear). Models J and N were
+byte-unchanged at the 1b slice; the re-run record is commit
+`402a459562` (figures in that commit message and the checks'
+transcripts), and the same wired exhaustive checks were re-confirmed
+green against the unchanged model text at this counter-signature with
+distinct-state counts bit-identical to that baseline (figures in the
+counter-signature commit message). The busy-view OR-bridge this entry
+describes was later narrowed to the durable open-attempt view alone —
+that is the 1d entry's signed content below, not a correction to this
+one. No Model J/N assumption is invalidated.
 
 ## Executor-campaign 1c entry — the OA2 controller-side node-wedge aggregation (Model N input change)
 
@@ -1226,9 +1247,10 @@ T-1c.1), inside this campaign's Model N scope per the OA2 decision
 
 Controller-campaign owner signature for this entry: the scope and
 landing slot are exactly what the jointly-signed OA2 DECIDED block
-(2026-05-27) committed; counter-signature of the landed form to be
-collected at the executor campaign's 1c close-out review alongside the
-pending 1b counter-signature above.
+(2026-05-27) committed; counter-signature of the landed form remains
+to be collected (the 1b counter-signature above was collected at the
+campaign close-out on 2026-05-28; this entry's landed-form review was
+not part of that batch).
 
 ## Executor-campaign 1c' entry — deletion wave 1 and the Model J/N obligation re-derivation (delta pass)
 
@@ -1273,10 +1295,28 @@ and re-pointed the operator surfaces onto the open-attempt view.
   pass remains scheduled with the 1d re-derivation as recorded above.
 
 Controller-campaign owner counter-signature for this delta entry:
-PENDING (to be collected at the 1c' close-out, alongside the
-spec-sweep landing; the executor-campaign records reference this
-entry from `docs/spec/models/executor-invariant-map.md`'s Phase-1c'
-record).
+SIGNED 2026-05-28 (collected with the campaign close-out; the
+spec-sweep had landed). Checked at signing: `ListExecutors` is served
+from the durable open-attempt view (`admin/executors.rs` — busy ⇔ an
+open pull-mode attempt); the heartbeat-fed hung-node detector and the
+`GetSpawnIntents.dead_nodes` plumbing are gone from the scheduler
+(the proto field is reserved at the 1d sweep), leaving the OA2 wedge
+clustering as the only Dead-arm feed besides node conditions, exactly
+as stated; the ICE-cell clear edge is the fenced pull mint's
+single-cell clear; the termination-report idempotence the
+spawnCoherence assume-guarantee imports survives as the attempt-row
+idempotency plus the no-attempt no-op (the model header and a
+`pool/job.rs` comment still name the deleted `recently_disconnected`
+map — prose drift only, covered by the header touch-up this entry
+already defers to the model files' next rebuild); the
+`DrainExecutor`/`DebugListExecutors` clear-error stubs and the
+retained legacy pod-name exclusion key (P12) were as recorded at the
+slice. The 0e obligation-row re-derivation items (i)–(iii) are present
+in the executor map's Phase-1c' record. Models J and N are
+byte-unchanged since the 1c OA2 header note, so the wired checks were
+unaffected by construction at this slice; they are green at the
+as-landed tree (re-confirmed at this counter-signature). No Model J/N
+assumption is invalidated.
 
 ## Executor-campaign 1d entry — controller cleanup, proto sweep, Model D retirement (delta pass)
 
@@ -1325,5 +1365,32 @@ counter-signature collected with the 1d landing.
   as previously recorded.
 
 Controller-campaign owner counter-signature for this delta entry:
-PENDING (to be collected at the 1d landing review, alongside the
-executor campaign's G6 gate).
+SIGNED 2026-05-28 (collected after the 1d landing, with the campaign
+close-out). Checked at signing, against the as-landed tree: the
+orphan-Running reap reads only `ListOpenAttempts`, fail-closed on a
+failed read, with no leader-age or empty-list arm and foreground
+deletes (the `ctrl.ephemeral.reap-orphan-running+4` /
+`ctrl.job.busy-from-open-attempts+2` impl sites); the dropped gate
+arms are no-reap arms whose hazard — a post-failover in-memory map
+that has not refilled — does not exist for the durable ledger view,
+so `reapSafety`'s subject (busy ⇒ never reaped; no reap without a
+passed gate, the gate now being view-read-success) is preserved and
+the F1 busy-but-never-registered residual narrows exactly as stated;
+Model J keeps the stream-era 3-arm gate encoding and is therefore
+conservative with respect to the deleted arms until this campaign's
+own pull-only re-encode (already a recorded obligation above). The
+DisruptionTarget watcher takes the synthesize-preempted +
+foreground-delete path with no `DrainExecutor` hop; the NodeClaim
+Dead arm is fed by the OA2 wedge clustering alone, which Model N
+consumes as input only per its header note; `GetSpawnIntentsResponse.
+dead_nodes` is reserved and the stream-era executor/admin RPCs are
+out of the proto. Models J and N are byte-unchanged; the wired
+`quint-spawn-coherence-*` / `quint-nodeclaim-*` checks (all six J
+regimes, all four N regimes, and the J witnesses) were re-confirmed
+green at this counter-signature via `nix build --no-link` against the
+as-landed model text, with distinct-state counts bit-identical to the
+`402a459562` baselines (figures in the counter-signature commit
+message and the checks' transcripts). The Stage-C delta-pass claim —
+no calibrated controller family's mechanism changed at 1d — is
+consistent with the per-family tables above. No Model J/N assumption
+is invalidated.
