@@ -8,19 +8,17 @@
 //!
 //! Operator note: chart-side enablement (the engine's CiliumNetworkPolicy
 //! admissions + the campaign tenants' gateway build-policy defaults) comes
-//! from deploying with `cargo xtask k8s up --deploy-parity`. Helm gets a
-//! full fresh value set on every upgrade, so any redeploy while a campaign
-//! is running must keep passing `--deploy-parity` — omitting it reverts
-//! `parity.enabled` to the chart default (false) and rolls the gateway via
-//! its config checksum; the launch-time pre-flight cannot protect against
-//! a redeploy that happens after launch.
+//! from deploying with `cargo xtask k8s up --deploy-parity`; see
+//! `cargo xtask parity launch --help` for the redeploy warning that applies
+//! while a campaign is running.
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
+pub mod jobs;
 pub mod s3;
 
-// The constants below (and the `s3` helpers) have no non-test users yet:
+// Some constants below (and the `s3` helpers) have no non-test users yet:
 // the eval/launch/status/report implementations that consume them are
 // landing next. Each `allow(dead_code)` comes off with its first user.
 
@@ -44,9 +42,7 @@ pub const TENANT_WARM: &str = "parity-warm";
 /// pod label — the chart's CiliumNetworkPolicies admit the engine only
 /// from that namespace+label pair — and with the parity IRSA trust
 /// binding to `rio-parity:rio-parity` (infra/eks/parity.tf).
-#[allow(dead_code)]
 pub const NS_PARITY: &str = "rio-parity";
-#[allow(dead_code)]
 pub const SA_PARITY: &str = "rio-parity";
 
 /// S3 prefix inside the chunk bucket; must match the parity IRSA policy
@@ -93,7 +89,6 @@ enum ParityCmd {
     /// Print (or run) the recorded repro command for one job. M2.
     Repro {
         /// Campaign id.
-        #[arg(long)]
         campaign: String,
         /// Job name (manifest `job` field).
         job: String,
@@ -110,21 +105,28 @@ enum ParityCmd {
         campaign: String,
         /// Also delete the three campaign tenants.
         #[arg(long)]
-        delete_tenant: bool,
+        delete_tenants: bool,
     },
 }
 
 // Placeholder arg structs — swapped for the real ones as the
 // eval/launch/status/report implementations land (each lands by
-// replacing exactly one of these and its `run` arm).
+// replacing exactly one of these and its `run` arm). Campaign-scoped
+// commands take the campaign id positionally.
 #[derive(Args)]
 pub struct EvalArgs {}
 #[derive(Args)]
 pub struct LaunchArgs {}
 #[derive(Args)]
-pub struct StatusArgs {}
+pub struct StatusArgs {
+    /// Campaign id.
+    pub campaign: String,
+}
 #[derive(Args)]
-pub struct ReportArgs {}
+pub struct ReportArgs {
+    /// Campaign id.
+    pub campaign: String,
+}
 
 pub async fn run(args: ParityArgs) -> Result<()> {
     match args.cmd {
@@ -132,8 +134,14 @@ pub async fn run(args: ParityArgs) -> Result<()> {
         // until its implementation lands and replaces the arm.
         ParityCmd::Eval(_) => bail!("`cargo xtask parity eval` is not implemented yet"),
         ParityCmd::Launch(_) => bail!("`cargo xtask parity launch` is not implemented yet"),
-        ParityCmd::Status(_) => bail!("`cargo xtask parity status` is not implemented yet"),
-        ParityCmd::Report(_) => bail!("`cargo xtask parity report` is not implemented yet"),
+        ParityCmd::Status(a) => bail!(
+            "`cargo xtask parity status {}` is not implemented yet",
+            a.campaign
+        ),
+        ParityCmd::Report(a) => bail!(
+            "`cargo xtask parity report {}` is not implemented yet",
+            a.campaign
+        ),
         ParityCmd::Repro { .. } => not_yet("repro"),
         ParityCmd::Abort { .. } => not_yet("abort"),
         ParityCmd::Cleanup { .. } => not_yet("cleanup"),
@@ -144,7 +152,7 @@ pub async fn run(args: ParityArgs) -> Result<()> {
 /// surface documents the full campaign lifecycle from the start, but
 /// they fail loudly instead of pretending to work.
 fn not_yet(what: &str) -> Result<()> {
-    anyhow::bail!("`cargo xtask parity {what}` is not yet implemented (planned for M2)")
+    bail!("`cargo xtask parity {what}` is not yet implemented (planned for M2)")
 }
 
 #[cfg(test)]

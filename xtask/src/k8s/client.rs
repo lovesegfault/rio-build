@@ -148,6 +148,52 @@ pub async fn get_secret_key(
         .and_then(|v| String::from_utf8(v.0).ok()))
 }
 
+/// Create/update a Secret whose values are raw bytes (e.g. a service-HMAC
+/// key — random bytes, NOT UTF-8). Sibling of [`apply_secret`], which only
+/// handles string data. Idempotent.
+// Consumed by `parity launch` (landing next); the allow comes off with its
+// first user.
+#[allow(dead_code)]
+pub async fn apply_secret_bytes(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    data: BTreeMap<String, Vec<u8>>,
+) -> Result<()> {
+    let api: Api<Secret> = Api::namespaced(client.clone(), ns);
+    let mut secret = Secret::default();
+    secret.metadata.name = Some(name.into());
+    secret.metadata.namespace = Some(ns.into());
+    secret.data = Some(
+        data.into_iter()
+            .map(|(k, v)| (k, k8s_openapi::ByteString(v)))
+            .collect(),
+    );
+    let ssapply = PatchParams::apply("xtask").force();
+    api.patch(name, &ssapply, &Patch::Apply(&secret)).await?;
+    Ok(())
+}
+
+/// Read one string key from a ConfigMap. `None` if the ConfigMap or key
+/// doesn't exist.
+// Consumed by the parity launch pre-flight (landing next); the allow comes
+// off with its first user.
+#[allow(dead_code)]
+pub async fn get_configmap_key(
+    client: &Client,
+    ns: &str,
+    name: &str,
+    key: &str,
+) -> Result<Option<String>> {
+    use k8s_openapi::api::core::v1::ConfigMap;
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
+    Ok(api
+        .get_opt(name)
+        .await?
+        .and_then(|cm| cm.data)
+        .and_then(|d| d.get(key).cloned()))
+}
+
 /// LoadBalancer ingress hostname for the gateway Service. `Err` if the
 /// Service has no `.status.loadBalancer.ingress` yet (NLB still
 /// provisioning) — caller decides whether to wait or print a

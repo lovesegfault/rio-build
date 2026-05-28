@@ -2046,6 +2046,11 @@
       "doc": "`cargo xtask parity` — operator surface for the nixpkgs-parity campaign."
     },
     {
+      "path": "parity/jobs.rs",
+      "depth": 1,
+      "doc": "rio-parity namespace/SA bootstrap and the campaign / eval Job builders."
+    },
+    {
       "path": "parity/s3.rs",
       "depth": 1,
       "doc": "S3 layout + small read helpers for campaign artifacts."
