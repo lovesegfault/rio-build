@@ -97,8 +97,8 @@ arc_string_newtype! {
 
 arc_string_newtype! {
     /// Executor identifier newtype (e.g., `"builder-0"`, `"fetcher-2"`,
-    /// or a UUID). Covers both builder and fetcher pods — the scheduler
-    /// distinguishes by `ExecutorState.kind`, not by ID prefix.
+    /// or a UUID). Covers both builder and fetcher pods — kind is
+    /// derived from the work (`kind_for_drv`), never from an ID prefix.
     /// `Arc<str>` backing — clone is an atomic refcount bump, not alloc.
     pub struct ExecutorId
 }

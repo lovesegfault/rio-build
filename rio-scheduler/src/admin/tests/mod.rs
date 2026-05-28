@@ -11,7 +11,6 @@
 use super::*;
 use crate::actor::tests::setup_actor;
 use rio_test_support::TestDb;
-use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
 
 mod builds_tests;
@@ -743,16 +742,41 @@ async fn service_token_allowlist_enforced() {
     assert_eq!(n, 1, "exactly one accepted insert");
 
     // controller+cli allowlist (`["rio-controller","rio-cli"]`).
+    // DrainExecutor is a retired no-op (Unimplemented) — the assertion
+    // here is that an allowlisted caller gets PAST the token gate (the
+    // retirement error, not PermissionDenied), and that the gate still
+    // fronts the stub.
     let drain = DrainExecutorRequest {
         executor_id: "victim".into(),
         force: true,
     };
-    svc.drain_executor(req_with_token(&signer, "rio-controller", drain.clone()))
+    let err = svc
+        .drain_executor(req_with_token(&signer, "rio-controller", drain.clone()))
         .await
-        .expect("rio-controller allowed");
-    svc.drain_executor(req_with_token(&signer, "rio-cli", drain))
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "rio-controller passes the gate and reaches the retired-surface error"
+    );
+    let err = svc
+        .drain_executor(req_with_token(&signer, "rio-cli", drain.clone()))
         .await
-        .expect("rio-cli allowed");
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unimplemented,
+        "rio-cli passes the gate and reaches the retired-surface error"
+    );
+    let err = svc
+        .drain_executor(req_with_token(&signer, "rio-gateway", drain))
+        .await
+        .unwrap_err();
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "non-allowlisted caller is still rejected at the gate, before the stub"
+    );
 
     // cli-only allowlist (`["rio-cli"]`).
     let cp = ClearPoisonRequest {
@@ -928,38 +952,46 @@ async fn cluster_status_empty() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The executor counts are the busy view: one open pull-mode attempt
+/// per in-flight derivation. (Successor of the stream-era
+/// registered/draining census, which retired with the executors map —
+/// spawned-but-not-yet-pulled pods are the controller's Job census,
+/// not a scheduler count.)
 #[tokio::test]
-async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
-    use crate::actor::tests::connect_executor;
+async fn cluster_status_counts_open_attempts() -> anyhow::Result<()> {
+    use crate::actor::tests::{merge_single_node, pull_attempt};
+    use crate::state::PriorityClass;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
-    // Stream-only worker (no heartbeat) → total=1, active=0.
-    // is_registered() requires BOTH stream_tx AND system; this has
-    // only the stream. The autoscaler should NOT count it as
-    // available capacity.
-    let (stream_tx, _rx1) = mpsc::channel(16);
-    actor
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: "stream-only".into(),
-            stream_tx,
-            stream_epoch: crate::actor::tests::next_stream_epoch_for("stream-only"),
-            auth_intent: None,
-            reply: crate::actor::tests::noop_connect_reply(),
-        })
-        .await?;
-
-    // Fully registered worker (stream + heartbeat) → active.
-    let _rx2 = connect_executor(&actor, "full", "x86_64-linux").await?;
+    // Two single-node DAGs; only the first is taken by a pull attempt.
+    let _ev1 = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "cs-w1",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _ev2 = merge_single_node(
+        &actor,
+        uuid::Uuid::new_v4(),
+        "cs-w2",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    let _assignment = pull_attempt(&actor, "cs-w1").await;
 
     let resp = cluster_status_now(&svc, &actor).await?;
 
-    assert_eq!(resp.total_executors, 2);
     assert_eq!(
-        resp.active_executors, 1,
-        "only 'full' is registered (stream+heartbeat); 'stream-only' has no heartbeat"
+        resp.total_executors, 1,
+        "one open attempt = one busy executor; the un-pulled Ready drv is queue, not fleet"
     );
-    assert_eq!(resp.draining_executors, 0, "no workers draining");
+    assert_eq!(resp.active_executors, 1);
+    assert_eq!(
+        resp.draining_executors, 0,
+        "per-executor drain retired with the stream session; always 0"
+    );
     Ok(())
 }
 
@@ -989,15 +1021,18 @@ async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
     assert_eq!(resp.pending_builds, 0);
     // The DAG-status-derived counts are the pull-era truth: "b" is the
     // only Ready derivation, "a" is Running under its open attempt.
-    // The `queued_derivations` SCALAR still reads the ready_queue
-    // length, which a pull mint does not dequeue (the recorded
-    // over-count); it is re-pointed onto the DAG-status count by the
-    // operator-surface deletion commit (commit C), which re-adds the
-    // scalar assertion here.
+    // The scalar is counted from the same DAG pass as the per-system
+    // split (the recorded ready-queue over-count is fixed), so the two
+    // must agree exactly.
+    assert_eq!(
+        resp.queued_derivations, 1,
+        "one Ready derivation waiting for a worker (DAG-status based; a pulled drv is \
+         no longer queued)"
+    );
     assert_eq!(
         resp.queued_by_system.values().sum::<u32>(),
-        1,
-        "one Ready derivation waiting for a worker (DAG-status based)"
+        resp.queued_derivations,
+        "per-system split sums to the scalar by construction"
     );
     assert_eq!(
         resp.running_derivations, 1,
@@ -1042,42 +1077,54 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 // DrainExecutor
 // -----------------------------------------------------------------------
 
+/// DrainExecutor is a retired no-op until the 1d proto sweep: it must
+/// perform no action and return a clear error that names the successor
+/// procedures (cordon + AD2 exclusion / cancel + Job deletion /
+/// pool-level pause), never a silent success. The service-token gate
+/// stays in front of it (covered by
+/// [`mutating_rpcs_require_service_token`]).
 #[tokio::test]
-async fn drain_worker_empty_id_invalid() -> anyhow::Result<()> {
+async fn drain_worker_retired_returns_unimplemented() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
-    let result = svc
+    let status = svc
         .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: String::new(),
-            force: false,
+            executor_id: "any-worker".into(),
+            force: true,
         }))
-        .await;
-
-    let status = result.expect_err("empty executor_id should be InvalidArgument");
-    assert_eq!(status.code(), tonic::Code::InvalidArgument);
-    assert!(status.message().contains("executor_id"));
+        .await
+        .expect_err("retired surface must not report success");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(
+        status.message().contains("retired"),
+        "the error explains the retirement: {}",
+        status.message()
+    );
+    assert!(
+        status.message().contains("cordon") && status.message().contains("CancelBuild"),
+        "the error names the successor procedures: {}",
+        status.message()
+    );
     Ok(())
 }
 
+/// DebugListExecutors is likewise a retired no-op: there is no
+/// in-memory executor map left to snapshot; the error points at
+/// ListOpenAttempts and the Job/pod census.
 #[tokio::test]
-async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
-    // Unknown worker → accepted=false, running=0. NOT gRPC error:
-    // preStop may race with ExecutorDisconnected (SIGTERM → select!
-    // break → stream drop → actor removes entry → preStop's drain
-    // call arrives to an empty slot). The worker proceeds as if
-    // drain succeeded — nothing to wait for.
+async fn debug_list_executors_retired_returns_unimplemented() -> anyhow::Result<()> {
     let (svc, _actor, _task, _db) = setup_svc_default().await;
 
-    let resp = svc
-        .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: "ghost".into(),
-            force: false,
-        }))
-        .await?
-        .into_inner();
-
-    assert!(!resp.accepted, "unknown worker → accepted=false");
-    assert!(!resp.busy);
+    let status = svc
+        .debug_list_executors(Request::new(()))
+        .await
+        .expect_err("retired surface must not report success");
+    assert_eq!(status.code(), tonic::Code::Unimplemented);
+    assert!(
+        status.message().contains("ListOpenAttempts"),
+        "the error names the successor view: {}",
+        status.message()
+    );
     Ok(())
 }
 

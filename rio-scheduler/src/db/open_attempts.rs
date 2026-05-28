@@ -71,15 +71,21 @@ pub(crate) struct OpenAttemptRow {
     pub exec_id: Uuid,
     /// Executor identity the attempt is bound to (`assignments.builder_id`).
     pub executor_id: String,
+    /// `derivations.system` — what the pod was spawned to build. The
+    /// re-pointed `ListExecutors` surface reports it as the entry's
+    /// `systems`.
+    pub system: String,
+    /// `derivations.is_fixed_output` — drives the entry's
+    /// builder/fetcher `kind` on the re-pointed `ListExecutors`
+    /// surface (one-shot pods build exactly the drv they pulled).
+    pub is_fixed_output: bool,
     /// Controller-authoritative node binding, when known (071).
     pub source_node: Option<String>,
     /// Lease generation the assignment row carries.
     pub generation: i64,
     /// `assignments.assigned_at` as epoch seconds (PG clock).
     // The sweep's window math reads age_secs (PG-clock relative); this
-    // absolute stamp is the view-contract column tests assert on.
-    // allow: only the in-crate db tests read it today.
-    #[allow(dead_code)]
+    // absolute stamp feeds the re-pointed ListExecutors timestamps.
     pub assigned_at_epoch_secs: f64,
     /// Age of the assignment row in seconds (PG clock, non-negative).
     pub age_secs: f64,
@@ -289,7 +295,7 @@ impl SchedulerDb {
     /// path wrote.
     pub(crate) async fn list_open_pull_attempts(&self) -> Result<Vec<OpenAttemptRow>, sqlx::Error> {
         let rows: Vec<OpenAttemptRow> = sqlx::query_as(
-            "SELECT d.derivation_id, d.drv_hash, d.drv_path, \
+            "SELECT d.derivation_id, d.drv_hash, d.drv_path, d.system, d.is_fixed_output, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
                     e.source_node, e.dispatch_mode, e.deadline_secs, \
                     EXTRACT(EPOCH FROM a.assigned_at)::float8 AS assigned_at_epoch_secs, \

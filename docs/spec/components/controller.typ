@@ -752,19 +752,17 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
   the derivation requeues charge-free.
 ]
 
-*SIGTERM drain (no preStop hook needed):* the executor's main loop has a
-`select!` arm on SIGTERM. On signal:
-
-+ Set heartbeat `draining=true` (the executor-authoritative drain source ---
-  I-063); the scheduler's `has_capacity()` reads it via `is_draining()`.
-+ Keep the `BuildExecution` stream connected (and reconnect across scheduler
-  restart) until `BuildSlot::wait_idle()` returns --- the in-flight build's
-  completion is reported.
-+ Send `AdminService.DrainExecutor` (best-effort exit deregister) and exit 0.
-
-A preStop hook doing the same is redundant: K8s sends SIGTERM on pod
-termination regardless of preStop, and the executor's signal handler implements
-the drain. The Job pod template does NOT define a preStop.
+*SIGTERM handling (no preStop hook needed):* the builder's main loop has a
+`select!` arm on SIGTERM. For a pull-mode pod the signal is an abort, not a
+drain: the builder cgroup-kills the in-flight build, makes one bounded
+best-effort `ReportOutcome` attempt inside the AD5 grace
+(#rref("builder.shutdown.sigint+3")), and exits --- there is no
+scheduler-side drain step (`AdminService.DrainExecutor` is a retired no-op;
+the per-executor drain it set has no object), no registration to give back,
+and the requeue happens at the report fold or, failing that, the
+establishment sweep. A preStop hook would be redundant: K8s sends SIGTERM
+on pod termination regardless, and the signal handler implements the abort.
+The Job pod template does NOT define a preStop.
 
 #r("ctrl.drain.disruption-target+2")[
   *Eviction-triggered preemption:* the controller runs a Pod watcher filtered
@@ -795,11 +793,14 @@ the drain. The Job pod template does NOT define a preStop.
 
 == Pull-mode attempt lifecycle (additive)
 
-For pools whose pods dispatch via `PullAssignment`/`ReportOutcome`, the
-controller is the classifier of pod/Job terminal status and the consumer of
-the scheduler's ledger-backed open-attempt view. The stream-mode paths above
-(`ReportExecutorTermination`, `DrainExecutor`, the deadline-exceeded Job
-report) keep serving stream-mode pools unchanged during coexistence.
+For pools whose pods dispatch via `PullAssignment`/`ReportOutcome` --- the
+only delivery mode the scheduler still serves --- the controller is the
+classifier of pod/Job terminal status and the consumer of the scheduler's
+ledger-backed open-attempt view. Of the stream-mode paths above,
+`ReportExecutorTermination` is still answered (as an acknowledged no-op)
+until the 1d proto sweep; `DrainExecutor` is a retired no-op that returns a
+clear error, and the controller's remaining stream-mode call sites go away
+with the 1d controller cleanup.
 
 #r("ctrl.report.attempt-outcome")[
   The controller MUST fold a pull-mode attempt's pod/Job terminal status to

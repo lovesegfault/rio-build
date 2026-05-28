@@ -30,15 +30,15 @@ use crate::lease::LeaderState;
 use crate::queue::ReadyQueue;
 #[allow(unused_imports)]
 use crate::state::{
-    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, ExecutorState,
-    POISON_TTL, PoisonConfig, RetryPolicy,
+    BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId, POISON_TTL,
+    PoisonConfig, RetryPolicy,
 };
 
 // `impl DagActor` is sharded across these submodules by concern.
 // Cohesive field clusters live in sub-structs (`events: BuildEventBus`,
 // `leader: LeaderState`); the genuinely
-// cross-cutting fields (`dag`, `executors`, `builds`, `db`,
-// `ready_queue`) remain flat — every handler reads/writes them. Keep
+// cross-cutting fields (`dag`, `builds`, `db`, `ready_queue`) remain
+// flat — every handler reads/writes them. Keep
 // ALL `mod` decls here so the submodule list is discoverable in one
 // place.
 mod breaker;
@@ -65,7 +65,6 @@ pub use event::BuildEventReceivers;
 pub use handle::ActorHandle;
 #[cfg(test)]
 pub(crate) use handle::DebugDerivationInfo;
-pub(crate) use handle::DebugExecutorInfo;
 pub use pull::{PullOutcome, PullRejection};
 
 #[cfg(test)]
@@ -269,8 +268,6 @@ pub struct DagActor {
     /// Per-build event broadcast channels + sequence/debounce state +
     /// persister wire. See [`BuildEventBus`].
     events: BuildEventBus,
-    /// Connected workers.
-    executors: HashMap<ExecutorId, ExecutorState>,
     /// Kube-authoritative `drv_hash → (spec.nodeName, tenant)` from
     /// the controller's pod informer (`AckSpawnedIntents.bound_intents`).
     /// Read by the pull mint (AD2c `source_node` attribution) and the
@@ -379,14 +376,14 @@ pub struct DagActor {
     /// records the FULL A' cell-set of the controller-acked
     /// `SpawnIntent` per drv (arm-on-**ack**, not arm-on-emit —
     /// `solve_intent_for` is read-only so dashboard/CLI polls don't
-    /// leak entries); the registration edge in `handle_heartbeat`
-    /// looks it up and `ice.clear()`s **iff `len()==1`** (heartbeat ⇒
-    /// pod scheduled ⇒ ∃ cell ∈ A' with capacity; for `|A'|>1` it
-    /// identifies none — bug_030). Removed on that edge, executor
-    /// disconnect, or the `handle_tick` DAG-state sweep (cancel/
-    /// substitute/terminal). §13b's `AckSpawnedIntents.registered_
-    /// cells` (NodeClaim watcher) supersedes this once wired.
-    /// DashMap: read from `&self` `handle_heartbeat`. SmallVec:
+    /// leak entries); the first successful pull (the mint in
+    /// `actor/pull.rs`) looks it up and `ice.clear()`s **iff
+    /// `len()==1`** (a delivered pull ⇒ pod scheduled ⇒ ∃ cell ∈ A'
+    /// with capacity; for `|A'|>1` it identifies none — bug_030).
+    /// Removed on that edge or the `handle_tick` DAG-state sweep
+    /// (cancel/substitute/terminal). §13b's
+    /// `AckSpawnedIntents.registered_cells` (NodeClaim watcher)
+    /// supersedes this once wired. SmallVec:
     /// `|A'| ≤ |H|×|CapacityType::ALL|` (= |H|×2; 4 typical at 2
     /// hw_classes; spills at |H|≥3).
     pub(crate) dispatched_cells:
@@ -489,10 +486,7 @@ pub struct DagActor {
     /// (the pre-fix behaviour).
     service_signer: Option<Arc<rio_auth::hmac::HmacSigner>>,
     /// Shutdown token. When cancelled (SIGTERM via `shutdown_signal`),
-    /// the run loop drains `self.executors` and breaks. Dropping the
-    /// worker `stream_tx` senders cascades: `build-exec-bridge` tasks
-    /// exit → `ReceiverStream` closes → tonic's `serve_with_shutdown`
-    /// sees all response streams closed → server returns. Without
+    /// the run loop breaks. Without
     /// this, `serve_with_shutdown` deadlocks on open bidi streams
     /// because the `SchedulerGrpc` that holds an `ActorHandle`
     /// (sender) is itself held by the server's handler registry —
@@ -682,7 +676,6 @@ impl DagActor {
             ready_queue: ReadyQueue::new(),
             builds: HashMap::new(),
             events: BuildEventBus::new(plumbing.event_persist_tx),
-            executors: HashMap::new(),
             authoritative_binding: HashMap::new(),
             attempt_record_retries: HashMap::new(),
             retry_policy: cfg.retry_policy,
@@ -752,8 +745,7 @@ impl DagActor {
     /// fresh DAG so the I-204 strip survives leader transitions
     /// (regression: the original `self.dag = DerivationDag::new()` at
     /// each site dropped soft_features → first prod deploy of I-204
-    /// was a no-op after the lease acquired). Does NOT touch
-    /// `self.executors` — those are live connections, not persisted.
+    /// was a no-op after the lease acquired).
     pub(super) fn clear_persisted_state(&mut self) {
         // Exhaustive destructure so adding a DagActor field is a
         // compile error here until it's classified as cleared (bind +
@@ -773,7 +765,6 @@ impl DagActor {
             authoritative_binding,
             dag_authoritative,
             // Retained: rationale below.
-            executors: _,
             retry_policy: _,
             establishment_report_slack: _,
             poison_config: _,
@@ -852,7 +843,6 @@ impl DagActor {
         // staleness inferences fail closed in every empty-DAG window.
         *dag_authoritative = false;
         // Deliberately retained across generations:
-        // - `executors`: live connections, not persisted (doc above).
         // - `ice`: cluster-level cell-backoff signal, 60s TTL self-heals.
         // - `cache_breaker`: store availability is generation-independent.
         // - `sla_estimator`: cluster-wide fitted curves.
@@ -975,15 +965,7 @@ impl DagActor {
                 // we want fast drain, not a queue-process-then-exit.
                 biased;
                 _ = self.shutdown.cancelled() => {
-                    info!(
-                        workers = self.executors.len(),
-                        "actor shutting down, dropping worker streams"
-                    );
-                    // Drop all stream_tx → build-exec-bridge tasks
-                    // see actor_rx close → drop output_tx →
-                    // ReceiverStream closes → serve_with_shutdown
-                    // unblocks.
-                    self.executors.clear();
+                    info!("actor shutting down");
                     break;
                 }
                 cmd = rx.recv() => match cmd {
@@ -1091,33 +1073,6 @@ impl DagActor {
                         let _ = reply.send(result);
                     }
                 }
-                ActorCommand::ExecutorConnected {
-                    executor_id,
-                    stream_tx,
-                    stream_epoch,
-                    auth_intent,
-                    reply,
-                } => {
-                    let result = self.handle_worker_connected(
-                        &executor_id,
-                        stream_tx,
-                        stream_epoch,
-                        auth_intent,
-                    );
-                    let _ = reply.send(result);
-                }
-                ActorCommand::ExecutorDisconnected {
-                    executor_id,
-                    stream_epoch,
-                } => {
-                    // r[sched.lease.standby-drops-writes]: arm stays ungated
-                    // (executors-map/gauge bookkeeping must run on standby);
-                    // the PG-writing tail (reassign_derivations →
-                    // poison/Ready/terminal writes) self-gates on
-                    // is_leader() in executor.rs.
-                    self.handle_executor_disconnected(&executor_id, stream_epoch)
-                        .await;
-                }
                 ActorCommand::PullAssignment {
                     intent_id,
                     auth_intent,
@@ -1192,16 +1147,6 @@ impl DagActor {
                         );
                     }
                 }
-                ActorCommand::Heartbeat(hb) => {
-                    // r[sched.lease.standby-drops-writes]: arm stays
-                    // ungated (`handle_heartbeat` keeps `self.executors`
-                    // accurate for reconnect-after-reacquire and doesn't
-                    // write PG). The stream placement layer this used to
-                    // feed is gone; the arm survives only as the admin
-                    // surfaces' test plumbing until commit C re-points
-                    // them.
-                    self.handle_heartbeat(hb);
-                }
                 ActorCommand::Tick => {
                     self.handle_tick().await;
                 }
@@ -1234,14 +1179,6 @@ impl DagActor {
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
                     let _ = reply.send(cleared);
-                }
-                ActorCommand::DrainExecutor {
-                    executor_id,
-                    force,
-                    reply,
-                } => {
-                    let result = self.handle_drain_executor(&executor_id, force).await;
-                    let _ = reply.send(result);
                 }
                 // r[sched.lease.standby-drops-writes]: the forward arm
                 // stays ungated. ForwardPhase DOES persist Event::Phase

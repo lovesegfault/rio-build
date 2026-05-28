@@ -23,7 +23,7 @@ use tonic::transport::Channel;
 /// `AdminServiceClient` shape for all rio-cli→scheduler calls: a
 /// [`ServiceTokenInterceptor`](rio_auth::hmac::ServiceTokenInterceptor)
 /// (`caller="rio-cli"`) mints `x-rio-service-token` per request so the
-/// scheduler's controller-only-RPC gates (`DrainExecutor` allowlists
+/// scheduler's controller-only-RPC gates (`CancelBuild` allowlists
 /// `["rio-controller", "rio-cli"]`) pass. Signer absent → no header
 /// (dev-mode pass-through).
 pub(crate) type AdminClient = AdminServiceClient<
@@ -291,27 +291,20 @@ enum Cmd {
     ListTenants,
     /// Cluster status summary: workers, builds, queue depth.
     Status,
-    /// Detailed worker list. `Status` shows a one-line summary per
-    /// worker; this shows everything `ListExecutors` returns — features,
-    /// resources, current build — for operational drill-down.
-    ///
-    /// `--actor` reads the scheduler's IN-MEMORY map instead of PG —
-    /// what `dispatch_ready()` sees, not what `last_seen` claims.
-    /// I-048b/c diagnostic: PG showed fetchers `[alive]` (heartbeat
-    /// unary RPC reached the new leader), actor map was empty (bidi
-    /// stream stuck on TCP keepalive to old leader). `--diff` shows
-    /// both side-by-side with per-row `⚠` divergence markers.
+    /// Detailed worker list: one entry per open pull-mode attempt (the
+    /// pod that is building it), backed by the scheduler's durable
+    /// open-attempt view. Spawned-but-not-yet-pulled pods are not
+    /// listed — `kubectl get jobs/pods` (the Job census) is that view.
     Workers(workers::Args),
     /// List builds with optional filtering.
     Builds(builds::ListArgs),
     /// Actor in-memory DAG snapshot for a build. Unlike builds (PG
     /// summary) or GetBuildGraph (PG graph), this queries the LIVE
-    /// actor — exactly what dispatch_ready() sees. The I-025
-    /// diagnostic: if a derivation is Assigned to an executor whose
-    /// stream is dead (⚠ no-stream), dispatch is stuck forever.
+    /// actor — per-derivation status, retry/backoff state, and the
+    /// executor identity of the open attempt building it.
     ///
-    /// Status filter: "Ready" shows queued-not-dispatched (why?),
-    /// "Assigned" + ⚠ shows the freeze, "Queued" shows blocked-on-deps.
+    /// Status filter: "Ready" shows waiting-for-a-pod (why?),
+    /// "Queued" shows blocked-on-deps.
     Derivations(derivations::Args),
     /// Stream build logs for a derivation.
     ///
@@ -348,10 +341,12 @@ enum Cmd {
     /// the automatic one.
     // r[impl cli.cmd.cancel-build+2]
     CancelBuild(builds::CancelArgs),
-    /// Mark a worker draining. The scheduler stops dispatching new
-    /// builds to it; in-flight builds complete (or, with --force, are
-    /// reassigned). Same RPC the controller fires on SIGTERM/eviction —
-    /// this is the manual operator lever for the same path.
+    /// Retired: per-executor drain went away with the stream dispatch
+    /// protocol. The scheduler answers with a clear error naming the
+    /// successor procedures (cordon the node + AD2 exclusion, cancel
+    /// the open attempt and delete its Job, or pause the pool's spawn
+    /// intents); this subcommand surfaces it and is removed with the
+    /// RPC at the proto sweep.
     DrainExecutor(workers::DrainArgs),
     /// Inspect Pool CRs via the K8s apiserver (not gRPC). `get`
     /// lists Pools; `describe` shows spec + live status/conditions.

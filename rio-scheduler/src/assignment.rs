@@ -1,39 +1,17 @@
-//! Static executor/derivation eligibility plus the approximate input
-//! closure shared by the pull mint and the GC live-pin path.
+//! Approximate input closure shared by the pull mint and the GC
+//! live-pin path.
 //!
 //! The stream-era worker-selection half (`best_executor()`, the
 //! hard-filter/warm-gate two-pass and the per-clause rejection
-//! diagnostic) was deleted with the placement layer; the pull protocol
-//! has no scheduler-side placement decision (the controller's spawn
-//! gate owns source eligibility per AD2).
-
-use rio_proto::types::ExecutorKind;
+//! diagnostic) was deleted with the placement layer, and
+//! `statically_eligible` retired with the executors map: the pull
+//! protocol has no scheduler-side placement decision and no in-memory
+//! fleet to filter — the controller's spawn gate owns source
+//! eligibility per AD2 and its `NoEligibleSource` report is the
+//! fleet-exhaust path.
 
 use crate::dag::DerivationDag;
-use crate::state::{DerivationState, DrvHash, ExecutorState};
-
-/// Static eligibility: would `w` be a candidate for `drv` ignoring
-/// per-tick dynamic state (capacity / draining / degraded)?
-///
-/// Sole remaining consumer is the completion-time fleet-exhaust
-/// snapshot (E1's fleet arm feeding `retry_policy::placeable`), which
-/// reads the stream-era `executors` map — empty on a pull-mode fleet,
-/// so `placeable()` answers `NoEligibleWorkers` (never a poison) and
-/// the AD2 spawn-gate exhaustion check (`NoEligibleSource`) is the
-/// production fleet-exhaust path. Retires with the executors map.
-pub fn statically_eligible(w: &ExecutorState, drv: &DerivationState) -> bool {
-    drv.is_fixed_output == (w.kind == ExecutorKind::Fetcher)
-        && w.is_registered()
-        && w.systems.iter().any(|s| s == &drv.system)
-        // §13e + r35: read the EFFECTIVE feature set, not the raw
-        // declaration, so a misconfigured FOD is not mis-classified as
-        // fleet-exhausted.
-        && drv
-            .effective_features()
-            .as_slice()
-            .iter()
-            .all(|f| w.supported_features.contains(f))
-}
+use crate::state::DrvHash;
 
 /// Approximate input closure: the derivation's DAG children's
 /// expected output paths PLUS its own `inputSrcs` (already-built
@@ -95,6 +73,7 @@ pub(crate) fn approx_input_closure(dag: &DerivationDag, drv_hash: &DrvHash) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::DerivationState;
     use rio_test_support::fixtures::make_derivation_node;
 
     /// Shallow DAG: leaf node (no DAG children) with `inputSrcs` —

@@ -3099,7 +3099,7 @@ rows D0–D5.
 | Controller-map re-audit (T-1b.10) | `controller-invariant-map.md` "Executor-campaign 1b re-audit" entry | RECORDED; controller-campaign owner counter-signature PENDING at the close-out review |
 | Unit/integration red-first batteries (T-1b.1–T-1b.6) | Per-crate batteries landed with the code batch (exclusion re-key, anti-affinity/NoEligibleSource, C4/C5 re-point, AD5 SIGTERM-abort + cancel/disruption arms, ICE re-trigger, dispatchMode rendering) | GREEN at the code-batch landing (their gates ran with T-1b.1–T-1b.6; re-confirmed by the per-crate checks at this tree) |
 | Code-review pass over the 1a+1b pull-path code (T-1b.11) | `pull-path-review.md` (campaign workspace) + the "Code-review pass … review pass recorded + fixes landed" subsection in the Phase-1b record above | **RECORDED + FIXES LANDED (2026-05-27)**: 7 confirmed findings (P1–P7) fixed on this branch with red-first batteries, 1 refuted, minors taken or explicitly adjudicated; the two affected VM arms moved to the AD5 uncharged-close semantics and both hosting checks re-run green on the hardened tree |
-| OA5 surface review + OA4 call | Owner review against `ListOpenAttempts` + the VM-demonstrated fleet view (no running canary) | PENDING (owner action at the close-out review; surface notes in the Phase-1b record above) |
+| OA5 surface review + OA4 call | Owner review against `ListOpenAttempts` + the VM-demonstrated fleet view (no running canary) | OA5: SATISFIED by development-time review (v3 re-derivation — the running-canary sign-off was removed as a development-time gate; the surface-review record is in the Phase-1c' record below, written with deletion commit C, whose precondition it was; the live-fleet confirmation stays deployment-time row D7). OA4 (BuildPhase fate / DrainButton repoint): still the dashboard owner's call, due before T-1d.3 |
 | AD5 numeric budget / OA1 latency comparison / establishment-slack re-baseline / production rollback drill | Deployment-time validation checklist rows D1/D2/D5 | DEFERRED BY DESIGN (v3 directive); explicitly NOT development-time gate items |
 
 Deferral notes carried with the table: the AD5 numeric budget stays
@@ -3609,6 +3609,19 @@ deletion commits. The `workers_active` gauge keeps being emitted
 (reading zero on a pull-only fleet) until 1d precisely so that row D6
 stays evaluable after commits A–C land.
 
+Successor-signal re-point (recorded with deletion commit C, which
+pinned the gauge): on 1c'-era code the gauge is hardwired to zero (the
+intake that incremented it is deleted), so the gauge rule remains the
+honest D6 read only for the pre-deletion release it is evaluated
+against. The successor signal for "stream-mode executors still exist
+and are trying to register" on deletion-stage code is the
+`rio_scheduler_stream_stub_calls_total` counter (incremented by the
+BuildExecution/Heartbeat error stubs), pre-canned as the
+`rio:scheduler_stream_attempts:rate5m` recording rule next to the
+gauge rule. Row D6 evaluated against an environment already running
+deletion-stage code, and row D7's post-deletion "no calls to removed
+RPCs" watch, both read that series; the horizon formula is unchanged.
+
 #### Spec-consequence checklist for the 1c' sweep
 
 Queued at 0e (Phase-1 input list item 8), executed across the 1c'
@@ -3638,6 +3651,63 @@ re-points in that commit:
    (`sched.executor.{session-epoch,liveness-window,repair-precedence,one-shot}`,
    `builder.completion.exactly-once-or-death`) when the checks they
    cite re-target (T-1c'.5 for the session checks, 1d for Model D).
+
+#### OA5 surface-review record (development-time; precondition for deletion commit C)
+
+Recorded with deletion commit C (T-1c'.4), whose explicit precondition
+the OA5 sign-off was. Basis: the v3 re-derivation — the original
+running-canary operator sign-off was removed as a development-time
+gate; what stands in is a development-time review of the successor
+surface against the VM demonstrations and the 1b evidence assembly,
+with the live-fleet confirmation deferred to deployment-time checklist
+row D7.
+
+What the operator view becomes (the reviewed surface):
+
+- **`AdminService.ListOpenAttempts`** — the attempt-keyed fleet view:
+  every open pull-mode attempt with derivation, exec_id, executor
+  identity, source node (when known), generation, and age; the
+  `rio_scheduler_open_attempts` gauge is the same view as a fleet
+  count. Demonstrated by the `pull-mode` lifecycle subtest and the
+  `vm-pull-canary-k3s` scenario (the 1b evidence rows above) and by
+  the admin-surface unit batteries.
+- **`ListExecutors` (re-pointed at commit C)** — the same view
+  projected one-entry-per-attempt for existing CLI/dashboard/
+  controller callers (busy/alive entries keyed by the attempt's
+  executor identity, system/kind from the attempt's derivation,
+  attempt-open time in the timestamp fields, `leader_for_secs`
+  preserved). `rio-cli status` / `rio-cli workers` and the dashboard
+  Executors page keep working against it unchanged at the API level.
+- **`ClusterStatus` (re-pointed at commit C)** — executor counts are
+  the busy view (open attempts), `queued_derivations` is the
+  DAG-Ready count (now equal to `queued_by_system`'s sum by
+  construction — the recorded over-count is fixed), so the
+  autoscaler/dashboard headline numbers stay meaningful on a
+  pull-only fleet.
+- **The controller's Job census + dashboard views** — pod phase, node
+  and age for spawned-but-not-yet-pulled pods (the half the scheduler
+  no longer sees), per the OA5 0e record's "what the dashboard loses"
+  list; the dashboard keeps its Executors/Cluster pages against the
+  re-pointed RPCs, and the DrainButton/BuildPhase repoints remain the
+  recorded OA4/dashboard-owner ask due before T-1d.3.
+
+Operator controls reviewed against their successors (O1–O3, per the
+frozen contract): per-executor drain → cordon + AD2 node exclusion;
+force-evict → cancel verdict on the open attempt + controller Job
+deletion under the AD5 budget (cancel and preempt demonstrated
+end-to-end in `vm-pull-canary-k3s`, 9.9 s / 64.1 s VM-topology
+figures recorded in the Phase-1b record); fleet-wide stop → pause
+spawn-intent emission + bulk cancel. `DrainExecutor` and
+`DebugListExecutors` therefore retire to clear-error no-ops at commit
+C and their RPCs leave the proto at the 1d sweep.
+
+Verdict: the successor surfaces honestly carry the operator questions
+the stream-era surfaces answered ("what is building", "what is the
+fleet doing", "how do I stop/evict work"), with the named loss (per-pod
+heartbeat age / capacity flags / live stream state) already recorded in
+the 0e OA5 decision and re-pointed at the Job/pod census. The
+gate-evidence-table OA5 row above is marked satisfied by this record;
+the live-fleet OA5 confirmation remains deployment-time row D7.
 
 #### Pre-deletion go (development-time owner record)
 

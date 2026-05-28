@@ -1,9 +1,11 @@
 //! `rio-cli derivations` — actor in-memory DAG snapshot for a build.
 //!
 //! Unlike `builds` (PG summary) or `GetBuildGraph` (PG graph), this
-//! queries the LIVE actor — exactly what `dispatch_ready()` sees. The
-//! I-025 diagnostic: if a derivation is `Assigned` to an executor whose
-//! stream is dead (`⚠ no-stream`), dispatch is stuck forever.
+//! queries the LIVE actor: per-derivation status, retry/backoff state,
+//! and the executor identity of the open attempt building it. (The
+//! stream-era `⚠ no-stream` stuck-dispatch diagnostic retired with the
+//! stream pool — a stuck attempt is bounded by the Job deadline plus
+//! the establishment sweep.)
 
 use crate::AdminClient;
 use anyhow::anyhow;
@@ -26,8 +28,11 @@ pub(crate) struct Args {
     /// Filter by status ("Ready", "Assigned", "Running", "Queued", ...).
     #[arg(long)]
     status: Option<String>,
-    /// Only show derivations assigned to dead-stream executors
-    /// (the I-025 smoking gun).
+    /// Historical filter: matched derivations assigned to dead-stream
+    /// executors (the I-025 smoking gun). The stream pool is gone, so
+    /// this matches nothing on current schedulers; kept only so
+    /// existing invocations parse until the field retires with the
+    /// proto sweep.
     #[arg(long)]
     stuck: bool,
 }

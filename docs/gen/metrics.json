@@ -92,19 +92,15 @@
     "rio_scheduler_cache_check_failures_total",
     "rio_scheduler_cache_hit_deferred_total",
     "rio_scheduler_cache_hits_total",
-    "rio_scheduler_cancel_signal_dropped_total",
-    "rio_scheduler_cancel_signals_total",
     "rio_scheduler_cleanup_dropped_total",
     "rio_scheduler_critical_path_accuracy",
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
     "rio_scheduler_event_persist_dropped_total",
-    "rio_scheduler_executor_reconnect_rejected_total",
     "rio_scheduler_features_stripped_total",
     "rio_scheduler_generation_claim_failed_total",
     "rio_scheduler_generation_floor_read_failed_total",
-    "rio_scheduler_heartbeat_rejected_total",
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
@@ -139,6 +135,7 @@
     "rio_scheduler_stale_completed_reset_total",
     "rio_scheduler_stale_completed_substituted_total",
     "rio_scheduler_stale_realisation_filtered_total",
+    "rio_scheduler_stream_stub_calls_total",
     "rio_scheduler_substitute_demotions_total",
     "rio_scheduler_substitute_fetch_failures_total",
     "rio_scheduler_substitute_fetch_retries_total",
@@ -148,7 +145,6 @@
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
     "rio_scheduler_unroutable_features_total",
-    "rio_scheduler_worker_disconnects_total",
     "rio_scheduler_workers_active",
     "rio_store_check_available_duration_seconds",
     "rio_store_chunk_cache_hits_total",
@@ -683,16 +679,6 @@
         "help": "Derivations served from cache (labeled by source: scheduler/reprobe/existing/dispatch)"
       },
       {
-        "name": "rio_scheduler_cancel_signal_dropped_total",
-        "kind": "counter",
-        "help": "CancelSignal try_send drops (worker stream full/closed under backpressure). Best-effort: the transition to Cancelled is scheduler-authoritative regardless; worker disconnect reassign still fires. Alert if rate > 0 sustained."
-      },
-      {
-        "name": "rio_scheduler_cancel_signals_total",
-        "kind": "counter",
-        "help": "CancelSignal messages successfully delivered to the executor stream (Ok on try_send). Excludes drops (counted in cancel_signal_dropped_total) and skipped attempts."
-      },
-      {
         "name": "rio_scheduler_cleanup_dropped_total",
         "kind": "counter",
         "help": "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
@@ -710,7 +696,7 @@
       {
         "name": "rio_scheduler_derivations_queued",
         "kind": "gauge",
-        "help": "Derivations waiting for assignment"
+        "help": "Ready derivations waiting for a worker (DAG-status count; the per-system split is queued_by_system on ClusterStatus/GetSpawnIntents)"
       },
       {
         "name": "rio_scheduler_derivations_running",
@@ -721,11 +707,6 @@
         "name": "rio_scheduler_event_persist_dropped_total",
         "kind": "counter",
         "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
-      },
-      {
-        "name": "rio_scheduler_executor_reconnect_rejected_total",
-        "kind": "counter",
-        "help": "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
       },
       {
         "name": "rio_scheduler_features_stripped_total",
@@ -741,11 +722,6 @@
         "name": "rio_scheduler_generation_floor_read_failed_total",
         "kind": "counter",
         "help": "PG generation-floor reads that failed during recovery. The term proceeds unclaimed at the recovery-entry generation after the post-claim leadership confirmation — dispatch is not blocked, but that term's generation is absent from the leader_generation_claims ledger and may sit below the durable floor. Sustained nonzero means PG is flapping exactly at failover time."
-      },
-      {
-        "name": "rio_scheduler_heartbeat_rejected_total",
-        "kind": "counter",
-        "help": "Heartbeats dropped by the actor-side identity binding (label: reason)"
       },
       {
         "name": "rio_scheduler_lease_acquired_total",
@@ -918,6 +894,11 @@
         "help": "CA realisations dropped from cache-hit set because the realized path was GC'd from store. Same operator signal as stale_completed_reset; this counts the newly-inserted-CA path, that one counts the pre-existing-completed path."
       },
       {
+        "name": "rio_scheduler_stream_stub_calls_total",
+        "kind": "counter",
+        "help": "Calls to the retired stream-protocol RPCs (BuildExecution / Heartbeat error stubs), labeled by rpc. Any sustained rate means a stream-mode executor image is still deployed and trying to register — the deployment-time deletion-gate (checklist row D6) and post-deletion watch (row D7) successor signal for the pinned-to-zero workers_active gauge."
+      },
+      {
         "name": "rio_scheduler_substitute_demotions_total",
         "kind": "counter",
         "help": "Non-forgivable path failures in the detached substitute walk, labeled by a reason derived from the final error of the path's retry ladder: not_found (no configured upstream produced the path, or the store skipped substitution entirely — no upstreams configured for the tenant / no HTTP client on the replica; see rio_store_substitute_skipped_total for the store-side cause), not_found_infra (a NotFound that never reached an upstream — no tenant context / substituter not configured; fix the auth chain or config), error (non-transient gRPC error, no retry), exhausted (the retry budget ran out on a transient error). Any increment demotes the derivation — and therefore its whole build-time closure — to a from-source build over a failed download; page on any sustained rate."
@@ -963,14 +944,9 @@
         "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features."
       },
       {
-        "name": "rio_scheduler_worker_disconnects_total",
-        "kind": "counter",
-        "help": "Worker stream disconnects (graceful and ungraceful)"
-      },
-      {
         "name": "rio_scheduler_workers_active",
         "kind": "gauge",
-        "help": "Fully-registered workers (stream + heartbeat)"
+        "help": "DEPRECATED: stream-era registration gauge, pinned to 0 since the stream session machinery was deleted (kept emitting only so the deletion-gate recording rule rio:scheduler_stream_registrations:max stays a present-and-zero series until the 1d removal). Busy-fleet successor: rio_scheduler_open_attempts; stream-traffic successor signal: rio_scheduler_stream_stub_calls_total."
       }
     ],
     "store": [

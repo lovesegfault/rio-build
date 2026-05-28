@@ -302,7 +302,7 @@
     {
       "path": "workers.rs",
       "depth": 0,
-      "doc": "`rio-cli workers --actor` / `--diff` — scheduler in-memory executor state."
+      "doc": "`rio-cli workers` — the scheduler's busy-executor list."
     }
   ],
   "rio-common": [
@@ -872,7 +872,7 @@
     {
       "path": "actor/executor.rs",
       "depth": 1,
-      "doc": "Stream-era executor session plumbing: connect/disconnect/register,"
+      "doc": "Requeue chokepoint for derivations whose executor is gone."
     },
     {
       "path": "actor/floor.rs",
@@ -952,7 +952,7 @@
     {
       "path": "assignment.rs",
       "depth": 0,
-      "doc": "Static executor/derivation eligibility plus the approximate input"
+      "doc": "Approximate input closure shared by the pull mint and the GC"
     },
     {
       "path": "ca/",
@@ -1207,7 +1207,7 @@
     {
       "path": "state/executor.rs",
       "depth": 1,
-      "doc": "Executor connection state: [`ExecutorState`] (heartbeat/capacity tracking)"
+      "doc": "Executor-kind derivation ([`kind_for_drv`]) and [`RetryPolicy`]"
     },
     {
       "path": "state/newtypes.rs",

@@ -91,6 +91,11 @@ impl ExecutorService for SchedulerGrpc {
         _request: Request<tonic::Streaming<rio_proto::types::ExecutorMessage>>,
     ) -> Result<Response<Self::BuildExecutionStream>, Status> {
         warn!("BuildExecution called: the stream dispatch protocol has been removed");
+        // Deletion-gate / post-deletion-watch successor signal (rows
+        // D6/D7): a sustained rate here means a stream-mode executor
+        // image is still deployed and trying to register.
+        metrics::counter!("rio_scheduler_stream_stub_calls_total", "rpc" => "build_execution")
+            .increment(1);
         Err(Status::unimplemented(
             "the BuildExecution stream protocol has been removed; \
              executors are dispatched via PullAssignment/ReportOutcome (pull mode)",
@@ -108,6 +113,8 @@ impl ExecutorService for SchedulerGrpc {
         _request: Request<rio_proto::types::HeartbeatRequest>,
     ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
         warn!("Heartbeat called: the stream session protocol has been removed");
+        metrics::counter!("rio_scheduler_stream_stub_calls_total", "rpc" => "heartbeat")
+            .increment(1);
         Err(Status::unimplemented(
             "the Heartbeat RPC has been removed with the stream session protocol; \
              pull-mode executors need no heartbeat",

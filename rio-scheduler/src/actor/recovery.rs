@@ -160,15 +160,11 @@ impl DagActor {
         info!("starting state recovery from PG");
 
         // --- Clear in-mem state ---
-        // Standby schedulers merge DAGs live (dispatch.rs:12-20
-        // early-return on !is_leader means they don't dispatch, but
-        // they DO process MergeDag commands — state warm for fast
-        // takeover). On acquire, PG is the single source of truth
-        // — clear the standby's partial in-mem view, reload.
-        //
-        // DON'T clear self.executors: those are live connections
-        // (ExecutorConnected + Heartbeat), not persisted state. A
-        // worker connected to the standby is still connected.
+        // Standby schedulers merge DAGs live (they don't serve pulls —
+        // the leader gate rejects — but they DO process MergeDag
+        // commands, so state is warm for fast takeover). On acquire,
+        // PG is the single source of truth — clear the standby's
+        // partial in-mem view, reload.
         self.clear_persisted_state();
 
         // Test-only: deterministic DAG-load failure. Scoped to the load
@@ -1063,7 +1059,7 @@ impl DagActor {
     /// `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
     // r[impl sched.lease.standby-tick-noop+2]
-    // r[impl obs.metric.scheduler-leader-gate+2]
+    // r[impl obs.metric.scheduler-leader-gate+3]
     pub(super) fn handle_leader_lost(&mut self) {
         // A same-count re-acquire's kept recovery may have re-stamped
         // the completion after `on_lose` cleared it (the same-epoch
@@ -1078,13 +1074,9 @@ impl DagActor {
         self.leader.invalidate_recovery_completion();
         info!("leader lost: clearing persisted actor state");
         self.clear_persisted_state();
-        // workers_active is NOT zeroed: `executors` is retained
-        // (clear_persisted_state keeps live connections), and
-        // ExecutorDisconnected is not leader-gated — the inc/dec path
-        // (executor.rs) maintains the gauge on standby. Zeroing it
-        // here desyncs from N retained entries; each subsequent
-        // disconnect would decrement to −1…−N. Workers rebalancing to
-        // the new leader drain it naturally.
+        // workers_active is deprecated (pinned to 0 by
+        // tick_publish_gauges) and so needs no explicit zeroing here;
+        // the ex-leader's last published value is already 0.
         for g in [
             "rio_scheduler_derivations_queued",
             "rio_scheduler_builds_active",

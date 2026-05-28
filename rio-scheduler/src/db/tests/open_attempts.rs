@@ -122,6 +122,8 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
     );
     assert_eq!(row.exec_id, open_exec);
     assert_eq!(row.executor_id, "oa-open");
+    assert_eq!(row.system, "x86_64-linux");
+    assert!(!row.is_fixed_output, "test derivation defaults to non-FOD");
     assert_eq!(row.source_node.as_deref(), Some("node-1"));
     assert_eq!(row.generation, 7);
     assert_eq!(row.dispatch_mode, "pull");

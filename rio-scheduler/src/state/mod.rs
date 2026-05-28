@@ -3,7 +3,7 @@
 //! Submodules (glob-re-exported for zero external churn):
 //! - `derivation` — [`DerivationStatus`] + [`DerivationState`] + POISON consts
 //! - `build` — [`BuildState`] + [`BuildInfo`] + [`BuildOptions`]
-//! - `executor` — [`ExecutorState`] + [`RetryPolicy`]
+//! - `executor` — [`kind_for_drv`] + [`RetryPolicy`]
 //!
 //! This file holds cross-cutting types:
 //! - [`PriorityClass`] — used by both queue.rs and build.rs

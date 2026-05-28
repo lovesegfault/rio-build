@@ -250,47 +250,6 @@ impl DagActor {
         ))
     }
 
-    /// Append one attempt row with NO accompanying status persist — the
-    /// no-report observation sites (disconnect, force-drain, backstop)
-    /// whose own status writes happen elsewhere (inside
-    /// `reassign_derivations`, per drv). Best-effort like every 1a
-    /// append; leader-gated because the disconnect/drain arms also run
-    /// on standby replicas, which must not write attempt rows for
-    /// executions the live leader owns.
-    pub(super) async fn append_attempt_standalone(
-        &mut self,
-        drv_hash: &DrvHash,
-        row: Option<AttemptRow>,
-    ) {
-        if !self.leader.is_leader() {
-            return;
-        }
-        let Some(row) = row else {
-            return;
-        };
-        let result: Result<bool, sqlx::Error> = async {
-            let mut tx = self.db.pool().begin().await?;
-            let inserted = crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
-            tx.commit().await?;
-            Ok(inserted)
-        }
-        .await;
-        match result {
-            Ok(inserted) => {
-                if inserted {
-                    if let Some(state) = self.dag.node_mut(drv_hash) {
-                        state.push_attempt_record(row.to_record());
-                    }
-                    self.refresh_retry_view(drv_hash);
-                }
-            }
-            Err(e) => {
-                error!(drv_hash = %drv_hash, error = %e,
-                       "failed to persist attempt row (no-report observation)");
-            }
-        }
-    }
-
     /// Build a reset-event ledger row for `drv_hash`. `resubmit_cycle`
     /// is read from the node's CURRENT in-memory value (already
     /// incremented for a resubmit reset; already cleared for a
@@ -2631,9 +2590,11 @@ impl DagActor {
     // r[impl sched.retry.transient-budget]
     /// E1, collapsed onto `decide()` (Phase 1b): the threshold /
     /// per-cycle-cap / retry verdict comes from the fold over the
-    /// appended attempt suffix inside the appending transaction, and the
-    /// fleet-exhaust arm consumes `Decision::exclusion` intersected with
-    /// the live eligible fleet via `placeable()` at this site. The
+    /// appended attempt suffix inside the appending transaction. (The
+    /// stream-era completion-time fleet-exhaust arm — `placeable()`
+    /// over the in-memory executors map — retired with that map; the
+    /// AD2 spawn-gate `NoEligibleSource` report is the source-exhaust
+    /// path.) The
     /// failure is charged once, by the appended row (no in-place RAM
     /// counter writes and no legacy mirror-column writes remain since
     /// T-1b.13 — the cached view is refreshed from the fold after the
@@ -2670,48 +2631,22 @@ impl DagActor {
             return FailureHandling::Handled;
         }
 
-        // r[impl sched.retry.per-executor-budget+3]
-        // The live eligible fleet snapshot for the fleet-exhaust arm:
-        // statically-eligible (kind/system/features), non-draining,
-        // registered workers — the same construction as the E9
-        // dispatch-time backstop (`dispatch_fleet_exhausted`). Under
-        // one-shot semantics (I-188; the only mode) failed workers are
-        // draining and the controller spawns fresh executor ids, so
-        // this arm stays the defense-in-depth backstop it has always
-        // been; the dispatch-time backstop (E9) covers paths that
-        // bypass this handler (worker disconnect, recovery reconcile).
-        let eligible: std::collections::BTreeSet<ExecutorId> = self
-            .dag
-            .node(drv_hash)
-            .map(|state| {
-                self.executors
-                    .values()
-                    .filter(|w| {
-                        !w.is_draining() && crate::assignment::statically_eligible(w, state)
-                    })
-                    .map(|w| w.executor_id.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        // The verdict: decide() over the appended suffix plus the
-        // placement check, inside the appending transaction; the
-        // verdict's status is persisted on the same connection
-        // (threshold / cap / fleet-exhaust poison -> Poisoned, retry ->
-        // Ready). The uncommitted-merge edge (no db row) folds the
-        // in-memory history plus a synthetic record for this
-        // observation and persists nothing.
-        let (decision, fleet_exhausted, recorded_row) = if let Some(row) = attempt_row {
-            let result: Result<(crate::retry_policy::Decision, bool), sqlx::Error> = async {
+        // The verdict: decide() over the appended suffix, inside the
+        // appending transaction; the verdict's status is persisted on
+        // the same connection (threshold / cap poison -> Poisoned,
+        // retry -> Ready). The stream-era completion-time fleet-exhaust
+        // arm (placeable() over the in-memory executors map) retired
+        // with that map: source exhaustion is now observed where the
+        // fleet actually lives — the controller's AD2 spawn gate
+        // reports `NoEligibleSource`, and `handle_no_eligible_source`
+        // poisons with the same metric. The uncommitted-merge edge (no
+        // db row) folds the in-memory history plus a synthetic record
+        // for this observation and persists nothing.
+        let (decision, recorded_row) = if let Some(row) = attempt_row {
+            let result: Result<crate::retry_policy::Decision, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
                 let (_, decision) = self.append_and_decide_in_tx(&mut tx, &row).await?;
-                let fleet_exhausted = matches!(
-                    crate::retry_policy::placeable(&decision.exclusion, &eligible),
-                    crate::retry_policy::Placement::FleetExhausted
-                );
-                if fleet_exhausted
-                    || matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_))
-                {
+                if matches!(decision.verdict, crate::retry_policy::Verdict::Poison(_)) {
                     crate::db::SchedulerDb::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
                 } else {
                     crate::db::SchedulerDb::update_derivation_status_in_tx(
@@ -2723,11 +2658,11 @@ impl DagActor {
                     .await?;
                 }
                 tx.commit().await?;
-                Ok((decision, fleet_exhausted))
+                Ok(decision)
             }
             .await;
             match result {
-                Ok((decision, fleet_exhausted)) => (decision, fleet_exhausted, Some(row)),
+                Ok(decision) => (decision, Some(row)),
                 Err(e) => {
                     warn!(drv_hash = %drv_hash, executor_id = %executor_id, error = %e,
                           "transient failure: appending transaction failed; derivation stays in \
@@ -2767,11 +2702,7 @@ impl DagActor {
                 crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
                 None,
             );
-            let fleet_exhausted = matches!(
-                crate::retry_policy::placeable(&decision.exclusion, &eligible),
-                crate::retry_policy::Placement::FleetExhausted
-            );
-            (decision, fleet_exhausted, None)
+            (decision, None)
         };
 
         // Push the committed row onto the in-memory history and refresh
@@ -2786,36 +2717,15 @@ impl DagActor {
         }
 
         // Act on the verdict with the as-built reason priority:
-        // fleet-exhaust > threshold > per-cycle cap. The poison reason
-        // stays the synthesized string (the worker's error_msg is
-        // diagnostics the E1 arm has never surfaced here); the report's
-        // line count rides along so the final execution's log reads
-        // complete.
-        if fleet_exhausted {
-            // I-065 operator triage + metric, emitted at the arm that
-            // acts on the placeable() verdict (the E9 dispatch-time
-            // backstop emits the same pair at its own verdict arm).
-            if let Some(state) = self.dag.node(drv_hash) {
-                warn!(
-                    drv_hash = %drv_hash,
-                    system = %state.system,
-                    declared_features = ?state.required_features(),
-                    effective_features = ?state.effective_features().as_slice(),
-                    failed_on = decision.exclusion.len(),
-                    "failed_builders excludes every statically-eligible worker \
-                     (kind+system+features); poisoning (would otherwise defer \
-                     forever — see I-065)"
-                );
-            }
-            metrics::counter!("rio_scheduler_poison_fleet_exhausted_total").increment(1);
-            self.poison_already_recorded(
-                drv_hash,
-                "failed on every eligible worker",
-                report.final_line_count,
-            )
-            .await;
-            return FailureHandling::Handled;
-        }
+        // threshold > per-cycle cap. The poison reason stays the
+        // synthesized string (the worker's error_msg is diagnostics the
+        // E1 arm has never surfaced here); the report's line count
+        // rides along so the final execution's log reads complete.
+        // Source exhaustion (every spawnable source excluded) is the
+        // controller's AD2 spawn-gate verdict, reported via
+        // `ReportAttemptOutcome(NoEligibleSource)` and acted on in
+        // `handle_no_eligible_source` — there is no in-memory fleet
+        // here to check against.
         match decision.verdict {
             crate::retry_policy::Verdict::Poison(
                 crate::retry_policy::PoisonReason::TransientBudget,

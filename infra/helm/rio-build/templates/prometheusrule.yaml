@@ -645,8 +645,22 @@ spec:
     # with <horizon> instantiated from the executor-invariant-map 1c
     # record at evaluation time. Recording-only: no alert fires from
     # this group during development or the pre-deletion window.
+    #
+    # Successor signal (operator-surface deletion onward): on releases
+    # where the scheduler-side stream session is deleted, the
+    # workers_active gauge is pinned to zero (no registration can
+    # happen), so the gauge rule above stays meaningful only for the
+    # PRE-deletion release that D6 is evaluated against. The second
+    # record carries the equivalent read for 1c'-era code: attempted
+    # calls to the retired stream RPCs (BuildExecution/Heartbeat error
+    # stubs). Row D6's evaluation on a fleet already running deletion-
+    # stage code, and row D7's post-deletion watch ("no calls to
+    # removed RPCs from stale clients"), both read this series:
+    #   max_over_time(rio:scheduler_stream_attempts:rate5m[<horizon>]) == 0
     - name: rio.deletion-gate.rules
       rules:
         - record: rio:scheduler_stream_registrations:max
           expr: max(rio_scheduler_workers_active)
+        - record: rio:scheduler_stream_attempts:rate5m
+          expr: sum(rate(rio_scheduler_stream_stub_calls_total[5m])) or vector(0)
 {{- end }}

@@ -1,75 +1,64 @@
 //! `AdminService.ListExecutors` implementation.
+//!
+//! Re-implemented over the durable open-attempt view when the stream
+//! session machinery (and with it the in-memory executors map this RPC
+//! used to snapshot) was deleted: every open pull-mode attempt is one
+//! busy executor — the pod that pulled it (P0537: at most one build per
+//! pod). Spawned-but-not-yet-pulled pods are not listed (the scheduler
+//! holds no registration state for them; the controller's Job census is
+//! that view), and there is no draining/degraded/connecting state to
+//! report. `ListOpenAttempts` is the richer, attempt-keyed form of the
+//! same view; this RPC stays so existing CLI/dashboard/controller
+//! callers keep a working endpoint until the 1d proto sweep.
 
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 
+use rio_common::grpc::StatusExt;
 use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
 use tonic::Status;
 
-use crate::actor::{ActorCommand, ActorHandle, AdminQuery, ExecutorSnapshot};
+use crate::db::SchedulerDb;
+use crate::db::open_attempts::OpenAttemptRow;
 
-/// Exhaustive list of values [`executor_status`] can return. The filter
-/// match below references this directly so the producer and consumer
-/// can't drift — adding a fifth status to `executor_status` without
-/// updating this array trips the `debug_assert!` in `list_executors`.
+/// Status values this surface can produce. Every open attempt is an
+/// actively-building pod, so the only producible status is "alive";
+/// the other historical filter values ("draining", "degraded",
+/// "connecting") are kept recognized so an explicit filter for them
+/// returns an empty list rather than leniently returning everything.
 const KNOWN_STATUSES: [&str; 4] = ["alive", "draining", "degraded", "connecting"];
 
-/// 3-bool → 4-state. `systems.is_empty()` = no heartbeat yet = not
-/// fully registered (stream-only or heartbeat-only) → "connecting".
-/// Draining wins over degraded: an operator who drained doesn't care
-/// the worker also reports a sick store. Degraded wins over alive:
-/// `has_capacity()` is false either way, but degraded names the cause.
-fn executor_status(s: &ExecutorSnapshot) -> &'static str {
-    if s.draining {
-        "draining"
-    } else if s.store_degraded {
-        "degraded"
-    } else if s.systems.is_empty() {
-        "connecting"
-    } else {
-        "alive"
-    }
-}
-
-/// Query the actor for all executors, filter by status, convert to proto.
+/// Query the open-attempt view, filter by status, convert to proto.
 ///
 /// `leader_for`: elapsed since this replica acquired leadership
 /// (`LeaderState::leader_for()`). Populates `leader_for_secs` so the
-/// controller's `orphan_reap_gate` can fail-closed during the
-/// post-failover partial-reconnect window. `None` is unreachable here
-/// (`ensure_leader()` is checked first); treated as 0 (young).
-// r[impl sched.admin.list-executors-leader-age]
+/// controller's `orphan_reap_gate` can fail-closed right after a
+/// failover. `None` is unreachable here (`ensure_leader()` is checked
+/// first); treated as 0 (young).
+// r[impl sched.admin.list-executors-leader-age+2]
+// r[impl sched.admin.list-executors+2]
 pub(super) async fn list_executors(
-    actor: &ActorHandle,
+    db: &SchedulerDb,
     status_filter: &str,
     leader_for: Option<Duration>,
 ) -> Result<ListExecutorsResponse, Status> {
-    let snapshots = super::query_actor(actor, |reply| {
-        ActorCommand::Admin(AdminQuery::ListExecutors { reply })
-    })
-    .await?;
+    let rows = db
+        .list_open_pull_attempts()
+        .await
+        .status_internal("list_open_pull_attempts")?;
 
-    let executors: Vec<ExecutorInfo> = snapshots
-        .into_iter()
-        // Empty filter = all. Known status = exact match. Unknown filter
-        // = all (lenient — operator typos shouldn't hide executors).
-        // The KNOWN_STATUSES indirection makes producer/consumer drift
-        // unrepresentable: previously "degraded" hit the lenient `_` arm
-        // and returned ALL executors precisely when the filter was needed
-        // (store incident, I-056b).
-        .filter(|w| match status_filter {
-            "" => true,
-            s if KNOWN_STATUSES.contains(&s) => executor_status(w) == s,
-            _ => true,
-        })
-        .inspect(|w| {
-            debug_assert!(
-                KNOWN_STATUSES.contains(&executor_status(w)),
-                "executor_status() returned {:?} not in KNOWN_STATUSES — update the array",
-                executor_status(w)
-            );
-        })
-        .map(snapshot_to_proto)
-        .collect();
+    // Empty filter = all. "alive" = all (every entry is alive). Any
+    // other known status = none (not producible here). Unknown filter
+    // = all (lenient — operator typos shouldn't hide executors).
+    let matches_filter = match status_filter {
+        "" | "alive" => true,
+        s if KNOWN_STATUSES.contains(&s) => false,
+        _ => true,
+    };
+    let executors: Vec<ExecutorInfo> = if matches_filter {
+        rows.into_iter().map(row_to_proto).collect()
+    } else {
+        Vec::new()
+    };
 
     Ok(ListExecutorsResponse {
         executors,
@@ -77,28 +66,28 @@ pub(super) async fn list_executors(
     })
 }
 
-fn snapshot_to_proto(s: ExecutorSnapshot) -> ExecutorInfo {
-    // Instant → SystemTime: compute "when in CURRENT wall-clock
-    // terms" by subtracting elapsed from SystemTime::now(). Same
-    // pattern as ClusterStatus.uptime_since. checked_sub for clock
-    // jumps — UNIX_EPOCH is less-wrong than panicking.
-    let now_sys = SystemTime::now();
-    let now_inst = Instant::now();
-    let instant_to_ts = |i: Instant| {
-        now_sys
-            .checked_sub(now_inst.saturating_duration_since(i))
-            .map(prost_types::Timestamp::from)
-    };
-    let status = executor_status(&s).to_string();
+fn row_to_proto(r: OpenAttemptRow) -> ExecutorInfo {
+    // The pull that opened the attempt is both "when this pod bound
+    // to the scheduler" and the last protocol contact the scheduler
+    // has had from it (pull-mode pods send nothing between the pull
+    // and the report) — populate both timestamp fields from it. The
+    // stream-era 30s heartbeat-staleness reading does not apply to
+    // these values; per-pod liveness is the Job/pod phase plus
+    // attempt age (the OA5 successor view).
+    let attempt_opened = SystemTime::UNIX_EPOCH
+        .checked_add(Duration::from_secs_f64(r.assigned_at_epoch_secs.max(0.0)))
+        .map(prost_types::Timestamp::from);
     ExecutorInfo {
-        executor_id: s.executor_id.to_string(),
-        systems: s.systems,
-        supported_features: s.supported_features,
-        busy: s.busy,
-        status,
-        resources: s.last_resources,
-        last_heartbeat: instant_to_ts(s.last_heartbeat),
-        connected_since: instant_to_ts(s.connected_since),
-        kind: s.kind as i32,
+        executor_id: r.executor_id,
+        // The system the attempt's derivation targets — what the pod
+        // was spawned to build.
+        systems: vec![r.system],
+        supported_features: Vec::new(),
+        busy: true,
+        status: "alive".to_string(),
+        resources: None,
+        last_heartbeat: attempt_opened,
+        connected_since: attempt_opened,
+        kind: crate::state::kind_for_drv(r.is_fixed_output) as i32,
     }
 }

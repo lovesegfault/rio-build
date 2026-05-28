@@ -6,62 +6,13 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::state::{BuildOptions, DrvHash, ExecutorId, PriorityClass};
 
 #[cfg(test)]
 use super::handle::DebugDerivationInfo;
-use super::handle::DebugExecutorInfo;
-
-/// Payload for [`ActorCommand::Heartbeat`]. Passed by value into
-/// `handle_heartbeat` instead of unpacking 9 positionals at the
-/// run_inner arm.
-pub struct HeartbeatPayload {
-    pub executor_id: ExecutorId,
-    /// Systems this worker can build for. Usually single-element
-    /// but multi-arch workers (e.g., qemu-user-static) declare
-    /// multiple. `rejection_reason` any-matches against the
-    /// derivation's target. Empty vec is rejected at the gRPC layer
-    /// (handle_heartbeat treats empty systems as "not registered").
-    pub systems: Vec<String>,
-    pub supported_features: Vec<String>,
-    /// drv_path the worker reports as in-flight (not a hash). P0537:
-    /// at most one build per pod — the wire field is `optional string
-    /// running_build`, passed through as-is.
-    pub running_build: Option<String>,
-    /// ResourceUsage from the heartbeat. Prost generates Option for
-    /// message fields; worker always populates, so None is defensive
-    /// (shouldn't happen). Stored on ExecutorState as `last_resources`
-    /// for `ListExecutors`.
-    pub resources: Option<rio_proto::types::ResourceUsage>,
-    /// FUSE circuit breaker open — worker can't fetch from store.
-    /// Proto bool, field 9: wire-default false (old workers don't
-    /// send it). Stored on ExecutorState; `has_capacity()` gates on
-    /// it the same as `draining`.
-    pub store_degraded: bool,
-    /// SIGTERM received — finishing in-flight, not accepting new
-    /// work. Proto bool, field 11. The worker is the authority
-    /// (it knows whether it got SIGTERM); `handle_heartbeat`
-    /// overwrites `worker.draining` from this every tick. I-063:
-    /// supersedes I-056a's reconnect-clears-draining, which was
-    /// wrong when the SAME draining process reconnects after a
-    /// scheduler restart.
-    pub draining: bool,
-    /// Builder or Fetcher (from `HeartbeatRequest.kind`, proto
-    /// field 10). Stored on ExecutorState; `hard_filter()` routes
-    /// FODs to fetchers and non-FODs to builders (ADR-019).
-    /// Wire-default 0 = Builder (pre-ADR-019 executors don't send
-    /// it; treated as builders, the safe default).
-    pub kind: rio_proto::types::ExecutorKind,
-    /// ADR-023 SpawnIntent match key. `None` = Static-sized pod
-    /// (proto empty-string). Stored on ExecutorState; dispatch
-    /// (Phase-2) prefers the pre-computed assignment for this
-    /// intent_id, falling through to pick-from-queue if no match
-    /// (e.g., scheduler restarted between spawn and heartbeat).
-    pub intent_id: Option<String>,
-}
 
 /// Request payload for [`ActorCommand::MergeDag`].
 #[derive(Debug)]
@@ -192,51 +143,13 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<bool, ActorError>>,
     },
 
-    /// A worker opened a BuildExecution stream.
-    ExecutorConnected {
-        executor_id: ExecutorId,
-        stream_tx: mpsc::Sender<rio_proto::types::SchedulerMessage>,
-        /// Per-stream epoch (monotonic across the process). The reader
-        /// task echoes this on `ExecutorDisconnected`; a stale
-        /// disconnect from a prior stream (I-056a connect-before-
-        /// disconnect ordering) is ignored when the epoch doesn't
-        /// match the entry's current `stream_epoch`.
-        stream_epoch: u64,
-        /// `r[sec.executor.identity-token]`: HMAC-attested
-        /// `ExecutorClaims.intent_id` from `x-rio-executor-token`.
-        /// `handle_worker_connected` rejects reconnect when this
-        /// doesn't match the stored `intent_id` (stream-hijack
-        /// guard). `None` in dev mode (no HMAC key configured).
-        auth_intent: Option<String>,
-        /// `r[sec.executor.identity-token]`: accept-gate. The gRPC
-        /// handler awaits this BEFORE spawning the
-        /// `worker-stream-reader` task; on `Err`, it returns
-        /// `PERMISSION_DENIED` and the reader is never spawned.
-        /// Without it, a spoofed `Register{executor_id=E_victim}` is
-        /// rejected by the actor (live-stream / intent-mismatch) but
-        /// the reader keeps forwarding `ProcessCompletion{E_victim}`
-        /// — forging terminal results for another tenant's build.
-        reply: oneshot::Sender<Result<(), &'static str>>,
-    },
-
-    /// A worker's BuildExecution stream closed.
-    ExecutorDisconnected {
-        executor_id: ExecutorId,
-        /// Epoch of the stream that closed. Compared against
-        /// `ExecutorState::stream_epoch`; mismatch → stale disconnect
-        /// from a prior stream → no-op.
-        stream_epoch: u64,
-    },
-
     /// Controller observed a builder/fetcher Pod's container terminate
     /// and reports the k8s reason (OOMKilled / Evicted-DiskPressure /
-    /// etc.). `OomKilled`/`EvictedDiskPressure` → promote
-    /// `resource_floor` for whatever drv was running at disconnect
-    /// (resolved via `recently_disconnected`). Other reasons → no-op.
-    ///
-    /// `send_unchecked`: a dropped report means a real OOM doesn't
-    /// promote → retry-storm on the same undersized class. Same
-    /// "must land under backpressure" reasoning as DrainExecutor.
+    /// etc.). The stream-era second-installment correlation this used
+    /// to drive is gone; the arm acknowledges as a no-op
+    /// (`promoted=false`) until the RPC retires with the 1d proto
+    /// sweep. Pod-terminal classification for pull attempts arrives via
+    /// `ReportAttemptOutcome`.
     ReportExecutorTermination {
         executor_id: ExecutorId,
         reason: rio_proto::types::TerminationReason,
@@ -315,9 +228,6 @@ pub enum ActorCommand {
         bound_intents: Vec<rio_proto::types::BoundIntent>,
     },
 
-    /// Periodic heartbeat from a worker.
-    Heartbeat(HeartbeatPayload),
-
     /// Periodic tick for housekeeping (timeouts, poison TTL expiry).
     Tick,
 
@@ -368,33 +278,6 @@ pub enum ActorCommand {
     ForwardPhase {
         phase: rio_proto::types::BuildPhase,
         executor_id: ExecutorId,
-    },
-
-    /// Mark a worker draining: stop sending new assignments.
-    ///
-    /// Called by the worker itself (step 1 of SIGTERM drain) or by
-    /// the controller (Pool finalizer cleanup). Idempotent: an
-    /// already-draining worker replies `accepted=true` with the same
-    /// running count. Unknown worker → `accepted=false, running=0`
-    /// (not an error; the worker may have already disconnected).
-    ///
-    /// `force=true` additionally reassigns in-flight builds (same path
-    /// as `ExecutorDisconnected`). Use case: operator-initiated forced
-    /// drain when the worker is unhealthy but still heartbeating —
-    /// don't wait 2h for builds to complete, reassign now. The
-    /// worker's builds will still run to completion on the worker
-    /// (nix-daemon is already spawned) but the scheduler stops caring
-    /// about the result and re-dispatches elsewhere. Wasteful but
-    /// correct: deterministic builds, same output either way.
-    ///
-    /// `send_unchecked`: same reasoning as Heartbeat. A drain request
-    /// MUST land — dropping it under backpressure would leave a
-    /// shutting-down worker accepting new assignments right when
-    /// capacity is shrinking. That's a feedback loop into MORE load.
-    DrainExecutor {
-        executor_id: ExecutorId,
-        force: bool,
-        reply: oneshot::Sender<DrainResult>,
     },
 
     /// Read-only admin/snapshot query. See [`AdminQuery`].
@@ -473,11 +356,6 @@ pub enum AdminQuery {
     /// the store's mark phase — protects in-flight build outputs
     /// that may not be in narinfo yet (worker hasn't uploaded).
     GcRoots { reply: oneshot::Sender<Vec<String>> },
-    /// Snapshot all workers for `AdminService.ListExecutors`.
-    /// O(workers) scan; acceptable for dashboard polling.
-    ListExecutors {
-        reply: oneshot::Sender<Vec<ExecutorSnapshot>>,
-    },
     /// Actor in-memory snapshot of a build's derivations + live
     /// executor stream IDs. I-025 diagnostic: surfaces the PG-vs-
     /// stream-pool mismatch that silently freezes dispatch. Unlike
@@ -486,14 +364,6 @@ pub enum AdminQuery {
     InspectBuildDag {
         build_id: Uuid,
         reply: oneshot::Sender<(Vec<rio_proto::types::DerivationDiagnostic>, Vec<String>)>,
-    },
-    /// Actor in-memory executor map snapshot. I-048b/c diagnostic:
-    /// surfaces `has_stream`/`warm`/`kind` per entry — what
-    /// `dispatch_ready()` filters on, not what PG `last_seen` claims.
-    /// Promoted from cfg(test) for the `DebugListExecutors` RPC; tests
-    /// keep using it for assertions.
-    DebugQueryWorkers {
-        reply: oneshot::Sender<Vec<DebugExecutorInfo>>,
     },
     /// `AdminService.SlaStatus`: snapshot one cached `FittedParams` +
     /// the override that would apply to this key. Reflects the last
@@ -583,16 +453,6 @@ pub enum DebugCmd {
     ForceAssign {
         drv_hash: String,
         executor_id: ExecutorId,
-        reply: oneshot::Sender<bool>,
-    },
-    /// Set `worker.running_build = Some(drv_hash)` directly, bypassing
-    /// the DAG-status guard. For heartbeat-reconcile safety-net tests
-    /// that need a `running_build` entry pointing at a terminal-status
-    /// drv (where `ForceAssign` would refuse the Poisoned→Assigned
-    /// transition).
-    SetRunningBuild {
-        executor_id: ExecutorId,
-        drv_hash: String,
         reply: oneshot::Sender<bool>,
     },
     /// Backdate a derivation's `running_since` and force it into
@@ -704,9 +564,7 @@ impl AdminQuery {
         match self {
             Self::GetSpawnIntents { .. } => "GetSpawnIntents",
             Self::GcRoots { .. } => "GcRoots",
-            Self::ListExecutors { .. } => "ListExecutors",
             Self::InspectBuildDag { .. } => "InspectBuildDag",
-            Self::DebugQueryWorkers { .. } => "DebugQueryWorkers",
             Self::SlaStatus { .. } => "SlaStatus",
             Self::SlaEvict { .. } => "SlaEvict",
             Self::SlaExplain { .. } => "SlaExplain",
@@ -731,20 +589,16 @@ impl ActorCommand {
             Self::SubstituteComplete { .. } => "SubstituteComplete",
             Self::SubstituteProgress { .. } => "SubstituteProgress",
             Self::CancelBuild { .. } => "CancelBuild",
-            Self::ExecutorConnected { .. } => "ExecutorConnected",
-            Self::ExecutorDisconnected { .. } => "ExecutorDisconnected",
             Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
             Self::PullAssignment { .. } => "PullAssignment",
             Self::ReportPullOutcome { .. } => "ReportPullOutcome",
             Self::ReportAttemptOutcome { .. } => "ReportAttemptOutcome",
             Self::AckSpawnedIntents { .. } => "AckSpawnedIntents",
-            Self::Heartbeat(_) => "Heartbeat",
             Self::Tick => "Tick",
             Self::QueryBuildStatus { .. } => "QueryBuildStatus",
             Self::WatchBuild { .. } => "WatchBuild",
             Self::CleanupTerminalBuild { .. } => "CleanupTerminalBuild",
             Self::ForwardPhase { .. } => "ForwardPhase",
-            Self::DrainExecutor { .. } => "DrainExecutor",
             Self::Admin(q) => q.name(),
             Self::ClearPoison { .. } => "ClearPoison",
             Self::LeaderAcquired => "LeaderAcquired",
@@ -753,40 +607,6 @@ impl ActorCommand {
             Self::Debug(_) => "Debug",
         }
     }
-}
-
-/// Reply for `ActorCommand::DrainExecutor`.
-///
-/// `accepted=false` only for unknown executor_id — NOT an error, the
-/// worker may have disconnected (preStop races with stream close on
-/// SIGTERM). Caller treats `accepted=false, running=0` as "nothing to
-/// wait for, proceed."
-#[derive(Debug, Clone, Copy)]
-pub struct DrainResult {
-    pub accepted: bool,
-    /// Whether a build is still in-flight on the worker after drain
-    /// (P0537: at most one). For `force=false`, it will complete
-    /// normally. For `force=true`, this is `false` (reassigned). The
-    /// worker's preStop hook uses this to decide whether to wait.
-    pub busy: bool,
-}
-
-/// Point-in-time executor snapshot for `AdminService.ListExecutors`.
-/// Internal (not proto) — `admin.rs` translates to `ExecutorInfo`.
-/// `Instant` fields are converted to wall-clock `SystemTime` there.
-#[derive(Debug, Clone)]
-pub struct ExecutorSnapshot {
-    pub executor_id: ExecutorId,
-    pub kind: rio_proto::types::ExecutorKind,
-    pub systems: Vec<String>,
-    pub supported_features: Vec<String>,
-    /// P0537: at most one build per executor.
-    pub busy: bool,
-    pub draining: bool,
-    pub store_degraded: bool,
-    pub connected_since: std::time::Instant,
-    pub last_heartbeat: std::time::Instant,
-    pub last_resources: Option<rio_proto::types::ResourceUsage>,
 }
 
 /// Server-side filter for [`AdminQuery::GetSpawnIntents`]. Mirrors the
@@ -846,19 +666,29 @@ pub struct SpawnIntentsSnapshot {
 /// callers had started relying on implicit copies.
 #[derive(Debug, Clone, Default)]
 pub struct ClusterSnapshot {
-    /// `workers.len()`. Includes unregistered (stream-only or
-    /// heartbeat-only) and draining.
+    /// Executors with work in flight, counted from DAG status
+    /// (`Assigned|Running` — one open pull-mode attempt per such
+    /// derivation, one attempt per pod). The scheduler holds no
+    /// registration state for pull-mode pods, so spawned-but-not-yet-
+    /// pulled pods are not visible here — the controller's Job census
+    /// is that view. Equals `active_executors`.
     pub total_executors: u32,
-    /// `is_registered() && !draining`. The dispatchable population.
+    /// Same count as `total_executors` (no registered-vs-draining
+    /// distinction exists without the stream session).
     pub active_executors: u32,
-    /// `draining` flag set.
+    /// Always 0: per-executor drain retired with the stream session
+    /// (Job/pool-level draining is the successor). Kept until the 1d
+    /// proto sweep so the response shape is unchanged.
     pub draining_executors: u32,
     /// `BuildState::Pending` — merged but not yet active.
     pub pending_builds: u32,
     /// `BuildState::Active` — at least one derivation dispatched.
     pub active_builds: u32,
-    /// `ready_queue.len()`. Ready-to-dispatch derivations waiting for
-    /// worker capacity. This is the autoscaling input signal.
+    /// `DerivationStatus::Ready` across the DAG: derivations waiting
+    /// for a worker. This is the autoscaling input signal, and it is
+    /// computed from DAG status (NOT the legacy ready-queue membership,
+    /// which a pull mint never dequeued — the recorded over-count).
+    /// Always equals the sum of `queued_by_system`.
     pub queued_derivations: u32,
     /// `DerivationStatus::{Assigned|Running}` across the DAG. Workers
     /// currently occupied.
@@ -955,13 +785,12 @@ impl BackpressureReader {
 /// Same pattern as [`BackpressureReader`]: the writers (the lease
 /// task's `on_acquire`/`on_rebound` deriving from the Lease's
 /// transition count, and recovery's PG-floor seed — all `fetch_max` on
-/// the inner Arc) only ever raise it; everyone else observes. The two worker-visible
-/// consumers are gated on the same recovery condition:
-/// `WorkAssignment.generation` reads the raw value actor-side
-/// (dispatch.rs) and is gated by `dispatch_ready`;
-/// `HeartbeatResponse.generation` reads [`advertised`](Self::advertised)
-/// — workers compare the two to detect stale assignments after leader
-/// failover.
+/// the inner Arc) only ever raise it; everyone else observes. The
+/// worker-visible consumer is gated on the recovery condition:
+/// `WorkAssignment.generation` carries [`advertised`](Self::advertised)
+/// as observability on the pull payload; the durable claims-floor
+/// fence inside the pull/establishment transactions is what actually
+/// rejects stale authority.
 ///
 /// `Acquire` not `Relaxed`: the generation is a fence. When the lease
 /// task acquires leadership and writes the new generation, it also

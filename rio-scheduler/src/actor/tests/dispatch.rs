@@ -488,7 +488,6 @@ async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
 #[tokio::test]
 async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     let (_db, handle, _task) = setup().await;
-    let _rx = connect_executor(&handle, "i163-snap-w", "x86_64-linux").await?;
     let _ev = merge_single_node(
         &handle,
         Uuid::new_v4(),
@@ -499,23 +498,31 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     barrier(&handle).await;
 
     // No Tick yet → watch holds the Default snapshot (all zeros).
-    // The connected executor and the merged node exist in actor state,
-    // but the cached snapshot doesn't see them until Tick publishes.
+    // The merged (Ready) node exists in actor state, but the cached
+    // snapshot doesn't see it until Tick publishes.
     let pre = handle.cluster_snapshot_cached();
     assert_eq!(
-        pre.total_executors, 0,
+        pre.queued_derivations, 0,
         "cached snapshot is Tick-published, not live; pre-Tick must be Default"
     );
 
     // Open the node's pull attempt so the post-Tick snapshot has a
-    // running derivation to reflect.
+    // running derivation (= one busy executor) to reflect.
     let _assignment = pull_attempt(&handle, "i163-snap").await;
     tick(&handle).await?;
 
     let post = handle.cluster_snapshot_cached();
-    assert_eq!(post.total_executors, 1);
+    assert_eq!(
+        post.total_executors, 1,
+        "one open attempt = one busy executor"
+    );
     assert_eq!(post.active_executors, 1);
+    assert_eq!(post.draining_executors, 0);
     assert_eq!(post.running_derivations, 1);
+    assert_eq!(
+        post.queued_derivations, 0,
+        "the pulled drv is no longer Ready"
+    );
     Ok(())
 }
 
@@ -991,21 +998,17 @@ async fn ice_step_doubles_across_mark_without_clear() {
     assert_eq!(actor.ice.step(&cell), None, "registered_cells clears");
 }
 
-/// Regression (bug_030): the §13a interim heartbeat ICE-clear used
-/// `cells[0]`, but a pod's `nodeAffinity` is an OR over A' — kube-
-/// scheduler may bind it to `cells[i≠0]`. A heartbeat proves only
-/// "∃ cell ∈ A' with capacity"; for `|A'|>1` it identifies none, so
-/// clearing `cells[0]` defeats backoff doubling (same wrong-edge shape
-/// as `ice_step_doubles_across_mark_without_clear`). Now: heartbeat
-/// clears iff `|A'|==1`; `registered_cells` is the per-cell signal.
+/// The pull-mint ICE clear keeps the bug_030 discipline now that the
+/// heartbeat edge is gone: a successful pull is the success signal for
+/// its intent, but a pod's `nodeAffinity` is an OR over A' — for
+/// `|A'|>1` the pull identifies no single cell, so nothing is cleared
+/// (over-clearing `cells[0]` would defeat `ice_step_doubles`); for
+/// `|A'|==1` the single armed cell is cleared. `registered_cells`
+/// (A18) stays the per-cell signal either way.
 // r[verify sched.sla.hw-class.ice-mask]
 #[tokio::test]
-async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
-    use crate::sla::config::CapacityType;
+async fn pull_mint_ice_clear_only_at_single_cell() -> TestResult {
     use rio_proto::types::{NodeSelectorRequirement, NodeSelectorTerm, SpawnIntent};
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_hw(db.pool.clone());
-    let h0: crate::sla::config::Cell = ("h0".into(), CapacityType::Spot);
 
     let term = |h: &str| NodeSelectorTerm {
         match_expressions: vec![
@@ -1021,53 +1024,87 @@ async fn ice_step_doubles_across_heartbeat_at_multi_cell() {
             },
         ],
     };
-    // Seed `dispatched_cells["d"]` via the realistic ack path with
-    // |A'|=2. At ad5d288e this records only `(h0,spot)`.
-    let spawned = SpawnIntent {
-        intent_id: "d".into(),
-        hw_class_names: vec!["h0".into(), "h1".into()],
-        node_affinity: vec![term("h0"), term("h1")],
-        ..Default::default()
+    let ack =
+        |intent_id: &str, hw: &[&str], unfulfillable: &[&str]| ActorCommand::AckSpawnedIntents {
+            spawned: vec![SpawnIntent {
+                intent_id: intent_id.into(),
+                hw_class_names: hw.iter().map(|h| h.to_string()).collect(),
+                node_affinity: hw.iter().map(|h| term(h)).collect(),
+                ..Default::default()
+            }],
+            unfulfillable_cells: unfulfillable.iter().map(|c| c.to_string()).collect(),
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![],
+        };
+    let masked = |snap: &crate::actor::SpawnIntentsSnapshot, cell: &str| {
+        snap.ice_masked_cells.iter().any(|c| c == cell)
     };
-    actor.handle_ack_spawned_intents(std::slice::from_ref(&spawned), &[], &[], &[], &[]);
+    async fn snapshot(handle: &ActorHandle) -> crate::actor::SpawnIntentsSnapshot {
+        handle
+            .query_unchecked(|reply| {
+                ActorCommand::Admin(AdminQuery::GetSpawnIntents {
+                    req: crate::actor::SpawnIntentsRequest::default(),
+                    reply,
+                })
+            })
+            .await
+            .expect("actor alive")
+    }
 
-    actor.ice.mark(&h0);
-    assert_eq!(actor.ice.step(&h0), Some(0), "precondition: marked");
+    let (_db, handle, _task) = setup().await;
 
-    // Heartbeat-edge for "d": connect with auth_intent + first heartbeat
-    // → registration edge fires → §13a ICE-clear path runs.
-    let (tx, _rx) = mpsc::channel(8);
-    let _ = actor.handle_worker_connected(
-        &"w-d".into(),
-        tx,
-        next_stream_epoch_for("w-d"),
-        Some("d".into()),
+    // |A'| = 2: arm both cells for "ice-multi" and mark h0 ICE.
+    let _ev1 = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ice-multi",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .send_unchecked(ack("ice-multi", &["h0", "h1"], &["h0:spot"]))
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        masked(&snapshot(&handle).await, "h0:spot"),
+        "precondition: h0:spot marked ICE before the pull"
     );
-    actor.handle_heartbeat(HeartbeatPayload {
-        executor_id: "w-d".into(),
-        systems: vec!["x86_64-linux".into()],
-        supported_features: vec![],
-        running_build: None,
-        resources: None,
-        store_degraded: false,
-        draining: false,
-        kind: rio_proto::types::ExecutorKind::Builder,
-        intent_id: Some("d".into()),
-    });
 
-    // |A'|=2 ⇒ heartbeat identifies no specific cell ⇒ NO clear.
-    // At ad5d288e: `cells[0]=(h0,spot)` was cleared → step lost → fails.
-    assert_eq!(
-        actor.ice.step(&h0),
-        Some(0),
-        "|A'|>1: heartbeat must NOT clear cells[0]; backoff state preserved"
+    let _assignment = pull_attempt(&handle, "ice-multi").await;
+    assert!(
+        masked(&snapshot(&handle).await, "h0:spot"),
+        "|A'|>1: the pull identifies no single cell; the mask (and its backoff step) \
+         must survive the mint"
     );
-    actor.ice.mark(&h0);
-    assert_eq!(
-        actor.ice.step(&h0),
-        Some(1),
-        "doubling intact across multi-cell heartbeat"
+
+    // |A'| = 1: the single armed cell IS cleared by the pull.
+    let _ev2 = merge_single_node(
+        &handle,
+        Uuid::new_v4(),
+        "ice-single",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    handle
+        .send_unchecked(ack("ice-single", &["h2"], &["h2:spot"]))
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        masked(&snapshot(&handle).await, "h2:spot"),
+        "precondition: h2:spot marked ICE before the pull"
     );
+    let _assignment = pull_attempt(&handle, "ice-single").await;
+    let snap = snapshot(&handle).await;
+    assert!(
+        !masked(&snap, "h2:spot"),
+        "|A'|==1: the pull is the success edge for the single armed cell — cleared"
+    );
+    assert!(
+        masked(&snap, "h0:spot"),
+        "the multi-cell intent's mask is untouched by the other intent's pull"
+    );
+    Ok(())
 }
 
 /// `r[sched.sla.hw-class.epsilon-explore]`: ε_h coin is a pure
@@ -1551,28 +1588,6 @@ async fn solve_intent_deadline_denormalized_to_slowest_hw() {
         (3.5..=4.5).contains(&ratio),
         "slow/fast deadline ratio ≈ min_factor inverse: {ratio}"
     );
-}
-
-/// Connect+heartbeat+warm a builder against a bare (unspawned) actor.
-/// `resources=None` so the resource-fit gate is bypassed.
-fn bare_connect_builder(
-    actor: &mut DagActor,
-    id: &str,
-) -> mpsc::Receiver<rio_proto::types::SchedulerMessage> {
-    let (tx, rx) = mpsc::channel(8);
-    let _ = actor.handle_worker_connected(&id.into(), tx, next_stream_epoch_for(id), None);
-    actor.handle_heartbeat(HeartbeatPayload {
-        executor_id: id.into(),
-        systems: vec!["x86_64-linux".into()],
-        supported_features: vec![],
-        running_build: None,
-        resources: None,
-        store_degraded: false,
-        draining: false,
-        kind: rio_proto::types::ExecutorKind::Builder,
-        intent_id: None,
-    });
-    rx
 }
 
 // ---------------------------------------------------------------------------

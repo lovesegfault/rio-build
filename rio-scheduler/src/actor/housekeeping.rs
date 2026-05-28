@@ -488,44 +488,51 @@ impl DagActor {
 
     /// Update metrics. All gauges are set from ground-truth state on each
     /// Tick — this is self-healing against any counting bugs elsewhere.
-    /// The inc/dec calls at connect/disconnect/heartbeat stay — they give
-    /// sub-tick responsiveness. This block corrects any drift every tick.
     ///
     /// Leader-only via the `handle_tick` early-return above. A fresh
     /// standby never reaches here so it exports no series (see
     /// `test_not_leader_does_not_set_gauges`). A was-leader-now-standby
     /// has its gauges zeroed once by `handle_leader_lost` so its frozen
-    /// last-tick values don't sit in Prometheus indefinitely —
-    /// EXCEPT `workers_active`, which is connection-state (not
-    /// leader-state) and is maintained by the inc/dec path on standby
-    /// as workers rebalance away. Net: queries see one non-zero series
-    /// for the leader-state gauges, no max() wrapper needed.
-    // r[impl obs.metric.scheduler-leader-gate+2]
+    /// last-tick values don't sit in Prometheus indefinitely. Net:
+    /// queries see one non-zero series per gauge, no max() wrapper
+    /// needed.
+    ///
+    /// `derivations_queued` is the DAG `Ready` count — the same
+    /// population `ClusterStatus.queued_derivations` and
+    /// `queued_by_system` report (the legacy ready-queue membership a
+    /// pull mint never dequeued is no longer a metric source).
+    ///
+    /// `workers_active` is deprecated: the stream registration it
+    /// counted cannot happen any more (the stream RPCs are error
+    /// stubs), so it is pinned to 0 here. It keeps being emitted only
+    /// so the deletion-gate recording rule
+    /// (`rio:scheduler_stream_registrations:max`, deployment checklist
+    /// row D6) stays evaluable as a present-and-zero series until the
+    /// gauge is removed at the 1d cleanup; the successor signal for
+    /// "stream-mode executors still exist" is
+    /// `rio_scheduler_stream_stub_calls_total` (the stub-call counter).
+    /// `rio_scheduler_open_attempts` (set by the establishment sweep)
+    /// is the busy-fleet successor gauge.
+    // r[impl obs.metric.scheduler-leader-gate+3]
     fn tick_publish_gauges(&self) {
-        metrics::gauge!("rio_scheduler_derivations_queued").set(self.ready_queue.len() as f64);
-        metrics::gauge!("rio_scheduler_workers_active").set(
-            self.executors
-                .values()
-                .filter(|w| w.is_registered())
-                .count() as f64,
-        );
+        let mut queued = 0usize;
+        let mut running = 0usize;
+        for s in self.dag.iter_values() {
+            match s.status() {
+                DerivationStatus::Ready => queued += 1,
+                DerivationStatus::Running | DerivationStatus::Assigned => running += 1,
+                _ => {}
+            }
+        }
+        metrics::gauge!("rio_scheduler_derivations_queued").set(queued as f64);
+        metrics::gauge!("rio_scheduler_workers_active").set(0.0);
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
                 .values()
                 .filter(|b| b.state() == BuildState::Active)
                 .count() as f64,
         );
-        metrics::gauge!("rio_scheduler_derivations_running").set(
-            self.dag
-                .iter_values()
-                .filter(|s| {
-                    matches!(
-                        s.status(),
-                        DerivationStatus::Running | DerivationStatus::Assigned
-                    )
-                })
-                .count() as f64,
-        );
+        metrics::gauge!("rio_scheduler_derivations_running").set(running as f64);
     }
 
     /// Establishment sweep for open pull-mode attempts — the single

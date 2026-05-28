@@ -193,7 +193,10 @@ async fn human_output_empty_state_messages() -> anyhow::Result<()> {
     // human-readable path should print the "(no X)" placeholder, not
     // an empty table header or nothing at all.
     let (_, stdout, _) = run_cli(&addr, &["workers"]);
-    assert!(stdout.contains("(no executors)"), "executors: {stdout}");
+    assert!(
+        stdout.contains("(no executors building"),
+        "executors: {stdout}"
+    );
 
     let (_, stdout, _) = run_cli(&addr, &["builds"]);
     assert!(stdout.contains("(no builds"), "builds: {stdout}");

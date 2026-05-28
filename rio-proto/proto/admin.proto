@@ -19,10 +19,14 @@ import "build_types.proto"; // CancelBuildRequest/Response (shared with Schedule
 // and methods needing custom behavior go in MANUAL_METHODS (build.rs)
 // plus a hand-written body in grpc.rs.
 service AdminService {
-  // Get overall cluster status (executor count, queue depth, etc.).
+  // Get overall cluster status (busy-executor count, queue depth, etc.).
   rpc ClusterStatus(google.protobuf.Empty) returns (rio.types.ClusterStatusResponse);
 
-  // List registered executors with their status and resource usage.
+  // Busy-executor list backed by the durable open-attempt view: one
+  // entry per open pull-mode attempt (the pod that pulled it).
+  // Spawned-but-not-yet-pulled pods are the controller's Job census,
+  // not a scheduler surface. ListOpenAttempts is the attempt-keyed
+  // form of the same view.
   rpc ListExecutors(rio.types.ListExecutorsRequest) returns (rio.types.ListExecutorsResponse);
 
   // List builds with optional status filtering and pagination.
@@ -35,7 +39,11 @@ service AdminService {
   // Trigger garbage collection (streaming progress updates).
   rpc TriggerGC(rio.types.GCRequest) returns (stream rio.types.GCProgress);
 
-  // Drain an executor: stop sending new assignments, wait for running builds to complete.
+  // RETIRED no-op (removed at the next proto sweep): per-executor drain
+  // went away with the stream dispatch protocol. Always answers
+  // UNIMPLEMENTED with the successor procedures (cordon + node
+  // exclusion / cancel the open attempt + delete its Job / pause the
+  // pool's spawn intents).
   rpc DrainExecutor(rio.types.DrainExecutorRequest) returns (rio.types.DrainExecutorResponse);
 
   // Cancel a build. Operator override — caller_tenant=None bypasses the
@@ -85,8 +93,7 @@ service AdminService {
   // terminal fill yet). Serves the controller's busy-signal bridge
   // (orphan-reap consults it), the cancel/preempt read, the OA2
   // node-clustering aggregation, and the operator fleet view (OA5).
-  // Stream-mode executors are NOT listed here — `ListExecutors` stays
-  // the stream-fleet surface, untouched.
+  // ListExecutors is a coarser projection of the same view.
   rpc ListOpenAttempts(rio.types.ListOpenAttemptsRequest)
       returns (rio.types.ListOpenAttemptsResponse);
 
@@ -99,18 +106,17 @@ service AdminService {
   // r[impl proto.admin.diag-rpc]
 
   // Actor in-memory DAG snapshot for a build. Unlike GetBuildGraph (reads
-  // PG, works for completed builds), this queries the live actor — the
-  // exact view dispatch_ready() sees. The executor_has_stream field is
-  // the I-025 diagnostic: if a derivation is Assigned to an executor
-  // that is NOT in the live stream pool, dispatch is stuck forever.
+  // PG, works for completed builds), this queries the live actor:
+  // per-derivation status, retry/backoff state, and the executor
+  // identity of the open attempt building it. (The stream-era
+  // executor_has_stream / per-executor rejections diagnostics are
+  // vestigial — kept in the message until the proto sweep.)
   rpc InspectBuildDag(rio.types.InspectBuildDagRequest) returns (rio.types.InspectBuildDagResponse);
 
-  // Actor in-memory executor map snapshot. Unlike ListExecutors (PG
-  // last_seen), this reads the live self.executors HashMap. I-048b/c
-  // diagnostic: PG showed fetchers [alive], actor map was empty (stream
-  // not connected to new leader post-failover) — four wrong hypotheses
-  // before finding it. has_stream=false on an entry = zombie. NOT
-  // gated on ensure_leader(): a standby's empty map is itself useful.
+  // RETIRED no-op (removed at the next proto sweep): the in-memory
+  // executor map this snapshotted is gone with the stream session.
+  // Always answers UNIMPLEMENTED naming the successors
+  // (ListOpenAttempts + the Job/pod census).
   rpc DebugListExecutors(google.protobuf.Empty) returns (rio.types.DebugListExecutorsResponse);
 
   // List all tenants.

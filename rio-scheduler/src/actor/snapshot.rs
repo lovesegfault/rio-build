@@ -1,7 +1,6 @@
 //! Read-only snapshot/inspect handlers on [`DagActor`]. All methods
-//! here are `&self` over the in-memory DAG/executors and back the admin
-//! RPCs (ClusterStatus, GetSpawnIntents, InspectBuildDag,
-//! DebugListExecutors).
+//! here are `&self` over the in-memory DAG and back the admin RPCs
+//! (ClusterStatus, GetSpawnIntents, InspectBuildDag).
 
 use std::collections::HashMap;
 
@@ -10,8 +9,7 @@ use uuid::Uuid;
 use crate::state::{BuildState, DerivationStatus, DrvHash, SolvedIntent};
 
 use super::{
-    AdminQuery, AuthBinding, ClusterSnapshot, DagActor, DebugExecutorInfo, SpawnIntentsRequest,
-    SpawnIntentsSnapshot, command,
+    AdminQuery, AuthBinding, ClusterSnapshot, DagActor, SpawnIntentsRequest, SpawnIntentsSnapshot,
 };
 
 /// §13e + r35: thin accessor for the drv's stored
@@ -143,14 +141,8 @@ impl DagActor {
             AdminQuery::GcRoots { reply } => {
                 let _ = reply.send(self.handle_gc_roots());
             }
-            AdminQuery::ListExecutors { reply } => {
-                let _ = reply.send(self.handle_list_executors());
-            }
             AdminQuery::InspectBuildDag { build_id, reply } => {
                 let _ = reply.send(self.handle_inspect_build_dag(build_id));
-            }
-            AdminQuery::DebugQueryWorkers { reply } => {
-                let _ = reply.send(self.handle_debug_query_workers());
             }
             AdminQuery::SlaStatus { key, reply } => {
                 // active_override: surface the matching ROW (not the
@@ -214,30 +206,23 @@ impl DagActor {
 
     /// Compute counts for `AdminService.ClusterStatus`.
     ///
-    /// O(workers + builds + dag_nodes) per call. The autoscaler polls
-    /// every 30s; even with 10k active derivations that's ~300μs/call —
-    /// not worth maintaining incremental counters. Revisit if dashboards
-    /// start polling at 1Hz.
+    /// O(builds + dag_nodes) per call. The autoscaler polls every 30s;
+    /// even with 10k active derivations that's ~300μs/call — not worth
+    /// maintaining incremental counters. Revisit if dashboards start
+    /// polling at 1Hz.
+    ///
+    /// Every count is DAG-status / build-state derived. The executor
+    /// counts are the busy view: one open pull-mode attempt per
+    /// `Assigned|Running` derivation, one attempt per pod, so the
+    /// in-flight derivation count IS the busy-executor count. The
+    /// scheduler holds no registration state for pull-mode pods
+    /// (spawned-but-not-yet-pulled pods are the controller's Job
+    /// census), and per-executor drain retired with the stream session,
+    /// so `draining_executors` is always 0.
     ///
     /// `as u32` casts: if any collection exceeds 4B entries, truncation
-    /// is the LEAST of our problems. The `ready_queue.len()` is bounded
-    /// by `ACTOR_CHANNEL_CAPACITY × derivations_per_submit` anyway (you
-    /// can't enqueue what you can't merge).
+    /// is the LEAST of our problems.
     pub(super) fn compute_cluster_snapshot(&self) -> ClusterSnapshot {
-        let mut active_executors = 0u32;
-        let mut draining_executors = 0u32;
-        // Single pass: registered ∧ ¬draining → active. draining →
-        // draining (regardless of registered — a draining worker that
-        // lost its stream mid-drain is still "draining" for the
-        // controller's "how many pods are shutting down" question).
-        for w in self.executors.values() {
-            if w.is_draining() {
-                draining_executors += 1;
-            } else if w.is_registered() {
-                active_executors += 1;
-            }
-        }
-
         let mut pending_builds = 0u32;
         let mut active_builds = 0u32;
         for b in self.builds.values() {
@@ -257,9 +242,10 @@ impl DagActor {
         }
 
         // Running = Assigned | Running. Both mean "a worker slot is taken."
-        // Assigned hasn't acked yet but the slot is reserved; for "how
-        // busy are workers" they're equivalent.
+        // Assigned is the just-minted pull attempt; for "how busy are
+        // workers" they're equivalent.
         let mut running_derivations = 0u32;
+        let mut queued_derivations = 0u32;
         let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
         // r[impl sched.admin.snapshot-substituting]
@@ -275,10 +261,12 @@ impl DagActor {
                     running_derivations += 1;
                 }
                 DerivationStatus::Ready => {
-                    // I-107: per-system queued breakdown so per-arch
-                    // Pools scale on their own backlog. Ready-only
-                    // to match `queued_derivations` (= ready_queue.len())
-                    // semantics — sum across keys equals the scalar.
+                    // The scalar and the I-107 per-system breakdown are
+                    // counted in the same arm so the sum across keys
+                    // equals the scalar by construction (the ready-queue
+                    // membership the scalar used to read was not
+                    // dequeued by pull mints — the recorded over-count).
+                    queued_derivations += 1;
                     *queued_by_system.entry(s.system.clone()).or_default() += 1;
                 }
                 // r[impl ctrl.scaler.signal-substituting]
@@ -299,12 +287,14 @@ impl DagActor {
         }
 
         ClusterSnapshot {
-            total_executors: self.executors.len() as u32,
-            active_executors,
-            draining_executors,
+            // The busy view: one open attempt per in-flight derivation,
+            // one attempt per pod (P0537).
+            total_executors: running_derivations,
+            active_executors: running_derivations,
+            draining_executors: 0,
             pending_builds,
             active_builds,
-            queued_derivations: self.ready_queue.len() as u32,
+            queued_derivations,
             running_derivations,
             substituting_derivations,
             queued_by_system,
@@ -784,8 +774,8 @@ impl DagActor {
     /// decides.
     ///
     /// Until §13b A18 populates `registered_cells`, the §13a interim
-    /// success signal is first-heartbeat — see `handle_heartbeat`'s
-    /// registration edge.
+    /// success signal is the first successful pull — see the mint's
+    /// ICE-clear in `actor/pull.rs`.
     // r[impl sched.sla.hw-class.ice-mask]
     pub(super) fn handle_ack_spawned_intents(
         &mut self,
@@ -1831,31 +1821,17 @@ impl DagActor {
         }
     }
 
-    pub(super) fn handle_list_executors(&self) -> Vec<command::ExecutorSnapshot> {
-        self.executors
-            .values()
-            .map(|w| command::ExecutorSnapshot {
-                executor_id: w.executor_id.clone(),
-                kind: w.kind,
-                systems: w.systems.clone(),
-                supported_features: w.supported_features.clone(),
-                busy: w.running_build.is_some(),
-                draining: w.is_draining(),
-                store_degraded: w.store_degraded,
-                connected_since: w.connected_since,
-                last_heartbeat: w.last_heartbeat,
-                last_resources: w.last_resources,
-            })
-            .collect()
-    }
-
-    // r[impl sched.admin.inspect-dag]
-    /// Actor in-memory snapshot of a build's derivations cross-referenced
-    /// with the live stream pool. I-025 diagnostic: `executor_has_stream`
-    /// is false when a derivation is Assigned to an executor whose gRPC
-    /// bidi stream is gone from `self.executors` — dispatch can never
-    /// complete. PG (`rio-cli workers`) may still show the executor as
-    /// alive; only the actor's HashMap knows the stream is dead.
+    // r[impl sched.admin.inspect-dag+2]
+    /// Actor in-memory snapshot of a build's derivations. The stream-era
+    /// cross-reference against the live stream pool (the I-025
+    /// `executor_has_stream` diagnostic) retired with the executors map:
+    /// a pull-mode in-flight derivation's executor identity is its open
+    /// attempt, so `live_executor_ids` is now the set of executor ids
+    /// the DAG currently has work assigned to, and `executor_has_stream`
+    /// is simply "this derivation has an in-flight assignment" (kept
+    /// only for wire-shape compatibility until the 1d proto sweep; a
+    /// stuck attempt is bounded by `activeDeadlineSeconds` plus the
+    /// establishment sweep, not by stream liveness).
     pub(super) fn handle_inspect_build_dag(
         &self,
         build_id: Uuid,
@@ -1871,11 +1847,14 @@ impl DagActor {
                     .as_ref()
                     .map(|e| e.to_string())
                     .unwrap_or_default();
-                // THE I-025 signal.
-                let executor_has_stream = s
-                    .assigned_executor
-                    .as_ref()
-                    .is_some_and(|e| self.executors.contains_key(e));
+                // In-flight = the assignment is live in the DAG. The
+                // stream-pool membership check this replaced cannot be
+                // asked of a pull-mode pod.
+                let executor_has_stream = s.assigned_executor.is_some()
+                    && matches!(
+                        s.status(),
+                        DerivationStatus::Assigned | DerivationStatus::Running
+                    );
                 let backoff_remaining_secs = s
                     .retry
                     .backoff_until
@@ -1916,35 +1895,22 @@ impl DagActor {
                 }
             })
             .collect();
-        let live_executor_ids = self.executors.keys().map(|e| e.to_string()).collect();
-        (derivations, live_executor_ids)
-    }
-
-    // r[impl sched.admin.debug-list-executors]
-    /// Snapshot the in-memory executor map. Backs both unit-test
-    /// assertions and the `DebugListExecutors` RPC (`rio-cli workers
-    /// --actor`). The fields beyond the original four are the I-048b/c
-    /// post-mortem additions: `has_stream` and `kind` together would
-    /// have collapsed that investigation into one look — PG showed
-    /// fetchers `[alive]`, but the actor map had zero fetcher-kind
-    /// entries with `has_stream=true`.
-    pub(super) fn handle_debug_query_workers(&self) -> Vec<DebugExecutorInfo> {
-        self.executors
-            .values()
-            .map(|w| DebugExecutorInfo {
-                executor_id: w.executor_id.to_string(),
-                has_stream: w.stream_tx.is_some(),
-                is_registered: w.is_registered(),
-                warm: w.warm,
-                kind: w.kind,
-                systems: w.systems.clone(),
-                last_heartbeat_ago_secs: w.last_heartbeat.elapsed().as_secs(),
-                running_build: w.running_build.as_ref().map(|h| h.to_string()),
-                draining: w.is_draining(),
-                store_degraded: w.store_degraded,
-                intent_id: w.intent_id.clone(),
+        // The executor identities the DAG currently has work assigned
+        // to (the pull-mode "live" set: one open attempt per entry).
+        let live_executor_ids = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Assigned | DerivationStatus::Running
+                )
             })
-            .collect()
+            .filter_map(|(_, s)| s.assigned_executor.as_ref().map(|e| e.to_string()))
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect();
+        (derivations, live_executor_ids)
     }
 
     /// Collect `expected_output_paths ∪ output_paths` from all

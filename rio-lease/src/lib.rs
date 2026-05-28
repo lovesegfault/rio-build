@@ -615,7 +615,7 @@ impl LeaderState {
 
     /// Elapsed since this replica acquired leadership, or `None` when
     /// not leading. Populates `ListExecutorsResponse.leader_for_secs`.
-    // r[impl sched.admin.list-executors-leader-age]
+    // r[impl sched.admin.list-executors-leader-age+2]
     pub fn leader_for(&self) -> Option<Duration> {
         self.became_leader_at.read().map(|t| t.elapsed())
     }
@@ -1774,7 +1774,7 @@ mod tests {
     // (`.unwrap_or_else(|| Uuid::new_v4())`). Not worth a test —
     // the UUID crate tests itself.
 
-    // r[verify sched.admin.list-executors-leader-age]
+    // r[verify sched.admin.list-executors-leader-age+2]
     /// `leader_for()` tracks acquire/lose. `pending` → None;
     /// `on_acquire` → Some; `on_lose` → None; `always_leader`/
     /// `Default` → Some (non-K8s mode reports a real age so the

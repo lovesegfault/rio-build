@@ -95,13 +95,14 @@ performed asynchronously by the actor.
 
 = Scheduling Algorithm
 
-*Implemented:* critical-path priority (BinaryHeap ReadyQueue), per-derivation
+*Implemented:* critical-path priority, per-derivation
 SLA sizing (`solve_intent_for` → `(cores, mem, disk, deadline)` per
-#rref("sched.admin.spawn-intents")), PrefetchHint (full `approx_input_closure`
-before WorkAssignment), @leader-election via Kubernetes Lease gated on
-`RIO_LEASE_NAME`, `AdminService.ClusterStatus`/`DrainExecutor`, Pool @crd +
-one-shot Job reconciler. Interactive builds get a +1e9 priority boost (dwarfs
-any critical-path value).
+#rref("sched.admin.spawn-intents")), pull-mode delivery with the
+input-closure prefetch carried on the assignment payload, @leader-election
+via Kubernetes Lease gated on `RIO_LEASE_NAME`,
+`AdminService.ClusterStatus`/`ListOpenAttempts`, Pool @crd + one-shot Job
+reconciler. Interactive builds get a +1e9 priority boost (dwarfs any
+critical-path value).
 
 ```
 1. Receive derivation DAG from gateway
@@ -450,25 +451,11 @@ epilogue in the success path).
   defers, because an empty pool/fleet is a provisioning transient
   (autoscaler lag, a deployment rollout in progress), and poisoning on it
   would brick every build submitted during the rollout.
-  Stream-path evaluation point (dispatch time, until that path retires):
-  when `find_executor` returns `None` and every _statically-eligible_
-  *non-draining* registered worker (matching kind, `system`, and
-  `required_features`) is already in `failed_builders`, the derivation is
-  poisoned immediately rather than deferring. Draining workers MUST be
-  excluded: under one-shot semantics
-  (#rref("sched.ephemeral.no-redispatch-after-completion")), a just-failed
-  worker is draining but still in the executor map at completion-time; counting
-  it poisons a `poolSize=1` (or `required_features`-narrowed) derivation on the
-  FIRST transient failure, bypassing `max_retries` and the poison threshold.
-  Under one-shot the controller spawns fresh `executor_id`s ∉
-  `failed_builders`, so this check returns `false` in practice and
-  poison-on-repeated-failure flows through `PoisonConfig::is_poisoned(threshold)`;
-  the check remains as defense-in-depth for any future path where a worker
-  fails without draining. The fleet filter MUST match the static-eligibility
-  subset of `rejection_reason` (#rref("sched.admin.inspect-dag")); a narrower
-  filter (e.g. kind-only) lets a drv defer forever in a multi-arch or
-  feature-partitioned cluster with no INFO-level signal (the I-065 hang shape
-  on the system/features axis).
+  (The stream-path evaluation points --- the dispatch-time
+  `find_executor`/E9 backstop and the completion-time check over the
+  in-memory executors map --- retired with that path, per this rule's own
+  "until that path retires" scoping; the spawn-intent gate below is the
+  evaluation point.)
   Pull-mode evaluation point (the spawn-intent gate, AD2): the
   spawnable-source universe is k8s-side knowledge, so the controller ---
   which holds the node informers and renders the intent's `excluded_nodes`
@@ -756,29 +743,37 @@ parents whose cascade was interrupted by a crash. All three exist because a
 keep-going build with a poisoned leaf otherwise hangs Active forever ---
 `completed + failed` never reaches `total`.
 
-#r("sched.admin.list-executors-leader-age")[
+#r("sched.admin.list-executors-leader-age+2")[
   `ListExecutorsResponse.leader_for_secs` is the seconds since this replica
   acquired leadership (`LeaderState::leader_for()`). Consumers MUST treat the
-  executor list as potentially incomplete when `leader_for_secs` is small: on
-  2-replica failover the new leader's `self.executors` map starts empty and
-  fills incrementally as workers reconnect over a 1--10s spread, so a non-empty
-  partial list cannot prove absence. The controller's `orphan_reap_gate`
-  fail-closes when `leader_for_secs < ORPHAN_REAP_GRACE` --- see
-  #rref("ctrl.ephemeral.reap-orphan-running").
+  executor list as potentially incomplete when `leader_for_secs` is small and
+  MUST NOT use it to prove absence right after a failover. The controller's
+  `orphan_reap_gate` fail-closes when `leader_for_secs < ORPHAN_REAP_GRACE`
+  --- see #rref("ctrl.ephemeral.reap-orphan-running").
 ]
+The historical hazard was the in-memory executors map refilling
+incrementally over the reconnect window; the open-attempt view behind the
+re-implemented surface is durable, but the freshness input (and the
+controller gate that consumes it) is kept until the 1d controller cleanup
+removes the consultation.
 
-#r("sched.admin.list-executors")[
-  `AdminService.ListExecutors` returns a point-in-time snapshot of all
-  connected executors via an `ActorCommand::ListExecutors` (O(executors) scan,
-  `send_unchecked` like `ClusterSnapshot` --- dashboard needs a reading even
-  under saturation). Each `ExecutorInfo` includes `executor_id`, `systems`,
-  `supported_features`, `busy` (a build is in flight), `status`
-  ("alive"/"draining"/"connecting"), `connected_since`, `last_heartbeat`, and
-  `last_resources`. `Instant` fields are converted to wall-clock `SystemTime`
-  by subtracting elapsed from `SystemTime::now()`. The optional `status_filter`
-  matches "alive" (registered + not draining), "draining", or empty/unknown
-  (show all).
+#r("sched.admin.list-executors+2")[
+  `AdminService.ListExecutors` MUST return one entry per open pull-mode
+  attempt, read from the same durable open-attempt view as
+  #rref("sched.admin.list-open-attempts"): the entry's `executor_id` is the
+  attempt's executor identity, `busy` is true, `status` is "alive",
+  `systems`/`kind` come from the attempt's derivation, and
+  `connected_since`/`last_heartbeat` carry the attempt-open time (the pull).
+  The optional `status_filter` matches "alive" (or empty) to return the
+  list, any other known historical status ("draining"/"degraded"/
+  "connecting") to return an empty list, and unknown values leniently
+  (show all). The response's `leader_for_secs` keeps the
+  #rref("sched.admin.list-executors-leader-age+2") semantics.
 ]
+This is the busy-fleet projection kept for existing CLI/dashboard/
+controller callers until the 1d proto sweep; spawned-but-not-yet-pulled
+pods are the controller's Job census, and there is no scheduler-side
+registration, draining, degraded, or connecting state left to report.
 
 #r("sched.admin.list-builds")[
   `AdminService.ListBuilds` paginates via a direct PostgreSQL query with
@@ -920,26 +915,29 @@ keep-going build with a poisoned leaf otherwise hangs Active forever ---
   and poisoned firefox-unwrapped before reaching a viable size.
 ]
 
-#r("sched.admin.inspect-dag")[
+#r("sched.admin.inspect-dag+2")[
   `AdminService.InspectBuildDag` returns the actor's in-memory snapshot of a
-  build's derivations cross-referenced with the live executor stream pool. Each
-  derivation row includes `rejections` --- a per-executor list of
-  `{executor_id, reason}` veto strings from `dispatch_ready()` (e.g.
-  `at-capacity`, `stream-closed`, `feature-missing`, `system-mismatch`) --- so
-  a stuck-Ready node is directly diagnosable without log diving.
-  `executor_has_stream=false` for an Assigned derivation means its assigned
-  executor's gRPC bidi stream is gone from the actor's map --- dispatch can
-  never complete. PG may still show the executor as alive; only the actor knows
-  the stream is dead.
+  build's derivations: per-derivation status, retry/backoff state, the
+  executor identity of the open attempt building it (when in flight), and
+  the set of executor identities the DAG currently has work assigned to
+  (`live_executor_ids`).
 ]
+The stream-era cross-reference fields are vestigial until the 1d proto
+sweep: `rejections` is always empty (there is no placement decision to
+explain) and `executor_has_stream` simply mirrors "the derivation has an
+in-flight assignment" --- a stuck attempt is bounded by the Job's
+`activeDeadlineSeconds` plus the establishment sweep, not by stream
+liveness.
 
-#r("sched.admin.debug-list-executors")[
-  `AdminService.DebugListExecutors` snapshots the in-memory executor map
-  (`has_stream`, `warm`, `kind` per entry) --- what `dispatch_ready()` filters
-  on, not what PG `last_seen` claims. This RPC is *exempt from the
-  leader-guard* by design: a stuck or partitioned standby replica can be
-  queried directly to compare its view against the leader's.
-]
+*Retired (1c' deletion commit C --- the operator surfaces):*
+`sched.admin.debug-list-executors`. `DebugListExecutors` snapshotted the
+in-memory executor map (`has_stream`/`warm`/`kind` per entry --- the
+I-048b/c "PG says alive, actor has no stream" diagnostic). That map is
+deleted: pull-mode pods hold no scheduler-side connection state, so the
+PG-vs-actor divergence class the RPC existed to expose cannot form. The
+RPC remains in the proto until the 1d sweep as an UNIMPLEMENTED stub whose
+error names the successors --- `ListOpenAttempts` (the durable in-flight
+view) and the controller's Job/pod census.
 
 #r("sched.gc.live-pins")[
   On dispatch, the scheduler writes the assigned derivation's input-closure
@@ -2041,22 +2039,14 @@ exponential backoff until the scheduler accepts it.
 
 = Executor Registration Protocol
 
-#r("sched.executor.dual-register")[
-  Executor registration is *two-step* --- there is no single registration RPC;
-  instead, the scheduler infers registration from two separate interactions:
-  + Executor opens a `BuildExecution` bidirectional stream to the scheduler
-    (calling `ExecutorService.BuildExecution`).
-  + Executor calls the separate `Heartbeat` unary RPC with its initial
-    capabilities: `executor_id` (unique, derived from pod UID), `systems`
-    (list, e.g., `[x86_64-linux]`; an executor may support multiple target
-    systems via emulation), `supported_features` (list of
-    `requiredSystemFeatures` the executor supports).
-  + When the scheduler receives the first `Heartbeat` from an `executor_id`
-    that also has an open `BuildExecution` stream, it creates an in-memory
-    executor entry with the reported capabilities and marks the executor as
-    `alive`.
-  + Scheduler begins sending `WorkAssignment` messages on the stream.
-]
+*Retired (1c' deletion commit C --- the operator surfaces):*
+`sched.executor.dual-register`. The two-step stream+heartbeat registration
+protocol described here has no scheduler side left: the `BuildExecution`/
+`Heartbeat` RPCs are unconditional error stubs and the in-memory executor
+entry they used to create is deleted. There is no registration in the pull
+protocol --- work binds only at a successful `PullAssignment` (the pull is
+both halves), and the never-create half survives as the no-attempt no-op
+rule on the report path (#rref("ctrl.report.attempt-outcome")).
 
 #r("sched.executor.session-epoch")[
   Every executor-session event is attributed to exactly the stream that
@@ -2555,12 +2545,15 @@ mint-time solve is covered by the report slack.
   hash), derivation path, `exec_id`, executor identity, source node when
   known, the assignment's generation, and its age; the response carries
   `leader_for_secs` with the same fail-closed freshness semantics as
-  #rref("sched.admin.list-executors-leader-age"). The RPC is leader-served.
+  #rref("sched.admin.list-executors-leader-age+2"). The RPC is leader-served.
 ]
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
 (the pull-mode successor of the stream fleet's
-#(refs.metric)("rio_scheduler_workers_active"), which stays) and the
-establishment sweep.
+#(refs.metric)("rio_scheduler_workers_active"), which is deprecated and
+pinned to zero until its 1d removal --- it remains only so the
+deletion-gate recording rule stays a present series) and the establishment
+sweep, and backs the re-implemented #rref("sched.admin.list-executors+2")
+projection.
 
 = Backpressure
 
@@ -2917,12 +2910,10 @@ model assumes) so no constant moves without the others.
   `ReportExecutorTermination`, `AckSpawnedIntents`, `ReconcileAssignments`,
   `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
   defense-in-depth.
-  `ExecutorConnected`/`Disconnected`/`DrainExecutor`/`Heartbeat`/`PrefetchComplete`
-  arms stay ungated (they keep `self.executors` accurate for dashboard +
-  reconnect-after-reacquire); their PG-touching sub-calls (`drain_phantoms`,
-  `dispatch_ready`, and `reassign_derivations` --- the disconnect/force-drain
-  tail that can poison a derivation and run the terminal log epilogue) are
-  individually leader-gated.
+  `reassign_derivations` --- the requeue tail that can poison a derivation
+  and run the terminal log epilogue --- is individually leader-gated at its
+  own chokepoint (the stream-era `ExecutorConnected`/`Disconnected`/
+  `DrainExecutor`/`Heartbeat` arms it used to ride behind are deleted).
   `ForwardLogBatch` is NOT gated (in-memory ring only). `ForwardPhase` is NOT
   gated either, and is a deliberate exception to the table list above:
   `Event::Phase` is persisted (#rref("sched.log.phase-binding")), so a deposed
@@ -3579,7 +3570,7 @@ entirely: a `requirements` edit takes effect on the next rollout.
 - #src("rio-scheduler/src/event_log.rs") --- PostgreSQL-backed
   `build_event_log` writes for gateway `since_sequence` replay
 - #src("rio-scheduler/src/admin/") --- AdminService gRPC (ClusterStatus,
-  DrainExecutor, TriggerGC)
+  ListExecutors/ListOpenAttempts, TriggerGC)
 
 CA early cutoff is end-to-end: compare (#rref("sched.ca.cutoff-compare") ---
 completion-time content-index lookup), propagate

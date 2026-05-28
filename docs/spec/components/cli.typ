@@ -51,8 +51,8 @@ per-message progress drains without a whole-call deadline.
   [One-screen workers/builds/queue summary],
 
   [`workers`],
-  [`AdminService.ListExecutors` (PG) / `DebugListExecutors` (actor)],
-  [Detailed executor list; `--actor`/`--diff` modes],
+  [`AdminService.ListExecutors`],
+  [Busy-executor list (one entry per open pull-mode attempt)],
 
   [`builds`],
   [`AdminService.ListBuilds`],
@@ -79,7 +79,8 @@ per-message progress drains without a whole-call deadline.
 
   [`drain-executor`],
   [`AdminService.DrainExecutor`],
-  [Mark a worker draining (`--force` reassigns)],
+  [Retired no-op --- surfaces the scheduler's error naming the successor
+    procedures (cordon + exclusion / cancel + Job delete / pool pause)],
 
   [`pool`], [k8s apiserver (no gRPC)], [`Pool` CR get/describe],
 
@@ -152,17 +153,10 @@ per-message progress drains without a whole-call deadline.
   `--sig-mode {keep|add|replace}`.
 ]
 
-#r("cli.workers.actor-diff")[
-  `rio-cli workers --actor` calls `DebugListExecutors` (in-memory
-  `self.executors` map). `--diff` calls BOTH `ListExecutors` (PG) and
-  `DebugListExecutors` and joins by `executor_id` with per-row `⚠` divergence
-  markers: `pg-only` = stream not connected to this leader (I-048c symptom),
-  `actor-only` = PG `last_seen` stale (transient), `both` +
-  `has_stream=false` = I-048b zombie (heartbeat-created entry, no
-  `stream_tx`). Both `--actor`
-  header lines and `--diff` rows show `ZOMBIE`/`DRAINING`/`DEGRADED` markers
-  --- all three gate `has_capacity()`, so any present means dispatch can't
-  reach this worker even if stream/registered/warm all show Y.
-  `DRAINING`/`DEGRADED` are not counted as divergence (operator-intent, not
-  PG-vs-actor drift).
-]
+*Retired (1c' deletion commit C --- the operator surfaces):*
+`cli.workers.actor-diff`. The `--actor`/`--diff` modes existed to diff the
+scheduler's in-memory executor map against PG (the I-048b/c zombie-stream
+diagnostics). That map --- and the divergence class it exposed --- is gone
+with the stream session; `rio-cli workers` now reads the durable
+open-attempt view directly, and per-pod liveness questions belong to the
+Job/pod census (`kubectl get jobs/pods`).

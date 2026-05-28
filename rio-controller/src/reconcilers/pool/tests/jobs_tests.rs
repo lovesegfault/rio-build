@@ -1124,10 +1124,9 @@ fn orphan_reap_gate_failclosed_on_empty_and_err() {
 }
 
 // r[verify ctrl.ephemeral.reap-orphan-running+3]
-// r[verify sched.admin.list-executors-leader-age]
-/// bug_073: during scheduler failover, `self.executors` fills
-/// INCREMENTALLY as workers reconnect over a 1-10s spread. A
-/// non-empty PARTIAL list cannot prove absence —
+// r[verify sched.admin.list-executors-leader-age+2]
+/// bug_073 (stream era): right after a failover the busy view could be
+/// incomplete, so a non-empty PARTIAL list cannot prove absence —
 /// `select_orphan_running`'s `None => true` arm would
 /// foreground-delete every not-yet-reconnected worker's Running Job
 /// mid-build. `leader_for_secs < ORPHAN_REAP_GRACE` → fail-closed.

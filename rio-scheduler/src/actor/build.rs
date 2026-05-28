@@ -5,7 +5,7 @@
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use crate::state::{BuildState, BuildStateExt, DerivationStatus, DrvHash, ExecutorId};
+use crate::state::{BuildState, BuildStateExt, DerivationStatus, DrvHash};
 
 use super::{ActorCommand, ActorError, DagActor, TERMINAL_CLEANUP_DELAY};
 
@@ -29,15 +29,19 @@ impl DagActor {
     /// Cancel all non-terminal derivations for a build and remove the
     /// build's interest from the DAG.
     ///
-    /// Sends CancelSignal to workers for sole-interest Running/Assigned
-    /// derivations, transitions them to Cancelled, removes build interest
-    /// from the DAG, and prunes orphaned ready-queue entries. Does NOT
-    /// transition the build state itself — caller decides Cancelled vs
-    /// Failed. Extracted from [`handle_cancel_build`] so the per-build-
-    /// timeout check in `handle_tick` (`sched.timeout.per-build` spec) can
-    /// reuse the derivation-cancellation path but end in Failed.
+    /// Transitions sole-interest in-flight derivations to Cancelled,
+    /// removes build interest from the DAG, and prunes orphaned
+    /// ready-queue entries. Does NOT transition the build state itself
+    /// — caller decides Cancelled vs Failed. Extracted from
+    /// [`handle_cancel_build`] so the per-build-timeout check in
+    /// `handle_tick` (`sched.timeout.per-build` spec) can reuse the
+    /// derivation-cancellation path but end in Failed.
     ///
-    /// `signal_reason` is the CancelSignal.reason sent to workers.
+    /// The pod side of a pull-mode cancel is the controller's job: it
+    /// observes the closed attempt (the cancel verdict closes it at the
+    /// fold) and deletes the owning Job, whose SIGTERM aborts the build
+    /// inside the AD5 grace — there is no scheduler→executor signal
+    /// path. `signal_reason` is recorded for diagnostics only.
     ///
     /// [`handle_cancel_build`]: Self::handle_cancel_build
     pub(super) async fn cancel_build_derivations(&mut self, build_id: Uuid, signal_reason: &str) {
@@ -50,7 +54,7 @@ impl DagActor {
         //
         // Shared derivations (another build still cares) are left alone
         // — the other build drives them.
-        let mut to_cancel: Vec<(DrvHash, String, Option<ExecutorId>)> = Vec::new();
+        let mut to_cancel: Vec<(DrvHash, String)> = Vec::new();
         let mut to_cancel_substituting: Vec<DrvHash> = Vec::new();
         let mut to_depfail: Vec<DrvHash> = Vec::new();
         for (h, s) in self.dag.iter_nodes() {
@@ -58,17 +62,10 @@ impl DagActor {
                 continue;
             }
             match s.status() {
-                // In-flight on a worker → CancelSignal + transition Cancelled.
-                // assigned_executor should always be Some for these, but
-                // a stuck node without one still gets the transition
-                // (signal skipped) — None indicates a prior bug, not a
-                // reason to leak the node.
+                // In-flight on a worker → transition Cancelled (the
+                // controller's Job deletion aborts the pod).
                 DerivationStatus::Assigned | DerivationStatus::Running => {
-                    to_cancel.push((
-                        h.into(),
-                        s.drv_path().to_string(),
-                        s.assigned_executor.clone(),
-                    ));
+                    to_cancel.push((h.into(), s.drv_path().to_string()));
                 }
                 // Detached fetch in flight → transition Cancelled (no
                 // executor to signal). handle_substitute_complete's
@@ -93,41 +90,36 @@ impl DagActor {
             }
         }
 
-        // Send CancelSignal + transition Cancelled. The worker's
-        // cgroup.kill SIGKILLs the daemon tree → run_daemon_build
-        // Errs → worker reports BuildResultStatus::Cancelled →
-        // completion handler is a no-op (we already transitioned).
-        //
-        // try_send (not send): fire-and-forget. If the worker's
-        // stream is full/closed, it's about to disconnect anyway
-        // and reassign_derivations will handle it. The transition
-        // to Cancelled still happens — scheduler-authoritative.
+        // Transition Cancelled + stamp the cancelled execution. The pod
+        // is stopped by the controller deleting its Job (the cancel
+        // verdict closes the open attempt at the fold; the deletion's
+        // SIGTERM cgroup-kills the build inside the AD5 grace) — the
+        // scheduler has no executor channel to signal.
         //
         // PG writes are batched AFTER the loop (persist_status_batch
         // + unpin_best_effort_batch). The per-item variant caused an
         // N+1 actor stall: a 500-derivation cancel = ~1000 sequential
         // PG round-trips inside the single-threaded actor, blocking
-        // heartbeats/completions/dispatch for the duration. Batching
-        // collapses that to 2 round-trips regardless of N.
+        // pulls/completions for the duration. Batching collapses that
+        // to 2 round-trips regardless of N.
         let mut transitioned: Vec<&str> = Vec::with_capacity(to_cancel.len());
-        let mut sent: u64 = 0;
-        for (drv_hash, drv_path, executor_id) in &to_cancel {
+        for (drv_hash, _drv_path) in &to_cancel {
             // Transition FIRST. If it fails (state changed under
             // us — completion arrived between the collect above and
-            // here), skip the signal — the build finished naturally.
+            // here), skip — the build finished naturally.
             if let Some(state) = self.dag.node_mut(drv_hash) {
                 if let Err(e) = state.transition(DerivationStatus::Cancelled) {
                     debug!(drv_hash = %drv_hash, error = %e,
-                           "cancel transition failed (completion raced us), skipping signal");
+                           "cancel transition failed (completion raced us), skipping");
                     continue;
                 }
                 state.assigned_executor = None;
             }
             // Stamp the cancelled execution's drv_executions row +
-            // bd.exec_id correlation. The worker's eventual
-            // CompletionReport(Cancelled) is a no-op early-return at
-            // process_completion (completion.rs), so this is the only
-            // place that can stamp the cancelled exec — for any of
+            // bd.exec_id correlation. The worker's eventual report (if
+            // any arrives before the pod dies) is a no-op early-return
+            // at the completion intake, so this is the only place that
+            // can stamp the cancelled exec — for any of
             // cancel_build_derivations' callers (user cancel, per-build
             // timeout, fail-fast, top-down substitute fail).
             // Sole-interest filter at collect time means `&[build_id]`
@@ -142,36 +134,15 @@ impl DagActor {
             // cancelled execution's log is truncated).
             self.terminal_log_epilogue(drv_hash, "cancelled", &[build_id], None);
             transitioned.push(drv_hash.as_str());
-            let Some(executor_id) = executor_id else {
-                continue;
-            };
-            if let Some(worker) = self.executors.get(executor_id)
-                && let Some(tx) = &worker.stream_tx
-            {
-                match tx.try_send(rio_proto::types::SchedulerMessage {
-                    msg: Some(rio_proto::types::scheduler_message::Msg::Cancel(
-                        rio_proto::types::CancelSignal {
-                            drv_path: drv_path.clone(),
-                            reason: signal_reason.to_string(),
-                        },
-                    )),
-                }) {
-                    Ok(()) => sent += 1,
-                    Err(e) => {
-                        debug!(executor_id = %executor_id, drv_hash = %drv_hash, error = %e,
-                               "cancel signal dropped (stream full/closed)");
-                        metrics::counter!("rio_scheduler_cancel_signal_dropped_total").increment(1);
-                    }
-                }
-            }
-            // Clear worker's running build — no longer counted against
-            // capacity. They'll re-report it on next heartbeat but our
-            // reconcile logic keeps scheduler-authoritative.
-            if let Some(worker) = self.executors.get_mut(executor_id)
-                && worker.running_build.as_ref() == Some(drv_hash)
-            {
-                worker.running_build = None;
-            }
+        }
+        if !to_cancel.is_empty() {
+            info!(
+                build_id = %build_id,
+                count = to_cancel.len(),
+                reason = signal_reason,
+                "cancelled sole-interest in-flight derivations \
+                 (the controller's Job deletion stops the pods)"
+            );
         }
         for drv_hash in &to_cancel_substituting {
             if let Some(state) = self.dag.node_mut(drv_hash)
@@ -187,19 +158,6 @@ impl DagActor {
                 .await;
             self.unpin_best_effort_batch(&transitioned).await;
         }
-        // cancel_signals_total counts signals DELIVERED (Ok on try_send),
-        // matching housekeeping.rs's documented semantic. Previously this
-        // emitted to_cancel.len(), which counted items skipped before
-        // try_send and items already in dropped_total.
-        if sent > 0 {
-            info!(
-                build_id = %build_id,
-                count = sent,
-                "sent CancelSignal to workers for sole-interest in-flight derivations"
-            );
-            metrics::counter!("rio_scheduler_cancel_signals_total").increment(sent);
-        }
-
         // Sole-interest Queued/Ready/Created → DependencyFailed.
         // Without this, remove_build_interest orphans them (no
         // interested build → never dispatched → never terminal) but

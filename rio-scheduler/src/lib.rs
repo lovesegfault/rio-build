@@ -134,7 +134,8 @@ pub fn describe_metrics() {
     describe_gauge!("rio_scheduler_builds_active", "Currently active builds");
     describe_gauge!(
         "rio_scheduler_derivations_queued",
-        "Derivations waiting for assignment"
+        "Ready derivations waiting for a worker (DAG-status count; the per-system \
+         split is queued_by_system on ClusterStatus/GetSpawnIntents)"
     );
     describe_gauge!(
         "rio_scheduler_derivations_running",
@@ -244,7 +245,11 @@ pub fn describe_metrics() {
     );
     describe_gauge!(
         "rio_scheduler_workers_active",
-        "Fully-registered workers (stream + heartbeat)"
+        "DEPRECATED: stream-era registration gauge, pinned to 0 since the stream session \
+         machinery was deleted (kept emitting only so the deletion-gate recording rule \
+         rio:scheduler_stream_registrations:max stays a present-and-zero series until the \
+         1d removal). Busy-fleet successor: rio_scheduler_open_attempts; stream-traffic \
+         successor signal: rio_scheduler_stream_stub_calls_total."
     );
     describe_gauge!(
         "rio_scheduler_open_attempts",
@@ -282,12 +287,12 @@ pub fn describe_metrics() {
          no_assignment | executor_mismatch."
     );
     describe_counter!(
-        "rio_scheduler_executor_reconnect_rejected_total",
-        "BuildExecution reconnects rejected by the stream-hijack guard (label: reason)"
-    );
-    describe_counter!(
-        "rio_scheduler_heartbeat_rejected_total",
-        "Heartbeats dropped by the actor-side identity binding (label: reason)"
+        "rio_scheduler_stream_stub_calls_total",
+        "Calls to the retired stream-protocol RPCs (BuildExecution / Heartbeat error \
+         stubs), labeled by rpc. Any sustained rate means a stream-mode executor image \
+         is still deployed and trying to register — the deployment-time deletion-gate \
+         (checklist row D6) and post-deletion watch (row D7) successor signal for the \
+         pinned-to-zero workers_active gauge."
     );
     describe_counter!(
         "rio_scheduler_pull_rejected_total",
@@ -362,21 +367,6 @@ pub fn describe_metrics() {
         "rio_scheduler_recovery_duration_seconds",
         "Time to reconstruct actor state from PG on LeaderAcquired \
          (labeled by outcome=success|failure)"
-    );
-    describe_counter!(
-        "rio_scheduler_worker_disconnects_total",
-        "Worker stream disconnects (graceful and ungraceful)"
-    );
-    describe_counter!(
-        "rio_scheduler_cancel_signals_total",
-        "CancelSignal messages successfully delivered to the executor stream (Ok on try_send). \
-         Excludes drops (counted in cancel_signal_dropped_total) and skipped attempts."
-    );
-    describe_counter!(
-        "rio_scheduler_cancel_signal_dropped_total",
-        "CancelSignal try_send drops (worker stream full/closed under backpressure). \
-         Best-effort: the transition to Cancelled is scheduler-authoritative regardless; \
-         worker disconnect reassign still fires. Alert if rate > 0 sustained."
     );
     describe_counter!(
         "rio_scheduler_attempt_record_retries_total",

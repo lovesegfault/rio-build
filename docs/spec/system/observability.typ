@@ -195,23 +195,21 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   metrics MUST follow the `rio_scheduler_*` naming prefix.
 ]
 
-#r("obs.metric.scheduler-leader-gate+2")[
-  Scheduler leader-state gauges (`_builds_active`, `_derivations_queued`,
-  `_derivations_running`, `_queue_depth`) are published *only by the leader*.
-  The standby's actor is warm (DAGs merge for fast takeover per
-  #rref("sched.lease.k8s-lease")), so its counts are stale or zero; with
-  `replicas>1`, publishing from both would create duplicate Prometheus series
-  with identical labels, and stat-panel reducers pick one
-  nondeterministically. `_workers_active` is *not* leader-state: it tracks
-  executors connected to *this pod*, maintained by inc/dec on
-  connect/disconnect on the standby too. After a lease loss, the ex-leader's
-  `_workers_active` series drains naturally to zero as executors rebalance to
-  the new leader (it is never zeroed explicitly --- doing so would desync
-  from the retained `executors` map and go negative on subsequent
-  disconnects). Counters and histograms are unaffected --- the standby's
-  dispatch loop no-ops, so its counters stay at zero naturally, and
-  `sum(rate(...))` is the idiomatic query form anyway.
+#r("obs.metric.scheduler-leader-gate+3")[
+  Scheduler state gauges (`_builds_active`, `_derivations_queued`,
+  `_derivations_running`, and the deprecated `_workers_active`) are
+  published *only by the leader*. The standby's actor is warm (DAGs merge
+  for fast takeover per #rref("sched.lease.k8s-lease")), so its counts are
+  stale or zero; with `replicas>1`, publishing from both would create
+  duplicate Prometheus series with identical labels, and stat-panel
+  reducers pick one nondeterministically. Counters and histograms are
+  unaffected --- the standby's handlers no-op, so its counters stay at zero
+  naturally, and `sum(rate(...))` is the idiomatic query form anyway.
 ]
+The stream-era `_workers_active` connection-state exception (it used to be
+maintained by inc/dec on connect/disconnect on the standby too) retired
+with the stream session: the gauge is deprecated, pinned to zero, and
+emitted from the same leader-gated block as the rest until its 1d removal.
 
 == Store Metrics
 

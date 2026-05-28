@@ -3,52 +3,6 @@
 
 use super::*;
 
-/// Actor in-memory snapshot of one executor's connection state.
-///
-/// Serves both unit-test assertions and the `DebugListExecutors` gRPC
-/// RPC. The fields beyond the original four (`has_stream`, `warm`,
-/// `kind`, `systems`, `last_heartbeat_ago_secs`) were added for the
-/// I-048b/c diagnostic: PG showed fetchers `[alive]` (heartbeat unary
-/// RPC succeeded against the new leader), but the actor map had no
-/// entry (BuildExecution stream still stuck on TCP keepalive to the
-/// old leader). `rio-cli workers` lied; only `has_stream` here knows.
-#[derive(Debug, Clone)]
-pub struct DebugExecutorInfo {
-    pub executor_id: String,
-    /// `stream_tx.is_some()` — BuildExecution bidi stream connected to
-    /// THIS actor instance. The I-048b zombie signature is `false` here
-    /// while PG `last_seen` is recent.
-    pub has_stream: bool,
-    /// `has_stream && !systems.is_empty()` — dispatch's hard filter.
-    pub is_registered: bool,
-    /// Warm-gate. `false` until `PrefetchComplete` ACK. A registered
-    /// cold worker is filtered out of dispatch unless no warm worker
-    /// passes the hard filter.
-    pub warm: bool,
-    /// Builder vs fetcher. FOD routing partitions on this.
-    pub kind: rio_proto::types::ExecutorKind,
-    /// Populated by first heartbeat; empty until then. The
-    /// `is_registered` second leg.
-    pub systems: Vec<String>,
-    /// `last_heartbeat.elapsed().as_secs()`. Staleness of the actor's
-    /// view — PG `last_seen` may differ (heartbeat reaches PG and actor
-    /// independently; post-failover PG can be fresher).
-    pub last_heartbeat_ago_secs: u64,
-    /// P0537: at most one. Populated from `ExecutorState.running_build`.
-    pub running_build: Option<String>,
-    /// I-056b: `has_capacity()` checks both. Either true → invisible
-    /// to dispatch regardless of `is_registered`/`warm`. Added after
-    /// 45min chasing PG/recovery red herrings when a stale drain flag
-    /// surviving reconnect was the actual FOD-stuck-22min root.
-    pub draining: bool,
-    pub store_degraded: bool,
-    /// `r[sec.executor.identity-token]`: HMAC-attested SpawnIntent id
-    /// the executor is bound to. `None` for hw-agnostic pods or after
-    /// the not-Ready→None downgrade. Exposed for the heartbeat-spoof
-    /// guard's regression test.
-    pub intent_id: Option<String>,
-}
-
 /// Test-only: snapshot of derivation state for assertions. Mirrors the
 /// nested sub-struct shape of [`crate::state::DerivationState`] so test
 /// accesses (`info.retry.count`, `info.ca.output_unchanged`) read the
@@ -215,15 +169,6 @@ impl ActorHandle {
         self.send_unchecked(mk_cmd(tx)).await?;
         rx.await.map_err(|_| ActorError::ChannelSend)
     }
-
-    /// Query the actor's in-memory executor map. Used by both unit
-    /// tests and the `DebugListExecutors` gRPC handler. Bypasses
-    /// backpressure (`send_unchecked`) — diagnostic queries must
-    /// succeed under saturation, that's exactly when you need them.
-    pub async fn debug_query_workers(&self) -> Result<Vec<DebugExecutorInfo>, ActorError> {
-        self.query_unchecked(|reply| ActorCommand::Admin(AdminQuery::DebugQueryWorkers { reply }))
-            .await
-    }
 }
 
 /// Test-only `debug_*` actor queries. Thin wrappers over
@@ -262,8 +207,8 @@ impl ActorHandle {
     /// exec-keyed terminal writes (`drv_executions`, the
     /// `build_derivations.exec_id` correlation, log finalization)
     /// silently exercises the no-carrier early-return instead of the
-    /// path it means to test. For those, merge against a connected idle
-    /// worker and let `dispatch_ready` perform the real assignment.
+    /// path it means to test. For those, deliver through a real pull
+    /// (`pull_attempt`) so the mint stamps an exec_id.
     pub async fn debug_force_assign(
         &self,
         drv_hash: &str,
@@ -274,25 +219,6 @@ impl ActorHandle {
         self.debug(|reply| DebugCmd::ForceAssign {
             drv_hash,
             executor_id,
-            reply,
-        })
-        .await
-    }
-
-    /// Set `worker.running_build` directly, bypassing DAG-status guards.
-    /// For the heartbeat-reconcile safety-net test where the drv is
-    /// terminal (Poisoned). Returns `false` if the executor isn't
-    /// registered.
-    pub async fn debug_set_running_build(
-        &self,
-        executor_id: &str,
-        drv_hash: &str,
-    ) -> Result<bool, ActorError> {
-        let executor_id = executor_id.into();
-        let drv_hash = drv_hash.to_string();
-        self.debug(|reply| DebugCmd::SetRunningBuild {
-            executor_id,
-            drv_hash,
             reply,
         })
         .await

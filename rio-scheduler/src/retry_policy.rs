@@ -36,8 +36,14 @@ use std::collections::BTreeSet;
 use crate::state::{AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty};
 
 pub(crate) use rio_retry_kernel::{
-    AbsTime, Budget, FloorOutcomeView, ObservedFailure, Placement, PoisonReason, Verdict, placeable,
+    AbsTime, Budget, FloorOutcomeView, ObservedFailure, PoisonReason, Verdict,
 };
+// The placement partition is consumed by the AD2 spawn gate
+// (controller-side) and the retry-kernel Kani contracts; in this crate
+// only the equivalence-oracle tests still exercise it since the
+// completion-time fleet-exhaust arm retired with the executors map.
+#[cfg(test)]
+pub(crate) use rio_retry_kernel::{Placement, placeable};
 
 /// The ten `RetryState` counters as the fold computes them, in the
 /// fold's `String` executor-identity vocabulary

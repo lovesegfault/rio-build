@@ -1,9 +1,11 @@
 //! AdminService gRPC implementation.
 //!
-//! All RPCs are fully implemented as of phase4a:
-//! `ClusterStatus`, `DrainExecutor`, `TriggerGC`, `ListExecutors`,
-//! `ListBuilds`, `ClearPoison`, `ListTenants`, `CreateTenant`,
-//! `GetBuildGraph`, `GetSpawnIntents`.
+//! The operator/controller surface: `ClusterStatus`, `ListExecutors`
+//! (open-attempt backed), `ListOpenAttempts`, `ListBuilds`,
+//! `ClearPoison`, `ListTenants`, `CreateTenant`, `GetBuildGraph`,
+//! `GetSpawnIntents`, `TriggerGC`, the SLA family. `DrainExecutor` and
+//! `DebugListExecutors` are retired no-ops (clear error naming the
+//! successor) until the 1d proto sweep removes them.
 //!
 //! Per-RPC bodies live in submodules (`gc`, `tenants`,
 //! `builds`, `workers`, `graph`, `spawn_intents`). This file holds only the
@@ -19,7 +21,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use rio_common::grpc::StatusExt;
-use tracing::instrument;
+use tracing::{instrument, warn};
 
 use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
@@ -27,19 +29,19 @@ use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
     AckSpawnedIntentsRequest, AppendInterruptSampleRequest, CancelBuildRequest,
     CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    CreateTenantRequest, CreateTenantResponse, DebugExecutorState, DebugListExecutorsResponse,
-    DeleteTenantRequest, DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse,
-    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
-    GetBuildGraphResponse, GetHwClassConfigResponse, GetSlaMispredictorsRequest,
-    GetSlaMispredictorsResponse, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
-    HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
-    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
-    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
-    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse,
-    MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
-    ReportExecutorTerminationRequest, ReportExecutorTerminationResponse, ResetSlaModelRequest,
-    SetSlaOverrideRequest, SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride,
-    SlaStatusRequest, SlaStatusResponse, TerminationReason,
+    CreateTenantRequest, CreateTenantResponse, DebugListExecutorsResponse, DeleteTenantRequest,
+    DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest,
+    ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse,
+    GetHwClassConfigResponse, GetSlaMispredictorsRequest, GetSlaMispredictorsResponse,
+    GetSpawnIntentsRequest, GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse,
+    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
+    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
+    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
+    ListSlaOverridesResponse, ListTenantsResponse, MintExecutorTokensRequest,
+    MintExecutorTokensResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
+    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
+    SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
+    SlaStatusResponse, TerminationReason,
 };
 use uuid::Uuid;
 
@@ -74,11 +76,11 @@ pub use sla::duration_fit_from_status;
 
 pub struct AdminServiceImpl {
     pool: PgPool,
-    /// For `ClusterStatus` / `DrainExecutor` — sends query commands into
-    /// the actor event loop. `ClusterSnapshot` bypasses backpressure
-    /// (`send_unchecked`): the autoscaler needs a reading especially
-    /// when saturated. Dropping the query under load would blind the
-    /// controller exactly when it needs to scale up.
+    /// For `ClusterStatus` and the actor-backed admin queries — sends
+    /// query commands into the actor event loop. `ClusterSnapshot`
+    /// bypasses backpressure (`send_unchecked`): the autoscaler needs a
+    /// reading especially when saturated. Dropping the query under load
+    /// would blind the controller exactly when it needs to scale up.
     actor: ActorHandle,
     /// Process start time. `ClusterStatusResponse.uptime_since` wants a
     /// wall-clock `Timestamp`, but we don't want to capture `SystemTime`
@@ -122,12 +124,12 @@ pub struct AdminServiceImpl {
     /// because `DagActor` holds the same.
     sla_config: Arc<crate::sla::config::SlaConfig>,
     /// Verifies `x-rio-service-token` for controller-only mutating RPCs
-    /// (`AppendInterruptSample`, `DrainExecutor`). `None` = dev mode
+    /// (`AppendInterruptSample`, `CancelBuild`). `None` = dev mode
     /// (accept all) — same pass-through pattern as the store's
     /// assignment-token verifier. The threat: builders share port 9001
     /// with this service (CCNP allows scheduler:9001 at L4 only), and a
     /// compromised builder could forge `interrupt_samples` to bias
-    /// λ\[h\] or drain arbitrary executors. See `r[sec.authz.service-token]`.
+    /// λ\[h\] or cancel arbitrary builds. See `r[sec.authz.service-token]`.
     service_verifier: Option<Arc<rio_auth::hmac::HmacVerifier>>,
     /// §13c-2: the same `Arc<RwLock<CostTable>>` `main.rs` shares with
     /// the actor + cost pollers. `GetHwClassConfig` reads
@@ -174,8 +176,8 @@ impl AdminServiceImpl {
         crate::grpc::actor_guards::check_actor_alive(&self.actor)
     }
 
-    /// Leader guard. Admin RPCs mutate state (DrainExecutor,
-    /// ClearPoison, CreateTenant, TriggerGC) or reflect actor state
+    /// Leader guard. Admin RPCs mutate state (ClearPoison,
+    /// CreateTenant, TriggerGC) or reflect leader-owned state
     /// (ClusterStatus, ListExecutors) — standby has no actor authority
     /// and its view is stale. Delegates to the shared
     /// [`actor_guards::ensure_leader`](crate::grpc::actor_guards).
@@ -199,7 +201,7 @@ impl AdminServiceImpl {
     ///
     /// Builders share port 9001 with this service; without this gate a
     /// compromised builder could write straight into `interrupt_samples`
-    /// (poisoning λ\[h\]), drain arbitrary executors, or set SLA
+    /// (poisoning λ\[h\]), cancel arbitrary builds, or set SLA
     /// overrides to bias the solver fleet-wide.
     ///
     /// MUST gate every mutating RPC. The canonical list lives in
@@ -233,8 +235,13 @@ impl AdminService for AdminServiceImpl {
     /// The controller spawns one-shot Jobs up to `max_concurrent` from
     /// `queued_derivations`. `queued_derivations` is the primary signal —
     /// that's how many ready-to-build derivations are waiting for a
-    /// worker. `running_derivations` is secondary (for "scale-down is
-    /// safe when queue=0 AND running is below capacity").
+    /// worker, counted from DAG status (always the sum of
+    /// `queued_by_system`). `running_derivations` is secondary (for
+    /// "scale-down is safe when queue=0 AND running is below
+    /// capacity"). The executor counts are the busy view (one open
+    /// pull-mode attempt per in-flight derivation); `draining_executors`
+    /// is always 0 — per-executor drain retired with the stream
+    /// session.
     ///
     /// `store_size_bytes` is a cached value from the 60s background
     /// refresh task — NOT a live PG query (this endpoint is on the
@@ -281,7 +288,12 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    // r[impl sched.admin.list-executors]
+    /// Busy-fleet view over the durable open-attempt rows (one entry
+    /// per open pull-mode attempt — the pod that pulled it). Kept so
+    /// existing CLI/dashboard/controller callers keep a working
+    /// endpoint until the 1d proto sweep; `ListOpenAttempts` is the
+    /// attempt-keyed form of the same view.
+    // r[impl sched.admin.list-executors+2]
     #[instrument(skip(self, request), fields(rpc = "ListExecutors"))]
     async fn list_executors(
         &self,
@@ -289,11 +301,10 @@ impl AdminService for AdminServiceImpl {
     ) -> Result<Response<ListExecutorsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
         self.ensure_leader()?;
-        self.check_actor_alive()?;
         let req = request.into_inner();
+        let db = crate::db::SchedulerDb::new(self.pool.clone());
         let resp =
-            executors::list_executors(&self.actor, &req.status_filter, self.leader.leader_for())
-                .await?;
+            executors::list_executors(&db, &req.status_filter, self.leader.leader_for()).await?;
         Ok(Response::new(resp))
     }
 
@@ -362,61 +373,39 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(stream))
     }
 
-    /// Mark a worker draining: `has_capacity()` returns false, dispatch
-    /// skips it. In-flight builds continue. Called by:
-    ///   - Controller's Pool finalizer cleanup
-    ///   - rio-cli `drain` command (operator workstation)
+    /// Retired with the stream session: there is no per-executor drain
+    /// state left to set (nothing is dispatched to a registered
+    /// executor any more — each pod pulls exactly the work it was
+    /// spawned for). The RPC keeps its place in the proto until the 1d
+    /// sweep but is a no-op that returns a clear error naming the
+    /// successor procedures: node-level drain is `kubectl cordon` plus
+    /// the AD2 node exclusion; force-evicting one pod's build is a
+    /// cancel verdict on its open attempt (`CancelBuild` /
+    /// `ReportAttemptOutcome`) plus the controller deleting the Job;
+    /// fleet-wide stop is pausing spawn intents at the pool.
     ///
-    /// Builders do NOT call this (their self-drain goodbye was removed
-    /// — heartbeat `draining=true` + stream-close are the deregistration
-    /// path; the service-token gate below excludes builders by design).
-    ///
-    /// `force=true` reassigns in-flight builds — the worker's nix-daemon
-    /// keeps running them (we can't reach into its process tree) but the
-    /// scheduler redispatches to fresh workers. Wasteful but unblocks.
-    ///
-    /// Unknown executor_id → `accepted=false, running=0`. NOT an error:
-    /// SIGTERM may race with stream close (ExecutorDisconnected removes
-    /// the entry). The caller proceeds as if drain succeeded.
-    ///
-    /// Empty executor_id → InvalidArgument. Catches the proto-default
-    /// (empty string) before it gets interpreted as "worker named ''
-    /// not found."
+    /// The service-token gate stays (defense in depth; the error must
+    /// not become an unauthenticated probe).
     #[instrument(skip(self, request), fields(rpc = "DrainExecutor"))]
     async fn drain_executor(
         &self,
         request: Request<DrainExecutorRequest>,
     ) -> Result<Response<DrainExecutorResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        // Service-token gate: builders share this port; a compromised
-        // builder draining arbitrary executors is a DoS. rio-cli runs
-        // from operator workstations (outside builder netns) but uses
-        // the same shared key — both legitimate callers allowlisted.
         self.ensure_service_caller(request.metadata(), &["rio-controller", "rio-cli"])?;
-        self.ensure_leader()?;
-        self.check_actor_alive()?;
         let req = request.into_inner();
-
-        if req.executor_id.is_empty() {
-            return Err(Status::invalid_argument("executor_id is required"));
-        }
-
-        // send_unchecked: drain MUST land even under backpressure. A
-        // shutting-down worker accepting new assignments is a feedback
-        // loop into MORE load — exactly what we don't want.
-        let executor_id = req.executor_id.into();
-        let force = req.force;
-        let result = query_actor(&self.actor, |reply| ActorCommand::DrainExecutor {
-            executor_id,
-            force,
-            reply,
-        })
-        .await?;
-
-        Ok(Response::new(DrainExecutorResponse {
-            accepted: result.accepted,
-            busy: result.busy,
-        }))
+        warn!(
+            executor_id = %req.executor_id,
+            force = req.force,
+            "DrainExecutor called: per-executor drain has been retired with the stream \
+             dispatch protocol"
+        );
+        Err(Status::unimplemented(
+            "per-executor drain has been retired with the stream dispatch protocol; \
+             drain the node (kubectl cordon + the AD2 exclusion), cancel the open \
+             attempt (CancelBuild / ReportAttemptOutcome) and delete its Job, or pause \
+             the pool's spawn intents instead",
+        ))
     }
 
     /// Operator cancel — service-token gated, dispatches
@@ -977,46 +966,23 @@ impl AdminService for AdminServiceImpl {
         }))
     }
 
-    /// Actor in-memory executor map snapshot. Unlike `ListExecutors`
-    /// (PG `last_seen`), this reads `self.executors` — exactly what
-    /// `dispatch_ready()` filters on. I-048b/c diagnostic.
-    ///
-    /// NO `ensure_leader()`: a standby's actor map is empty (cleared
-    /// on lease loss) and that's USEFUL — `rio-cli workers --diff`
-    /// against a standby shows every PG-known worker as PG-only,
-    /// confirming "the actor I asked has no streams" rather than
-    /// rejecting with FAILED_PRECONDITION and leaving the operator
-    /// to guess. Also: NO `check_actor_alive()` — if the actor task
-    /// died, `debug_query_workers()`'s `rx.await` returns `ChannelSend`
-    /// and the mapped Status surfaces that more precisely than the
-    /// guard's generic "actor not alive".
+    /// Retired: the in-memory executor map this RPC snapshotted is
+    /// gone with the stream session machinery — there is no
+    /// scheduler-side connection state to debug. The RPC keeps its
+    /// place in the proto until the 1d sweep and returns a clear error
+    /// naming the successors: `ListOpenAttempts` (the durable
+    /// in-flight view) and the controller's Job/pod census.
     #[instrument(skip(self, request), fields(rpc = "DebugListExecutors"))]
     async fn debug_list_executors(
         &self,
         request: Request<()>,
     ) -> Result<Response<DebugListExecutorsResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
-        let workers = self
-            .actor
-            .debug_query_workers()
-            .await
-            .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
-        let executors = workers
-            .into_iter()
-            .map(|w| DebugExecutorState {
-                executor_id: w.executor_id,
-                has_stream: w.has_stream,
-                is_registered: w.is_registered,
-                warm: w.warm,
-                kind: w.kind as i32,
-                systems: w.systems,
-                last_heartbeat_ago_secs: w.last_heartbeat_ago_secs,
-                running_build: w.running_build,
-                draining: w.draining,
-                store_degraded: w.store_degraded,
-            })
-            .collect();
-        Ok(Response::new(DebugListExecutorsResponse { executors }))
+        Err(Status::unimplemented(
+            "DebugListExecutors has been retired with the stream session machinery (there \
+             is no in-memory executor map); use ListOpenAttempts for in-flight attempts \
+             and the Job/pod census for fleet membership",
+        ))
     }
 
     // ─── ADR-023 SLA overrides ────────────────────────────────────────

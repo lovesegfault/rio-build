@@ -17,8 +17,13 @@ import "build_types.proto"; // BuildInfo.state → BuildState; ExecutorInfo.kind
 // ───────────────────────────────────────────────────────────────────────────
 
 message ClusterStatusResponse {
+  // Busy executors: one open pull-mode attempt per in-flight
+  // derivation (one attempt per pod). Spawned-but-not-yet-pulled pods
+  // are the controller's Job census, not a scheduler count.
   uint32 total_executors = 1;
+  // Same count as total_executors (no registration state exists).
   uint32 active_executors = 2;
+  // Always 0: per-executor drain retired with the stream session.
   uint32 draining_executors = 3;
   uint32 pending_builds = 4;
   uint32 active_builds = 5;
@@ -38,35 +43,36 @@ message ClusterStatusResponse {
 }
 
 message ListExecutorsRequest {
-  string status_filter = 1;              // Optional: "alive", "draining", "degraded", "connecting"
+  // Optional. Every open attempt reports "alive"; the other historical
+  // values ("draining", "degraded", "connecting") match nothing.
+  string status_filter = 1;
 }
 
 message ListExecutorsResponse {
+  // One entry per open pull-mode attempt (the busy view).
   repeated ExecutorInfo executors = 1;
   // Seconds since this replica acquired leadership. Consumers MUST
-  // treat the executor list as potentially incomplete (workers
-  // reconnecting) when this is small. The controller's
-  // orphan_reap_gate fail-closes when leader_for_secs <
-  // ORPHAN_REAP_GRACE: a non-empty PARTIAL list during the reconnect
-  // window cannot prove absence, and select_orphan_running's
-  // None=>true arm would otherwise foreground-delete every
-  // not-yet-reconnected worker's Running Job mid-build.
+  // treat the list as potentially incomplete when this is small; the
+  // controller's orphan_reap_gate fail-closes when leader_for_secs <
+  // ORPHAN_REAP_GRACE so a freshly-failed-over leader's view is never
+  // used to prove absence.
   uint64 leader_for_secs = 2;
 }
 
 message ExecutorInfo {
+  // The open attempt's executor identity (the attested intent id).
   string executor_id = 1;
-  // Systems this executor supports. Mirrors HeartbeatRequest.systems.
+  // The system the attempt's derivation targets.
   repeated string systems = 2;
-  repeated string supported_features = 3;
+  repeated string supported_features = 3;  // empty (no advertisement exists)
   reserved 4;                            // was max_builds (P0537: always 1)
   reserved 5;                            // was uint32 running_builds (P0537: → bool busy)
-  string status = 6;                     // "alive", "draining", "degraded", "connecting"
-  ResourceUsage resources = 7;           // (types.proto)
-  google.protobuf.Timestamp last_heartbeat = 8;
-  google.protobuf.Timestamp connected_since = 9;
-  ExecutorKind kind = 11;                // builder or fetcher (build_types.proto)
-  bool busy = 12;                        // A build is in flight (P0537: at most one per executor)
+  string status = 6;                     // always "alive" (an open attempt is an active build)
+  ResourceUsage resources = 7;           // unset (no per-pod telemetry on this surface)
+  google.protobuf.Timestamp last_heartbeat = 8;   // attempt-open time (the pull)
+  google.protobuf.Timestamp connected_since = 9;  // attempt-open time (the pull)
+  ExecutorKind kind = 11;                // builder or fetcher (from the attempt's derivation)
+  bool busy = 12;                        // always true (an open attempt IS a build in flight)
 }
 
 message ListBuildsRequest {

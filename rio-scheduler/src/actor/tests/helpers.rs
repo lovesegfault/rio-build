@@ -1,47 +1,12 @@
 //! Shared test helpers: actor setup, fixture builders, synchronization barrier.
+//!
+//! Work delivery in tests goes through the production pull surface
+//! (`pull_attempt` / `merge_*` + the report intake); the stream-era
+//! connect/heartbeat helpers retired with the session machinery and
+//! the operator surfaces that were their last drivers.
 
 use super::*;
 use tokio::sync::mpsc;
-
-/// Per-stream-epoch source for tests. Mirrors the production
-/// `STREAM_EPOCH_SEQ` in `grpc/executor_service.rs`. Process-global so
-/// every `connect_executor*` (and inline `ExecutorConnected{..}`
-/// construction) draws from the same monotonic sequence regardless of
-/// which test or helper allocated it.
-static STREAM_EPOCH_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// Last epoch allocated per executor_id. `disconnect()` and inline
-/// `ExecutorDisconnected{..}` sites read this so the epoch matches the
-/// connect's. Tests run in parallel but use distinct executor names,
-/// so per-key races are not a concern.
-static STREAM_EPOCHS: std::sync::LazyLock<dashmap::DashMap<String, u64>> =
-    std::sync::LazyLock::new(dashmap::DashMap::new);
-
-/// Throwaway `ExecutorConnected.reply` for test sites that don't care
-/// about the accept/reject result. The receiver is dropped immediately;
-/// the actor's `let _ = reply.send(..)` ignores send failure.
-pub(crate) fn noop_connect_reply() -> oneshot::Sender<Result<(), &'static str>> {
-    oneshot::channel().0
-}
-
-/// Allocate a fresh stream epoch for `executor_id` and record it.
-/// Call at every `ExecutorConnected{..}` construction site (helper or
-/// inline).
-pub(crate) fn next_stream_epoch_for(executor_id: &str) -> u64 {
-    let epoch = STREAM_EPOCH_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-    STREAM_EPOCHS.insert(executor_id.to_string(), epoch);
-    epoch
-}
-
-/// Current recorded epoch for `executor_id`. Call at every
-/// `ExecutorDisconnected{..}` construction site. Panics if no connect
-/// preceded — that's a test bug (production never sends disconnect
-/// without a prior connect from the same reader task).
-pub(crate) fn stream_epoch_for(executor_id: &str) -> u64 {
-    STREAM_EPOCHS
-        .get(executor_id)
-        .map(|e| *e)
-        .unwrap_or_else(|| panic!("stream_epoch_for({executor_id:?}): no prior connect recorded"))
-}
 
 // Re-exports: fixtures imported once here, used by sibling test modules
 // via `use super::*` and by grpc/tests.rs via `crate::actor::tests::*`.
@@ -85,12 +50,9 @@ pub(crate) struct CaFixture {
     pub store: rio_test_support::grpc::MockStore,
     /// Actor handle — send commands, await replies.
     pub actor: ActorHandle,
-    /// Connected worker's message receiver — `recv_assignment(&mut f.rx)`
-    /// to get the dispatched assignment after the single-node merge.
-    pub rx: mpsc::Receiver<rio_proto::types::SchedulerMessage>,
     /// The single CA derivation's path (`test_drv_path(key)`).
     pub drv_path: String,
-    /// The connected worker's id (`"w-{key}"`). Pass to [`complete_ca`].
+    /// Synthetic executor id (`"w-{key}"`). Pass to [`complete_ca`].
     pub executor_id: String,
     /// Build id for the merged single-node DAG.
     pub build_id: Uuid,
@@ -126,14 +88,14 @@ pub(crate) async fn seed_realisation(
 }
 
 /// Standard CA-compare test setup: spawn MockStore, actor with store
-/// client, connect a worker, merge a single `is_content_addressed=true`
-/// node, return all handles bundled as [`CaFixture`].
+/// client, merge a single `is_content_addressed=true` node, return all
+/// handles bundled as [`CaFixture`].
 ///
 /// Absorbs the 8-copy boilerplate that had accrued across `completion.rs`
 /// (5 added by P0311, 3 pre-existing): `TestDb::new` +
 /// `spawn_mock_store_with_client` + `setup_actor_with_store` +
-/// `connect_executor` + `make_test_node(ca=true)` + `merge_dag`. Each test
-/// drops from ~15L setup to 1-2L.
+/// `make_test_node(ca=true)` + `merge_dag`. Each test drops from ~15L
+/// setup to 1-2L.
 ///
 /// The fixture returns with the actor holding the node in Ready/Assigned
 /// — the CA-compare callsite at `completion.rs` only fires on
@@ -160,7 +122,6 @@ pub(crate) async fn setup_ca_fixture_configured(
         setup_actor_configured(db.pool.clone(), Some(store_client), configure);
 
     let executor_id = format!("w-{key}");
-    let rx = connect_executor(&actor, &executor_id, "x86_64-linux").await?;
 
     // Deterministic modular_hash per key — the CA-compare gate
     // requires `state.ca.modular_hash.is_some()`. Real flow: the
@@ -181,7 +142,6 @@ pub(crate) async fn setup_ca_fixture_configured(
     Ok(CaFixture {
         store,
         actor,
-        rx,
         drv_path,
         executor_id,
         build_id,
@@ -246,22 +206,6 @@ pub(crate) async fn setup() -> (TestDb, ActorHandle, tokio::task::JoinHandle<()>
     (db, handle, task)
 }
 
-/// Bootstrap PG + actor + one fully-registered worker.
-/// Returns the scheduler→worker message receiver alongside the standard triple.
-pub(crate) async fn setup_with_worker(
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<(
-    TestDb,
-    ActorHandle,
-    tokio::task::JoinHandle<()>,
-    mpsc::Receiver<rio_proto::types::SchedulerMessage>,
-)> {
-    let (db, handle, task) = setup().await;
-    let rx = connect_executor(&handle, executor_id, system).await?;
-    Ok((db, handle, task, rx))
-}
-
 /// Bootstrap PG + [`MockStore`](rio_test_support::grpc::MockStore) +
 /// actor wired with the store client. Absorbs the `TestDb::new` →
 /// `spawn_mock_store_with_client` → `setup_actor_with_store` preamble
@@ -285,183 +229,6 @@ pub(crate) async fn setup_with_mock_store() -> anyhow::Result<(
         rio_test_support::grpc::spawn_mock_store_with_client().await?;
     let (handle, actor_task) = setup_actor_with_store(db.pool.clone(), Some(store_client));
     Ok((db, store, handle, (store_task, actor_task)))
-}
-
-/// Overridable fields of an `ActorCommand::Heartbeat` for
-/// [`send_heartbeat_with`]. `executor_id` and `systems` are NOT here —
-/// every caller passes those explicitly. `Default` is "idle builder,
-/// no class, nothing running".
-pub(crate) struct HeartbeatFields {
-    pub store_degraded: bool,
-    pub draining: bool,
-    pub kind: rio_proto::types::ExecutorKind,
-    pub resources: Option<rio_proto::types::ResourceUsage>,
-    pub supported_features: Vec<String>,
-    pub running_build: Option<String>,
-    pub intent_id: Option<String>,
-}
-
-impl Default for HeartbeatFields {
-    fn default() -> Self {
-        Self {
-            store_degraded: false,
-            draining: false,
-            kind: rio_proto::types::ExecutorKind::Builder,
-            resources: None,
-            supported_features: vec![],
-            running_build: None,
-            intent_id: None,
-        }
-    }
-}
-
-/// Send an `ActorCommand::Heartbeat` with default fields, after `f`
-/// mutates the 1-2 the test cares about. THE single test-side
-/// construction site for the variant — when `ActorCommand::Heartbeat`
-/// grows a field, this is the only edit (not 20+ scattered across
-/// test modules). No trailing `Tick` — callers that need the
-/// dispatch-dirty drain compose with [`tick`] or use [`send_heartbeat`].
-pub(crate) async fn send_heartbeat_with(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-    f: impl FnOnce(&mut HeartbeatFields),
-) -> anyhow::Result<()> {
-    let mut hb = HeartbeatFields::default();
-    f(&mut hb);
-    // §13e + r35: fetcher pods are stamped `RIO_FEATURES=fetcher` by
-    // the controller (`pool/pod.rs::effective_features`); the worker
-    // heartbeat advertises it. Mirror that here so the dispatch-time
-    // `hard_filter` features check (`effective_features = [fetcher]`
-    // for every FOD post-r35) matches like production. A fetcher
-    // worker without `[fetcher]` is misconfigured. Only fill the
-    // default-empty case — a test that explicitly sets
-    // `supported_features` overrides.
-    if hb.kind == rio_proto::types::ExecutorKind::Fetcher && hb.supported_features.is_empty() {
-        hb.supported_features = vec![rio_common::k8s::FETCHER_FEATURE.to_string()];
-    }
-    handle
-        .send_unchecked(ActorCommand::Heartbeat(HeartbeatPayload {
-            executor_id: executor_id.into(),
-            systems: vec![system.into()],
-            store_degraded: hb.store_degraded,
-            draining: hb.draining,
-            kind: hb.kind,
-            resources: hb.resources,
-            supported_features: hb.supported_features,
-            running_build: hb.running_build,
-            intent_id: hb.intent_id,
-        }))
-        .await?;
-    Ok(())
-}
-
-/// Connect a worker (stream + heartbeat) WITHOUT the automatic
-/// `PrefetchComplete` ACK. For warm-gate tests that need to observe
-/// the initial `PrefetchHint` arrival and/or prove dispatch blocks
-/// until the ACK.
-pub(crate) async fn connect_executor_no_ack(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_no_ack_kind(
-        handle,
-        executor_id,
-        system,
-        rio_proto::types::ExecutorKind::Builder,
-    )
-    .await
-}
-
-/// [`connect_executor_no_ack`] with explicit executor kind. For FOD
-/// routing tests that need a fetcher-kind executor (ADR-019). The
-/// builder-default wrapper above keeps the 60+ existing call sites
-/// unchanged.
-pub(crate) async fn connect_executor_no_ack_kind(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-    kind: rio_proto::types::ExecutorKind,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_with(handle, executor_id, system, false, |hb| hb.kind = kind).await
-}
-
-/// Single body backing every `connect_executor*` variant: stream
-/// connect, first heartbeat (with caller-mutated [`HeartbeatFields`]),
-/// and optional warm-gate `PrefetchComplete` ACK. The named wrappers
-/// below pass the 1-2 fields they care about; when
-/// `ActorCommand::ExecutorConnected` / `Heartbeat` grow a field, this
-/// is the only edit.
-pub(crate) async fn connect_executor_with(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-    ack: bool,
-    f: impl FnOnce(&mut HeartbeatFields),
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (stream_tx, stream_rx) = mpsc::channel(256);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx,
-            stream_epoch: next_stream_epoch_for(executor_id),
-            auth_intent: None,
-            reply: noop_connect_reply(),
-        })
-        .await?;
-    send_heartbeat_with(handle, executor_id, system, f).await?;
-    // The warm-gate PrefetchComplete ACK retired with the placement
-    // layer; `ack` is kept so call sites stay stable until commit C
-    // removes the stream test plumbing entirely.
-    let _ = ack;
-    Ok(stream_rx)
-}
-
-/// Connect a kind-typed executor (stream + heartbeat + warm-gate ACK).
-/// Callers can merge then `recv_assignment` directly.
-pub(crate) async fn connect_executor_kind(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-    kind: rio_proto::types::ExecutorKind,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_with(handle, executor_id, system, true, |hb| {
-        hb.kind = kind;
-    })
-    .await
-}
-
-/// [`connect_executor_kind`] with `kind = Builder`.
-pub(crate) async fn connect_builder(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    connect_executor_kind(
-        handle,
-        executor_id,
-        system,
-        rio_proto::types::ExecutorKind::Builder,
-    )
-    .await
-}
-
-/// Send a default heartbeat then a `Tick`. For the "extra heartbeat to
-/// trigger dispatch" pattern where the test doesn't care about
-/// heartbeat field values, only that dispatch runs.
-///
-/// I-163: Heartbeat alone now sets `dispatch_dirty` instead of
-/// dispatching inline; the trailing `Tick` drains it. Callers that
-/// need a raw heartbeat-without-Tick use [`send_heartbeat_with`].
-pub(crate) async fn send_heartbeat(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<()> {
-    send_heartbeat_with(handle, executor_id, system, |_| {}).await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    Ok(())
 }
 
 /// Send `ActorCommand::Tick` and barrier on it. For tests driving the
@@ -490,29 +257,6 @@ pub(crate) async fn merge_dag_req(
         .await?;
     // Tests assert on state events; the log channel is dropped here.
     Ok(reply_rx.await??.state)
-}
-
-/// Connect a worker (stream + heartbeat) so it becomes fully registered.
-/// Returns the mpsc::Receiver for scheduler→worker messages.
-pub(crate) async fn connect_executor(
-    handle: &ActorHandle,
-    executor_id: &str,
-    system: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    // Warm-gate: unconditionally ACK so the worker flips warm=true
-    // regardless of whether on_worker_registered sent an initial
-    // PrefetchHint (it only does so when the ready queue is non-
-    // empty at registration time). Idempotent: if the queue was
-    // empty, warm was already flipped true by the registration hook;
-    // the ACK is a no-op re-set. Either way, the worker is warm by
-    // the time subsequent dispatch_ready calls run — existing tests'
-    // "connect then merge then recv_assignment" flow is preserved.
-    //
-    // Tests that merge FIRST then connect will see the initial
-    // PrefetchHint on stream_rx before any Assignment. Such tests
-    // must drain the hint themselves (recv + match Prefetch) or
-    // use a recv loop that skips Prefetch variants.
-    connect_executor_with(handle, executor_id, system, true, |_| {}).await
 }
 
 /// Merge a single-node DAG and return the event receiver.
@@ -626,34 +370,6 @@ pub(crate) async fn try_query_status(
         })
         .await?;
     Ok(rx.await?)
-}
-
-/// Receive the next SchedulerMessage and unwrap it as a WorkAssignment.
-/// Panics on timeout (2s), channel close, or wrong message variant.
-///
-/// Extracts the common `match msg.msg { Some(Msg::Assignment(a)) => a, _ => panic! }`
-/// pattern repeated across coverage/wiring/grpc tests.
-pub(crate) async fn recv_assignment(
-    rx: &mut mpsc::Receiver<rio_proto::types::SchedulerMessage>,
-) -> rio_proto::types::WorkAssignment {
-    // Skip PrefetchHint messages: send_prefetch_hint fires before each
-    // Assignment when approx_input_closure is non-empty. Since
-    // approx_input_closure now reads realized output_paths (not just
-    // expected_output_paths), any dispatch following a completed
-    // dependency may be preceded by a hint. Tests asserting on
-    // assignment ORDER don't care about the hint (it's a cache-warming
-    // side-channel); drain until the actual Assignment arrives.
-    loop {
-        let msg = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-            .await
-            .expect("recv_assignment: timeout waiting for SchedulerMessage")
-            .expect("recv_assignment: channel closed");
-        match msg.msg {
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => return a,
-            Some(rio_proto::types::scheduler_message::Msg::Prefetch(_)) => continue,
-            other => panic!("recv_assignment: expected Assignment, got {other:?}"),
-        }
-    }
 }
 
 /// Send a successful completion (Built) with a single `out` output.
@@ -801,50 +517,6 @@ pub(crate) async fn expect_drv(handle: &ActorHandle, hash: &str) -> DebugDerivat
         .await
         .expect("actor alive")
         .unwrap_or_else(|| panic!("derivation {hash:?} should exist in DAG"))
-}
-
-/// Query workers and find one by id. Replaces the 29×
-/// `debug_query_workers().await?; ...iter().find(|w| w.executor_id == id).expect(...)`.
-pub(crate) async fn expect_worker(handle: &ActorHandle, id: &str) -> DebugExecutorInfo {
-    handle
-        .debug_query_workers()
-        .await
-        .expect("actor alive")
-        .into_iter()
-        .find(|w| w.executor_id == id)
-        .unwrap_or_else(|| panic!("executor {id:?} should be registered"))
-}
-
-/// Send `ExecutorDisconnected` and barrier. Replaces the ~40×
-/// open-coded `send_unchecked(ExecutorDisconnected{...}) + barrier()`.
-pub(crate) async fn disconnect(handle: &ActorHandle, id: &str) -> anyhow::Result<()> {
-    handle
-        .send_unchecked(ActorCommand::ExecutorDisconnected {
-            executor_id: id.into(),
-            stream_epoch: stream_epoch_for(id),
-        })
-        .await?;
-    barrier(handle).await;
-    Ok(())
-}
-
-/// Send `ReportExecutorTermination` and return whether the floor was
-/// promoted. Simulates the controller's follow-up after observing
-/// k8s Pod-status. Barriered.
-pub(crate) async fn report_termination(
-    handle: &ActorHandle,
-    id: &str,
-    reason: rio_proto::types::TerminationReason,
-) -> anyhow::Result<bool> {
-    let promoted = handle
-        .query_unchecked(|reply| ActorCommand::ReportExecutorTermination {
-            executor_id: id.into(),
-            reason,
-            reply,
-        })
-        .await?;
-    barrier(handle).await;
-    Ok(promoted)
 }
 
 /// `[sla]` config for tests that exercise the solve/explore branch
@@ -1256,7 +928,11 @@ pub(crate) async fn fail_on_workers(
 /// captured tracing output) or assertions on shared Arc state that the
 /// actor mutates as a side effect.
 pub(crate) async fn barrier(handle: &ActorHandle) {
-    let _ = handle.debug_query_workers().await;
+    // Any request-reply round-trip flushes everything queued ahead of
+    // it; GcRoots is the cheapest read-only admin query.
+    let _ = handle
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::GcRoots { reply }))
+        .await;
 }
 
 /// Poll until none of `hashes` is `Substituting` — i.e. every detached
@@ -1314,15 +990,15 @@ pub(crate) use rio_test_support::metrics::CountingRecorder;
 // ─────────────────────────────────────────────────────────────────────────
 // Pull-mode delivery helpers.
 //
-// The stream-session helpers above (`connect_executor` / `setup_with_worker`
-// → `recv_assignment` → `complete_*`) deliver work through the
-// `ExecutorConnected`/`Heartbeat`/`ProcessCompletion` intake. The helpers
-// below are their pull-protocol equivalents: an attempt is opened through
-// the same `admit_pull` + fenced-mint transaction production uses
+// The only delivery vehicle: an attempt is opened through the same
+// `admit_pull` + fenced-mint transaction production uses
 // (`ActorCommand::PullAssignment`), outcomes land through the report intake
 // (`ReportPullOutcome` → the same `handle_completion` entry point), and
 // pod-terminal/fault injection goes through `ReportAttemptOutcome` or the
-// establishment sweep — never by writing rows directly.
+// establishment sweep — never by writing rows directly. (The stream-session
+// helpers that used to sit above — `connect_executor` → `recv_assignment` →
+// `complete_*` — retired with the session machinery; `complete_*` survive
+// as thin report-intake wrappers.)
 //
 // Identity convention (mirrors actor/pull.rs): a pull attempt's executor
 // identity IS the attested intent id (the drv hash). Exclusion/budget keys
@@ -1679,8 +1355,10 @@ async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
     let (handle, task) = setup_actor(db.pool.clone());
     // Query should succeed (actor is running). Also acts as a barrier.
-    let workers = handle.debug_query_workers().await?;
-    assert!(workers.is_empty());
+    let roots = handle
+        .query_unchecked(|reply| ActorCommand::Admin(AdminQuery::GcRoots { reply }))
+        .await?;
+    assert!(roots.is_empty());
     // Drop handle to close channel
     drop(handle);
     // Actor task should exit

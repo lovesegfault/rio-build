@@ -79,25 +79,19 @@ fn spawn_actor_with_flags(
     (h, t)
 }
 
-// r[verify obs.metric.scheduler-leader-gate+2]
+// r[verify obs.metric.scheduler-leader-gate+3]
 /// When is_leader=false, handle_tick must NOT set state gauges.
-/// Standby actor is warm (DAGs merge for takeover) but workers don't
-/// connect to it (leader-guarded gRPC) — its counts are stale/zero.
-/// Publishing them creates a second Prometheus series that stat-panel
-/// reducers pick nondeterministically.
+/// Standby actor is warm (DAGs merge for takeover) but its counts are
+/// stale/zero. Publishing them creates a second Prometheus series that
+/// stat-panel reducers pick nondeterministically.
 ///
-/// Mechanism mirrors test_force_drain_increments_cancel_signals_total
-/// (tests/`state/executor.rs`): `set_default_local_recorder` installs a
-/// thread-local recorder; `#[tokio::test]`'s current-thread runtime
-/// means the actor task sees it at `.await` points. The recorder's
-/// `register_gauge` tracks names touched — absence of all four gauge
-/// names after Tick proves the gate held.
-///
-/// No connect_executor: the inc/dec at `state/executor.rs`/76/384 would touch
-/// `workers_active` outside the gated block. MergeDag is safe —
-/// dispatch_ready (the only gauge path reachable from merge) early-
-/// returns at dispatch.rs:18 on a standby before touching
-/// class_queue_depth.
+/// Mechanism: `set_default_local_recorder` installs a thread-local
+/// recorder; `#[tokio::test]`'s current-thread runtime means the actor
+/// task sees it at `.await` points. The recorder's `register_gauge`
+/// tracks names touched — absence of all four gauge names after Tick
+/// proves the gate held (workers_active, though deprecated/pinned to
+/// zero, is published from the same gated block, so it is asserted
+/// with the rest).
 #[tokio::test]
 async fn test_not_leader_does_not_set_gauges() -> TestResult {
     let recorder = CountingRecorder::default();
@@ -137,7 +131,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 }
 
 // r[verify sched.lease.standby-tick-noop+2]
-// r[verify obs.metric.scheduler-leader-gate+2]
+// r[verify obs.metric.scheduler-leader-gate+3]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
 /// NOT write `Cancelled` to PG for builds the new leader is running.
