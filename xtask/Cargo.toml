@@ -39,6 +39,10 @@ async-trait.workspace = true
 # gRPC (qa scenarios: i026 health probe)
 tonic = { workspace = true, features = ["transport"] }
 tonic-health.workspace = true
+tonic-prost.workspace = true
+# Raw method-path probe in the parity pre-flight: checks whether the
+# scheduler AdminService serves QueryDerivationStatuses.
+http.workspace = true
 
 # Shell-out
 xshell.workspace = true

@@ -16,6 +16,7 @@ use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
 pub mod jobs;
+pub mod preflight;
 pub mod s3;
 
 // Some constants below (and the `s3` helpers) have no non-test users yet:

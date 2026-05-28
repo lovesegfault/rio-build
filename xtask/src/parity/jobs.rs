@@ -21,10 +21,13 @@
 //! ConfigMap, not through env vars: the engine reads no `RIO_*` env
 //! beyond the eval CLI's `RIO_PARITY_S3_BUCKET` default.
 
+use std::collections::BTreeMap;
+
 use ::kube::api::{Api, Patch, PatchParams, PostParams};
 use anyhow::{Result, bail};
 use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::ServiceAccount;
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::json;
 
 use super::{NS_PARITY, SA_PARITY};
@@ -36,24 +39,58 @@ pub const SSH_SECRET_NAME: &str = "rio-parity-ssh";
 
 /// Where the campaign Job mounts [`SSH_SECRET_NAME`]. The launch-written
 /// campaign spec points its ssh-ng store URLs at `<dir>/<tenant>` via the
-/// `ssh-key=` query parameter.
+/// `ssh-key=` query parameter (see [`ssh_key_path`]).
 pub const SSH_KEY_MOUNT_DIR: &str = "/etc/rio/parity-ssh";
+
+/// Per-tenant SSH private-key path inside the campaign pod: the
+/// [`SSH_SECRET_NAME`] data key for `tenant`, mounted under
+/// [`SSH_KEY_MOUNT_DIR`] — what the launch-written spec records in each
+/// store URL's `ssh-key=` query parameter.
+// Consumed by `parity launch` (landing next); the allow comes off with
+// its first user.
+#[allow(dead_code)]
+pub fn ssh_key_path(tenant: &str) -> String {
+    format!("{SSH_KEY_MOUNT_DIR}/{tenant}")
+}
 
 /// Service-HMAC Secret in the parity namespace (copied from the
 /// rio-system Secret of the same name by `parity launch`).
 pub const HMAC_SECRET_NAME: &str = "rio-service-hmac";
 
-/// Where the campaign Job mounts [`HMAC_SECRET_NAME`].
-pub const HMAC_MOUNT_DIR: &str = "/etc/rio/hmac";
+// The HMAC mount dir and key filename are spelled as macros so
+// [`HMAC_KEY_MOUNT_PATH`] can be composed from them at compile time
+// (`concat!` only takes literals) — the dir, the filename, and the full
+// path can never drift apart.
+macro_rules! hmac_mount_dir {
+    () => {
+        "/etc/rio/hmac"
+    };
+}
+macro_rules! hmac_key_filename {
+    () => {
+        "service-hmac.key"
+    };
+}
 
-/// HMAC key file path inside the campaign pod — what the launch-written
-/// spec records in `cluster.service_hmac_key_path`. Same Secret name +
-/// key layout as the chart's serviceHmac mounts (`rio-service-hmac` →
-/// `/etc/rio/hmac/service-hmac.key`).
+/// Where the campaign Job mounts [`HMAC_SECRET_NAME`].
+pub const HMAC_MOUNT_DIR: &str = hmac_mount_dir!();
+
+/// Data key of [`HMAC_SECRET_NAME`] (and therefore the file name under
+/// [`HMAC_MOUNT_DIR`]) — the same key the chart's serviceHmac mounts
+/// use; `parity launch` copies the rio-system Secret's value under this
+/// key.
 // Consumed by `parity launch` (landing next); the allow comes off with
 // its first user.
 #[allow(dead_code)]
-pub const HMAC_KEY_MOUNT_PATH: &str = "/etc/rio/hmac/service-hmac.key";
+pub const HMAC_KEY_FILENAME: &str = hmac_key_filename!();
+
+/// HMAC key file path inside the campaign pod
+/// ([`HMAC_MOUNT_DIR`]/[`HMAC_KEY_FILENAME`]) — what the launch-written
+/// spec records in `cluster.service_hmac_key_path`.
+// Consumed by `parity launch` (landing next); the allow comes off with
+// its first user.
+#[allow(dead_code)]
+pub const HMAC_KEY_MOUNT_PATH: &str = concat!(hmac_mount_dir!(), "/", hmac_key_filename!());
 
 /// Scratch volume mount point; also HOME for the engine and its
 /// nix/ssh/tar children.
@@ -316,40 +353,53 @@ pub fn eval_job(
     Ok(job)
 }
 
+/// The IRSA-annotated [`SA_PARITY`] ServiceAccount both Job shapes run
+/// as. Pure builder (no I/O) so the IRSA binding and the token-automount
+/// posture stay unit-testable; [`ensure_base`] applies it.
+fn parity_service_account(role_arn: &str) -> ServiceAccount {
+    ServiceAccount {
+        metadata: ObjectMeta {
+            name: Some(SA_PARITY.into()),
+            namespace: Some(NS_PARITY.into()),
+            labels: Some(BTreeMap::from([
+                ("app.kubernetes.io/part-of".into(), "rio-build".into()),
+                ("app.kubernetes.io/managed-by".into(), "xtask".into()),
+            ])),
+            // IRSA: the EKS pod-identity webhook injects the projected
+            // web-identity token off this annotation; the role's trust
+            // policy is bound to rio-parity:rio-parity
+            // (infra/eks/parity.tf).
+            annotations: Some(BTreeMap::from([(
+                "eks.amazonaws.com/role-arn".into(),
+                role_arn.to_owned(),
+            )])),
+            ..Default::default()
+        },
+        // The engine never talks to the k8s API, and IRSA injects its own
+        // projected token — the default SA token is not needed (same as
+        // the chart's bootstrap Job).
+        automount_service_account_token: Some(false),
+        ..Default::default()
+    }
+}
+
 /// Ensure namespace + IRSA-annotated ServiceAccount exist (idempotent,
 /// SSA). Both `parity eval` and `parity launch` call this first.
 #[allow(dead_code)] // consumed by `parity eval`/`parity launch` (landing next)
 pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
     kube::ensure_namespace(client, NS_PARITY, false).await?;
-    let sa: ServiceAccount = serde_json::from_value(json!({
-        "apiVersion": "v1",
-        "kind": "ServiceAccount",
-        "metadata": {
-            "name": SA_PARITY,
-            "namespace": NS_PARITY,
-            "labels": {
-                "app.kubernetes.io/part-of": "rio-build",
-                "app.kubernetes.io/managed-by": "xtask",
-            },
-            // IRSA: the EKS pod-identity webhook injects the projected
-            // web-identity token off this annotation; the role's trust
-            // policy is bound to rio-parity:rio-parity
-            // (infra/eks/parity.tf).
-            "annotations": {"eks.amazonaws.com/role-arn": role_arn},
-        },
-        // The engine never talks to the k8s API, and IRSA injects its own
-        // projected token — the default SA token is not needed (same as
-        // the chart's bootstrap Job).
-        "automountServiceAccountToken": false,
-    }))?;
+    let sa = parity_service_account(role_arn);
     let api: Api<ServiceAccount> = Api::namespaced(client.clone(), NS_PARITY);
     let ssapply = PatchParams::apply("xtask").force();
     api.patch(SA_PARITY, &ssapply, &Patch::Apply(&sa)).await?;
     Ok(())
 }
 
-/// Create the Job; a 409 (already exists) is turned into actionable
-/// guidance instead of an SSA overwrite (Job templates are immutable).
+/// Create the Job in [`NS_PARITY`] — the only namespace campaign/eval
+/// Jobs run in (the `job` built by [`campaign_job`]/[`eval_job`] already
+/// pins its metadata there). A 409 (already exists) is turned into
+/// actionable guidance instead of an SSA overwrite (Job templates are
+/// immutable).
 #[allow(dead_code)] // consumed by `parity eval`/`parity launch` (landing next)
 pub async fn create_job(client: &kube::Client, job: &Job) -> Result<()> {
     let name = job.metadata.name.clone().unwrap_or_default();
@@ -466,6 +516,16 @@ mod tests {
                     .as_ref()
                     .is_some_and(|s| s.secret_name.as_deref() == Some(HMAC_SECRET_NAME))
         }));
+        // Secret files are 0400: fsGroup re-modes them owner+group read
+        // for uid 65532, and "other" stays off entirely.
+        for name in ["parity-ssh", "service-hmac"] {
+            let v = vols.iter().find(|v| v.name == name).unwrap();
+            assert_eq!(
+                v.secret.as_ref().unwrap().default_mode,
+                Some(0o400),
+                "volume {name} defaultMode"
+            );
+        }
         let mounts: Vec<_> = c
             .volume_mounts
             .clone()
@@ -520,6 +580,22 @@ mod tests {
         assert_eq!(spec.ttl_seconds_after_finished, Some(86400));
         assert_eq!(spec.backoff_limit, Some(1));
         assert_eq!(spec.active_deadline_seconds, None);
+
+        // Same node-role pin and Karpenter disruption opt-out as the
+        // campaign Job: a full-scope eval holds a large node for 1-2h.
+        assert_eq!(
+            pod_spec(&scoped)
+                .node_selector
+                .as_ref()
+                .unwrap()
+                .get("rio.build/node-role"),
+            Some(&"general".to_string())
+        );
+        let ann = spec.template.metadata.clone().unwrap().annotations.unwrap();
+        assert_eq!(
+            ann.get("karpenter.sh/do-not-disrupt").map(String::as_str),
+            Some("true")
+        );
 
         // Eval Jobs mount no campaign secrets and upload via the
         // RIO_PARITY_S3_BUCKET env the eval CLI reads.
@@ -589,11 +665,37 @@ mod tests {
     }
 
     #[test]
+    fn service_account_pins_irsa_role_and_disables_token_automount() {
+        let arn = "arn:aws:iam::123456789012:role/rio-parity";
+        let sa = parity_service_account(arn);
+        assert_eq!(sa.metadata.name.as_deref(), Some(SA_PARITY));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some(NS_PARITY));
+        // IRSA: the pod-identity webhook keys off this exact annotation.
+        assert_eq!(
+            sa.metadata
+                .annotations
+                .as_ref()
+                .unwrap()
+                .get("eks.amazonaws.com/role-arn")
+                .map(String::as_str),
+            Some(arn)
+        );
+        // IRSA injects its own projected token; the default SA token
+        // must stay off.
+        assert_eq!(sa.automount_service_account_token, Some(false));
+    }
+
+    #[test]
     fn spec_mount_constants_are_consistent() {
         assert_eq!(SPEC_MOUNT_PATH, format!("{SPEC_MOUNT_DIR}/{SPEC_FILENAME}"));
+        assert_eq!(HMAC_KEY_MOUNT_PATH, "/etc/rio/hmac/service-hmac.key");
         assert_eq!(
             HMAC_KEY_MOUNT_PATH,
-            format!("{HMAC_MOUNT_DIR}/service-hmac.key")
+            format!("{HMAC_MOUNT_DIR}/{HMAC_KEY_FILENAME}")
+        );
+        assert_eq!(
+            ssh_key_path("parity-leaf"),
+            "/etc/rio/parity-ssh/parity-leaf"
         );
         assert_eq!(
             spec_configmap_name("parity-leaf-20260601-ab12"),

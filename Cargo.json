@@ -30073,6 +30073,10 @@
           "packageId": "hex"
         },
         {
+          "name": "http",
+          "packageId": "http 1.4.0"
+        },
+        {
           "name": "human-panic",
           "packageId": "human-panic"
         },
@@ -30179,6 +30183,10 @@
         {
           "name": "tonic-health",
           "packageId": "tonic-health"
+        },
+        {
+          "name": "tonic-prost",
+          "packageId": "tonic-prost"
         },
         {
           "name": "tracing",

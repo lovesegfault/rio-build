@@ -11,7 +11,9 @@ pub mod ami;
 mod bootstrap;
 pub(super) mod deploy;
 pub(in crate::k8s) mod destroy;
-mod push;
+// pub(crate) so the parity eval/launch path can reuse the ECR
+// presence guard (`push::assert_in_ecr`) for the rio-parity image.
+pub(crate) mod push;
 // pub so k3s/smoke.rs can reuse the provider-agnostic chaos helpers
 // (tenant setup, ssh key, worker-kill, smoke_build).
 pub mod smoke;

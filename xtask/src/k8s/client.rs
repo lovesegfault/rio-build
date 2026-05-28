@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Pod, Secret, Service};
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
 use kube::api::{Api, ListParams, Patch, PatchParams};
@@ -176,16 +176,12 @@ pub async fn apply_secret_bytes(
 
 /// Read one string key from a ConfigMap. `None` if the ConfigMap or key
 /// doesn't exist.
-// Consumed by the parity launch pre-flight (landing next); the allow comes
-// off with its first user.
-#[allow(dead_code)]
 pub async fn get_configmap_key(
     client: &Client,
     ns: &str,
     name: &str,
     key: &str,
 ) -> Result<Option<String>> {
-    use k8s_openapi::api::core::v1::ConfigMap;
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), ns);
     Ok(api
         .get_opt(name)

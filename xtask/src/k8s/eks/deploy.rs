@@ -70,7 +70,7 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
 
-    super::push::assert_in_ecr(tag, &region).await?;
+    super::push::assert_in_ecr("rio-gateway", tag, &region).await?;
 
     // ADR-021: NixOS node AMI is the only EC2NodeClass. I-182: resolve
     // the content-addressed `rio.build/ami` tag from EC2 (newest image

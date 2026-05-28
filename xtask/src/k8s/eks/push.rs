@@ -274,20 +274,20 @@ async fn build_all(out: &std::path::Path, cfg: &XtaskConfig) -> Result<()> {
     Ok(())
 }
 
-/// Deploy-time guard: bail if `rio-gateway:{tag}` isn't in ECR. Mirrors
+/// Deploy/launch-time guard: bail if `<repo>:{tag}` isn't in ECR. Mirrors
 /// [`super::ami::assert_registered`] — `--deploy` recomputes the image
 /// tag (content-addressed via [`crate::git::image_tag`]); if the tree
 /// drifted since `--push`, the recomputed tag won't be in ECR and this
-/// fails with a clear "run --push first". `rio-gateway` is the canary
-/// repo (always pushed; see `rio_images` in `infra/eks/ecr.tf`). The
-/// manifest-list tag (no `-{arch}` suffix) is what the chart pulls, so
-/// that's what's checked.
-pub async fn assert_in_ecr(tag: &str, region: &str) -> Result<()> {
+/// fails with a clear "run --push first". The deploy path checks
+/// `rio-gateway`, the canary repo (always pushed; see `rio_images` in
+/// `infra/eks/ecr.tf`). The manifest-list tag (no `-{arch}` suffix) is
+/// what the chart pulls, so that's what's checked.
+pub async fn assert_in_ecr(repo: &str, tag: &str, region: &str) -> Result<()> {
     let conf = crate::aws::config(Some(region)).await;
     let ecr = aws_sdk_ecr::Client::new(conf);
     let found = ecr
         .describe_images()
-        .repository_name("rio-gateway")
+        .repository_name(repo)
         .image_ids(
             aws_sdk_ecr::types::ImageIdentifier::builder()
                 .image_tag(tag)
@@ -299,7 +299,7 @@ pub async fn assert_in_ecr(tag: &str, region: &str) -> Result<()> {
         Ok(_) => Ok(()),
         Err(e) if matches!(e.as_service_error(), Some(se) if se.is_image_not_found_exception()) => {
             bail!(
-                "no rio-gateway:{tag} in ECR — run `cargo xtask k8s -p eks up --push` first \
+                "no {repo}:{tag} in ECR — run `cargo xtask k8s -p eks up --push` first \
                  (deploying a non-existent tag wedges pods in ImagePullBackOff)"
             )
         }
