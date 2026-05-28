@@ -6445,13 +6445,25 @@
       },
       "dependencies": [
         {
+          "name": "allocator-api2",
+          "packageId": "allocator-api2"
+        },
+        {
+          "name": "equivalent",
+          "packageId": "equivalent"
+        },
+        {
           "name": "foldhash",
           "packageId": "foldhash 0.1.5"
         }
       ],
       "resolvedDefaultFeatures": [
+        "allocator-api2",
+        "default",
         "default-hasher",
-        "inline-more"
+        "equivalent",
+        "inline-more",
+        "raw-entry"
       ],
       "libCrateTypes": [
         "lib"
@@ -19509,6 +19521,11 @@
         },
         {
           "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
           "packageId": "hashbrown 0.16.1",
           "rename": "hashbrown_986da7b5efc2b80e"
         },
@@ -20088,6 +20105,11 @@
         },
         {
           "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
           "packageId": "hashbrown 0.16.1",
           "rename": "hashbrown_986da7b5efc2b80e"
         },
@@ -20631,8 +20653,10 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "alloc",
         "derive",
         "simd",
+        "std",
         "zerocopy-derive"
       ],
       "libCrateTypes": [

@@ -32,6 +32,9 @@ async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 clap = { workspace = true }
+# In-process reader for the DwarFS images replay archives are published
+# as (no external tools needed to read an archive).
+dwarfs = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
 # Timestamps in the replay-archive manifest (`created_at`/`from`/`to`)

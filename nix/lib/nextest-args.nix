@@ -63,11 +63,13 @@ in
   #     nix-instantiate); rio-builder spawns nix-daemon --stdio
   #   postgresql — rio-test-support ephemeral PG bootstrap
   #   openssh — rio-gateway SSH accept tests
+  #   dwarfs (mkdwarfs) — rio-parity packs replay-archive images in tests
   runtimeTestInputs =
     member:
     pkgs.lib.optional (member == null || builtins.elem member needsNix) nixForTests
     ++ pkgs.lib.optional (member == null || builtins.elem member needsPg) pkgs.postgresql_18
-    ++ pkgs.lib.optional (member == null || member == "rio-gateway") pkgs.openssh;
+    ++ pkgs.lib.optional (member == null || member == "rio-gateway") pkgs.openssh
+    ++ pkgs.lib.optional (member == null || member == "rio-parity") pkgs.dwarfs;
   # Env vars for test runners, keyed by member. PG_BIN so
   # rio-test-support finds initdb/postgres; RIO_GOLDEN_* so
   # golden tests don't try to `nix build` their fixture

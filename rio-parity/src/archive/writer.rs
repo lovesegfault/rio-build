@@ -512,6 +512,32 @@ impl ArchiveWriter {
     }
 }
 
+/// Pack a staged archive directory into a single DwarFS image with the
+/// external `mkdwarfs` tool (the published, at-rest form of an archive).
+/// The image's contents — not its filename or compression parameters —
+/// carry the archive identity, so no determinism flags are required.
+/// Blocking; call via `spawn_blocking` from async contexts.
+pub fn pack_with_mkdwarfs(staging: &Path, image: &Path) -> anyhow::Result<()> {
+    let out = std::process::Command::new("mkdwarfs")
+        .arg("-i")
+        .arg(staging)
+        .arg("-o")
+        .arg(image)
+        .arg("--no-progress")
+        .arg("--force")
+        .output()
+        .context("spawn mkdwarfs (is the dwarfs package in the environment?)")?;
+    anyhow::ensure!(
+        out.status.success(),
+        "mkdwarfs -i {} -o {} failed ({}): {}",
+        staging.display(),
+        image.display(),
+        out.status,
+        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
+    );
+    Ok(())
+}
+
 /// Write one JSON record per line, each line terminated by `\n`, streamed
 /// through a buffered writer rather than assembled in memory.
 fn write_jsonl<T: Serialize>(path: &Path, records: &[T]) -> anyhow::Result<()> {
@@ -1122,5 +1148,22 @@ mod tests {
             err.contains("does not match the embedded path"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn pack_with_mkdwarfs_produces_an_image_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        tiny_archive(&root);
+
+        // mkdwarfs's exit status is the success signal here; assert only that
+        // a single non-empty image file came out. Validating the image's
+        // contents is the job of whatever opens it.
+        let image = dir.path().join("basic.dwarfs");
+        pack_with_mkdwarfs(&root, &image).unwrap();
+        let meta = std::fs::metadata(&image).unwrap();
+        assert!(!meta.is_dir(), "expected a file, found a directory");
+        assert!(meta.is_file(), "expected a regular image file");
+        assert!(meta.len() > 0, "image file is empty");
     }
 }

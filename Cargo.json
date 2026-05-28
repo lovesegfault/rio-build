@@ -3710,11 +3710,16 @@
         {
           "name": "regex-automata",
           "packageId": "regex-automata"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
         }
       ],
       "resolvedDefaultFeatures": [
         "alloc",
         "default",
+        "serde",
         "std",
         "unicode"
       ],
@@ -5902,6 +5907,75 @@
       ],
       "authors": [
         "Kornel <kornel@geekhood.net>"
+      ]
+    },
+    "dwarfs": {
+      "crateName": "dwarfs",
+      "version": "0.2.1",
+      "edition": "2024",
+      "sha256": "1d9addgbmg3f1ch5qlsygfz0ylqyckm78g8i39xvc39g53896dkg",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "bstr",
+          "packageId": "bstr"
+        },
+        {
+          "name": "liblzma",
+          "packageId": "liblzma"
+        },
+        {
+          "name": "log",
+          "packageId": "log"
+        },
+        {
+          "name": "lru",
+          "packageId": "lru 0.14.0"
+        },
+        {
+          "name": "lz4",
+          "packageId": "lz4"
+        },
+        {
+          "name": "measure_time",
+          "packageId": "measure_time"
+        },
+        {
+          "name": "positioned-io",
+          "packageId": "positioned-io"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "sha2",
+          "packageId": "sha2 0.10.9"
+        },
+        {
+          "name": "xxhash-rust",
+          "packageId": "xxhash-rust"
+        },
+        {
+          "name": "zerocopy",
+          "packageId": "zerocopy"
+        },
+        {
+          "name": "zstd-safe",
+          "packageId": "zstd-safe"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "log",
+        "lz4",
+        "lzma",
+        "zstd"
+      ],
+      "libCrateTypes": [
+        "lib"
       ]
     },
     "dyn-clone": {
@@ -11320,13 +11394,25 @@
       },
       "dependencies": [
         {
+          "name": "allocator-api2",
+          "packageId": "allocator-api2"
+        },
+        {
+          "name": "equivalent",
+          "packageId": "equivalent"
+        },
+        {
           "name": "foldhash",
           "packageId": "foldhash 0.1.5"
         }
       ],
       "resolvedDefaultFeatures": [
+        "allocator-api2",
+        "default",
         "default-hasher",
-        "inline-more"
+        "equivalent",
+        "inline-more",
+        "raw-entry"
       ],
       "libCrateTypes": [
         "lib"
@@ -14346,6 +14432,31 @@
         "Carl Lerche <me@carllerche.com>"
       ]
     },
+    "lru 0.14.0": {
+      "crateName": "lru",
+      "version": "0.14.0",
+      "edition": "2015",
+      "sha256": "160ivb75982rdarpals1d9cxcfjlixl7kwx6k7ghpwamc48cg34z",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5"
+        }
+      ],
+      "resolvedDefaultFeatures": [
+        "default",
+        "hashbrown"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jerome Froelich <jeromefroelic@hotmail.com>"
+      ]
+    },
     "lru 0.16.4": {
       "crateName": "lru",
       "version": "0.16.4",
@@ -14409,6 +14520,59 @@
       ],
       "authors": [
         "Benjamin Saunders <ben.e.saunders@gmail.com>"
+      ]
+    },
+    "lz4": {
+      "crateName": "lz4",
+      "version": "1.28.1",
+      "edition": "2018",
+      "sha256": "1x2svvs3gkn3krv61nd7ms4vmikibsnfl31mk0z480qdhqz542x2",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "lz4-sys",
+          "packageId": "lz4-sys"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Jens Heyens <jens.heyens@ewetel.net>",
+        "Artem V. Navrotskiy <bozaro@buzzsoft.ru>",
+        "Patrick Marks <pmarks@gmail.com>"
+      ]
+    },
+    "lz4-sys": {
+      "crateName": "lz4-sys",
+      "version": "1.11.1+lz4-1.10.0",
+      "edition": "2015",
+      "sha256": "1rhqnhwq05fmlc2q39ipsq0vpi0xf6w6p22j6q5x637dqvbc1n3b",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "cc",
+          "packageId": "cc"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "links": "lz4",
+      "authors": [
+        "Jens Heyens <jens.heyens@ewetel.net>",
+        "Artem V. Navrotskiy <bozaro@buzzsoft.ru>",
+        "Patrick Marks <pmarks@gmail.com>"
       ]
     },
     "matchers": {
@@ -14568,6 +14732,27 @@
         "Tony Arcieri <bascule@gmail.com>",
         "Wim de With <register@dewith.io>",
         "Yosef Dinerstein <yosefdi@gmail.com>"
+      ]
+    },
+    "measure_time": {
+      "crateName": "measure_time",
+      "version": "0.9.0",
+      "edition": "2021",
+      "sha256": "03pw6ni975lmm16fkr4ajwvxp161yhbgmicn8dqaphrgwxhmviai",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "log",
+          "packageId": "log"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Pascal Seitz <pascal.seitz@gmail.com>"
       ]
     },
     "memchr": {
@@ -17212,6 +17397,34 @@
       ],
       "libCrateTypes": [
         "lib"
+      ]
+    },
+    "positioned-io": {
+      "crateName": "positioned-io",
+      "version": "0.3.5",
+      "edition": "2021",
+      "sha256": "19xdrnzky9bfa56dvwmfhypx40wmbl178s4vp49360qg0s04pv6l",
+      "source": {
+        "type": "crates-io"
+      },
+      "dependencies": [
+        {
+          "name": "libc",
+          "packageId": "libc",
+          "target": "cfg(unix)"
+        },
+        {
+          "name": "winapi",
+          "packageId": "winapi",
+          "target": "cfg(windows)"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Dave Vasilevsky <dave@vasilevsky.ca>",
+        "Niklas Fiekas <niklas.fiekas@backscattering.de>"
       ]
     },
     "potential_utf": {
@@ -20021,6 +20234,10 @@
         {
           "name": "clap",
           "packageId": "clap"
+        },
+        {
+          "name": "dwarfs",
+          "packageId": "dwarfs"
         },
         {
           "name": "futures-util",
@@ -27616,18 +27833,23 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "basetsd",
         "cfg",
         "evntrace",
+        "fileapi",
         "handleapi",
         "in6addr",
         "inaddr",
+        "memoryapi",
         "minwinbase",
+        "minwindef",
         "ntsecapi",
         "profileapi",
         "std",
         "sysinfoapi",
         "windef",
         "winioctl",
+        "winnt",
         "winsock2"
       ],
       "libCrateTypes": [
@@ -28911,6 +29133,11 @@
         },
         {
           "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
+        },
+        {
+          "name": "hashbrown",
           "packageId": "hashbrown 0.16.1",
           "rename": "hashbrown_986da7b5efc2b80e"
         },
@@ -29487,6 +29714,11 @@
           "packageId": "getrandom 0.4.2",
           "rename": "getrandom_9fbad63c4bcf4a8f",
           "target": "x86_64-unknown-linux-gnu"
+        },
+        {
+          "name": "hashbrown",
+          "packageId": "hashbrown 0.15.5",
+          "rename": "hashbrown_3575ec1268b04181"
         },
         {
           "name": "hashbrown",
@@ -30212,6 +30444,24 @@
         }
       ]
     },
+    "xxhash-rust": {
+      "crateName": "xxhash-rust",
+      "version": "0.8.15",
+      "edition": "2018",
+      "sha256": "1lrmffpn45d967afw7f1p300rsx7ill66irrskxpcm1p41a0rlpx",
+      "source": {
+        "type": "crates-io"
+      },
+      "resolvedDefaultFeatures": [
+        "xxh3"
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Douman <douman@gmx.se>"
+      ]
+    },
     "yansi": {
       "crateName": "yansi",
       "version": "1.0.1",
@@ -30316,8 +30566,10 @@
         }
       ],
       "resolvedDefaultFeatures": [
+        "alloc",
         "derive",
         "simd",
+        "std",
         "zerocopy-derive"
       ],
       "libCrateTypes": [

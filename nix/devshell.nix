@@ -56,6 +56,11 @@ let
     # binary nix-fast-build and gen-matrix already use.
     nix-eval-jobs
 
+    # DwarFS image tools (mkdwarfs): pack replay-archive staging
+    # directories into the .dwarfs images the campaign engine consumes,
+    # and (re)generate the committed archive test fixtures.
+    dwarfs
+
     # Cargo tools
     cargo-edit
     cargo-expand
