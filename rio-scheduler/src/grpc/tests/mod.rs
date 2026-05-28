@@ -59,5 +59,6 @@ pub(super) async fn setup_grpc_with_pool() -> (
 
 mod bridge_tests;
 mod guards_tests;
+mod pull_tests;
 mod stream_tests;
 mod submit_tests;

@@ -64,13 +64,17 @@ spec:
         # Ready) surfaces as its builds silently running out their
         # attempt deadlines and being established by the sweep as
         # unreported executor crashes instead of reporting. Fleet-wide
-        # >=2 establishments inside 30m is the tripwire (the
-        # establishment histogram is labeled by cause only, not node);
-        # the per-node clustering discrimination is the ledger query in
-        # the runbook, and the permanent controller-side per-node
-        # aggregation replaces this alert's job at the 1c slice.
+        # >=2 establishments inside 30m is the tripwire, summed across
+        # replicas and keyed on the dedicated pull-sweep counter (the
+        # attempt_requeue histogram's establishment cause is shared
+        # with the stream-mode correlation-TTL sweep and is per-series,
+        # so a leader change or a stream establishment could otherwise
+        # split or fake the signal); the per-node clustering
+        # discrimination is the ledger query in the runbook, and the
+        # permanent controller-side per-node aggregation replaces this
+        # alert's job at the 1c slice.
         - alert: RioSchedulerAttemptEstablishmentCluster
-          expr: increase(rio_scheduler_attempt_requeue_seconds_count{cause="establishment"}[30m]) >= 2
+          expr: sum(increase(rio_scheduler_pull_establishments_total[30m])) >= 2
           for: 0m
           labels:
             severity: warning

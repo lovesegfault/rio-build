@@ -375,6 +375,22 @@ pub fn describe_metrics() {
         "rio_scheduler_heartbeat_rejected_total",
         "Heartbeats dropped by the actor-side identity binding (label: reason)"
     );
+    describe_counter!(
+        "rio_scheduler_pull_rejected_total",
+        "Pull-mode unaries rejected for identity reasons (labels: rpc = \
+         pull_assignment|report_outcome, reason = unauthenticated|token_mismatch). \
+         A sustained rate means a pod fleet holds mis-bound/expired executor \
+         tokens or an HMAC rotation skew — the rejected pods exit nonzero and \
+         their logs are ephemeral, so this counter is the alertable trace."
+    );
+    describe_counter!(
+        "rio_scheduler_pull_establishments_total",
+        "Open pull-mode attempts established as unreported executor crashes \
+         by the establishment sweep (the C2 charge arm; the store-probe adopt \
+         arm does not count). Feeds the OA2 interim hung-node tripwire — the \
+         attempt_requeue histogram's establishment cause is shared with the \
+         stream-mode correlation-TTL sweep and is unsuitable for that alert."
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

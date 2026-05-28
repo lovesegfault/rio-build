@@ -980,22 +980,31 @@ pub(super) async fn reap_orphan_running(
 /// is no longer backed by the (successful) view read is selected for
 /// cancellation — the closed→active edge — and its evidence consumed;
 /// a Job never recorded is never selected (bare absence, no age gate
-/// in either direction). Evidence for Jobs no longer active in `ns`
-/// is pruned so the map stays bounded.
+/// in either direction). Evidence is keyed and pruned per
+/// `{ns}/{pool}/` scope: `active` is one pool's Job set, so the prune
+/// must only ever touch that pool's own keys — two pull-mode pools
+/// sharing a namespace would otherwise erase each other's evidence
+/// every tick and the closed→active edge would never be observed. The
+/// pool name is a slash-delimited segment (never a name prefix —
+/// dash-prefixed pool names like `x86-64`/`x86-64-kvm` must not
+/// cross-prune).
 pub(super) fn select_closed_attempt_jobs<'a>(
     active: &[&'a Job],
     open_attempts: &[rio_proto::types::OpenAttempt],
     seen_open: &mut HashMap<String, Instant>,
     ns: &str,
+    pool: &str,
 ) -> Vec<&'a Job> {
-    let key_of = |name: &str| format!("{ns}/{name}");
+    let key_of = |name: &str| format!("{ns}/{pool}/{name}");
+    let scope = format!("{ns}/{pool}/");
     let active_keys: HashSet<String> = active
         .iter()
         .filter_map(|j| j.metadata.name.as_deref().map(key_of))
         .collect();
-    // Prune evidence for Jobs that are no longer active in this
-    // namespace (completed, deleted, or replaced).
-    seen_open.retain(|k, _| !k.starts_with(&format!("{ns}/")) || active_keys.contains(k));
+    // Prune evidence for THIS pool's Jobs that are no longer active
+    // (completed, deleted, or replaced); other pools' evidence is
+    // never touched here.
+    seen_open.retain(|k, _| !k.starts_with(&scope) || active_keys.contains(k));
     let mut selected = Vec::new();
     for job in active {
         let Some(name) = job.metadata.name.as_deref() else {
@@ -1060,11 +1069,13 @@ pub(super) async fn cancel_closed_attempt_jobs(
         .filter(|j| is_active_job(j) && j.metadata.deletion_timestamp.is_none())
         .collect();
     if active.is_empty() {
-        // Nothing active: drop any leftover evidence for this pool's
-        // namespace prefix so the map stays bounded.
+        // Nothing active: drop any leftover evidence for THIS pool's
+        // scope so the map stays bounded — never the whole namespace,
+        // which would erase sibling pools' evidence every tick.
+        let scope = format!("{ns}/{pool}/");
         ctx.pull_attempt_seen_open
             .lock()
-            .retain(|k, _| !k.starts_with(&format!("{ns}/")));
+            .retain(|k, _| !k.starts_with(&scope));
         return 0;
     }
     // One view read per tick; fail-closed on error (no decisions, no
@@ -1087,7 +1098,7 @@ pub(super) async fn cancel_closed_attempt_jobs(
     };
     let to_cancel: Vec<&Job> = {
         let mut seen_open = ctx.pull_attempt_seen_open.lock();
-        select_closed_attempt_jobs(&active, &open_attempts, &mut seen_open, ns)
+        select_closed_attempt_jobs(&active, &open_attempts, &mut seen_open, ns, pool)
     };
     let mut cancelled = 0u32;
     for job in to_cancel {

@@ -699,6 +699,12 @@ impl ExecutorService for SchedulerGrpc {
             Err(metadata_err) => {
                 let body_token = request.get_ref().executor_token.as_str();
                 if body_token.is_empty() {
+                    metrics::counter!(
+                        "rio_scheduler_pull_rejected_total",
+                        "rpc" => "pull_assignment",
+                        "reason" => "unauthenticated"
+                    )
+                    .increment(1);
                     return Err(metadata_err);
                 }
                 // r[impl sched.executor.input-bounds+2]
@@ -714,6 +720,12 @@ impl ExecutorService for SchedulerGrpc {
                 };
                 let claims: rio_auth::hmac::ExecutorClaims =
                     key.verify(body_token).map_err(|e| {
+                        metrics::counter!(
+                            "rio_scheduler_pull_rejected_total",
+                            "rpc" => "pull_assignment",
+                            "reason" => "unauthenticated"
+                        )
+                        .increment(1);
                         Status::unauthenticated(format!("executor_token verification failed: {e}"))
                     })?;
                 Some(claims.intent_id)
@@ -758,6 +770,12 @@ impl ExecutorService for SchedulerGrpc {
                 return Err(Status::unavailable("not leader (standby replica)"));
             }
             Err(crate::actor::PullRejection::TokenMismatch) => {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "pull_assignment",
+                    "reason" => "token_mismatch"
+                )
+                .increment(1);
                 return Err(Status::permission_denied(
                     "executor token is bound to a different intent",
                 ));
@@ -785,7 +803,22 @@ impl ExecutorService for SchedulerGrpc {
         self.ensure_leader()?;
         self.check_actor_alive()?;
         // r[impl sec.executor.identity-token+2]
-        let auth_intent = self.require_executor(&request)?.map(|c| c.intent_id);
+        // The metadata header is the report's only identity carrier
+        // (the frozen signature has no body token field), so a missing
+        // or invalid token under the enforced HMAC posture is counted
+        // for alertability — the rejected pod's own logs are ephemeral.
+        let auth_intent = match self.require_executor(&request) {
+            Ok(claims) => claims.map(|c| c.intent_id),
+            Err(e) => {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "report_outcome",
+                    "reason" => "unauthenticated"
+                )
+                .increment(1);
+                return Err(e);
+            }
+        };
         let req = request.into_inner();
 
         let exec_id: uuid::Uuid = req
@@ -838,9 +871,17 @@ impl ExecutorService for SchedulerGrpc {
             | Err(crate::actor::PullRejection::StaleGeneration) => {
                 Err(Status::unavailable("not leader (standby replica)"))
             }
-            Err(crate::actor::PullRejection::TokenMismatch) => Err(Status::permission_denied(
-                "executor token is bound to a different intent",
-            )),
+            Err(crate::actor::PullRejection::TokenMismatch) => {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "report_outcome",
+                    "reason" => "token_mismatch"
+                )
+                .increment(1);
+                Err(Status::permission_denied(
+                    "executor token is bound to a different intent",
+                ))
+            }
             Err(crate::actor::PullRejection::Internal(msg)) => Err(Status::internal(msg)),
         }
     }

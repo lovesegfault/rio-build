@@ -1113,6 +1113,11 @@ impl DagActor {
             "cause" => "establishment"
         )
         .record(attempt.age_secs.max(0.0));
+        // Dedicated pull-sweep establishment count for the OA2 interim
+        // alert: the requeue histogram's establishment cause is shared
+        // with the stream-mode correlation-TTL sweep, so the per-node
+        // clustering tripwire keys on this counter instead.
+        metrics::counter!("rio_scheduler_pull_establishments_total").increment(1);
         if let Some(state) = self.dag.node_mut(&drv_hash) {
             state.push_attempt_record(row.to_record());
         }

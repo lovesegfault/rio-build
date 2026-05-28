@@ -1384,18 +1384,26 @@ with `ExecutorService.PullAssignment` and reports the outcome with
 `ExecutorService.ReportOutcome`, both retried until acked. The stream-mode
 client below is unchanged and remains the default.
 
-#r("builder.pull.retry-loop")[
-  In pull mode the builder MUST retry an unservable `PullAssignment`
-  (not-leader, recovery-gated, RPC error/timeout) with jittered exponential
-  backoff for as long as the pod lives, MUST re-pull after the suggested
-  `retry_after` on `NotYetReady`, and MUST retry `ReportOutcome` until it is
-  acknowledged or the pod's remaining lifetime is exhausted; the pod never
-  exits merely because the pull cannot land --- `activeDeadlineSeconds`
-  bounds the wait.
+#r("builder.pull.retry-loop+2")[
+  In pull mode the builder MUST retry a retryably-unservable `PullAssignment`
+  (not-leader, recovery-gated, transport error/timeout) with jittered
+  exponential backoff for as long as the pod lives, MUST re-pull after the
+  suggested `retry_after` on `NotYetReady`, and MUST retry `ReportOutcome`
+  until it is acknowledged or the pod's remaining lifetime is exhausted; the
+  pod never exits merely because the pull cannot land ---
+  `activeDeadlineSeconds` bounds the wait. Permanent rejections are the
+  exception: an identity/auth rejection (`Unauthenticated`,
+  `PermissionDenied`), `Unimplemented`, or `InvalidArgument` answer MUST
+  terminate the pull or report loop promptly with a nonzero exit and a
+  warning-or-higher log line, never a silent retry that holds the node for
+  the full deadline.
 ]
 Scheduler unavailability shorter than the Job deadline shows up as pull
 retries (pods parked, building the moment the leader returns), not as Failed
-Jobs.
+Jobs; a mis-bound or expired executor token, an HMAC rotation skew, or a
+pull pool pointed at a pre-pull scheduler shows up as a promptly Failed Job
+with a clear log line instead of a node silently held until
+`activeDeadlineSeconds`.
 
 #r("builder.pull.exit-codes")[
   In pull mode exit code 0 is reserved for exactly three cases: a `Gone`

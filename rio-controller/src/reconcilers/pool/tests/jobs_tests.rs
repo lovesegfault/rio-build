@@ -1393,23 +1393,23 @@ fn cancel_arm_selects_only_closed_attempt_edges() {
     // nothing selected; the never-pulled Job has no attempt → nothing
     // recorded, nothing selected (bare absence, even at 1 h old).
     let open = vec![pull_attempt("drv-building", "exec-b", "node-1")];
-    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio");
+    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio", "p");
     assert!(
         selected.is_empty(),
         "open attempts and bare absence never cancel"
     );
-    assert!(seen_open.contains_key("rio/rio-builder-p-bld1"));
-    assert!(!seen_open.contains_key("rio/rio-builder-p-wait1"));
+    assert!(seen_open.contains_key("rio/p/rio-builder-p-bld1"));
+    assert!(!seen_open.contains_key("rio/p/rio-builder-p-wait1"));
 
     // Tick 2: same view → still nothing selected (no churn while open).
-    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio");
+    let selected = select_closed_attempt_jobs(&active, &open, &mut seen_open, "rio", "p");
     assert!(selected.is_empty());
 
     // Tick 3: the attempt closed (a successful read no longer lists
     // it) while both Jobs are still active → exactly the previously
     // covered Job is selected, immediately (no age gate); the
     // never-pulled one is still untouched.
-    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
+    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
     assert_eq!(selected.len(), 1);
     assert_eq!(
         selected[0].metadata.name.as_deref(),
@@ -1417,18 +1417,89 @@ fn cancel_arm_selects_only_closed_attempt_edges() {
         "only the closed→active edge cancels"
     );
     assert!(
-        !seen_open.contains_key("rio/rio-builder-p-bld1"),
+        !seen_open.contains_key("rio/p/rio-builder-p-bld1"),
         "the consumed edge does not re-fire next tick"
     );
 
     // Tick 4: nothing further — the edge was consumed.
-    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
+    let selected = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
     assert!(selected.is_empty());
 
     // Pruning: evidence for a Job that is no longer active is dropped.
-    seen_open.insert("rio/rio-builder-p-gone1".into(), Instant::now());
-    let _ = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio");
-    assert!(!seen_open.contains_key("rio/rio-builder-p-gone1"));
+    seen_open.insert("rio/p/rio-builder-p-gone1".into(), Instant::now());
+    let _ = select_closed_attempt_jobs(&active, &[], &mut seen_open, "rio", "p");
+    assert!(!seen_open.contains_key("rio/p/rio-builder-p-gone1"));
+}
+
+// r[verify ctrl.drain.disruption-target+2]
+/// The AD5 evidence map is scoped per pool: one pool's tick (with its
+/// own active set, or the empty-active early return) never erases a
+/// sibling pool's evidence in the same namespace, the sibling's
+/// closed→active edge still fires, each pool's own stale keys are
+/// still pruned, and dash-prefixed pool names (`x86-64` vs
+/// `x86-64-kvm`) do not cross-prune.
+#[test]
+fn cancel_arm_evidence_is_scoped_per_pool() {
+    use crate::reconcilers::pool::job::select_closed_attempt_jobs;
+    use std::collections::HashMap;
+    use std::time::Instant;
+
+    let mut seen_open: HashMap<String, Instant> = HashMap::new();
+
+    // Pool b records evidence for its building Job.
+    let b_job = running_job_for_intent("rio-builder-b-bld1", "drv-b");
+    let b_active = [&b_job];
+    let b_open = vec![pull_attempt("drv-b", "exec-b", "node-1")];
+    let selected = select_closed_attempt_jobs(&b_active, &b_open, &mut seen_open, "rio", "b");
+    assert!(selected.is_empty());
+    assert!(seen_open.contains_key("rio/b/rio-builder-b-bld1"));
+
+    // Pool a's tick runs with a DIFFERENT active set (and a stale key
+    // of its own): b's evidence must survive, a's stale key must not.
+    seen_open.insert("rio/a/rio-builder-a-gone1".into(), Instant::now());
+    let a_job = running_job_for_intent("rio-builder-a-bld1", "drv-a");
+    let a_active = [&a_job];
+    let _ = select_closed_attempt_jobs(&a_active, &[], &mut seen_open, "rio", "a");
+    assert!(
+        seen_open.contains_key("rio/b/rio-builder-b-bld1"),
+        "pool a's prune must not erase pool b's evidence"
+    );
+    assert!(
+        !seen_open.contains_key("rio/a/rio-builder-a-gone1"),
+        "pool a's own stale keys are still pruned (per-pool boundedness)"
+    );
+
+    // The empty-active early-return path of pool a (modeled directly
+    // as the same scope-prefixed retain the production arm applies)
+    // must also leave b's evidence alone.
+    let scope_a = "rio/a/";
+    seen_open.retain(|k, _| !k.starts_with(scope_a));
+    assert!(seen_open.contains_key("rio/b/rio-builder-b-bld1"));
+
+    // Pool b's next tick observes the attempt gone → its own edge
+    // still fires.
+    let selected = select_closed_attempt_jobs(&b_active, &[], &mut seen_open, "rio", "b");
+    assert_eq!(selected.len(), 1);
+    assert_eq!(
+        selected[0].metadata.name.as_deref(),
+        Some("rio-builder-b-bld1"),
+        "the sibling pool's closed→active edge still fires after pool a's ticks"
+    );
+
+    // Dash-prefix pool names: x86-64's slash-terminated scope must not
+    // cross-prune x86-64-kvm's evidence.
+    let kvm_job = running_job_for_intent("rio-builder-x86-64-kvm-bld1", "drv-kvm");
+    let kvm_active = [&kvm_job];
+    let kvm_open = vec![pull_attempt("drv-kvm", "exec-k", "node-2")];
+    let _ = select_closed_attempt_jobs(&kvm_active, &kvm_open, &mut seen_open, "rio", "x86-64-kvm");
+    assert!(seen_open.contains_key("rio/x86-64-kvm/rio-builder-x86-64-kvm-bld1"));
+    let plain_job = running_job_for_intent("rio-builder-x86-64-bld1", "drv-plain");
+    let plain_active = [&plain_job];
+    let _ = select_closed_attempt_jobs(&plain_active, &[], &mut seen_open, "rio", "x86-64");
+    assert!(
+        seen_open.contains_key("rio/x86-64-kvm/rio-builder-x86-64-kvm-bld1"),
+        "a dash-prefix pool name must not cross-prune its sibling's evidence"
+    );
 }
 
 // r[verify ctrl.drain.disruption-target+2]
@@ -1445,9 +1516,10 @@ async fn cancel_arm_deletes_job_on_closed_edge() {
 
     let job = running_job_for_intent("rio-builder-p-edge1", "drv-edge");
     // Previously observed open (the recorded evidence half of the edge).
-    ctx.pull_attempt_seen_open
-        .lock()
-        .insert("rio/rio-builder-p-edge1".into(), std::time::Instant::now());
+    ctx.pull_attempt_seen_open.lock().insert(
+        "rio/test-pool/rio-builder-p-edge1".into(),
+        std::time::Instant::now(),
+    );
 
     // The MockAdmin's ListOpenAttempts returns an empty view — the
     // "subsequent successful read no longer lists it" half.
@@ -1471,16 +1543,17 @@ async fn cancel_arm_fail_closed_on_view_error() {
     let jobs_api: Api<Job> = Api::namespaced(client, "rio");
 
     let job = running_job_for_intent("rio-builder-p-fc1", "drv-fc");
-    ctx.pull_attempt_seen_open
-        .lock()
-        .insert("rio/rio-builder-p-fc1".into(), std::time::Instant::now());
+    ctx.pull_attempt_seen_open.lock().insert(
+        "rio/test-pool/rio-builder-p-fc1".into(),
+        std::time::Instant::now(),
+    );
 
     let cancelled = cancel_closed_attempt_jobs(&jobs_api, &[job], &ctx, "rio", "test-pool").await;
     assert_eq!(cancelled, 0, "no decisions on a failed view read");
     assert!(
         ctx.pull_attempt_seen_open
             .lock()
-            .contains_key("rio/rio-builder-p-fc1"),
+            .contains_key("rio/test-pool/rio-builder-p-fc1"),
         "the evidence is retained for the next successful read"
     );
 }

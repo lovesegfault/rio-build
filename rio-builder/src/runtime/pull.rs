@@ -94,6 +94,28 @@ pub(super) enum PullPhaseOutcome {
     /// Shutdown fired while still waiting for work: exit 0 (nothing
     /// started, nothing to report).
     Shutdown,
+    /// The scheduler rejected the pull with a permanent,
+    /// non-retryable status (identity/auth rejection, unimplemented
+    /// RPC, invalid request): exit nonzero promptly instead of holding
+    /// the node for the full `activeDeadlineSeconds`.
+    Rejected(tonic::Status),
+}
+
+/// Permanent, non-retryable rejection codes: a mis-bound or
+/// expired/invalid executor token (PermissionDenied / Unauthenticated),
+/// a scheduler without the pull RPCs (Unimplemented), or a request the
+/// server will never accept (InvalidArgument). Retrying these holds a
+/// node for the full `activeDeadlineSeconds` with no chance of
+/// progress; the loops terminate promptly and loudly instead
+/// (`builder.pull.retry-loop+2`).
+fn is_fatal_rejection(code: tonic::Code) -> bool {
+    matches!(
+        code,
+        tonic::Code::PermissionDenied
+            | tonic::Code::Unauthenticated
+            | tonic::Code::Unimplemented
+            | tonic::Code::InvalidArgument
+    )
 }
 
 /// The two unaries the loop speaks, abstracted so the state machine is
@@ -109,34 +131,71 @@ pub(super) trait PullTransport {
     ) -> impl Future<Output = Result<(), tonic::Status>> + Send;
 }
 
+/// Wrap one unary request with the executor identity header, exactly
+/// as the stream open and every heartbeat do (no-op in dev mode where
+/// the token is empty and the scheduler is keyless/permissive).
+fn authed_request<T>(req: T, executor_token: &str) -> tonic::Request<T> {
+    let mut request = tonic::Request::new(req);
+    if !executor_token.is_empty() {
+        // r[impl sec.executor.identity-token+2]
+        let _ = rio_common::grpc::inject_metadata(
+            request.metadata_mut(),
+            &[(rio_proto::EXECUTOR_TOKEN_HEADER, executor_token)],
+        );
+    }
+    request
+}
+
 /// The production transport: the same `ExecutorServiceClient` the
 /// stream path uses (balanced channel in K8s, single channel in VM
-/// tests).
-impl PullTransport for super::setup::WorkerClient {
+/// tests), wrapped with the executor identity credential so both
+/// unaries present `x-rio-executor-token`. `PullAssignment` keeps its
+/// body `executor_token` too (frozen signature; the scheduler accepts
+/// either carrier), but `ReportOutcome` has no body field — under the
+/// enforced executor-HMAC posture the metadata header is the only
+/// carrier, so without it every pull-mode report would be rejected
+/// Unauthenticated and outcomes would degrade to establishment-sweep
+/// classification.
+pub(super) struct AuthedPullTransport {
+    pub(super) client: super::setup::WorkerClient,
+    pub(super) executor_token: String,
+}
+
+impl PullTransport for AuthedPullTransport {
     async fn pull(
         &mut self,
         req: PullAssignmentRequest,
     ) -> Result<PullAssignmentResponse, tonic::Status> {
-        self.pull_assignment(req).await.map(|r| r.into_inner())
+        self.client
+            .pull_assignment(authed_request(req, &self.executor_token))
+            .await
+            .map(|r| r.into_inner())
     }
 
     async fn report(&mut self, req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
-        self.report_outcome(req).await.map(|_| ())
+        self.client
+            .report_outcome(authed_request(req, &self.executor_token))
+            .await
+            .map(|_| ())
     }
 }
 
 /// Ask for the assignment until the question is resolved.
 ///
-/// - Unservable (RPC error: not-leader, recovery-gated, timeout) →
-///   retry with the P5 envelope for as long as the pod lives; the pod
-///   never exits merely because the pull cannot land
-///   (`activeDeadlineSeconds` bounds the wait).
+/// - Unservable (retryable RPC error: not-leader, recovery-gated,
+///   transport error/timeout) → retry with the P5 envelope for as long
+///   as the pod lives; the pod never exits merely because the pull
+///   cannot land (`activeDeadlineSeconds` bounds the wait).
+/// - Permanent rejection (Unauthenticated / PermissionDenied /
+///   Unimplemented / InvalidArgument) → resolve `Rejected` after the
+///   single answer: retrying cannot succeed and would silently hold
+///   the node for the full deadline.
 /// - `NotYetReady{retry_after}` → re-pull after the suggested delay
 ///   (±20 % jitter); after receiving only `NotYetReady` for
 ///   `idle_timeout`, exit charge-free (the I-116 successor).
 /// - `Gone` / `WorkAssignment` → resolved.
 /// - Shutdown → stop waiting (nothing started yet).
-// r[impl builder.pull.retry-loop]
+// r[impl builder.pull.retry-loop+2]
 pub(super) async fn pull_until_resolved<T: PullTransport>(
     transport: &mut T,
     intent_id: &str,
@@ -188,8 +247,13 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
                     RETRY_ENVELOPE.duration(attempt - 1)
                 }
             },
+            Err(status) if is_fatal_rejection(status.code()) => {
+                tracing::error!(code = ?status.code(), msg = status.message(),
+                    "PullAssignment permanently rejected; exiting instead of holding the node");
+                return PullPhaseOutcome::Rejected(status);
+            }
             Err(status) => {
-                tracing::debug!(code = ?status.code(), msg = status.message(),
+                warn!(code = ?status.code(), msg = status.message(),
                     "PullAssignment unservable; retrying");
                 attempt = attempt.saturating_add(1);
                 RETRY_ENVELOPE.duration(attempt - 1)
@@ -210,11 +274,14 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
 /// acknowledges it (the ack is what licenses exit 0 — the scheduler
 /// commits the attempt row before answering).
 ///
-/// Returns `true` on ack. `false` when the budget is exhausted or when
-/// shutdown fired and the single best-effort attempt also failed — the
-/// caller exits nonzero so the Job goes Failed and the controller's
+/// Returns `true` on ack. `false` when the budget is exhausted, when
+/// the scheduler answers with a permanent rejection (identity/auth,
+/// unimplemented, invalid — retrying cannot succeed; the establishment
+/// sweep remains the backstop for the open attempt), or when shutdown
+/// fired and the single best-effort attempt also failed — the caller
+/// exits nonzero so the Job goes Failed and the controller's
 /// pod-terminal path classifies it.
-// r[impl builder.pull.retry-loop]
+// r[impl builder.pull.retry-loop+2]
 pub(super) async fn report_until_acked<T: PullTransport>(
     transport: &mut T,
     exec_id: &str,
@@ -236,15 +303,33 @@ pub(super) async fn report_until_acked<T: PullTransport>(
                 Ok(Ok(()))
             );
         }
-        match transport.report(req).await {
+        // Race the in-flight RPC against SIGTERM so a black-holed
+        // scheduler (request never answered) cannot pin the process
+        // past the pull-mode grace: when shutdown wins, loop back and
+        // take the bounded single-attempt arm above.
+        let result = tokio::select! {
+            biased;
+            _ = shutdown.cancelled() => None,
+            r = transport.report(req) => Some(r),
+        };
+        let Some(result) = result else {
+            continue;
+        };
+        match result {
             Ok(()) => return true,
+            Err(status) if is_fatal_rejection(status.code()) => {
+                tracing::error!(code = ?status.code(), msg = status.message(),
+                    "ReportOutcome permanently rejected; exiting nonzero (establishment sweep \
+                     remains the backstop)");
+                return false;
+            }
             Err(status) => {
                 if started.elapsed() >= budget {
                     warn!(code = ?status.code(), msg = status.message(),
                         "ReportOutcome never acknowledged within the retry budget");
                     return false;
                 }
-                tracing::debug!(code = ?status.code(), msg = status.message(),
+                warn!(code = ?status.code(), msg = status.message(),
                     "ReportOutcome not acknowledged; retrying");
                 attempt = attempt.saturating_add(1);
                 let delay = RETRY_ENVELOPE.duration(attempt - 1);
@@ -315,8 +400,11 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
         !rt.intent_id.is_empty(),
         "dispatch_mode=pull requires RIO_INTENT_ID (the controller injects it at Job spawn)"
     );
-    let mut transport = rt.scheduler_client.clone();
     let executor_token = rt.executor_token.clone();
+    let mut transport = AuthedPullTransport {
+        client: rt.scheduler_client.clone(),
+        executor_token: executor_token.clone(),
+    };
     let outcome = pull_until_resolved(
         &mut transport,
         &rt.intent_id,
@@ -345,6 +433,19 @@ pub(super) async fn run_pull(mut rt: BuilderRuntime) -> anyhow::Result<()> {
             info!(intent_id = %rt.intent_id, "shutdown while waiting for work; exiting 0");
             run_teardown(rt);
             return Ok(());
+        }
+        PullPhaseOutcome::Rejected(status) => {
+            // Permanent rejection: nothing was started and nothing is
+            // owed; exit nonzero promptly so the Job goes Failed and
+            // the pod-terminal path (charge-free, no attempt row)
+            // surfaces the misconfiguration instead of the node idling
+            // until activeDeadlineSeconds.
+            run_teardown(rt);
+            anyhow::bail!(
+                "PullAssignment permanently rejected ({:?}): {}",
+                status.code(),
+                status.message()
+            );
         }
         PullPhaseOutcome::Assigned(a) => a,
     };
@@ -495,7 +596,7 @@ mod tests {
     /// (a) Unservable pulls (not-leader / timeout / transport error)
     /// are retried with backoff and the loop never exits on its own —
     /// an hour of simulated unavailability and it is still asking.
-    // r[verify builder.pull.retry-loop]
+    // r[verify builder.pull.retry-loop+2]
     #[tokio::test(start_paused = true)]
     async fn pull_retries_unservable_and_never_gives_up() {
         let mut t = ScriptedTransport::new(
@@ -524,7 +625,7 @@ mod tests {
 
     /// (a/continued) After transient unavailability the next answer is
     /// honored — here the third pull delivers.
-    // r[verify builder.pull.retry-loop]
+    // r[verify builder.pull.retry-loop+2]
     #[tokio::test(start_paused = true)]
     async fn pull_recovers_after_transient_errors() {
         let mut t = ScriptedTransport::new(
@@ -559,7 +660,7 @@ mod tests {
     /// (c) `NotYetReady{5}` re-pulls after ~5 s (±20 % jitter), and a
     /// pod that receives only `NotYetReady` for `idle_timeout` exits
     /// charge-free (the OA6 pod-side bounded retry loop).
-    // r[verify builder.pull.retry-loop]
+    // r[verify builder.pull.retry-loop+2]
     // r[verify builder.pull.exit-codes]
     #[tokio::test(start_paused = true)]
     async fn not_yet_ready_repulls_and_idle_bounds() {
@@ -586,7 +687,7 @@ mod tests {
     /// (f) The pull phase stops at the first delivered assignment — it
     /// never pulls again, so the client cannot start a second build
     /// (one slot, one claim, one spawned task).
-    // r[verify builder.pull.retry-loop]
+    // r[verify builder.pull.retry-loop+2]
     #[tokio::test(start_paused = true)]
     async fn pull_phase_stops_at_first_assignment() {
         let mut t = ScriptedTransport::new(
@@ -607,7 +708,7 @@ mod tests {
 
     /// (d) The report is retried until acknowledged, then the loop
     /// stops (exit 0 follows at the caller).
-    // r[verify builder.pull.retry-loop]
+    // r[verify builder.pull.retry-loop+2]
     // r[verify builder.pull.exit-codes]
     #[tokio::test(start_paused = true)]
     async fn report_retries_until_acked() {
@@ -656,6 +757,154 @@ mod tests {
             t.report_calls >= 3,
             "the budget window must be spent retrying, saw {} calls",
             t.report_calls
+        );
+    }
+
+    /// (g) Permanent rejections (mis-bound/expired token, pre-pull
+    /// scheduler, invalid request) resolve the pull phase after exactly
+    /// one call instead of silently holding the node for the full
+    /// activeDeadlineSeconds.
+    // r[verify builder.pull.retry-loop+2]
+    #[tokio::test(start_paused = true)]
+    async fn pull_fatal_rejection_resolves_after_one_call() {
+        for status in [
+            tonic::Status::permission_denied("token bound to a different intent"),
+            tonic::Status::unauthenticated("executor token expired"),
+            tonic::Status::unimplemented("PullAssignment not served"),
+            tonic::Status::invalid_argument("intent_id is required"),
+        ] {
+            let code = status.code();
+            let mut t = ScriptedTransport::new(vec![Err(status)], vec![]);
+            let shutdown = token();
+            let outcome = pull_until_resolved(&mut t, "intent-a", "tok", IDLE, &shutdown).await;
+            match outcome {
+                PullPhaseOutcome::Rejected(s) => assert_eq!(s.code(), code),
+                other => panic!("expected Rejected for {code:?}, got {other:?}"),
+            }
+            assert_eq!(
+                t.pull_calls, 1,
+                "a permanent rejection must not be retried ({code:?})"
+            );
+        }
+    }
+
+    /// (g/continued) The same discrimination in the report loop: a
+    /// permanent rejection gives up after exactly one call (nonzero
+    /// exit; the establishment sweep stays the backstop), while the
+    /// existing retryable behaviour is untouched.
+    // r[verify builder.pull.retry-loop+2]
+    #[tokio::test(start_paused = true)]
+    async fn report_fatal_rejection_gives_up_after_one_call() {
+        for status in [
+            tonic::Status::permission_denied("token bound to a different intent"),
+            tonic::Status::unauthenticated("executor token expired"),
+            tonic::Status::unimplemented("ReportOutcome not served"),
+        ] {
+            let code = status.code();
+            let mut t = ScriptedTransport::new(vec![], vec![Err(status)]);
+            let shutdown = token();
+            let acked = report_until_acked(
+                &mut t,
+                "exec-1",
+                CompletionReport::default(),
+                REPORT_RETRY_BUDGET,
+                &shutdown,
+            )
+            .await;
+            assert!(!acked, "a permanently rejected report is not an ack");
+            assert_eq!(
+                t.report_calls, 1,
+                "a permanent rejection must not burn the retry budget ({code:?})"
+            );
+        }
+    }
+
+    /// The production transport presents the executor identity token as
+    /// call metadata on both unaries (the same header the stream open
+    /// and heartbeats use); dev mode (empty token) sends no header.
+    // r[verify sec.executor.identity-token+2]
+    #[test]
+    fn authed_request_injects_the_identity_header() {
+        let req = authed_request(PullAssignmentRequest::default(), "tok-abc");
+        assert_eq!(
+            req.metadata()
+                .get(rio_proto::EXECUTOR_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("tok-abc"),
+            "the identity header rides every authed unary"
+        );
+        let req = authed_request(ReportOutcomeRequest::default(), "tok-abc");
+        assert_eq!(
+            req.metadata()
+                .get(rio_proto::EXECUTOR_TOKEN_HEADER)
+                .and_then(|v| v.to_str().ok()),
+            Some("tok-abc"),
+            "ReportOutcome carries the same header (it has no body fallback)"
+        );
+        let req = authed_request(PullAssignmentRequest::default(), "");
+        assert!(
+            req.metadata()
+                .get(rio_proto::EXECUTOR_TOKEN_HEADER)
+                .is_none(),
+            "dev mode (no token) sends no header"
+        );
+    }
+
+    /// A black-holed scheduler (in-flight report never answered) does
+    /// not pin the process past SIGTERM: the in-flight RPC is raced
+    /// against shutdown and the loop falls through to the bounded
+    /// single-attempt arm.
+    // r[verify builder.pull.retry-loop+2]
+    #[tokio::test(start_paused = true)]
+    async fn report_in_flight_black_hole_yields_to_sigterm() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        struct BlackHoleTransport {
+            calls: Arc<AtomicU32>,
+        }
+        impl PullTransport for BlackHoleTransport {
+            async fn pull(
+                &mut self,
+                _req: PullAssignmentRequest,
+            ) -> Result<PullAssignmentResponse, tonic::Status> {
+                Err(tonic::Status::unavailable("unused"))
+            }
+            async fn report(&mut self, _req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                unreachable!("the black hole never answers")
+            }
+        }
+
+        let calls = Arc::new(AtomicU32::new(0));
+        let mut t = BlackHoleTransport {
+            calls: Arc::clone(&calls),
+        };
+        let shutdown = token();
+        let shutdown_for_task = shutdown.clone();
+        let task = tokio::spawn(async move {
+            report_until_acked(
+                &mut t,
+                "exec-bh",
+                CompletionReport::default(),
+                REPORT_RETRY_BUDGET,
+                &shutdown_for_task,
+            )
+            .await
+        });
+        // Let the first report get in flight, then deliver SIGTERM.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        shutdown.cancel();
+        let acked = tokio::time::timeout(Duration::from_secs(120), task)
+            .await
+            .expect("the loop must resolve within the SIGTERM report timeout, not hang")
+            .expect("task not panicked");
+        assert!(!acked, "nothing was ever acknowledged");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the abandoned in-flight call plus the bounded single attempt"
         );
     }
 }
