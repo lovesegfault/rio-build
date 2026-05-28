@@ -123,11 +123,13 @@ logs show `build succeeded, uploading outputs`.
 = Step 6: Resilience Test (Kill Worker)
 
 ```bash
-# Baseline metric (G6 lesson: capture BEFORE action)
-DISCONNECTS_BEFORE=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
+# Baseline metric (G6 lesson: capture BEFORE action). A killed pod's
+# attempt is requeued at the report fold / establishment sweep — the
+# requeue histogram count is the observable (summed across causes).
+REQUEUES_BEFORE=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
   curl -s localhost:9091/metrics | \
-  grep '^rio_scheduler_worker_disconnects_total' | awk '{print $NF}')
-echo "Baseline disconnects: $DISCONNECTS_BEFORE"
+  grep '^rio_scheduler_attempt_requeue_seconds_count' | awk '{s+=$NF} END {print s+0}')
+echo "Baseline requeues: $REQUEUES_BEFORE"
 
 # Start a longer build in background
 nix build nixpkgs#git \
@@ -145,11 +147,11 @@ kubectl -n rio-builders delete pod \
 wait $BUILD_PID && echo "Build completed despite worker kill ✓"
 
 # Verify metric
-DISCONNECTS_AFTER=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
+REQUEUES_AFTER=$(kubectl -n rio-system exec deploy/rio-scheduler -- \
   curl -s localhost:9091/metrics | \
-  grep '^rio_scheduler_worker_disconnects_total' | awk '{print $NF}')
-echo "After disconnects: $DISCONNECTS_AFTER"
-[[ $DISCONNECTS_AFTER -gt $DISCONNECTS_BEFORE ]] && echo "Reassign confirmed ✓"
+  grep '^rio_scheduler_attempt_requeue_seconds_count' | awk '{s+=$NF} END {print s+0}')
+echo "After requeues: $REQUEUES_AFTER"
+[[ $REQUEUES_AFTER -gt $REQUEUES_BEFORE ]] && echo "Requeue confirmed ✓"
 ```
 
 = Step 7: GC Test (optional)
