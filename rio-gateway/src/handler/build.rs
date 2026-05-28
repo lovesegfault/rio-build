@@ -234,6 +234,11 @@ struct BuildActivityState {
     /// (`machineName`). NOT per-pod — see the comment at the
     /// `Status::Started` arm. Read once from `RIO_GATEWAY_MACHINE_NAME`.
     machine_name: String,
+    /// Per-derivation terminal results recorded from `DerivationEvent`s
+    /// (Completed/Cached/Failed) so multi-root build opcodes can report
+    /// each requested root's own outcome instead of the DAG-level result.
+    /// First terminal per drv wins; later duplicates are ignored.
+    terminal: HashMap<String, BuildResult>,
 }
 
 impl Default for BuildActivityState {
@@ -244,6 +249,7 @@ impl Default for BuildActivityState {
             builds_root: None,
             subst_expected: 0,
             machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
+            terminal: HashMap::default(),
         }
     }
 }
@@ -432,6 +438,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             act.drv.insert(drv_event.derivation_path.clone(), aid);
         }
         types::DerivationEventKind::Completed => {
+            // Record this drv's own terminal so multi-root opcodes can
+            // report it per root. First terminal wins — a duplicate
+            // (re-dispatch replay) cannot overwrite it.
+            act.terminal
+                .entry(drv_event.derivation_path.clone())
+                .or_insert_with(|| BuildResult {
+                    status: BuildStatus::Built,
+                    ..Default::default()
+                });
             // Terminal: close any dangling actSubstitute + actCopyPath.
             // Substituting → Completed shouldn't happen via the normal
             // scheduler FSM, but terminal-arm symmetry costs nothing
@@ -458,6 +473,18 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             }
         }
         types::DerivationEventKind::Failed => {
+            // Record this drv's own terminal failure (status + message)
+            // so multi-root opcodes can report it per root. First
+            // terminal wins; the message is cloned because the relay
+            // log line below still needs `drv_event.error_message`.
+            act.terminal
+                .entry(drv_event.derivation_path.clone())
+                .or_insert_with(|| {
+                    BuildResult::failure(
+                        drv_event.failure_status().into(),
+                        drv_event.error_message.clone(),
+                    )
+                });
             // Terminal: close any dangling actSubstitute. Scheduler
             // path Substituting → (silent revert to Queued via
             // `handle_substitute_complete(ok=false)` with
@@ -512,6 +539,15 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 .await?;
         }
         types::DerivationEventKind::Cached => {
+            // Record this drv's own terminal (fetched from a
+            // substituter, not executed) so multi-root opcodes can
+            // report it per root. First terminal wins.
+            act.terminal
+                .entry(drv_event.derivation_path.clone())
+                .or_insert_with(|| BuildResult {
+                    status: BuildStatus::Substituted,
+                    ..Default::default()
+                });
             // Substituting → Cached: close the actSubstitute +
             // actCopyPath pair. Merge-time cache hits never went
             // Substituting → no aids → no-op.
@@ -895,7 +931,21 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     Ok((build_id, event_stream))
 }
 
-/// Submit a build to the scheduler and process events, returning a BuildResult.
+/// One processed DAG submission: the DAG-level result plus every
+/// per-derivation terminal recorded while relaying its events.
+struct ProcessedBuild {
+    /// DAG-level outcome (Completed/Failed/Cancelled or stream error),
+    /// exactly what the single-result opcodes (9, 36) report.
+    result: BuildResult,
+    /// Per-derivation terminal results captured from `DerivationEvent`s,
+    /// keyed by drv path. Multi-root opcodes use these to report each
+    /// requested root's own outcome; roots without an entry fall back
+    /// to `result`.
+    per_drv: HashMap<String, BuildResult>,
+}
+
+/// Submit a build to the scheduler and process events, returning the
+/// DAG-level BuildResult plus the recorded per-derivation terminals.
 #[instrument(
     skip_all,
     fields(tenant = %request.tenant_name, build_id = tracing::field::Empty)
@@ -906,7 +956,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashMap<String, u64>,
     jwt_token: Option<&str>,
-) -> anyhow::Result<BuildResult> {
+) -> anyhow::Result<ProcessedBuild> {
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
     // is THE hop that makes distributed tracing work; without it,
@@ -1108,21 +1158,25 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         let _ = stderr.stop_activity(aid).await;
     }
 
-    match outcome {
-        Ok(BuildEventOutcome::Completed) => Ok(BuildResult::success()),
+    let result = match outcome {
+        Ok(BuildEventOutcome::Completed) => BuildResult::success(),
         Ok(BuildEventOutcome::Failed {
             status,
             error_message,
-        }) => Ok(BuildResult::failure(status.into(), error_message)),
-        Ok(BuildEventOutcome::Cancelled { reason }) => Ok(BuildResult::failure(
+        }) => BuildResult::failure(status.into(), error_message),
+        Ok(BuildEventOutcome::Cancelled { reason }) => BuildResult::failure(
             BuildStatus::TransientFailure,
             format!("build cancelled: {reason}"),
-        )),
-        Err(e) => Ok(BuildResult::failure(
+        ),
+        Err(e) => BuildResult::failure(
             BuildStatus::TransientFailure,
             format!("build stream error (reconnect exhausted): {e}"),
-        )),
-    }
+        ),
+    };
+    Ok(ProcessedBuild {
+        result,
+        per_drv: act.terminal,
+    })
 }
 
 // r[impl gw.opcode.build-derivation+2]
@@ -1284,7 +1338,9 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     )
     .await
     {
-        Ok(r) => r,
+        // Single-derivation opcode: the DAG-level result IS this drv's
+        // result, so the per-drv map is not consulted.
+        Ok(p) => p.result,
         Err(e) => {
             warn!(error = %e, "build submission failed");
             BuildResult::failure(
@@ -1668,8 +1724,10 @@ enum DagSubmitOutcome {
     /// `BuildResult::failure(InputRejected, …)` (wopBuildPathsWithResults).
     Rejected(String),
     /// Build was submitted and the scheduler returned a result
-    /// (success OR failure — caller inspects `.status`).
-    Built(BuildResult),
+    /// (success OR failure — caller inspects `.result.status`),
+    /// alongside the per-derivation terminals recorded from the
+    /// event stream.
+    Built(ProcessedBuild),
 }
 
 /// Shared DAG-submit pipeline:
@@ -1835,8 +1893,8 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 stderr_err!(stderr, "build rejected: {reason}")
             }
-            Ok(DagSubmitOutcome::Built(r)) if !r.status.is_success() => {
-                stderr_err!(stderr, "build failed: {}", r.error_msg)
+            Ok(DagSubmitOutcome::Built(p)) if !p.result.status.is_success() => {
+                stderr_err!(stderr, "build failed: {}", p.result.error_msg)
             }
             Ok(DagSubmitOutcome::Built(_)) => {
                 // r[impl gw.opcode.build-results-honest+2]
@@ -1870,7 +1928,7 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     Ok(())
 }
 
-// r[impl gw.opcode.build-paths-with-results]
+// r[impl gw.opcode.build-paths-with-results+2]
 // r[impl gw.stderr.error-before-return+2]
 /// wopBuildPathsWithResults (46): Build paths and return per-path BuildResult.
 #[instrument(skip_all, fields(count = tracing::field::Empty))]
@@ -1958,20 +2016,24 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        let build_result = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        let processed = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
-            Ok(DagSubmitOutcome::Rejected(reason)) => {
-                BuildResult::failure(BuildStatus::InputRejected, reason)
-            }
-            Ok(DagSubmitOutcome::Built(r)) => r,
+            Ok(DagSubmitOutcome::Rejected(reason)) => ProcessedBuild {
+                result: BuildResult::failure(BuildStatus::InputRejected, reason),
+                per_drv: HashMap::new(),
+            },
+            Ok(DagSubmitOutcome::Built(p)) => p,
             Err(e) => {
                 warn!(error = %e, "wopBuildPathsWithResults: build submission failed");
                 metrics::counter!("rio_gateway_errors_total", "type" => "scheduler_submit")
                     .increment(1);
-                BuildResult::failure(
-                    BuildStatus::TransientFailure,
-                    format!("scheduler error: {e}"),
-                )
+                ProcessedBuild {
+                    result: BuildResult::failure(
+                        BuildStatus::TransientFailure,
+                        format!("scheduler error: {e}"),
+                    ),
+                    per_drv: HashMap::new(),
+                }
             }
         };
 
@@ -1983,6 +2045,13 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
         // by an unrelated failure elsewhere in the batch. One batched
         // FindMissingPaths; store errors abort the opcode (stderr_err!
         // inside, before stderr.finish()).
+        //
+        // Each target's verdict starts from its own recorded terminal
+        // (per-drv status + error message captured from the event stream —
+        // see `ProcessedBuild`); targets with no recorded terminal (event
+        // lost, build cancelled mid-flight) fall back to the DAG-level
+        // result. The store check then refines that per-root verdict in
+        // both directions.
         let mut hash_cache: HashMap<String, [u8; 32]> = HashMap::new();
         let mut checks =
             check_targets_against_store(stderr, ctx, &drv_for_idx, &mut hash_cache).await?;
@@ -1993,24 +2062,31 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                 continue;
             }
             let (Some(demand), Some(check)) = (drv_for_idx.get(&idx), checks.remove(&idx)) else {
-                results.push(build_result.clone());
+                results.push(processed.result.clone());
                 continue;
             };
-            if build_result.status.is_success() {
+            // This target's own recorded terminal; DAG-level result when
+            // none was recorded.
+            let per_root = processed
+                .per_drv
+                .get(&demand.drv_path)
+                .cloned()
+                .unwrap_or_else(|| processed.result.clone());
+            if per_root.status.is_success() {
                 if check.missing.is_empty() {
                     // Verified (or unverifiable — defer to the scheduler):
                     // success, with builtOutputs covering exactly the
                     // wanted outputs.
                     results.push(result_with_wanted_outputs(
-                        build_result.clone(),
+                        per_root,
                         demand,
                         &check,
                         &ctx.drv_cache,
                         &mut hash_cache,
                     ));
                 } else {
-                    // Wrong-success: the aggregate says Built but this
-                    // target's requested outputs are not in the store.
+                    // Wrong-success: this target's terminal says built but
+                    // its requested outputs are not in the store.
                     warn!(
                         drv = %demand.drv_path,
                         missing = ?check.missing,
@@ -2025,7 +2101,8 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     ));
                 }
             } else if check.confirmed_present {
-                // Partial outcome: the aggregate failed, but every output
+                // Partial outcome: this target's terminal (or the DAG-level
+                // result it fell back to) is a failure, but every output
                 // THIS target asked for is present in the store — report
                 // the target honestly as built.
                 results.push(result_with_wanted_outputs(
@@ -2036,9 +2113,9 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
                     &mut hash_cache,
                 ));
             } else {
-                // Unverified target under a failed aggregate: keep the
-                // mapped failure status + error message.
-                results.push(build_result.clone());
+                // Unverified target with a failed per-root terminal: keep
+                // that target's own failure status + error message.
+                results.push(per_root);
             }
         }
     } else {

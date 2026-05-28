@@ -1,5 +1,5 @@
 // r[verify gw.opcode.build-paths]
-// r[verify gw.opcode.build-paths-with-results]
+// r[verify gw.opcode.build-paths-with-results+2]
 // r[verify gw.opcode.build-derivation+2]
 // r[verify gw.wire.derived-path]
 // r[verify gw.dag.reconstruct+3]

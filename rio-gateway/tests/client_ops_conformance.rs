@@ -46,6 +46,18 @@ fn conf_drv_aterm() -> String {
     )
 }
 
+/// Second input-addressed test derivation: recorded as FAILING by the
+/// scripted scheduler while the sibling root completes.
+const CONF_DRV_FAIL_PATH: &str = "/nix/store/22222222222222222222222222222222-conformance-fail.drv";
+const CONF_DRV_FAIL_OUT: &str = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-conformance-fail-out";
+
+/// Minimal valid ATerm body for [`CONF_DRV_FAIL_PATH`] (one output, no inputs).
+fn conf_fail_drv_aterm() -> String {
+    format!(
+        r#"Derive([("out","{CONF_DRV_FAIL_OUT}","","")],[],[],"x86_64-linux","/bin/sh",["-c","false"],[("out","{CONF_DRV_FAIL_OUT}")])"#
+    )
+}
+
 /// Take the session's client-side duplex stream, split it, and run the REAL
 /// client handshake ([`client_handshake`]) against the gateway. Returns the
 /// read/write halves plus the negotiated protocol version.
@@ -224,7 +236,7 @@ async fn conformance_add_to_store_nar_large_streams() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.opcode.build-paths-with-results]
+// r[verify gw.opcode.build-paths-with-results+2]
 /// `client_build_paths_with_results` against the real gateway with the mock
 /// scheduler completing the build: one keyed result, the echoed derived path
 /// equals the submission, the status is the success status the mock
@@ -280,6 +292,98 @@ async fn conformance_build_paths_with_results() -> anyhow::Result<()> {
     // Mock-side observation: the gateway actually submitted the build.
     let submits = sess.scheduler.submit_calls.read().unwrap().clone();
     assert_eq!(submits.len(), 1, "scheduler should receive one SubmitBuild");
+
+    finish(&mut sess, rd, wr).await;
+    Ok(())
+}
+
+// r[verify gw.opcode.build-paths-with-results+2]
+/// Multi-root submission with one failing root: the gateway must report
+/// each root's own terminal status — the completed root comes back Built
+/// (with its builtOutputs), the failed root comes back with its own
+/// failure status and error message — instead of cloning the DAG-level
+/// failure onto every root.
+#[tokio::test]
+async fn conformance_build_paths_with_results_multi_root_per_root_status() -> anyhow::Result<()> {
+    use rio_proto::types;
+    let mut sess = GatewaySession::new().await?;
+    sess.store
+        .seed_with_content(CONF_DRV_PATH, conf_drv_aterm().as_bytes());
+    sess.store
+        .seed_with_content(CONF_DRV_FAIL_PATH, conf_fail_drv_aterm().as_bytes());
+    let fail_msg = "builder failed with exit code 2";
+    sess.scheduler
+        .set_submit_outcome(SubmitOutcome::scripted(vec![
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Started(types::BuildStarted {
+                    total_derivations: 2,
+                    cached_derivations: 0,
+                })),
+                ..Default::default()
+            },
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Derivation(
+                    types::DerivationEvent::completed(
+                        CONF_DRV_PATH.to_string(),
+                        vec![CONF_DRV_OUT.to_string()],
+                    ),
+                )),
+                ..Default::default()
+            },
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Derivation(
+                    types::DerivationEvent {
+                        derivation_path: CONF_DRV_FAIL_PATH.to_string(),
+                        kind: types::DerivationEventKind::Failed as i32,
+                        error_message: fail_msg.to_string(),
+                        failure_status: types::BuildResultStatus::PermanentFailure as i32,
+                        ..Default::default()
+                    },
+                )),
+                ..Default::default()
+            },
+            types::BuildEvent {
+                event: Some(types::build_event::Event::Failed(types::BuildFailed {
+                    error_message: format!("derivation '{CONF_DRV_FAIL_PATH}' failed: {fail_msg}"),
+                    failed_derivation: CONF_DRV_FAIL_PATH.to_string(),
+                    status: types::BuildResultStatus::PermanentFailure as i32,
+                })),
+                ..Default::default()
+            },
+        ]));
+    let (mut rd, mut wr, version) = handshake_session(&mut sess).await?;
+
+    let ok_path = format!("{CONF_DRV_PATH}!out");
+    let fail_path = format!("{CONF_DRV_FAIL_PATH}!out");
+    let results = client_build_paths_with_results(
+        &mut rd,
+        &mut wr,
+        &[ok_path.as_str(), fail_path.as_str()],
+        version,
+    )
+    .await?;
+
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].derived_path, ok_path);
+    assert_eq!(results[1].derived_path, fail_path);
+    // Per-root fidelity: the completed sibling is NOT dragged down by the
+    // failing root.
+    assert_eq!(
+        results[0].result.status,
+        BuildStatus::Built,
+        "completed root must be Built, got {:?} ({})",
+        results[0].result.status,
+        results[0].result.error_msg
+    );
+    assert_eq!(results[0].result.built_outputs.len(), 1);
+    assert_eq!(results[0].result.built_outputs[0].out_path, CONF_DRV_OUT);
+    // The failing root carries its own status and error message.
+    assert_eq!(results[1].result.status, BuildStatus::PermanentFailure);
+    assert!(
+        results[1].result.error_msg.contains(fail_msg),
+        "failing root must carry the scheduler's error text, got: {}",
+        results[1].result.error_msg
+    );
 
     finish(&mut sess, rd, wr).await;
     Ok(())

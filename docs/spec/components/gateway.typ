@@ -640,10 +640,15 @@ Response (after STDERR loop):
 
 == wopBuildPathsWithResults (46) Response Wire Format
 
-#r("gw.opcode.build-paths-with-results")[
+#r("gw.opcode.build-paths-with-results+2")[
   `wopBuildPathsWithResults` (opcode 46) returns one `KeyedBuildResult` per
-  requested path --- the key echoes the `DerivedPath` string the client sent.
-  Response structure (after the STDERR loop):
+  requested path --- the key echoes the `DerivedPath` string the client sent,
+  and each entry's `BuildResult` MUST reflect that root's own terminal outcome
+  (its recorded per-derivation status and error message; successes enriched
+  with that derivation's `builtOutputs`), not a copy of another root's or the
+  merged DAG-level result. Roots without a recorded per-derivation terminal
+  fall back to the DAG-level result. Response structure (after the STDERR
+  loop):
 ]
 
 #table(
