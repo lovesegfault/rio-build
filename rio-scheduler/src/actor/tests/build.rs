@@ -1551,3 +1551,73 @@ async fn cancel_reprobed_drv_skips_finalized_exec(
     );
     Ok(())
 }
+
+// r[verify sched.build.terminal-status-settled]
+/// The WatchBuild terminal re-send replays the output paths captured at
+/// complete_build time. A displacement during the cleanup window removes
+/// the finished build's interest from the fresh node, so a re-walk of the
+/// DAG would come back empty — the late subscriber must still receive the
+/// settled BuildCompleted.
+#[tokio::test]
+async fn test_watch_build_terminal_resend_replays_captured_output_paths() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    // Authoritative single-node build, completed normally.
+    let build_id = Uuid::new_v4();
+    let out_path = test_store_path("watch-replay-out");
+    let mut node = make_node("watch-replay");
+    node.drv_content = b"Derive-watch-replay".to_vec();
+    node.drv_content_authoritative = true;
+    node.expected_output_paths = vec![out_path.clone()];
+    let original_rx = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "watch-replay-w", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    complete_success(&handle, "watch-replay-w", &assn.drv_path, &out_path).await?;
+    wait_for_status(&handle, "watch-replay", DerivationStatus::Completed).await;
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+    drop(original_rx);
+
+    // Displace the (terminal) node out from under the finished build
+    // while it is still resident in its cleanup window.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("watch-replay", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Late WatchBuild: the re-sent BuildCompleted must carry the settled
+    // output paths, not a re-computed (now empty) set.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            since_sequence: 0,
+            reply: reply_tx,
+        })
+        .await?;
+    let (mut watch_rx, _) = reply_rx.await??;
+    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.state.recv())
+        .await
+        .expect("WatchBuild on terminal build should not hang")
+        .expect("should receive an event");
+    match event.event {
+        Some(Event::Completed(c)) => {
+            assert_eq!(
+                c.output_paths,
+                vec![out_path],
+                "re-sent BuildCompleted replays the captured output paths"
+            );
+        }
+        other => panic!("expected re-sent BuildCompleted, got {other:?}"),
+    }
+    Ok(())
+}

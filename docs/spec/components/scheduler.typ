@@ -1470,6 +1470,26 @@ Queue-level preemption is fully supported:
     or API call).
 ]
 
+#r("sched.build.terminal-status-settled")[
+  Once a build reaches a terminal state, the progress and result data
+  served for it MUST be the values settled at its terminal transition:
+  `QueryBuildStatus` MUST serve the counts frozen at that transition
+  rather than recomputing them from live DAG state, a re-sent terminal
+  `BuildCompleted` event MUST carry the output paths captured when the
+  build completed, and a cancellation MUST refresh the build's counts
+  from the DAG once before the terminal transition freezes them.
+]
+Terminal builds stay resident — and queryable, and re-subscribable via
+`WatchBuild` — for the terminal-cleanup window while the global DAG keeps
+evolving: shared-node re-probes, later submissions, and displacement of a
+node the build was interested in
+(#rref("sched.merge.authoritative-conflict")) all mutate the state a live
+recompute would read, so a finished build's served progress could shrink
+(or its re-sent completion event lose output paths) after the fact.
+Serving the settled values keeps a terminal build's externally visible
+history immutable, matching the persisted-count freeze at the terminal
+transition.
+
 = Leader Transition Protocol
 
 The scheduler uses a leader-elected model for the in-memory global DAG. On
@@ -1685,10 +1705,14 @@ instead the displaced hash stops counting toward still-running prior
 interested builds (they keep any results already received), so those
 builds neither hang nor get silently re-pointed at a definition they never
 submitted, while builds that already finished are history and keep their
-settled counts. The removal is made durable by deleting those prior
-builds' `build_derivations` links in the same transaction as the
-recreate-refresh, so a recovery rebuilt purely from the database cannot
-re-point them at the displacing definition.
+settled counts. Removal is total: when the pruned result had not been
+received yet, the build's absolute totals (in memory and in
+`builds.total_drvs`) shrink with the slot in the same transaction, so the
+build can still reach `completed == total`; a result already received
+keeps both the credit and the total. The removal is made durable by
+deleting those prior builds' `build_derivations` links in the same
+transaction as the recreate-refresh, so a recovery rebuilt purely from
+the database cannot re-point them at the displacing definition.
 
 #r("sched.merge.authoritative-claim-no-redefine")[
   A submission claiming authoritative inline content that lands on an

@@ -5349,3 +5349,94 @@ async fn test_recovery_after_displacement_does_not_inherit_squatter_edges() -> T
     );
     Ok(())
 }
+
+// r[verify sched.merge.authoritative-conflict+4]
+/// The displacement total adjustment must survive leader failover: the
+/// pruned build's `builds.total_drvs` was decremented in the displacing
+/// merge's transaction, so recovery — which re-seeds totals from that
+/// column — rebuilds the build waiting on exactly its remaining slots and
+/// it can still finish at completed == total.
+#[tokio::test]
+async fn test_displaced_total_adjustment_survives_failover() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let squatter = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter build: poison-locked authoritative squat (no result
+        // ever delivered) plus its own filler node.
+        let mut squat = make_node("squat-total");
+        squat.drv_content = b"Derive-squat-total".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(
+            &handle,
+            squatter,
+            vec![squat, make_node("fillerV")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        assert!(
+            handle
+                .debug_force_poisoned("squat-total", POISON_RESUBMIT_RETRY_LIMIT)
+                .await?
+        );
+
+        // Displacer: conflicting verifiable identity displaces the locked
+        // squat; the squatter build's slot is removed (total 2 → 1) in
+        // the same transaction.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-total", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the recovered build waits on ONE slot, not two.
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "prior build recovered Active"
+    );
+    assert_eq!(
+        status.total_derivations, 1,
+        "recovered total re-seeded from the decremented builds.total_drvs"
+    );
+
+    // Completing its own remaining node finishes the build consistently.
+    let mut rx = connect_executor(&handle, "w-total-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("fillerV"),
+        "only the prior build's own node is dispatchable on x86_64"
+    );
+    complete_success(
+        &handle,
+        "w-total-r",
+        &assn.drv_path,
+        &test_store_path("fillerV-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "prior build completes post-failover with the displaced slot removed"
+    );
+    assert_eq!(
+        (status.total_derivations, status.completed_derivations),
+        (1, 1),
+        "post-failover accounting consistent at terminal"
+    );
+    Ok(())
+}

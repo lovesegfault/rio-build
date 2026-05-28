@@ -1151,9 +1151,13 @@ async fn test_delete_displaced_build_links_scoped() -> anyhow::Result<()> {
 
     // Prune the squatter's and joiner's links to the displaced derivation.
     let mut tx = db.pool().begin().await?;
-    let pruned =
-        SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[squatter, joiner])
-            .await?;
+    let pruned = SchedulerDb::delete_displaced_build_links(
+        &mut tx,
+        displaced_id,
+        &[squatter, joiner],
+        false,
+    )
+    .await?;
     tx.commit().await?;
     assert_eq!(pruned, 2, "exactly the two prior builds' links removed");
 
@@ -1177,8 +1181,105 @@ async fn test_delete_displaced_build_links_scoped() -> anyhow::Result<()> {
 
     // Empty prior set is a no-op (no statement issued).
     let mut tx = db.pool().begin().await?;
-    let pruned = SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[]).await?;
+    let pruned =
+        SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[], true).await?;
     tx.commit().await?;
     assert_eq!(pruned, 0);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+4]
+/// `delete_displaced_build_links` decrements the pruned builds'
+/// `builds.total_drvs` in the same statement when (and only when) the
+/// caller asks for it — i.e. when the displaced result had not been
+/// received — and never drives a total negative.
+#[tokio::test]
+async fn test_delete_displaced_build_links_adjusts_total_only_when_requested() -> anyhow::Result<()>
+{
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let displaced_id = insert_test_derivation(&db, "displaced-total").await?;
+    let other_id = insert_test_derivation(&db, "other-total").await?;
+
+    // Two prior builds: one whose total is adjusted, one pruned without
+    // adjustment (its result was already received), plus a zero-total
+    // build pinning the GREATEST clamp.
+    let pruned_pending = Uuid::new_v4();
+    let pruned_credited = Uuid::new_v4();
+    let zero_total = Uuid::new_v4();
+    for b in [pruned_pending, pruned_credited, zero_total] {
+        db.insert_build(
+            b,
+            None,
+            crate::state::PriorityClass::Scheduled,
+            false,
+            &crate::state::BuildOptions::default(),
+            None,
+        )
+        .await?;
+    }
+    db.persist_build_counts(pruned_pending, 2, 1, 0).await?;
+    db.persist_build_counts(pruned_credited, 2, 2, 0).await?;
+    db.persist_build_counts(zero_total, 0, 0, 0).await?;
+
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, pruned_pending, &[displaced_id, other_id])
+        .await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, pruned_credited, &[displaced_id]).await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, zero_total, &[displaced_id]).await?;
+    tx.commit().await?;
+
+    let totals = |pool: sqlx::PgPool| async move {
+        let rows: Vec<(Uuid, i32)> =
+            sqlx::query_as("SELECT build_id, total_drvs FROM builds ORDER BY build_id")
+                .fetch_all(&pool)
+                .await?;
+        anyhow::Ok(
+            rows.into_iter()
+                .collect::<std::collections::HashMap<_, _>>(),
+        )
+    };
+
+    // adjust_total = true: the not-yet-received prune decrements totals
+    // for exactly the pruned builds (clamped at zero).
+    let mut tx = db.pool().begin().await?;
+    let pruned = SchedulerDb::delete_displaced_build_links(
+        &mut tx,
+        displaced_id,
+        &[pruned_pending, zero_total],
+        true,
+    )
+    .await?;
+    tx.commit().await?;
+    assert_eq!(pruned, 2);
+    let after = totals(test_db.pool.clone()).await?;
+    assert_eq!(
+        after[&pruned_pending], 1,
+        "total decremented with the prune"
+    );
+    assert_eq!(after[&zero_total], 0, "zero total clamped, not negative");
+    assert_eq!(after[&pruned_credited], 2, "unpruned build untouched");
+
+    // adjust_total = false: the already-received prune deletes the link
+    // but keeps the persisted total (the build keeps the credit).
+    let mut tx = db.pool().begin().await?;
+    let pruned =
+        SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[pruned_credited], false)
+            .await?;
+    tx.commit().await?;
+    assert_eq!(pruned, 1);
+    let after = totals(test_db.pool.clone()).await?;
+    assert_eq!(
+        after[&pruned_credited], 2,
+        "credited prune keeps the persisted total"
+    );
+    // Links to other derivations are never touched by either form.
+    let other_links: Vec<Uuid> =
+        sqlx::query_scalar("SELECT build_id FROM build_derivations WHERE derivation_id = $1")
+            .bind(other_id)
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(other_links, vec![pruned_pending]);
     Ok(())
 }

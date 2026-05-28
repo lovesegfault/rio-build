@@ -78,6 +78,22 @@ pub(super) struct MergeReconcile {
     pub other_builds: HashSet<Uuid>,
 }
 
+/// Prior-interest snapshot for one displaced hash, computed by
+/// [`DagActor::displaced_prior_interest`] and consumed by both the
+/// in-memory prune (reconcile) and the durable link prune + total
+/// adjustment (persist transaction).
+#[derive(Default)]
+struct DisplacedPriorInterest {
+    /// Still-running prior builds (≠ the displacer) interested in the
+    /// displaced node.
+    prior_builds: Vec<Uuid>,
+    /// Whether the displaced node had already delivered its result
+    /// (`Completed`/`Skipped`). True → those builds keep the credit
+    /// (slot + completed count both stay); false → the slot is removed
+    /// from their absolute totals (in memory and in `builds.total_drvs`).
+    prior_completed: bool,
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // MergeDag
@@ -820,29 +836,44 @@ impl DagActor {
         // — but every removal path must either carry or prune interest,
         // otherwise a prior-interested build keeps counting a hash that
         // no longer exists for it and can hang Active forever. Prune the
-        // displaced hash from those builds' accounting (they keep any
-        // results they already received) and re-check their completion
-        // via the same `other_builds` fan-out used for shared-node
-        // re-probes. Scope: still-running prior builds only — a build
-        // already terminal at displacement time has settled accounting
-        // that must not be rewritten (its persisted counts are frozen by
-        // update_build_counts_with's terminal guard, and it keeps its
-        // build_derivations link as history). The durable half of this
-        // prune — deleting the same builds' build_derivations links —
-        // already committed inside persist_merge_to_db's transaction;
-        // accepted residual: if the leader dies after that commit but
-        // before this in-memory fan-out runs, a prior single-derivation
-        // build can be recovered as Active with zero remaining links and
-        // only completes via its per-build timeout.
+        // displaced hash from those builds' accounting and re-check their
+        // completion via the same `other_builds` fan-out used for
+        // shared-node re-probes. The pruned slot's absolute accounting
+        // follows the prior result: if the displaced node had already
+        // delivered (Completed/Skipped), the build keeps the credit —
+        // `recovered_completed` absorbs it because the fresh node carries
+        // no prior interest, so `build_summary` no longer counts it — and
+        // the total stays; otherwise the build no longer waits on the
+        // slot at all, so `total_count` shrinks with it (the durable
+        // `builds.total_drvs` decrement rides the persist transaction via
+        // delete_displaced_build_links). Scope: still-running prior
+        // builds only — a build already terminal at displacement time has
+        // settled accounting that must not be rewritten (its persisted
+        // counts are frozen by update_build_counts_with's terminal guard,
+        // and it keeps its build_derivations link as history). The
+        // durable half of this prune — deleting the same builds'
+        // build_derivations links — already committed inside
+        // persist_merge_to_db's transaction; accepted residual: if the
+        // leader dies after that commit but before this in-memory fan-out
+        // runs, a prior single-derivation build can be recovered as
+        // Active with zero remaining links and only completes via its
+        // per-build timeout.
         // both sides are driven by displaced_prior_interest so they
         // cannot diverge. Runs after the point of no return (the build
         // is already committed), so a later rollback can no longer occur.
+        // r[impl sched.merge.authoritative-conflict+4]
         let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
-            for prior_build in self.displaced_prior_interest(merge_result, hash, ingest.build_id) {
+            let interest = self.displaced_prior_interest(merge_result, hash, ingest.build_id);
+            for prior_build in interest.prior_builds {
                 if let Some(b) = self.builds.get_mut(&prior_build)
                     && b.derivation_hashes.remove(hash)
                 {
+                    if interest.prior_completed {
+                        b.recovered_completed += 1;
+                    } else {
+                        b.total_count = b.total_count.saturating_sub(1);
+                    }
                     displaced_prune_builds.insert(prior_build);
                 }
             }
@@ -1976,26 +2007,30 @@ impl DagActor {
     /// displaced node's prior state EXCEPT the displacing build and
     /// builds already terminal at displacement time — a terminal build's
     /// completion accounting and its build_derivations links are settled
-    /// history (sched.merge.authoritative-conflict). One helper feeds
-    /// BOTH the durable link DELETE inside the persist transaction and
-    /// the in-memory prune/fan-out in reconcile_merged_state, so the two
-    /// prune sets are congruent by construction (the actor is
-    /// single-threaded, so build states cannot change between the two
+    /// history (sched.merge.authoritative-conflict). Also reports whether
+    /// the displaced node had already delivered its result
+    /// (`Completed`/`Skipped`) to those builds, which decides between
+    /// keeping the credit and shrinking the total. One helper feeds
+    /// BOTH the durable link DELETE + total adjustment inside the persist
+    /// transaction and the in-memory prune/fan-out in
+    /// reconcile_merged_state, so the two prune sets (and the
+    /// credit-vs-total decision) are congruent by construction (the actor
+    /// is single-threaded, so build states cannot change between the two
     /// call sites within one merge).
     fn displaced_prior_interest(
         &self,
         merge_result: &crate::dag::MergeResult,
         hash: &DrvHash,
         displacer: Uuid,
-    ) -> Vec<Uuid> {
+    ) -> DisplacedPriorInterest {
         let Some((_, prior)) = merge_result
             .removed_retriable
             .iter()
             .find(|(h, _)| h == hash)
         else {
-            return Vec::new();
+            return DisplacedPriorInterest::default();
         };
-        prior
+        let prior_builds: Vec<Uuid> = prior
             .interested_builds
             .iter()
             .filter(|b| **b != displacer)
@@ -2005,7 +2040,14 @@ impl DagActor {
                     .is_some_and(|info| !info.state().is_terminal())
             })
             .copied()
-            .collect()
+            .collect();
+        DisplacedPriorInterest {
+            prior_builds,
+            prior_completed: matches!(
+                prior.status(),
+                DerivationStatus::Completed | DerivationStatus::Skipped
+            ),
+        }
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge,
@@ -2165,10 +2207,18 @@ impl DagActor {
         // links in the SAME transaction as the recreate-refresh makes the
         // prune survive leader failover — recovery rebuilds interest
         // purely from this table, so a surviving link would silently
-        // re-point those builds at the displacing definition. Scope:
-        // non-terminal prior builds only (terminal builds keep links and
-        // counts as settled history), never the displacer. Per-hash loop
-        // is fine — displacement is a rare, adversarial-only path.
+        // re-point those builds at the displacing definition. When the
+        // pruned result had NOT been received yet (the displaced node was
+        // not Completed/Skipped), the same statement also decrements the
+        // pruned builds' `builds.total_drvs`, mirroring the in-memory
+        // `total_count` decrement — recovery re-seeds totals from that
+        // column, so leaving it would resurrect a permanently
+        // unreachable slot (Succeeded builds stuck at N-1/N). Received
+        // results keep both the link-derived credit (recovered_completed
+        // in memory) and the persisted total. Scope: non-terminal prior
+        // builds only (terminal builds keep links and counts as settled
+        // history), never the displacer. Per-hash loop is fine —
+        // displacement is a rare, adversarial-only path.
         // r[impl sched.merge.authoritative-conflict+4]
         for hash in &merge_result.displaced {
             let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {
@@ -2178,14 +2228,15 @@ impl DagActor {
                       "displaced hash missing from upsert id_map; skipping durable link prune");
                 continue;
             };
-            let prior_builds = self.displaced_prior_interest(merge_result, hash, build_id);
-            if prior_builds.is_empty() {
+            let interest = self.displaced_prior_interest(merge_result, hash, build_id);
+            if interest.prior_builds.is_empty() {
                 continue;
             }
             let pruned = crate::db::SchedulerDb::delete_displaced_build_links(
                 &mut tx,
                 *displaced_id,
-                &prior_builds,
+                &interest.prior_builds,
+                !interest.prior_completed,
             )
             .await?;
             debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");

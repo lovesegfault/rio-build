@@ -374,24 +374,60 @@ impl SchedulerDb {
     /// caller passes only non-terminal prior builds (terminal builds keep
     /// their links as settled history) and never the displacing build,
     /// whose own link is inserted by the same transaction.
+    ///
+    /// `adjust_total`: when the displaced node's result had NOT been
+    /// received by those builds (not `Completed`/`Skipped`), the same
+    /// statement decrements each pruned build's `builds.total_drvs` by
+    /// the number of links it lost — the durable mirror of the
+    /// in-memory `total_count` decrement, so recovery (which re-seeds
+    /// totals from that column) cannot resurrect a slot the build no
+    /// longer waits on. Pass `false` when the result was already
+    /// received: the build keeps the credit and the total.
     /// Returns the number of links removed. Plain runtime query — no
     /// `.sqlx/` impact.
     pub(crate) async fn delete_displaced_build_links(
         tx: &mut PgConnection,
         derivation_id: Uuid,
         prior_build_ids: &[Uuid],
+        adjust_total: bool,
     ) -> Result<u64, sqlx::Error> {
         if prior_build_ids.is_empty() {
             return Ok(0);
         }
-        let res = sqlx::query(
-            "DELETE FROM build_derivations WHERE derivation_id = $1 AND build_id = ANY($2)",
+        if !adjust_total {
+            let res = sqlx::query(
+                "DELETE FROM build_derivations WHERE derivation_id = $1 AND build_id = ANY($2)",
+            )
+            .bind(derivation_id)
+            .bind(prior_build_ids)
+            .execute(&mut *tx)
+            .await?;
+            return Ok(res.rows_affected());
+        }
+        // GREATEST(.., 0): defensive clamp — totals are display/recovery
+        // accounting, and a clamp is strictly better than a negative
+        // total if a future caller double-prunes.
+        let pruned: i64 = sqlx::query_scalar(
+            r#"
+            WITH pruned AS (
+                DELETE FROM build_derivations
+                WHERE derivation_id = $1 AND build_id = ANY($2)
+                RETURNING build_id
+            ),
+            adjusted AS (
+                UPDATE builds b
+                SET total_drvs = GREATEST(b.total_drvs - p.cnt, 0)
+                FROM (SELECT build_id, COUNT(*)::int AS cnt FROM pruned GROUP BY build_id) p
+                WHERE b.build_id = p.build_id
+            )
+            SELECT COUNT(*) FROM pruned
+            "#,
         )
         .bind(derivation_id)
         .bind(prior_build_ids)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        Ok(res.rows_affected())
+        Ok(pruned.max(0) as u64)
     }
 
     /// Durable half of the displaced-edge scrub

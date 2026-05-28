@@ -8940,6 +8940,25 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         rio_proto::types::BuildState::Succeeded as i32,
         "prior-interested build completes after displacement (hash pruned)"
     );
+    // The joiner had already RECEIVED the squat's result before the
+    // displacement, so the prune keeps both the slot and the credit: its
+    // served and persisted accounting end at 2/2, not 2/1.
+    let joiner_status = query_status(&handle, joiner).await?;
+    assert_eq!(joiner_status.total_derivations, 2, "joiner keeps its slot");
+    assert_eq!(
+        joiner_status.completed_derivations, 2,
+        "joiner keeps the received result's credit after the prune"
+    );
+    let joiner_counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(joiner)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        joiner_counts,
+        (2, 2),
+        "persisted joiner counts keep slot + credit for the received result"
+    );
     // The displacer owns the fresh node (aarch64 → never dispatched to w1).
     assert_eq!(
         query_status(&handle, displacer).await?.state,
@@ -9519,5 +9538,183 @@ async fn test_authoritative_displacement_unblocks_hook_fallback_victim() -> Test
         rio_proto::types::BuildState::Succeeded as i32,
         "victim build completes on the displacing definition"
     );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+4]
+/// When the displaced result had NOT been received by a still-running
+/// prior build, the prune removes the slot from the build's absolute
+/// totals — in the same transaction durably (`builds.total_drvs`) and in
+/// memory — so the build can still finish with `completed == total`
+/// instead of being stuck forever at N-1 of N.
+#[tokio::test]
+async fn test_displacement_decrements_running_build_total_for_unreceived_result() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+
+    // The squatter's own build carries the squat plus one node of its
+    // own. The squat is authoritative and parks poison-locked without
+    // ever delivering a result to the build.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatT");
+    squat.drv_content = b"Derive-squatT".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("fillerT")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, squatter).await?.total_derivations,
+        2,
+        "two slots before displacement"
+    );
+    assert!(
+        handle
+            .debug_force_poisoned("squatT", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The displacer: conflicting verifiable identity (different system)
+    // displaces the locked squat.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatT", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Durable half: builds.total_drvs dropped with the prune, inside the
+    // displacing merge's transaction.
+    let (total_drvs,): (i32,) = sqlx::query_as("SELECT total_drvs FROM builds WHERE build_id = $1")
+        .bind(squatter)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        total_drvs, 1,
+        "persisted total decremented for the unreceived displaced result"
+    );
+    // In-memory half: the served total shrank with the slot.
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(status.total_derivations, 1, "served total decremented");
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "prior build stays live on its own remaining node"
+    );
+
+    // The prior build finishes consistently: its remaining node is the
+    // only x86_64 work (the displaced fresh node is aarch64-only), and
+    // completing it ends the build at completed == total == 1.
+    let mut rx = connect_executor(&handle, "w-total", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, test_drv_path("fillerT"));
+    complete_success(
+        &handle,
+        "w-total",
+        &test_drv_path("fillerT"),
+        &test_store_path("fillerT-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, squatter).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "prior build completes after the displaced slot is removed"
+    );
+    assert_eq!(status.total_derivations, 1);
+    assert_eq!(status.completed_derivations, 1);
+    let counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(counts, (1, 1), "persisted counts agree at terminal");
+    Ok(())
+}
+
+// r[verify sched.build.terminal-status-settled]
+/// A build that already finished keeps serving its settled progress after
+/// one of its nodes is displaced: QueryBuildStatus short-circuits on the
+/// terminal state and serves the frozen counts instead of recomputing
+/// them from the mutated DAG (which no longer carries the build's
+/// interest on the fresh node).
+#[tokio::test]
+async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("squatU");
+
+    // The squatter build completes normally: 1/1, Succeeded, counts
+    // persisted and frozen at the terminal transition.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatU");
+    squat.drv_content = b"Derive-squatU".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![test_store_path("squatU-out")];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w-settled", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path);
+    complete_success(
+        &handle,
+        "w-settled",
+        &squat_path,
+        &test_store_path("squatU-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "squatU", DerivationStatus::Completed).await;
+    let before = query_status(&handle, squatter).await?;
+    assert_eq!(before.state, rio_proto::types::BuildState::Succeeded as i32);
+    assert_eq!(
+        (before.total_derivations, before.completed_derivations),
+        (1, 1)
+    );
+
+    // A conflicting store-backed submission displaces the (terminal)
+    // node while the finished build is still resident in its cleanup
+    // window.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatU", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The finished build's served progress is settled history — not a
+    // live recompute over a DAG that no longer counts the node for it.
+    let after = query_status(&handle, squatter).await?;
+    assert_eq!(
+        after.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "terminal state unchanged"
+    );
+    assert_eq!(
+        (after.total_derivations, after.completed_derivations),
+        (1, 1),
+        "served counts stay settled after the displacement"
+    );
+    assert_eq!(after.failed_derivations, 0);
+    assert_eq!(after.running_derivations, 0);
+    // Persisted counts were already frozen by the terminal guard.
+    let counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(counts, (1, 1), "persisted counts untouched");
     Ok(())
 }
