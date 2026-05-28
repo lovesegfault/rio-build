@@ -57,6 +57,23 @@ pub enum DagError {
          that conflicts with this submission's declared identity"
     )]
     ConflictingInFlightContent { drv_path: String },
+    /// The inverse direction of [`Self::ConflictingInFlightContent`]: a
+    /// submission claiming authoritative inline content landed on an
+    /// existing STORE-BACKED node that is eligible for the
+    /// resubmit-reset, and its verifiable identity does not match the
+    /// existing node's. Admitting it would let the claim redefine a
+    /// parked (failed / cancelled / poison-reset) store-backed
+    /// definition through the reset, carrying the prior builds' interest
+    /// onto bytes only the claimant can see. An identity-matching claim
+    /// is admitted through the normal resubmit-reset instead, and an
+    /// authoritative claim never displaces a store-backed node. Maps to
+    /// `FAILED_PRECONDITION` (client-actionable conflict, not an
+    /// internal invariant breach).
+    #[error(
+        "authoritative inline content for {drv_path} conflicts with the \
+         existing store-backed derivation definition"
+    )]
+    AuthoritativeClaimIdentityConflict { drv_path: String },
 }
 
 /// `sched.merge.authoritative-conflict` cross-check: does the submission's
@@ -82,6 +99,13 @@ pub enum DagError {
 /// No evidence (the degenerate floating-CA case where the incoming side
 /// carries no hash, or the hashes differ) is treated as a conflict and
 /// falls through to the reject-in-flight / displace-when-terminal arms.
+///
+/// Also used in the INVERSE direction
+/// (`sched.merge.authoritative-claim-no-redefine`): an incoming
+/// authoritative claim landing on a store-backed node that is eligible
+/// for the resubmit-reset must prove the same verifiable identity, with
+/// the same evidence rules and the same no-evidence-is-conflict stance —
+/// `existing` is then the store-backed node and `node` the claimant.
 fn verifiable_identity_matches(
     existing: &DerivationState,
     node: &crate::domain::DerivationNode,
@@ -522,10 +546,18 @@ impl DerivationDag {
             //     poison-budget-exhausted squat — (the verifiable
             //     definition wins; prior interest is NOT carried and the
             //     fresh node starts with a fresh poison budget: it is a
-            //     different definition, not a retry of the old one).
-            // Store-backed existing nodes are exempt: their truth lives
-            // in the store, so a later submission's bytes are ignored
-            // and the node joins as before.
+            //     different definition, not a retry of the old one);
+            //   - the INVERSE direction is gated too
+            //     (sched.merge.authoritative-claim-no-redefine): an
+            //     authoritative claim landing on a STORE-BACKED node
+            //     that is eligible for the resubmit-reset must prove the
+            //     same verifiable identity or be rejected — on a match
+            //     it is admitted through the normal reset and its bytes
+            //     are adopted; it never displaces the store-backed node.
+            // Store-backed existing nodes are otherwise exempt — live,
+            // or terminal but not retriable on resubmit: their truth
+            // lives in the store, so a later submission's bytes are
+            // ignored and the node joins as before.
             if let Some(existing) = self.nodes.get(&drv_hash) {
                 if node.drv_content_authoritative && existing.drv_content_authoritative {
                     if existing.drv_content != node.drv_content {
@@ -569,6 +601,36 @@ impl DerivationDag {
                             drv_path: node.drv_path.clone(),
                         });
                     }
+                } else if node.drv_content_authoritative
+                    && !existing.drv_content_authoritative
+                    && existing.is_retriable_on_resubmit()
+                    && !verifiable_identity_matches(existing, node)
+                {
+                    // r[impl sched.merge.authoritative-claim-no-redefine]
+                    // The claim would otherwise be ADOPTED by the
+                    // resubmit-reset below (`is_retriable_on_resubmit`
+                    // is exactly the reset's admission set), redefining
+                    // a parked store-backed definition with bytes only
+                    // the claimant can see — so a conflicting identity
+                    // is rejected here, leaving the existing node
+                    // untouched. A matching identity falls through and
+                    // takes the normal reset (bytes adopted, prior
+                    // interest carried, resubmit cycle accumulated).
+                    // Live and non-retriable store-backed nodes never
+                    // reach this arm: they keep the join-and-ignore
+                    // semantics, and an authoritative claim never
+                    // displaces a store-backed node.
+                    self.rollback_merge(
+                        &newly_inserted,
+                        &new_edges,
+                        &interest_added,
+                        &traceparent_upgraded,
+                        build_id,
+                        removed_retriable,
+                    );
+                    return Err(DagError::AuthoritativeClaimIdentityConflict {
+                        drv_path: node.drv_path.clone(),
+                    });
                 }
             }
 

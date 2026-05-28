@@ -78,7 +78,8 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // of the same submission can then succeed.
         ActorError::Dag(e) => match &e {
             crate::dag::DagError::AuthoritativeContentMismatch { .. }
-            | crate::dag::DagError::ConflictingInFlightContent { .. } => {
+            | crate::dag::DagError::ConflictingInFlightContent { .. }
+            | crate::dag::DagError::AuthoritativeClaimIdentityConflict { .. } => {
                 Status::failed_precondition(format!("DAG merge failed: {e}"))
             }
             crate::dag::DagError::CycleDetected | crate::dag::DagError::InvalidDrvPath { .. } => {

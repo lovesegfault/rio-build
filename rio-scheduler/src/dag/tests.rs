@@ -2677,6 +2677,181 @@ fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::R
     Ok(())
 }
 
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// The inverse direction of the gate: an authoritative claim landing on
+/// a STORE-BACKED node that is eligible for the resubmit-reset must not
+/// be able to redefine it. With a conflicting verifiable identity
+/// (different system here) the claim is rejected and the parked
+/// store-backed node is left exactly as it was — still store-backed,
+/// same status, no interest recorded for the rejecter.
+#[rstest]
+#[case::failed(DerivationStatus::Failed)]
+#[case::cancelled(DerivationStatus::Cancelled)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed)]
+#[case::poisoned_under_budget(DerivationStatus::Poisoned)]
+fn authoritative_claim_rejected_on_retriable_store_backed_node(
+    #[case] prior: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Store-backed (verifiable) definition first, then parked retriable.
+    let mut store_backed = make_node("claim-park", "aarch64-linux");
+    store_backed.is_content_addressed = true;
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-park")
+        .unwrap()
+        .set_status_for_test(prior);
+    let prior_cycles = dag.node("claim-park").unwrap().retry.resubmit_cycles;
+
+    // Authoritative claim with a conflicting identity (x86_64 vs the
+    // parked aarch64 definition) → rejected, nothing adopted.
+    let err = dag
+        .merge(
+            b2,
+            &[authoritative_node("claim-park", b"Derive-EVIL")],
+            &[],
+            "",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DagError::AuthoritativeClaimIdentityConflict { .. }
+    ));
+    let node = dag.node("claim-park").unwrap();
+    assert_eq!(node.status(), prior, "parked status untouched");
+    assert_eq!(node.system, "aarch64-linux");
+    assert!(node.drv_content.is_empty(), "no bytes adopted");
+    assert!(!node.drv_content_authoritative, "still store-backed");
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles);
+    assert!(node.interested_builds.contains(&b1));
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// An authoritative claim whose verifiable identity MATCHES the parked
+/// store-backed node (same public attributes plus content-bound
+/// evidence) is the legitimate hook-fallback retry: it is admitted
+/// through the normal resubmit-reset — bytes adopted, prior interest
+/// carried, resubmit cycle accumulated — and never via displacement.
+/// Covers both evidence forms: a byte-equal CA modular hash and a
+/// shared non-empty fixed-output expected path.
+#[test]
+fn authoritative_claim_with_matching_identity_resets_store_backed_node() -> anyhow::Result<()> {
+    // Floating-CA evidence: matching modular hash.
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    let mut store_backed = make_node("claim-ca", "x86_64-linux");
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![String::new()];
+    store_backed.ca_modular_hash = Some([0xAB; 32]);
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-ca")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+    let prior_cycles = dag.node("claim-ca").unwrap().retry.resubmit_cycles;
+
+    let res = dag.merge(b2, &[authoritative_node("claim-ca", b"Derive-A")], &[], "")?;
+    assert!(res.newly_inserted.contains("claim-ca"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "claim-ca"),
+        "admitted through the resubmit-reset"
+    );
+    assert!(
+        res.displaced.is_empty(),
+        "never displaces a store-backed node"
+    );
+    let node = dag.node("claim-ca").unwrap();
+    assert_eq!(node.drv_content, b"Derive-A", "claim bytes adopted");
+    assert!(node.drv_content_authoritative);
+    assert!(
+        node.interested_builds.contains(&b1),
+        "prior interest carried"
+    );
+    assert!(node.interested_builds.contains(&b2));
+    assert_eq!(node.retry.resubmit_cycles, prior_cycles + 1);
+
+    // Fixed-output evidence: shared non-empty expected path.
+    let mut dag = DerivationDag::new();
+    let b3 = Uuid::new_v4();
+    let b4 = Uuid::new_v4();
+    let fod_path = "/nix/store/ffffffffffffffffffffffffffffffff-fod-out";
+    let mut fod_store_backed = make_node("claim-fod", "x86_64-linux");
+    fod_store_backed.is_fixed_output = true;
+    fod_store_backed.is_content_addressed = true;
+    fod_store_backed.expected_output_paths = vec![fod_path.to_string()];
+    dag.merge(b3, &[fod_store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-fod")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Cancelled);
+
+    let mut fod_claim = authoritative_node("claim-fod", b"Derive-FOD");
+    fod_claim.is_fixed_output = true;
+    fod_claim.expected_output_paths = vec![fod_path.to_string()];
+    fod_claim.ca_modular_hash = None;
+    let res = dag.merge(b4, &[fod_claim], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "claim-fod")
+    );
+    let node = dag.node("claim-fod").unwrap();
+    assert_eq!(node.drv_content, b"Derive-FOD");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b3));
+    assert!(node.interested_builds.contains(&b4));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-claim-no-redefine]
+/// Degenerate-evidence parity with the store-backed→authoritative arm:
+/// a parked retriable store-backed floating-CA node that carries NO
+/// content-bound evidence (no modular hash) cannot be claimed by an
+/// authoritative submission — no evidence is a conflict, not a match.
+#[test]
+fn authoritative_claim_without_evidence_is_rejected() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    // Same public attributes as the claimant (system, CA flag, output
+    // set) but no modular hash on the parked node → no evidence.
+    let mut store_backed = make_node("claim-noev", "x86_64-linux");
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![String::new()];
+    dag.merge(b1, &[store_backed], &[], "")?;
+    dag.nodes
+        .get_mut("claim-noev")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let err = dag
+        .merge(
+            b2,
+            &[authoritative_node("claim-noev", b"Derive-A")],
+            &[],
+            "",
+        )
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        DagError::AuthoritativeClaimIdentityConflict { .. }
+    ));
+    let node = dag.node("claim-noev").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert!(node.drv_content.is_empty());
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
 // r[verify sched.merge.authoritative-conflict+3]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node in a retriable state (Failed / Cancelled / DependencyFailed /
