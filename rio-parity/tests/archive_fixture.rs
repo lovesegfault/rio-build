@@ -30,9 +30,10 @@ const V1_BASIC_ARCHIVE_ID: &str =
     "9fbf07bcc90bd64d3f29ea098ea7412a74c05208985afd48b4b6c57d225f0dee";
 
 /// Store paths of the fixture archive. Deliberately restated here instead of
-/// reusing the crate-private test support: this file is the executable
-/// specification of the committed fixture, and integration tests cannot see
-/// `#[cfg(test)]` items anyway.
+/// reusing `crate::archive::writer::test_support` (which carries the same
+/// constants and tree builder): this file is the executable specification of
+/// the committed fixture, and integration tests cannot see `#[cfg(test)]`
+/// items anyway.
 const DEP_DRV: &str = "/nix/store/d1111111111111111111111111111111-dep.drv";
 const APP_DRV: &str = "/nix/store/d2222222222222222222222222222222-app.drv";
 const OOM_DRV: &str = "/nix/store/d3333333333333333333333333333333-oom.drv";
@@ -277,17 +278,21 @@ fn generate_v1_basic(root: &Path) -> FinalizedArchive {
 }
 
 /// What one fixture entry is, for byte-level comparison: directories by
-/// presence, symlinks by their literal target, regular files by their bytes.
+/// presence, symlinks by their literal target, regular files by their bytes
+/// plus the executable bit (a lost 100755 mode must fail the comparison and
+/// name the file — the exec bit is part of the NAR serialization).
 #[derive(Debug, PartialEq, Eq)]
 enum EntryFingerprint {
     Dir,
     Symlink(PathBuf),
-    File(Vec<u8>),
+    File { bytes: Vec<u8>, exec: bool },
 }
 
 /// Recursively fingerprint every entry under `root`, keyed by relative path.
 fn collect_tree(root: &Path) -> BTreeMap<String, EntryFingerprint> {
     fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, EntryFingerprint>) {
+        use std::os::unix::fs::PermissionsExt as _;
+
         for entry in std::fs::read_dir(dir).unwrap() {
             let entry = entry.unwrap();
             let path = entry.path();
@@ -309,7 +314,14 @@ fn collect_tree(root: &Path) -> BTreeMap<String, EntryFingerprint> {
                     EntryFingerprint::Symlink(std::fs::read_link(&path).unwrap()),
                 );
             } else {
-                out.insert(rel, EntryFingerprint::File(std::fs::read(&path).unwrap()));
+                let exec = entry.metadata().unwrap().permissions().mode() & 0o100 != 0;
+                out.insert(
+                    rel,
+                    EntryFingerprint::File {
+                        bytes: std::fs::read(&path).unwrap(),
+                        exec,
+                    },
+                );
             }
         }
     }

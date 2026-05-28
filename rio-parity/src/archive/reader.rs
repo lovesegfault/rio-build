@@ -13,7 +13,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
-use anyhow::{Context, Result, anyhow, bail, ensure};
+use anyhow::{Context, Result, anyhow, ensure};
 use rio_nix::narinfo::NarInfo;
 
 use super::backend::{Backend, EntryKind, WalkEntry};
@@ -25,7 +25,7 @@ use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
     NARINFO_DIR, OUTCOMES_MEMBER, REQUESTS_MEMBER, STORE_DIR, UNITS_MEMBER,
 };
-use super::{identity, schema};
+use super::{identity, schema, v0};
 
 /// Which on-disk contract an opened archive was written to. The in-memory
 /// model is always v1; v0 archives are upgraded on open.
@@ -74,18 +74,17 @@ impl ReplayArchive {
         })?;
 
         // A manifest without `format_version` is a v0 archive (the contract
-        // predating the versioned format).
+        // predating the versioned format) and goes through the
+        // upgrade-on-open shim instead of the v1 validation pipeline.
+        // Either way every validation failure names the archive being
+        // opened, so a caller juggling several archives can tell which one
+        // is bad.
         let probe: serde_json::Value = serde_json::from_slice(&manifest_bytes)
             .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
         if probe.get("format_version").is_none() {
-            bail!(
-                "{}: {MANIFEST_MEMBER} carries no format_version (a v0 archive); \
-                 v0 archives are not yet supported by this reader",
-                path.display()
-            );
+            return Self::open_v0(path, backend, &manifest_bytes)
+                .with_context(|| format!("open v0 replay archive {}", path.display()));
         }
-        // Every v1 validation failure names the archive being opened, so a
-        // caller juggling several archives can tell which one is bad.
         Self::open_v1(path, backend, manifest_bytes)
             .with_context(|| format!("open replay archive {}", path.display()))
     }
@@ -166,31 +165,7 @@ impl ReplayArchive {
             .get(REQUESTS_MEMBER)
             .ok_or_else(|| anyhow!("{}: no {REQUESTS_MEMBER}", path.display()))?;
         let mut requests: Vec<RequestRecord> = super::parse_jsonl(requests_bytes, REQUESTS_MEMBER)?;
-        for record in &mut requests {
-            ensure!(
-                !record.targets.is_empty(),
-                "{REQUESTS_MEMBER}: request record (session {}) must have non-empty targets",
-                record.session
-            );
-            // Clock skew at capture time can produce slightly negative
-            // offsets; clamp instead of rejecting the whole archive.
-            record.offset_s = record.offset_s.max(0.0);
-            for target in &mut record.targets {
-                // `[]` and `["*"]` both mean "all outputs"; normalize so
-                // downstream consumers see one spelling.
-                if target.outputs.is_empty() {
-                    target.outputs = vec!["*".to_string()];
-                }
-            }
-        }
-        // Recorded lines are not guaranteed globally ordered (per-session
-        // buffers get flushed independently); the replay timeline wants
-        // ascending offsets.
-        requests.sort_by(|a, b| a.offset_s.total_cmp(&b.offset_s));
-        let workload_units: BTreeSet<String> = requests
-            .iter()
-            .flat_map(|record| record.targets.iter().map(|target| target.drv.clone()))
-            .collect();
+        let workload_units = normalize_requests(&mut requests)?;
 
         // Expected outcomes keyed by (session, drv); duplicate keys keep the
         // last record (a re-recorded outcome supersedes the earlier one).
@@ -250,40 +225,8 @@ impl ReplayArchive {
             None => Vec::new(),
         };
 
-        // narinfo sidecars: an unparseable sidecar is a hard error naming the
-        // offending file. Skipping it could never help a v1 archive anyway —
-        // a skipped sidecar is missing from the recomputed narinfo listing
-        // digest, so the aggregate check below would reject the archive with
-        // a far less actionable message.
-        let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
-        let mut narinfo_digests: Vec<(String, String)> = Vec::new();
-        for entry in backend.list_dir(NARINFO_DIR)?.unwrap_or_default() {
-            if entry.kind != EntryKind::Regular {
-                continue;
-            }
-            let Some(stem) = entry.name.strip_suffix(".narinfo") else {
-                continue;
-            };
-            let rel = format!("{NARINFO_DIR}/{}", entry.name);
-            let bytes = backend
-                .read_file(&rel)?
-                .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
-            let narinfo = std::str::from_utf8(&bytes)
-                .map_err(anyhow::Error::from)
-                .and_then(|text| super::parse_narinfo_sidecar(text, stem))
-                .with_context(|| format!("unparseable narinfo sidecar {rel}"))?;
-            narinfo_digests.push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
-            // Key by the hash part so `<hash>-<name>.narinfo` sidecar naming
-            // resolves the same as the canonical `<hash>.narinfo`.
-            narinfos.insert(super::hash_part(stem).to_string(), narinfo);
-        }
-
-        // nix/store/ entry index: hash part → entry. Drives the store-path
-        // keyed lookups; contents stay in the backend until asked for.
-        let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
-        for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
-            store_entries.insert(super::hash_part(&entry.name).to_string(), entry);
-        }
+        let (narinfos, narinfo_digests) = index_narinfos(&backend, SidecarPolicy::Strict)?;
+        let store_entries = index_store_entries(&backend)?;
 
         // The narinfo listing digest covers the sidecars' load-bearing
         // References lines; verify it at open time (sidecars are small).
@@ -400,6 +343,95 @@ impl ReplayArchive {
             closures,
             impure_env,
             exclusions,
+            narinfos,
+            store_entries,
+        })
+    }
+
+    /// The v0 upgrade-on-open path: parse the legacy nxb-replay members and
+    /// map them into the v1 in-memory model (see
+    /// `docs/dev/2026-05-28-build-replay-design.md`, "v0 compatibility").
+    ///
+    /// v0 archives carry no `files`/`content_digests` integrity tables, no
+    /// capability flags, and no content-addressed identity, so the v1
+    /// digest, sidecar-presence, relay-scheme, and capability cross-checks
+    /// do not apply; capabilities are inferred from member presence (and are
+    /// therefore consistent by construction). Units, closures, and
+    /// exclusions do not exist in v0 and load as empty.
+    fn open_v0(path: &Path, backend: Backend, manifest_bytes: &[u8]) -> Result<Self> {
+        let v0_manifest: v0::V0Manifest = serde_json::from_slice(manifest_bytes)
+            .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
+
+        // requests.jsonl is required in v0 just as in v1: without it there is
+        // no workload to replay.
+        let requests_bytes = backend
+            .read_file(REQUESTS_MEMBER)?
+            .ok_or_else(|| anyhow!("{}: no {REQUESTS_MEMBER}", path.display()))?;
+        let mut requests: Vec<RequestRecord> =
+            super::parse_jsonl::<v0::V0Request>(&requests_bytes, REQUESTS_MEMBER)?
+                .into_iter()
+                .map(v0::map_request)
+                .collect();
+        let workload_units = normalize_requests(&mut requests)?;
+
+        // builds.jsonl is the v0 truth member; each record maps into the
+        // neutral outcome vocabulary, keyed like v1 with the last record
+        // winning (a re-recorded outcome supersedes the earlier one).
+        let builds_bytes = backend.read_file(v0::V0_BUILDS_MEMBER)?;
+        let has_builds = builds_bytes.is_some();
+        let mut outcomes: HashMap<(Option<i64>, String), OutcomeRecord> = HashMap::new();
+        if let Some(bytes) = &builds_bytes {
+            for record in super::parse_jsonl::<v0::V0BuildRecord>(bytes, v0::V0_BUILDS_MEMBER)? {
+                let mapped = v0::map_build_record(record);
+                outcomes.insert((mapped.session, mapped.drv.clone()), mapped);
+            }
+        }
+
+        let impure_env_bytes = backend.read_file(IMPURE_ENV_MEMBER)?;
+        let has_impure_env = impure_env_bytes.is_some();
+        let impure_env: ImpureEnv = match &impure_env_bytes {
+            Some(bytes) => serde_json::from_slice(bytes)
+                .with_context(|| format!("malformed {IMPURE_ENV_MEMBER}"))?,
+            None => ImpureEnv::new(),
+        };
+
+        // Sidecars and the store index are read exactly as for v1 (including
+        // the URL-synthesis fallback); only the unparseable-sidecar policy
+        // differs — see [`SidecarPolicy`]. The v1 narinfo listing digest has
+        // nothing to be checked against, so the recomputed digests are
+        // dropped.
+        let (narinfos, _) = index_narinfos(&backend, SidecarPolicy::WarnAndSkip)?;
+        let store_entries = index_store_entries(&backend)?;
+
+        let output_hashes_present = outcomes.values().any(|record| !record.outputs.is_empty());
+        let has_embedded_paths = store_entries
+            .values()
+            .any(|entry| !entry.name.ends_with(".drv"));
+
+        let mut manifest = v0::map_manifest(
+            v0_manifest,
+            workload_units.len() as u64,
+            has_builds,
+            output_hashes_present,
+            has_impure_env,
+            has_embedded_paths,
+        );
+        manifest.counts.expected_outcomes = outcomes.len() as u64;
+
+        Ok(Self {
+            format: ArchiveFormat::V0,
+            backend,
+            manifest,
+            // v0 archives have no content-addressed identity; they are
+            // referenced by path and cannot be published to the v1 S3 layout.
+            archive_id: None,
+            requests,
+            workload_units,
+            outcomes,
+            units: HashMap::new(),
+            closures: Vec::new(),
+            impure_env,
+            exclusions: Vec::new(),
             narinfos,
             store_entries,
         })
@@ -593,6 +625,108 @@ impl ReplayArchive {
         }
         Ok(nar)
     }
+}
+
+/// What to do with a narinfo sidecar that fails to parse, the one place the
+/// v0 and v1 open paths deliberately differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SidecarPolicy {
+    /// v1: a hard open error naming the offending file. Skipping could never
+    /// help a v1 archive anyway — a skipped sidecar would be missing from
+    /// the recomputed narinfo listing digest, so open would still fail, just
+    /// with a far less actionable message.
+    Strict,
+    /// v0: warn and skip. v0 archives are digest-less, irreplaceable
+    /// recordings of past production windows; one bad sidecar only makes
+    /// that path non-uploadable from the archive and must not refuse the
+    /// whole recording.
+    WarnAndSkip,
+}
+
+/// `(store path, sidecar sha256)` listing entries, in the shape
+/// [`identity::listing_digest`] consumes.
+type SidecarDigestListing = Vec<(String, String)>;
+
+/// Index the `narinfo/` sidecar directory: store-path hash part → parsed
+/// sidecar, plus the `(store path, sidecar sha256)` listing the v1 integrity
+/// check recomputes its narinfo digest from. Sidecars without a `URL:` line
+/// get one synthesized (see [`super::parse_narinfo_sidecar`]); sidecars that
+/// still fail to parse are handled per `policy`.
+fn index_narinfos(
+    backend: &Backend,
+    policy: SidecarPolicy,
+) -> Result<(HashMap<String, NarInfo>, SidecarDigestListing)> {
+    let mut narinfos: HashMap<String, NarInfo> = HashMap::new();
+    let mut narinfo_digests: SidecarDigestListing = Vec::new();
+    for entry in backend.list_dir(NARINFO_DIR)?.unwrap_or_default() {
+        if entry.kind != EntryKind::Regular {
+            continue;
+        }
+        let Some(stem) = entry.name.strip_suffix(".narinfo") else {
+            continue;
+        };
+        let rel = format!("{NARINFO_DIR}/{}", entry.name);
+        let bytes = backend
+            .read_file(&rel)?
+            .ok_or_else(|| anyhow!("{rel}: listed but unreadable"))?;
+        let parsed = std::str::from_utf8(&bytes)
+            .map_err(anyhow::Error::from)
+            .and_then(|text| super::parse_narinfo_sidecar(text, stem));
+        let narinfo = match (parsed, policy) {
+            (Ok(narinfo), _) => narinfo,
+            (Err(err), SidecarPolicy::Strict) => {
+                return Err(err.context(format!("unparseable narinfo sidecar {rel}")));
+            }
+            (Err(err), SidecarPolicy::WarnAndSkip) => {
+                tracing::warn!("skipping unparseable narinfo sidecar {rel}: {err:#}");
+                continue;
+            }
+        };
+        narinfo_digests.push((narinfo.store_path.clone(), identity::sha256_hex(&bytes)));
+        // Key by the hash part so `<hash>-<name>.narinfo` sidecar naming
+        // resolves the same as the canonical `<hash>.narinfo`.
+        narinfos.insert(super::hash_part(stem).to_string(), narinfo);
+    }
+    Ok((narinfos, narinfo_digests))
+}
+
+/// Index `nix/store/`: hash part → entry. Drives the store-path keyed
+/// lookups; contents stay in the backend until asked for.
+fn index_store_entries(backend: &Backend) -> Result<HashMap<String, WalkEntry>> {
+    let mut store_entries: HashMap<String, WalkEntry> = HashMap::new();
+    for entry in backend.list_dir(STORE_DIR)?.unwrap_or_default() {
+        store_entries.insert(super::hash_part(&entry.name).to_string(), entry);
+    }
+    Ok(store_entries)
+}
+
+/// Request post-processing shared by both open paths: every request must
+/// name at least one target, negative offsets are clamped to 0 (clock skew
+/// at capture time can produce slightly negative values; rejecting the whole
+/// archive for that would be overkill), `[]` output lists are normalized to
+/// `["*"]` (both spellings mean "all outputs"), and the records are sorted
+/// by offset ascending (recorded lines are not guaranteed globally ordered —
+/// per-session buffers get flushed independently — and the replay timeline
+/// wants ascending offsets). Returns the distinct workload-unit drv paths.
+fn normalize_requests(requests: &mut [RequestRecord]) -> Result<BTreeSet<String>> {
+    for record in requests.iter_mut() {
+        ensure!(
+            !record.targets.is_empty(),
+            "{REQUESTS_MEMBER}: request record (session {}) must have non-empty targets",
+            record.session
+        );
+        record.offset_s = record.offset_s.max(0.0);
+        for target in &mut record.targets {
+            if target.outputs.is_empty() {
+                target.outputs = vec!["*".to_string()];
+            }
+        }
+    }
+    requests.sort_by(|a, b| a.offset_s.total_cmp(&b.offset_s));
+    Ok(requests
+        .iter()
+        .flat_map(|record| record.targets.iter().map(|target| target.drv.clone()))
+        .collect())
 }
 
 #[cfg(test)]
@@ -1014,22 +1148,227 @@ mod tests {
         );
     }
 
+    // ----- v0 upgrade-on-open shim, against the committed nxb-replay fixture -----
+
+    /// Store paths of the committed v0 fixture (byte-exact copy of the
+    /// origin/xtask-replay `replay/basic` fixture; never edited).
+    const V0_DEP_DRV: &str = "/nix/store/a1111111111111111111111111111111-dep.drv";
+    const V0_APP_DRV: &str = "/nix/store/a2222222222222222222222222222222-app.drv";
+    const V0_IMPURE_DRV: &str = "/nix/store/a3333333333333333333333333333333-impure.drv";
+    const V0_CACHED_DRV: &str = "/nix/store/a4444444444444444444444444444444-cached.drv";
+    const V0_SRC_PATH: &str = "/nix/store/b1111111111111111111111111111111-src.txt";
+
+    /// The committed v0 fixture directory.
+    fn v0_fixture_dir() -> PathBuf {
+        crate::test_manifest_dir().join("tests/fixtures/archive/v0-basic")
+    }
+
+    /// Recursive copy of the committed v0 fixture into `dst` so tests can
+    /// delete or edit individual files without touching the committed copy.
+    fn copy_v0_fixture_to(dst: &Path) {
+        fn copy_tree(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for entry in std::fs::read_dir(src).unwrap() {
+                let entry = entry.unwrap();
+                let to = dst.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &to);
+                } else {
+                    std::fs::copy(entry.path(), &to).unwrap();
+                }
+            }
+        }
+        copy_tree(&v0_fixture_dir(), dst);
+    }
+
     #[test]
-    fn v0_manifest_is_recognized_but_unsupported_until_the_shim_lands() {
+    fn opens_the_v0_fixture_through_the_upgrade_shim() {
+        let archive = ReplayArchive::open(&v0_fixture_dir()).unwrap();
+        assert_eq!(archive.format(), ArchiveFormat::V0);
+        assert!(archive.archive_id().is_none());
+        assert!(archive.archive_id_short().is_none());
+
+        let manifest = archive.manifest();
+        assert_eq!(
+            manifest.substituters.relay,
+            vec!["https://cache.example.org".to_string()]
+        );
+        assert!(!manifest.fat);
+        assert_eq!(
+            manifest.counts,
+            Counts {
+                requests: 4,
+                workload_units: 4,
+                expected_outcomes: 3,
+                embedded_drvs: 4,
+                embedded_store_paths: 1,
+            }
+        );
+
+        // Capabilities are inferred from member presence: builds.jsonl,
+        // output hashes, an embedded tree, and impure-env.json are all
+        // there; closures never exist in v0.
+        let capabilities = archive.capabilities();
+        assert!(capabilities.timed);
+        assert!(capabilities.expected_outcomes);
+        assert!(capabilities.output_hashes);
+        assert!(capabilities.embedded_store_paths);
+        assert!(capabilities.impure_env);
+        assert!(!capabilities.dependency_closures);
+
+        // Sorted by offset regardless of file order; sessions follow.
+        let offsets: Vec<f64> = archive.requests().iter().map(|r| r.offset_s).collect();
+        assert_eq!(offsets, vec![0.25, 2.0, 5.5, 9.0]);
+        let sessions: Vec<i64> = archive.requests().iter().map(|r| r.session).collect();
+        assert_eq!(sessions, vec![10, 13, 11, 12]);
+        // The offset-9.0 request's second target was recorded with `[]`
+        // (all outputs); the v1 model spells that `["*"]`.
+        let last = &archive.requests()[3];
+        assert_eq!(last.targets[1].drv, V0_DEP_DRV);
+        assert_eq!(last.targets[1].outputs, vec!["*".to_string()]);
+
+        // Truth records arrive through the native-status mapping.
+        let dep = archive.expected_outcome(10, V0_DEP_DRV).unwrap();
+        assert_eq!(dep.outcome, schema::ExpectedOutcome::Built);
+        assert_eq!(dep.outputs["out"].nar_size, 120);
+        let app = archive.expected_outcome(11, V0_APP_DRV).unwrap();
+        assert_eq!(app.outcome, schema::ExpectedOutcome::Failed);
+        assert_eq!(
+            app.detail.as_deref(),
+            Some("builder failed with exit code 1")
+        );
+        let impure = archive.expected_outcome(12, V0_IMPURE_DRV).unwrap();
+        assert_eq!(impure.outcome, schema::ExpectedOutcome::Disconnected);
+        assert_eq!(impure.stop_offset_s, Some(11.0));
+        // The cached drv was a cache hit at record time: no truth record.
+        assert!(archive.expected_outcome(12, V0_CACHED_DRV).is_none());
+
+        assert_eq!(archive.impure_env().len(), 1);
+        assert!(archive.units().is_empty());
+        assert!(archive.closures().is_empty());
+        assert!(archive.exclusions().is_empty());
+
+        // Embedded content is reachable exactly as for v1.
+        assert!(archive.has_embedded(V0_SRC_PATH));
+        let aterm = archive.read_drv(V0_DEP_DRV).unwrap();
+        let derivation = rio_nix::derivation::Derivation::parse(&aterm).unwrap();
+        assert_eq!(derivation.outputs().len(), 1);
+
+        let nar = archive.dump_nar(V0_SRC_PATH).unwrap();
+        let sidecar = archive.narinfo(V0_SRC_PATH).unwrap();
+        assert_eq!(nar.len() as u64, sidecar.nar_size);
+        assert_eq!(
+            identity::sha256_hex(&nar),
+            crate::nixcache::narhash_to_hex(&sidecar.nar_hash).unwrap()
+        );
+
+        // The URL-less c111… sidecar is accepted via the URL-synthesis
+        // fallback, same as v1.
+        assert!(
+            archive
+                .narinfo("c1111111111111111111111111111111")
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn opens_the_v0_fixture_dwarfs_image() {
+        // The committed image predates the `c111…` sidecar, so assert only
+        // content it actually carries.
+        let image = crate::test_manifest_dir().join("tests/fixtures/archive/v0-basic.dwarfs");
+        let archive = ReplayArchive::open(&image).unwrap();
+        assert_eq!(archive.format(), ArchiveFormat::V0);
+        assert_eq!(archive.requests().len(), 4);
+        assert!(archive.has_embedded(V0_SRC_PATH));
+
+        let nar = archive.dump_nar(V0_SRC_PATH).unwrap();
+        let sidecar = archive.narinfo(V0_SRC_PATH).unwrap();
+        assert_eq!(nar.len() as u64, sidecar.nar_size);
+        assert_eq!(
+            identity::sha256_hex(&nar),
+            crate::nixcache::narhash_to_hex(&sidecar.nar_hash).unwrap()
+        );
+    }
+
+    #[test]
+    fn v0_missing_optional_files_are_tolerated() {
         let dir = tempfile::TempDir::new().unwrap();
         let root = dir.path().join("archive");
-        std::fs::create_dir_all(&root).unwrap();
-        std::fs::write(
-            root.join(MANIFEST_MEMBER),
-            concat!(
-                "{\"from\":\"2026-05-01T00:00:00Z\",\"to\":\"2026-05-01T01:00:00Z\",",
-                "\"created_at\":\"2026-05-01T01:00:00Z\",\"requests\":4}\n"
-            ),
-        )
-        .unwrap();
+        copy_v0_fixture_to(&root);
+        std::fs::remove_file(root.join(crate::archive::v0::V0_BUILDS_MEMBER)).unwrap();
+        std::fs::remove_file(root.join(IMPURE_ENV_MEMBER)).unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert!(archive.outcomes().is_empty());
+        assert!(archive.impure_env().is_empty());
+        assert!(!archive.capabilities().expected_outcomes);
+        assert!(!archive.capabilities().impure_env);
+        assert_eq!(archive.requests().len(), 4);
+    }
+
+    #[test]
+    fn v0_malformed_request_line_reports_member_and_line() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+        let path = root.join(REQUESTS_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str("{\"ssh_session_id\":99,\n");
+        std::fs::write(&path, text).unwrap();
 
         let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
-        assert!(err.contains("v0"), "got: {err}");
-        assert!(err.contains("not yet supported"), "got: {err}");
+        assert!(err.contains(REQUESTS_MEMBER), "got: {err}");
+        assert!(err.contains("line 5"), "got: {err}");
+    }
+
+    #[test]
+    fn v0_negative_offsets_clamp_to_zero() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+        let path = root.join(REQUESTS_MEMBER);
+        let mut text = std::fs::read_to_string(&path).unwrap();
+        text.push_str(
+            "{\"ssh_session_id\":14,\"offset_s\":-3.5,\"paths\":[[\"/nix/store/a1111111111111111111111111111111-dep.drv\",[\"out\"]]]}\n",
+        );
+        std::fs::write(&path, text).unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.requests().len(), 5);
+        // Clamped to 0.0 it sorts before the 0.25 request.
+        assert_eq!(archive.requests()[0].session, 14);
+        assert_eq!(archive.requests()[0].offset_s, 0.0);
+    }
+
+    #[test]
+    fn v0_unparseable_narinfo_sidecar_is_skipped_not_fatal() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+
+        // Break one sidecar. The same corruption in a v1 archive is a hard
+        // open error (`unparseable_narinfo_sidecar_is_an_open_error`); the
+        // v0 shim only skips the affected path because the recording cannot
+        // be regenerated.
+        let sidecar = root
+            .join(NARINFO_DIR)
+            .join("c1111111111111111111111111111111.narinfo");
+        let text = std::fs::read_to_string(&sidecar).unwrap();
+        let broken = text.replace("NarSize: ", "NarSize: not-a-number-");
+        assert_ne!(broken, text, "sidecar has a NarSize line to break");
+        std::fs::write(&sidecar, broken).unwrap();
+
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert_eq!(archive.requests().len(), 4);
+        assert!(
+            archive
+                .narinfo("c1111111111111111111111111111111")
+                .is_none(),
+            "the broken sidecar is skipped"
+        );
+        assert!(
+            archive.narinfo(V0_SRC_PATH).is_some(),
+            "the intact sidecar still loads"
+        );
     }
 }

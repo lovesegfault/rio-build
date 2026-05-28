@@ -14,6 +14,7 @@ pub(crate) mod backend;
 pub mod identity;
 pub mod reader;
 pub mod schema;
+pub(crate) mod v0;
 pub mod writer;
 
 /// Member paths inside an archive (identical in the directory and image forms).

@@ -1,0 +1,6 @@
+StorePath: /nix/store/c1111111111111111111111111111111-dep
+Compression: none
+NarHash: sha256:2g8hvik0fpkrrza5fz8935fsd0607qk7i63z2rzz0db51cmc30dh
+NarSize: 200
+References:
+Deriver: a1111111111111111111111111111111-dep.drv

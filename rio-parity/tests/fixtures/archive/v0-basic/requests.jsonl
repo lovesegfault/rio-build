@@ -1,0 +1,4 @@
+{"ssh_session_id":11,"offset_s":5.5,"paths":[["/nix/store/a2222222222222222222222222222222-app.drv",["*"]]]}
+{"ssh_session_id":10,"offset_s":0.25,"paths":[["/nix/store/a1111111111111111111111111111111-dep.drv",["out"]]]}
+{"ssh_session_id":12,"offset_s":9.0,"paths":[["/nix/store/a3333333333333333333333333333333-impure.drv",["out"]],["/nix/store/a1111111111111111111111111111111-dep.drv",[]]]}
+{"ssh_session_id":13,"offset_s":2.0,"paths":[["/nix/store/a4444444444444444444444444444444-cached.drv",["out","dev"]]]}
