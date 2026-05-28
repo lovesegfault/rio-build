@@ -4,6 +4,7 @@
 //! binary entry point is `src/main.rs`; everything else is a library
 //! module so it can be unit-tested against recorded fixtures.
 
+pub mod archive;
 pub mod cmd;
 pub mod evalset;
 pub mod hydra;

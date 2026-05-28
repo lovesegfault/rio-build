@@ -34,7 +34,11 @@ aws-sdk-s3 = { workspace = true }
 clap = { workspace = true }
 futures-util = { workspace = true }
 hex = { workspace = true }
-jiff = { workspace = true }
+# Timestamps in the replay-archive manifest (`created_at`/`from`/`to`)
+# serialize as RFC 3339 strings; the serde feature is explicit here so
+# the archive schema does not depend on feature unification through
+# workspace-hack.
+jiff = { workspace = true, features = ["serde"] }
 regex = { workspace = true }
 reqwest = { workspace = true }
 serde = { workspace = true }

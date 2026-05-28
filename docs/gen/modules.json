@@ -751,6 +751,16 @@
   ],
   "rio-parity": [
     {
+      "path": "archive/",
+      "depth": 0,
+      "doc": "Replay archives — the source-agnostic record/replay package consumed"
+    },
+    {
+      "path": "archive/schema.rs",
+      "depth": 1,
+      "doc": "Serde types for the v1 replay-archive members."
+    },
+    {
       "path": "cmd/",
       "depth": 0,
       "doc": "Subcommand implementations live here, one submodule per subcommand."
