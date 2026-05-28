@@ -991,7 +991,7 @@
       "enum": "DagError",
       "name": "AuthoritativeClaimIdentityConflict",
       "crate": "rio-scheduler",
-      "msg": "authoritative inline content for {drv_path} conflicts with the existing store-backed derivation definition",
+      "msg": "authoritative inline content for {drv_path} conflicts with the existing store-backed derivation definition (no matching content-bound identity evidence); if this is your own derivation, re-upload the .drv and resubmit store-backed, ask an operator to clear the parked definition, or wait for its retention window to expire",
       "doc": "The inverse direction of [`Self::ConflictingInFlightContent`]: a submission claiming authoritative inline content landed on an existing STORE-BACKED node that is eligible for the resubmit-reset, and its verifiable identity does not match the existing node's. Admitting it would let the claim redefine a parked (failed / cancelled / poison-reset) store-backed definition through the reset, carrying the prior builds' interest onto bytes only the claimant can see. An identity-matching claim is admitted through the normal resubmit-reset instead, and an authoritative claim never displaces a store-backed node. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
     },
     {
@@ -999,7 +999,7 @@
       "name": "AuthoritativeContentMismatch",
       "crate": "rio-scheduler",
       "msg": "conflicting authoritative derivation content for {drv_path}: a node with different inline content already exists",
-      "doc": "A submission claimed authoritative inline derivation content for a node that already holds DIFFERENT authoritative content. Those bytes are the only copy of their derivation anywhere, so silently joining would let the second submitter redefine what the first one's build runs and what recovery rebuilds. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
+      "doc": "A submission claimed authoritative inline derivation content for a node that already holds DIFFERENT authoritative content. Those bytes are the only copy of their derivation anywhere, so silently joining would let the second submitter redefine what the first one's build runs and what recovery rebuilds. Returned only while the existing claim is live, `Failed` (still owned by the retry machinery), or finished successfully — once it parks in a terminal failure state the byte-different submission displaces it instead of being rejected. Maps to `FAILED_PRECONDITION` (client-actionable conflict, not an internal invariant breach)."
     },
     {
       "enum": "DagError",
