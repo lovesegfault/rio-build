@@ -829,7 +829,7 @@ in
   #   report-slack (asserted via occurred_at − assigned_at ≥ slack) —
   #   and the requeued drv still delivers its store path under a fresh
   #   exec with no further charge.
-  # r[verify ctrl.drain.disruption-target+2]
+  # r[verify ctrl.drain.disruption-target+3]
   #   preempt arm: patching DisruptionTarget=True on a pull-mode pod
   #   makes the controller synthesize the preempted report and
   #   foreground-delete the owning Job (report-then-delete, no

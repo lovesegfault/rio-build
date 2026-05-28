@@ -117,26 +117,27 @@ pool-delete cleanup.
   for them.
 ]
 
-#r("ctrl.ephemeral.reap-orphan-running+3")[
+#r("ctrl.ephemeral.reap-orphan-running+4")[
   When a Running Job (`JobStatus.ready > 0`) is older than the orphan grace
-  (default 5min) AND the scheduler does not consider its executor busy ---
-  either the pod's `executor_id` is absent from `ListExecutors`, or present
-  with `busy == false` --- the controller MUST delete the Job. This is the
-  controller-side backstop for I-165: a builder process stuck in
+  (default 5min) AND no open pull-mode attempt from
+  `AdminService.ListOpenAttempts` covers it (match key: the Job's
+  `rio.build/intent-id` annotation), the controller MUST delete the Job. This
+  is the controller-side backstop for I-165: a builder process stuck in
   uninterruptible sleep (D-state FUSE wait, OOM-loop) cannot self-exit via the
-  120s `RIO_IDLE_SECS` idle-timeout, never disconnects from the scheduler, and
+  120s `RIO_IDLE_SECS` idle bound, never completes a pull, and
   would otherwise sit until `activeDeadlineSeconds` (default 1h). The grace
-  MUST exceed the builder's idle-timeout so the process-level exit is given
+  MUST exceed the builder's idle bound so the process-level exit is given
   first chance; the controller reap fires only when the process cannot act on
-  its own. A Job whose executor reports `busy == true` is NOT reaped --- the
-  scheduler believes a build is in progress; `activeDeadlineSeconds` is the
-  backstop for stuck-mid-build. The reap is *skipped entirely* when
-  `ListExecutors` fails, returns empty, *or reports `leader_for_secs` below the
-  orphan grace* (scheduler unreachable, new-leader pre-reconnect, or
-  partial-reconnect window) --- fail-closed, same posture as
-  #rref("ctrl.ephemeral.reap-excess-pending"). The new leader's executor map
-  fills incrementally as workers reconnect over a 1--10s spread; a non-empty
-  partial list cannot prove absence.
+  its own. A Job covered by an open attempt is NOT reaped --- the ledger says
+  a build is in progress; `activeDeadlineSeconds` is the
+  backstop for stuck-mid-build. The reap is *skipped entirely* when the
+  `ListOpenAttempts` read fails (scheduler unreachable / standby) ---
+  fail-closed, same posture as
+  #rref("ctrl.ephemeral.reap-excess-pending"). A successful read is
+  authoritative on its own: the view is durable ledger state that survives
+  scheduler failover, so there is no leader-age or empty-list precondition
+  (the stream-era `ListExecutors` consultation and its leader-age arm retired
+  with the stream protocol at the 1d controller cleanup).
 ]
 
 *Cleanup:* the finalizer's `cleanup()` returns immediately. In-flight Jobs
@@ -340,11 +341,12 @@ two reads.
   signal would stall a cold-store bootstrap.
 ]
 
-#r("ctrl.pool.disruption")[
+#r("ctrl.pool.disruption+2")[
   The DisruptionTarget watcher selects on `POOL_LABEL` (which the reconciler
   stamps on every kind=Builder AND kind=Fetcher pod), so fetcher pods gain the
   same fast-preemption behavior as builders: K8s sets `DisruptionTarget=True` →
-  `DrainExecutor{force:true}` → reassign in seconds instead of burning the
+  the watcher synthesizes the preempted report and foreground-deletes the
+  owning Job → the build aborts and requeues in seconds instead of burning the
   grace period.
 ]
 
@@ -764,27 +766,19 @@ establishment sweep. A preStop hook would be redundant: K8s sends SIGTERM
 on pod termination regardless, and the signal handler implements the abort.
 The Job pod template does NOT define a preStop.
 
-#r("ctrl.drain.disruption-target+2")[
+#r("ctrl.drain.disruption-target+3")[
   *Eviction-triggered preemption:* the controller runs a Pod watcher filtered
   to `rio.build/pool`-labeled pods with
-  `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks a
-  stream-mode pod
-  for eviction (node drain, spot interrupt), the watcher calls
-  `AdminService.DrainExecutor{force:true}` --- the scheduler sends
-  `CancelSignal` for the in-flight build → executor `cgroup.kill()`s → the
-  build reassigns to a healthy executor within seconds. Without this, the
-  evicting pod would self-drain with `force=false` and wait up to
-  `terminationGracePeriodSeconds` (2h) for the in-flight build to complete
-  naturally before SIGKILL loses it anyway. The SIGTERM self-drain path (above)
-  is the fallback if the watcher misses the window. For a pull-mode pod
-  (its container carries `RIO_DISPATCH_MODE=pull`, the rendering of
-  `dispatchMode: Pull`) the watcher MUST NOT call `DrainExecutor` (a
-  structural no-op for a pod with no executor entry or stream); the AD5/C6
-  successor is report-then-delete: synthesize the terminal
+  `status.conditions[type=DisruptionTarget,status=True]`. When K8s marks an
+  executor pod for eviction (node drain, spot interrupt), the watcher MUST
+  preempt by report-then-delete: synthesize the terminal
   `ReportAttemptOutcome(preempted)` for the pod's attempt, then
   foreground-delete the owning Job, so the pod's SIGTERM-abort fires within
   the 45 s grace and the requeue happens at the report fold, never the
-  establishment sweep. The same closed-attempt evidence drives the cancel
+  establishment sweep. The pod's own SIGTERM abort is the fallback if the
+  watcher misses the window. There is no per-executor drain RPC --- the
+  stream-era `DrainExecutor{force:true}` hop retired with the stream
+  protocol. The same closed-attempt evidence drives the cancel
   successor: the reconcile foreground-deletes an active pull-mode Job only on
   the closed→active edge of the open-attempt view (an attempt previously
   observed open for that Job no longer listed by a later successful read),
@@ -793,14 +787,14 @@ The Job pod template does NOT define a preStop.
 
 == Pull-mode attempt lifecycle (additive)
 
-For pools whose pods dispatch via `PullAssignment`/`ReportOutcome` --- the
-only delivery mode the scheduler still serves --- the controller is the
-classifier of pod/Job terminal status and the consumer of the scheduler's
-ledger-backed open-attempt view. Of the stream-mode paths above,
-`ReportExecutorTermination` is still answered (as an acknowledged no-op)
-until the 1d proto sweep; `DrainExecutor` is a retired no-op that returns a
-clear error, and the controller's remaining stream-mode call sites go away
-with the 1d controller cleanup.
+Executor pods dispatch via `PullAssignment`/`ReportOutcome` --- the only
+delivery mode --- and the controller is the classifier of pod/Job terminal
+status and the consumer of the scheduler's ledger-backed open-attempt view.
+The controller has no stream-mode call sites left: the 1d controller cleanup
+removed the `ListExecutors` busy consultation, the `DrainExecutor` preemption
+hop, and the executor-id prefix correlation; the legacy
+`ReportExecutorTermination` and `DrainExecutor` RPCs leave the proto with the
+1d sweep.
 
 #r("ctrl.report.attempt-outcome")[
   The controller MUST fold a pull-mode attempt's pod/Job terminal status to
@@ -827,16 +821,16 @@ The deletion destroys the only Job/pod terminal status the unified report
 could otherwise fold; synthesizing keeps requeue at the next fold instead of
 waiting for the establishment sweep.
 
-#r("ctrl.job.busy-from-open-attempts")[
-  During coexistence the orphan-Running reap MUST treat a Job as busy when
-  either the stream-mode busy signal (`ListExecutors.running_build`) or an
-  open pull-mode attempt from `AdminService.ListOpenAttempts` covers it, and
-  MUST keep the existing fail-closed posture: an RPC error on either source
-  means no reap this tick.
+#r("ctrl.job.busy-from-open-attempts+2")[
+  The orphan-Running reap MUST treat a Job as busy exactly when an open
+  pull-mode attempt from `AdminService.ListOpenAttempts` covers it (match
+  key: the Job's intent annotation), and MUST keep the fail-closed posture:
+  an error on the view read means no reap this tick.
 ]
-At no point during the transition may the orphan reap evaluate a pull-mode
-pod against the raw stream-registered list alone --- the not-in-list arm
-would foreground-delete every pull-mode build older than the reap grace.
+The open-attempt ledger is the only busy carrier --- the stream-mode
+`ListExecutors.running_build` arm and the executor-id prefix correlation it
+needed retired with the stream protocol, and at no point may the reap infer
+busyness (or its absence) from anything other than the durable view.
 
 = ComponentScaler
 

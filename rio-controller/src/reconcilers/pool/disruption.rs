@@ -2,37 +2,34 @@
 //!
 //! K8s sets `status.conditions[type=DisruptionTarget, status=True]`
 //! when eviction is imminent (node drain, spot interrupt, PDB-
-//! mediated disruption). We fire `DrainExecutor{force:true}` → the
-//! scheduler reads `running_build`, sends `CancelSignal` → worker
-//! `cgroup.kill()`s → the build reassigns in seconds
-//! instead of burning the 2h `terminationGracePeriodSeconds`.
-//!
-//! This is what the four pre-existing comments at
-//! `rio-scheduler/src/actor/worker.rs:220`, `actor/tests/worker.rs:345`,
-//! `builders.rs:171`, and `builderpool/mod.rs:204` have been asserting
-//! — without a production caller until now.
+//! mediated disruption). The watcher synthesizes the terminal
+//! `ReportAttemptOutcome(preempted)` for the pod's attempt and
+//! foreground-deletes the owning Job, so the pod's SIGTERM-abort
+//! cgroup-kills the build now and the drv requeues at the report fold
+//! in seconds instead of burning `activeDeadlineSeconds` (AD5/C6; the
+//! stream-era `DrainExecutor{force:true}` hop retired with the stream
+//! protocol at the 1d controller cleanup).
 //!
 //! # Why a Pod watcher, not a preStop hook
 //!
 //! `preStop` fires on EVERY termination, including graceful scale-
-//! down where `force=false` is correct (let in-flight builds finish).
-//! `DisruptionTarget` fires only on eviction-budget-mediated
+//! down. `DisruptionTarget` fires only on eviction-budget-mediated
 //! disruption (node drain, spot interrupt, Karpenter consolidation)
 //! where preemption IS the right call: the pod is dying regardless,
-//! so reassigning in-flight builds to healthy workers is strictly
-//! better than letting them burn 2h of wall-clock and then SIGKILL.
+//! so closing its attempt and requeueing now is strictly better than
+//! letting the build burn the grace period and then lose it anyway.
 //!
 //! # Idempotence
 //!
 //! `DisruptionTarget` stays True for the pod's remaining lifetime
 //! (the condition is sticky until pod termination). Every watcher
-//! event for that pod fires another `DrainExecutor{force:true}`. The
-//! scheduler's `handle_drain_executor` is idempotent: `force=true`
-//! with `draining=true` re-preempts, which is a no-op on an
-//! already-cleared `running_build`. No client-side dedup needed.
+//! event for that pod re-synthesizes the same terminal report — the
+//! scheduler's first-classifier-wins fill makes the repeat a no-op —
+//! and re-issues the (idempotent) Job delete. No client-side dedup
+//! needed.
 
-// r[impl ctrl.drain.disruption-target+2]
-// r[impl ctrl.pool.disruption]
+// r[impl ctrl.drain.disruption-target+3]
+// r[impl ctrl.pool.disruption+2]
 
 use futures_util::StreamExt;
 use k8s_openapi::api::batch::v1::Job;
@@ -110,75 +107,16 @@ pub async fn run(client: Client, mut admin: AdminClient, shutdown: rio_common::s
             continue;
         };
 
-        // r[impl ctrl.drain.disruption-target+2]
-        // AD5/C6 successor for pull-mode pods: `DrainExecutor` /
-        // `CancelSignal` are structural no-ops for a pod with no
-        // executor entry or stream, so preemption becomes synthesize
-        // the terminal report, then foreground-delete the Job — the
-        // deletion's SIGTERM is the abort (the builder cgroup-kills and
-        // makes its one bounded report attempt inside the 45 s grace),
-        // and the requeue happens at the report fold, never the
-        // establishment sweep. Stream pods keep the force-drain hop
-        // below, untouched.
-        if let Some(preempt) = pull_mode_preemption(&pod) {
-            preempt_pull_mode_pod(&client_for_jobs, &mut admin, &preempt).await;
-            continue;
-        }
-
-        // Best-effort. `force=true` triggers the preemption block
-        // at `rio-scheduler/src/actor/worker.rs:211-258`: take
-        // running_build → CancelSignal → reassign.
-        //
-        // Failure modes:
-        //   - Scheduler down → tonic ConnectError. Worker's own
-        //     SIGTERM handler also calls DrainExecutor (force=false)
-        //     via its direct channel, so no-drain is only as bad
-        //     as "no preemption" (builds burn grace period).
-        //   - Scheduler is standby → UNAVAILABLE. The `admin`
-        //     channel is balanced (main.rs connect loop), routes
-        //     to the leader. Standby reject is transient.
-        //   - Unknown executor_id → accepted=false. Pod hasn't
-        //     heartbeated yet, or already disconnected. No-op.
-        match admin_call(
-            admin.drain_executor(rio_proto::types::DrainExecutorRequest {
-                executor_id: executor_id.to_string(),
-                force: true,
-            }),
-        )
-        .await
-        {
-            Ok(resp) => {
-                let r = resp.into_inner();
-                metrics::counter!(
-                    "rio_controller_disruption_drains_total",
-                    "result" => "sent"
-                )
-                .increment(1);
-                info!(
-                    executor_id,
-                    busy = r.busy,
-                    accepted = r.accepted,
-                    "DisruptionTarget: DrainExecutor force=true"
-                );
-            }
-            Err(e) => {
-                let result = if e.code() == tonic::Code::DeadlineExceeded {
-                    "timeout"
-                } else {
-                    "rpc_error"
-                };
-                metrics::counter!(
-                    "rio_controller_disruption_drains_total",
-                    "result" => result
-                )
-                .increment(1);
-                warn!(
-                    executor_id,
-                    error = %e,
-                    "DisruptionTarget: DrainExecutor failed (SIGTERM fallback will drain)"
-                );
-            }
-        }
+        // r[impl ctrl.drain.disruption-target+3]
+        // AD5/C6: preemption is synthesize the terminal report, then
+        // foreground-delete the owning Job — the deletion's SIGTERM is
+        // the abort (the builder cgroup-kills and makes its one
+        // bounded report attempt inside the 45 s grace), and the
+        // requeue happens at the report fold, never the establishment
+        // sweep. There is no per-executor drain RPC: the stream-era
+        // `DrainExecutor` hop retired with the stream protocol.
+        let preempt = preemption_for_pod(&pod, executor_id);
+        preempt_disrupted_pod(&client_for_jobs, &mut admin, &preempt).await;
     }
 }
 
@@ -207,7 +145,7 @@ pub(super) fn is_disruption_target(pod: &Pod) -> Option<&str> {
     pod.metadata.name.as_deref()
 }
 
-/// What the AD5/C6 preemption successor needs for one pull-mode pod:
+/// What the AD5/C6 preemption needs for one disruption-targeted pod:
 /// the owning Job to foreground-delete, the attempt identity to
 /// synthesize the `preempted` report with, and the namespace to do it
 /// in.
@@ -220,19 +158,14 @@ pub(super) struct PullPreemption {
     pub pod_name: String,
 }
 
-/// Pure decision: a disruption-targeted pod belongs to a pull-mode
-/// pool iff its executor container carries `RIO_DISPATCH_MODE=pull` —
-/// the rendering of the Pool CR's `dispatchMode: Pull` (T-1b.6), so
-/// gating on the env IS gating on the CR field without an extra
-/// apiserver read from the watcher's hot path (the shared
-/// `pod::pod_is_pull_mode` discriminator). Stream pods return `None`
-/// and keep the force-drain hop.
-pub(super) fn pull_mode_preemption(pod: &Pod) -> Option<PullPreemption> {
-    if !super::pod::pod_is_pull_mode(pod) {
-        return None;
-    }
-    let pod_name = pod.metadata.name.clone()?;
-    Some(PullPreemption {
+/// Pure projection of a disruption-targeted pod onto the preemption
+/// decision: the owning Job, the intent annotation (the attempt
+/// identity), the bound node, and the namespace. Every executor pod
+/// takes this path — there is no per-mode gate left (the stream-era
+/// force-drain hop is gone, and the builder aborts on SIGTERM
+/// regardless of what its pod template renders).
+pub(super) fn preemption_for_pod(pod: &Pod, pod_name: &str) -> PullPreemption {
+    PullPreemption {
         namespace: pod.metadata.namespace.clone().unwrap_or_default(),
         job_name: pod
             .metadata
@@ -252,17 +185,16 @@ pub(super) fn pull_mode_preemption(pod: &Pod) -> Option<PullPreemption> {
             .as_ref()
             .and_then(|s| s.node_name.clone())
             .unwrap_or_default(),
-        pod_name,
-    })
+        pod_name: pod_name.to_owned(),
+    }
 }
 
-/// Execute one pull-mode preemption: synthesize the terminal
+/// Execute one preemption: synthesize the terminal
 /// `ReportAttemptOutcome(preempted)` for the pod's attempt (best-effort
 /// — the establishment sweep is the fallback classifier), then
 /// foreground-delete the owning Job so the pod's SIGTERM-abort fires
-/// now instead of at `activeDeadlineSeconds`. No `DrainExecutor` is
-/// ever sent for a pull-mode pod.
-async fn preempt_pull_mode_pod(client: &Client, admin: &mut AdminClient, p: &PullPreemption) {
+/// now instead of at `activeDeadlineSeconds`.
+async fn preempt_disrupted_pod(client: &Client, admin: &mut AdminClient, p: &PullPreemption) {
     match admin_call(
         admin.report_attempt_outcome(rio_proto::types::ReportAttemptOutcomeRequest {
             intent_id: p.intent_id.clone(),
@@ -284,7 +216,7 @@ async fn preempt_pull_mode_pod(client: &Client, admin: &mut AdminClient, p: &Pul
                 pod = %p.pod_name,
                 job = ?p.job_name,
                 intent_id = %p.intent_id,
-                "DisruptionTarget: synthesized preempted report for pull-mode pod"
+                "DisruptionTarget: synthesized preempted report for the disrupted pod"
             );
         }
         Err(e) => {
@@ -301,18 +233,18 @@ async fn preempt_pull_mode_pod(client: &Client, admin: &mut AdminClient, p: &Pul
         }
     }
     let Some(job_name) = p.job_name.as_deref() else {
-        debug!(pod = %p.pod_name, "pull-mode pod has no owning Job; nothing to delete");
+        debug!(pod = %p.pod_name, "disrupted pod has no owning Job; nothing to delete");
         return;
     };
     let jobs: Api<Job> = Api::namespaced(client.clone(), &p.namespace);
     match jobs.delete(job_name, &DeleteParams::foreground()).await {
         Ok(_) => {
-            info!(job = %job_name, ns = %p.namespace, "DisruptionTarget: foreground-deleted pull-mode Job")
+            info!(job = %job_name, ns = %p.namespace, "DisruptionTarget: foreground-deleted the disrupted Job")
         }
         Err(kube::Error::Api(ae)) if ae.code == 404 => {
-            debug!(job = %job_name, "pull-mode Job already gone");
+            debug!(job = %job_name, "disrupted Job already gone");
         }
         Err(e) => warn!(job = %job_name, error = %e,
-                        "DisruptionTarget: pull-mode Job delete failed (kubelet eviction will still abort the pod)"),
+                        "DisruptionTarget: Job delete failed (kubelet eviction will still abort the pod)"),
     }
 }

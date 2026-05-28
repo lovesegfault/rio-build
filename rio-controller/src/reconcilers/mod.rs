@@ -77,11 +77,12 @@ pub fn require_namespace<K: kube::Resource<DynamicType = ()>>(obj: &K) -> Result
 /// Shared `AdminServiceClient` shape: balanced channel +
 /// [`ServiceTokenInterceptor`](rio_auth::hmac::ServiceTokenInterceptor)
 /// (`caller="rio-controller"`). The scheduler gates controller-only
-/// mutating RPCs (`AppendInterruptSample`, `DrainExecutor`,
-/// `ReportExecutorTermination`, `AckSpawnedIntents`) on
+/// mutating RPCs (`AppendInterruptSample`, `ReportAttemptOutcome`,
+/// `AckSpawnedIntents`, `MintExecutorTokens`) on
 /// `x-rio-service-token` — builders share the scheduler's port 9001 at L4
 /// (CCNP), so without the gate a compromised builder could poison λ\[h\],
-/// drain executors, or arm false ICE marks. All controller→scheduler
+/// forge attempt classifications, or arm false ICE marks. All
+/// controller→scheduler
 /// callsites (`Ctx.admin`, `disruption::run`, `node_informer::*`) use
 /// this alias so a single interceptor covers every RPC.
 pub type AdminClient = rio_proto::AdminServiceClient<
@@ -107,8 +108,8 @@ pub struct Ctx {
     /// an Arc internally).
     pub client: Client,
     /// Balanced AdminServiceClient with service-token interceptor
-    /// (DrainExecutor in pool finalizer, AppendInterruptSample,
-    /// ClusterStatus).
+    /// (ReportAttemptOutcome, AppendInterruptSample, ClusterStatus,
+    /// the spawn-intent loop).
     pub admin: AdminClient,
     /// rio-scheduler addresses. For builder pod env injection ONLY
     /// (reconcilers use `admin` above). `balance_host = None` → env
@@ -177,7 +178,7 @@ pub struct Ctx {
     /// instance shared with `node_informer::run` and the
     /// nodeclaim_pool reconciler.
     pub hw_config: node_informer::HwClassConfig,
-    /// Pod/Job names whose first acked `ReportExecutorTermination` has
+    /// Pod/Job names whose first acked pod-terminal report has
     /// already been sampled into
     /// `rio_controller_job_terminal_report_seconds` (the OA1
     /// interval-(i) instrument), with the insertion instant for

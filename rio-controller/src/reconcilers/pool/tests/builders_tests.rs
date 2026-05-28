@@ -820,15 +820,14 @@ fn executor_pod_has_downward_hwclass_volume() {
     );
 }
 
-// r[verify ctrl.drain.disruption-target+2]
+// r[verify ctrl.drain.disruption-target+3]
 /// DisruptionTarget filter: Pod with `conditions[DisruptionTarget]=
 /// True` → `Some(name)`. Anything else → `None`.
 ///
 /// Tests the PURE filter, not the watcher loop (that's K8s-API
-/// machinery tested at the VM tier). The loop calls
-/// `admin.drain_executor(DrainExecutorRequest { force: true, ... })`
-/// when this filter returns `Some` — the prod `force: true` caller
-/// the 4 lying comments have been asserting exists.
+/// machinery tested at the VM tier). The loop synthesizes the
+/// preempted report and foreground-deletes the owning Job when this
+/// filter returns `Some`.
 #[test]
 fn disruption_filter_true_returns_name() {
     use k8s_openapi::api::core::v1::{PodCondition, PodStatus};
@@ -1061,14 +1060,13 @@ fn job_pod_image_pull_policy_passthrough() {
 // AD5: pull-mode preemption decision (DisruptionTarget watcher)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify ctrl.drain.disruption-target+2]
-/// A disruption-targeted pod of a pull-mode pool (its container
-/// carries `RIO_DISPATCH_MODE=pull` — the rendering of
-/// `dispatchMode: Pull`) takes the synthesize-preempted +
-/// foreground-delete-the-Job path: the decision carries the owning
-/// Job, the intent identity, and the node attribution, and the stream
-/// force-drain hop is NOT taken. A stream pod (no pull env) keeps the
-/// unchanged DrainExecutor path.
+// r[verify ctrl.drain.disruption-target+3]
+/// Every disruption-targeted executor pod takes the
+/// synthesize-preempted + foreground-delete-the-Job path: the decision
+/// carries the owning Job, the intent identity, and the node
+/// attribution. The pod-template env no longer matters (the stream-era
+/// force-drain hop is gone), so a pod rendered without
+/// `RIO_DISPATCH_MODE=pull` projects to the same decision.
 #[test]
 fn disruption_pull_mode_pod_preempts_via_job_delete() {
     use k8s_openapi::api::core::v1::{Container, EnvVar, PodSpec as K8sPodSpec};
@@ -1107,20 +1105,19 @@ fn disruption_pull_mode_pod_preempts_via_job_delete() {
         pod
     };
 
-    // Pull-mode pod → the preemption decision, fully attributed.
-    let preempt = disruption::pull_mode_preemption(&mk_pod(true))
-        .expect("pull-mode pod takes the report+delete path");
+    // The preemption decision, fully attributed.
+    let preempt = disruption::preemption_for_pod(&mk_pod(true), "rio-builder-pull-7abcd");
     assert_eq!(preempt.namespace, "rio");
     assert_eq!(preempt.job_name.as_deref(), Some("rio-builder-pull-7"));
     assert_eq!(preempt.intent_id, "drv-pull-7");
     assert_eq!(preempt.node_name, "node-3");
     assert_eq!(preempt.pod_name, "rio-builder-pull-7abcd");
 
-    // Stream pod (no RIO_DISPATCH_MODE=pull) → None: the unchanged
-    // force-drain hop handles it.
+    // A pod rendered WITHOUT the pull env projects to the same
+    // decision — there is no per-mode gate left.
+    let no_env = disruption::preemption_for_pod(&mk_pod(false), "rio-builder-pull-7abcd");
     assert_eq!(
-        disruption::pull_mode_preemption(&mk_pod(false)),
-        None,
-        "stream pods keep the DrainExecutor force-drain path"
+        no_env, preempt,
+        "the preemption decision is mode-independent (no force-drain hop remains)"
     );
 }

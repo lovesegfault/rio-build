@@ -27,8 +27,9 @@
 //!   discrimination the manual runbook query makes.
 //!
 //! Clustered nodes are fed to [`super::health::reap_unhealthy`] as the
-//! union with the scheduler-reported `dead_nodes` (stream pools keep
-//! feeding that input until 1d), so the existing `ReapReason::Dead` arm
+//! Dead-node input (the only such signal — the scheduler's stream-era
+//! heartbeat detector and its `dead_nodes` field are gone), so the
+//! existing `ReapReason::Dead` arm
 //! — including its per-tick `dead_reap_cap` blast-radius bound — is the
 //! single consumer. Evidence is event-shaped and in-memory only: a
 //! restart under-detects for at most one window (safe direction, same
@@ -170,19 +171,6 @@ impl WedgeTracker {
     }
 }
 
-/// Union of the scheduler-reported `dead_nodes` (stream pools, until
-/// 1d) and the controller-side wedge clustering — the single
-/// `dead_nodes`-shaped input `reap_unhealthy` consumes during
-/// coexistence.
-// r[impl ctrl.nodeclaim.wedge-cluster]
-pub(super) fn dead_union(scheduler_reported: &[String], wedged: &[String]) -> Vec<String> {
-    let mut set: HashSet<&str> = scheduler_reported.iter().map(String::as_str).collect();
-    set.extend(wedged.iter().map(String::as_str));
-    let mut out: Vec<String> = set.into_iter().map(str::to_owned).collect();
-    out.sort();
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::NodeClaimPoolConfig;
@@ -234,11 +222,10 @@ mod tests {
         );
         assert_eq!(wedged, vec!["node-1".to_string()]);
 
-        // The union flows into `classify` exactly like dead_nodes: the
+        // The wedge list flows into `classify` as the Dead input: the
         // registered NodeClaim backing node-1 classifies Dead; node-2
         // (one expiry) and node-3 (healthy pulls) do not.
-        let union = dead_union(&[], &wedged);
-        let dead_set: HashSet<&str> = union.iter().map(String::as_str).collect();
+        let dead_set: HashSet<&str> = wedged.iter().map(String::as_str).collect();
         let cfg = NodeClaimPoolConfig::default();
         let sk = CellSketches::default();
         let live: Vec<_> = ["node-1", "node-2", "node-3"]
@@ -355,25 +342,6 @@ mod tests {
             tracker
                 .update(&[a, b], &HashMap::new(), 10_000.0)
                 .is_empty()
-        );
-    }
-
-    /// The union keeps the scheduler-reported names (stream pools still
-    /// feed dead_nodes until 1d) alongside the wedge-clustered ones.
-    // r[verify ctrl.nodeclaim.wedge-cluster]
-    #[test]
-    fn dead_union_keeps_both_sources() {
-        let union = dead_union(
-            &["node-stream".to_string(), "node-both".to_string()],
-            &["node-pull".to_string(), "node-both".to_string()],
-        );
-        assert_eq!(
-            union,
-            vec![
-                "node-both".to_string(),
-                "node-pull".to_string(),
-                "node-stream".to_string()
-            ]
         );
     }
 }

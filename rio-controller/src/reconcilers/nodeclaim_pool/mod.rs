@@ -16,7 +16,7 @@
 //!    with 1×anchor + N×bulk NodeClaims, capped at
 //!    `max_node_claims_per_cell_per_tick` and `max_fleet_cores`.
 //! 4. Reap idle Registered claims via windowed-rate break-even.
-//! 5. Reap unhealthy (scheduler-reported `dead_nodes`) and ICE-stuck
+//! 5. Reap unhealthy (OA2 wedge-clustered dead nodes) and ICE-stuck
 //!    claims.
 //! 6. Persist `CellSketches` (lead-time quantile sketches + idle-gap log) to PG.
 //!
@@ -759,9 +759,9 @@ pub struct NodeClaimPoolReconciler {
     tick_counter: u64,
     /// OA2: per-node clustering of pull-mode attempt-deadline expiries
     /// over the open-attempt ledger view ([`wedge::WedgeTracker`]).
-    /// Produces the controller-side half of the `dead_nodes`-shaped
-    /// input `reap_unhealthy` consumes (unioned with the
-    /// scheduler-reported set during coexistence). In-memory only and
+    /// Produces the Dead-node input `reap_unhealthy` consumes (the
+    /// only such signal since the scheduler-side detector retired with
+    /// the stream protocol). In-memory only and
     /// NOT cleared on lease edges: evidence is event-shaped (an expiry
     /// observed at time T never un-happens) and ages out of its window;
     /// a fresh process under-detects for at most one window — the same
@@ -1274,13 +1274,12 @@ impl NodeClaimPoolReconciler {
         self.placeable_tx
             .send_replace(Some(Arc::new(on_registered)));
 
-        // OA2: controller-side per-node wedge clustering. Pull-mode
-        // pods never feed the scheduler's heartbeat-fed detector, so
-        // the controller derives the same Dead-equivalent signal from
-        // the open-attempt ledger view (deadline expiries clustered per
-        // source node) and consumes the UNION with the
-        // scheduler-reported `dead_nodes` (stream pools keep feeding
-        // that until 1d). RPC failure is fail-open for observation
+        // OA2: controller-side per-node wedge clustering — the only
+        // hung-node signal (the scheduler's heartbeat-fed detector and
+        // its `dead_nodes` field are gone with the stream protocol).
+        // The controller derives the Dead-equivalent signal from the
+        // open-attempt ledger view (deadline expiries clustered per
+        // source node). RPC failure is fail-open for observation
         // only: the tick skips new evidence, previously accumulated
         // evidence stays, and no node is marked from stale data.
         // r[impl ctrl.nodeclaim.wedge-cluster]
@@ -1297,8 +1296,7 @@ impl NodeClaimPoolReconciler {
                 Vec::new()
             }
         };
-        let wedged = self.wedge.update(&open_attempts, &bound, now);
-        let dead_input = wedge::dead_union(&intents.dead_nodes, &wedged);
+        let dead_input = self.wedge.update(&open_attempts, &bound, now);
 
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
@@ -1434,7 +1432,8 @@ impl NodeClaimPoolReconciler {
             },
         )
         .await?;
-        // No `dead_nodes` signal without the scheduler; local
+        // No wedge evidence without the scheduler (the open-attempt
+        // view is unreadable); local
         // ICE-timeout detection still runs on `live`. The returned
         // ice_cells are dropped — `report_unfulfillable` needs the
         // scheduler reachable.

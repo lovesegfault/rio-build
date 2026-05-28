@@ -137,10 +137,10 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_controller_disruption_drains_total",
-        "DisruptionTarget watcher preemption actions. Stream pods: DrainExecutor calls \
-         (result=sent|timeout|rpc_error). Pull-mode pods: synthesized preempted report + \
+        "DisruptionTarget watcher preemption actions: synthesized preempted report + \
          foreground Job delete (result=preempted_pull|preempted_pull_report_failed). \
-         Zero rate with evictions happening = watcher dead, falling back to SIGTERM self-drain."
+         Zero rate with evictions happening = watcher dead, falling back to the pod's \
+         own SIGTERM abort."
     );
     describe_gauge!(
         "rio_controller_component_scaler_learned_ratio",
@@ -184,10 +184,9 @@ pub fn describe_metrics() {
          reason=idle: NA-consolidate break-even; reason=ice: \
          Launched=False (timeout or terminal LaunchFailed reason); \
          reason=boot-timeout: Launched=True ∧ Registered=False past \
-         timeout; reason=dead: hung node — the scheduler-reported \
-         dead_nodes signal (stream pools) or the controller-side OA2 \
-         per-node deadline-expiry clustering (pull pools), consumed as \
-         one union; \
+         timeout; reason=dead: hung node — the controller-side OA2 \
+         per-node deadline-expiry clustering over the open-attempt \
+         view; \
          reason=vanished: in-flight claim Karpenter-GC'd between ticks."
     );
     describe_counter!(
@@ -247,7 +246,7 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_controller_job_terminal_report_seconds",
         "OA1 interval (i): Pod/Job terminal-condition timestamp → \
-         ReportExecutorTermination acked by the scheduler, by reason \
+         the pod-terminal ReportAttemptOutcome acked by the scheduler, by reason \
          (oom_killed | disk_pressure | deadline_exceeded). Sampled once \
          per terminal Pod/Job per controller process at the first acked \
          report — the report path re-reports the same object every tick \

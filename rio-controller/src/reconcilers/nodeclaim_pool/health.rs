@@ -10,14 +10,15 @@
 //!   `ice_timeout`): instance came up but kubelet never registered
 //!   (AMI/network/nodeadm failure). Delete; the cell isn't ICE-masked
 //!   (capacity exists, the boot failed).
-//! - **Dead** (scheduler-reported `dead_nodes`): the §13b hung-node
-//!   detector — ≥max(2,⌈0.5·occ⌉) stale-heartbeat executors across ≥2
-//!   tenants on one Node. Delete the NodeClaim (Karpenter handles
-//!   cordon+drain via finalizer).
+//! - **Dead** (the OA2 wedge clustering): per-node clustering of
+//!   pull-mode attempt-deadline expiries over the open-attempt ledger
+//!   view (`wedge::WedgeTracker` — the successor of the stream-era
+//!   heartbeat-fed hung-node detector). Delete the NodeClaim
+//!   (Karpenter handles cordon+drain via finalizer).
 //!
 //! Dead reaping is capped at `min(3, ⌈5%·|registered|⌉)` per tick
 //! (registered ∧ ¬terminating, the only population `classify` can emit
-//! `Dead` for) — a false-positive scheduler signal can't drain the
+//! `Dead` for) — a false-positive wedge signal can't drain the
 //! fleet in one tick.
 
 use std::collections::{HashMap, HashSet};
@@ -130,8 +131,9 @@ pub fn classify(
         if n.terminating() {
             continue;
         }
-        // Scheduler dead-node signal: keyed on the backing Node name
-        // (what executors heartbeat against), not the NodeClaim name.
+        // Dead-node signal (OA2 wedge clustering): keyed on the
+        // backing Node name (the attempt rows' source attribution),
+        // not the NodeClaim name.
         if n.registered
             && n.node_name
                 .as_deref()

@@ -107,7 +107,8 @@ async fn main() -> anyhow::Result<()> {
     };
     // Wrap the balanced channel with a service-token interceptor: every
     // AdminService RPC carries `x-rio-service-token` so the scheduler's
-    // controller-only gates (AppendInterruptSample, DrainExecutor) pass.
+    // controller-only gates (AppendInterruptSample, ReportAttemptOutcome,
+    // AckSpawnedIntents, MintExecutorTokens) pass.
     // r[impl sec.authz.service-token]
     let service_signer = rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
         .map_err(|e| anyhow::anyhow!("service HMAC key load: {e}"))?
@@ -208,11 +209,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ---- DisruptionTarget watcher ----
     // Pod watcher: K8s sets DisruptionTarget=True on a pod BEFORE
-    // eviction (node drain, spot interrupt). We fire DrainExecutor
-    // {force:true} → scheduler preempts in-flight builds (cgroup.
-    // kill + reassign) in seconds instead of burning the 2h
-    // terminationGracePeriodSeconds. SIGTERM self-drain (force=
-    // false) is the fallback if this task misses the window.
+    // eviction (node drain, spot interrupt). We synthesize the
+    // preempted report and foreground-delete the owning Job → the
+    // pod's SIGTERM-abort cgroup-kills the build and the drv requeues
+    // in seconds instead of burning the grace period. The pod's own
+    // SIGTERM abort is the fallback if this task misses the window.
     //
     // spawn_monitored: if the watcher panics, logged; controller
     // keeps reconciling. Loses fast-preemption but not correctness

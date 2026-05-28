@@ -19,8 +19,8 @@ use kube::api::{Api, DeleteParams, ObjectList, ObjectMeta};
 
 use crate::fixtures::{ApiServerVerifier, Scenario};
 use crate::reconcilers::pool::job::{
-    JobCensus, ORPHAN_REAP_GRACE, SpawnOutcome, delete_job_with_synthesized_report, is_active_job,
-    job_census, orphan_reap_gate, reap_excess_pending, spawn_for_each, synthesized_report_for_job,
+    JobCensus, SpawnOutcome, delete_job_with_synthesized_report, is_active_job, job_census,
+    reap_excess_pending, reap_orphan_running, spawn_for_each, synthesized_report_for_job,
     try_spawn_job,
 };
 use crate::reconcilers::pool::jobs::{
@@ -1085,98 +1085,56 @@ async fn delete_job_report_failure_does_not_block_delete() {
     guard.verified().await;
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+3]
-/// `orphan_reap_gate` returns `None` (skip reap) for `Err` AND
-/// `Ok(empty)`. On 2-replica scheduler failover the new leader returns
-/// `Ok([])` until workers reconnect; `select_orphan_running`'s
-/// `None => true` arm would foreground-delete every Running Job past
-/// the 5-min grace.
-#[test]
-fn orphan_reap_gate_failclosed_on_empty_and_err() {
-    use rio_proto::types::ListExecutorsResponse;
-    let resp = |execs: Vec<rio_proto::types::ExecutorInfo>| ListExecutorsResponse {
-        executors: execs,
-        // Past ORPHAN_REAP_GRACE (300s) so the leader-age arm is NOT
-        // what's under test here.
-        leader_for_secs: 600,
-    };
-    assert!(
-        orphan_reap_gate(Ok(resp(vec![])), "p", ORPHAN_REAP_GRACE).is_none(),
-        "Ok(empty) → None (new-leader pre-reconnect)"
+// r[verify ctrl.ephemeral.reap-orphan-running+4]
+/// Obligation-(i) posture after the 1d cleanup: the orphan reap's only
+/// busy source is the durable open-attempt view, and an unreadable
+/// view (RPC error / scheduler unreachable) means NO reap this tick —
+/// fail-closed is retained while the stream-era leader-age and
+/// empty-list arms are gone (they gated an in-memory map that no
+/// longer exists). With the dead admin channel every RPC fails, so the
+/// Running Job past the grace must NOT be deleted.
+#[tokio::test]
+async fn reap_orphan_running_fail_closed_on_view_error() {
+    let (client, _verifier) = ApiServerVerifier::new();
+    // Dead admin channel: ListOpenAttempts fails.
+    let ctx = super::test_ctx(client.clone());
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    // Running (ready=1), 600 s old — past the 300 s orphan grace.
+    let job = running_job_for_intent("rio-builder-p-orph1", "drv-orph-1");
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    assert_eq!(
+        reaped, 0,
+        "unreadable open-attempt view → fail-closed → no orphan reap"
     );
-    assert!(
-        orphan_reap_gate(
-            Err(tonic::Status::unavailable("standby")),
-            "p",
-            ORPHAN_REAP_GRACE
-        )
-        .is_none(),
-        "Err → None (unreachable)"
-    );
-    let exec = rio_proto::types::ExecutorInfo {
-        executor_id: "x".into(),
-        ..Default::default()
-    };
-    assert!(
-        orphan_reap_gate(Ok(resp(vec![exec])), "p", ORPHAN_REAP_GRACE).is_some(),
-        "Ok(nonempty, old leader) → Some"
-    );
+    // No DELETE was issued: the fail-closed return happens before any
+    // kube call, so the un-driven mock apiserver is never touched (a
+    // wrongly-attempted DELETE would hang this test against the
+    // never-answering verifier instead of passing).
 }
 
-// r[verify ctrl.ephemeral.reap-orphan-running+3]
-// r[verify sched.admin.list-executors-leader-age+2]
-/// bug_073 (stream era): right after a failover the busy view could be
-/// incomplete, so a non-empty PARTIAL list cannot prove absence —
-/// `select_orphan_running`'s `None => true` arm would
-/// foreground-delete every not-yet-reconnected worker's Running Job
-/// mid-build. `leader_for_secs < ORPHAN_REAP_GRACE` → fail-closed.
-#[test]
-fn orphan_reap_gate_failclosed_on_young_leader() {
-    use rio_proto::types::{ExecutorInfo, ListExecutorsResponse};
-    let one = vec![ExecutorInfo {
-        executor_id: "a-1-pqrst".into(),
-        ..Default::default()
-    }];
-    // 10s into failover: one foreign-pool worker reconnected. Gate
-    // MUST NOT pass — pool-B workers haven't reconnected yet.
-    assert!(
-        orphan_reap_gate(
-            Ok(ListExecutorsResponse {
-                executors: one.clone(),
-                leader_for_secs: 10
-            }),
-            "pool-b",
-            ORPHAN_REAP_GRACE
-        )
-        .is_none(),
-        "young leader (10s < 300s grace) → None even with non-empty list"
-    );
-    // Past grace: every worker has had ORPHAN_REAP_GRACE to reconnect;
-    // absence is now meaningful.
-    assert!(
-        orphan_reap_gate(
-            Ok(ListExecutorsResponse {
-                executors: one,
-                leader_for_secs: 301
-            }),
-            "pool-b",
-            ORPHAN_REAP_GRACE
-        )
-        .is_some(),
-        "leader past grace (301s ≥ 300s) → Some"
-    );
-    // Past grace BUT empty: still fail-closed (belt-and-suspenders).
-    assert!(
-        orphan_reap_gate(
-            Ok(ListExecutorsResponse {
-                executors: vec![],
-                leader_for_secs: 600
-            }),
-            "pool-b",
-            ORPHAN_REAP_GRACE
-        )
-        .is_none(),
-        "empty still gates regardless of leader age"
+// r[verify ctrl.ephemeral.reap-orphan-running+4]
+// r[verify ctrl.job.busy-from-open-attempts+2]
+/// Positive control for the fail-closed test above, and the busy-view
+/// re-key: with a readable (empty) open-attempt view the same Job IS
+/// reaped — absence from the durable view is authoritative on its own,
+/// with no leader-age or non-empty-list precondition; and a Job whose
+/// intent has an open attempt is left alone.
+#[tokio::test]
+async fn reap_orphan_running_reaps_on_readable_view() {
+    let (client, verifier) = ApiServerVerifier::new();
+    // In-process MockAdmin: ListOpenAttempts answers Ok with the
+    // default (empty) view.
+    let (ctx, _admin_handle) = ctx_with_mock_admin(client.clone()).await;
+    let jobs_api: Api<Job> = Api::namespaced(client, "rio");
+
+    let job = running_job_for_intent("rio-builder-p-orph2", "drv-orph-2");
+    let guard = verifier.run(vec![delete_scenario("rio-builder-p-orph2")]);
+    let reaped = reap_orphan_running(&jobs_api, &[job], &HashSet::new(), &ctx, "p").await;
+    guard.verified().await;
+    assert_eq!(
+        reaped, 1,
+        "readable view with no covering attempt → the orphan is reaped"
     );
 }
 
@@ -1362,7 +1320,7 @@ fn report_intent_id_is_populated_only_for_pull_mode() {
 // AD5 cancel arm (pull-mode pools only)
 // ───────────────────────────────────────────────────────────────────
 
-// r[verify ctrl.drain.disruption-target+2]
+// r[verify ctrl.drain.disruption-target+3]
 /// The cancel arm's evidence rule, exhaustively: only the
 /// closed→active edge selects a Job; an open attempt records evidence;
 /// bare absence (a pod that has not pulled yet, or one waiting on
@@ -1428,7 +1386,7 @@ fn cancel_arm_selects_only_closed_attempt_edges() {
     assert!(!seen_open.contains_key("rio/p/rio-builder-p-gone1"));
 }
 
-// r[verify ctrl.drain.disruption-target+2]
+// r[verify ctrl.drain.disruption-target+3]
 /// The AD5 evidence map is scoped per pool: one pool's tick (with its
 /// own active set, or the empty-active early return) never erases a
 /// sibling pool's evidence in the same namespace, the sibling's
@@ -1499,7 +1457,7 @@ fn cancel_arm_evidence_is_scoped_per_pool() {
     );
 }
 
-// r[verify ctrl.drain.disruption-target+2]
+// r[verify ctrl.drain.disruption-target+3]
 /// End-to-end over the wire mocks: a recorded closed→active edge gets
 /// its Job foreground-deleted (and only that Job); the synthesize arm
 /// is structurally inert because nothing is open any more.
@@ -1526,7 +1484,7 @@ async fn cancel_arm_deletes_job_on_closed_edge() {
     assert_eq!(cancelled, 1, "exactly the edge Job is deleted");
 }
 
-// r[verify ctrl.drain.disruption-target+2]
+// r[verify ctrl.drain.disruption-target+3]
 /// Fail-closed: a failed `ListOpenAttempts` read produces no cancel
 /// decisions and leaves the recorded evidence untouched, exactly like
 /// the orphan reap's posture.
