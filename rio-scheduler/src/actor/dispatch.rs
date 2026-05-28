@@ -1813,10 +1813,8 @@ impl DagActor {
             // chain-scoped — clear it so a LATER chain (e.g. a stale-
             // Completed reset after GC) starts with a clean slate
             // instead of vetoing forgiveness of a path no live build
-            // wants any more. The closure-hole breadcrumb is dropped
-            // with the same completion hygiene.
+            // wants any more.
             state.never_forgive_paths.clear();
-            state.closure_hole = false;
             // IA-only convenience: `expected_output_paths` IS the
             // realised path. Non-destructive when a path is already
             // known — the floating-CA reprobe→re-substitute lane

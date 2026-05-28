@@ -420,14 +420,16 @@ impl SchedulerDb {
 
     /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, on
     /// the pool (outside any transaction). Sole caller: the merge-time
-    /// heal in `handle_merge_dag`, for the edge parents of a full merge
-    /// whose IN-MEMORY node carried the breadcrumb before the heal
-    /// flipped it (the heal clears the hole even when the
-    /// `topdown_pruned` mark stays, so it cannot ride the mark-clear
-    /// helpers above). Returns the number of rows actually cleared. The
-    /// caller warns and continues on error — a stale persisted hole errs
-    /// toward the bounded fail-fast after a later failover, never the
-    /// doomed from-source dispatch.
+    /// heal in `handle_merge_dag`, for EVERY edge parent of a full
+    /// merge (the heal clears the hole even when the `topdown_pruned`
+    /// mark stays, so it cannot ride the mark-clear helpers above; it
+    /// is total — not keyed on the in-memory bit — because the
+    /// persisted copy can be stale when the in-memory one was cleared
+    /// elsewhere or lost, and the `AND closure_hole` WHERE keeps the
+    /// statement a no-op for clean rows). Returns the number of rows
+    /// actually cleared. The caller warns and continues on error — a
+    /// stale persisted hole errs toward the bounded fail-fast after a
+    /// later failover, never the doomed from-source dispatch.
     pub(crate) async fn clear_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],

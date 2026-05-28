@@ -3913,6 +3913,502 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
 }
 
 // r[verify sched.merge.substitute-topdown+10]
+/// The closure-hole breadcrumb must survive the node's own Completed →
+/// stale-reset round-trip (bughunter round-21 bug_007). Staging: B1's
+/// prune stamps R and parks its detached fetch; BC produces dep2; B2
+/// full-merges app→R→{dep1 unbuilt, dep2 produced}; B2's cancel reaps
+/// the un-produced dep1 out from under R while R's walk is still in
+/// flight (closure hole set in memory, persisted by the leader's reap
+/// hook). R's parked fetch then SUCCEEDS — R completes through the
+/// inline store completion while still carrying the hole. Its recorded
+/// output is treated as GC'd (it was never in the local store) and a
+/// later build C re-references R through another pruned merge (no edges
+/// declared → no heal): the stale-Completed verify resets R and
+/// re-spawns the walk. When that walk fails, the surviving child set
+/// ({dep2}, produced) is a reap-truncated view of R's pruned closure,
+/// so the verdict must take the resubmit-directing fail-fast — NOT the
+/// Vouched lazy clear + Ready revert that hands R to a worker from
+/// source. Pre-fix the completion dropped the in-memory hole, the lazy
+/// clear judged the truncated set Vouched (laundering the persisted
+/// mark AND breadcrumb), and the next dispatch pass cut a doomed
+/// from-source assignment.
+#[tokio::test]
+async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park every detached fetch on the QPI gate (never released) so
+    // walk verdicts are injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep1 with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless),
+    // drops dep1.
+    let r_out = test_store_path("tdcr-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdcr-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("tdcr-dep1");
+        n.expected_output_paths = vec![test_store_path("tdcr-dep1-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdcr-r", "tdcr-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdcr-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // BC: dep2 is produced (cache-hit at merge) and kept alive by BC's
+    // interest across B2's later reap.
+    let dep2_out = test_store_path("tdcr-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("tdcr-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evbc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdcr-dep2").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep2 is produced before B2 attaches it to R"
+    );
+
+    // B2: full merge app→R→{dep1 unbuilt, dep2 produced}; the mark
+    // survives (children not all produced).
+    let mut app = make_node("tdcr-app");
+    app.expected_output_paths = vec![test_store_path("tdcr-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdcr-app", "tdcr-r"),
+            make_test_edge("tdcr-r", "tdcr-dep1"),
+            make_test_edge("tdcr-r", "tdcr-dep2"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Cancel B2 and reap its sole-interest nodes WHILE R's walk is
+    // still parked: dep1 — never produced — is reaped out from under R
+    // (closure hole, persisted by the leader's reap hook); dep2
+    // survives via BC's interest, R via B1's.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdcr-dep1").await?.is_none(),
+        "B2's sole-interest unbuilt dep1 must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdcr-dep2").await?.is_some(),
+        "dep2 must survive the reap (BC still holds interest in it)"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tdcr-r").await.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the reap must not settle a survivor whose walk is in flight"
+    );
+
+    // R's parked fetch now SUCCEEDS: the inline store completion ends
+    // the chain and R goes Completed while still carrying the hole.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdcr-r".into(),
+            ok: true,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tdcr-r").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: the ok=true verdict completes R inline"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "fixture premise: B1 succeeds when R completes"
+    );
+
+    // R's recorded output was never in the local store (it "completed"
+    // via the substitution path, and from here on it is treated as
+    // GC'd while upstream still advertises it). Build C re-references
+    // R through another pruned merge — its dep is dropped, so NO edge
+    // where R is a parent is declared and the merge-time heal cannot
+    // fire. The stale-Completed verify finds R's recorded output
+    // missing-but-substitutable, resets R, and re-spawns the walk.
+    let mk_depc = || {
+        let mut n = make_node("tdcr-depc");
+        n.expected_output_paths = vec![test_store_path("tdcr-depc-out")];
+        n
+    };
+    let c = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        c,
+        vec![mk_r(), mk_depc()],
+        vec![make_test_edge("tdcr-r", "tdcr-depc")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, c).await?.total_derivations,
+        1,
+        "fixture premise: C took the roots-only prune path (no edges declared, no heal)"
+    );
+    let staged = expect_drv(&handle, "tdcr-r").await;
+    assert_eq!(
+        staged.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the stale-Completed verify reset R and re-spawned its walk"
+    );
+    // The mark and the persisted breadcrumb both survive the
+    // Completed→stale-reset round-trip: completing the node does not
+    // re-declare its edges, so it must not launder the truncation
+    // evidence.
+    assert!(
+        staged.topdown_pruned,
+        "the topdown_pruned mark must survive R's completion and stale reset"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdcr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "the persisted mark and closure-hole breadcrumb must survive the \
+         Completed→stale-reset round-trip (topdown_pruned={pg_pruned}, \
+         closure_hole={pg_hole})"
+    );
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the truncated child set is wrongly judged
+    // Vouched after the walk failure.
+    let mut worker_rx = connect_executor(&handle, "tdcr-w", "x86_64-linux").await?;
+
+    // The re-spawned walk genuinely fails (upstream advertised the
+    // path but could not deliver). R's surviving children ({dep2}) are
+    // all produced but reap-truncated: the verdict must take the
+    // resubmit-directing fail-fast, not the Vouched lazy clear.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdcr-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let sc = query_status(&handle, c).await?;
+    assert_eq!(
+        sc.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "C must fail via the resubmit-directing fail-fast when the re-spawned walk \
+         fails (was: the completion-time hole drop made the truncated child set \
+         Vouched → lazy clear → Ready revert, C left Active)"
+    );
+    assert!(
+        sc.error_summary.contains("topdown") && sc.error_summary.contains("resubmit"),
+        "C's error summary should direct resubmit; got {:?}",
+        sc.error_summary
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the fail-fast must not disturb the already-completed B1"
+    );
+
+    // No from-source dispatch may follow: drive a dispatch pass and
+    // assert R was neither left dispatchable nor handed to the worker.
+    tick(&handle).await?;
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a marked closure-holed root must never be dispatched from source after \
+             its walk fails (its pruned closure was never merged — the worker would \
+             ENOENT)"
+        );
+    }
+    let r = expect_drv(&handle, "tdcr-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "R must not be dispatchable from source after the closure hole; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the fail-fast consumes (clears) the mark it acted on"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdcr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !pg_pruned && !pg_hole,
+        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+         closure_hole={pg_hole})"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
+/// for every edge parent it re-declares, regardless of the in-memory
+/// copy's history (bughunter round-21 merged_bug_001). Staging: same
+/// reap shape as above (B1's prune stamps R; BC produces dep2; B2
+/// full-merges app→R→{dep1 unbuilt, dep2 produced}; B2's cancel reaps
+/// dep1 → closure hole set in memory and persisted). R's parked fetch
+/// then succeeds → R completes, and its output is seeded so no
+/// stale-Completed reset interferes. A later build D full-merges R
+/// with its real edges (app2→R→{dep1, dep2}; dep1 re-inserted unbuilt
+/// so the produced-children clear pass cannot drop the mark and take
+/// the breadcrumb with it — the heal is the only PG clear in play):
+/// re-declaring R's edges makes its child set representative again, so
+/// the persisted breadcrumb must be FALSE once that merge commits.
+/// Pre-fix the completion dropped the in-memory hole and the heal
+/// pushed the PG clear only for parents whose in-memory bit was still
+/// set, so the stale persisted hole survived completion + the full
+/// re-merge, and a later failover would restore it as
+/// permanently-Broken closure evidence (wrongful fail-fast for a node
+/// whose closure was in fact fully re-merged).
+#[tokio::test]
+async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park every detached fetch on the QPI gate (never released) so
+    // walk verdicts are injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep1 with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless).
+    let r_out = test_store_path("tdhc-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdhc-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("tdhc-dep1");
+        n.expected_output_paths = vec![test_store_path("tdhc-dep1-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdhc-r", "tdhc-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    assert!(
+        expect_drv(&handle, "tdhc-r").await.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+
+    // BC: dep2 is produced (cache-hit at merge) and kept alive by BC's
+    // interest across B2's later reap.
+    let dep2_out = test_store_path("tdhc-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("tdhc-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evbc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // B2: full merge app→R→{dep1 unbuilt, dep2 produced}; the mark
+    // survives (children not all produced).
+    let mut app = make_node("tdhc-app");
+    app.expected_output_paths = vec![test_store_path("tdhc-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdhc-app", "tdhc-r"),
+            make_test_edge("tdhc-r", "tdhc-dep1"),
+            make_test_edge("tdhc-r", "tdhc-dep2"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Cancel B2 and reap its sole-interest nodes WHILE R's walk is
+    // still parked: dep1 — never produced — is reaped out from under R
+    // and the leader's reap hook persists the breadcrumb.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdhc-dep1").await?.is_none(),
+        "B2's sole-interest unbuilt dep1 must be reaped (closure hole on R)"
+    );
+
+    // R's parked fetch SUCCEEDS: R completes while carrying the hole.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdhc-r".into(),
+            ok: true,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tdhc-r").await.status,
+        DerivationStatus::Completed,
+        "fixture premise: the ok=true verdict completes R inline"
+    );
+    let (pg_hole_before,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'tdhc-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_hole_before,
+        "fixture premise: the persisted breadcrumb survives R's completion (completion \
+         is not an edge-redeclaring event)"
+    );
+
+    // Seed R's output so D's merge does not trigger the stale-Completed
+    // reset — the heal is the only closure-hole-clearing mechanism in
+    // play for this merge.
+    store.seed_with_content(&r_out, b"r-out");
+
+    // D: a FULL merge that re-declares R's real edge set
+    // (app2 → R → {dep1, dep2}; app2's output is not substitutable, so
+    // no prune). dep1 is re-inserted unbuilt, so the produced-children
+    // clear pass keeps the mark — only the heal may touch the persisted
+    // breadcrumb here.
+    let mut app2 = make_node("tdhc-app2");
+    app2.expected_output_paths = vec![test_store_path("tdhc-app2-out")];
+    let d = Uuid::new_v4();
+    let _evd = merge_dag(
+        &handle,
+        d,
+        vec![app2, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdhc-app2", "tdhc-r"),
+            make_test_edge("tdhc-r", "tdhc-dep1"),
+            make_test_edge("tdhc-r", "tdhc-dep2"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The full re-merge must leave the persisted breadcrumb FALSE: the
+    // heal pushes the PG clear for every re-declared edge parent, so
+    // the outcome cannot depend on the in-memory bit's history (here
+    // the breadcrumb rode through R's completion and this heal flips
+    // it; the in-memory-cleared/lost shapes are guarded by the heal
+    // being total in code — see its comment in `handle_merge_dag`).
+    // The mark itself stays — R's re-declared children are not all
+    // produced — pinning that the heal clears the breadcrumb
+    // independently of the mark-clear helpers.
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdhc-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !pg_hole,
+        "a full merge that re-declares R's edges must clear the persisted closure_hole \
+         even when the in-memory copy was already clear/lost — otherwise the stale \
+         persisted breadcrumb survives every later merge and a failover restores it as \
+         permanently-Broken closure evidence (wrongful fail-fast)"
+    );
+    assert!(
+        pg_pruned,
+        "fixture premise: the mark itself stays (re-declared children are not all \
+         produced) — the breadcrumb clear must not depend on the mark clear"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
 /// The lazy clear in `handle_substitute_complete`: when a pruned root's
 /// children are ALL produced by the time its own walk fails, the mark is
 /// moot — cleared in memory AND in PG (best-effort, so a failover cannot

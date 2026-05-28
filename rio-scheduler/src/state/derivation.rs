@@ -893,15 +893,21 @@ pub struct DerivationState {
     /// `SubstituteComplete{ok=false}`, `handle_substitute_complete`
     /// fails every interested build instead of demoting to Ready
     /// (which would dispatch a doomed build); the dispatch-time probes
-    /// take the same fail-fast arm for a childless flagged node whose
-    /// wanted outputs turn out missing and unsubstitutable, and the
-    /// reap-time hook and the walk-failure children gate treat a
-    /// `closure_hole` survivor (an un-produced child reaped out from
-    /// under it — see that field) as childless-equivalent.
+    /// take the same fail-fast arm via `must_substitute` — mark set
+    /// AND closure evidence `Broken`, i.e. childless OR carrying the
+    /// `closure_hole` breadcrumb (an un-produced child reaped out from
+    /// under it — see that field) — when the flagged node's wanted
+    /// outputs turn out missing and unsubstitutable; every
+    /// children-keyed verdict (the dispatch guards, the reap-time
+    /// hook, the walk-failure gate, and all clear sites) judges the
+    /// same `ClosureEvidence`, treating a closure-holed survivor as
+    /// childless-equivalent.
     /// r[sched.merge.substitute-topdown+10]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
-    /// cleared once its children are all produced, or when the
-    /// fail-fast consumes it) and restored by
+    /// cleared only on a `Vouched` verdict — ≥1 child, all produced,
+    /// no closure hole, and at recovery additionally a still-live
+    /// build co-owning the parent to vouch for each produced child —
+    /// or when the fail-fast consumes it) and restored by
     /// `from_recovery_row` — unlike `substitute_tried`, losing it
     /// across failover re-arms the doomed from-source dispatch.
     pub topdown_pruned: bool,
@@ -932,16 +938,30 @@ pub struct DerivationState {
     /// GC'd by `gc_orphan_terminal_derivations`, so the persisted
     /// breadcrumb is the only durable record of the truncation);
     /// `from_poisoned_row` keeps it false (poisoned restores are
-    /// TTL-tracking stubs, never children-judged). Reset automatically
-    /// on a resubmit-rebuild (fresh `try_from_node` state) and on
-    /// `rollback_merge` (the removed node is restored wholesale) —
-    /// same lifecycle as `substitute_tried`/`never_forgive_paths` —
-    /// and cleared explicitly when a later full merge re-declares the
-    /// node's edges (its child set is representative again; the heal
-    /// also pushes the clear to PG for the nodes that carried it), when
-    /// the fail-fast consumes the node (the PG mark-clear drops both
-    /// bits), and when the node itself completes or is skipped (no PG
-    /// counterpart needed: terminal rows are never recovered). Known
+    /// TTL-tracking stubs, never children-judged).
+    ///
+    /// The breadcrumb's lifecycle is decoupled from the node's own
+    /// status: it records the relation between the node's child set
+    /// and its pruned input closure, and the node completing or being
+    /// skipped does not repair that relation — so terminal transitions
+    /// do NOT drop it. It stays set and dormant: the children-keyed
+    /// consumers either never evaluate a terminal node (the dispatch
+    /// guards and the walk/reap fail-fast arms only see non-terminal
+    /// ones) or err conservative on it (the stamp gates and the clear
+    /// passes judge the holed child set Broken — a completed node
+    /// later re-kept by a prune is stamped, not exempted), and the
+    /// breadcrumb still guards the node when an in-tenure
+    /// stale-Completed reset or a failover re-opens its lifecycle.
+    /// Reset automatically on a resubmit-rebuild (fresh
+    /// `try_from_node` state) and on `rollback_merge` (the removed
+    /// node is restored wholesale) — same lifecycle as
+    /// `substitute_tried`/`never_forgive_paths` — and cleared
+    /// explicitly (memory + PG) only when a later full merge
+    /// re-declares the node's edges (its child set is representative
+    /// again; the heal pushes the PG clear for every re-declared edge
+    /// parent) and when the mark-clear / fail-fast helpers consume the
+    /// `topdown_pruned` mark it qualifies
+    /// (`clear_topdown_pruned_by_hash{,es}` drop both bits). Known
     /// residual: the poison-TTL sweep and admin ClearPoison delete
     /// children through `remove_node` without setting this breadcrumb
     /// (same accepted class as the GC residual).

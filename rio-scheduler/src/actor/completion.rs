@@ -1010,13 +1010,6 @@ impl DagActor {
                 return;
             }
 
-            // Completion hygiene: the closure-hole breadcrumb is scoped
-            // to the node's pre-completion lifetime (same as the
-            // chain-scoped spent-forgiveness set cleared by
-            // handle_completion above) — drop it with the terminal
-            // transition.
-            state.closure_hole = false;
-
             // Store output paths from built_outputs
             state.output_paths = result
                 .built_outputs

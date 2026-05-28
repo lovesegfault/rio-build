@@ -122,9 +122,12 @@ pub struct ReapOutcome {
 /// (see the breadcrumb loop in
 /// [`DerivationDag::remove_build_interest_and_reap`]), so whatever
 /// children survive are a reap-truncated view of its input closure.
-/// The breadcrumb is healed when a full merge re-declares the node's
-/// edges (the post-reconciliation pass in `handle_merge_dag`) and
-/// dropped when the node itself is produced or skipped.
+/// The breadcrumb survives the node's own completion or skip (those
+/// transitions do not repair the truncation); it is dropped only by the
+/// merge-time heal when a full merge re-declares the node's edges (the
+/// post-reconciliation pass in `handle_merge_dag`), by the mark-clear /
+/// fail-fast consumption of the `topdown_pruned` mark it qualifies, or
+/// by a resubmit/rollback rebuild of the node state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureEvidence {
     /// At least one child, every child produced (Completed/Skipped),
@@ -1188,11 +1191,8 @@ impl DerivationDag {
                 // node parked Queued (a downgraded walk waiting on the
                 // dep this cascade just resolved), so drop the
                 // chain-scoped spent-forgiveness set — same as the
-                // other completion sites. The closure-hole breadcrumb
-                // is likewise scoped to the node's pre-completion
-                // lifetime — drop it with the same hygiene.
+                // other completion sites.
                 state.never_forgive_paths.clear();
-                state.closure_hole = false;
                 skipped.push(hash);
             }
         }

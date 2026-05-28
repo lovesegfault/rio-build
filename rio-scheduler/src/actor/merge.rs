@@ -166,27 +166,34 @@ impl DagActor {
         // reap-truncated child set Broken, never Vouched.
         //
         // The persisted breadcrumb (`migrations/064`) is cleared here
-        // too, best-effort, for exactly the parents whose IN-MEMORY
-        // value was set before this loop flipped it: the upsert above
-        // never clears the column (OR-on-conflict, merge binds false),
-        // and the heal must also fire when the `topdown_pruned` mark
-        // stays (unbuilt children), so it cannot ride the mark-clear
-        // statement below. Keying on the pre-clear value keeps this a
-        // no-op for the overwhelming majority of merges instead of an
-        // UPDATE per edge parent.
-        let mut healed_holes: Vec<String> = Vec::new();
+        // too, best-effort, for EVERY edge parent of this submission:
+        // the upsert above never clears the column (OR-on-conflict,
+        // merge binds false), and the heal must also fire when the
+        // `topdown_pruned` mark stays (unbuilt children), so it cannot
+        // ride the mark-clear statement below. The clear is total —
+        // NOT keyed on the pre-clear in-memory value — because the
+        // persisted bit can be stale when the in-memory copy was
+        // cleared elsewhere or lost: the node may have been reaped out
+        // and re-inserted fresh (or restored by a poisoned-stub
+        // recovery) with the field at its `false` default while the
+        // OR-combined column still carries the old truncation, and an
+        // earlier heal's best-effort write may simply have failed. The
+        // helper's `AND closure_hole` WHERE keeps the statement a
+        // no-op for rows that never carried the hole.
         for hash in &ingest.edge_parent_hashes {
             if let Some(s) = self.dag.node_mut(hash) {
-                if s.closure_hole {
-                    healed_holes.push(hash.to_string());
-                }
                 s.closure_hole = false;
             }
         }
-        if !healed_holes.is_empty()
-            && let Err(e) = self.db.clear_closure_hole_by_hashes(&healed_holes).await
+        let heal_parents: Vec<String> = ingest
+            .edge_parent_hashes
+            .iter()
+            .map(|h| h.to_string())
+            .collect();
+        if !heal_parents.is_empty()
+            && let Err(e) = self.db.clear_closure_hole_by_hashes(&heal_parents).await
         {
-            warn!(build_id = %build_id, count = healed_holes.len(), error = %e,
+            warn!(build_id = %build_id, count = heal_parents.len(), error = %e,
                   "failed to clear persisted closure_hole after merge heal (continuing)");
         }
         let mut clear_candidates: HashSet<DrvHash> =
@@ -1035,10 +1042,8 @@ impl DagActor {
                     // trigger-wanting build went terminal before the delta
                     // re-walk ran). The spent-forgiveness set is
                     // chain-scoped — clear it like every other completion
-                    // site does. The closure-hole breadcrumb is dropped
-                    // with the same completion hygiene.
+                    // site does.
                     state.never_forgive_paths.clear();
-                    state.closure_hole = false;
                     // I-099/I-094: re-probe hit on a previously-failed node
                     // — failure history is moot now we have the output.
                     if matches!(
