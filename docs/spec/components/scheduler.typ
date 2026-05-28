@@ -1784,6 +1784,31 @@ edge-preserving semantics, and nodes that depend ON the displaced hash
 keep their edges --- they want its output whichever definition produces
 it.
 
+#r("sched.merge.displaced-failure-evidence")[
+  When the displacement interest prune removes a displaced derivation
+  from a still-running prior build that has already observed a failure,
+  the build's sticky first-failure summary MUST be persisted in the same
+  transaction as the link prune, and recovery MUST seed a recovered
+  non-terminal build's sticky failure from that persisted value. A prior
+  build with no observed failure MUST NOT be marked failed by the prune.
+]
+For a still-running `keepGoing` build the deleted `build_derivations`
+link was the only failover-recoverable evidence that the build ever had a
+failed derivation: its sticky failure lives in memory until the terminal
+transition, and recovery reconstructs the flag only from failed
+derivations still linked to the build. Without the in-transaction
+persist, a leader failover between the displacement and the build's
+remaining derivations finishing recovers the build with no failure
+evidence and it terminates `succeeded` --- a silent wrong-success whose
+outcome depends on whether a failover happened. Riding the merge
+transaction means the evidence cannot be lost once the prune is durable,
+and the no-observed-failure clause keeps joining a later-displaced node
+from being treated as a failure (the displaced result, if already
+received, stays credited per
+#rref("sched.merge.authoritative-conflict")). The pre-existing
+administrative prune paths (poison clear, TTL expiry) keep the link and
+therefore keep the reconstruction path; they are unaffected.
+
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from
   the submission that (re)creates its in-memory node. Submissions that join

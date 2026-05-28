@@ -8924,6 +8924,19 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         counts_after_displacement, squatter_counts,
         "terminal squatter's persisted counts frozen at its terminal transition"
     );
+    // r[verify sched.merge.displaced-failure-evidence]
+    // The still-running joiner never observed a failure (the squat
+    // Completed for it before the displacement), so the prune must not
+    // persist failure evidence for it.
+    let (joiner_summary,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(joiner)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        joiner_summary, None,
+        "no failure evidence persisted for a build with no observed failure"
+    );
 
     // The joiner's accounting no longer includes the displaced hash:
     // completing fillerB is enough to finish the build (no Active hang).
@@ -9716,5 +9729,107 @@ async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
             .fetch_one(&db.pool)
             .await?;
     assert_eq!(counts, (1, 1), "persisted counts untouched");
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-evidence]
+/// Displacing a failed derivation out of a still-running keep_going
+/// build persists that build's sticky first-failure summary in the same
+/// transaction as the link prune — and the build's live outcome is
+/// unchanged: it still ends Failed once its remaining derivations
+/// resolve.
+#[tokio::test]
+async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("squatW");
+
+    // keep_going build: an authoritative x86_64 node that will fail, plus
+    // its own aarch64 node so the build keeps running afterwards.
+    let watcher = Uuid::new_v4();
+    let mut squat = make_node("squatW");
+    squat.drv_content = b"Derive-squatW".to_vec();
+    squat.drv_content_authoritative = true;
+    merge_dag(
+        &handle,
+        watcher,
+        vec![squat, make_test_node("fillerW", "aarch64-linux")],
+        vec![],
+        true,
+    )
+    .await?;
+
+    // The squat fails permanently on a real worker → the watcher records
+    // its sticky first failure in memory and (keep_going) stays Active.
+    let mut rx = connect_executor(&handle, "w-evi", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path, squat_path,
+        "squat dispatched to the x86 worker"
+    );
+    complete_failure(
+        &handle,
+        "w-evi",
+        &squat_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "builder exploded",
+    )
+    .await?;
+    wait_for_status(&handle, "squatW", DerivationStatus::Poisoned).await;
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going build stays live after the failure"
+    );
+    // Nothing persisted yet: the sticky failure is in-memory only while
+    // the build runs (the terminal transition would normally write it).
+    let (pre,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(pre, None, "no evidence persisted before the displacement");
+
+    // A conflicting store-backed submission displaces the poisoned squat:
+    // the watcher's link (its only failed-node link) is pruned, so the
+    // same transaction must persist the failure evidence.
+    let displacer = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        displacer,
+        vec![make_test_node("squatW", "riscv64-linux")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        evidence.as_deref(),
+        Some("derivation squatW failed"),
+        "first-failure evidence persisted in the displacing merge's transaction"
+    );
+
+    // Live outcome unchanged: completing the watcher's remaining node
+    // ends the build Failed (sticky failure), not Succeeded.
+    let mut rx2 = connect_executor(&handle, "w-evi-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx2).await;
+    assert_eq!(assn.drv_path, test_drv_path("fillerW"));
+    complete_success(
+        &handle,
+        "w-evi-arm",
+        &test_drv_path("fillerW"),
+        &test_store_path("fillerW-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build still ends Failed after the displacement"
+    );
     Ok(())
 }

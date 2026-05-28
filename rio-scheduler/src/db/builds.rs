@@ -241,6 +241,31 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Persist a still-running build's sticky first-failure summary
+    /// without touching its status — `COALESCE` keeps an already-persisted
+    /// summary, so the first write wins (mirroring the in-memory
+    /// `get_or_insert_with`). Executor-scoped: the displacement path calls
+    /// this inside the merge transaction
+    /// (`sched.merge.displaced-failure-evidence`) so the evidence commits
+    /// or rolls back together with the link prune that would otherwise
+    /// erase the only recoverable trace of the failure. Plain runtime
+    /// query — no `.sqlx/` impact.
+    // r[impl sched.merge.displaced-failure-evidence]
+    pub(crate) async fn persist_build_error_summary_tx(
+        conn: &mut sqlx::PgConnection,
+        build_id: Uuid,
+        error_summary: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE builds SET error_summary = COALESCE(error_summary, $2) WHERE build_id = $1",
+        )
+        .bind(build_id)
+        .bind(error_summary)
+        .execute(&mut *conn)
+        .await?;
+        Ok(())
+    }
+
     /// Update a build's status.
     pub async fn update_build_status(
         &self,

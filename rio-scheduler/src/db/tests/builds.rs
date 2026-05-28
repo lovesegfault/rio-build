@@ -107,3 +107,46 @@ async fn test_list_builds_denorm_counts_roundtrip() -> anyhow::Result<()> {
     assert_eq!(row.completed_derivations, 50);
     Ok(())
 }
+
+// r[verify sched.merge.displaced-failure-evidence]
+/// `persist_build_error_summary_tx` records the first failure and never
+/// overwrites an already-persisted summary (COALESCE semantics).
+#[tokio::test]
+async fn test_persist_build_error_summary_tx_first_failure_wins() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let build_id = Uuid::new_v4();
+    db.insert_build(
+        build_id,
+        None,
+        crate::state::PriorityClass::Scheduled,
+        true,
+        &Default::default(),
+        None,
+    )
+    .await?;
+
+    let read = || async {
+        let (s,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(build_id)
+                .fetch_one(&test_db.pool)
+                .await?;
+        anyhow::Ok(s)
+    };
+    assert_eq!(read().await?, None);
+
+    let mut conn = db.pool().acquire().await?;
+    SchedulerDb::persist_build_error_summary_tx(&mut conn, build_id, "derivation a failed").await?;
+    assert_eq!(read().await?.as_deref(), Some("derivation a failed"));
+
+    // A later write does not displace the first failure.
+    SchedulerDb::persist_build_error_summary_tx(&mut conn, build_id, "derivation b failed").await?;
+    assert_eq!(
+        read().await?.as_deref(),
+        Some("derivation a failed"),
+        "first persisted failure wins"
+    );
+    Ok(())
+}

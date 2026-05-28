@@ -5440,3 +5440,105 @@ async fn test_displaced_total_adjustment_survives_failover() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.merge.displaced-failure-evidence]
+/// Wrong-success regression: a keep_going build whose FAILED derivation
+/// is displaced out of its interest must still end Failed after a leader
+/// failover. The displacement prune deletes the build's only failed-node
+/// link, so without the persisted evidence recovery rebuilds the build
+/// with no failure trace and the completion of its remaining derivations
+/// flips it to Succeeded.
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_displacement() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // keep_going build: an authoritative x86_64 node that fails for
+        // real (PermanentFailure → Poisoned → sticky in-memory failure),
+        // plus its own aarch64 node still pending at failover time.
+        let mut squat = make_node("squat-evi");
+        squat.drv_content = b"Derive-squat-evi".to_vec();
+        squat.drv_content_authoritative = true;
+        merge_dag(
+            &handle,
+            watcher,
+            vec![squat, make_test_node("filler-evi", "aarch64-linux")],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-evi-r", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("squat-evi"));
+        complete_failure(
+            &handle,
+            "w-evi-r",
+            &test_drv_path("squat-evi"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "squat-evi", DerivationStatus::Poisoned).await;
+
+        // Conflicting store-backed submission displaces the poisoned
+        // node, pruning the watcher's only failed-node link — and
+        // persisting its failure evidence in the same transaction.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-evi", "riscv64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "failure evidence persisted before the failover"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the watcher recovers Active with its sticky failure
+    // seeded from PG; finishing its remaining derivation must end the
+    // build Failed — not the silent wrong-success.
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx = connect_executor(&handle, "w-evi-r-arm", "aarch64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("filler-evi"),
+        "only the watcher's own remaining node is dispatchable on aarch64"
+    );
+    complete_success(
+        &handle,
+        "w-evi-r-arm",
+        &assn.drv_path,
+        &test_store_path("filler-evi-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    let status = query_status(&handle, watcher).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build ends Failed post-failover (evidence survived the prune)"
+    );
+    assert!(
+        !status.error_summary.is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    Ok(())
+}

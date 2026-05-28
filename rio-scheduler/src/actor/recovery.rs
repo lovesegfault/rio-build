@@ -668,6 +668,15 @@ impl DagActor {
             info.total_count = row.total_drvs as u32;
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
+            // r[impl sched.merge.displaced-failure-evidence]
+            // Sticky first-failure evidence persisted while the build was
+            // running (displacement prune). Seeding it here keeps a
+            // keep_going build's outcome failover-independent even when
+            // the failed derivation is no longer linked to it; the
+            // failed_count-based reconstruction in
+            // finalize_recovered_builds stays as the fallback for builds
+            // whose failed nodes are still linked.
+            info.error_summary = row.error_summary;
             // Seed submitted_at from PG so r[sched.timeout.per-build]
             // and rio_scheduler_build_duration_seconds survive failover
             // (otherwise each failover grants a fresh full

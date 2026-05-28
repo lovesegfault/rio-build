@@ -2220,6 +2220,7 @@ impl DagActor {
         // history), never the displacer. Per-hash loop is fine —
         // displacement is a rare, adversarial-only path.
         // r[impl sched.merge.authoritative-conflict+4]
+        let mut evidence_persisted: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
             let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {
                 // displaced ⊆ newly_inserted, so the upsert returned an id
@@ -2240,6 +2241,38 @@ impl DagActor {
             )
             .await?;
             debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");
+
+            // r[impl sched.merge.displaced-failure-evidence]
+            // For a still-running keep_going build, the link just deleted
+            // was the only durable evidence that it ever had a failed
+            // derivation: its sticky error_summary lives in memory only
+            // (persisted at the terminal transition), and recovery
+            // reconstructs the sticky flag from failed nodes still LINKED
+            // to the build. Persist the in-memory first-failure summary in
+            // the same transaction, so a leader failover before the
+            // build's remaining derivations finish cannot flip its
+            // outcome to a silent wrong-success. Builds with no observed
+            // failure (e.g. the displaced node had Completed for them)
+            // are left untouched — joining a later-displaced node is not
+            // a failure.
+            for prior_build in &interest.prior_builds {
+                if !evidence_persisted.insert(*prior_build) {
+                    continue;
+                }
+                let Some(summary) = self
+                    .builds
+                    .get(prior_build)
+                    .and_then(|b| b.error_summary.as_deref())
+                else {
+                    continue;
+                };
+                crate::db::SchedulerDb::persist_build_error_summary_tx(
+                    &mut tx,
+                    *prior_build,
+                    summary,
+                )
+                .await?;
+            }
         }
 
         // Batch 2c: durable half of the displaced-edge scrub

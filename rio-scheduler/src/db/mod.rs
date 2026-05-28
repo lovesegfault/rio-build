@@ -196,6 +196,15 @@ pub(crate) struct RecoveryBuildRow {
     pub total_drvs: i32,
     pub completed_drvs: i32,
     pub cached_drvs: i32,
+    /// Sticky first-failure summary persisted while the build was still
+    /// running (`sched.merge.displaced-failure-evidence`): a keep_going
+    /// build whose failed derivation was displaced has no failed node
+    /// linked to it anymore, so the failed-count reconstruction cannot
+    /// rebuild the sticky flag — this column is the durable evidence.
+    /// `NULL` for builds that never observed a failure (terminal
+    /// transitions also write the column, but those rows aren't loaded
+    /// here).
+    pub error_summary: Option<String>,
     /// PG-side `now() - submitted_at` so the caller can reconstruct an
     /// `Instant` (same pattern as [`PoisonedDerivationRow`]). Seeds
     /// `BuildInfo::submitted_at` so `r[sched.timeout.per-build]` and
