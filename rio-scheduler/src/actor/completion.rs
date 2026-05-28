@@ -191,8 +191,13 @@ impl DagActor {
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
     /// flagged parent whose children are now ALL produced
-    /// (`children_all_produced` — the same criterion every stamp and
-    /// clear site uses). This is the children-became-produced clearing
+    /// (`children_all_produced` — the criterion the stamp sites and the
+    /// in-process clear sites share; the in-process clears additionally
+    /// honor the closure-hole veto below, and the recovery-time gate
+    /// applies a strictly stronger per-child criterion: produced AND
+    /// vouched for by a still-live build —
+    /// `load_parents_with_all_children_produced`). This is the
+    /// children-became-produced clearing
     /// site the merge-time post-reconciliation pass cannot see: that
     /// pass only sees the children already produced while a merge is
     /// being ingested, but a pruned node's children are typically

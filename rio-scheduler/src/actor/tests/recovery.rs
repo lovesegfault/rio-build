@@ -3897,7 +3897,12 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
 // r[verify sched.merge.substitute-topdown+10]
 /// Failover counterpart of the children-became-produced clear: a
 /// restored `topdown_pruned` mark must be DROPPED at recovery when the
-/// node's persisted children are all produced (`completed`/`skipped`).
+/// node's persisted children are all produced (`completed`/`skipped`)
+/// and vouched for by a still-live build. This test stages the
+/// live-vouched side of that gate; the keep side — produced children
+/// linked only to terminal builds — is pinned by
+/// `test_failover_keeps_topdown_pruned_when_produced_children_belong_to_terminal_build`
+/// below.
 ///
 /// The recovered in-memory DAG cannot tell such a parent apart from a
 /// genuine childless pruned root — produced children are filtered out
