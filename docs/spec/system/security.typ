@@ -115,12 +115,25 @@
   The scheduler signs *assignment tokens* (HMAC-SHA256) when dispatching work.
   Token format is
   `base64url(json(AssignmentClaims)).base64url(hmac_sha256(key, claims_json))`.
-  `AssignmentClaims` has exactly five fields: `executor_id` (string, audit only
-  --- the store doesn't know which executor is calling), `drv_hash` (string,
-  ties token to a specific build), `expected_outputs` (list of store paths, the
-  authorization check), `is_ca` (bool, skips the membership check for
-  floating-CA derivations whose output paths are computed post-build),
-  `expiry_unix` (u64 Unix seconds, replay prevention).
+  `AssignmentClaims` carries: `executor_id` (string, audit only --- the store
+  doesn't know which executor is calling), `drv_hash` (string, ties token to a
+  specific build), `expected_outputs` (list of store paths, the authorization
+  check), `is_ca` (bool, skips the membership check for floating-CA derivations
+  whose output paths are computed post-build), `expiry_unix` (u64 Unix seconds,
+  replay prevention), `tenant` (optional UUID string, attribution for
+  `hw_perf_samples.submitting_tenant` --- derived from claims, never from the
+  request body, so a compromised worker cannot fabricate tenant identities),
+  `role` (`TokenRole` enum --- what the holder may do; the store gates `PutPath`
+  and `Begin` on `Builder`), and `input_closure_digest` (hex
+  `blake3(sorted(input_closure).join("\n"))`, the §6.3 server-side refscan
+  attestation; empty = scheduler couldn't compute the closure at dispatch ---
+  see #rref("sched.dispatch.input-roots+2")). `tenant`, `role`, and
+  `input_closure_digest` are `#[serde(default)]` (old token still parses) and
+  `#[serde(skip_serializing_if = …)]` (default-valued token serializes to the
+  pre-P0589 byte shape, so `deny_unknown_fields` on a not-yet-rolled store
+  still parses it). Once the scheduler emits a non-default `role` or a non-empty
+  `input_closure_digest`, the new-token-to-old-store skew is closed only by
+  deploy ordering (store fleet rolls before the scheduler singleton).
   - Executors present the assignment token in the `x-rio-assignment-token` gRPC
     metadata header when calling `PutPath` on the store. The store verifies the
     token signature, checks `now < expiry_unix`, and rejects with
@@ -225,26 +238,30 @@
   user-namespaced.
 ]
 
-// rule-id is historical; mechanism is base_runtime_spec since ADR-021 §7
-#r("sec.pod.fuse-device-plugin")[
-  Executor pods MUST NOT obtain `/dev/fuse` via a hostPath volume --- the
-  kernel rejects idmap mounts on device nodes (ADR-012 Phase 1a spike finding),
-  so hostPath is incompatible with `hostUsers: false`. The device node is
-  delivered by containerd's `base_runtime_spec` declaring `/dev/{fuse,kvm}` in
-  OCI `linux.devices` (`nix/base-runtime-spec.nix`) --- runc `mknod`s them
-  inside the container's `/dev` with container-namespace uid/gid, so no
-  idmap-mount rejection. Every pod on a configured node gets `/dev/fuse`;
-  `/dev/kvm` is host-conditional --- containerd's `ExecStartPre` picks the
-  `withKvm` spec variant iff `test -c /dev/kvm` succeeds on the host and
-  symlinks it to `/run/base-runtime-spec.json`, so non-`.metal` pods don't see
-  a dead device node. No extended resource is requested and no device plugin
-  runs. kvm pods route to `.metal` via per-intent `nodeAffinity`
+// rule-id is historical (device-plugin era); FUSE delivery is the rio-mountd
+// fd handoff since ADR-022 P0560, /dev/kvm stays base_runtime_spec (ADR-021 §7)
+#r("sec.pod.fuse-device-plugin+1")[
+  Executor pods MUST NOT mount `/dev/fuse` --- not via a hostPath volume (the
+  kernel rejects idmap mounts on device nodes, ADR-012 Phase 1a spike finding,
+  so hostPath is incompatible with `hostUsers: false`), and not via any device
+  plugin or extended resource. Since the castore cutover (ADR-022 P0560) the
+  executor never opens the device node at all: the per-node rio-mountd
+  DaemonSet opens `/dev/fuse`, creates the per-build castore-FUSE mount under
+  `/var/rio/castore/<build_id>`, and hands the backing fd to the builder over
+  the `/run/rio-mountd/rio-mountd.sock` UDS via `SCM_RIGHTS`; the mount
+  reaches the executor through its `HostToContainer`-propagated hostPath. The
+  `privileged: true` escape hatch changes the pod's seccomp/userns posture,
+  not the FUSE delivery path --- privileged pods get no `/dev/fuse` volume
+  either. containerd's `base_runtime_spec` (`nix/base-runtime-spec.nix`) still
+  `mknod`s `/dev/fuse` into every pod's `/dev` (no longer load-bearing for the
+  store) and remains the delivery path for `/dev/kvm`, which is
+  host-conditional --- containerd's `ExecStartPre` picks the `withKvm` spec
+  variant iff `test -c /dev/kvm` succeeds on the host and symlinks it to
+  `/run/base-runtime-spec.json`, so non-`.metal` pods don't see a dead device
+  node. kvm pods route to `.metal` via per-intent `nodeAffinity`
   (`r[ctrl.pool.node-affinity-from-intent]`) plus a pool-static `rio.build/kvm`
   toleration (`r[ctrl.pool.kvm-device+2]`) --- never a pool-static
   nodeSelector, which would deadlock against the affinity on shared features.
-  `privileged: true` remains an escape hatch for clusters whose containerd
-  lacks `base_runtime_spec` device injection; it falls back to the hostPath
-  mechanism and MUST NOT be the production default.
 ]
 
 #r("sec.psa.control-plane-restricted")[

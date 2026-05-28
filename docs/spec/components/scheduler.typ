@@ -687,6 +687,29 @@ jitter_fraction = 0.2              # ± fractional jitter on each backoff
   uploaded.
 ]
 
+#r("sched.dispatch.input-roots+2")[
+  `WorkAssignment` MUST carry the build's transitive input closure
+  (`input_closure`, sorted store-path strings) and, for each closure path that
+  has a `nar_index` row, its castore root node (`input_roots`). The closure is
+  the BFS over `narinfo.references` from the dispatch-time seeds, which MUST be
+  derived from the parsed derivation's exact direct inputs (`inputSrcs` ∪ the
+  outputs of every `inputDrvs` entry, resolved through the in-memory DAG) ---
+  not the shallow `approx_input_closure` prefetch hint. The same sorted
+  `input_closure` is what `AssignmentClaims.input_closure_digest` hashes
+  (#rref("common.hmac.claims")). The attested closure MUST NOT be narrower than
+  the build's true input closure: when the scheduler cannot establish the exact
+  direct-input set (no inlined `.drv` --- e.g. a recovery-loaded node --- or an
+  `inputDrvs` entry whose output paths are unknown), or on PG failure, it sends
+  both fields empty and the builder falls back to its own drv-parsed
+  `QueryPathInfo` BFS.
+]
+The `nar_index.root_node` column is written in the same transaction that makes
+a path's manifest `complete` (#rref("store.index.authoritative")), so every
+closure path that is substitutable at dispatch time has an `input_roots`
+entry. A closure path with no entry is one the store does not (yet) hold; the
+builder falls back to `GetNarIndex`/`QueryPathInfo` for it and fails the build
+as infra-failed if the path never materializes.
+
 #r("sched.heartbeat.adopt")[
   A heartbeat-reported running build the scheduler doesn't have on record for
   that executor is adopted into BOTH `executor.running_build` (so dispatch sees
