@@ -3384,3 +3384,155 @@ the development-time defaults flip above does not remove that lever,
 because Stream remains selectable until the 1c'/1d deletions and the
 deletion-stage releases stay separate (row D0 ordering). Recorded
 2026-05-27 with the rest of this record.
+
+## Phase-1c' record (Slice 1c' — deletion wave 1 + the model re-target)
+
+### T-1c'.1 — pre-deletion checkpoint (the development-time deletion gate)
+
+Recorded by the slice-1c' first batch (Phase-1 plan v3, T-1c'.1).
+Under the 2026-05-27 directive the §4.5 deletion-gate observable —
+the production stream-registration gauge at zero over the computed
+deadline horizon — is a deployment-time read and is NOT what gates
+development-time deletion. The development-time go for deletion wave
+1 is re-derived from the verification evidence below; the production
+gauge-at-zero read is deployment-time validation checklist row D6 and
+remains the precondition for rolling out the **deletion-stage
+release** (the deletion slices ship as separate releases at
+deployment time, row D0 ordering, so a template flip back to Stream
+stays available right up to that release).
+
+#### Verification evidence the deletion wave rests on
+
+| Evidence item | Where recorded | Status at this checkpoint |
+|---|---|---|
+| T-1c.2b VM-corpus disposition table executed for the k3s corpus | The per-check disposition table + its verification record (Phase-1c record above): all seventeen k3s checks rebuilt once, serially, green on the re-pointed configuration | GREEN |
+| Pull-path lifecycle/scheduling/chaos VM coverage at the 1c landing | Development-time 1c gate evidence table (Phase-1c record above): `pull-mode`, `pull-canary`, `pull-fetcher` green; the k3s corpus delivery re-pointed by T-1c.2b | GREEN for everything in the 1c batch's scope; the standalone (non-k3s) corpus is the open half, see the precondition subsection below |
+| 1b code-review pass over the 1a+1b pull-path code (T-1b.11) | Phase-1b gate evidence table: `pull-path-review.md`, 7 confirmed findings fixed with red-first batteries, hosting VM checks re-run green | RECORDED + FIXES LANDED (2026-05-27) |
+| 1b / 1c gate records in place | Phase-1b record + Phase-1b gate evidence table; Phase-1c record + development-time 1c gate evidence table (both above) | IN PLACE (the two PENDING-owner rows of the 1b table — OA5 surface review sign-off and the controller-map counter-signature — are owner actions at the close-out review; OA5 sign-off remains the explicit precondition for deletion commit C, not for commits A/B) |
+| The VM suite's own stream-registration read on the pull path | Pull-mode pods never register: the pull arms (`pull-mode`, `pull-canary`, `pull-fetcher`) prove delivery, attempt mint, and report entirely through `dispatch_mode='pull'` execution rows and `ListOpenAttempts`, with no stream registration required; after T-1c.2b the only k3s consumer of the stream path is the `pull-canary` stream-baseline arm behind its own `values/vmtest-pull-canary.yaml` pin (retiring with deletion commit A) | DEMONSTRATED at the VM level (the production gauge read stays row D6) |
+
+#### The standalone (non-k3s) corpus precondition for deletion commit A
+
+The T-1c.2b disposition table marks the standalone corpus rows
+KEEP-STREAM in two flavors. The **pending-harness** rows
+(protocol-warm, protocol-warm-lix, protocol-cold, ca-cutoff,
+sla-sizing, scheduling-core, observability, chaos, plus the
+delivery-only subtests of scheduling-disrupt and security) assert
+dispatch-mode-independent behavior and stay on the stream path only
+because the standalone fixture cannot mint pull intents (no
+controller/Job spawner to inject `RIO_INTENT_ID` + a per-intent
+token); the **retires-with-machinery** rows (the pull-canary
+stream-baseline arm, `reassign`, the stream cancel-timing budget,
+`executor-kind-spoof` + the static stream executor token at deletion
+commit A; `warm-gate` at commit B; `sigint-graceful`'s stream-era
+re-statement at T-1d.1) test the stream machinery itself and go when
+it goes. Deletion commit A may not land while any pending-harness row
+remains unresolved: those rows are resolved by the standalone
+pull-harness commit of this same batch (option (a) of the
+standalone-corpus note — a minimal per-intent spawn mechanism in the
+harness driving the scheduler's real `GetSpawnIntents` /
+`MintExecutorTokens` / `AckSpawnedIntents` surface), and the
+disposition table above is updated row by row as each re-point is
+executed and rebuilt green. Any row the harness genuinely cannot
+reproduce gets a named replacement-coverage disposition in the same
+update — never a silent drop.
+
+#### The deletion commit set and the revert-cleanliness contract
+
+Deletion wave 1 lands as three named, individually revert-clean
+commits, in order, each naming in its commit message the
+disposition-table rows it discharges (AD6 in both directions, P13 for
+every deleted test):
+
+- **Commit A (T-1c'.2)** — the scheduler session machinery:
+  per-mechanism rows #1–#5, #7–#11, #13–#14, #16–#19 and the #21
+  shrink (heartbeat intake/reaper/stall credit, adopt, phantom
+  two-strike, reconnect stale-flag clear, stale-epoch filter,
+  `recently_disconnected` + TTL sweep, disconnect→reassign detection,
+  the `BuildExecution`/`Heartbeat` handlers reduced to unconditional
+  error stubs, `ExecutorState` and the session maps, the 45 s
+  post-failover reconcile special case, the backstop's
+  cancel/quarantine halves, dispatch rollback, the DeadlineExceeded
+  prefix-match), their tests, and the retires-with-machinery VM
+  pieces tagged T-1c'.2 in the disposition table (the pull-canary
+  stream-baseline arm and its values pin, `reassign`, the stream
+  cancel-timing budget, `executor-kind-spoof` + the static stream
+  executor token).
+- **Commit B (T-1c'.3)** — the placement/eligibility layer
+  (dispatch_ready pacing, placement decision, warm-gate two-pass,
+  intent-match override, became_idle inline dispatch, closed-stream
+  exclusion, the 4-phase assign path; rows #11/#18 dispatch-side
+  remnants; `sched.sla.intent-match` and `sched.assign.warm-gate`
+  retired; the legacy pod-name exclusion key dropped per P12).
+- **Commit C (T-1c'.4)** — operator surfaces O1–O3 + admin plumbing,
+  only after the OA5 sign-off (the PENDING owner row above);
+  `ListExecutors` re-implemented over the open-attempt view,
+  `DebugListExecutors` retired, `DrainExecutor` per the plan's
+  default (no-op-with-error until the 1d proto sweep).
+
+Contract: each commit reverts cleanly on its own (`git revert` of
+that single commit restores the deleted machinery and its tests
+without touching the other commits), and the reverts are kept rebased
+and re-tested until the Phase-2 close-out per the frozen §4.5 choice
+(forward-fix-only explicitly not adopted). Nothing the disposition
+table marks KEEP-STREAM-until-B/C or pending-harness may be taken by
+commit A; a later commit may not silently absorb an earlier one.
+Larger model re-targeting (T-1c'.5: Model S re-target, witness and
+calibration flips) and the as-built-channel retryPolicy regime
+retirement (T-1c'.6) follow the deletion commits in the same slice;
+the wired as-built executor session checks stay untouched and green
+through commits A–C because they model the pre-deletion file as it
+was — they are re-wired only at T-1c'.5.
+
+#### Row-D6 deferral note
+
+The §4.5 deletion-gate observable (the
+`rio:scheduler_stream_registrations:max` recording rule at zero for
+the computed deadline horizon, instantiated in the Phase-1c record
+above) arms only once a real fleet runs pull-mode. Its evaluation is
+deployment-time validation checklist row D6 and gates the rollout of
+the deletion-stage release, not the development-time landing of the
+deletion commits. The `workers_active` gauge keeps being emitted
+(reading zero on a pull-only fleet) until 1d precisely so that row D6
+stays evaluable after commits A–C land.
+
+#### Spec-consequence checklist for the 1c' sweep
+
+Queued at 0e (Phase-1 input list item 8), executed across the 1c'
+commits — each item lands in the same commit as the code change or
+model re-target that licenses it, with `tracey bump` + marker
+re-points in that commit:
+
+1. AD4: the `sched.lease.generation-fence+2` amendment (the
+   worker-side latch and `WorkAssignment.generation` consumer give
+   way to the transaction-side fence) and the
+   claim-before-advertise → claim-before-serve successor statement in
+   the lease-checklist re-derivation (T-1c'.7, per the T-0e.2 note).
+2. C2: the `sched.executor.deregister-reassign` epoch qualification —
+   resolved at commit A by retiring/re-stating the rule with the
+   session machinery it describes (the contradiction record stays as
+   history).
+3. C3: the `controller.typ` Executor Lifecycle SIGTERM-drain prose
+   (stale `DrainExecutor` step) — fixed no later than commit C, which
+   touches the surface the prose misdescribes.
+4. C4: the `sla-sizing.typ` `@alg-pool` `dead_nodes` annotation
+   (floor and TTL wording) — fixed with the 1c' spec sweep or, at the
+   latest, when the detector moves at 1d.
+5. Retiring `sched.sla.intent-match` and `sched.assign.warm-gate`
+   with their mechanisms (commit B), with retirement records — not
+   silent deletion.
+6. Re-pointing the five 0b rules' verify markers
+   (`sched.executor.{session-epoch,liveness-window,repair-precedence,one-shot}`,
+   `builder.completion.exactly-once-or-death`) when the checks they
+   cite re-target (T-1c'.5 for the session checks, 1d for Model D).
+
+#### Pre-deletion go (development-time owner record)
+
+Go for deletion wave 1 recorded against the verification evidence
+above, per the v3 owner table (T-1c'.1 row). The go covers commits A
+and B unconditionally and commit C conditionally on the OA5 surface
+sign-off recorded at the 1b close-out review; it is a development-time
+record only — no production read is implied, and the deletion-stage
+release remains gated by row D6 at deployment time. Recorded
+2026-05-28 by the slice-1c' first batch executing the campaign
+owner's instruction.
