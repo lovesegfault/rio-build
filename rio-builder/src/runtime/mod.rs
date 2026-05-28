@@ -125,8 +125,8 @@ pub struct BuildSpawnContext {
     /// `i686-linux` is then accepted by the x86_64 daemon.
     pub systems: Arc<[String]>,
     /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
-    /// the executor can `register_inputs` (JIT allowlist) and
-    /// `prefetch_manifests` (I-110c) before daemon spawn.
+    /// the executor can `register_inputs` (JIT allowlist) before
+    /// daemon spawn.
     pub fuse_cache: Arc<crate::fuse::cache::Cache>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
     /// JIT lookup scales it per path via `jit_fetch_timeout(this,
@@ -437,7 +437,6 @@ pub async fn spawn_build_task(
         ctx.completion_pending
             .store(true, std::sync::atomic::Ordering::Release);
 
-        let mut store_client = ctx.store_clients.store.clone();
         // Same Arc as the slot's cancel flag. execute_build polls it
         // during the pre-cgroup phase (I-166).
         let build_env = ctx.executor_env(Arc::clone(&cancelled));
@@ -506,7 +505,7 @@ pub async fn spawn_build_task(
             let o = executor::execute_build(
                 &assignment,
                 &build_env,
-                &mut store_client,
+                &ctx.store_clients,
                 &ctx.stream_tx,
                 prev_line_count,
             )
@@ -2535,7 +2534,7 @@ mod tests {
     /// is the lesser evil — a build the scheduler already cancelled
     /// has no client waiting on its real outcome.
     ///
-    // r[verify builder.cancel.pre-cgroup-deferred]
+    // r[verify builder.cancel.pre-cgroup-deferred+2]
     #[test]
     fn cancel_build_cgroup_missing_keeps_flag() {
         // Path that definitely doesn't exist. tmpdir/nonexistent so

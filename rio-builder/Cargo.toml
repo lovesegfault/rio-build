@@ -47,6 +47,9 @@ tonic = { workspace = true }
 # google.protobuf.Timestamp in BuildResult.start_time/stop_time.
 # Scheduler's build_samples insert is gated on both being Some.
 prost-types = { workspace = true }
+# castore_fuse/tree.rs keys GetDirectory bodies by their recomputed
+# canonical digest = blake3(Message::encode_to_vec(dir)).
+prost = { workspace = true }
 fuser = { workspace = true }
 sqlx = { workspace = true }
 nix = { workspace = true }
@@ -76,6 +79,10 @@ postcard = { workspace = true }
 # rio-mountd Promote re-hashes staged content before it becomes visible
 # in the node-shared cache.
 blake3 = { workspace = true }
+# ADR-022 §6.1: the fused output walk chunks each regular file
+# builder-side. Parameters come from rio_common::limits::FASTCDC_* so
+# they cannot drift from the store's chunker.
+fastcdc = { workspace = true }
 toml = { workspace = true, optional = true }
 # I-178b: ANSI-escape strip in is_input_materialization_failure.
 regex = { workspace = true }
@@ -86,6 +93,15 @@ rstest = { workspace = true }
 # upload.rs tests use the eager `nar::dump_path` as a byte-exact oracle for
 # the streaming upload pipeline.
 rio-nix = { workspace = true, features = ["test-oracle"] }
+# upload/agreement_tests.rs drives the REAL PutPathChunked handler
+# (ephemeral PG + in-memory chunk backend) with what the production
+# client assembles, so the fused walk and the store's validate/verify
+# pipeline are checked against each other at the wire level.
+rio-store = { workspace = true, features = ["test-utils"] }
+# Signs the HMAC assignment token the agreement fixture's real
+# ChunkService requires — HasChunks rejects anonymous probes, so the
+# dedup-through-the-real-probe test needs a verifiable caller identity.
+rio-auth = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 rio-test-support = { workspace = true }

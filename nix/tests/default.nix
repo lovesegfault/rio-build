@@ -63,6 +63,10 @@ let
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
   mountd = import ./scenarios/mountd.nix;
+  # castore-fuse exports { fuseClientModule, mkTest } — the client VM
+  # doubles as the FUSE/mountd machine, so the node config and the
+  # testScript that depends on it live in the same file.
+  castore-fuse = import ./scenarios/castore-fuse.nix { inherit pkgs common; };
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -126,6 +130,17 @@ let
       pkgs.postgresql
       pkgs.grpcurl
     ];
+  };
+
+  # Store-side filesystem chunk backend: payloads above INLINE_THRESHOLD
+  # take the chunked PutPath, so StatBlob/GetChunks have a chunk list to
+  # serve. Shared by schedulingFixture and vm-castore-fuse.
+  chunkBackendStoreConfig = {
+    extraConfig = ''
+      [chunk_backend]
+      kind = "filesystem"
+      base_dir = "/var/lib/rio/store/chunks"
+    '';
   };
 
   # Shared fixture for both scheduling splits — identical VM topology.
@@ -193,13 +208,7 @@ let
         max_mem = 2147483648
       '';
     };
-    extraStoreConfig = {
-      extraConfig = ''
-        [chunk_backend]
-        kind = "filesystem"
-        base_dir = "/var/lib/rio/store/chunks"
-      '';
-    };
+    extraStoreConfig = chunkBackendStoreConfig;
     # grpcurl: cancel-timing submits + cancels via plaintext gRPC :9001
     # (no withHmac). ssh-ng:// doesn't surface build_id to the
     # client, and client-disconnect mid-wopBuildDerivation doesn't fire
@@ -270,6 +279,30 @@ in
   # r[verify builder.mountd.promote-bounded-copy]
   # r[verify builder.mountd.orphan-scan]
   vm-mountd = mountd { inherit pkgs common; };
+
+  # ── castore-FUSE (ADR-022 §2): production session against a real store ─
+  # serve-castore (spike_mountd_client) drives the production
+  # castore_fuse::session assembly on the client VM: rio-mountd fd
+  # handoff, tenant-scoped Directory-DAG prefetch from rio-store,
+  # whole-file and streaming reads, shared-cache passthrough hits, and
+  # clean SIGTERM teardown. Subtest map: the scenario header.
+  # r[verify builder.fs.digest-fuse-open]
+  # r[verify builder.fs.shared-backing-cache]
+  vm-castore-fuse = castore-fuse.mkTest {
+    fixture = standalone {
+      # DirectoryService/ChunkService are tenant-scoped: the store needs
+      # RIO_HMAC_KEY_PATH to verify the x-rio-assignment-token the test
+      # mints; the gateway needs the service key for the seed/build
+      # uploads.
+      withHmac = true;
+      # bigblob (300 KiB > INLINE_THRESHOLD) must take the chunked
+      # PutPath so StatBlob/GetChunks have a chunk list to stream from.
+      extraStoreConfig = chunkBackendStoreConfig;
+      # psql() on control for the tenant + path_tenants setup.
+      extraPackages = [ pkgs.postgresql_18 ];
+      extraClientModules = [ castore-fuse.fuseClientModule ];
+    };
+  };
 
   # r[verify gw.conn.exit-status+3]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
@@ -730,7 +763,7 @@ in
       "gc-dry-run"
       # r[verify store.gc.tenant-retention]
       "gc-sweep"
-      # r[verify builder.upload.references-scanned]
+      # r[verify builder.upload.references-scanned+2]
       # r[verify builder.upload.deriver-populated]
       # r[verify store.gc.two-phase]
       "refs-end-to-end"

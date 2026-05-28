@@ -45,7 +45,7 @@ mod outputs;
 mod sandbox;
 
 use daemon::{DaemonBuildOpts, run_daemon_build, spawn_daemon_in_namespace};
-use inputs::{compute_input_closure, fetch_drv_from_store, prefetch_manifests};
+use inputs::{compute_input_closure, fetch_drv_from_store};
 use monitors::{drain_build_cgroup, spawn_cgroup_monitors};
 use outputs::{BuildOutputs, collect_outputs};
 use sandbox::prepare_sandbox;
@@ -117,10 +117,9 @@ pub struct ExecutorEnv {
     /// cases.
     pub hw_class: Option<String>,
     /// Handle to the FUSE local cache. The executor calls
-    /// `register_inputs` (JIT allowlist, I-043 redesign) and
-    /// `prefetch_manifests` (I-110c PG-skip hints) on it after
+    /// `register_inputs` (JIT allowlist, I-043 redesign) on it after
     /// `compute_input_closure` and before daemon spawn. `None` in
-    /// tests that don't mount FUSE — both calls are skipped.
+    /// tests that don't mount FUSE — the call is skipped.
     pub fuse_cache: Option<Arc<crate::fuse::cache::Cache>>,
     /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`
     /// (`builder.toml fuse_fetch_timeout_secs`, default 60s). JIT
@@ -429,10 +428,14 @@ enum PreDaemon {
 pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
-    store_client: &mut StoreServiceClient<Channel>,
+    store_clients: &crate::store_fetch::StoreClients,
     log_tx: &mpsc::Sender<ExecutorMessage>,
     first_line: u64,
 ) -> ExecuteOutcome {
+    // Most of the executor only needs the StoreService client; the full
+    // bundle is threaded so the chunked upload can also reach
+    // ChunkService.HasChunks. Clones share the underlying channel.
+    let mut store_client = store_clients.store.clone();
     let drv_path = &assignment.drv_path;
     let build_id = sanitize_build_id(drv_path);
 
@@ -451,7 +454,7 @@ pub async fn execute_build(
     // missing-output nodes; empty means cache-hit or
     // inline-budget exceeded, so fall back to store fetch.
     let drv = if assignment.drv_content.is_empty() {
-        match fetch_drv_from_store(store_client, drv_path).await {
+        match fetch_drv_from_store(&mut store_client, drv_path).await {
             Ok(d) => d,
             Err(e) => return ExecuteOutcome::pre_cgroup(e, first_line),
         }
@@ -602,7 +605,7 @@ pub async fn execute_build(
                 input_paths,
                 input_sized,
                 input_metadata,
-            } = resolve_inputs(&*store_client, &drv, drv_path).await?;
+            } = resolve_inputs(&store_client, &drv, drv_path).await?;
 
             // r[impl builder.cores.cgroup-clamp+2]
             // Compute once: feeds BOTH nix.conf `cores=` (defense-in-depth)
@@ -659,17 +662,16 @@ pub async fn execute_build(
             // This replaces the pre-daemon `warm_inputs_in_fuse` phase, which
             // fetched the WHOLE closure (~800–1500 paths) up-front — defeating
             // lazy fetch for builds that touch a fraction of their closure.
-            // The I-165 47-min hang window is gone with it: register +
-            // prefetch_manifests together are <100 ms (one HashMap extend +
-            // one BatchGetManifest RPC).
+            // The I-165 47-min hang window is gone with it: register is
+            // <100 ms (one HashMap extend).
             //
-            // r[impl builder.cancel.pre-cgroup-deferred]
+            // r[impl builder.cancel.pre-cgroup-deferred+2]
             // I-166: the cgroup doesn't exist yet (created post-spawn below),
             // so a Cancel that arrived during overlay/resolve/prepare landed
             // as ENOENT in `try_cancel_build` — which now LEAVES the flag
             // set. Check it here. The pre-cgroup window is now overlay →
-            // resolve → prepare_sandbox → register + prefetch (sub-second);
-            // the cancel_poll select that covered the warm hang is no longer
+            // resolve → prepare_sandbox → register (sub-second); the
+            // cancel_poll select that covered the warm hang is no longer
             // needed.
             if env.cancelled.load(Ordering::Acquire) {
                 tracing::info!(drv_path = %drv_path, "build cancelled (pre-cgroup)");
@@ -682,11 +684,6 @@ pub async fn execute_build(
                 }));
                 metrics::gauge!("rio_builder_jit_inputs_registered")
                     .set(cache.known_inputs_len() as f64);
-                // I-110c: prime manifest hints so each JIT fetch's `GetPath`
-                // skips PG. ~1600 PG hits/builder → ≤2. Best-effort — on
-                // Unimplemented (old store) or any error, the per-path
-                // `GetPath` queries PG as before.
-                prefetch_manifests(store_client, cache, &input_paths).await;
             }
 
             // 5. Spawn nix-daemon --stdio --store 'local?root={build_dir}'.
@@ -805,12 +802,13 @@ pub async fn execute_build(
         Err(e) => Err(e),
         Ok(br) => collect_outputs(
             &br,
-            store_client,
+            store_clients,
             &overlay_mount,
             &drv,
             drv_path,
             is_fod,
             &input_paths,
+            &assignment.input_closure,
             &assignment.assignment_token,
         )
         .await
@@ -1166,8 +1164,8 @@ struct ResolvedInputs {
     basic_drv: rio_nix::derivation::BasicDerivation,
     /// Full transitive input closure (BFS over QueryPathInfo references,
     /// seeded from input_srcs + resolved inputDrv outputs). Used for
-    /// `prefetch_manifests` and the output reference-scan candidate
-    /// set. Derived from `input_metadata` (each entry's `.path`).
+    /// the output reference-scan candidate set. Derived from
+    /// `input_metadata` (each entry's `.path`).
     input_paths: Vec<String>,
     /// `(path, nar_size)` for every closure path. Used for the FUSE
     /// warm — I-178: per-path timeout and overall deadline scale with
@@ -1319,10 +1317,9 @@ async fn resolve_inputs(
         .collect();
     // I-178: project (path, nar_size) for the JIT FUSE allowlist
     // (`register_inputs`). ValidatedPathInfo already has nar_size from
-    // BatchQueryPathInfo (authoritative; the ManifestHint.info.nar_size
-    // is best-effort). Two projections from input_metadata is cheaper
-    // than passing &input_metadata around — the other consumers
-    // (prefetch_manifests, ref-scan) want plain &[String].
+    // BatchQueryPathInfo. Two projections from input_metadata is
+    // cheaper than passing &input_metadata around — the other consumer
+    // (ref-scan) wants plain &[String].
     let input_sized: Vec<(String, u64)> = input_metadata
         .iter()
         .map(|m| (m.store_path.to_string(), m.nar_size))
