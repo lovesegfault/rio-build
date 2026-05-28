@@ -3476,7 +3476,7 @@ fn rollback_restores_a_displaced_poisoned_squat() -> anyhow::Result<()> {
 
 // ── sched.merge.displaced-edge-scrub ────────────────────────────────────
 
-// r[verify sched.merge.displaced-edge-scrub]
+// r[verify sched.merge.displaced-edge-scrub+2]
 /// Displacement scrubs the squatter's dependency (children) edges: the
 /// displacing fresh node's initial state is computed against ITS OWN
 /// declared dependency set (none here), not the squatter's — whether the
@@ -3546,7 +3546,7 @@ fn displacement_scrubs_inherited_dependency_edges(
     Ok(())
 }
 
-// r[verify sched.merge.displaced-edge-scrub]
+// r[verify sched.merge.displaced-edge-scrub+2]
 /// The scrub is children-direction only: nodes that DEPEND ON the
 /// displaced hash keep their edges (they want its output, whichever
 /// definition produces it), while the displaced node's own dependency
@@ -3607,7 +3607,7 @@ fn displacement_preserves_dependent_edges() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.displaced-edge-scrub]
+// r[verify sched.merge.displaced-edge-scrub+2]
 /// A merge that displaces a squat (scrubbing its dependency edges) but
 /// fails on a LATER node in the same submission must restore the squat
 /// WITH its scrubbed edges — the pre-merge DAG exactly.
@@ -3662,6 +3662,215 @@ fn rollback_restores_displaced_dependency_edges() -> anyhow::Result<()> {
             .any(|h| h.as_str() == "edge-squat-rb"),
         "reverse direction restored too"
     );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The authority takeover through the resubmit-reset (identity-matching
+/// store-backed resubmission of a parked, still-retriable authoritative
+/// claim) is a definition change: the squat's dependency (children)
+/// edges must not carry onto the taken-over node — whether the
+/// squatter-attached child is terminally failed (would seed
+/// `DependencyFailed`) or merely incomplete (would park it `Queued`).
+/// The dependent (parents) direction is preserved.
+#[rstest]
+#[case::terminal_failed_child(DerivationStatus::Poisoned)]
+#[case::incomplete_child(DerivationStatus::Queued)]
+fn authority_takeover_scrubs_inherited_dependency_edges(
+    #[case] junk_status: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    // Squatter: dependent → squat → junk, squat carries authoritative
+    // bytes and parks retriable (Poisoned under budget).
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("ats-squat", b"Derive-ats"),
+            make_node("ats-junk", "x86_64-linux"),
+            make_node("ats-dependent", "x86_64-linux"),
+        ],
+        &[
+            make_edge("ats-squat", "ats-junk"),
+            make_edge("ats-dependent", "ats-squat"),
+        ],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("ats-junk")
+        .unwrap()
+        .set_status_for_test(junk_status);
+    {
+        let n = dag.nodes.get_mut("ats-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1; // under POISON_RESUBMIT_RETRY_LIMIT
+    }
+
+    // Victim: identity-matching store-backed resubmission → authority
+    // takeover via the resubmit-reset (NOT displacement).
+    let mut takeover = make_node("ats-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(victim, &[takeover], &[], "")?;
+
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "takeover goes through the resubmit-reset"
+    );
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "ats-squat")
+    );
+    assert!(res.displaced.is_empty(), "not a displacement");
+
+    // Children direction scrubbed…
+    assert!(
+        dag.get_children("ats-squat").is_empty(),
+        "squat→junk edge must not carry onto the taken-over definition"
+    );
+    assert!(
+        !dag.get_parents("ats-junk")
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "junk no longer lists the taken-over hash as a dependent"
+    );
+    // …parents direction preserved, interest carried.
+    assert!(
+        dag.get_children("ats-dependent")
+            .iter()
+            .any(|h| h.as_str() == "ats-squat"),
+        "dependent→squat edge preserved"
+    );
+    assert!(
+        dag.get_parents("ats-squat")
+            .iter()
+            .any(|h| h.as_str() == "ats-dependent")
+    );
+    let n = dag.node("ats-squat").unwrap();
+    assert!(n.interested_builds.contains(&squatter), "interest carried");
+    assert!(n.interested_builds.contains(&victim));
+
+    // Initial state seeds from the takeover's own (empty) dependency set.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        states["ats-squat"],
+        DerivationStatus::Ready,
+        "taken-over node seeds Ready, not from the squatter's junk child"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// A merge that takes over a parked authoritative claim (scrubbing its
+/// dependency edges) but fails on a LATER node in the same submission
+/// must restore the squat verbatim — status, authoritative flag,
+/// resubmit budget, and its children edges in both directions.
+#[test]
+fn rollback_restores_takeover_scrubbed_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[
+            authoritative_node("ats-rb-squat", b"Derive-ats-rb"),
+            make_node("ats-rb-junk", "x86_64-linux"),
+        ],
+        &[make_edge("ats-rb-squat", "ats-rb-junk")],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("ats-rb-squat").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 1;
+    }
+
+    // Identity-matching store-backed takeover plus an invalid second
+    // node: the merge fails AFTER the takeover scrub ran.
+    let mut takeover = make_node("ats-rb-squat", "x86_64-linux");
+    takeover.is_content_addressed = true;
+    takeover.ca_modular_hash = Some([0xAB; 32]);
+    let result = dag.merge(
+        victim,
+        &[
+            takeover,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("ats-rb-squat").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert!(n.drv_content_authoritative, "authoritative claim restored");
+    assert_eq!(n.retry.resubmit_cycles, 1, "consumed budget restored");
+    assert!(
+        dag.get_children("ats-rb-squat")
+            .iter()
+            .any(|h| h.as_str() == "ats-rb-junk"),
+        "scrubbed squat→junk edge restored on rollback"
+    );
+    assert!(
+        dag.get_parents("ats-rb-junk")
+            .iter()
+            .any(|h| h.as_str() == "ats-rb-squat"),
+        "reverse direction restored too"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// Contrast pin: a SAME-definition resubmit (store-backed → store-backed)
+/// keeps the node's dependency edges — the scrub is scoped to definition
+/// changes only.
+#[test]
+fn same_definition_resubmit_keeps_dependency_edges() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(
+        b1,
+        &[
+            make_node("sdr-x", "x86_64-linux"),
+            make_node("sdr-dep", "x86_64-linux"),
+        ],
+        &[make_edge("sdr-x", "sdr-dep")],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sdr-x")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Failed);
+
+    let res = dag.merge(b2, &[make_node("sdr-x", "x86_64-linux")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit.iter().any(|h| h.as_str() == "sdr-x"),
+        "same-definition resubmit-reset"
+    );
+    assert!(res.authority_takeovers.is_empty());
+    assert!(
+        dag.get_children("sdr-x")
+            .iter()
+            .any(|h| h.as_str() == "sdr-dep"),
+        "same-definition reset keeps its dependency edges"
+    );
+    // Parked behind its (incomplete) dependency, exactly as before.
+    let states: HashMap<_, _> = dag
+        .compute_initial_states(&res.newly_inserted)
+        .into_iter()
+        .collect();
+    assert_eq!(states["sdr-x"], DerivationStatus::Queued);
     Ok(())
 }
 

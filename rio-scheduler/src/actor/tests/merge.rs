@@ -9358,7 +9358,7 @@ async fn test_matching_retriable_takeover_resets_row_accounting() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.merge.displaced-edge-scrub]
+// r[verify sched.merge.displaced-edge-scrub+2]
 /// End-to-end displaced-edge scrub: a poison-locked authoritative squat
 /// carries an attacker-attached dependency edge onto a junk node that can
 /// never complete. The victim's identity-matching store-backed submission
@@ -9567,6 +9567,114 @@ async fn test_foreign_junk_edge_not_attached_or_persisted() -> TestResult {
         query_status(&handle, build_b).await?.state,
         rio_proto::types::BuildState::Active as i32,
         "build B keeps waiting on its own junk node"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// End-to-end authority-takeover edge scrub: a parked (still retriable)
+/// authoritative squat carries an attacker-attached dependency edge onto
+/// a junk node. The victim's identity-matching store-backed resubmission
+/// takes the definition over through the resubmit-reset; the taken-over
+/// node must NOT inherit the squatter's dependency set — in memory (the
+/// victim build stays live and the node dispatches) or in PG (the
+/// parent-side `derivation_edges` row is deleted in the merge
+/// transaction; the child-side row of a node depending ON the hash is
+/// preserved) — while the squatter build's interest and link carry over
+/// (a takeover, unlike displacement, keeps prior interest).
+#[tokio::test]
+async fn test_takeover_scrubs_squatter_edges_and_unblocks_victim() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let squat_path = test_drv_path("tkSquatA");
+    let squat_out = test_store_path("tkSquatA-out");
+
+    // Squatter build: dependent → squat → junk, squat authoritative.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("tkSquatA");
+    squat.drv_content = b"Derive-tkSquatA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(
+        &handle,
+        squatter,
+        vec![squat, make_node("tkJunkA"), make_node("tkDependentA")],
+        vec![
+            make_test_edge("tkSquatA", "tkJunkA"),
+            make_test_edge("tkDependentA", "tkSquatA"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Junk parked terminally failed; squat parked Poisoned UNDER budget
+    // (still retriable on resubmit → the takeover path, not displacement).
+    assert!(
+        handle
+            .debug_force_status("tkJunkA", DerivationStatus::Poisoned)
+            .await?
+    );
+    assert!(handle.debug_force_poisoned("tkSquatA", 1).await?);
+
+    // Victim: identity-matching store-backed resubmission (same declared
+    // output path) → authority takeover.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("tkSquatA");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not inherit the squatter's dependency set"
+    );
+
+    // PG: parent-side edge gone, child-side edge preserved.
+    let (parent_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.parent_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parent_side, 0, "squat→junk edge row deleted in-tx");
+    let (child_side,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM derivation_edges e
+         JOIN derivations d ON d.derivation_id = e.child_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(child_side, 1, "dependent→squat edge row preserved");
+
+    // Takeover (not displacement): BOTH builds stay linked to the row.
+    let (links,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM build_derivations bd
+         JOIN derivations d ON d.derivation_id = bd.derivation_id
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        links, 2,
+        "squatter and victim both linked (interest carried)"
+    );
+
+    // The taken-over node dispatches and completes — the victim build
+    // finishes on the new definition.
+    let mut rx = connect_executor(&handle, "w-tk", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_path, "taken-over node dispatched");
+    complete_success(&handle, "w-tk", &squat_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the taken-over definition"
     );
     Ok(())
 }

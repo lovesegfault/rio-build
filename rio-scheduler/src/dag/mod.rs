@@ -199,6 +199,10 @@ pub struct MergeResult {
     /// state starts with a fresh poison-resubmit budget — so the actor
     /// must NOT also run `clear_poison_batch` on them (it would
     /// re-increment `resubmit_cycles` in PG and diverge from memory).
+    /// Their children edges are scrubbed exactly like displacement
+    /// (recorded in `displaced_scrubbed_edges`), and the actor chains
+    /// these hashes into the durable parent-side `derivation_edges`
+    /// delete (`sched.merge.displaced-edge-scrub`).
     pub authority_takeovers: Vec<DrvHash>,
     /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
     /// node (`sched.merge.authoritative-conflict`): a store-backed
@@ -226,12 +230,12 @@ pub struct MergeResult {
     /// `{retriable-X, cycle}` submission would wipe X and reset its
     /// `POISON_RESUBMIT_RETRY_LIMIT` accumulator (I-169).
     pub removed_retriable: Vec<(DrvHash, DerivationState)>,
-    /// Dependency (children) edges scrubbed from displaced nodes
-    /// (`sched.merge.displaced-edge-scrub`), keyed by the displaced
-    /// hash. `rollback_merge` re-attaches them when restoring the
-    /// displaced node, and `persist_merge_to_db` mirrors the scrub
-    /// durably by deleting the displaced rows' parent-side
-    /// `derivation_edges` in the same transaction.
+    /// Dependency (children) edges scrubbed from displaced or
+    /// taken-over nodes (`sched.merge.displaced-edge-scrub`), keyed by
+    /// the removed hash. `rollback_merge` re-attaches them when
+    /// restoring the node, and `persist_merge_to_db` mirrors the scrub
+    /// durably by deleting those rows' parent-side `derivation_edges`
+    /// in the same transaction.
     pub displaced_scrubbed_edges: Vec<(DrvHash, HashSet<DrvHash>)>,
     /// Submitted edges skipped by the creation-scoped edge gate
     /// (`sched.merge.edge-creation-scoped`): their parent is a resident
@@ -646,7 +650,7 @@ impl DerivationDag {
                         if terminal_failure {
                             let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
                             removed_retriable.push((drv_hash.clone(), old));
-                            // r[impl sched.merge.displaced-edge-scrub]
+                            // r[impl sched.merge.displaced-edge-scrub+2]
                             let scrubbed = self.scrub_dependency_edges(&drv_hash);
                             if !scrubbed.is_empty() {
                                 displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
@@ -696,7 +700,7 @@ impl DerivationDag {
                             // this same submission fails the merge.
                             let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
                             removed_retriable.push((drv_hash.clone(), old));
-                            // r[impl sched.merge.displaced-edge-scrub]
+                            // r[impl sched.merge.displaced-edge-scrub+2]
                             // The displacing submission is a different
                             // definition: drop the dependency edges earlier
                             // submissions attached to this hash so the fresh
@@ -777,9 +781,14 @@ impl DerivationDag {
             // newly-inserted, and `handle_merge_dag`'s pre-existing-node
             // match ignores Cancelled — the resubmitted build would hang.
             //
-            // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
-            // string, so they stay valid across the remove+reinsert. The merge's
-            // own edge loop re-adds this submission's edges idempotently.
+            // Edges are NOT scrubbed for same-definition resets (including
+            // byte-identical authoritative retries): `children`/`parents`
+            // are keyed by hash string, so they stay valid across the
+            // remove+reinsert and the merge's own edge loop re-adds this
+            // submission's edges idempotently. An authority takeover
+            // (authoritative squat replaced by a store-backed definition)
+            // is a definition change and gets the same children scrub as
+            // displacement — see below.
             // Because the (possibly reap-truncated) child set survives the
             // reset without being re-declared, the `closure_hole`
             // breadcrumb that qualifies it must ride along in the carry
@@ -818,6 +827,21 @@ impl DerivationDag {
                 // carry over (sched.merge.displaced-failure-reset).
                 let authority_flip =
                     old.drv_content_authoritative && !node.drv_content_authoritative;
+                if authority_flip {
+                    // r[impl sched.merge.displaced-edge-scrub+2]
+                    // Definition change ⇒ the same children scrub as
+                    // displacement: the squat's dependency edges must not
+                    // carry onto the store-backed definition taking over
+                    // the hash. Recorded in displaced_scrubbed_edges so a
+                    // failed merge restores them with the node, and so the
+                    // persist deletes the parent-side rows in the same
+                    // transaction. Same-definition resets (the
+                    // !authority_flip path) keep their edges.
+                    let scrubbed = self.scrub_dependency_edges(&drv_hash);
+                    if !scrubbed.is_empty() {
+                        displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
+                    }
+                }
                 let carry = (
                     old.interested_builds.clone(),
                     old.retry.resubmit_cycles,
@@ -1231,11 +1255,12 @@ impl DerivationDag {
 
         // Hashes being restored below — their children[X]/parents[X]
         // entries are pre-existing and must NOT be scrubbed: the
-        // resubmit-reset removes only nodes[X] (never edges), and the
-        // displacement arms remove nodes[X] plus the children direction,
-        // which is re-attached from `displaced_scrubbed_edges` at the end
-        // of this rollback. The new_edges loop above already reverted any
-        // edges THIS merge added to them.
+        // same-definition resubmit-reset removes only nodes[X] (never
+        // edges), while the displacement arms and the authority-takeover
+        // reset remove nodes[X] plus the children direction, which is
+        // re-attached from `displaced_scrubbed_edges` at the end of this
+        // rollback. The new_edges loop above already reverted any edges
+        // THIS merge added to them.
         // Owned (not borrowed) because the per-field restore loops at the
         // bottom also consult it, after `removed_retriable` is consumed.
         let restoring: HashSet<DrvHash> =
@@ -1268,12 +1293,12 @@ impl DerivationDag {
             self.nodes.insert(hash, state);
         }
 
-        // r[impl sched.merge.displaced-edge-scrub]
+        // r[impl sched.merge.displaced-edge-scrub+2]
         // Re-attach the dependency edges scrubbed by the displacement
-        // arms, so a failed merge restores the displaced node together
-        // with its (possibly squatter-attached) children edges — exactly
-        // the pre-merge DAG. Runs after the node restore so both
-        // endpoints exist again.
+        // arms and the authority-takeover reset, so a failed merge
+        // restores the removed node together with its (possibly
+        // squatter-attached) children edges — exactly the pre-merge DAG.
+        // Runs after the node restore so both endpoints exist again.
         for (hash, children) in displaced_scrubbed_edges {
             for c in &children {
                 self.parents
@@ -1835,13 +1860,14 @@ impl DerivationDag {
     /// former child `c`. Returns the scrubbed child set so the caller can
     /// record it for rollback restoration.
     ///
-    /// Used by the displacement arms of `merge()`
-    /// (`sched.merge.displaced-edge-scrub`): the displacing submission is
+    /// Used by the displacement arms of `merge()` and by the
+    /// authority-takeover path of the resubmit-reset
+    /// (`sched.merge.displaced-edge-scrub`): the replacing submission is
     /// a DIFFERENT definition, so the dependency edges earlier
     /// submissions attached to the hash must not constrain the fresh node
     /// — `compute_initial_states` would otherwise seed it
     /// `DependencyFailed` (or park it `Queued` forever) from a dependency
-    /// set the displacing submission never declared. The PARENTS
+    /// set the replacing submission never declared. The PARENTS
     /// direction is deliberately preserved: nodes that depend on this
     /// hash still want its output, whichever definition produces it.
     /// Same-definition resubmit-resets keep their edge-preserving

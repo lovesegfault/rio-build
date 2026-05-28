@@ -445,16 +445,16 @@ impl SchedulerDb {
 
     /// Durable half of the displaced-edge scrub
     /// (`sched.merge.displaced-edge-scrub`): delete every
-    /// `derivation_edges` row whose PARENT is a displaced derivation,
-    /// inside the same transaction as its recreate-refresh and strictly
-    /// before this merge's own edges are inserted. The displaced row
-    /// keeps its `derivation_id`, so without this delete a leader
-    /// failover would reload the squatter's dependency edges onto the
-    /// displacing definition (seeding it `DependencyFailed` or parking it
-    /// behind a child it never declared). Child-side rows — edges where
-    /// the displaced derivation is the dependency of someone else — are
-    /// preserved. Returns the number of edges removed. Plain runtime
-    /// query — no `.sqlx/` impact.
+    /// `derivation_edges` row whose PARENT is a displaced or taken-over
+    /// (authority-flip) derivation, inside the same transaction as its
+    /// recreate-refresh and strictly before this merge's own edges are
+    /// inserted. The removed node's row keeps its `derivation_id`, so
+    /// without this delete a leader failover would reload the squatter's
+    /// dependency edges onto the replacing definition (seeding it
+    /// `DependencyFailed` or parking it behind a child it never
+    /// declared). Child-side rows — edges where the removed derivation is
+    /// the dependency of someone else — are preserved. Returns the number
+    /// of edges removed. Plain runtime query — no `.sqlx/` impact.
     pub(crate) async fn delete_displaced_parent_edges(
         tx: &mut PgConnection,
         derivation_ids: &[Uuid],

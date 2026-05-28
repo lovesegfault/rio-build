@@ -1854,27 +1854,38 @@ cost: a hook-fallback definition later resubmitted store-backed re-learns
 its resource floor once (one extra failure-and-resize cycle); same-content
 authoritative resubmits and store-origin rows are unaffected.
 
-#r("sched.merge.displaced-edge-scrub")[
-  Displacement MUST scrub the displaced node's dependency (children)
-  edges: the in-memory children edges are dropped when the node is
-  displaced, and the persisted `derivation_edges` rows whose parent is
-  the displaced derivation MUST be deleted in the same transaction as
-  its recreate-refresh, before the displacing submission's own edges are
-  inserted. Edges in the dependent (parents) direction MUST be
-  preserved, and a merge that fails after displacing a node MUST restore
-  the scrubbed edges together with the node.
+#r("sched.merge.displaced-edge-scrub+2")[
+  Displacement and the authority takeover through the resubmit-reset MUST
+  scrub the removed node's dependency (children) edges: the in-memory
+  children edges are dropped when the node is removed for re-creation,
+  and the persisted `derivation_edges` rows whose parent is that
+  derivation MUST be deleted in the same transaction as its
+  recreate-refresh, before the replacing submission's own edges are
+  inserted. Edges in the dependent (parents) direction MUST be preserved;
+  same-definition resubmit-resets and byte-identical authoritative
+  retries MUST keep their edges; and a merge that fails after the scrub
+  MUST restore the scrubbed edges together with the node.
 ]
-The displacing submission is a different definition: evaluating its
+The replacing submission is a different definition: evaluating its
 initial state against dependency edges earlier submissions attached to the
 hash would hand the squatter a denial-of-service handle that survives the
-displacement --- a failing or never-completing attacker child seeds the
-fresh node `DependencyFailed` (or parks it `Queued` forever), resubmits
-repeat the failure because the resubmit-reset deliberately keeps edges,
-and the persisted rows would resurrect the inherited dependency set after
-a leader failover. Same-definition resubmit-resets keep their
-edge-preserving semantics, and nodes that depend ON the displaced hash
-keep their edges --- they want its output whichever definition produces
-it.
+replacement --- a failing or never-completing attacker child seeds the
+fresh node `DependencyFailed` (or parks it `Queued` forever), and the
+persisted rows would resurrect the inherited dependency set after a
+leader failover. The boundary is the definition change, so it applies
+identically whether the new definition arrives by displacing a terminal
+squat or by taking over a parked-but-retriable authoritative claim
+through the resubmit-reset (the same path
+#rref("sched.merge.displaced-failure-reset") already treats as a
+definition change for the failure accumulators). Same-definition
+resubmit-resets keep their edge-preserving semantics, and nodes that
+depend ON the removed hash keep their edges --- they want its output
+whichever definition produces it. Accepted trade: a taken-over node's
+prior legitimate dependency edges are dropped unless the takeover
+submission re-declares them (gateway full-closure submissions always
+do). Known residual: a reaped authoritative row later re-created
+store-backed has no in-memory node to scrub, so stale persisted
+parent-side edges it left behind survive until a future row-level sweep.
 
 #r("sched.merge.displaced-failure-evidence")[
   When the displacement interest prune removes a displaced derivation

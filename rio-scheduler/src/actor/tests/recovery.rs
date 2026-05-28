@@ -5277,7 +5277,7 @@ async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() 
     Ok(())
 }
 
-// r[verify sched.merge.displaced-edge-scrub]
+// r[verify sched.merge.displaced-edge-scrub+2]
 /// The displaced-edge scrub must survive leader failover: the squatter's
 /// dependency edge (squat → junk) is deleted from `derivation_edges` in
 /// the displacing merge's transaction, so post-failover recovery cannot
@@ -5343,6 +5343,79 @@ async fn test_recovery_after_displacement_does_not_inherit_squatter_edges() -> T
         "recovered displacing node dispatches instead of being re-failed by the squatter's edge"
     );
     complete_success(&handle, "w-edge-r", &assn.drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes post-failover without inheriting the squatter's dependency set"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-edge-scrub+2]
+/// The authority-takeover edge scrub must survive leader failover: the
+/// squatter's dependency edge (squat → junk) is deleted from
+/// `derivation_edges` in the takeover merge's transaction, so
+/// post-failover recovery cannot re-fail the taken-over definition via
+/// `load_parents_with_failed_deps` (the junk's persisted status is a
+/// terminal failure). Mirrors the displacement variant above with a
+/// retriable (under-budget) squat taken over through the resubmit-reset.
+#[tokio::test]
+async fn test_recovery_after_takeover_does_not_inherit_squatter_edges() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    let squat_out = test_store_path("tk-recover-out");
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Squatter: authoritative squat with an attacker-attached edge
+        // onto its own junk node.
+        let mut squat = make_node("tk-recover");
+        squat.drv_content = b"Derive-tk-recover".to_vec();
+        squat.drv_content_authoritative = true;
+        squat.expected_output_paths = vec![test_store_path("tk-recover-out")];
+        merge_dag(
+            &handle,
+            squatter,
+            vec![squat, make_node("tk-junk-r")],
+            vec![make_test_edge("tk-recover", "tk-junk-r")],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+
+        // The junk's PERSISTED status is a terminal failure — exactly the
+        // state load_parents_with_failed_deps keys on after failover.
+        sqlx::query(
+            "UPDATE derivations SET status = 'poisoned', poisoned_at = now() \
+             WHERE drv_hash = 'tk-junk-r'",
+        )
+        .execute(&pool)
+        .await?;
+        // Park the squat Poisoned UNDER budget so the victim's
+        // identity-matching submission takes it over through the
+        // resubmit-reset (not displacement).
+        assert!(handle.debug_force_poisoned("tk-recover", 1).await?);
+
+        // Victim: identity-matching store-backed resubmission; its build
+        // is still running at failover time.
+        let mut victim_node = make_node("tk-recover");
+        victim_node.expected_output_paths = vec![test_store_path("tk-recover-out")];
+        merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover the taken-over node must be dispatchable (not
+    // DependencyFailed from the squatter's edge).
+    let mut rx = connect_executor(&handle, "w-tk-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("tk-recover"),
+        "recovered taken-over node dispatches instead of being re-failed by the squatter's edge"
+    );
+    complete_success(&handle, "w-tk-r", &assn.drv_path, &squat_out).await?;
     barrier(&handle).await;
     assert_eq!(
         query_status(&handle, victim).await?.state,

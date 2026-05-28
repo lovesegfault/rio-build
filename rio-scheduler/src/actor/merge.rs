@@ -2285,27 +2285,31 @@ impl DagActor {
 
         // Batch 2c: durable half of the displaced-edge scrub
         // (sched.merge.displaced-edge-scrub). dag.merge() already dropped
-        // the displaced nodes' in-memory children edges; deleting the
-        // persisted parent-side rows in the SAME transaction — and
-        // strictly BEFORE batch_insert_edges re-inserts the displacing
-        // submission's own edges for the same parent id — keeps a leader
-        // failover from rebuilding the squatter's dependency set onto the
-        // displacing definition. Child-side rows (other nodes depending
-        // on the displaced hash) are preserved, mirroring the in-memory
-        // parents-direction preservation.
-        // r[impl sched.merge.displaced-edge-scrub]
-        let displaced_ids: Vec<Uuid> = merge_result
+        // the displaced and taken-over nodes' in-memory children edges;
+        // deleting the persisted parent-side rows in the SAME transaction
+        // — and strictly BEFORE batch_insert_edges re-inserts the
+        // replacing submission's own edges for the same parent id — keeps
+        // a leader failover from rebuilding the squatter's dependency set
+        // onto the replacing definition. Authority takeovers (an
+        // authoritative squat replaced by a store-backed re-creation
+        // through the resubmit-reset) are the same definition-change
+        // boundary, so their hashes are chained in. Child-side rows
+        // (other nodes depending on the removed hash) are preserved,
+        // mirroring the in-memory parents-direction preservation.
+        // r[impl sched.merge.displaced-edge-scrub+2]
+        let edge_scrub_ids: Vec<Uuid> = merge_result
             .displaced
             .iter()
+            .chain(merge_result.authority_takeovers.iter())
             .filter_map(|h| id_map.get(h.as_str()).map(|(id, _)| *id))
             .collect();
-        if !displaced_ids.is_empty() {
+        if !edge_scrub_ids.is_empty() {
             let scrubbed =
-                crate::db::SchedulerDb::delete_displaced_parent_edges(&mut tx, &displaced_ids)
+                crate::db::SchedulerDb::delete_displaced_parent_edges(&mut tx, &edge_scrub_ids)
                     .await?;
             debug!(
                 count = scrubbed,
-                "scrubbed displaced nodes' persisted dependency edges"
+                "scrubbed displaced/taken-over nodes' persisted dependency edges"
             );
         }
 
