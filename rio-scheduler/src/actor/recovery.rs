@@ -61,10 +61,11 @@ struct RecoveryLoad {
     bd_rows: Vec<(Uuid, Uuid)>,
     build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     /// Recovered parents with ≥1 `poisoned`/`dependency_failed`/
-    /// `cancelled` child in PG. `seed_ready_queue` short-circuits
-    /// these to `DependencyFailed` BEFORE `compute_initial_states`
-    /// (which would otherwise see no edge → `all_deps_completed`
-    /// → wrong Ready). r[sched.recovery.failed-dep-cascade]
+    /// `cancelled` child in PG that a live co-owning build vouches
+    /// for. `seed_ready_queue` short-circuits these to
+    /// `DependencyFailed` BEFORE `compute_initial_states` (which would
+    /// otherwise see no edge → `all_deps_completed` → wrong Ready).
+    /// r[sched.recovery.failed-dep-cascade]
     failed_dep_parents: HashSet<DrvHash>,
 }
 
@@ -331,6 +332,14 @@ impl DagActor {
         // these to Ready. Load the set here (uses id_to_hash, internal
         // to this fn) and pass through RecoveryLoad for seed_ready_
         // queue to short-circuit → DependencyFailed.
+        //
+        // Evidence rule (shared with the produced-children gate below,
+        // in the failing direction here): a child's terminal failure
+        // counts against a recovered parent only when a LIVE build that
+        // also owns the parent vouches for that child — another build's
+        // dead/cancelled, never-wanted child must not condemn a healthy
+        // build's parent (bug_009). Parents excluded by the rule
+        // recover childless and are re-discovered at dispatch time.
         let failed_dep_parents: HashSet<DrvHash> = self
             .db
             .load_parents_with_failed_deps(&drv_ids)
@@ -379,17 +388,23 @@ impl DagActor {
         // is re-evaluated against the same produced-children criterion.
         //
         // The produced evidence is additionally scoped to children
-        // linked to a LIVE ('pending'/'active') build — the recovery
-        // mirror of the merge-time decision to clear only after
-        // verify_preexisting_completed: a PG 'completed' row vouched
-        // for only by long-terminal builds is stale evidence (the
-        // previous-generation re-request shape — the store may have
-        // GC'd those outputs long ago) and must not launder a clear.
-        // The gate's purpose is absorbing live-flow skew (the lost
-        // best-effort clears above), and in those flows the produced
-        // children are linked to a still-live build; parents whose only
-        // produced evidence is historical keep the restored mark and
-        // the bounded fail-fast handles them instead.
+        // vouched for by a LIVE ('pending'/'active') build that also
+        // owns the parent (the same evidence rule the failed-dep
+        // cascade above applies in the failing direction) — the
+        // recovery mirror of the merge-time decision to clear only
+        // after verify_preexisting_completed: a PG 'completed' row
+        // vouched for only by long-terminal builds is stale evidence
+        // (the previous-generation re-request shape — the store may
+        // have GC'd those outputs long ago), a row vouched for only by
+        // builds that never owned the parent is cross-build evidence
+        // (a pruning build links only its kept roots, so only a
+        // full-merge owner can vouch), and neither must launder a
+        // clear. The gate's purpose is absorbing live-flow skew (the
+        // lost best-effort clears above), and in those flows the
+        // produced children are linked to the still-live build that
+        // owns the parent too; parents whose only produced evidence is
+        // historical or cross-build keep the restored mark and the
+        // bounded fail-fast handles them instead.
         if !flagged.is_empty() {
             let produced_parents = self
                 .db

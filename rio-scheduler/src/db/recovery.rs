@@ -105,11 +105,14 @@ impl SchedulerDb {
     /// two: a completed/skipped dependency IS satisfied.
     ///
     /// Edges to `poisoned`/`dependency_failed`/`cancelled` children are
-    /// ALSO dropped here (they're terminal too) — those parents are
-    /// handled by [`Self::load_parents_with_failed_deps`] and
-    /// short-circuited to `DependencyFailed` in `seed_ready_queue`
-    /// BEFORE `compute_initial_states` runs, so the missing edge can't
-    /// cause a wrong `all_deps_completed() == true` promotion.
+    /// ALSO dropped here (they're terminal too) — parents whose failed
+    /// child is vouched for by a live co-owning build are returned by
+    /// [`Self::load_parents_with_failed_deps`] and short-circuited to
+    /// `DependencyFailed` in `seed_ready_queue` BEFORE
+    /// `compute_initial_states` runs, so the missing edge can't cause a
+    /// wrong `all_deps_completed() == true` promotion; the rest
+    /// deliberately recover childless and are re-discovered at dispatch
+    /// time (see that query's doc for the evidence rule).
     ///
     /// ANY($1): PG unnest-style array comparison. Scales to ~100k
     /// IDs before the planner starts preferring a temp table; recovery
@@ -134,7 +137,10 @@ impl SchedulerDb {
 
     // r[impl sched.recovery.failed-dep-cascade]
     /// Recovered parents with at least one terminal-**failure**
-    /// dependency (`poisoned`/`dependency_failed`/`cancelled`).
+    /// dependency (`poisoned`/`dependency_failed`/`cancelled`) that is
+    /// vouched for by a LIVE build co-owning the parent: the failed
+    /// child must carry a `build_derivations` link to a
+    /// `'pending'`/`'active'` build that ALSO links the parent.
     ///
     /// [`Self::load_edges_for_derivations`] drops edges to ALL terminal
     /// children, so `any_dep_terminally_failed` walks an empty
@@ -145,6 +151,30 @@ impl SchedulerDb {
     /// failure (CA-cutoff — `all_deps_completed` treats it as
     /// satisfied) and `'completed'` is the genuine satisfied case;
     /// neither is matched here.
+    ///
+    /// The co-ownership + liveness scoping exists because a persisted
+    /// failure edge is not, by itself, evidence that THIS parent's
+    /// dependency cascade was interrupted mid-crash: a pruning build is
+    /// interested in its kept root but never in the root's closure, so
+    /// a shared root can carry an edge to a child that went `cancelled`
+    /// purely because a DIFFERENT build that owned it was cancelled
+    /// (bug_009's shape). Condemning the recovered parent on that
+    /// dead-build / cross-build evidence terminally fails a healthy
+    /// build whose own substitution or rebuild would have succeeded.
+    /// Only a failed child that a still-live owner of the parent
+    /// demanded counts.
+    ///
+    /// Liveness is read at this query's instant, while
+    /// `interested_builds` is rebuilt from `builds`/`build_derivations`
+    /// reads later in recovery — a build flipping terminal in between
+    /// makes the two views disagree (read skew). Both directions err
+    /// conservatively: a parent cascaded on a voucher that died moments
+    /// later is just a terminal row no live build is interested in
+    /// (reaped/GC'd as usual), and an under-cascaded parent recovers
+    /// childless and is re-discovered at dispatch time — the
+    /// must-substitute guards keep a marked node off the doomed
+    /// from-source path, and an unmarked node's from-source dispatch is
+    /// exactly what its own live builds submitted it for.
     pub(crate) async fn load_parents_with_failed_deps(
         &self,
         derivation_ids: &[Uuid],
@@ -159,6 +189,13 @@ impl SchedulerDb {
             JOIN derivations d ON d.derivation_id = e.child_id
             WHERE e.parent_id = ANY($1)
               AND d.status IN ('poisoned', 'dependency_failed', 'cancelled')
+              AND EXISTS (SELECT 1 FROM build_derivations bd
+                          JOIN builds b ON b.build_id = bd.build_id
+                          JOIN build_derivations bdp
+                            ON bdp.build_id = bd.build_id
+                           AND bdp.derivation_id = e.parent_id
+                          WHERE bd.derivation_id = e.child_id
+                            AND b.status IN ('pending', 'active'))
             "#,
         )
         .bind(derivation_ids)
@@ -167,13 +204,18 @@ impl SchedulerDb {
     }
 
     /// Recovered parents whose persisted children are ALL produced
-    /// (`'completed' | 'skipped'`) AND vouched for by a build that is
-    /// still live: each child must carry a `build_derivations` link to
-    /// a `'pending'`/`'active'` build. This is the PG mirror of the
-    /// in-memory `children_all_produced` criterion every other
-    /// `topdown_pruned` clear site uses — that criterion is computed
-    /// over the live graph, so its PG mirror must not accept produced
-    /// rows whose only evidence is a long-terminal build.
+    /// (`'completed' | 'skipped'`) AND vouched for by a live build that
+    /// also owns the parent: each child must carry a
+    /// `build_derivations` link to a `'pending'`/`'active'` build that
+    /// ALSO links the parent. This is the PG mirror of the in-memory
+    /// closure-evidence judgment
+    /// ([`crate::dag::ClosureEvidence::Vouched`], computed by
+    /// [`crate::dag::DerivationDag::closure_evidence`] and surfaced to
+    /// the actor as `closure_vouched`) every other `topdown_pruned`
+    /// clear site routes through — that judgment is computed over the
+    /// live graph, so its PG mirror must not accept produced rows whose
+    /// only evidence is a long-terminal build or a build that never
+    /// owned the parent.
     ///
     /// Consumed by the recovery-time `topdown_pruned` gate in
     /// `load_dag_from_rows`: produced children are excluded from
@@ -189,12 +231,17 @@ impl SchedulerDb {
     /// store may GC the actual outputs at any point — when a later
     /// build re-requests the drv via the prune (no new edges, mark
     /// stamped), those historical rows are stale evidence and must NOT
-    /// clear the restored mark. Such parents keep the flag and at worst
-    /// take the bounded resubmit-directing fail-fast — never the doomed
+    /// clear the restored mark. The co-ownership requirement closes the
+    /// cross-build half of the same hole: a pruning build links only
+    /// its kept roots, never the children, so only a full-merge owner
+    /// of the parent can vouch — produced children belonging to some
+    /// unrelated live build must not launder a clear for a parent that
+    /// build never owned. Such parents keep the flag and at worst take
+    /// the bounded resubmit-directing fail-fast — never the doomed
     /// from-source dispatch of a closure that was never merged. Any
     /// unbuilt / `failed` / `cancelled` / `poisoned` /
-    /// `dependency_failed` child — and any produced child linked only
-    /// to terminal builds — fails the `bool_and`, so the
+    /// `dependency_failed` child — and any produced child without a
+    /// live co-owning voucher — fails the `bool_and`, so the
     /// must-substitute guard is kept for those parents too.
     pub(crate) async fn load_parents_with_all_children_produced(
         &self,
@@ -214,6 +261,9 @@ impl SchedulerDb {
                 c.status IN ('completed', 'skipped')
                 AND EXISTS (SELECT 1 FROM build_derivations bd
                             JOIN builds b ON b.build_id = bd.build_id
+                            JOIN build_derivations bdp
+                              ON bdp.build_id = bd.build_id
+                             AND bdp.derivation_id = e.parent_id
                             WHERE bd.derivation_id = c.derivation_id
                               AND b.status IN ('pending', 'active'))
             )

@@ -4165,3 +4165,388 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     );
     Ok(())
 }
+
+/// Phase-1 staging shared by the three bug_009 regression tests below:
+/// build `b2` full-merges parent→child (the `derivation_edges` row and
+/// B2's `build_derivations` links to BOTH rows are persisted), build
+/// `b1` is the pruned re-request that links ONLY the parent (no edges).
+/// After the merges the phase-1 handle is dropped and the persisted
+/// rows are backdated to the bug_009 crash shape: the child went
+/// `cancelled` when `b2` was cancelled (`builds.status = 'cancelled'`),
+/// the parent is left mid-substitution (`substituting`, plus
+/// `topdown_pruned = true` when `mark_parent`), and `b1` stays
+/// `active`. The parent declares outputs `[out, debug]` with stored
+/// wanted `'{}'` (= all declared) and `expected_output_paths`
+/// `[out_path, dbg_path]` so the phase-2 store staging decides the
+/// post-failover route (substitution / from-source / fail-fast).
+#[allow(clippy::too_many_arguments)] // test staging helper — a struct param would just rename the args
+async fn stage_parent_with_other_builds_cancelled_child(
+    handle: ActorHandle,
+    pool: &sqlx::PgPool,
+    b2: Uuid,
+    b1: Uuid,
+    root: &str,
+    dep: &str,
+    out_path: &str,
+    dbg_path: &str,
+    mark_parent: bool,
+) -> anyhow::Result<()> {
+    let mk_parent = || {
+        let mut n = make_node(root);
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![out_path.to_string(), dbg_path.to_string()];
+        n.wanted_output_names = vec![];
+        n
+    };
+    // B2: full merge parent→child WITH the edge persisted — the build
+    // whose cancellation later cancels the sole-interest child.
+    merge_dag(
+        &handle,
+        b2,
+        vec![mk_parent(), make_node(dep)],
+        vec![make_test_edge(root, dep)],
+        false,
+    )
+    .await?;
+    // B1: the pruned re-request — parent only, no edges, so
+    // batch_insert_build_derivations links B1 to the parent only.
+    merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
+    barrier(&handle).await;
+    drop(handle);
+    // Backdate AFTER the last merge (a later merge re-upserts the
+    // derivation row): the child is the row cancel_build_derivations
+    // persists for B2's sole-interest unbuilt child when B2 is
+    // cancelled; the parent is the post-prune persisted shape for B1.
+    sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE drv_hash = $1")
+        .bind(dep)
+        .execute(pool)
+        .await?;
+    if mark_parent {
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = $1",
+        )
+        .bind(root)
+        .execute(pool)
+        .await?;
+    } else {
+        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = $1")
+            .bind(root)
+            .execute(pool)
+            .await?;
+    }
+    sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
+        .bind(b2)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+// r[verify sched.recovery.failed-dep-cascade]
+/// bug_009, clearing harm: another build's cancelled, never-wanted
+/// child must not condemn a healthy pruning build's recovered parent.
+/// The failed-dep cascade only counts a terminal-failure child when a
+/// LIVE build that also owns the parent vouches for it; B2 is
+/// `cancelled`, so its child is dead cross-build evidence.
+///
+/// Staging: see [`stage_parent_with_other_builds_cancelled_child`]
+/// (parent marked `topdown_pruned`). Phase-2 store: ALL of the parent's
+/// declared outputs are substitutable, so the only correct outcome is
+/// completion via the substitution carve-out.
+///
+/// Pre-fix: `load_parents_with_failed_deps` returns the parent on the
+/// strength of B2's cancelled child alone, `seed_ready_queue`
+/// short-circuits it Substituting→Queued→DependencyFailed and persists
+/// it, and B1 is terminally failed with the recovery dependency-failure
+/// summary — substitution never gets a chance. Post-fix the parent
+/// recovers childless with the kept mark, completes via substitution,
+/// and B1 succeeds.
+#[tokio::test]
+async fn test_failover_pruned_build_completes_via_substitution_despite_other_builds_cancelled_child()
+-> TestResult {
+    let out = test_store_path("bug9s-root-out");
+    let dbg = test_store_path("bug9s-root-debug");
+
+    // Phase-2 store: every declared output is substitutable upstream.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    {
+        let mut sub = store.state.substitutable.write().unwrap();
+        sub.push(out.clone());
+        sub.push(dbg.clone());
+    }
+
+    let b2 = Uuid::new_v4(); // other build — cancelled at failover
+    let b1 = Uuid::new_v4(); // healthy pruning build under test
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        stage_parent_with_other_builds_cancelled_child(
+            handle,
+            &pool,
+            b2,
+            b1,
+            "bug9s-root",
+            "bug9s-dep",
+            &out,
+            &dbg,
+            true,
+        )
+        .await
+    })
+    .await?;
+    let handle = f.handle;
+
+    // The core regression assertion: the cascade must not have condemned
+    // the parent during recovery over B2's cancelled child.
+    let d = expect_drv(&handle, "bug9s-root").await;
+    assert_ne!(
+        d.status,
+        DerivationStatus::DependencyFailed,
+        "another build's cancelled child must not condemn the recovered parent \
+         of a healthy pruning build"
+    );
+
+    // A worker is available — a wrongful from-source dispatch would have
+    // somewhere to land.
+    let mut worker_rx = connect_executor(&handle, "bug9s-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+    // Deterministic end state: the kept mark routes the node through the
+    // substitution carve-out and the detached fetch completes it.
+    wait_for_status(&handle, "bug9s-root", DerivationStatus::Completed).await;
+
+    // No WorkAssignment was ever sent for the parent (substitution, not
+    // a from-source dispatch).
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "the parent must complete via substitution, never via a from-source \
+             dispatch (its closure was never merged for B1)"
+        );
+    }
+    // Not condemned in PG either.
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'bug9s-root'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_ne!(
+        pg_status, "dependency_failed",
+        "the cascade must not persist a dependency-failure verdict for the parent"
+    );
+    assert_eq!(
+        pg_status, "completed",
+        "the parent completes via substitution after failover"
+    );
+    // B1 is never condemned by another build's child: with every output
+    // substitutable it deterministically completes.
+    let s = query_status(&handle, b1).await?;
+    assert_ne!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the healthy pruning build must not be failed over another build's \
+         cancelled child; error={:?}",
+        s.error_summary
+    );
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "with all outputs substitutable the pruning build completes via \
+         substitution; got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.failed-dep-cascade]
+// r[verify sched.merge.substitute-topdown+10]
+/// bug_009, verdict harm: when the recovered parent's wanted set is
+/// genuinely unsatisfiable by substitution, the verdict and error must
+/// come from the node's OWN bounded resubmit-directing fail-fast — not
+/// from the failed-dep cascade acting on another build's cancelled
+/// child.
+///
+/// Same staging as the substitution variant above, but the phase-2
+/// store has `out` substitutable and `debug` missing / not
+/// substitutable, so the recovered all-declared wanted set cannot be
+/// satisfied and the kept mark must route the node to the fail-fast
+/// arm (the keep-test shape, with the historical edge pointing at a
+/// cancelled — not produced — child).
+///
+/// Deliberately NOT asserted: "the parent is not DependencyFailed".
+/// The bounded fail-fast itself terminalizes a sole-interest parked
+/// node as DependencyFailed (`fail_fast_topdown_pruned_root` parks it
+/// Queued, then `cancel_build_derivations` dependency-fails every
+/// sole-interest not-yet-dispatched node of the failing build), so the
+/// node's terminal status converges with the pre-fix outcome. What
+/// distinguishes the two paths — and what this test pins — is the
+/// provenance: B1's error is the actionable "topdown … resubmit"
+/// fail-fast, NOT the recovery cascade's "recovered with N failed
+/// derivation(s)" summary, and the mark is consumed by that fail-fast
+/// (PG `topdown_pruned = false`; the cascade never touches the mark and
+/// would leave it true).
+#[tokio::test]
+async fn test_failover_pruned_build_gets_resubmit_error_not_dependency_failure_from_other_builds_child()
+-> TestResult {
+    let out = test_store_path("bug9f-root-out");
+    let dbg = test_store_path("bug9f-root-debug");
+
+    // Phase-2 store: `out` substitutable upstream; `debug` missing and
+    // NOT substitutable — substitution cannot satisfy the recovered
+    // all-declared wanted set, so the kept mark must route the node to
+    // the fail-fast arm, not to a from-source dispatch.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let b2 = Uuid::new_v4(); // other build — cancelled at failover
+    let b1 = Uuid::new_v4(); // healthy pruning build under test
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        stage_parent_with_other_builds_cancelled_child(
+            handle,
+            &pool,
+            b2,
+            b1,
+            "bug9f-root",
+            "bug9f-dep",
+            &out,
+            &dbg,
+            true,
+        )
+        .await
+    })
+    .await?;
+    let handle = f.handle;
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the kept mark fails to gate it.
+    let mut worker_rx = connect_executor(&handle, "bug9f-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // No WorkAssignment is ever sent for the parent: its closure was
+    // never merged for B1, so a from-source dispatch would ENOENT.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a pruned root with an unsatisfiable wanted set must take the bounded \
+             fail-fast, never a from-source dispatch"
+        );
+    }
+    let d = expect_drv(&handle, "bug9f-root").await;
+    assert!(
+        !matches!(
+            d.status,
+            DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "the parent must never be handed to a worker; got {:?}",
+        d.status
+    );
+    // B1's terminal outcome is its OWN resubmit-directing fail-fast, not
+    // a dependency-failure verdict inherited from B2's cancelled child.
+    let s = query_status(&handle, b1).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "with `debug` unsatisfiable the pruning build takes the bounded \
+         fail-fast; got state={} error={:?}",
+        s.state,
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+        "error summary must be the resubmit-directing fail-fast; got {:?}",
+        s.error_summary
+    );
+    assert!(
+        !s.error_summary.contains("recovered with")
+            && !s.error_summary.contains("failed derivation"),
+        "error summary must not be the recovery cascade's dependency-failure \
+         wording; got {:?}",
+        s.error_summary
+    );
+    // The mark was consumed by the fail-fast (in PG too). The cascade
+    // never touches the mark, so pre-fix this stays true — a second
+    // discriminator between the two paths.
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'bug9f-root'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert!(
+        !pg_pruned,
+        "the bounded fail-fast consumes the topdown_pruned mark; the recovery \
+         cascade would have left it set"
+    );
+    Ok(())
+}
+
+// r[verify sched.recovery.failed-dep-cascade]
+/// The unflagged variant of the two tests above (no `topdown_pruned`
+/// backdate — the gateway single-node-fallback shape: B1 submitted just
+/// the parent, no prune involved). Another build's cancelled child must
+/// not condemn it either: the parent recovers childless, comes back
+/// Ready, and dispatches from source to the connected worker; B1 stays
+/// alive. Pre-fix the cascade short-circuited it to DependencyFailed at
+/// recovery (the cascade never consulted the mark, so the unflagged
+/// shape was bitten identically) and the dispatch never happened.
+#[tokio::test]
+async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispatches_from_source()
+-> TestResult {
+    let out = test_store_path("bug9u-root-out");
+    let dbg = test_store_path("bug9u-root-debug");
+
+    // Phase-2 store: `out` substitutable, `debug` missing and not
+    // substitutable — substitution cannot satisfy the wanted set, and
+    // with no mark the node must dispatch from source.
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let b2 = Uuid::new_v4(); // other build — cancelled at failover
+    let b1 = Uuid::new_v4(); // healthy single-node build under test
+    let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, pool| {
+        stage_parent_with_other_builds_cancelled_child(
+            handle,
+            &pool,
+            b2,
+            b1,
+            "bug9u-root",
+            "bug9u-dep",
+            &out,
+            &dbg,
+            false,
+        )
+        .await
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Not condemned by B2's cancelled child at recovery time.
+    let d = expect_drv(&handle, "bug9u-root").await;
+    assert_ne!(
+        d.status,
+        DerivationStatus::DependencyFailed,
+        "another build's cancelled child must not condemn the recovered parent \
+         of a healthy unflagged build"
+    );
+
+    // The node recovered childless and unmarked → it dispatches from
+    // source to the connected worker.
+    let mut worker_rx = connect_executor(&handle, "bug9u-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+    let a = recv_assignment(&mut worker_rx).await;
+    assert_eq!(
+        a.drv_path,
+        test_drv_path("bug9u-root"),
+        "the unflagged recovered parent must dispatch from source after failover"
+    );
+    // B1 stays alive (the assignment is in flight).
+    let s = query_status(&handle, b1).await?;
+    assert_ne!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the healthy build must not be failed over another build's cancelled \
+         child; error={:?}",
+        s.error_summary
+    );
+    Ok(())
+}
