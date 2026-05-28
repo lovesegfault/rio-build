@@ -124,6 +124,10 @@ pub enum StallKind {
 pub struct StallVerdict {
     pub job: String,
     pub kind: StallKind,
+    /// Queued-watchdog re-enqueues this job has used AFTER this verdict
+    /// (the post-increment count for a [`StallKind::QueuedRequeue`]), so
+    /// the operator log can report "requeue n/max_queued_requeues".
+    pub requeues_used: u32,
 }
 
 /// One contiguous window during which the suspension predicate was true.
@@ -180,6 +184,10 @@ pub struct TickOutcome {
     /// True when the dispatch-gap component is active — the run loop also
     /// pauses submission on it, not just the clocks.
     pub dispatch_pause: bool,
+    /// The suspension window that ended on this tick, if one did (already
+    /// recorded in the summary). Exposed so the run loop can act on window
+    /// edges without edge-detecting `suspended` across ticks itself.
+    pub closed_window: Option<SuspensionWindow>,
 }
 
 impl Watchdog {
@@ -284,6 +292,7 @@ impl Watchdog {
         let dispatch_pause = components.contains(&COMPONENT_DISPATCH);
 
         // Suspension-window bookkeeping.
+        let mut closed_window = None;
         if suspended {
             for c in &components {
                 *self
@@ -301,6 +310,11 @@ impl Watchdog {
                     }
                 }
                 None => {
+                    tracing::info!(
+                        components = ?components,
+                        at_unix = tick.at_unix,
+                        "suspension window opened: stall clocks frozen"
+                    );
                     self.current_window = Some(SuspensionWindow {
                         started_at_unix: tick.at_unix,
                         ended_at_unix: None,
@@ -310,7 +324,13 @@ impl Watchdog {
             }
         } else if let Some(mut w) = self.current_window.take() {
             w.ended_at_unix = Some(tick.at_unix);
-            self.summary.windows.push(w);
+            tracing::info!(
+                components = ?w.components,
+                duration_secs = tick.at_unix - w.started_at_unix,
+                "suspension window closed: stall clocks resume"
+            );
+            self.summary.windows.push(w.clone());
+            closed_window = Some(w);
         }
 
         // Clocks accrue only while not suspended.
@@ -325,6 +345,7 @@ impl Watchdog {
                         stalled.push(StallVerdict {
                             job: job.clone(),
                             kind: StallKind::ActiveStall,
+                            requeues_used: clock.requeues,
                         });
                         clock.accrued_secs = 0.0;
                     }
@@ -333,12 +354,14 @@ impl Watchdog {
                             stalled.push(StallVerdict {
                                 job: job.clone(),
                                 kind: StallKind::QueuedEscalate,
+                                requeues_used: clock.requeues,
                             });
                         } else {
                             clock.requeues += 1;
                             stalled.push(StallVerdict {
                                 job: job.clone(),
                                 kind: StallKind::QueuedRequeue,
+                                requeues_used: clock.requeues,
                             });
                         }
                         clock.accrued_secs = 0.0;
@@ -355,6 +378,7 @@ impl Watchdog {
             components,
             stalled,
             dispatch_pause,
+            closed_window,
         }
     }
 
@@ -420,8 +444,13 @@ mod tests {
         assert!(o.suspended);
         assert_eq!(o.components, vec![COMPONENT_IDLE]);
         assert!(!o.dispatch_pause);
-        // Recovery closes the window.
-        assert!(!wd.on_tick(&tick(240, cluster(10, 4, 0, 8))).suspended);
+        // Recovery closes the window — and the closing tick reports the
+        // just-closed window so the run loop never edge-detects.
+        let o = wd.on_tick(&tick(240, cluster(10, 4, 0, 8)));
+        assert!(!o.suspended);
+        let closed = o.closed_window.expect("closing tick exposes the window");
+        assert_eq!(closed.started_at_unix, 180);
+        assert_eq!(closed.ended_at_unix, Some(240));
         let summary = wd.suspension_summary();
         assert_eq!(summary.windows.len(), 1);
         assert_eq!(summary.windows[0].components, vec![COMPONENT_IDLE]);
@@ -508,7 +537,8 @@ mod tests {
             o.stalled,
             vec![StallVerdict {
                 job: "queued.x86_64-linux".into(),
-                kind: StallKind::QueuedRequeue
+                kind: StallKind::QueuedRequeue,
+                requeues_used: 1,
             }]
         );
 
@@ -519,7 +549,8 @@ mod tests {
             o.stalled,
             vec![StallVerdict {
                 job: "queued.x86_64-linux".into(),
-                kind: StallKind::QueuedRequeue
+                kind: StallKind::QueuedRequeue,
+                requeues_used: 2,
             }]
         );
 
@@ -531,11 +562,13 @@ mod tests {
         assert_eq!(o.stalled.len(), 2, "{:?}", o.stalled);
         assert!(o.stalled.contains(&StallVerdict {
             job: "queued.x86_64-linux".into(),
-            kind: StallKind::QueuedEscalate
+            kind: StallKind::QueuedEscalate,
+            requeues_used: 2,
         }));
         assert!(o.stalled.contains(&StallVerdict {
             job: "active.x86_64-linux".into(),
-            kind: StallKind::ActiveStall
+            kind: StallKind::ActiveStall,
+            requeues_used: 0,
         }));
 
         // Phase change resets the clock; terminal removal stops tracking.
@@ -543,6 +576,79 @@ mod tests {
         wd.remove_job("queued.x86_64-linux");
         let o = wd.on_tick(&tick(17 * 3600, cluster(5, 5, 0, 8)));
         assert!(o.stalled.is_empty());
+    }
+
+    #[test]
+    fn second_suspension_window_accumulates_totals() {
+        let mut wd = Watchdog::new(knobs());
+        // Window 1: paused for 60s (0→60), recovers at 120.
+        wd.on_tick(&tick(0, cluster(5, 5, 0, 8)));
+        let mut t = tick(60, cluster(5, 5, 0, 8));
+        t.engine_paused = true;
+        assert!(wd.on_tick(&t).suspended);
+        let mut t = tick(120, cluster(5, 5, 0, 8));
+        t.engine_paused = true;
+        assert!(wd.on_tick(&t).suspended);
+        let o = wd.on_tick(&tick(180, cluster(5, 5, 0, 8)));
+        assert!(o.closed_window.is_some(), "first window closes");
+        // Window 2: paused again for one 60s tick, recovers at 300.
+        let mut t = tick(240, cluster(5, 5, 0, 8));
+        t.engine_paused = true;
+        assert!(wd.on_tick(&t).suspended);
+        let o = wd.on_tick(&tick(300, cluster(5, 5, 0, 8)));
+        assert!(o.closed_window.is_some(), "second window closes");
+
+        let summary = wd.suspension_summary();
+        assert_eq!(summary.windows.len(), 2);
+        assert_eq!(summary.windows[0].started_at_unix, 60);
+        assert_eq!(summary.windows[0].ended_at_unix, Some(180));
+        assert_eq!(summary.windows[1].started_at_unix, 240);
+        assert_eq!(summary.windows[1].ended_at_unix, Some(300));
+        // Totals accumulate ACROSS windows: 60s+60s from window 1 (the
+        // deltas of its two suspended ticks) plus 60s from window 2.
+        assert!(
+            (summary.total_secs_by_component[COMPONENT_PAUSE] - 180.0).abs() < 1e-9,
+            "{summary:?}"
+        );
+    }
+
+    #[test]
+    fn dispatch_pause_clears_once_the_gap_clears() {
+        let mut wd = Watchdog::new(knobs());
+        // Build the dispatch-gap streak to its 5-poll threshold.
+        for i in 0..5 {
+            wd.on_tick(&tick(i * 60, cluster(100, 10, 0, 100)));
+        }
+        let o = wd.on_tick(&tick(5 * 60, cluster(100, 10, 0, 100)));
+        assert!(o.dispatch_pause, "gap sustained → submission paused");
+        // One healthy poll (gap below threshold) clears the streak: the
+        // pause lifts on the very next tick instead of lingering.
+        let o = wd.on_tick(&tick(6 * 60, cluster(100, 90, 0, 100)));
+        assert!(!o.dispatch_pause);
+        assert!(!o.suspended);
+        assert!(o.closed_window.is_some(), "dispatch window closed");
+    }
+
+    #[test]
+    fn poll_outage_preserves_an_in_progress_idle_streak() {
+        let mut wd = Watchdog::new(knobs());
+        // Two idle polls build the streak to 2 (threshold is 3).
+        assert!(!wd.on_tick(&tick(0, cluster(10, 0, 0, 8))).suspended);
+        assert!(!wd.on_tick(&tick(60, cluster(10, 0, 0, 8))).suspended);
+        // Poll outage: no cluster counts. The streak must neither advance
+        // nor reset.
+        let outage = PollTick {
+            at_unix: 120,
+            cluster: None,
+            ice: None,
+            engine_paused: false,
+        };
+        assert!(!wd.on_tick(&outage).suspended);
+        // Next observed idle poll is the third in the streak → suspended.
+        // (A reset streak would need two more idle polls to get here.)
+        let o = wd.on_tick(&tick(180, cluster(10, 0, 0, 8)));
+        assert!(o.suspended, "outage tick preserved the idle streak");
+        assert_eq!(o.components, vec![COMPONENT_IDLE]);
     }
 
     #[test]

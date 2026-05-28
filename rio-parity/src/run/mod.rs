@@ -22,6 +22,7 @@ pub mod hydra_truth;
 pub mod model;
 pub mod plan;
 pub mod reader;
+pub mod report;
 pub mod spec;
 pub mod state;
 pub mod stderrparse;

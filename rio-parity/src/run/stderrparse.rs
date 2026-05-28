@@ -169,14 +169,18 @@ pub fn signature_for(reason: Option<&str>, log_tail: Option<&str>) -> Option<Str
         };
         return Some(sig);
     }
-    log_tail.map(|t| {
+    log_tail.and_then(|t| {
         let line = t
             .lines()
             .rev()
             .find(|l| !l.trim().is_empty())
             .unwrap_or("")
             .trim();
-        format!("log:{}", slug60(line))
+        let slug = slug60(line);
+        // A whitespace-only (or all-punctuation) tail slugs to nothing; a
+        // bare "log:" would group unrelated failures together, so report no
+        // signature at all instead.
+        (!slug.is_empty()).then(|| format!("log:{slug}"))
     })
 }
 
@@ -364,5 +368,9 @@ mod tests {
         let s = signature_for(None, Some("phase x\nerror: linker `cc` not found\n"));
         assert!(s.unwrap().starts_with("log:error--linker"));
         assert_eq!(signature_for(None, None), None);
+        // Tails whose slug is empty (whitespace-only, or nothing but
+        // punctuation) must not yield a bare "log:" signature.
+        assert_eq!(signature_for(None, Some("   \n\t  \n")), None);
+        assert_eq!(signature_for(None, Some("*** !!! ***\n")), None);
     }
 }

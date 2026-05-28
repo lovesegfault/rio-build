@@ -881,6 +881,11 @@
       "doc": "`ResultReader` — the trait collect uses to learn per-(build, drv) status"
     },
     {
+      "path": "run/report.rs",
+      "depth": 1,
+      "doc": "Report rendering: summary.md, per-bucket JSONL, and progress.json."
+    },
+    {
       "path": "run/spec.rs",
       "depth": 1,
       "doc": "Campaign spec (operator input), engine knobs, and the campaign.json record."

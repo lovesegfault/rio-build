@@ -1,0 +1,31 @@
+{
+  "campaignId": "c-golden-0001",
+  "createdAt": "2026-05-26T00:00:00Z",
+  "engineVersion": "0.1.0",
+  "signatureTableVersion": "m1-raw-evidence",
+  "spec": {
+    "campaign_id": "c-golden-0001",
+    "mode": "leaf",
+    "eval_set": { "hydra_eval_id": 1824219, "key_digest": "deadbeef" },
+    "tenants": { "build_tenant": "parity-leaf", "warm_tenant": "parity-warm", "upstreams_verified": true },
+    "filters": { "systems": ["x86_64-linux"], "exclude_features": ["kvm"] }
+  },
+  "evalSet": { "hydraEvalId": 1824219, "keyDigest": "deadbeef", "manifestSha256": "abc123" },
+  "comparability": {
+    "evalSet": "1824219/deadbeef",
+    "manifestSha256": "abc123",
+    "mode": "leaf",
+    "buildTenant": "parity-leaf",
+    "filters": { "systems": ["x86_64-linux"], "exclude_features": ["kvm"] },
+    "engineVersion": "0.1.0",
+    "signatureTableVersion": "m1-raw-evidence",
+    "inScope": 0, "attemptable": 0, "attempted": 0, "excluded": {}, "completenessPct": 0.0,
+    "lowConfidence": []
+  },
+  "plan": {
+    "plannedAt": "2026-05-26T00:10:00Z",
+    "inScope": [], "skipped": {}, "notAttemptable": [], "warmSet": [],
+    "cachedPriorPaths": [], "cachedPriorJobs": [],
+    "counts": { "inScope": 10, "attemptable": 8, "skipped": 1, "notAttemptable": 1, "warmSet": 4, "cachedPriorJobs": 1 }
+  }
+}
