@@ -561,45 +561,44 @@ rec {
   #
   # nixForBuilder (not pkgs.nix): same derivation the builder/bootstrap
   # images already pull in, so the layers dedup; the EXDEV patch is
-  # inert outside the builder's overlayfs setup.
-  parity = mkImage {
-    name = "parity";
-    bins = [ rio-crates.rio-parity ];
-    user = nonrootUser;
-    extraContents = nonrootEtc ++ [
-      nixForBuilder
-      pkgs.nix-eval-jobs
-      pkgs.openssh
-      pkgs.bash
-      pkgs.coreutils
-      pkgs.gnutar
-      pkgs.gzip
-      pkgs.zstd
-      # New-style `nix` CLI needs the experimental flag; the engine and
-      # operators exec `nix` inside this image, never nix-daemon.
-      (pkgs.writeTextDir "etc/nix/nix.conf" ''
-        experimental-features = nix-command
-      '')
-    ];
-    extraEnv = [
-      "PATH=${
-        lib.makeBinPath [
-          nixForBuilder
-          pkgs.nix-eval-jobs
-          pkgs.openssh
-          pkgs.bash
-          pkgs.coreutils
-          pkgs.gnutar
-          pkgs.gzip
-          pkgs.zstd
-        ]
-      }"
-    ];
-    extraCommands = ''
-      mkdir -p tmp
-      chmod 1777 tmp
-    '';
-  };
+  # inert outside the builder's overlayfs setup. (nix-eval-jobs links
+  # the unpatched upstream nix component libraries, so its closure rides
+  # along regardless — the dedup covers only the nix CLI itself.)
+  parity =
+    let
+      # Runtime tools the engine shells out to. Single list consumed by
+      # BOTH extraContents and the image PATH so the two cannot drift.
+      parityTools = [
+        nixForBuilder
+        pkgs.nix-eval-jobs
+        pkgs.openssh
+        pkgs.bash
+        pkgs.coreutils
+        pkgs.gnutar
+        pkgs.gzip
+        pkgs.zstd
+      ];
+    in
+    mkImage {
+      name = "parity";
+      bins = [ rio-crates.rio-parity ];
+      user = nonrootUser;
+      extraContents =
+        nonrootEtc
+        ++ parityTools
+        ++ [
+          # New-style `nix` CLI needs the experimental flag; the engine and
+          # operators exec `nix` inside this image, never nix-daemon.
+          (pkgs.writeTextDir "etc/nix/nix.conf" ''
+            experimental-features = nix-command
+          '')
+        ];
+      extraEnv = [ "PATH=${lib.makeBinPath parityTools}" ];
+      extraCommands = ''
+        mkdir -p tmp
+        chmod 1777 tmp
+      '';
+    };
 
   # ── AMI layer-cache warm: builder image as an OCI archive ─────────────
   # r[impl infra.node.prebake-layer-warm]

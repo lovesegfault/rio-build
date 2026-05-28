@@ -938,7 +938,7 @@
               # Container images. `.#dockerImages` is the linkFarm xtask
               # `eks push` walks; individual images at `.#dockerImages.<name>`
               # via passthru (gateway, scheduler, store, builder, controller,
-              # bootstrap, dashboard, executorSeed, vmTestSeed). The flat
+              # bootstrap, dashboard, parity, executorSeed, vmTestSeed). The flat
               # `docker-<name>` aliases are gone — pure re-exports, no callers.
               # overrideAttrs (not `drv // { passthru = … }`) so mkDerivation's
               # extendDerivation promotes passthru attrs to top-level — that's
