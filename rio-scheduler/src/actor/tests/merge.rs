@@ -9059,3 +9059,94 @@ async fn test_displacement_resets_resource_floor() -> TestResult {
     assert!(builders.is_empty(), "failed_builders cleared");
     Ok(())
 }
+
+/// End-to-end match-displacement (bug_014): a poison-budget-exhausted
+/// authoritative squat must not lock later legitimate store-backed
+/// submissions of the SAME verifiable identity out of the hash for the
+/// rest of its poison TTL. The victim's submission displaces the locked
+/// squat instead of joining it: the victim build does not fail-fast,
+/// the fresh node dispatches and completes, the persisted failure
+/// accounting is reset, and the squatter's still-running build loses
+/// its durable link to the displaced hash.
+// r[verify sched.merge.authoritative-conflict+3]
+#[tokio::test]
+async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_drv_path = test_drv_path("squatG");
+    let squat_out = test_store_path("squatG-out");
+
+    // The squatter: authoritative content-bound node, then poison-locked
+    // (budget exhausted) — the state in which it can never run again.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatG");
+    squat.drv_content = b"Derive-squatG".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_force_poisoned("squatG", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: store-backed submission with the SAME verifiable
+    // identity (shared non-empty expected output path as content
+    // evidence) → match-displaces the locked squat.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("squatG");
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Not captured by the locked squat: the victim build is live, the
+    // node is store-backed again, and its persisted failure accounting
+    // is reset.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not fail-fast on the locked squat"
+    );
+    let info = expect_drv(&handle, "squatG").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "fresh node");
+    let (cycles, poisoned): (i32, bool) = sqlx::query_as(
+        "SELECT resubmit_cycles, poisoned_at IS NOT NULL FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatG")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(cycles, 0, "displaced row's poison budget reset");
+    assert!(!poisoned, "displaced row's poisoned_at cleared");
+
+    // The squatter's still-running build no longer counts the displaced
+    // hash (durable prune): only the victim keeps a link.
+    let linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_drv_path)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        linked,
+        vec![victim],
+        "squatter's link pruned, victim's kept"
+    );
+
+    // The displaced fresh node actually dispatches and completes — the
+    // hash is usable again.
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_drv_path, "displaced node dispatched");
+    complete_success(&handle, "w1", &squat_drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
+    );
+    Ok(())
+}

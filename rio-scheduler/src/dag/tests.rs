@@ -2853,6 +2853,190 @@ fn authoritative_claim_without_evidence_is_rejected() -> anyhow::Result<()> {
 }
 
 // r[verify sched.merge.authoritative-conflict+3]
+/// Match-displacement of a poison-locked squat: an identity-MATCHING
+/// store-backed submission must DISPLACE (not join) an authoritative
+/// node that sits in a terminal failure state no longer retriable on
+/// resubmit (poison budget exhausted) — otherwise the locked claim
+/// would capture every later legitimate submission of the derivation
+/// for the rest of its poison TTL. FOD-shaped here: path agreement is
+/// the content evidence, exactly the join-evidence the squat used.
+#[test]
+fn fod_matching_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    let fod_path = "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-fod-out";
+
+    let mut squat = authoritative_node("locked-fod", b"Derive-FOD");
+    squat.is_fixed_output = true;
+    squat.expected_output_paths = vec![fod_path.to_string()];
+    squat.ca_modular_hash = None;
+    dag.merge(squatter, &[squat], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("locked-fod").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    // Same verifiable identity (shared non-empty expected path).
+    let mut store_backed = make_node("locked-fod", "x86_64-linux");
+    store_backed.is_fixed_output = true;
+    store_backed.is_content_addressed = true;
+    store_backed.expected_output_paths = vec![fod_path.to_string()];
+    let res = dag.merge(victim, &[store_backed], &[], "")?;
+
+    assert!(res.newly_inserted.contains("locked-fod"));
+    assert!(
+        res.displaced.iter().any(|h| h.as_str() == "locked-fod"),
+        "match-displacement, not a join"
+    );
+    assert!(
+        res.reset_on_resubmit.is_empty(),
+        "not the resubmit-reset path"
+    );
+    let n = dag.node("locked-fod").unwrap();
+    assert!(n.drv_content.is_empty());
+    assert!(!n.drv_content_authoritative);
+    assert_eq!(
+        n.interested_builds,
+        HashSet::from([victim]),
+        "no inherited interest"
+    );
+    assert_eq!(n.retry.resubmit_cycles, 0, "fresh poison budget");
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// Match-displacement is scoped to LOCKED terminal failures only: a
+/// successfully finished authoritative node (Completed or Skipped)
+/// keeps the join semantics for an identity-matching store-backed
+/// submission, so cache-hit dedup of an already-built derivation is
+/// not lost.
+#[rstest]
+#[case::completed(DerivationStatus::Completed)]
+#[case::skipped(DerivationStatus::Skipped)]
+fn matching_identity_joins_completed_authoritative_node(
+    #[case] terminal_ok: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("done-auth", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("done-auth")
+        .unwrap()
+        .set_status_for_test(terminal_ok);
+
+    let mut same = make_node("done-auth", "x86_64-linux");
+    same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(b2, &[same], &[], "")?;
+    assert!(res.newly_inserted.is_empty(), "joins, not displaced");
+    assert!(res.displaced.is_empty());
+    let node = dag.node("done-auth").unwrap();
+    assert_eq!(node.status(), terminal_ok, "terminal-success state kept");
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// An UNDER-budget poisoned squat is still retriable on resubmit, so an
+/// identity-matching store-backed submission takes the normal
+/// resubmit-reset (interest carried, cycle accumulated, the squat's
+/// bytes replaced by the store-backed definition) — the
+/// match-displacement arm must not pre-empt it.
+#[test]
+fn matching_identity_resets_poisoned_under_budget_squat() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let resubmitter = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("under-budget", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("under-budget").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = 0; // under POISON_RESUBMIT_RETRY_LIMIT
+    }
+
+    let mut same = make_node("under-budget", "x86_64-linux");
+    same.is_content_addressed = true;
+    same.ca_modular_hash = Some([0xAB; 32]);
+    let res = dag.merge(resubmitter, &[same], &[], "")?;
+
+    assert!(res.newly_inserted.contains("under-budget"));
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "under-budget"),
+        "resubmit-reset, not displacement"
+    );
+    assert!(res.displaced.is_empty());
+    let n = dag.node("under-budget").unwrap();
+    assert!(n.interested_builds.contains(&squatter), "interest carried");
+    assert!(n.interested_builds.contains(&resubmitter));
+    assert_eq!(n.retry.resubmit_cycles, 1, "poison budget accumulates");
+    assert!(n.drv_content.is_empty(), "store-backed definition adopted");
+    assert!(!n.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// A merge that match-displaces a poison-locked squat but fails on a
+/// LATER node in the same submission must restore the squat exactly —
+/// the match-displacement rides the same rollback container as the
+/// conflict-displacement.
+#[test]
+fn rollback_restores_a_match_displaced_poisoned_squat() -> anyhow::Result<()> {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+
+    dag.merge(
+        squatter,
+        &[authoritative_node("locked-rb", b"Derive-A")],
+        &[],
+        "",
+    )?;
+    {
+        let n = dag.nodes.get_mut("locked-rb").unwrap();
+        n.set_status_for_test(DerivationStatus::Poisoned);
+        n.retry.resubmit_cycles = POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    let mut displacing = make_node("locked-rb", "x86_64-linux");
+    displacing.is_content_addressed = true;
+    displacing.ca_modular_hash = Some([0xAB; 32]);
+    let result = dag.merge(
+        victim,
+        &[
+            displacing,
+            make_node_with_path("bad", "not-a-store-path", "x86_64-linux"),
+        ],
+        &[],
+        "",
+    );
+    assert!(matches!(result, Err(DagError::InvalidDrvPath { .. })));
+
+    let n = dag.node("locked-rb").expect("squat restored");
+    assert_eq!(n.status(), DerivationStatus::Poisoned);
+    assert_eq!(n.drv_content, b"Derive-A");
+    assert!(n.drv_content_authoritative);
+    assert_eq!(n.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT);
+    assert_eq!(n.interested_builds, HashSet::from([squatter]));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+3]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node in a retriable state (Failed / Cancelled / DependencyFailed /
 /// Poisoned-under-budget) cannot be silently redefined by different

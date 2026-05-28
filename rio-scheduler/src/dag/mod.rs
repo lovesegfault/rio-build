@@ -51,7 +51,11 @@ pub enum DagError {
     /// Joining would attribute that in-flight build's results to a
     /// derivation that either provably differs or cannot be shown to be
     /// the same. Maps to `FAILED_PRECONDITION`; once the conflicting node
-    /// is terminal the verifiable definition displaces it instead.
+    /// is terminal the verifiable definition displaces it instead. (An
+    /// identity-MATCHING store-backed submission never sees this error:
+    /// it joins the node, or displaces it without error when the node is
+    /// poison-locked — terminal failure, no longer retriable on
+    /// resubmit.)
     #[error(
         "in-flight derivation {drv_path} carries authoritative inline content \
          that conflicts with this submission's declared identity"
@@ -175,15 +179,18 @@ pub struct MergeResult {
     /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
     pub reset_on_resubmit: Vec<DrvHash>,
     /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
-    /// node whose verifiable identity conflicted with this submission
-    /// (`sched.merge.authoritative-conflict`). Mutually exclusive with
+    /// node (`sched.merge.authoritative-conflict`): either its verifiable
+    /// identity conflicted with this submission, or it matched but the
+    /// node sat in a poison-locked terminal failure state no longer
+    /// retriable on resubmit. Mutually exclusive with
     /// `reset_on_resubmit`: a hash appears in exactly one of the two.
     /// Unlike the resubmit-reset path, displacement carries NO prior
-    /// interest and starts `resubmit_cycles` at 0 — the fresh node is a
-    /// different derivation definition, not a retry of the old one. The
-    /// actor uses this to reset the displaced row's poison/failure
-    /// accounting and to prune the displaced hash from prior interested
-    /// builds' completion accounting.
+    /// interest and starts `resubmit_cycles` at 0 — the fresh node is
+    /// the verifiable definition taking over the hash, not a retry of
+    /// the squat. The actor uses this to reset the displaced row's
+    /// poison/failure accounting (including its resource floors) and to
+    /// prune the displaced hash from prior interested builds'
+    /// completion accounting.
     pub displaced: Vec<DrvHash>,
     /// Full prior state of every pre-existing node this merge
     /// destructively removed — resubmit-reset of retriable nodes and
@@ -546,7 +553,13 @@ impl DerivationDag {
             //     poison-budget-exhausted squat — (the verifiable
             //     definition wins; prior interest is NOT carried and the
             //     fresh node starts with a fresh poison budget: it is a
-            //     different definition, not a retry of the old one);
+            //     different definition, not a retry of the old one); an
+            //     identity-MATCHING store-backed submission joins as
+            //     usual, EXCEPT when the node sits in a poison-locked
+            //     terminal failure state (no longer retriable on
+            //     resubmit): then it displaces the node too, so a locked
+            //     claim cannot capture later legitimate submissions for
+            //     the rest of its poison TTL;
             //   - the INVERSE direction is gated too
             //     (sched.merge.authoritative-claim-no-redefine): an
             //     authoritative claim landing on a STORE-BACKED node
@@ -573,33 +586,53 @@ impl DerivationDag {
                             drv_path: node.drv_path.clone(),
                         });
                     }
-                } else if !node.drv_content_authoritative
-                    && existing.drv_content_authoritative
-                    && !verifiable_identity_matches(existing, node)
-                {
-                    if existing.status().is_terminal() {
-                        // Displacement: remove the squat so the fresh
-                        // store-backed definition is inserted below as a
-                        // brand-new node (prior=None → no interest carry,
-                        // resubmit_cycles=0, not in reset_on_resubmit).
-                        // The prior state still rides in removed_retriable
-                        // so rollback_merge restores it if a LATER node in
-                        // this same submission fails the merge.
-                        let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                        removed_retriable.push((drv_hash.clone(), old));
-                        displaced.push(drv_hash.clone());
-                    } else {
-                        self.rollback_merge(
-                            &newly_inserted,
-                            &new_edges,
-                            &interest_added,
-                            &traceparent_upgraded,
-                            build_id,
-                            removed_retriable,
-                        );
-                        return Err(DagError::ConflictingInFlightContent {
-                            drv_path: node.drv_path.clone(),
-                        });
+                } else if !node.drv_content_authoritative && existing.drv_content_authoritative {
+                    let identity_matches = verifiable_identity_matches(existing, node);
+                    // Poison-locked: a terminal failure state the
+                    // resubmit-reset can no longer clear (today this is
+                    // exactly Poisoned with the resubmit budget
+                    // exhausted; written broadly as defense-in-depth).
+                    // An identity-MATCHING store-backed submission must
+                    // displace such a node rather than join it —
+                    // joining would attach the submitter to a build
+                    // that can never run again, so the locked claim
+                    // would capture every later legitimate submission
+                    // of the derivation for the rest of its poison TTL.
+                    let locked_terminal_failure = existing.status().is_terminal()
+                        && !matches!(
+                            existing.status(),
+                            DerivationStatus::Completed | DerivationStatus::Skipped
+                        )
+                        && !existing.is_retriable_on_resubmit();
+                    if !identity_matches || locked_terminal_failure {
+                        if existing.status().is_terminal() {
+                            // Displacement: remove the squat so the fresh
+                            // store-backed definition is inserted below as a
+                            // brand-new node (prior=None → no interest carry,
+                            // resubmit_cycles=0, not in reset_on_resubmit).
+                            // The prior state still rides in removed_retriable
+                            // so rollback_merge restores it if a LATER node in
+                            // this same submission fails the merge.
+                            let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                            removed_retriable.push((drv_hash.clone(), old));
+                            displaced.push(drv_hash.clone());
+                        } else {
+                            // Only reachable on an identity conflict — a
+                            // poison-locked node is terminal by
+                            // construction, so the matching case never
+                            // lands here.
+                            self.rollback_merge(
+                                &newly_inserted,
+                                &new_edges,
+                                &interest_added,
+                                &traceparent_upgraded,
+                                build_id,
+                                removed_retriable,
+                            );
+                            return Err(DagError::ConflictingInFlightContent {
+                                drv_path: node.drv_path.clone(),
+                            });
+                        }
                     }
                 } else if node.drv_content_authoritative
                     && !existing.drv_content_authoritative

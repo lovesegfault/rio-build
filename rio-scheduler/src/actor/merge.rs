@@ -726,8 +726,10 @@ impl DagActor {
         // Displaced authoritative squats (sched.merge.authoritative-conflict)
         // get the FULL failure-history reset (`reset_displaced_derivation`,
         // which zeroes `resubmit_cycles` AND the reactive resource floors),
-        // not `clear_poison_batch`: the fresh node is a different
-        // derivation definition, not a retry of the squat, so it must not
+        // not `clear_poison_batch`: the fresh node is the verifiable
+        // store-backed definition taking over the hash (a conflicting
+        // identity, or the matching one evicting a poison-locked claim),
+        // not a retry of the squat, so it must not
         // inherit the squat's failure history, consume its poison-resubmit
         // budget, or be dispatched at the ceiling sizes the squat's
         // deliberate failures ratcheted the floors up to (the
@@ -792,8 +794,10 @@ impl DagActor {
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         // Displacement accounting (sched.merge.authoritative-conflict):
-        // a displaced node is a DIFFERENT derivation definition, so the
-        // spec forbids carrying the squat's interest onto the fresh node
+        // a displaced node is a different derivation definition — or a
+        // poison-locked authoritative claim evicted by its verifiable
+        // store-backed form — and the spec forbids carrying the squat's
+        // interest onto the fresh node
         // — but every removal path must either carry or prune interest,
         // otherwise a prior-interested build keeps counting a hash that
         // no longer exists for it and can hang Active forever. Prune the
