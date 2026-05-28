@@ -279,6 +279,7 @@ pub fn describe_metrics() {
         "rio_store_chunk_cache_misses_total",
         "moka chunk cache misses"
     );
+    // r[impl obs.metric.chunk-backend-tiered]
     describe_counter!(
         "rio_store_tiered_local_hits_total",
         "Tiered backend Express-tier hits (chunk served without an S3-standard RTT)"

@@ -9,7 +9,7 @@
 //! [`CircuitBreaker::record`].
 //!
 //! Two trip conditions — EITHER opens the circuit:
-//!   (a) `threshold` (default 5) consecutive `ensure_cached` fetch failures
+//!   (a) `threshold` (default 5) consecutive store-fetch failures
 //!   (b) `last_success.elapsed() > wall_clock_trip` (default 720s) AND at
 //!       least one failure since last success — catches the degraded-but-
 //!       alive store (accepting connections, serving slowly) without waiting

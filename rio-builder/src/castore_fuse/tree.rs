@@ -396,6 +396,7 @@ impl InoMap {
     /// Canonical store-path attributes for `ino`. Everything is owned
     /// by root, timestamped at epoch+1s, and read-only — the same
     /// normalization the NAR format applies.
+    // r[impl builder.fuse.canonical-metadata+2]
     pub fn attr(&self, ino: u64) -> Option<FileAttr> {
         if ino == INodeNo::ROOT.0 {
             return Some(make_attr(ino, FileType::Directory, 0, 0o555));
@@ -647,6 +648,7 @@ mod tests {
     /// allowlist), and the §2.4 TTL every reply carries is infinite.
     // r[verify builder.fs.castore-dag-source]
     // r[verify builder.fs.castore-cache-config]
+    // r[verify builder.fuse.canonical-metadata+2]
     #[test]
     fn lookup_round_trip() {
         let (roots, dirs) = sample();
@@ -667,6 +669,10 @@ mod tests {
             .expect("symlink root");
         assert_eq!(link.kind, FileType::Symlink);
         assert_eq!(
+            link.perm, 0o777,
+            "symlink mode is the Linux-immutable 0o777"
+        );
+        assert_eq!(
             map.node(link_ino),
             Some(&Node::Symlink {
                 target: b"aaa-pkg".to_vec()
@@ -684,6 +690,7 @@ mod tests {
         // Canonical store-path metadata: epoch+1 mtime, root-owned.
         assert_eq!(lib.mtime, UNIX_EPOCH + Duration::from_secs(1));
         assert_eq!(lib.uid, 0);
+        assert_eq!(lib.gid, 0);
 
         // Outside the closure → None → cached negative entry. The
         // closure IS the allowlist; a typo'd dependency must not

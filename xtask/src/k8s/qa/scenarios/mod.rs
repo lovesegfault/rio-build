@@ -41,7 +41,6 @@ mod i102_cli_builds_latency;
 mod i109_authorized_keys_hot_reload;
 mod i110_batch_rpc_scale;
 mod i114_liveness_kill;
-mod i115_temp_suffix_fastpath;
 mod i116_idle_exit;
 mod i126_do_not_disrupt;
 mod i156_histogram_buckets;
@@ -82,7 +81,6 @@ pub static ALL: &[&dyn Scenario] = &[
     &i049_dispatch_latency::DispatchLatency,
     &i095_ghost_dispatch::GhostDispatch,
     &i114_liveness_kill::LivenessKill,
-    &i115_temp_suffix_fastpath::TempSuffixFastpath,
     &i116_idle_exit::IdleExit,
     &i126_do_not_disrupt::DoNotDisrupt,
     &i163_mailbox_under_load::MailboxUnderLoad,

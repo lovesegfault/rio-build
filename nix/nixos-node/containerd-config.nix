@@ -31,7 +31,7 @@ pkgs.writeText "containerd-config.toml" ''
   [plugins.'io.containerd.cri.v1.runtime'.containerd.runtimes.runc]
   runtime_type = "io.containerd.runc.v2"
   # /dev/{fuse,kvm} injection — shared with the k3s VM-test path
-  # (nix/tests/fixtures/k3s-full.nix). r[impl sec.pod.fuse-device-plugin]
+  # (nix/tests/fixtures/k3s-full.nix). r[impl sec.pod.fuse-device-plugin+1]
   # marker lives on the shared file. Both withKvm variants are baked
   # into the AMI; eks-node.nix's containerd ExecStartPre
   # (baseRuntimeSpec.pickExecStartPre) symlinks the right one here

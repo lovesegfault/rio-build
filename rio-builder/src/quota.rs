@@ -326,6 +326,39 @@ fn qcmd(cmd: libc::c_int, typ: libc::c_int) -> libc::c_int {
     (cmd << 8) | (typ & 0xff)
 }
 
+/// `ioctl(FS_IOC_FSGETXATTR)`: read the project id + xflags of the
+/// directory behind `fd`.
+fn fsgetxattr(fd: libc::c_int) -> io::Result<Fsxattr> {
+    let mut x = Fsxattr::default();
+    // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
+    // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
+    if unsafe { libc::ioctl(fd, FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(x)
+}
+
+/// `quotactl_fd(2)` (Linux 5.14+): one quota command against the
+/// filesystem holding `fd`. Whether `dq` is read or written depends on
+/// `cmd`.
+fn quotactl_fd(fd: libc::c_int, cmd: libc::c_int, id: u32, dq: &mut libc::dqblk) -> io::Result<()> {
+    // SAFETY: SYS_quotactl_fd(int fd, int cmd, qid_t id, void *addr).
+    // All four args are passed as c_long per the raw-syscall ABI.
+    let r = unsafe {
+        libc::syscall(
+            libc::SYS_quotactl_fd,
+            fd as libc::c_long,
+            cmd as libc::c_long,
+            id as libc::c_long,
+            dq as *mut _ as libc::c_long,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Returns kubelet's project-quota usage for the emptyDir at `dir`, or
 /// `None` if the filesystem has no project quota assigned (gp3-root pool
 /// without `-o prjquota`, tmpfs, or any ioctl/syscall failure).
@@ -335,13 +368,10 @@ fn qcmd(cmd: libc::c_int, typ: libc::c_int) -> libc::c_int {
 // r[impl sched.sla.disk-scalar]
 pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
     let f = File::open(dir)?;
-    let mut x = Fsxattr::default();
-    // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
-    // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
-    if unsafe { libc::ioctl(f.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
+    let Ok(x) = fsgetxattr(f.as_raw_fd()) else {
         // ENOTTY (tmpfs) / EOPNOTSUPP (fs without xattr) → no quota.
         return Ok(None);
-    }
+    };
     if x.fsx_projid == 0 {
         // projid 0 = no project assigned (kubelet didn't set one, or
         // the node fs lacks -o prjquota).
@@ -351,18 +381,7 @@ pub fn current_bytes(dir: &Path) -> io::Result<Option<u64>> {
     // it on Q_GETQUOTA success.
     let mut dq: libc::dqblk = unsafe { std::mem::zeroed() };
     let cmd = qcmd(libc::Q_GETQUOTA, PRJQUOTA);
-    // SAFETY: SYS_quotactl_fd(int fd, int cmd, qid_t id, void *addr).
-    // All four args are passed as c_long per the raw-syscall ABI.
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_quotactl_fd,
-            f.as_raw_fd() as libc::c_long,
-            cmd as libc::c_long,
-            x.fsx_projid as libc::c_long,
-            &mut dq as *mut _ as libc::c_long,
-        )
-    };
-    if r < 0 {
+    if quotactl_fd(f.as_raw_fd(), cmd, x.fsx_projid, &mut dq).is_err() {
         // ENOSYS (kernel <5.14), ESRCH (projid has no quota record),
         // EINVAL (quota not enabled on this mount) → no signal.
         return Ok(None);
@@ -776,12 +795,7 @@ fn statvfs_of(dir: &Path) -> Option<libc::statvfs> {
 /// 1024-byte blocks per `<sys/quota.h>`.
 pub fn apply_project_quota(dirfd: &impl AsRawFd, projid: u32, limit_bytes: u64) -> io::Result<()> {
     // ── 1. Tag the directory with the project id + inherit flag.
-    let mut x = Fsxattr::default();
-    // SAFETY: FS_IOC_FSGETXATTR writes exactly sizeof(Fsxattr) bytes to
-    // the pointer. `x` is repr(C), Default-zeroed, lives on our stack.
-    if unsafe { libc::ioctl(dirfd.as_raw_fd(), FS_IOC_FSGETXATTR, &mut x as *mut _) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    let mut x = fsgetxattr(dirfd.as_raw_fd())?;
     x.fsx_projid = projid;
     x.fsx_xflags |= FS_XFLAG_PROJINHERIT;
     // SAFETY: FS_IOC_FSSETXATTR reads exactly sizeof(Fsxattr) bytes.
@@ -796,20 +810,7 @@ pub fn apply_project_quota(dirfd: &impl AsRawFd, projid: u32, limit_bytes: u64) 
     dq.dqb_bsoftlimit = dq.dqb_bhardlimit;
     dq.dqb_valid = QIF_LIMITS;
     let cmd = qcmd(libc::Q_SETQUOTA, PRJQUOTA);
-    // SAFETY: SYS_quotactl_fd(int fd, int cmd, qid_t id, void *addr).
-    let r = unsafe {
-        libc::syscall(
-            libc::SYS_quotactl_fd,
-            dirfd.as_raw_fd() as libc::c_long,
-            cmd as libc::c_long,
-            projid as libc::c_long,
-            &mut dq as *mut _ as libc::c_long,
-        )
-    };
-    if r < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    quotactl_fd(dirfd.as_raw_fd(), cmd, projid, &mut dq)
 }
 
 #[cfg(test)]

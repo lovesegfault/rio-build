@@ -30,28 +30,6 @@ pub(super) use common::{
     verify_nar,
 };
 
-/// Drain remaining messages from a streaming request.
-///
-/// Must be called before returning early from PutPath to avoid leaving
-/// unconsumed data on the gRPC transport. Bounded by DEFAULT_GRPC_TIMEOUT
-/// to prevent a slow client from holding the handler indefinitely.
-async fn drain_stream(stream: &mut Streaming<PutPathRequest>) {
-    let drain = async {
-        while let Ok(Some(_)) = stream.message().await {
-            // discard
-        }
-    };
-    if tokio::time::timeout(rio_common::grpc::DEFAULT_GRPC_TIMEOUT, drain)
-        .await
-        .is_err()
-    {
-        warn!(
-            timeout = ?rio_common::grpc::DEFAULT_GRPC_TIMEOUT,
-            "drain_stream timed out; client may be sending slowly"
-        );
-    }
-}
-
 impl StoreServiceImpl {
     /// HMAC assignment-token gate — the SOLE producer of
     /// [`IngestAuthority`] (callers must NOT restate the admit
@@ -242,11 +220,11 @@ impl StoreServiceImpl {
             {
                 Ok(Some(g)) => Some(g),
                 Ok(None) => {
-                    drain_stream(&mut stream).await;
+                    common::drain_stream("PutPath", &mut stream).await;
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
                 Err(e) => {
-                    drain_stream(&mut stream).await;
+                    common::drain_stream("PutPath", &mut stream).await;
                     return Err(e);
                 }
             }

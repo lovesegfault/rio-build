@@ -27,7 +27,6 @@ use crate::k8s::{NAMESPACES, NS, NS_BUILDERS, NS_FETCHERS, NS_STORE};
 /// The Service spec only exposes 9001 (gRPC) — must target the pod.
 pub(crate) const SCHED_METRICS_PORT: u16 = 9091;
 pub(crate) const STORE_METRICS_PORT: u16 = 9092;
-pub(crate) const BUILDER_METRICS_PORT: u16 = 9093;
 /// Per-scrape timeout. Anything slower means bigger problems.
 const SCRAPE_TIMEOUT: Duration = Duration::from_secs(3);
 
