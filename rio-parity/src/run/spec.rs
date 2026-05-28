@@ -103,10 +103,11 @@ pub struct ClusterEndpoints {
     pub store_addr: String,
     /// Path to the HMAC key for `x-rio-service-token` (None = no token, dev mode).
     pub service_hmac_key_path: Option<PathBuf>,
-    /// Gateway SSH host key to pin: an OpenSSH public-key line
-    /// (`ssh-ed25519 AAAA… comment`) or a `SHA256:…` fingerprint. When set
-    /// the engine's transport accepts only this key; when absent it accepts
-    /// the first key offered and records the observed fingerprint for audit.
+    /// Gateway SSH host key the engine's transport pins: an OpenSSH
+    /// public-key line (`ssh-ed25519 AAAA… comment`) or a `SHA256:…`
+    /// fingerprint. Required — the launcher reads it from the gateway
+    /// host-key Secret; [`CampaignSpec::validate`] rejects specs without it
+    /// because omitting it would disable SSH host-key verification.
     pub gateway_host_key: Option<String>,
 }
 
@@ -321,6 +322,17 @@ impl CampaignSpec {
                 "campaign spec field {field} must not be empty"
             );
         }
+        // The transport pins the gateway host key against this value on every
+        // dial; a spec without one would silently disable SSH host-key
+        // verification, so it is rejected here rather than at first dial.
+        anyhow::ensure!(
+            self.cluster
+                .gateway_host_key
+                .as_deref()
+                .is_some_and(|key| !key.trim().is_empty()),
+            "campaign spec field cluster.gateway_host_key must be set; omitting it would disable \
+             SSH host-key verification (the launcher populates it from the gateway host-key Secret)"
+        );
         anyhow::ensure!(
             self.eval_set.hydra_eval_id != 0,
             "campaign spec field eval_set.hydra_eval_id must be a nonzero Hydra eval id"
@@ -549,7 +561,8 @@ mod tests {
             "mode": "leaf",
             "eval_set": {"hydra_eval_id": 1, "key_digest": "ab12cd34"},
             "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
-                        "scheduler_addr": "s:9001", "store_addr": "st:9002"},
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002",
+                        "gateway_host_key": "SHA256:0000000000000000000000000000000000000000000"},
             "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"},
             "knobs": {"connections": 0}
         }"#;
@@ -563,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn cluster_gateway_host_key_is_optional_and_round_trips() {
+    fn cluster_gateway_host_key_is_required_and_round_trips() {
         let spec: CampaignSpec = serde_json::from_str(
             r#"{"cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                             "scheduler_addr": "s:9001", "store_addr": "st:9002",
@@ -580,6 +593,32 @@ mod tests {
         let re: CampaignSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(re.cluster.gateway_host_key, spec.cluster.gateway_host_key);
+
+        // An otherwise-valid spec without the pin is rejected naming the
+        // field: omitting it would disable SSH host-key verification.
+        let json = r#"{
+            "mode": "leaf",
+            "eval_set": {"hydra_eval_id": 1, "key_digest": "ab12cd34"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}
+        }"#;
+        let unpinned: CampaignSpec = serde_json::from_str(json).unwrap();
+        let err = unpinned.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("cluster.gateway_host_key"),
+            "{err:#}"
+        );
+        // An explicitly empty pin is rejected the same way.
+        let mut empty_pin = unpinned;
+        empty_pin.cluster.gateway_host_key = Some("  ".into());
+        assert!(
+            empty_pin
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("cluster.gateway_host_key")
+        );
     }
 
     #[test]
@@ -619,7 +658,8 @@ mod tests {
             "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
             "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
-                        "store_addr": "rio-store.rio-store.svc:9002"},
+                        "store_addr": "rio-store.rio-store.svc:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
             "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
                         "upstreams_verified": true},
             "knobs": {"batch_timeout_hours": 0.0}
@@ -638,7 +678,8 @@ mod tests {
             "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
             "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
-                        "store_addr": "rio-store.rio-store.svc:9002"},
+                        "store_addr": "rio-store.rio-store.svc:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
             "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
                         "upstreams_verified": true},
             "bogus_future_field": {"nested": [1, 2, 3]}
