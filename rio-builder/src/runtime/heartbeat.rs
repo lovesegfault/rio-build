@@ -1,9 +1,11 @@
 //! Heartbeat construction and the background heartbeat loop.
 //!
 //! `build_heartbeat_request` assembles capability/resource data for the
-//! scheduler; `spawn_heartbeat` drives the 10s tick. The generation
-//! fence (`r[sched.lease.generation-fence+2]`) is updated from the
-//! response.
+//! scheduler; `spawn_heartbeat` drives the 10s tick. Stream-era: the
+//! scheduler-side Heartbeat RPC is an error stub and the worker-side
+//! generation latch this loop fed is no longer the spec'd fence (the
+//! fence is transaction-side since the pull cutover); the loop stays
+//! compiled until the 1d builder runtime collapse.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -203,7 +205,6 @@ pub(super) fn apply_heartbeat_response(
                 // (already-true → true is a no-op at the atomic
                 // level) and cheaper than a load-then-store.
                 ready.store(true, std::sync::atomic::Ordering::Relaxed);
-                // r[impl sched.lease.generation-fence+2]
                 // fetch_max, not store: while a deposed leader still
                 // believes it leads (its belief lags by up to one
                 // RENEW_INTERVAL while it retains apiserver

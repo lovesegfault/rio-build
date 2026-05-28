@@ -4,7 +4,7 @@
 // sched.lease.k8s-lease (what happens on acquire). The test here
 // verifies the LeaderAcquired → recover_from_pg → recovery_complete
 // pipeline; the lease loop's acquire behavior is covered in
-// lease.rs tests (sched.lease.generation-fence+2 verify).
+// lease.rs tests (sched.lease.generation-fence+3 verify).
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

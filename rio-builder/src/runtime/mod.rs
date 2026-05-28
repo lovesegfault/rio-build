@@ -67,13 +67,15 @@ use crate::{executor, log_stream};
 /// because its log could not be persisted.
 const LOG_DRAIN_GRACE: Duration = Duration::from_secs(2);
 
-/// Generation fence: should this assignment be rejected as stale?
+/// Generation fence, stream-era worker-side latch: should this
+/// assignment be rejected as stale? No longer the spec'd fence (the
+/// fence is transaction-side since the pull cutover); kept with the
+/// stream runtime until the 1d collapse.
 ///
 /// Separate from the event-loop handler for testability — main.rs's
 /// event loop has no mock SchedulerMessage stream. Strictly-less (`<`):
 /// generation is constant during a leader's tenure, so `assignment_gen
 /// == latest_observed` is the steady state.
-// r[impl sched.lease.generation-fence+2]
 pub fn is_stale_assignment(assignment_gen: u64, latest_observed: u64) -> bool {
     assignment_gen < latest_observed
 }
@@ -1225,8 +1227,8 @@ async fn handle_assignment(
     rt: &BuilderRuntime,
     done_watcher_spawned: &AtomicBool,
 ) {
-    // r[impl sched.lease.generation-fence+2]
-    // Reject assignments from a deposed leader.
+    // Reject assignments from a deposed leader (stream-era worker-side
+    // latch; the spec'd fence is transaction-side since the pull cutover).
     // Strictly-less (`<`): equal is the steady
     // state (generation constant per leader
     // tenure). The deposed leader's BuildExecution
@@ -2993,7 +2995,6 @@ mod tests {
     }
 }
 
-// r[verify sched.lease.generation-fence+2]
 #[cfg(test)]
 mod fence_tests {
     use super::heartbeat::apply_heartbeat_response;
@@ -3079,11 +3080,11 @@ mod fence_tests {
     }
 
     /// `HeartbeatResponse.generation == 0` is the proto-unset / "leader
-    /// still recovering" sentinel (sched.lease.claim-before-advertise):
-    /// it must leave a non-zero fence untouched while still flipping
-    /// readiness on an accepted heartbeat. Pins the sentinel as a
-    /// contract — a future "treat 0 as a reset" refactor goes red here.
-    // r[verify sched.lease.claim-before-advertise]
+    /// still recovering" sentinel (the stream-era half of what is now
+    /// claim-before-serve): it must leave a non-zero fence untouched
+    /// while still flipping readiness on an accepted heartbeat. Pins the
+    /// sentinel as a contract for the stream-era latch until the 1d
+    /// collapse deletes it.
     #[test]
     fn heartbeat_gen_zero_sentinel_keeps_fence() {
         let g = AtomicU64::new(2);

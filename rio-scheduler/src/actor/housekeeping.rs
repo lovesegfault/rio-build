@@ -696,6 +696,7 @@ impl DagActor {
         type ChargeOutcome = Option<(bool, crate::retry_policy::Decision)>;
         let result: Result<ChargeOutcome, sqlx::Error> = async {
             let mut tx = self.db.pool().begin().await?;
+            // r[impl sched.lease.generation-fence+3]
             // The same generation fence the pull transaction applies:
             // a below-floor serving generation writes nothing.
             let floor: Option<i64> = sqlx::query_scalar(

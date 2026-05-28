@@ -4,7 +4,7 @@
 //! renews a `coordination.k8s.io/v1` Lease. On acquire, it derives
 //! the generation from the lease's transition count (workers reject
 // r[impl sched.lease.k8s-lease+2]
-// r[impl sched.lease.generation-fence+2]
+// r[impl sched.lease.generation-fence+3]
 //! the old leader's stale-gen assignments once the post-recovery
 //! generation reaches them via heartbeat) and sets `is_leader=true`
 //! (dispatch_ready checks this).
@@ -173,7 +173,7 @@ const RENEW_SLOP: Duration = Duration::from_secs(2);
 /// the separation is a 1.5s one-sided clock-skew budget — far above NTP
 /// drift on cloud nodes. A clock pause longer than that re-opens the
 /// window, which is the impossibility result the generation fence
-/// (r\[sched.lease.generation-fence+2\]) backstops. The model also shows
+/// (r\[sched.lease.generation-fence+3\]) backstops. The model also shows
 /// the bound is tight: one tick less separation and a dual-belief state
 /// is reachable.
 const FENCE_MARGIN: Duration = Duration::from_secs(4);
@@ -764,7 +764,7 @@ impl LeaderState {
     /// [`on_rebound`](Self::on_rebound) instead — same count recording
     /// and generation derivation, different recovery-completion
     /// handling.
-    // r[impl sched.lease.generation-fence+2]
+    // r[impl sched.lease.generation-fence+3]
     pub fn on_acquire(&self, lease_transitions: u64) -> u64 {
         let target = lease_transitions.saturating_add(1);
         // fetch_max returns the PREVIOUS value; the new value is the max
@@ -838,7 +838,7 @@ impl LeaderState {
     /// residual is priced at the recovery gate's entry-snapshot comment
     /// in rio-scheduler.
     // r[impl sched.lease.rebound]
-    // r[impl sched.lease.generation-fence+2]
+    // r[impl sched.lease.generation-fence+3]
     pub fn on_rebound(&self, lease_transitions: u64) -> u64 {
         self.recovery_completed_for
             .store(RECOVERY_NOT_COMPLETE, Ordering::SeqCst);
@@ -1274,7 +1274,7 @@ pub(crate) async fn run_lease_loop_with_client<H: LeaseHooks>(
                 // scheduled anyway. In the asymmetric case (WE are
                 // partitioned, peer is not) NOT flipping makes us a
                 // stale-assignment noise generator. Worker-side
-                // generation fence (r[sched.lease.generation-fence+2])
+                // generation fence (r[sched.lease.generation-fence+3])
                 // saves correctness either way; this fence saves ops
                 // sanity.
                 if maybe_self_fence(
@@ -1714,7 +1714,7 @@ pub(crate) fn maybe_spawn_leader_marks(
 }
 
 // r[verify sched.lease.k8s-lease+2]
-// r[verify sched.lease.generation-fence+2]
+// r[verify sched.lease.generation-fence+3]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1826,7 +1826,7 @@ mod tests {
     /// counterexample documented in `docs/spec/models/leaderElection.qnt`'s
     /// StaleLeaderHasStaleGeneration archaeology is exactly two local
     /// increments seeded from the same stale high-water mark).
-    // r[verify sched.lease.generation-fence+2]
+    // r[verify sched.lease.generation-fence+3]
     #[test]
     fn generation_derives_from_lease_transitions() {
         let state = LeaderState::pending(Arc::new(AtomicU64::new(1)));

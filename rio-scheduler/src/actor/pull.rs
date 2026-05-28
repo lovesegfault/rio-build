@@ -121,6 +121,7 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
         return PullDecision::RejectToken;
     }
 
+    // r[impl sched.lease.generation-fence+3]
     // Transaction-side generation fence, advisory half: a serving
     // generation below the durable claims floor answers nothing. The
     // authoritative check re-runs inside the mint transaction.

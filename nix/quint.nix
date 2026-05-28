@@ -2618,6 +2618,8 @@ in
     # is fenced to a no-op — StaleAuthorityWritesAreInert, the checked
     # successor of the dual-belief residual the as-built model priced
     # (T-0e.2 / the 1c' lease-checklist re-derivation).
+    # r[verify sched.lease.generation-fence+3]
+    # r[verify sched.lease.claim-before-advertise+2]
     quint-executor-session-fault-leader = mkQuintCheck {
       name = "executor-session-fault-leader";
       spec = "executorSession";

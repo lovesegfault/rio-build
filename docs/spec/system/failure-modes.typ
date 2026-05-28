@@ -21,14 +21,16 @@ If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 
 == Network Partition: Scheduler ↔ Executors
 
-- Executors detect partition via heartbeat timeout (\~30--40s wall-clock:
-  `HEARTBEAT_TIMEOUT_SECS = 30s` checked on each \~10s scheduler tick)
-- Executors close their `BuildExecution` stream and attempt reconnection with
-  backoff
-- The scheduler calls `reset_to_ready()` on disconnected executors' running
-  builds --- they go directly back to Ready (increment `retry_count`), no
-  intermediate status classification
-- Builds already assigned but not yet started are reassigned immediately
+- Executor pods notice nothing beyond failed unaries: an in-flight build keeps
+  running and retries `ReportOutcome` until acked; a not-yet-pulled pod
+  retries `PullAssignment` for as long as it lives (bounded by the Job's
+  `activeDeadlineSeconds`)
+- The scheduler resets nothing on the partition itself --- the open attempt is
+  resolved by the report that eventually lands, by the controller's
+  pod-terminal report if the pod dies first, or by the establishment sweep at
+  deadline + report-slack
+- Spawned-but-unpulled intents simply re-arm; the controller keeps its Job
+  census and reaps only per its own graces
 
 == Network Partition: Gateway ↔ Scheduler
 
@@ -43,24 +45,22 @@ If S3 writes fail but reads succeed (e.g., S3 rate limiting on PUTs):
 Split-brain is closed by the fence/steal asymmetry --- a leader that cannot
 renew self-fences at `SELF_FENCE_AFTER` (11s), `2 × FENCE_MARGIN` before any
 standby's `STEAL_AFTER` (19s) steal threshold --- and bounded by the
-executor-side generation fence for the clock-pause residual:
+generation-fenced authority transactions for the clock-pause residual:
 - The leadership generation derives from the Lease's `leaseTransitions` count
   (the lease loop applies `fetch_max(transitions + 1)` to the shared in-memory
   `Arc<AtomicU64>`), floored during recovery by the durable PG history
   (`assignments` plus the `leader_generation_claims` ledger); a same-epoch
-  re-acquire keeps its generation
-- The generation flows into `WorkAssignment.generation`; the new leader's
-  heartbeat replies advertise 0 (the proto-unset sentinel) until its recovery
-  completes (#rref("sched.lease.claim-before-advertise")), so executors begin
-  rejecting the old leader's stale-generation assignments once the
-  post-recovery generation reaches them via heartbeat; the pre-arming interim
-  is the same dual-leader window priced by the idempotent-writes bullet below
-- *No PostgreSQL-level write fencing exists* --- a deposed leader's in-flight
-  PG writes will succeed. PG writes are idempotent (INSERT ON CONFLICT,
-  status-check UPDATEs), which limits the damage
-- Optional future hardening: add a `scheduler_meta` row with a generation-guard
-  WHERE clause for strict fencing (current: idempotent writes tolerate
-  dual-leader window)
+  re-acquire keeps its generation; the claim row is durable before recovery
+  completes and work is served (#rref("sched.lease.claim-before-advertise"))
+- Every authority-exercising transaction (the pull mint, the establishment
+  charge, the synthesized close) carries the serving generation, persists it
+  on the row it writes, and aborts when it is below the durable claims floor
+  (#rref("sched.lease.generation-fence")), so a deposed leader can neither
+  bind new work nor consume outcomes once the new leader's generation is
+  durable
+- Scheduler writes outside those transactions are not generation-fenced --- a
+  deposed leader's in-flight PG writes will succeed. They are idempotent
+  (INSERT ON CONFLICT, status-check UPDATEs), which limits the damage
 
 == Cascading FUSE Cache Miss Storm
 

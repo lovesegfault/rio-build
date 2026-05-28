@@ -1397,6 +1397,11 @@ impl DagActor {
                 .is_some_and(|(g, h)| u64::try_from(*g).ok() == Some(at_gen) && h == holder)
         };
         // r[impl sched.lease.generation-claim+2]
+        // r[impl sched.lease.claim-before-advertise+2]
+        // Claim-before-serve: the claim INSERT computed here lands
+        // before set_recovery_complete(), and the work-serving surfaces
+        // (pull mint / establishment / synthesized close) come up behind
+        // recovery, all additionally fenced against the durable floor.
         let (claim_target, floor_vouches_entry) = match &pg_floor_read {
             // Floor unreadable: PG could not answer even the
             // single-row floor query, so it cannot vouch for the entry

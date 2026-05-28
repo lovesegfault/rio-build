@@ -866,7 +866,6 @@ impl GenerationReader {
     /// count (the stamp mismatches — the different-count case above),
     /// or at the same count (the deliberate same-epoch keep); a rebound
     /// only becomes possible again after re-acquiring.
-    // r[impl sched.lease.claim-before-advertise]
     pub fn advertised(&self) -> u64 {
         if self.leader.recovery_complete() {
             self.generation.load(Ordering::Acquire)

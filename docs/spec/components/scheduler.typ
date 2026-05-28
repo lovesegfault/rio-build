@@ -1714,9 +1714,11 @@ leadership transitions:
   `fetch_max(transitions + 1)` on the shared `Arc<AtomicU64>`, floored during
   recovery by the durable PG history ---
   #rref("sched.recovery.fetch-max-seed")); a same-epoch re-acquire keeps its
-  generation. Each `WorkAssignment` carries this generation number. Executors
-  compare it against the generation seen in `HeartbeatResponse` and reject
-  stale-generation assignments.
+  generation. Every authority-exercising transaction (the pull mint, the
+  establishment charge, the synthesized close) carries this generation,
+  persists it on the row it writes, and is admitted against the durable
+  claims floor (#rref("sched.lease.generation-fence")), so a deposed
+  leader's writes are fenced at the transaction rather than at the worker.
 + *Recovery completion keyed to the acquire-epoch*: The lease acquire
   transition fires a `LeaderAcquired` command to the actor (delivered
   asynchronously and in order --- lease renewal MUST NOT block on recovery
@@ -1786,14 +1788,16 @@ actor's command channel, so invocation order is preserved end-to-end.
   leaving dispatch gated until a later acquire edge or rebound re-runs
   recovery. Dispatch is a no-op until the recorded completion matches the
   current count.
-+ *Executor reconnection*: Executors reconnect their `BuildExecution` streams
-  to the new leader. Stale completion reports (carrying an old generation
-  number) are verified against rio-store for output existence before
-  acceptance.
-+ *In-flight assignments*: Assignments from the old leader are verified via
-  heartbeat. If an executor reports it is still running the assigned
-  derivation, the new leader reuses the assignment with the new generation
-  number.
++ *Executor retries*: in-flight pods notice nothing beyond failed unaries ---
+  they keep retrying `PullAssignment`/`ReportOutcome` with backoff until the
+  new leader serves them (#rref("builder.pull.retry-loop")).
++ *In-flight attempts*: recovery reloads the open pull attempts (assignment
+  rows plus their `exec_id`s) from PostgreSQL, so a re-pull after failover
+  returns the identical payload, a report lands on the same attempt row, and
+  an attempt whose pod died during the failover is resolved by the
+  controller's pod-terminal report or the establishment sweep
+  (#rref("sched.attempt.establishment-window")). The store-probe arm adopts
+  work that completed while no leader was serving.
 #set enum(start: 1)
 
 = Synchronous vs. Async Writes
@@ -1886,17 +1890,20 @@ recovery outlives its deposal --- a Lease deletion lands mid-recovery, a
 standby re-creates the Lease, claims one past the old floor, and starts
 dispatching, all before the old leader's lease loop observes anything ---
 would compute a target one past the _live_ leader's
-(#rref("sched.recovery.fetch-max-seed")), seed it, and answer heartbeats with
-it, inverting the executor fence (#rref("sched.lease.generation-fence")):
-every worker that heard the stale believer latches the higher generation and
-silently rejects the live leader's assignments for the rest of its term. The
+(#rref("sched.recovery.fetch-max-seed")), seed it, and exercise authority
+with it, inverting the fence (#rref("sched.lease.generation-fence")): the
+stale believer's pull mints and establishment charges pass the floor
+admission and raise the durable floor above the live leader's generation, so
+the live leader's own authority transactions abort as below-floor for the
+rest of its term. The
 same inversion exists downward: a predecessor that died between its acquire
 edge and its claim INSERT leaves a derived-but-never-claimed generation with
 no durable trace, so the floor sits more than one generation below the next
 believer's entry value; a post-deletion successor seeds one past that stale
 floor --- _below_ the deposed believer's entry generation --- and without the
 wait the deposed believer completes at its higher retained generation and
-inverts the fence the same way. The confirmation keeps apiserver I/O in the
+inverts the fence the same way (its fenced transactions out-floor the live
+successor's). The confirmation keeps apiserver I/O in the
 lease loop --- the recovery only observes the renew-round counters the loop
 publishes. It does not contradict the proceed-on-PG-failure rationale of
 #rref("sched.lease.generation-claim"): the wait applies to bump targets and
@@ -1908,9 +1915,9 @@ renew/fence machinery, and a discarded recovery re-runs on the next acquire
 edge --- it does not reintroduce the indefinite-block-on-PG failure mode that
 rationale rejects. (The rule keeps its historical `bump-confirm` name while
 also covering these non-bump retains; on the retain path the seed clause is
-an idempotent no-op and the operative prohibitions are dispatch-ungating and,
-via the sentinel of #rref("sched.lease.claim-before-advertise"), generation
-advertisement.) Residuals that remain: the count-coincidence ABA documented
+an idempotent no-op and the operative prohibition is recovery-completion
+ungating --- and with it the serving of fenced authority transactions at the
+unconfirmed generation, #rref("sched.lease.claim-before-advertise").) Residuals that remain: the count-coincidence ABA documented
 at the recovery gate's entry-snapshot comment --- an edge-ful re-steal, or a
 rebound (#rref("sched.lease.rebound")), whose observed transition count lands
 exactly back on the recorded value; in the rebound sub-case no command is
@@ -1981,18 +1988,19 @@ Recovery sequence:
 + *Identify nodes in "waiting" state whose dependencies are all complete, and
   transition them to "ready"* (handles the case where the previous scheduler
   crashed between completing a node and releasing downstream)
-+ Discover executors from the `assignments` table and from Kubernetes pod list
-+ Query each known executor for current state via Heartbeat
-+ For derivations marked "assigned":
-  - If the assigned executor reports completion → process the result
-  - If the assigned executor is gone → check rio-store for the output (it may
-    have been uploaded before the executor died). If found, mark complete.
-    Otherwise, reassign.
-+ Resume scheduling from the reconstructed state
++ Restore the open pull attempts from the `assignments`/`drv_executions`
+  rows (assigned executor identity and `exec_id`), so post-failover re-pulls
+  and reports stay idempotent against the same attempt
++ For derivations marked "assigned"/"running" with no live attempt to wait
+  on, check rio-store for the outputs (they may have been uploaded before the
+  executor died): adopt as completed if present, otherwise leave the open
+  attempt to the establishment sweep / the controller's pod-terminal report,
+  and reset orphaned rows with no open attempt back to Ready
++ Resume serving pulls and reports from the reconstructed state
 
-Executors buffer completion reports with retry logic: if `ReportCompletion`
-fails (scheduler unreachable during failover), the executor retries with
-exponential backoff until the scheduler accepts it.
+Executor pods retry their unaries with backoff: a pull or report that fails
+while no leader is serving (failover in progress) simply lands on the new
+leader once recovery completes.
 
 #r("sched.recovery.poisoned-failed-count")[
   Recovered builds whose derivations include failure-terminal states (Poisoned,
@@ -2670,10 +2678,12 @@ CREATE INDEX assignments_builder_idx ON assignments (builder_id, status);
   pre-asymmetric deployments the degraded-regime modules
   (`leaderElectionBase`, `leaderElectionDeletion` in
   `docs/spec/models/leaderElection.qnt`) describe ---
-  dispatch is idempotent: DAG merge dedups by `drv_hash`, and executors reject
-  stale-generation assignments after seeing the new generation in
-  `HeartbeatResponse`. Worst case: a derivation is dispatched twice, builds
-  twice, produces the same deterministic output. Wasteful but correct.
+  work-binding stays safe: DAG merge dedups by `drv_hash`, and the
+  authority-exercising transactions are fenced against the durable claims
+  floor (#rref("sched.lease.generation-fence")), so a stale believer's mints
+  and charges abort once the new leader's generation is durable. Worst case
+  inside the window: a derivation builds twice and produces the same
+  deterministic output. Wasteful but correct.
 
 #r("sched.lease.at-most-one-leader+3")[
   The Lease MUST be held by at most one scheduler identity at the apiserver
@@ -2749,12 +2759,10 @@ model assumes) so no constant moves without the others.
 
 #r("sched.lease.standby-drops-writes")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state
-  (`derivations`, `realisations`, `build_samples`, `build_event_log`). Open
-  `BuildExecution` worker streams are generation-fenced at the gRPC reader: the
-  reader captures the lease generation at stream-open and breaks the loop
-  (closing the stream) before forwarding `ProcessCompletion` /
-  `PrefetchComplete` if `is_leader=false` or the generation has changed --- the
-  worker reconnects to the new leader. `ProcessCompletion`, `CancelBuild`,
+  (`derivations`, `realisations`, `build_samples`, `build_event_log`). The
+  pull-mode work surfaces are leader-gated at the gRPC layer and the fenced
+  transactions re-check the durable floor
+  (#rref("sched.lease.generation-fence")). `ProcessCompletion`, `CancelBuild`,
   `ReportExecutorTermination`, `AckSpawnedIntents`, `ReconcileAssignments`,
   `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
   defense-in-depth.
@@ -2779,25 +2787,28 @@ model assumes) so no constant moves without the others.
   topdown fail-fast --- is individually leader-gated, like the per-sub-call
   gates above.
 
-#r("sched.lease.generation-fence+2")[
-  *Generation-based staleness detection is executor-side only.* The leadership
-  generation MUST derive from the Lease's `leaseTransitions` count
+#r("sched.lease.generation-fence+3")[
+  *Authority is generation-fenced at the transactions that exercise it.* The
+  leadership generation MUST derive from the Lease's `leaseTransitions` count
   (`generation = leaseTransitions + 1`): the apiserver bumps that field
   atomically with the holder change inside the resourceVersion-guarded PUT, so
   two replicas that both believe they lead can never have acquired at the same
   count --- their generations are distinct without any coordination beyond the
-  CAS that already serializes the steal. Executors see the new generation in
-  `HeartbeatResponse` and reject any `WorkAssignment` carrying an older
-  generation. *No PostgreSQL-level write fencing exists.* A deposed leader's
-  in-flight PG writes will succeed; the dual-belief window is closed by the
-  fence/steal asymmetry --- a leader that cannot renew self-fences at
-  `SELF_FENCE_AFTER` (11s), `2 × FENCE_MARGIN` before any standby's
-  `STEAL_AFTER` (19s) steal threshold, so the window is empty under bounded
-  clock skew (#rref("sched.lease.self-fence+2")) --- and this rule is the
-  backstop for the clock-pause residual that asymmetry cannot close. Because
-  the writes in question are idempotent upserts keyed by `drv_hash` and
-  status transitions are monotone, brief dual-writer windows do not corrupt
-  state.
+  CAS that already serializes the steal. Every authority-exercising
+  transaction --- the pull mint, the establishment charge, and the
+  synthesized/uncharged close --- MUST carry the serving replica's generation,
+  persist it on the row it writes (`assignments.generation`), and commit only
+  if that generation is not below the durable claims floor (`GREATEST` over
+  `leader_generation_claims` and `assignments`); a below-floor serving
+  generation MUST abort the transaction with nothing written and surface as
+  the same retryable not-leader error the leader guard produces, so a
+  deposed-but-still-believing leader can neither bind new work nor consume
+  outcomes. This rule is the backstop for the clock-pause residual the
+  fence/steal asymmetry cannot close (#rref("sched.lease.self-fence+2")).
+  Scheduler writes outside these transactions are not generation-fenced; they
+  remain idempotent upserts keyed by `drv_hash` with monotone status
+  transitions, so the brief dual-writer windows the lease model prices do not
+  corrupt state.
 ]
 
 A local counter cannot provide the distinctness half of this rule: an
@@ -2807,18 +2818,15 @@ generation-collision counterexample preserved in
 `docs/spec/models/leaderElection.qnt`'s history). The
 transition count is the epoch source only while the Lease object exists;
 #rref("sched.lease.generation-claim") extends the distinctness guarantee
-across Lease-object deletion. Executor-side _arming_ of this fence is deferred
-until the new leader's recovery completes
-(#rref("sched.lease.claim-before-advertise")); the interim is covered by the
-idempotent-writes pricing above.
-
-#memo(title: [Optional future hardening])[
-  If stricter at-most-one-writer semantics are needed, add a `scheduler_meta`
-  row with a `leader_generation` column and gate all synchronous writes with
-  `WHERE leader_generation = $current_gen`. Not currently implemented --- the
-  executor-side generation check plus idempotent PG schema is sufficient for
-  correctness.
-]
+across Lease-object deletion. The fence moved with the work-binding
+authority: the stream-era form of this rule had executors latch the
+generation from heartbeat replies and reject older `WorkAssignment`s, and the
+previously memo'd "optional future hardening" (a PG-side generation guard on
+the writes) is now the implemented mechanism for exactly the writes that bind
+work and consume outcomes --- the worker-side latch retired with the stream
+(its `WorkAssignment.generation` field stays on the wire as observability
+only), and what a worker could once latch is replaced by what the durable
+floor covers.
 
 #r("sched.lease.generation-claim+2")[
   Before completing recovery and ungating dispatch, a newly-acquired leader
@@ -2868,48 +2876,38 @@ residuals; that regime's module header records the procedure for re-deriving
 them, and the trace evidence lives in that regime's introducing commit
 message.
 
-#r("sched.lease.claim-before-advertise")[
-  A newly-acquired leader MUST NOT advertise a leadership generation to
-  executors while its recovery is incomplete: `HeartbeatResponse.generation`
-  MUST carry 0 --- the proto-unset sentinel, a no-op for the executor's
-  `fetch_max` fence latch --- from lease acquisition until recovery completes,
-  and the leader's post-recovery generation only after.
+#r("sched.lease.claim-before-advertise+2")[
+  A newly-acquired leader MUST durably claim the generation it will exercise
+  authority at before it completes recovery and serves authority-exercising
+  work (claim-before-serve): the claim INSERT precedes
+  `set_recovery_complete()` (#rref("sched.lease.generation-claim")), and the
+  fenced transactions that mint pulls, charge establishments and apply
+  synthesized closes additionally persist their serving generation on the
+  rows they write, so every generation at which authority has ever been
+  exercised is covered by the durable floor those same transactions are
+  admitted against (#rref("sched.lease.generation-fence")).
 ]
 
-The executor fence only rises. An advertised-but-unclaimed generation latched
-from a leader that dies mid-recovery is recorded nowhere durable, so after a
-Lease deletion the surviving previous holder legitimately retains its lower
-claimed generation (per the retain behavior of
-#rref("sched.recovery.fetch-max-seed")) and the latched workers silently
-reject every assignment of the active leader until the next holder change or a
-worker restart. Gating the advertisement keeps "what a worker can latch"
-inside "what the durable floor covers". The rule is named for the claim
-association: the claim INSERT precedes `set_recovery_complete()`
-(#rref("sched.lease.generation-claim")), so on the non-degraded path the
-advertised generation is always durably claimed. The degraded paths inherit
-the existing pricing rather than new pricing: a claim-write failure or
-claim-conflict exhaustion proceeds unclaimed (a DAG-load failure on its own
-does not --- the floor is read independently of the load, so that term still
-claims; only the builds are lost), and a floor-unreadable recovery completes
-(only after the post-claim leadership confirmation, which needs no PG)
-at the recovery-entry generation --- both degraded shapes advertise an
-unclaimed generation (the same one-term residual already priced for the claim
-machinery above), and the floor-unreadable term carries, additionally,
-under-floor advertisement in the saturated post-deletion regime: the
-executors' latch silently rejects its dispatches until the next leadership
-transition. The
-trade-off is that fence arming is deferred:
-workers learn the new generation only after the new leader's recovery
-completes, plus up to one heartbeat interval, so a paused-and-deposed
-ex-leader's stale assignments are not generation-rejected during that window
---- covered by the existing #rref("sched.lease.generation-fence") pricing (the
-new leader dispatches nothing before recovery completes, since dispatch gates
-on the same flag, and brief dual-writer windows do not corrupt state).
-Rejecting heartbeats outright during recovery is deliberately not done ---
-executor re-registration and readiness must proceed while the new leader
-recovers; only the generation payload is withheld. Non-K8s single-scheduler
-deployments construct `LeaderState` with recovery already complete, so they
-never emit the sentinel.
+The rule keeps its historical `claim-before-advertise` name; there is no
+advertisement channel left, and the operative ordering is claim-before-serve.
+The stream-era form gated the heartbeat-reply sentinel
+(`HeartbeatResponse.generation = 0` until recovery completed) so that workers
+could never latch an advertised-but-unclaimed generation --- a latch that
+only rises would otherwise wedge the fleet against the active leader after a
+Lease deletion. With the latch and the heartbeat channel retired, nothing
+latches a generation and that failure mode cannot form; what remains
+load-bearing is the ordering itself --- recovery claims before it completes,
+and the work-serving surfaces come up behind recovery --- which keeps "what
+has exercised authority" inside "what the durable floor covers"
+(#rref("sched.recovery.fetch-max-seed")). The degraded paths keep their
+existing pricing: a claim-write failure or claim-conflict exhaustion proceeds
+unclaimed and a floor-unreadable recovery completes at the recovery-entry
+generation (both only after the post-claim leadership confirmation,
+#rref("sched.recovery.bump-confirm")) --- the one-term residual is unchanged,
+and even an unclaimed term's exercised authority becomes durable through the
+generation its fenced transactions persist on the rows they write. Non-K8s
+single-scheduler deployments construct `LeaderState` with recovery already
+complete, so the ordering is trivially satisfied there.
 
 #r("sched.lease.graceful-release")[
   On graceful shutdown (SIGTERM), if the lease loop was leading, it calls
