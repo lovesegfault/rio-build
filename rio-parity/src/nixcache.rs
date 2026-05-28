@@ -5,7 +5,10 @@
 //! narinfo fetches; bulk callers are expected to bound their own
 //! concurrency politely.
 
+use std::collections::{BTreeMap, HashSet};
+
 use anyhow::Context as _;
+use futures_util::StreamExt;
 use rio_nix::narinfo::NarInfo;
 use rio_nix::store_path::StorePath;
 
@@ -112,6 +115,150 @@ impl NixCacheClient {
             }
         }
     }
+}
+
+/// Upstream narinfo facts for one store path, as collected by
+/// [`sweep_narinfos`]: presence plus the NAR identity (lowercase hex
+/// NarHash and NarSize) when the narinfo carried a usable hash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NarinfoFact {
+    /// The cache served a narinfo for this path (HTTP 200). A 200 body
+    /// that fails to parse still counts as found — the path demonstrably
+    /// exists upstream — it just carries no usable NAR identity.
+    pub found: bool,
+    /// Lowercase hex sha256 NarHash, present only when the narinfo
+    /// parsed and its `NarHash` converted cleanly via [`narhash_to_hex`].
+    pub nar_hash_hex: Option<String>,
+    /// `NarSize` in bytes, present whenever the narinfo parsed.
+    pub nar_size: Option<u64>,
+}
+
+/// Retry policy for transient cache errors (5xx, connection resets)
+/// during a bulk sweep. `Backoff` has no `Default` by design — per-site
+/// constants stay local (`rio-common/src/backoff.rs`); these match the
+/// campaign engine's narinfo sweep so recorder and engine retry the same
+/// upstream with the same cadence. Full jitter desynchronizes the
+/// concurrent fetchers so retries don't re-arrive as a synchronized
+/// burst.
+const SWEEP_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
+    base: std::time::Duration::from_millis(500),
+    mult: 2.0,
+    cap: std::time::Duration::from_secs(15),
+    jitter: rio_common::backoff::Jitter::Full,
+};
+
+/// Emit a sweep-progress log line every this many completed fetches, so
+/// an operator watching the logs can tell a long-but-moving sweep apart
+/// from one wedged in retry backoff.
+const SWEEP_PROGRESS_LOG_EVERY: usize = 500;
+
+/// Fetch one path's narinfo with bounded retries (transient errors only)
+/// and fold it into a [`NarinfoFact`]. A 200 body that fails to parse,
+/// or whose `NarHash` cannot be converted to hex, is recorded as found
+/// with no usable hash: the path demonstrably exists upstream, so
+/// treating it as absent would mis-classify it, but its hash cannot be
+/// compared.
+async fn fetch_one_fact(
+    client: &NixCacheClient,
+    path: &str,
+    max_attempts: u32,
+) -> anyhow::Result<NarinfoFact> {
+    let mut attempt = 0u32;
+    let text = loop {
+        match client.fetch_narinfo_text(path).await {
+            Ok(text) => break text,
+            Err(e) if attempt + 1 < max_attempts => {
+                let delay = SWEEP_BACKOFF.duration(attempt);
+                tracing::warn!(path, attempt, error = %e, "narinfo sweep fetch failed; retrying");
+                tokio::time::sleep(delay).await;
+                attempt += 1;
+            }
+            Err(e) => return Err(e.context(format!("narinfo sweep fetch for {path}"))),
+        }
+    };
+    Ok(match text {
+        None => NarinfoFact {
+            found: false,
+            nar_hash_hex: None,
+            nar_size: None,
+        },
+        Some(text) => match NarInfo::parse(&text) {
+            Ok(ni) => {
+                let nar_hash_hex = match narhash_to_hex(&ni.nar_hash) {
+                    Ok(hex) => Some(hex),
+                    Err(e) => {
+                        tracing::warn!(path, error = %e, "narinfo NarHash unusable; recorded as found without a hash");
+                        None
+                    }
+                };
+                NarinfoFact {
+                    found: true,
+                    nar_hash_hex,
+                    nar_size: Some(ni.nar_size),
+                }
+            }
+            Err(e) => {
+                tracing::warn!(path, error = %e, "malformed narinfo treated as found (hash unusable)");
+                NarinfoFact {
+                    found: true,
+                    nar_hash_hex: None,
+                    nar_size: None,
+                }
+            }
+        },
+    })
+}
+
+/// Bulk narinfo sweep: fetch every distinct path in `paths` with bounded
+/// concurrency and per-path retries, returning each path's upstream
+/// presence and NAR identity. This is how the recorder acquires ground
+/// truth at archive-creation time (cache.nixos.org sits behind a CDN, so
+/// there is no request budget — `concurrency` is the politeness bound).
+///
+/// Duplicate input paths are fetched once. A malformed store path is a
+/// hard error up front (a bug in the caller's path set, not a transient
+/// fetch failure), and a path that still fails after `max_attempts` is
+/// reached aborts the sweep with an error naming it.
+pub async fn sweep_narinfos(
+    client: &NixCacheClient,
+    paths: &[String],
+    concurrency: usize,
+    max_attempts: u32,
+) -> anyhow::Result<BTreeMap<String, NarinfoFact>> {
+    // Validate before fetching anything: fail fast on malformed paths
+    // instead of discovering them mid-sweep after spending fetches.
+    for path in paths {
+        let _ =
+            StorePath::parse(path).map_err(|e| anyhow::anyhow!("bad store path {path}: {e}"))?;
+    }
+    // Dedupe preserving first occurrence so each path is fetched once.
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut want: Vec<&str> = Vec::new();
+    for path in paths {
+        if seen.insert(path.as_str()) {
+            want.push(path.as_str());
+        }
+    }
+    let to_fetch = want.len();
+    tracing::info!(to_fetch, "narinfo sweep starting");
+
+    let mut fetches = futures_util::stream::iter(want.into_iter().map(|path| async move {
+        let fact = fetch_one_fact(client, path, max_attempts).await;
+        (path, fact)
+    }))
+    .buffer_unordered(concurrency.max(1));
+
+    let mut facts = BTreeMap::new();
+    let mut completed = 0usize;
+    while let Some((path, fact)) = fetches.next().await {
+        let fact = fact?;
+        completed += 1;
+        facts.insert(path.to_string(), fact);
+        if completed.is_multiple_of(SWEEP_PROGRESS_LOG_EVERY) {
+            tracing::info!(completed, to_fetch, "narinfo sweep progress");
+        }
+    }
+    Ok(facts)
 }
 
 #[cfg(test)]
@@ -263,5 +410,38 @@ Sig: cache.nixos.org-1:c2lnbmF0dXJlLWJ5dGVzLW5vdC1yZWFsLWp1c3QtZml4dHVyZQ==
             "got: {msg}"
         );
         assert!(msg.contains("cache backend exploded"), "got: {msg}");
+    }
+
+    #[tokio::test]
+    async fn sweep_collects_facts_and_dedupes_paths() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let absent = "/nix/store/zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-nope-1.0".to_string();
+        let paths = vec![
+            HELLO_PATH.to_string(),
+            HELLO_PATH.to_string(),
+            absent.clone(),
+        ];
+        let facts = sweep_narinfos(&c, &paths, 4, 3).await.unwrap();
+        assert_eq!(facts.len(), 2, "duplicate input paths are fetched once");
+        let hello = &facts[HELLO_PATH];
+        assert!(hello.found);
+        assert_eq!(hello.nar_size, Some(226504));
+        assert!(hello.nar_hash_hex.is_some());
+        let gone = &facts[&absent];
+        assert!(!gone.found);
+        assert!(gone.nar_hash_hex.is_none());
+    }
+
+    #[tokio::test]
+    async fn sweep_propagates_persistent_errors() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let broken = "/nix/store/cccccccccccccccccccccccccccccccc-broken-1.0".to_string();
+        let err = sweep_narinfos(&c, &[broken], 2, 2).await.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("cccccccccccccccccccccccccccccccc"),
+            "error names the path"
+        );
     }
 }
