@@ -12,6 +12,7 @@ use tracing::{debug, error, info, warn};
 
 use rio_proto::types::FindMissingPathsRequest;
 
+use crate::dag::ClosureEvidence;
 use crate::state::{
     DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths, wanted_subset,
 };
@@ -321,23 +322,23 @@ impl DagActor {
         }
 
         // r[impl sched.merge.substitute-topdown+10]
-        // Fail-open carve-out: a CHILDLESS topdown-pruned node must
-        // never be handed to a worker — its dep closure was never
-        // merged, so a from-source build is doomed (ENOENT on
-        // inputDrvs). Reaching this point still Ready means the
-        // dispatch-time probes produced no definitive verdict for it
-        // this pass (store RPC failed / timed out — every definitive
+        // Fail-open carve-out: a topdown-pruned node whose closure
+        // evidence is Broken — childless or closure-holed, see
+        // `must_substitute` — must never be handed to a worker: its dep
+        // closure was never merged (or the surviving children are a
+        // reap-truncated view of it), so a from-source build is doomed
+        // (ENOENT on inputDrvs). Reaching this point still Ready means
+        // the dispatch-time probes produced no definitive verdict for
+        // it this pass (store RPC failed / timed out — every definitive
         // outcome completes it inline, routes it to substitution, or
         // fail-fasts it). Defer it for this pass instead of letting
         // the generic fail-open dispatch pick it up; the next pass
         // re-probes. All other nodes keep the existing fail-open
         // behaviour.
-        if self.dag.node(&drv_hash).is_some_and(|s| s.topdown_pruned)
-            && self.dag.get_children(&drv_hash).is_empty()
-        {
+        if self.must_substitute(&drv_hash) {
             debug!(%drv_hash,
-                   "childless topdown-pruned node has no store verdict this pass; \
-                    deferring instead of dispatching from source");
+                   "topdown-pruned node with broken closure evidence has no store \
+                    verdict this pass; deferring instead of dispatching from source");
             ctx.deferred.push(drv_hash);
             return false;
         }
@@ -696,9 +697,10 @@ impl DagActor {
         // reaped. The Substituting branch already batched.
         let mut locally_present = Vec::new();
         let mut to_spawn = Vec::new();
-        // Childless topdown-pruned roots whose wanted set can neither
-        // complete inline nor route to substitution: fail fast instead
-        // of leaving them Ready (see the arm below).
+        // Topdown-pruned roots with broken closure evidence (childless
+        // or closure-holed) whose wanted set can neither complete
+        // inline nor route to substitution: fail fast instead of
+        // leaving them Ready (see the arm below).
         let mut to_fail_fast: Vec<DrvHash> = Vec::new();
         for (drv_hash, paths) in candidates {
             checked.insert(drv_hash.clone());
@@ -751,14 +753,13 @@ impl DagActor {
                 // merge.rs. The closure walk's failure path falls
                 // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
-            } else if self.dag.node(&drv_hash).is_some_and(|s| s.topdown_pruned)
-                && self.dag.get_children(&drv_hash).is_empty()
-            {
+            } else if self.must_substitute(&drv_hash) {
                 // r[impl sched.merge.substitute-topdown+10]
                 // Truly missing (a wanted output is missing upstream and
                 // not substitutable): every other node is left Ready and
-                // dispatches from source. A CHILDLESS topdown-pruned
-                // root must not — its dep closure was never merged, so a
+                // dispatches from source. A topdown-pruned root whose
+                // closure evidence is Broken (childless or closure-holed)
+                // must not — its dep closure was never merged, so a
                 // from-source dispatch is doomed (worker ENOENTs on
                 // inputDrvs). This is the post-failover shape: the
                 // recovered wanted union ('{}' = all declared) is wider
@@ -1105,7 +1106,6 @@ impl DagActor {
             return;
         }
         let topdown_pruned = state.topdown_pruned;
-        let closure_hole = state.closure_hole;
         // r[impl sched.merge.wanted-outputs+2]
         // The walk's forgiveness verdict was computed against the
         // wanted set as of SPAWN time. A build that merged during the
@@ -1122,10 +1122,10 @@ impl DagActor {
         // forgivable set, so the delta is re-substituted (and a genuine
         // miss then fails the walk → `substitute_tried` → from-source
         // build). Two revert targets cannot wait for "the next pass" —
-        // a topdown-pruned childless root and a node whose dep is
-        // terminally failed — so for those the walk is re-spawned
-        // immediately below instead (see the downgrade re-spawn ahead
-        // of the generic revert).
+        // a topdown-pruned root with broken closure evidence (childless
+        // or closure-holed) and a node whose dep is terminally failed —
+        // so for those the walk is re-spawned immediately below instead
+        // (see the downgrade re-spawn ahead of the generic revert).
         //
         // The trigger paths (forgiven at spawn time AND wanted now) are
         // collected — not just detected — so the downgrade can record
@@ -1206,67 +1206,64 @@ impl DagActor {
         // construction; there is no other work to "keep going" with,
         // and leaving the build Active would hang it.
         //
-        // Gate on `get_children().is_empty()`: a backstop for stale
-        // flags. The stamp is conditional (closure-dropped nodes whose
-        // existing children are not already produced) and a clear only
-        // happens once a node's children are all produced (the
-        // post-reconciliation pass in `handle_merge_dag`, the
-        // completion-time `clear_topdown_pruned_for_produced_parents`,
-        // the recovery-time gate in `load_dag_from_rows`, or lazily
-        // here), so a live flag alongside children — typically
-        // unbuilt ones kept by design — is normal. If R has children the "deps
-        // were dropped" invariant no longer holds for routing —
-        // suppress the fail-fast and fall through to normal
-        // Ready/Queued handling instead of collaterally failing a build
-        // whose R IS buildable; the flag itself is only cleared (in
-        // memory and, best-effort, in PG) once those children are all
-        // produced.
+        // The marked node's routing is keyed on its closure evidence
+        // (`DerivationDag::closure_evidence`):
         //
-        // Also gate on `!closure_hole`: a closure-holed node — the
-        // terminal-build reap removed an un-produced child out from
-        // under it — is excluded from this arm entirely. Its post-reap
-        // child set is not representative of the pruned input closure,
-        // so neither the lazy clear nor the suppression below may trust
-        // it; the node falls through to the fail-fast arm instead (the
-        // bounded resubmit-directing outcome, never the doomed
-        // from-source dispatch a Ready revert over the truncated set
-        // would produce).
+        //  - Vouched (≥1 child, all produced, no closure hole): the
+        //    "deps were dropped" invariant is moot — lazily clear the
+        //    flag (memory + best-effort PG) and fall through to the
+        //    normal revert. This backstops the stamp being conditional
+        //    and the other clear sites (post-reconciliation,
+        //    completion-time, recovery-time) having missed it.
+        //  - Pending (children present but not all produced): a live
+        //    flag alongside unbuilt children is normal (kept by
+        //    design — they can still be reaped unbuilt). Suppress the
+        //    fail-fast, keep the mark, and fall through to the normal
+        //    Ready/Queued handling instead of collaterally failing a
+        //    build whose node IS buildable once those children land.
+        //  - Broken (childless or closure-holed): the child set must
+        //    not vouch for a from-source dispatch — a closure-holed
+        //    node's post-reap children are not representative of the
+        //    pruned input closure, so neither the lazy clear nor the
+        //    suppression may trust them. Take the fail-fast arm below
+        //    (the bounded resubmit-directing outcome, never the doomed
+        //    from-source dispatch a Ready revert would produce).
         //
-        // Also gate on `!forgiven_now_wanted`: that downgrade means
-        // the fetch did NOT definitively fail — it forgave a seed
-        // that has since become wanted. Failing the build here would
-        // be premature; fall through to the downgrade re-spawn below,
-        // which re-walks immediately with the corrected forgivable
-        // set. A genuine failure on that second walk lands back here
-        // with `forgiven_now_wanted = false` and fails the build then.
-        if topdown_pruned && !closure_hole && !self.dag.get_children(drv_hash).is_empty() {
-            if self.children_all_produced(drv_hash) {
-                debug!(%drv_hash,
-                       "topdown-pruned root's children are all produced; \
-                        invariant moot, clearing flag (memory + PG)");
-                if let Some(s) = self.dag.node_mut(drv_hash) {
-                    s.topdown_pruned = false;
-                }
-                // Best-effort PG counterpart of the in-memory clear:
-                // this lazy clear backstops the children-produced-later
-                // case (the completion-time clear in
-                // `clear_topdown_pruned_for_produced_parents` is the
-                // primary site), and the column is what a failover
-                // restores — left set, a new leader would resurrect the
-                // mark onto a node whose closure IS produced and a
-                // later walk failure would wrongly fail-fast. Same
-                // error posture as the fail-fast's clear: warn and
-                // continue, never fail the handler.
-                if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
-                    warn!(%drv_hash, error = %e,
-                          "failed to clear persisted topdown_pruned after lazy clear (continuing)");
-                }
-            } else {
-                debug!(%drv_hash,
-                       "topdown-pruned root has unbuilt DAG children; \
-                        suppressing the fail-fast but keeping the mark \
-                        (children can still be reaped unbuilt)");
+        // The fail-fast arm additionally gates on
+        // `!forgiven_now_wanted`: that downgrade means the fetch did
+        // NOT definitively fail — it forgave a seed that has since
+        // become wanted. Failing the build here would be premature;
+        // fall through to the downgrade re-spawn below, which re-walks
+        // immediately with the corrected forgivable set. A genuine
+        // failure on that second walk lands back here with
+        // `forgiven_now_wanted = false` and fails the build then.
+        let evidence = self.dag.closure_evidence(drv_hash);
+        if topdown_pruned && evidence == ClosureEvidence::Vouched {
+            debug!(%drv_hash,
+                   "topdown-pruned root's children are all produced; \
+                    invariant moot, clearing flag (memory + PG)");
+            if let Some(s) = self.dag.node_mut(drv_hash) {
+                s.topdown_pruned = false;
             }
+            // Best-effort PG counterpart of the in-memory clear:
+            // this lazy clear backstops the children-produced-later
+            // case (the completion-time clear in
+            // `clear_topdown_pruned_for_produced_parents` is the
+            // primary site), and the column is what a failover
+            // restores — left set, a new leader would resurrect the
+            // mark onto a node whose closure IS produced and a
+            // later walk failure would wrongly fail-fast. Same
+            // error posture as the fail-fast's clear: warn and
+            // continue, never fail the handler.
+            if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
+                warn!(%drv_hash, error = %e,
+                      "failed to clear persisted topdown_pruned after lazy clear (continuing)");
+            }
+        } else if topdown_pruned && evidence == ClosureEvidence::Pending {
+            debug!(%drv_hash,
+                   "topdown-pruned root has unbuilt DAG children; \
+                    suppressing the fail-fast but keeping the mark \
+                    (children can still be reaped unbuilt)");
         } else if topdown_pruned && !forgiven_now_wanted {
             self.fail_fast_topdown_pruned_root(
                 drv_hash,
@@ -1281,16 +1278,17 @@ impl DagActor {
         // Queued (Queued with a Poisoned dep is stuck forever — see
         // `revert_target_for`).
         let to = self.dag.revert_target_for(drv_hash);
-        // Childlessness for the downgrade re-spawn's topdown leg below:
-        // the flag now survives merges that add unbuilt children, so
-        // "flagged" no longer implies "childless" — the childless shape
-        // is the doomed-from-source one this leg must catch. A
-        // closure-holed survivor (un-produced child reaped — see
-        // `closure_hole`) is kept out of the lazy clear by the children
-        // gate above, and a genuine failure on it takes the fail-fast
-        // arm before reaching here; the immediate re-spawn below still
-        // keys on literal childlessness.
-        let childless = self.dag.get_children(drv_hash).is_empty();
+        // Must-substitute judgment for the downgrade re-spawn's topdown
+        // leg below: the flag now survives merges that add unbuilt
+        // children, so "flagged" no longer implies "childless" — the
+        // doomed-from-source shape this leg must catch is a marked node
+        // whose closure evidence is Broken (childless OR closure-holed,
+        // same predicate as the dispatch guards). A genuine failure on
+        // such a node takes the fail-fast arm before reaching here;
+        // this leg only matters for the forgiven-now-wanted downgrade.
+        // Evaluated before `node_mut` because the `&mut` borrow is held
+        // at the use site.
+        let must_sub = self.must_substitute(drv_hash);
         let Some(state) = self.dag.node_mut(drv_hash) else {
             return;
         };
@@ -1305,12 +1303,14 @@ impl DagActor {
         //    wanted seed never had a single real attempt (forgivable
         //    seeds are forgiven on their first failure). There is no
         //    "next pass" out of DependencyFailed.
-        //  - a topdown-pruned childless root (revert target `Ready`):
-        //    its dep closure was dropped from the submission, so plain
-        //    Ready without `substitute_tried` is a doomed from-source
-        //    dispatch (worker ENOENTs on inputDrvs) if the next probe
-        //    finds the now-wanted path definitively missing — the exact
-        //    hazard the fail-fast arm above exists to prevent.
+        //  - a topdown-pruned root with broken closure evidence
+        //    (childless or closure-holed — `must_substitute`): its dep
+        //    closure was dropped from the submission and the current
+        //    child set cannot vouch for it, so plain Ready without
+        //    `substitute_tried` is a doomed from-source dispatch
+        //    (worker ENOENTs on inputDrvs) if the next probe finds the
+        //    now-wanted path definitively missing — the exact hazard
+        //    the fail-fast arm above exists to prevent.
         //
         // For both, re-spawn the walk NOW: `spawn_substitute_fetches`
         // recomputes the forgivable set from the CURRENT effective
@@ -1354,7 +1354,7 @@ impl DagActor {
         // DAG and Completed). Falls through to that plain revert if the
         // store/self handles are gone (shutdown) — pre-fix behaviour.
         if forgiven_now_wanted
-            && (to == DerivationStatus::DependencyFailed || (state.topdown_pruned && childless))
+            && (to == DerivationStatus::DependencyFailed || must_sub)
             && !state.output_paths.is_empty()
             && self.store_client.is_some()
             && self.self_tx.is_some()
@@ -1386,8 +1386,8 @@ impl DagActor {
         // walk either succeeds or fails the now-unforgivable seed →
         // lands back here with `forgiven_now_wanted = false` → sets the
         // one-shot flag. (The hazardous DependencyFailed /
-        // topdown-childless targets never reach here — they re-spawned
-        // above.)
+        // topdown-must-substitute targets never reach here — they
+        // re-spawned above.)
         if !forgiven_now_wanted {
             state.substitute_tried = true;
         }
@@ -1449,21 +1449,24 @@ impl DagActor {
     /// error summary ("topdown-pruned root <hash>: <cause>; resubmit
     /// to re-probe or full-merge").
     ///
-    /// Callers (all gate on `topdown_pruned` plus a child set that no
-    /// longer vouches for the pruned closure — literally childless for
-    /// the dispatch-time probes, childless or closure-holed for the
-    /// rest; unbuilt children suppress the fail-fast but no longer shed
-    /// the mark; only children that are all produced clear it):
+    /// Callers (all gate on `topdown_pruned` plus closure evidence the
+    /// classifier judges `Broken` — childless or closure-holed, the
+    /// `must_substitute` predicate — so a reap-truncated child set is
+    /// treated exactly like an empty one at every site; unbuilt
+    /// children (`Pending`) suppress the fail-fast but no longer shed
+    /// the mark; only a `Vouched` child set — all produced, no hole —
+    /// clears it):
     ///  - `handle_substitute_complete` on a failed/downgraded detached
-    ///    fetch (`SubstituteComplete{ok=false}` after the children
-    ///    gate), the original home of this block;
+    ///    fetch (`SubstituteComplete{ok=false}` after the
+    ///    closure-evidence gate), the original home of this block;
     ///  - the dispatch-time probes (`batch_probe_cached_ready`,
-    ///    `ready_check_or_spawn`) when a childless pruned node can
-    ///    neither complete inline nor be routed to substitution — the
-    ///    post-failover shape, where the recovered (wider) wanted union
-    ///    contains an output that is genuinely missing upstream. Pre-
-    ///    fix that outcome left the node Ready and dispatched it from
-    ///    source — the doomed dispatch this arm exists to prevent;
+    ///    `ready_check_or_spawn`) when a marked node with Broken
+    ///    evidence can neither complete inline nor be routed to
+    ///    substitution — the post-failover shape, where the recovered
+    ///    (wider) wanted union contains an output that is genuinely
+    ///    missing upstream. Pre-fix that outcome left the node Ready
+    ///    and dispatched it from source — the doomed dispatch this arm
+    ///    exists to prevent;
     ///  - the reap-time survivor re-evaluation in
     ///    `handle_cleanup_terminal_build` (leader-gated), which
     ///    additionally requires `substitute_tried` (the node's own walk
@@ -1728,12 +1731,11 @@ impl DagActor {
                 }
                 // r[impl sched.merge.substitute-topdown+10]
                 // Truly missing → the caller dispatches from source. A
-                // childless topdown-pruned root must not be (its dep
+                // topdown-pruned root with broken closure evidence
+                // (childless or closure-holed) must not be (its dep
                 // closure was never merged) — same fail-fast as the
                 // batch pre-pass above; `true` = handled, don't dispatch.
-                if self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned)
-                    && self.dag.get_children(drv_hash).is_empty()
-                {
+                if self.must_substitute(drv_hash) {
                     self.fail_fast_topdown_pruned_root(
                         drv_hash,
                         "wanted output(s) missing upstream and not substitutable at dispatch \

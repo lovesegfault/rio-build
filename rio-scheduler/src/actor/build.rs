@@ -801,12 +801,15 @@ impl DagActor {
         //    pruned input closure, so nothing children-keyed may settle
         //    it: `find_newly_ready` only fires on completions, and the
         //    promote arm below would lift a holed survivor Ready over the
-        //    vacuously-produced remainder for the doomed from-source
-        //    dispatch. Take the resubmit-directing fail-fast now. Two
-        //    restrictions:
+        //    vacuously-produced remainder. Take the resubmit-directing
+        //    fail-fast now. Two restrictions:
         //    `substitute_tried` keeps never-walked nodes out (the next
-        //    dispatch pass re-probes those, with its own carve-out and
-        //    fail-fast arms), and the arm is skipped while the survivor is
+        //    dispatch pass re-probes those with its own hole-aware
+        //    carve-out and fail-fast arms — they judge the same
+        //    `must_substitute` predicate as this arm, so a marked
+        //    survivor with broken closure evidence is deferred or
+        //    fail-fasted there, never dispatched from source), and the
+        //    arm is skipped while the survivor is
         //    `Substituting` — a walk in flight keeps its chance, and
         //    STATUS is the only reliable signal for that: the one-shot
         //    `substitute_tried` bit is sticky (never cleared on a live
@@ -848,17 +851,16 @@ impl DagActor {
                     continue;
                 }
                 let status = node.status();
-                let topdown_pruned = node.topdown_pruned;
                 let substitute_tried = node.substitute_tried;
-                let closure_hole = node.closure_hole;
-                // Childless OR holed: a closure hole means the surviving
-                // children are a reap-truncated view of the pruned
-                // closure, so they must not vouch for a from-source
-                // dispatch any more than an empty set would.
-                if topdown_pruned
+                // `must_substitute` = marked AND closure evidence
+                // Broken (childless OR closure-holed): a closure hole
+                // means the surviving children are a reap-truncated
+                // view of the pruned closure, so they must not vouch
+                // for a from-source dispatch any more than an empty
+                // set would.
+                if self.must_substitute(&parent)
                     && substitute_tried
                     && status != DerivationStatus::Substituting
-                    && (closure_hole || self.dag.get_children(&parent).is_empty())
                 {
                     self.fail_fast_topdown_pruned_root(
                         &parent,

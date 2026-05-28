@@ -99,6 +99,38 @@ pub struct ReapOutcome {
     pub surviving_parents: Vec<DrvHash>,
 }
 
+/// Trust classification of a node's current DAG child set as evidence
+/// about its dependency closure — the single judgment behind every
+/// `topdown_pruned` stamp gate, clear site, and dispatch-time guard.
+/// Computed by [`DerivationDag::closure_evidence`].
+///
+/// `Broken` means "the current child set must NOT vouch for a
+/// from-source dispatch": the node is absent, has no children at all
+/// (a fired prune dropped its closure from the submission, or every
+/// child was reaped), or carries the `closure_hole` breadcrumb — the
+/// terminal-build reap removed an un-produced child out from under it
+/// (see the breadcrumb loop in
+/// [`DerivationDag::remove_build_interest_and_reap`]), so whatever
+/// children survive are a reap-truncated view of its input closure.
+/// The breadcrumb is healed when a full merge re-declares the node's
+/// edges (the post-reconciliation pass in `handle_merge_dag`) and
+/// dropped when the node itself is produced or skipped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosureEvidence {
+    /// At least one child, every child produced (Completed/Skipped),
+    /// and no closure hole: the dependency closure is in the store, so
+    /// a from-source dispatch is not doomed and a `topdown_pruned`
+    /// mark may be cleared.
+    Vouched,
+    /// At least one child and no closure hole, but not every child is
+    /// produced yet: keep any mark (the children can still be reaped
+    /// unbuilt later) and re-judge once they are produced or reaped.
+    Pending,
+    /// Absent, childless, or closure-holed: the child set must not
+    /// vouch for a from-source dispatch.
+    Broken,
+}
+
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug, Default)]
 pub struct DerivationDag {
@@ -809,6 +841,46 @@ impl DerivationDag {
                 )
             })
         })
+    }
+
+    /// Classify `drv_hash`'s current child set as closure evidence (see
+    /// [`ClosureEvidence`]): absent node → `Broken`; `closure_hole` set
+    /// → `Broken`; no children → `Broken`; at least one child and all
+    /// of them Completed/Skipped → `Vouched`; otherwise `Pending`.
+    ///
+    /// Every `topdown_pruned` decision site (the stamp gates in
+    /// `validate_and_ingest` / `persist_merge_to_db`, the
+    /// produced-children clear sites, and the dispatch-time / reap-time
+    /// guards) judges the child set through this one classifier so no
+    /// site can drift into trusting a reap-truncated child set. The
+    /// hole input is set by [`Self::remove_build_interest_and_reap`]
+    /// and healed by the merge-time edge re-declaration.
+    pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
+        let Some(node) = self.nodes.get(drv_hash) else {
+            return ClosureEvidence::Broken;
+        };
+        if node.closure_hole {
+            return ClosureEvidence::Broken;
+        }
+        let Some(children) = self.children.get(drv_hash) else {
+            return ClosureEvidence::Broken;
+        };
+        if children.is_empty() {
+            return ClosureEvidence::Broken;
+        }
+        let all_produced = children.iter().all(|child_hash| {
+            self.nodes.get(child_hash).is_some_and(|n| {
+                matches!(
+                    n.status(),
+                    DerivationStatus::Completed | DerivationStatus::Skipped
+                )
+            })
+        });
+        if all_produced {
+            ClosureEvidence::Vouched
+        } else {
+            ClosureEvidence::Pending
+        }
     }
 
     /// Check whether any dependency is in a terminal failure state.

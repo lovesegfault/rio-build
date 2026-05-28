@@ -190,12 +190,12 @@ impl DagActor {
     // r[impl sched.merge.substitute-topdown+10]
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
-    /// flagged parent whose children are now ALL produced
-    /// (`children_all_produced` — the criterion the stamp sites and the
-    /// in-process clear sites share; the in-process clears additionally
-    /// honor the closure-hole veto below, and the recovery-time gate
-    /// applies a strictly stronger per-child criterion: produced AND
-    /// vouched for by a still-live build —
+    /// flagged parent whose closure is now vouched for
+    /// (`closure_vouched` — the classifier criterion every stamp gate
+    /// and in-process clear site shares: at least one child, all of
+    /// them produced, no closure hole; the recovery-time gate applies a
+    /// strictly stronger per-child criterion: produced AND vouched for
+    /// by a still-live build —
     /// `load_parents_with_all_children_produced`). This is the
     /// children-became-produced clearing
     /// site the merge-time post-reconciliation pass cannot see: that
@@ -205,14 +205,14 @@ impl DagActor {
     /// clear the persisted column would survive into a leader failover
     /// and the restored mark would wrongly fail-fast a node whose
     /// closure IS in the store. Parents carrying the `closure_hole`
-    /// breadcrumb are skipped: an un-produced child was reaped out from
-    /// under them, so their produced children are a truncated view of
-    /// the pruned closure — the fail-fast or a later full merge
-    /// re-declaring their edges resolves them instead. Per-parent work
-    /// is flag-gated (one node lookup) before the children scan; the PG
-    /// write is one batched best-effort statement (warn-and-continue,
-    /// same posture as the lazy and fail-fast clears — the in-memory
-    /// clear never depends on PG).
+    /// breadcrumb are never Vouched and so are skipped: an un-produced
+    /// child was reaped out from under them, so their produced children
+    /// are a truncated view of the pruned closure — the fail-fast or a
+    /// later full merge re-declaring their edges resolves them instead.
+    /// Per-parent work is flag-gated (one node lookup) before the
+    /// children scan; the PG write is one batched best-effort statement
+    /// (warn-and-continue, same posture as the lazy and fail-fast
+    /// clears — the in-memory clear never depends on PG).
     pub(super) async fn clear_topdown_pruned_for_produced_parents(
         &mut self,
         completed: &[DrvHash],
@@ -223,11 +223,8 @@ impl DagActor {
         }
         let mut cleared: Vec<String> = Vec::new();
         for parent in candidates {
-            if self
-                .dag
-                .node(&parent)
-                .is_some_and(|s| s.topdown_pruned && !s.closure_hole)
-                && self.children_all_produced(&parent)
+            if self.dag.node(&parent).is_some_and(|s| s.topdown_pruned)
+                && self.closure_vouched(&parent)
                 && let Some(s) = self.dag.node_mut(&parent)
             {
                 s.topdown_pruned = false;

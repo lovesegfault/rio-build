@@ -1573,8 +1573,8 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
 /// `children[R]`; R's fetch then fails. With the stamp eagerly cleared
 /// the flag-keyed protections are all skipped and R is dispatched from
 /// source (worker ENOENT — the doomed dispatch this machinery exists to
-/// prevent). The clear must therefore use the same
-/// `children_all_produced` criterion as the stamp: B2's unbuilt dep
+/// prevent). The clear must therefore use the same closure-evidence
+/// criterion as the stamp (`closure_vouched`): B2's unbuilt dep
 /// must NOT clear the mark, in memory or in PG, and after the reap the
 /// walk failure must take the designed resubmit-directing fail-fast.
 #[tokio::test]
@@ -3057,6 +3057,548 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
     assert!(
         r.topdown_pruned,
         "the mark must be kept while an unbuilt child remains attached"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// The `topdown_pruned` STAMP must treat a closure-holed kept node like
+/// a childless one. Staging: BC full-merges R → D (D's output already
+/// present upstream, so it cache-hits to Completed) and keeps both
+/// alive; B2 full-merges app → R → {D, E} with E unbuilt and B2's sole
+/// interest; B2 is cancelled and its cleanup reaps E — never produced —
+/// out from under R, stamping the `closure_hole` breadcrumb while the
+/// produced D survives. No prune has fired for R yet, so it is
+/// unmarked. A NEW pruned merge (B3: R → dep3 with R's wanted output
+/// substitutable upstream) then keeps {R}, drops dep3, and MUST stamp R
+/// in memory and in PG: the surviving child set ({D}, produced) is a
+/// reap-truncated view of R's input closure, so it must not exempt R
+/// from the must-substitute guard any more than an empty set would.
+/// Pre-classifier the stamp gates keyed on produced-children alone and
+/// skipped the mark over the truncated survivor, leaving R guard-less
+/// for the doomed from-source dispatch (bughunter round-20 bug_010).
+#[tokio::test]
+async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park any detached fetch (B3's walk for R below) on the QPI gate
+    // so no SubstituteComplete verdict can race the stamp assertions.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let r_out = test_store_path("tdsh-r-out");
+    let d_out = test_store_path("tdsh-d-out");
+    let mk_r = || {
+        let mut n = make_node("tdsh-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_d = || {
+        let mut n = make_node("tdsh-d");
+        n.expected_output_paths = vec![d_out.clone()];
+        n
+    };
+    let mk_e = || {
+        let mut n = make_node("tdsh-e");
+        n.expected_output_paths = vec![test_store_path("tdsh-e-out")];
+        n
+    };
+
+    // BC: full merge R → D. D's output is already present upstream, so
+    // it cache-hits to Completed at merge; R's output is neither
+    // present nor substitutable yet, so no prune fires and R carries no
+    // mark. BC keeps R and D alive across B2's reap below.
+    store.seed_with_content(&d_out, b"d-out");
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdsh-r", "tdsh-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdsh-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced at BC's merge"
+    );
+    assert!(
+        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
+        "fixture premise: no prune has fired for R yet"
+    );
+
+    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
+    // sole interest.
+    let mut app = make_node("tdsh-app");
+    app.expected_output_paths = vec![test_store_path("tdsh-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_d(), mk_e()],
+        vec![
+            make_test_edge("tdsh-app", "tdsh-r"),
+            make_test_edge("tdsh-r", "tdsh-d"),
+            make_test_edge("tdsh-r", "tdsh-e"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Cancel B2 and reap its sole-interest nodes: E — never produced —
+    // is reaped out from under R (closure hole), app goes with it; D
+    // and R survive via BC's interest.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdsh-e").await?.is_none(),
+        "B2's sole-interest unbuilt E must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdsh-app").await?.is_none(),
+        "B2's sole-interest app must be reaped"
+    );
+    assert!(
+        handle.debug_query_derivation("tdsh-d").await?.is_some(),
+        "D must survive the reap (BC still holds interest in it)"
+    );
+    assert!(
+        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
+        "fixture premise: R is still unmarked after the reap"
+    );
+
+    // B3: R's wanted output is now substitutable upstream → the prune
+    // fires, keeps {R}, drops dep3.
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_dep3 = || {
+        let mut n = make_node("tdsh-dep3");
+        n.expected_output_paths = vec![test_store_path("tdsh-dep3-out")];
+        n
+    };
+    let b3 = Uuid::new_v4();
+    let _ev3 = merge_dag(
+        &handle,
+        b3,
+        vec![mk_r(), mk_dep3()],
+        vec![make_test_edge("tdsh-r", "tdsh-dep3")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b3).await?.total_derivations,
+        1,
+        "fixture premise: B3 took the roots-only prune path"
+    );
+
+    // Designed outcome: the closure-holed kept node must be stamped —
+    // its produced survivor must not vouch for the dropped closure.
+    assert!(
+        expect_drv(&handle, "tdsh-r").await.topdown_pruned,
+        "a closure-holed kept node must be stamped even though its surviving \
+         children are all produced (was: stamp skipped over the reap-truncated \
+         child set, leaving R guard-less for the doomed from-source dispatch)"
+    );
+    let (pg_pruned,): (bool,) =
+        sqlx::query_as("SELECT topdown_pruned FROM derivations WHERE drv_hash = 'tdsh-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_pruned,
+        "the stamp for a closure-holed kept node must also be persisted so a \
+         failover cannot resurrect the unguarded shape"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// The dispatch-time guards must treat a marked closure-holed survivor
+/// like a childless one (bughunter round-20 merged_bug_001). Staging
+/// follows that report's proof: B1's prune (wanting only R's `out`,
+/// which is substitutable upstream) stamps R and parks its detached
+/// fetch; BC produces dep2; B2 full-merges app → R → {dep1 unbuilt,
+/// dep2 produced}; B4 (live) wants R's `debug` output — missing and
+/// never substitutable. The parked walk reports ok with `debug`
+/// forgiven → the forgiven-now-wanted downgrade parks R Queued with the
+/// mark kept and `substitute_tried` deliberately left false. B2's
+/// cancel then reaps the un-produced dep1 (closure hole); the reap
+/// hook's fail-fast arm requires `substitute_tried`, so the promote arm
+/// lifts R to Ready over its produced survivor — the merged_bug_001
+/// exit shape: Ready, marked, holed, NOT childless, no walk pending.
+/// At the next dispatch pass R's wanted `debug` output can neither
+/// complete inline nor route to substitution; the guards must take the
+/// resubmit-directing fail-fast instead of assigning R from source over
+/// the reap-truncated child set (pre-classifier they keyed on literal
+/// childlessness and handed R to the worker).
+#[tokio::test]
+async fn test_topdown_pruned_holed_survivor_fails_fast_at_dispatch_not_assigned_from_source()
+-> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park R's detached fetch on the QPI gate (never released) so its
+    // verdict is injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // R declares two outputs: `out` is substitutable upstream (B1's
+    // narrow wanted set, so the prune fires); `debug` is missing and
+    // never substitutable (the output the walk forgives and a later
+    // build then wants).
+    let r_out = test_store_path("tdhd-r-out");
+    let r_dbg = test_store_path("tdhd-r-debug");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = |wanted: Vec<String>| {
+        let mut n = make_node("tdhd-r");
+        n.output_names = vec!["out".into(), "debug".into()];
+        n.expected_output_paths = vec![r_out.clone(), r_dbg.clone()];
+        n.wanted_output_names = wanted;
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("tdhd-dep1");
+        n.expected_output_paths = vec![test_store_path("tdhd-dep1-out")];
+        n
+    };
+
+    // B1: root → dep1, wanting only R's `out` → the prune fires, keeps
+    // {R} (stamped, childless), drops dep1, and parks R's fetch.
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(vec!["out".into()]), mk_dep1()],
+        vec![make_test_edge("tdhd-r", "tdhd-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdhd-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // BC: dep2 is produced by an unrelated build and survives B2's
+    // later reap via BC's interest.
+    let dep2_out = test_store_path("tdhd-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("tdhd-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdhd-dep2").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep2 is produced before B2 attaches it to R"
+    );
+
+    // B2: full merge app → R → {dep1 unbuilt (B2's sole interest),
+    // dep2 produced (shared with BC)}. The mark survives.
+    let mut app = make_node("tdhd-app");
+    app.expected_output_paths = vec![test_store_path("tdhd-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(vec!["out".into()]), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdhd-app", "tdhd-r"),
+            make_test_edge("tdhd-r", "tdhd-dep1"),
+            make_test_edge("tdhd-r", "tdhd-dep2"),
+        ],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "tdhd-r").await.topdown_pruned,
+        "fixture premise: a merge whose added children are not all produced keeps the mark"
+    );
+
+    // B4: a live build that wants R's `debug` output — the output the
+    // parked walk's spawn-time forgivable set could forgive.
+    let b4 = Uuid::new_v4();
+    let _ev4 = merge_dag(&handle, b4, vec![mk_r(vec!["debug".into()])], vec![], false).await?;
+    barrier(&handle).await;
+
+    // R's parked walk reports success but with `debug` forgiven (it was
+    // unwanted at spawn time). A live build now wants it → the
+    // forgiven-now-wanted downgrade: lazy clear and fail-fast are both
+    // skipped, R parks Queued behind its unbuilt child with the mark
+    // kept and `substitute_tried` deliberately left false.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdhd-r".into(),
+            ok: true,
+            forgiven: vec![r_dbg.clone()],
+        })
+        .await?;
+    barrier(&handle).await;
+    let mid = expect_drv(&handle, "tdhd-r").await;
+    assert_eq!(
+        mid.status,
+        DerivationStatus::Queued,
+        "fixture premise: the forgiven-now-wanted downgrade parks R Queued behind dep1"
+    );
+    assert!(
+        mid.topdown_pruned && !mid.substitute_tried,
+        "fixture premise: mark kept, one-shot flag deliberately not set by the downgrade"
+    );
+
+    // Cancel B2 and reap its sole-interest nodes: dep1 — never produced
+    // — is reaped out from under R (closure hole), app goes with it;
+    // dep2 survives via BC. The reap hook's fail-fast arm requires
+    // `substitute_tried`, so it skips R; the promote arm lifts the
+    // vacuously dep-complete R to Ready over its produced survivor.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdhd-dep1").await?.is_none(),
+        "B2's sole-interest unbuilt dep1 must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdhd-app").await?.is_none(),
+        "B2's sole-interest app must be reaped"
+    );
+    assert!(
+        handle.debug_query_derivation("tdhd-dep2").await?.is_some(),
+        "dep2 must survive the reap (BC still holds interest in it)"
+    );
+    let staged = expect_drv(&handle, "tdhd-r").await;
+    assert_eq!(
+        staged.status,
+        DerivationStatus::Ready,
+        "fixture premise: the reap-time promote arm lifts R Ready over its produced survivor"
+    );
+    assert!(
+        staged.topdown_pruned,
+        "fixture premise: R is still marked when it reaches Ready"
+    );
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the dispatch-time guards ignore the hole.
+    let mut worker_rx = connect_executor(&handle, "tdhd-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+
+    // Designed outcome: R's wanted `debug` output is missing upstream
+    // and not substitutable, so the probes can neither complete it
+    // inline nor route it to substitution — the holed survivor must
+    // take the resubmit-directing fail-fast, NOT a from-source
+    // assignment over the reap-truncated child set.
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a marked closure-holed survivor must never be dispatched from source \
+             (its pruned closure was never merged — the worker would ENOENT)"
+        );
+    }
+    let r = expect_drv(&handle, "tdhd-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "R must not be left dispatchable from source after the closure hole; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the fail-fast consumes (clears) the mark it acted on"
+    );
+    for (label, b) in [("B1", b1), ("B4", b4)] {
+        let s = query_status(&handle, b).await?;
+        assert_eq!(
+            s.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "{label} must fail via the resubmit-directing fail-fast; got state={} error={:?}",
+            s.state,
+            s.error_summary
+        );
+        assert!(
+            s.error_summary.contains("topdown") && s.error_summary.contains("resubmit"),
+            "{label}'s error summary should direct resubmit; got {:?}",
+            s.error_summary
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// Guard companion: a closure hole alone — no `topdown_pruned` mark —
+/// must not defer or fail-fast anything at dispatch time. Same staging
+/// as the stamp test above (BC keeps R + D, B2's cancel reaps the
+/// un-produced E out from under R) but no prune ever fires for R: its
+/// wanted output is neither present nor substitutable, so the probes
+/// leave it Ready and the generic dispatch hands it to a worker from
+/// source — the correct outcome for an unmarked node whose closure no
+/// prune ever dropped. Pins that the must-substitute judgment requires
+/// the mark, not just broken closure evidence.
+#[tokio::test]
+async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let r_out = test_store_path("tdnm-r-out");
+    let d_out = test_store_path("tdnm-d-out");
+    let mk_r = || {
+        let mut n = make_node("tdnm-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_d = || {
+        let mut n = make_node("tdnm-d");
+        n.expected_output_paths = vec![d_out.clone()];
+        n
+    };
+    let mk_e = || {
+        let mut n = make_node("tdnm-e");
+        n.expected_output_paths = vec![test_store_path("tdnm-e-out")];
+        n
+    };
+
+    // BC: full merge R → D; D cache-hits to Completed, R stays unbuilt
+    // and unmarked (its output is neither present nor substitutable).
+    store.seed_with_content(&d_out, b"d-out");
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdnm-r", "tdnm-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdnm-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced at BC's merge"
+    );
+
+    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
+    // sole interest. Cancel + cleanup reaps E un-produced out from
+    // under R (closure hole) while the produced D survives via BC.
+    let mut app = make_node("tdnm-app");
+    app.expected_output_paths = vec![test_store_path("tdnm-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_d(), mk_e()],
+        vec![
+            make_test_edge("tdnm-app", "tdnm-r"),
+            make_test_edge("tdnm-r", "tdnm-d"),
+            make_test_edge("tdnm-r", "tdnm-e"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdnm-e").await?.is_none(),
+        "B2's sole-interest unbuilt E must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdnm-d").await?.is_some(),
+        "D must survive the reap (BC still holds interest in it)"
+    );
+    assert!(
+        !expect_drv(&handle, "tdnm-r").await.topdown_pruned,
+        "fixture premise: R is unmarked (no prune ever fired for it)"
+    );
+
+    // A builder connects; the next dispatch pass must hand R to it.
+    let mut worker_rx = connect_executor(&handle, "tdnm-w", "x86_64-linux").await?;
+    tick(&handle).await?;
+    let assn = recv_assignment(&mut worker_rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("tdnm-r"),
+        "an unmarked node with a closure hole and produced survivors must still \
+         dispatch from source (no prune ever dropped its closure)"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tdnm-r").await.status,
+        DerivationStatus::Assigned,
+        "R must be assigned to the worker, not deferred or fail-fasted"
+    );
+    assert_eq!(
+        query_status(&handle, bc).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "BC must stay Active (no spurious resubmit-directing fail-fast)"
     );
     Ok(())
 }

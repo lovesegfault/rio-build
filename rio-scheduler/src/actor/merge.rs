@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use rio_proto::types::FindMissingPathsRequest;
 
+use crate::dag::ClosureEvidence;
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, effective_wanted,
     union_wanted_saturating, verifiable_wanted_paths,
@@ -147,11 +148,11 @@ impl DagActor {
         // wrongful fail-fast that a resubmit recovers, never the
         // unbounded doomed from-source dispatch. A merge that adds only
         // unbuilt children keeps the mark (they can be reaped unbuilt
-        // later — see `children_all_produced`); once those children are
-        // produced, the completion-time
-        // `clear_topdown_pruned_for_produced_parents` drops it (with the
-        // lazy clear in `handle_substitute_complete` as the walk-failure
-        // backstop).
+        // later — the classifier judges them Pending, not Vouched; see
+        // `closure_vouched`); once those children are produced, the
+        // completion-time `clear_topdown_pruned_for_produced_parents`
+        // drops it (with the lazy clear in `handle_substitute_complete`
+        // as the walk-failure backstop).
         //
         // Closure-hole healing comes FIRST: a full merge that
         // re-declares a node's edges re-supplies its inputDrvs, so its
@@ -161,8 +162,8 @@ impl DagActor {
         // no edges (`edge_parent_hashes` is empty), so it never heals a
         // hole. Candidates that are NOT edge parents of this submission
         // (e.g. pre-existing DAG parents of a cache hit) keep their
-        // breadcrumb and are skipped below: their produced children are
-        // still a reap-truncated view.
+        // breadcrumb and are skipped below: the classifier judges their
+        // reap-truncated child set Broken, never Vouched.
         for hash in &ingest.edge_parent_hashes {
             if let Some(s) = self.dag.node_mut(hash) {
                 s.closure_hole = false;
@@ -175,11 +176,8 @@ impl DagActor {
         }
         let mut cleared: Vec<String> = Vec::new();
         for hash in clear_candidates {
-            if self
-                .dag
-                .node(&hash)
-                .is_some_and(|s| s.topdown_pruned && !s.closure_hole)
-                && self.children_all_produced(&hash)
+            if self.dag.node(&hash).is_some_and(|s| s.topdown_pruned)
+                && self.closure_vouched(&hash)
                 && let Some(s) = self.dag.node_mut(&hash)
             {
                 s.topdown_pruned = false;
@@ -375,9 +373,9 @@ impl DagActor {
                 metrics::counter!("rio_scheduler_topdown_prune_total").increment(1);
                 // Parents of the ORIGINAL submission's edges: the nodes
                 // whose dependency closure this prune is about to drop.
-                // Only these (∩ the kept set, and only when their
-                // existing children are not already all produced — see
-                // children_all_produced) get the topdown_pruned marker
+                // Only these (∩ the kept set, and only when the closure
+                // classifier does not vouch for their existing children
+                // — see closure_vouched) get the topdown_pruned marker
                 // — a dep-less demanded leaf never had a closure to
                 // drop, a from-source dispatch of it would succeed, and
                 // marking it would only turn a routine substitute
@@ -553,21 +551,23 @@ impl DagActor {
         //
         // Only kept nodes whose dependency closure this prune actually
         // dropped — parents of the ORIGINAL submission's edges
-        // (`pruned_closure_parents`) — are stamped, and only when their
-        // existing DAG children (if any) are not already all produced.
-        // A dep-less demanded leaf never had a closure to drop, and a
-        // kept node whose children are all Completed/Skipped has its
-        // closure in the store; neither needs the "must complete via
-        // substitution" guard, and stamping them would only manufacture
-        // the stale flag the fail-fast clear has to mop up. Children
-        // that are present but UNBUILT do not exempt the node — see
-        // `children_all_produced` for the reap hazard and the
-        // deliberate trade. Mirrors the row-level bind in
-        // persist_merge_to_db.
+        // (`pruned_closure_parents`) — are stamped, and only when the
+        // closure classifier does NOT vouch for their existing DAG
+        // children. A dep-less demanded leaf never had a closure to
+        // drop, and a kept node whose child set is Vouched (≥1 child,
+        // all Completed/Skipped, no closure hole) has its closure in
+        // the store; neither needs the "must complete via substitution"
+        // guard, and stamping them would only manufacture the stale
+        // flag the fail-fast clear has to mop up. Children that are
+        // present but UNBUILT do not exempt the node, and neither do
+        // produced survivors of a closure-holed reap (their child set
+        // is a truncated view of the pruned closure) — see
+        // `closure_vouched` for the reap hazard and the deliberate
+        // trade. Mirrors the row-level bind in persist_merge_to_db.
         if topdown_fired {
             for n in &nodes {
                 if pruned_closure_parents.contains(n.drv_hash.as_str())
-                    && !self.children_all_produced(&n.drv_hash)
+                    && !self.closure_vouched(&n.drv_hash)
                     && let Some(s) = self.dag.node_mut(&n.drv_hash)
                 {
                     s.topdown_pruned = true;
@@ -619,8 +619,8 @@ impl DagActor {
     /// Their rows get `topdown_pruned = true` inside the persist
     /// transaction (the failover-safe counterpart of the post-commit
     /// in-memory stamp in `validate_and_ingest`), additionally gated on
-    /// the node's existing children (if any) not being all produced
-    /// (`children_all_produced`).
+    /// the closure classifier not vouching for the node's existing
+    /// children (`closure_vouched`).
     ///
     /// The PG side of Pending→Active rides the SAME transaction
     /// (`activate_build_tx`, the last statement before commit), so a
@@ -1780,46 +1780,66 @@ impl DagActor {
         reset
     }
 
-    /// True when `drv_hash` has at least one child in the DAG and every
-    /// one of them is already produced (Completed/Skipped) — the only
-    /// children shape that exempts a kept closure-dropped node from the
-    /// `topdown_pruned` stamp: its dependency closure exists in the
-    /// store, so a from-source dispatch is not doomed. Children that
-    /// are merely *present* but unbuilt do NOT exempt it — they can
-    /// belong to another build and be reaped unbuilt later (cancel →
-    /// cascade terminal → reap → `children` scrubbed), leaving the node
-    /// childless with a never-produced closure and, without the stamp,
-    /// eligible for the doomed from-source dispatch. Deliberate trade:
-    /// a node stamped alongside unbuilt children carries the mark only
-    /// until those children are produced (the completion-time
-    /// `clear_topdown_pruned_for_produced_parents` drops it then); in
-    /// the residual missed-clear window (e.g. a failover restoring a
-    /// persisted mark whose best-effort PG clear was lost) one
-    /// substitute failure can still fail-fast where a from-source
+    /// True when [`crate::dag::DerivationDag::closure_evidence`] judges
+    /// `drv_hash`'s child set [`ClosureEvidence::Vouched`]: at least
+    /// one DAG child, every one of them already produced
+    /// (Completed/Skipped), and no `closure_hole` breadcrumb — the only
+    /// children shape that says the node's dependency closure exists in
+    /// the store, so a from-source dispatch is not doomed.
+    ///
+    /// Used by the stamp gates (the in-memory loop in
+    /// `validate_and_ingest` and the row-level bind in
+    /// `persist_merge_to_db` — a kept closure-dropped node is exempted
+    /// from the `topdown_pruned` stamp only when its closure is
+    /// vouched) and by the in-process clear sites (the
+    /// post-reconciliation pass in `handle_merge_dag`, the
+    /// completion-time `clear_topdown_pruned_for_produced_parents`, and
+    /// the lazy clear in `handle_substitute_complete`), so the stamps
+    /// and the clears always judge the same criterion. Children that
+    /// are merely *present* but unbuilt do NOT vouch
+    /// ([`ClosureEvidence::Pending`]) — they can belong to another
+    /// build and be reaped unbuilt later (cancel → cascade terminal →
+    /// reap → `children` scrubbed), leaving the node childless or
+    /// closure-holed with a never-produced closure; and produced
+    /// SURVIVORS of such a reap do not vouch either
+    /// ([`ClosureEvidence::Broken`] via the hole) — they are a
+    /// truncated view of the pruned closure. Deliberate trade: a node
+    /// stamped alongside unbuilt children carries the mark only until
+    /// those children are produced (the completion-time clear drops it
+    /// then); in the residual missed-clear window (e.g. a failover
+    /// restoring a persisted mark whose best-effort PG clear was lost)
+    /// one substitute failure can still fail-fast where a from-source
     /// dispatch would have worked — bounded (the fail-fast clears the
     /// marker it consumes; a resubmit recovers) and strictly preferable
-    /// to the unbounded doomed-dispatch corner. Used by both
-    /// the in-memory stamping loop in `validate_and_ingest` and the
-    /// row-level bind in `persist_merge_to_db` so the two always agree.
-    /// Also gates the in-process clear sites (the post-reconciliation
-    /// clear pass in `handle_merge_dag`, the completion-time clear in
-    /// `clear_topdown_pruned_for_produced_parents`, and the lazy clear
-    /// in `handle_substitute_complete`); the recovery-time gate
-    /// evaluates a strictly stronger SQL variant of this criterion
-    /// (`load_parents_with_all_children_produced`: every persisted
-    /// child produced AND vouched for by a still-live build), so no
-    /// clear site is ever more permissive than the stamp.
-    pub(super) fn children_all_produced(&self, drv_hash: &str) -> bool {
-        let children = self.dag.get_children(drv_hash);
-        !children.is_empty()
-            && children.iter().all(|c| {
-                self.dag.node(c).is_some_and(|s| {
-                    matches!(
-                        s.status(),
-                        DerivationStatus::Completed | DerivationStatus::Skipped
-                    )
-                })
-            })
+    /// to the unbounded doomed-dispatch corner. The recovery-time gate
+    /// evaluates a stricter SQL variant of the Vouched criterion over
+    /// *persisted* children (`load_parents_with_all_children_produced`:
+    /// every child produced AND vouched for by a still-live build); the
+    /// dispatch-time and reap-time guards consume the inverse judgment
+    /// via [`Self::must_substitute`].
+    pub(super) fn closure_vouched(&self, drv_hash: &str) -> bool {
+        self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
+    }
+
+    // r[impl sched.merge.substitute-topdown+10]
+    /// True when `drv_hash` carries the `topdown_pruned` mark AND its
+    /// closure evidence is [`ClosureEvidence::Broken`] (childless or
+    /// closure-holed): its dependency closure was dropped from the
+    /// submission and the current child set cannot vouch for it, so the
+    /// node must complete via substitution — a from-source dispatch is
+    /// doomed (the worker ENOENTs on inputDrvs that were never merged).
+    ///
+    /// This is the single predicate behind the dispatch-time carve-out
+    /// and fail-fast arms (`try_dispatch_one`,
+    /// `batch_probe_cached_ready`, `ready_check_or_spawn`), the
+    /// downgrade re-spawn key in `handle_substitute_complete`, and the
+    /// reap-hook fail-fast in `handle_cleanup_terminal_build` — a
+    /// closure-holed survivor is treated exactly like a childless node
+    /// at every guard. Unmarked nodes are never affected, whatever
+    /// their evidence.
+    pub(super) fn must_substitute(&self, drv_hash: &str) -> bool {
+        self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned)
+            && self.dag.closure_evidence(drv_hash) == ClosureEvidence::Broken
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge,
@@ -1830,8 +1850,8 @@ impl DagActor {
     /// `topdown_pruned_parents`: kept nodes whose dependency closure a
     /// fired prune dropped (empty otherwise) — only their rows are
     /// upserted with `topdown_pruned = true` (OR-on-conflict, see
-    /// `db/batch.rs`), additionally gated on their existing children
-    /// (if any) not being all produced (`children_all_produced`).
+    /// `db/batch.rs`), additionally gated on the closure classifier not
+    /// vouching for their existing children (`closure_vouched`).
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
@@ -1878,19 +1898,21 @@ impl DagActor {
                     // Mark only kept nodes whose dependency closure the
                     // prune dropped (parents of the ORIGINAL
                     // submission's edges) so the guard survives leader
-                    // failover, and only when their existing DAG
-                    // children (if any) are not already all produced: a
+                    // failover, and only when the closure classifier
+                    // does not vouch for their existing DAG children: a
                     // dep-less demanded leaf never had a closure to
-                    // drop, and a node whose children are all
-                    // Completed/Skipped has its closure in the store —
-                    // neither must carry the marker. Unbuilt children
-                    // do NOT exempt the node (they can be reaped
-                    // unbuilt; see `children_all_produced`). Mirrors
-                    // the in-memory stamp gate in validate_and_ingest.
-                    // OR-on-conflict upsert: a later non-pruned merge
-                    // of the same drv (false here) never clears it.
+                    // drop, and a node whose child set is Vouched (all
+                    // produced, no closure hole) has its closure in the
+                    // store — neither must carry the marker. Unbuilt
+                    // children do NOT exempt the node (they can be
+                    // reaped unbuilt), and neither do the produced
+                    // survivors of a closure-holed reap (see
+                    // `closure_vouched`). Mirrors the in-memory stamp
+                    // gate in validate_and_ingest. OR-on-conflict
+                    // upsert: a later non-pruned merge of the same drv
+                    // (false here) never clears it.
                     topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
-                        && !self.children_all_produced(&node.drv_hash),
+                        && !self.closure_vouched(&node.drv_hash),
                 }
             })
             .collect();
