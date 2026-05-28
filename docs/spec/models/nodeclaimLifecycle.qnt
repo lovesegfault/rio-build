@@ -54,7 +54,14 @@
 //   - classify()'s in-live ICE / boot-timeout arms are folded into one
 //     "stuck" bit per in-flight claim; the dead_nodes arm is consumed
 //     input only and out of model (its protection is the §4(a)1 gate
-//     tests, not these invariants).
+//     tests, not these invariants). Input-source note (executor 1c /
+//     OA2): the dead_nodes-shaped input is now the union of the
+//     scheduler-reported set (stream pools, until 1d) and the
+//     controller-side per-node deadline-expiry clustering over the
+//     open-attempt ledger view (nodeclaim_pool/wedge.rs). Still
+//     consumed input only — none of this model's checked invariants
+//     quantify over it; the clustering's protection is its own unit
+//     battery plus the same dead-reap cap the modeled reaps respect.
 //   - The Pool-coverage filter and its fail-open posture are out of
 //     model (demand is post-coverage); the unknown-cell drop and the
 //     ceilings gate of the config mirror ARE modeled.

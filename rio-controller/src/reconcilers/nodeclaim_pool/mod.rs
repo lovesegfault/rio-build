@@ -32,6 +32,7 @@ mod cover;
 pub(crate) mod ffd;
 mod health;
 pub mod sketch;
+mod wedge;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -45,7 +46,8 @@ use rio_crds::karpenter::NodeClaim;
 use rio_crds::pool::{ExecutorKind, Pool};
 use rio_lease::LeaderState;
 use rio_proto::types::{
-    AckSpawnedIntentsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse, SpawnIntent,
+    AckSpawnedIntentsRequest, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
+    ListOpenAttemptsRequest, SpawnIntent,
 };
 
 use crate::reconcilers::node_informer::{HwClassConfig, PodRequestedCache};
@@ -755,6 +757,16 @@ pub struct NodeClaimPoolReconciler {
     /// Monotonic tick counter for `cover_deficit`'s rotating-start
     /// round-robin.
     tick_counter: u64,
+    /// OA2: per-node clustering of pull-mode attempt-deadline expiries
+    /// over the open-attempt ledger view ([`wedge::WedgeTracker`]).
+    /// Produces the controller-side half of the `dead_nodes`-shaped
+    /// input `reap_unhealthy` consumes (unioned with the
+    /// scheduler-reported set during coexistence). In-memory only and
+    /// NOT cleared on lease edges: evidence is event-shaped (an expiry
+    /// observed at time T never un-happens) and ages out of its window;
+    /// a fresh process under-detects for at most one window — the same
+    /// safe direction as the heartbeat detector it succeeds.
+    wedge: wedge::WedgeTracker,
 }
 
 /// Cells `emit_live_gauges` must write this tick. r41 bug_025: a live
@@ -884,6 +896,7 @@ impl NodeClaimPoolReconciler {
             inflight_created: HashMap::new(),
             consecutive_bot_ticks: 0,
             tick_counter: 0,
+            wedge: wedge::WedgeTracker::default(),
         }
     }
 
@@ -1261,6 +1274,32 @@ impl NodeClaimPoolReconciler {
         self.placeable_tx
             .send_replace(Some(Arc::new(on_registered)));
 
+        // OA2: controller-side per-node wedge clustering. Pull-mode
+        // pods never feed the scheduler's heartbeat-fed detector, so
+        // the controller derives the same Dead-equivalent signal from
+        // the open-attempt ledger view (deadline expiries clustered per
+        // source node) and consumes the UNION with the
+        // scheduler-reported `dead_nodes` (stream pools keep feeding
+        // that until 1d). RPC failure is fail-open for observation
+        // only: the tick skips new evidence, previously accumulated
+        // evidence stays, and no node is marked from stale data.
+        // r[impl ctrl.nodeclaim.wedge-cluster]
+        let open_attempts = match admin_call(
+            self.admin
+                .clone()
+                .list_open_attempts(ListOpenAttemptsRequest {}),
+        )
+        .await
+        {
+            Ok(r) => r.into_inner().attempts,
+            Err(e) => {
+                warn!(error = %e, "ListOpenAttempts failed; node-wedge clustering skips this tick's observation");
+                Vec::new()
+            }
+        };
+        let wedged = self.wedge.update(&open_attempts, &bound, now);
+        let dead_input = wedge::dead_union(&intents.dead_nodes, &wedged);
+
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
         // immediately re-create what we just deleted). `reap_unhealthy`
@@ -1271,7 +1310,7 @@ impl NodeClaimPoolReconciler {
         let (mut ice_cells, reaped) = health::reap_unhealthy(
             &self.nodeclaims,
             &live,
-            &intents.dead_nodes,
+            &dead_input,
             &self.sketches,
             &self.cfg,
             now,

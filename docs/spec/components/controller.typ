@@ -1139,6 +1139,37 @@ fleet-wide learning.
   honored during the outage.
 ]
 
+#r("ctrl.nodeclaim.wedge-cluster")[
+  On every full reconcile tick the NodeClaim-pool reconciler MUST compute a
+  per-node clustering of pull-mode attempt-deadline expiries from the
+  open-attempt ledger view (`AdminService.ListOpenAttempts`): an open attempt
+  whose age exceeds its known intent deadline by the observation grace
+  contributes its derivation as evidence against the node it is bound to ---
+  the ledger's `source_node`, falling back to the controller's own
+  kube-authoritative intent→node binding; an attempt with no node attribution
+  or no known deadline contributes nothing. A node accumulating evidence for
+  at least 2 distinct derivations inside the 30-minute window MUST be treated
+  as Dead-equivalent: unioned with the scheduler-reported `dead_nodes` and
+  consumed by the unhealthy reap's `Dead` arm under the same per-tick
+  dead-reap cap. One derivation expiring repeatedly MUST NOT mark a node by
+  itself; an open-attempt RPC failure MUST only skip that tick's observation
+  (previously accumulated evidence is retained, and no node is marked from
+  data the controller did not observe).
+]
+
+This is the OA2 successor to the heartbeat-fed hung-node detector
+(#rref("sched.admin.hung-node-detector")) for pull-mode pools: pull-mode pods
+never register or heartbeat, so a wedged-but-`Ready` node (EBS stall, kernel
+softlockup, D-state runtime) is visible only as its builds running out their
+attempt deadlines without any report. The clustering reads only ledger facts
+plus the spawn-ack node binding, so it keeps working after the session
+machinery is deleted; during coexistence the scheduler-reported `dead_nodes`
+keeps covering stream-mode pools and the controller consumes the union. The
+#(refs.metric)("rio_controller_node_wedge_marked_total") counter records each
+not-wedged→wedged transition; the `RioSchedulerAttemptEstablishmentCluster`
+alert and the manual-reap runbook remain the independent operator-facing
+tripwire and confirmation procedure.
+
 = Build CRD (removed)
 
 The `Build` CRD (`rio.build/v1alpha1 Build`) was removed in P0294. It was an

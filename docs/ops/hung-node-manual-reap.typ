@@ -7,11 +7,16 @@ sweep (an open attempt past its intent deadline plus the report slack is
 established as an unreported executor crash and requeued). A node whose
 kubelet or container runtime wedges while the Node object stays `Ready` is
 therefore invisible to the heartbeat-fed hung-node detector for pull-mode
-attempts: its builds simply run out their deadlines one by one. Until the
-controller-side per-node deadline-clustering aggregation lands (the permanent
-OA2 signal, executor-lifecycle slice 1c), the
-`RioSchedulerAttemptEstablishmentCluster` alert plus this runbook are the
-interim compensating controls (OA2 option C).
+attempts: its builds simply run out their deadlines one by one. The
+controller-side per-node deadline-clustering aggregation (the permanent OA2
+signal, landed at executor-lifecycle slice 1c) automates exactly the
+clustering described below — a node accumulating expired open attempts for
+two or more distinct derivations inside the 30-minute window is marked
+Dead-equivalent (#(refs.metric)("rio_controller_node_wedge_marked_total"))
+and reaped through the existing capped NodeClaim Dead arm. The
+`RioSchedulerAttemptEstablishmentCluster` alert plus this runbook remain the
+independent operator-facing tripwire and the manual confirmation/fallback
+procedure (OA2 option C's compensating controls, kept as deliverables).
 
 = When the alert fires
 
@@ -84,13 +89,14 @@ deadlines, so reap it once confirmed:
   them) build elsewhere. The exclusion keeps them off the dead node's name
   even if it briefly reappears.
 
-= Rules while operating under the interim signal
+= Rules while operating on this signal
 
-- *Never reap a `Ready` node automatically on this alert alone.* The alert is
+- *Never reap a `Ready` node manually on this alert alone.* The alert is
   fleet-wide and over-approximates; only the per-node ledger query (or the
-  1c aggregation once it lands) justifies touching a node. Bulk-reaping Ready
-  nodes on a noisy tripwire converts a latency problem into a capacity
-  outage.
+  controller-side aggregation's own marking, which applies the same
+  two-distinct-derivations discrimination and is bounded by the per-tick
+  dead-reap cap) justifies touching a node. Bulk-reaping Ready nodes on a
+  noisy tripwire converts a latency problem into a capacity outage.
 - While the alert is quiet, no manual action is owed: single establishments
   are the sweep working as designed.
 - Karpenter NodeRepair only covers nodes whose `Ready` condition goes

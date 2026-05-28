@@ -184,8 +184,23 @@ pub fn describe_metrics() {
          reason=idle: NA-consolidate break-even; reason=ice: \
          Launched=False (timeout or terminal LaunchFailed reason); \
          reason=boot-timeout: Launched=True ∧ Registered=False past \
-         timeout; reason=dead: scheduler-reported hung node; \
+         timeout; reason=dead: hung node — the scheduler-reported \
+         dead_nodes signal (stream pools) or the controller-side OA2 \
+         per-node deadline-expiry clustering (pull pools), consumed as \
+         one union; \
          reason=vanished: in-flight claim Karpenter-GC'd between ticks."
+    );
+    describe_counter!(
+        "rio_controller_node_wedge_marked_total",
+        "Nodes newly marked Dead-equivalent by the controller-side OA2 \
+         clustering: ≥2 distinct derivations' open pull-mode attempts \
+         expired (age past intent deadline + grace) on one node inside \
+         the 30-minute window. One increment per not-wedged→wedged \
+         transition; the resulting NodeClaim deletions are counted in \
+         nodeclaim_reaped_total{reason=\"dead\"} subject to the per-tick \
+         dead-reap cap. Non-zero = a node is eating builds without \
+         reporting (the wedged-but-Ready failure mode); see the \
+         hung-node runbook."
     );
     describe_counter!(
         "rio_controller_nodeclaim_intent_dropped_total",

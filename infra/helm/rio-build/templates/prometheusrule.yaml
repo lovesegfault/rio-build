@@ -58,21 +58,23 @@ spec:
               idle for 5m. Check system/kind routing and ghost-executor
               accumulation.
 
-        # executor-formal OA2 interim control (option C): pull-mode
-        # attempts carry no per-pod heartbeat, so a wedged-but-Ready
-        # node (kubelet/containerd hung while the Node object stays
-        # Ready) surfaces as its builds silently running out their
-        # attempt deadlines and being established by the sweep as
-        # unreported executor crashes instead of reporting. Fleet-wide
-        # >=2 establishments inside 30m is the tripwire, summed across
+        # executor-formal OA2 control: pull-mode attempts carry no
+        # per-pod heartbeat, so a wedged-but-Ready node
+        # (kubelet/containerd hung while the Node object stays Ready)
+        # surfaces as its builds silently running out their attempt
+        # deadlines and being established by the sweep as unreported
+        # executor crashes instead of reporting. Fleet-wide >=2
+        # establishments inside 30m is the tripwire, summed across
         # replicas and keyed on the dedicated pull-sweep counter (the
         # attempt_requeue histogram's establishment cause is shared
         # with the stream-mode correlation-TTL sweep and is per-series,
         # so a leader change or a stream establishment could otherwise
         # split or fake the signal); the per-node clustering
-        # discrimination is the ledger query in the runbook, and the
-        # permanent controller-side per-node aggregation replaces this
-        # alert's job at the 1c slice.
+        # discrimination is the ledger query in the runbook. The
+        # permanent controller-side per-node aggregation (landed at the
+        # 1c slice) automates that discrimination and feeds the capped
+        # NodeClaim Dead reap; this alert stays as the independent
+        # fleet-wide tripwire backing the runbook's manual confirmation.
         - alert: RioSchedulerAttemptEstablishmentCluster
           expr: sum(increase(rio_scheduler_pull_establishments_total[30m])) >= 2
           for: 0m

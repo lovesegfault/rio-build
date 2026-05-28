@@ -464,6 +464,11 @@
       "doc": "Per-cell quantile-sketch state + PG persist (migration 059"
     },
     {
+      "path": "reconcilers/nodeclaim_pool/wedge.rs",
+      "depth": 2,
+      "doc": "OA2: controller-side per-node wedge clustering for pull-mode pools."
+    },
+    {
       "path": "reconcilers/pool/",
       "depth": 1,
       "doc": "Pool reconciler: spawn/reap one-shot rio-builder Jobs."

@@ -1185,3 +1185,47 @@ Controller-campaign owner counter-signature for this re-audit entry:
 PENDING (to be collected at the executor campaign's 1b close-out
 review; the executor-campaign records reference this entry from
 `docs/spec/models/executor-invariant-map.md`'s Phase-1b record).
+
+## Executor-campaign 1c entry — the OA2 controller-side node-wedge aggregation (Model N input change)
+
+Recorded by the executor-lifecycle campaign's slice 1c (Phase-1 plan
+T-1c.1), inside this campaign's Model N scope per the OA2 decision
+(executor map, "OA2 — hung-node signal owner and shape: DECIDED
+(2026-05-27)", option A with option C as the canary-window interim).
+
+- **What landed.** `reconcilers/nodeclaim_pool/wedge.rs`: per-node
+  clustering of pull-mode attempt-deadline expiries over the
+  open-attempt ledger view (`AdminService.ListOpenAttempts`), keyed on
+  the ledger's `source_node` (the kube-authoritative spawn-ack binding)
+  with the controller's own `bound_intents()` map as the fallback
+  attribution. A node accumulating expired attempts for ≥2 distinct
+  derivations inside a 30-minute window is marked Dead-equivalent
+  (`rio_controller_node_wedge_marked_total`) and `reconcile_once`
+  passes the union of that set and the scheduler-reported `dead_nodes`
+  to `health::reap_unhealthy` — the same Dead arm, the same per-tick
+  `dead_reap_cap`, no new reap path. Spec rule:
+  `ctrl.nodeclaim.wedge-cluster` (controller.typ); red-first unit
+  battery in `wedge.rs` (cluster threshold, single-derivation and
+  healthy-pull non-marking, window aging, attribution fallback,
+  unknown-deadline exclusion, union composition).
+- **Model N impact: input source only.** The dead_nodes arm is consumed
+  input, out of Model N's checked invariants (Stage-B encoding notes;
+  the model header now carries the input-source note). No transition,
+  bound, or invariant changes; the wired `quint-nodeclaim-*` checks are
+  unaffected by construction and re-confirmed at the 1c landing gate.
+  The Model N checklist re-derivation proper remains the 1c'/1d item
+  already recorded in this map.
+- **Coexistence posture.** The scheduler-side heartbeat detector and
+  the `GetSpawnIntents.dead_nodes` plumbing are untouched and keep
+  covering stream-mode pools until 1d (`sched.admin.hung-node-detector`
+  unchanged); consolidate-only ticks still perform no Dead reaps from
+  either source. The interim alert
+  (`RioSchedulerAttemptEstablishmentCluster`) and the manual-reap
+  runbook stay as the operator-facing tripwire and confirmation
+  procedure (deployment-time checklist row D3).
+
+Controller-campaign owner signature for this entry: the scope and
+landing slot are exactly what the jointly-signed OA2 DECIDED block
+(2026-05-27) committed; counter-signature of the landed form to be
+collected at the executor campaign's 1c close-out review alongside the
+pending 1b counter-signature above.

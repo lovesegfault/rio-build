@@ -40,6 +40,7 @@
     "rio_controller_job_terminal_report_seconds",
     "rio_controller_lease_acquired_total",
     "rio_controller_lease_lost_total",
+    "rio_controller_node_wedge_marked_total",
     "rio_controller_nodeclaim_consolidate_threshold_seconds",
     "rio_controller_nodeclaim_created_total",
     "rio_controller_nodeclaim_forecast_hit_ewma",
@@ -435,6 +436,11 @@
         "help": "nodeclaim_pool lease lose transitions (explicit lose or local self-fence)."
       },
       {
+        "name": "rio_controller_node_wedge_marked_total",
+        "kind": "counter",
+        "help": "Nodes newly marked Dead-equivalent by the controller-side OA2 clustering: ≥2 distinct derivations' open pull-mode attempts expired (age past intent deadline + grace) on one node inside the 30-minute window. One increment per not-wedged→wedged transition; the resulting NodeClaim deletions are counted in nodeclaim_reaped_total{reason=\"dead\"} subject to the per-tick dead-reap cap. Non-zero = a node is eating builds without reporting (the wedged-but-Ready failure mode); see the hung-node runbook."
+      },
+      {
         "name": "rio_controller_nodeclaim_consolidate_threshold_seconds",
         "kind": "gauge",
         "help": "Per-`cell` idle-NodeClaim reap threshold from the NA consolidation model (last node evaluated this tick; 0 when no idle nodes in the cell). max(boot_median/2, min_consolidation_time[cell]) floored. NA-extends past the floor ONLY for cells packing ~1 intent/node (E[c_fit] > cores/2); for bin-packed cells (the §13b MostAllocated builder default) the floor is a hard bound the model cannot exceed. Watch fetcher-* >= 600s and builder cells >= the 300s `*` floor to confirm the per-cell e_fitting_cores partition and the policy floor are both routing (r35 bug_023/bug_050; r38 bug_022)."
@@ -482,7 +488,7 @@
       {
         "name": "rio_controller_nodeclaim_reaped_total",
         "kind": "counter",
-        "help": "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. reason=idle: NA-consolidate break-even; reason=ice: Launched=False (timeout or terminal LaunchFailed reason); reason=boot-timeout: Launched=True ∧ Registered=False past timeout; reason=dead: scheduler-reported hung node; reason=vanished: in-flight claim Karpenter-GC'd between ticks."
+        "help": "nodeclaim_pool NodeClaim deletions by `reason` × `cell`. reason=idle: NA-consolidate break-even; reason=ice: Launched=False (timeout or terminal LaunchFailed reason); reason=boot-timeout: Launched=True ∧ Registered=False past timeout; reason=dead: hung node — the scheduler-reported dead_nodes signal (stream pools) or the controller-side OA2 per-node deadline-expiry clustering (pull pools), consumed as one union; reason=vanished: in-flight claim Karpenter-GC'd between ticks."
       },
       {
         "name": "rio_controller_nodeclaim_terminating_age_max_seconds",
