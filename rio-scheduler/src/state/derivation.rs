@@ -956,10 +956,11 @@ pub struct DerivationState {
     /// later re-kept by a prune is stamped, not exempted), and the
     /// breadcrumb still guards the node when an in-tenure
     /// stale-Completed reset or a failover re-opens its lifecycle.
-    /// Reset automatically on a resubmit-rebuild (fresh
-    /// `try_from_node` state) and on `rollback_merge` (the removed
-    /// node is restored wholesale) — same lifecycle as
-    /// `substitute_tried`/`never_forgive_paths` — and cleared
+    /// Carried across a resubmit-reset (the truncation outlives the
+    /// retry: the reset rebuilds the state via `try_from_node` but
+    /// keeps the truncated edges without re-declaring them, so the
+    /// breadcrumb rides along with the other carried fields); a
+    /// `rollback_merge` restores the prior state wholesale. Cleared
     /// explicitly (memory + PG) only when a later full merge
     /// re-declares the node's edges (its child set is representative
     /// again; the heal pushes the PG clear for every re-declared edge

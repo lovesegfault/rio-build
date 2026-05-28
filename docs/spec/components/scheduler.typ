@@ -883,8 +883,8 @@ submitted after the failover record contributions as usual).
   memory) only once the node's children are all already produced in the
   DAG and no un-produced child has been reaped out from under it since
   (the closure-hole breadcrumb is recorded in memory and persisted
-  alongside the mark, and is dropped when the
-  fail-fast consumes the node, when it is reset for resubmission, or when a
+  alongside the mark, is carried across a resubmit retry of the node, and is
+  dropped when the fail-fast consumes the node or when a
   later full merge re-declares its edges), or
   when the fail-fast below consumes it --- a merge that gives it only
   unbuilt children leaves the mark in place. The scheduler MUST

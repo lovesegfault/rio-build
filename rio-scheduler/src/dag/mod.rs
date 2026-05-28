@@ -396,6 +396,10 @@ impl DerivationDag {
             // Edges are NOT scrubbed: `children`/`parents` are keyed by hash
             // string, so they stay valid across the remove+reinsert. The merge's
             // own edge loop re-adds this submission's edges idempotently.
+            // Because the (possibly reap-truncated) child set survives the
+            // reset without being re-declared, the `closure_hole`
+            // breadcrumb that qualifies it must ride along in the carry
+            // below.
             //
             // Prior interested_builds are carried over so any OTHER build
             // that was stuck on this Cancelled node also benefits from the
@@ -403,6 +407,18 @@ impl DerivationDag {
             // Poisoned-resubmit bound (POISON_RESUBMIT_RETRY_LIMIT)
             // accumulates across resubmits — without this, every reset
             // would start at 0 and the bound would never fire (I-169).
+            // closure_hole is carried because the breadcrumb records the
+            // relation between the node's child set and its pruned input
+            // closure: the reset keeps the (possibly truncated) edges and
+            // does not re-declare them, so the truncation evidence must
+            // outlive the retry — dropped, a re-pruning merge of a holed
+            // node with produced survivors reads as Vouched and both stamp
+            // gates skip the mark, re-arming the doomed from-source
+            // dispatch. topdown_pruned is deliberately NOT carried: the
+            // incoming merge's own prune/stamp decision re-derives it (a
+            // re-pruning merge sees Broken evidence via the carried hole
+            // and re-stamps; a full merge re-declares the edges and the
+            // heal clears the carried hole).
             let prior = if self
                 .nodes
                 .get(&drv_hash)
@@ -414,6 +430,7 @@ impl DerivationDag {
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
+                    old.closure_hole,
                 );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
@@ -527,9 +544,16 @@ impl DerivationDag {
                 // set with only the resubmitter's would shrink it. Their
                 // per-build contributions are carried alongside (they
                 // follow interest membership); `or_insert` keeps the
-                // resubmitter's own entry authoritative.
-                if let Some((prior_interest, prior_cycles, prior_wanted, prior_contributions)) =
-                    prior
+                // resubmitter's own entry authoritative. The closure-hole
+                // breadcrumb rides along too — the kept edges were not
+                // re-declared by this reset (see the carry site above).
+                if let Some((
+                    prior_interest,
+                    prior_cycles,
+                    prior_wanted,
+                    prior_contributions,
+                    prior_closure_hole,
+                )) = prior
                 {
                     state.interested_builds.extend(prior_interest);
                     state.retry.resubmit_cycles = prior_cycles + 1;
@@ -537,6 +561,7 @@ impl DerivationDag {
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
                     }
+                    state.closure_hole = prior_closure_hole;
                     reset_on_resubmit.push(drv_hash.clone());
                 }
                 state.traceparent = submitter_traceparent.to_string();

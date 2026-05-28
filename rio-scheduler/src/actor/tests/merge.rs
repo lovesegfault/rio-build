@@ -4207,6 +4207,309 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
 }
 
 // r[verify sched.merge.substitute-topdown+10]
+/// The closure-hole breadcrumb must be carried across the merge-time
+/// resubmit-reset (bughunter round-22 bug_006). Staging: B1's prune
+/// stamps R and parks its detached fetch; BC produces dep2; B2
+/// full-merges app→R→{dep1 unbuilt, dep2 produced}; B2's cancel+cleanup
+/// reaps the un-produced dep1 out from under R while R's walk is still
+/// in flight (closure hole set in memory, persisted by the leader's
+/// reap hook). B1's cancel then transitions its sole-interest R to
+/// Cancelled — retriable on resubmit — and B3 resubmits the same target
+/// through another pruned merge BEFORE B1's delayed terminal cleanup
+/// runs (the TERMINAL_CLEANUP_DELAY window the resubmit-reset exists to
+/// serve). The reset removes and re-inserts R while its reap-truncated
+/// child set ({dep2}, produced) survives un-re-declared, so the
+/// truncation evidence must ride along: with the carried hole the stamp
+/// gates see Broken closure evidence and re-stamp `topdown_pruned`, and
+/// the later walk failure takes the bounded resubmit-directing
+/// fail-fast. Pre-fix the reset rebuilt R hole-less, the all-produced
+/// survivor read as Vouched, both stamp gates skipped the mark, and the
+/// walk failure took the generic revert to Ready — handing R to a
+/// worker from source even though its pruned closure was never merged.
+#[tokio::test]
+async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park every detached fetch on the QPI gate (never released) so
+    // walk verdicts are injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep1 with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless),
+    // drops dep1, and parks R's detached fetch.
+    let r_out = test_store_path("tdrr-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdrr-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("tdrr-dep1");
+        n.expected_output_paths = vec![test_store_path("tdrr-dep1-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdrr-r", "tdrr-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdrr-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // BC: dep2 is produced (cache-hit at merge) and kept alive by BC's
+    // interest across B2's later reap.
+    let dep2_out = test_store_path("tdrr-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("tdrr-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evbc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdrr-dep2").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep2 is produced before B2 attaches it to R"
+    );
+
+    // B2: full merge app→R→{dep1 unbuilt, dep2 produced}; the mark
+    // survives (children not all produced).
+    let mut app = make_node("tdrr-app");
+    app.expected_output_paths = vec![test_store_path("tdrr-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdrr-app", "tdrr-r"),
+            make_test_edge("tdrr-r", "tdrr-dep1"),
+            make_test_edge("tdrr-r", "tdrr-dep2"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Cancel B2 and reap its sole-interest nodes WHILE R's walk is
+    // still parked: dep1 — never produced — is reaped out from under R
+    // (closure hole set in memory, persisted by the leader's reap
+    // hook); dep2 survives via BC's interest, R via B1's.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdrr-dep1").await?.is_none(),
+        "B2's sole-interest unbuilt dep1 must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdrr-dep2").await?.is_some(),
+        "dep2 must survive the reap (BC still holds interest in it)"
+    );
+    let holed = expect_drv(&handle, "tdrr-r").await;
+    assert_eq!(
+        holed.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the reap must not settle a survivor whose walk is in flight"
+    );
+    assert!(
+        holed.topdown_pruned,
+        "fixture premise: the mark survives the reap of an un-produced child"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdrr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "fixture premise: the mark and the closure-hole breadcrumb are persisted after \
+         the reap (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
+    );
+
+    // Cancel B1: R is now its sole interest and mid-walk, so it
+    // transitions Cancelled — retriable on resubmit. B1's terminal
+    // cleanup is deliberately NOT driven here: the resubmit below lands
+    // inside the TERMINAL_CLEANUP_DELAY window, which is exactly the
+    // window the merge-time resubmit-reset is load-bearing for.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b1,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B1 cancel must be accepted");
+    barrier(&handle).await;
+    let cancelled = expect_drv(&handle, "tdrr-r").await;
+    assert_eq!(
+        cancelled.status,
+        DerivationStatus::Cancelled,
+        "fixture premise: cancelling B1 leaves its sole-interest mid-walk R Cancelled \
+         (retriable on resubmit)"
+    );
+    assert!(
+        cancelled.topdown_pruned,
+        "fixture premise: the terminal transition does not drop the mark"
+    );
+
+    // B3 resubmits the same target. R's wanted output is still
+    // substitutable upstream, so the prune fires again and the
+    // Cancelled R goes through the merge-time resubmit-reset
+    // (remove + fresh re-insert) while its reap-truncated child set
+    // ({dep2}, produced) survives un-re-declared.
+    let b3 = Uuid::new_v4();
+    let _ev3 = merge_dag(
+        &handle,
+        b3,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdrr-r", "tdrr-dep1")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b3).await?.total_derivations,
+        1,
+        "fixture premise: B3 took the roots-only prune path"
+    );
+    let reset = expect_drv(&handle, "tdrr-r").await;
+    assert_eq!(
+        reset.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the resubmitted R is re-routed to the detached fetch"
+    );
+    // Designed outcome: the carried closure hole keeps the truncated
+    // child set Broken, so the stamp gates must re-stamp the kept node.
+    assert!(
+        reset.topdown_pruned,
+        "the resubmit-reset must carry the closure-hole breadcrumb so the re-pruning \
+         merge re-stamps R (was: the reset rebuilt R hole-less, the produced survivor \
+         read as Vouched, and both stamp gates skipped the mark)"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdrr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "the persisted mark and breadcrumb must still be set after B3's pruned merge \
+         (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
+    );
+
+    // A builder is available — the doomed from-source dispatch has
+    // somewhere to go if the laundered child set were wrongly trusted
+    // after the walk failure.
+    let mut worker_rx = connect_executor(&handle, "tdrr-w", "x86_64-linux").await?;
+
+    // The re-spawned walk genuinely fails (upstream advertised the
+    // path but could not deliver). The re-stamped, still-holed R must
+    // take the bounded resubmit-directing fail-fast, not the generic
+    // revert to Ready.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdrr-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let s3 = query_status(&handle, b3).await?;
+    assert_eq!(
+        s3.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B3 must fail via the resubmit-directing fail-fast when the re-spawned walk \
+         fails (was: the unmarked R took the generic revert to Ready and stayed \
+         dispatchable from source)"
+    );
+    assert!(
+        s3.error_summary.contains("topdown") && s3.error_summary.contains("resubmit"),
+        "B3's error summary should direct resubmit; got {:?}",
+        s3.error_summary
+    );
+
+    // No from-source dispatch may follow: drive a dispatch pass and
+    // assert R was neither left dispatchable nor handed to the worker.
+    tick(&handle).await?;
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a re-pruned closure-holed root must never be dispatched from source after \
+             its walk fails (its pruned closure was never merged — the worker would \
+             ENOENT)"
+        );
+    }
+    let r = expect_drv(&handle, "tdrr-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "R must not be dispatchable from source after the fail-fast; got {:?}",
+        r.status
+    );
+    assert!(
+        !r.topdown_pruned,
+        "the fail-fast consumes (clears) the mark it acted on"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdrr-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !pg_pruned && !pg_hole,
+        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+         closure_hole={pg_hole})"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
 /// for every edge parent it re-declares, regardless of the in-memory
 /// copy's history (bughunter round-21 merged_bug_001). Staging: same
