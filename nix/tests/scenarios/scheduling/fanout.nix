@@ -48,12 +48,9 @@ scope: with scope; ''
           "rio_store_put_path_total", 5.0, labels='{result="created"}')
 
       # PrefetchHint assertion removed at the T-1c.2b standalone
-      # re-point: scheduler-pushed PrefetchHints exist only on the
-      # stream dispatch path (the executor's own closure-compute warm
-      # path covers pull-mode inputs), so this fixture no longer
-      # exercises rio_scheduler_prefetch_paths_sent_total. The
-      # prefetch-hint plumbing keeps its scheduler/builder unit-test
-      # coverage until the warm-gate machinery retires with the 1c'
-      # placement-layer deletion (executor-invariant-map.md, T-1c.2b
-      # disposition table).
+      # re-point and the scheduler-side prefetch-hint plumbing itself
+      # deleted with the 1c' placement-layer deletion (deletion commit
+      # B): scheduler-pushed PrefetchHints existed only on the stream
+      # dispatch path; the executor's own closure-compute warm path
+      # covers pull-mode inputs.
 ''

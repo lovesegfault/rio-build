@@ -312,10 +312,6 @@ for HTTP request latencies. Build durations span seconds to hours, so
   (refs.metric)("rio_controller_nodeclaim_tick_duration_seconds"),
   [`[0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0]`],
 
-  (refs.metric)("rio_scheduler_dispatch_wait_seconds"),
-  [`[0.1, 0.5, 1, 5, 10, 30, 60, 120, 180, 300, 600]` (ephemeral builders:
-    dominated by node-provision)],
-
   (refs.metric)("rio_scheduler_build_graph_edges"),
   [`[100, 500, 1000, 5000, 10000, 20000]` (count)],
 

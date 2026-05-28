@@ -113,13 +113,6 @@ impl DagActor {
         if !self.leader.is_leader() {
             return;
         }
-        // Reset the "worker newly available" inline-dispatch budget.
-        // See `BECAME_IDLE_INLINE_CAP` — past the cap, became_idle
-        // heartbeats and PrefetchComplete cold→warm edges since the
-        // previous Tick set dispatch_dirty instead; the dispatch
-        // below drains it.
-        self.became_idle_inline_this_tick = 0;
-
         self.maybe_refresh_estimator().await;
 
         let now = Instant::now();
@@ -138,26 +131,24 @@ impl DagActor {
         self.tick_publish_gauges();
         self.tick_sweep_open_pull_attempts().await;
 
-        // r[impl sched.actor.dispatch-decoupled]
-        // I-163: coalesced dispatch. Heartbeat sets the flag; we drain
-        // it at Tick cadence (≤1/s) instead of per-heartbeat (29/s at
-        // 290 workers). dispatch_ready clears the flag itself (after
-        // its leader/recovery gates) so inline callers (MergeDag,
-        // ProcessCompletion, the capped became_idle/PrefetchComplete
-        // carve-out) also satisfy it.
-        //
-        // Advance probe_generation here (1/s) — NOT per dispatch_ready
-        // call — so a Ready node is FMP-probed at most once per Tick
-        // regardless of how many inline dispatches fire between Ticks.
+        // Advance probe_generation here (1/s) — NOT per
+        // `sweep_ready_cached` call — so a Ready node is FMP-probed at
+        // most once per Tick regardless of how many inline sweeps fire
+        // between Ticks (after merges and completion cascades).
         self.probe_generation = self.probe_generation.wrapping_add(1);
-        if self.dispatch_dirty {
-            self.dispatch_ready().await;
-        }
+        // Tick-cadence ready-set store short-circuit. The stream fleet
+        // got this cadence implicitly (heartbeats marked the dispatch
+        // pass dirty every tick, and the pass began with the batch
+        // probe); running the surviving probe here keeps "outputs
+        // appeared in the store after merge" bounded by one Tick
+        // instead of waiting for the next merge/completion, on any
+        // fleet. `probed_generation` stamping makes it one batched FMP
+        // per Tick at most.
+        self.sweep_ready_cached().await;
 
         // r[impl sched.admin.snapshot-cached]
-        // Publish AFTER dispatch so the snapshot reflects this Tick's
-        // assignments. send_replace: single-slot overwrite, never blocks,
-        // returns the previous Arc (dropped). No-receiver is fine —
+        // send_replace: single-slot overwrite, never blocks, returns
+        // the previous Arc (dropped). No-receiver is fine —
         // watch::Sender holds the value regardless.
         self.snapshot_tx
             .send_replace(Arc::new(self.compute_cluster_snapshot()));

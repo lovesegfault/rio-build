@@ -3474,46 +3474,6 @@ async fn forecast_budget_drop_metric() {
     );
 }
 
-/// **r33 bug_013 — `solve_inputs()` hoisted to `dispatch_ready`.**
-/// `solve_inputs()` clones `HwTable` + `CostTable` and emits the
-/// §13c-2 `class_ceiling_uncatalogued` gauge once per hwClass. Pre-fix
-/// `try_dispatch_one` called it once per drv inside the drain loop —
-/// `O(|hw_classes| × |Ready|)` gauge sets per pass, plus a per-drv
-/// re-read TOCTOU (`compute_spawn_intents` was explicitly fixed for
-/// this; `try_dispatch_one` was the unswept sibling). Post-fix: ONE
-/// snapshot per `dispatch_ready` pass, threaded via `DispatchTickCtx`.
-///
-/// Pre-fix: RED — counter == 3 (one per Ready drv).
-#[tokio::test]
-async fn solve_inputs_called_once_per_dispatch_pass() {
-    use std::sync::atomic::Ordering::SeqCst;
-    let db = TestDb::new(&MIGRATOR).await;
-    let mut actor = bare_actor_hw(db.pool.clone());
-    // 3 Ready drvs, no executor — every drv is popped, solve_intent_for
-    // runs, then the placement defers it. `bare_actor_*` is a non-K8s
-    // actor: `LeaderState::default()` is `always_leader` (is_leader =
-    // recovery_complete = true), so `dispatch_ready`'s gates pass.
-    for d in ["d0", "d1", "d2"] {
-        actor.test_inject_ready(d, Some("test-pkg"), "x86_64-linux", false);
-        actor.push_ready(d.into());
-    }
-
-    let before = actor.test_counters.solve_inputs_calls.load(SeqCst);
-    actor.dispatch_ready().await;
-    let after = actor.test_counters.solve_inputs_calls.load(SeqCst);
-
-    assert_eq!(
-        after - before,
-        1,
-        "ONE `solve_inputs()` snapshot per `dispatch_ready` pass — the \
-         per-drv re-read is both the §13c-2 gauge spam (O(|hw_classes| × \
-         |Ready|)) and a latent TOCTOU at the same `inputs_gen` if \
-         `spot_price_poller` writes mid-pass. Got {} calls for 3 Ready \
-         drvs.",
-        after - before,
-    );
-}
-
 /// **First pull clears the single-cell ICE mask** (mechanism #22's
 /// clear half, pull-mode trigger): a pull-mode pod's first successful
 /// pull is the success edge for its intent — the cell the spawn ack

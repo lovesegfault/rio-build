@@ -1,6 +1,8 @@
 //! PrefetchHint handling: warm the FUSE cache and ACK the scheduler.
 //!
-//! Warm-gate protocol (`r[sched.assign.warm-gate]`): the scheduler
+//! Stream-era warm-gate protocol (scheduler rule retired with the
+//! placement layer; this client half retires with the builder runtime
+//! collapse at 1d): the scheduler
 //! gates dispatch on `ExecutorState.warm = true`, flipped on receipt of
 //! `PrefetchComplete`. We send the ACK AFTER every path's fetch task
 //! has returned — the scheduler's first assignment then arrives with a
@@ -55,7 +57,7 @@ pub(super) struct PrefetchDeps {
 /// from `sem` before entering the blocking pool. A joiner task awaits
 /// all handles and sends the warm-gate ACK.
 ///
-/// Warm-gate protocol (`r[sched.assign.warm-gate]`): the scheduler
+/// Stream-era warm-gate protocol (scheduler-side rule retired): the scheduler
 /// gates dispatch on `ExecutorState.warm = true`, flipped on receipt of
 /// `PrefetchComplete`. We send the ACK AFTER every path's fetch task
 /// has returned — the scheduler's first assignment then arrives with a
@@ -218,7 +220,6 @@ pub fn handle_prefetch_hint(
         handles.push(handle);
     }
 
-    // r[impl sched.assign.warm-gate]
     // r[impl builder.warmgate.handshake]
     // Joiner: wait for ALL path-fetch tasks to return, then send the
     // PrefetchComplete ACK. spawn_monitored so a panic in the joiner

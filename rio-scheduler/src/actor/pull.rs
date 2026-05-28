@@ -308,7 +308,12 @@ impl DagActor {
         // The deadline this attempt is dispatched under (the same solve
         // that sized the spawn intent / activeDeadlineSeconds),
         // persisted so the establishment window is anchored to it and
-        // can never shrink below it while the attempt is open.
+        // can never shrink below it while the attempt is open. The
+        // solve is NOT stamped onto the node: with the stream dispatch
+        // pass gone there is no dispatch-time intent writer, and the
+        // pull-path conventions (recorded with the unit-corpus
+        // re-point) treat the explicit per-test/operator seed as the
+        // only source for `last_intent`-derived baselines.
         let deadline_secs = {
             let (hw, cost, inputs_gen) = self.solve_inputs();
             self.dag.node(drv_hash).map(|state| {

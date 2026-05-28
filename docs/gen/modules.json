@@ -862,7 +862,7 @@
     {
       "path": "actor/dispatch.rs",
       "depth": 1,
-      "doc": "Ready-queue dispatch: assign ready derivations to available workers."
+      "doc": "Ready-set store short-circuit and substitution machinery, plus the"
     },
     {
       "path": "actor/event.rs",
@@ -952,7 +952,7 @@
     {
       "path": "assignment.rs",
       "depth": 0,
-      "doc": "Worker selection."
+      "doc": "Static executor/derivation eligibility plus the approximate input"
     },
     {
       "path": "ca/",

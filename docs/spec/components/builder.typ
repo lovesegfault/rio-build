@@ -217,8 +217,9 @@ value carries no semantics beyond cross-builder parity.
   fire-and-forget fetch task per hinted path (bounded by a semaphore), then a
   joiner task that awaits ALL of them and sends
   `PrefetchComplete{paths_fetched, paths_cached}` on the BuildExecution
-  stream. The scheduler gates the first assignment on receipt of this ACK
-  (#rref("sched.assign.warm-gate")), so the build starts with a warm cache. An
+  stream. (The scheduler-side warm-gate that consumed this ACK retired with
+  the stream placement layer; the prefetch itself still warms the cache
+  before the build starts.) An
   empty hint sends the ACK immediately. The hint handler MUST NOT block the
   BuildExecution event loop --- per-path tasks queue in tokio's scheduler and
   only enter the blocking pool once a permit is acquired. Per-path outcomes

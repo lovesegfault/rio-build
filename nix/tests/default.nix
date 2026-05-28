@@ -591,14 +591,11 @@ in
           # r[verify obs.metric.builder]
           # r[verify obs.metric.store]
           "load-50drv"
-          # warm-gate and sigint-graceful unwired at the T-1c.2b
+          # warm-gate and sigint-graceful were unwired at the T-1c.2b
           # standalone re-point (delivery is pull now; neither can run
-          # against a pull-mode fixture). Coverage carriers until their
-          # owning deletion/re-statement commits:
-          #   - sched.assign.warm-gate: the PrefetchComplete/warm-gate
-          #     unit tests (rio-scheduler/src/assignment.rs) until the
-          #     rule + mechanism retire with the 1c' placement-layer
-          #     deletion (T-1c'.3).
+          # against a pull-mode fixture). The warm-gate fragment, rule
+          # and mechanism retired with the 1c' placement-layer deletion
+          # (deletion commit B). Remaining carrier:
           #   - builder.shutdown.sigint+3: the pull-loop SIGINT unit
           #     test (rio-builder/src/runtime/pull.rs); the VM-level
           #     re-statement (SIGTERM/SIGINT abort semantics on a live

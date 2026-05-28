@@ -130,6 +130,15 @@ impl ReadyQueue {
     /// pushes of a hash already popped, or leftovers from a prior
     /// membership session of a re-pushed hash. All three reduce to
     /// "does this entry's gen match `members[hash]`?".
+    /// Production code no longer pops: the stream dispatch pass was the
+    /// only consumer, so since the placement-layer deletion the queue
+    /// is written (push/remove/clear/compact) and measured
+    /// (`len()` feeds the `queued_derivations` ClusterStatus scalar and
+    /// the `rio_scheduler_derivations_queued` gauge) but never drained.
+    /// It is retired together with that scalar's re-point onto
+    /// DAG-status counts (the operator-surface deletion commit); the
+    /// unit tests below keep exercising pop until then.
+    #[cfg(test)]
     pub fn pop(&mut self) -> Option<DrvHash> {
         loop {
             let (_, _, g, hash) = self.heap.pop()?;

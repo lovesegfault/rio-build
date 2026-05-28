@@ -1016,39 +1016,14 @@ impl DagActor {
         };
         let drv_hash = &drv_hash;
 
-        // Free worker capacity NOW, before any early-return below. The
-        // early-return guards (already-Completed, already-terminal,
-        // stale-executor) all mean "this completion's per-derivation
-        // work is moot" — but the executor's slot must still free.
-        // I-042: before this hoist, a completion arriving for an
-        // already-Poisoned derivation (parallel-retry race: drv assigned
-        // to executor-B, executor-A's prior completion poisoned it,
-        // executor-B's completion arrives) hit the not-Assigned/Running
-        // early-return and leaked executor-B's slot. The heartbeat
-        // reconcile (executor.rs:608) eventually frees it via the
-        // still_inflight filter, but that's a ~10s delay (one
-        // heartbeat) of dead capacity per leaked slot.
-        //
-        // Idempotent: clearing None or a different drv is a no-op.
-        if let Some(worker) = self.executors.get_mut(executor_id)
-            && worker.running_build.as_ref() == Some(drv_hash)
-        {
-            worker.running_build = None;
-            // r[impl sched.ephemeral.no-redispatch-after-completion]
-            // r[impl sched.executor.one-shot]
-            // I-188: every executor is one-shot — it exits after this
-            // completion. Mark it draining NOW, before dispatch_ready
-            // below, so the freed slot isn't re-assigned a dependent
-            // the executor will never start. Without this, the
-            // dependent goes Assigned → ExecutorDisconnected →
-            // reassign, and (pre-I-188) walked the size ladder via
-            // spurious floor promotion.
-            if !worker.draining {
-                worker.draining = true;
-                debug!(executor_id = %executor_id,
-                       "executor completed its build; marking draining (one-shot exit)");
-            }
-        }
+        // The stream-era post-completion capacity bookkeeping that
+        // lived here (clear `worker.running_build` before any
+        // early-return, mark the one-shot executor draining so the
+        // freed slot was not re-assigned — I-042 / I-188) retired with
+        // the placement layer: there is no dispatch decision left to
+        // protect. Pull-mode executors are never in the executors map;
+        // the pod exits after its report and the Job is reaped by the
+        // controller.
 
         // Find the derivation in the DAG
         let Some(state) = self.dag.node(drv_hash) else {
@@ -1376,8 +1351,10 @@ impl DagActor {
             }
         }
 
-        // Dispatch newly ready derivations
-        self.dispatch_ready().await;
+        // Newly-ready dependents: complete/substitute any whose outputs
+        // already exist (the store short-circuit; delivery itself is
+        // pull — the controller observes Ready via GetSpawnIntents).
+        self.sweep_ready_cached().await;
     }
 
     pub(super) async fn handle_success_completion(
@@ -2106,7 +2083,6 @@ impl DagActor {
                         // costs nothing and prevents silent corruption.
                         peak_memory_bytes: peak_memory_bytes.min(i64::MAX as u64) as i64,
                         peak_cpu_cores: peak_cpu,
-                        // r[impl sched.sla.intent-match]
                         // The fit's independent variable is the
                         // parallelism the build RAN at — the builder
                         // sets `NIX_BUILD_CORES = min(assigned_cores,

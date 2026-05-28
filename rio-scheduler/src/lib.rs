@@ -69,18 +69,6 @@ pub use rio_migrations::MIGRATOR;
 /// long tails on both sides.
 const CRITICAL_PATH_ACCURACY_BUCKETS: &[f64] = &[0.5, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 5.0];
 
-/// Histogram bucket boundaries for scheduler assignment latency (seconds).
-///
-/// Time from a derivation becoming Ready to being assigned to a worker.
-/// With a warm static fleet this is sub-second. With ephemeral builders the
-/// latency is dominated by node-provision (~60–180s on EKS), so the original
-/// `[0.001..5.0]` set put every sample in `+Inf` (I-124). These span
-/// 100ms..10min: low buckets catch the warm-fleet path, the 30s..600s range
-/// gives resolution across cold-node provision.
-const DISPATCH_WAIT_BUCKETS: &[f64] = &[
-    0.1, 0.5, 1.0, 5.0, 10.0, 30.0, 60.0, 120.0, 180.0, 300.0, 600.0,
-];
-
 /// Histogram bucket boundaries for `rio_scheduler_build_graph_edges`.
 ///
 /// Edge COUNT (not seconds) per GetBuildGraph response. Range is 0..~20K
@@ -89,14 +77,6 @@ const DISPATCH_WAIT_BUCKETS: &[f64] = &[
 /// sample lands in `+Inf`. These match the suggested buckets in
 /// observability.typ's Histogram Buckets table.
 const GRAPH_EDGES_BUCKETS: &[f64] = &[100.0, 500.0, 1000.0, 5000.0, 10000.0, 20000.0];
-
-/// Histogram bucket boundaries for `rio_scheduler_warm_prefetch_paths`.
-///
-/// Path COUNT (not seconds) per `PrefetchComplete` ACK — how many paths
-/// the worker actually fetched for a warm-gate hint. Hard-capped at 100
-/// (scheduler-side `MAX_PREFETCH_PATHS`). 0 = already warm (all cache
-/// hits). Small-leaf closures: 1–10. Fat stdenv closures: 30–80.
-const WARM_PREFETCH_PATHS_BUCKETS: &[f64] = &[0.0, 1.0, 5.0, 10.0, 25.0, 50.0, 100.0];
 
 /// Histogram bucket boundaries for `rio_scheduler_merge_phase_seconds`.
 /// Spans sub-ms (in-mem phases) → minute (PG/store-RPC phases) so a
@@ -132,16 +112,11 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
         "rio_scheduler_critical_path_accuracy",
         CRITICAL_PATH_ACCURACY_BUCKETS,
     ),
-    ("rio_scheduler_dispatch_wait_seconds", DISPATCH_WAIT_BUCKETS),
     ("rio_scheduler_merge_phase_seconds", MERGE_PHASE_BUCKETS),
     ("rio_scheduler_build_graph_edges", GRAPH_EDGES_BUCKETS),
     (
         "rio_scheduler_attempt_requeue_seconds",
         ATTEMPT_REQUEUE_BUCKETS,
-    ),
-    (
-        "rio_scheduler_warm_prefetch_paths",
-        WARM_PREFETCH_PATHS_BUCKETS,
     ),
 ];
 
@@ -282,29 +257,6 @@ pub fn describe_metrics() {
         "Total derivation-to-worker assignments"
     );
     describe_counter!(
-        "rio_scheduler_prefetch_hints_sent_total",
-        "PrefetchHint messages sent (one per assignment with paths to warm). \
-         Missing from a dispatch = leaf drv (no children)."
-    );
-    describe_counter!(
-        "rio_scheduler_prefetch_paths_sent_total",
-        "Total paths in sent PrefetchHints. Divide by hints_sent for avg \
-         paths-per-hint."
-    );
-    describe_counter!(
-        "rio_scheduler_warm_gate_fallback_total",
-        "best_executor() fell back to cold workers because NO warm worker \
-         passed the hard filter. Single-worker clusters and mass scale-up \
-         expect nonzero; sustained high rate = workers never warming \
-         (PrefetchComplete not arriving — check worker logs)."
-    );
-    describe_histogram!(
-        "rio_scheduler_warm_prefetch_paths",
-        "Paths fetched per initial warm-gate PrefetchHint (from the worker's \
-         PrefetchComplete ACK). 0 = worker was already warm (cache hit on \
-         everything); high = fresh worker cold-fetched everything."
-    );
-    describe_counter!(
         "rio_scheduler_cleanup_dropped_total",
         "Terminal-build cleanup commands dropped due to channel backpressure; alert if rate > 0"
     );
@@ -356,25 +308,6 @@ pub fn describe_metrics() {
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"
-    );
-    describe_gauge!(
-        "rio_scheduler_queue_depth",
-        "Deferred Ready derivations waiting for an executor of the matching \
-         kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). \
-         Sustained nonzero → scale the matching pool."
-    );
-    describe_gauge!(
-        "rio_scheduler_unroutable_ready",
-        "Ready derivations whose `system` is advertised by zero registered \
-         executors of the matching kind (labeled by system; snapshot per \
-         dispatch pass). Nonzero = no pool exists for that system; add it \
-         to a Pool's `systems` list."
-    );
-    describe_gauge!(
-        "rio_scheduler_utilization",
-        "Fraction of executors currently running a build (busy/total; labeled \
-         by kind=builder|fetcher). Emitted per dispatch pass alongside \
-         queue_depth."
     );
     describe_counter!(
         "rio_scheduler_cache_check_circuit_open_total",
@@ -511,12 +444,6 @@ pub fn describe_metrics() {
         "ActorCommand mpsc queue depth, sampled once per dequeued command. \
          Growth = commands arriving faster than the single-threaded loop \
          retires them. Pair with actor_cmd_seconds to localize a wedge."
-    );
-    describe_histogram!(
-        "rio_scheduler_dispatch_wait_seconds",
-        "Time from a derivation entering Ready to being Assigned (fed \
-         from DerivationState.ready_at). With ephemeral builders, \
-         dominated by node-provision (~60–180s on EKS)."
     );
     describe_histogram!(
         "rio_scheduler_attempt_requeue_seconds",

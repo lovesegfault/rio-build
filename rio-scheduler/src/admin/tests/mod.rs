@@ -965,52 +965,43 @@ async fn cluster_status_counts_registered_workers() -> anyhow::Result<()> {
 
 #[tokio::test]
 async fn cluster_status_counts_queued_and_running() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_executor, merge_single_node};
+    use crate::actor::tests::{merge_single_node, pull_attempt};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, _db) = setup_svc_default().await;
 
-    // One-shot worker: will accept exactly one assignment, leaving
-    // the second derivation in ready_queue.
-    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux").await?;
-
-    // Two independent single-node DAGs. First dispatches (worker has
-    // capacity 1), second stays queued.
+    // Two independent single-node DAGs. The first is taken by a
+    // pull-mode attempt (Running); the second stays Ready.
     let _ev1 =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
     let _ev2 =
         merge_single_node(&actor, uuid::Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
-
-    // Drain the assignment for 'a' — dispatch happened synchronously
-    // during merge (dispatch_ready is called after merge completes),
-    // but the message is in the channel. Receiving it doesn't change
-    // actor state (worker ack → Running requires a separate
-    // ProcessCompletion roundtrip we're not doing here), it just
-    // proves the assignment went out.
-    let msg = worker_rx.recv().await.expect("assignment for first drv");
-    assert!(matches!(
-        msg.msg,
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-    ));
+    let _assignment = pull_attempt(&actor, "a").await;
 
     let resp = cluster_status_now(&svc, &actor).await?;
 
-    // First derivation is Assigned (worker slot reserved, not yet acked
-    // → Running). Second is in ready_queue (no capacity). BOTH builds
-    // transition to Active on merge (merge.rs sets Active as soon as
-    // derivations are tracked, not waiting for dispatch).
+    // BOTH builds transition to Active on merge (merge.rs sets Active
+    // as soon as derivations are tracked, not waiting for delivery).
     assert_eq!(
         resp.active_builds, 2,
         "both builds transitioned to Active on merge"
     );
     assert_eq!(resp.pending_builds, 0);
+    // The DAG-status-derived counts are the pull-era truth: "b" is the
+    // only Ready derivation, "a" is Running under its open attempt.
+    // The `queued_derivations` SCALAR still reads the ready_queue
+    // length, which a pull mint does not dequeue (the recorded
+    // over-count); it is re-pointed onto the DAG-status count by the
+    // operator-surface deletion commit (commit C), which re-adds the
+    // scalar assertion here.
     assert_eq!(
-        resp.queued_derivations, 1,
-        "second drv waiting for capacity (one-shot worker is busy)"
+        resp.queued_by_system.values().sum::<u32>(),
+        1,
+        "one Ready derivation waiting for a worker (DAG-status based)"
     );
     assert_eq!(
         resp.running_derivations, 1,
-        "first drv is Assigned → counts as running (slot reserved)"
+        "first drv runs under its open pull attempt"
     );
     Ok(())
 }
@@ -1087,137 +1078,6 @@ async fn drain_worker_unknown_not_error() -> anyhow::Result<()> {
 
     assert!(!resp.accepted, "unknown worker → accepted=false");
     assert!(!resp.busy);
-    Ok(())
-}
-
-#[tokio::test]
-async fn drain_worker_stops_dispatch() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_executor, merge_single_node};
-    use crate::state::PriorityClass;
-
-    let (svc, actor, _task, _db) = setup_svc_default().await;
-
-    let mut worker_rx = connect_executor(&actor, "w1", "x86_64-linux").await?;
-
-    // First drv: dispatches normally.
-    let _ev1 =
-        merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
-    let msg1 = worker_rx.recv().await.expect("first assignment");
-    assert!(matches!(
-        msg1.msg,
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-    ));
-
-    // Drain. running=1 (the drv we just dispatched is Assigned on w1).
-    let resp = svc
-        .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: "w1".into(),
-            force: false,
-        }))
-        .await?
-        .into_inner();
-    assert!(resp.accepted);
-    assert!(resp.busy, "the first drv is in-flight (Assigned)");
-
-    // Second drv: should NOT dispatch. Worker is busy with first drv
-    // AND draining → has_capacity() false.
-    let _ev2 =
-        merge_single_node(&actor, uuid::Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
-
-    // Can't easily assert "nothing arrived" without a timeout. Instead,
-    // check ClusterStatus: the second drv should be queued, not running.
-    let status = cluster_status_now(&svc, &actor).await?;
-    assert_eq!(status.queued_derivations, 1, "second drv waiting (drained)");
-    assert_eq!(status.running_derivations, 1, "only first drv on worker");
-    assert_eq!(status.draining_executors, 1);
-    assert_eq!(
-        status.active_executors, 0,
-        "draining worker is NOT active — controller sees capacity=0"
-    );
-
-    // Idempotent: second drain → same running count, still accepted.
-    let resp2 = svc
-        .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: "w1".into(),
-            force: false,
-        }))
-        .await?
-        .into_inner();
-    assert!(resp2.accepted);
-    assert!(resp2.busy);
-    Ok(())
-}
-
-#[tokio::test]
-async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
-    use crate::actor::tests::{connect_executor, merge_single_node};
-    use crate::state::PriorityClass;
-
-    let (svc, actor, _task, _db) = setup_svc_default().await;
-
-    // Two workers: w1 gets the first dispatch, then we force-drain it.
-    // The reassigned drv should go to w2 on the next dispatch.
-    let mut rx1 = connect_executor(&actor, "w1", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&actor, "w2", "x86_64-linux").await?;
-
-    let _ev =
-        merge_single_node(&actor, uuid::Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
-
-    // ONE of them got it. With two idle one-shot workers,
-    // best_executor picks the first HashMap-iteration entry →
-    // nondeterministic. Poll both with try_recv to find which.
-    let (first_worker, other_rx) = if let Ok(msg) = rx1.try_recv() {
-        assert!(matches!(
-            msg.msg,
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-        ));
-        ("w1", &mut rx2)
-    } else {
-        let msg = rx2
-            .try_recv()
-            .expect("one of w1/w2 must have the assignment");
-        assert!(matches!(
-            msg.msg,
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(_))
-        ));
-        ("w2", &mut rx1)
-    };
-
-    // Force-drain the worker that got it. running=0 in response:
-    // force reassigns then replies, so nothing is left.
-    let resp = svc
-        .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: first_worker.into(),
-            force: true,
-        }))
-        .await?
-        .into_inner();
-    assert!(resp.accepted);
-    assert!(
-        !resp.busy,
-        "force=true reassigned → idle (caller doesn't wait)"
-    );
-
-    // reassign_derivations pushes to ready_queue but dispatch_ready
-    // isn't called from handle_drain_executor — it fires on the NEXT
-    // Tick/merge/completion. Heartbeat sets dispatch_dirty, Tick
-    // drains it (I-163).
-    crate::actor::tests::send_heartbeat(&actor, first_worker, "x86_64-linux").await?;
-
-    // The OTHER worker should now get the reassigned drv.
-    let msg = crate::actor::tests::recv_assignment(other_rx).await;
-    let _ = msg; // recv_assignment already asserts variant + 2s timeout
-
-    // ClusterStatus: 1 draining, 1 active, 1 running (on the other
-    // worker now), 0 queued.
-    let status = cluster_status_now(&svc, &actor).await?;
-    assert_eq!(status.draining_executors, 1);
-    assert_eq!(status.active_executors, 1);
-    assert_eq!(
-        status.running_derivations, 1,
-        "drv re-Assigned to other worker"
-    );
-    assert_eq!(status.queued_derivations, 0);
     Ok(())
 }
 

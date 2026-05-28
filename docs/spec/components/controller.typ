@@ -1461,9 +1461,9 @@ cold. Every executor needs to fetch the same common dependencies (glibc,
 coreutils, etc.) from rio-store, creating a thundering herd on the store's S3
 backend. Mitigations: an in-process LRU chunk cache on rio-store (`ChunkCache`,
 moka-based, default 2 GiB) reduces S3 round-trips for hot chunks; and
-per-derivation #glspl("prefetch-hint") --- the scheduler sends input-path prefetch to
-the assigned executor before dispatch, so the FUSE cache warms during the
-scheduling window rather than on first `read()`. Staggered scheduling with the
-cold-start prefetch warm-gate (#rref("sched.assign.warm-gate")) is implemented
-and is the relevant mechanism for ephemeral builders, where every build
-cold-starts (#rref("ctrl.pool.ephemeral")).
+per-derivation #glspl("prefetch-hint") --- the builder prefetches the
+assignment payload's input closure into its FUSE cache before the build
+starts, so the cache warms during setup rather than on first `read()`. (The
+scheduler-side cold-start warm-gate retired with the stream placement
+layer; prefetch is builder-local for pull-mode pods, where every build
+cold-starts --- #rref("ctrl.pool.ephemeral").)

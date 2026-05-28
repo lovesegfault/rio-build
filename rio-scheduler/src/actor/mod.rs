@@ -62,8 +62,6 @@ pub use command::*;
 pub use config::{DagActorConfig, DagActorPlumbing};
 use event::BuildEventBus;
 pub use event::BuildEventReceivers;
-#[cfg(test)]
-pub(crate) use executor::compute_initial_prefetch_paths;
 pub use handle::ActorHandle;
 #[cfg(test)]
 pub(crate) use handle::DebugDerivationInfo;
@@ -73,17 +71,10 @@ pub use pull::{PullOutcome, PullRejection};
 #[cfg(test)]
 mod debug;
 #[cfg(test)]
-use debug::backdate;
-#[cfg(test)]
 pub(crate) mod tests;
 
 /// Channel capacity for the actor command channel.
 pub(crate) const ACTOR_CHANNEL_CAPACITY: usize = 10_000;
-
-/// Max store paths per `PrefetchHint`. Shared between the initial-warm
-/// hint in `on_executor_registered` and the per-dispatch
-/// hint in `dispatch.rs` — bump BOTH semantics by changing this once.
-pub(crate) const MAX_PREFETCH_PATHS: usize = 100;
 
 /// Backpressure: reject new work above this fraction of channel capacity.
 const BACKPRESSURE_HIGH_WATERMARK: f64 = 0.80;
@@ -108,10 +99,11 @@ const ATTEMPT_RECORD_REDELIVERY_DELAY: std::time::Duration = std::time::Duration
 /// Number of state events to retain in each build's broadcast ring for
 /// late subscribers.
 ///
-/// 4096 (was 1024 — I-144): `handle_merge_dag` calls `dispatch_ready()`
-/// BEFORE returning `event_rx`, so the initial dispatch burst (one
-/// Derivation::Started per ready node) lands in the ring before the
-/// SubmitBuild bridge starts draining. A 153k-node submission with ~500
+/// 4096 (was 1024 — I-144): `handle_merge_dag` used to dispatch ready
+/// nodes BEFORE returning `event_rx`, so the initial event burst (one
+/// Derivation::Started per ready node) landed in the ring before the
+/// SubmitBuild bridge started draining; pull-mode attempt opens emit
+/// the same Started events asynchronously. A 153k-node submission with ~500
 /// ready nodes plus Progress emitted ~1.3k events synchronously → the
 /// bridge's first `recv()` was `Lagged`. 4096 gives headroom for the
 /// initial burst; the bridge now also continues across `Lagged` instead
@@ -246,25 +238,13 @@ pub const MERGE_FMP_TIMEOUT: std::time::Duration = std::time::Duration::from_sec
 /// is dropped.
 const TERMINAL_CLEANUP_DELAY: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Max inline `dispatch_ready` calls from the "worker newly available"
-/// carve-out per Tick — Heartbeat `became_idle` (capacity 0→1) and
-/// `PrefetchComplete` (cold→warm) share this budget. Past it, both
-/// only set `dispatch_dirty` (deferred ≤1 Tick). Prevents
-/// leader-failover from reintroducing the I-163 storm: with 290
-/// executors all reconnecting, 290 first-heartbeats are 0→1
-/// transitions and 290 PrefetchComplete ACKs follow → 580 sequential
-/// `dispatch_ready` passes uncapped (each does the ~150ms batch-FOD
-/// precheck). 4 inline + remainder coalesced bounds the burst at
-/// ~600ms regardless of fleet size while keeping the steady-state
-/// "fresh ephemeral dispatches immediately" win.
-pub(crate) const BECAME_IDLE_INLINE_CAP: u32 = 4;
-
-/// Max Ready candidates per dispatch-time `FindMissingPaths` batch.
-/// Keeps the FMP RPC in the actor's ~100ms budget for very wide DAG
-/// layers — dispatch-time runs under `grpc_timeout` (30s), not
-/// [`MERGE_FMP_TIMEOUT`]. The truncated tail is picked up on the next
-/// inline `dispatch_ready` (same `probe_generation`, so the window
-/// advances rather than re-probing the head).
+/// Max Ready candidates per `FindMissingPaths` batch in the ready-set
+/// store short-circuit (`sweep_ready_cached`). Keeps the FMP RPC in
+/// the actor's ~100ms budget for very wide DAG layers — the sweep runs
+/// under `grpc_timeout` (30s), not [`MERGE_FMP_TIMEOUT`]. The
+/// truncated tail is picked up on the next sweep (same
+/// `probe_generation`, so the window advances rather than re-probing
+/// the head).
 pub(crate) const DISPATCH_PROBE_BATCH_CAP: usize = 2048;
 
 /// Entry in [`DagActor::authoritative_binding`]: kube-authoritative
@@ -462,7 +442,8 @@ pub struct DagActor {
     ///
     /// NOT the same thing as [`LeaderState::recovery_complete`]: that
     /// flag is deliberately set true even when recovery FAILS (empty
-    /// DAG — "degrade, don't block", which `dispatch_ready` wants).
+    /// DAG — "degrade, don't block", which the pull/admission paths
+    /// want).
     /// Destructive consumers that infer "stale" from "not in the DAG"
     /// must check THIS bit instead.
     ///
@@ -520,25 +501,6 @@ pub struct DagActor {
     /// Default (from `new()`) is a fresh never-cancelled token →
     /// tests and non-production constructors are unchanged.
     shutdown: rio_common::signal::Token,
-    /// I-025 freeze detector: when `fod_deferred > 0 && fetcher_streams == 0`
-    /// first became true. `dispatch_ready` WARNs after 60s elapsed, then
-    /// resets this so the WARN re-fires once/minute (not once/dispatch-pass).
-    /// Reset to None when either side of the AND clears.
-    ///
-    /// The scheduler already surfaces the freeze via the
-    /// `rio_scheduler_queue_depth{kind}` + `rio_scheduler_utilization{kind}`
-    /// gauges — but those require a port-forward to observe. A WARN lands
-    /// in `kubectl logs`. QA I-025: all 4 builds froze at 29/219 for 20min
-    /// with zero ERROR/WARN while queue_depth{fetcher}=41 and fetcher
-    /// streams=0. Per-kind so builder/fetcher freeze independently.
-    freeze_builders_since: Option<Instant>,
-    freeze_fetchers_since: Option<Instant>,
-    /// Systems already WARNed as unroutable. Edge-triggers the
-    /// `r[sched.dispatch.unroutable-system]` log: WARN once when a
-    /// system first has Ready drvs but zero advertising executors;
-    /// re-armed when the system becomes routable again. Also the set
-    /// the gauge zeroing loop iterates so stale labels don't persist.
-    unroutable_warned: HashSet<String>,
     /// `(tenant, required_features)` tuples already counted and WARNed
     /// as unroutable in `solve_intent_for` (no hwClass `provides_features`
     /// hosts the tuple). Debounces `rio_scheduler_unroutable_features_total`
@@ -585,37 +547,15 @@ pub struct DagActor {
     /// and on pod restart. Retained across `clear_persisted_state` —
     /// the drv set doesn't change on leader transition.
     forecast_dropped_warned: parking_lot::Mutex<lru::LruCache<(String, &'static str), ()>>,
-    /// Set by events that change dispatch eligibility (Heartbeat, drain).
-    /// `handle_tick` consumes it: `if dirty { dispatch_ready(); dirty=false; }`.
-    /// I-163: Heartbeat used to call `dispatch_ready` inline — at 290
-    /// workers / 10s × 169ms each that's ~5× actor capacity. Coalescing
-    /// to once-per-Tick drops it to ≤1/s; ProcessCompletion / MergeDag
-    /// still dispatch inline (those genuinely unlock new derivations);
-    /// Heartbeat became_idle and PrefetchComplete share the
-    /// [`BECAME_IDLE_INLINE_CAP`] budget (those only change placement
-    /// candidacy).
-    // r[impl sched.actor.dispatch-decoupled]
-    dispatch_dirty: bool,
-    /// Advances once per `handle_tick`. The dispatch-time substitute
-    /// probe stamps each checked node's `probed_generation` with this
-    /// value and skips already-stamped nodes within the same
-    /// generation, so the [`DISPATCH_PROBE_BATCH_CAP`] truncate window
-    /// advances across inline `dispatch_ready` calls instead of
-    /// re-FMP'ing the same head. Starts at 1 so freshly-inserted nodes
-    /// (`probed_generation: 0`) are immediately eligible.
+    /// Advances once per `handle_tick`. The ready-set store
+    /// short-circuit (`sweep_ready_cached`) stamps each checked node's
+    /// `probed_generation` with this value and skips already-stamped
+    /// nodes within the same generation, so the
+    /// [`DISPATCH_PROBE_BATCH_CAP`] truncate window advances across
+    /// inline sweep calls instead of re-FMP'ing the same head. Starts
+    /// at 1 so freshly-inserted nodes (`probed_generation: 0`) are
+    /// immediately eligible.
     probe_generation: u64,
-    /// Inline `dispatch_ready` calls fired from the "worker newly
-    /// available" carve-out (Heartbeat `became_idle` + `PrefetchComplete`
-    /// cold→warm) since the last Tick. Capped at
-    /// [`BECAME_IDLE_INLINE_CAP`]; once hit, further such edges only
-    /// set `dispatch_dirty`. Reset to 0 in `handle_tick`. Guards the
-    /// failover/mass-reconnect case where every executor's first
-    /// heartbeat is a 0→1 transition AND its PrefetchComplete is a
-    /// cold→warm edge — the `r[sched.dispatch.became-idle-immediate]`
-    /// carve-out assumed "≤1 per executor per spawn cycle", which is
-    /// true steady-state but becomes 2N-at-once after leader failover
-    /// (the I-163 storm via the back door).
-    became_idle_inline_this_tick: u32,
     /// Last [`ClusterSnapshot`] published by `handle_tick`. The
     /// AdminService `cluster_status` handler reads `snapshot_tx.
     /// subscribe().borrow()` via [`ActorHandle::cluster_snapshot_cached`]
@@ -657,19 +597,16 @@ pub struct DagActor {
 #[cfg(test)]
 #[derive(Debug, Default)]
 pub(crate) struct TestCounters {
-    /// Incremented on every `dispatch_ready` entry (after the
-    /// leader/recovery gate). Asserts on the I-163 dispatch-decoupled
-    /// rule: a steady-state heartbeat must NOT bump this.
-    pub dispatch_ready_calls: std::sync::atomic::AtomicU64,
     /// Incremented on every singular `persist_status` call (NOT the
     /// batch variant). Asserts on the I-139 rule: a batched completion
     /// path must NOT touch the per-row helper.
     pub persist_status_calls: std::sync::atomic::AtomicU64,
     /// Incremented on every `solve_inputs()` call. Asserts on the r33
-    /// bug_013 hoist: one `dispatch_ready` pass over N Ready drvs must
-    /// snapshot the solve inputs exactly ONCE, not once-per-drv (the
-    /// per-drv re-read is both the §13c-2 gauge spam and a TOCTOU at
-    /// the same `inputs_gen` if `spot_price_poller` writes mid-pass).
+    /// bug_013 hoist: one `compute_spawn_intents` pass over N Ready
+    /// drvs must snapshot the solve inputs exactly ONCE, not
+    /// once-per-drv (the per-drv re-read is both the §13c-2 gauge spam
+    /// and a TOCTOU at the same `inputs_gen` if `spot_price_poller`
+    /// writes mid-pass).
     pub solve_inputs_calls: std::sync::atomic::AtomicU64,
 }
 
@@ -678,7 +615,6 @@ impl TestCounters {
     pub(crate) fn snapshot(&self) -> TestCountersSnapshot {
         use std::sync::atomic::Ordering::SeqCst;
         TestCountersSnapshot {
-            dispatch_ready_calls: self.dispatch_ready_calls.load(SeqCst),
             persist_status_calls: self.persist_status_calls.load(SeqCst),
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
             // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
@@ -695,7 +631,6 @@ impl TestCounters {
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TestCountersSnapshot {
-    pub dispatch_ready_calls: u64,
     pub persist_status_calls: u64,
     pub solve_inputs_calls: u64,
     /// `DagActor.substitute_sem.available_permits()` at snapshot time.
@@ -780,9 +715,6 @@ impl DagActor {
             hmac_signer: plumbing.hmac_signer,
             service_signer: plumbing.service_signer,
             shutdown: plumbing.shutdown,
-            freeze_builders_since: None,
-            freeze_fetchers_since: None,
-            unroutable_warned: HashSet::new(),
             unroutable_features_warned: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(UNROUTABLE_FEATURES_WARNED_CAP).unwrap(),
             )),
@@ -792,9 +724,7 @@ impl DagActor {
             forecast_dropped_warned: parking_lot::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(FORECAST_DROPPED_WARNED_CAP).unwrap(),
             )),
-            dispatch_dirty: false,
             probe_generation: 1,
-            became_idle_inline_this_tick: 0,
             snapshot_tx: watch::channel(Arc::new(ClusterSnapshot::default())).0,
             #[cfg(test)]
             recovery_toctou_gate: plumbing.recovery_toctou_gate,
@@ -872,16 +802,11 @@ impl DagActor {
             hmac_signer: _,
             service_signer: _,
             shutdown: _,
-            freeze_builders_since: _,
-            freeze_fetchers_since: _,
-            unroutable_warned: _,
             // Retained: a leader transition doesn't change the SLA or
             // override config; the operator already saw the WARN. The
             // bound is the LRU cap (mb_001), not a `.retain()` —
-            // unlike `unroutable_warned`, whose key universe is
-            // operator-config-bounded `system` strings, these key on
-            // tenant-controlled fields with no equivalent bounded
-            // universe to retain against.
+            // these key on tenant-controlled fields with no
+            // operator-config-bounded universe to retain against.
             unroutable_features_warned: _,
             cap_mismatch_warned: _,
             // Retained: same rationale as the two siblings above. The
@@ -889,9 +814,7 @@ impl DagActor {
             // it doesn't change on leader transition. The bound is the
             // LRU cap (r34 bug_018), not a `.retain()`.
             forecast_dropped_warned: _,
-            dispatch_dirty: _,
             probe_generation: _,
-            became_idle_inline_this_tick: _,
             snapshot_tx: _,
             #[cfg(test)]
                 recovery_toctou_gate: _,
@@ -1269,63 +1192,15 @@ impl DagActor {
                         );
                     }
                 }
-                ActorCommand::PrefetchComplete {
-                    executor_id,
-                    paths_fetched,
-                } => {
-                    // r[impl sched.dispatch.became-idle-immediate]
-                    // Cold→warm is the same "worker newly available"
-                    // edge as Heartbeat became_idle — it changes
-                    // placement candidacy, not derivation readiness.
-                    // Share the inline budget so leader-failover (N
-                    // reconnects → N near-simultaneous PrefetchComplete
-                    // ACKs) coalesces to dispatch_dirty instead of N
-                    // sequential dispatch_ready passes. Already-warm
-                    // re-ACKs (per-assignment hints) change no
-                    // eligibility → skip dispatch entirely.
-                    //
-                    // r[sched.lease.standby-drops-writes]: arm stays
-                    // ungated — `handle_prefetch_complete` is in-memory
-                    // only; `dispatch_ready` self-gates on `is_leader()`
-                    // (dispatch.rs).
-                    if self.handle_prefetch_complete(&executor_id, paths_fetched) {
-                        if self.became_idle_inline_this_tick < BECAME_IDLE_INLINE_CAP {
-                            self.became_idle_inline_this_tick += 1;
-                            self.dispatch_ready().await;
-                        } else {
-                            self.dispatch_dirty = true;
-                        }
-                    }
-                }
                 ActorCommand::Heartbeat(hb) => {
                     // r[sched.lease.standby-drops-writes]: arm stays
                     // ungated (`handle_heartbeat` keeps `self.executors`
                     // accurate for reconnect-after-reacquire and doesn't
-                    // write PG). `dispatch_ready` below self-gates
-                    // (dispatch.rs).
-                    let became_idle = self.handle_heartbeat(hb);
-                    // I-163: mark dirty instead of dispatching inline.
-                    // 290 workers × 10s heartbeat × 169ms dispatch_ready
-                    // = ~5× actor capacity → mailbox_depth=9.5k → admin
-                    // RPC timeouts. handle_tick drains the flag at ≤1/s;
-                    // ProcessCompletion / MergeDag still dispatch inline
-                    // (those unlock new derivations).
-                    // r[impl sched.actor.dispatch-decoupled]
-                    //
-                    // r[impl sched.dispatch.became-idle-immediate]
-                    // Carve-out: capacity 0→1 (fresh ephemeral, degrade
-                    // clear, drain clear) dispatches inline. ≤1 per
-                    // executor per spawn cycle steady-state — but
-                    // leader-failover makes EVERY executor's first
-                    // heartbeat a 0→1 edge. Cap inline dispatches per
-                    // Tick so mass-reconnect coalesces to dirty
-                    // instead of N sequential dispatch_ready passes.
-                    if became_idle && self.became_idle_inline_this_tick < BECAME_IDLE_INLINE_CAP {
-                        self.became_idle_inline_this_tick += 1;
-                        self.dispatch_ready().await;
-                    } else {
-                        self.dispatch_dirty = true;
-                    }
+                    // write PG). The stream placement layer this used to
+                    // feed is gone; the arm survives only as the admin
+                    // surfaces' test plumbing until commit C re-points
+                    // them.
+                    self.handle_heartbeat(hb);
                 }
                 ActorCommand::Tick => {
                     self.handle_tick().await;
@@ -1380,14 +1255,11 @@ impl DagActor {
                 }
                 ActorCommand::LeaderAcquired => {
                     self.handle_leader_acquired().await;
-                    // Immediate dispatch attempt after recovery. If
-                    // workers haven't reconnected yet, dispatch finds
-                    // no candidates → no-op. If they HAVE (workers
-                    // reconnect on scheduler restart faster than this
-                    // actor command is processed), dispatch fires
-                    // immediately instead of waiting ~10s for the
-                    // first heartbeat to trigger it.
-                    self.dispatch_ready().await;
+                    // Immediate ready-set store sweep after recovery so
+                    // recovered Ready derivations whose outputs already
+                    // exist complete/substitute instead of waiting for
+                    // the next merge or completion to trigger it.
+                    self.sweep_ready_cached().await;
                 }
                 ActorCommand::SubstituteComplete {
                     drv_hash,

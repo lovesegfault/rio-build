@@ -1,99 +1,23 @@
 //! Stream-era executor session plumbing: connect/disconnect/register,
 //! heartbeat reconcile, drain. Production traffic no longer reaches it
 //! (the `BuildExecution`/`Heartbeat` RPCs are unconditional error
-//! stubs); it remains because the placement layer and the admin
-//! surfaces — owned by the next deletion commits — still read the
-//! `executors` map and their tests still drive these arms. Periodic
-//! `tick_*` housekeeping lives in [`super::housekeeping`].
+//! stubs) and the placement layer it used to feed is deleted; it
+//! remains only because the admin/operator surfaces — owned by the
+//! next deletion commit — still read the `executors` map and their
+//! tests still drive these arms. The warm-gate/prefetch half retired
+//! with the placement layer. Periodic `tick_*` housekeeping lives in
+//! [`super::housekeeping`].
 // r[impl sched.executor.dual-register]
 
-use std::collections::HashMap;
 use std::time::Instant;
 
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::dag::DerivationDag;
 use crate::state::{DerivationStatus, DrvHash, ExecutorId, ExecutorState};
 
-/// Initial-hint budget: max store paths to send in the registration-
-/// time `PrefetchHint`. A broad common-set (glibc, stdenv, etc.) is the
-/// intent, not the entire queue's closure. See [`on_worker_registered`].
-///
-/// [`on_worker_registered`]: DagActor::on_worker_registered
-use super::{DagActor, DrainResult, HeartbeatPayload, MAX_PREFETCH_PATHS};
-
-/// Initial-hint scan budget: max Ready derivations to consider. Don't
-/// walk 10k Ready nodes just to send 100 paths. 32 derivations × ~40
-/// paths covers `MAX_PREFETCH_PATHS` with typical closure sizes.
-const MAX_READY_TO_SCAN: usize = 32;
-
-/// Compute the initial `PrefetchHint` path-set for a freshly registered
-/// worker. Pure function over the DAG: no side effects, no actor state.
-/// Extracted from `on_worker_registered` so the determinism test can
-/// exercise it directly (building 40+ Ready nodes via the full actor
-/// loop is prohibitive — each needs a connect/assign/complete round-trip).
-///
-/// Sort Ready nodes by fan-in (`interested_builds.len()`) descending.
-/// Highest fan-in = most likely to be dispatched first. Their closures
-/// are the paths a warm cache wants preloaded. Deterministic: sort key
-/// is stable across restarts for the same queue state (same Ready set,
-/// same `interested_builds`).
-///
-/// Tie-break on `drv_hash` ascending so identical-fan-in nodes get a
-/// reproducible order — `drv_hash` is the DAG key, always unique.
-///
-/// Why fan-in not `submitted_at`: `submitted_at` lives on `BuildState`,
-/// not on `DerivationState`. A derivation with 5 interested builds was
-/// needed by 5 submissions — that's a stronger dispatch-priority signal
-/// than which single build submitted first.
-///
-/// `interested_builds.len()` is O(1) (`HashSet::len`). Sort is
-/// O(n log n) over Ready nodes. Acceptable: registration is once per
-/// worker per reconnect, not hot-path.
-pub(crate) fn compute_initial_prefetch_paths(dag: &DerivationDag) -> Vec<String> {
-    let mut ready: Vec<(&str, &crate::state::DerivationState)> = dag
-        .iter_nodes()
-        .filter(|(_, s)| s.status() == DerivationStatus::Ready)
-        .collect();
-    ready.sort_by(|(ha, a), (hb, b)| {
-        b.interested_builds
-            .len()
-            .cmp(&a.interested_builds.len())
-            .then_with(|| ha.cmp(hb))
-    });
-    let ready_hashes: Vec<DrvHash> = ready
-        .into_iter()
-        .take(MAX_READY_TO_SCAN)
-        .map(|(h, _)| DrvHash::from(h))
-        .collect();
-
-    // Count how many of the scanned derivations want each path.
-    // High-count paths are the "broad common-set" — glibc/stdenv
-    // appearing in most closures. Sort by count descending (tie-break
-    // on path string for reproducibility), take the top 100.
-    //
-    // Why not BTreeSet (would give deterministic lexicographic
-    // iteration): lex order has no correlation with prefetch-value
-    // (`/nix/store/0...` first). Frequency-sort is the same
-    // O(n log n) and directly serves the "broad common-set" intent
-    // — a path that appears in 30/32 closures is one every upcoming
-    // assignment will want.
-    let mut path_counts: HashMap<String, usize> = HashMap::new();
-    for h in &ready_hashes {
-        for p in crate::assignment::approx_input_closure(dag, h) {
-            *path_counts.entry(p).or_default() += 1;
-        }
-    }
-    let mut paths: Vec<(String, usize)> = path_counts.into_iter().collect();
-    paths.sort_by(|(pa, ca), (pb, cb)| cb.cmp(ca).then_with(|| pa.cmp(pb)));
-    paths
-        .into_iter()
-        .take(MAX_PREFETCH_PATHS)
-        .map(|(p, _)| p)
-        .collect()
-}
+use super::{DagActor, DrainResult, HeartbeatPayload};
 
 impl DagActor {
     // -----------------------------------------------------------------------
@@ -235,107 +159,8 @@ impl DagActor {
         if !was_registered && worker.is_registered() {
             info!(executor_id = %executor_id, "worker fully registered (stream + heartbeat)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
-            self.on_worker_registered(executor_id);
         }
         Ok(())
-    }
-
-    /// Flip `warm=true` on PrefetchComplete ACK. See
-    /// `r[sched.assign.warm-gate]`. No-op if the worker is unknown
-    /// (disconnected between hint and ACK — rare race).
-    ///
-    /// Returns `true` on a cold→warm transition (the caller dispatches
-    /// inline, capped per Tick); `false` for already-warm re-ACKs
-    /// (per-assignment hints) and unknown workers.
-    pub(super) fn handle_prefetch_complete(
-        &mut self,
-        executor_id: &ExecutorId,
-        paths_fetched: u32,
-    ) -> bool {
-        let Some(w) = self.executors.get_mut(executor_id) else {
-            debug!(executor_id = %executor_id,
-                   "PrefetchComplete for unknown worker (disconnected?)");
-            return false;
-        };
-        // Idempotent: a worker sending two ACKs (e.g., pre-dispatch
-        // hint + first per-assignment hint both getting ACKed) just
-        // re-sets an already-true flag. No warn — this is expected
-        // for the per-assignment PrefetchHint path (dispatch.rs:342)
-        // which also triggers worker-side PrefetchComplete.
-        let was_warm = w.warm;
-        w.warm = true;
-        if !was_warm {
-            info!(executor_id = %executor_id, paths_fetched,
-                  "warm-gate open: worker ACKed initial prefetch");
-        }
-        // Record unconditionally: every PrefetchComplete is a data
-        // point about hint effectiveness (fetched vs cached). The
-        // histogram serves observability, not gating — the gate is
-        // the warm flag flip above, which is idempotent.
-        metrics::histogram!("rio_scheduler_warm_prefetch_paths").record(f64::from(paths_fetched));
-        !was_warm
-    }
-
-    /// Hook fired exactly once per worker when it transitions
-    /// not-registered → registered (both stream AND heartbeat present).
-    ///
-    /// r[impl sched.assign.warm-gate]
-    /// Sends the INITIAL PrefetchHint so the worker can warm its FUSE
-    /// cache before receiving any WorkAssignment. If the ready queue
-    /// is empty (nothing to prefetch for), the gate flips open
-    /// immediately — spec: "Empty scheduler queue at registration
-    /// time → warm flips true immediately."
-    ///
-    /// Hint contents: see [`compute_initial_prefetch_paths`] — union
-    /// of top-fan-in Ready derivations' input closures (same
-    /// `approx_input_closure` as the per-assignment hint in
-    /// dispatch.rs), capped at 100 paths.
-    fn on_worker_registered(&mut self, executor_id: &ExecutorId) {
-        let paths = compute_initial_prefetch_paths(&self.dag);
-
-        let Some(worker) = self.executors.get_mut(executor_id) else {
-            return; // can't happen (caller just looked it up) but be defensive
-        };
-
-        if paths.is_empty() {
-            // Nothing queued → nothing to prefetch → gate open now.
-            // Same flip as handle_prefetch_complete, just short-
-            // circuited. Tests that register workers BEFORE merging
-            // a DAG land here — keeps their dispatch assumptions
-            // valid without a synthetic ACK.
-            worker.warm = true;
-            debug!(executor_id = %executor_id,
-                   "warm-gate open on registration: ready queue empty");
-            return;
-        }
-
-        // Send the hint. try_send: if the freshly-opened stream is
-        // somehow already full (256 cap) something is very wrong; log
-        // and flip warm anyway (gate is optimization, not correctness).
-        let hint_len = paths.len();
-        let msg = rio_proto::types::SchedulerMessage {
-            msg: Some(rio_proto::types::scheduler_message::Msg::Prefetch(
-                rio_proto::types::PrefetchHint { store_paths: paths },
-            )),
-        };
-        let sent = worker
-            .stream_tx
-            .as_ref()
-            .is_some_and(|tx| tx.try_send(msg).is_ok());
-        if sent {
-            debug!(executor_id = %executor_id, paths = hint_len,
-                   "warm-gate: sent initial PrefetchHint on registration");
-            metrics::counter!("rio_scheduler_prefetch_hints_sent_total").increment(1);
-            metrics::counter!("rio_scheduler_prefetch_paths_sent_total").increment(hint_len as u64);
-            // warm stays false until PrefetchComplete arrives.
-        } else {
-            // stream_tx None or channel full — neither should happen
-            // for a just-registered worker. Flip warm so dispatch
-            // isn't permanently wedged for this worker.
-            warn!(executor_id = %executor_id,
-                  "warm-gate: initial hint send failed; flipping warm anyway");
-            worker.warm = true;
-        }
     }
 
     pub(super) async fn handle_executor_disconnected(
@@ -772,10 +597,11 @@ impl DagActor {
         }
     }
 
-    /// Returns the `became_idle` (capacity 0→1) edge-detect for inline
-    /// dispatch. Kept sync — the caller (mod.rs Heartbeat arm) already
-    /// `.await`s `dispatch_ready`.
-    pub(super) fn handle_heartbeat(&mut self, hb: HeartbeatPayload) -> bool {
+    /// Reconcile one heartbeat into the (production-unreachable)
+    /// executors map. Kept only as the admin surfaces' test plumbing
+    /// until commit C re-points them; the became-idle inline-dispatch
+    /// edge this used to report retired with the placement layer.
+    pub(super) fn handle_heartbeat(&mut self, hb: HeartbeatPayload) {
         let executor_id = &hb.executor_id;
         // r[impl sched.executor.session-epoch]
         // I-048b: heartbeat for an executor without a stream entry is
@@ -798,7 +624,7 @@ impl DagActor {
                 "heartbeat for unknown executor; dropping \
                  (stream not yet connected — scheduler restart race?)"
             );
-            return false;
+            return;
         }
         // r[impl sec.executor.identity-token+2]
         // Bind the heartbeat to the executor entry: `hb.intent_id` is
@@ -823,7 +649,7 @@ impl DagActor {
             metrics::counter!("rio_scheduler_heartbeat_rejected_total",
                               "reason" => "intent_mismatch")
             .increment(1);
-            return false;
+            return;
         }
 
         // TOCTOU fix: a stale heartbeat must not clobber a fresh assignment.
@@ -834,15 +660,6 @@ impl DagActor {
         //     (shouldn't happen; indicates split-brain or restart).
         //   - Clear if absent from heartbeat AND DAG state is no longer
         //     Assigned/Running (completion already processed).
-        // I-163: capture pre-heartbeat capacity for the 0→1 edge-detect
-        // (`r[sched.dispatch.became-idle-immediate]`). Read here, before
-        // the field updates below — same "before any mutation" snapshot
-        // as `prev_running`.
-        let had_capacity = self
-            .executors
-            .get(executor_id.as_str())
-            .is_some_and(|w| w.has_capacity());
-
         let reconciled = self.reconcile_running_build(executor_id, hb.running_build);
 
         // intent_id: DOWNGRADE to None if it doesn't point at a
@@ -938,26 +755,10 @@ impl DagActor {
             info!(executor_id = %executor_id, "draining cleared (heartbeat-reported)");
         }
 
-        // r[impl sched.dispatch.became-idle-immediate]
-        // Capacity 0→1 edge: fresh registration (is_registered flip),
-        // store_degraded clear, draining_hb clear, or running_build
-        // cleared via reconcile. Computed AFTER all field
-        // writes above (running_build, store_degraded, draining_hb)
-        // and BEFORE on_worker_registered borrows &mut self. The
-        // caller (mod.rs Heartbeat arm) dispatches inline on this
-        // signal instead of deferring to Tick — at most one such
-        // transition per executor per spawn/degrade cycle, so this
-        // doesn't reintroduce the I-163 heartbeat-storm.
-        let became_idle = !had_capacity && worker.has_capacity();
-
         if !was_registered && worker.is_registered() {
             let auth_intent = worker.auth_intent.clone();
             info!(executor_id = %executor_id, "worker fully registered (heartbeat + stream)");
             metrics::gauge!("rio_scheduler_workers_active").increment(1.0);
-            // Same hook as handle_worker_connected: whichever of
-            // (stream, heartbeat) arrives SECOND triggers the warm-
-            // gate initial prefetch. dual-register step 3.
-            self.on_worker_registered(executor_id);
             // r[impl sched.sla.hw-class.ice-mask]
             // §13a interim ICE clear: heartbeat ⇒ pod scheduled ⇒
             // ∃ cell ∈ A' with capacity. |A'|=1 ⇒ that cell — clear
@@ -978,8 +779,6 @@ impl DagActor {
                 self.ice.clear(cell);
             }
         }
-
-        became_idle
     }
 
     /// TOCTOU reconcile: a stale heartbeat must not clobber a fresh

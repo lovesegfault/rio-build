@@ -298,8 +298,9 @@ impl DagActor {
                        "failed to persist build completion (build is Active; continuing)");
             }
         } else {
-            // Dispatch ready derivations to workers
-            self.dispatch_ready().await;
+            // Complete/substitute any Ready node whose outputs already
+            // exist (the store short-circuit; delivery itself is pull).
+            self.sweep_ready_cached().await;
         }
         debug!(
             elapsed = ?t_total.elapsed(),

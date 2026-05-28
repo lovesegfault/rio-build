@@ -99,7 +99,6 @@
     "rio_scheduler_derivations_gc_deleted_total",
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
-    "rio_scheduler_dispatch_wait_seconds",
     "rio_scheduler_event_persist_dropped_total",
     "rio_scheduler_executor_reconnect_rejected_total",
     "rio_scheduler_features_stripped_total",
@@ -114,12 +113,9 @@
     "rio_scheduler_orphan_builds_cancelled_total",
     "rio_scheduler_phases_rejected_total",
     "rio_scheduler_poison_fleet_exhausted_total",
-    "rio_scheduler_prefetch_hints_sent_total",
-    "rio_scheduler_prefetch_paths_sent_total",
     "rio_scheduler_pull_establishments_total",
     "rio_scheduler_pull_rejected_total",
     "rio_scheduler_queue_backpressure",
-    "rio_scheduler_queue_depth",
     "rio_scheduler_recovery_duration_seconds",
     "rio_scheduler_recovery_total",
     "rio_scheduler_resource_floor_bumps_total",
@@ -152,10 +148,6 @@
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
     "rio_scheduler_unroutable_features_total",
-    "rio_scheduler_unroutable_ready",
-    "rio_scheduler_utilization",
-    "rio_scheduler_warm_gate_fallback_total",
-    "rio_scheduler_warm_prefetch_paths",
     "rio_scheduler_worker_disconnects_total",
     "rio_scheduler_workers_active",
     "rio_store_check_available_duration_seconds",
@@ -726,11 +718,6 @@
         "help": "Derivations currently building"
       },
       {
-        "name": "rio_scheduler_dispatch_wait_seconds",
-        "kind": "histogram",
-        "help": "Time from a derivation entering Ready to being Assigned (fed from DerivationState.ready_at). With ephemeral builders, dominated by node-provision (~60–180s on EKS)."
-      },
-      {
         "name": "rio_scheduler_event_persist_dropped_total",
         "kind": "counter",
         "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
@@ -801,16 +788,6 @@
         "help": "Derivations poisoned because failed_builders excluded every registered worker of the matching kind (I-065). Nonzero rate with small fleet = poison threshold unreachable; the build would otherwise defer forever."
       },
       {
-        "name": "rio_scheduler_prefetch_hints_sent_total",
-        "kind": "counter",
-        "help": "PrefetchHint messages sent (one per assignment with paths to warm). Missing from a dispatch = leaf drv (no children)."
-      },
-      {
-        "name": "rio_scheduler_prefetch_paths_sent_total",
-        "kind": "counter",
-        "help": "Total paths in sent PrefetchHints. Divide by hints_sent for avg paths-per-hint."
-      },
-      {
         "name": "rio_scheduler_pull_establishments_total",
         "kind": "counter",
         "help": "Open pull-mode attempts established as unreported executor crashes by the establishment sweep (the C2 charge arm; the store-probe adopt arm does not count). Feeds the OA2 interim hung-node tripwire — the attempt_requeue histogram's establishment cause is shared with the stream-mode correlation-TTL sweep and is unsuitable for that alert."
@@ -824,11 +801,6 @@
         "name": "rio_scheduler_queue_backpressure",
         "kind": "counter",
         "help": "Backpressure activations (queue reached 80% capacity)"
-      },
-      {
-        "name": "rio_scheduler_queue_depth",
-        "kind": "gauge",
-        "help": "Deferred Ready derivations waiting for an executor of the matching kind (snapshot per dispatch pass; labeled by kind=builder|fetcher). Sustained nonzero → scale the matching pool."
       },
       {
         "name": "rio_scheduler_recovery_duration_seconds",
@@ -989,26 +961,6 @@
         "name": "rio_scheduler_unroutable_features_total",
         "kind": "counter",
         "help": "§13c: solve_intent_for found NO hwClass whose provides_features hosts the drv's required_features (labeled tenant). Debounced once per (tenant, required_features) edge. The intent is unroutable until a `[sla.hw_classes.$h]` with matching providesFeatures is added; the WARN names which features."
-      },
-      {
-        "name": "rio_scheduler_unroutable_ready",
-        "kind": "gauge",
-        "help": "Ready derivations whose `system` is advertised by zero registered executors of the matching kind (labeled by system; snapshot per dispatch pass). Nonzero = no pool exists for that system; add it to a Pool's `systems` list."
-      },
-      {
-        "name": "rio_scheduler_utilization",
-        "kind": "gauge",
-        "help": "Fraction of executors currently running a build (busy/total; labeled by kind=builder|fetcher). Emitted per dispatch pass alongside queue_depth."
-      },
-      {
-        "name": "rio_scheduler_warm_gate_fallback_total",
-        "kind": "counter",
-        "help": "best_executor() fell back to cold workers because NO warm worker passed the hard filter. Single-worker clusters and mass scale-up expect nonzero; sustained high rate = workers never warming (PrefetchComplete not arriving — check worker logs)."
-      },
-      {
-        "name": "rio_scheduler_warm_prefetch_paths",
-        "kind": "histogram",
-        "help": "Paths fetched per initial warm-gate PrefetchHint (from the worker's PrefetchComplete ACK). 0 = worker was already warm (cache hit on everything); high = fresh worker cold-fetched everything."
       },
       {
         "name": "rio_scheduler_worker_disconnects_total",

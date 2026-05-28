@@ -242,8 +242,8 @@ is the actor's inevitable unknown-derivation discard moved off the
 single-threaded event loop — no legitimate completion is lost. Phase
 rejections increment #(refs.metric)("rio_scheduler_phases_rejected_total")
 with reason `phase_too_long`; the unresolvable-path completion drop
-increments `rio_scheduler_completions_rejected_total` (retired with the
-stream completion intake) with reason `path_too_long`.
+increments the rio_scheduler_completions_rejected_total counter (retired with
+the stream completion intake) with reason `path_too_long`.
 
 `CompletionReport.final_line_count` is the motivating numeric field: the
 scheduler folds it into the `drv_executions` row that rio-store's log
@@ -884,7 +884,7 @@ keep-going build with a poisoned leaf otherwise hangs Active forever ---
   inflate a victim node's `occupancy` and suppress detection. Executors lacking
   an authoritative binding (controller-lag, ack channel down) are skipped ---
   fail-safe --- and counted in
-  `rio_scheduler_hung_detect_skipped_no_authoritative_total` (retired with the
+  rio_scheduler_hung_detect_skipped_no_authoritative_total (retired with the
   scheduler-side hung-node detector).
   The controller's `nodeclaim_pool::reap_unhealthy` consumes `dead_nodes` as
   `ReapReason::Dead` --- the only reap path for a `Registered=True` NodeClaim
@@ -995,7 +995,8 @@ keep-going build with a poisoned leaf otherwise hangs Active forever ---
   When a Ready derivation's `system` is advertised by zero registered executors
   of the matching kind, dispatch defers it (same as no-capacity) but
   additionally counts it under
-  #(refs.metric)("rio_scheduler_unroutable_ready")`{system=…}` and WARNs once
+  the rio_scheduler_unroutable_ready gauge (retired with the placement layer,
+  labeled by system) and WARNs once
   when the system first becomes unroutable. The WARN re-arms after the system
   has been observed routable. This distinguishes "no capacity right now"
   (autoscaler resolves) from "no pool exists" (operator action: add the system
@@ -2114,8 +2115,8 @@ first, else `best_executor()` over the kind-matching pool. The `kind=fetcher`
 hard-filter in #rref("sched.dispatch.fod-to-fetcher") is the absolute boundary
 --- if no fetcher is available the @fod queues; the scheduler NEVER sends a FOD
 to a builder under pressure. A queued FOD is preferable to a builder with
-internet access. The #(refs.metric)("rio_scheduler_queue_depth")`{kind}` gauge
-tracks queued derivations per kind.
+internet access. The rio_scheduler_queue_depth gauge (retired with the
+placement layer) tracked queued derivations per kind.
 
 #r("sched.timeout.promote-on-exceed+3")[
   A `BuildResultStatus::TimedOut` completion MUST double
@@ -2237,23 +2238,15 @@ attempt accounting relies on it.
   rather than OOM-killing mid-build.
 ]
 
-#r("sched.assign.warm-gate")[
-  A newly-registered executor (step 3 above --- first heartbeat with open
-  stream) receives an initial @prefetch-hint before any `WorkAssignment`. The
-  executor fetches the hinted paths into its FUSE cache and replies with
-  `PrefetchComplete` on the `BuildExecution` stream. The scheduler's
-  `ExecutorState.warm` flag starts `false` and flips `true` on receipt.
-  `best_executor()` filters out `warm=false` executors from its candidate set
-  --- but falls back to cold executors if no warm executor passes the hard
-  filter (single-executor clusters and mass-scale-up must not deadlock). Empty
-  scheduler queue at registration time → `warm` flips `true` immediately
-  (nothing to prefetch for). Hint contents select up to 32 Ready derivations
-  sorted by fan-in (interested-builds count) descending, union their input
-  closures, sort by occurrence frequency descending, cap at 100 paths --- the
-  selection is deterministic for a given queue state. The warm-gate is
-  per-executor: a second executor registering while the first is still warming
-  does not delay builds that the second (already warm) executor can take.
-]
+*Retired (1c' deletion commit B — the placement layer):* the warm-gate
+(initial `PrefetchHint` → `PrefetchComplete` → `ExecutorState.warm` →
+`best_executor()` two-pass) existed to order the stream scheduler's
+placement decisions toward executors whose FUSE cache was already warm.
+Pull-mode delivery has no scheduler-side placement decision — the pod is
+spawned for exactly one derivation and pulls it — so there is nothing for
+a warm gate to order; the per-assignment input-closure prefetch the
+builder performs before building is unchanged and is bounded by the same
+build it serves.
 
 #r("sched.executor.deregister-reassign")[
   *Deregistration:* An executor is removed from the scheduler's state when:
@@ -2380,8 +2373,8 @@ isolation.
   `failure_count`, and adds the executor to `failed_builders`. This catches the
   "executor is heartbeating but daemon is wedged" case where no stream-close or
   heartbeat-timeout fires; the accounting bounds the loop at the poison
-  threshold. The `rio_scheduler_backstop_timeouts_total` counter (retired with the
-  backstop) tracked these events.
+  threshold. The rio_scheduler_backstop_timeouts_total counter (retired with
+  the backstop) tracked these events.
 ]
 
 #r("sched.timeout.per-build")[
@@ -3711,12 +3704,11 @@ for store vs. scheduler if write contention becomes an issue.
 == Predictive cache warming // supersedes ADR-009
 <sched-rationale-prefetch>
 
-The scheduler drives @fuse cache pre-warming. When scheduling a derivation to a
-worker, the scheduler sends prefetch hints for the input closure paths via the
-bidirectional build execution stream (#rref("sched.assign.warm-gate")). The
-worker's FUSE daemon begins fetching these paths into its local SSD cache
-before the build starts, converting serial "fetch then build" into overlapped
-execution.
+The scheduler used to drive @fuse cache pre-warming: prefetch hints for the
+input closure paths were sent via the bidirectional build execution stream
+(the retired warm-gate). With pull-mode delivery the builder warms its own
+cache from the assignment payload's input closure before building,
+converting serial "fetch then build" into overlapped execution.
 
 Unlike a shared PV approach, each worker manages its own cache independently
 with no coordination overhead. The scheduler's hints are best-effort: if

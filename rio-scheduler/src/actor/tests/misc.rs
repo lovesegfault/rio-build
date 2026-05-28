@@ -79,39 +79,6 @@ fn spawn_actor_with_flags(
     (h, t)
 }
 
-// r[verify sched.recovery.gate-dispatch]
-/// `dispatch_ready` early-returns when `is_leader=false` OR
-/// `recovery_complete=false`. Worker connected, DAG merged, heartbeat
-/// sent → NO assignment received.
-#[rstest::rstest]
-#[case::not_leader(false, true)]
-#[case::recovery_incomplete(true, false)]
-#[tokio::test]
-async fn test_dispatch_gated_on_leader_and_recovery(
-    #[case] is_leader: bool,
-    #[case] recovery_complete: bool,
-) -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = spawn_actor_with_flags(db.pool.clone(), is_leader, recovery_complete);
-
-    let mut rx = connect_executor(&handle, "gate-w", "x86_64-linux").await?;
-    merge_single_node(
-        &handle,
-        Uuid::new_v4(),
-        "gate-drv",
-        PriorityClass::Scheduled,
-    )
-    .await?;
-    send_heartbeat(&handle, "gate-w", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    assert!(
-        rx.try_recv().is_err(),
-        "is_leader={is_leader} recovery_complete={recovery_complete} → no dispatch"
-    );
-    Ok(())
-}
-
 // r[verify obs.metric.scheduler-leader-gate+2]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but workers don't
@@ -1886,34 +1853,6 @@ async fn test_mailbox_depth_gauge_set_per_command() -> TestResult {
         "mailbox_depth gauge not set after dequeuing commands.\n\
          Gauges touched: {:?}",
         recorder.gauge_names()
-    );
-    Ok(())
-}
-
-// r[verify obs.metric.scheduler]
-/// dispatch_wait_seconds is recorded on Ready→Assigned. Connect a
-/// worker, merge a single-node DAG (enters Ready immediately — no
-/// deps), wait for the assignment to land, then assert the histogram
-/// was touched. Elapsed value is non-deterministic; touch-set only.
-#[tokio::test]
-async fn test_dispatch_wait_recorded_on_assignment() -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor(db.pool.clone());
-
-    let mut rx = connect_executor(&handle, "dw-worker", "x86_64-linux").await?;
-    merge_single_node(&handle, Uuid::new_v4(), "dw-drv", PriorityClass::Scheduled).await?;
-
-    // MergeDag's reply is sent AFTER dispatch_ready runs inline
-    // (helpers.rs:624), so the assignment is already in flight. Drain
-    // it to confirm assign_to_worker actually ran.
-    let _assignment = recv_assignment(&mut rx).await;
-
-    assert!(
-        recorder.histogram_touched("rio_scheduler_dispatch_wait_seconds"),
-        "dispatch_wait_seconds not recorded on Ready→Assigned"
     );
     Ok(())
 }

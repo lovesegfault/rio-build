@@ -2,55 +2,12 @@
 
 use super::*;
 
-/// Dispatch should skip over derivations with no eligible worker (wrong
-/// system or missing feature) instead of blocking the entire queue.
-#[tokio::test]
-async fn test_dispatch_skips_ineligible_derivation() -> TestResult {
-    // Only x86_64 worker registered.
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("x86-only-worker", "x86_64-linux").await?;
-
-    // Merge aarch64 derivation FIRST (goes to queue head), then x86_64.
-    // With the old `None => break`, the aarch64 drv at head would block
-    // the x86_64 drv from being dispatched.
-    let build_arm = Uuid::new_v4();
-    let _rx = merge_dag(
-        &handle,
-        build_arm,
-        vec![make_test_node("arm-hash", "aarch64-linux")],
-        vec![],
-        false,
-    )
-    .await?;
-
-    let build_x86 = Uuid::new_v4();
-    let p_x86 = test_drv_path("x86-hash");
-    let _rx = merge_single_node(&handle, build_x86, "x86-hash", PriorityClass::Scheduled).await?;
-
-    // x86_64 derivation should be dispatched despite aarch64 ahead of it.
-    let dispatched_path = recv_assignment(&mut stream_rx).await.drv_path;
-    assert_eq!(
-        dispatched_path, p_x86,
-        "x86_64 derivation should be dispatched even with ineligible aarch64 ahead in queue"
-    );
-
-    // aarch64 derivation should still be Ready (not stuck, not dispatched).
-    let arm_info = expect_drv(&handle, "arm-hash").await;
-    assert_eq!(
-        arm_info.status,
-        DerivationStatus::Ready,
-        "aarch64 derivation should remain Ready (no eligible worker)"
-    );
-    Ok(())
-}
-
 /// Per-build BuildOptions (max_silent_time, build_timeout) must propagate
 /// to the worker via WorkAssignment. Regression guard: without
 /// propagation, all-zeros defaults would be sent.
 #[tokio::test]
 async fn test_build_options_propagated_to_worker() -> TestResult {
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("options-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Submit with build_timeout=300, max_silent_time=60.
     let build_id = Uuid::new_v4();
@@ -75,8 +32,8 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
     )
     .await?;
 
-    // Worker should receive assignment with the build's options.
-    let assignment = recv_assignment(&mut stream_rx).await;
+    // The pull payload carries the build's options.
+    let assignment = pull_attempt(&handle, "opts-hash").await;
     let opts = assignment.build_options.expect("options should be set");
     assert_eq!(
         opts.build_timeout, 300,
@@ -102,8 +59,7 @@ async fn test_build_options_propagated_to_worker() -> TestResult {
 // r[verify sched.trace.assignment-traceparent]
 #[tokio::test]
 async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("trace-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Known traceparent (W3C format: version-trace_id-span_id-flags).
     // The exact bytes don't matter for this test — we just verify it
@@ -128,7 +84,7 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
     )
     .await?;
 
-    let assignment = recv_assignment(&mut stream_rx).await;
+    let assignment = pull_attempt(&handle, "trace-hash").await;
     assert_eq!(
         assignment.traceparent, known_tp,
         "WorkAssignment.traceparent must match the submitter's traceparent, \
@@ -143,8 +99,6 @@ async fn test_dispatch_carries_submitter_traceparent() -> TestResult {
 /// the derivation (operationally: the trace that will have waited longest).
 #[tokio::test]
 async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult {
-    // P0537: delay capacity by not connecting the worker until after
-    // both merges (zero-capacity workers are no longer expressible).
     let (db, handle, _task) = setup().await;
 
     let tp_first = "00-11111111111111111111111111111111-1111111111111111-01";
@@ -169,10 +123,8 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
     // Second submit: SAME derivation, DIFFERENT traceparent (dedup hit).
     let _ = merge_dag_req(&handle, merge_with_tp(tp_second)).await?;
 
-    // Now give capacity: connect worker → dispatch fires.
-    let mut stream_rx = connect_executor(&handle, "dedup-worker", "x86_64-linux").await?;
-
-    let assignment = recv_assignment(&mut stream_rx).await;
+    // Pull the deduped node: the payload carries the stored traceparent.
+    let assignment = pull_attempt(&handle, "dedup-hash").await;
     assert_eq!(
         assignment.traceparent, tp_first,
         "first submitter's traceparent should win on dedup (existing state not overwritten)"
@@ -188,7 +140,6 @@ async fn test_dispatch_traceparent_first_submitter_wins_on_dedup() -> TestResult
 #[tokio::test]
 async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let (db, handle, _task) = setup().await;
-    // P0537: delay capacity by not connecting until after both merges.
 
     let merge_with_tp = |tp: &str| MergeDagRequest {
         build_id: Uuid::new_v4(),
@@ -211,10 +162,7 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     let live_tp = "00-33333333333333333333333333333333-3333333333333333-01";
     let _ = merge_dag_req(&handle, merge_with_tp(live_tp)).await?;
 
-    // Give capacity: connect worker → dispatch.
-    let mut stream_rx = connect_executor(&handle, "upgrade-worker", "x86_64-linux").await?;
-
-    let assignment = recv_assignment(&mut stream_rx).await;
+    let assignment = pull_attempt(&handle, "upgrade-hash").await;
     assert_eq!(
         assignment.traceparent, live_tp,
         "empty traceparent (recovery) should be upgraded by first live submitter"
@@ -223,145 +171,9 @@ async fn test_dedup_upgrades_empty_traceparent_from_recovery() -> TestResult {
     Ok(())
 }
 
-/// Interactive builds get a priority boost (+1e9 instead of the old
-/// push_front). After a dependency completes, an Interactive build's
-/// newly-ready derivation dispatches BEFORE already-queued Scheduled work.
-///
-/// Same observable behavior as the old push_front test; different
-/// mechanism underneath (priority number vs queue position).
-#[tokio::test]
-async fn test_interactive_priority_boost() -> TestResult {
-    // Worker with 1 slot so dispatch order is observable.
-    let (_db, handle, _task, mut worker_rx) =
-        setup_with_worker("prio-builder", "x86_64-linux").await?;
-
-    // Build 1: Scheduled, 2 independent leaves (Q, R). Both queue immediately.
-    // Only 1 dispatches (worker has 1 slot); the other stays queued.
-    let build1 = Uuid::new_v4();
-    let _rx1 = merge_dag(
-        &handle,
-        build1,
-        vec![make_node("prioQ"), make_node("prioR")],
-        vec![],
-        false,
-    )
-    .await?;
-
-    // Build 2: Interactive, 2-node chain A → B. B is a leaf, A blocked.
-    let p_prio_a = test_drv_path("prioA");
-    let p_prio_b = test_drv_path("prioB");
-    let build2 = Uuid::new_v4();
-    let _rx2 = merge_dag_req(
-        &handle,
-        MergeDagRequest {
-            build_id: build2,
-            tenant_id: None,
-            priority_class: PriorityClass::Interactive,
-            nodes: vec![make_node("prioA"), make_node("prioB")],
-            edges: vec![make_test_edge("prioA", "prioB")],
-            options: BuildOptions::default(),
-            keep_going: false,
-            traceparent: String::new(),
-            jti: None,
-            jwt_token: None,
-        },
-    )
-    .await?;
-
-    // Worker connected before the merges, so the first assignment is one
-    // of Q/R (NOT B — Interactive merged after Q/R were already
-    // dispatched/queued). Complete until prioB is dispatched; then A
-    // becomes newly-ready with INTERACTIVE_BOOST, and the NEXT dispatch
-    // should be A (not a leftover Q/R).
-    //
-    // One-shot workers: each completion drains the worker; connect a
-    // fresh one per iteration.
-    let mut seen_paths = Vec::new();
-    let mut wid = "prio-builder".to_string();
-    for i in 0..4 {
-        let Some(msg) = worker_rx.recv().await else {
-            break;
-        };
-        let Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) = msg.msg else {
-            continue;
-        };
-        let path = a.drv_path.clone();
-        seen_paths.push(path.clone());
-        complete_success(&handle, &wid, &path, &test_store_path("out")).await?;
-        // Fresh worker for the next dispatch.
-        wid = format!("prio-builder-{}", i + 1);
-        worker_rx = connect_executor(&handle, &wid, "x86_64-linux").await?;
-        // If we just completed B, the NEXT dispatch should be A (priority boost).
-        if path == p_prio_b {
-            // Regression guard: if INTERACTIVE_BOOST = 0, B is just
-            // another leaf and dispatches FIFO after both Q and R. The
-            // boost must have brought B forward past at least one
-            // Scheduled leaf — otherwise the next-is-A assertion below
-            // is vacuous (Q/R already drained, A is the only Ready).
-            assert!(
-                seen_paths.len() < 3,
-                "prioB must dispatch before both Scheduled leaves drain \
-                 (boost beats FIFO); history: {seen_paths:?}"
-            );
-            let next_a = recv_assignment(&mut worker_rx).await;
-            assert_eq!(
-                next_a.drv_path, p_prio_a,
-                "Interactive newly-ready A should dispatch before queued Scheduled work. \
-                 Dispatch history: {seen_paths:?}"
-            );
-            return Ok(());
-        }
-    }
-    panic!("never dispatched prioB within 4 completions. Dispatch history: {seen_paths:?}");
-}
-
 // -----------------------------------------------------------------------------
 // C1: Leader generation — Arc<AtomicU64>, single-load consistency
 // -----------------------------------------------------------------------------
-
-/// The generation in a WorkAssignment must equal the generation a
-/// heartbeat would return at the same moment. The heartbeat payload is
-/// `advertised_generation()` (gated on recovery completion); this
-/// always-leader fixture has recovery complete, so it equals the raw
-/// `leader_generation()`. All read the same `Arc<AtomicU64>`, and with
-/// no lease task running (no writer) every read sees the init value.
-///
-/// This catches the previous design's hardcoded-1 bug: if
-/// `HeartbeatResponse` and `WorkAssignment` used DIFFERENT generation
-/// sources (one hardcoded, one from actor state), this test fails.
-#[tokio::test]
-async fn test_generation_consistent_between_heartbeat_and_assignment() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
-
-    let _ev = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
-    let assignment = recv_assignment(&mut rx).await;
-
-    // Both sourced from the same Arc<AtomicU64>. No writer → both = 1.
-    assert_eq!(assignment.generation, 1, "init value, no lease task");
-    assert_eq!(handle.leader_generation(), 1);
-    assert_eq!(
-        assignment.generation,
-        handle.leader_generation(),
-        "WorkAssignment and the raw (not recovery-gated) generation read the same atomic"
-    );
-    assert_eq!(
-        assignment.generation,
-        handle.advertised_generation(),
-        "WorkAssignment.generation and the HeartbeatResponse payload (advertised_generation) \
-         must agree when recovery is complete"
-    );
-
-    // The assignment_token embeds the generation too (format string).
-    // Trailing suffix check — the token is "{executor_id}-{drv_hash}-{gen}",
-    // drv_hash is variable-length so we can't split cleanly, but the
-    // suffix is reliable.
-    assert!(
-        assignment.assignment_token.ends_with("-1"),
-        "token embeds generation as suffix: {}",
-        assignment.assignment_token
-    );
-    Ok(())
-}
 
 /// The generation starts at 1, not 0. Proto-default is 0; a worker
 /// receiving `generation=0` should interpret it as "field unset (old
@@ -397,138 +209,17 @@ async fn test_generation_starts_at_one_not_zero() -> TestResult {
 // PrefetchHint before WorkAssignment
 // -----------------------------------------------------------------------------
 
-/// PrefetchHint arrives BEFORE the WorkAssignment on the stream.
-/// Worker starts warming while still parsing the .drv — a few
-/// seconds of head start on multi-minute fetches.
-///
-/// Setup: two-node chain (child → parent). Dispatch the parent;
-/// the hint should contain the child's output path (parent's input).
-/// The child itself is a leaf (no children → no hint → the first
-/// message for it IS the assignment).
-#[tokio::test]
-async fn test_prefetch_hint_before_assignment() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
-
-    // Two-node chain: child (leaf) → parent (depends on child).
-    // merge_dag edges point parent→child (parent's input is child's output).
-    //
-    // make_test_node leaves expected_output_paths EMPTY by default —
-    // most tests don't care about it. approx_input_closure DOES care
-    // (that's what it iterates). Populate explicitly.
-    let child_out = rio_test_support::fixtures::test_store_path("child-out");
-    let mut child = make_node("child");
-    child.expected_output_paths = vec![child_out.clone()];
-    let parent = make_node("parent");
-    let edge = make_test_edge("parent", "child");
-
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![child, parent],
-        vec![edge],
-        false,
-    )
-    .await?;
-
-    // First message: child is a leaf (no DAG children → no inputs
-    // to prefetch → send_prefetch_hint early-returns). So the FIRST
-    // thing we get is the child's Assignment.
-    let first = rx.recv().await.expect("first message");
-    match first.msg {
-        Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => {
-            assert!(
-                a.drv_path.contains("child"),
-                "leaf dispatches first (no deps), no hint precedes it: {a:?}"
-            );
-        }
-        other => panic!("expected Assignment for leaf child, got {other:?}"),
-    }
-
-    // Complete the child so parent becomes ready. w1 drains; connect w2.
-    complete_success_empty(&handle, "w1", "child").await?;
-    let mut rx = connect_executor(&handle, "w2", "x86_64-linux").await?;
-
-    // Parent has one child in the DAG (the completed "child"). Its
-    // approx_input_closure = child's expected_output_paths.
-    //
-    // A fresh worker connecting with a non-empty ready queue gets the
-    // on_worker_registered initial PrefetchHint AND the dispatch-time
-    // hint (became-idle inline dispatch races ahead of PrefetchComplete
-    // and assigns via cold-fallback). Drain ≥1 hint, then the assignment.
-    let mut got_hint = None;
-    let asgn = loop {
-        match rx.recv().await.expect("msg").msg {
-            Some(rio_proto::types::scheduler_message::Msg::Prefetch(h)) => got_hint = Some(h),
-            Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) => break a,
-            other => panic!("expected Prefetch or Assignment, got {other:?}"),
-        }
-    };
-    let hint = got_hint.expect("at least one PrefetchHint before Assignment");
-    assert_eq!(
-        hint.store_paths,
-        vec![child_out],
-        "hint = child's output path (parent's direct input via DAG children)"
-    );
-    assert!(asgn.drv_path.contains("parent"));
-
-    Ok(())
-}
-
-/// Two assignments within the same dispatch pass carry the same
-/// generation. This is the single-load-per-assignment guarantee —
-/// without a lease writer, it's trivially true (nothing changes
-/// between loads), but it exercises the dispatch.rs load-once path.
-///
-/// The REAL torn-read test (concurrent lease fetch_add racing with
-/// dispatch) lives with the lease task. This is the structural
-/// precursor: proves the single load is what gets used throughout
-/// send_assignment.
-#[tokio::test]
-async fn test_generation_single_load_within_assignment() -> TestResult {
-    // P0537: two workers so the same dispatch_ready pass produces two
-    // assignments (was one 4-slot worker).
-    let (_db, handle, _task, mut rx) = setup_with_worker("w1", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
-
-    // Two independent derivations in the same dispatch pass.
-    let _ev1 = merge_single_node(&handle, Uuid::new_v4(), "a", PriorityClass::Scheduled).await?;
-    let _ev2 = merge_single_node(&handle, Uuid::new_v4(), "b", PriorityClass::Scheduled).await?;
-
-    let a1 = recv_assignment(&mut rx).await;
-    let a2 = recv_assignment(&mut rx2).await;
-
-    // Same generation across both, and token suffix agrees with field.
-    // If the load happened twice per assignment (e.g., once for token,
-    // once for the field), a concurrent writer could split them —
-    // token says "-1", field says 2. No writer here, so this asserts
-    // STRUCTURAL consistency (same local used for both), not concurrent
-    // safety (that's the lease task's job).
-    assert_eq!(a1.generation, a2.generation);
-    let expected_suffix = format!("-{}", a1.generation);
-    assert!(
-        a1.assignment_token.ends_with(&expected_suffix),
-        "token suffix matches generation field: {} ends with {}",
-        a1.assignment_token,
-        expected_suffix
-    );
-    assert!(
-        a2.assignment_token.ends_with(&expected_suffix),
-        "same suffix on both assignments (single load per dispatch)"
-    );
-    Ok(())
-}
-
 /// Dispatch pins input-closure paths; terminal unpins.
 /// Verifies the end-to-end pin → unpin lifecycle via scheduler_
 /// live_pins row count.
 // r[verify sched.gc.live-pins]
 #[tokio::test]
 async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("w-x9", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // Two-node chain: child (leaf, no inputs) + parent (depends
     // on child). Parent's approx_input_closure = child's
-    // expected_output_paths. Dispatch of PARENT should pin those.
+    // expected_output_paths. The pull mint of PARENT should pin those.
     //
     // make_test_node defaults expected_output_paths=vec![]; set
     // explicitly so approx_input_closure has something to collect.
@@ -546,8 +237,8 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     )
     .await?;
 
-    // Child dispatches first (leaf → Ready immediately).
-    let assignment_child = recv_assignment(&mut stream_rx).await;
+    // Child is pullable first (leaf → Ready immediately).
+    let assignment_child = pull_attempt(&handle, "x9-child").await;
     assert!(assignment_child.drv_path.contains("x9-child"));
 
     // Child is leaf → approx_input_closure empty → no pin.
@@ -557,22 +248,9 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
             .await?;
     assert_eq!(count, 0, "leaf drv (no inputs) should not pin anything");
 
-    // Complete child → parent becomes Ready → dispatched → pinned.
-    // One-shot: w-x9 drains; connect a fresh worker for parent.
-    complete_success_empty(&handle, "w-x9", "x9-child").await?;
-    let mut stream_rx = connect_executor(&handle, "w-x9-2", "x86_64-linux").await?;
-    // Parent dispatch sends PrefetchHint FIRST (child has expected_
-    // output_paths set above), then Assignment. Drain both.
-    let assignment_parent = loop {
-        let msg = tokio::time::timeout(Duration::from_secs(2), stream_rx.recv())
-            .await
-            .expect("timeout")
-            .expect("channel closed");
-        if let Some(rio_proto::types::scheduler_message::Msg::Assignment(a)) = msg.msg {
-            break a;
-        }
-        // Else: PrefetchHint, skip.
-    };
+    // Complete child → parent becomes Ready → its pull mint pins.
+    pull_complete_success_empty(&handle, "x9-child").await?;
+    let assignment_parent = pull_attempt(&handle, "x9-parent").await;
     assert!(assignment_parent.drv_path.contains("x9-parent"));
     barrier(&handle).await;
 
@@ -582,10 +260,10 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
         sqlx::query_scalar("SELECT COUNT(*) FROM scheduler_live_pins WHERE drv_hash = 'x9-parent'")
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(count, 1, "parent dispatch should pin its 1 input path");
+    assert_eq!(count, 1, "parent pull mint should pin its 1 input path");
 
     // Complete parent → unpin.
-    complete_success_empty(&handle, "w-x9-2", "x9-parent").await?;
+    pull_complete_success_empty(&handle, "x9-parent").await?;
     barrier(&handle).await;
 
     let count: i64 =
@@ -600,10 +278,6 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
 // -----------------------------------------------------------------------------
 // CA recovery-resolve: fetch ATerm from store when drv_content empty
 // -----------------------------------------------------------------------------
-
-// `recv_assignment` (helpers.rs) already skips Prefetch — alias kept so
-// the CA-on-CA test bodies below stay readable at the old name.
-use super::recv_assignment as recv_assignment_skip_prefetch;
 
 /// Build a CA-on-CA fixture: (child_node, parent_node, parent_aterm,
 /// placeholder, child_modular_hash, realized_path).
@@ -657,180 +331,6 @@ fn ca_on_ca_fixture() -> (
     )
 }
 
-// r[verify sched.ca.resolve+3]
-/// Recovered CA-on-CA dispatch: scheduler restart cleared
-/// `drv_content`, but the store has the `.drv` — `maybe_resolve_ca`
-/// fetches it via `GetPath`, NAR-unwraps, and resolves placeholders.
-///
-/// Flow:
-///   1. Seed MockStore with parent's ATerm bytes at its `.drv` path
-///      (as a single-file NAR — same as `nix-store --dump` of a `.drv`).
-///   2. Seed PG `realisations` with child's `(modular_hash, "out")` →
-///      `realized_path`.
-///   3. Merge CA-on-CA DAG (parent depends on child, both CA).
-///   4. Child dispatches. Clear parent's `drv_content` (simulate
-///      recovery).
-///   5. Complete child → parent becomes Ready → `maybe_resolve_ca`
-///      sees empty `drv_content` → fetches from MockStore → unwraps
-///      NAR → `resolve_ca_inputs` rewrites placeholder.
-///   6. Parent's `WorkAssignment.drv_content` contains the realized
-///      path, not the placeholder.
-#[tokio::test]
-async fn recovered_ca_on_ca_dispatch_fetches_from_store() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let (child, parent, parent_aterm, placeholder, child_modular, realized_path) =
-        ca_on_ca_fixture();
-
-    // Seed MockStore: parent's ATerm wrapped in a single-file NAR
-    // at its .drv store path. `seed_with_content` does the NAR wrap.
-    store.seed_with_content(&parent.drv_path, parent_aterm.as_bytes());
-
-    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux").await?;
-
-    // Merge: child + parent, edge parent → child.
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![child, parent],
-        vec![make_test_edge("ca-parent", "ca-child")],
-        false,
-    )
-    .await?;
-
-    // Child dispatches first (leaf → Ready immediately).
-    let a1 = recv_assignment_skip_prefetch(&mut rx).await;
-    assert!(a1.drv_path.contains("ca-child"), "child dispatches first");
-
-    // Seed PG realisations: child's (modular_hash, "out") → realized.
-    // This is what `resolve_ca_inputs` queries to map placeholder →
-    // realized path. Seeded AFTER merge so the child doesn't cache-hit
-    // via check_cached_outputs' CA realisation lookup (GAP-3 fix) —
-    // this test needs the child to actually dispatch and complete.
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(&realized_path)
-    .bind([0u8; 32].as_slice())
-    .execute(&_db.pool)
-    .await?;
-
-    // Clear parent's drv_content BEFORE completing child — actor
-    // processes serially, so the clear lands before the completion
-    // fires dispatch_ready for the parent.
-    let cleared = handle.debug_clear_drv_content("ca-parent").await?;
-    assert!(cleared, "parent should be in DAG");
-
-    // Complete child → parent becomes Ready → dispatch fires →
-    // maybe_resolve_ca sees empty drv_content → fetches from store.
-    complete_success(
-        &handle,
-        "ca-w",
-        "ca-child",
-        &test_store_path("ca-child-out"),
-    )
-    .await?;
-    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux").await?;
-
-    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
-    assert!(a2.drv_path.contains("ca-parent"));
-
-    // The load-bearing assertions: drv_content was fetched + resolved.
-    assert!(
-        !a2.drv_content.is_empty(),
-        "drv_content must be fetched from store, not left empty"
-    );
-    let text = std::str::from_utf8(&a2.drv_content).expect("ATerm is ASCII");
-    assert!(
-        !text.contains(&placeholder),
-        "placeholder {placeholder:?} must be replaced post-fetch-and-resolve"
-    );
-    assert!(
-        text.contains(&realized_path),
-        "realized path {realized_path:?} must be present in resolved ATerm"
-    );
-
-    Ok(())
-}
-
-/// Fail-safe preserved: store unreachable → dispatch still proceeds
-/// with empty `drv_content`. Same degrade as before the fetch
-/// existed — worker fails on placeholder, self-heals via retry after
-/// a fresh `SubmitBuild` re-merges with inline `drv_content`.
-///
-/// Also covers `store_client = None` via the early `?` in
-/// `fetch_drv_content_from_store` — this test uses the explicit
-/// `fail_get_path` knob instead (closer to a real store outage).
-#[tokio::test]
-async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let (child, parent, _parent_aterm, _placeholder, child_modular, _realized_path) =
-        ca_on_ca_fixture();
-
-    let mut rx = connect_executor(&handle, "ca-w", "x86_64-linux").await?;
-
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![child, parent],
-        vec![make_test_edge("ca-parent", "ca-child")],
-        false,
-    )
-    .await?;
-
-    let a1 = recv_assignment_skip_prefetch(&mut rx).await;
-    assert!(a1.drv_path.contains("ca-child"));
-
-    // Seed the realisation AFTER merge (so the ONLY failure is the
-    // store fetch, not a missing-realisation — we're testing the
-    // fetch fallback specifically). Seeded post-merge so the child
-    // doesn't cache-hit via check_cached_outputs' CA realisation
-    // lookup (GAP-3 fix) — this test needs child to dispatch.
-    sqlx::query(
-        "INSERT INTO realisations (drv_hash, output_name, output_path, output_hash)
-         VALUES ($1, 'out', $2, $3)",
-    )
-    .bind(child_modular.as_slice())
-    .bind(test_store_path("irrelevant"))
-    .bind([0u8; 32].as_slice())
-    .execute(&_db.pool)
-    .await?;
-
-    // Clear parent's drv_content AND make GetPath fail. Order matters:
-    // actor serializes, so both land before the completion's dispatch.
-    let cleared = handle.debug_clear_drv_content("ca-parent").await?;
-    assert!(cleared);
-    store
-        .faults
-        .fail_get_path
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-
-    complete_success(
-        &handle,
-        "ca-w",
-        "ca-child",
-        &test_store_path("ca-child-out"),
-    )
-    .await?;
-    let mut rx = connect_executor(&handle, "ca-w-2", "x86_64-linux").await?;
-
-    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
-    assert!(a2.drv_path.contains("ca-parent"));
-
-    // Fail-safe: store fetch failed → drv_content stays empty →
-    // worker will fetch + fail on placeholder + retry. Same degrade
-    // as before the store-fetch shortcut existed.
-    assert!(
-        a2.drv_content.is_empty(),
-        "store fetch failed → drv_content must stay empty (degrade preserved)"
-    );
-
-    Ok(())
-}
-
 // -----------------------------------------------------------------------------
 // maybe_resolve_ca gate-path passthrough coverage
 // -----------------------------------------------------------------------------
@@ -842,7 +342,7 @@ async fn recovered_ca_on_ca_dispatch_degrades_on_store_failure() -> TestResult {
 /// every IA-with-IA-inputs dispatch takes it.
 #[tokio::test]
 async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("ia-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let original_content = b"dummy-ia-aterm-content".to_vec();
     let mut node = make_node("ia-drv");
@@ -851,313 +351,11 @@ async fn maybe_resolve_ca_ia_derivation_passthrough() -> TestResult {
     node.drv_content = original_content.clone();
 
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-    let asgn = recv_assignment(&mut rx).await;
+    let asgn = pull_attempt(&handle, "ia-drv").await;
 
     assert_eq!(
         asgn.drv_content, original_content,
         "IA derivation → maybe_resolve_ca passthrough; drv_content unchanged"
-    );
-    Ok(())
-}
-
-// r[verify sched.ca.resolve+3]
-/// FOD passthrough: `is_ca = true` BUT `needs_resolve = false` (FOD
-/// output path is eval-time known; gateway doesn't set needs_resolve
-/// unless an inputDrv is floating-CA). ADR-018 `shouldResolve` table:
-/// FOD → only if ca-derivations feature enabled (optional optimization;
-/// rio doesn't fire it unless inputs are actually CA).
-#[tokio::test]
-async fn maybe_resolve_ca_fixed_output_passthrough() -> TestResult {
-    // FOD routing (ADR-019): FODs only dispatch to fetchers. The
-    // default Builder-kind worker from setup_with_worker would never
-    // receive the assignment (hard_filter rejects FOD→builder).
-    let (_db, handle, _task) = setup().await;
-    let mut rx = connect_executor_no_ack_kind(
-        &handle,
-        "fod-w",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: "fod-w".into(),
-            paths_fetched: 0,
-        })
-        .await?;
-
-    let original_content = b"dummy-fod-aterm-content".to_vec();
-    let mut node = make_node("fod-drv");
-    node.is_content_addressed = true;
-    node.is_fixed_output = true;
-    node.needs_resolve = false; // gateway: FOD with no CA inputs → no resolve
-    node.drv_content = original_content.clone();
-
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-    let asgn = recv_assignment(&mut rx).await;
-
-    assert_eq!(
-        asgn.drv_content, original_content,
-        "FOD (is_ca && is_fixed_output) → passthrough; output path known at eval"
-    );
-    Ok(())
-}
-
-// r[verify sched.ca.resolve+3]
-/// No-CA-inputs passthrough: floating-CA derivation whose children
-/// are all IA → `collect_ca_inputs` returns `[]` → gate at
-/// dispatch.rs:694 fails → passthrough. The common case: a CA
-/// `mkDerivation` on IA stdenv. No resolve needed — no placeholder
-/// in the ATerm because all input paths were known at eval time.
-#[tokio::test]
-async fn maybe_resolve_ca_no_ca_inputs_passthrough() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("noca-w", "x86_64-linux").await?;
-
-    let original_content = b"floating-ca-with-ia-deps".to_vec();
-    let mut parent = make_node("noca-parent");
-    parent.is_content_addressed = true;
-    parent.is_fixed_output = false;
-    parent.needs_resolve = true; // floating-CA self — gate passes
-    parent.drv_content = original_content.clone();
-
-    // IA child — collect_ca_inputs skips it (is_ca=false).
-    let child = make_node("noca-child");
-
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![parent, child],
-        vec![make_test_edge("noca-parent", "noca-child")],
-        false,
-    )
-    .await?;
-
-    // Child dispatches first (leaf).
-    let a1 = recv_assignment(&mut rx).await;
-    assert!(a1.drv_path.contains("noca-child"));
-    complete_success_empty(&handle, "noca-w", &test_drv_path("noca-child")).await?;
-    let mut rx = connect_executor(&handle, "noca-w-2", "x86_64-linux").await?;
-
-    // Parent dispatches. collect_ca_inputs(parent) = [] (child is IA)
-    // → ca_inputs.is_empty() gate → passthrough.
-    let a2 = recv_assignment_skip_prefetch(&mut rx).await;
-    assert!(a2.drv_path.contains("noca-parent"));
-    assert_eq!(
-        a2.drv_content, original_content,
-        "floating-CA with only IA children → collect_ca_inputs=[] → \
-         passthrough (no resolve, drv_content unchanged)"
-    );
-    Ok(())
-}
-
-/// I-163 Fix 1 + became-idle carve-out: steady-state Heartbeats set
-/// `dispatch_dirty` (drained by `Tick`); a Heartbeat that flips
-/// capacity 0→1 dispatches inline. At 290 workers × 169ms/dispatch
-/// the unconditional inline path was ~5× actor capacity — the 0→1
-/// edge is bounded by spawn rate, not heartbeat rate.
-///
-/// Shape: merge with no worker (Ready, deferred) → connect_no_ack
-/// (registration heartbeat = 0→1 → inline dispatch, cold-fallback
-/// places the node) → assert Assignment lands WITHOUT a Tick. Then a
-/// SECOND heartbeat for the now-busy worker is steady-state (0→0) →
-/// only dirty, no inline dispatch.
-// r[verify sched.actor.dispatch-decoupled]
-// r[verify sched.dispatch.became-idle-immediate]
-#[tokio::test]
-async fn heartbeat_sets_dirty_tick_dispatches() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Merge first: dispatch_ready runs at end-of-merge with zero
-    // workers → deferred. ready_queue holds the node.
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), "i163-hb", PriorityClass::Scheduled).await?;
-
-    // Connected + Heartbeat. Registration heartbeat is a 0→1 capacity
-    // edge → became_idle=true → inline dispatch_ready. Cold-fallback
-    // places the node on the freshly-registered worker (warm-gate
-    // sent a PrefetchHint but cold-fallback ignores warm).
-    let mut rx = connect_executor_no_ack(&handle, "i163-w", "x86_64-linux").await?;
-    let a = recv_assignment(&mut rx).await;
-    assert!(
-        a.drv_path.contains("i163-hb"),
-        "registration heartbeat (0→1) must dispatch inline — \
-         r[sched.dispatch.became-idle-immediate]"
-    );
-
-    // Second heartbeat: worker is now busy (running_build=Some) →
-    // capacity 0→0 → became_idle=false → only dispatch_dirty set.
-    // Structural assertion: a steady-state heartbeat must NOT call
-    // `dispatch_ready` inline. The previous "no Assignment on rx"
-    // check was vacuous — there's no idle capacity AND no queued
-    // work, so it passes even if the heartbeat handler dispatches
-    // inline. Counting `dispatch_ready` calls fails under the I-163
-    // mutation (revert decoupling → heartbeat calls inline).
-    let before = handle.debug_counters().await?;
-    send_heartbeat_with(&handle, "i163-w", "x86_64-linux", |hb| {
-        hb.running_build = Some(a.drv_path.clone());
-    })
-    .await?;
-    barrier(&handle).await;
-    let after_hb = handle.debug_counters().await?;
-    assert_eq!(
-        after_hb.dispatch_ready_calls, before.dispatch_ready_calls,
-        "steady-state heartbeat (0→0, busy) must NOT call dispatch_ready inline — \
-         r[sched.actor.dispatch-decoupled]"
-    );
-    // …and Tick drains the dirty flag (exactly one dispatch_ready).
-    tick(&handle).await?;
-    let after_tick = handle.debug_counters().await?;
-    assert_eq!(
-        after_tick.dispatch_ready_calls,
-        before.dispatch_ready_calls + 1,
-        "Tick must drain dispatch_dirty exactly once"
-    );
-    // Belt: still no spurious Assignment on the stream.
-    while let Ok(m) = rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "steady-state heartbeat (0→0, busy) must not dispatch inline"
-        );
-    }
-    Ok(())
-}
-
-/// I-163 Fix 2: deferred FODs are checked by the batch pre-pass (one
-/// `FindMissingPaths`), and the drain loop SKIPS the per-FOD
-/// `fod_outputs_in_store` for hashes the batch already covered. The
-/// doc-comment on `fod_outputs_in_store` claimed this; the code
-/// didn't honor it (211 deferred FODs × ~0.7ms RTT ≈ 150ms of the
-/// 169ms/Heartbeat I-163 cost).
-///
-/// Shape: merge 5 Ready FODs with no fetcher (all defer); count
-/// `FindMissingPaths` across one dispatch_ready. Want exactly 1 (the
-/// batch). Pre-fix would be 1 + 5 = 6.
-#[tokio::test]
-async fn batch_checked_fods_skip_per_fod_rpc() -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    // Builder, not fetcher: FODs route to fetchers (ADR-019), so all
-    // 5 defer in the drain loop — that's the I-163 hot path.
-    let _rx = connect_executor(&handle, "i163-builder", "x86_64-linux").await?;
-
-    let nodes: Vec<_> = (0..5)
-        .map(|i| {
-            let mut n = make_node(&format!("i163-fod-{i}"));
-            n.is_fixed_output = true;
-            // batch pre-pass filters on !expected_output_paths.is_empty()
-            n.expected_output_paths = vec![test_store_path(&format!("i163-fod-{i}-out"))];
-            n
-        })
-        .collect();
-    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
-
-    // Merge ran check_cached_outputs (1 RPC) + dispatch_ready (1 batch
-    // RPC). Reset the baseline; the assertion is on the NEXT
-    // dispatch_ready in isolation.
-    barrier(&handle).await;
-    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
-
-    // Drive one dispatch_ready: Heartbeat (dirty) + Tick (drain).
-    // send_heartbeat already chains the Tick.
-    send_heartbeat(&handle, "i163-builder", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    let calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
-    assert_eq!(
-        calls, 1,
-        "one dispatch_ready over 5 deferred FODs must issue exactly the batch \
-         FindMissingPaths (got {calls}); >1 means the per-FOD fallback fired \
-         for batch-checked hashes"
-    );
-    Ok(())
-}
-
-/// I-163 Fix 2, fail-open edge: when the batch RPC fails, the per-drv
-/// fallback in the drain loop STILL fires for nodes the batch didn't
-/// stamp (cascade-promoted). Nodes the batch DID stamp this gen are
-/// `probed_generation`-gated in the per-drv path too, so a batch
-/// failure for them defers retry to the next Tick (1/s) instead of
-/// firing N sequential per-drv FMPs in the same pass.
-#[tokio::test]
-async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let _rx = connect_executor(&handle, "i163-fo-b", "x86_64-linux").await?;
-
-    // fod1: leaf, Ready at merge → always in the batch snapshot.
-    let mut fod1 = make_node("i163-fo-fod");
-    fod1.is_fixed_output = true;
-    fod1.expected_output_paths = vec![test_store_path("i163-fo-fod-out")];
-    // fod2 depends on dep. dep's output is seeded AFTER merge so the
-    // dispatch-time batch (not merge-time check_cached_outputs)
-    // completes dep → cascade-promotes fod2 to Ready DURING the
-    // dispatch pass, AFTER the batch's candidate snapshot — fod2 is
-    // unstamped this gen → the per-drv `ready_check_or_spawn`
-    // fallback fires for it.
-    let dep_out = test_store_path("i163-fo-dep-out");
-    let mut dep = make_node("i163-fo-dep");
-    // FOD so it routes to fetcher (none connected → defers) instead
-    // of dispatching to i163-fo-b during merge's inline dispatch_ready.
-    dep.is_fixed_output = true;
-    dep.expected_output_paths = vec![dep_out.clone()];
-    let mut fod2 = make_node("i163-fo-fod2");
-    fod2.is_fixed_output = true;
-    fod2.expected_output_paths = vec![test_store_path("i163-fo-fod2-out")];
-    let _ev = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![fod1, fod2, dep],
-        vec![make_test_edge("i163-fo-fod2", "i163-fo-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    // ── per-drv fallback path (test name half 2): seed dep present
-    // NOW (post-merge), then drive one dispatch_ready. Batch sees
-    // [fod1, dep] (both Ready); completes dep → fod2 promoted →
-    // drain loop hits the `!batch_checked.contains(fod2)` branch →
-    // `ready_check_or_spawn(fod2)` issues 1 per-drv FMP. Total = 2.
-    // Mutation guard: delete the `ready_check_or_spawn` clause and
-    // fod2 is never store-checked → ==1.
-    store
-        .state
-        .paths
-        .write()
-        .unwrap()
-        .insert(dep_out, Default::default());
-    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
-    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
-    barrier(&handle).await;
-    let calls = store.calls.find_missing_calls.load(Ordering::SeqCst);
-    assert_eq!(
-        calls, 2,
-        "cascade-promoted fod2 must hit the per-drv ready_check_or_spawn \
-         fallback (1 batch + 1 per-drv); got {calls}"
-    );
-    assert_eq!(
-        expect_drv(&handle, "i163-fo-dep").await.status,
-        DerivationStatus::Completed
-    );
-
-    // ── fail-open gating path (test name half 1): arm the failure;
-    // next gen's batch stamps fod1+fod2 (1 FMP, fails). batch_checked
-    // returns empty BUT both have probed_generation == gen → per-drv
-    // path's `probed_generation >= probe_gen` gate suppresses re-fire.
-    // Exactly 1 proves a batch failure doesn't degrade to N
-    // sequential per-drv FMPs in the same pass.
-    store.faults.fail_find_missing.store(true, Ordering::SeqCst);
-    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
-    send_heartbeat(&handle, "i163-fo-b", "x86_64-linux").await?;
-    barrier(&handle).await;
-    assert_eq!(
-        store.calls.find_missing_calls.load(Ordering::SeqCst),
-        1,
-        "batch-stamped nodes must not re-fire per-drv FMP within a generation"
     );
     Ok(())
 }
@@ -1178,10 +376,6 @@ async fn batch_fod_fail_open_preserves_per_fod_fallback() -> TestResult {
 #[tokio::test]
 async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    // x86_64 builder; node is aarch64 → defers regardless of FOD-ness
-    // (no system match), so merge-time dispatch can't assign it.
-    let _rx = connect_executor(&handle, "sub-b", "x86_64-linux").await?;
-
     let out = test_store_path("dispatch-sub-out");
     let mut n = make_node("dispatch-sub-drv");
     n.is_fixed_output = is_fod;
@@ -1192,12 +386,11 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
     let mut ev_rx = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
     barrier(&handle).await;
     // Merge-time saw nothing (substitutable not yet seeded) → node
-    // Ready/deferred, stamped probed_generation=1. Seed; the next
-    // send_heartbeat is NOT became_idle (worker already idle) → sets
-    // dispatch_dirty → chained Tick advances probe_generation → batch
-    // re-probes → spawns substitute fetch.
+    // stays Ready, stamped probed_generation=1. Seed; the next Tick
+    // advances probe_generation and re-runs the ready-set sweep → the
+    // batch probe sees it → spawns the substitute fetch.
     store.state.substitutable.write().unwrap().push(out.clone());
-    send_heartbeat(&handle, "sub-b", "x86_64-linux").await?;
+    tick(&handle).await?;
     settle_substituting(&handle, &[&make_node("dispatch-sub-drv").drv_hash]).await;
     tick(&handle).await?;
 
@@ -1251,7 +444,6 @@ async fn dispatch_time_substitutable_completes(#[case] is_fod: bool) -> TestResu
 #[tokio::test]
 async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let _rx = connect_executor(&handle, "bpw-b", "x86_64-linux").await?;
 
     let out = test_store_path("bpw-out");
     let dbg = test_store_path("bpw-debug");
@@ -1271,9 +463,9 @@ async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
 
     // P_out appears in the store AFTER merge (another build uploaded
     // it). P_debug stays missing and unsubstitutable. The next
-    // heartbeat-driven dispatch pass batch-probes the Ready node.
+    // The next Tick's ready-set sweep batch-probes the Ready node.
     store.seed_with_content(&out, b"out");
-    send_heartbeat(&handle, "bpw-b", "x86_64-linux").await?;
+    tick(&handle).await?;
     barrier(&handle).await;
 
     assert_eq!(
@@ -1284,180 +476,6 @@ async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
     );
     let status = query_status(&handle, build_id).await?;
     assert_eq!(status.state, rio_proto::types::BuildState::Succeeded as i32);
-    Ok(())
-}
-
-// r[verify sched.merge.wanted-outputs+2]
-/// `ready_check_or_spawn` × wanted outputs: same scenario as
-/// [`batch_probe_completes_on_missing_unwanted_output`] but through the
-/// per-drv fallback path. The multi-output node is a PARENT promoted to
-/// Ready mid-pass by its dep completing via the batch probe — it is not
-/// in the batch's candidate snapshot, so the drain loop's
-/// `!batch_checked.contains()` branch sends it through
-/// `ready_check_or_spawn`. The FMP-call count proves the per-drv path
-/// (not the batch) made the decision.
-#[tokio::test]
-async fn ready_check_completes_on_missing_unwanted_output() -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let _rx = connect_executor(&handle, "rcw-b", "x86_64-linux").await?;
-
-    let dep_out = test_store_path("rcw-dep-out");
-    let app_out = test_store_path("rcw-app-out");
-    let app_dbg = test_store_path("rcw-app-debug");
-    // Both aarch64 so neither can dispatch to the x86_64 worker — the
-    // only way out of Ready is the store probe.
-    let mut dep = make_node("rcw-dep");
-    dep.system = "aarch64-linux".into();
-    dep.expected_output_paths = vec![dep_out.clone()];
-    let mut app = make_node("rcw-app");
-    app.system = "aarch64-linux".into();
-    app.output_names = vec!["out".into(), "debug".into()];
-    app.expected_output_paths = vec![app_out.clone(), app_dbg.clone()];
-    app.wanted_output_names = vec!["out".into()];
-    let build_id = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        build_id,
-        vec![app, dep],
-        vec![make_test_edge("rcw-app", "rcw-dep")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-
-    // Seed dep's output and app's WANTED output post-merge. app's
-    // unwanted P_debug stays missing+unsubstitutable.
-    store.seed_with_content(&dep_out, b"dep");
-    store.seed_with_content(&app_out, b"out");
-    store.calls.find_missing_calls.store(0, Ordering::SeqCst);
-    send_heartbeat(&handle, "rcw-b", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    // Batch (1 FMP) completes dep → app promoted to Ready mid-pass →
-    // per-drv probe (1 FMP) → all wanted present → completed.
-    assert_eq!(
-        store.calls.find_missing_calls.load(Ordering::SeqCst),
-        2,
-        "1 batch FMP (dep) + 1 per-drv FMP (cascade-promoted app) — \
-         proves ready_check_or_spawn made app's decision, not the batch"
-    );
-    assert_eq!(
-        expect_drv(&handle, "rcw-app").await.status,
-        DerivationStatus::Completed,
-        "all WANTED outputs present → completed by the per-drv probe; \
-         the missing unwanted P_debug must not force a dispatch"
-    );
-    let status = query_status(&handle, build_id).await?;
-    assert_eq!(status.state, rio_proto::types::BuildState::Succeeded as i32);
-    Ok(())
-}
-
-// r[verify sched.merge.wanted-outputs+2]
-/// `batch_probe_cached_ready` × the LIVE effective wanted set: same
-/// liveness gate as the merge-time test, evaluated by the dispatch-time
-/// batch probe. Build A (wants ALL outputs via the empty sentinel)
-/// saturated the stored union before going terminal; build B (live)
-/// wants only `out`. P_out appears in the store after B's merge; P_debug
-/// stays missing and unsubstitutable. The probe must complete the node
-/// inline when A is terminal (only B's wants count) and leave it Ready
-/// when A is live.
-#[rstest::rstest]
-#[case::interested_build_terminal(true, DerivationStatus::Completed)]
-#[case::interested_build_live(false, DerivationStatus::Ready)]
-#[tokio::test]
-async fn batch_probe_classifies_against_live_builds_effective_wanted(
-    #[case] a_terminal: bool,
-    #[case] expect_status: DerivationStatus,
-) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let out = test_store_path("lpw-out");
-    let dbg = test_store_path("lpw-debug");
-    // aarch64 so the x86_64 worker connected below can never take it —
-    // the node leaves Ready only via the batch probe's verdict.
-    let mk = |wanted: &[&str]| {
-        let mut d = make_node("lpw-drv");
-        d.system = "aarch64-linux".into();
-        d.output_names = vec!["out".into(), "debug".into()];
-        d.expected_output_paths = vec![out.clone(), dbg.clone()];
-        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
-        d
-    };
-
-    // Build A wants ALL declared outputs (empty sentinel).
-    let build_a = Uuid::new_v4();
-    if a_terminal {
-        // Dispatch A's node on a matching (aarch64) worker and fail it
-        // permanently: keep_going=true routes the build through
-        // check_build_completion → Failed without the cancel sweep, so
-        // A's interest and terminal BuildInfo stay behind.
-        let mut w1 = connect_executor(&handle, "lpw-w1", "aarch64-linux").await?;
-        let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
-        let assn = recv_assignment(&mut w1).await;
-        complete_failure(
-            &handle,
-            "lpw-w1",
-            &assn.drv_path,
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
-        assert_eq!(
-            query_status(&handle, build_a).await?.state,
-            rio_proto::types::BuildState::Failed as i32,
-            "precondition: A is terminal, interest retained"
-        );
-        // The aarch64 worker leaves so the re-merged node stays Ready.
-        disconnect(&handle, "lpw-w1").await?;
-    } else {
-        let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
-    }
-
-    // x86_64 worker: triggers dispatch passes but can never take the node.
-    let _rx = connect_executor(&handle, "lpw-b", "x86_64-linux").await?;
-
-    // Build B wants only {out}. Nothing is in the store yet, so B's merge
-    // classifies nothing — the decision under test happens at dispatch
-    // time.
-    let build_b = Uuid::new_v4();
-    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, "lpw-drv").await.status,
-        DerivationStatus::Ready,
-        "precondition: nothing in store at merge time → Ready"
-    );
-
-    // P_out appears in the store AFTER the merges (another tenant
-    // uploaded it); P_debug stays missing and unsubstitutable. The next
-    // heartbeat-driven dispatch pass batch-probes the Ready node.
-    store.seed_with_content(&out, b"out");
-    send_heartbeat(&handle, "lpw-b", "x86_64-linux").await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        expect_drv(&handle, "lpw-drv").await.status,
-        expect_status,
-        "a_terminal={a_terminal}: the dispatch-time verdict must follow \
-         the live builds' effective wanted set, not the stored union"
-    );
-    let status_b = query_status(&handle, build_b).await?;
-    if a_terminal {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Succeeded as i32,
-            "all of B's wanted outputs present → completed inline"
-        );
-    } else {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Active as i32,
-            "A (live) still wants the missing P_debug → left Ready"
-        );
-    }
     Ok(())
 }
 
@@ -1481,21 +499,22 @@ async fn cluster_snapshot_cached_reflects_tick() -> TestResult {
     barrier(&handle).await;
 
     // No Tick yet → watch holds the Default snapshot (all zeros).
-    // connect_executor's PrefetchComplete dispatched the node, but
-    // the cached snapshot doesn't see that until Tick publishes.
+    // The connected executor and the merged node exist in actor state,
+    // but the cached snapshot doesn't see them until Tick publishes.
     let pre = handle.cluster_snapshot_cached();
     assert_eq!(
         pre.total_executors, 0,
         "cached snapshot is Tick-published, not live; pre-Tick must be Default"
     );
 
+    // Open the node's pull attempt so the post-Tick snapshot has a
+    // running derivation to reflect.
+    let _assignment = pull_attempt(&handle, "i163-snap").await;
     tick(&handle).await?;
 
     let post = handle.cluster_snapshot_cached();
     assert_eq!(post.total_executors, 1);
     assert_eq!(post.active_executors, 1);
-    // Node was assigned by PrefetchComplete's inline dispatch (still
-    // runs inline — only Heartbeat moved to dirty-flag).
     assert_eq!(post.running_derivations, 1);
     Ok(())
 }
@@ -1528,14 +547,15 @@ async fn cgroup_oom_doubles_mem_floor(
         c.sla = test_sla_config();
     });
 
-    let mut rx = connect_executor_kind(&handle, "w-1", "x86_64-linux", kind).await?;
+    // Delivery is pull; the executor kind no longer routes anything.
+    let _ = kind;
 
     let mut node = make_node(tag);
     node.is_fixed_output = is_fod;
     let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
     barrier(&handle).await;
-    let first_asgn = recv_assignment(&mut rx).await;
+    let first_asgn = pull_attempt(&handle, tag).await;
     assert!(first_asgn.drv_path.contains(tag));
 
     // Seed est_memory_bytes so the doubling has a base.
@@ -1544,9 +564,8 @@ async fn cgroup_oom_doubles_mem_floor(
         .await?;
 
     // Worker-reported CgroupOom → floor.mem doubled.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "w-1",
         tag,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
@@ -1563,81 +582,6 @@ async fn cgroup_oom_doubles_mem_floor(
         4 << 30,
         "CgroupOom → mem floor doubled (2GiB→4GiB)"
     );
-    Ok(())
-}
-
-// r[verify sched.dispatch.unroutable-system+2]
-/// Ready drv whose `system` is advertised by zero registered executors:
-/// stays Ready (deferred), WARN fires once (edge-triggered, not per
-/// tick). Connecting a matching executor dispatches it.
-#[tokio::test]
-#[tracing_test::traced_test]
-async fn test_unroutable_system_warn_then_dispatch() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Only an x86_64 builder registered.
-    let _w = connect_executor(&handle, "x86-b1", "x86_64-linux").await?;
-
-    // riscv drv has no advertising pool.
-    let riscv = make_test_node("rv-unroutable", "riscv64-linux");
-    let rv_hash = riscv.drv_hash.clone();
-    // Hold the event receiver so the orphan-watcher doesn't auto-cancel.
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![riscv], vec![], false).await?;
-    tick(&handle).await?;
-
-    let d = expect_drv(&handle, &rv_hash).await;
-    assert_eq!(
-        d.status,
-        DerivationStatus::Ready,
-        "unroutable drv defers (not poisoned/failed)"
-    );
-    assert!(
-        logs_contain("no registered executor advertises this system")
-            && logs_contain("riscv64-linux"),
-        "WARN fires when system first becomes unroutable"
-    );
-
-    // Edge-triggered: a second tick must NOT re-WARN.
-    tick(&handle).await?;
-    logs_assert(|lines| {
-        let n = lines
-            .iter()
-            .filter(|l| l.contains("no registered executor advertises this system"))
-            .count();
-        if n == 1 {
-            Ok(())
-        } else {
-            Err(format!("WARN must fire once across both ticks; got {n}"))
-        }
-    });
-
-    // Connect a riscv builder → next tick dispatches. That same tick
-    // sees riscv as routable, so `unroutable_warned.retain()` drops it.
-    let mut rv_rx = connect_executor(&handle, "rv-b1", "riscv64-linux").await?;
-    tick(&handle).await?;
-    let assn = recv_assignment(&mut rv_rx).await;
-    assert!(assn.drv_path.contains("rv-unroutable"));
-
-    // Re-arm: riscv becomes unroutable again (only executor gone) → a
-    // fresh riscv drv must trip a SECOND WARN.
-    disconnect(&handle, "rv-b1").await?;
-    let riscv2 = make_test_node("rv-unroutable-2", "riscv64-linux");
-    let _ev2 = merge_dag(&handle, Uuid::new_v4(), vec![riscv2], vec![], false).await?;
-    tick(&handle).await?;
-    logs_assert(|lines| {
-        let n = lines
-            .iter()
-            .filter(|l| l.contains("no registered executor advertises this system"))
-            .count();
-        if n == 2 {
-            Ok(())
-        } else {
-            Err(format!(
-                "WARN must re-arm after routable→unroutable; got {n}"
-            ))
-        }
-    });
-
     Ok(())
 }
 
@@ -2498,32 +1442,24 @@ async fn work_assignment_carries_sla_cores() {
     });
 
     actor.test_inject_ready("fitted", Some("test-pkg"), "x86_64-linux", false);
-    let expected_cores = {
+    let intent = {
         let state = actor.dag.node("fitted").unwrap();
-        solve_intent(&actor, state).cores
+        solve_intent(&actor, state)
     };
-    actor.push_ready("fitted".to_string().into());
+    let expected_cores = intent.cores;
 
-    let mut rx = bare_connect_builder(&mut actor, "w-sla");
-    actor.dispatch_ready().await;
-
-    let assignment = recv_assignment(&mut rx).await;
+    // The pull mint is the intent writer now: stamp the solve onto the
+    // node exactly as `mint_and_deliver` does, then build the payload it
+    // would deliver.
+    actor.dag.node_mut("fitted").unwrap().sched.last_intent = Some(intent);
+    let assignment = actor
+        .build_assignment_proto(&"fitted".into(), &"fitted".into(), 1)
+        .await
+        .expect("payload for an injected Ready node");
     assert_eq!(
         assignment.assigned_cores,
         Some(expected_cores),
         "SLA mode: WorkAssignment.assigned_cores == solve_intent_for().cores"
-    );
-    assert_eq!(
-        actor
-            .dag
-            .node("fitted")
-            .unwrap()
-            .sched
-            .last_intent
-            .as_ref()
-            .map(|i| i.cores),
-        Some(expected_cores),
-        "last_intent.cores persisted on state for build_assignment_proto"
     );
 }
 
@@ -2636,277 +1572,12 @@ fn bare_connect_builder(
         kind: rio_proto::types::ExecutorKind::Builder,
         intent_id: None,
     });
-    actor.handle_prefetch_complete(&id.into(), 0);
     rx
-}
-
-/// A worker heartbeating `intent_id == drv_hash` gets THAT drv even when
-/// it isn't FIFO-first. Proves the `find_executor` intent match preempts
-/// pick-from-queue. On miss (stale intent), the worker falls through to
-/// FIFO.
-// r[verify sched.sla.intent-match]
-#[tokio::test]
-async fn heartbeat_intent_id_prefers_precomputed_drv() -> TestResult {
-    let (_db, handle, _task) = setup().await;
-
-    // Two Ready drvs: "a" merged first (FIFO head), "b" second.
-    let _rx = merge_dag(
-        &handle,
-        Uuid::new_v4(),
-        vec![make_node("a"), make_node("b")],
-        vec![],
-        false,
-    )
-    .await?;
-
-    // Worker spawned for "b" (intent_id = drv_hash). Without the
-    // intent-match it would get "a" (FIFO).
-    let mut rx = connect_executor_with_intent(&handle, "w-b", "b").await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    let asg = recv_assignment(&mut rx).await;
-    assert_eq!(
-        asg.drv_path,
-        test_drv_path("b"),
-        "intent_id=b → worker gets b, not FIFO-head a"
-    );
-
-    // Stale-intent fallback: worker for "gone" (no such drv) → FIFO
-    // pick-from-queue → gets "a".
-    let mut rx2 = connect_executor_with_intent(&handle, "w-stale", "gone").await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    let asg2 = recv_assignment(&mut rx2).await;
-    assert_eq!(
-        asg2.drv_path,
-        test_drv_path("a"),
-        "no intent match → falls through to pick-from-queue"
-    );
-    Ok(())
-}
-
-/// Connect a builder with `intent_id` set. Local helper for the
-/// ADR-023 intent-match tests above.
-async fn connect_executor_with_intent(
-    handle: &ActorHandle,
-    executor_id: &str,
-    intent_id: &str,
-) -> anyhow::Result<mpsc::Receiver<rio_proto::types::SchedulerMessage>> {
-    let (tx, rx) = mpsc::channel(16);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: executor_id.into(),
-            stream_tx: tx,
-            stream_epoch: next_stream_epoch_for(executor_id),
-            auth_intent: None,
-            reply: noop_connect_reply(),
-        })
-        .await?;
-    send_heartbeat_with(handle, executor_id, "x86_64-linux", |hb| {
-        hb.intent_id = Some(intent_id.into());
-    })
-    .await?;
-    handle
-        .send_unchecked(ActorCommand::PrefetchComplete {
-            executor_id: executor_id.into(),
-            paths_fetched: 0,
-        })
-        .await?;
-    Ok(rx)
 }
 
 // ---------------------------------------------------------------------------
 // I-065 fleet-exhaustion: system/feature awareness
 // ---------------------------------------------------------------------------
-
-// r[verify sched.dispatch.fleet-exhaust+4]
-/// The dispatch-time fleet-exhaust backstop (`dispatch_fleet_exhausted`,
-/// `placeable()` over the fold-derived exclusion) under one-shot (I-188)
-/// semantics: failed workers are draining and excluded from the fleet
-/// count, so the drv DEFERS (Ready) for the controller to spawn fresh
-/// workers, rather than poisoning. When a fresh statically-eligible
-/// worker connects, the drv dispatches to it.
-///
-/// The original I-065 multi-arch silent-hang scenario (an x86 drv
-/// that failed on every x86 worker, with aarch64 padding keeping a
-/// kind-only fleet "non-exhausted") cannot occur under one-shot:
-/// fresh same-arch workers replace the failed ones, so
-/// `failed_builders` never contains a non-draining live worker. This
-/// test verifies that the function reaches the same defer-don't-
-/// poison verdict and that re-dispatch to a fresh worker succeeds.
-///
-/// bug_108 / `case::system` over-determination: previously the
-/// just-failed draining workers counted toward "the fleet", so 2/2
-/// failures on x86+kvm builders poisoned immediately (bypassing
-/// `poison_config.threshold=3`). Now they're excluded → empty
-/// non-draining fleet → `false` → Ready.
-#[tokio::test]
-async fn test_fleet_exhaustion_defers_under_one_shot() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.poison = crate::PoisonConfig {
-            threshold: 3,
-            require_distinct_workers: true,
-        };
-        c.retry_policy.max_retries = 10;
-        // No backoff: the post-connect tick must dispatch immediately.
-        c.retry_policy.backoff_base_secs = 0.0;
-    });
-    let _db = db;
-
-    // 2 statically-eligible x86+kvm builders. The drv will fail on both.
-    let _b1 = connect_executor_with(&handle, "b1", "x86_64-linux", true, |hb| {
-        hb.supported_features = vec!["kvm".into()];
-    })
-    .await?;
-    let _b2 = connect_executor_with(&handle, "b2", "x86_64-linux", true, |hb| {
-        hb.supported_features = vec!["kvm".into()];
-    })
-    .await?;
-
-    // x86 drv requiring kvm.
-    let mut node = make_node("fe-drv");
-    node.required_features = vec!["kvm".into()];
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
-
-    // Fail on both eligible workers (one-shot → both now draining).
-    fail_on_workers(
-        &handle,
-        "fe-drv",
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        &["b1", "b2"],
-    )
-    .await?;
-    tick(&handle).await?;
-
-    let info = expect_drv(&handle, "fe-drv").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Ready,
-        "all eligible workers failed BUT draining → fleet (non-draining) \
-         empty → defer, NOT poison (pre-fix: poisoned here on 2/2, \
-         bypassing threshold=3)"
-    );
-    assert_eq!(info.retry.failed_builders.len(), 2);
-
-    // Fresh worker (controller-spawned replacement) connects → drv
-    // dispatches to it. b3 ∉ failed_builders so hard_filter accepts.
-    let mut b3 = connect_executor_with(&handle, "b3", "x86_64-linux", true, |hb| {
-        hb.supported_features = vec!["kvm".into()];
-    })
-    .await?;
-    tick(&handle).await?;
-    let asn = recv_assignment(&mut b3).await;
-    assert_eq!(asn.drv_path, test_drv_path("fe-drv"));
-    let info = expect_drv(&handle, "fe-drv").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Assigned,
-        "fresh worker ∉ failed_builders → dispatched"
-    );
-    Ok(())
-}
-
-// r[verify sched.dispatch.fleet-exhaust+4]
-/// Negative: a statically-eligible worker NOT in `failed_builders` keeps
-/// the fleet non-exhausted (defer, don't poison). Guards against the
-/// fix over-filtering.
-#[tokio::test]
-async fn test_fleet_exhaustion_spare_eligible_defers() -> TestResult {
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.poison.threshold = 3;
-        c.retry_policy.max_retries = 10;
-    });
-    let _db = db;
-
-    let _b1 = connect_executor(&handle, "b1", "x86_64-linux").await?;
-    let _b2 = connect_executor(&handle, "b2", "x86_64-linux").await?;
-    // b3 is statically eligible AND not in failed_builders → fleet not
-    // exhausted; drv should defer (or dispatch to b3), NOT poison.
-    let _b3 = connect_executor(&handle, "b3", "x86_64-linux").await?;
-
-    let _ev = merge_single_node(
-        &handle,
-        Uuid::new_v4(),
-        "fe-spare",
-        PriorityClass::Scheduled,
-    )
-    .await?;
-    fail_on_workers(
-        &handle,
-        "fe-spare",
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        &["b1", "b2"],
-    )
-    .await?;
-    tick(&handle).await?;
-
-    let info = expect_drv(&handle, "fe-spare").await;
-    assert_ne!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "b3 statically-eligible and untried → fleet NOT exhausted"
-    );
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// queue_depth / unroutable_ready gauge exactness under active dispatch
-// ---------------------------------------------------------------------------
-
-// r[verify obs.metric.scheduler]
-/// `queue_depth` / `unroutable_ready` gauges report the FINAL-iteration
-/// deferral count, not the sum across outer-loop iterations. Regression
-/// for the per-iteration accumulator never being cleared: with 1 idle
-/// worker + N ready, iter1 dispatches 1 + defers N-1 → iter2 re-defers
-/// N-1 → exit. Gauge must read N-1, not 2×(N-1).
-#[rstest::rstest]
-#[case::queue_depth(
-    &["x86_64-linux"; 5],
-    "rio_scheduler_queue_depth{kind=EXECUTOR_KIND_BUILDER}",
-    4.0
-)]
-#[case::unroutable(
-    // 1 x86 (dispatches → dispatched_any=true → 2nd iteration) + 3 riscv
-    // (no advertiser → unroutable). Pre-fix gauge read 6.0.
-    &["x86_64-linux", "riscv64-linux", "riscv64-linux", "riscv64-linux"],
-    "rio_scheduler_unroutable_ready{system=riscv64-linux}",
-    3.0
-)]
-#[tokio::test]
-async fn test_queue_depth_gauge_exact_under_active_dispatch(
-    #[case] systems: &[&str],
-    #[case] gauge_key: &str,
-    #[case] expected: f64,
-) -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let (_db, handle, _task) = setup().await;
-
-    let mut rx = connect_executor(&handle, "qd-w1", "x86_64-linux").await?;
-    let nodes: Vec<_> = systems
-        .iter()
-        .enumerate()
-        .map(|(i, sys)| make_test_node(&format!("qd-{i}"), sys))
-        .collect();
-    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
-    let _asgn = recv_assignment(&mut rx).await; // exactly 1 dispatched
-
-    let got = recorder.gauge_value(gauge_key).unwrap_or_else(|| {
-        panic!(
-            "gauge {gauge_key} not set; gauges={:?}",
-            recorder.gauge_names()
-        )
-    });
-    assert_eq!(
-        got,
-        expected,
-        "{gauge_key}: 1 worker, {} ready → 1 dispatched + {expected} deferred; \
-         pre-fix this read {} (double-counted across outer-loop iterations)",
-        systems.len(),
-        2.0 * expected
-    );
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // Detached-substitute completion: leader gate, one-shot suppress, progress
@@ -3006,137 +1677,6 @@ async fn substitute_complete_on_standby_is_noop() -> TestResult {
         expect_drv(&handle, "sub-standby").await.status,
         DerivationStatus::Substituting,
         "leader gate dropped BOTH messages; node stays Substituting"
-    );
-    Ok(())
-}
-
-// r[verify sched.substitute.detached+5]
-/// `SubstituteComplete{ok=false}` sets `substitute_tried` so the next
-/// dispatch pass falls through to a worker instead of re-spawning the
-/// fetch every Tick (~1/s livelock when FMP HEAD says substitutable
-/// but QPI GET says no).
-#[tokio::test]
-async fn substitute_ok_false_suppresses_respawn() -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    // Fetcher so the FOD has somewhere to dispatch on fall-through.
-    let mut frx = connect_executor_kind(
-        &handle,
-        "sub-fall-f",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-
-    let out = test_store_path("sub-fall-out");
-    store.state.substitutable.write().unwrap().push(out.clone());
-    // Permanent (non-transient) QPI failure → detached task posts
-    // ok=false on the first attempt.
-    store
-        .faults
-        .fail_query_path_info_permanent
-        .store(true, Ordering::SeqCst);
-
-    let mut n = make_node("sub-fall");
-    n.is_fixed_output = true;
-    n.expected_output_paths = vec![out];
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
-    // Spawn → Substituting → task fails → ok=false → Ready.
-    settle_substituting(&handle, &["sub-fall"]).await;
-
-    let info = expect_drv(&handle, "sub-fall").await;
-    assert!(
-        info.substitute_tried,
-        "ok=false must set substitute_tried (one-shot fall-through)"
-    );
-    let qpi_before = store.calls.qpi_calls.read().unwrap().len();
-
-    // Next dispatch pass: partition's `!substitute_tried` guard skips
-    // the spawn lane → drv stays Ready → drains to find_executor →
-    // dispatched to the fetcher. Pre-fix: re-spawned every tick,
-    // qpi_calls grows, never Assigned.
-    tick(&handle).await?;
-    let a = recv_assignment(&mut frx).await;
-    assert!(a.drv_path.contains("sub-fall"));
-    assert_eq!(
-        store.calls.qpi_calls.read().unwrap().len(),
-        qpi_before,
-        "no re-spawn after ok=false (substitute_tried suppression)"
-    );
-    Ok(())
-}
-
-// r[verify sched.substitute.detached+5]
-/// `walk_substitute_closure` may ingest the seed (output) then fail on
-/// a ref → `ok=false` → `substitute_tried=true`. The seed is now in
-/// PG. Next-tick FMP probes OUTPUT paths only, sees present, and
-/// pre-fix marked Completed — leaving a hole in the runtime closure
-/// (dependent ENOENT at exec time). The `locally_present` branch must
-/// gate on `!substitute_tried`: a present-but-tried output falls
-/// through to dispatch so the build re-derives the full closure.
-#[tokio::test]
-async fn partial_closure_walk_seed_in_pg_does_not_mark_completed() -> TestResult {
-    use std::sync::atomic::Ordering;
-
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut frx = connect_executor_kind(
-        &handle,
-        "pcw-f",
-        "x86_64-linux",
-        rio_proto::types::ExecutorKind::Fetcher,
-    )
-    .await?;
-
-    let out = test_store_path("pcw-out");
-    store.state.substitutable.write().unwrap().push(out.clone());
-    // Detached walk: QPI fails permanently → ok=false on attempt 1.
-    // The "seed in PG" half of the scenario is modeled explicitly
-    // below (insert into `paths` after revert) so the test doesn't
-    // depend on MockStore's QPI side-effect ordering.
-    store
-        .faults
-        .fail_query_path_info_permanent
-        .store(true, Ordering::SeqCst);
-
-    let mut n = make_node("pcw");
-    n.is_fixed_output = true;
-    n.expected_output_paths = vec![out.clone()];
-    let _ev = merge_dag(&handle, Uuid::new_v4(), vec![n], vec![], false).await?;
-    settle_substituting(&handle, &["pcw"]).await;
-
-    let info = expect_drv(&handle, "pcw").await;
-    assert!(info.substitute_tried, "ok=false sets substitute_tried");
-    assert_eq!(info.status, DerivationStatus::Ready);
-
-    // Model "seed ingested, ref-walk failed": output now present in
-    // PG (FMP returns it as not-missing); refs are not.
-    store
-        .faults
-        .fail_query_path_info_permanent
-        .store(false, Ordering::SeqCst);
-    store
-        .state
-        .paths
-        .write()
-        .unwrap()
-        .insert(out.clone(), Default::default());
-
-    // Next pass: FMP says output present. Pre-fix: locally_present →
-    // Completed (closure hole). Post-fix: substitute_tried gates the
-    // locally_present branch → falls through to find_executor.
-    tick(&handle).await?;
-    let info = expect_drv(&handle, "pcw").await;
-    assert_ne!(
-        info.status,
-        DerivationStatus::Completed,
-        "substitute_tried + output-present must NOT short-circuit to \
-         Completed (closure walk failed; refs may be absent)"
-    );
-    let a = recv_assignment(&mut frx).await;
-    assert!(
-        a.drv_path.contains("pcw"),
-        "substitute_tried + output-present falls through to worker dispatch"
     );
     Ok(())
 }
@@ -3281,10 +1821,6 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
     // Builder for an unrelated arch: heartbeat sets dispatch_dirty so
-    // Tick drains, but it can't take any of the x86_64 nodes (so no
-    // record_assignment → no singular persist_status(Assigned) noise).
-    let _rx = connect_executor(&handle, "bp-hb", "aarch64-linux").await?;
-
     // 50 leaves, all outputs seeded present → all hit the
     // locally-present branch on the first dispatch_ready.
     let mut nodes = Vec::with_capacity(50);
@@ -3310,7 +1846,7 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
         .store(false, Ordering::SeqCst);
 
     let before = handle.debug_counters().await?.persist_status_calls;
-    send_heartbeat(&handle, "bp-hb", "aarch64-linux").await?;
+    tick(&handle).await?;
     barrier(&handle).await;
     let after = handle.debug_counters().await?.persist_status_calls;
 
@@ -3333,47 +1869,6 @@ async fn batch_probe_locally_present_batches_pg() -> TestResult {
 // ---------------------------------------------------------------------------
 // rollback_assignment is a complete inverse of record_assignment
 // ---------------------------------------------------------------------------
-
-/// `rollback_assignment` must persist `Ready` to PG — `record_
-/// assignment` wrote `status=Assigned`+`assigned_executor`; without
-/// the inverse, a scheduler crash in the deferred window reloads
-/// `Assigned` and `reset_orphan_to_ready` charges a spurious
-/// retry/poison for an assignment that never reached the worker.
-#[tokio::test]
-async fn rollback_assignment_persists_ready_to_pg() -> TestResult {
-    let (db, handle, _task) = setup().await;
-
-    // Connect a worker but immediately drop its rx so the channel
-    // closes — `try_send_assignment` fails → `rollback_assignment`.
-    let rx = connect_executor(&handle, "rb-w", "x86_64-linux").await?;
-    drop(rx);
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), "rb-drv", PriorityClass::Scheduled).await?;
-    barrier(&handle).await;
-
-    let info = expect_drv(&handle, "rb-drv").await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Ready,
-        "in-mem reset_to_ready ran"
-    );
-    let row: (String, Option<String>) = sqlx::query_as(
-        "SELECT status::text, assigned_builder_id FROM derivations WHERE drv_hash = $1",
-    )
-    .bind("rb-drv")
-    .fetch_one(&db.pool)
-    .await?;
-    assert_eq!(
-        row.0, "ready",
-        "rollback_assignment must persist Ready to PG (was: {})",
-        row.0
-    );
-    assert_eq!(
-        row.1, None,
-        "rollback_assignment must clear assigned_builder_id in PG"
-    );
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // I-139/I-140: batch-probe truncated tail must NOT hit per-drv FMP fallback
@@ -3409,82 +1904,24 @@ async fn batch_probe_tail_never_per_drv_fmp() -> TestResult {
     store.faults.fail_find_missing.store(true, Ordering::SeqCst);
     let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
     let after_merge = store.calls.find_missing_calls.load(Ordering::SeqCst);
-    // dispatch_ready runs inside merge (post-6e); count what THAT did.
+    // The ready-set sweep runs inline inside merge; count what THAT did.
     tick(&handle).await?;
     let total = store.calls.find_missing_calls.load(Ordering::SeqCst);
-    // 1 batch per dispatch_ready pass (merge_dag's inline + our explicit
-    // tick). Neither pass may trigger per-drv tail calls. Allow up to
-    // BECAME_IDLE_INLINE_CAP+2 batch passes; the bug case is +12 EXTRA
-    // (one per tail node).
-    let dispatch_calls = total - after_merge;
+    // 1 batch FMP per sweep (merge's inline sweep + our explicit tick).
+    // Neither may trigger per-drv tail calls — the per-drv fallback no
+    // longer exists; the bug case was +12 EXTRA (one per tail node).
+    let sweep_calls = total - after_merge;
     assert!(
-        dispatch_calls <= 2,
-        "tick → ≤2 dispatch_ready passes → ≤2 batch FMPs; \
-         got {dispatch_calls} (pre-fix: 1 batch + 12 per-drv tail = 13)"
+        sweep_calls <= 2,
+        "tick → ≤2 ready-set sweeps → ≤2 batch FMPs; \
+         got {sweep_calls} (pre-fix: 1 batch + 12 per-drv tail = 13)"
     );
     assert!(
-        total <= crate::actor::BECAME_IDLE_INLINE_CAP + 4,
+        total <= 8,
         "total FMPs across merge+tick bounded by batch passes, NOT by \
-         tail size; got {total} (CAP+12 nodes; pre-fix tail=12 leaked \
-         to per-drv path each pass)"
+         tail size; got {total} (12 truncated nodes; pre-fix the tail \
+         leaked to per-drv calls each pass)"
     );
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// `unroutable_ready{system}` label cardinality bound
-// ---------------------------------------------------------------------------
-
-// r[verify sched.dispatch.unroutable-system+2]
-/// Tenant-supplied `system` strings outside `[a-z0-9_-]{1,32}` must
-/// bucket to `unknown` so a tenant can't mint unbounded Prometheus
-/// series. Real-but-unrouted systems stay visible by name. Pre-fix:
-/// each garbage value created its own permanent gauge series.
-#[tokio::test]
-async fn unroutable_system_label_bounded() -> TestResult {
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let (_db, handle, _task) = setup().await;
-    let _w = connect_executor(&handle, "ub-w", "x86_64-linux").await?;
-
-    // 5 garbage systems (uppercase, dot, too-long, braces, space) + 1
-    // real-but-unrouted (aarch64-linux: matches the shape, no executor
-    // advertises it).
-    let garbage = [
-        "Fake-System",
-        "x86.64-linux",
-        "this-system-string-is-definitely-longer-than-thirty-two-chars",
-        "x{uuid}",
-        "has space",
-    ];
-    let mut nodes: Vec<_> = garbage
-        .iter()
-        .enumerate()
-        .map(|(i, sys)| make_test_node(&format!("ub-g{i}"), sys))
-        .collect();
-    nodes.push(make_test_node("ub-real", "aarch64-linux"));
-    let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], false).await?;
-    tick(&handle).await?;
-
-    assert_eq!(
-        recorder.gauge_value("rio_scheduler_unroutable_ready{system=unknown}"),
-        Some(5.0),
-        "garbage systems collapse to one `unknown` series; gauges={:?}",
-        recorder.gauge_names()
-    );
-    assert_eq!(
-        recorder.gauge_value("rio_scheduler_unroutable_ready{system=aarch64-linux}"),
-        Some(1.0),
-        "plausible-but-unrouted system stays visible by name"
-    );
-    for sys in garbage {
-        assert!(
-            recorder
-                .gauge_value(&format!("rio_scheduler_unroutable_ready{{system={sys}}}"))
-                .is_none(),
-            "garbage system {sys:?} must NOT get its own series (pre-fix: did)"
-        );
-    }
     Ok(())
 }
 
@@ -4332,113 +2769,6 @@ async fn substitute_walk_forgives_unwanted_seed_end_to_end() -> TestResult {
 
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+5]
-/// The substitute walk's forgivable-seed set × the LIVE effective wanted
-/// set: a declared output path is forgivable only when NO LIVE build
-/// wants it. Build A wants ALL outputs (the empty sentinel) and saturates
-/// the stored union; build B wants only `out`. P_out is substitutable;
-/// P_debug's fetch always fails (injected non-retryable Internal).
-///
-/// - A TERMINAL (still interested, pre-cleanup): only B counts → P_debug
-///   is forgivable → its failure is forgiven → the walk completes the
-///   node and B succeeds.
-/// - A LIVE: P_debug is still effectively wanted → not forgivable → its
-///   failure fails the walk → the node demotes to Ready for a
-///   from-source dispatch.
-#[rstest::rstest]
-#[case::interested_build_terminal(true, "x86_64-linux", DerivationStatus::Completed)]
-#[case::interested_build_live(false, "aarch64-linux", DerivationStatus::Ready)]
-#[tokio::test]
-async fn substitute_forgivable_set_follows_live_builds_effective_wanted(
-    #[case] a_terminal: bool,
-    #[case] system: &str,
-    #[case] expect_status: DerivationStatus,
-) -> TestResult {
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-    let mut w1 = connect_executor(&handle, "lfw-w1", "x86_64-linux").await?;
-
-    let out = test_store_path("lfw-out");
-    let dbg = test_store_path("lfw-debug");
-    let mk = |wanted: &[&str]| {
-        let mut d = make_node("lfw-drv");
-        d.system = system.into();
-        d.output_names = vec!["out".into(), "debug".into()];
-        d.expected_output_paths = vec![out.clone(), dbg.clone()];
-        d.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
-        d
-    };
-
-    // Build A wants ALL declared outputs; the store has nothing armed
-    // yet, so A's own merge classifies nothing (no hit, nothing
-    // substitutable) and the node seeds Ready.
-    let build_a = Uuid::new_v4();
-    let _ev_a = merge_dag(&handle, build_a, vec![mk(&[])], vec![], true).await?;
-
-    if a_terminal {
-        // Same terminal-but-still-interested staging as the merge-time
-        // test: dispatched (x86_64 in this case), permanent failure,
-        // keep_going=true → Failed via check_build_completion.
-        let assn = recv_assignment(&mut w1).await;
-        complete_failure(
-            &handle,
-            "lfw-w1",
-            &assn.drv_path,
-            rio_proto::types::BuildResultStatus::PermanentFailure,
-            "permanent",
-        )
-        .await?;
-        barrier(&handle).await;
-        assert_eq!(
-            query_status(&handle, build_a).await?.state,
-            rio_proto::types::BuildState::Failed as i32,
-            "precondition: A is terminal, interest retained"
-        );
-    }
-
-    // Now arm the store: P_out substitutable (probe + GET agree),
-    // P_debug indeterminate at probe time (optimistically routed to the
-    // walk) but its GET always fails with a non-retryable Internal.
-    store.state.substitutable.write().unwrap().push(out.clone());
-    store.state.indeterminate.write().unwrap().push(dbg.clone());
-    store
-        .faults
-        .fail_qpi_internal_paths
-        .write()
-        .unwrap()
-        .insert(dbg.clone());
-
-    // Build B re-merges the node wanting only {out} → classified
-    // pending-substitute → the detached walk runs with the forgivable
-    // set under test.
-    let build_b = Uuid::new_v4();
-    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
-    settle_substituting(&handle, &["lfw-drv"]).await;
-
-    assert_eq!(
-        expect_drv(&handle, "lfw-drv").await.status,
-        expect_status,
-        "a_terminal={a_terminal}: P_debug's fetch failure is forgiven iff \
-         no LIVE build wants it"
-    );
-    let status_b = query_status(&handle, build_b).await?;
-    if a_terminal {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Succeeded as i32,
-            "B's wanted output substituted; the unwanted P_debug failure \
-             is forgiven"
-        );
-    } else {
-        assert_eq!(
-            status_b.state,
-            rio_proto::types::BuildState::Active as i32,
-            "A (live) wants P_debug → its failure must fail the walk"
-        );
-    }
-    Ok(())
-}
-
-// r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+5]
 /// An UNRESOLVABLE wanted set (non-empty but matching no declared
 /// output name — a `drv^bogus` root the gateway didn't validate) must
 /// not invert the forgiveness gate. The wanted subset resolves to
@@ -4621,9 +2951,6 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
         n
     };
 
-    // x86_64 worker: provides the heartbeat-driven dispatch passes.
-    let _rx = connect_executor(&handle, "nfg-b", "x86_64-linux").await?;
-
     // Build B wants only {out} → pending-substitute → walk 1 spawned
     // with forgivable = {P_debug}, parked at the QPI gate.
     let build_b = Uuid::new_v4();
@@ -4677,7 +3004,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
     // walk. P_debug already triggered a downgrade, so it must NOT be
     // forgivable — its (genuine) failure must fail the walk and demote
     // the node, NOT complete it without the output.
-    send_heartbeat(&handle, "nfg-b", "x86_64-linux").await?;
+    tick(&handle).await?;
     settle_substituting(&handle, &["nfg-drv"]).await;
 
     assert_eq!(
@@ -4750,10 +3077,6 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
             .debug_set_output_paths("fnw-td", vec![out.clone(), dbg.clone()])
             .await?
     );
-
-    // A builder is available — the doomed from-source dispatch has
-    // somewhere to go if the downgrade leaves R plain-Ready.
-    let _erx = connect_executor(&handle, "fnw-td-w", "x86_64-linux").await?;
 
     // Build B merges mid-fetch and wants {debug}: the union grows to
     // {debug, out} while the (staged) walk still holds the spawn-time
@@ -5116,157 +3439,6 @@ async fn substitute_downgrade_with_poisoned_dep_reattempts_delta_before_failing_
 
 // r[verify sched.merge.wanted-outputs+2]
 // r[verify sched.substitute.detached+5]
-/// Spent forgiveness is scoped to the substitution chain that spent it,
-/// not to the node's DAG lifetime. A downgrade-bearing chain that ends
-/// in a from-source build must NOT leave its trigger path vetoed for a
-/// LATER, unrelated substitution chain of the same node: once the
-/// outputs are GC'd and a stale-Completed reset spawns a fresh walk,
-/// no live build wants the path any more, so the new walk must forgive
-/// its absence and complete the node by substitution — not burn the
-/// failure and demote to a from-source dispatch even though every
-/// output a live build wants was just substituted.
-///
-/// Staging: build B wants {out}; walk 1 forgives P_debug; build C
-/// (wanting {debug}) merges mid-fetch → the completion is downgraded
-/// and P_debug's forgiveness is spent (chain 1). The next pass re-walks
-/// with the corrected forgivable set; P_debug is genuinely absent → the
-/// walk fails → the node demotes and is built from source (chain 1 is
-/// over). The outputs are then GC'd, B/C are terminal, and build D
-/// (wanting only {out}) merges: the stale-Completed verify resets the
-/// node and spawns a NEW chain. P_out is substitutable; P_debug is
-/// absent and unwanted — the new walk must forgive it.
-#[tokio::test]
-async fn substitute_spent_forgiveness_is_chain_scoped_not_node_scoped() -> TestResult {
-    use std::sync::atomic::Ordering;
-    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
-
-    let out = test_store_path("nfg-cs-out");
-    let dbg = test_store_path("nfg-cs-debug");
-    // P_out: substitutable (probe + GET agree). P_debug: indeterminate
-    // at probe time (so re-walks keep being spawned optimistically);
-    // its GET always fails with a non-retryable Internal — genuinely
-    // absent upstream for the whole test.
-    store.state.substitutable.write().unwrap().push(out.clone());
-    store.state.indeterminate.write().unwrap().push(dbg.clone());
-    store
-        .faults
-        .fail_qpi_internal_paths
-        .write()
-        .unwrap()
-        .insert(dbg.clone());
-    store
-        .faults
-        .query_path_info_gate_armed
-        .store(true, Ordering::SeqCst);
-
-    let mk = |wanted: &[&str]| {
-        let mut n = make_node("nfg-cs-drv");
-        n.output_names = vec!["out".into(), "debug".into()];
-        n.expected_output_paths = vec![out.clone(), dbg.clone()];
-        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
-        n
-    };
-
-    // One x86_64 worker: drives dispatch passes and (later) takes the
-    // from-source build that ends chain 1.
-    let mut wrx = connect_executor(&handle, "nfg-cs-w", "x86_64-linux").await?;
-
-    // Chain 1, walk 1: build B wants only {out} → forgivable={P_debug},
-    // parked at the QPI gate. (Keep the event receivers alive — the
-    // orphan-watcher cancels unwatched Active builds in tests.)
-    let build_b = Uuid::new_v4();
-    let _ev_b = merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
-    wait_for_status(&handle, "nfg-cs-drv", DerivationStatus::Substituting).await;
-
-    // Build C merges mid-fetch and wants {debug}.
-    let build_c = Uuid::new_v4();
-    let _ev_c = merge_dag(&handle, build_c, vec![mk(&["debug"])], vec![], false).await?;
-    barrier(&handle).await;
-
-    // Release walk 1: P_out substitutes, P_debug fails and is forgiven
-    // against the spawn-time forgivable set → ok=true forgiven=[P_debug]
-    // → the handler downgrades (C wants it now) and spends P_debug's
-    // forgiveness for this chain.
-    store
-        .faults
-        .query_path_info_gate_armed
-        .store(false, Ordering::SeqCst);
-    store.faults.query_path_info_gate.notify_waiters();
-    settle_substituting(&handle, &["nfg-cs-drv"]).await;
-    assert_eq!(
-        expect_drv(&handle, "nfg-cs-drv").await.status,
-        DerivationStatus::Ready,
-        "precondition: the downgraded completion reverts to Ready for \
-         re-substitution of the delta"
-    );
-
-    // Chain 1, walk 2: the next pass re-walks with the corrected
-    // forgivable set; P_debug (now wanted by C, and unforgivable) is
-    // genuinely absent → the walk fails → demote for a from-source
-    // dispatch. Chain 1's substitution attempts end here.
-    send_heartbeat(&handle, "nfg-cs-w", "x86_64-linux").await?;
-    settle_substituting(&handle, &["nfg-cs-drv"]).await;
-    assert!(
-        expect_drv(&handle, "nfg-cs-drv").await.substitute_tried,
-        "precondition: the corrected re-walk must have run and failed \
-         (one-shot from-source fall-through set)"
-    );
-
-    // Chain 1 ends from source: the node dispatches to the worker,
-    // which builds and reports both outputs; B and C complete.
-    send_heartbeat(&handle, "nfg-cs-w", "x86_64-linux").await?;
-    let assignment = recv_assignment(&mut wrx).await;
-    assert!(
-        assignment.drv_path.ends_with("nfg-cs-drv.drv"),
-        "from-source dispatch should target the staged drv, got {}",
-        assignment.drv_path
-    );
-    complete_ca(
-        &handle,
-        "nfg-cs-w",
-        "nfg-cs-drv",
-        &[
-            ("out", out.as_str(), vec![0u8; 32]),
-            ("debug", dbg.as_str(), vec![0u8; 32]),
-        ],
-    )
-    .await?;
-    assert_eq!(
-        expect_drv(&handle, "nfg-cs-drv").await.status,
-        DerivationStatus::Completed,
-        "precondition: the node completed from source"
-    );
-
-    // Later: the outputs are GC'd from the store (P_out stays
-    // substitutable upstream) and a NEW build D — wanting only {out} —
-    // merges the same drv. The stale-Completed verify resets the node
-    // and spawns a fresh substitution chain. No live build wants
-    // P_debug (B and C are terminal), so the new walk must forgive its
-    // absence: P_out is re-substituted and the node completes.
-    store.state.paths.write().unwrap().remove(&out);
-    let build_d = Uuid::new_v4();
-    let _ev_d = merge_dag(&handle, build_d, vec![mk(&["out"])], vec![], false).await?;
-    settle_substituting(&handle, &["nfg-cs-drv"]).await;
-
-    assert_eq!(
-        expect_drv(&handle, "nfg-cs-drv").await.status,
-        DerivationStatus::Completed,
-        "a path whose forgiveness was spent in an EARLIER, finished \
-         substitution chain must be forgivable again in a later chain: \
-         nothing live wants P_debug, P_out was substituted, so the node \
-         must complete by substitution — not demote to a from-source \
-         dispatch"
-    );
-    assert_eq!(
-        query_status(&handle, build_d).await?.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "build D's wanted output was substituted; it must complete"
-    );
-    Ok(())
-}
-
-// r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.substitute.detached+5]
 /// Same chain-scoping property as the test above, but chain 1 ends
 /// through the OTHER non-substitution completion path: after the
 /// downgrade, the build that wanted the trigger path is cancelled, so
@@ -5306,9 +3478,6 @@ async fn substitute_inline_store_completion_clears_spent_forgiveness() -> TestRe
         n
     };
 
-    // x86_64 worker: heartbeat-driven dispatch passes only.
-    let _wrx = connect_executor(&handle, "nfg-ic-w", "x86_64-linux").await?;
-
     // Chain 1: B wants {out} → walk 1 (forgivable={P_debug}) parks at
     // the gate; C (wanting {debug}) merges mid-fetch; release → the
     // completion is downgraded and P_debug's forgiveness is spent.
@@ -5345,7 +3514,7 @@ async fn substitute_inline_store_completion_clears_spent_forgiveness() -> TestRe
         })
         .await?;
     assert!(cancel_rx.await??, "cancel C");
-    send_heartbeat(&handle, "nfg-ic-w", "x86_64-linux").await?;
+    tick(&handle).await?;
     assert_eq!(
         expect_drv(&handle, "nfg-ic-drv").await.status,
         DerivationStatus::Completed,
@@ -5864,82 +4033,6 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
             .contains(&"hi-ebs-x86:spot".to_string()),
         "masked cell flows to snapshot via cell_label: got {:?}",
         snap.ice_masked_cells
-    );
-    Ok(())
-}
-
-/// E9 (Phase 1a + T-1b.7): the dispatch-time fleet-exhaust poison —
-/// now `placeable()` over the fold-derived exclusion — appends one
-/// `fleet_exhaust` marker row (a verdict marker with no execution of
-/// its own) after the trigger's earlier failure rows, and increments
-/// `rio_scheduler_poison_fleet_exhausted_total` at the dispatch-time
-/// arm that acts on the verdict (the emission moved there from the
-/// deleted RAM-reading predicate; no other test pins it).
-#[tokio::test]
-async fn attempt_ledger_e9_fleet_exhaust_marker_row() -> TestResult {
-    // current-thread runtime: the actor task shares this OS thread at
-    // .await points, so the thread-local recorder sees its counter!()
-    // calls (same mechanism as the cancel-signals metric test).
-    let recorder = CountingRecorder::default();
-    let _guard = metrics::set_default_local_recorder(&recorder);
-    let metric_key = "rio_scheduler_poison_fleet_exhausted_total{}";
-
-    let db = TestDb::new(&MIGRATOR).await;
-    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, |c, _| {
-        c.retry_policy.backoff_base_secs = 0.0;
-    });
-    let w_rx = connect_executor(&handle, "ale9-w", "x86_64-linux").await?;
-    let drv_hash = "ale9-drv";
-    let _ev =
-        merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-
-    // One transient failure: ale9-w joins failed_builders and (one-shot
-    // semantics) starts draining, so the requeue finds no candidate yet.
-    complete_failure(
-        &handle,
-        "ale9-w",
-        &test_drv_path(drv_hash),
-        rio_proto::types::BuildResultStatus::TransientFailure,
-        "boom",
-    )
-    .await?;
-    barrier(&handle).await;
-    let before = recorder.get(metric_key);
-
-    // The same executor identity reconnects fresh (not draining): every
-    // statically-eligible worker has now already failed this drv, so
-    // the next dispatch pass takes the fleet-exhaust backstop. Drop the
-    // old stream first — the reconnect hijack guard rejects a new
-    // stream while the prior one is still open.
-    drop(w_rx);
-    let _w2 = connect_executor(&handle, "ale9-w", "x86_64-linux").await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    barrier(&handle).await;
-
-    assert_eq!(
-        expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Poisoned,
-        "the fold-derived exclusion covers the whole eligible fleet → dispatch-time poison"
-    );
-    let classes = ledger_classes(&db.pool, drv_hash).await;
-    assert_eq!(
-        classes,
-        vec!["transient", "fleet_exhaust"],
-        "one marker row for the dispatch-time verdict, after the trigger's row"
-    );
-    let rows = ledger_rows(&db.pool, drv_hash).await;
-    let marker = rows.last().expect("marker row");
-    assert!(
-        marker.exec_id.is_none() && marker.executor_id.is_none(),
-        "the verdict marker is not an execution"
-    );
-    assert_eq!(
-        recorder.get(metric_key) - before,
-        1,
-        "the dispatch-time fleet-exhaust poison increments \
-         rio_scheduler_poison_fleet_exhausted_total exactly once; \
-         registered counters: {:#?}",
-        recorder.all_keys(),
     );
     Ok(())
 }

@@ -1386,7 +1386,8 @@ impl DerivationState {
             wanted_by_build: HashMap::new(),
             db_id: Some(row.derivation_id),
             // Instant fields: conservative defaults.
-            // ready_at: Some(now) if Ready → dispatch_wait_seconds
+            // ready_at: Some(now) if Ready (informational; the
+            // dispatch-wait histogram retired with the placement layer)
             // metric skews (looks like instant dispatch) but
             // doesn't break anything.
             ready_at: (status == DerivationStatus::Ready).then_some(now),

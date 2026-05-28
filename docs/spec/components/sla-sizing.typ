@@ -1186,12 +1186,12 @@ and operational invariants).
   preserving CLI behavior.
 ]
 
-#r("sched.sla.intent-match")[
-  `intent_id` is the derivation's `drv_hash`. A worker heartbeating
-  `intent_id == drv_hash` is preferred for that derivation over FIFO
-  pick-from-queue; on miss (drv re-planned, scheduler restart) dispatch
-  falls through to the regular overflow walk.
-]
+*Retired (1c' deletion commit B — the placement layer):* the intent-match
+override (`intent_id == drv_hash` reserved a stream worker for the
+derivation it was spawned for) was the stream dispatcher's way of keeping a
+purpose-sized pod for its purpose. Under pull-mode delivery the binding is
+structural: the pod's HMAC-attested intent IS the only derivation it can
+pull, so no scheduler-side override exists to apply.
 
 = Glossary
 

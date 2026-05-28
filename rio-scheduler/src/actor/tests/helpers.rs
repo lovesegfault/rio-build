@@ -411,14 +411,10 @@ pub(crate) async fn connect_executor_with(
         })
         .await?;
     send_heartbeat_with(handle, executor_id, system, f).await?;
-    if ack {
-        handle
-            .send_unchecked(ActorCommand::PrefetchComplete {
-                executor_id: executor_id.into(),
-                paths_fetched: 0,
-            })
-            .await?;
-    }
+    // The warm-gate PrefetchComplete ACK retired with the placement
+    // layer; `ack` is kept so call sites stay stable until commit C
+    // removes the stream test plumbing entirely.
+    let _ = ack;
     Ok(stream_rx)
 }
 
@@ -1205,13 +1201,10 @@ impl RecoveryFixture {
 /// PermanentFailure completion. Three recovery tests share this exact
 /// 10-line sequence.
 pub(crate) async fn seed_poisoned(handle: &ActorHandle, drv_hash: &str) -> anyhow::Result<()> {
-    let mut rx = connect_executor(handle, "seed-poison-w", "x86_64-linux").await?;
     let _ev = merge_single_node(handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    let _ = rx.recv().await.expect("assignment");
-    complete_failure(
+    pull_complete_failure(
         handle,
-        "seed-poison-w",
-        &test_drv_path(drv_hash),
+        drv_hash,
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )
