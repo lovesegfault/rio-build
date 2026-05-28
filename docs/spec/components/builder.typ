@@ -218,8 +218,8 @@ value carries no semantics beyond cross-builder parity.
 scheduler-pushed `PrefetchHint` → `PrefetchComplete` warm-gate handshake and
 its I-212 path filter. The handshake's scheduler half retired with the stream
 placement layer (1c' deletion commit B); the builder half — the hint handler,
-its semaphore-bounded fetch tasks, and the
-`rio_builder_prefetch_total` / `rio_builder_prefetch_filtered_total` counters
+its semaphore-bounded fetch tasks, and the two prefetch outcome counters
+(rio_builder_prefetch_total and rio_builder_prefetch_filtered_total)
 — is deleted with the stream client, and those two metrics are retired with
 it (no replacement series: the warm path they measured no longer exists).
 Surviving carriers of the load-bearing content: the input-closure warm-up is

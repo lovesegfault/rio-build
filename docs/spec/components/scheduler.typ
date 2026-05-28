@@ -159,8 +159,8 @@ critical-path value).
 binding gate and the recv-loop length bound for `BuildPhase` updates arriving
 on the `BuildExecution` stream. That ingestion path no longer exists: the
 stream RPC is gone, the `ForwardPhase` actor command and its
-`handle_forward_phase` gate (and the `rio_scheduler_phases_rejected_total`
-counter) are deleted with it, and no scheduler code accepts a worker-supplied
+`handle_forward_phase` gate (and the phases-rejected counter that gate
+incremented) are deleted with it, and no scheduler code accepts a worker-supplied
 phase update any more --- the threat the rules guarded (attacker-controlled
 text injected into another tenant's progress display via a fabricated
 `derivation_path`) is unrepresentable without the intake. The dashboard/nom
