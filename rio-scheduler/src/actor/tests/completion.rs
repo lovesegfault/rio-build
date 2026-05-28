@@ -116,7 +116,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let f = setup_ca_fixture("ca-match").await?;
+    let f = setup_pull_ca_fixture("ca-match").await?;
 
     // Seed a PRIOR realisation: simulates a previous build (different
     // modular_hash) having registered the SAME output_path. The
@@ -136,10 +136,9 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     assert!(!pre.ca.output_unchanged, "default false before completion");
 
     let match_before = recorder.get(match_key);
-    complete_ca(
+    pull_complete_ca(
         &f.actor,
-        &f.executor_id,
-        &f.drv_path,
+        "ca-match",
         &[("out", &out_path, out_hash.to_vec())],
     )
     .await?;
@@ -158,14 +157,11 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 2: CA + mixed [match, miss] → AND-fold → false ───
-    // Fresh worker (one-shot: scenario-1's executor drained on completion).
-    let _rx2 = connect_executor(&f.actor, "ca-w2", "x86_64-linux").await?;
     let mixed_modular: [u8; 32] = {
         use sha2::{Digest, Sha256};
         Sha256::digest(b"ca-fixture:ca-mixed").into()
     };
     let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-mixed");
     let mut node = make_node("ca-mixed");
     node.is_content_addressed = true;
     node.ca_modular_hash = mixed_modular.to_vec();
@@ -178,10 +174,9 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 
     let miss_before = recorder.get(miss_key);
     let match_before2 = recorder.get(match_key);
-    complete_ca(
+    pull_complete_ca(
         &f.actor,
-        "ca-w2",
-        &drv_path,
+        "ca-mixed",
         &[
             ("out", &mixed_out, vec![0xab; 32]),
             ("dev", &test_store_path("ca-mixed-dev"), vec![0xcd; 32]),
@@ -207,9 +202,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
     );
 
     // ─── Scenario 3: non-CA → hook skipped ─────────────────────────
-    let _rx3 = connect_executor(&f.actor, "ca-w3", "x86_64-linux").await?;
     let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ia-skip");
     let node = make_node("ia-skip"); // is_content_addressed=false
     let _ev = merge_dag(&f.actor, build_id, vec![node], vec![], false).await?;
 
@@ -220,13 +213,7 @@ async fn ca_completion_hash_compare_sets_unchanged_and_counts() -> TestResult {
 
     let match_before3 = recorder.get(match_key);
     let miss_before3 = recorder.get(miss_key);
-    complete_ca(
-        &f.actor,
-        "ca-w3",
-        &drv_path,
-        &[("out", &ia_out, vec![0xef; 32])],
-    )
-    .await?;
+    pull_complete_ca(&f.actor, "ia-skip", &[("out", &ia_out, vec![0xef; 32])]).await?;
 
     let info = expect_drv(&f.actor, "ia-skip").await;
     assert!(!info.ca.is_ca);
@@ -294,7 +281,7 @@ async fn ca_compare_edge_cases(
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let f = setup_ca_fixture(key).await?;
+    let f = setup_pull_ca_fixture(key).await?;
 
     // Build output tuples: empty path-tag means literal "".
     let outputs: Vec<_> = outputs
@@ -333,7 +320,7 @@ async fn ca_compare_edge_cases(
         .iter()
         .map(|(n, p, h)| (*n, p.as_str(), h.clone()))
         .collect();
-    complete_ca(&f.actor, &f.executor_id, &f.drv_path, &outputs_ref).await?;
+    pull_complete_ca(&f.actor, key, &outputs_ref).await?;
 
     let info = expect_drv(&f.actor, key).await;
     assert_eq!(info.status, DerivationStatus::Completed);
@@ -372,13 +359,13 @@ async fn ca_compare_edge_cases(
 /// processing must be fast when PG is healthy.
 #[tokio::test]
 async fn ca_cutoff_compare_slow_store_doesnt_block_completion() -> TestResult {
-    let f = setup_ca_fixture_configured("ca-slow", |c, _| c.grpc_timeout = Duration::from_secs(3))
-        .await?;
+    let f =
+        setup_pull_ca_fixture_configured("ca-slow", |c, _| c.grpc_timeout = Duration::from_secs(3))
+            .await?;
 
-    complete_ca(
+    pull_complete_ca(
         &f.actor,
-        &f.executor_id,
-        &f.drv_path,
+        "ca-slow",
         &[("out", &test_store_path("ca-slow-out"), vec![0xAB; 32])],
     )
     .await?;
@@ -460,8 +447,6 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
     node_c.ca_modular_hash = c_modular.to_vec();
     node_c.pname = "verify-c".into();
 
-    let _rx = connect_executor(&handle, "verify-worker", "x86_64-linux").await?;
-
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -506,13 +491,7 @@ async fn cascade_only_skips_verified_candidates() -> TestResult {
 
     // Complete A. Its output_path matches the prior realisation
     // (a_prior, out) → ca_output_unchanged=true.
-    complete_ca(
-        &handle,
-        "verify-worker",
-        &test_drv_path("verify-a"),
-        &[("out", &a_out, vec![0xAA; 32])],
-    )
-    .await?;
+    pull_complete_ca(&handle, "verify-a", &[("out", &a_out, vec![0xAA; 32])]).await?;
     barrier(&handle).await;
 
     let info_a = expect_drv(&handle, "verify-a").await;
@@ -597,8 +576,6 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
     node_c.is_content_addressed = true;
     node_c.ca_modular_hash = c_modular.to_vec();
 
-    let _rx = connect_executor(&handle, "xmatch-worker", "x86_64-linux").await?;
-
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -627,13 +604,7 @@ async fn cascade_rejects_pname_suffix_cross_match() -> TestResult {
 
     store.seed_with_content(&b_out, b"b-content");
 
-    complete_ca(
-        &handle,
-        "xmatch-worker",
-        &test_drv_path("xmatch-a"),
-        &[("out", &a_out, vec![0xAA; 32])],
-    )
-    .await?;
+    pull_complete_ca(&handle, "xmatch-a", &[("out", &a_out, vec![0xAA; 32])]).await?;
     barrier(&handle).await;
 
     let info_a = expect_drv(&handle, "xmatch-a").await;
@@ -722,7 +693,6 @@ async fn cascade_matches_versioned_stdenv_name() -> TestResult {
     node_b.pname = "hello".into();
     node_b.version = Some("2.10".into());
 
-    let _rx = connect_executor(&handle, "stdenv-w", "x86_64-linux").await?;
     let _ev = merge_dag(
         &handle,
         Uuid::new_v4(),
@@ -744,13 +714,7 @@ async fn cascade_matches_versioned_stdenv_name() -> TestResult {
     .await?;
     store.seed_with_content(&b_out, b"hello-content");
 
-    complete_ca(
-        &handle,
-        "stdenv-w",
-        &test_drv_path("stdenv-a"),
-        &[("out", &a_out, vec![0xAA; 32])],
-    )
-    .await?;
+    pull_complete_ca(&handle, "stdenv-a", &[("out", &a_out, vec![0xAA; 32])]).await?;
     barrier(&handle).await;
 
     let info_a = expect_drv(&handle, "stdenv-a").await;
@@ -787,13 +751,11 @@ async fn built_outputs_membership_filter() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let (_db, handle, _task, _rx) = setup_with_worker("memb-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
     let drv_hash = "memb-drv";
-    let drv_path = test_drv_path(drv_hash);
     // make_node → output_names = ["out"] (1 declared output).
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    assert!(handle.debug_force_assign(drv_hash, "memb-w").await?);
 
     // 1 valid "out" + 100 fabricated names + 1 duplicate "out". All
     // paths are well-formed (the format-filter passes); only the
@@ -817,23 +779,16 @@ async fn built_outputs_membership_filter() -> TestResult {
         output_hash: vec![0u8; 32],
     });
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "memb-w".into(),
-            drv_key: drv_path,
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                built_outputs: outs,
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            peak_cpu_cores: 0.0,
-            node_name: None,
-            hw_class: None,
-            final_line_count: 0,
-            final_resources: None,
-        })
-        .await?;
+    pull_report(
+        &handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            built_outputs: outs,
+            ..Default::default()
+        }),
+    )
+    .await?;
     barrier(&handle).await;
 
     let info = expect_drv(&handle, drv_hash).await;
@@ -889,8 +844,6 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
     node_b.is_content_addressed = true;
     node_b.ca_modular_hash = b_modular.to_vec();
 
-    let _rx = connect_executor(&handle, "ambig-worker", "x86_64-linux").await?;
-
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -919,13 +872,7 @@ async fn cascade_rejects_ambiguous_prior_match() -> TestResult {
     store.seed_with_content(&b_out_1, b"b1");
     store.seed_with_content(&b_out_2, b"b2");
 
-    complete_ca(
-        &handle,
-        "ambig-worker",
-        &test_drv_path("ambig-a"),
-        &[("out", &a_out, vec![0xAA; 32])],
-    )
-    .await?;
+    pull_complete_ca(&handle, "ambig-a", &[("out", &a_out, vec![0xAA; 32])]).await?;
     barrier(&handle).await;
 
     let info_a = expect_drv(&handle, "ambig-a").await;
@@ -991,8 +938,6 @@ async fn cascade_batch_persists_skipped_and_ready() -> TestResult {
         })
         .collect();
 
-    let _rx = connect_executor(&handle, "batch-worker", "x86_64-linux").await?;
-
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -1026,13 +971,7 @@ async fn cascade_batch_persists_skipped_and_ready() -> TestResult {
         }
     }
 
-    complete_ca(
-        &handle,
-        "batch-worker",
-        &test_drv_path("batch-a"),
-        &[("out", &outs[0], vec![0x77; 32])],
-    )
-    .await?;
+    pull_complete_ca(&handle, "batch-a", &[("out", &outs[0], vec![0x77; 32])]).await?;
     barrier(&handle).await;
 
     let info_a = expect_drv(&handle, "batch-a").await;
@@ -1102,10 +1041,7 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
 
     let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
-    let _rx = connect_executor(&handle, "sc-worker", "x86_64-linux").await?;
-
     let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("ca-shortcircuit");
     let mut node = make_node("ca-shortcircuit");
     node.is_content_addressed = true;
     node.ca_modular_hash = vec![0xDD; 32];
@@ -1120,10 +1056,9 @@ async fn ca_compare_short_circuits_on_first_miss() -> TestResult {
     // Four outputs, none with a prior realisation seeded. output[0]
     // → miss → break. outputs[1..3] would ALSO miss but should
     // never be queried.
-    complete_ca(
+    pull_complete_ca(
         &handle,
-        "sc-worker",
-        &drv_path,
+        "ca-shortcircuit",
         &[
             ("out", &test_store_path("ca-sc-out"), vec![0x10; 32]),
             ("dev", &test_store_path("ca-sc-dev"), vec![0x11; 32]),
@@ -1995,8 +1930,7 @@ async fn test_same_worker_poison_threshold_distinct_mode(
 /// Completing a child releases its parent to Ready in a dependency chain.
 #[tokio::test]
 async fn test_dependency_chain_releases_parent() -> TestResult {
-    let (_db, handle, _task, mut stream_rx) =
-        setup_with_worker("chain-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // A depends on B. B is Ready (leaf), A is Queued.
     let build_id = Uuid::new_v4();
@@ -2011,19 +1945,18 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
     )
     .await?;
 
-    // B is dispatched first (leaf). A is Queued waiting for B.
+    // B is the deliverable leaf. A is Queued waiting for B.
     let info_a = expect_drv(&handle, "chainA").await;
     assert_eq!(info_a.status, DerivationStatus::Queued);
 
-    // Worker receives B's assignment.
-    let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
+    // The pull for B delivers it.
+    let assigned_path = pull_attempt(&handle, "chainB").await.drv_path;
     assert_eq!(assigned_path, p_chain_b);
 
-    // Complete B. One-shot worker drains; connect a fresh one for A.
-    complete_success_empty(&handle, "chain-worker", &p_chain_b).await?;
-    let mut stream_rx = connect_executor(&handle, "chain-worker-2", "x86_64-linux").await?;
+    // Complete B.
+    pull_complete_success_empty(&handle, "chainB").await?;
 
-    // A should now transition Queued -> Ready -> Assigned (dispatched).
+    // A should now transition Queued -> Ready (released by B's completion).
     let info_a = expect_drv(&handle, "chainA").await;
     assert!(
         matches!(
@@ -2034,8 +1967,8 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
         info_a.status
     );
 
-    // Fresh worker should receive A's assignment.
-    let assigned_path = recv_assignment(&mut stream_rx).await.drv_path;
+    // A is now deliverable through the pull path.
+    let assigned_path = pull_attempt(&handle, "chainA").await.drv_path;
     assert_eq!(
         assigned_path, p_chain_a,
         "A should be dispatched after B completes"
@@ -2053,8 +1986,7 @@ async fn test_dependency_chain_releases_parent() -> TestResult {
 /// substitute failure would wrongly fail-fast the build.
 #[tokio::test]
 async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("tdcomp-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // Full merge (nothing substitutable, no prune): parent → child.
     let build_id = Uuid::new_v4();
@@ -2068,8 +2000,9 @@ async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestRe
     )
     .await?;
 
-    // The leaf child is dispatched; the parent waits Queued.
-    let assigned = recv_assignment(&mut stream_rx).await.drv_path;
+    // The leaf child is delivered through the pull path; the parent
+    // waits Queued.
+    let assigned = pull_attempt(&handle, "tdcomp-child").await.drv_path;
     assert_eq!(assigned, p_child);
     assert_eq!(
         expect_drv(&handle, "tdcomp-parent").await.status,
@@ -2087,8 +2020,8 @@ async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestRe
         .execute(&db.pool)
         .await?;
 
-    // The child completes normally through the worker path.
-    complete_success_empty(&handle, "tdcomp-worker", &p_child).await?;
+    // The child completes normally through the worker report path.
+    pull_complete_success_empty(&handle, "tdcomp-child").await?;
     barrier(&handle).await;
 
     // The parent's closure is now fully in the store: the mark must be
@@ -2121,8 +2054,7 @@ async fn test_topdown_pruned_cleared_when_children_complete_normally() -> TestRe
 /// survive exactly this shape.
 #[tokio::test]
 async fn test_topdown_pruned_cleared_when_child_completes_while_parent_not_queued() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("tdnq-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // Full merge (nothing substitutable, no prune): parent → child.
     let build_id = Uuid::new_v4();
@@ -2136,8 +2068,8 @@ async fn test_topdown_pruned_cleared_when_child_completes_while_parent_not_queue
     )
     .await?;
 
-    // The leaf child is dispatched to the worker.
-    let assigned = recv_assignment(&mut stream_rx).await.drv_path;
+    // The leaf child is delivered through the pull path.
+    let assigned = pull_attempt(&handle, "tdnq-child").await.drv_path;
     assert_eq!(assigned, p_child);
 
     // Stage: the parent is mid-substitution (NOT Queued, so the child's
@@ -2151,8 +2083,8 @@ async fn test_topdown_pruned_cleared_when_child_completes_while_parent_not_queue
         .execute(&db.pool)
         .await?;
 
-    // The child completes normally through the worker path.
-    complete_success_empty(&handle, "tdnq-worker", &p_child).await?;
+    // The child completes normally through the worker report path.
+    pull_complete_success_empty(&handle, "tdnq-child").await?;
     barrier(&handle).await;
 
     // No node became newly Ready, yet the mark must still be gone — in
@@ -2245,20 +2177,29 @@ async fn test_topdown_pruned_cleared_when_child_substitution_succeeds() -> TestR
     Ok(())
 }
 
-/// Duplicate ProcessCompletion is an idempotent no-op.
+/// A duplicate report for the same open attempt is an idempotent no-op.
 #[tokio::test]
 async fn test_duplicate_completion_idempotent() -> TestResult {
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("idem-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "idem-hash";
-    let drv_path = test_drv_path(drv_hash);
     let mut event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Send completion TWICE.
+    // Open one pull attempt, then send the same Built report TWICE.
+    let exec_id = open_pull_exec(&handle, drv_hash).await;
     for _ in 0..2 {
-        complete_success_empty(&handle, "idem-worker", &drv_path).await?;
+        pull_report_exec(
+            &handle,
+            exec_id,
+            drv_hash,
+            pull_payload(rio_proto::types::BuildResult {
+                status: rio_proto::types::BuildResultStatus::Built.into(),
+                ..Default::default()
+            }),
+        )
+        .await?;
     }
 
     // completed_count should be 1, not 2.
@@ -2364,38 +2305,23 @@ async fn test_completion_for_non_running_state_ignored() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_unknown_build_status_treated_as_transient() -> TestResult {
-    let (_db, handle, _task, mut _rx) = setup_with_worker("unk-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
-    let drv_path = test_drv_path("unk-status");
     merge_single_node(&handle, build_id, "unk-status", PriorityClass::Scheduled).await?;
 
-    // Wait for dispatch (drv → Assigned to unk-w, the only worker).
-    barrier(&handle).await;
-    // Padding so fleet-exhaust doesn't poison on the single failure —
-    // we want the retry path, not the poison path. Connect AFTER
-    // dispatch so the drv is deterministically on unk-w.
-    let _rx2 = connect_executor(&handle, "unk-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "unk-w3", "x86_64-linux").await?;
-
-    // Send completion with an invalid status int (9999).
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "unk-w".into(),
-            drv_key: drv_path.clone(),
-            result: rio_proto::types::BuildResult {
-                status: 9999, // not a valid enum
-                error_msg: "mystery".into(),
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            peak_cpu_cores: 0.0,
-            node_name: None,
-            hw_class: None,
-            final_line_count: 0,
-            final_resources: None,
-        })
-        .await?;
+    // Open a pull attempt and report an invalid status int (9999)
+    // through the report intake.
+    pull_report(
+        &handle,
+        "unk-status",
+        pull_payload(rio_proto::types::BuildResult {
+            status: 9999, // not a valid enum
+            error_msg: "mystery".into(),
+            ..Default::default()
+        }),
+    )
+    .await?;
     barrier(&handle).await;
 
     assert!(
@@ -2496,7 +2422,7 @@ async fn test_cancelled_completion_after_cancel_is_noop() -> TestResult {
 /// complete_success_empty() helper (no timestamps) silently skips.
 #[tokio::test]
 async fn test_completion_writes_build_sample() -> TestResult {
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("bs-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // Merge with a distinct pname — make_test_node defaults to
     // "test-pkg", which is fine, but a unique pname makes the
@@ -2505,9 +2431,6 @@ async fn test_completion_writes_build_sample() -> TestResult {
     let mut node = make_node("bs-drv");
     node.pname = "sample-pkg".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-
-    // Receive assignment — proves dispatch happened (state → Assigned).
-    let _assignment = recv_assignment(&mut stream_rx).await;
 
     // Precondition: build_samples is empty. Test asserts its own
     // precondition so a stale row from a future test-helper change
@@ -2525,11 +2448,10 @@ async fn test_completion_writes_build_sample() -> TestResult {
     // peak_memory_bytes=8 MiB, non-zero so it's the interesting case
     // (0 is also valid for build_samples, but non-zero proves the
     // value round-trips).
-    let drv_path = test_drv_path("bs-drv");
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "bs-worker".into(),
-            drv_key: drv_path,
+    pull_report(
+        &handle,
+        "bs-drv",
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -2551,10 +2473,11 @@ async fn test_completion_writes_build_sample() -> TestResult {
             peak_cpu_cores: 1.5,
             node_name: None,
             hw_class: None,
-            final_line_count: 0,
             final_resources: None,
-        })
-        .await?;
+            final_line_count: 0,
+        },
+    )
+    .await?;
     barrier(&handle).await;
 
     // Exit criterion: exactly 1 row, correct (pname, system).
@@ -2730,16 +2653,15 @@ async fn test_completion_writes_hw_class_and_intent_cores() -> TestResult {
 /// (spurious 0.0s samples would poison the SLA estimator's percentiles).
 #[tokio::test]
 async fn test_completion_no_timestamps_no_sample() -> TestResult {
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("nt-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "nt-drv", PriorityClass::Scheduled).await?;
-    let _assignment = recv_assignment(&mut stream_rx).await;
 
-    // complete_success_empty: BuildResult::default() → start_time=None,
+    // pull_complete_success_empty: BuildResult::default() → start_time=None,
     // stop_time=None. The EMA block and build_samples write both gate
     // on these being Some.
-    complete_success_empty(&handle, "nt-worker", &test_drv_path("nt-drv")).await?;
+    pull_complete_success_empty(&handle, "nt-drv").await?;
     barrier(&handle).await;
 
     // Build succeeded (completion processed)…
@@ -2772,20 +2694,17 @@ async fn test_completion_no_timestamps_no_sample() -> TestResult {
 /// against a misbehaving worker rather than a realistic cgroup reading.
 #[tokio::test]
 async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("clamp-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let mut node = make_node("clamp-drv");
     node.pname = "clamp-pkg".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    let _assignment = recv_assignment(&mut stream_rx).await;
 
-    let drv_path = test_drv_path("clamp-drv");
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "clamp-worker".into(),
-            drv_key: drv_path,
+    pull_report(
+        &handle,
+        "clamp-drv",
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -2809,10 +2728,11 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
-            final_line_count: 0,
             final_resources: None,
-        })
-        .await?;
+            final_line_count: 0,
+        },
+    )
+    .await?;
     barrier(&handle).await;
 
     let mem: i64 =
@@ -3146,19 +3066,17 @@ async fn test_completion_out_of_domain_final_resources_recorded_as_null() -> Tes
 // r[verify sched.executor.input-bounds+2]
 #[tokio::test]
 async fn test_completion_valid_final_resources_round_trip() -> TestResult {
-    let (db, handle, _task, mut stream_rx) =
-        setup_with_worker("okres-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let mut node = make_node("okres-drv");
     node.pname = "okres-pkg".into();
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
-    let _assignment = recv_assignment(&mut stream_rx).await;
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "okres-worker".into(),
-            drv_key: test_drv_path("okres-drv"),
+    pull_report(
+        &handle,
+        "okres-drv",
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -3180,14 +3098,15 @@ async fn test_completion_valid_final_resources_round_trip() -> TestResult {
             peak_cpu_cores: 1.5,
             node_name: None,
             hw_class: None,
-            final_line_count: 0,
             final_resources: Some(rio_proto::types::ResourceUsage {
                 cpu_seconds_total: Some(12.5),
                 peak_io_pressure_pct: Some(42.5),
                 ..Default::default()
             }),
-        })
-        .await?;
+            final_line_count: 0,
+        },
+    )
+    .await?;
     barrier(&handle).await;
 
     let (cpu_secs, io_pct, peak_cpu): (Option<f64>, Option<f64>, Option<f64>) = sqlx::query_as(
@@ -3228,7 +3147,7 @@ async fn test_completion_valid_final_resources_round_trip() -> TestResult {
 async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
     use sha2::Digest;
 
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("pt-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // ── Seed 2 tenants. FK path_tenants→tenants ON DELETE CASCADE
     // means these rows MUST exist before the upsert. ─────────────────
@@ -3265,15 +3184,15 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
         let _rx = reply_rx.await??;
     }
 
-    // ONE assignment (dedup proof). Second merge saw existing node,
+    // ONE open attempt (dedup proof). Second merge saw existing node,
     // just added build_b to interested_builds.
-    let assignment = recv_assignment(&mut stream_rx).await;
+    let assignment = pull_attempt(&handle, drv_tag).await;
     assert_eq!(assignment.drv_path, drv_path, "dedup: one dispatch");
 
-    // Complete with a real output_path. complete_success sends
+    // Complete with a real output_path. pull_complete_success sends
     // built_outputs[0].output_path → completion.rs:260 stores it on
     // state.output_paths → :365 reads it → :406 upserts.
-    complete_success(&handle, "pt-worker", &drv_path, &out_path).await?;
+    pull_complete_success(&handle, drv_tag, &out_path).await?;
     barrier(&handle).await;
 
     // ── Assertion: 2 rows for out_path's hash (one per tenant) ──────
@@ -3342,14 +3261,12 @@ async fn test_completion_path_tenants_dedup_idempotent() -> TestResult {
 /// assert the row is gone (and the assignment row CASCADEd with it).
 #[tokio::test]
 async fn permanent_failure_terminals_assignment_and_records_executor() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("i209-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let _ev = merge_single_node(&handle, Uuid::new_v4(), "i209", PriorityClass::Scheduled).await?;
-    let _ = recv_assignment(&mut rx).await;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "i209-w",
-        &test_drv_path("i209"),
+        "i209",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "deterministic compile error",
     )
@@ -3375,7 +3292,8 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
     // recorded durably on the attempt row and surfaced through the
     // operator listing (the legacy `failed_builders` column is frozen
     // since the mirror-writer retirement, so the aggregate is the
-    // surface that must keep showing it).
+    // surface that must keep showing it). On the pull path the
+    // attempt's executor identity is the attested intent id.
     let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
     let display = sched_db.load_poisoned_display().await?;
     let entry = display
@@ -3384,7 +3302,7 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
         .expect("poisoned listing contains the i209 derivation");
     assert_eq!(
         entry.1,
-        vec!["i209-w".to_string()],
+        vec!["i209".to_string()],
         "I-209: ListPoisoned aggregate records the executor"
     );
 
@@ -3451,7 +3369,7 @@ fn drain_derivation_events(
 #[tokio::test]
 async fn test_high_fanin_completion_batches_ready() -> TestResult {
     const N: usize = 150;
-    let (db, handle, _task, mut rx) = setup_with_worker("fanin-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let mut nodes = vec![make_node("fanin-leaf")];
     let mut edges = Vec::with_capacity(N);
@@ -3461,8 +3379,7 @@ async fn test_high_fanin_completion_batches_ready() -> TestResult {
         edges.push(make_test_edge(&tag, "fanin-leaf"));
     }
     let _ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, true).await?;
-    let _ = recv_assignment(&mut rx).await;
-    complete_success_empty(&handle, "fanin-w", &test_drv_path("fanin-leaf")).await?;
+    pull_complete_success_empty(&handle, "fanin-leaf").await?;
     barrier(&handle).await;
 
     // All N parents Ready in-mem AND in PG.
@@ -3489,18 +3406,16 @@ async fn test_high_fanin_completion_batches_ready() -> TestResult {
 #[tokio::test]
 async fn test_cascade_emits_failed_per_node() -> TestResult {
     const N: usize = 30;
-    let (db, handle, _task, mut rx) = setup_with_worker("casc-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let nodes: Vec<_> = (0..N).map(|i| make_node(&format!("casc{i:02}"))).collect();
     let edges: Vec<_> = (0..N - 1)
         .map(|i| make_test_edge(&format!("casc{:02}", i + 1), &format!("casc{i:02}")))
         .collect();
     let mut ev = merge_dag(&handle, Uuid::new_v4(), nodes, edges, true).await?;
-    let _ = recv_assignment(&mut rx).await;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "casc-w",
-        &test_drv_path("casc00"),
+        "casc00",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "leaf busted",
     )
@@ -3564,10 +3479,6 @@ async fn test_poison_via_max_retries_emits_failed_event() -> TestResult {
         c.retry_policy.backoff_base_secs = 0.0;
     });
     let _db = db;
-    // Padding so fleet-exhaust doesn't fire (different poison reason).
-    let _rx1 = connect_executor(&handle, "pmax-w1", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "pmax-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "pmax-w3", "x86_64-linux").await?;
 
     let mut ev = merge_single_node(
         &handle,
@@ -3577,14 +3488,9 @@ async fn test_poison_via_max_retries_emits_failed_event() -> TestResult {
     )
     .await?;
     barrier(&handle).await;
-    let first = expect_drv(&handle, "pmax-drv")
-        .await
-        .assigned_executor
-        .expect("assigned");
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        &first,
-        &test_drv_path("pmax-drv"),
+        "pmax-drv",
         rio_proto::types::BuildResultStatus::TransientFailure,
         "boom",
     )
@@ -3618,7 +3524,7 @@ async fn test_poison_via_max_retries_emits_failed_event() -> TestResult {
 /// the dashboard sees `running_count` drop during the backoff window.
 #[tokio::test]
 async fn test_transient_retry_emits_progress() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("prog-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let mut ev = merge_single_node(
         &handle,
@@ -3627,20 +3533,17 @@ async fn test_transient_retry_emits_progress() -> TestResult {
         PriorityClass::Scheduled,
     )
     .await?;
-    // Padding so fleet-exhaust doesn't poison on the single failure.
-    // Connect AFTER merge so dispatch deterministically picked prog-w.
-    let _rx2 = connect_executor(&handle, "prog-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "prog-w3", "x86_64-linux").await?;
-    let _ = recv_assignment(&mut rx).await;
+    // Open the pull attempt (drv → Running) before draining, so the
+    // failure report below exercises the retry path.
+    let _assignment = pull_attempt(&handle, "prog-drv").await;
     barrier(&handle).await;
     // Drain pre-failure events and clear the 250ms emit_progress
     // debounce so the retry-path emit isn't suppressed.
     while ev.try_recv().is_ok() {}
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "prog-w",
-        &test_drv_path("prog-drv"),
+        "prog-drv",
         rio_proto::types::BuildResultStatus::TransientFailure,
         "flake",
     )
@@ -3680,12 +3583,14 @@ async fn test_transient_retry_emits_progress() -> TestResult {
 async fn test_progress_precedes_drv_completed_on_state_channel() -> TestResult {
     use rio_proto::types::{DerivationEventKind, build_event::Event};
 
-    let (_db, handle, _task, _rx) = setup_with_worker("ord-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
     let build_id = Uuid::new_v4();
     let mut ev = merge_single_node(&handle, build_id, "ord-drv", PriorityClass::Scheduled).await?;
 
-    // Drain dispatch-time events; stop once we see the dispatch-phase
-    // Progress (DrvStarted precedes it per dispatch.rs ordering).
+    // Open the pull attempt, then drain delivery-time events; stop once
+    // we see the delivery-phase Progress (DrvStarted precedes it per the
+    // assignment-started ordering).
+    let _assignment = pull_attempt(&handle, "ord-drv").await;
     loop {
         let e = tokio::time::timeout(Duration::from_secs(5), ev.recv())
             .await
@@ -3695,7 +3600,7 @@ async fn test_progress_precedes_drv_completed_on_state_channel() -> TestResult {
         }
     }
 
-    complete_success_empty(&handle, "ord-w", &test_drv_path("ord-drv")).await?;
+    pull_complete_success_empty(&handle, "ord-drv").await?;
     barrier(&handle).await;
 
     // Collect post-completion events in arrival order; record positions
@@ -3735,7 +3640,7 @@ async fn test_progress_precedes_drv_completed_on_state_channel() -> TestResult {
 /// were only set in the `!keep_going` branch → empty strings.
 #[tokio::test]
 async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Two independent derivations under keep_going; fail one,
     // succeed the other.
@@ -3743,20 +3648,15 @@ async fn test_keep_going_build_failed_records_first_failure() -> TestResult {
     let mut ev = merge_dag(&handle, Uuid::new_v4(), nodes, vec![], true).await?;
     barrier(&handle).await;
 
-    handle.debug_force_assign("kg-fail", "kg-w").await?;
-    let _ = recv_assignment(&mut rx).await;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "kg-w",
-        &test_drv_path("kg-fail"),
+        "kg-fail",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "boom",
     )
     .await?;
     barrier(&handle).await;
-    let _rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
-    handle.debug_force_assign("kg-ok", "kg-w2").await?;
-    complete_success_empty(&handle, "kg-w2", &test_drv_path("kg-ok")).await?;
+    pull_complete_success_empty(&handle, "kg-ok").await?;
     barrier(&handle).await;
 
     // BuildFailed event must name kg-fail.
@@ -3837,7 +3737,6 @@ async fn test_infra_retry_cap_uniform_across_reasons(
         c.retry_policy.max_infra_retries = MAX;
     });
     let _db = db;
-    let _rx = connect_executor(&handle, "uni-w", "x86_64-linux").await?;
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), "uni-drv", PriorityClass::Scheduled).await?;
     barrier(&handle).await;
@@ -3858,14 +3757,12 @@ async fn test_infra_retry_cap_uniform_across_reasons(
             .await?;
     }
 
-    let p = test_drv_path("uni-drv");
     // MAX failures → NOT poisoned yet (cap-check is BEFORE increment).
+    // Each attempt is a fresh pull + infra-failure report.
     for i in 0..MAX {
-        handle.debug_force_assign("uni-drv", "uni-w").await?;
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "uni-w",
-            &p,
+            "uni-drv",
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             error_msg,
         )
@@ -3880,11 +3777,9 @@ async fn test_infra_retry_cap_uniform_across_reasons(
         );
     }
     // MAX+1-th failure → poison.
-    handle.debug_force_assign("uni-drv", "uni-w").await?;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "uni-w",
-        &p,
+        "uni-drv",
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         error_msg,
     )
@@ -3920,16 +3815,16 @@ async fn test_infra_retry_cap_uniform_across_reasons(
 // r[verify sched.merge.exec-correlation+7]
 #[tokio::test]
 async fn completion_records_build_exec_correlation() -> TestResult {
-    let (db, handle, _task, mut stream_rx) = setup_with_worker("ec-worker", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let node = make_node("ec-drv");
     let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
 
-    // Dispatch happened — capture the minted exec_id from the wire
+    // The pull mint happened — capture the minted exec_id from the wire
     // carrier. This is the same UUIDv7 stamped on `state.exec_id` that
     // the completion handler will read.
-    let assignment = recv_assignment(&mut stream_rx).await;
+    let assignment = pull_attempt(&handle, "ec-drv").await;
     let expected_exec: Uuid = assignment
         .exec_id
         .parse()
@@ -3952,13 +3847,7 @@ async fn completion_records_build_exec_correlation() -> TestResult {
         "exec_id NULL before completion (set on terminal)"
     );
 
-    complete_success(
-        &handle,
-        "ec-worker",
-        &test_drv_path("ec-drv"),
-        &test_store_path("ec-out"),
-    )
-    .await?;
+    pull_complete_success(&handle, "ec-drv", &test_store_path("ec-out")).await?;
     barrier(&handle).await;
 
     // Poll PG: the exec-correlation write is spawned (fire-and-forget),
@@ -4142,26 +4031,24 @@ async fn exec_correlation_skips_terminal_builds() -> TestResult {
 // `final_line_count IS NULL` = count not reported).
 // ---------------------------------------------------------------------------
 
-/// The `drv_executions` row a successful dispatch creates: keyed by the
+/// The `drv_executions` row opening an attempt creates: keyed by the
 /// `drv_log_hash()` 32-char form of the *path* (not the DAG key), the
 /// assigned executor, a non-NULL `started_at`, and — until the
 /// execution terminates — a NULL `status` and NULL `final_line_count`.
 #[tokio::test]
 async fn dispatch_inserts_drv_executions_row() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("dexe-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "dexe-drv";
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    // The merge auto-dispatches to the connected idle worker
-    // (dispatch_ready runs at the end of MergeDag). Do NOT
-    // debug_force_assign here: it is a reset+reassign shortcut that
-    // clears the exec_id the real dispatch minted without minting a
-    // new one.
+    // The pull mint writes the fenced assignments + drv_executions rows
+    // and transitions the node out of Ready in the same transaction.
+    let _assignment = pull_attempt(&handle, drv_hash).await;
     barrier(&handle).await;
     assert_eq!(
         expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Assigned,
-        "the merge must auto-dispatch to the idle worker"
+        DerivationStatus::Running,
+        "the pull mint must open the attempt"
     );
     barrier(&handle).await;
 
@@ -4179,7 +4066,7 @@ async fn dispatch_inserts_drv_executions_row() -> TestResult {
     let (got_hash, got_exec, got_status, got_count) =
         row.expect("dispatch must insert a drv_executions row");
     assert_eq!(got_hash, expected_hash);
-    assert_eq!(got_exec, "dexe-w");
+    assert_eq!(got_exec, drv_hash);
     assert_eq!(
         got_status, None,
         "a still-running execution's status must be NULL (the store's \
@@ -4197,27 +4084,16 @@ async fn dispatch_inserts_drv_executions_row() -> TestResult {
 /// is set, and the report's `final_line_count` lands as-is.
 #[tokio::test]
 async fn terminal_stamps_drv_executions() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("texe-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "texe-drv";
     let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    // The merge auto-dispatches to the connected idle worker
-    // (dispatch_ready runs at the end of MergeDag). Do NOT
-    // debug_force_assign here: it is a reset+reassign shortcut that
-    // clears the exec_id the real dispatch minted without minting a
-    // new one.
-    barrier(&handle).await;
-    assert_eq!(
-        expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Assigned,
-        "the merge must auto-dispatch to the idle worker"
-    );
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "texe-w".into(),
-            drv_key: drv_path.clone(),
+    pull_report(
+        &handle,
+        drv_hash,
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::Built.into(),
                 built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -4231,10 +4107,11 @@ async fn terminal_stamps_drv_executions() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
-            final_line_count: 405,
             final_resources: None,
-        })
-        .await?;
+            final_line_count: 405,
+        },
+    )
+    .await?;
     barrier(&handle).await;
 
     // The stamp is fire-and-forget (spawn_monitored) — poll PG.
@@ -4291,30 +4168,13 @@ async fn terminal_with_zero_line_count_writes_null() -> TestResult {
     let (db, handle, _task) = setup().await;
 
     for (tag, reported_count) in [("zexe-zero", 0u64), ("zexe-overflow", u64::MAX)] {
-        // A fresh worker per case: an executor that has completed a
-        // build is excluded from re-dispatch
-        // (sched.ephemeral.no-redispatch-after-completion), so a single
-        // worker would leave the second case's node stuck at Ready.
-        let worker = format!("{tag}-w");
-        let _rx = connect_executor(&handle, &worker, "x86_64-linux").await?;
         let drv_path = test_drv_path(tag);
         let _ev = merge_single_node(&handle, Uuid::new_v4(), tag, PriorityClass::Scheduled).await?;
-        // The merge auto-dispatches to the connected idle worker
-        // (dispatch_ready runs at the end of MergeDag). Do NOT
-        // debug_force_assign here: it is a reset+reassign shortcut that
-        // clears the exec_id the real dispatch minted without minting a
-        // new one.
-        barrier(&handle).await;
-        assert_eq!(
-            expect_drv(&handle, tag).await.status,
-            DerivationStatus::Assigned,
-            "the merge must auto-dispatch {tag} to the idle worker"
-        );
 
-        handle
-            .send_unchecked(ActorCommand::ProcessCompletion {
-                executor_id: worker.as_str().into(),
-                drv_key: drv_path.clone(),
+        pull_report(
+            &handle,
+            tag,
+            PullReportPayload {
                 result: rio_proto::types::BuildResult {
                     status: rio_proto::types::BuildResultStatus::Built.into(),
                     built_outputs: vec![rio_proto::types::BuiltOutput {
@@ -4328,10 +4188,11 @@ async fn terminal_with_zero_line_count_writes_null() -> TestResult {
                 peak_cpu_cores: 0.0,
                 node_name: None,
                 hw_class: None,
-                final_line_count: reported_count,
                 final_resources: None,
-            })
-            .await?;
+                final_line_count: reported_count,
+            },
+        )
+        .await?;
         barrier(&handle).await;
 
         let key = rio_nix::store_path::drv_log_hash(&drv_path);
@@ -4456,20 +4317,17 @@ async fn second_terminal_does_not_overwrite() -> TestResult {
 async fn started_event_carries_exec_id() -> TestResult {
     use rio_proto::types::build_event::Event;
 
-    let (db, handle, _task, _rx) = setup_with_worker("sexe-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "sexe-drv";
     let mut events =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    // The merge auto-dispatches to the connected idle worker
-    // (dispatch_ready runs at the end of MergeDag). Do NOT
-    // debug_force_assign here: it is a reset+reassign shortcut that
-    // clears the exec_id the real dispatch minted without minting a
-    // new one.
+    // The pull mint stamps the exec_id and emits the Started event.
+    let _assignment = pull_attempt(&handle, drv_hash).await;
     barrier(&handle).await;
     assert_eq!(
         expect_drv(&handle, drv_hash).await.status,
-        DerivationStatus::Assigned,
-        "the merge must auto-dispatch to the idle worker"
+        DerivationStatus::Running,
+        "the pull mint must open the attempt"
     );
 
     // Drain until the DrvStarted event.
@@ -4517,18 +4375,17 @@ async fn started_event_carries_exec_id() -> TestResult {
 /// `error_msg` (already true for the permanent path — regression pin).
 #[tokio::test]
 async fn failure_terminal_stamps_report_final_line_count() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("flc-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "flc-drv";
     let drv_path = test_drv_path(drv_hash);
     let mut ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    let _assignment = recv_assignment(&mut rx).await;
 
     // Worker report: permanent failure, 37 log lines emitted.
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "flc-w".into(),
-            drv_key: drv_path.clone(),
+    pull_report(
+        &handle,
+        drv_hash,
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "missing header: zlib.h".into(),
@@ -4538,10 +4395,11 @@ async fn failure_terminal_stamps_report_final_line_count() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
-            final_line_count: 37,
             final_resources: None,
-        })
-        .await?;
+            final_line_count: 37,
+        },
+    )
+    .await?;
     barrier(&handle).await;
     assert_eq!(
         expect_drv(&handle, drv_hash).await.status,
@@ -4669,25 +4527,17 @@ async fn reportless_backstop_poison_keeps_final_line_count_null() -> TestResult 
 /// the reporting worker and its error message.
 #[tokio::test]
 async fn attempt_ledger_e1_transient_rows() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux").await?;
-    // Pad workers so the fleet-exhaust clamp doesn't fire before
-    // max_retries (same shape as test_transient_failure_max_retries_poisons).
-    let _rx2 = connect_executor(&handle, "ale1-pad2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "ale1-pad3", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "ale1-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
+    // Each attempt is a fresh pull (same intent identity, no binding)
+    // followed by a transient-failure report through the report intake.
     for attempt in 0..3 {
-        assert!(
-            handle.debug_force_assign(drv_hash, "flaky-worker").await?,
-            "force-assign (attempt {attempt})"
-        );
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "flaky-worker",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
@@ -4709,7 +4559,7 @@ async fn attempt_ledger_e1_transient_rows() -> TestResult {
     for (i, r) in rows.iter().enumerate() {
         assert_eq!(r.event_kind, "attempt");
         assert_eq!(r.outcome_class, "transient", "row {i}");
-        assert_eq!(r.executor_id.as_deref(), Some("flaky-worker"));
+        assert_eq!(r.executor_id.as_deref(), Some(drv_hash));
         assert_eq!(
             r.error_msg.as_deref(),
             Some(format!("attempt {i} failed").as_str()),
@@ -4727,28 +4577,23 @@ async fn attempt_ledger_e1_transient_rows() -> TestResult {
 /// flag set (and no floor promotion).
 #[tokio::test]
 async fn attempt_ledger_e2_infra_and_exempt_rows() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("ale2-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "ale2-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
     // Non-exempt infra failure (FUSE-style worker-local error).
-    assert!(handle.debug_force_assign(drv_hash, "ale2-w").await?);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "ale2-w",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "fuse: transport endpoint is not connected",
     )
     .await?;
     // Exempt infra failure (lost the upload race to a concurrent PutPath).
-    assert!(handle.debug_force_assign(drv_hash, "ale2-w").await?);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "ale2-w",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         rio_proto::CONCURRENT_PUTPATH_MSG,
     )
@@ -4773,17 +4618,15 @@ async fn attempt_ledger_e2_infra_and_exempt_rows() -> TestResult {
 /// execution id of the dispatched attempt.
 #[tokio::test]
 async fn attempt_ledger_e3_permanent_row() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("ale3-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv_hash = "ale3-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-    let _assignment = recv_assignment(&mut rx).await;
 
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "ale3-w".into(),
-            drv_key: drv_path.clone(),
+    pull_report(
+        &handle,
+        drv_hash,
+        PullReportPayload {
             result: rio_proto::types::BuildResult {
                 status: rio_proto::types::BuildResultStatus::PermanentFailure.into(),
                 error_msg: "missing header: zlib.h".into(),
@@ -4793,17 +4636,18 @@ async fn attempt_ledger_e3_permanent_row() -> TestResult {
             peak_cpu_cores: 0.0,
             node_name: None,
             hw_class: None,
-            final_line_count: 21,
             final_resources: None,
-        })
-        .await?;
+            final_line_count: 21,
+        },
+    )
+    .await?;
     barrier(&handle).await;
 
     let rows = ledger_rows(&db.pool, drv_hash).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     let r = &rows[0];
     assert_eq!(r.outcome_class, "permanent");
-    assert_eq!(r.executor_id.as_deref(), Some("ale3-w"));
+    assert_eq!(r.executor_id.as_deref(), Some(drv_hash));
     assert!(
         r.exec_id.is_some(),
         "the report-bearing attempt keeps its execution id"
@@ -4825,19 +4669,16 @@ async fn attempt_ledger_e4_timeout_rows() -> TestResult {
             ..Default::default()
         };
     });
-    let _w = connect_builder(&handle, "ale4-w", "x86_64-linux").await?;
     let drv_hash = "ale4-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
     // Under cap → retry; cap (1) exhausted on the second → Cancelled.
+    // Each attempt is a fresh pull + TimedOut report.
     for _ in 0..2 {
-        assert!(handle.debug_force_assign(drv_hash, "ale4-w").await?);
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "ale4-w",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::TimedOut,
             "build exceeded daemon_timeout_secs",
         )
@@ -4855,7 +4696,7 @@ async fn attempt_ledger_e4_timeout_rows() -> TestResult {
     assert!(rows.iter().all(|r| r.outcome_class == "timeout"));
     assert!(
         rows.iter()
-            .all(|r| r.executor_id.as_deref() == Some("ale4-w"))
+            .all(|r| r.executor_id.as_deref() == Some(drv_hash))
     );
     Ok(())
 }
@@ -4866,7 +4707,7 @@ async fn attempt_ledger_e4_timeout_rows() -> TestResult {
 /// persist.
 #[tokio::test]
 async fn attempt_ledger_cascade_row_for_dependent() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("alc-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let child = "alc-child";
     let parent = "alc-parent";
     let _ev = merge_dag(
@@ -4877,12 +4718,10 @@ async fn attempt_ledger_cascade_row_for_dependent() -> TestResult {
         false,
     )
     .await?;
-    let _assignment = recv_assignment(&mut rx).await;
 
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "alc-w",
-        &test_drv_path(child),
+        child,
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "no such file or directory",
     )
@@ -4935,7 +4774,7 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
         S::InputRejected,
     ];
     for (i, status) in statuses.into_iter().enumerate() {
-        let (db, handle, _task, mut rx) = setup_with_worker("e3w", "x86_64-linux").await?;
+        let (db, handle, _task) = setup().await;
         let child = format!("e3c{i}");
         let parent = format!("e3p{i}");
         let mut ev = merge_dag(
@@ -4946,15 +4785,7 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
             false,
         )
         .await?;
-        let _ = recv_assignment(&mut rx).await;
-        complete_failure(
-            &handle,
-            "e3w",
-            &test_drv_path(&child),
-            status,
-            "deterministic boom",
-        )
-        .await?;
+        pull_complete_failure(&handle, &child, status, "deterministic boom").await?;
         barrier(&handle).await;
 
         let trigger = expect_drv(&handle, &child).await;
@@ -4968,7 +4799,7 @@ async fn phase1b_e3_permanent_statuses_poison_identically() -> TestResult {
             "{status:?}: poisoned_at stamped"
         );
         assert!(
-            trigger.retry.failed_builders.contains("e3w"),
+            trigger.retry.failed_builders.contains(child.as_str()),
             "{status:?}: legacy RAM exclusion write stays in place (rule 1)"
         );
         assert_eq!(
@@ -5022,19 +4853,14 @@ async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
             ..Default::default()
         };
     });
-    let _w1 = connect_builder(&handle, "e4w-a", "x86_64-linux").await?;
-    let _w2 = connect_builder(&handle, "e4w-b", "x86_64-linux").await?;
     let drv_hash = "e4-timeout";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
     // ── Attempt 1: under cap → Requeue ──────────────────────────────
-    assert!(handle.debug_force_assign(drv_hash, "e4w-a").await?);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "e4w-a",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TimedOut,
         "deadline exceeded",
     )
@@ -5063,11 +4889,9 @@ async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
     );
 
     // ── Attempt 2: cap exhausted → terminal Cancelled, not Poisoned ─
-    assert!(handle.debug_force_assign(drv_hash, "e4w-b").await?);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "e4w-b",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TimedOut,
         "deadline exceeded",
     )
@@ -5109,18 +4933,15 @@ async fn phase1b_e4_timeout_verdicts_unchanged() -> TestResult {
 /// caps) and the ledger carries the per-class rows the fold reads.
 #[tokio::test]
 async fn phase1b_e2_worker_only_infra_battery_counters_and_rows_agree() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("e2batt-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let drv = "e2batt";
-    let drv_path = test_drv_path(drv);
     let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
     let putpath = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
     let msgs = ["fuse: EIO", putpath.as_str(), "store unreachable"];
     for msg in msgs {
-        assert!(handle.debug_force_assign(drv, "e2batt-w").await?);
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "e2batt-w",
-            &drv_path,
+            drv,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             msg,
         )
@@ -5329,17 +5150,15 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
             require_distinct_workers: false,
         };
     });
-    let _w = connect_builder(&handle, "e1nd-w", "x86_64-linux").await?;
     let drv = "e1nd";
-    let drv_path = test_drv_path(drv);
     let _ev = merge_single_node(&handle, Uuid::new_v4(), drv, PriorityClass::Scheduled).await?;
 
-    // Failure 1: under the threshold → retry with backoff.
-    assert!(handle.debug_force_assign(drv, "e1nd-w").await?);
-    complete_failure(
+    // Failure 1: under the threshold → retry with backoff. Same intent
+    // identity on every attempt (the non-distinct flat count is the
+    // subject).
+    pull_complete_failure(
         &handle,
-        "e1nd-w",
-        &drv_path,
+        drv,
         rio_proto::types::BuildResultStatus::TransientFailure,
         "flaky once",
     )
@@ -5355,11 +5174,9 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
     );
 
     // Failure 2: flat count reaches the threshold → poison.
-    assert!(handle.debug_force_assign(drv, "e1nd-w").await?);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "e1nd-w",
-        &drv_path,
+        drv,
         rio_proto::types::BuildResultStatus::TransientFailure,
         "flaky twice",
     )
