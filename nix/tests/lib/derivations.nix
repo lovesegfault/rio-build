@@ -91,6 +91,11 @@ rec {
   # bulk-ready dispatch (the actual load concern).
   fiftyFanout = "${dir}/fifty-fanout.nix";
 
+  # Shared dep + big-dep + four consumers for vm-castore-e2e
+  # (cold/warm/outage/post-restart builds over the castore-FUSE lower).
+  # Built with -A consumer1 … -A consumer4.
+  castoreE2e = "${dir}/castore-e2e.nix";
+
   # Host-side pre-fetch of the busybox for airgapped VM workers. Served
   # via Python http.server on the client VM (see coldBootstrapServer
   # below); cold-bootstrap.nix's url is overridden to http://client:8000/

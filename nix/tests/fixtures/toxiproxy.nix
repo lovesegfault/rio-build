@@ -1,6 +1,6 @@
 # Toxiproxy chaos fixture: standalone topology + fault-injection proxy.
 #
-# Wraps the standalone pattern (PG + store + scheduler + gateway on one
+# Wraps the standalone fixture (PG + store + scheduler + gateway on one
 # control VM, 1 worker VM, 1 client VM) with a toxiproxy-server systemd
 # unit ON THE CONTROL VM sitting between scheduler↔store and worker↔store.
 #
@@ -45,8 +45,15 @@
 #   lifecycle.nix already covers via controller-restart. The chaos
 #   scenarios here target the unary-RPC retry/timeout/breaker paths.
 #
+# Built ON TOP of fixtures/standalone.nix (since P0560): the chaos
+# subtests drive real builds, so the fixture-level tenancy stopgap
+# (defaultTenant — HMAC keys, tenant seed, key-comment attribution,
+# narinfo trigger) must apply here too. Wrapping standalone instead of
+# re-implementing the control/worker/client nodes keeps that machinery
+# in one place for P0593 to delete.
+#
 # Returns the same shape as standalone.nix:
-#   { nodes, waitReady, pyNodeVars, gatewayHost, pki }
+#   { nodes, waitReady, pyNodeVars, gatewayHost, sshKeySetup? }
 # plus `toxiproxyHost` (= "control") for scenarios that want to be
 # explicit about where toxiproxy-cli runs.
 {
@@ -58,7 +65,7 @@
 }:
 let
   inherit (pkgs) lib;
-  common = import ../common.nix {
+  standalone = import ./standalone.nix {
     inherit
       pkgs
       rio-workspace
@@ -116,32 +123,39 @@ let
     environment.systemPackages = [ pkgs.toxiproxy ];
   };
 in
-# No per-test knobs for now. `_:` keeps the call shape consistent
-# with standalone (callsite: `toxiproxy { }`). Not `{ }:` — statix
-# W10 flags empty destructuring patterns.
-_: {
+{
+  # P0560 fixture-tenancy stopgap passthrough (see standalone.nix
+  # `defaultTenant`): the chaos subtests submit real builds, whose
+  # inputs only materialize through the tenant-scoped castore reads.
+  # default.nix sets "vmtest", same as the rest of the build matrix.
+  defaultTenant ? null,
+}:
+let
+  base = standalone {
+    inherit defaultTenant;
+    # Scheduler reaches the store through the scheduler_store proxy.
+    # standalone passes this through to mkControlNode, where `//`
+    # makes it win over the `storeAddr = "localhost:9002"` default.
+    extraSchedulerConfig = {
+      storeAddr = "localhost:19002";
+    };
+  };
+in
+{
   gatewayHost = "control";
   toxiproxyHost = "control";
 
   nodes = {
     control = {
       imports = [
-        (common.mkControlNode {
-          hostName = "control";
-          # Override scheduler's storeAddr through the proxy. `//` in
-          # mkControlNode (common.nix:327) makes this win over the
-          # `storeAddr = "localhost:9002"` default.
-          extraSchedulerConfig = {
-            storeAddr = "localhost:19002";
-          };
-          # 29002: worker_store proxy listener (cross-VM).
-          # 9093: worker metrics port (scraped in subtest 2/4 assertions).
-          extraFirewallPorts = [
-            29002
-            9093
-          ];
-        })
+        base.nodes.control
         toxiproxyModule
+      ];
+      # 29002: worker_store proxy listener (cross-VM).
+      # 9093: worker metrics port (scraped in subtest 2/4 assertions).
+      networking.firewall.allowedTCPPorts = [
+        29002
+        9093
       ];
       # Belt-and-suspenders: scheduler unit waits for toxiproxy unit.
       # The Before= on toxiproxy already implies this, but explicit
@@ -151,47 +165,35 @@ _: {
     };
 
     worker = {
-      imports = [
-        (common.mkWorkerNode {
-          hostName = "worker";
-        })
-      ];
+      imports = [ base.nodes.worker ];
       # mkWorkerNode hardcodes storeAddr = "control:9002" with no override
       # hook. Layer a module-merge override instead of patching common.nix.
-      # mkForce because the module's own value is also a plain string
-      # (common.nix:402) — two plain strings at the same option = conflict.
+      # mkForce because the module's own value is also a plain string —
+      # two plain strings at the same option = conflict.
       services.rio.worker.storeAddr = lib.mkForce "control:29002";
     };
 
-    client = common.mkClientNode { gatewayHost = "control"; };
+    inherit (base.nodes) client;
   };
 
-  # Boot sequence mirrors standalone.waitReady, plus the proxy checks
-  # slotted between store-ready and scheduler-ready (same order as the
-  # systemd After=/Before= chain). Verifying 19002/29002 open BEFORE
-  # asserting scheduler-ready proves the worker_store proxy is listening
-  # before the worker connects.
-  waitReady = ''
-    control.wait_for_unit("postgresql.service")
-    control.wait_for_unit("rio-store.service")
-    control.wait_for_open_port(9002)
+  # standalone's waitReady (control plane + seed-tenant + worker
+  # registered), then the proxy checks. The systemd After=/Before=
+  # chain (store → toxiproxy → scheduler) provides the boot-order
+  # guarantee; these asserts prove both proxies are listening before
+  # any subtest injects a toxic.
+  # Note the ordering inversion vs the pre-P0560 self-contained fixture:
+  # the proxy-port checks now run AFTER worker registration (which
+  # already flowed through worker_store), so they are confirmation of
+  # the systemd ordering, not the gate that establishes it.
+  waitReady = base.waitReady + ''
     control.wait_for_unit("toxiproxy.service")
     control.wait_for_open_port(8474)   # admin API
     control.wait_for_open_port(19002)  # scheduler_store proxy
     control.wait_for_open_port(29002)  # worker_store proxy
-    control.wait_for_unit("rio-scheduler.service")
-    control.wait_for_open_port(9001)
-    # No store_client=None hard-check: connect_store_lazy (main.rs:51)
-    # only returns None on malformed addr/TLS — the boot-race this once
-    # guarded against cannot happen under lazy connect. The breaker is
-    # always live for chaos scenarios.
-    worker.wait_for_unit("rio-builder.service")
-    control.wait_until_succeeds(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep -x 'rio_scheduler_workers_active 1'",
-        timeout=30,
-    )
   '';
 
-  pyNodeVars = "control, worker, client";
+  inherit (base) pyNodeVars;
 }
+# sshKeySetup only exists on the base when defaultTenant is set (the
+# tenant-comment variant); pass it through so mkBootstrap picks it up.
+// lib.optionalAttrs (base ? sshKeySetup) { inherit (base) sshKeySetup; }
