@@ -1387,9 +1387,11 @@ pub const M_068: () = ();
 /// the startup-run migration metadata-only on the largest table in the
 /// schema (no full-table rewrite or update).
 ///
-/// **Numbering:** 069 is reserved by the retry campaign's deferred
-/// mirror-column drop (see the retry invariant map close-out); the gap
-/// is deliberate, not a missing file.
+/// **Numbering:** 069 was reserved by the retry campaign's deferred
+/// mirror-column drop while that drop was gated on a drain condition;
+/// the drop ultimately shipped as migration 075 (see M_075 for why the
+/// reservation was not used), so the 069 gap is permanent and
+/// deliberate, not a missing file.
 pub const M_070: () = ();
 
 /// `migrations/071_drop_refcount_check_and_index.sql`
@@ -1520,6 +1522,52 @@ pub const M_073: () = ();
 /// moved inside that gap; the configured report slack plus the
 /// controller's worker-timeout margin covers that residue.
 pub const M_074: () = ();
+
+/// `migrations/075_drop_retry_mirror_columns.sql`
+///
+/// Retry-formal campaign Phase-2 coda: drops the three frozen retry
+/// mirror columns `derivations.{retry_count, failed_builders,
+/// resubmit_cycles}`. Metadata-only (catalog update, no table rewrite);
+/// `IF EXISTS` per the 035 style. `poisoned_at` is NOT dropped — it is
+/// the poison-lifecycle TTL anchor (`sched.poison.ttl-persist`), not a
+/// counter mirror.
+///
+/// **Why the columns are dead:** since the Phase-1b cutover (T-1b.13)
+/// every retry/poison budget is a fold over the `drv_attempts` ledger
+/// (068) and survives failover through it; the per-counter mirror
+/// writers were deleted then, leaving the columns frozen and read only
+/// by the transitional legacy seed (`load_retry_seed_in_tx`, decision
+/// P5) that floored the fold for failure histories predating 068. The
+/// reset paths' column zeroing and the `load_poisoned_display` legacy
+/// union are removed together with this migration; the seed machinery
+/// itself (the `legacy_seed` argument of `decide()`) is retired in the
+/// follow-up commit, restoring the frozen three-argument decision
+/// surface.
+///
+/// **Why the drain condition is satisfied:** the Phase-2 close-out
+/// deferred this drop behind a drain condition — no non-terminal or
+/// poisoned derivation may still carry a failure history whose only
+/// record is the mirror columns — because at the 068 release boundary
+/// that condition is unmet by definition for any database that upgrades
+/// through 068. The campaign owner's deployment-model clarification
+/// (2026-05-27, the same fresh-only directive M_072 records: no staged
+/// rollouts, no existing cluster or live database — every eventual
+/// deployment is fresh) makes the condition vacuously true: a fresh
+/// database never has pre-068 failure histories, so there is nothing
+/// for the seed to preserve and the drop is ordinary development work.
+/// The operational drain probe recorded in the retry invariant map
+/// close-out is therefore moot for fresh deployments and is retained
+/// there only as history.
+///
+/// **Numbering (why 075 and not the reserved 069):** the close-out
+/// reserved 069 for this drop, but 070–074 shipped while it was
+/// deferred. Claiming the lower number now would make the applied order
+/// on a fresh database differ from the authored order and would
+/// re-order the chain relative to databases that hypothetically applied
+/// 070+ already; the only value of the 069 slot — keeping the drop
+/// adjacent to 068 — matters to neither, so the drop takes the next
+/// free number and 069 stays a permanent, deliberate gap (see M_070).
+pub const M_075: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

@@ -20,14 +20,13 @@ use super::DagActor;
 
 impl DagActor {
     /// E5's poison-threshold re-check as a `decide()` caller (Phase 1b,
-    /// T-1b.8): fold the derivation's durable attempt suffix plus the
-    /// transitional legacy mirror-column seed (P5) and report whether
-    /// the verdict is a threshold poison. Read-only — this site appends
-    /// nothing and charges nothing for the disconnect itself (the
-    /// no-report establishment charge lands at the TTL sweep / backstop,
-    /// T-1b.11, not here); the disconnect / force-drain / backstop rows
-    /// it folds over were appended by their observation sites before
-    /// this runs.
+    /// T-1b.8): fold the derivation's durable attempt suffix and report
+    /// whether the verdict is a threshold poison. Read-only — this site
+    /// appends nothing and charges nothing for the disconnect itself
+    /// (the no-report establishment charge lands at the TTL sweep /
+    /// backstop, T-1b.11, not here); the disconnect / force-drain /
+    /// backstop rows it folds over were appended by their observation
+    /// sites before this runs.
     ///
     /// Acts only on the threshold reason — exactly the check
     /// `PoisonConfig::is_poisoned` performed over the RAM counters —
@@ -54,19 +53,11 @@ impl DagActor {
                         derivation_id,
                     )
                     .await?;
-                    let seed =
-                        crate::db::SchedulerDb::load_retry_seed_in_tx(&mut conn, derivation_id)
-                            .await?;
                     let history: Vec<crate::state::AttemptRecord> = suffix
                         .iter()
                         .map(crate::db::attempts::AttemptRow::to_record)
                         .collect();
-                    Ok(crate::retry_policy::decide(
-                        &history,
-                        &budget,
-                        now,
-                        seed.as_ref(),
-                    ))
+                    Ok(crate::retry_policy::decide(&history, &budget, now, None))
                 }
                 .await;
                 match read {

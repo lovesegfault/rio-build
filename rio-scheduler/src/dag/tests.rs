@@ -546,7 +546,7 @@ fn test_initial_states() -> anyhow::Result<()> {
 #[case::failed(DerivationStatus::Failed, 0, false, true, DerivationStatus::Created)]
 // I-169 bound: at resubmit_cycles >= LIMIT, Poisoned stays Poisoned on
 // resubmit. 24h TTL or ClearPoison are the only overrides.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[case::poisoned_at_limit(
     DerivationStatus::Poisoned,
     crate::state::POISON_RESUBMIT_RETRY_LIMIT,
@@ -605,7 +605,7 @@ fn merge_reset_single_node(
 /// per-cycle `max_retries` gate (capped at 2) and the cross-cycle
 /// `POISON_RESUBMIT_RETRY_LIMIT` gate (6) — `2 < 6` was permanently
 /// true and this loop never terminated.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[test]
 fn test_poison_resubmit_bound_fires_via_natural_accumulation() -> anyhow::Result<()> {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
@@ -666,7 +666,7 @@ fn test_poison_resubmit_bound_fires_via_natural_accumulation() -> anyhow::Result
 // I-169: Poisoned with resubmit_cycles < LIMIT resets; resubmit_cycles
 // incremented so the bound accumulates; surfaced in reset_on_resubmit for
 // db.clear_poison.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[case::poisoned_under_limit(DerivationStatus::Poisoned, 1, true, DerivationStatus::Queued)]
 // DependencyFailed reset is self-correcting when dep is STILL Poisoned (at
 // limit): compute_initial_states re-checks any_dep_terminally_failed and
@@ -981,7 +981,7 @@ fn test_cycle_rollback_preserves_prior_interest() -> anyhow::Result<()> {
 /// keyed on its hash. Without restore, `{retriable-X, cycle}` wipes X
 /// and resets its resubmit counter, defeating
 /// `POISON_RESUBMIT_RETRY_LIMIT` (I-169).
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[test]
 fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -1063,7 +1063,7 @@ fn test_cyclic_merge_restores_removed_retriable() -> anyhow::Result<()> {
 /// touched so far: earlier-iteration fresh inserts, interest added to
 /// pre-existing nodes, and removed retriable nodes. Previously the `?`
 /// dropped all rollback state on the floor.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[test]
 fn test_invalid_drv_path_rolls_back_everything() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();

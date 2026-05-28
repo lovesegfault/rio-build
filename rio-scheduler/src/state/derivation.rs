@@ -957,19 +957,6 @@ pub struct DerivationState {
     /// decision in Phase 1a — the RAM counters in [`Self::retry`] stay
     /// authoritative until the Phase-1b collapse.
     attempt_history: Vec<AttemptRecord>,
-    /// The transitional legacy fold seed (decision P5): the
-    /// `derivations.{retry_count, failed_builders, resubmit_cycles}`
-    /// mirror columns as they were read when this node was constructed
-    /// from a recovery row. Empty for nodes merged live (their pre-066
-    /// history, if any, is read by the appending transactions directly
-    /// from the columns). Carried on the node so every fold input
-    /// construction that cannot do its own PG read — the recovered
-    /// retry view, the dispatch-time fleet-exhaust check, and (from
-    /// T-1b.13) the cached dispatch view — applies the same floor a
-    /// boundary-spanning history keeps until its first post-066 reset
-    /// event. Read-only after construction; dropped with the columns in
-    /// Phase 2.
-    legacy_retry_floor: crate::retry_policy::PersistedRetryColumns,
     /// Realized output store paths (filled on completion).
     pub output_paths: Vec<String>,
     /// Expected output paths (from the proto node at merge time).
@@ -1240,7 +1227,6 @@ impl DerivationState {
             input_srcs,
             retry: RetryState::default(),
             attempt_history: Vec::new(),
-            legacy_retry_floor: crate::retry_policy::PersistedRetryColumns::default(),
             output_paths: Vec::new(),
             expected_output_paths: node.expected_output_paths.clone(),
             wanted_output_names: node.wanted_output_names.clone(),
@@ -1298,18 +1284,6 @@ impl DerivationState {
             &row.required_features,
             row.pname.as_deref(),
         );
-        // The transitional legacy fold seed (P5): captured from the
-        // mirror columns before the row is torn apart, so the recovered
-        // retry view and the dispatch-time fold inputs keep flooring a
-        // boundary-spanning history at what the columns hold.
-        // `poisoned_at` stays out of the seed — poison status and its
-        // TTL anchor are derivations-row-owned (`sched.poison.ttl-persist`).
-        let legacy_retry_floor = crate::retry_policy::PersistedRetryColumns {
-            retry_count: row.retry_count.max(0) as u32,
-            resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-            failed_builders: row.failed_builders.iter().cloned().collect(),
-            poisoned_at: None,
-        };
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -1354,25 +1328,18 @@ impl DerivationState {
             },
             drv_content: Vec::new(), // worker fetches from store
             input_srcs: Vec::new(),  // unparsed (no drv_content); DAG-children-only prefetch
-            // The pure legacy projection of the mirror columns. This is
-            // only the CONSTRUCTION-TIME view: recovery re-derives the
-            // retry view from the attempt-ledger fold (seeded by
-            // `legacy_retry_floor`) via `rebuild_retry_view_from_ledger`
-            // once the suffix is loaded, so budgets survive failover
-            // (`sched.retry.failover-budget`). For a node with no
-            // attempt rows the rebuild degenerates to exactly this
-            // projection.
-            retry: RetryState {
-                count: row.retry_count.max(0) as u32,
-                resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-                failure_count: row.failed_builders.len() as u32,
-                failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
-                ..Default::default()
-            },
+            // Construction-time placeholder: recovery re-derives the
+            // retry view from the attempt-ledger fold via
+            // `rebuild_retry_view_from_ledger` once the suffix is
+            // loaded, so budgets survive failover
+            // (`sched.retry.failover-budget`). The attempt ledger is the
+            // only failure-history record (migration 073 dropped the
+            // mirror columns); a node with no attempt rows recovers the
+            // default (empty) retry state.
+            retry: RetryState::default(),
             // Populated from the attempt ledger by the recovery load
             // (`load_attempt_suffix`) after construction.
             attempt_history: Vec::new(),
-            legacy_retry_floor,
             output_paths: Vec::new(), // completed rows not loaded
             expected_output_paths: row.expected_output_paths,
             // Persisted with union-on-conflict (`migrations/062`,
@@ -1452,17 +1419,6 @@ impl DerivationState {
         // correctly; non-FOD ⟹ `[]`.
         let effective_features =
             EffectiveFeatures::derive(row.is_fixed_output, &[], row.pname.as_deref());
-        // Transitional legacy fold seed (P5). `PoisonedDerivationRow`
-        // does not carry `retry_count` (poisoned-row recovery never
-        // recovered `count`; the `sched.retry.recovery-projection+2`
-        // text records that), so the floor's count is 0; `poisoned_at`
-        // stays derivations-row-owned and out of the seed.
-        let legacy_retry_floor = crate::retry_policy::PersistedRetryColumns {
-            retry_count: 0,
-            resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-            failed_builders: row.failed_builders.iter().cloned().collect(),
-            poisoned_at: None,
-        };
         Ok(Self {
             drv_hash: row.drv_hash.into(),
             drv_path,
@@ -1484,21 +1440,19 @@ impl DerivationState {
             sched: SchedHint::default(),
             drv_content: Vec::new(),
             input_srcs: Vec::new(),
-            // Construction-time legacy projection; the recovery load
-            // re-derives the counters from the seeded ledger fold via
-            // `rebuild_retry_view_from_ledger` (which preserves this
-            // row-derived `poisoned_at` — `sched.poison.ttl-persist`).
+            // Construction-time placeholder carrying only the row-owned
+            // `poisoned_at`; the recovery load re-derives the counters
+            // (exclusion set, resubmit bound, budgets) from the
+            // attempt-ledger fold via `rebuild_retry_view_from_ledger`,
+            // which preserves this row-derived `poisoned_at`
+            // (`sched.poison.ttl-persist`).
             retry: RetryState {
-                resubmit_cycles: row.resubmit_cycles.max(0) as u32,
-                failure_count: row.failed_builders.len() as u32,
-                failed_builders: row.failed_builders.into_iter().map(Into::into).collect(),
                 poisoned_at: Some(poisoned_at),
                 ..Default::default()
             },
             // Populated from the attempt ledger by the recovery load
             // (`load_attempt_suffix`) after construction.
             attempt_history: Vec::new(),
-            legacy_retry_floor,
             output_paths: Vec::new(),
             expected_output_paths: Vec::new(),
             wanted_output_names: Vec::new(),
@@ -1727,7 +1681,7 @@ impl DerivationState {
         }
     }
 
-    // r[impl sched.merge.poisoned-resubmit-bounded+3]
+    // r[impl sched.merge.poisoned-resubmit-bounded+4]
     /// Whether a resubmit of THIS node should reset it for re-dispatch.
     ///
     /// Wraps [`DerivationStatus::is_retriable_on_resubmit`] (the
@@ -1738,8 +1692,9 @@ impl DerivationState {
     /// (I-169: I-167's `?id=` patch poisoned, then 27k dependents
     /// re-derived `DependencyFailed` from the still-poisoned parent on
     /// every resubmit). `resubmit_cycles` is incremented on each reset
-    /// (`dag::merge`) and persisted (`M_051`) so the bound accumulates
-    /// across re-submissions and survives leader failover. At/above the
+    /// (`dag::merge`) and persisted as the `resubmit_reset` attempt-
+    /// ledger row so the bound accumulates across re-submissions and
+    /// survives leader failover. At/above the
     /// limit, 24h TTL or `ClearPoison` are the only overrides.
     pub fn is_retriable_on_resubmit(&self) -> bool {
         self.status.is_retriable_on_resubmit()
@@ -1822,22 +1777,12 @@ impl DerivationState {
         nodes
     }
 
-    /// The transitional legacy fold seed (decision P5) carried on the
-    /// node: the mirror columns as read at recovery construction. Empty
-    /// for live-merged nodes. Callers hand it to `decide` as the
-    /// `legacy_seed`; `decide` itself ignores an empty floor and any
-    /// floor behind a suffix that begins with a reset row.
-    pub(crate) fn legacy_retry_floor(&self) -> &crate::retry_policy::PersistedRetryColumns {
-        &self.legacy_retry_floor
-    }
-
     // r[impl sched.retry.recovery-projection+2]
     // r[impl sched.retry.failover-budget]
     /// Rebuild the in-memory retry view from the attempt-ledger fold
-    /// over [`Self::attempt_history`], seeded by the carried legacy
-    /// floor (`legacy_retry_floor`, decision P5). Recovery calls this
+    /// over [`Self::attempt_history`]. Recovery calls this
     /// once per loaded node after the suffix load, so the recovered
-    /// view is the same seeded fold the live appending transactions
+    /// view is the same fold the live appending transactions
     /// compute — budgets and the placement exclusion survive a leader
     /// failover (`sched.retry.failover-budget`) instead of the
     /// pre-ledger selective forgiveness.
@@ -1856,12 +1801,8 @@ impl DerivationState {
         budget: &crate::retry_policy::Budget,
         now_epoch_secs: crate::retry_policy::AbsTime,
     ) {
-        let decision = crate::retry_policy::decide(
-            &self.attempt_history,
-            budget,
-            now_epoch_secs,
-            Some(&self.legacy_retry_floor),
-        );
+        let decision =
+            crate::retry_policy::decide(&self.attempt_history, budget, now_epoch_secs, None);
         let c = decision.counters;
         let now = Instant::now();
         // Epoch-seconds → Instant conversions. Past timestamps clamp at
@@ -1894,8 +1835,9 @@ impl DerivationState {
         };
     }
 
-    /// Refresh the cached dispatch view (`self.retry`) from the seeded
-    /// fold after the in-memory attempt history changed (an append or a
+    /// Refresh the cached dispatch view (`self.retry`) from the
+    /// attempt-ledger fold after the in-memory attempt history changed
+    /// (an append or a
     /// two-installment classification committed). Same computation as
     /// [`Self::rebuild_retry_view_from_ledger`], but the actor-managed
     /// `backoff_until` carve-out is preserved instead of being replaced
@@ -2585,10 +2527,8 @@ mod tests {
             drv_path: "not-a-store-path".into(),
             pname: None,
             system: "x86_64-linux".into(),
-            failed_builders: vec![],
             elapsed_secs: 100.0,
             is_fixed_output: false,
-            resubmit_cycles: 0,
         };
         let err = DerivationState::from_poisoned_row(row).unwrap_err();
         assert_eq!(
@@ -2618,8 +2558,6 @@ mod tests {
             status: "queued".into(),
             required_features: vec![],
             assigned_builder_id: None,
-            retry_count: 0,
-            resubmit_cycles: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
             wanted_output_names: vec![],
@@ -2630,7 +2568,6 @@ mod tests {
             is_ca: true,
             topdown_pruned: false,
             closure_hole: false,
-            failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
@@ -2823,10 +2760,8 @@ mod tests {
             drv_path: rio_test_support::fixtures::test_drv_path("inf"),
             pname: None,
             system: "x86_64-linux".into(),
-            failed_builders: vec![],
             elapsed_secs: f64::INFINITY,
             is_fixed_output: false,
-            resubmit_cycles: 0,
         };
         let state = DerivationState::from_poisoned_row(row).unwrap();
         // Clamp caps at 1yr, checked_sub(1yr) on most boxes → None →

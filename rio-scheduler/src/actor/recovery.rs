@@ -350,16 +350,15 @@ impl DagActor {
 
         // --- Rebuild every loaded node's retry view from the fold ---
         // Phase 1b (T-1b.12a): the recovered retry view is `decide()`'s
-        // counters over the loaded suffix, seeded by the legacy mirror
-        // columns captured at construction (the same seeded fold the
-        // live appending transactions compute), replacing the pre-ledger
+        // counters over the loaded suffix (the same fold the live
+        // appending transactions compute), replacing the pre-ledger
         // selective forgiveness — budgets, the 300 s window anchor, and
         // the placement exclusion (including backstop- and
-        // crash-established entries that never had a column mirror)
-        // survive a leader failover (`sched.retry.failover-budget`).
+        // crash-established entries) survive a leader failover
+        // (`sched.retry.failover-budget`).
         // Runs for EVERY loaded node, not only those with attempt rows:
-        // with an empty suffix the seeded fold degenerates to the pure
-        // legacy projection, exactly what construction already set.
+        // with an empty suffix the fold degenerates to the default
+        // (empty) retry state, exactly what construction already set.
         // `poisoned_at`/status stay row-owned (`sched.poison.ttl-persist`),
         // and the verdict is not acted on here — recovery-time verdict
         // enforcement is T-1b.12b.
@@ -911,12 +910,10 @@ impl DagActor {
     /// which also own the `TtlExpire` verdict), and `Cancel` is not
     /// enforced here — the timeout cap re-converges on the next
     /// deadline observation exactly as before. The verdict comes from
-    /// the same seeded fold the live appending transactions compute
-    /// (T-1b.12a); a legacy-columns-only history with no ledger rows
-    /// folds to `Requeue` (no decision-bearing event), so pre-066
-    /// at-threshold state still converges at its next observation, not
-    /// here. The establishment sweep's store-probe adopt arm
-    /// (`adopt_orphan_completion`) is unchanged.
+    /// the same attempt-ledger fold the live appending transactions
+    /// compute (T-1b.12a); a derivation with no ledger rows folds to
+    /// `Requeue` (no decision-bearing event). The establishment sweep's
+    /// store-probe adopt arm (`adopt_orphan_completion`) is unchanged.
     async fn enforce_recovered_verdicts(&mut self) {
         let budget = self.decision_budget();
         let now_epoch = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
@@ -932,12 +929,8 @@ impl DagActor {
                 )
             })
             .filter_map(|(h, s)| {
-                let decision = crate::retry_policy::decide(
-                    s.attempt_history(),
-                    &budget,
-                    now_epoch,
-                    Some(s.legacy_retry_floor()),
-                );
+                let decision =
+                    crate::retry_policy::decide(s.attempt_history(), &budget, now_epoch, None);
                 match decision.verdict {
                     crate::retry_policy::Verdict::Poison(reason) => Some((h.into(), reason)),
                     _ => None,

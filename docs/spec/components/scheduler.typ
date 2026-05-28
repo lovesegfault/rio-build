@@ -1545,7 +1545,7 @@ Queue-level preemption is fully supported:
   The `poisoned → created` transition is gated by a 24h TTL.
 ]
 
-#r("sched.merge.poisoned-resubmit-bounded+3")[
+#r("sched.merge.poisoned-resubmit-bounded+4")[
   When a build merges and finds a pre-existing `poisoned` node in the global
   DAG, the node resets for re-dispatch (same as
   `cancelled`/`failed`/`dependency_failed`) iff its `resubmit_cycles` is below
@@ -1554,13 +1554,16 @@ Queue-level preemption is fully supported:
   cause --- but bounded so a genuinely-broken derivation cannot loop forever.
   `resubmit_cycles` is incremented on each reset and persisted durably --- the
   `resubmit_reset` attempt-ledger row appended for the reset carries the new
-  cycle index, and the frozen legacy `derivations.resubmit_cycles` column
-  floors pre-ledger history --- so the bound accumulates across re-submissions
+  cycle index --- so the bound accumulates across re-submissions
   and survives scheduler restart. The reset gives the node a fresh per-cycle
   `retry_count = 0` (full `max_retries` budget). At or above the limit the
   node stays `poisoned` and the build fail-fasts (use the 24h TTL or
   `ClearPoison` admin RPC to override).
 ]
+The `+4` revision dropped the frozen `derivations.resubmit_cycles` mirror
+column from the durability clause: migration 073 removed the column, and the
+attempt-ledger reset row has been the only carrier of the cycle index since
+the Phase-1b cutover froze the column.
 
 #r("sched.merge.stale-completed-verify+5")[
   When a build merges and finds a pre-existing `completed` or `skipped` node in
@@ -2513,17 +2516,21 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   transactional chokepoint. Mirrors `sweep_stale_live_pins`.
 ]
 
-#r("sched.db.clear-poison-batch+2")[
+#r("sched.db.clear-poison-batch+3")[
   `clear_poison` has a `clear_poison_batch(&[DrvHash])` variant using `WHERE
   drv_hash = ANY($1)`. The merge-time resubmit-reset path (`reset_on_resubmit`)
   clears poison for every node a resubmit flipped from terminal to fresh;
   per-hash sequential calls inside the single-threaded actor cost N round-trips
-  on the dispatch hot path. The batch variant leaves the frozen
-  `resubmit_cycles` mirror column untouched --- the new cycle index is carried
-  by the `resubmit_reset` attempt-ledger row appended in the same transaction
-  (the scalar zeroes the column: admin/TTL = full reset; resubmit = bound
-  accumulates via the ledger).
+  on the dispatch hot path. Both variants clear only the poison-lifecycle
+  state on the derivations row (`poisoned_at`, status) --- every retry/poison
+  budget, including the resubmit cycle index, is carried by the attempt
+  ledger (the `resubmit_reset` row appended in the same transaction), not by
+  derivations columns.
 ]
+The `+3` revision dropped the frozen-mirror-column clause (the batch variant
+used to be distinguished by leaving `derivations.resubmit_cycles` untouched);
+migration 073 removed the mirror columns, so the two variants now differ only
+in call shape, not column set.
 
 == Schema (pseudo-DDL)
 
@@ -2551,7 +2558,7 @@ CREATE TABLE derivations (
     required_features   TEXT[] NOT NULL DEFAULT '{}',
     assigned_builder_id TEXT,
     -- assignment_gen lives on assignments table (as generation), not here
-    retry_count         INT NOT NULL DEFAULT 0,
+    -- retry/poison counters live in the drv_attempts ledger (066), not here
     created_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at          TIMESTAMPTZ NOT NULL DEFAULT now(),
     CONSTRAINT derivations_drv_hash_uq UNIQUE (drv_hash)

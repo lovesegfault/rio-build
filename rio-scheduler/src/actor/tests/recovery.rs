@@ -1752,36 +1752,47 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
 }
 
 /// bug_001 + discovered_001: `resubmit_cycles` survives recovery.
-/// Poison + resubmit twice (PG `resubmit_cycles` → 2 = LIMIT), restart
-/// scheduler, resubmit → bound MUST hold. Before `M_051`,
-/// `from_poisoned_row` left the cross-cycle counter at default 0 and
-/// `clear_poison_batch` zeroed PG on every resubmit, so failover gave a
-/// fresh budget.
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+/// Drive the resubmit bound to LIMIT, restart the scheduler, resubmit →
+/// bound MUST hold. The cross-cycle counter's durable carrier is the
+/// `resubmit_reset` attempt-ledger row (the mirror column it once also
+/// lived in was dropped by migration 073), so the seed here is the
+/// ledger row the production resubmit path appends — recovery rebuilds
+/// the counter from the ledger fold.
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 #[tokio::test]
 async fn test_poisoned_recovery_preserves_resubmit_cycles() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
     let f = RecoveryFixture::run(async |handle, pool| {
         seed_poisoned(&handle, "rs-cyc").await?;
-        // Drive resubmit_cycles to LIMIT in PG (mirror the in-mem
-        // increment that `clear_poison_batch` would have done over
-        // LIMIT resubmit cycles). Status stays 'poisoned' so recovery
-        // loads via `load_poisoned_derivations`.
-        sqlx::query("UPDATE derivations SET resubmit_cycles = $2 WHERE drv_hash = $1")
-            .bind("rs-cyc")
-            .bind(POISON_RESUBMIT_RETRY_LIMIT as i32)
-            .execute(&pool)
-            .await?;
+        // Drive the resubmit bound to LIMIT via the durable carrier:
+        // append the `resubmit_reset` ledger row the LIMIT-th resubmit
+        // would have appended (cycle index = LIMIT). Status stays
+        // 'poisoned' so recovery loads via `load_poisoned_derivations`,
+        // and the ledger fold recovers `resubmit_cycles = LIMIT`.
+        let derivation_id: Uuid =
+            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+                .bind("rs-cyc")
+                .fetch_one(&pool)
+                .await?;
+        let reset = crate::db::attempts::AttemptRow::new_reset(
+            derivation_id,
+            crate::state::OutcomeClass::ResubmitReset,
+            crate::state::ReportingParty::Scheduler,
+            POISON_RESUBMIT_RETRY_LIMIT as i32,
+        );
+        let mut tx = pool.begin().await?;
+        crate::db::SchedulerDb::append_attempt(&mut tx, &reset).await?;
+        tx.commit().await?;
         Ok(())
     })
     .await?;
 
-    // After recovery: resubmit_cycles loaded from PG.
+    // After recovery: resubmit_cycles rebuilt from the ledger fold.
     let post = expect_drv(&f.handle, "rs-cyc").await;
     assert_eq!(post.status, DerivationStatus::Poisoned);
     assert_eq!(
         post.retry.resubmit_cycles, POISON_RESUBMIT_RETRY_LIMIT,
-        "bug_001: from_poisoned_row must load resubmit_cycles from PG"
+        "bug_001: recovery must rebuild resubmit_cycles from the ledger fold"
     );
 
     // Resubmit on the fresh actor → bound holds (stays Poisoned).
@@ -3847,110 +3858,6 @@ async fn test_leader_lost_invalidates_kept_recovery_completion() -> TestResult {
 //         actor/tests/executor.rs.
 // ---------------------------------------------------------------------------
 
-// r[verify sched.retry.recovery-projection+2]
-/// A suffix that begins with a reset row ignores the legacy columns:
-/// the reset cleared the within-cycle state under both eras' semantics,
-/// so the recovered view is the fold of the post-reset rows only.
-#[tokio::test]
-async fn phase1b_recovery_reset_row_ignores_legacy_columns() -> TestResult {
-    let drv_hash = "legreset-drv";
-    let f = RecoveryFixture::run(async move |handle, pool| {
-        let _ev =
-            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-        barrier(&handle).await;
-        sqlx::query(
-            "UPDATE derivations SET retry_count = 2, \
-             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
-             WHERE drv_hash = $1",
-        )
-        .bind(drv_hash)
-        .execute(&pool)
-        .await?;
-        let derivation_id: Uuid =
-            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
-                .bind(drv_hash)
-                .fetch_one(&pool)
-                .await?;
-        // The suffix starts at a reset row (admin poison-clear shape),
-        // followed by one post-reset attempt from a fresh executor.
-        let reset = crate::db::attempts::AttemptRow::new_reset(
-            derivation_id,
-            crate::state::OutcomeClass::PoisonCleared,
-            crate::state::ReportingParty::Admin,
-            0,
-        );
-        let mut attempt = crate::db::attempts::AttemptRow::new(
-            derivation_id,
-            crate::state::OutcomeClass::Transient,
-            crate::state::ReportingParty::Worker,
-        );
-        attempt.executor_id = Some("post-w".into());
-        let mut tx = pool.begin().await?;
-        crate::db::SchedulerDb::append_attempt(&mut tx, &reset).await?;
-        crate::db::SchedulerDb::append_attempt(&mut tx, &attempt).await?;
-        tx.commit().await?;
-        Ok(())
-    })
-    .await?;
-    let handle = f.handle;
-
-    let info = expect_drv(&handle, drv_hash).await;
-    for legacy in ["leg-a", "leg-b"] {
-        assert!(
-            !info.retry.failed_builders.contains(legacy),
-            "a suffix that begins with a reset row must ignore the legacy \
-             columns (got {legacy} in {:?})",
-            info.retry.failed_builders
-        );
-    }
-    assert!(
-        info.retry.failed_builders.contains("post-w"),
-        "the post-reset row still counts"
-    );
-    assert_eq!(info.retry.count, 1, "fold of the post-reset rows only");
-    assert_eq!(
-        info.retry.resubmit_cycles, 0,
-        "the columns' resubmit_cycles is ignored behind the reset row"
-    );
-    Ok(())
-}
-
-// r[verify sched.retry.recovery-projection+2]
-/// Pre-ledger fallback: a derivation with non-empty mirror columns and
-/// NO attempt rows recovers exactly the pure legacy projection, as it
-/// did before the ledger existed.
-#[tokio::test]
-async fn phase1b_recovery_pre_ledger_columns_only_is_legacy_projection() -> TestResult {
-    let drv_hash = "legonly-drv";
-    let f = RecoveryFixture::run(async move |handle, pool| {
-        let _ev =
-            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-        barrier(&handle).await;
-        sqlx::query(
-            "UPDATE derivations SET retry_count = 2, \
-             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
-             WHERE drv_hash = $1",
-        )
-        .bind(drv_hash)
-        .execute(&pool)
-        .await?;
-        Ok(())
-    })
-    .await?;
-    let handle = f.handle;
-
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(info.retry.count, 2);
-    assert_eq!(info.retry.resubmit_cycles, 1);
-    assert_eq!(info.retry.failure_count, 2);
-    assert_eq!(info.retry.failed_builders.len(), 2);
-    assert!(info.retry.failed_builders.contains("leg-a"));
-    assert!(info.retry.failed_builders.contains("leg-b"));
-    assert_eq!(info.retry.infra_count, 0);
-    assert_eq!(info.retry.timeout_count, 0);
-    Ok(())
-}
-
 /// Companion guard for T-1b.12b: recovery over an under-budget history
 /// poisons nothing (the mass-poison regression guard) — the node stays
 /// dispatchable with its recovered counters intact.
@@ -3993,70 +3900,6 @@ async fn phase1b_recovery_under_budget_history_poisons_nothing() -> TestResult {
         2,
         "the recovered counters are intact"
     );
-    Ok(())
-}
-
-/// The at-budget mixed-era variant of the boundary-spanning merge: the
-/// legacy floor (P5) participates in the recovery-time verdict, so a
-/// history that is at the poison threshold only when both eras are
-/// counted ({leg-a,leg-b} from the columns plus one post-066 counted
-/// row) converges to Poisoned at recovery — the same verdict the
-/// as-built code would have produced when that row's event was
-/// observed live — and the merged exclusion survives onto the poisoned
-/// node.
-#[tokio::test]
-async fn phase1b_recovery_legacy_floor_contributes_to_at_budget_verdict() -> TestResult {
-    let drv_hash = "legcap-drv";
-    let f = RecoveryFixture::run(async move |handle, pool| {
-        let _ev =
-            merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
-        barrier(&handle).await;
-        sqlx::query(
-            "UPDATE derivations SET retry_count = 2, \
-             failed_builders = '{leg-a,leg-b}', resubmit_cycles = 1 \
-             WHERE drv_hash = $1",
-        )
-        .bind(drv_hash)
-        .execute(&pool)
-        .await?;
-        let derivation_id: Uuid =
-            sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
-                .bind(drv_hash)
-                .fetch_one(&pool)
-                .await?;
-        let mut row = crate::db::attempts::AttemptRow::new(
-            derivation_id,
-            crate::state::OutcomeClass::Transient,
-            crate::state::ReportingParty::Worker,
-        );
-        row.executor_id = Some("leg-c".into());
-        let mut tx = pool.begin().await?;
-        crate::db::SchedulerDb::append_attempt(&mut tx, &row).await?;
-        tx.commit().await?;
-        Ok(())
-    })
-    .await?;
-    let handle = f.handle;
-
-    let info = expect_drv(&handle, drv_hash).await;
-    assert_eq!(
-        info.status,
-        DerivationStatus::Poisoned,
-        "the threshold crossed across both eras converges at recovery"
-    );
-    for w in ["leg-a", "leg-b", "leg-c"] {
-        assert!(
-            info.retry.failed_builders.contains(w),
-            "the merged exclusion {w} survives onto the poisoned node, got {:?}",
-            info.retry.failed_builders
-        );
-    }
-    let pg_status: String =
-        sqlx::query_scalar("SELECT status FROM derivations WHERE drv_hash = $1")
-            .bind(drv_hash)
-            .fetch_one(&f.db.pool)
-            .await?;
-    assert_eq!(pg_status, "poisoned", "the recovery-time verdict persists");
     Ok(())
 }
 

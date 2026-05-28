@@ -294,8 +294,7 @@ impl SchedulerDb {
     ) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
-                 resubmit_cycles = 0, status = 'created', updated_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now()
              WHERE drv_hash = $1",
             drv_hash.as_str(),
         )
@@ -304,13 +303,13 @@ impl SchedulerDb {
         .map(|_| ())
     }
 
-    /// Clear poison state: NULL `poisoned_at`, empty `failed_builders`,
-    /// zero `retry_count`, zero `resubmit_cycles`, status='created'. Used
-    /// by ClearPoison admin RPC + TTL expiry in `handle_tick` — admin
-    /// override and TTL expiry are full resets (unlike
-    /// [`Self::clear_poison_batch`], which leaves the frozen
-    /// `resubmit_cycles` mirror column untouched — the resubmit-bound is
-    /// carried by the `resubmit_reset` ledger row).
+    /// Clear poison state: NULL `poisoned_at`, status='created'. Used
+    /// by ClearPoison admin RPC + TTL expiry in `handle_tick`. The
+    /// retry/poison counters themselves are not derivations columns any
+    /// more (migration 073 dropped the frozen mirror columns) — the
+    /// budget reset is carried by the `poison_cleared` / `resubmit_reset`
+    /// ledger row appended in the same transaction, which starts a fresh
+    /// fold suffix.
     ///
     /// Owns its connection; reset sites that already hold a transaction
     /// use `clear_poison_in_tx` instead.
@@ -320,25 +319,25 @@ impl SchedulerDb {
         tx.commit().await
     }
 
-    // r[impl sched.db.clear-poison-batch+2]
+    // r[impl sched.db.clear-poison-batch+3]
     /// Batch poison clear for the resubmit-reset path: one round-trip
-    /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears per-cycle
-    /// state (`poisoned_at`, `failed_builders`, `retry_count`) and
-    /// leaves the frozen `resubmit_cycles` mirror column untouched —
-    /// the new cycle index that keeps the
-    /// `r[sched.merge.poisoned-resubmit-bounded]` bound alive across a
-    /// leader failover is carried by the `resubmit_reset` ledger row
-    /// appended in the same transaction (the in-mem carry at
-    /// `dag::merge` is the dispatch-time seed it stamps).
+    /// for N hashes via `WHERE drv_hash = ANY($1)`. Clears the
+    /// poison-lifecycle state (`poisoned_at`, status) — the new cycle
+    /// index that keeps the `r[sched.merge.poisoned-resubmit-bounded]`
+    /// bound alive across a leader failover is carried by the
+    /// `resubmit_reset` ledger row appended in the same transaction (the
+    /// in-mem carry at `dag::merge` is the dispatch-time seed it
+    /// stamps).
     ///
     /// I-169: `merge.rs`' resubmit-reset path called `clear_poison`
     /// per-hash inside the single-threaded actor — a 500-node resubmit
     /// blocked heartbeat/dispatch for 500 sequential PG round-trips.
     /// Same shape as [`update_derivation_status_batch`].
     ///
-    /// NOT the same column set as [`clear_poison`]: that one also
-    /// zeroes `resubmit_cycles` (admin/TTL → full reset); this one
-    /// never touches it (resubmit → bound accumulates via the ledger).
+    /// Same column set as [`clear_poison`] since migration 073 dropped
+    /// the frozen mirror columns; the two stay separate functions
+    /// because the batch form is the hot-path vehicle and the scalar
+    /// form owns its own connection.
     ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
@@ -365,8 +364,7 @@ impl SchedulerDb {
         let hashes: Vec<&str> = drv_hashes.iter().map(DrvHash::as_str).collect();
         let result = sqlx::query!(
             "UPDATE derivations
-             SET poisoned_at = NULL, failed_builders = '{}', retry_count = 0,
-                 status = 'created', updated_at = now()
+             SET poisoned_at = NULL, status = 'created', updated_at = now()
              WHERE drv_hash = ANY($1::text[])",
             &hashes as &[&str],
         )
@@ -442,54 +440,6 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    /// Load the legacy retry mirror columns
-    /// (`derivations.{retry_count, failed_builders, resubmit_cycles}`)
-    /// for one derivation, on the caller's connection — the transitional
-    /// legacy seed (decision P5) the Phase-1b appending transactions hand
-    /// to `decide()` so a failure history that spans the 066 deployment
-    /// keeps the budgets and exclusions the columns hold. Returns `None`
-    /// when the derivation row does not exist (uncommitted merge);
-    /// `poisoned_at` is deliberately not read here — the live failure
-    /// paths only run for non-terminal derivations, and the recovery-side
-    /// seed construction (T-1b.12a) owns the poisoned-row variant.
-    ///
-    /// The mirror columns are frozen as of the T-1b.13 cutover: their
-    /// per-counter writers are gone and only the reset paths still zero
-    /// them, so they hold at most what the pre-cutover writers left.
-    // TODO: drop the `derivations.{retry_count, failed_builders,
-    // resubmit_cycles}` mirror columns, this seed loader, and the
-    // `legacy_seed` parameter of `decide()` (restoring the frozen §5a-2
-    // 3-arg signature) once the drain condition holds: no non-terminal or
-    // poisoned derivation has non-empty mirror columns together with an
-    // attempt suffix that contains no reset row — i.e. every live failure
-    // history is either fully post-066 or has passed through a reset that
-    // makes the seed unreachable. The Phase-2 close-out deferred the drop
-    // (the condition is unmet by definition at the 066 release boundary);
-    // the operational drain probe and the retirement checklist live in
-    // docs/spec/models/retry-invariant-map.md ("Mirror-column
-    // retirement").
-    pub(crate) async fn load_retry_seed_in_tx(
-        tx: &mut PgConnection,
-        derivation_id: uuid::Uuid,
-    ) -> Result<Option<crate::retry_policy::PersistedRetryColumns>, sqlx::Error> {
-        let row: Option<(i32, i32, Vec<String>)> = sqlx::query_as(
-            "SELECT COALESCE(retry_count, 0), COALESCE(resubmit_cycles, 0), \
-                    COALESCE(failed_builders, '{}') \
-             FROM derivations WHERE derivation_id = $1",
-        )
-        .bind(derivation_id)
-        .fetch_optional(&mut *tx)
-        .await?;
-        Ok(row.map(|(retry_count, resubmit_cycles, failed_builders)| {
-            crate::retry_policy::PersistedRetryColumns {
-                retry_count: u32::try_from(retry_count).unwrap_or(0),
-                resubmit_cycles: u32::try_from(resubmit_cycles).unwrap_or(0),
-                failed_builders: failed_builders.into_iter().collect(),
-                poisoned_at: None,
-            }
-        }))
-    }
-
     /// Load poisoned derivations with their `poisoned_at` timestamps
     /// for recovery. Separate from `load_nonterminal_derivations`
     /// because `TERMINAL_STATUSES` includes `"poisoned"`.
@@ -503,17 +453,18 @@ impl SchedulerDb {
     /// can never be in this state.
     ///
     /// Returns minimal fields — poisoned rows aren't dispatched, just
-    /// TTL-tracked + resubmit-bound checked. `failed_builders` matters
-    /// for display; `resubmit_cycles` for `is_retriable_on_resubmit`;
-    /// `elapsed_secs` is `now() - poisoned_at` computed PG-side so
-    /// the caller can convert `Instant::now() - Duration::from_secs(elapsed)`.
+    /// TTL-tracked + resubmit-bound checked (the exclusion set and the
+    /// resubmit bound are rebuilt from the attempt-ledger fold after the
+    /// suffix load). `elapsed_secs` is `now() - poisoned_at` computed
+    /// PG-side so the caller can convert
+    /// `Instant::now() - Duration::from_secs(elapsed)`.
     pub(crate) async fn load_poisoned_derivations(
         &self,
     ) -> Result<Vec<PoisonedDerivationRow>, sqlx::Error> {
         sqlx::query_as(
             r#"
             SELECT derivation_id, drv_hash, drv_path, pname, system,
-                   failed_builders, is_fixed_output, resubmit_cycles,
+                   is_fixed_output,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
                        0.0
@@ -529,13 +480,9 @@ impl SchedulerDb {
     /// Operator-facing poisoned listing for `AdminService.ListPoisoned`:
     /// `(drv_path, failed_executors, poisoned_secs_ago)` per poisoned
     /// derivation, with `failed_executors` aggregated from the attempt
-    /// ledger UNIONed with the frozen legacy `failed_builders` column.
-    ///
-    /// The legacy column stopped being written at the T-1b.13 cutover,
-    /// so post-cutover poisons would otherwise display an empty executor
-    /// list; the union keeps pre-066 poisons (whose history exists only
-    /// in the column) displaying exactly as before. Only the ledger
-    /// classes whose fold arm charges the exclusion set
+    /// ledger (the legacy `failed_builders` column union retired with
+    /// migration 073 — the ledger is the only failure-history record).
+    /// Only the ledger classes whose fold arm charges the exclusion set
     /// (`transient`, `permanent`, `backstop`, `executor_crash`) are
     /// aggregated, so the displayed set keeps the as-built meaning of
     /// "executors whose failure charged this derivation" rather than
@@ -547,18 +494,13 @@ impl SchedulerDb {
             r#"
             SELECT d.drv_path,
                    COALESCE(
-                       (SELECT array_agg(DISTINCT e ORDER BY e)
-                        FROM (
-                            SELECT unnest(d.failed_builders) AS e
-                            UNION
-                            SELECT a.executor_id
-                            FROM drv_attempts a
-                            WHERE a.derivation_id = d.derivation_id
-                              AND a.executor_id IS NOT NULL
-                              AND a.event_kind = 'attempt'
-                              AND a.outcome_class IN
-                                  ('transient', 'permanent', 'backstop', 'executor_crash')
-                        ) u),
+                       (SELECT array_agg(DISTINCT a.executor_id ORDER BY a.executor_id)
+                        FROM drv_attempts a
+                        WHERE a.derivation_id = d.derivation_id
+                          AND a.executor_id IS NOT NULL
+                          AND a.event_kind = 'attempt'
+                          AND a.outcome_class IN
+                              ('transient', 'permanent', 'backstop', 'executor_crash')),
                        '{}'::text[]
                    ) AS failed_executors,
                    COALESCE(

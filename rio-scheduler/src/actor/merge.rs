@@ -683,19 +683,18 @@ impl DagActor {
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
         // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
-        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
-        // so without this PG keeps stale poison fields. The status itself
+        // CONFLICT does NOT touch poisoned_at, so without this PG keeps a
+        // stale poison stamp. The status itself
         // is overwritten by `update_derivation_status_batch` below
         // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
-        // resurrect it; this is about keeping failed_builders/poisoned_at
+        // resurrect it; this is about keeping poisoned_at
         // consistent for the NEXT poison cycle. The new cycle index is
         // carried by each reset node's `resubmit_reset` ledger row
         // (appended in the same transaction as this batched clear, so
         // the suffix cut and the per-cycle reset commit together) — that
-        // row is what makes the resubmit bound survive leader failover;
-        // the legacy `resubmit_cycles` mirror column is frozen and no
-        // longer incremented here. Best-effort.
-        // r[impl sched.db.clear-poison-batch+2]
+        // row is what makes the resubmit bound survive leader failover.
+        // Best-effort.
+        // r[impl sched.db.clear-poison-batch+3]
         if !merge_result.reset_on_resubmit.is_empty()
             && let Err(e) = self
                 .record_resubmit_resets(&merge_result.reset_on_resubmit)

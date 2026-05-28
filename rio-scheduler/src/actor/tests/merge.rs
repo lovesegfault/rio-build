@@ -6514,7 +6514,7 @@ async fn test_resubmit_poisoned_retry_limit_bound(
     Ok(())
 }
 
-// r[verify sched.merge.poisoned-resubmit-bounded+3]
+// r[verify sched.merge.poisoned-resubmit-bounded+4]
 // r[verify sched.substitute.detached+5]
 /// I-094 substitutable lane: a `Poisoned` node at the resubmit limit
 /// whose output is upstream-substitutable (NOT locally present) on

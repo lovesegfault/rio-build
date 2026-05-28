@@ -339,7 +339,7 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
-    // r[impl sched.merge.poisoned-resubmit-bounded+3]
+    // r[impl sched.merge.poisoned-resubmit-bounded+4]
     pub fn merge(
         &mut self,
         build_id: Uuid,

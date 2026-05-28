@@ -208,8 +208,9 @@ pub(crate) struct RecoveryBuildRow {
 }
 
 /// Row from `load_poisoned_derivations`. Minimal — poisoned rows
-/// aren't dispatched, just TTL-tracked + resubmit-bound checked
-/// (`is_retriable_on_resubmit` reads `resubmit_cycles`). `elapsed_secs`
+/// aren't dispatched, just TTL-tracked + resubmit-bound checked (the
+/// resubmit bound and the exclusion set are rebuilt from the
+/// attempt-ledger fold after the suffix load). `elapsed_secs`
 /// is computed PG-side (`now() - poisoned_at`) so the caller can
 /// reconstruct an `Instant` via
 /// `Instant::now() - Duration::from_secs_f64(elapsed)`.
@@ -220,21 +221,21 @@ pub(crate) struct PoisonedDerivationRow {
     pub drv_path: String,
     pub pname: Option<String>,
     pub system: String,
-    pub failed_builders: Vec<String>,
     pub elapsed_secs: f64,
     /// I-057: previously hardcoded false in `from_poisoned_row`. A
     /// poison-recovered FOD with `is_fixed_output: false` would route
     /// to a builder via the kind XOR in `hard_filter`, hit `WrongKind`
     /// at executor/mod.rs:390, and re-poison. Thread it through.
     pub is_fixed_output: bool,
-    /// `M_051`: resubmit-bound counter; persisted so the bound survives
-    /// failover (bug_001).
-    pub resubmit_cycles: i32,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
 /// columns from `batch_upsert_derivations` plus live-state fields
-/// (retry_count, assigned_builder_id, failed_builders).
+/// (assigned_builder_id, the persisted resource floor, the active
+/// exec_id). Retry counters are not derivations columns (the attempt
+/// ledger is the only failure-history record since migration 073);
+/// recovery rebuilds the retry view from the ledger fold after the
+/// suffix load.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct RecoveryDerivationRow {
     pub derivation_id: Uuid,
@@ -245,8 +246,6 @@ pub(crate) struct RecoveryDerivationRow {
     pub status: String,
     pub required_features: Vec<String>,
     pub assigned_builder_id: Option<String>,
-    pub retry_count: i32,
-    pub resubmit_cycles: i32,
     pub expected_output_paths: Vec<String>,
     pub output_names: Vec<String>,
     /// Demand-driven wanted-output set (`migrations/062`). Empty = all
@@ -278,7 +277,6 @@ pub(crate) struct RecoveryDerivationRow {
     /// produced survivors cannot launder the mark away after a failover
     /// (the un-produced child's own row may have been GC'd by then).
     pub closure_hole: bool,
-    pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
     /// (`i64`) — saturating-cast to `u64`/`u32` at hydration.
     pub floor_mem_bytes: i64,
@@ -307,8 +305,6 @@ impl RecoveryDerivationRow {
             status: "ready".into(),
             required_features: vec![],
             assigned_builder_id: None,
-            retry_count: 0,
-            resubmit_cycles: 0,
             expected_output_paths: vec![],
             output_names: vec!["out".into()],
             wanted_output_names: vec![],
@@ -316,7 +312,6 @@ impl RecoveryDerivationRow {
             is_ca: false,
             topdown_pruned: false,
             closure_hole: false,
-            failed_builders: vec![],
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,

@@ -219,10 +219,10 @@ impl DagActor {
     }
 
     /// The read half of a Phase-1b appending transaction: append `row`,
-    /// load the post-reset suffix it now belongs to and the legacy
-    /// mirror-column seed (decision P5) on the same connection, and fold
-    /// them through `decide()`. The caller persists the verdict's status
-    /// via the `_in_tx` variants on the same connection and commits.
+    /// load the post-reset suffix it now belongs to on the same
+    /// connection, and fold it through `decide()`. The caller persists
+    /// the verdict's status via the `_in_tx` variants on the same
+    /// connection and commits.
     ///
     /// Returns whether the append actually inserted (an exec_id-bearing
     /// duplicate is rejected by the partial-unique index and reads back
@@ -236,7 +236,6 @@ impl DagActor {
         let inserted = crate::db::SchedulerDb::append_attempt(tx, row).await?;
         let suffix =
             crate::db::SchedulerDb::load_attempt_suffix_one_in_tx(tx, row.derivation_id).await?;
-        let seed = crate::db::SchedulerDb::load_retry_seed_in_tx(tx, row.derivation_id).await?;
         let history: Vec<crate::state::AttemptRecord> =
             suffix.iter().map(AttemptRow::to_record).collect();
         Ok((
@@ -245,7 +244,7 @@ impl DagActor {
                 &history,
                 &self.decision_budget(),
                 crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-                seed.as_ref(),
+                None,
             ),
         ))
     }

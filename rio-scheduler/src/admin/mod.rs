@@ -563,10 +563,9 @@ impl AdminService for AdminServiceImpl {
         // DB is the source of truth for poisoned_at (the in-memory DAG
         // reconstructs Instant from elapsed_secs at startup but doesn't
         // store the original timestamp for display). `failed_executors`
-        // is the attempt-ledger aggregate UNIONed with the frozen legacy
-        // `failed_builders` column, so post-cutover poisons keep listing
-        // the executors that failed them and pre-066 poisons display
-        // exactly as before.
+        // is the attempt-ledger aggregate (the only failure-history
+        // record since migration 073), so poisons list the executors
+        // whose failures charged them.
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db
             .load_poisoned_display()

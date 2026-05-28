@@ -1155,7 +1155,7 @@ fn apply<Id: Ord + Clone>(
         }
 
         // ── dag::merge resubmit reset ───────────────────────────────
-        // r[impl sched.merge.poisoned-resubmit-bounded+3]
+        // r[impl sched.merge.poisoned-resubmit-bounded+4]
         // A fresh `DerivationState` is constructed (all counters at
         // their defaults, including `backoff_until`) and
         // `resubmit_cycles` is carried over and incremented — the reset

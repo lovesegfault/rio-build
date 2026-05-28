@@ -67,13 +67,14 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.clear-poison-batch+2]
+// r[verify sched.db.clear-poison-batch+3]
 /// `clear_poison_batch` clears N rows in one round-trip. Asserts the
 /// rows_affected count (N hashes in → N rows touched, single statement)
-/// and the column set: per-cycle state cleared, the frozen
-/// `resubmit_cycles` mirror column left untouched (vs scalar
-/// `clear_poison` which zeroes it; the resubmit bound is carried by the
-/// `resubmit_reset` ledger row, not by this column).
+/// and the column set: the poison lifecycle state is cleared
+/// (status='created', poisoned_at NULL). The retry counters are not
+/// derivations columns (migration 073) — the budget reset is carried by
+/// the `resubmit_reset` ledger row appended in the same transaction by
+/// the production caller.
 #[tokio::test]
 async fn test_clear_poison_batch() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -95,20 +96,14 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     let affected = db.clear_poison_batch(&hashes).await?;
     assert_eq!(affected, 100, "one ANY($1) UPDATE should touch all 100");
 
-    // Per-cycle state cleared (status='created', poisoned_at NULL,
-    // failed_builders empty, retry_count 0); resubmit_cycles left
-    // untouched (still at its default 0 here) — the column is frozen
-    // legacy state since the mirror-writer retirement; the resubmit
-    // bound is carried by the `resubmit_reset` ledger row instead.
-    // Scalar `clear_poison` still zeroes it (admin/TTL = full reset).
+    // Poison lifecycle state cleared: status='created', poisoned_at
+    // NULL. Nothing else on the derivations row carries retry state any
+    // more (migration 073 dropped the mirror columns).
     assert!(db.load_poisoned_derivations().await?.is_empty());
-    let (n_created, n_clean, n_untouched): (i64, i64, i64) = sqlx::query_as(
+    let (n_created, n_clean): (i64, i64) = sqlx::query_as(
         "SELECT
              COUNT(*) FILTER (WHERE status = 'created'),
-             COUNT(*) FILTER (WHERE poisoned_at IS NULL
-                              AND failed_builders = '{}'
-                              AND retry_count = 0),
-             COUNT(*) FILTER (WHERE resubmit_cycles = 0)
+             COUNT(*) FILTER (WHERE poisoned_at IS NULL)
          FROM derivations WHERE drv_hash = ANY($1)",
     )
     .bind(hashes.iter().map(DrvHash::as_str).collect::<Vec<_>>())
@@ -116,10 +111,6 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     .await?;
     assert_eq!(n_created, 100);
     assert_eq!(n_clean, 100);
-    assert_eq!(
-        n_untouched, 100,
-        "frozen resubmit_cycles column not incremented in PG"
-    );
 
     // Empty input: no-op, no PG round-trip.
     assert_eq!(db.clear_poison_batch(&[]).await?, 0);
