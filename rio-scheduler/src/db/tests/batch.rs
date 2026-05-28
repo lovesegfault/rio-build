@@ -1116,7 +1116,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.authoritative-conflict+4]
 /// `delete_displaced_build_links` removes exactly the passed prior builds'
 /// links to the displaced derivation — the displacing build's link and
 /// other derivations' links are untouched.

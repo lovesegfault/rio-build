@@ -1608,13 +1608,16 @@ cannot drift, no migration is needed, and a row whose bytes fail to parse
 degrades to an unset hash (the build still completes; only realisation
 registration is lost, with a warning).
 
-#r("sched.merge.authoritative-conflict+3")[
+#r("sched.merge.authoritative-conflict+4")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
-  `drv_hash`: a submission that itself claims authoritative content MUST be
-  rejected unless its bytes are identical to the existing node's, and a
-  store-backed (non-authoritative) submission MUST only join the node when
-  its verifiable identity matches --- the public attributes (system, output
+  `drv_hash`: a submission that itself claims authoritative content with
+  bytes that are not identical to the existing node's MUST be rejected
+  while the existing node is live, `Failed`, or finished successfully, and
+  MUST displace it as a fresh node once it sits in a terminal failure
+  state (`Poisoned`, `Cancelled`, or `DependencyFailed`); a store-backed
+  (non-authoritative) submission MUST only join the node when its
+  verifiable identity matches --- the public attributes (system, output
   names, fixed-output flag, content-addressed flag, declared expected
   output paths) AND at least one piece of content-bound evidence: agreement
   on a non-empty fixed-output expected path, or a byte-equal CA modular
@@ -1632,14 +1635,25 @@ registration is lost, with a warning).
   the displaced node from the completion accounting of prior interested
   builds that are still non-terminal at displacement time --- builds
   already terminal at that moment keep their settled accounting --- and
-  that removal MUST survive leader failover. Both rejections surface as
+  that removal MUST survive leader failover. All rejections surface as
   `FAILED_PRECONDITION`.
 ]
 The byte-equality arm makes the legitimate producer's behaviour (identical
 hook-fallback resubmissions) a no-op while closing the cross-tenant
 pre-squat: a predictable `drv_path` cannot be claimed with attacker bytes
 and then silently joined by --- or built on behalf of --- the victim's
-submission. Public attributes alone are copyable from the victim's public
+submission. First-writer-wins for byte-different authoritative content is
+deliberately scoped to claims that are live, still owned by the retry
+machinery, or already built: the hook-fallback population (the gateway
+always submits the content-bound fallback authoritatively) has no
+store-backed form to displace a squat with, so without the
+terminal-failure displacement arm a pre-squat that fails and parks would
+hold those victims out of the hash for the rest of its poison TTL ---
+exactly the lockout the store-backed arms already refuse. A successfully
+finished claim is never redefined, so an attacker cannot use the arm to
+rewrite a built derivation; while the claim is live the rejection is
+unchanged, so nothing can yank a definition out from under a running
+build. Public attributes alone are copyable from the victim's public
 derivation, and floating-CA expected paths are empty by construction, so a
 match must additionally rest on content evidence. The two forms guarantee
 different things: for a floating-CA derivation the modular hash is
@@ -1654,8 +1668,10 @@ arguments, or environment would over-reject legitimate identical-output
 joins, and the residual harm is availability-only --- a squat that joins
 and fail-fasts can cost a joiner one spurious failure or a bounded wait,
 and a genuinely dead FOD at most one extra poison cycle --- which the
-match-displacement clause bounds by refusing to let a poison-locked claim
-hold the hash for its TTL. Tenant-scoped poisoning and stronger FOD
+displacement clauses bound by refusing to let a failed claim hold the
+hash for its TTL, whichever submission shape (store-backed or
+authoritative) the later legitimate producer uses. Tenant-scoped
+poisoning and stronger FOD
 evidence were considered and rejected as disproportionate. Identical
 content still joins: the hook receives an already-resolved derivation ---
 CppNix resolves CA derivations before hook dispatch (the building goal

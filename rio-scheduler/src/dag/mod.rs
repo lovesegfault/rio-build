@@ -35,9 +35,12 @@ pub enum DagError {
     /// node that already holds DIFFERENT authoritative content. Those
     /// bytes are the only copy of their derivation anywhere, so silently
     /// joining would let the second submitter redefine what the first
-    /// one's build runs and what recovery rebuilds. Maps to
-    /// `FAILED_PRECONDITION` (client-actionable conflict, not an internal
-    /// invariant breach).
+    /// one's build runs and what recovery rebuilds. Returned only while
+    /// the existing claim is live, `Failed` (still owned by the retry
+    /// machinery), or finished successfully — once it parks in a
+    /// terminal failure state the byte-different submission displaces it
+    /// instead of being rejected. Maps to `FAILED_PRECONDITION`
+    /// (client-actionable conflict, not an internal invariant breach).
     #[error(
         "conflicting authoritative derivation content for {drv_path}: a node \
          with different inline content already exists"
@@ -192,18 +195,20 @@ pub struct MergeResult {
     /// re-increment `resubmit_cycles` in PG and diverge from memory).
     pub authority_takeovers: Vec<DrvHash>,
     /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
-    /// node (`sched.merge.authoritative-conflict`): either its verifiable
-    /// identity conflicted with this submission, or it matched but the
-    /// node sat in a poison-locked terminal failure state no longer
-    /// retriable on resubmit. Mutually exclusive with
+    /// node (`sched.merge.authoritative-conflict`): a store-backed
+    /// submission whose verifiable identity conflicted with the terminal
+    /// node, an identity-MATCHING store-backed submission landing on a
+    /// poison-locked node no longer retriable on resubmit, or an
+    /// authoritative submission with byte-different content landing on a
+    /// node parked in a terminal failure state. Mutually exclusive with
     /// `reset_on_resubmit`: a hash appears in exactly one of the two.
     /// Unlike the resubmit-reset path, displacement carries NO prior
     /// interest and starts `resubmit_cycles` at 0 — the fresh node is
-    /// the verifiable definition taking over the hash, not a retry of
+    /// the replacing definition taking over the hash, not a retry of
     /// the squat. The actor uses this to reset the displaced row's
-    /// poison/failure accounting (including its resource floors) and to
-    /// prune the displaced hash from prior interested builds'
-    /// completion accounting.
+    /// poison/failure accounting (including its resource floors), to
+    /// scrub its persisted dependency edges, and to prune the displaced
+    /// hash from prior interested builds' completion accounting.
     pub displaced: Vec<DrvHash>,
     /// Full prior state of every pre-existing node this merge
     /// destructively removed — resubmit-reset of retriable nodes and
@@ -555,7 +560,7 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // r[impl sched.merge.authoritative-conflict+3]
+            // r[impl sched.merge.authoritative-conflict+4]
             // Authoritative-content protection. Evaluated BEFORE the
             // resubmit-reset below so the existing node is examined in
             // EVERY lifecycle state — running it after the reset would
@@ -568,8 +573,16 @@ impl DerivationDag {
             // redefine it:
             //   - another AUTHORITATIVE submission must be byte-identical
             //     (identical hook resubmissions — the only legitimate
-            //     producer — are; anything else is a conflict, in every
-            //     lifecycle state);
+            //     producer — are) while the existing claim is live,
+            //     Failed (still owned by the retry machinery), or
+            //     finished successfully; once the existing claim is
+            //     parked in a TERMINAL FAILURE state (Poisoned /
+            //     Cancelled / DependencyFailed), a byte-different
+            //     authoritative submission DISPLACES it instead — the
+            //     hook-fallback population submits authoritatively and
+            //     has no store-backed form, so without this arm a failed
+            //     squat would lock those victims out of the hash for the
+            //     rest of its poison TTL;
             //   - a store-backed (non-authoritative) submission whose
             //     verifiable identity conflicts is rejected while the
             //     node is in flight, and DISPLACES it once the node is
@@ -598,18 +611,43 @@ impl DerivationDag {
             if let Some(existing) = self.nodes.get(&drv_hash) {
                 if node.drv_content_authoritative && existing.drv_content_authoritative {
                     if existing.drv_content != node.drv_content {
-                        self.rollback_merge(
-                            &newly_inserted,
-                            &new_edges,
-                            &interest_added,
-                            &traceparent_upgraded,
-                            build_id,
-                            removed_retriable,
-                            displaced_scrubbed_edges,
-                        );
-                        return Err(DagError::AuthoritativeContentMismatch {
-                            drv_path: node.drv_path.clone(),
-                        });
+                        // Byte-different authoritative content. A claim
+                        // that finished successfully (Completed/Skipped)
+                        // is never redefined, and a live or Failed claim
+                        // keeps first-writer-wins; but a claim parked in
+                        // a terminal failure state is displaced by the
+                        // redefinition — same bookkeeping as the
+                        // store-backed displacement arm below, so the
+                        // link prune, in-tx accumulator reset, edge
+                        // scrub, and accounting all apply to it.
+                        let terminal_failure = existing.status().is_terminal()
+                            && !matches!(
+                                existing.status(),
+                                DerivationStatus::Completed | DerivationStatus::Skipped
+                            );
+                        if terminal_failure {
+                            let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                            removed_retriable.push((drv_hash.clone(), old));
+                            // r[impl sched.merge.displaced-edge-scrub]
+                            let scrubbed = self.scrub_dependency_edges(&drv_hash);
+                            if !scrubbed.is_empty() {
+                                displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
+                            }
+                            displaced.push(drv_hash.clone());
+                        } else {
+                            self.rollback_merge(
+                                &newly_inserted,
+                                &new_edges,
+                                &interest_added,
+                                &traceparent_upgraded,
+                                build_id,
+                                removed_retriable,
+                                displaced_scrubbed_edges,
+                            );
+                            return Err(DagError::AuthoritativeContentMismatch {
+                                drv_path: node.drv_path.clone(),
+                            });
+                        }
                     }
                 } else if !node.drv_content_authoritative && existing.drv_content_authoritative {
                     let identity_matches = verifiable_identity_matches(existing, node);

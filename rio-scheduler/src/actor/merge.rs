@@ -812,10 +812,11 @@ impl DagActor {
             nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
 
         // Displacement accounting (sched.merge.authoritative-conflict):
-        // a displaced node is a different derivation definition — or a
-        // poison-locked authoritative claim evicted by its verifiable
-        // store-backed form — and the spec forbids carrying the squat's
-        // interest onto the fresh node
+        // a displaced node is a different derivation definition — a
+        // conflicting-identity squat, a poison-locked claim evicted by an
+        // identity-matching store-backed submission, or a terminal-failure
+        // claim replaced by byte-different authoritative content — and the
+        // spec forbids carrying the squat's interest onto the fresh node
         // — but every removal path must either carry or prune interest,
         // otherwise a prior-interested build keeps counting a hash that
         // no longer exists for it and can hang Active forever. Prune the
@@ -2168,7 +2169,7 @@ impl DagActor {
         // non-terminal prior builds only (terminal builds keep links and
         // counts as settled history), never the displacer. Per-hash loop
         // is fine — displacement is a rare, adversarial-only path.
-        // r[impl sched.merge.authoritative-conflict+3]
+        // r[impl sched.merge.authoritative-conflict+4]
         for hash in &merge_result.displaced {
             let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {
                 // displaced ⊆ newly_inserted, so the upsert returned an id

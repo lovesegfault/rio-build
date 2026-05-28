@@ -5113,7 +5113,7 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
 /// displacing submission's `.drv` path, not the squatter's decoy path —
 /// so recovery rebuilds (and re-dispatches) that definition — not the
 /// squatter's — and without the squatter's stale authoritative bytes.
-// r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.authoritative-conflict+4]
 // r[verify sched.persist.recreate-refresh+2]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
@@ -5177,7 +5177,7 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.authoritative-conflict+4]
 /// The displacement interest prune must survive leader failover (bug_001):
 /// recovery rebuilds `interested_builds` purely from `build_derivations`,
 /// so a surviving link would re-point a prior-interested build at the

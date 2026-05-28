@@ -73,9 +73,11 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // conflicts with state another submission established
         // (sched.merge.authoritative-conflict): they map to
         // FAILED_PRECONDITION rather than INTERNAL. The precondition can
-        // clear later — once the conflicting node reaches a terminal
-        // state it is displaced by the verifiable definition, so a retry
-        // of the same submission can then succeed.
+        // clear later — once the conflicting node parks in a terminal
+        // FAILURE state, a retry of the same submission (store-backed or
+        // authoritative) displaces it and succeeds; a node that finished
+        // successfully keeps its definition, so that conflict clears
+        // only when the node is reaped or the contents match.
         ActorError::Dag(e) => match &e {
             crate::dag::DagError::AuthoritativeContentMismatch { .. }
             | crate::dag::DagError::ConflictingInFlightContent { .. }

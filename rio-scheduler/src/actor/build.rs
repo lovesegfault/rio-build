@@ -463,7 +463,7 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
-        // r[impl sched.merge.authoritative-conflict+3]
+        // r[impl sched.merge.authoritative-conflict+4]
         // A terminal build's progress accounting is settled at its
         // terminal transition (counts are persisted immediately before
         // complete_build / transition_build_to_failed runs). Terminal

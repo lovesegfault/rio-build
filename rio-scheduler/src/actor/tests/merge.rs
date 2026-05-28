@@ -8791,7 +8791,7 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 /// identity is what PG persists, the displaced hash stops counting toward
 /// prior interested builds (they complete instead of hanging Active), and
 /// the displaced fresh node belongs to the displacer only.
-// r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.authoritative-conflict+4]
 #[tokio::test]
 async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -9068,7 +9068,7 @@ async fn test_displacement_resets_resource_floor() -> TestResult {
 /// the fresh node dispatches and completes, the persisted failure
 /// accounting is reset, and the squatter's still-running build loses
 /// its durable link to the displaced hash.
-// r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.authoritative-conflict+4]
 #[tokio::test]
 async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
@@ -9411,6 +9411,113 @@ async fn test_reaped_authoritative_squat_row_resets_on_fresh_store_backed_merge(
     assert_eq!(
         info.sched.resource_floor.mem_bytes, 0,
         "fresh node not hydrated with the reaped squat's floors"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+4]
+/// End-to-end auth-vs-auth displacement: a poison-locked authoritative
+/// squat must not lock a later authoritative (hook-fallback) submission
+/// of byte-different content out of the hash for the rest of its poison
+/// TTL. The victim's submission displaces the locked squat: the victim
+/// build does not fail-fast, the persisted row carries the victim's
+/// bytes with its failure accounting reset in the same transaction, the
+/// squatter's still-running build loses its durable link, and the
+/// dispatched assignment carries the victim's content — which then
+/// completes the victim build.
+#[tokio::test]
+async fn test_authoritative_displacement_unblocks_hook_fallback_victim() -> TestResult {
+    use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    let (db, handle, _task) = setup().await;
+    let squat_drv_path = test_drv_path("squatH");
+    let squat_out = test_store_path("squatH-out");
+
+    // The squatter: an authoritative content-bound claim, then
+    // poison-locked (budget exhausted) — it can never run again.
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("squatH");
+    squat.drv_content = b"Derive-squatH".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_force_poisoned("squatH", POISON_RESUBMIT_RETRY_LIMIT)
+            .await?,
+        "squat parked Poisoned over budget"
+    );
+
+    // The victim: the legitimate hook fallback for the same drv_hash —
+    // authoritative, byte-different content (the squatter's bytes were
+    // never the real derivation).
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("squatH");
+    victim_node.drv_content = b"Derive-victimH".to_vec();
+    victim_node.drv_content_authoritative = true;
+    victim_node.expected_output_paths = vec![squat_out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Not captured by the locked squat: the victim build is live and the
+    // fresh node carries the victim's definition.
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "victim build must not fail-fast on the locked squat"
+    );
+    let info = expect_drv(&handle, "squatH").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "fresh node");
+
+    // Persisted row: the victim's bytes, with the squat's failure
+    // accounting reset inside the merge transaction.
+    let (content, cycles, poisoned): (Option<Vec<u8>>, i32, bool) = sqlx::query_as(
+        "SELECT drv_content, resubmit_cycles, poisoned_at IS NOT NULL
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("squatH")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-victimH".as_slice()),
+        "row refreshed to the victim's authoritative bytes"
+    );
+    assert_eq!(cycles, 0, "displaced row's poison budget reset");
+    assert!(!poisoned, "displaced row's poisoned_at cleared");
+
+    // The squatter's still-running build no longer counts the displaced
+    // hash (durable prune): only the victim keeps a link.
+    let linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_drv_path)
+    .fetch_all(&db.pool)
+    .await?;
+    assert_eq!(
+        linked,
+        vec![victim],
+        "squatter's link pruned, victim's kept"
+    );
+
+    // The displaced fresh node dispatches with the VICTIM's content and
+    // completes — the hash is usable again.
+    let mut rx = connect_executor(&handle, "w-auth", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, squat_drv_path, "displaced node dispatched");
+    assert_eq!(
+        assn.drv_content,
+        b"Derive-victimH".to_vec(),
+        "assignment carries the displacing definition's bytes, not the squat's"
+    );
+    complete_success(&handle, "w-auth", &squat_drv_path, &squat_out).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, victim).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "victim build completes on the displacing definition"
     );
     Ok(())
 }
