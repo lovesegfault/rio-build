@@ -19,7 +19,7 @@ use rio_nix::narinfo::NarInfo;
 use super::backend::{Backend, EntryKind, WalkEntry};
 use super::schema::{
     Capabilities, ClosureRecord, Counts, ExclusionRecord, ImpureEnv, Manifest, MemberPresence,
-    OutcomeRecord, RequestRecord, UnitRecord,
+    OutcomeRecord, RequestRecord, Substituters, UnitRecord,
 };
 use super::{
     CLOSURES_MEMBER, EXCLUSIONS_MEMBER, IMPURE_ENV_MEMBER, MANIFEST_MEMBER, METADATA_MEMBERS,
@@ -97,14 +97,7 @@ impl ReplayArchive {
         schema::parse_format_version(&manifest.format_version)
             .with_context(|| format!("{}: {MANIFEST_MEMBER}", path.display()))?;
 
-        // Relay substituters are campaign-time fetch sources; refuse plain
-        // http:// (the engine never relays over cleartext).
-        for relay in &manifest.substituters.relay {
-            ensure!(
-                relay.starts_with("https://") || relay.starts_with("s3://"),
-                "relay substituter {relay:?}: only https:// and s3:// are allowed"
-            );
-        }
+        ensure_relay_substituter_schemes(&manifest.substituters)?;
 
         // The staged metadata members and the manifest's `files` table must
         // describe the same set, and every listed member's bytes must match
@@ -354,10 +347,12 @@ impl ReplayArchive {
     ///
     /// v0 archives carry no `files`/`content_digests` integrity tables, no
     /// capability flags, and no content-addressed identity, so the v1
-    /// digest, sidecar-presence, relay-scheme, and capability cross-checks
-    /// do not apply; capabilities are inferred from member presence (and are
-    /// therefore consistent by construction). Units, closures, and
-    /// exclusions do not exist in v0 and load as empty.
+    /// digest, sidecar-presence, and capability cross-checks do not apply;
+    /// capabilities are inferred from member presence (and are therefore
+    /// consistent by construction). The relay-substituter scheme rule does
+    /// apply: a cleartext relay is just as unusable at campaign time in a v0
+    /// recording as in a v1 archive. Units, closures, and exclusions do not
+    /// exist in v0 and load as empty.
     fn open_v0(path: &Path, backend: Backend, manifest_bytes: &[u8]) -> Result<Self> {
         let v0_manifest: v0::V0Manifest = serde_json::from_slice(manifest_bytes)
             .with_context(|| format!("{}: malformed {MANIFEST_MEMBER}", path.display()))?;
@@ -416,7 +411,14 @@ impl ReplayArchive {
             has_impure_env,
             has_embedded_paths,
         );
+        // The recorded v0 counts are advisory; requests and expected
+        // outcomes (which v0 manifests never record) are recomputed from the
+        // parsed members so the exposed counts always describe what was
+        // actually loaded.
+        manifest.counts.requests = requests.len() as u64;
         manifest.counts.expected_outcomes = outcomes.len() as u64;
+
+        ensure_relay_substituter_schemes(&manifest.substituters)?;
 
         Ok(Self {
             format: ArchiveFormat::V0,
@@ -625,6 +627,19 @@ impl ReplayArchive {
         }
         Ok(nar)
     }
+}
+
+/// Relay substituters are campaign-time fetch sources; refuse plain http://
+/// (the engine never relays over cleartext). Applies to both archive
+/// formats — for v0 the list comes from the mapped `src_substituters`.
+fn ensure_relay_substituter_schemes(substituters: &Substituters) -> Result<()> {
+    for relay in &substituters.relay {
+        ensure!(
+            relay.starts_with("https://") || relay.starts_with("s3://"),
+            "relay substituter {relay:?}: only https:// and s3:// are allowed"
+        );
+    }
+    Ok(())
 }
 
 /// What to do with a narinfo sidecar that fails to parse, the one place the
@@ -1233,9 +1248,10 @@ mod tests {
         assert_eq!(dep.outputs["out"].nar_size, 120);
         let app = archive.expected_outcome(11, V0_APP_DRV).unwrap();
         assert_eq!(app.outcome, schema::ExpectedOutcome::Failed);
+        // detail keeps the native code alongside the recorder's message.
         assert_eq!(
             app.detail.as_deref(),
-            Some("builder failed with exit code 1")
+            Some("status=1: builder failed with exit code 1")
         );
         let impure = archive.expected_outcome(12, V0_IMPURE_DRV).unwrap();
         assert_eq!(impure.outcome, schema::ExpectedOutcome::Disconnected);
@@ -1370,5 +1386,46 @@ mod tests {
             archive.narinfo(V0_SRC_PATH).is_some(),
             "the intact sidecar still loads"
         );
+    }
+
+    #[test]
+    fn v0_cleartext_relay_substituter_is_rejected_on_open() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+
+        // The relay-scheme rule applies to v0 archives too: rewrite the
+        // recorded src_substituters entry to plain http://.
+        let manifest_path = root.join(MANIFEST_MEMBER);
+        let text = std::fs::read_to_string(&manifest_path).unwrap();
+        let rewritten = text.replace("https://cache.example.org", "http://cache.example.org");
+        assert_ne!(rewritten, text, "manifest has a relay entry to rewrite");
+        std::fs::write(&manifest_path, rewritten).unwrap();
+
+        let err = format!("{:#}", ReplayArchive::open(&root).unwrap_err());
+        assert!(
+            err.contains("only https:// and s3:// are allowed"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn v0_embedded_path_without_sidecar_dumps_unverified() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("archive");
+        copy_v0_fixture_to(&root);
+        std::fs::remove_file(
+            root.join(NARINFO_DIR)
+                .join("b1111111111111111111111111111111.narinfo"),
+        )
+        .unwrap();
+
+        // v0 has no sidecar-presence rule, so the archive still opens…
+        let archive = ReplayArchive::open(&root).unwrap();
+        assert!(archive.narinfo(V0_SRC_PATH).is_none());
+        // …and the embedded tree still NAR-serializes — unverified, because
+        // there is no sidecar to check it against (v1 refuses this at open).
+        let nar = archive.dump_nar(V0_SRC_PATH).unwrap();
+        assert!(!nar.is_empty());
     }
 }

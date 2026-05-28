@@ -65,7 +65,8 @@ pub(crate) struct V0BuildRecord {
 /// v0 builds.jsonl member name (v1 uses outcomes.jsonl).
 pub(crate) const V0_BUILDS_MEMBER: &str = "builds.jsonl";
 
-/// Recorded v0 status codes with a dedicated neutral mapping.
+/// Recorded v0 status codes with a dedicated neutral mapping: the recording
+/// service's build-status codes as defined by the v0 archive contract.
 pub(crate) mod v0_status {
     pub const BUILT: i32 = 0;
     pub const CANCELLED: i32 = 6;
@@ -76,7 +77,8 @@ pub(crate) mod v0_status {
 
 /// Map one v0 build record into a v1 outcome record (the neutral
 /// vocabulary). The native code is preserved in `detail` for every
-/// non-built status; `status_msg` wins when the recorder captured one.
+/// non-built status, with the recorder's `status_msg` appended when one was
+/// captured.
 pub(crate) fn map_build_record(record: V0BuildRecord) -> OutcomeRecord {
     let outcome = match record.status {
         v0_status::BUILT => ExpectedOutcome::Built,
@@ -87,6 +89,9 @@ pub(crate) fn map_build_record(record: V0BuildRecord) -> OutcomeRecord {
         _ => ExpectedOutcome::Failed,
     };
     let detail = match record.status_msg {
+        Some(msg) if record.status != v0_status::BUILT => {
+            Some(format!("status={}: {msg}", record.status))
+        }
         Some(msg) => Some(msg),
         None if record.status != v0_status::BUILT => Some(format!("status={}", record.status)),
         None => None,
@@ -127,7 +132,9 @@ pub(crate) fn map_request(request: V0Request) -> RequestRecord {
 /// Map the v0 manifest plus inferred capability/count facts into the v1
 /// in-memory manifest. `workload_units`, `output_hashes_present`,
 /// `has_builds`, `has_impure_env`, and `has_embedded_paths` are derived by
-/// the reader from the archive contents.
+/// the reader from the archive contents; the reader also overrides
+/// `counts.requests` and `counts.expected_outcomes` with values recomputed
+/// from the parsed members.
 pub(crate) fn map_manifest(
     v0: V0Manifest,
     workload_units: u64,
@@ -154,6 +161,8 @@ pub(crate) fn map_manifest(
             dependency_closures: false,
         },
         counts: Counts {
+            // Advisory recorded value; the reader replaces it with the
+            // parsed request count.
             requests: v0.requests,
             workload_units,
             // Placeholder; the reader sets this to the mapped outcome count.
@@ -218,12 +227,23 @@ mod tests {
         // The native code is preserved in detail for non-built statuses…
         let exhausted = map_build_record(record_with_status(16));
         assert_eq!(exhausted.detail, Some("status=16".into()));
-        // …unless the recorder captured a message, which wins…
+        // …with the recorder's message appended when one was captured…
         let mut with_msg = record_with_status(1);
         with_msg.status_msg = Some("boom".to_string());
-        assert_eq!(map_build_record(with_msg).detail, Some("boom".into()));
-        // …and a built record without a message carries no detail at all.
+        assert_eq!(
+            map_build_record(with_msg).detail,
+            Some("status=1: boom".into())
+        );
+        // …a built record without a message carries no detail at all…
         assert!(map_build_record(record_with_status(0)).detail.is_none());
+        // …and a built record's captured message is carried as-is (there is
+        // no failure code worth prefixing).
+        let mut built_with_msg = record_with_status(0);
+        built_with_msg.status_msg = Some("served from cache".to_string());
+        assert_eq!(
+            map_build_record(built_with_msg).detail,
+            Some("served from cache".into())
+        );
     }
 
     #[test]
