@@ -1230,15 +1230,11 @@ async fn drain_worker_force_reassigns() -> anyhow::Result<()> {
 /// Verifies cleared=true, in-mem status reset, PG poisoned_at cleared.
 #[tokio::test]
 async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
-    use crate::actor::tests::{
-        complete_failure, connect_executor, merge_single_node, test_drv_path,
-    };
+    use crate::actor::tests::{merge_single_node, pull_complete_failure, test_drv_path};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_executor(&actor, "poison-w", "x86_64-linux").await?;
 
-    // Merge → dispatches to worker.
     let _ev = merge_single_node(
         &actor,
         uuid::Uuid::new_v4(),
@@ -1246,13 +1242,12 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
         PriorityClass::Scheduled,
     )
     .await?;
-    let _ = worker_rx.recv().await.expect("assignment");
 
-    // PermanentFailure → poisoned (both in-mem and PG).
-    complete_failure(
+    // PermanentFailure → poisoned (both in-mem and PG). Delivered
+    // through the pull report intake.
+    pull_complete_failure(
         &actor,
-        "poison-w",
-        &test_drv_path("poison-me"),
+        "poison-me",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "test permanent failure",
     )
@@ -1322,13 +1317,10 @@ async fn test_clear_poison_happy_path() -> anyhow::Result<()> {
 /// retry hit the not-poisoned guard → permanent no-op.
 #[tokio::test]
 async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyhow::Result<()> {
-    use crate::actor::tests::{
-        complete_failure, connect_executor, merge_single_node, test_drv_path,
-    };
+    use crate::actor::tests::{merge_single_node, pull_complete_failure};
     use crate::state::PriorityClass;
 
     let (svc, actor, _task, db) = setup_svc_default().await;
-    let mut worker_rx = connect_executor(&actor, "pg-blip-w", "x86_64-linux").await?;
 
     let _ev = merge_single_node(
         &actor,
@@ -1337,11 +1329,9 @@ async fn test_clear_poison_pg_failure_leaves_inmem_poisoned_for_retry() -> anyho
         PriorityClass::Scheduled,
     )
     .await?;
-    let _ = worker_rx.recv().await.expect("assignment");
-    complete_failure(
+    pull_complete_failure(
         &actor,
-        "pg-blip-w",
-        &test_drv_path("pg-blip"),
+        "pg-blip",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "test",
     )

@@ -105,14 +105,12 @@ async fn pull_double_pull_is_idempotent() -> TestResult {
 /// (b) A pull for a completed drv returns Gone and writes nothing new.
 #[tokio::test]
 async fn pull_completed_drv_returns_gone() -> TestResult {
-    let (db, handle, _task, mut rx) = setup_with_worker("w-gone", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), "pull-b", PriorityClass::Scheduled).await?;
-    let assignment = recv_assignment(&mut rx).await;
-    complete_success(
+    pull_complete_success(
         &handle,
-        "w-gone",
-        &assignment.drv_path,
+        "pull-b",
         &rio_test_support::fixtures::test_store_path("pull-b-out"),
     )
     .await?;
