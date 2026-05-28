@@ -347,8 +347,6 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
-    let mut worker_rx = connect_executor(&handle, "hmac-w", "x86_64-linux").await?;
-
     // Merge a node WITH expected_output_paths set — the token's
     // claims must include them.
     let expected_out = test_store_path("hmac-expected-out");
@@ -356,11 +354,14 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
     node.expected_output_paths = vec![expected_out.clone()];
     merge_dag(&handle, Uuid::new_v4(), vec![node], vec![], false).await?;
 
-    let assignment = recv_assignment(&mut worker_rx).await;
+    let assignment = pull_attempt(&handle, "hmac-drv").await;
 
-    // Token is NOT the legacy "{worker}-{hash}-{gen}" format.
+    // Token is NOT the legacy "{executor}-{hash}-{gen}" format (the
+    // pull identity is the intent id).
     assert!(
-        !assignment.assignment_token.starts_with("hmac-w-hmac-drv-"),
+        !assignment
+            .assignment_token
+            .starts_with("hmac-drv-hmac-drv-"),
         "should be HMAC-signed, not legacy format: {}",
         assignment.assignment_token
     );
@@ -371,7 +372,7 @@ async fn test_hmac_signer_produces_verifiable_token() -> TestResult {
         .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
         .expect("token should verify with same key");
 
-    assert_eq!(claims.executor_id, "hmac-w");
+    assert_eq!(claims.executor_id, "hmac-drv");
     assert_eq!(claims.drv_hash, "hmac-drv");
     assert!(
         claims.expected_outputs.contains(&expected_out),
@@ -422,8 +423,6 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
         p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
-    let mut worker_rx = connect_executor(&handle, "phase2-w", "x86_64-linux").await?;
-
     let _ = merge_dag_req(
         &handle,
         MergeDagRequest {
@@ -441,7 +440,7 @@ async fn test_hmac_assignment_carries_tenant() -> TestResult {
     )
     .await?;
 
-    let assignment = recv_assignment(&mut worker_rx).await;
+    let assignment = pull_attempt(&handle, "phase2-drv").await;
     let claims = HmacVerifier::from_key(test_key)
         .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
         .expect("token verifies");
@@ -471,8 +470,6 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
         p.hmac_signer = Some(Arc::new(HmacSigner::from_key(test_key.clone())));
     });
 
-    let mut worker_rx = connect_executor(&handle, "clamp-w", "x86_64-linux").await?;
-
     // Merge with build_timeout = u64::MAX.
     let _ = merge_dag_req(
         &handle,
@@ -494,7 +491,7 @@ async fn test_hmac_timeout_clamps_to_seven_days() -> TestResult {
     )
     .await?;
 
-    let assignment = recv_assignment(&mut worker_rx).await;
+    let assignment = pull_attempt(&handle, "clamp-drv").await;
 
     let claims = HmacVerifier::from_key(test_key)
         .verify::<rio_auth::hmac::AssignmentClaims>(&assignment.assignment_token)
@@ -2015,25 +2012,9 @@ async fn spawn_intents_end_to_end_and_deadline_clamp() -> TestResult {
         assert!(i.deadline_secs <= crate::actor::floor::DEADLINE_CAP_SECS);
     }
 
-    // Connect a worker. Heartbeat triggers dispatch_ready → one
-    // derivation moves to Assigned (one build per pod) → drops out of
-    // the intent stream.
-    let (tx, mut rx) = mpsc::channel(16);
-    handle
-        .send_unchecked(ActorCommand::ExecutorConnected {
-            executor_id: "w0".into(),
-            stream_tx: tx,
-            stream_epoch: next_stream_epoch_for("w0"),
-            auth_intent: None,
-            reply: noop_connect_reply(),
-        })
-        .await?;
-    send_heartbeat_with(&handle, "w0", "x86_64-linux", |_| {}).await?;
-    handle.send_unchecked(ActorCommand::Tick).await?;
-    let _assignment = tokio::time::timeout(Duration::from_secs(5), rx.recv())
-        .await
-        .expect("assignment within 5s")
-        .expect("assignment not dropped");
+    // Open a pull attempt for one derivation — it moves to Running
+    // and drops out of the intent stream.
+    let _assignment = pull_attempt(&handle, "a").await;
 
     let snap = handle
         .query_unchecked(|reply| {

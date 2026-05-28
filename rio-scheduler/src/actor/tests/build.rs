@@ -20,7 +20,7 @@ enum Terminalize {
 #[case::cancelled(Terminalize::Cancel)]
 #[tokio::test]
 async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize) -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("watch-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let original_rx =
@@ -29,13 +29,12 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
 
     match how {
         Terminalize::Success => {
-            complete_success_empty(&handle, "watch-w", &test_drv_path("watch-hash")).await?;
+            pull_complete_success_empty(&handle, "watch-hash").await?;
         }
         Terminalize::PermanentFailure => {
-            complete_failure(
+            pull_complete_failure(
                 &handle,
-                "watch-w",
-                &test_drv_path("watch-hash"),
+                "watch-hash",
                 rio_proto::types::BuildResultStatus::PermanentFailure,
                 "test permanent failure",
             )
@@ -94,17 +93,15 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
 /// scheduling itself is trivially correct (tokio::time::sleep + try_send).
 #[tokio::test]
 async fn test_terminal_build_cleanup_after_delay() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cleanup-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Complete a build.
     let build_id = Uuid::new_v4();
     let drv_hash = "cleanup-hash";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    complete_success_empty(&handle, "cleanup-worker", &drv_path).await?;
+    pull_complete_success_empty(&handle, drv_hash).await?;
 
     // Build should be Succeeded and still queryable.
     let status = try_query_status(&handle, build_id).await?;
@@ -198,8 +195,7 @@ async fn test_cancel_build_active_drains_derivations() -> TestResult {
 /// (The after-completion case is tested separately.)
 #[tokio::test]
 async fn test_watch_build_receives_events() -> TestResult {
-    let (_db, handle, _task, _rx) =
-        setup_with_worker("watch-events-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let _original = merge_single_node(
@@ -223,12 +219,7 @@ async fn test_watch_build_receives_events() -> TestResult {
     let (mut watch_rx, _last_seq) = reply_rx.await??;
 
     // Complete the build; watcher should see BuildCompleted.
-    complete_success_empty(
-        &handle,
-        "watch-events-worker",
-        &test_drv_path("watch-events-hash"),
-    )
-    .await?;
+    pull_complete_success_empty(&handle, "watch-events-hash").await?;
 
     let mut saw_completed = false;
     // Drain events with a timeout.
@@ -459,11 +450,13 @@ async fn test_query_unknown_build_returns_not_found() -> TestResult {
 async fn test_inputs_resolved_fires_between_started_and_dispatch() -> TestResult {
     use rio_proto::types::build_event::Event;
 
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("inputs-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let mut events =
         merge_single_node(&handle, build_id, "inputs-drv", PriorityClass::Scheduled).await?;
+    // Open the pull attempt so the delivery-phase DrvStarted is emitted.
+    let _assignment = pull_attempt(&handle, "inputs-drv").await;
 
     // Collect all merge-time + dispatch events. Single-node fresh
     // build with no cache hits: no DerivationCached events — the
@@ -578,11 +571,13 @@ async fn test_inputs_resolved_fires_without_worker() -> TestResult {
 async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
     use rio_proto::types::build_event::Event;
 
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("prog-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let mut events =
         merge_single_node(&handle, build_id, "prog-drv", PriorityClass::Scheduled).await?;
+    // Open the pull attempt: the mint emits DrvStarted then Progress.
+    let _assignment = pull_attempt(&handle, "prog-drv").await;
 
     // Drain until Progress. Single-node fresh build with worker:
     // Started → InputsResolved → DrvStarted → Progress. The Progress
@@ -620,7 +615,7 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
     assert_eq!(progress.total, 1);
     assert_eq!(
         progress.assigned_executors,
-        vec!["prog-w"],
+        vec!["prog-drv"],
         "dispatch sets assigned_executor before emitting; Progress must carry it"
     );
     assert!(
@@ -651,26 +646,18 @@ async fn test_progress_event_on_dispatch_carries_worker() -> TestResult {
 async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
     const N: usize = 100;
     let (_db, handle, _task) = setup().await;
-    // P0537: one build per worker → N workers for N concurrent
-    // assignments. The original single high-capacity worker is no
-    // longer expressible.
-    let mut rxs = Vec::with_capacity(N);
-    for i in 0..N {
-        rxs.push(connect_executor(&handle, &format!("batch-w-{i:03}"), "x86_64-linux").await?);
-    }
 
-    // 100 independent nodes (no edges) — all become Ready on merge
-    // and dispatch one-per-worker.
+    // 100 independent nodes (no edges) — all become Ready on merge.
     let build_id = Uuid::new_v4();
     let nodes: Vec<_> = (0..N)
         .map(|i| make_node(&format!("batch-{i:03}")))
         .collect();
     let _ev = merge_dag(&handle, build_id, nodes, vec![], false).await?;
 
-    // Drain dispatches so the worker streams don't back up.
-    // recv_assignment skips PrefetchHint for us.
-    for rx in &mut rxs {
-        let _ = recv_assignment(rx).await;
+    // Open a pull attempt for every node so all N are in flight
+    // (Assigned/Running) and land in the cancel's `to_cancel` set.
+    for i in 0..N {
+        let _ = pull_attempt(&handle, &format!("batch-{i:03}")).await;
     }
 
     // Cancel the build. With batched PG writes this returns quickly.
@@ -714,7 +701,7 @@ async fn test_cancel_large_build_does_not_stall_actor() -> TestResult {
 /// `cancel_build_derivations`) actually reaped.
 #[tokio::test]
 async fn test_cancel_reaps_dag_nodes() -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("reap-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // 3 sole-interest nodes: dispatched (Assigned/Running) + 2 queued
     // behind it (Queued → DependencyFailed). Covers both transition
@@ -735,7 +722,7 @@ async fn test_cancel_reaps_dag_nodes() -> TestResult {
         false,
     )
     .await?;
-    let _ = recv_assignment(&mut rx).await;
+    let _ = pull_attempt(&handle, "reap-a").await;
 
     let (tx, rrx) = oneshot::channel();
     handle

@@ -32,25 +32,18 @@ async fn test_worker_registers_via_stream_and_heartbeat() -> TestResult {
 /// and the build stays Active forever.
 #[tokio::test]
 async fn test_completion_resolves_drv_path_to_hash() -> TestResult {
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Merge a single-node DAG
     let build_id = Uuid::new_v4();
     let drv_hash = "abc123hash";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // Worker should have received an assignment (derivation is ready, worker has capacity)
-    // Now send completion using drv_PATH (mimics what grpc.rs does with report.drv_path)
-    // Note: PATH, not hash — tests that grpc.rs drv_path resolves correctly.
-    complete_success(
-        &handle,
-        "test-worker",
-        &drv_path,
-        &test_store_path("xyz-foo"),
-    )
-    .await?;
+    // The pull report intake hands handle_completion the attempt row's
+    // drv_PATH (same as the gRPC report path) — the path→hash
+    // resolution must complete the build.
+    pull_complete_success(&handle, drv_hash, &test_store_path("xyz-foo")).await?;
 
     // Query build status — should be Succeeded (single derivation, completed)
     let status = query_status(&handle, build_id).await?;
@@ -145,20 +138,18 @@ async fn test_worker_disconnect_running_derivation() -> TestResult {
 #[tokio::test]
 #[traced_test]
 async fn test_completion_infrastructure_failure_handled() -> TestResult {
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-fail-hash";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Send completion with InfrastructureFailure (what gRPC layer sends
     // for None result)
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "test-worker",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "worker sent CompletionReport with no result",
     )
@@ -196,45 +187,37 @@ async fn test_completion_infrastructure_failure_handled() -> TestResult {
 /// not panic the actor with integer overflow in the EMA duration computation.
 #[tokio::test]
 async fn test_completion_with_extreme_timestamps() -> TestResult {
-    let (_db, handle, _task, _stream_rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "extreme-ts-hash";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Send completion with extreme timestamps that would overflow i64 subtraction.
     // Without saturating-sub: stop.seconds - start.seconds = i64::MAX - i64::MIN overflows (panic in debug).
-    handle
-        .send_unchecked(ActorCommand::ProcessCompletion {
-            executor_id: "test-worker".into(),
-            drv_key: drv_path,
-            result: rio_proto::types::BuildResult {
-                status: rio_proto::types::BuildResultStatus::Built.into(),
-                start_time: Some(prost_types::Timestamp {
-                    seconds: i64::MIN,
-                    nanos: i32::MIN,
-                }),
-                stop_time: Some(prost_types::Timestamp {
-                    seconds: i64::MAX,
-                    nanos: i32::MAX,
-                }),
-                built_outputs: vec![rio_proto::types::BuiltOutput {
-                    output_name: "out".into(),
-                    output_path: test_store_path("xyz-extreme"),
-                    output_hash: vec![0u8; 32],
-                }],
-                ..Default::default()
-            },
-            peak_memory_bytes: 0,
-            peak_cpu_cores: 0.0,
-            node_name: None,
-            hw_class: None,
-            final_line_count: 0,
-            final_resources: None,
-        })
-        .await?;
+    pull_report(
+        &handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            start_time: Some(prost_types::Timestamp {
+                seconds: i64::MIN,
+                nanos: i32::MIN,
+            }),
+            stop_time: Some(prost_types::Timestamp {
+                seconds: i64::MAX,
+                nanos: i32::MAX,
+            }),
+            built_outputs: vec![rio_proto::types::BuiltOutput {
+                output_name: "out".into(),
+                output_path: test_store_path("xyz-extreme"),
+                output_hash: vec![0u8; 32],
+            }],
+            ..Default::default()
+        }),
+    )
+    .await?;
 
     // Verify completion was processed (build succeeded). query_status is
     // the barrier — it queues after ProcessCompletion, so by the time it

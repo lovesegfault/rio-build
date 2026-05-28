@@ -218,7 +218,7 @@ async fn test_starvation_intersects_live() -> TestResult {
 /// Old code: notify trigger's set {X} → Y hangs. New: union {X,Y}.
 #[tokio::test]
 async fn test_cascade_notifies_union_across_chain() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("chain-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Build X: A→B→C.
     let build_x = Uuid::new_v4();
@@ -243,10 +243,9 @@ async fn test_cascade_notifies_union_across_chain() -> TestResult {
     let _ev_y = merge_dag(&handle, build_y, vec![make_node("chain-a")], vec![], true).await?;
 
     // C fails. Cascade: B→DependencyFailed, A→DependencyFailed.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "chain-w",
-        &test_drv_path("chain-c"),
+        "chain-c",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "perm",
     )
@@ -325,12 +324,9 @@ async fn test_cancel_transitions_queued() -> TestResult {
 /// derivations are cancelled (not left running/queued).
 #[tokio::test]
 async fn test_keep_going_false_cancels_remaining() -> TestResult {
-    // P0537: two workers for two concurrent assignments (was one
-    // 4-slot worker).
-    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
-    // Two independent nodes, keep_going=false. Dispatch one-per-worker.
+    // Two independent nodes, keep_going=false. Both in flight.
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
         &handle,
@@ -341,21 +337,15 @@ async fn test_keep_going_false_cancels_remaining() -> TestResult {
     )
     .await?;
 
-    // Determine routing.
-    let a1 = recv_assignment(&mut rx).await;
-    let _a2 = recv_assignment(&mut rx2).await;
-    let w_a = if a1.drv_path.contains("kg-a") {
-        "kg-w"
-    } else {
-        "kg-w2"
-    };
+    // Open both attempts so B is in flight when A fails.
+    let _a1 = pull_attempt(&handle, "kg-a").await;
+    let _a2 = pull_attempt(&handle, "kg-b").await;
 
     // A fails permanently. Before fix: build → Failed, but B stays
     // Assigned/Running (burning worker CPU). After: B cancelled.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        w_a,
-        &test_drv_path("kg-a"),
+        "kg-a",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "perm",
     )
@@ -438,7 +428,7 @@ async fn test_upsert_at_merge_cache_hit() -> TestResult {
 async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
     use sha2::Digest;
 
-    let (db, handle, _task, _rx) = setup_with_worker("pre-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     let tenant_a = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-a").await;
     let tenant_b = rio_store::test_helpers::seed_tenant(&db.pool, "pre-tenant-b").await;
@@ -462,7 +452,7 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
     )
     .await?;
     let out_path = test_store_path("pre-out");
-    complete_success(&handle, "pre-w", &test_drv_path("pre-drv"), &out_path).await?;
+    pull_complete_success(&handle, "pre-drv", &out_path).await?;
     barrier(&handle).await;
 
     // Build B merges the SAME drv. It's pre-existing Completed.
@@ -504,18 +494,12 @@ async fn test_upsert_at_merge_preexisting_completed() -> TestResult {
 /// node with no tenant-resolved builds → no upsert (empty tenant_ids).
 #[tokio::test]
 async fn test_upsert_skips_no_tenant() -> TestResult {
-    let (db, handle, _task, _rx) = setup_with_worker("nt-w", "x86_64-linux").await?;
+    let (db, handle, _task) = setup().await;
 
     // No tenant_id on the build (None = single-tenant mode).
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "nt-drv", PriorityClass::Scheduled).await?;
-    complete_success(
-        &handle,
-        "nt-w",
-        &test_drv_path("nt-drv"),
-        &test_store_path("nt-out"),
-    )
-    .await?;
+    pull_complete_success(&handle, "nt-drv", &test_store_path("nt-out")).await?;
     barrier(&handle).await;
 
     let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM path_tenants")
@@ -545,8 +529,7 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 #[case::admin_clear(false)]
 #[tokio::test]
 async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("pr-w", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "pr-w2", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let _ev = merge_dag(
@@ -558,19 +541,14 @@ async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> Test
     )
     .await?;
 
-    let a1 = recv_assignment(&mut rx).await;
-    let _a2 = recv_assignment(&mut rx2).await;
-    let (w_d1, w_d2) = if a1.drv_path.contains("pr-d1") {
-        ("pr-w", "pr-w2")
-    } else {
-        ("pr-w2", "pr-w")
-    };
+    // Open both attempts so D2 is in flight while D1 poisons.
+    let _a1 = pull_attempt(&handle, "pr-d1").await;
+    let _a2 = pull_attempt(&handle, "pr-d2").await;
 
     // Poison D1. keep_going=true → build stays Active, D2 keeps running.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        w_d1,
-        &test_drv_path("pr-d1"),
+        "pr-d1",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "bad",
     )
@@ -603,7 +581,7 @@ async fn test_poison_removal_keep_going_completes(#[case] via_ttl: bool) -> Test
 
     // Complete D2. Pre-fix: spuriously Succeeded (failed_count derived from
     // DAG → 0 after D1 removed). Post-fix: sticky error_summary forces Failed.
-    complete_success_empty(&handle, w_d2, &test_drv_path("pr-d2")).await?;
+    pull_complete_success_empty(&handle, "pr-d2").await?;
     let status = query_status(&handle, build_id).await?;
     assert_eq!(
         status.state,

@@ -14,8 +14,7 @@ async fn test_keepgoing_two_node_fail_one(
     #[case] keep_going: bool,
     #[case] expect_mid: rio_proto::types::BuildState,
 ) -> TestResult {
-    let (_db, handle, _task, mut rx) = setup_with_worker("kg-w1", "x86_64-linux").await?;
-    let mut rx2 = connect_executor(&handle, "kg-w2", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let _rx = merge_dag(
@@ -27,18 +26,13 @@ async fn test_keepgoing_two_node_fail_one(
     )
     .await?;
 
-    let a1 = recv_assignment(&mut rx).await;
-    let _a2 = recv_assignment(&mut rx2).await;
-    let (w_a, w_b) = if a1.drv_path.contains("hashA") {
-        ("kg-w1", "kg-w2")
-    } else {
-        ("kg-w2", "kg-w1")
-    };
+    // Open both attempts so both nodes are in flight when A fails.
+    let _a1 = pull_attempt(&handle, "hashA").await;
+    let _a2 = pull_attempt(&handle, "hashB").await;
 
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        w_a,
-        &test_drv_path("hashA"),
+        "hashA",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
@@ -52,7 +46,7 @@ async fn test_keepgoing_two_node_fail_one(
 
     if keep_going {
         // Complete hashB → build now fails (all resolved, one failed).
-        complete_success_empty(&handle, w_b, &test_drv_path("hashB")).await?;
+        pull_complete_success_empty(&handle, "hashB").await?;
         assert_eq!(
             query_status(&handle, build_id).await?.state,
             rio_proto::types::BuildState::Failed as i32,
@@ -68,9 +62,7 @@ async fn test_keepgoing_two_node_fail_one(
 /// total -> build hangs.
 #[tokio::test]
 async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
-    // Worker with capacity 1: only the leaf gets dispatched initially.
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("cascade-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Chain: A depends on B depends on C. C is the leaf.
     let build_id = Uuid::new_v4();
@@ -97,10 +89,9 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
     assert_eq!(info_b.status, DerivationStatus::Queued);
 
     // Poison C via PermanentFailure.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "cascade-worker",
-        &test_drv_path("cascadeC"),
+        "cascadeC",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "compile error",
     )
@@ -142,16 +133,14 @@ async fn test_keepgoing_poisoned_dependency_cascades_failure() -> TestResult {
 /// only runs on *transition to* Poisoned).
 #[tokio::test]
 async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("poison-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Build 1: single leaf, poisoned via PermanentFailure.
     let build1 = Uuid::new_v4();
     let _rx1 = merge_single_node(&handle, build1, "preleaf", PriorityClass::Scheduled).await?;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "poison-worker",
-        &test_drv_path("preleaf"),
+        "preleaf",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "preleaf failed",
     )
@@ -209,16 +198,14 @@ async fn test_merge_with_prepoisoned_dep_marks_dependency_failed() -> TestResult
 /// sat Active with completed=0, failed=0, total=1.
 #[tokio::test]
 async fn test_resubmit_poisoned_node_itself_fails_fast() -> TestResult {
-    let (_db, handle, _task, _stream_rx) =
-        setup_with_worker("resub-poison-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     // Build 1: poison the leaf.
     let build1 = Uuid::new_v4();
     let _rx1 = merge_single_node(&handle, build1, "resub-poison", PriorityClass::Scheduled).await?;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "resub-poison-w",
-        &test_drv_path("resub-poison"),
+        "resub-poison",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent",
     )

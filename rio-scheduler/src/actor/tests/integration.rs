@@ -75,7 +75,7 @@ async fn test_scheduler_cache_check_skips_build() -> TestResult {
 #[tokio::test]
 async fn test_scheduler_cache_check_skipped_without_store() -> TestResult {
     // No store client — setup() uses setup_actor(pool, None).
-    let (_db, handle, _task, _rx) = setup_with_worker("test-worker", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let mut node = make_node("uncached-hash");
@@ -365,18 +365,19 @@ async fn test_assign_send_failure_cleans_running_build() -> TestResult {
 /// rogue had been forwarded, it would appear first.
 #[tokio::test]
 async fn test_forward_phase_rejects_unassigned_executor() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("w1", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
     let build_id = Uuid::new_v4();
     let drv_hash = "phasegate";
     let drv_path = test_drv_path(drv_hash);
     let mut events =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = pull_attempt(&handle, drv_hash).await;
 
-    // Sanity: merge dispatched the drv to w1 (the only registered
-    // worker). The gate compares against this.
+    // Sanity: the pull mint opened the attempt on the intent identity.
+    // The gate compares against this.
     let pre = expect_drv(&handle, drv_hash).await;
-    assert_eq!(pre.status, DerivationStatus::Assigned);
-    assert_eq!(pre.assigned_executor.as_deref(), Some("w1"));
+    assert_eq!(pre.status, DerivationStatus::Running);
+    assert_eq!(pre.assigned_executor.as_deref(), Some(drv_hash));
 
     // Rogue executor "w2" — never registered, never assigned this drv —
     // spoofs a Phase. MUST be dropped before reaching the broadcast.
@@ -399,7 +400,7 @@ async fn test_forward_phase_rejects_unassigned_executor() -> TestResult {
                 derivation_path: drv_path.clone(),
                 phase: "buildPhase".into(),
             },
-            executor_id: "w1".into(),
+            executor_id: drv_hash.into(),
         })
         .await?;
 
@@ -447,19 +448,20 @@ async fn test_forward_phase_rejects_terminal_drv() -> TestResult {
     let recorder = CountingRecorder::default();
     let _guard = metrics::set_default_local_recorder(&recorder);
 
-    let (_db, handle, _task, _rx) = setup_with_worker("w1", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
     let build_id = Uuid::new_v4();
     let drv_hash = "termphase";
     let drv_path = test_drv_path(drv_hash);
     let _events = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
+    let _assignment = pull_attempt(&handle, drv_hash).await;
 
-    // Sanity: drv dispatched to w1.
+    // Sanity: the pull mint opened the attempt on the intent identity.
     let pre = expect_drv(&handle, drv_hash).await;
-    assert_eq!(pre.status, DerivationStatus::Assigned);
-    assert_eq!(pre.assigned_executor.as_deref(), Some("w1"));
+    assert_eq!(pre.status, DerivationStatus::Running);
+    assert_eq!(pre.assigned_executor.as_deref(), Some(drv_hash));
 
     // Drive the drv to a terminal state via the legitimate executor.
-    complete_success_empty(&handle, "w1", &drv_path).await?;
+    pull_complete_success_empty(&handle, drv_hash).await?;
 
     // Fixture-validity guard: the residual window MUST exist for this
     // test to mean anything. `transition(Completed)` does not clear
@@ -471,7 +473,7 @@ async fn test_forward_phase_rejects_terminal_drv() -> TestResult {
     assert_eq!(post.status, DerivationStatus::Completed);
     assert_eq!(
         post.assigned_executor.as_deref(),
-        Some("w1"),
+        Some(drv_hash),
         "transition(Completed) must NOT clear assigned_executor in this \
          test's setup — otherwise the test no longer exercises the \
          post-terminal residual window"
@@ -485,7 +487,7 @@ async fn test_forward_phase_rejects_terminal_drv() -> TestResult {
                 derivation_path: drv_path.clone(),
                 phase: "stale-post-terminal".into(),
             },
-            executor_id: "w1".into(),
+            executor_id: drv_hash.into(),
         })
         .await?;
     barrier(&handle).await;
