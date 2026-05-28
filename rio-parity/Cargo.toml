@@ -44,6 +44,9 @@ hex = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }
 regex = { workspace = true }
 reqwest = { workspace = true }
+# In-process SSH client for the gateway worker-protocol transport
+# (run::transport's GatewayPool / DaemonChannel).
+russh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
@@ -60,6 +63,8 @@ workspace-hack = { version = "0.1", path = "../workspace-hack" }
 axum = { workspace = true }
 aws-sdk-s3 = { workspace = true, features = ["test-util"] }
 aws-smithy-mocks = { workspace = true }
+# Ephemeral ed25519 keys for the transport host-key policy tests.
+rand = { workspace = true }
 rstest = { workspace = true }
 tempfile = { workspace = true }
 # Politeness-budget spacing test uses paused-clock time (start_paused).

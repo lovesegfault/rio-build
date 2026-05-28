@@ -1430,6 +1430,11 @@
       "doc": ""
     },
     {
+      "name": "TransportError",
+      "crate": "rio-parity",
+      "doc": "Errors the campaign engine distinguishes when driving daemon operations. Hand-rolled `Display`/`Error` impls (the variants carry everything the submitter needs without another derive dependency)."
+    },
+    {
       "name": "NarCollectError",
       "crate": "rio-proto",
       "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`]."

@@ -961,6 +961,11 @@
       "doc": "Batch submission to the rio gateway over ssh-ng."
     },
     {
+      "path": "run/transport.rs",
+      "depth": 1,
+      "doc": "In-process SSH transport for the gateway's nix-daemon worker protocol."
+    },
+    {
       "path": "run/warm.rs",
       "depth": 1,
       "doc": "Warm stage (leaf mode): batched root submissions of the warm set's"
