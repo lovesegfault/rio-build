@@ -1229,3 +1229,51 @@ landing slot are exactly what the jointly-signed OA2 DECIDED block
 (2026-05-27) committed; counter-signature of the landed form to be
 collected at the executor campaign's 1c close-out review alongside the
 pending 1b counter-signature above.
+
+## Executor-campaign 1c' entry — deletion wave 1 and the Model J/N obligation re-derivation (delta pass)
+
+Recorded by the executor-lifecycle campaign's slice-1c' model-and-spec
+batch (Phase-1 plan v3, T-1c'.7 re-derivation half), after deletion
+commits A–C removed the scheduler's stream session/placement machinery
+and re-pointed the operator surfaces onto the open-attempt view.
+
+- **What changed that this map's models consume.**
+  `ListExecutors` is now served from the durable open-attempt view
+  (busy = an open pull-mode attempt; the orphan-reap gate's
+  fail-closed arms are unchanged and the leader-age arm survives until
+  1d). The scheduler-side hung-node detector was deleted at commit A —
+  earlier than the 1d slot the 1c entry above anticipated — so
+  `GetSpawnIntents.dead_nodes` is now always empty and the OA2
+  controller-side node-wedge clustering (live since 1c) is the only
+  Dead-arm feed besides node conditions; the proto field is removed at
+  the 1d sweep. The heartbeat registration edge is gone: the ICE-cell
+  clear edge is the first successful pull (the fenced mint's
+  single-cell clear). Termination-report dedup is the idempotent
+  `ReportAttemptOutcome` fill plus the no-attempt no-op (the
+  `recently_disconnected` map is deleted). `DrainExecutor` and
+  `DebugListExecutors` are retired to clear-error stubs (RPC removal
+  at 1d). The legacy pod-name exclusion key is still carried alongside
+  the node key (P12 remains unexecuted).
+- **Obligation-table re-derivation.** The seven Model J/N obligation
+  rows of the executor map's 0e table are re-derived against the
+  pull-only world in that map's Phase-1c' record (T-1c'.7 section),
+  with re-derivation items (i)–(iii) discharged there: the reapSafety
+  gate posture is retained (fail-closed on RPC error, leader-age arm
+  unchanged until 1d), ORPHAN_REAP_GRACE re-validated against
+  worst-case container-start → first successful pull with the accepted
+  miss consequence limited to respawn churn (never a mid-build reap,
+  never a charge), and the no-attempt no-op rule available as an
+  assumption (spec'd and model-checked).
+- **Model impact: none at this slice.** Models J and N are
+  byte-unchanged; no transition, bound, or invariant changes; the
+  wired `quint-spawn-coherence-*` / `quint-nodeclaim-*` checks are
+  unaffected by construction. The header-checklist prose updates in
+  the two model files ride with the campaign close-out (one rebuild of
+  their checks instead of two). The Stage-C calibration table delta
+  pass remains scheduled with the 1d re-derivation as recorded above.
+
+Controller-campaign owner counter-signature for this delta entry:
+PENDING (to be collected at the 1c' close-out, alongside the
+spec-sweep landing; the executor-campaign records reference this
+entry from `docs/spec/models/executor-invariant-map.md`'s Phase-1c'
+record).

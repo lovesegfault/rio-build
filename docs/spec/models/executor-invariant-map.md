@@ -3855,3 +3855,85 @@ New markers carried by the re-targeted wiring:
 `sched.attempt.establishment-window+2` on
 `quint-executor-session-base` (the model now machine-checks the
 NotYetReady inertness clause and the establishment-window discipline).
+
+### T-1c'.7 (re-derivation half) — the neighbor-interface re-derivations and the net-diff record
+
+Recorded by the slice-1c' model-and-spec batch. This is the
+re-derivation half of T-1c'.7 only: the obligations are re-derived
+against the pull-only world and recorded here and in the neighbor
+maps. The 1c' landing itself (full gate, campaign close-out) is the
+campaign owner's separate step and is NOT performed by this batch.
+
+#### Model J/N obligation rows re-derived (the 0e table, post-deletion)
+
+| Row | Obligation | Re-derivation against the pull-only world |
+|---|---|---|
+| 1 | busy view for the orphan-Running reap | `ListExecutors` is re-implemented over the durable open-attempt view (deletion commit C reads `list_open_pull_attempts`); busy = an open pull-mode attempt. The orphan-reap gate's fail-closed posture is retained (RPC error / young leader / empty list ⇒ no reap) — re-derivation item (i) discharged; only the leader-age arm remains a 1d retirement candidate, unchanged at this slice. Freshness improves (durable, survives failover). |
+| 2 | registration-edge ICE clear | The clear edge is the first successful pull: the fenced mint clears the intent's `dispatched_cells` entry and the ICE cell under the same single-cell discipline as the retired registration edge (`pull_mint_ice_clear_only_at_single_cell` is the dedicated test). The heartbeat ICE-clear edge died with the heartbeat intake (commit C); arming and the DAG-state sweep are untouched. |
+| 3 | `dispatched_cells` ack-arming | Unchanged — `AckSpawnedIntents` arming and Model J's subject are untouched by the deletion wave. |
+| 4 | termination-report idempotency | Carried by the idempotent `ReportAttemptOutcome` column fill keyed by attempt identity plus the no-attempt no-op; the in-memory `recently_disconnected` first-report-wins map is deleted (commit A) and the durable guard (`WHERE termination_reason IS NULL`, exec-keyed uniqueness) is the only dedup needed. Strictly stronger than the as-built provider (no TTL race, survives failover). |
+| 5 | `dead_nodes` hung-node signal | The scheduler-side detector was deleted at commit A (ahead of the 1d slot this map's 1c entry anticipated); the OA2 controller-side node-wedge clustering (live since 1c) is the successor, `GetSpawnIntents.dead_nodes` is now explicitly empty, and the proto field stays until the 1d sweep. Model N consumes the same Dead arm; no model change. |
+| 6 | placeable-set input distribution (OA6) | Resolved on the option-(a) leg: the publish keeps no ready filter, Model J is unchanged, and the NotYetReady wait state is priced into the re-targeted Model S (the T-1c'.5 record above is the discharge). |
+| 7 | cancellation/preemption read | The controller's disruption/cancel arms read the same open-attempt view and close open attempts via the synthesized-verdict path (charge-free, requeue at the fold); the read-every-tick obligation is carried as environment in this re-derivation, and the explicit Model-J action for it remains with the 1d Model-J pass if that pass finds it load-bearing. |
+
+Re-derivation work items (i)–(iii): (i) discharged as row 1 above;
+(ii) `ORPHAN_REAP_GRACE` (300 s, creation-age) re-validated against
+worst-case container-start → first successful pull under leader
+failover + recovery gating + the 5 s NotYetReady re-pull pacing and
+the bounded idle exit — the budget holds with wide margin for the
+non-failover case and the accepted miss consequence under a failover
+that outlasts the grace is pod respawn/churn only: a never-pulled pod
+has no attempt (the no-attempt no-op keeps it charge-free) and a
+mid-build pod has an open attempt (the busy view keeps it un-reaped);
+never a mid-build reap, never a charge. (iii) the no-attempt no-op
+rule is now both spec'd (`sched.attempt.no-attempt-no-op`) and
+model-checked (the re-targeted Model S witness `canReachNoAttemptNoop`
+plus the retry pull regime's `noNoAttemptReportNoop`), so the
+reapSafety/degradedPolarity re-derivations may rely on it as an
+assumption.
+
+Models J and N are byte-unchanged at this slice; their wired checks
+are unaffected by construction (the green state at this tree is the
+standing CI state). The header-checklist prose updates inside
+`spawnCoherence.qnt` / `nodeclaimLifecycle.qnt` ride with the
+campaign close-out so those files rebuild their checks exactly once;
+the re-derivations of record are this section and the controller
+map's 1c' delta entry.
+
+#### The lease-seam re-derivation (T-0e.2 executed at 1c')
+
+Recorded in the re-targeted model's assume-guarantee header
+(executorSession.qnt) and re-stated here: all four lease exports stay
+consumed (`atMostOneCASWinner`, `boundedDualLeadership`,
+`staleLeaderHasStaleGeneration`, regime-scoped `neverDual` still not
+imported); the consumer moved from the deleted worker-side B5 latch
+to the transaction-side fence (the claims-floor GREATEST read inside
+the pull mint, the uncharged close and the establishment charge);
+claim-before-advertise's successor is claim-before-serve (the new
+leader's claim row is durable before it serves pulls — recovery's
+ordering, encoded in the model's failover action); the dual-belief
+residual's checked successor is `StaleAuthorityWritesAreInert`
+(wired, fault-leader regime) plus the Phase-2 `admit_pull` Kani
+contract; the acquire-epoch-vs-generation distinction is preserved by
+construction (the fence compares against the durable floor, never
+against "the generation moved"). The `sched.lease.generation-fence+2`
+/ claim-before-advertise spec amendments (AD4, spec-consequence item
+1) are NOT made by this batch — they belong to the 1c' scheduler.typ
+spec sweep, which remains outstanding, and are recorded there.
+
+#### The retryPolicy environment re-derivation note
+
+Executed as T-1c'.6 (see the retry map's cross-campaign retirement
+addendum): the as-built-channel regimes retired, the pull regime is
+the wired set, and the per-pin carrier table records what carries
+each retired non-vacuity pin.
+
+#### The 1c' net-diff record (deletion commits A–C)
+
+`git diff --stat` over commits A^..C (b5b961866^..94e6e2e4d):
+84 files changed, 2289 insertions, 24925 deletions — net −22636
+lines. Scoped to `rio-scheduler/src`: 52 files, +1791/−23526 — net
+−21735; scoped to the non-test scheduler session core: 29 files,
++763/−7547 — net −6784. Net-negative as required; no deviation.
+Per-commit figures are in the deletion commits' messages
+(A: −14771, B: −5886, C: −1982).
