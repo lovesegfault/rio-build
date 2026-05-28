@@ -310,6 +310,35 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Durable half of the displacement interest prune
+    /// (`sched.merge.authoritative-conflict`): delete prior interested
+    /// builds' links to a displaced derivation inside the same
+    /// transaction as its recreate-refresh, so a leader failover — which
+    /// rebuilds `interested_builds` purely from `build_derivations` —
+    /// cannot re-point those builds at the displacing definition. The
+    /// caller passes only non-terminal prior builds (terminal builds keep
+    /// their links as settled history) and never the displacing build,
+    /// whose own link is inserted by the same transaction.
+    /// Returns the number of links removed. Plain runtime query — no
+    /// `.sqlx/` impact.
+    pub(crate) async fn delete_displaced_build_links(
+        tx: &mut PgConnection,
+        derivation_id: Uuid,
+        prior_build_ids: &[Uuid],
+    ) -> Result<u64, sqlx::Error> {
+        if prior_build_ids.is_empty() {
+            return Ok(0);
+        }
+        let res = sqlx::query(
+            "DELETE FROM build_derivations WHERE derivation_id = $1 AND build_id = ANY($2)",
+        )
+        .bind(derivation_id)
+        .bind(prior_build_ids)
+        .execute(&mut *tx)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Batch-insert edges.
     pub async fn batch_insert_edges(
         tx: &mut PgConnection,

@@ -921,3 +921,70 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     assert_eq!(links, 1, "link committed with the activation");
     Ok(())
 }
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// `delete_displaced_build_links` removes exactly the passed prior builds'
+/// links to the displaced derivation — the displacing build's link and
+/// other derivations' links are untouched.
+#[tokio::test]
+async fn test_delete_displaced_build_links_scoped() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let displaced_id = insert_test_derivation(&db, "displaced-links").await?;
+    let other_id = insert_test_derivation(&db, "other-links").await?;
+
+    let squatter = Uuid::new_v4();
+    let joiner = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    for b in [squatter, joiner, displacer] {
+        db.insert_build(
+            b,
+            None,
+            crate::state::PriorityClass::Scheduled,
+            false,
+            &crate::state::BuildOptions::default(),
+            None,
+        )
+        .await?;
+    }
+
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, squatter, &[displaced_id]).await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, joiner, &[displaced_id, other_id]).await?;
+    SchedulerDb::batch_insert_build_derivations(&mut tx, displacer, &[displaced_id]).await?;
+    tx.commit().await?;
+
+    // Prune the squatter's and joiner's links to the displaced derivation.
+    let mut tx = db.pool().begin().await?;
+    let pruned =
+        SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[squatter, joiner])
+            .await?;
+    tx.commit().await?;
+    assert_eq!(pruned, 2, "exactly the two prior builds' links removed");
+
+    let remaining: Vec<Uuid> =
+        sqlx::query_scalar("SELECT build_id FROM build_derivations WHERE derivation_id = $1")
+            .bind(displaced_id)
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(remaining, vec![displacer], "displacer keeps its link");
+
+    let other_links: Vec<Uuid> =
+        sqlx::query_scalar("SELECT build_id FROM build_derivations WHERE derivation_id = $1")
+            .bind(other_id)
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(
+        other_links,
+        vec![joiner],
+        "links to other derivations are untouched"
+    );
+
+    // Empty prior set is a no-op (no statement issued).
+    let mut tx = db.pool().begin().await?;
+    let pruned = SchedulerDb::delete_displaced_build_links(&mut tx, displaced_id, &[]).await?;
+    tx.commit().await?;
+    assert_eq!(pruned, 0);
+    Ok(())
+}

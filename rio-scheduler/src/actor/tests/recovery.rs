@@ -5169,3 +5169,101 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
     );
     Ok(())
 }
+
+// r[verify sched.merge.authoritative-conflict+3]
+/// The displacement interest prune must survive leader failover (bug_001):
+/// recovery rebuilds `interested_builds` purely from `build_derivations`,
+/// so a surviving link would re-point a prior-interested build at the
+/// displacing definition — one it never submitted and that may never
+/// complete — and that build would hang Active. With the durable prune the
+/// joiner finishes as soon as its own remaining node completes.
+#[tokio::test]
+async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() -> TestResult {
+    let squatter = Uuid::new_v4();
+    let joiner = Uuid::new_v4();
+    let displacer = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, _| {
+        // Squatter: in-flight authoritative single-node squat. Connect the
+        // worker while it is the only Ready node so the first assignment
+        // is deterministically the squat.
+        let mut squat = make_node("squat-prune");
+        squat.drv_content = b"Derive-squat".to_vec();
+        squat.drv_content_authoritative = true;
+        squat.expected_output_paths = vec![test_store_path("squat-prune-out")];
+        merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+        let mut rx = connect_executor(&handle, "w-x86", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("squat-prune"));
+
+        // Joiner: joins the in-flight squat with matching identity and
+        // content evidence, plus its own fillerC node.
+        let mut squat_join = make_node("squat-prune");
+        squat_join.expected_output_paths = vec![test_store_path("squat-prune-out")];
+        merge_dag(
+            &handle,
+            joiner,
+            vec![squat_join, make_node("fillerC")],
+            vec![],
+            false,
+        )
+        .await?;
+
+        // Complete the squat: the squatter succeeds, the joiner stays
+        // Active on fillerC (w-x86 is one-shot, so fillerC is undispatched).
+        complete_success(
+            &handle,
+            "w-x86",
+            &test_drv_path("squat-prune"),
+            &test_store_path("squat-prune-out"),
+        )
+        .await?;
+        wait_for_status(&handle, "squat-prune", DerivationStatus::Completed).await;
+
+        // Displacer: conflicting verifiable identity displaces the
+        // now-terminal squat. The joiner's link must be pruned in the same
+        // transaction so the failover below cannot resurrect it.
+        merge_dag(
+            &handle,
+            displacer,
+            vec![make_test_node("squat-prune", "aarch64-linux")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: an x86_64 worker can only receive fillerC (the
+    // displaced definition is aarch64-only). Completing it must finish the
+    // joiner — pre-fix the stale build_derivations link re-pointed the
+    // joiner at the displacing definition and it hung Active forever.
+    let mut rx = connect_executor(&handle, "w-x86-2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("fillerC"),
+        "only the joiner's own node is dispatchable on x86_64 post-failover"
+    );
+    complete_success(
+        &handle,
+        "w-x86-2",
+        &assn.drv_path,
+        &test_store_path("fillerC-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "joiner completes from its own nodes; not re-pointed at the displacing definition"
+    );
+    assert_eq!(
+        query_status(&handle, displacer).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "displacer still waiting on its aarch64 node"
+    );
+    Ok(())
+}

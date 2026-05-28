@@ -8840,6 +8840,13 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         rio_proto::types::BuildState::Active as i32,
         "joiner still waiting on fillerB"
     );
+    // Settled accounting of the terminal squatter, captured before the
+    // displacement — it must never be rewritten afterwards.
+    let squatter_counts: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
 
     // Build 3 (the displacer): conflicting verifiable identity (different
     // system) for the same drv_hash → displaces the now-terminal squat.
@@ -8886,6 +8893,38 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "started_at set by the in-tx Active update"
     );
 
+    // The durable half of the interest prune: the still-running joiner's
+    // build_derivations link to the displaced hash is deleted in the same
+    // transaction, the terminal squatter keeps its link as history, and
+    // the displacer's own link is present — so a leader failover cannot
+    // re-point the joiner at the displacing definition.
+    let mut linked: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT bd.build_id FROM build_derivations bd \
+         JOIN derivations d ON d.derivation_id = bd.derivation_id \
+         WHERE d.drv_path = $1",
+    )
+    .bind(&squat_path)
+    .fetch_all(&db.pool)
+    .await?;
+    linked.sort();
+    let mut expected_links = vec![squatter, displacer];
+    expected_links.sort();
+    assert_eq!(
+        linked, expected_links,
+        "joiner's link pruned durably; terminal squatter and displacer keep theirs"
+    );
+    // The terminal squatter's settled accounting is untouched by the
+    // displacement fan-out.
+    let counts_after_displacement: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        counts_after_displacement, squatter_counts,
+        "terminal squatter's persisted counts frozen at its terminal transition"
+    );
+
     // The joiner's accounting no longer includes the displaced hash:
     // completing fillerB is enough to finish the build (no Active hang).
     // Executors are one-shot (drain after their completion), so a second
@@ -8906,6 +8945,17 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         query_status(&handle, displacer).await?.state,
         rio_proto::types::BuildState::Active as i32,
         "displacer build is live on the fresh node"
+    );
+    // And the terminal squatter's settled accounting is still untouched
+    // after the joiner's completion fan-out.
+    let counts_at_end: (i32, i32) =
+        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
+            .bind(squatter)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        counts_at_end, squatter_counts,
+        "terminal squatter's counts still frozen after later completions"
     );
     Ok(())
 }

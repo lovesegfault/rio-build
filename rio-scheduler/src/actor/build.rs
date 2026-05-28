@@ -463,6 +463,19 @@ impl DagActor {
         let Some(build) = self.builds.get_mut(&build_id) else {
             return;
         };
+        // r[impl sched.merge.authoritative-conflict+3]
+        // A terminal build's progress accounting is settled at its
+        // terminal transition (counts are persisted immediately before
+        // complete_build / transition_build_to_failed runs). Terminal
+        // builds stay resident — and in nodes' interested_builds — for
+        // TERMINAL_CLEANUP_DELAY, so shared-node fan-outs
+        // (release_downstream, displacement re-checks, dispatch-time
+        // cache hits) can still reach here; freezing structurally keeps
+        // any of them (e.g. a displaced node vanishing from the build
+        // summary) from rewriting the settled counts.
+        if build.state().is_terminal() {
+            return;
+        }
         build.completed_count = summary.completed;
         build.failed_count = summary.failed;
         // I-103: persist denormalized counts so list_builds is O(LIMIT).

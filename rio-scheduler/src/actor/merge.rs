@@ -675,17 +675,11 @@ impl DagActor {
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
-        self.persist_merge_to_db(
-            build_id,
-            nodes,
-            edges,
-            &merge_result.newly_inserted,
-            topdown_pruned_parents,
-        )
-        .await
-        .inspect_err(
-            |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
-        )?;
+        self.persist_merge_to_db(build_id, nodes, edges, merge_result, topdown_pruned_parents)
+            .await
+            .inspect_err(
+                |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
+            )?;
 
         // In-memory Pending→Active, strictly after the commit
         // (sched.db.tx-commit-before-mutate). Always a valid transition
@@ -801,25 +795,23 @@ impl DagActor {
         // displaced hash from those builds' accounting (they keep any
         // results they already received) and re-check their completion
         // via the same `other_builds` fan-out used for shared-node
-        // re-probes. Runs after the point of no return (the build is
-        // already committed), so a later rollback can no longer occur.
+        // re-probes. Scope: still-running prior builds only — a build
+        // already terminal at displacement time has settled accounting
+        // that must not be rewritten (its persisted counts are frozen by
+        // update_build_counts_with's terminal guard, and it keeps its
+        // build_derivations link as history). The durable half of this
+        // prune — deleting the same builds' build_derivations links —
+        // already committed inside persist_merge_to_db's transaction;
+        // both sides are driven by displaced_prior_interest so they
+        // cannot diverge. Runs after the point of no return (the build
+        // is already committed), so a later rollback can no longer occur.
         let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
-            let Some((_, prior)) = merge_result
-                .removed_retriable
-                .iter()
-                .find(|(h, _)| h == hash)
-            else {
-                continue;
-            };
-            for prior_build in &prior.interested_builds {
-                if *prior_build == ingest.build_id {
-                    continue;
-                }
-                if let Some(b) = self.builds.get_mut(prior_build)
+            for prior_build in self.displaced_prior_interest(merge_result, hash, ingest.build_id) {
+                if let Some(b) = self.builds.get_mut(&prior_build)
                     && b.derivation_hashes.remove(hash)
                 {
-                    displaced_prune_builds.insert(*prior_build);
+                    displaced_prune_builds.insert(prior_build);
                 }
             }
         }
@@ -1947,6 +1939,43 @@ impl DagActor {
             && self.dag.closure_evidence(drv_hash) == ClosureEvidence::Broken
     }
 
+    /// Prior interested builds of a displaced node that must lose the
+    /// displaced hash from their accounting: every build captured on the
+    /// displaced node's prior state EXCEPT the displacing build and
+    /// builds already terminal at displacement time — a terminal build's
+    /// completion accounting and its build_derivations links are settled
+    /// history (sched.merge.authoritative-conflict). One helper feeds
+    /// BOTH the durable link DELETE inside the persist transaction and
+    /// the in-memory prune/fan-out in reconcile_merged_state, so the two
+    /// prune sets are congruent by construction (the actor is
+    /// single-threaded, so build states cannot change between the two
+    /// call sites within one merge).
+    fn displaced_prior_interest(
+        &self,
+        merge_result: &crate::dag::MergeResult,
+        hash: &DrvHash,
+        displacer: Uuid,
+    ) -> Vec<Uuid> {
+        let Some((_, prior)) = merge_result
+            .removed_retriable
+            .iter()
+            .find(|(h, _)| h == hash)
+        else {
+            return Vec::new();
+        };
+        prior
+            .interested_builds
+            .iter()
+            .filter(|b| **b != displacer)
+            .filter(|b| {
+                self.builds
+                    .get(b)
+                    .is_some_and(|info| !info.state().is_terminal())
+            })
+            .copied()
+            .collect()
+    }
+
     /// Persist nodes and edges to the DB after a successful DAG merge,
     /// and flip the build to Active as the transaction's last statement.
     /// Extracted from handle_merge_dag so failures can be caught and
@@ -1977,9 +2006,10 @@ impl DagActor {
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
-        newly_inserted: &HashSet<DrvHash>,
+        merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
     ) -> Result<(), ActorError> {
+        let newly_inserted = &merge_result.newly_inserted;
         // r[impl sched.persist.creation-scoped]
         // Build input rows for batch upsert — creation-scoped: only the
         // nodes this merge inserted (fresh or reset-recreated). The SQL
@@ -2095,6 +2125,39 @@ impl DagActor {
             db_ids.push(db_id);
         }
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
+
+        // Batch 2b: durable half of the displacement interest prune
+        // (sched.merge.authoritative-conflict). The in-memory prune in
+        // reconcile_merged_state stops still-running prior builds from
+        // counting the displaced hash; deleting their build_derivations
+        // links in the SAME transaction as the recreate-refresh makes the
+        // prune survive leader failover — recovery rebuilds interest
+        // purely from this table, so a surviving link would silently
+        // re-point those builds at the displacing definition. Scope:
+        // non-terminal prior builds only (terminal builds keep links and
+        // counts as settled history), never the displacer. Per-hash loop
+        // is fine — displacement is a rare, adversarial-only path.
+        // r[impl sched.merge.authoritative-conflict+3]
+        for hash in &merge_result.displaced {
+            let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {
+                // displaced ⊆ newly_inserted, so the upsert returned an id
+                // for it; tolerate drift defensively rather than abort.
+                warn!(drv_hash = %hash,
+                      "displaced hash missing from upsert id_map; skipping durable link prune");
+                continue;
+            };
+            let prior_builds = self.displaced_prior_interest(merge_result, hash, build_id);
+            if prior_builds.is_empty() {
+                continue;
+            }
+            let pruned = crate::db::SchedulerDb::delete_displaced_build_links(
+                &mut tx,
+                *displaced_id,
+                &prior_builds,
+            )
+            .await?;
+            debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");
+        }
 
         // Batch 3: insert edges. Resolve drv_path -> db_id via:
         //   1. this tx's id_map — exactly the rows this merge wrote,
