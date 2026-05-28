@@ -135,6 +135,121 @@ rec {
     in
     builtins.all checkOne chains;
 
+  # ── Pull-mode intent spawner (standalone harness) ───────────────────
+  # The pull protocol binds work to an intent-scoped executor identity
+  # (`RIO_INTENT_ID` == drv hash) plus an optional per-intent HMAC
+  # executor token, both injected at spawn by the controller's
+  # Job-spawn loop in k8s. The standalone (non-k8s) fixtures have no
+  # controller, so this wrapper plays that role with the smallest
+  # honest equivalent of the production sequence, against the
+  # scheduler's REAL admin surface (the same RPCs the controller
+  # calls):
+  #
+  #   GetSpawnIntents (kind-filtered) → pick one Ready intent
+  #   MintExecutorTokens([intent])    → per-intent RIO_EXECUTOR_TOKEN
+  #                                     (empty map in dev mode; signed
+  #                                     by the scheduler under HMAC —
+  #                                     never minted locally)
+  #   AckSpawnedIntents(spawned=[i])  → the controller's "Job created"
+  #                                     ack
+  #   exec rio-builder                → one-shot pull → build → report
+  #
+  # systemd's Restart=always then restarts the wrapper for the next
+  # intent — the same role the k8s Job controller plays for pull-mode
+  # pods. Under withHmac fixtures the wrapper presents the
+  # controller-role service token (RIO_PULL_SPAWNER_SERVICE_TOKEN,
+  # minted by fixtures/standalone.nix) on the admin calls, exactly as
+  # rio-controller presents its own. Executor-lifecycle T-1c.2b
+  # standalone re-point; per-check dispositions live in
+  # docs/spec/models/executor-invariant-map.md (Phase-1c record).
+  #
+  # Intent pick: ordinal-staggered (trailing digits of the hostname)
+  # so a multi-worker fixture spreads simultaneously-Ready intents
+  # across workers instead of racing for the first one; a residual
+  # collision resolves as NotYetReady on the loser, which idles out
+  # (RIO_IDLE_SECS below) and re-picks.
+  pullSpawner = pkgs.writeShellApplication {
+    name = "rio-pull-spawner";
+    runtimeInputs = [
+      pkgs.grpcurl
+      pkgs.jq
+    ];
+    text = ''
+      addr="''${RIO_SCHEDULER__ADDR:-localhost:9001}"
+      addr="''${addr#http://}"
+
+      kind_filter="EXECUTOR_KIND_BUILDER"
+      case "''${RIO_EXECUTOR_KIND:-builder}" in
+        [Ff]etcher) kind_filter="EXECUTOR_KIND_FETCHER" ;;
+        *) ;;
+      esac
+
+      # Stable per-worker ordinal from the hostname's trailing digits
+      # (worker1 → 1, worker3 → 3, plain "worker"/"fetcher" → 0).
+      ordinal="$(grep -o '[0-9]*$' /proc/sys/kernel/hostname || true)"
+      ordinal="''${ordinal:-0}"
+
+      svc_token="''${RIO_PULL_SPAWNER_SERVICE_TOKEN:-}"
+
+      grpc_admin() {
+        # $1 = AdminService method, $2 = JSON request body.
+        if [ -n "$svc_token" ]; then
+          grpcurl -plaintext -max-time 10 \
+            -protoset ${protoset}/rio.protoset \
+            -H "x-rio-service-token: $svc_token" \
+            -d "$2" "$addr" "rio.admin.AdminService/$1"
+        else
+          grpcurl -plaintext -max-time 10 \
+            -protoset ${protoset}/rio.protoset \
+            -d "$2" "$addr" "rio.admin.AdminService/$1"
+        fi
+      }
+
+      logged_reachable=0
+      while true; do
+        if intents_json="$(grpc_admin GetSpawnIntents "{\"kind\": \"$kind_filter\"}" 2>/dev/null)"; then
+          if [ "$logged_reachable" = 0 ]; then
+            echo "rio-pull-spawner: scheduler reachable at $addr (kind=$kind_filter)"
+            logged_reachable=1
+          fi
+          # Ready intents only (`ready` is true/absent for the Ready
+          # loop); forecast intents (ready=false) are NodeClaim
+          # pre-provisioning input, not work this harness may take.
+          mapfile -t ready_ids < <(jq -r \
+            '[.intents[]? | select(.ready != false)] | .[].intentId' \
+            <<<"$intents_json")
+          n="''${#ready_ids[@]}"
+          if [ "$n" -gt 0 ]; then
+            idx=$((ordinal % n))
+            intent_id="''${ready_ids[$idx]}"
+            intent_json="$(jq -c --arg id "$intent_id" \
+              '[.intents[]? | select(.intentId == $id)] | .[0]' \
+              <<<"$intents_json")"
+            token="$(grpc_admin MintExecutorTokens \
+              "{\"intentIds\": [\"$intent_id\"]}" 2>/dev/null \
+              | jq -r --arg id "$intent_id" '.tokens[$id] // empty')" || token=""
+            grpc_admin AckSpawnedIntents \
+              "{\"spawned\": [$intent_json]}" >/dev/null 2>&1 || true
+            echo "rio-pull-spawner: spawning rio-builder for intent $intent_id"
+            export RIO_INTENT_ID="$intent_id"
+            export RIO_EXECUTOR_TOKEN="$token"
+            export RIO_DISPATCH_MODE=pull
+            # Bound the NotYetReady wait (a lost pull race) so the
+            # worker frees up quickly; controller-spawned production
+            # pods keep the builder default via their Job env.
+            export RIO_IDLE_SECS="''${RIO_IDLE_SECS:-30}"
+            exec ${rio-workspace}/bin/rio-builder
+          fi
+        fi
+        sleep 2
+      done
+    '';
+  };
+
+  # Compiled proto descriptor set for grpcurl (also used by scenarios;
+  # rio servers do not register tonic-reflection).
+  protoset = import ./lib/protoset.nix { inherit pkgs; };
+
   # Static busybox: closure of exactly 1 path (no glibc, no runtime deps).
   # The sole input seed for all VM tests — FUSE fetches it on every worker,
   # validating the lazy-fetch path.
@@ -430,27 +545,26 @@ rec {
       # critical trace hop), but having them in Tempo makes the trace
       # tree match the observability.typ spec diagram.
       #
-      # RIO_DISPATCH_MODE=stream: the builder binary's compiled default
-      # flipped to pull at the executor-lifecycle 1c cutover, but the
-      # standalone (non-k3s) topology has no controller/Job spawner to
-      # inject RIO_INTENT_ID + a per-intent executor token, so its
-      # workers stay on the legacy session protocol. Dispositioned
-      # KEEP-STREAM (pending-harness) by the T-1c.2b per-check
-      # disposition table (docs/spec/models/executor-invariant-map.md,
-      # Phase-1c record): resolving those rows — a per-intent spawn
-      # mechanism in this harness, a re-home onto a k3s fixture, or
-      # retirement with named replacement coverage — is the recorded
-      # precondition for the 1c' deletion commit that removes the
-      # stream session machinery. extraServiceEnv can still override
-      # for targeted experiments.
-      systemd.services.rio-builder.environment = {
-        RIO_DISPATCH_MODE = "stream";
-      }
-      // lib.optionalAttrs (otelEndpoint != null) {
-        RIO_OTEL_ENDPOINT = otelEndpoint;
-      }
-      // extraServiceEnv
-      // covEnv;
+      # Pull-mode delivery (T-1c.2b standalone re-point): ExecStart is
+      # the pull spawner above — it acquires a per-intent identity and
+      # token from the scheduler's admin surface (the controller's own
+      # path) and execs rio-builder for exactly that intent;
+      # Restart=always (worker module) brings the wrapper back for the
+      # next intent. RIO_DISPATCH_MODE=pull is set explicitly here as
+      # the discriminator (and again by the wrapper before exec) so
+      # extraServiceEnv overrides stay possible for targeted
+      # experiments while the stream path still exists.
+      systemd.services.rio-builder = {
+        serviceConfig.ExecStart = lib.mkForce "${pullSpawner}/bin/rio-pull-spawner";
+        environment = {
+          RIO_DISPATCH_MODE = "pull";
+        }
+        // lib.optionalAttrs (otelEndpoint != null) {
+          RIO_OTEL_ENDPOINT = otelEndpoint;
+        }
+        // extraServiceEnv
+        // covEnv;
+      };
 
       systemd.tmpfiles.rules = covTmpfiles;
 

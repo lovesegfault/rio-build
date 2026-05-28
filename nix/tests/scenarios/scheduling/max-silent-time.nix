@@ -41,14 +41,18 @@ scope: with scope; ''
       )
       per_attempt = elapsed / attempts
       # Timing proof. 10s silence + daemon-setup + QEMU/SSH overhead
-      # → expect ~12-25s/attempt. 30s/attempt upper bound is <<60s
-      # (the key constraint: silence arm fired, sleep didn't run to
+      # → expect ~12-25s/attempt, plus the pull-cycle slack between
+      # I-200 retries (requeue → spawner poll ≤2s → fresh builder
+      # start + FUSE mount + pull) since the T-1c.2b delivery
+      # re-point. 40s/attempt upper bound is still <<60s (the key
+      # constraint: silence arm fired, sleep didn't run to
       # completion). Lower bound 8s: the silence arm can't fire
       # before the 10s deadline; if per_attempt<8s the failure was
       # something else (immediate daemon crash, wrong status code).
-      assert 8 < per_attempt < 30, (
+      assert 8 < per_attempt < 40, (
           f"expected silence kill at ~10s/attempt (per-attempt "
-          f"~12-25s), got {per_attempt:.1f}s over {attempts} attempts "
+          f"~12-30s incl. pull-cycle slack), got {per_attempt:.1f}s "
+          f"over {attempts} attempts "
           f"(total {elapsed:.1f}s). If ~60s/attempt: silence arm "
           f"never fired, sleep ran to completion. If <8s: failed "
           f"before silence deadline.\nBuild output:\n{out}"

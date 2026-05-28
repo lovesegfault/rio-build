@@ -78,40 +78,62 @@ let
     RIO_SERVICE_HMAC_KEY_PATH = "${hmacKeys}/service-hmac.key";
   };
 
-  # Static RIO_EXECUTOR_TOKEN for standalone workers. In k8s the
-  # scheduler signs ExecutorClaims{intent_id,kind,expiry} per
-  # SpawnIntent and the controller injects it as a pod env var;
-  # standalone has no SpawnIntent flow, so mint one here with
-  # intent_id="" (matches the worker's empty Config.intent_id →
-  # heartbeat body check passes), kind=0 (Builder — standalone workers
-  # heartbeat the proto default; deny_unknown_fields means the field
-  # MUST be present), and a far-future expiry. Signed with the SAME
-  # hmac.key the scheduler loads so require_executor() verifies.
+  # Worker EnvironmentFile under withHmac. Two credentials:
+  #
+  #   RIO_PULL_SPAWNER_SERVICE_TOKEN — controller-role ServiceClaims
+  #     {caller="rio-controller", far-future expiry} signed with
+  #     service-hmac.key. The pull spawner (common.nix) presents it as
+  #     `x-rio-service-token` on GetSpawnIntents / MintExecutorTokens /
+  #     AckSpawnedIntents — exactly the credential rio-controller holds
+  #     in k8s for the same calls. The per-intent executor token is NOT
+  #     minted here: the spawner asks the scheduler (MintExecutorTokens),
+  #     so the real signing/verification path is exercised end to end.
+  #     r[sec.authz.service-token].
+  #
+  #   RIO_EXECUTOR_TOKEN — the legacy static stream-session executor
+  #     token (intent_id="", kind=0, far-future expiry, signed with
+  #     hmac.key). Only the stream-era surfaces still read it (the
+  #     security scenario's executor-kind-spoof Heartbeat probe); the
+  #     pull spawner always overrides this variable with the
+  #     scheduler-minted per-intent token before exec'ing rio-builder.
+  #     Retires with the stream session machinery (1c' deletion commit
+  #     A) together with that probe. r[sec.executor.identity-token].
+  #
   # Written as a systemd EnvironmentFile (KEY=value) — NOT
   # readFile-into-env: eval-time readFile of a derivation output is
   # an IFD anti-pattern even now that the hmacKeys derivation is
-  # deterministic. r[sec.executor.identity-token].
+  # deterministic.
   executorTokenEnv =
     pkgs.runCommand "rio-executor-token-env"
       {
         nativeBuildInputs = [ pkgs.python3 ];
       }
       ''
-        python3 - ${hmacKeys}/hmac.key > $out <<'EOF'
+        python3 - ${hmacKeys}/hmac.key ${hmacKeys}/service-hmac.key > $out <<'EOF'
         import base64, hashlib, hmac, json, sys
-        key = open(sys.argv[1], "rb").read()
-        # Mirror rio-auth load_key() trailing-newline trim.
-        for suf in (b"\r\n", b"\n"):
-            if key.endswith(suf):
-                key = key[: -len(suf)]
-                break
-        claims = json.dumps(
-            {"intent_id": "", "kind": 0, "expiry_unix": 9999999999},
-            separators=(",", ":"),
-        ).encode()
-        sig = hmac.new(key, claims, hashlib.sha256).digest()
+
+        def load_key(path):
+            key = open(path, "rb").read()
+            # Mirror rio-auth load_key() trailing-newline trim.
+            for suf in (b"\r\n", b"\n"):
+                if key.endswith(suf):
+                    key = key[: -len(suf)]
+                    break
+            return key
+
         b64 = lambda b: base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-        print(f"RIO_EXECUTOR_TOKEN={b64(claims)}.{b64(sig)}")
+
+        def sign(key, claims_dict):
+            claims = json.dumps(claims_dict, separators=(",", ":")).encode()
+            sig = hmac.new(key, claims, hashlib.sha256).digest()
+            return f"{b64(claims)}.{b64(sig)}"
+
+        exec_key = load_key(sys.argv[1])
+        svc_key = load_key(sys.argv[2])
+        print("RIO_EXECUTOR_TOKEN=" + sign(
+            exec_key, {"intent_id": "", "kind": 0, "expiry_unix": 9999999999}))
+        print("RIO_PULL_SPAWNER_SERVICE_TOKEN=" + sign(
+            svc_key, {"caller": "rio-controller", "expiry_unix": 9999999999}))
         EOF
       '';
 
@@ -229,10 +251,10 @@ let
   # ── Worker nodes ────────────────────────────────────────────────────
   # mapAttrs' renames to the worker's hostName while passing through
   # the scenario's per-worker args + fixture-level OTel. When
-  # withHmac, also mount the static executor-token EnvironmentFile so
-  # rio-builder presents x-rio-executor-token (otherwise the
-  # scheduler's require_executor() rejects the BuildExecution stream
-  # and every heartbeat with Unauthenticated).
+  # withHmac, also mount the credentials EnvironmentFile so the pull
+  # spawner can present the controller-role service token on the
+  # spawn-intent admin calls (and the legacy static executor token
+  # stays available for the stream-era probes until the 1c' deletion).
   workerNodes = lib.mapAttrs (name: args: {
     imports = [
       (common.mkWorkerNode (
@@ -283,20 +305,21 @@ in
     control.wait_for_unit("opentelemetry-collector.service")
     control.wait_for_open_port(4317)
   ''
+  # Pull-era boot gate: pull-mode workers never register, so there is
+  # no `workers_active` count to wait on. The harness-ready signal is
+  # each worker's pull spawner having completed one successful
+  # GetSpawnIntents poll against the scheduler (proves the unit is up,
+  # grpcurl + protoset work, and the admin surface answers — the
+  # things the old registration wait actually guarded). Work delivery
+  # itself is asserted by the scenarios' own builds.
   + lib.concatMapStrings (w: ''
     ${w}.wait_for_unit("rio-builder.service")
-  '') workerNames
-  # All workers registered at scheduler. Exact count, not `[1-9]`.
-  # Handles the stream-then-heartbeat gauge race (58c0145) by waiting
-  # instead of asserting immediately — but the WAIT uses an exact
-  # match, so if the gauge is still wrong, this times out loudly.
-  + ''
-    control.wait_until_succeeds(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep -x 'rio_scheduler_workers_active ${toString (builtins.length workerNames)}'",
-        timeout=30,
+    ${w}.wait_until_succeeds(
+        "journalctl -u rio-builder --no-pager | "
+        "grep -q 'rio-pull-spawner: scheduler reachable'",
+        timeout=60,
     )
-  '';
+  '') workerNames;
 
   # For `${common.collectCoverage pyNodeVars}`.
   pyNodeVars = lib.concatStringsSep ", " ([ "control" ] ++ workerNames ++ [ "client" ]);

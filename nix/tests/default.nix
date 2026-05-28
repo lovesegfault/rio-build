@@ -593,30 +593,26 @@ in
           # r[verify obs.metric.builder]
           # r[verify obs.metric.store]
           "load-50drv"
-          # r[verify sched.assign.warm-gate]
-          #   Placed AFTER load-50drv so the per-assignment PrefetchHint
-          #   → worker-ACK → rio_scheduler_warm_prefetch_paths histogram
-          #   has had many opportunities to fire. Passive check (~0s).
-          "warm-gate"
-          # r[verify builder.shutdown.sigint+3]
-          # sigint-graceful AFTER reassign: reassign already disturbs a
-          # worker (SIGKILL + wait_for_unit restart); sigint is the
-          # gentler sibling. Uses worker2 only — no cache-chain coupling.
-          # ~35s: SIGINT + 30s inactive-wait + restart + FUSE remount.
-          #
-          # sigint-graceful LAST: restarts worker2 (systemctl start) but
-          # doesn't wait for scheduler re-registration (HEARTBEAT_INTERVAL
-          # = 10s at rio-common/src/limits.rs:51). If load-50drv ran AFTER
-          # it'd see 2 slots not 4 → ~26 waves instead of ~13 → ~2×
-          # walltime. Placing sigint last makes the re-registration
-          # window non-load-bearing (collectCoverage reads profraw from
-          # the host fs, doesn't need worker2 registered with scheduler).
-          "sigint-graceful"
+          # warm-gate and sigint-graceful unwired at the T-1c.2b
+          # standalone re-point (delivery is pull now; neither can run
+          # against a pull-mode fixture). Coverage carriers until their
+          # owning deletion/re-statement commits:
+          #   - sched.assign.warm-gate: the PrefetchComplete/warm-gate
+          #     unit tests (rio-scheduler/src/assignment.rs) until the
+          #     rule + mechanism retire with the 1c' placement-layer
+          #     deletion (T-1c'.3).
+          #   - builder.shutdown.sigint+3: the pull-loop SIGINT unit
+          #     test (rio-builder/src/runtime/pull.rs); the VM-level
+          #     re-statement (SIGTERM/SIGINT abort semantics on a live
+          #     pull build) lands with the builder runtime collapse
+          #     (T-1d.1) per the disposition table.
+          # The fragment files stay in scenarios/scheduling/ for those
+          # commits to re-state or delete.
         ];
-        # Default 600s is tight now: max-silent-time ~25s + cancel-timing
-        # ~40s + reassign ~60s + load-50drv ~60s + sigint ~35s ≈ 220s
-        # subtests + ~120s boot. load-50drv under TCG could stretch to
-        # 150s (13 waves × tick=2s × TCG overhead). 900s is comfortable
+        # Default 600s is tight: max-silent-time ~75-150s (I-200
+        # retries × pull cycle) + setoptions ~5s + cancel-timing ~40s
+        # + reassign ~60s + load-50drv ~60-130s (pull is one attempt
+        # per worker at a time) + ~120s boot. 900s keeps headroom
         # without being an open-ended escape hatch.
         globalTimeout = 900;
       };

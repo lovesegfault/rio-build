@@ -117,9 +117,16 @@ pkgs.testers.runNixOSTest {
             "rio_gateway_channels_active",
         ],
         (${gatewayHost}, 9091, "scheduler"): [
-            "rio_scheduler_workers_active",
+            # Pull-era fleet observable (set every establishment-sweep
+            # tick, so present even at 0); replaces the stream-era
+            # rio_scheduler_workers_active registration gauge here —
+            # standalone workers deliver over the pull path since the
+            # T-1c.2b re-point and never register.
+            "rio_scheduler_open_attempts",
             "rio_scheduler_builds_total",
             "rio_scheduler_builds_active",
+            # Incremented per delivered assignment on BOTH paths (the
+            # pull transaction increments it too).
             "rio_scheduler_assignments_total",
         ],
         (${gatewayHost}, 9092, "store"): [
@@ -143,20 +150,16 @@ pkgs.testers.runNixOSTest {
                 f"{sorted(m for m in present if m.startswith(f'rio_{component}_'))}"
             )
 
-        # Worker metrics: rio-builder is one-shot (exits after each
-        # build, systemd restarts). A scrape sees a fresh idle process
-        # — metrics-exporter-prometheus emits no series (and thus no
-        # # HELP line) for counters/gauges that haven't recorded yet,
-        # even when describe_*!() ran. So per-name presence on an idle
-        # worker is untestable. Assert the endpoint is UP (proves
-        # bootstrap() wired the exporter); the journald check below
-        # proves the increment paths fired across restarts.
-        w = workers[0]
-        w.wait_until_succeeds(
-            "curl -sf http://localhost:9093/metrics", timeout=15
-        )
-        # The chain build that ran above DID exercise the increment
-        # paths — verify via journald (survives one-shot restarts).
+        # Worker metrics: rio-builder is one-shot per intent on the
+        # pull path (the spawner execs it per assignment; it exits
+        # after its report). Between builds no rio-builder process is
+        # running, so neither per-name presence nor endpoint-up is
+        # testable after the fact. The journald count below proves the
+        # builder processes ran, completed, and exercised their
+        # increment paths (the exporter is wired by the same
+        # bootstrap() call that emits these log lines); endpoint
+        # exposure on a live builder stays covered by the k8s
+        # readiness probes against :9193 health and by unit tests.
         total_builds = sum(journal_builds_succeeded(w) for w in workers)
         assert total_builds >= 3, (
             f"chain A→B→C should produce ≥3 successful builds across "

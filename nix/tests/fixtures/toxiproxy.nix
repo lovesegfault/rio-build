@@ -186,10 +186,13 @@ _: {
     # guarded against cannot happen under lazy connect. The breaker is
     # always live for chaos scenarios.
     worker.wait_for_unit("rio-builder.service")
-    control.wait_until_succeeds(
-        "curl -sf http://localhost:9091/metrics | "
-        "grep -x 'rio_scheduler_workers_active 1'",
-        timeout=30,
+    # Pull-era boot gate (mirrors standalone.nix): the worker's pull
+    # spawner has completed one successful GetSpawnIntents poll —
+    # registration no longer exists on the pull path.
+    worker.wait_until_succeeds(
+        "journalctl -u rio-builder --no-pager | "
+        "grep -q 'rio-pull-spawner: scheduler reachable'",
+        timeout=60,
     )
   '';
 

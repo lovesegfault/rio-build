@@ -3292,18 +3292,18 @@ Dispositions:
 | `vm-substitute-scale-k3s` | substitution cascade + scaler signal; leaves substituted (no builder pods), the unsubstitutable roots build via the chart pool | RE-POINT | Delivery-only for the roots; substitution/scaler assertions unaffected. |
 | `vm-sla-sizing-kwok` | nodeclaim_pool forecast provisioning under KWOK fake nodes; builder Jobs never run on a real kubelet | MODE-INDEPENDENT | The executor protocol is never exercised (KWOK Stages fake the nodes), so the rendered dispatch mode is inert here. |
 | `vm-nixos-node` | AMI boot path; no rio services | MODE-INDEPENDENT | — |
-| `vm-protocol-warm-standalone` | gateway ssh-ng opcodes, exit-status, connection grace; builds delivered by the standalone systemd stream workers | KEEP-STREAM, pending-harness | Assertions are gateway-side; only the delivery is stream. Blocks T-1c'.2 until the standalone-corpus re-point (see note). |
-| `vm-protocol-warm-lix-standalone` | the same against a Lix (protocol 1.35) client | KEEP-STREAM, pending-harness | As above. |
-| `vm-protocol-cold-standalone` | cold-bootstrap DAG incl. the FOD→fetcher-kind worker split | KEEP-STREAM, pending-harness | As above. |
-| `vm-ca-cutoff-standalone` | CA chain builds, cutoff saves, IA-on-CA resolution | KEEP-STREAM, pending-harness | As above. |
+| `vm-protocol-warm-standalone` | gateway ssh-ng opcodes, exit-status, connection grace; builds delivered by the standalone pull harness | RE-POINTED (was pending-harness) | Assertions are gateway-side; delivery now runs over the pull harness (spawner → `GetSpawnIntents`/`MintExecutorTokens`/`AckSpawnedIntents` → one-shot pull builder). No assertion changes. |
+| `vm-protocol-warm-lix-standalone` | the same against a Lix (protocol 1.35) client | RE-POINTED (was pending-harness) | As above. |
+| `vm-protocol-cold-standalone` | cold-bootstrap DAG incl. the FOD→fetcher-kind worker split | RE-POINTED (was pending-harness) | As above; the fetcher worker's spawner filters `GetSpawnIntents` by kind=Fetcher, so the FOD→fetcher routing assertion is preserved on the pull path. |
+| `vm-ca-cutoff-standalone` | CA chain builds, cutoff saves, IA-on-CA resolution | RE-POINTED (was pending-harness) | As above (withHmac: the spawner presents the controller-role service token; per-intent executor tokens are scheduler-minted). |
 | `vm-substitute-standalone` | store-side substitution, tenant gating, ssh-ng read opcodes; zero workers | MODE-INDEPENDENT | No executors in the fixture. |
 | `vm-log-service-standalone` | store LogService ingest/tail/dedup; zero workers | MODE-INDEPENDENT | No executors in the fixture. |
-| `vm-sla-sizing-standalone` | SLA estimator/explore/cost-solve fed by a scripted-telemetry stream worker (incl. `workers_active` boot waits) | KEEP-STREAM, pending-harness | Sample delivery and the boot gate are stream-era; re-point follows the standalone-corpus decision. |
-| `vm-scheduling-core-standalone` | FUSE/overlay/chunks/cgroup builder mechanics on 3 stream workers | KEEP-STREAM, pending-harness | Assertions are builder-mechanics; only the delivery is stream. |
-| `vm-scheduling-disrupt-standalone` | max-silent-time, setoptions-unreachable, cancel-timing (stream 5 s budget), reassign (disconnect→reassign), load-50drv, warm-gate, sigint-graceful (drain + re-register) | KEEP-STREAM, mixed | The stream-machinery subtests retire with their mechanisms: `reassign` (mechanism #3) and the stream cancel budget at T-1c'.2 (pull successors: the pull-canary cancel arm and the killed-mid-build pull-mode arm), `warm-gate` at T-1c'.3 (`sched.assign.warm-gate` retired), `sigint-graceful` re-stated at T-1d.1 (builder stream collapse). max-silent-time / setoptions-unreachable / load-50drv are delivery-only (pending-harness). |
-| `vm-security-standalone` | HMAC/JWT boundaries, tenant resolve, rate limit, quota, executor identity token + kind-spoof heartbeat | KEEP-STREAM, mixed | `executor-kind-spoof` and the static stream executor token are session machinery — they retire with T-1c'.2; the pull side's per-unary token↔intent binding (mechanism #6) is carried by the 1a/1b unit batteries and the pull VM arms. The remaining subtests are delivery-only (pending-harness). |
-| `vm-observability-standalone` | metric presence (incl. `rio_scheduler_workers_active`), log pipeline, trace export and traceparent propagation over stream dispatch | KEEP-STREAM, pending-harness | EXPECTED_METRICS and the trace-propagation assertions read stream-era observables; their pull equivalents (`rio_scheduler_open_attempts`, spans over the pull unaries) land with the standalone re-point or a re-home. |
-| `vm-chaos-standalone` | store-RPC fault injection (latency / reset / partition / bandwidth) under live builds on a stream worker | KEEP-STREAM, pending-harness | Assertions are store-client resilience (mode-independent). Named Model-D carrier for T-1d.1/T-1d.4 — per the plan it must be re-pointed, not retired, before the builder stream collapse. |
+| `vm-sla-sizing-standalone` | SLA estimator/explore/cost-solve fed by a scripted-telemetry worker (RIO_BUILDER_SCRIPT intercept is below the dispatch layer) | RE-POINTED (was pending-harness) | Sample delivery now runs over the pull harness; the `workers_active` boot/restore waits are replaced by the spawner-reachable boot gate and the unit-active condition (stop-the-worker-to-keep-it-queued still works — a stopped spawner pulls nothing). |
+| `vm-scheduling-core-standalone` | FUSE/overlay/chunks/cgroup builder mechanics on 3 pull-harness workers | RE-POINTED (was pending-harness) | Builder-mechanics assertions unchanged; delivery is pull. The fanout PrefetchHint metric assertion was removed (stream-only mechanism; unit-test coverage carries it until T-1c'.3 retires it) and the fuse-direct overlay-bypass `ls` is best-effort when no builder process is live between pulls (the in-build FUSE coverage is unchanged). |
+| `vm-scheduling-disrupt-standalone` | max-silent-time, setoptions-unreachable, cancel-timing (stream 5 s budget), reassign (disconnect→reassign), load-50drv | PARTIALLY RE-POINTED (delivery + delivery-only subtests), mixed | max-silent-time / setoptions-unreachable / load-50drv are RE-POINTED (delivery-only; the max-silent-time per-attempt bound gained documented pull-cycle slack). The stream-machinery subtests still retire with their mechanisms: `reassign` (mechanism #3) and the stream cancel budget at T-1c'.2 (pull successors: the pull-canary cancel arm and the killed-mid-build pull-mode arm). DEVIATION executed at the harness re-point: `warm-gate` (owned by T-1c'.3) and `sigint-graceful` (re-statement owned by T-1d.1) were unwired from this check at the re-point itself because neither can execute against a pull-delivery fixture; their named carriers until their owning commits are the warm-gate/PrefetchComplete unit tests (`rio-scheduler/src/assignment.rs`, `r[verify sched.assign.warm-gate]`) and the pull-loop SIGINT unit test (`rio-builder/src/runtime/pull.rs`, `r[verify builder.shutdown.sigint+3]`); the fragment files remain for T-1c'.3 / T-1d.1 to retire or re-state. The check is buildable green only once deletion commit A removes reassign + cancel-timing. |
+| `vm-security-standalone` | HMAC/JWT boundaries, tenant resolve, rate limit, quota, executor identity token + kind-spoof heartbeat | PARTIALLY RE-POINTED (delivery), mixed | Delivery-only subtests are RE-POINTED (HMAC posture preserved: the spawner holds the controller-role service token, executor tokens are scheduler-minted per intent). `executor-kind-spoof` and the static stream executor token are session machinery — they retire with T-1c'.2; the pull side's per-unary token↔intent binding (mechanism #6) is carried by the 1a/1b unit batteries and the pull VM arms. |
+| `vm-observability-standalone` | metric presence, log pipeline, trace export and traceparent propagation | RE-POINTED (was pending-harness) | EXPECTED_METRICS now reads `rio_scheduler_open_attempts` (pull-era fleet observable) instead of `workers_active`; the worker endpoint-up probe was replaced by the journald build-count proof (no idle builder process exists between pulls). The traceparent data-carry assertions are unchanged — `build_assignment_proto` embeds the same submit-time traceparent on both paths. |
+| `vm-chaos-standalone` | store-RPC fault injection (latency / reset / partition / bandwidth) under live builds on a pull-harness worker | RE-POINTED (was pending-harness) | Assertions are store-client resilience (mode-independent); delivery is pull. Still the named Model-D carrier for T-1d.1/T-1d.4. |
 
 **What RE-POINT concretely changed at this task.** The
 `values/vmtest-full.yaml` `poolDefaults.dispatchMode: Stream` pin is
@@ -3315,23 +3315,35 @@ re-pointed k3s scenarios were replaced by pull-path equivalents
 `dispatch_mode='pull'` assertion instead of the re-registration wait,
 the AD5 composite cancel bound instead of the stream cancel dispatch
 timing). The standalone fixture (`nix/tests/common.nix`
-`RIO_DISPATCH_MODE=stream`) keeps its pin, now annotated with this
-table's disposition.
+`RIO_DISPATCH_MODE=stream`) kept its pin at that batch, annotated with
+this table's disposition; the pin was removed by the standalone
+pull-harness batch below.
 
-**The standalone-corpus note (the open half of T-1c.2b).** The pull
-protocol binds work to an intent-scoped executor (`RIO_INTENT_ID` plus
-a per-intent token minted at spawn); the standalone topology has no
-controller or Job spawner, so its long-lived systemd workers cannot
-exercise the pull path by a configuration flip — `run_pull` refuses to
-start without an intent id by design. The KEEP-STREAM *pending-harness*
-rows above therefore stay on the stream path at this task. Before
-deletion commit A (T-1c'.2) can land, one of the recorded options must
-be executed per row: (a) a minimal per-intent spawn mechanism in the
-standalone harness (poll `GetSpawnIntents`, mint the per-intent token,
-spawn a one-shot builder), (b) re-home the build-delivering scenarios
-onto a k3s fixture, or (c) retire with named replacement coverage
-(P13). This is the same precondition the Phase-1 plan states for
-T-1c'.1/T-1c'.2; this table makes it per-check instead of implicit.
+**The standalone-corpus note (the open half of T-1c.2b — RESOLVED by
+the standalone pull-harness batch).** The pull protocol binds work to
+an intent-scoped executor (`RIO_INTENT_ID` plus a per-intent token
+minted at spawn); the standalone topology has no controller or Job
+spawner, so its long-lived systemd workers could not exercise the pull
+path by a configuration flip — `run_pull` refuses to start without an
+intent id by design. The KEEP-STREAM *pending-harness* rows above
+therefore stayed on the stream path at that task. Option (a) of the
+recorded choices was executed by the slice-1c' first batch as the
+recorded precondition for deletion commit A: the standalone harness
+gained a per-intent spawn mechanism (`rio-pull-spawner`,
+`nix/tests/common.nix`) that polls the scheduler's real
+`GetSpawnIntents` surface, asks the scheduler to mint the per-intent
+executor token (`MintExecutorTokens` — the production signing path,
+never a locally-forged credential), acks via `AckSpawnedIntents`, and
+execs a one-shot pull-mode `rio-builder` for exactly that intent;
+systemd's `Restart=always` plays the Job controller's respawn role.
+Under withHmac fixtures the spawner authenticates with a
+controller-role service token minted by the fixture
+(`fixtures/standalone.nix`), mirroring rio-controller's own
+credential. The per-row dispositions above were updated in place
+(RE-POINTED / PARTIALLY RE-POINTED) by that batch; rows it could not
+honestly reproduce carry named replacement coverage instead of a
+silent drop (the warm-gate / sigint-graceful deviation recorded in
+the scheduling-disrupt row).
 
 #### T-1c.2b verification record (the re-point batch)
 

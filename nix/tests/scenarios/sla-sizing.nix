@@ -535,14 +535,12 @@ let
               )
           # Cleanup: drain the backgrounded build + restore the worker
           # so seed-corpus (chained after) has a working fixture.
+          # Pull path: the restarted spawner polls GetSpawnIntents on
+          # its own — there is no registration to wait for; the unit
+          # being active is the whole precondition.
           client.execute("pkill -f 'nix-build.*synth-cost' || true")
           worker.systemctl("start rio-builder")
           worker.wait_for_unit("rio-builder.service")
-          ${gatewayHost}.wait_until_succeeds(
-              "curl -fsS localhost:9091/metrics | "
-              "awk '/^rio_scheduler_workers_active / {exit !($2>=1)}'",
-              timeout=60,
-          )
     '';
 
     admissible-set = ''
@@ -648,15 +646,11 @@ let
           # Per-value emit coverage (both directions) is owned by the
           # `labeled_metric_values_have_emit_sites` unit test now —
           # this subtest only asserts the HELP line surfaces.
-          # Cleanup: drain + restore worker for seed-corpus.
+          # Cleanup: drain + restore worker for seed-corpus. Pull path:
+          # no registration wait — the active unit is the precondition.
           client.execute("pkill -f 'nix-build.*synth-' || true")
           worker.systemctl("start rio-builder")
           worker.wait_for_unit("rio-builder.service")
-          ${gatewayHost}.wait_until_succeeds(
-              "curl -fsS localhost:9091/metrics | "
-              "awk '/^rio_scheduler_workers_active / {exit !($2>=1)}'",
-              timeout=60,
-          )
     '';
 
     seed-corpus = ''

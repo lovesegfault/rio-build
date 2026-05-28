@@ -47,11 +47,13 @@ scope: with scope; ''
       assert_metric_ge(${gatewayHost}, 9092,
           "rio_store_put_path_total", 5.0, labels='{result="created"}')
 
-      # PrefetchHint: the collector (rio-root) has 4 DAG children.
-      # When root dispatches, approx_input_closure returns the 4
-      # leaf output paths → hint sent with ≥1 path. paths_sent is
-      # tighter than hints_sent: an empty-hint bug (message sent,
-      # 0 paths) would pass hints≥1 but fail paths≥1. (phase3a:485)
-      assert_metric_ge(${gatewayHost}, 9091,
-          "rio_scheduler_prefetch_paths_sent_total", 1.0)
+      # PrefetchHint assertion removed at the T-1c.2b standalone
+      # re-point: scheduler-pushed PrefetchHints exist only on the
+      # stream dispatch path (the executor's own closure-compute warm
+      # path covers pull-mode inputs), so this fixture no longer
+      # exercises rio_scheduler_prefetch_paths_sent_total. The
+      # prefetch-hint plumbing keeps its scheduler/builder unit-test
+      # coverage until the warm-gate machinery retires with the 1c'
+      # placement-layer deletion (executor-invariant-map.md, T-1c.2b
+      # disposition table).
 ''
