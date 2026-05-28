@@ -4511,23 +4511,24 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
 
 // r[verify sched.merge.substitute-topdown+10]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
-/// for every edge parent it re-declares, regardless of the in-memory
-/// copy's history (bughunter round-21 merged_bug_001). Staging: same
-/// reap shape as above (B1's prune stamps R; BC produces dep2; B2
-/// full-merges app→R→{dep1 unbuilt, dep2 produced}; B2's cancel reaps
-/// dep1 → closure hole set in memory and persisted). R's parked fetch
-/// then succeeds → R completes, and its output is seeded so no
-/// stale-Completed reset interferes. A later build D full-merges R
-/// with its real edges (app2→R→{dep1, dep2}; dep1 re-inserted unbuilt
-/// so the produced-children clear pass cannot drop the mark and take
-/// the breadcrumb with it — the heal is the only PG clear in play):
-/// re-declaring R's edges makes its child set representative again, so
-/// the persisted breadcrumb must be FALSE once that merge commits.
-/// Pre-fix the completion dropped the in-memory hole and the heal
-/// pushed the PG clear only for parents whose in-memory bit was still
-/// set, so the stale persisted hole survived completion + the full
-/// re-merge, and a later failover would restore it as
-/// permanently-Broken closure evidence (wrongful fail-fast for a node
+/// for every edge parent it re-declares, even when the in-memory copy
+/// of the breadcrumb is GONE (bughunter round-21 merged_bug_001;
+/// staging hardened in round-22 bug_012). Staging: same reap shape as
+/// above (B1's prune stamps R; BC produces dep2; B2 full-merges
+/// app→R→{dep1 unbuilt, dep2 produced}; B2's cancel reaps dep1 →
+/// closure hole set in memory and persisted). R's parked fetch then
+/// succeeds → R completes, which completes B1 (R is its only
+/// derivation); B1's cleanup then reaps the orphaned Completed R out
+/// of the DAG entirely while the persisted row keeps closure_hole=true
+/// (and topdown_pruned=true) — the reap deletes no rows. A later build
+/// D full-merges R with its real edges (app2→R→{dep1, dep2}): R is
+/// re-inserted FRESH, so its in-memory breadcrumb sits at the `false`
+/// default while the OR-on-conflict upsert leaves the persisted column
+/// true. Only a TOTAL heal — push every re-declared edge parent to the
+/// PG clear — drops it; a heal keyed on the pre-clear in-memory value
+/// skips the fresh R, the stale persisted hole survives every later
+/// merge, and the next failover restores it as permanently-Broken
+/// closure evidence (wrongful resubmit-directing fail-fast for a node
 /// whose closure was in fact fully re-merged).
 #[tokio::test]
 async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() -> TestResult {
@@ -4655,16 +4656,55 @@ async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() 
          is not an edge-redeclaring event)"
     );
 
-    // Seed R's output so D's merge does not trigger the stale-Completed
-    // reset — the heal is the only closure-hole-clearing mechanism in
-    // play for this merge.
+    // R's completion completed B1 (R is its only derivation). Clean B1
+    // up so the reap removes the now-orphaned Completed R from the DAG
+    // entirely: the in-memory copies of the breadcrumb and the mark go
+    // with the node, while the persisted row stays behind with both
+    // bits still true. This stages the divergence the heal's totality
+    // exists for — any later re-insert of R starts from the in-memory
+    // `false` defaults, so only the persisted column remembers the
+    // truncation.
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "fixture premise: R's completion completed B1 (its only derivation), so B1 is \
+         terminal and its cleanup may reap R"
+    );
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b1 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdhc-r").await?.is_none(),
+        "fixture premise: R (Completed, sole interest B1) must be reaped from the DAG \
+         so the next merge re-inserts it fresh"
+    );
+    let (pg_pruned_after_reap, pg_hole_after_reap): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdhc-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned_after_reap && pg_hole_after_reap,
+        "fixture premise: the reap leaves the persisted row behind with both bits still \
+         set (topdown_pruned={pg_pruned_after_reap}, closure_hole={pg_hole_after_reap}) \
+         while the in-memory copies are gone with the node"
+    );
+
+    // Seed R's output so D's merge re-finds R as a local cache hit
+    // (deferred behind the unbuilt dep1, so no new substitution walk is
+    // spawned for it) — the heal is the only closure-hole-clearing
+    // mechanism in play for this merge.
     store.seed_with_content(&r_out, b"r-out");
 
     // D: a FULL merge that re-declares R's real edge set
     // (app2 → R → {dep1, dep2}; app2's output is not substitutable, so
-    // no prune). dep1 is re-inserted unbuilt, so the produced-children
-    // clear pass keeps the mark — only the heal may touch the persisted
-    // breadcrumb here.
+    // no prune). R and dep1 are re-inserted fresh: dep1 unbuilt (so no
+    // produced-children mark clear can fire and take the breadcrumb
+    // with it) and R with its in-memory breadcrumb/mark at the `false`
+    // defaults — only the persisted columns, which the upsert
+    // OR-combines, still carry the old state. Only the heal may touch
+    // the persisted breadcrumb here.
     let mut app2 = make_node("tdhc-app2");
     app2.expected_output_paths = vec![test_store_path("tdhc-app2-out")];
     let d = Uuid::new_v4();
@@ -4682,15 +4722,27 @@ async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() 
     .await?;
     barrier(&handle).await;
 
+    // R is back in the DAG as a fresh insert: D's full merge does not
+    // prune (so it never stamps), and a fresh node carries the `false`
+    // defaults — the persisted row is the only carrier of the old
+    // truncation evidence at heal time.
+    let r_after = expect_drv(&handle, "tdhc-r").await;
+    assert!(
+        !r_after.topdown_pruned,
+        "fixture premise: D's full merge re-inserts R fresh (unmarked in memory) — the \
+         old state survives only in the persisted row"
+    );
+
     // The full re-merge must leave the persisted breadcrumb FALSE: the
     // heal pushes the PG clear for every re-declared edge parent, so
-    // the outcome cannot depend on the in-memory bit's history (here
-    // the breadcrumb rode through R's completion and this heal flips
-    // it; the in-memory-cleared/lost shapes are guarded by the heal
-    // being total in code — see its comment in `handle_merge_dag`).
-    // The mark itself stays — R's re-declared children are not all
-    // produced — pinning that the heal clears the breadcrumb
-    // independently of the mark-clear helpers.
+    // it cannot depend on the in-memory bit's history — here the
+    // in-memory breadcrumb was LOST with the reap and the re-inserted
+    // R sits at the `false` default, so a heal keyed on the pre-clear
+    // in-memory value would skip R and leave the column stale.
+    // The persisted mark stays — the upsert OR-combines it and the
+    // fresh-inserted R is unmarked in memory, so no mark-clear pass
+    // fires — pinning that the breadcrumb clear came from the heal,
+    // not from a mark-clear helper (which drops both bits at once).
     let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
         "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdhc-r'",
     )
@@ -4699,14 +4751,15 @@ async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() 
     assert!(
         !pg_hole,
         "a full merge that re-declares R's edges must clear the persisted closure_hole \
-         even when the in-memory copy was already clear/lost — otherwise the stale \
-         persisted breadcrumb survives every later merge and a failover restores it as \
-         permanently-Broken closure evidence (wrongful fail-fast)"
+         even when the in-memory copy was lost (R was reaped out and re-inserted fresh) \
+         — otherwise the stale persisted breadcrumb survives every later merge and a \
+         failover restores it as permanently-Broken closure evidence (wrongful fail-fast)"
     );
     assert!(
         pg_pruned,
-        "fixture premise: the mark itself stays (re-declared children are not all \
-         produced) — the breadcrumb clear must not depend on the mark clear"
+        "fixture premise: the persisted mark survives the re-merge (OR-combined upsert, \
+         no mark-clear pass for the unmarked fresh insert) — the breadcrumb clear must \
+         not have ridden a mark-clear statement"
     );
     Ok(())
 }
