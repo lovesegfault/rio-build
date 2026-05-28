@@ -4575,3 +4575,433 @@ exactly the code `executorSessionAsBuilt.qnt` models. Therefore:
   is a deferred item in the campaign close-out below, conditioned on
   the deployment-time validation checklist passing through row D7 —
   the same condition and template the refcount close-out recorded.
+
+## Campaign close-out — executor-lifecycle / session-protocol replacement (campaign #1)
+
+The executor-lifecycle campaign is complete through Phase 2 under the
+2026-05-27 no-deploy directive: Phase 0 (the re-pin, the spec audit,
+Models S and D, the calibration, the frozen 0e contract and go),
+Phase 1 (the additive pull path, the verification-only canary slice,
+fleet-wide pull-path readiness, deletion wave 1 with the model
+re-target, and the builder/controller/proto collapse with Model D's
+retirement), and Phase 2 (the acceptance table, the Kani decision, and
+this close-out). This section is the campaign-level record in the same
+shape as the retry and refcount close-outs; the per-phase evidence
+lives in the sections above, the introducing commits, and the CI
+transcripts. The owner's close-out signature (gate G7) and the
+controller-campaign counter-signatures are the signatures that remain
+open; they are listed under deferred items.
+
+### What was delivered, phase by phase
+
+- **Phase 0a–0e** (records above): the churn pin and inventory re-pin;
+  the 170-commit corpus partition (50 in-family / 21 retry / 43
+  controller / 56 out-of-scope); the Stage-A invariant↔rule map with
+  the five composition rules and the contradiction records; Stage B —
+  Models S and D wired with witnesses, one real as-built defect found
+  by the armed-safety invariant and fixed (`1bbad1ee7`), the
+  over-budget regimes recorded as the pre-registered fallback; Stage C
+  — twelve override modules, six wired calibration guards, per-family
+  falsification/ENC-A/NOT-ENC verdicts with every prediction
+  correction recorded; the 0e frozen contract (unary signatures,
+  frozen invariant list, finalized disposition table, Model J/N
+  obligation table, lease-seam note, OA decisions) and the go.
+- **Slice 1a** (additive): the four unaries, migration 071, the
+  open-attempt view and gauge, the fenced pull transaction with
+  `admit_pull`, the idempotent report intakes, the establishment sweep
+  and report-slack config, the §4.5 option-(b) busy bridge, the
+  synthesize-on-delete arm, the builder pull client behind the flag,
+  the pull-mode VM subtest, and the OA2 interim controls.
+- **Slice 1b** (verification-only): AD2 on both halves (source-node
+  exclusion re-key + anti-affinity/NoEligibleSource), the C4/C5
+  unification onto `ReportAttemptOutcome`, the AD5 successors
+  (SIGTERM-abort, 45 s TGPS, synthesized-report + foreground delete),
+  the ICE first-pull re-trigger, the Pool `dispatchMode` CRD field,
+  the retryPolicy pull-mode regime, the `vm-pull-canary-k3s` scenario
+  with the fold-input and AD5 timing assertions, the Model J re-runs,
+  and the recorded pull-path review pass.
+- **Slice 1c**: the OA2 controller-side wedge clustering, the
+  deletion-gate observable and recording rule with the horizon
+  formula, fetcher-kind pull coverage, the defaults flip to pull, and
+  the T-1c.2b VM-corpus re-point with its per-check disposition table.
+- **Slice 1c'**: deletion commits A–C (session machinery, placement
+  layer, operator surfaces), the Model S re-target with the
+  witness/calibration flips and check re-wiring, the as-built-channel
+  retry regime retirement, the Model J/N and lease-seam
+  re-derivations, and the scheduler.typ spec sweep.
+- **Slice 1d**: the builder runtime collapse to the pull loop, the
+  controller coexistence-shim removal, the proto sweep, Model D's
+  retirement with named carriers, the controller-map delta pass, and
+  the close-out prep record.
+- **Phase 2**: the acceptance table over the full partitioned corpus,
+  the Kani reasoned omission with its carrier table, the as-built
+  model/calibration retention decision, and this close-out with the
+  finalized deployment-time validation checklist.
+
+### Outcome against the design's two committed goals (§1)
+
+Both hold, with the §6-row-2 Kani slot discharged by reasoned omission
+rather than proof (the same shape as the refcount close-out). The
+as-built session protocol's safety properties were stated as invariant
+families, exhaustively checked where encodable, calibrated
+commit-by-commit against the partitioned fix corpus, and the one
+as-built defect the models surfaced was fixed and re-verified rather
+than modeled around. The replacement landed in the order the design
+required (additive surface → consumers re-wired → cutover → deletion),
+every deletion is justified by the finalized disposition table plus
+the calibration evidence (AD6 in both directions), the re-targeted
+model and the pull-mode retry regime are the wired verification stack
+for the as-landed protocol, and the acceptance table above closes the
+loop family by family. The redundant re-binding hop and the in-memory
+fleet model it defended no longer exist; what remains is the short
+checked list the design predicted: ledger idempotency, the
+establishment sweep, the transaction fence, the spawn-side eligibility
+gate, and the controller-side successors.
+
+### Final verification inventory (at this close-out)
+
+- **Models.** `executorSession.qnt` (re-targeted, the model of record
+  for the landed pull protocol): 2 wired exhaustive TLC regimes
+  (`quint-executor-session-base`, `quint-executor-session-fault-leader`),
+  last recorded distinct-state counts 15,648 / 108,864 (search depths
+  21 / 24) at the T-1c'.5 re-target, re-built green at the 1d tree;
+  12 wired expect-violation witnesses (the OA6 pair, establishment,
+  store-adopt, synthesized-close, second-installment, re-pull,
+  orphaned-attempt, late-report, no-attempt-noop, stale-fenced,
+  post-failover-deliver); 1 wired calibration flip
+  (`quint-executor-calib-f4-establishment-window`).
+  `executorSessionAsBuilt.qnt`: frozen, unwired, kept typechecking
+  (P14). `executorDelivery.qnt` (Model D): retired at 1d with named
+  carriers (T-1d.4 record). Cross-campaign additions recorded in the
+  neighbor maps: `quint-retry-policy-pull` plus nine pull-mode
+  witnesses on the retry model (T-1b.7/T-1c'.6); Models J and N
+  byte-unchanged with their wired checks re-run green at 1c'/1d.
+  Check-budget end state: 15 wired executor-session checks against the
+  as-built peak of 28 (5 cfgs / 17 witnesses / 6 calib), with the 8
+  as-built-channel retry checks retired and 10 pull-regime retry
+  checks added — the gate plan's net-fewer-checks expectation held,
+  and the fault-leader residual is now exhaustively checked rather
+  than a manual target.
+- **Calibration.** Twelve as-built override modules were written at 0d;
+  at this close-out ten remain committed as evidence modules over the
+  frozen as-built encoding (the two Model-D modules were deleted with
+  Model D at 1d), plus the one wired pull-era override. Each retired
+  wired guard carries its (a)-retired or (b)-re-encoded record
+  (T-1c'.5 / T-1d.4); the retained corpus's retirement is deferred
+  (below).
+- **Kani.** No executor-side harness (the reasoned omission above);
+  `kani-rio-retry-kernel` (7 harnesses) carries the decision
+  arithmetic unchanged; `kani-rio-lease` / `kani-rio-store`
+  unaffected.
+- **Spec.** The pull-protocol rule set landed marker-first across
+  1a–1d (`sched.executor.pull-{transaction,gone,not-ready}`,
+  `sched.executor.report-idempotent`, `sched.attempt.{no-attempt-no-op,
+  synthesized-verdict,establishment-window+2}`,
+  `ctrl.report.attempt-outcome`, `ctrl.nodeclaim.wedge-cluster`,
+  `builder.pull.{retry-loop+2,exit-codes}`, the AD2/AD5 amendments).
+  The 1c' sweep retired 15 stream-era scheduler rules with retirement
+  records naming their carriers and re-stated 8 more (tracey bumps with
+  markers re-pointed in the same commits); builder.typ's stream-runtime
+  rules were retired at the 1d collapse; of the five 0b composition
+  rules, `sched.executor.one-shot+2` survives re-stated,
+  `builder.completion.exactly-once-or-death+2` is re-pointed at the
+  pull report loop, and the session-epoch / liveness-window /
+  repair-precedence rules are retired with their machinery and their
+  successor content named. `tracey query stale` is empty at this
+  close-out; the campaign's added rules carry impl and verify
+  references.
+- **Tests.** The pull-path batteries as landed: the admission/
+  idempotency/fence/no-attempt/synthesized-verdict battery
+  (rio-scheduler/src/actor/tests/pull.rs, 23 tests), the establishment
+  sweep battery (actor/tests/establishment.rs, 6), the pull-mode
+  ICE-clear test (actor/tests/dispatch.rs), the `admit_pull` kernel
+  table tests (3), the controller busy-bridge / orphan-reap /
+  synthesize-on-delete battery (reconcilers/pool/tests/jobs_tests.rs,
+  27), the wedge-clustering battery (nodeclaim_pool/wedge.rs, 5), and
+  the builder pull-loop / report-retry / exit-code batteries
+  (rio-builder/src/runtime/). The wider scheduler actor corpus (322
+  test functions under actor/tests/ at this tip) was re-pointed from
+  stream delivery onto pull delivery at 1c' with per-test
+  justifications (P13), rather than deleted.
+- **VM scenarios.** `pull-mode` (lifecycle-autoscale group),
+  `vm-pull-canary-k3s` (its own check: equivalence at 1b, pull-only
+  after the re-point, the AD5 cancel/preempt timing arms, the
+  fold-input assertions), `pull-fetcher` (OA3 one-pull shape), and the
+  standalone + k3s corpus re-pointed onto the pull path per the
+  T-1c.2b disposition table; the stream-era subtests that table marked
+  retire-with-machinery were deleted with their machinery, with
+  carriers named per row.
+- **Schema and instrumentation.** Migrations 071
+  (`source_node` + `dispatch_mode`) and 072 (`deadline_secs`) are
+  landed and PINNED (additive; never applied anywhere — no deployment
+  exists). Instrumentation shipped with the code: the OA1 histogram
+  pair, the `rio_scheduler_open_attempts` gauge,
+  `rio_controller_node_wedge_marked_total`, the
+  `RioSchedulerAttemptEstablishmentCluster` alert, the
+  `docs/ops/hung-node-manual-reap.typ` runbook, the deletion-gate
+  recording rules (on pre-deletion-stage releases), and the 45 s
+  pull-mode TGPS in the rendered pod template.
+- **Reviews and owner records.** The 0c falsification adjudication and
+  fix; the 1b pull-path code-review pass and its fix dispositions; the
+  OA5 surface review (precondition for deletion commit C); the
+  development-time pre-deletion go (T-1c'.1); the controller-map 1b
+  re-audit and 1d delta entries (counter-signatures pending); the
+  slices integrated serially onto `formal-sprint` per the plan's
+  landing mechanics (G1–G6), with G7 being this close-out.
+
+### The honest final accounting: net code delta across the campaign
+
+Per-slice figures, measured at this close-out as `git diff --stat`
+over each slice's commit range on the integrated branch (campaign
+commits only — the slices interleave with refcount-campaign landings
+on the same branch, so whole-branch diffs would overcount). "Production
+crates" = rio-{scheduler,builder,controller}/src, rio-proto, rio-crds,
+rio-cli, rio-dashboard, rio-migrations, including their in-crate test
+modules; "whole tree" additionally includes docs/spec, models,
+nix/tests, helm, and generated metadata. The 1c' and 1d rows match the
+figures already recorded in their slice records (small deltas are the
+close-out-prep commits measured here and scope differences noted
+there).
+
+| Slice | Whole tree (+/−, net) | Production crates (+/−, net) |
+|---|---|---|
+| 1a (additive surface) | +5,805 / −79 = **+5,726** | +4,940 / −76 = **+4,864** |
+| 1b (canary verification slice) | +6,291 / −339 = **+5,952** | +3,936 / −215 = **+3,721** |
+| 1c (fleet readiness + re-points) | +1,495 / −289 = **+1,206** | +577 / −98 = **+479** |
+| 1c' (deletion wave 1 + re-target) | +7,679 / −30,223 = **−22,544** | +2,729 / −24,790 = **−22,061** |
+| 1d (builder/controller/proto collapse) | +1,307 / −6,865 = **−5,558** | +667 / −4,966 = **−4,299** |
+| **Total, 1a–1d** | +22,577 / −37,795 = **−15,218** | +12,849 / −30,145 = **−17,296** |
+
+(The recorded headline figures stand: deletion commits A–C alone were
+net −22,636 with the non-test scheduler session core at −6,784, and
+the 1d batch net −5,656 — the two deletion slices remove ≈28.3k lines
+gross-net, against ≈+10k added by the three build-up slices.) Phase 0
+additionally added the models, the calibration corpus, this map, the
+OA1 instrument, and the `1bbad1ee7` defect fix — almost entirely
+docs/spec/model content.
+
+The same accounting over the design's own subject area — the nine
+corpus paths plus the new pull files, raw file lines including
+in-file tests, measured 0a pin (`277618342`) → this tip (the interval
+includes everything that landed on those files in between, dominated
+by this campaign):
+
+| Area | At the 0a pin | Now | Δ |
+|---|---|---|---|
+| Scheduler session core (state/executor.rs, actor/executor.rs, actor/housekeeping.rs, grpc/executor_service.rs, assignment.rs) | 5,003 | 1,576 | −3,427 |
+| New scheduler pull path (actor/pull.rs) | 0 | 1,130 | +1,130 |
+| Builder (runtime/ + main.rs + health.rs; runtime now includes pull.rs at 1,073) | 5,169 | 3,567 | −1,602 |
+| Controller pool reconciler (reconcilers/pool/) | 8,731 | 10,769 | +2,038 |
+| New controller wedge successor (nodeclaim_pool/wedge.rs) | 0 | 347 | +347 |
+| **Subject-area total** | **18,903** | **17,389** | **−1,514** |
+
+What the design promised vs what happened: the §4.2 disposition
+(14 mechanisms objectless, 6 surviving as guards, 1 moved to the
+controller, 1 remaining time-based repair) is exactly what landed, and
+the design's expectation that the retry campaign's growth caveat would
+not apply held for the deleting side — the net is strongly negative
+everywhere the old machinery lived (scheduler session core −3.4k,
+builder runtime −1.6k, the whole-tree campaign total −15.2k). The
+honest counterweight is the controller: the pool reconciler grew by
+≈2k lines (busy bridge then open-attempt view, synthesize-on-delete,
+`ReportAttemptOutcome`, AD2 anti-affinity/NoEligibleSource,
+dispatchMode rendering and the AD5 grace) plus the 347-line wedge
+successor — the "1 moves to the controller" row and the introduced
+mechanisms are real code, paid where the design said they would be
+paid. The new scheduler-side protocol (pull.rs + the attempts/view
+plumbing) is ≈1.1k lines against the ≈3.4k it replaced, and the
+subject-area total still ends ≈1.5k lines lighter than where the
+campaign started while carrying durable attempts, a fenced
+transaction, and the successor operator surfaces the stream era never
+had.
+
+### Decisions and adjudications as exercised
+
+- **AD1** (controller stays the pod-terminal observer): exercised as
+  designed — `ReportAttemptOutcome` + the no-attempt no-op rule are
+  the only pod-terminal channel; the scheduler gained no informer.
+- **AD2** (node-keyed exclusion, exhaustion survives re-keyed):
+  landed on both halves at 1b with migration 071; both keys carried
+  through coexistence; the legacy pod-name key drop is the open P12
+  item (deferred, retry-campaign co-owned).
+- **AD3** (pull = Ready→Running, leader-served, idempotent): as
+  landed (`sched.executor.pull-transaction`); re-pulls idempotent;
+  `Gone` charge-free.
+- **AD4** (no periodic worker channel; fence transaction-side): as
+  landed; `sched.lease.generation-fence+3` /
+  claim-before-advertise+2 amended at the 1c' sweep; the lease-seam
+  re-derivation found nothing unconsumable.
+- **AD5** (synthesized-report + deletion; SIGTERM = abort): the
+  mechanism, the 45 s TGPS, and the charge-free closes are landed and
+  VM-asserted; **the numeric budget remains unsigned** (deployment row
+  D1) — the VM-topology figures (≈9.9 s cancel, ≈64.1 s preempt
+  end-to-end in the canary scenario) are development-time evidence of
+  the component structure, not production budgets.
+- **AD6** (the disposition table is the deletion contract, both
+  directions): every deletion commit named its rows; the introduced
+  mechanisms got their red-first tests and model coverage; the
+  acceptance table above is the closing audit of the same contract.
+- **OA1**: instrument landed (0a) and emission paths exercised by
+  tests; the baseline distribution and the establishment-slack
+  re-baseline are deployment rows D1/D2.
+- **OA2**: decided at 0e, landed at 1c (wedge clustering), scheduler
+  detector deleted at 1c'/1d; interim controls (alert + runbook)
+  shipped; live observation is row D3.
+- **OA3**: one-pull stands (no multi-pull loop was needed); exercised
+  by the `pull-fetcher` subtest.
+- **OA4**: BuildPhase dropped per the recorded recommendation; the
+  dashboard derives phase from attempt/derivation status;
+  `BuildEvent.phase` remains a producer-less display arm.
+- **OA5**: the successor surfaces (ListOpenAttempts, re-pointed
+  ListExecutors/ClusterStatus, the gauge, the Job census) are landed
+  and surface-reviewed; the live-fleet confirmation is row D7.
+- **OA6**: option (a) (`NotYetReady{retry_after}`) landed end-to-end
+  (proto, scheduler, builder bounded retry, spec rule) and is priced
+  into the re-targeted model (`NotYetReadyIsInert` + the two
+  reachability witnesses).
+
+### What remains unsigned, pending deployment data (AD5 / OA1 and the observation rows)
+
+Deliberately left open by the no-deploy directive, all collected in
+the finalized checklist below: the OA1 baseline accumulation and the
+AD5 numeric cancel/preempt + death→requeue budget signature (D1); the
+post-flip latency comparison against that signed budget (D2); the OA2
+live-signal observation and alert triage (D3); the post-flip watch
+with its ledger spot-checks (D4); the production rollback drill or its
+recorded waiver (D5); the deletion-gate gauge-at-zero evaluation over
+the computed horizon (D6); the post-deletion-release watches and the
+OA5 live-fleet confirmation (D7). None of these gate anything in the
+development tree; all of them gate the staged rollout.
+
+### Deferred items, owners, and conditions
+
+| Item | Owner | Condition / where recorded |
+|---|---|---|
+| P12: drop the legacy pod-name exclusion key; re-state `sched.retry.per-executor-budget+3`'s establishment-vehicle list and key clause | Retry campaign (co-owned with this campaign's owner) | Blocked on hoisting the retry kernel's placeholder identity to a first-class optional identity (event alphabet + CBMC contracts); blocker note `~/tmp/rio-formal-verification/executor-1d-blocker-p12.md`; the fold meanwhile keys legacy stream-era rows by pod name (mixed-era handling per AD2 stays correct) |
+| Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side gates | Campaign owner | Retire once a deprecation path for existing CRs is chosen (CRD version bump + pod.rs/job.rs gates + helm knob); until then the value is selectable but the builder always pulls |
+| Deployment-time validation checklist rows D0–D7 | Operator / campaign owner at deployment time | The finalized table below; the D6/D7 signal-shape note (the gauge and stub-counter series exist only on pre-deletion-stage releases — evaluate against the release being upgraded FROM; the 1d-stage watch falls back to error rates and gateway unknown-method observability) is part of row D6/D7 |
+| Controller-map counter-signatures (the 1b re-audit entry and the 1d delta entry) and the owner's G6/G7 signatures | Controller-campaign owner / campaign owner (same person, recorded as self-issued) | At the close-out review; nothing in the records is provisional on them beyond the signature itself |
+| Retire `executorSessionAsBuilt.qnt` + the as-built calibration evidence modules; re-point or drop the calibration README recipe | Whoever picks up the post-deployment items | After the deployment-time checklist passes through row D7 (the retained-at-close-out decision above); the retry campaign's retirement section is the template (preserve any non-vacuity anchor a live invariant still needs) |
+| Kani harness for the pull kernels | Whoever next touches `admit_pull`/`fold_report` | Only on the recorded reconsideration triggers (loops/collections/counter arithmetic in the kernels, an extraction, or a changed floor-comparison shape); the rio-retry-kernel bounded-representation pattern is the template |
+| MBT over the pull handlers | Same | Only if a pure protocol core worth driving emerges (the retry campaign's omission triggers transfer); the quint-connect machinery is in-tree |
+| OA4/OA5 dashboard follow-ups: the fleet-view repoint ask and any future BuildPhase carrier | Dashboard owner | Recorded asks from 1b/1d; the Executors page works against the re-pointed RPCs today; DrainButton removal was acknowledged as the recorded fallback at the 1d landing review |
+| `ExecutorMessage` proto envelope re-homing onto a builder-local type | Any future build_types.proto change | Cosmetic (1d record item 7) |
+| `sched.backpressure.hysteresis+2`, reactive-floor residual, and the other 1d-recorded accepted residuals | Standing | Already re-stated/recorded at 1d; listed here only so the close-out's leftover list is the 1d record's, not a shorter one |
+
+### What the campaign does NOT claim
+
+Per the 2026-05-27 directive there was no cluster, no fleet, and no
+deployment at any point during the workstream, so nothing in this
+record is deployment-validated: no OA1 baseline or production latency
+distribution exists, the AD5 numeric budget is unsigned, no pool
+template has ever been flipped on a running fleet, no soak/watch
+window has been observed, the rollback drill has only its VM
+demonstration, the deletion-gate gauge has never been read against a
+real fleet (it is hardwired to zero on 1c'-era code and absent on
+1d-era code), the OA2 wedge signal has never fired on a real node, the
+OA5 surfaces have not been confirmed against a live fleet, and
+migrations 071/072 have never been applied outside tests. The VM
+timing figures recorded at 1b are VM-topology measurements used to
+validate the AD5 component structure, not budgets. The model verdicts
+hold at the models' stated bounds (the re-targeted state space and the
+regime constants recorded at T-1c'.5), the retry-kernel Kani proofs
+hold over their stated bounded domains, and nothing on the
+executor side is machine-proved (the reasoned omission above). The
+mixed-fleet/coexistence orderings (busy bridge, both-keys exclusion,
+template-flip rollback) were verified by construction, unit/VM tests,
+and review — never against a production mixed fleet. Those
+observations are exactly rows D0–D7 below and remain open until the
+completed workstream deploys.
+
+### The revert-cleanliness obligation ends at this close-out
+
+The frozen §4.5 choice required the deletion-wave commits (A–C and the
+1d set) to stay individually revert-clean, with the reverts kept
+rebased and re-tested **until the Phase-2 close-out**. That obligation
+ends with this record. From here on, restoring the stream era in a
+deployed environment is not a git operation but a release operation:
+roll back to the previous stage's images (the proto surface survives
+through the 1c'-stage release; pool templates are unaffected), per
+checklist rows D6/D7. The deletion commits remain individually
+revertible as ordinary git history, but no one is maintaining rebased
+revert branches for them after this point.
+
+### Deployment-time validation checklist (finalized; the operator handoff)
+
+The plan's v3 checklist, finalized against the as-landed signal names
+and surfaces. The deliverables that make it executable ship with the
+code: the OA1 histogram pair `rio_scheduler_attempt_requeue_seconds`
+(by cause) / `rio_controller_job_terminal_report_seconds` (by reason);
+the OA5 surface (`AdminService.ListOpenAttempts`, the re-pointed
+`ListExecutors`/`ClusterStatus`, the `rio_scheduler_open_attempts`
+gauge, the controller Job census); the OA2 wedge clustering
+(`ctrl.nodeclaim.wedge-cluster`, `rio_controller_node_wedge_marked_total`)
+plus the `RioSchedulerAttemptEstablishmentCluster` alert and the
+`docs/ops/hung-node-manual-reap.typ` runbook; the Pool CRD
+`spec.dispatchMode` and chart `poolDefaults.dispatchMode` /
+`pools[].dispatchMode` knobs with the builder Config `dispatch_mode`;
+the scheduler Config `establishment_report_slack` (env
+`establishment_report_slack_secs`, default 120 s); the deletion-gate
+recording rules `rio:scheduler_stream_registrations:max` and
+`rio:scheduler_stream_attempts:rate5m` (present on pre-deletion-stage
+releases only); and the 45 s pull-mode `terminationGracePeriodSeconds`
+in the rendered pod template. Stop-and-report discipline applies to
+every FAIL: the lever column is the sanctioned response, adjudicated
+by the owner/operator — never a silent retune of a budget, slack, or
+gate.
+
+**Ordering preamble (D0).** The staged rollout preserves the slice
+ordering the code was constructed for: deploy the pre-deletion tree
+first (the 1c-stage release — full pull path present and verified,
+stream path intact), flip pool templates to Pull (canary-first at the
+operator's discretion), and only after rows D1–D6 pass roll out the
+deletion-stage releases (the 1c'-stage tree, then the 1d-stage tree —
+kept as separate releases precisely so the template-flip rollback path
+exists until the gauge evidence says nothing needs it). On a fresh
+fleet with no stream-mode pools ever having run, the coexistence
+hazards are vacuous and the operator may collapse the additive/flip
+stages (deploy with templates already Pull — which is the chart
+default); the deletion-stage-after-D6 rule always applies (trivially
+satisfied if no stream registrations ever existed), and rows D1–D5 are
+still executed — they validate the replacement against real load, not
+against a fleet shape.
+
+| Row | What to run / observe (as-landed names) | Pass criterion | Lever if it fails |
+|---|---|---|---|
+| **D0 — staged-rollout ordering** | Pre-deletion (1c-stage) release → per-pool `dispatchMode` flips (Pool CR / `pools[].dispatchMode`; canary-first preferring a pool whose drvs the remaining stream pools rarely take) → 1c'-stage deletion release → 1d-stage cleanup release | The order above is what is actually executed; no deletion-stage image rolls out before rows D1–D6 pass; the 1d release follows a healthy 1c' watch (D7) | Re-stage; do not proceed out of order — the coexistence hazards (busy bridge, mixed-era exclusion keys, template-flip rollback) are exactly what the ordering preserves |
+| **D1 — OA1 baseline + AD5 numeric budget signature** | `rio_scheduler_attempt_requeue_seconds` (by cause) and `rio_controller_job_terminal_report_seconds` (by reason) over the pre-flip window (as-built baseline, if any stream pools run) and the post-flip window; sign the AD5 composite cancel/preempt + death→requeue budget against that data; re-baseline `establishment_report_slack` against the controller report p99 | The AD5 numeric budget is signed by the campaign owner against measured data (the work item the 0e close left open); the slack value confirmed or re-set from the same instrument | No usable distribution → extend the observation window before flipping further pools; budget cannot be met structurally → lengthen `establishment_report_slack` (config-only; degrades requeue latency, not correctness) or owner adjudication / design re-entry — never a silent number |
+| **D2 — post-flip latency comparison** | Death→requeue p50/p99 by cause for pull-mode attempts vs the D1 baseline; cancel/preempt observed latencies vs the signed AD5 budget; per pool as each flips, then fleet-wide | Latencies within the signed budgets; no regression past what the owner signed at D1 | Stop flipping further pools (or flip back — D5's path); lengthen the establishment slack; investigate against the T-1b.9 VM component evidence; owner adjudication before the deletion stage |
+| **D3 — OA2 node-wedge signal observation** | `rio_controller_node_wedge_marked_total` and the wedge-clustered Dead-arm reaps for flipped pools; the `RioSchedulerAttemptEstablishmentCluster` alert + the manual NodeClaim-reap runbook over the same window | The clustering feeds `reap_unhealthy` as designed; the alert is quiet, or every firing triages per the runbook to a real node wedge | Signal absent/broken → fix before the deletion stage (the heartbeat-fed detector still exists only on the pre-deletion release — from the 1c'-stage on there is no fallback detector); alert noisy → tune the ≥2-distinct-derivations / 30-minute clustering thresholds with a recorded justification; real wedge → runbook manual reap + AD2 exclusion bounds the blast radius |
+| **D4 — post-flip watch (the former soak)** | Suggested ≥ 7 calendar days covering ≥ 1 organic pod-terminal classification and ≥ 1 preemption/cancel; ledger spot-checks: one open attempt per `PullAssignment` (`ListOpenAttempts` / `dispatch_mode='pull'` rows), no second attempt row per exec_id, no establishment inside the deadline+slack window, no state created by no-attempt reports; the OA5 view consistent with the Job census | Zero double-charge / fabricated-completion / in-window-establishment occurrences; the organic pod-terminal and preempt/cancel events classified as second-installment fills, never new rows; OA5 matches the census | Any occurrence: STOP the staged rollout before the deletion stage, flip templates back (D5), investigate against the model/tests/red-first batteries, owner adjudication |
+| **D5 — rollback drill** | Flip one pull-mode pool's template back to `dispatchMode: Stream` once, in production, and observe the next pod register/build/report on the stream path (only meaningful while the pre-deletion release is still deployed; the VM demonstration is the T-1b.8 record) | The flip-back works as demonstrated, or the owner explicitly records the VM demonstration as the accepted evidence in lieu of a production drill | Fix the template/CR tooling before proceeding; the drill (or its waiver) must be recorded before the deletion-stage release removes the flip-back path |
+| **D6 — deletion-gate evaluation** | `max_over_time(rio:scheduler_stream_registrations:max[<horizon>]) == 0` with the horizon = max(`activeDeadlineSeconds` over live intents) + builder `idle_timeout` (default 120 s) + `establishment_report_slack` (default 120 s), on every environment sharing the scheduler, evaluated against the pre-deletion release (the only release that emits the gauge); no pool template references Stream | The gauge reads zero for the full horizon everywhere; on an environment already running 1c'-stage code the equivalent read is `rio:scheduler_stream_attempts:rate5m` == 0 (the stub-call counter); both series are absent from the 1d-stage release | Wait; identify which pools/pods still register stream executors and flip or drain them; never roll out the deletion-stage release early — the template-flip rollback (D5) ceases to exist once it ships |
+| **D7 — post-deletion-release watch + OA5 live confirmation** | 2–3 days after the 1c' stage and again after the 1d stage: scheduler/controller error rates; absence of calls to removed RPCs (1c' stage: the stream stub-call counter; 1d stage: gateway unknown-method observability and error rates — no dedicated counter exists); latency steady vs D2; `ListOpenAttempts` / the re-pointed `ListExecutors`/`ClusterStatus` / the dashboard confirmed against the live fleet; the OA2 aggregation still feeding reap decisions | No regressions attributable to the deletions; OA5 confirmed live by the operator (the half deferred from the 1b surface review); the 1d release only follows a healthy 1c' watch | Roll back the deletion-stage release (the previous stage's images — recorded safe: the proto surface survives until the 1d stage and pool templates are unaffected); investigate before re-attempting; any double-charge-class signal routes to D4's stop rule |
+
+### Spec/docs alignment check
+
+Checked at this close-out: the scheduler, builder, controller, fetcher
+and failure-modes chapters describe pull-only delivery (the 1c' sweep
+and the 1d retirement records); no rule or prose presents the stream
+session, the heartbeat, the placement layer, the relay choreography,
+or the operator drain RPCs as live behavior — the stream era survives
+only as retirement records, contradiction history, and this map's
+Stage-A/B/C sections, which is intentional. `sched.backpressure.
+hysteresis+2` and the reactive-floor rule were re-derived for the
+pull-only protocol at 1d; the phase-binding/path-length rules are
+retired with their surface. The known remaining stale text is the
+retry-owned `sched.retry.per-executor-budget+3` vehicle list (the P12
+deferral above). The deployment checklist above supersedes the plan
+document's copy as the operator-facing version; the
+`hung-node-manual-reap` runbook's row-D3 reference is consistent with
+it. `tracey query stale` is empty and `tracey query validate` reports
+zero errors; none of the rules this campaign *added* appear in
+`tracey query untested`. Two rules the 1c' sweep *re-stated* do appear
+there — `sched.dispatch.fod-builtin-any-arch+2` and
+`sched.reassign.no-promote-on-ephemeral-disconnect+5` — because the
+stream-era tests that carried their verify markers were deleted with
+the machinery and the sweep re-pointed only their impl markers;
+re-pointing their verify coverage at the surviving batteries (the
+spawn-side kind/arch tests for the former, the uncharged-requeue
+batteries for the latter) is open follow-up for the campaign owner's
+next touch of those rules, recorded here rather than silently left to
+the untested query.
