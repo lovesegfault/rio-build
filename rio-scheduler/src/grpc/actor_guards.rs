@@ -71,13 +71,17 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // malformed paths — both also pre-screened at ingress) EXCEPT the
         // authoritative-content protections, which are client-actionable
         // conflicts with state another submission established
-        // (sched.merge.authoritative-conflict): they map to
+        // (sched.merge.authoritative-conflict,
+        // sched.merge.authoritative-claim-no-redefine): they map to
         // FAILED_PRECONDITION rather than INTERNAL. The precondition can
-        // clear later — once the conflicting node parks in a terminal
-        // FAILURE state, a retry of the same submission (store-backed or
-        // authoritative) displaces it and succeeds; a node that finished
-        // successfully keeps its definition, so that conflict clears
-        // only when the node is reaped or the contents match.
+        // clear later — via a later submission, the conflicting node
+        // reaching a displaceable state, or operator action — but HOW it
+        // clears differs per variant; notably an authoritative claim
+        // onto a parked store-backed node is never cleared by retrying
+        // the same claim (an authoritative claim never displaces a
+        // store-backed definition). Each DagError variant's doc and its
+        // #[error] remediation text are the single source of truth for
+        // the per-variant clearing semantics.
         ActorError::Dag(e) => match &e {
             crate::dag::DagError::AuthoritativeContentMismatch { .. }
             | crate::dag::DagError::ConflictingInFlightContent { .. }
