@@ -12,13 +12,16 @@
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::io::Write as _;
 
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
-use super::model::{Bucket, JobRecord};
-use super::spec::{CampaignRecord, ComparabilityBlock};
+use super::model::{Bucket, JobRecord, is_terminal_bucket};
+use super::spec::{
+    CampaignRecord, ComparabilityBlock, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+};
 use super::state::StateDir;
 use super::watchdog::SuspensionSummary;
 
@@ -116,6 +119,18 @@ fn fmt_pct(v: Option<f64>) -> String {
     }
 }
 
+/// Number of jobs whose latest record sits in a terminal bucket — the one
+/// "terminal" definition the report path uses (completeness, progress
+/// remaining-work). Delegates to [`is_terminal_bucket`] so it can never
+/// drift from the run loop's notion of terminal.
+fn terminal_job_count(bucket_counts: &BTreeMap<String, usize>) -> usize {
+    bucket_counts
+        .iter()
+        .filter(|(bucket, _)| is_terminal_bucket(bucket))
+        .map(|(_, count)| *count)
+        .sum()
+}
+
 /// Refresh the comparability block with final counts.
 pub fn comparability_with_counts(
     base: &ComparabilityBlock,
@@ -123,8 +138,11 @@ pub fn comparability_with_counts(
     plan_counts: &BTreeMap<String, usize>,
 ) -> ComparabilityBlock {
     let mut block = base.clone();
-    block.in_scope = plan_counts.get("inScope").copied().unwrap_or(0);
-    block.attemptable = plan_counts.get("attemptable").copied().unwrap_or(0);
+    block.in_scope = plan_counts.get(PLAN_COUNT_IN_SCOPE).copied().unwrap_or(0);
+    block.attemptable = plan_counts
+        .get(PLAN_COUNT_ATTEMPTABLE)
+        .copied()
+        .unwrap_or(0);
     block.attempted = agg.attempted;
     let mut excluded = BTreeMap::new();
     for b in [
@@ -144,12 +162,7 @@ pub fn comparability_with_counts(
         }
     }
     block.excluded = excluded;
-    let terminal: usize = agg
-        .bucket_counts
-        .iter()
-        .filter(|(k, _)| k.as_str() != Bucket::NotAttempted.as_str())
-        .map(|(_, v)| v)
-        .sum();
+    let terminal = terminal_job_count(&agg.bucket_counts);
     block.completeness_pct = if block.in_scope > 0 {
         100.0 * terminal as f64 / block.in_scope as f64
     } else {
@@ -285,6 +298,13 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     sigs.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
     if sigs.is_empty() {
         let _ = writeln!(out, "(none)");
+    } else if sigs.len() > input.top_n {
+        let _ = writeln!(
+            out,
+            "Showing the top {} of {} distinct signatures.",
+            input.top_n,
+            sigs.len()
+        );
     }
     for (sig, count) in sigs.into_iter().take(input.top_n) {
         let _ = writeln!(out, "- `{sig}`: {count}");
@@ -292,6 +312,13 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let _ = writeln!(out, "\n## NAR divergence top offenders");
     if agg.nar_divergent_jobs.is_empty() {
         let _ = writeln!(out, "(none)");
+    } else if agg.nar_divergent_jobs.len() > input.top_n {
+        let _ = writeln!(
+            out,
+            "Showing the first {} of {} divergent jobs.",
+            input.top_n,
+            agg.nar_divergent_jobs.len()
+        );
     }
     for job in agg.nar_divergent_jobs.iter().take(input.top_n) {
         let _ = writeln!(out, "- {job}");
@@ -354,12 +381,7 @@ pub fn build_progress(
         .map(|p| &p.counts)
         .unwrap_or(&empty_counts);
     let block = comparability_with_counts(&campaign.comparability, &agg, plan_counts);
-    let terminal: usize = agg
-        .bucket_counts
-        .iter()
-        .filter(|(k, _)| k.as_str() != Bucket::NotAttempted.as_str())
-        .map(|(_, v)| v)
-        .sum();
+    let terminal = terminal_job_count(&agg.bucket_counts);
     let remaining = block.in_scope.saturating_sub(terminal);
     Progress {
         campaign_id: campaign.campaign_id.clone(),
@@ -370,8 +392,10 @@ pub fn build_progress(
         infra_rate_pct: agg.infra_rate_pct,
         hydra_unknown_rate_pct: agg.hydra_unknown_rate_pct,
         jobs_per_hour,
+        // ETA is undefined when the plan has no in-scope work at all — a
+        // "0h remaining" figure for an empty campaign would be misleading.
         eta_hours: jobs_per_hour
-            .filter(|jph| *jph > 0.0)
+            .filter(|jph| *jph > 0.0 && block.in_scope > 0)
             .map(|jph| remaining as f64 / jph),
         suspension: suspension.clone(),
         comparability: block,
@@ -405,12 +429,20 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
         by_bucket.entry(rec.bucket.clone()).or_default().push(rec);
     }
     for (bucket, recs) in by_bucket {
-        let mut body = String::new();
+        let path = state.path(&format!("buckets/{bucket}.jsonl"));
+        let file =
+            std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
+        let mut writer = std::io::BufWriter::new(file);
         for rec in recs {
-            body.push_str(&serde_json::to_string(rec)?);
-            body.push('\n');
+            serde_json::to_writer(&mut writer, rec)
+                .with_context(|| format!("write job record to {}", path.display()))?;
+            writer
+                .write_all(b"\n")
+                .with_context(|| format!("write {}", path.display()))?;
         }
-        state.write_bytes(&format!("buckets/{bucket}.jsonl"), body.as_bytes())?;
+        writer
+            .flush()
+            .with_context(|| format!("flush {}", path.display()))?;
     }
     Ok(summary)
 }
@@ -548,6 +580,88 @@ mod tests {
             (p.eta_hours.unwrap() - 4.5).abs() < 1e-9,
             "remaining 9 / 2 per hour"
         );
+    }
+
+    #[test]
+    fn eta_is_none_when_nothing_is_in_scope() {
+        // A campaign whose plan has zero in-scope jobs must not render a
+        // misleading "0h remaining" ETA even when a throughput figure exists.
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-empty".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::EvalSetPin::default(),
+        );
+        let p = build_progress(
+            &campaign,
+            &BTreeMap::new(),
+            &SuspensionSummary::default(),
+            "submit+collect",
+            "2026-05-26T01:00:00Z".into(),
+            Some(2.0),
+        );
+        assert_eq!(p.comparability.in_scope, 0);
+        assert_eq!(p.eta_hours, None);
+    }
+
+    #[test]
+    fn truncated_lists_carry_a_showing_n_of_m_note() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-trunc".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::EvalSetPin::default(),
+        );
+        // Three distinct signatures and three NAR-divergent jobs, rendered
+        // with top_n = 2 → both lists are truncated and must say so.
+        let mut records = BTreeMap::new();
+        for (i, sig) in ["sig-a", "sig-b", "sig-c"].iter().enumerate() {
+            records.insert(
+                format!("fail{i}"),
+                rec(
+                    &format!("fail{i}"),
+                    Bucket::RioOnlyFailure,
+                    1,
+                    Some(sig),
+                    false,
+                ),
+            );
+        }
+        for i in 0..3 {
+            let mut r = rec(&format!("div{i}"), Bucket::MatchBuilt, 1, None, false);
+            r.nar_compare
+                .insert("out".to_string(), crate::run::classify::NAR_DIFFERS.into());
+            records.insert(format!("div{i}"), r);
+        }
+        let suspension = SuspensionSummary::default();
+        let input = ReportInput {
+            campaign: &campaign,
+            records: &records,
+            suspension: &suspension,
+            generated_at: "2026-05-26T12:00:00Z".into(),
+            partial: false,
+            top_n: 2,
+        };
+        let out = render_summary(&input);
+        assert!(
+            out.contains("Showing the top 2 of 3 distinct signatures."),
+            "{out}"
+        );
+        assert!(
+            out.contains("Showing the first 2 of 3 divergent jobs."),
+            "{out}"
+        );
+        // Untruncated lists (top_n large enough) carry no note.
+        let input = ReportInput {
+            top_n: 20,
+            ..input.clone()
+        };
+        let out = render_summary(&input);
+        assert!(!out.contains("Showing the"), "{out}");
     }
 
     #[test]

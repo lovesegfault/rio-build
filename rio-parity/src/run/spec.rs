@@ -351,6 +351,16 @@ pub struct ComparabilityBlock {
     pub low_confidence: Vec<String>,
 }
 
+/// Key of [`PlanOutput::counts`] holding the number of in-scope jobs.
+/// Shared between the plan stage (which writes the counts map) and the
+/// report path (which reads it into the comparability block) so the two
+/// can never drift apart on the key spelling.
+pub const PLAN_COUNT_IN_SCOPE: &str = "inScope";
+
+/// Key of [`PlanOutput::counts`] holding the number of attemptable jobs
+/// (in scope minus not-attemptable). See [`PLAN_COUNT_IN_SCOPE`].
+pub const PLAN_COUNT_ATTEMPTABLE: &str = "attemptable";
+
 /// Plan-stage output persisted inside campaign.json: warm and
 /// not-attemptable membership plus the plan-time validity snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

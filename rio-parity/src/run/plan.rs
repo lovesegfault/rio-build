@@ -11,7 +11,10 @@ use super::evalset_input::{DepClosureEntry, ManifestEntry};
 use super::glob::glob_match;
 use super::grpc::StoreApi;
 use super::model::now_rfc3339;
-use super::spec::{CampaignSpec, EvalSetPin, Filters, Mode, PlanOutput, WARM_TENANT};
+use super::spec::{
+    CampaignSpec, EvalSetPin, Filters, Mode, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+    PlanOutput, WARM_TENANT,
+};
 
 /// Why a job was excluded at plan time (the values of [`ScopeResult::skipped`]).
 pub const SKIP_SYSTEM: &str = "system-filtered";
@@ -354,11 +357,11 @@ pub async fn run_plan(
     let (valid_paths, cached_jobs) = validity_snapshot(store, &manifest, &scope.in_scope).await?;
 
     let mut counts = BTreeMap::new();
-    counts.insert("inScope".to_string(), scope.in_scope.len());
+    counts.insert(PLAN_COUNT_IN_SCOPE.to_string(), scope.in_scope.len());
     counts.insert("skipped".to_string(), scope.skipped.len());
     counts.insert("notAttemptable".to_string(), warm.not_attemptable.len());
     counts.insert(
-        "attemptable".to_string(),
+        PLAN_COUNT_ATTEMPTABLE.to_string(),
         scope
             .in_scope
             .iter()

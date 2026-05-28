@@ -17,7 +17,7 @@
 //!   fsync, rename over the target.
 //! - Stage done-markers: empty files under `markers/<stage>.done`.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -185,8 +185,13 @@ impl StateDir {
 }
 
 /// Reduce an append-only results stream to the latest record per job.
-pub fn latest_per_job(records: Vec<JobRecord>) -> HashMap<String, JobRecord> {
-    let mut map = HashMap::new();
+///
+/// Returns a `BTreeMap` — the canonical, deterministically ordered shape
+/// the run loop and the report path consume, so anything iterating the
+/// latest records (per-bucket files, progress counts, log lines) is stable
+/// across reloads.
+pub fn latest_per_job(records: Vec<JobRecord>) -> BTreeMap<String, JobRecord> {
+    let mut map = BTreeMap::new();
     for r in records {
         map.insert(r.job.clone(), r);
     }
