@@ -16,6 +16,7 @@ mod k8s;
 mod lint;
 mod migration;
 mod mutants;
+mod parity;
 mod regen;
 mod sh;
 mod ssh;
@@ -55,6 +56,10 @@ enum Cmd {
     NewMigration(migration::MigrationArgs),
     /// Kubernetes deploy (--provider {k3s,eks}).
     K8s(k8s::K8sArgs),
+    /// nixpkgs-parity validation campaign: build eval sets, launch
+    /// campaigns, watch progress, render reports; repro/abort/cleanup
+    /// are stubs for a later milestone (M2).
+    Parity(parity::ParityArgs),
     /// Workspace-level invariant checks ("lints that can't be lints").
     /// With no subcommand, runs every lint.
     Lint {
@@ -101,6 +106,7 @@ async fn run(cmd: Cmd, cfg: XtaskConfig) -> Result<()> {
         Cmd::Fuzz(args) => fuzz::run(args),
         Cmd::NewMigration(args) => migration::run(args),
         Cmd::K8s(args) => k8s::run(args, &cfg).await,
+        Cmd::Parity(args) => parity::run(args).await,
         Cmd::Lint { which: Some(l) } => lint::run(&l),
         Cmd::Lint { which: None } => lint::run_all(),
     }

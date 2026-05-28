@@ -135,6 +135,8 @@ pub struct UpOpts {
     deploy_no_hooks: bool,
     /// Deploy with parity.enabled=true (nixpkgs-parity campaign
     /// enablement — engine CNP admissions + gateway build-policy).
+    /// EKS-only; omitting it on a later deploy reverts parity to
+    /// disabled and rolls the gateway via the config checksum.
     #[arg(long = "deploy-parity")]
     deploy_parity: bool,
     /// After deploy, block until Karpenter has replaced all Drifted
