@@ -356,7 +356,7 @@ impl DagActor {
         }
         info!(count = edge_rows.len(), "loaded edges");
 
-        // r[impl sched.merge.substitute-topdown+9]
+        // r[impl sched.merge.substitute-topdown+10]
         // Produced-children gate on restored `topdown_pruned` marks:
         // drop the mark from any flagged row whose persisted children
         // are ALL produced (`completed`/`skipped`). The check MUST be

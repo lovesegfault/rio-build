@@ -898,7 +898,7 @@ pub struct DerivationState {
     /// reap-time hook and the walk-failure children gate treat a
     /// `closure_hole` survivor (an un-produced child reaped out from
     /// under it — see that field) as childless-equivalent.
-    /// r[sched.merge.substitute-topdown+9]. Persisted (`migrations/063`,
+    /// r[sched.merge.substitute-topdown+10]. Persisted (`migrations/063`,
     /// stamped in the pruned merge's own transaction, OR-on-conflict,
     /// cleared once its children are all produced, or when the
     /// fail-fast consumes it) and restored by

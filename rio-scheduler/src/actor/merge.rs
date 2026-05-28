@@ -122,7 +122,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+9]
+        // r[impl sched.merge.substitute-topdown+10]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -328,7 +328,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+9]
+        // r[impl sched.merge.substitute-topdown+10]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -533,7 +533,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+9]
+        // r[impl sched.merge.substitute-topdown+10]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -2498,7 +2498,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+9]
+    // r[impl sched.merge.substitute-topdown+10]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

@@ -333,7 +333,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+9]
+// r[verify sched.merge.substitute-topdown+10]
 /// `topdown_pruned` persists with OR-on-conflict semantics (a pruned
 /// merge sets it; an unrelated non-pruned merge of the same drv never
 /// clears it), is cleared by the tx-scoped

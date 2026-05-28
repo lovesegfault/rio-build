@@ -858,7 +858,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+9")[
+#r("sched.merge.substitute-topdown+10")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -881,20 +881,28 @@ submitted after the failover record contributions as usual).
   be applied only after the merge has committed, MUST be persisted and
   restored at leader-failover recovery, and MUST be cleared (in PG and in
   memory) only once the node's children are all already produced in the
-  DAG or when the fail-fast below consumes it --- a merge that gives it
-  only unbuilt children leaves the mark in place. The scheduler MUST
+  DAG and no un-produced child has been reaped out from under it since
+  (the closure-hole breadcrumb is in-memory only and is dropped when the
+  fail-fast consumes the node, when the node completes, when it is reset
+  for resubmission, or when a later full merge re-declares its edges), or
+  when the fail-fast below consumes it --- a merge that gives it only
+  unbuilt children leaves the mark in place. The scheduler MUST
   fall through to the full merge and the bottom-up `check_cached_outputs`
   when any demanded node's criterion set contains a wanted output that is
   missing and not substitutable, when a demanded node's own selector
   resolves to no declared output, when a criterion set resolves to no
   verifiable path, or on any other uncertainty (store unreachable,
-  floating-CA demanded node). A childless `topdown_pruned` node MUST NOT be
-  dispatched as a from-source build: when its deferred fetch fails
-  (`SubstituteComplete{ok=false}`), or its wanted outputs can neither be
-  completed inline nor routed to substitution at dispatch time, the
-  scheduler MUST fail every interested build with a resubmit-directing error
-  --- the dependency subgraph was dropped, so the worker cannot resolve
-  `inputDrvs` --- and this MUST hold across leader failover.
+  floating-CA demanded node). A `topdown_pruned` node whose current DAG
+  children no longer cover its pruned input closure --- childless, or left
+  with a closure hole because the cleanup of a terminal interested build
+  reaped an un-produced child out from under it --- MUST NOT be dispatched
+  as a from-source build: when its deferred fetch fails
+  (`SubstituteComplete{ok=false}`), when the reap itself strands it with an
+  already-spent walk, or when its wanted outputs can neither be completed
+  inline nor routed to substitution at dispatch time, the scheduler MUST
+  fail every interested build with a resubmit-directing error --- the
+  dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
+  --- and this MUST hold across leader failover.
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the

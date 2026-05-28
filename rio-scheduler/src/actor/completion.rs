@@ -187,7 +187,7 @@ impl DagActor {
             .await;
     }
 
-    // r[impl sched.merge.substitute-topdown+9]
+    // r[impl sched.merge.substitute-topdown+10]
     /// Completion-time `topdown_pruned` clear: walk the (deduped) DAG
     /// parents of every hash in `completed` and drop the mark from any
     /// flagged parent whose children are now ALL produced
