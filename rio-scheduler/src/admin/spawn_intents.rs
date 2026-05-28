@@ -48,7 +48,6 @@ pub(super) async fn get_spawn_intents(
     Ok(GetSpawnIntentsResponse {
         intents: snap.intents,
         queued_by_system: snap.queued_by_system,
-        dead_nodes: snap.dead_nodes,
         ice_masked_cells: snap.ice_masked_cells,
     })
 }

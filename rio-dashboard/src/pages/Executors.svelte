@@ -1,26 +1,28 @@
 <script lang="ts">
-  // Executors page: listExecutors poll + per-row DrainButton + kind
-  // filter. The busy/idle pill and >30s-stale heartbeat are the two
+  // Executors page: listExecutors poll + kind filter. The list is the
+  // open-attempt view (one row per in-flight pull-mode attempt). The
+  // busy/idle pill and the >30s-stale attempt-age highlight are the two
   // operator affordances a metrics dashboard can't give you: under
   // one-build-per-pod the load is binary (so a pill, not a bar), and
-  // the red-timestamp is the "something's wrong with this node, go
-  // look at its pod" signal.
+  // the red-timestamp is the "something's wrong with this attempt, go
+  // look at its pod" signal. Per-executor drain retired with the stream
+  // protocol — eviction is cordon + cancel/Job-delete (cluster-side),
+  // so there is no per-row action button.
   //
   // r[impl dash.executors.kind-filter]
   // The kind filter is the dashboard surface for the ADR-019 builder/
   // fetcher split — lets the operator narrow to just the airgapped
   // builders or just the open-egress fetchers when diagnosing.
   import { admin } from '../api/admin';
-  import DrainButton from '../components/DrainButton.svelte';
   import Pill from '../components/Pill.svelte';
   import type { ExecutorInfo } from '../api/types';
   import { fmtTsRel, tsToMs } from '../lib/buildInfo';
   import { startPoll } from '../lib/poll';
 
-  // 30s matches the scheduler's dead-executor threshold (heartbeat period
-  // is 10s, dead after 3 misses — see scheduler spec). A heartbeat
-  // older than that and still status=alive means the scheduler hasn't
-  // swept yet; the operator gets the heads-up first.
+  // The timestamp shown is the attempt-open time (the pull); an entry
+  // sitting unchanged for a long time with status=alive is the cue to
+  // check the pod. 30s keeps the staleness highlight conservative for
+  // short builds.
   const STALE_MS = 30_000;
 
   // ExecutorKind wire values (build_types.proto). Keyed on raw numbers
@@ -97,8 +99,7 @@
         <th>kind</th>
         <th>status</th>
         <th>load</th>
-        <th>heartbeat</th>
-        <th></th>
+        <th>pulled</th>
       </tr>
     </thead>
     <tbody>
@@ -123,7 +124,6 @@
           <td class:stale data-testid="heartbeat-cell"
             >{fmtTsRel(e.lastHeartbeat, now)}</td
           >
-          <td><DrainButton executorId={e.executorId} bind:executors /></td>
         </tr>
       {/each}
     </tbody>

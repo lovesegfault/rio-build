@@ -2,8 +2,8 @@ syntax = "proto3";
 package rio.types;
 
 // Build lifecycle wire types — SubmitBuild/WatchBuild/QueryBuild/CancelBuild
-// requests, BuildEvent stream, BuildExecution bidirectional stream messages,
-// and the heartbeat protocol.
+// requests, the BuildEvent stream, and the pull-mode dispatch payloads
+// (PullAssignment / ReportOutcome).
 //
 // Same `package rio.types;` as types.proto / dag.proto / admin_types.proto
 // — prost merges by package into a single `rio.types.rs`.
@@ -11,7 +11,7 @@ package rio.types;
 import "google/protobuf/timestamp.proto";
 import "dag.proto";   // BuildEvent.derivation → DerivationEvent;
                       // SubmitBuildRequest.{nodes,edges} → DerivationNode/Edge
-import "types.proto"; // HeartbeatRequest → ResourceUsage;
+import "types.proto"; // CompletionReport.final_resources → ResourceUsage;
                       // BuildResult.status → BuildResultStatus
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -132,52 +132,36 @@ message BuildCancelled {
 }
 
 // ───────────────────────────────────────────────────────────────────────────
-// BuildExecution bidirectional stream messages
+// Build-task envelope (builder-internal)
 // ───────────────────────────────────────────────────────────────────────────
 
-// Executor -> Scheduler messages on the BuildExecution stream.
+// The builder's internal build-task → runtime envelope: the spawned
+// build task sends its CompletionReport (and phase edges) through a
+// process-lifetime channel typed with this message; the pull loop
+// consumes it and forwards the report via ReportOutcome. NOT sent on
+// any wire since the BuildExecution stream was removed (the stream-era
+// register/ack/prefetch-ack arms are reserved below).
 message ExecutorMessage {
   reserved 4;  // was ProgressUpdate (mid-build ema; consumer removed with legacy sizer)
   // 2 was `BuildLogBatch log_batch` — batched log lines. Removed by the
   // build-log data-plane cutover: builders stream log batches to
   // rio-store's LogService.AppendLog instead of the scheduler.
   reserved 2;
+  // 1 was `WorkAssignmentAck ack`, 5 was `ExecutorRegister register`,
+  // 6 was `PrefetchComplete prefetch_complete` — removed with the
+  // BuildExecution stream (executor-lifecycle collapse).
+  reserved 1, 5, 6;
+  reserved "ack", "register", "prefetch_complete";
   oneof msg {
-    WorkAssignmentAck ack = 1;              // Executor confirms receipt of assignment
     CompletionReport completion = 3;        // Build result
     BuildPhase phase = 7;                   // Build phase change (forwarded resSetPhase)
-    ExecutorRegister register = 5;          // First message: identifies the executor
-    PrefetchComplete prefetch_complete = 6; // Warm-gate ACK: FUSE cache warmed the hinted paths
   }
-}
-
-// First message sent by an executor on the BuildExecution stream.
-// Establishes the executor_id before any assignments are dispatched.
-message ExecutorRegister {
-  string executor_id = 1;
-}
-
-// Scheduler -> Executor messages on the BuildExecution stream.
-message SchedulerMessage {
-  oneof msg {
-    WorkAssignment assignment = 1;          // New work to execute
-    CancelSignal cancel = 2;               // Cancel a specific derivation
-    PrefetchHint prefetch = 3;             // Paths to pre-warm in FUSE cache
-  }
-}
-
-// Executor acknowledges receipt of a WorkAssignment.
-message WorkAssignmentAck {
-  string drv_path = 1;                     // Which assignment is being acknowledged
-  string assignment_token = 2;             // Echo back the assignment token
 }
 
 // Build phase change forwarded from the daemon's resSetPhase
-// (`STDERR_RESULT{SetPhase}`). Carried on its own oneof arm rather than
-// piggybacking on BuildLogBatch so the scheduler relay stays a pure
-// pass-through (no inspection of batch contents) and so a phase change
-// is not subject to the batcher's 100ms / 64-line buffering — phase is a
-// state edge, not log spew.
+// (`STDERR_RESULT{SetPhase}`). Builder-internal (the ExecutorMessage
+// envelope above) and the BuildEvent.phase arm's payload type; the
+// stream-era scheduler relay that forwarded it is gone.
 message BuildPhase {
   string derivation_path = 1;              // Which derivation entered this phase
   string phase = 2;                        // e.g. "unpackPhase", "buildPhase"
@@ -305,16 +289,19 @@ message WorkAssignment {
   string drv_path = 1;                    // Store path of the .drv file
   bytes drv_content = 2;                  // Inline ATerm content. Empty = fallback (budget exceeded / cache-hit / store-error safe-degrade); executor fetches via GetPath.
   // Field 3 (input_paths) was never populated — scheduler always sent
-  // empty, executor always computed closure via QueryPathInfo BFS. Phase3a
-  // prefetch hints use a separate PrefetchHint message on the
-  // BuildExecution stream, not an inline WorkAssignment field.
+  // empty, executor always computed closure via QueryPathInfo BFS (the
+  // executor's own manifest prime + JIT fetch is the warm path).
   reserved 3;
   reserved "input_paths";
   repeated string output_names = 4;       // Outputs to build (e.g. ["out", "dev"])
   BuildOptions build_options = 5;         // Build configuration
   string assignment_token = 6;            // HMAC-SHA256-signed claims (executor_id, drv_hash,
                                           //  expected_outputs, expiry) — store verifies on PutPath
-  uint64 generation = 7;                  // Leader election generation counter
+  // 7 was `uint64 generation` — the stream-era worker-side fence input.
+  // The generation fence is transaction-side (the pull mint checks the
+  // durable claims floor); the payload no longer carries it.
+  reserved 7;
+  reserved "generation";
   bool is_fixed_output = 8;              // FOD: needs network access, verify output hash
   // W3C traceparent for distributed tracing across the SSH boundary.
   // ssh-ng has no gRPC metadata channel, so the scheduler injects its
@@ -353,88 +340,20 @@ message BuildOptions {
   reserved "keep_going";
 }
 
-// Cancel a specific derivation on an executor.
-message CancelSignal {
-  string drv_path = 1;                   // Derivation to cancel
-  string reason = 2;                     // e.g. "client_disconnect", "scheduler_reassign"
-}
+// CancelSignal, PrefetchHint and PrefetchComplete were removed with the
+// BuildExecution stream (executor-lifecycle collapse): cancellation and
+// preemption are pod terminations (the controller deletes the Job and the
+// builder's SIGTERM-abort cgroup-kills the build), and input warm-up is the
+// executor's own manifest prime + JIT fetch. Whole-message deletions need no
+// reserved statements; the messages were only ever carried inside the
+// removed stream envelopes.
 
-// Hint to pre-warm FUSE cache for upcoming builds.
-message PrefetchHint {
-  repeated string store_paths = 1;        // Paths to pre-fetch from store
-}
 
-// Executor signals its FUSE cache has warmed the hinted paths. Scheduler
-// flips ExecutorState.warm = true on receipt (r[sched.assign.warm-gate]).
-// paths_fetched/paths_cached are for observability — the scheduler gates
-// on receipt of the message, not on the counts.
-message PrefetchComplete {
-  uint32 paths_fetched = 1;              // How many hint paths were actually fetched
-  uint32 paths_cached = 2;               // How many were already in FUSE cache (0 for fresh executor)
-}
-
-// ───────────────────────────────────────────────────────────────────────────
-// Heartbeat
-// ───────────────────────────────────────────────────────────────────────────
-
-// r[impl proto.heartbeat.capability-fields]
-// Executor heartbeat sent periodically to the scheduler.
-message HeartbeatRequest {
-  string executor_id = 1;
-  reserved 2;                             // was repeated string running_builds (P0537: → optional running_build)
-  ResourceUsage resources = 3;            // (types.proto)
-  // Systems this executor can build for (e.g., ["x86_64-linux",
-  // "aarch64-linux"] for a multi-arch executor). Replaces the old
-  // singular `system` field — same field number, wire-compatible
-  // for single-element encodings. Empty = unregistered.
-  repeated string systems = 5;
-  repeated string supported_features = 6; // requiredSystemFeatures this executor supports
-  reserved 7;                             // was max_builds (P0537: always 1)
-  reserved 8;                             // was size_class (ADR-023: SLA per-drv sizing)
-  // FUSE circuit breaker open — executor cannot fetch from store.
-  // Scheduler treats like `draining`: `has_capacity()` returns false.
-  // Cleared when breaker closes/half-opens. Default false — wire-compatible
-  // (old executors don't send it, scheduler reads false).
-  // Spec: r[builder.heartbeat.store-degraded]
-  bool store_degraded = 9;
-  // What role this executor plays — builder (airgapped) or fetcher
-  // (open egress, FOD-only). Default BUILDER (wire-compatible: old
-  // executors don't send it, scheduler reads 0 = BUILDER). See
-  // spec sched.dispatch.fod-to-fetcher for routing semantics.
-  ExecutorKind kind = 10;
-  // SIGTERM received — finishing in-flight, not accepting new work.
-  // The worker is the authority on its own drain state (it knows
-  // whether it got SIGTERM). Scheduler sets `worker.draining` from
-  // this on every heartbeat, NOT from DrainExecutor RPC or reconnect
-  // inference (I-063: I-056a's reconnect-clears-draining was wrong
-  // when the SAME draining process reconnects after a scheduler
-  // restart). Default false — wire-compatible.
-  bool draining = 11;
-  // Derivation path currently building (P0537: at most one per
-  // executor). Unset = idle. Replaces the legacy `repeated string
-  // running_builds` (field 2, reserved).
-  optional string running_build = 12;
-  // ADR-023: opaque SpawnIntent.intent_id this pod was spawned for.
-  // Read from the `rio.build/intent-id` pod annotation via downward-
-  // API → `RIO_INTENT_ID`. Empty = Static-sized pod (no pre-computed
-  // assignment; scheduler picks from queue as before). Scheduler maps
-  // empty → None.
-  string intent_id = 13;
-  // Field 14 was `node_name` (R24B6b) — removed: worker-supplied
-  // node identity is untrusted (r[sched.admin.hung-node-detector+3]
-  // threat model). The controller now reports the kube-authoritative
-  // binding via `AckSpawnedIntentsRequest.bound_intents`.
-  reserved 14;
-  reserved "node_name";
-}
-
-message HeartbeatResponse {
-  bool accepted = 1;                      // Whether the scheduler accepted the heartbeat
-  // Current leader generation. 0 = unset / leader still recovering:
-  // executors treat 0 as no information (their fetch_max fence latch
-  // ignores it) and only latch the post-recovery value.
-  uint64 generation = 2;
-}
+// HeartbeatRequest / HeartbeatResponse were removed with the Heartbeat RPC
+// (executor-lifecycle collapse): there is no scheduler-side registration or
+// liveness state to feed — pod liveness belongs to the kubelet/Job
+// lifecycle, attempt liveness to the durable open-attempt row plus the
+// establishment sweep.
 
 // ───────────────────────────────────────────────────────────────────────────
 // Pull-mode dispatch (ExecutorService.PullAssignment / ReportOutcome)

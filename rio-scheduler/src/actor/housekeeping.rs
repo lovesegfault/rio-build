@@ -502,18 +502,11 @@ impl DagActor {
     /// `queued_by_system` report (the legacy ready-queue membership a
     /// pull mint never dequeued is no longer a metric source).
     ///
-    /// `workers_active` is deprecated: the stream registration it
-    /// counted cannot happen any more (the stream RPCs are error
-    /// stubs), so it is pinned to 0 here. It keeps being emitted only
-    /// so the deletion-gate recording rule
-    /// (`rio:scheduler_stream_registrations:max`, deployment checklist
-    /// row D6) stays evaluable as a present-and-zero series until the
-    /// gauge is removed at the 1d cleanup; the successor signal for
-    /// "stream-mode executors still exist" is
-    /// `rio_scheduler_stream_stub_calls_total` (the stub-call counter).
+    /// The stream-era `workers_active` gauge is gone (removed with the
+    /// proto sweep once its deletion-gate role ended);
     /// `rio_scheduler_open_attempts` (set by the establishment sweep)
-    /// is the busy-fleet successor gauge.
-    // r[impl obs.metric.scheduler-leader-gate+3]
+    /// is the busy-fleet gauge.
+    // r[impl obs.metric.scheduler-leader-gate+4]
     fn tick_publish_gauges(&self) {
         let mut queued = 0usize;
         let mut running = 0usize;
@@ -525,7 +518,6 @@ impl DagActor {
             }
         }
         metrics::gauge!("rio_scheduler_derivations_queued").set(queued as f64);
-        metrics::gauge!("rio_scheduler_workers_active").set(0.0);
         metrics::gauge!("rio_scheduler_builds_active").set(
             self.builds
                 .values()

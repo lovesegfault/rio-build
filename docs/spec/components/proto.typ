@@ -98,28 +98,22 @@ service SchedulerService {
 }
 
 // builder.proto --- executor-facing RPCs (same server process as SchedulerService)
-// Covers BOTH builder and fetcher pods; the executor reports its role via HeartbeatRequest.kind.
+// Covers BOTH builder and fetcher pods (same binary, RIO_EXECUTOR_KIND env).
 service ExecutorService {
-  // Bidirectional stream: scheduler sends assignments + prefetch hints + cancel signals;
-  // executor sends log batches + completion reports + ack messages
-  rpc BuildExecution(stream ExecutorMessage) returns (stream SchedulerMessage);
-  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
-  // Pull-mode dispatch (additive): a pod born knowing its derivation asks
-  // for it and reports the outcome; no registration, heartbeat, or stream.
+  // Pull-mode dispatch: a pod born knowing its derivation asks for it and
+  // reports the outcome; no registration, heartbeat, or stream.
   rpc PullAssignment(PullAssignmentRequest) returns (PullAssignmentResponse);
   rpc ReportOutcome(ReportOutcomeRequest) returns (ReportOutcomeResponse);
 }
 ```
 
-#info(title: [Executor registration])[
-  Executor registration is implicit and two-step: (1) the executor opens a
-  `BuildExecution` bidirectional stream, (2) the executor calls the separate
-  `Heartbeat` unary RPC with its initial capabilities (executor_id, systems,
-  supported_features, kind). The scheduler creates the executor entry when it
-  receives a heartbeat from an executor_id that also has an open
-  `BuildExecution` stream. Periodic heartbeats update resource usage. See the
-  rio-scheduler chapter §Executor registration protocol for deregistration
-  rules.
+#info(title: [No executor registration])[
+  There is no registration step: the executor-lifecycle collapse removed the
+  `BuildExecution` stream, the `Heartbeat` unary, and the in-memory executor
+  entry they fed. A pod's existence is the controller's Job census; its
+  liveness is the kubelet/Job lifecycle; the scheduler learns about it only
+  through its pull (which binds the open attempt) and its report (or the
+  pod-terminal / establishment classifiers when the report never arrives).
 ]
 
 #info(title: [Pull-mode dispatch messages])[
@@ -211,7 +205,6 @@ service AdminService {
   rpc ListExecutors(ListExecutorsRequest) returns (ListExecutorsResponse);
   rpc ListBuilds(ListBuildsRequest) returns (ListBuildsResponse);
   rpc TriggerGC(GCRequest) returns (stream GCProgress);
-  rpc DrainExecutor(DrainExecutorRequest) returns (DrainExecutorResponse);
   rpc CancelBuild(CancelBuildRequest) returns (CancelBuildResponse);  // operator override (caller_tenant=None); service-token gated
   rpc ClearPoison(ClearPoisonRequest) returns (ClearPoisonResponse);
   rpc ListTenants(Empty) returns (ListTenantsResponse);
@@ -220,23 +213,20 @@ service AdminService {
   rpc GetSpawnIntents(GetSpawnIntentsRequest) returns (GetSpawnIntentsResponse);  // ADR-023 per-drv spawn intents, kind/system/feature filtered
   rpc ListPoisoned(Empty) returns (ListPoisonedResponse);
   rpc InspectBuildDag(InspectBuildDagRequest) returns (InspectBuildDagResponse);  // actor in-memory DAG snapshot (I-025 diag)
-  rpc DebugListExecutors(Empty) returns (DebugListExecutorsResponse);             // actor in-memory executor map (I-048b/c diag)
-  rpc ReportAttemptOutcome(ReportAttemptOutcomeRequest) returns (ReportAttemptOutcomeResponse);  // pull-mode pod-terminal classification (C4/C5 unification)
+  rpc ReportAttemptOutcome(ReportAttemptOutcomeRequest) returns (ReportAttemptOutcomeResponse);  // pod-terminal classification (C4/C5 unification)
   rpc ListOpenAttempts(ListOpenAttemptsRequest) returns (ListOpenAttemptsResponse);              // ledger-backed open pull-mode attempts (busy bridge + OA5 fleet view)
 }
 ```
 
-#r("proto.admin.diag-rpc")[
-  `InspectBuildDag` and `DebugListExecutors` query the scheduler actor's
-  *in-memory* state --- what `dispatch_ready()` sees --- NOT PostgreSQL.
-  `GetBuildGraph` / `ListExecutors` read PG (work for completed builds,
-  survive actor restart); the diagnostic pair surface live dispatch-filter
-  inputs that PG can't show: `executor_has_stream` (assigned to a dead-stream
-  executor = stuck forever, I-025) and `has_stream` / `warm` / `draining` /
-  `store_degraded` per executor (PG `last_seen` says alive but actor map
-  empty = bidi stream stuck on TCP keepalive to old leader, I-048b/c).
-  `DebugListExecutors` is NOT leader-gated --- a standby's empty map is itself
-  diagnostic.
+#r("proto.admin.diag-rpc+2")[
+  `InspectBuildDag` queries the scheduler actor's *in-memory* state --- what
+  the pull-admission and retry logic see --- NOT PostgreSQL.
+  `GetBuildGraph` / `ListExecutors` read durable state (work for completed
+  builds, survive actor restart); the diagnostic surfaces live retry/backoff
+  and open-attempt inputs that the durable views can't show (I-025 / I-062).
+  (`DebugListExecutors` was removed with the in-memory executor map at the
+  proto sweep; the open-attempt view plus the Job/pod census are the
+  successors.)
 ]
 
 #info(title: [TriggerGC layering])[
@@ -351,43 +341,19 @@ ADR-023 @sla fit. Zero is the no-signal sentinel (cgroup setup failed or build
 failed before the cgroup was populated). cgroup v2 is a *hard requirement*; the
 executor fails startup if the delegated subtree is unavailable.
 
-=== HeartbeatRequest
+=== HeartbeatRequest (removed)
 
-#r("proto.heartbeat.capability-fields")[
-  Executors include inventory data in heartbeats so the scheduler can make
-  informed placement decisions. Fields 9--11 are the *dispatch-filter
-  capability set* the scheduler reads on every heartbeat: `store_degraded`
-  (FUSE breaker open → `has_capacity()` returns false), `kind`
-  (builder/fetcher routing), `draining` (executor-authoritative --- the
-  executor knows whether it received SIGTERM; scheduler sets `worker.draining`
-  from this field, NOT from `DrainExecutor` RPC or reconnect inference). All
-  default to zero/false (wire-compatible with old executors). Field 8
-  (`size_class`) is reserved.
-]
-
-```protobuf
-message HeartbeatRequest {
-  string executor_id = 1;
-  reserved 2;                      // was repeated string running_builds (→ optional running_build, field 12)
-  ResourceUsage resources = 3;
-  reserved 4;                      // was BloomFilter local_paths — locality routing dropped with persistent executors
-  repeated string systems = 5;     // Systems this executor builds for (e.g. ["x86_64-linux", "aarch64-linux"])
-  repeated string supported_features = 6;  // e.g. ["big-parallel", "kvm"]
-  reserved 7;                      // was max_builds (always 1 now)
-  reserved 8;                      // was size_class (ADR-023: SLA per-drv sizing)
-  bool store_degraded = 9;         // Store-upload circuit breaker OPEN; scheduler routes away until cleared
-  ExecutorKind kind = 10;          // builder (airgapped) or fetcher (open egress, FOD-only)
-  bool draining = 11;              // executor-authoritative drain flag; scheduler stops dispatching
-  optional string running_build = 12;  // drv path in flight (at most one per executor); unset = idle
-}
-```
-
-#info(title: [Locality routing removed])[
-  Field 4 previously carried a bloom filter of cached store paths for
-  transfer-cost-weighted placement. Under the ephemeral one-build-per-pod
-  model an executor has no warm cache to advertise, so locality routing was
-  dropped entirely.
-]
+*Retired (1d proto sweep --- the heartbeat protocol):*
+`proto.heartbeat.capability-fields` normed the dispatch-filter capability set
+(`store_degraded`, `kind`, `draining`, `running_build`) the scheduler read on
+every heartbeat. `HeartbeatRequest`/`HeartbeatResponse` and the `Heartbeat`
+RPC were removed with the stream session: there is no scheduler-side
+registration or capacity state left for those fields to feed. Capability
+matching happens at the spawn-intent filter (`GetSpawnIntentsRequest.{kind,
+systems, filter_features}`), the kind boundary is enforced at spawn and
+re-checked by the executor's own kind gate
+(#rref("builder.executor.kind-gate")), and a degraded store surfaces as the
+affected build's infra-classed outcome rather than a capacity flag.
 
 === BuildEvent
 
@@ -556,13 +522,15 @@ message WatchBuildRequest {
 
     [`build_types.proto`],
     [Build lifecycle: `BuildEvent*`, `SubmitBuildRequest`, `BuildResult`,
-      `BuildStatus`, `ExecutorMessage` / `SchedulerMessage` bidi-stream types,
-      `BuildPhase`, `Heartbeat*`],
+      `BuildStatus`, the pull-mode dispatch payloads
+      (`PullAssignment*` / `ReportOutcome*`, `WorkAssignment`,
+      `CompletionReport`), `BuildPhase`],
 
     [`admin_types.proto`],
     [Admin RPC data types: `ClusterStatusResponse`,
       `ListExecutors*` / `Builds*` / `Tenants*`,
-      `SpawnIntent` / `GetSpawnIntents*`, `DrainExecutor*`, `ClearPoison*`],
+      `SpawnIntent` / `GetSpawnIntents*`, `OpenAttempt` /
+      `ReportAttemptOutcome*`, `ClearPoison*`],
   ),
 )
 

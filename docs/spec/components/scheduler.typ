@@ -154,56 +154,22 @@ critical-path value).
   #(refs.metric)("rio_scheduler_undeclared_built_output_total").
 ]
 
-#r("sched.log.phase-binding")[
-  The `BuildPhase` ingestion path MUST drop phase updates whose
-  `derivation_path` does not match an active assignment held by the calling
-  executor.
-]
-
-The second worker-supplied `derivation_path` consumer in the `BuildExecution`
-recv loop, and the phase-path analogue of
-#rref("sched.completion.output-membership"). (Log batches no longer transit
-the scheduler at all --- the equivalent binding gate for the log data plane is
-#rref("store.log.append-auth"), enforced by rio-store against the assignment
-token.) Phase updates have no recv-task side effect
---- every sink they reach is fed from inside the actor. The gate
-therefore runs in the actor against `(status, assigned_executor)`: the same
-`Assigned|Running` precondition + executor comparison as the
-#rref("sched.completion.idempotent") stale-report guard. The status
-precondition is load-bearing: `transition()` never touches
-`assigned_executor`, and the worker-completion terminal handlers
-(`handle_success_completion`, `terminal_failure_epilogue`) leave it set, so
-for the ~60s window before `CleanupTerminalBuild` reaps the DAG node a bare
-executor comparison would accept a late phase from the just-finished
-executor. Unlike the completion guard, this one also fails closed on
-`assigned_executor = None`: a phase for a derivation with no active
-assignment has no live build to render to. Without this gate, a compromised
-executor sending `BuildPhase` with a fabricated `derivation_path` injects
-attacker-controlled text into another tenant's `nix build -L` progress
-display via the gateway's `SetPhase` relay (persisted to `build_event_log`
-and pinned in the per-build state ring --- `Phase` is not a display-only
-event). Dropped phase updates increment
-#(refs.metric)("rio_scheduler_phases_rejected_total"), labeled by reason
-(`not_active` | `no_assignment` | `executor_mismatch` | `path_too_long` |
-`phase_too_long`).
-
-#r("sched.log.path-length+2")[
-  The `BuildExecution` recv loop MUST drop any `BuildPhase` whose
-  `derivation_path` exceeds 512 bytes, before the path is cloned, hashed, or
-  forwarded to the actor.
-]
-
-A legitimate Nix store path is at most ~259 bytes (`/nix/store/` + 32-char
-hash + `-` + the 211-char name limit + `.drv`); the proto `string` field is
-otherwise bounded only by the 256 MiB `max_decoding_message_size`. The
-binding gate verifies the path's _normalized hash component_ — `drv_log_hash`
-collapses `"{hash}-<anything>"` back to `{hash}` — so a
-`"{hash}-" + 255 MiB` alias for a legitimately assigned derivation would pass
-#rref("sched.log.phase-binding") and otherwise be cloned into the actor's
-single-threaded mailbox and rendered into every interested tenant's terminal.
-Rejections increment the arm's rejection counter with reason `path_too_long`.
-(The `BuildLogBatch` half of this bound moved to rio-store with the log data
-plane --- #rref("store.log.ingest-bounds").)
+*Retired (1d proto sweep --- the stream-carried BuildPhase surface):*
+`sched.log.phase-binding` and `sched.log.path-length` normed the actor-side
+binding gate and the recv-loop length bound for `BuildPhase` updates arriving
+on the `BuildExecution` stream. That ingestion path no longer exists: the
+stream RPC is gone, the `ForwardPhase` actor command and its
+`handle_forward_phase` gate (and the `rio_scheduler_phases_rejected_total`
+counter) are deleted with it, and no scheduler code accepts a worker-supplied
+phase update any more --- the threat the rules guarded (attacker-controlled
+text injected into another tenant's progress display via a fabricated
+`derivation_path`) is unrepresentable without the intake. The dashboard/nom
+phase column derives from attempt/derivation status (the OA4 disposition);
+the `BuildEvent.phase` arm remains in the proto as a producer-less display
+event for a possible future carrier, and any such carrier must re-introduce a
+binding gate with the same shape (status precondition + executor match). The
+log-batch half of the old length bound lives on at rio-store
+(#rref("store.log.ingest-bounds")).
 
 #r("sched.executor.input-bounds+2")[
   Every worker-supplied string field on the `ExecutorService` surface MUST be
@@ -228,9 +194,8 @@ its `error_msg` truncated rather than the report being rejected, because a
 lost completion strands the derivation in `Running`, and its `drv_path` is
 dropped before the actor entirely — `exec_id` names the attempt, so there is
 no path-resolution step left for an oversized path to abuse. (The stream-era
-`BuildExecution`/`Heartbeat` RPCs are unconditional error stubs until the 1d
-proto sweep; no field of theirs reaches the actor, and the per-message
-rejection counters that intake carried were retired with it.)
+`BuildExecution`/`Heartbeat` RPCs were removed by the proto sweep; no other
+worker-facing surface exists.)
 
 `CompletionReport.final_line_count` is the motivating numeric field: the
 scheduler folds it into the `drv_executions` row that rio-store's log
@@ -729,19 +694,18 @@ parents whose cascade was interrupted by a crash. All three exist because a
 keep-going build with a poisoned leaf otherwise hangs Active forever ---
 `completed + failed` never reaches `total`.
 
-#r("sched.admin.list-executors-leader-age+2")[
+#r("sched.admin.list-executors-leader-age+3")[
   `ListExecutorsResponse.leader_for_secs` is the seconds since this replica
   acquired leadership (`LeaderState::leader_for()`). Consumers MUST treat the
-  executor list as potentially incomplete when `leader_for_secs` is small and
-  MUST NOT use it to prove absence right after a failover. The controller's
-  `orphan_reap_gate` fail-closes when `leader_for_secs < ORPHAN_REAP_GRACE`
-  --- see #rref("ctrl.ephemeral.reap-orphan-running").
+  list as a freshly-acquired leader's view when `leader_for_secs` is small
+  and MUST NOT use it alone to prove absence right after a failover.
 ]
 The historical hazard was the in-memory executors map refilling
 incrementally over the reconnect window; the open-attempt view behind the
-re-implemented surface is durable, but the freshness input (and the
-controller gate that consumes it) is kept until the 1d controller cleanup
-removes the consultation.
+re-implemented surface is durable, so today the field is an operator/CLI
+freshness hint --- the controller's orphan reap no longer consults
+`ListExecutors` at all (its busy view is `ListOpenAttempts`,
+#rref("ctrl.job.busy-from-open-attempts")).
 
 #r("sched.admin.list-executors+2")[
   `AdminService.ListExecutors` MUST return one entry per open pull-mode
@@ -756,8 +720,8 @@ removes the consultation.
   (show all). The response's `leader_for_secs` keeps the
   #rref("sched.admin.list-executors-leader-age+2") semantics.
 ]
-This is the busy-fleet projection kept for existing CLI/dashboard/
-controller callers until the 1d proto sweep; spawned-but-not-yet-pulled
+This is the busy-fleet projection kept for existing CLI/dashboard callers;
+spawned-but-not-yet-pulled
 pods are the controller's Job census, and there is no scheduler-side
 registration, draining, degraded, or connecting state left to report.
 
@@ -1489,10 +1453,11 @@ Queue-level preemption is fully supported:
 )
 
 #info(title: [Connection direction])[
-  The architecture diagram shows arrows FROM the scheduler TO executors for the
-  `BuildExecution` stream. This reflects data flow direction (scheduler sends
-  assignments). The gRPC connection direction is the reverse: executors are the
-  gRPC client calling the scheduler's `ExecutorService.BuildExecution` RPC.
+  The architecture diagram shows arrows FROM the scheduler TO executors for
+  work delivery. This reflects data flow direction (the scheduler answers with
+  the dispatch payload). The gRPC connection direction is the reverse:
+  executor pods are the gRPC clients calling the scheduler's
+  `ExecutorService.PullAssignment` / `ReportOutcome` unaries.
 ]
 
 #r("sched.state.transitions")[
@@ -1507,11 +1472,12 @@ Queue-level preemption is fully supported:
     [`created → queued`], [Build is accepted into the scheduler],
     [`queued → ready`], [All dependency derivations are in `completed` state],
     [`ready → assigned`],
-    [An executor passes resource-fit check and is selected by the scoring
-      algorithm],
+    [The pod spawned for the derivation pulls it (the fenced pull
+      transaction binds the attempt)],
 
     [`assigned → running`],
-    [Executor sends acknowledgement on the `BuildExecution` stream],
+    [Same pull transaction (the mint records the execution row and the
+      derivation is running on the pod that pulled it)],
 
     [`running → completed`],
     [Executor reports success (output uploaded by executor before reporting;
@@ -2015,10 +1981,11 @@ leader once recovery completes.
 
 = Executor Registration Protocol
 
-*Retired (1c' deletion commit C --- the operator surfaces):*
+*Retired (1c' deletion commit C --- the operator surfaces; RPCs removed at
+the 1d proto sweep):*
 `sched.executor.dual-register`. The two-step stream+heartbeat registration
 protocol described here has no scheduler side left: the `BuildExecution`/
-`Heartbeat` RPCs are unconditional error stubs and the in-memory executor
+`Heartbeat` RPCs are gone from the proto and the in-memory executor
 entry they used to create is deleted. There is no registration in the pull
 protocol --- work binds only at a successful `PullAssignment` (the pull is
 both halves), and the never-create half survives as the no-attempt no-op
@@ -2403,12 +2370,9 @@ mint-time solve is covered by the report slack.
   #rref("sched.admin.list-executors-leader-age+2"). The RPC is leader-served.
 ]
 The same view feeds the #(refs.metric)("rio_scheduler_open_attempts") gauge
-(the pull-mode successor of the stream fleet's
-#(refs.metric)("rio_scheduler_workers_active"), which is deprecated and
-pinned to zero until its 1d removal --- it remains only so the
-deletion-gate recording rule stays a present series) and the establishment
-sweep, and backs the re-implemented #rref("sched.admin.list-executors+2")
-projection.
+(the busy-fleet gauge; the stream fleet's `workers_active` is retired) and
+the establishment sweep, and backs the re-implemented
+#rref("sched.admin.list-executors+2") projection.
 
 = Backpressure
 
@@ -2420,21 +2384,22 @@ that cannot be served (overload, failover, recovery) surfaces as a retried
 unary on the pod side; the actor never queues undelivered work for a slow
 consumer.
 
-#r("sched.backpressure.hysteresis")[
+#r("sched.backpressure.hysteresis+2")[
   *Actor queue depth limit:* The DAG actor's `mpsc` channel has a fixed
   capacity (`ACTOR_CHANNEL_CAPACITY` = 10,000 messages; compile-time constant).
   If the queue depth exceeds 80% of capacity:
-  + `CompletionReport` messages from executor `BuildExecution` streams block
-    the stream-reader task on the actor channel send (completions must not be
-    dropped --- a lost completion would leave the derivation stuck `Running`).
-  + `LogBatch` messages are dropped (non-blocking `try_send`) --- the ring
-    buffer already holds log lines and live-forward is a nice-to-have.
   + New `SubmitBuild` requests from the gateway receive gRPC
     `RESOURCE_EXHAUSTED` status.
   + The scheduler increments the
     #(refs.metric)("rio_scheduler_queue_backpressure") counter for alerting.
+  + Pull-mode report intake keeps using `send_unchecked` --- a completion
+    report must never be dropped (a lost completion would leave the
+    derivation stuck `Running`); the pod's bounded retry is the relief
+    valve, never discard.
   Normal processing resumes when the queue depth drops below 60% (hysteresis to
-  prevent oscillation).
+  prevent oscillation). (The stream-era intake arms this rule used to
+  enumerate --- blocking the `BuildExecution` reader on completions and
+  dropping `LogBatch` forwards --- left with that protocol surface.)
 ]
 
 *Gateway timeout:* If a `SubmitBuild` request takes longer than 30 seconds to
@@ -2763,21 +2728,14 @@ model assumes) so no constant moves without the others.
   pull-mode work surfaces are leader-gated at the gRPC layer and the fenced
   transactions re-check the durable floor
   (#rref("sched.lease.generation-fence")). `ProcessCompletion`, `CancelBuild`,
-  `ReportExecutorTermination`, `AckSpawnedIntents`, `ReconcileAssignments`,
+  `AckSpawnedIntents`, `ReconcileAssignments`,
   `SubstituteComplete`, and `Tick` are additionally gated at actor dispatch as
   defense-in-depth.
   `reassign_derivations` --- the requeue tail that can poison a derivation
   and run the terminal log epilogue --- is individually leader-gated at its
   own chokepoint (the stream-era `ExecutorConnected`/`Disconnected`/
-  `DrainExecutor`/`Heartbeat` arms it used to ride behind are deleted).
-  `ForwardLogBatch` is NOT gated (in-memory ring only). `ForwardPhase` is NOT
-  gated either, and is a deliberate exception to the table list above:
-  `Event::Phase` is persisted (#rref("sched.log.phase-binding")), so a deposed
-  leader whose stale DAG still holds the assignment writes `build_event_log`
-  rows. Gating the arm would not seal the table (the event-log persister task
-  has no leader gate); the sequence collision with the new leader is resolved
-  first-writer-wins by `ON CONFLICT (build_id, sequence) DO NOTHING` inside
-  the #rref("sched.lease.generation-fence") dual-writer window.
+  `DrainExecutor`/`Heartbeat`/`ReportExecutorTermination`/`ForwardPhase` arms
+  it used to ride behind are deleted with their commands).
 ]
 
 - *Terminal-build cleanup:* the `CleanupTerminalBuild` arm also stays ungated
@@ -3603,9 +3561,9 @@ with the scheduler→store cache-lookup channel.
 
 *Consequences.* The scheduler's log subsystem (ring buffers, flusher,
 leadership reconciliation, `GetDerivationLogs`) is deleted; the scheduler
-drops `aws-sdk-s3` entirely. The `BuildExecution` stream carries control
-messages only, so a chatty build cannot contend with completions for the
-scheduler's recv loop or mailbox. Log loss on scheduler failover is zero by
+drops `aws-sdk-s3` entirely. No log byte ever transits the scheduler --- the
+pull/report unaries carry only control and the completion report, so a
+chatty build cannot contend with completions for the scheduler's mailbox. Log loss on scheduler failover is zero by
 construction (the scheduler holds no log data); the loss budget moves to the
 builder's retransmit buffer and the store's ingest path. The cost is that
 rio-store gains a position-addressed, TTL-retained object class that does not

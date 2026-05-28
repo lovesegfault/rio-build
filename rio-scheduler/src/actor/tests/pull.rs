@@ -86,7 +86,6 @@ async fn pull_double_pull_is_idempotent() -> TestResult {
     assert_eq!(first.drv_content, second.drv_content);
     assert_eq!(first.output_names, second.output_names);
     assert_eq!(first.assignment_token, second.assignment_token);
-    assert_eq!(first.generation, second.generation);
     assert_eq!(first.is_fixed_output, second.is_fixed_output);
 
     let (assignments, executions) = row_counts(&db.pool, "pull-a").await;

@@ -6,34 +6,19 @@ import "build_types.proto";
 // Executor-facing RPCs served by the rio-scheduler process.
 // "Executor" is the generic term for both builders (airgapped, arbitrary
 // derivation code) and fetchers (open egress, FOD-only, hash-check bounded)
-// — same binary, same gRPC stream, different RIO_EXECUTOR_KIND env.
+// — same binary, same pair of unaries, different RIO_EXECUTOR_KIND env.
 //
 // Separated from SchedulerService for distinct auth/rate-limiting interceptors
 // and independent evolution. Both services run in the same scheduler binary.
+//
+// The stream session protocol (BuildExecution bidi stream, Heartbeat
+// unary, ExecutorRegister/WorkAssignmentAck/HeartbeatRequest/
+// HeartbeatResponse messages) was removed by the executor-lifecycle
+// collapse: a pod is born knowing its derivation (RIO_INTENT_ID + HMAC
+// executor token injected at Job spawn) and speaks exactly the two
+// idempotent unaries below. Service-level RPCs have no wire numbers to
+// reserve in proto3.
 service ExecutorService {
-  // Bidirectional stream for build execution.
-  // Scheduler sends: WorkAssignment, CancelSignal, PrefetchHint
-  // Executor sends: ExecutorRegister (first), then WorkAssignmentAck,
-  //   BuildLogBatch, CompletionReport
-  // The first message MUST be ExecutorRegister{executor_id} — the scheduler
-  // uses this to associate the stream with the executor's identity.
-  rpc BuildExecution(stream rio.types.ExecutorMessage) returns (stream rio.types.SchedulerMessage);
-
-  // Periodic heartbeat with executor capabilities and resource usage.
-  // Executor registration: the scheduler creates the executor entry when it
-  // sees both an ExecutorRegister on the BuildExecution stream AND a
-  // Heartbeat with the same executor_id. Only then is the executor eligible
-  // for assignments.
-  rpc Heartbeat(rio.types.HeartbeatRequest) returns (rio.types.HeartbeatResponse);
-
-  // ─── Pull-mode dispatch (additive; coexists with the stream path) ──────
-  //
-  // A pull-mode pod is born knowing its derivation (RIO_INTENT_ID +
-  // HMAC executor token injected at Job spawn) and speaks exactly two
-  // idempotent unaries instead of the registration/heartbeat/stream
-  // session above. Nothing in the stream path changes; a pool opts in
-  // per its dispatch mode.
-
   // The pod's first and only ask. Leader-served, three-outcome:
   // WorkAssignment (the existing payload, deps Ready, this pod now owns
   // the open attempt), Gone (drv no longer wanted — pod exits 0,

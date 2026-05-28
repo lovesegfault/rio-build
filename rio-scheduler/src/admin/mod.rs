@@ -3,9 +3,11 @@
 //! The operator/controller surface: `ClusterStatus`, `ListExecutors`
 //! (open-attempt backed), `ListOpenAttempts`, `ListBuilds`,
 //! `ClearPoison`, `ListTenants`, `CreateTenant`, `GetBuildGraph`,
-//! `GetSpawnIntents`, `TriggerGC`, the SLA family. `DrainExecutor` and
-//! `DebugListExecutors` are retired no-ops (clear error naming the
-//! successor) until the 1d proto sweep removes them.
+//! `GetSpawnIntents`, `TriggerGC`, the SLA family. The stream-era
+//! `DrainExecutor`, `DebugListExecutors` and `ReportExecutorTermination`
+//! RPCs were removed by the proto sweep (cordon + cancel/Job-delete,
+//! `ListOpenAttempts` + the Job census, and `ReportAttemptOutcome` are
+//! the successors).
 //!
 //! Per-RPC bodies live in submodules (`gc`, `tenants`,
 //! `builds`, `workers`, `graph`, `spawn_intents`). This file holds only the
@@ -21,7 +23,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 
 use rio_common::grpc::StatusExt;
-use tracing::{instrument, warn};
+use tracing::instrument;
 
 use rio_common::tenant::NormalizedName;
 use rio_proto::AdminService;
@@ -29,19 +31,17 @@ use rio_proto::types::ClearSlaOverrideRequest;
 use rio_proto::types::{
     AckSpawnedIntentsRequest, AppendInterruptSampleRequest, CancelBuildRequest,
     CancelBuildResponse, ClearPoisonRequest, ClearPoisonResponse, ClusterStatusResponse,
-    CreateTenantRequest, CreateTenantResponse, DebugListExecutorsResponse, DeleteTenantRequest,
-    DeleteTenantResponse, DrainExecutorRequest, DrainExecutorResponse, ExportSlaCorpusRequest,
-    ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest, GetBuildGraphResponse,
-    GetHwClassConfigResponse, GetSlaMispredictorsRequest, GetSlaMispredictorsResponse,
-    GetSpawnIntentsRequest, GetSpawnIntentsResponse, HwClassSampledRequest, HwClassSampledResponse,
-    ImportSlaCorpusRequest, ImportSlaCorpusResponse, InjectBuildSampleRequest,
-    InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest, ListBuildsResponse,
-    ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse, ListSlaOverridesRequest,
-    ListSlaOverridesResponse, ListTenantsResponse, MintExecutorTokensRequest,
-    MintExecutorTokensResponse, PoisonedDerivation, ReportExecutorTerminationRequest,
-    ReportExecutorTerminationResponse, ResetSlaModelRequest, SetSlaOverrideRequest,
-    SlaDefaultsResponse, SlaExplainRequest, SlaExplainResponse, SlaOverride, SlaStatusRequest,
-    SlaStatusResponse, TerminationReason,
+    CreateTenantRequest, CreateTenantResponse, DeleteTenantRequest, DeleteTenantResponse,
+    ExportSlaCorpusRequest, ExportSlaCorpusResponse, GcProgress, GcRequest, GetBuildGraphRequest,
+    GetBuildGraphResponse, GetHwClassConfigResponse, GetSlaMispredictorsRequest,
+    GetSlaMispredictorsResponse, GetSpawnIntentsRequest, GetSpawnIntentsResponse,
+    HwClassSampledRequest, HwClassSampledResponse, ImportSlaCorpusRequest, ImportSlaCorpusResponse,
+    InjectBuildSampleRequest, InspectBuildDagRequest, InspectBuildDagResponse, ListBuildsRequest,
+    ListBuildsResponse, ListExecutorsRequest, ListExecutorsResponse, ListPoisonedResponse,
+    ListSlaOverridesRequest, ListSlaOverridesResponse, ListTenantsResponse,
+    MintExecutorTokensRequest, MintExecutorTokensResponse, PoisonedDerivation,
+    ResetSlaModelRequest, SetSlaOverrideRequest, SlaDefaultsResponse, SlaExplainRequest,
+    SlaExplainResponse, SlaOverride, SlaStatusRequest, SlaStatusResponse,
 };
 use uuid::Uuid;
 
@@ -373,41 +373,6 @@ impl AdminService for AdminServiceImpl {
         Ok(Response::new(stream))
     }
 
-    /// Retired with the stream session: there is no per-executor drain
-    /// state left to set (nothing is dispatched to a registered
-    /// executor any more — each pod pulls exactly the work it was
-    /// spawned for). The RPC keeps its place in the proto until the 1d
-    /// sweep but is a no-op that returns a clear error naming the
-    /// successor procedures: node-level drain is `kubectl cordon` plus
-    /// the AD2 node exclusion; force-evicting one pod's build is a
-    /// cancel verdict on its open attempt (`CancelBuild` /
-    /// `ReportAttemptOutcome`) plus the controller deleting the Job;
-    /// fleet-wide stop is pausing spawn intents at the pool.
-    ///
-    /// The service-token gate stays (defense in depth; the error must
-    /// not become an unauthenticated probe).
-    #[instrument(skip(self, request), fields(rpc = "DrainExecutor"))]
-    async fn drain_executor(
-        &self,
-        request: Request<DrainExecutorRequest>,
-    ) -> Result<Response<DrainExecutorResponse>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        self.ensure_service_caller(request.metadata(), &["rio-controller", "rio-cli"])?;
-        let req = request.into_inner();
-        warn!(
-            executor_id = %req.executor_id,
-            force = req.force,
-            "DrainExecutor called: per-executor drain has been retired with the stream \
-             dispatch protocol"
-        );
-        Err(Status::unimplemented(
-            "per-executor drain has been retired with the stream dispatch protocol; \
-             drain the node (kubectl cordon + the AD2 exclusion), cancel the open \
-             attempt (CancelBuild / ReportAttemptOutcome) and delete its Job, or pause \
-             the pool's spawn intents instead",
-        ))
-    }
-
     /// Operator cancel — service-token gated, dispatches
     /// `ActorCommand::CancelBuild{caller_tenant: None}` (bypasses the
     /// tenant-ownership check that `SchedulerService::cancel_build`
@@ -438,51 +403,6 @@ impl AdminService for AdminServiceImpl {
         .map_err(crate::grpc::SchedulerGrpc::actor_error_to_status)?;
 
         Ok(Response::new(CancelBuildResponse { cancelled }))
-    }
-
-    /// Controller reports a builder/fetcher Pod's k8s termination
-    /// reason. OOMKilled/DiskPressure → promote `resource_floor`
-    /// for whatever drv was running at disconnect; other reasons →
-    /// no-op. Replaces the bare-disconnect OOM heuristic.
-    ///
-    /// Unknown executor_id → `promoted=false`, NOT an error: the
-    /// controller's reconcile loop re-reports the same Pod every
-    /// ~10s for `JOB_TTL_SECS=600`; the actor's first-report-wins
-    /// dedup means subsequent calls are expected to miss.
-    #[instrument(skip(self, request), fields(rpc = "ReportExecutorTermination"))]
-    async fn report_executor_termination(
-        &self,
-        request: Request<ReportExecutorTerminationRequest>,
-    ) -> Result<Response<ReportExecutorTerminationResponse>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        // Service-token gate: a forged
-        // `{reason: OOMKilled, executor_id: <any>}` from a compromised
-        // builder would promote `resource_floor` for arbitrary
-        // derivations → fleet-wide over-allocation. Same threat surface
-        // as `append_interrupt_sample`.
-        self.ensure_service_caller(request.metadata(), &["rio-controller"])?;
-        self.ensure_leader()?;
-        self.check_actor_alive()?;
-        let req = request.into_inner();
-
-        if req.executor_id.is_empty() {
-            return Err(Status::invalid_argument("executor_id is required"));
-        }
-        let reason = TerminationReason::try_from(req.reason).unwrap_or(TerminationReason::Unknown);
-        let executor_id = req.executor_id.into();
-
-        let promoted = query_actor(&self.actor, |reply| {
-            ActorCommand::ReportExecutorTermination {
-                executor_id,
-                reason,
-                reply,
-            }
-        })
-        .await?;
-
-        Ok(Response::new(ReportExecutorTerminationResponse {
-            promoted,
-        }))
     }
 
     #[instrument(skip(self, request), fields(rpc = "ClearPoison"))]
@@ -964,25 +884,6 @@ impl AdminService for AdminServiceImpl {
             derivations,
             live_executor_ids,
         }))
-    }
-
-    /// Retired: the in-memory executor map this RPC snapshotted is
-    /// gone with the stream session machinery — there is no
-    /// scheduler-side connection state to debug. The RPC keeps its
-    /// place in the proto until the 1d sweep and returns a clear error
-    /// naming the successors: `ListOpenAttempts` (the durable
-    /// in-flight view) and the controller's Job/pod census.
-    #[instrument(skip(self, request), fields(rpc = "DebugListExecutors"))]
-    async fn debug_list_executors(
-        &self,
-        request: Request<()>,
-    ) -> Result<Response<DebugListExecutorsResponse>, Status> {
-        rio_proto::interceptor::link_parent(&request);
-        Err(Status::unimplemented(
-            "DebugListExecutors has been retired with the stream session machinery (there \
-             is no in-memory executor map); use ListOpenAttempts for in-flight attempts \
-             and the Job/pod census for fleet membership",
-        ))
     }
 
     // ─── ADR-023 SLA overrides ────────────────────────────────────────

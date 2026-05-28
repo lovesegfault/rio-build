@@ -71,7 +71,6 @@ const ALL_SUBCOMMANDS: &[&str] = &[
     "poison-clear",
     "poison-list",
     "cancel-build",
-    "drain-executor",
     "pool",
     "sla",
     "verify-chunks",
@@ -183,10 +182,6 @@ fn per_subcommand_help_renders() {
 #[case::cancel_min(&["cancel-build", "abc-123"], true)]
 #[case::cancel_with_reason(&["cancel-build", "abc-123", "--reason", "stuck"], true)]
 #[case::cancel_missing_id(&["cancel-build"], false)]
-// drain-executor: positional id required; --force flag.
-#[case::drain_min(&["drain-executor", "builder-0"], true)]
-#[case::drain_force(&["drain-executor", "builder-0", "--force"], true)]
-#[case::drain_missing_id(&["drain-executor"], false)]
 // pool: nested. get has default namespace; describe needs a name; bare errors.
 #[case::pool_get_default_ns(&["pool", "get"], true)]
 #[case::pool_get_ns(&["pool", "get", "-n", "rio-system"], true)]

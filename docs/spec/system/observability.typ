@@ -195,9 +195,9 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   metrics MUST follow the `rio_scheduler_*` naming prefix.
 ]
 
-#r("obs.metric.scheduler-leader-gate+3")[
+#r("obs.metric.scheduler-leader-gate+4")[
   Scheduler state gauges (`_builds_active`, `_derivations_queued`,
-  `_derivations_running`, and the deprecated `_workers_active`) are
+  `_derivations_running`, `_open_attempts`) are
   published *only by the leader*. The standby's actor is warm (DAGs merge
   for fast takeover per #rref("sched.lease.k8s-lease")), so its counts are
   stale or zero; with `replicas>1`, publishing from both would create
@@ -206,10 +206,11 @@ Each component exposes a Prometheus-compatible `/metrics` endpoint via
   unaffected --- the standby's handlers no-op, so its counters stay at zero
   naturally, and `sum(rate(...))` is the idiomatic query form anyway.
 ]
-The stream-era `_workers_active` connection-state exception (it used to be
-maintained by inc/dec on connect/disconnect on the standby too) retired
-with the stream session: the gauge is deprecated, pinned to zero, and
-emitted from the same leader-gated block as the rest until its 1d removal.
+The stream-era `_workers_active` gauge (and its connection-state exception
+to the leader gate) is retired: it was deprecated and pinned to zero when
+the stream session was deleted, kept only as the deletion-gate recording
+series, and removed with the proto sweep once that role ended.
+`_open_attempts` is the busy-fleet gauge.
 
 == Store Metrics
 

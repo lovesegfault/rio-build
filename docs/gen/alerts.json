@@ -3,7 +3,6 @@
     "KubeBuildSchedulerDown",
     "KubeBuildSchedulerPendingStuck",
     "RioControllerRestarts",
-    "RioDispatchStarved",
     "RioLogChunkWriteFailures",
     "RioLogReadDataLoss",
     "RioNodeclaimPoolAllCellsIceMasked",

@@ -71,7 +71,7 @@ pkgs.testers.runNixOSTest {
         )
         # Mutating route MUST NOT exist — enableMutatingMethods defaults
         # false. Any accidental render = fail-open on ClearPoison/
-        # DrainExecutor/CreateTenant/TriggerGC.
+        # CreateTenant/TriggerGC.
         k3s_server.fail(
             "k3s kubectl -n ${ns} get httproute rio-scheduler-mutating"
         )

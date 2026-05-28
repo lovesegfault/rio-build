@@ -12,7 +12,6 @@
     "poison-clear",
     "poison-list",
     "cancel-build",
-    "drain-executor",
     "pool",
     "sla",
     "verify-chunks",

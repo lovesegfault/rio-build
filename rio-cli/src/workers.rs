@@ -9,8 +9,7 @@
 //! diff against).
 
 use crate::AdminClient;
-use rio_proto::types::{DrainExecutorRequest, ExecutorInfo, ListExecutorsRequest};
-use serde::Serialize;
+use rio_proto::types::{ExecutorInfo, ListExecutorsRequest};
 
 use crate::{json, rpc};
 
@@ -21,16 +20,6 @@ pub(crate) struct Args {
     /// known status returns an empty list.
     #[arg(long)]
     status: Option<String>,
-}
-
-#[derive(clap::Args, Clone)]
-pub(crate) struct DrainArgs {
-    /// Worker ID (as shown by `rio-cli workers`).
-    executor_id: String,
-    /// Historical flag: per-executor force-drain no longer exists
-    /// server-side; kept only so existing invocations parse.
-    #[arg(long)]
-    force: bool,
 }
 
 pub(crate) async fn run(as_json: bool, client: &mut AdminClient, a: Args) -> anyhow::Result<()> {
@@ -58,55 +47,6 @@ pub(crate) async fn run_pg(
         for w in &resp.executors {
             print_worker(w);
         }
-    }
-    Ok(())
-}
-
-/// `rio-cli drain-executor` — retired lever. Per-executor drain went
-/// away with the stream dispatch protocol; the scheduler answers with
-/// a clear error naming the successor procedures (cordon the node +
-/// AD2 exclusion, cancel the open attempt and delete its Job, or pause
-/// the pool's spawn intents). This subcommand surfaces that error
-/// verbatim so scripts and operators are pointed at the replacement;
-/// it is removed together with the RPC at the proto sweep.
-pub(crate) async fn run_drain(
-    as_json: bool,
-    client: &mut AdminClient,
-    a: DrainArgs,
-) -> anyhow::Result<()> {
-    let DrainArgs { executor_id, force } = a;
-    // Unary — rpc() helper applies. The current scheduler always
-    // answers Unimplemented with the successor procedure in the
-    // message; an older scheduler still performs the drain.
-    let req = DrainExecutorRequest {
-        executor_id: executor_id.clone(),
-        force,
-    };
-    let resp = rpc("DrainExecutor", async || {
-        client.drain_executor(req.clone()).await
-    })
-    .await?;
-    if as_json {
-        #[derive(Serialize)]
-        struct DrainJson<'a> {
-            executor_id: &'a str,
-            accepted: bool,
-            busy: bool,
-        }
-        json(&DrainJson {
-            executor_id: &executor_id,
-            accepted: resp.accepted,
-            busy: resp.busy,
-        })?;
-    } else if resp.accepted {
-        let action = if force { "reassigned" } else { "in flight" };
-        if resp.busy {
-            println!("draining {executor_id} (build {action})");
-        } else {
-            println!("draining {executor_id} (idle)");
-        }
-    } else {
-        println!("{executor_id}: not found (nothing to drain)");
     }
     Ok(())
 }

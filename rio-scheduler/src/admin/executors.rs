@@ -34,7 +34,7 @@ const KNOWN_STATUSES: [&str; 4] = ["alive", "draining", "degraded", "connecting"
 /// controller's `orphan_reap_gate` can fail-closed right after a
 /// failover. `None` is unreachable here (`ensure_leader()` is checked
 /// first); treated as 0 (young).
-// r[impl sched.admin.list-executors-leader-age+2]
+// r[impl sched.admin.list-executors-leader-age+3]
 // r[impl sched.admin.list-executors+2]
 pub(super) async fn list_executors(
     db: &SchedulerDb,

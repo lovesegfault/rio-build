@@ -244,18 +244,10 @@ pub fn describe_metrics() {
         "Backpressure activations (queue reached 80% capacity)"
     );
     describe_gauge!(
-        "rio_scheduler_workers_active",
-        "DEPRECATED: stream-era registration gauge, pinned to 0 since the stream session \
-         machinery was deleted (kept emitting only so the deletion-gate recording rule \
-         rio:scheduler_stream_registrations:max stays a present-and-zero series until the \
-         1d removal). Busy-fleet successor: rio_scheduler_open_attempts; stream-traffic \
-         successor signal: rio_scheduler_stream_stub_calls_total."
-    );
-    describe_gauge!(
         "rio_scheduler_open_attempts",
         "Open pull-mode attempts (active assignment + execution pair minted by \
-         PullAssignment, no terminal classification yet). The pull-mode successor \
-         of workers_active; stream-mode executors stay on workers_active."
+         PullAssignment, no terminal classification yet). The busy-fleet gauge \
+         (successor of the retired stream-era workers_active)."
     );
     describe_counter!(
         "rio_scheduler_assignments_total",
@@ -278,21 +270,6 @@ pub fn describe_metrics() {
         "rio_scheduler_undeclared_built_output_total",
         "Worker-supplied BuiltOutput.output_name not in derivation's output_names \
          (dropped at handle_completion membership filter); alert if rate > 0"
-    );
-    describe_counter!(
-        "rio_scheduler_phases_rejected_total",
-        "BuildPhase dropped by the actor-side (status, executor) binding check: \
-         the named derivation has no active (Assigned|Running) assignment or the \
-         caller is not the assigned executor. Labeled by reason: not_active | \
-         no_assignment | executor_mismatch."
-    );
-    describe_counter!(
-        "rio_scheduler_stream_stub_calls_total",
-        "Calls to the retired stream-protocol RPCs (BuildExecution / Heartbeat error \
-         stubs), labeled by rpc. Any sustained rate means a stream-mode executor image \
-         is still deployed and trying to register — the deployment-time deletion-gate \
-         (checklist row D6) and post-deletion watch (row D7) successor signal for the \
-         pinned-to-zero workers_active gauge."
     );
     describe_counter!(
         "rio_scheduler_pull_rejected_total",

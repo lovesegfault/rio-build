@@ -341,13 +341,6 @@ enum Cmd {
     /// the automatic one.
     // r[impl cli.cmd.cancel-build+2]
     CancelBuild(builds::CancelArgs),
-    /// Retired: per-executor drain went away with the stream dispatch
-    /// protocol. The scheduler answers with a clear error naming the
-    /// successor procedures (cordon the node + AD2 exclusion, cancel
-    /// the open attempt and delete its Job, or pause the pool's spawn
-    /// intents); this subcommand surfaces it and is removed with the
-    /// RPC at the proto sweep.
-    DrainExecutor(workers::DrainArgs),
     /// Inspect Pool CRs via the K8s apiserver (not gRPC). `get`
     /// lists Pools; `describe` shows spec + live status/conditions.
     Pool {
@@ -426,7 +419,6 @@ async fn main() -> anyhow::Result<()> {
                 Cmd::Gc(a) => gc::run(&mut c, a).await,
                 Cmd::PoisonClear(a) => poison::run_clear(as_json, &mut c, a).await,
                 Cmd::PoisonList => poison::run_list(as_json, &mut c).await,
-                Cmd::DrainExecutor(a) => workers::run_drain(as_json, &mut c, a).await,
                 Cmd::Sla { cmd } => sla::run(as_json, &mut c, cmd).await,
                 Cmd::Pool { .. } | Cmd::Upstream { .. } | Cmd::VerifyChunks(_) | Cmd::Logs(_) => {
                     unreachable!("handled above")

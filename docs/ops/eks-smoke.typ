@@ -182,8 +182,9 @@ helm uninstall rio -n rio-system    # or: cargo xtask k8s destroy -p eks for ful
   [privileged: true or SYS_ADMIN cap],
 
   [Build hangs at "waiting for build"],
-  [Scheduler metrics #(refs.metric)("rio_scheduler_workers_active")],
-  [0 → no worker registered. Check worker logs.],
+  [Scheduler metrics #(refs.metric)("rio_scheduler_open_attempts")],
+  [0 → no executor pod has pulled its assignment yet. Check the pool's
+    Jobs/pods and the builder logs.],
 
   [`nix copy` permission denied],
   [`authorized_keys` secret],

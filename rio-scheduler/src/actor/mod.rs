@@ -1109,25 +1109,6 @@ impl DagActor {
                     self.handle_report_attempt_outcome(identity, reason, node_name, reply)
                         .await;
                 }
-                ActorCommand::ReportExecutorTermination {
-                    executor_id,
-                    reason,
-                    reply,
-                } => {
-                    // The stream-era second-installment correlation
-                    // (`recently_disconnected` → floor bump → fill) is
-                    // gone with the session machinery. The RPC stays
-                    // until the 1d proto sweep so existing controller
-                    // deployments keep getting an ack; pod-terminal
-                    // classification for pull attempts arrives via
-                    // `ReportAttemptOutcome` and the establishment
-                    // sweep. Always `promoted=false`.
-                    debug!(executor_id = %executor_id, ?reason,
-                           "ReportExecutorTermination acknowledged as a no-op \
-                            (stream-era correlation removed; pull attempts are \
-                            classified via ReportAttemptOutcome/establishment)");
-                    let _ = reply.send(false);
-                }
                 ActorCommand::AckSpawnedIntents {
                     spawned,
                     unfulfillable_cells,
@@ -1179,13 +1160,6 @@ impl DagActor {
                 ActorCommand::ClearPoison { drv_hash, reply } => {
                     let cleared = self.handle_clear_poison(&drv_hash).await;
                     let _ = reply.send(cleared);
-                }
-                // r[sched.lease.standby-drops-writes]: the forward arm
-                // stays ungated. ForwardPhase DOES persist Event::Phase
-                // to build_event_log — a documented exception. See the
-                // spec block before assuming this arm is PG-free.
-                ActorCommand::ForwardPhase { phase, executor_id } => {
-                    self.handle_forward_phase(phase, &executor_id);
                 }
                 ActorCommand::LeaderLost => {
                     self.handle_leader_lost();

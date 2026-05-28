@@ -2,7 +2,7 @@ syntax = "proto3";
 package rio.types;
 
 // Admin/status wire types — ClusterStatus, ListExecutors/Builds/Tenants,
-// DrainExecutor, ClearPoison, GetSpawnIntents. Data
+// ClearPoison, GetSpawnIntents. Data
 // types for the AdminService RPCs defined in admin.proto.
 //
 // Same `package rio.types;` — prost merges by package into a single
@@ -114,26 +114,22 @@ message BuildInfo {
 // LogService.TailLog; see store.proto's TailLogRequest / TailLogChunk).
 
 // ───────────────────────────────────────────────────────────────────────────
-// Drain / poison / tenants
+// Pod-terminal classification / poison / tenants
 // ───────────────────────────────────────────────────────────────────────────
 
-message DrainExecutorRequest {
-  string executor_id = 1;
-  bool force = 2;                        // If true, cancel running builds on the executor
-}
-
-message DrainExecutorResponse {
-  bool accepted = 1;
-  reserved 2;                            // was uint32 running_builds (P0537: → bool busy)
-  bool busy = 3;                         // A build is still in flight (will complete before drain)
-}
+// DrainExecutorRequest/Response and ReportExecutorTerminationRequest/Response
+// were removed with their RPCs by the executor-lifecycle proto sweep
+// (whole-message deletions need no reserved statements). The
+// TerminationReason vocabulary below stays: it is the shared k8s
+// pod-terminal classification the controller derives from PodStatus and the
+// scheduler's resource-floor arms consume (mapped onto AttemptTerminalReason
+// for the wire).
 
 // Why a builder/fetcher Pod's container terminated. Populated by the
 // controller from k8s PodStatus (containerStatuses[].state.terminated.
 // reason for OOMKilled/Completed/Error; status.reason+message for
 // Evicted). The scheduler uses OomKilled / EvictedDiskPressure /
-// DeadlineExceeded to gate `resource_floor` bump — bare disconnect no
-// longer infers OOM.
+// DeadlineExceeded to gate `resource_floor` bump.
 enum TerminationReason {
   // Wire-default: controller couldn't classify (no terminated state,
   // status not yet populated). Scheduler treats as no-op.
@@ -158,26 +154,8 @@ enum TerminationReason {
   // activeDeadlineSeconds backstop fired (worker wedged past its own
   // daemon_timeout). → bump `resource_floor.deadline_secs` (same
   // bounded ladder as worker-reported TimedOut). Reported by JOB name
-  // (pod is already deleted by Job controller); scheduler prefix-
-  // matches recently_disconnected.
+  // (pod is already deleted by Job controller).
   TERMINATION_REASON_DEADLINE_EXCEEDED = 6;
-}
-
-message ReportExecutorTerminationRequest {
-  // Pod metadata.name (== RIO_EXECUTOR_ID downward-API value the
-  // worker registered with). Scheduler resolves to the drv that was
-  // running at disconnect via its recently_disconnected map.
-  string executor_id = 1;
-  TerminationReason reason = 2;
-}
-
-message ReportExecutorTerminationResponse {
-  // `resource_floor` was actually bumped. False for non-resource
-  // reasons, unknown executor (already swept / never had a running
-  // build at disconnect), or already at ceiling on the relevant
-  // dimension (in which case `bump_floor_or_count` increments the
-  // matching budget counter instead).
-  bool promoted = 1;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -354,57 +332,9 @@ message InspectBuildDagResponse {
 // signal: an entry with has_stream=false is a zombie (heartbeat-created,
 // no BuildExecution stream — dispatch can never reach it). PG last_seen
 // shows it [alive]; the actor knows it's dead.
-message DebugExecutorState {
-  string executor_id = 1;
-  // stream_tx.is_some(). false = no BuildExecution bidi stream connected
-  // to THIS leader. PG may show last_seen recent (heartbeat is unary,
-  // succeeds independently). I-048b zombies have has_stream=false: entry
-  // exists, no stream. The smoking gun for "PG says alive, actor disagrees".
-  bool has_stream = 2;
-  // has_stream && !systems.is_empty(). Dispatch's hard filter — false
-  // means this entry is invisible to assignment.
-  bool is_registered = 3;
-  // Warm-gate. false = waiting on PrefetchComplete ACK; dispatch blocked
-  // unless no warm worker passes the hard filter (cold-fallback). Warm
-  // builders prevent that fallback for cold ones — explains "registered
-  // but never gets work".
-  bool warm = 4;
-  // Builder vs fetcher. FOD dispatch only routes to fetchers, non-FOD only
-  // to builders, no fallback. A queued FOD with zero fetcher entries here
-  // = stuck (the I-048c symptom: fod_queue=3 fetcher_util=0.00).
-  ExecutorKind kind = 5;
-  // Populated by first heartbeat. Empty = stream connected, no heartbeat
-  // arrived yet (the gap is_registered checks for).
-  repeated string systems = 6;
-  // Instant::elapsed() on last_heartbeat. Staleness of the actor's view.
-  // PG last_seen may be more recent if heartbeats reach PG but the actor's
-  // entry was created stale (or vice versa post-failover).
-  uint64 last_heartbeat_ago_secs = 7;
-  reserved 8;                            // was uint32 running_count (P0537: derivable as running_build.is_some())
-  reserved 9;                            // was repeated string running_builds (P0537: → optional running_build)
-  // I-056b: has_capacity() checks `!draining && !store_degraded`. Neither
-  // was visible here — 45min chasing PG/recovery red herrings when the
-  // FOD-stuck-22min root was a stale drain flag surviving reconnect.
-  // The diagnostic for "why isn't this dispatching" couldn't show the
-  // answer. Either true → has_capacity() is false → invisible to dispatch
-  // regardless of stream/registered/warm.
-  bool draining = 10;
-  bool store_degraded = 11;
-  // The drv hash the actor THINKS this worker is building (P0537: at
-  // most one). Can drift from the worker's own view (TOCTOU,
-  // I-032-style lost completions). For diffing against
-  // InspectBuildDag's assigned_executor — a derivation Assigned to an
-  // executor not listing it here (or one whose has_stream=false) is
-  // stuck.
-  optional string running_build = 12;
-}
-
-message DebugListExecutorsResponse {
-  // One per entry in the actor's self.executors HashMap. Empty on a
-  // standby (actor map cleared on lease loss) — useful diagnostic info
-  // in itself; this RPC deliberately does NOT reject on standby.
-  repeated DebugExecutorState executors = 1;
-}
+// DebugExecutorState / DebugListExecutorsResponse were removed with the
+// DebugListExecutors RPC by the executor-lifecycle proto sweep: the
+// in-memory executor map they snapshotted is gone with the stream session.
 
 // Tenant info for ListTenants/CreateTenant.
 message TenantInfo {
@@ -611,11 +541,12 @@ message GetSpawnIntentsResponse {
   // snapshot with `intents` so a controller reading both sees one
   // queue state.
   map<string, uint64> queued_by_system = 2;
-  // §13b: scheduler-computed hung-node detector. A node enters this
-  // list when ≥max(2, ⌈0.5·occupancy⌉) executors across ≥2 distinct
-  // tenants on that node have stale-heartbeat. Controller cordons +
-  // evicts (`r[sched.admin.hung-node-detector+3]`).
-  repeated string dead_nodes = 3;
+  // 3 was `repeated string dead_nodes` — the stream-era heartbeat-fed
+  // hung-node detector's output. Removed by the executor-lifecycle proto
+  // sweep: the OA2 controller-side wedge clustering over the open-attempt
+  // view (`ctrl.nodeclaim.wedge-cluster`) is the successor signal.
+  reserved 3;
+  reserved "dead_nodes";
   // §13b: per-cell ICE mask ("h:cap" strings) so the controller's
   // @alg-pool excludes the same cells the scheduler has marked
   // ICE-infeasible. Coherent snapshot with `intents` (one tick).

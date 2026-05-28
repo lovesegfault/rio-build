@@ -1,12 +1,12 @@
 // Centralized admin-RPC mock surface + Svelte-effect flush helpers.
 //
 // PROBLEM: every page/component test that renders a management-action
-// child (DrainButton, ClearPoisonButton, the BuildDrawer's embedded
+// child (ClearPoisonButton, the BuildDrawer's embedded
 // LogViewer) needs that child's RPC stubbed even if the test never
-// clicks it — otherwise `admin.drainExecutor is not a function` at
+// clicks it — otherwise `admin.someRpc is not a function` at
 // render-time. Pre-P0389 every test file re-derived the same
 // vi.hoisted/vi.mock/fake-timer/flush dance; each new page test started
-// from a copy of DrainButton.test.ts.
+// from a copy of an existing page test.
 //
 // PATTERN: tests import adminMock + helpers from here, then keep a
 // single depth-specific `vi.mock('../../api/admin', () => ({ admin:
@@ -54,12 +54,10 @@ export const adminMock = {
   listExecutors: vi.fn(),
   listBuilds: vi.fn(),
   triggerGC: vi.fn(emptyStream) as Mock,
-  drainExecutor: vi.fn(),
   cancelBuild: vi.fn(),
   clearPoison: vi.fn(),
   listPoisoned: vi.fn(),
   inspectBuildDag: vi.fn(),
-  debugListExecutors: vi.fn(),
   listTenants: vi.fn(),
   createTenant: vi.fn(),
   deleteTenant: vi.fn(),
@@ -70,7 +68,6 @@ export const adminMock = {
   getSpawnIntents: vi.fn(),
   mintExecutorTokens: vi.fn(),
   ackSpawnedIntents: vi.fn(),
-  reportExecutorTermination: vi.fn(),
   reportAttemptOutcome: vi.fn(),
   listOpenAttempts: vi.fn(),
   injectBuildSample: vi.fn(),
@@ -103,7 +100,7 @@ export const logsMock = {
 
 // toast.info/error stubs for components that surface RPC success/failure
 // via the toast portal. Tests that exercise those paths vi.mock the
-// toast module against this object (see DrainButton.test.ts). Tests
+// toast module against this object (see ClearPoisonButton tests). Tests
 // that don't can ignore it — the real toast store is a harmless no-op
 // under jsdom (pushes to an array nobody subscribes to).
 export const toastMock = {

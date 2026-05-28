@@ -254,15 +254,15 @@ impl DagActor {
             }
             PullDecision::DeliverExisting { exec_id } => {
                 // Idempotent re-pull: read, never write. The payload is
-                // rebuilt from the same inputs (drv, identity,
-                // generation), so the load-bearing fields — drv path,
-                // ATerm, exec_id, resources — are identical.
+                // rebuilt from the same inputs (drv, identity), so the
+                // load-bearing fields — drv path, ATerm, exec_id,
+                // resources — are identical.
                 debug_assert_eq!(
                     self.dag.node(&drv_hash).and_then(|s| s.exec_id),
                     Some(exec_id)
                 );
                 let assignment = self
-                    .build_assignment_proto(&drv_hash, &pulling_identity, serving_generation)
+                    .build_assignment_proto(&drv_hash, &pulling_identity)
                     .await
                     .ok_or_else(|| {
                         PullRejection::Internal("derivation vanished during re-pull".into())
@@ -406,7 +406,7 @@ impl DagActor {
         }
 
         let assignment = self
-            .build_assignment_proto(drv_hash, pulling_identity, serving_generation)
+            .build_assignment_proto(drv_hash, pulling_identity)
             .await
             .ok_or_else(|| {
                 PullRejection::Internal("derivation vanished while building the payload".into())

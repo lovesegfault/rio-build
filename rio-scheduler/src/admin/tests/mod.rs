@@ -260,9 +260,7 @@ fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T)
 const SERVICE_GATED: &[&str] = &[
     // Mutating ([`mutating_rpcs_require_service_token`]):
     "TriggerGC",
-    "DrainExecutor",
     "CancelBuild",
-    "ReportExecutorTermination",
     "ClearPoison",
     "CreateTenant",
     "DeleteTenant",
@@ -291,12 +289,7 @@ const SERVICE_GATED: &[&str] = &[
     "HwClassSampled",
     "GetHwClassConfig",
 ];
-const UNGATED_PUBLIC: &[&str] = &[
-    "ClusterStatus",
-    "ListExecutors",
-    "ListBuilds",
-    "DebugListExecutors",
-];
+const UNGATED_PUBLIC: &[&str] = &["ClusterStatus", "ListExecutors", "ListBuilds"];
 
 /// Every mutating AdminService RPC is service-token gated. Builders
 /// share port 9001 with this service (CCNP allows scheduler:9001 at L4
@@ -322,20 +315,6 @@ async fn mutating_rpcs_require_service_token() {
         }};
     }
 
-    assert_gated!(
-        "DrainExecutor",
-        svc.drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: "victim".into(),
-            force: true,
-        }))
-    );
-    assert_gated!(
-        "ReportExecutorTermination",
-        svc.report_executor_termination(Request::new(ReportExecutorTerminationRequest {
-            executor_id: "victim".into(),
-            reason: TerminationReason::OomKilled as i32,
-        }))
-    );
     assert_gated!(
         "ReportAttemptOutcome",
         svc.report_attempt_outcome(Request::new(
@@ -741,41 +720,41 @@ async fn service_token_allowlist_enforced() {
         .unwrap();
     assert_eq!(n, 1, "exactly one accepted insert");
 
-    // controller+cli allowlist (`["rio-controller","rio-cli"]`).
-    // DrainExecutor is a retired no-op (Unimplemented) — the assertion
-    // here is that an allowlisted caller gets PAST the token gate (the
-    // retirement error, not PermissionDenied), and that the gate still
-    // fronts the stub.
-    let drain = DrainExecutorRequest {
-        executor_id: "victim".into(),
-        force: true,
+    // controller+cli allowlist (`["rio-controller","rio-cli"]`):
+    // CancelBuild is allowlisted for both; an allowlisted caller gets
+    // PAST the token gate (reaching argument validation, not
+    // PermissionDenied) and a non-allowlisted caller is rejected at
+    // the gate.
+    let cancel = rio_proto::types::CancelBuildRequest {
+        build_id: "not-a-uuid".into(),
+        reason: "gate-check".into(),
     };
     let err = svc
-        .drain_executor(req_with_token(&signer, "rio-controller", drain.clone()))
+        .cancel_build(req_with_token(&signer, "rio-controller", cancel.clone()))
         .await
         .unwrap_err();
     assert_eq!(
         err.code(),
-        tonic::Code::Unimplemented,
-        "rio-controller passes the gate and reaches the retired-surface error"
+        tonic::Code::InvalidArgument,
+        "rio-controller passes the gate and reaches argument validation"
     );
     let err = svc
-        .drain_executor(req_with_token(&signer, "rio-cli", drain.clone()))
+        .cancel_build(req_with_token(&signer, "rio-cli", cancel.clone()))
         .await
         .unwrap_err();
     assert_eq!(
         err.code(),
-        tonic::Code::Unimplemented,
-        "rio-cli passes the gate and reaches the retired-surface error"
+        tonic::Code::InvalidArgument,
+        "rio-cli passes the gate and reaches argument validation"
     );
     let err = svc
-        .drain_executor(req_with_token(&signer, "rio-gateway", drain))
+        .cancel_build(req_with_token(&signer, "rio-gateway", cancel))
         .await
         .unwrap_err();
     assert_eq!(
         err.code(),
         tonic::Code::PermissionDenied,
-        "non-allowlisted caller is still rejected at the gate, before the stub"
+        "non-allowlisted caller is still rejected at the gate"
     );
 
     // cli-only allowlist (`["rio-cli"]`).
@@ -1076,57 +1055,6 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 // -----------------------------------------------------------------------
 // DrainExecutor
 // -----------------------------------------------------------------------
-
-/// DrainExecutor is a retired no-op until the 1d proto sweep: it must
-/// perform no action and return a clear error that names the successor
-/// procedures (cordon + AD2 exclusion / cancel + Job deletion /
-/// pool-level pause), never a silent success. The service-token gate
-/// stays in front of it (covered by
-/// [`mutating_rpcs_require_service_token`]).
-#[tokio::test]
-async fn drain_worker_retired_returns_unimplemented() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc_default().await;
-
-    let status = svc
-        .drain_executor(Request::new(DrainExecutorRequest {
-            executor_id: "any-worker".into(),
-            force: true,
-        }))
-        .await
-        .expect_err("retired surface must not report success");
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(
-        status.message().contains("retired"),
-        "the error explains the retirement: {}",
-        status.message()
-    );
-    assert!(
-        status.message().contains("cordon") && status.message().contains("CancelBuild"),
-        "the error names the successor procedures: {}",
-        status.message()
-    );
-    Ok(())
-}
-
-/// DebugListExecutors is likewise a retired no-op: there is no
-/// in-memory executor map left to snapshot; the error points at
-/// ListOpenAttempts and the Job/pod census.
-#[tokio::test]
-async fn debug_list_executors_retired_returns_unimplemented() -> anyhow::Result<()> {
-    let (svc, _actor, _task, _db) = setup_svc_default().await;
-
-    let status = svc
-        .debug_list_executors(Request::new(()))
-        .await
-        .expect_err("retired surface must not report success");
-    assert_eq!(status.code(), tonic::Code::Unimplemented);
-    assert!(
-        status.message().contains("ListOpenAttempts"),
-        "the error names the successor view: {}",
-        status.message()
-    );
-    Ok(())
-}
 
 // ---------------------------------------------------------------------------
 // ClearPoison happy path

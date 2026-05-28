@@ -11,7 +11,7 @@ use crate::k8s::{NS_BUILDERS, NS_STORE};
 
 /// `DebugListExecutors` row, via `rio-cli workers --actor`. The actor's
 /// in-memory executor map — same source the dispatcher reads, no
-/// gauge-tick lag (`housekeeping.rs` recomputes `workers_active` on a
+/// gauge-tick lag (`housekeeping.rs` recomputes its gauges on a
 /// tick, which can lie for one cycle after a leader-kill).
 /// `has_stream=false` is an I-048b zombie: a heartbeat-only entry with
 /// no `stream_tx` — there's no live stream for a keepalive to time out.
@@ -28,7 +28,7 @@ pub struct DebugList {
 
 /// Live (`has_stream=true`) executor IDs from the actor's in-memory
 /// map. Use as a snapshot-diff precondition: capture before a warmup
-/// build, gate on a fresh ID appearing — `workers_active > 0` alone
+/// build, gate on a fresh ID appearing — a nonzero busy gauge alone
 /// can be satisfied by a leftover that's about to leave (the i048c
 /// full-QA precondition race, 2026-05-13: satisfied at T+2.6s by a
 /// prior scenario's mid-drain builder, long before the warmup builder
@@ -168,7 +168,7 @@ pub async fn wait_recovery_done(ctx: &QaCtx, before: f64, deadline: Duration) ->
 ///
 /// Waiting for a *fresh* smoke build to *complete* proves both:
 /// gateway → new-leader routing AND cold-builder dispatch. Waiting
-/// for `workers_active > 0` or `recovery_total > 0` proves neither
+/// for `open_attempts > 0` or `recovery_total > 0` proves neither
 /// (i024's bg builder reconnects via the gateway's `WatchBuild`
 /// retry with its pre-existing JWT — a different code path from a
 /// fresh `SubmitBuild`; recovery is ~40ms, well before either path

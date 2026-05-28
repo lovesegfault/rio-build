@@ -48,14 +48,13 @@ pub mod validated;
 /// The underlying `.proto` definitions are spread across `types.proto`
 /// (shared primitives: store, chunk, GC, ResourceUsage, BuildResultStatus),
 /// `dag.proto` (DAG + derivation events + GraphNode/Edge),
-/// `build_types.proto` (build lifecycle, executor stream, heartbeat), and
+/// `build_types.proto` (build lifecycle + pull-mode dispatch payloads), and
 /// `admin_types.proto` (admin RPC data types). All four share
 /// `package rio.types;`, so prost merges them into ONE module here.
 // r[impl proto.executor.kind]
-// r[impl proto.heartbeat.capability-fields]
 // (Tracey doesn't scan .proto — the documentary annotations live in
-// build_types.proto next to the wire definitions; these markers are the
-// scannable anchors at the Rust point-of-generation.)
+// build_types.proto next to the wire definitions; this marker is the
+// scannable anchor at the Rust point-of-generation.)
 pub mod types {
     tonic::include_proto!("rio.types");
 }
@@ -146,7 +145,7 @@ pub mod store {
 }
 
 /// Admin service: dashboard and CLI RPCs.
-// r[impl proto.admin.diag-rpc]
+// r[impl proto.admin.diag-rpc+2]
 pub mod admin {
     tonic::include_proto!("rio.admin");
 }

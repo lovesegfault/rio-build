@@ -177,7 +177,7 @@ spec:
     # runs on a cluster node and is classified as `host`/`remote-node`
     # instead. Both are listed so the rule works in either topology.
     - toEntities: [kube-apiserver, host, remote-node]
-    # Scheduler (ClusterStatus/DrainExecutor admin RPCs) + store (GC
+    # Scheduler (ClusterStatus/CancelBuild admin RPCs) + store (GC
     # tick connects to StoreAdminService). The old k8s-NP RFC1918
     # ipBlock incidentally matched these (ClusterIPs in 10/8); CNP
     # toCIDR does not match in-cluster endpoints.

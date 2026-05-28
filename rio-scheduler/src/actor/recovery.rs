@@ -1059,7 +1059,7 @@ impl DagActor {
     /// `handle_tick` gate). Prometheus then sees two series per
     /// gauge until this pod restarts.
     // r[impl sched.lease.standby-tick-noop+2]
-    // r[impl obs.metric.scheduler-leader-gate+3]
+    // r[impl obs.metric.scheduler-leader-gate+4]
     pub(super) fn handle_leader_lost(&mut self) {
         // A same-count re-acquire's kept recovery may have re-stamped
         // the completion after `on_lose` cleared it (the same-epoch
@@ -1074,9 +1074,8 @@ impl DagActor {
         self.leader.invalidate_recovery_completion();
         info!("leader lost: clearing persisted actor state");
         self.clear_persisted_state();
-        // workers_active is deprecated (pinned to 0 by
-        // tick_publish_gauges) and so needs no explicit zeroing here;
-        // the ex-leader's last published value is already 0.
+        // (The stream-era workers_active gauge is gone; nothing
+        // registration-shaped needs zeroing here.)
         for g in [
             "rio_scheduler_derivations_queued",
             "rio_scheduler_builds_active",

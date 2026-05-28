@@ -41,23 +41,6 @@ spec:
               rio-controller container restarted
               {{`{{ $value | humanize }}`}} time(s) in the last 5m.
 
-        # I-095/I-097 ghost-dispatch shape: workers registered but not
-        # running anything. workers_active counts heartbeating executors;
-        # derivations_running counts in-flight builds. A sustained gap
-        # >50 means dispatch is starved (closed-channel ghosts, system/kind
-        # mismatch, or the actor is wedged — cross-ref RioSchedulerActorSlow).
-        - alert: RioDispatchStarved
-          expr: rio_scheduler_workers_active - rio_scheduler_derivations_running > 50
-          for: 5m
-          labels:
-            severity: warning
-          annotations:
-            summary: ">50 idle executors with work queued"
-            description: >-
-              {{`{{ $value | humanize }}`}} executors are heartbeating but
-              idle for 5m. Check system/kind routing and ghost-executor
-              accumulation.
-
         # executor-formal OA2 control: pull-mode attempts carry no
         # per-pod heartbeat, so a wedged-but-Ready node
         # (kubelet/containerd hung while the Node object stays Ready)
@@ -629,38 +612,13 @@ spec:
               transactions in pg_stat_activity and see
               docs/ops/gc-enablement.typ (slow upgrade transactions).
 
-    # Executor-lifecycle deletion gate (design §4.5; deployment-time
-    # validation checklist row D6): the stream-path deletion release may
-    # roll out only after the stream-registration gauge has read zero
-    # continuously for the computed deadline horizon
-    #   max(activeDeadlineSeconds over live intents)
-    #     + builder idle-timeout (Config idle_timeout, default 120 s)
-    #     + establishment report slack (scheduler Config
-    #       establishment_report_slack, default 120 s).
-    # The record below pre-cans the fleet-wide aggregate (max across
-    # scheduler replicas — a standby that still believes it has
-    # registered stream executors keeps the gate honest). Row D6 is then
-    # evaluated as
-    #   max_over_time(rio:scheduler_stream_registrations:max[<horizon>]) == 0
-    # with <horizon> instantiated from the executor-invariant-map 1c
-    # record at evaluation time. Recording-only: no alert fires from
-    # this group during development or the pre-deletion window.
-    #
-    # Successor signal (operator-surface deletion onward): on releases
-    # where the scheduler-side stream session is deleted, the
-    # workers_active gauge is pinned to zero (no registration can
-    # happen), so the gauge rule above stays meaningful only for the
-    # PRE-deletion release that D6 is evaluated against. The second
-    # record carries the equivalent read for 1c'-era code: attempted
-    # calls to the retired stream RPCs (BuildExecution/Heartbeat error
-    # stubs). Row D6's evaluation on a fleet already running deletion-
-    # stage code, and row D7's post-deletion watch ("no calls to
-    # removed RPCs from stale clients"), both read this series:
-    #   max_over_time(rio:scheduler_stream_attempts:rate5m[<horizon>]) == 0
-    - name: rio.deletion-gate.rules
-      rules:
-        - record: rio:scheduler_stream_registrations:max
-          expr: max(rio_scheduler_workers_active)
-        - record: rio:scheduler_stream_attempts:rate5m
-          expr: sum(rate(rio_scheduler_stream_stub_calls_total[5m])) or vector(0)
+    # The executor-lifecycle deletion-gate recording rules
+    # (rio:scheduler_stream_registrations:max over the workers_active
+    # gauge, and rio:scheduler_stream_attempts:rate5m over the stream
+    # stub-call counter) were removed with the metrics they read once
+    # the stream protocol surface itself was deleted (the source series
+    # no longer exist on this release). The deployment-time deletion-gate
+    # evaluation (checklist rows D6/D7) runs against the chart/release
+    # that still emits those series — i.e. the release being upgraded
+    # FROM — per the executor-invariant-map deployment checklist.
 {{- end }}

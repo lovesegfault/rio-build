@@ -1311,7 +1311,6 @@ impl DagActor {
         &mut self,
         drv_hash: &DrvHash,
         executor_id: &ExecutorId,
-        generation: u64,
     ) -> Option<rio_proto::types::WorkAssignment> {
         // CA input resolution: rewrite placeholder paths in
         // env/args/builder to realized output paths before
@@ -1415,8 +1414,10 @@ impl DagActor {
             })
         } else {
             // Legacy unsigned: format-string. Store with
-            // hmac_verifier=None accepts this.
-            format!("{executor_id}-{drv_hash}-{generation}")
+            // hmac_verifier=None accepts this (content is not
+            // verified; the executor/drv pair keeps it unique enough
+            // for log correlation).
+            format!("{executor_id}-{drv_hash}")
         };
 
         Some(rio_proto::types::WorkAssignment {
@@ -1433,7 +1434,6 @@ impl DagActor {
             output_names: state.output_names.clone(),
             build_options: Some(build_opts),
             assignment_token,
-            generation,
             is_fixed_output: state.is_fixed_output,
             traceparent: state.traceparent.clone(),
             // Intent for this drv (matches the SpawnIntent that spawned the

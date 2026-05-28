@@ -54,8 +54,6 @@ describe('Executors page', () => {
     expect(table).toHaveTextContent('e-fresh');
     expect(table).toHaveTextContent('e-old');
     expect(screen.getAllByTestId('load-pill')[0]).toHaveTextContent('busy');
-    // Two rows → two DrainButtons.
-    expect(screen.getAllByTestId('drain-btn')).toHaveLength(2);
   });
 
   it('flags >30s-stale heartbeat', async () => {

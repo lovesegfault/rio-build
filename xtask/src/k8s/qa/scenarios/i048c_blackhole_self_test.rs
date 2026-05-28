@@ -37,7 +37,7 @@ impl Scenario for BlackholeSelfTest {
     async fn run(&self, ctx: &mut QaCtx) -> Result<Verdict> {
         // The chaos can only break a stream the scheduler actually
         // holds. The precondition must be IDENTITY-based, not gauge-
-        // based: `rio_scheduler_workers_active > 0` alone was satisfied
+        // based: a nonzero fleet gauge alone was satisfied
         // 2.6s into a full-QA run by a leftover from the previous
         // Exclusive scenario (i046's mid-drain builder) — long before
         // the warmup builder could spawn — and that worker exited or

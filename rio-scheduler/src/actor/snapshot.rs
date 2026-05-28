@@ -694,13 +694,6 @@ impl DagActor {
                 .iter()
                 .map(crate::sla::config::cell_label)
                 .collect(),
-            // OA2: the scheduler-side hung-node detector is gone with
-            // the stream session machinery (heartbeats no longer
-            // exist to derive staleness from). The controller-side
-            // node-wedge aggregation (`nodeclaim_pool/wedge.rs`,
-            // landed at 1c) is the successor signal; this field stays
-            // explicitly empty until the 1d proto sweep retires it.
-            dead_nodes: Vec::new(),
         }
     }
 

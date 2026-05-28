@@ -79,7 +79,7 @@ fn spawn_actor_with_flags(
     (h, t)
 }
 
-// r[verify obs.metric.scheduler-leader-gate+3]
+// r[verify obs.metric.scheduler-leader-gate+4]
 /// When is_leader=false, handle_tick must NOT set state gauges.
 /// Standby actor is warm (DAGs merge for takeover) but its counts are
 /// stale/zero. Publishing them creates a second Prometheus series that
@@ -131,7 +131,7 @@ async fn test_not_leader_does_not_set_gauges() -> TestResult {
 }
 
 // r[verify sched.lease.standby-tick-noop+2]
-// r[verify obs.metric.scheduler-leader-gate+3]
+// r[verify obs.metric.scheduler-leader-gate+4]
 /// Was-leader → standby: `LeaderLost` clears in-memory state and zeros
 /// gauges; subsequent `Tick` early-returns so the orphan-watcher does
 /// NOT write `Cancelled` to PG for builds the new leader is running.
@@ -565,7 +565,7 @@ async fn test_merge_dag_reply_dropped_cancels_orphan() -> TestResult {
 // Backpressure hysteresis (direct unit test)
 // ---------------------------------------------------------------------------
 
-// r[verify sched.backpressure.hysteresis]
+// r[verify sched.backpressure.hysteresis+2]
 /// Hysteresis: active fires at ≥80% (HIGH), clears at ≤60% (LOW).
 /// Between 60-80% the current state is sticky — prevents flapping.
 ///

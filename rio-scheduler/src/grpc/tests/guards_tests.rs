@@ -6,7 +6,7 @@
 //! plus the leader-guard RPC-rejection end-to-end.
 
 use super::*;
-use rio_proto::{ExecutorService, SchedulerService};
+use rio_proto::SchedulerService;
 
 /// Compile-time exhaustiveness pin for the `cases` array below:
 /// `ActorError` is `thiserror`, no macro-generated `ALL`, so a no-
@@ -156,15 +156,8 @@ async fn test_not_leader_rejects_all_rpcs() -> anyhow::Result<()> {
 
     // ExecutorService: the live work-delivery surface is the pull
     // unaries, whose leader gate is actor-side (PullRejection::
-    // NotLeader, covered by the actor pull tests). BuildExecution/
-    // Heartbeat are unconditional `Unimplemented` stubs since the
-    // session-machinery deletion, so they are no longer part of the
-    // leader-guard surface.
-    let s = grpc
-        .heartbeat(tonic::Request::new(Default::default()))
-        .await
-        .expect_err("stubbed heartbeat always errors");
-    assert_eq!(s.code(), tonic::Code::Unimplemented);
+    // NotLeader, covered by the actor pull tests); the stream-era
+    // BuildExecution/Heartbeat RPCs no longer exist.
 
     Ok(())
 }

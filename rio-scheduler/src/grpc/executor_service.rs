@@ -1,13 +1,11 @@
 //! `ExecutorService` gRPC implementation for [`SchedulerGrpc`].
 //!
 //! Worker-facing RPCs: the pull-mode `PullAssignment`/`ReportOutcome`
-//! unaries. The legacy `BuildExecution` stream and `Heartbeat` unary
-//! are unconditional error stubs — the session machinery behind them
-//! was deleted; the RPCs themselves (and the generated trait methods)
-//! stay until the 1d proto sweep so a stray stream-mode executor gets
-//! a clear error instead of a hang.
+//! unaries — the only work-delivery surface (the legacy `BuildExecution`
+//! stream and `Heartbeat` unary were removed with the proto sweep; a
+//! stray stream-mode executor now gets tonic's unimplemented-method
+//! answer at the routing layer).
 
-use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{instrument, warn};
 
@@ -32,9 +30,6 @@ use super::SchedulerGrpc;
 //              CompletionReport payload fields (the report itself must reach
 //              the actor — a lost completion strands the derivation in
 //              Running).
-// (BuildExecution / Heartbeat are unconditional error stubs: no field
-// of theirs reaches the actor.)
-//
 // PullAssignment RPC (pull-mode dispatch):
 //   intent_id                         → DAG lookup, assignments/executions rows → reject RPC > MAX_IDENT_LEN
 //   executor_token                    → HMAC-verified then dropped        → reject RPC > MAX_EXECUTOR_TOKEN_LEN
@@ -77,50 +72,6 @@ pub(super) const MAX_EXECUTOR_TOKEN_LEN: usize = 8 * 1024;
 
 #[tonic::async_trait]
 impl ExecutorService for SchedulerGrpc {
-    type BuildExecutionStream = ReceiverStream<Result<rio_proto::types::SchedulerMessage, Status>>;
-
-    /// Unconditional error stub. The stream dispatch protocol was
-    /// removed with the scheduler session machinery: work is delivered
-    /// by `PullAssignment` and reported by `ReportOutcome`. The RPC and
-    /// the generated trait method survive only until the 1d proto sweep
-    /// (the tonic server trait has no default method bodies), so a
-    /// stray stream-mode executor gets a clear error instead of a hang.
-    #[instrument(skip(self, _request), fields(rpc = "BuildExecution"))]
-    async fn build_execution(
-        &self,
-        _request: Request<tonic::Streaming<rio_proto::types::ExecutorMessage>>,
-    ) -> Result<Response<Self::BuildExecutionStream>, Status> {
-        warn!("BuildExecution called: the stream dispatch protocol has been removed");
-        // Deletion-gate / post-deletion-watch successor signal (rows
-        // D6/D7): a sustained rate here means a stream-mode executor
-        // image is still deployed and trying to register.
-        metrics::counter!("rio_scheduler_stream_stub_calls_total", "rpc" => "build_execution")
-            .increment(1);
-        Err(Status::unimplemented(
-            "the BuildExecution stream protocol has been removed; \
-             executors are dispatched via PullAssignment/ReportOutcome (pull mode)",
-        ))
-    }
-
-    /// Unconditional error stub, same rationale as
-    /// [`Self::build_execution`]: there is no scheduler-side liveness
-    /// or registration state to feed. Pod liveness belongs to the
-    /// kubelet/Job controller; attempt liveness is the durable
-    /// open-attempt row plus the establishment sweep.
-    #[instrument(skip(self, _request), fields(rpc = "Heartbeat"))]
-    async fn heartbeat(
-        &self,
-        _request: Request<rio_proto::types::HeartbeatRequest>,
-    ) -> Result<Response<rio_proto::types::HeartbeatResponse>, Status> {
-        warn!("Heartbeat called: the stream session protocol has been removed");
-        metrics::counter!("rio_scheduler_stream_stub_calls_total", "rpc" => "heartbeat")
-            .increment(1);
-        Err(Status::unimplemented(
-            "the Heartbeat RPC has been removed with the stream session protocol; \
-             pull-mode executors need no heartbeat",
-        ))
-    }
-
     // Pull-mode dispatch surface — the only work-delivery path.
 
     /// The pull-mode pod's single ask. Leader-served; the actor turn

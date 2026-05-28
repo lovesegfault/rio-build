@@ -86,30 +86,6 @@ async fn unary_subcommands_exit_ok() -> anyhow::Result<()> {
         "builds --status",
         run_cli(&addr, &["builds", "--status", "active", "--limit", "5"]),
     );
-    assert_ok(
-        "drain-executor",
-        run_cli(&addr, &["drain-executor", "builder-0"]),
-    );
-    assert_ok(
-        "drain-worker --force",
-        run_cli(&addr, &["drain-executor", "builder-0", "--force"]),
-    );
-    Ok(())
-}
-
-#[tokio::test(flavor = "multi_thread")]
-async fn drain_executor_not_found_message() -> anyhow::Result<()> {
-    let (_admin, addr, _handle) = spawn_mock_admin().await?;
-
-    // MockAdmin's drain_executor returns DrainExecutorResponse::default()
-    // — accepted=false. The CLI should print the "not found" branch,
-    // not the "draining <id>" branch.
-    let (status, stdout, stderr) = run_cli(&addr, &["drain-executor", "builder-0"]);
-    assert!(status.success(), "drain-worker: {stderr}");
-    assert!(
-        stdout.contains("not found"),
-        "expected not-found branch for accepted=false: {stdout}"
-    );
     Ok(())
 }
 
@@ -153,18 +129,6 @@ async fn json_flag_produces_valid_json() -> anyhow::Result<()> {
     let v: serde_json::Value = serde_json::from_str(&stdout)?;
     assert!(v.get("total_executors").is_some()); // flattened ClusterStatusResponse field
     assert!(v.get("executors").is_some_and(|w| w.is_array()));
-
-    // drain-executor --json: inline struct with executor_id echoed back
-    // and the two proto response fields.
-    let (status, stdout, stderr) = run_cli(&addr, &["drain-executor", "builder-0", "--json"]);
-    assert!(status.success(), "drain-executor --json: {stderr}");
-    let v: serde_json::Value = serde_json::from_str(&stdout)?;
-    assert_eq!(
-        v.get("executor_id").and_then(|w| w.as_str()),
-        Some("builder-0")
-    );
-    assert!(v.get("accepted").is_some_and(|a| a.is_boolean()));
-    assert!(v.get("busy").is_some_and(|b| b.is_boolean()));
 
     // poison-clear --json: inline struct, drv_hash echoed + cleared bool.
     let hash = "/nix/store/deadbeef0000000000000000000000000-test.drv";

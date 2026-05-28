@@ -9,19 +9,20 @@
 //! and the new receiver reads the proto3 default.
 
 use prost::Message;
-use rio_proto::types::{DerivationNode, GetSpawnIntentsResponse, HeartbeatRequest};
+use rio_proto::types::{DerivationNode, GetSpawnIntentsResponse, ReportOutcomeRequest};
 
-/// `store_degraded` (field 9) defaults to false through a full
-/// encode/decode cycle. Wire-compatibility: an old worker that
-/// doesn't know field 9 sends nothing for it; the scheduler reads
-/// `false` (healthy). If this ever flips to `true` by default,
-/// every legacy worker instantly looks store-degraded.
+/// `ReportOutcomeRequest.exec_id` defaults to empty through a full
+/// encode/decode cycle (the no-attempt no-op key: an empty/unknown
+/// exec_id is acknowledged and ignored). Wire-compatibility for the
+/// pull-mode report payload: a sender that omits the field and a
+/// receiver decoding the same bytes agree on the empty default.
 #[test]
-fn heartbeat_request_store_degraded_default_false() {
-    let req = HeartbeatRequest::default();
+fn report_outcome_request_exec_id_default_empty() {
+    let req = ReportOutcomeRequest::default();
     let bytes = req.encode_to_vec();
-    let decoded = HeartbeatRequest::decode(&*bytes).unwrap();
-    assert!(!decoded.store_degraded);
+    let decoded = ReportOutcomeRequest::decode(&*bytes).unwrap();
+    assert!(decoded.exec_id.is_empty());
+    assert!(decoded.report.is_none());
 }
 
 /// `GetSpawnIntentsResponse` roundtrip. The controller's pool
@@ -75,7 +76,6 @@ fn spawn_intents_proto_roundtrip() {
             },
         ],
         queued_by_system: [("x86_64-linux".into(), 4), ("aarch64-linux".into(), 1)].into(),
-        dead_nodes: vec!["ip-10-0-1-42".into()],
         ice_masked_cells: vec!["mid:spot".into()],
     };
     let bytes = orig.encode_to_vec();

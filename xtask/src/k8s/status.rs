@@ -447,7 +447,7 @@ async fn print_metrics_detail(client: &k::Client) {
         ("rio_scheduler_actor_mailbox_depth", "mailbox_depth"),
         ("rio_scheduler_derivations_queued", "derivations_queued"),
         ("rio_scheduler_derivations_running", "derivations_running"),
-        ("rio_scheduler_workers_active", "workers_active"),
+        ("rio_scheduler_open_attempts", "open_attempts"),
         ("rio_scheduler_builds_active", "builds_active"),
         ("rio_scheduler_queue_depth", "queue_depth"),
         ("rio_scheduler_utilization", "utilization"),
@@ -1048,12 +1048,12 @@ mod tests {
             "HTTP/1.0 200 OK\n\
              # HELP rio_scheduler_derivations_queued queued\n\
              rio_scheduler_derivations_queued 42\n\
-             rio_scheduler_workers_active{pool=\"x86-64-tiny\"} 3\n\
-             rio_scheduler_workers_active{pool=\"x86-64-small\"} 1\n",
+             rio_scheduler_open_attempts{pool=\"x86-64-tiny\"} 3\n\
+             rio_scheduler_open_attempts{pool=\"x86-64-small\"} 1\n",
         );
         assert_eq!(s.first("rio_scheduler_derivations_queued"), Some(42.0));
         assert_eq!(s.first("rio_scheduler_absent"), None);
-        assert_eq!(s.series("rio_scheduler_workers_active").len(), 2);
+        assert_eq!(s.series("rio_scheduler_open_attempts").len(), 2);
         // HTTP status line + # HELP harmlessly skipped (rsplit "OK" not f64).
         assert!(!s.by_name.contains_key("HTTP/1.0"));
     }

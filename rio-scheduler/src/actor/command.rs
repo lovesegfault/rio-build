@@ -143,19 +143,6 @@ pub enum ActorCommand {
         reply: oneshot::Sender<Result<bool, ActorError>>,
     },
 
-    /// Controller observed a builder/fetcher Pod's container terminate
-    /// and reports the k8s reason (OOMKilled / Evicted-DiskPressure /
-    /// etc.). The stream-era second-installment correlation this used
-    /// to drive is gone; the arm acknowledges as a no-op
-    /// (`promoted=false`) until the RPC retires with the 1d proto
-    /// sweep. Pod-terminal classification for pull attempts arrives via
-    /// `ReportAttemptOutcome`.
-    ReportExecutorTermination {
-        executor_id: ExecutorId,
-        reason: rio_proto::types::TerminationReason,
-        reply: oneshot::Sender<bool>,
-    },
-
     /// Pull-mode dispatch: a pod asks for the work it was spawned for
     /// (`ExecutorService.PullAssignment`). Leader-served; the actor
     /// answers Deliver/Gone/NotYetReady or rejects (stale generation,
@@ -261,24 +248,6 @@ pub enum ActorCommand {
     /// Internal: clean up terminal build state (maps + DAG interest) after
     /// a delay. Scheduled by complete_build/transition_build_to_failed/cancel.
     CleanupTerminalBuild { build_id: Uuid },
-
-    /// Forward a build-phase change to interested gateways via
-    /// `emit_build_event`. Sent by the BuildExecution recv task via
-    /// `try_send` (NOT `send_unchecked`) — a dropped phase under
-    /// backpressure is a cosmetic nom regression, not a hang.
-    /// Fire-and-forget.
-    ///
-    /// `executor_id` is the calling stream's identity; `handle_forward_phase`
-    /// gates on `(status, assigned_executor)` and drops on mismatch
-    /// (`r[sched.log.phase-binding]`). Two-part gate mirroring
-    /// [`ProcessCompletion`](Self::ProcessCompletion)'s stale-report guard,
-    /// but stricter — also fails closed on `assigned_executor == None`. See
-    /// `event.rs::handle_forward_phase` for the gate mechanics and the
-    /// defense-in-depth rationale.
-    ForwardPhase {
-        phase: rio_proto::types::BuildPhase,
-        executor_id: ExecutorId,
-    },
 
     /// Read-only admin/snapshot query. See [`AdminQuery`].
     Admin(AdminQuery),
@@ -589,7 +558,6 @@ impl ActorCommand {
             Self::SubstituteComplete { .. } => "SubstituteComplete",
             Self::SubstituteProgress { .. } => "SubstituteProgress",
             Self::CancelBuild { .. } => "CancelBuild",
-            Self::ReportExecutorTermination { .. } => "ReportExecutorTermination",
             Self::PullAssignment { .. } => "PullAssignment",
             Self::ReportPullOutcome { .. } => "ReportPullOutcome",
             Self::ReportAttemptOutcome { .. } => "ReportAttemptOutcome",
@@ -598,7 +566,6 @@ impl ActorCommand {
             Self::QueryBuildStatus { .. } => "QueryBuildStatus",
             Self::WatchBuild { .. } => "WatchBuild",
             Self::CleanupTerminalBuild { .. } => "CleanupTerminalBuild",
-            Self::ForwardPhase { .. } => "ForwardPhase",
             Self::Admin(q) => q.name(),
             Self::ClearPoison { .. } => "ClearPoison",
             Self::LeaderAcquired => "LeaderAcquired",
@@ -646,11 +613,6 @@ pub struct SpawnIntentsSnapshot {
     /// scheduler's accumulated ladder instead of rediscovering ICE
     /// per cell.
     pub ice_masked_cells: Vec<String>,
-    /// k8s `spec.nodeName`s the hung-node detector flagged
-    /// (`r[sched.admin.hung-node-detector]`). The controller's
-    /// `nodeclaim_pool::health` reaps the corresponding NodeClaim
-    /// (`ReapReason::Dead`, capped per tick).
-    pub dead_nodes: Vec<String>,
 }
 
 /// Point-in-time cluster state counts for `AdminService.ClusterStatus`.

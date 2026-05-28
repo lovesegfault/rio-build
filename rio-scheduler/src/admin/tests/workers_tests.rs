@@ -12,7 +12,7 @@ use crate::actor::tests::{merge_single_node, pull_attempt, pull_complete_success
 use crate::state::PriorityClass;
 
 // r[verify sched.admin.list-executors+2]
-// r[verify sched.admin.list-executors-leader-age+2]
+// r[verify sched.admin.list-executors-leader-age+3]
 #[tokio::test]
 async fn test_list_workers_open_attempt_backed() -> anyhow::Result<()> {
     let (svc, actor, _task, _db) = setup_svc_default().await;

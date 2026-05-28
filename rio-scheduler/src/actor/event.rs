@@ -13,7 +13,7 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::state::{DerivationStatus, DrvHash, ExecutorId};
+use crate::state::DrvHash;
 
 use super::{BUILD_EVENT_BUFFER_SIZE, DagActor, LOG_EVENT_BUFFER_SIZE};
 
@@ -285,101 +285,6 @@ impl DagActor {
             .unwrap_or_default();
         v.sort_unstable();
         v
-    }
-
-    /// Relay a build-phase change to interested gateways. Phase is a
-    /// state edge, not log content. Unknown drv_path → drop
-    /// silently (late-arrival race or buggy worker).
-    ///
-    /// `executor_id` is the calling `BuildExecution` stream's identity.
-    /// The gate against `(status, assigned_executor)` closes the
-    /// spoofing hole — a worker-supplied `derivation_path`
-    /// consumed without checking the calling executor actually owns the
-    /// assignment. Without it, a compromised builder spoofs
-    /// `BuildPhase{derivation_path: <victim>, phase: <text>}` and the
-    /// gateway renders attacker-controlled `phase` text as `SetPhase`
-    /// into another tenant's `nix build -L` progress display.
-    ///
-    /// Two-part gate, mirroring `ProcessCompletion`'s stale-report guard
-    /// (`r[sched.completion.idempotent]`): an `Assigned|Running` status
-    /// precondition, then an exact-match `assigned_executor` comparison.
-    /// Both checks are load-bearing — see `sched.log.phase-binding` in
-    /// `scheduler.typ` for why each matters and what fails without it.
-    /// Unlike that guard, this one also fails closed on
-    /// `assigned_executor == None` (defense-in-depth; unreachable when
-    /// the precondition passed).
-    pub(super) fn handle_forward_phase(
-        &mut self,
-        phase: rio_proto::types::BuildPhase,
-        executor_id: &ExecutorId,
-    ) {
-        let Some(hash) = self.dag.hash_for_path(&phase.derivation_path).cloned() else {
-            return;
-        };
-        // r[impl sched.log.phase-binding]
-        // Status precondition: `transition()` never clears
-        // `assigned_executor`, and the worker-completion terminal handlers
-        // leave it set, so a bare executor match would accept a late phase
-        // from the just-finished executor for ~60s until
-        // `CleanupTerminalBuild` reaps the DAG node. Rationale in spec
-        // (`sched.log.phase-binding`).
-        let Some(node) = self.dag.node(&hash) else {
-            // hash_for_path() and dag.node() are kept in lockstep —
-            // unreachable, but fail closed (consistent with the
-            // hash_for_path None-arm above).
-            return;
-        };
-        let status = node.status();
-        if !matches!(
-            status,
-            DerivationStatus::Assigned | DerivationStatus::Running
-        ) {
-            tracing::debug!(
-                drv = %phase.derivation_path,
-                sender = %executor_id,
-                status = ?status,
-                reason = "not_active",
-                "dropping phase update for non-active derivation"
-            );
-            metrics::counter!(
-                "rio_scheduler_phases_rejected_total",
-                "reason" => "not_active"
-            )
-            .increment(1);
-            return;
-        }
-        let assigned = node.assigned_executor.as_ref();
-        if assigned != Some(executor_id) {
-            // debug!, not warn!: the common cause is a benign late
-            // phase from a heartbeat-timed-out executor whose drv was
-            // re-dispatched, same as ProcessCompletion's stale-report
-            // guard (completion.rs). The metric covers the
-            // attack-detection use case without log noise.
-            let reason = if assigned.is_none() {
-                "no_assignment"
-            } else {
-                "executor_mismatch"
-            };
-            tracing::debug!(
-                drv = %phase.derivation_path,
-                sender = %executor_id,
-                assigned = ?assigned,
-                reason,
-                "dropping phase update from non-assigned executor"
-            );
-            metrics::counter!(
-                "rio_scheduler_phases_rejected_total",
-                "reason" => reason
-            )
-            .increment(1);
-            return;
-        }
-        for build_id in self.get_interested_builds(&hash) {
-            self.events.emit(
-                build_id,
-                rio_proto::types::build_event::Event::Phase(phase.clone()),
-            );
-        }
     }
 
     /// Resolve the exec_id to correlate/stamp at a terminal transition.

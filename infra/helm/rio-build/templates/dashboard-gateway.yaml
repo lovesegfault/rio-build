@@ -137,7 +137,6 @@ spec:
 ---
 # ── Mutating methods: gated behind values flag ────────────────────────
 # ClearPoison   — un-brakes a deliberately blocked derivation
-# DrainExecutor — marks an executor draining; can stall the fleet if abused
 # CreateTenant  — writes PG rows; resource creation
 # TriggerGC     — deletes store paths; data loss potential
 #
@@ -158,7 +157,6 @@ spec:
   rules:
     - matches:
         - path: { type: Exact, value: /rio.admin.AdminService/ClearPoison }
-        - path: { type: Exact, value: /rio.admin.AdminService/DrainExecutor }
         - path: { type: Exact, value: /rio.admin.AdminService/CreateTenant }
         - path: { type: Exact, value: /rio.admin.AdminService/TriggerGC }
       backendRefs:
