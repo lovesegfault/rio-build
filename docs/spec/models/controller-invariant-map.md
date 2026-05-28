@@ -1277,3 +1277,53 @@ PENDING (to be collected at the 1c' close-out, alongside the
 spec-sweep landing; the executor-campaign records reference this
 entry from `docs/spec/models/executor-invariant-map.md`'s Phase-1c'
 record).
+
+## Executor-campaign 1d entry — controller cleanup, proto sweep, Model D retirement (delta pass)
+
+Cross-campaign record for the executor-lifecycle campaign's Slice 1d
+(T-1d.1–T-1d.4 on the `executor-1d` branch), the contained delta pass
+this map's cross-campaign entry requires. Written by that campaign;
+counter-signature collected with the 1d landing.
+
+- **What changed that this map's models consume.**
+  The orphan-Running reap consults only the durable open-attempt view:
+  the `ListExecutors` call, the leader-age arm and the empty-list arm
+  are gone (`ctrl.ephemeral.reap-orphan-running+4`,
+  `ctrl.job.busy-from-open-attempts+2`); fail-closed on a failed
+  `ListOpenAttempts` read is retained, and a successful read is
+  authoritative on its own (durable ledger state). The DisruptionTarget
+  watcher's `DrainExecutor` force-drain hop is removed: every
+  disruption-targeted pod takes the synthesize-preempted +
+  foreground-delete path (`ctrl.drain.disruption-target+3`,
+  `ctrl.pool.disruption+2`). The nodeclaim Dead-arm input is the OA2
+  wedge clustering alone (`dead_union` removed; the
+  `GetSpawnIntentsResponse.dead_nodes` field is reserved at the proto).
+  The stream-era admin RPCs (`DrainExecutor`, `DebugListExecutors`,
+  `ReportExecutorTermination`) and the `BuildExecution`/`Heartbeat`
+  executor RPCs left the proto; the controller's pod-terminal path was
+  already `ReportAttemptOutcome`-only since 1b. The builder runtime is
+  the pull loop only (Pool `dispatchMode: Stream` still renders its
+  template, but the builder ignores the env and always pulls — see the
+  1d landing record's deferred-items list).
+- **Model impact: none.** Models J and N are byte-unchanged. The
+  leader-age retirement is an environment-input change below the
+  models' abstraction: `reapSafety`'s subject — no orphan reap of a
+  busy executor and no reap outside a passed gate — is preserved with
+  the gate now being "view read succeeded" (fail-closed on error), and
+  the busy-but-never-registered residual recorded at F1 is narrowed
+  (there is no registration; busy is the durable open attempt).
+  `quint-spawn-coherence-base` (reapSafety, orphanRemoved) and the
+  orphan-reap / excess-reap witnesses were rebuilt green at the 1d
+  tree.
+- **Stage-C calibration table delta pass.** No controller-campaign
+  calibration family's mechanism changed behavior at 1d: G-A/G-B
+  (spawn dedupe/headroom), G-G (gate), M-1/M-2 (scaler), FFD and the
+  M-3/M-4 rows are untouched; the only controller behavior changes are
+  the reap-gate input re-key and the preemption hop removal recorded
+  above, neither of which is a calibrated family. The full table
+  re-validation stays scheduled with this campaign's own Phase-1 work
+  as previously recorded.
+
+Controller-campaign owner counter-signature for this delta entry:
+PENDING (to be collected at the 1d landing review, alongside the
+executor campaign's G6 gate).

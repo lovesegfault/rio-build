@@ -7,9 +7,11 @@ have no file), one file per fix family of the refcount corpus
 (`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), and —
 the executor-lifecycle campaign's variant of the layout — one file per
 *representative* of the executor corpus
-(`executor-<family>-<slug>.qnt` over `executorSession.qnt` /
-`executorDelivery.qnt`; a family with two falsifying representatives
-has two files). Each module instantiates the as-built model, defines a
+(`executor-<family>-<slug>.qnt` over `executorSessionAsBuilt.qnt`; a
+family with two falsifying representatives has two files — the
+`executor-f2d-*.qnt` pair over the retired `executorDelivery.qnt` was
+deleted with Model D at the 1d builder collapse, see the invariant
+map's retirement record). Each module instantiates the as-built model, defines a
 local PRE-FIX variant of one action (the behavior the named
 historical fix removed), and exposes it through a `calibStep`. The
 violation latches inside the pre-fix action keep the AS-BUILT oracle: the

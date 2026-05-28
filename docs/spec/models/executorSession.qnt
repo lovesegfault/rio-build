@@ -68,11 +68,11 @@
 //     environment action that may legitimately arrive before the drv is
 //     Ready (the OA6 forecast-spawn case — Model J's no-ready-filter
 //     publish stands per the OA6(a) decision).
-//   - The builder's internal delivery choreography (Model D,
-//     executorDelivery.qnt) — still wired for the stream-era builder
-//     until the 1d builder collapse; the pull-mode pod's report loop is
-//     a single bounded-retry unary and is folded into the report
-//     actions here.
+//   - The builder's internal delivery choreography (the stream-era
+//     Model D, executorDelivery.qnt) — retired with the 1d builder
+//     collapse; the pull-mode pod's report loop is a single
+//     bounded-retry unary and is folded into the report actions here
+//     (the retirement record names the unit/VM carriers).
 //   - The token↔intent HMAC check (admit_pull's RejectToken arm) and
 //     the gRPC-layer leader guard: input hardening, pre-registered
 //     NOT-ENCODED (F8 posture unchanged from the as-built model).

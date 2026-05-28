@@ -4042,3 +4042,72 @@ retired `dead_nodes` aggregation (C4 closed).
   longer promotes the floor (the worker-reported `CgroupOom`/`TimedOut`
   arms still do). Either the second-installment path gains the promote
   arms or the rule is re-derived; not adjudicated by this batch.
+
+## Phase-1d record (Slice 1d — builder collapse, controller/proto cleanup, Model D retirement)
+
+### T-1d.4 — Model D retirement record
+
+Recorded by the slice-1d batch after the builder runtime collapse
+(T-1d.1) deleted the delivery choreography Model D encoded.
+
+Model D (`executorDelivery.qnt`) modeled the stream-era builder's
+delivery machinery at await-point granularity: the permanent sink, the
+relay swap-after-confirmed-open, the stream-local in-flight cell, the
+half-close flush, the SIGTERM drain gate, the I-116 idle exit and the
+B5 generation watermark. That machinery was deleted by T-1d.1 (the
+runtime is the pull loop; SIGTERM is an abort; the fence is
+transaction-side), so the model is retired per P14 — deleted, not
+frozen (`git log -- docs/spec/models/executorDelivery.qnt` recovers
+it); `executorSessionAsBuilt.qnt` remains the only frozen as-built
+encoding.
+
+Checks unwired (3 cfgs + 5 witnesses + 1 calibration):
+`quint-executor-delivery-{base,fault-stream,fault-process}`,
+`quint-executor-delivery-witness-{half-close-flush,exit-blocked,
+swap-with-owed,cell-dropped,stale-rejected}`, and
+`quint-executor-calib-f2d-exit-owed` (its two override modules,
+`calibration/executor-f2d-{late-arm,eager-swap}.qnt`, are deleted with
+the model they instantiate).
+
+Carriers of the obligations Model D discharged (the
+`reportSurvivesStreamChurn`/F2 family and the
+exactly-once-or-death assumption the session models import):
+
+| Obligation | Carrier after retirement |
+|---|---|
+| A started build's report is eventually delivered to some leader unless the pod dies first | the pull report-retry loop (`report_until_acked`: unbounded-until-acked with the bounded-budget nonzero exit), unit-tested in `rio-builder/src/runtime/pull.rs` (`r[verify builder.completion.exactly-once-or-death+2]`), plus `builder.pull.retry-loop+2` / `builder.pull.exit-codes` batteries |
+| Never two reports with different outcomes for one build | the single `send_completion` chokepoint + the scheduler's exec_id-keyed first-classifier-wins fill (`sched.executor.report-idempotent`, `sched.completion.idempotent` test batteries) |
+| Died-before-delivery is observed and classified (the "or death" arm) | the controller pod-terminal `ReportAttemptOutcome` second installment and the establishment sweep (re-targeted Model S invariants `unresolvedClaimHasRepairArmed`, `establishmentOnlyAfterWindowCloses`, `attemptResolvesAtMostOnce`, all wired and HOLDing) |
+| Store-fault resilience of the delivery path end-to-end | the chaos VM suite (`vm-chaos-standalone`, rebuilt green on the collapsed builder at T-1d.1) and the lifecycle/pull-canary k3s arms |
+| Phase-2 deferred | the `fold_report` Kani contract (design §6 row 2), which assumes the report intake is the only classification writer — unchanged by this retirement |
+
+Calibration disposition (the F2d family): the two pre-fix
+representatives (late `completion_pending` arming, dropped half-close
+— bug_012 / bug_117 / 8201db59b) pinned states of the deleted relay
+machinery; they are unconstructible by design on the pull path (no
+relay, no drain gate, no graceful-exit latch — exit code 0 is
+structurally tied to an acknowledged report or a charge-free outcome).
+Acceptance-table verdict pre-staged: "cannot recur by construction",
+with the report-retry/exit-code unit batteries as the regression
+tripwire. This completes the calibration-flip table started at
+T-1c'.5 (f2d was the one "kept" row).
+
+The 1d re-runs: Models J and N are byte-unchanged by this slice;
+`quint-spawn-coherence-base` (carrying `reapSafety` and
+`orphanRemoved`), the orphan-reap and excess-reap witnesses, and the
+re-targeted `quint-executor-session-base` were rebuilt green at this
+tree after the controller cleanup (the leader-age arm retirement is a
+controller-environment change below the models' abstraction — the
+reap gate's fail-closed posture, which is what `reapSafety` checks,
+is retained).
+
+### T-1d.4 — controller-map delta pass
+
+Recorded in `docs/spec/models/controller-invariant-map.md` ("Executor-
+campaign 1d entry"); summary here: busy = open-attempt view only (the
+stream busy arm and the leader-age gate retired; fail-closed on a
+failed view read retained), preemption = report-then-delete for every
+disruption-targeted pod (no DrainExecutor hop), the hung-node feed is
+the OA2 wedge clustering alone (`GetSpawnIntents.dead_nodes` reserved
+at the proto), and the dispatch payload no longer carries a
+generation. Models J/N unchanged; checks re-run green as above.

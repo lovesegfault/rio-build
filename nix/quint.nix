@@ -2576,13 +2576,18 @@ in
     # disposition of every retired witness/calibration check are
     # recorded in the invariant map's Phase-1c' re-target record.
     #
-    # Model D (executorDelivery.qnt) — the builder's delivery
-    # choreography at await-point granularity: the permanent sink, the
-    # relay swap-after-confirmed-open, the stream-local in-flight cell,
-    # the half-close flush, the SIGTERM drain gate, the idle exit and
-    # the generation watermark. Still the as-built (stream-era) builder
-    # — it retires with the 1d builder collapse, not with the 1c'
-    # scheduler deletion.
+    # Model D (executorDelivery.qnt) was retired with the 1d builder
+    # collapse (T-1d.4): the stream-era delivery choreography it modeled
+    # (permanent sink, relay swap, half-close flush, drain gate, idle
+    # exit, generation watermark) no longer exists. Its guarantees'
+    # carriers are recorded in the invariant map's Model-D retirement
+    # record: the pull report-retry loop and exit-code unit batteries
+    # (builder.completion.exactly-once-or-death+2 verify markers), the
+    # scheduler-side report idempotency tests, the chaos VM suite, and
+    # — Phase 2 — the fold_report Kani contract. The model file and its
+    # two f2d calibration override modules are deleted (git history
+    # holds them); the f2d calibration family's acceptance verdict is
+    # pre-staged in the retirement record.
     #
     # The invariant ↔ rule map, the Stage-B record for the frozen
     # as-built model, and the Phase-1c' re-target record (verdicts,
@@ -2624,38 +2629,6 @@ in
       name = "executor-session-fault-leader";
       spec = "executorSession";
       main = "executorSessionFaultLeader";
-      invariants = [ "allInvariants" ];
-    };
-
-    # Model D, base regime: the happy-path delivery choreography plus
-    # the SIGTERM drain and idle-exit orderings.
-    quint-executor-delivery-base = mkQuintCheck {
-      name = "executor-delivery-base";
-      spec = "executorDelivery";
-      main = "executorDeliveryBase";
-      invariants = [ "allInvariants" ];
-    };
-
-    # Model D, fault-stream: failed opens, confirmed streams dying
-    # under the relay, and one generation move — the reconnect /
-    # park / re-buffer choreography and the B5 watermark fence carried
-    # the stream-era exactly-once-or-death obligation here (the rule's
-    # verify markers moved to the pull report-loop tests with the 1d
-    # builder collapse; this model retires at T-1d.4).
-    quint-executor-delivery-fault-stream = mkQuintCheck {
-      name = "executor-delivery-fault-stream";
-      spec = "executorDelivery";
-      main = "executorDeliveryFaultStream";
-      invariants = [ "allInvariants" ];
-    };
-
-    # Model D, fault-process: SIGKILL / OOM-kill at any point (the "or
-    # death" arm) on top of one stream death — no graceful-exit latch
-    # may fire even though the report can be lost with the pod.
-    quint-executor-delivery-fault-process = mkQuintCheck {
-      name = "executor-delivery-fault-process";
-      spec = "executorDelivery";
-      main = "executorDeliveryFaultProcess";
       invariants = [ "allInvariants" ];
     };
 
@@ -2748,38 +2721,6 @@ in
       witness = "canReachPostFailoverDeliver";
     };
 
-    # Non-vacuity witnesses for Model D.
-    quint-executor-delivery-witness-half-close-flush = mkQuintWitnessCheck {
-      name = "executor-delivery-witness-half-close-flush";
-      spec = "executorDelivery";
-      main = "executorDeliveryBase";
-      witness = "noHalfCloseFlush";
-    };
-    quint-executor-delivery-witness-exit-blocked = mkQuintWitnessCheck {
-      name = "executor-delivery-witness-exit-blocked";
-      spec = "executorDelivery";
-      main = "executorDeliveryBase";
-      witness = "noExitBlockedWhileOwed";
-    };
-    quint-executor-delivery-witness-swap-with-owed = mkQuintWitnessCheck {
-      name = "executor-delivery-witness-swap-with-owed";
-      spec = "executorDelivery";
-      main = "executorDeliveryFaultStream";
-      witness = "noSwapWithReportOwed";
-    };
-    quint-executor-delivery-witness-cell-dropped = mkQuintWitnessCheck {
-      name = "executor-delivery-witness-cell-dropped";
-      spec = "executorDelivery";
-      main = "executorDeliveryFaultStream";
-      witness = "noInFlightCellDropped";
-    };
-    quint-executor-delivery-witness-stale-rejected = mkQuintWitnessCheck {
-      name = "executor-delivery-witness-stale-rejected";
-      spec = "executorDelivery";
-      main = "executorDeliveryFaultStream";
-      witness = "noStaleAssignmentRejected";
-    };
-
     # ---- Executor-lifecycle Stage-C calibration witnesses -------------
     # The executor-lifecycle (campaign #1) historical-fix corpus replayed
     # against Models S and D (executor-invariant-map.md, the Stage-C
@@ -2809,22 +2750,13 @@ in
     # Their override modules stay under calibration/ as evidence over
     # the frozen executorSessionAsBuilt.qnt, re-runnable with the
     # README recipe. F4 re-encodes against the re-targeted model below;
-    # F2d (Model D, builder half) is unchanged until the 1d builder
-    # collapse. Deliberately no tracey markers (the spec rules are
-    # verified by the HOLD regime checks above, not by these pre-fix
-    # reproductions).
-
-    # F2 builder half (8201db59b / bug_012 / bug_117): arming
-    # completion_pending late and dropping the half-close lets a
-    # graceful exit leave with the report still owed.
-    quint-executor-calib-f2d-exit-owed = mkQuintWitnessCheck {
-      name = "executor-calib-f2d-exit-owed";
-      spec = "calibration/executor-f2d-late-arm";
-      main = "executorCalibF2dLateArmNoHalfClose";
-      extraSpecs = [ "executorDelivery" ];
-      step = "calibStep";
-      witness = "noExitWithReportOwed";
-    };
+    # F2d (Model D, builder half) retired with Model D at the 1d builder
+    # collapse — the machinery it pinned (completion_pending arming, the
+    # half-close flush) no longer exists, so the state is
+    # unconstructible by design; verdict pre-staged in the invariant
+    # map's retirement record. Deliberately no tracey markers (the spec
+    # rules are verified by the HOLD regime checks above, not by these
+    # pre-fix reproductions).
 
     # F4 (death attribution / the I-197 double-charge precondition),
     # re-encoded against the re-targeted model: losing the

@@ -20,7 +20,8 @@
 // builder behind each slot is an honest-but-racy peer (it heartbeats
 // what its slot holds, accepts at most one assignment, reports each
 // accepted build at most once, never fabricates); its delivery
-// choreography is Model D (executorDelivery.qnt), which discharges the
+// choreography was Model D (executorDelivery.qnt, retired with the 1d
+// builder collapse), which discharged the
 // "a started build's report is eventually delivered to some leader
 // unless the pod dies first, and never twice as two different
 // outcomes" assumption this model makes about its peer.
