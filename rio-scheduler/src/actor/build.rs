@@ -263,7 +263,7 @@ impl DagActor {
             return Ok(false);
         }
 
-        // r[impl sched.build.terminal-status-settled]
+        // r[impl sched.build.terminal-status-settled+2]
         // Refresh the build's counts from the DAG once, BEFORE the
         // cancellation tears its interest out of the DAG
         // (cancel_build_derivations ends with remove_build_interest, so a
@@ -326,7 +326,7 @@ impl DagActor {
             return Err(ActorError::PermissionDenied { build_id });
         }
 
-        // r[impl sched.build.terminal-status-settled]
+        // r[impl sched.build.terminal-status-settled+2]
         // A terminal build's progress is settled at its terminal
         // transition: serve the frozen counts rather than recomputing
         // from the DAG, which keeps mutating while the build stays
@@ -415,7 +415,7 @@ impl DagActor {
         {
             let terminal_event = match build.state() {
                 BuildState::Succeeded => {
-                    // r[impl sched.build.terminal-status-settled]
+                    // r[impl sched.build.terminal-status-settled+2]
                     // Replay the output paths captured at complete_build
                     // time instead of re-walking the DAG: the build's
                     // roots may have been mutated since (e.g. a
@@ -600,7 +600,7 @@ impl DagActor {
                     .unwrap_or_default()
             })
             .collect();
-        // r[impl sched.build.terminal-status-settled]
+        // r[impl sched.build.terminal-status-settled+2]
         // Capture the settled output paths on the build: the WatchBuild
         // terminal re-send replays this value for late subscribers, so a
         // DAG mutation during the cleanup window (e.g. a displacement

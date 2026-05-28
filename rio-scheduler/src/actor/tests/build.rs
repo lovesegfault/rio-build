@@ -1552,7 +1552,7 @@ async fn cancel_reprobed_drv_skips_finalized_exec(
     Ok(())
 }
 
-// r[verify sched.build.terminal-status-settled]
+// r[verify sched.build.terminal-status-settled+2]
 /// The WatchBuild terminal re-send replays the output paths captured at
 /// complete_build time. A displacement during the cleanup window removes
 /// the finished build's interest from the fresh node, so a re-walk of the

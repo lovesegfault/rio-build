@@ -5852,3 +5852,105 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A dispatch-time store hit that fans out to a resident terminal build
+/// must not mutate its served accounting: the terminal build's
+/// cached_derivations stays frozen and it gets no post-terminal
+/// BuildProgress, while the live build sharing the node gets the cached
+/// completion, the DerivationCached event, and Succeeds.
+#[tokio::test]
+async fn test_terminal_build_cached_count_frozen_on_dispatch_store_hit() -> TestResult {
+    use rio_proto::types::build_event::Event;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let x_path = test_drv_path("tcf-x");
+    let x_out = test_store_path("tcf-x-out");
+
+    // Phase 1: B1 (keep_going) fails its single node on a connected
+    // worker → Failed, interest retained on the poisoned node.
+    let mut wrx = connect_executor(&handle, "tcf-w", "x86_64-linux").await?;
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tcf-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut rx1 = merge_dag(&handle, b1, vec![x], vec![], true).await?;
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tcf-w",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+    let frozen = query_status(&handle, b1).await?;
+    assert_eq!(frozen.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(frozen.cached_derivations, 0);
+    while rx1.try_recv().is_ok() {} // drain pre-terminal history
+
+    // No workers from here on: the resubmitted node must sit Ready so
+    // the next dispatch pass takes the store-probe path, not assignment.
+    disconnect(&handle, "tcf-w").await?;
+
+    // Phase 2: B2 resubmits the node (carrying B1's interest); only THEN
+    // does the output appear in the store, so the merge-time cache check
+    // missed and the dispatch-time batched Ready probe is what completes
+    // it as cached.
+    let b2 = Uuid::new_v4();
+    let mut x2 = make_node("tcf-x");
+    x2.expected_output_paths = vec![x_out.clone()];
+    let mut rx2 = merge_dag(&handle, b2, vec![x2], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tcf-x").await.status,
+        DerivationStatus::Ready,
+        "resubmitted node waits in the ready queue (no workers, not yet in store)"
+    );
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(x_out.clone(), Default::default());
+    // Advance probe_generation (Tick) so the batched Ready store probe
+    // re-asks for X, then trigger a dispatch pass via a fresh worker
+    // registration: the batch probe runs before placement, so the store
+    // hit completes X as cached instead of assigning it.
+    tick(&handle).await?;
+    let _wrx2 = connect_executor(&handle, "tcf-w2", "x86_64-linux").await?;
+    barrier(&handle).await;
+
+    // Live build: cached completion counted, DerivationCached seen,
+    // build Succeeded.
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(s2.state, rio_proto::types::BuildState::Succeeded as i32);
+    assert_eq!(s2.cached_derivations, 1, "live build counts the store hit");
+    let mut b2_saw_cached = false;
+    while let Ok(ev) = rx2.try_recv() {
+        if let Some(Event::Derivation(d)) = &ev.event
+            && d.kind() == rio_proto::types::DerivationEventKind::Cached
+        {
+            b2_saw_cached = true;
+        }
+    }
+    assert!(b2_saw_cached, "live build sees DerivationCached");
+
+    // Terminal build: served accounting frozen, no post-terminal
+    // Progress (per-derivation events may still flow).
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(after.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(
+        after.cached_derivations, 0,
+        "terminal build's cached_derivations must not drift after the terminal transition"
+    );
+    assert_eq!(after.total_derivations, frozen.total_derivations);
+    while let Ok(ev) = rx1.try_recv() {
+        assert!(
+            !matches!(ev.event, Some(Event::Progress(_))),
+            "terminal build received a post-BuildFailed BuildProgress: {:?}",
+            ev.event
+        );
+    }
+    Ok(())
+}

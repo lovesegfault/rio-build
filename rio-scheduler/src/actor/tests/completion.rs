@@ -4635,3 +4635,165 @@ async fn cascade_finalizes_reset_ancestor_exec_log() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A build that already reached a terminal state must not receive further
+/// `BuildProgress` events from shared-node completion fan-outs: a
+/// keep_going build fails, stays resident with its interest retained, the
+/// failed node is resubmitted by another build (carrying that interest),
+/// and when the node then completes only the live build gets Progress —
+/// the terminal build's event stream stays settled after its BuildFailed
+/// and QueryBuildStatus keeps serving the frozen counts.
+#[tokio::test]
+async fn test_terminal_build_skipped_by_completion_progress_fanout() -> TestResult {
+    use rio_proto::types::build_event::Event;
+    let (_db, handle, _task, mut wrx) = setup_with_worker("tsf-w", "x86_64-linux").await?;
+    let x_path = test_drv_path("tsf-x");
+    let x_out = test_store_path("tsf-x-out");
+
+    // B1 (keep_going): single node fails permanently → build Failed,
+    // interest retained on the poisoned node.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tsf-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let mut rx1 = merge_dag(&handle, b1, vec![x], vec![], true).await?;
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tsf-w",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+    let frozen = query_status(&handle, b1).await?;
+    assert_eq!(frozen.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(frozen.total_derivations, 1);
+    // Drain B1's pre-terminal event history (it ends with BuildFailed).
+    let mut saw_failed = false;
+    while let Ok(ev) = rx1.try_recv() {
+        if matches!(ev.event, Some(Event::Failed(_))) {
+            saw_failed = true;
+        }
+    }
+    assert!(saw_failed, "B1 should have received its BuildFailed");
+
+    // B2 resubmits the same derivation (resubmit-reset carries B1's
+    // interest onto the fresh node) and it now succeeds. Fresh worker
+    // for the re-dispatch (the harness pattern for chained dispatches).
+    disconnect(&handle, "tsf-w").await?;
+    let b2 = Uuid::new_v4();
+    let mut x2 = make_node("tsf-x");
+    x2.expected_output_paths = vec![x_out.clone()];
+    let mut rx2 = merge_dag(&handle, b2, vec![x2], vec![], false).await?;
+    barrier(&handle).await;
+    let mut wrx2 = connect_executor(&handle, "tsf-w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut wrx2).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_success(&handle, "tsf-w2", &x_path, &x_out).await?;
+    barrier(&handle).await;
+
+    // Live build: Progress flowed and it succeeded.
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+    let mut b2_saw_progress = false;
+    while let Ok(ev) = rx2.try_recv() {
+        if matches!(ev.event, Some(Event::Progress(_))) {
+            b2_saw_progress = true;
+        }
+    }
+    assert!(b2_saw_progress, "live build still gets Progress");
+
+    // Terminal build: no Progress after BuildFailed (per-derivation
+    // events may still flow; aggregate progress must not).
+    while let Ok(ev) = rx1.try_recv() {
+        assert!(
+            !matches!(ev.event, Some(Event::Progress(_))),
+            "terminal build received a post-BuildFailed BuildProgress: {:?}",
+            ev.event
+        );
+    }
+    // And its served status is still the frozen snapshot.
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(after.state, rio_proto::types::BuildState::Failed as i32);
+    assert_eq!(after.total_derivations, frozen.total_derivations);
+    assert_eq!(after.completed_derivations, frozen.completed_derivations);
+    assert_eq!(after.failed_derivations, frozen.failed_derivations);
+    Ok(())
+}
+
+// r[verify sched.build.terminal-status-settled+2]
+/// A late failure of a shared node must not rewrite a resident terminal
+/// build's settled outcome: the terminal build keeps its first-failure
+/// summary and frozen counts when the node it still holds interest in is
+/// resubmitted by another build and fails again with a different error.
+/// (The sticky first-failure get_or_insert already protects the summary;
+/// the terminal early-return in handle_derivation_failure is the
+/// structural guard that keeps every other side effect away from a
+/// settled build.)
+#[tokio::test]
+async fn test_terminal_build_outcome_not_mutated_by_late_shared_failure() -> TestResult {
+    let (_db, handle, _task, mut wrx) = setup_with_worker("tlf-w", "x86_64-linux").await?;
+    let x_path = test_drv_path("tlf-x");
+    let x_out = test_store_path("tlf-x-out");
+
+    // B1 (keep_going): fails once → Failed with the first error frozen.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tlf-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    let _rx1 = merge_dag(&handle, b1, vec![x], vec![], true).await?;
+    let assn = recv_assignment(&mut wrx).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tlf-w",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "first error",
+    )
+    .await?;
+    barrier(&handle).await;
+    let frozen = query_status(&handle, b1).await?;
+    assert_eq!(frozen.state, rio_proto::types::BuildState::Failed as i32);
+    assert!(!frozen.error_summary.is_empty(), "first failure recorded");
+
+    // B2 resubmits the node; it fails again with a different error.
+    // Fresh worker for the re-dispatch (harness chained-dispatch pattern).
+    disconnect(&handle, "tlf-w").await?;
+    let b2 = Uuid::new_v4();
+    let mut x2 = make_node("tlf-x");
+    x2.expected_output_paths = vec![x_out.clone()];
+    let _rx2 = merge_dag(&handle, b2, vec![x2], vec![], false).await?;
+    barrier(&handle).await;
+    let mut wrx2 = connect_executor(&handle, "tlf-w2", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut wrx2).await;
+    assert_eq!(assn.drv_path, x_path);
+    complete_failure(
+        &handle,
+        "tlf-w2",
+        &x_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "second error",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // The other build fails normally; the terminal build's settled
+    // outcome (state, summary, counts) is byte-for-byte unchanged.
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the resubmitting build fails on its own"
+    );
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(after.state, frozen.state);
+    assert_eq!(after.error_summary, frozen.error_summary);
+    assert_eq!(after.total_derivations, frozen.total_derivations);
+    assert_eq!(after.completed_derivations, frozen.completed_derivations);
+    assert_eq!(after.failed_derivations, frozen.failed_derivations);
+    Ok(())
+}

@@ -139,7 +139,7 @@ pub struct BuildInfo {
     /// (`complete_build`). Empty until then. The `WatchBuild` terminal
     /// re-send replays this settled value instead of re-walking the DAG,
     /// which may have been mutated (e.g. by a displacement) since the
-    /// build finished. r[impl sched.build.terminal-status-settled]
+    /// build finished. r[impl sched.build.terminal-status-settled+2]
     pub output_paths: Vec<String>,
     /// When the build was submitted (for rio_scheduler_build_duration_seconds).
     pub submitted_at: Instant,

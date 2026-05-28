@@ -1548,14 +1548,19 @@ Queue-level preemption is fully supported:
     or API call).
 ]
 
-#r("sched.build.terminal-status-settled")[
+#r("sched.build.terminal-status-settled+2")[
   Once a build reaches a terminal state, the progress and result data
   served for it MUST be the values settled at its terminal transition:
   `QueryBuildStatus` MUST serve the counts frozen at that transition
   rather than recomputing them from live DAG state, a re-sent terminal
   `BuildCompleted` event MUST carry the output paths captured when the
   build completed, and a cancellation MUST refresh the build's counts
-  from the DAG once before the terminal transition freezes them.
+  from the DAG once before the terminal transition freezes them. After
+  the terminal transition no further `BuildProgress` event may be
+  emitted for the build, and its served progress accounting (including
+  `cached_derivations` and the sticky failure summary) MUST NOT be
+  mutated --- shared-node fan-outs MUST skip interested builds that are
+  already terminal.
 ]
 Terminal builds stay resident — and queryable, and re-subscribable via
 `WatchBuild` — for the terminal-cleanup window while the global DAG keeps
@@ -1566,7 +1571,17 @@ recompute would read, so a finished build's served progress could shrink
 (or its re-sent completion event lose output paths) after the fact.
 Serving the settled values keeps a terminal build's externally visible
 history immutable, matching the persisted-count freeze at the terminal
-transition.
+transition. The frozen consumers are the `QueryBuildStatus` terminal arm,
+the `WatchBuild` terminal re-send, the count-persist path, the
+`BuildProgress` emitters (the debounced per-build emitter and the
+precomputed-summary fan-outs in completion and dispatch), the dispatch
+and CA-cutoff `cached_derivations` writers, and the per-derivation
+failure handler — a `BuildProgress` sequenced after `BuildCompleted`
+would otherwise be persisted to the event log and replayed to
+re-subscribers with totals shrunk by whatever mutated the DAG since.
+Per-derivation events (`DerivationCached`, `DerivationFailed`) still
+flow to a resident terminal build's channel; they are facts about the
+derivation, not aggregate progress of the finished build.
 
 = Leader Transition Protocol
 

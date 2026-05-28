@@ -9948,7 +9948,7 @@ async fn test_displacement_decrements_running_build_total_for_unreceived_result(
     Ok(())
 }
 
-// r[verify sched.build.terminal-status-settled]
+// r[verify sched.build.terminal-status-settled+2]
 /// A build that already finished keeps serving its settled progress after
 /// one of its nodes is displaced: QueryBuildStatus short-circuits on the
 /// terminal state and serves the frozen counts instead of recomputing
