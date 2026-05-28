@@ -1226,42 +1226,24 @@ async fn test_transient_retry_different_worker() -> TestResult {
 /// max_retries` branch, distinct from POISON_THRESHOLD 3-distinct-
 /// workers).
 ///
-/// Uses `debug_force_assign` between failures to bypass backoff_until
-/// and failed_builders exclusion (which correctly prevent immediate
-/// same-worker retry). The test drives the state machine directly to
-/// test the completion handler's max_retries logic, not dispatch.
+/// Pull-mode delivery: each attempt is a fresh pull (mint) followed by
+/// a failure report through the report intake — no binding, so every
+/// attempt charges the same intent identity and only the max_retries
+/// branch (not the distinct-source threshold) is in play.
 #[tokio::test]
 async fn test_transient_failure_max_retries_poisons() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("flaky-worker", "x86_64-linux").await?;
-    // Pad workers (statically-eligible — same system) so the
-    // fleet-exhaustion clamp (`r[sched.dispatch.fleet-exhaust]`)
-    // doesn't fire before max_retries; we're testing the max_retries
-    // branch specifically.
-    let _rx2 = connect_executor(&handle, "mr-pad2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "mr-pad3", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
-    let p_maxretry = test_drv_path("maxretry-hash");
     let _event_rx =
         merge_single_node(&handle, build_id, "maxretry-hash", PriorityClass::Scheduled).await?;
 
     // Default RetryPolicy::max_retries = 2. Fail 3 times:
     // retry_count 0 -> 1 (retry), 1 -> 2 (retry), 2 >= 2 -> Poisoned.
-    //
-    // debug_force_assign before each failure (except the first —
-    // initial dispatch happened) bypasses backoff so the completion
-    // handler sees Assigned state and processes the failure.
     for attempt in 0..3 {
-        // Force-assign (including attempt=0): with 3 statically-
-        // eligible workers, natural dispatch may pick a padding worker.
-        let ok = handle
-            .debug_force_assign("maxretry-hash", "flaky-worker")
-            .await?;
-        assert!(ok, "force-assign should succeed (attempt {attempt})");
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "flaky-worker",
-            &p_maxretry,
+            "maxretry-hash",
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("attempt {attempt} failed"),
         )
@@ -1312,10 +1294,7 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         // max_mem; the test asserts each rung promoted, not capped.
         c.sla = crate::actor::tests::test_sla_config();
     });
-    let mut rxs = Vec::new();
-    for n in names {
-        rxs.push(connect_builder(&handle, &format!("b-{n}"), "x86_64-linux").await?);
-    }
+    let _ = names; // class names retained for the ladder narrative below
 
     let _ev = merge_single_node(
         &handle,
@@ -1324,7 +1303,6 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         PriorityClass::Scheduled,
     )
     .await?;
-    let p = test_drv_path("ladder-drv");
 
     // Seed est_memory_bytes (the doubling base).
     handle
@@ -1332,18 +1310,22 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
         .await?;
 
     // Walk via worker-reported CgroupOom (InfrastructureFailure with
-    // the CgroupOom error string): each doubles mem floor;
-    // retry_count (transient budget) and infra_count stay 0
-    // (promoted=true → exempt_from_cap).
+    // the CgroupOom error string), each attempt a fresh pull + report:
+    // each doubles mem floor; retry_count (transient budget) and
+    // infra_count stay 0 (promoted=true → exempt_from_cap). The
+    // doubling base is re-seeded to the promoted floor before each
+    // rung (the dispatch-time D2 refresh that did this on the stream
+    // path is placement-side; the report intake does not re-solve).
     let mut prev_mem = 0u64;
     for c in &names[..4] {
-        handle
-            .debug_force_assign("ladder-drv", &format!("b-{c}"))
-            .await?;
-        complete_failure(
+        if prev_mem > 0 {
+            handle
+                .debug_seed_sched_hint("ladder-drv", Some(prev_mem), None, None, None)
+                .await?;
+        }
+        pull_complete_failure(
             &handle,
-            &format!("b-{c}"),
-            &p,
+            "ladder-drv",
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &format!("{}; bumping resource floor", rio_proto::CGROUP_OOM_MSG),
         )
@@ -1374,11 +1356,9 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
 
     // Sanity: a non-OOM InfrastructureFailure does NOT bump
     // (the over-broad I-199 promote is gone).
-    handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "b-xlarge",
-        &p,
+        "ladder-drv",
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "FUSE EIO: store unreachable",
     )
@@ -1393,11 +1373,9 @@ async fn test_transient_failure_promotion_exempt_from_max_retries() -> TestResul
     // exited nonzero — build-determinism signal). After 3 (max_
     // retries=2): poison. TransientFailure NEVER promotes.
     for attempt in 0..3 {
-        handle.debug_force_assign("ladder-drv", "b-xlarge").await?;
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "b-xlarge",
-            &p,
+            "ladder-drv",
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("xlarge attempt {attempt}"),
         )
@@ -1457,15 +1435,14 @@ async fn test_distinct_transient_poison_matrix(
     });
     let _db = db;
 
-    let mut _rxs = Vec::new();
-    for i in 1..=n_builders {
-        _rxs.push(connect_executor(&handle, &format!("pt-w{i}"), "x86_64-linux").await?);
-    }
-
     let build_id = Uuid::new_v4();
     let _ev = merge_single_node(&handle, build_id, "pt-drv", PriorityClass::Scheduled).await?;
 
-    fail_on_workers(
+    // Pull-mode delivery: each entry is one bound-node attempt (bind →
+    // pull → failure report), so each failure charges a distinct
+    // source-node exclusion key — the pull equivalent of N distinct
+    // stream workers.
+    pull_fail_on_nodes(
         &handle,
         "pt-drv",
         rio_proto::types::BuildResultStatus::TransientFailure,
@@ -1502,21 +1479,15 @@ async fn test_distinct_transient_poison_matrix(
 async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResult {
     let (_db, handle, _task) = setup().await;
 
-    // 4 workers so re-dispatch always has a candidate.
-    let mut _rxs = Vec::with_capacity(4);
-    for i in 1..=4 {
-        _rxs.push(connect_executor(&handle, &format!("infra-w{i}"), "x86_64-linux").await?);
-    }
-
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-drv";
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
-    // 3× InfrastructureFailure from distinct workers. TransientFailure
-    // would poison; here it must not (reset_to_ready WITHOUT
-    // failed_builders insert / backoff).
-    fail_on_workers(
+    // 3× InfrastructureFailure from distinct sources (bound node per
+    // attempt). TransientFailure would poison; here it must not
+    // (reset_to_ready WITHOUT failed_builders insert / backoff).
+    pull_fail_on_nodes(
         &handle,
         drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
@@ -1552,7 +1523,7 @@ async fn test_infrastructure_failure_does_not_count_toward_poison() -> TestResul
 
     // 4th attempt: now send TransientFailure. This DOES count — proving
     // the derivation is still live and the counting path still works.
-    fail_on_workers(
+    pull_fail_on_nodes(
         &handle,
         drv_hash,
         rio_proto::types::BuildResultStatus::TransientFailure,
@@ -1601,26 +1572,19 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     });
 
     // D4: bump_floor_or_count reads est_deadline_secs as the doubling
-    // base; class is irrelevant.
-    let _t = connect_builder(&handle, "to-tiny", "x86_64-linux").await?;
-    let _s = connect_builder(&handle, "to-small", "x86_64-linux").await?;
-    let _m = connect_builder(&handle, "to-medium", "x86_64-linux").await?;
-
+    // base; class is irrelevant. Each rung is one pull attempt + a
+    // TimedOut report through the report intake.
     let build_id = Uuid::new_v4();
     let drv_hash = "i200-timeout";
-    let drv_path = test_drv_path(drv_hash);
     let _ev = merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
     handle
         .debug_seed_sched_hint(drv_hash, None, None, Some(300), None)
         .await?;
 
     // ── Retry 1: TimedOut → floor.deadline=600, status=Ready ──────
-    let ok = handle.debug_force_assign(drv_hash, "to-tiny").await?;
-    assert!(ok, "force-assign tiny should succeed");
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "to-tiny",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
@@ -1658,18 +1622,15 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     );
 
     // ── Retry 2: TimedOut on small → floor doubled again, Ready ────
-    // D2: dispatch_ready (triggered by completion above) overwrote
-    // est_deadline_secs from solve_intent_for. Re-seed to keep the
-    // doubling base under test control.
+    // Re-seed to keep the doubling base under test control (mirrors
+    // the original re-seed; on the pull path no dispatch-time re-solve
+    // overwrites it, so the explicit seed is the single source).
     handle
         .debug_seed_sched_hint(drv_hash, None, None, Some(600), None)
         .await?;
-    let ok = handle.debug_force_assign(drv_hash, "to-small").await?;
-    assert!(ok, "force-assign small should succeed");
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "to-small",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
@@ -1692,12 +1653,9 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
     handle
         .debug_seed_sched_hint(drv_hash, None, None, Some(1200), None)
         .await?;
-    let ok = handle.debug_force_assign(drv_hash, "to-medium").await?;
-    assert!(ok, "force-assign medium should succeed");
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "to-medium",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::TimedOut,
         "build exceeded daemon_timeout_secs",
     )
@@ -1723,17 +1681,14 @@ async fn test_timeout_promotes_floor_then_cancels_at_cap() -> TestResult {
 /// before manual intervention — each cycle re-ran the full build.
 ///
 /// InfrastructureFailure has no backoff and doesn't touch
-/// `failed_builders`, so the same worker is immediately re-eligible;
-/// `debug_force_assign` here just makes the executor_id deterministic
-/// (the stale-report guard drops completions whose executor_id
-/// doesn't match `assigned_executor`).
+/// `failed_builders`; each attempt here is a fresh pull on the intent
+/// identity followed by an infra-failure report.
 #[tokio::test]
 async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("infra-cap-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "infra-cap-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
@@ -1746,12 +1701,9 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     // going in) the drv is still Ready post-handling. At attempt 10
     // (11th) it poisons. Assert both sides of the boundary.
     for attempt in 0..10 {
-        let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
-        assert!(ok, "force-assign should succeed at attempt {attempt}");
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "infra-cap-w",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &format!("infra attempt {attempt}"),
         )
@@ -1774,12 +1726,9 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
     assert_eq!(before.retry.infra_count, 10);
 
     // 11th failure: infra_retry_count=10 >= max_infra_retries=10 → poison.
-    let ok = handle.debug_force_assign(drv_hash, "infra-cap-w").await?;
-    assert!(ok);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "infra-cap-w",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "infra attempt 10 (cap hit)",
     )
@@ -1811,23 +1760,19 @@ async fn test_infrastructure_failure_max_infra_retries_poisons() -> TestResult {
 /// `infra_retry_count` does NOT increment, no matter how many times.
 #[tokio::test]
 async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("putpath-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "putpath-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
     // Drive WELL past the cap (default 10) — 15 concurrent-PutPath
     // failures. None should count; the drv stays Ready throughout.
-    for attempt in 0..15 {
-        let ok = handle.debug_force_assign(drv_hash, "putpath-w").await?;
-        assert!(ok, "force-assign should succeed at attempt {attempt}");
-        complete_failure(
+    for _attempt in 0..15 {
+        pull_complete_failure(
             &handle,
-            "putpath-w",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             "upload failed: concurrent PutPath in progress for this path; retry",
         )
@@ -1853,12 +1798,9 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
 
     // A NON-exempt infra failure after that DOES count — proves the
     // exemption is keyed on error_msg, not a blanket disable.
-    let ok = handle.debug_force_assign(drv_hash, "putpath-w").await?;
-    assert!(ok);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "putpath-w",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         "FUSE EIO",
     )
@@ -1880,11 +1822,10 @@ async fn test_infrastructure_failure_concurrent_putpath_exempt() -> TestResult {
 /// shape (output-index prefix + suffix) and asserts the exemption.
 #[tokio::test]
 async fn i127_batch_concurrent_putpath_exempt() -> TestResult {
-    let (_db, handle, _task, _rx) = setup_with_worker("batch-w", "x86_64-linux").await?;
+    let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
     let drv_hash = "batch-putpath-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _event_rx =
         merge_single_node(&handle, build_id, drv_hash, PriorityClass::Scheduled).await?;
 
@@ -1892,13 +1833,10 @@ async fn i127_batch_concurrent_putpath_exempt() -> TestResult {
         "output upload failed: output 1: {}; retry",
         rio_proto::CONCURRENT_PUTPATH_MSG
     );
-    for attempt in 0..15 {
-        let ok = handle.debug_force_assign(drv_hash, "batch-w").await?;
-        assert!(ok, "force-assign should succeed at attempt {attempt}");
-        complete_failure(
+    for _attempt in 0..15 {
+        pull_complete_failure(
             &handle,
-            "batch-w",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &batch_msg,
         )
@@ -1940,21 +1878,16 @@ async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
         c.retry_policy.max_exempt_infra_retries = 5;
     });
     let _db = db;
-    let _rx = connect_executor(&handle, "leak-w", "x86_64-linux").await?;
 
     let drv_hash = "leak-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
     let leaked_msg = format!("upload failed: {}", rio_proto::CONCURRENT_PUTPATH_MSG);
     for attempt in 0..4 {
-        let ok = handle.debug_force_assign(drv_hash, "leak-w").await?;
-        assert!(ok, "force-assign at attempt {attempt}");
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "leak-w",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::InfrastructureFailure,
             &leaked_msg,
         )
@@ -1974,12 +1907,9 @@ async fn exempt_infra_cap_terminates_leaked_lock() -> TestResult {
     }
 
     // 5th attempt: exempt_infra_count 5 >= max=5 → poison.
-    let ok = handle.debug_force_assign(drv_hash, "leak-w").await?;
-    assert!(ok);
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "leak-w",
-        &drv_path,
+        drv_hash,
         rio_proto::types::BuildResultStatus::InfrastructureFailure,
         &leaked_msg,
     )
@@ -2030,25 +1960,17 @@ async fn test_same_worker_poison_threshold_distinct_mode(
     });
     let _db = db;
 
-    let _rx = connect_executor(&handle, "solo-worker", "x86_64-linux").await?;
-    let _rx2 = connect_executor(&handle, "pad-w2", "x86_64-linux").await?;
-    let _rx3 = connect_executor(&handle, "pad-w3", "x86_64-linux").await?;
-
     let drv_hash = "distinct-mode-drv";
-    let drv_path = test_drv_path(drv_hash);
     let _ev =
         merge_single_node(&handle, Uuid::new_v4(), drv_hash, PriorityClass::Scheduled).await?;
 
+    // Three pull attempts on the same intent identity with NO node
+    // binding: every failure charges the same exclusion key — the
+    // pull-mode shape of "the same worker keeps failing".
     for i in 0..3 {
-        // Always force-assign (including i=0): with 3 statically-
-        // eligible workers, natural dispatch from merge may pick a
-        // padding worker. debug_force_assign resets Assigned→Ready
-        // then re-assigns to solo-worker.
-        assert!(handle.debug_force_assign(drv_hash, "solo-worker").await?);
-        complete_failure(
+        pull_complete_failure(
             &handle,
-            "solo-worker",
-            &drv_path,
+            drv_hash,
             rio_proto::types::BuildResultStatus::TransientFailure,
             &format!("same-worker failure {i}"),
         )
@@ -2059,7 +1981,7 @@ async fn test_same_worker_poison_threshold_distinct_mode(
     assert_eq!(
         info.retry.failed_builders.len(),
         1,
-        "HashSet: same worker inserted once, stays len()=1"
+        "HashSet: same source inserted once, stays len()=1"
     );
     assert_eq!(info.retry.failure_count, 3, "flat count always increments");
     assert_eq!(

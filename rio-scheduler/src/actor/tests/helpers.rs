@@ -1318,6 +1318,369 @@ pub(crate) async fn wait_for_status(
 // (P0330) — was 3× copied with method-name drift before that.
 pub(crate) use rio_test_support::metrics::CountingRecorder;
 
+// ─────────────────────────────────────────────────────────────────────────
+// Pull-mode delivery helpers.
+//
+// The stream-session helpers above (`connect_executor` / `setup_with_worker`
+// → `recv_assignment` → `complete_*`) deliver work through the
+// `ExecutorConnected`/`Heartbeat`/`ProcessCompletion` intake. The helpers
+// below are their pull-protocol equivalents: an attempt is opened through
+// the same `admit_pull` + fenced-mint transaction production uses
+// (`ActorCommand::PullAssignment`), outcomes land through the report intake
+// (`ReportPullOutcome` → the same `handle_completion` entry point), and
+// pod-terminal/fault injection goes through `ReportAttemptOutcome` or the
+// establishment sweep — never by writing rows directly.
+//
+// Identity convention (mirrors actor/pull.rs): a pull attempt's executor
+// identity IS the attested intent id (the drv hash). Exclusion/budget keys
+// for pull attempts come from the controller-authoritative node binding
+// ([`bind_intent_node`]) when present, falling back to the intent identity.
+// ─────────────────────────────────────────────────────────────────────────
+
+pub(crate) use crate::actor::pull::{PullOutcome, PullRejection, PullReportPayload};
+
+/// Send one `PullAssignment` for `drv_hash` and return the raw outcome.
+/// The auth token is bound to the same intent (the production pod-token
+/// shape); use this directly when the test asserts `Gone` / `NotYetReady`
+/// / a rejection rather than a delivery.
+pub(crate) async fn try_pull_attempt(
+    handle: &ActorHandle,
+    drv_hash: &str,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: drv_hash.into(),
+            auth_intent: Some(drv_hash.into()),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// Mint (or idempotently re-deliver) the open pull attempt for `drv_hash`
+/// and return its `WorkAssignment`. The pull-mode replacement for
+/// `recv_assignment`: when this returns, an open attempt exists for the
+/// drv on its intent identity, the durable mint has committed, and the
+/// node is Running. Panics when the pull does not deliver (drv not Ready /
+/// not wanted / open on another executor) — that is a test-sequencing bug,
+/// the same way a missing `recv_assignment` message was.
+pub(crate) async fn pull_attempt(
+    handle: &ActorHandle,
+    drv_hash: &str,
+) -> rio_proto::types::WorkAssignment {
+    match try_pull_attempt(handle, drv_hash).await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("pull_attempt({drv_hash:?}): expected Deliver, got {other:?}"),
+    }
+}
+
+/// The exec_id of the open pull attempt for `drv_hash`, minting one if
+/// none is open yet.
+pub(crate) async fn open_pull_exec(handle: &ActorHandle, drv_hash: &str) -> Uuid {
+    pull_attempt(handle, drv_hash)
+        .await
+        .exec_id
+        .parse()
+        .expect("pull-delivered exec_id is a uuid")
+}
+
+/// Wrap a `BuildResult` in the zeroed-readings report payload shape the
+/// stream-era `complete_*` helpers used (no resource readings, no node /
+/// hw-class attribution, no line count).
+pub(crate) fn pull_payload(result: rio_proto::types::BuildResult) -> PullReportPayload {
+    PullReportPayload {
+        result,
+        peak_memory_bytes: 0,
+        peak_cpu_cores: 0.0,
+        node_name: None,
+        hw_class: None,
+        final_resources: None,
+        final_line_count: 0,
+    }
+}
+
+/// Send one `ReportPullOutcome` for an explicit exec_id (token bound to
+/// `intent`). Use when the test must re-report a specific attempt (e.g.
+/// duplicate-report idempotency after the drv went terminal — a fresh pull
+/// could not return that exec any more).
+pub(crate) async fn pull_report_exec(
+    handle: &ActorHandle,
+    exec_id: Uuid,
+    intent: &str,
+    payload: PullReportPayload,
+) -> anyhow::Result<()> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some(intent.into()),
+            payload,
+            reply,
+        })
+        .await?
+        .map_err(|e| anyhow::anyhow!("ReportPullOutcome rejected: {e:?}"))?;
+    Ok(())
+}
+
+/// Report an outcome for the open pull attempt of `drv_hash`: pull (mint
+/// or re-deliver) to resolve the exec_id, then drive the report intake.
+/// When this returns the report has been fully folded (the reply is sent
+/// after `handle_completion` returns), so no extra barrier is needed.
+pub(crate) async fn pull_report(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    payload: PullReportPayload,
+) -> anyhow::Result<()> {
+    let exec_id = open_pull_exec(handle, drv_hash).await;
+    pull_report_exec(handle, exec_id, drv_hash, payload).await
+}
+
+/// Pull-mode `complete_success`: open attempt + Built report with a single
+/// `out` output (placeholder hash).
+pub(crate) async fn pull_complete_success(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    output_path: &str,
+) -> anyhow::Result<()> {
+    pull_report(
+        handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            built_outputs: vec![rio_proto::types::BuiltOutput {
+                output_name: "out".into(),
+                output_path: output_path.into(),
+                output_hash: vec![0u8; 32],
+            }],
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// Pull-mode `complete_success_empty`: Built report with no outputs.
+pub(crate) async fn pull_complete_success_empty(
+    handle: &ActorHandle,
+    drv_hash: &str,
+) -> anyhow::Result<()> {
+    pull_report(
+        handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// Pull-mode `complete_ca`: Built report with caller-controlled per-output
+/// hash bytes. Each entry is `(output_name, output_path, output_hash)`.
+pub(crate) async fn pull_complete_ca(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    outputs: &[(&str, &str, Vec<u8>)],
+) -> anyhow::Result<()> {
+    pull_report(
+        handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: rio_proto::types::BuildResultStatus::Built.into(),
+            built_outputs: outputs
+                .iter()
+                .map(|(name, path, hash)| rio_proto::types::BuiltOutput {
+                    output_name: (*name).into(),
+                    output_path: (*path).into(),
+                    output_hash: hash.clone(),
+                })
+                .collect(),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// Pull-mode `complete_failure`: open attempt + failure report with the
+/// given status and error message.
+pub(crate) async fn pull_complete_failure(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    status: rio_proto::types::BuildResultStatus,
+    error_msg: &str,
+) -> anyhow::Result<()> {
+    pull_report(
+        handle,
+        drv_hash,
+        pull_payload(rio_proto::types::BuildResult {
+            status: status.into(),
+            error_msg: error_msg.into(),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+/// Record the controller-authoritative pod→node binding for `intent`
+/// (`AckSpawnedIntents.bound_intents` — the same Model J surface the
+/// controller drives). Subsequent attempt rows for the intent carry
+/// `source_node = node`, so the exclusion fold keys them by node exactly
+/// as production pull attempts are keyed. Re-binding the same intent to a
+/// new node overwrites (the respawn-on-a-different-node shape).
+pub(crate) async fn bind_intent_node(
+    handle: &ActorHandle,
+    intent: &str,
+    node: &str,
+) -> anyhow::Result<()> {
+    handle
+        .send_unchecked(ActorCommand::AckSpawnedIntents {
+            spawned: vec![],
+            unfulfillable_cells: vec![],
+            registered_cells: vec![],
+            observed_instance_types: vec![],
+            bound_intents: vec![rio_proto::types::BoundIntent {
+                intent_id: intent.into(),
+                node_name: node.into(),
+            }],
+        })
+        .await?;
+    barrier(handle).await;
+    Ok(())
+}
+
+/// Pull-mode `fail_on_workers`: for each node in sequence, bind the
+/// intent to that node, open a pull attempt, and report `status`. Each
+/// iteration therefore charges a distinct source-node exclusion key —
+/// the pull-path equivalent of failing on N distinct stream workers.
+pub(crate) async fn pull_fail_on_nodes(
+    handle: &ActorHandle,
+    drv_hash: &str,
+    status: rio_proto::types::BuildResultStatus,
+    nodes: &[&str],
+) -> anyhow::Result<()> {
+    for (i, node) in nodes.iter().enumerate() {
+        bind_intent_node(handle, drv_hash, node).await?;
+        pull_complete_failure(handle, drv_hash, status, &format!("failure {i}")).await?;
+    }
+    Ok(())
+}
+
+/// Send one `ReportAttemptOutcome` (the unified pod-terminal intake):
+/// controller-synthesized verdicts (Cancelled/Preempted/Reaped), the
+/// second-installment reason fill, or the spawn-gate NoEligibleSource.
+/// The pull-mode fault-injection entry point for "the pod died".
+pub(crate) async fn report_attempt_terminal(
+    handle: &ActorHandle,
+    intent_id: Option<&str>,
+    exec_id: Option<Uuid>,
+    reason: rio_proto::types::AttemptTerminalReason,
+    node: Option<&str>,
+) -> Result<(), PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportAttemptOutcome {
+            identity: crate::actor::pull::AttemptIdentity {
+                intent_id: intent_id.map(Into::into),
+                job_name: None,
+                exec_id,
+            },
+            reason,
+            node_name: node.map(Into::into),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// Backdate the assignment row of one pull attempt past any establishment
+/// window (deadline + slack), so the next `Tick` runs the establishment
+/// sweep over it. The pull-mode injection point for "the executor crashed
+/// without ever reporting".
+pub(crate) async fn backdate_pull_attempt(
+    pool: &sqlx::PgPool,
+    exec_id: Uuid,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Bundle of handles for pull-mode CA-compare test scenarios. The
+/// pull-protocol sibling of [`CaFixture`]: no stream receiver and no
+/// worker identity — the attempt is opened by [`pull_complete_ca`] /
+/// [`pull_attempt`] on the intent identity itself.
+pub(crate) struct PullCaFixture {
+    /// MockStore handle — arm fault flags or seed paths BEFORE driving
+    /// the report intake to the CA-compare callsite.
+    pub store: rio_test_support::grpc::MockStore,
+    /// Actor handle.
+    pub actor: ActorHandle,
+    /// The single CA derivation's hash (the fixture key / intent id).
+    pub drv_hash: String,
+    /// The single CA derivation's path (`test_drv_path(key)`).
+    pub drv_path: String,
+    /// Build id for the merged single-node DAG.
+    pub build_id: Uuid,
+    /// The CA node's modular hash (see [`CaFixture::modular_hash`]).
+    pub modular_hash: [u8; 32],
+    /// PG pool — seed realisations directly.
+    pub pool: sqlx::PgPool,
+    /// PG test database — keep alive for the actor's pool.
+    pub _db: TestDb,
+    /// MockStore tokio task guard.
+    pub _store_task: tokio::task::JoinHandle<()>,
+    /// Actor tokio task guard.
+    pub _actor_task: tokio::task::JoinHandle<()>,
+}
+
+/// Pull-mode CA-compare setup: spawn MockStore, actor with store client,
+/// merge a single `is_content_addressed=true` node, return the bundle.
+/// No worker is registered and nothing is dispatched — the node is Ready
+/// when this returns, and the CA-compare only fires when the test drives
+/// the report intake ([`pull_complete_ca`]), so realisations/faults can be
+/// seeded after setup exactly as with [`setup_ca_fixture`].
+pub(crate) async fn setup_pull_ca_fixture(key: &str) -> anyhow::Result<PullCaFixture> {
+    setup_pull_ca_fixture_configured(key, |_, _| {}).await
+}
+
+/// Like [`setup_pull_ca_fixture`] but lets the caller mutate
+/// `DagActorConfig`/`DagActorPlumbing` before spawn.
+pub(crate) async fn setup_pull_ca_fixture_configured(
+    key: &str,
+    configure: impl FnOnce(&mut DagActorConfig, &mut DagActorPlumbing),
+) -> anyhow::Result<PullCaFixture> {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (actor, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), configure);
+
+    let modular_hash: [u8; 32] = {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(format!("ca-fixture:{key}").as_bytes()).into()
+    };
+    let mut node = make_node(key);
+    node.is_content_addressed = true;
+    node.ca_modular_hash = modular_hash.to_vec();
+    let drv_path = node.drv_path.clone();
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&actor, build_id, vec![node], vec![], false).await?;
+
+    Ok(PullCaFixture {
+        store,
+        actor,
+        drv_hash: key.to_string(),
+        drv_path,
+        build_id,
+        modular_hash,
+        pool: db.pool.clone(),
+        _db: db,
+        _store_task: store_task,
+        _actor_task: actor_task,
+    })
+}
+
 #[tokio::test]
 async fn test_actor_starts_and_stops() -> TestResult {
     let db = TestDb::new(&MIGRATOR).await;
