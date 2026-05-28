@@ -1212,7 +1212,8 @@ impl DagActor {
         // happens once a node's children are all produced (the
         // post-reconciliation pass in `handle_merge_dag`, the
         // completion-time `clear_topdown_pruned_for_produced_parents`,
-        // or lazily here), so a live flag alongside children — typically
+        // the recovery-time gate in `load_dag_from_rows`, or lazily
+        // here), so a live flag alongside children — typically
         // unbuilt ones kept by design — is normal. If R has children the "deps
         // were dropped" invariant no longer holds for routing —
         // suppress the fail-fast and fall through to normal
@@ -1448,9 +1449,11 @@ impl DagActor {
     /// error summary ("topdown-pruned root <hash>: <cause>; resubmit
     /// to re-probe or full-merge").
     ///
-    /// Callers (both gate on `topdown_pruned` AND no DAG children —
-    /// unbuilt children suppress the fail-fast but no longer shed the
-    /// mark; only children that are all produced clear it):
+    /// Callers (all gate on `topdown_pruned` plus a child set that no
+    /// longer vouches for the pruned closure — literally childless for
+    /// the dispatch-time probes, childless or closure-holed for the
+    /// rest; unbuilt children suppress the fail-fast but no longer shed
+    /// the mark; only children that are all produced clear it):
     ///  - `handle_substitute_complete` on a failed/downgraded detached
     ///    fetch (`SubstituteComplete{ok=false}` after the children
     ///    gate), the original home of this block;
@@ -1460,7 +1463,15 @@ impl DagActor {
     ///    post-failover shape, where the recovered (wider) wanted union
     ///    contains an output that is genuinely missing upstream. Pre-
     ///    fix that outcome left the node Ready and dispatched it from
-    ///    source — the doomed dispatch this arm exists to prevent.
+    ///    source — the doomed dispatch this arm exists to prevent;
+    ///  - the reap-time survivor re-evaluation in
+    ///    `handle_cleanup_terminal_build` (leader-gated), which
+    ///    additionally requires `substitute_tried` (the node's own walk
+    ///    already failed) and a non-`Substituting` status (a walk in
+    ///    flight keeps its chance) for a survivor the reap left
+    ///    childless or closure-holed — nothing children-keyed would
+    ///    ever re-evaluate it otherwise (`find_newly_ready` only fires
+    ///    on completions).
     pub(super) async fn fail_fast_topdown_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
         // A prior iteration of the same dispatch pass may already have
         // settled this node: `batch_probe_cached_ready` collects the

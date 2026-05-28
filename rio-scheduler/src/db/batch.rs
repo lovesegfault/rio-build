@@ -116,9 +116,11 @@ impl SchedulerDb {
         // an unrelated, non-pruned merge of the same drv elsewhere must
         // never clear a prior pruned merge's marker through the upsert.
         // Clearing happens elsewhere: `clear_topdown_pruned_by_hashes`
-        // from the post-reconciliation clear pass in `handle_merge_dag`
-        // (only for parents whose children are all already produced and
-        // verified), and `clear_topdown_pruned_by_hash` for the lazy
+        // from the post-reconciliation clear pass in `handle_merge_dag`,
+        // the completion-time `clear_topdown_pruned_for_produced_parents`,
+        // and the recovery-time gate in `load_dag_from_rows` (each keyed
+        // on the node's children being produced — see each caller's
+        // doc), and `clear_topdown_pruned_by_hash` for the lazy
         // walk-failure clear and when the topdown fail-fast consumes
         // the marker.
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
@@ -157,9 +159,10 @@ impl SchedulerDb {
             --
             -- topdown_pruned: OR — set by pruned merges; this upsert
             -- never clears it. Cleared by clear_topdown_pruned_by_hashes
-            -- (post-reconciliation pass, only once the children are all
-            -- produced and verified) and by clear_topdown_pruned_by_hash
-            -- (lazy walk-failure clear; fail-fast consumed it).
+            -- (post-reconciliation pass, completion-time clear,
+            -- recovery-time gate — once the node's children are
+            -- produced) and by clear_topdown_pruned_by_hash (lazy
+            -- walk-failure clear; fail-fast consumed it).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -300,8 +303,9 @@ impl SchedulerDb {
     /// `clear_topdown_pruned_for_produced_parents` in completion.rs
     /// (parents whose last child just became produced), and the
     /// recovery-time gate in `load_dag_from_rows` (restored marks whose
-    /// persisted children are all produced); each clears its batch in
-    /// one statement. Returns the number of rows actually cleared.
+    /// persisted children are all produced and vouched for by a
+    /// still-live build); each clears its batch in one statement.
+    /// Returns the number of rows actually cleared.
     /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
     /// warns and continues — the in-memory clear already happened and
     /// the merge outcome must not depend on this write.

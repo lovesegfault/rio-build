@@ -258,8 +258,8 @@ pub(crate) struct RecoveryDerivationRow {
     /// verbatim by `from_recovery_row` — resetting it to false is what
     /// allowed the post-failover doomed from-source dispatch.
     /// `load_dag_from_rows` then drops the restored mark when the row's
-    /// persisted children are all produced (see
-    /// `load_parents_with_all_children_produced`).
+    /// persisted children are all produced and vouched for by a
+    /// still-live build (see `load_parents_with_all_children_produced`).
     pub topdown_pruned: bool,
     pub failed_builders: Vec<String>,
     /// D4: persisted reactive resource floor (`M_044`). All `bigint`
@@ -382,8 +382,9 @@ pub(crate) struct DerivationRow {
     /// children are all produced (the post-reconciliation pass in
     /// `handle_merge_dag` via `clear_topdown_pruned_by_hashes`, the
     /// completion-time `clear_topdown_pruned_for_produced_parents`,
-    /// the lazy clear in `handle_substitute_complete`) and when the
-    /// topdown fail-fast consumes it.
+    /// the recovery-time gate in `load_dag_from_rows`, and the lazy
+    /// walk-failure clear in `handle_substitute_complete`) and when
+    /// the topdown fail-fast consumes it.
     pub topdown_pruned: bool,
 }
 

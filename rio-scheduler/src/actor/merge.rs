@@ -1804,10 +1804,11 @@ impl DagActor {
     /// Also gates the in-process clear sites (the post-reconciliation
     /// clear pass in `handle_merge_dag`, the completion-time clear in
     /// `clear_topdown_pruned_for_produced_parents`, and the lazy clear
-    /// in `handle_substitute_complete`); the recovery-time gate applies
-    /// the same children-all-produced criterion in SQL
-    /// (`load_parents_with_all_children_produced`) rather than through
-    /// this helper, so stamp and every clear still share one criterion.
+    /// in `handle_substitute_complete`); the recovery-time gate
+    /// evaluates a strictly stronger SQL variant of this criterion
+    /// (`load_parents_with_all_children_produced`: every persisted
+    /// child produced AND vouched for by a still-live build), so no
+    /// clear site is ever more permissive than the stamp.
     pub(super) fn children_all_produced(&self, drv_hash: &str) -> bool {
         let children = self.dag.get_children(drv_hash);
         !children.is_empty()

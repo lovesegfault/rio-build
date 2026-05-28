@@ -401,9 +401,9 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         "recovery SELECT must carry topdown_pruned"
     );
 
-    // 4. The same-tx helper clears the rows it is handed
-    //    (persist_merge_to_db only hands it parents whose children are
-    //    all produced, right after batch_insert_edges).
+    // 4. The same-tx helper clears the rows it is handed (test-only
+    //    today: its merge-time production caller was replaced by the
+    //    post-reconciliation clear pass — see the docstring above).
     let mut tx = db.pool().begin().await?;
     SchedulerDb::clear_topdown_pruned_for_parents(&mut tx, &[id]).await?;
     tx.commit().await?;
