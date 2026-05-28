@@ -1113,9 +1113,15 @@ pub const M_063: () = ();
 /// is set by `remove_build_interest_and_reap` on leaders and standbys
 /// alike; only the leader persists it, before the per-parent verdict
 /// loop, so a survivor that same loop fail-fasts converges back to
-/// false via the extended clear). A crash or lease loss between the
-/// reap and the stamp loses the persisted breadcrumb — same accepted
-/// best-effort posture as every `topdown_pruned` clear.
+/// false via the extended clear) and by the recovery-time stamp in
+/// `actor/recovery.rs::load_dag_from_rows` when the new leader drops an
+/// edge to an un-produced terminal child of a recovered parent — the
+/// recovery-side analogue of the same removal, which sets the in-memory
+/// breadcrumb and persists it in one place. A crash or lease loss
+/// between the reap and the stamp loses the persisted breadcrumb — same
+/// accepted best-effort posture as every `topdown_pruned` clear; the
+/// recovery-time stamp narrows that window by re-deriving the hole from
+/// the dropped child's still-present row at the next failover.
 /// The hook does not filter on `topdown_pruned`, so the column may
 /// also be set for surviving parents that are not (yet) marked; it is
 /// inert there because every consumer requires the mark (a hole on an

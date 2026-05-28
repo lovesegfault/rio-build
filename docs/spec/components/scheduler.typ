@@ -944,7 +944,9 @@ never vouched for can be definitively missing at dispatch time; without the
 restored flag the node would be left Ready and handed a doomed from-source
 dispatch whose `inputDrvs` were never merged. The closure-hole breadcrumb is
 persisted alongside the mark (migration 064, OR-on-conflict, written
-best-effort by the leader's terminal-build reap hook, restored at recovery,
+best-effort by the leader's terminal-build reap hook --- and by recovery
+itself when it drops an edge to an un-produced terminal child of a restored
+parent, the recovery-side analogue of that reap --- restored at recovery,
 and cleared with the mark or by the merge-time heal) so the recovery-time
 gate keeps refusing to treat a reap-truncated persisted child set as
 produced-closure evidence: the reaped un-produced child's own row and edge

@@ -387,14 +387,18 @@ impl SchedulerDb {
     }
 
     /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, on
-    /// the pool (outside any transaction). Sole caller: the leader-gated
+    /// the pool (outside any transaction). Two callers: the leader-gated
     /// survivor hook in `handle_cleanup_terminal_build`, for the parents
     /// the terminal-build reap just holed (`ReapOutcome::holed_parents`)
     /// — run BEFORE the per-parent verdict loop so a survivor that loop
     /// immediately fail-fasts converges back to false via
-    /// [`Self::clear_topdown_pruned_by_hash`]. The in-memory breadcrumb
-    /// is set by the reap itself on leaders and standbys alike; only the
-    /// leader persists it (`r[sched.lease.standby-drops-writes]`).
+    /// [`Self::clear_topdown_pruned_by_hash`] — and the recovery-time
+    /// stamp in `load_dag_from_rows`, for recovered parents whose
+    /// un-produced terminal children's edges the recovery load dropped
+    /// (the recovery-side analogue of the reap). The in-memory
+    /// breadcrumb is set by the reap itself on leaders and standbys
+    /// alike or by that recovery stamp on the just-acquired leader; only
+    /// a leader persists it (`r[sched.lease.standby-drops-writes]`).
     /// Returns the number of rows actually stamped. The caller warns and
     /// continues on error — losing the write costs durability of the
     /// breadcrumb across a failover (the already-accepted best-effort

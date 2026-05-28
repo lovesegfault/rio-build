@@ -931,7 +931,11 @@ pub struct DerivationState {
     /// leaders and standbys alike, and the leader's survivor hook then
     /// writes it to PG best-effort (a crash or lease loss between the
     /// reap and that write loses the persisted copy — the accepted
-    /// best-effort window). `from_recovery_row` restores it so the
+    /// best-effort window). Recovery additionally sets it (in memory,
+    /// best-effort in PG) in `load_dag_from_rows` when the edge load
+    /// drops an un-produced terminal child of a recovered parent — the
+    /// recovery-side analogue of the reap, covering the reap-then-
+    /// failover window above. `from_recovery_row` restores it so the
     /// recovery-time produced-children gate never clears a holed
     /// flagged parent on the strength of the surviving produced
     /// children (the un-produced child's own row and edge may have been

@@ -120,8 +120,10 @@ pub struct ReapOutcome {
 /// child was reaped), or carries the `closure_hole` breadcrumb — the
 /// terminal-build reap removed an un-produced child out from under it
 /// (see the breadcrumb loop in
-/// [`DerivationDag::remove_build_interest_and_reap`]), so whatever
-/// children survive are a reap-truncated view of its input closure.
+/// [`DerivationDag::remove_build_interest_and_reap`]) or leader-failover
+/// recovery dropped the edge to one (the recovery-time stamp in
+/// `load_dag_from_rows`), so whatever children survive are a truncated
+/// view of its input closure.
 /// The breadcrumb survives the node's own completion or skip (those
 /// transitions do not repair the truncation); it is dropped only by the
 /// merge-time heal when a full merge re-declares the node's edges (the
@@ -867,7 +869,9 @@ impl DerivationDag {
     /// guards) judges the child set through this one classifier so no
     /// site can drift into trusting a reap-truncated child set. The
     /// hole input is set by [`Self::remove_build_interest_and_reap`]
-    /// and healed by the merge-time edge re-declaration.
+    /// and by the recovery-time stamp in `load_dag_from_rows` (an edge
+    /// to an un-produced terminal child dropped at load), and healed by
+    /// the merge-time edge re-declaration.
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
         let Some(node) = self.nodes.get(drv_hash) else {
             return ClosureEvidence::Broken;

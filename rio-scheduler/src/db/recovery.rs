@@ -177,11 +177,11 @@ impl SchedulerDb {
     /// parent does inherit the verdict, but it is the same
     /// `DependencyFailed` the live in-memory cascade would have handed
     /// it when the vouched child terminally failed), and an
-    /// under-cascaded parent recovers childless and is re-discovered at
-    /// dispatch time — the must-substitute guards keep a marked node
-    /// off the doomed from-source path, and an unmarked node's
-    /// from-source dispatch is exactly what its own live builds
-    /// submitted it for.
+    /// under-cascaded parent keeps only its surviving non-terminal
+    /// children (possibly none) and is re-discovered at dispatch time —
+    /// the must-substitute guards keep a marked node off the doomed
+    /// from-source path, and an unmarked node's from-source dispatch is
+    /// exactly what its own live builds submitted it for.
     pub(crate) async fn load_parents_with_failed_deps(
         &self,
         derivation_ids: &[Uuid],
@@ -294,7 +294,13 @@ impl SchedulerDb {
     /// set: it is a transient retry status, not terminal — such a child
     /// is loaded by [`Self::load_nonterminal_derivations`] and keeps its
     /// edge. `'completed'`/`'skipped'` children are produced — their
-    /// dropped edge is the satisfied case, not a truncation.
+    /// dropped edge is the satisfied case, not a truncation. Within-TTL
+    /// `'poisoned'` children are loaded for TTL tracking and keep their
+    /// edges, yet still match here — conservative only (the breadcrumb
+    /// just keeps the un-produced child's parent off the from-source
+    /// path it could not take anyway); poison rows already expired at
+    /// load were reset to `'created'` before this query runs, so their
+    /// parents escape the stamp — the documented poison-TTL residual.
     ///
     /// Deliberately NO live-build / co-ownership scoping, unlike
     /// [`Self::load_parents_with_failed_deps`]: that query CONDEMNS the

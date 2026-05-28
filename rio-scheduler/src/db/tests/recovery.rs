@@ -251,7 +251,11 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
 /// unlike the failed-dep cascade — no build-liveness/co-ownership
 /// evidence is required: the truncation is recorded regardless of which
 /// build demanded the dropped child (parent A here has no build links at
-/// all and is still returned).
+/// all and is still returned). A `'failed'` child does not qualify
+/// either (parent C): `failed` is a transient retry status, not
+/// terminal — recovery loads such a child and keeps its edge, so there
+/// is no truncation to record; the exclusion is deliberate and pinned
+/// here so it cannot be silently widened later.
 #[tokio::test]
 async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_and_unbuilt()
 -> anyhow::Result<()> {
@@ -268,6 +272,10 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
     let b = insert_test_derivation(&db, "uptc-clean-parent").await?;
     let b_completed = insert_test_derivation(&db, "uptc-clean-completed").await?;
     let b_queued = insert_test_derivation(&db, "uptc-clean-queued").await?;
+    // Parent C: its only terminal-looking child is 'failed' (transient
+    // retry, non-terminal, edge kept at recovery) — never returned.
+    let c = insert_test_derivation(&db, "uptc-retry-parent").await?;
+    let c_failed = insert_test_derivation(&db, "uptc-retry-failed-child").await?;
 
     sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE derivation_id = $1")
         .bind(a_cancelled)
@@ -281,9 +289,13 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
         .bind(vec![a_queued, b_queued])
         .execute(&test_db.pool)
         .await?;
+    sqlx::query("UPDATE derivations SET status = 'failed' WHERE derivation_id = $1")
+        .bind(c_failed)
+        .execute(&test_db.pool)
+        .await?;
     sqlx::query(
         "INSERT INTO derivation_edges (parent_id, child_id) \
-         VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10)",
+         VALUES ($1, $2), ($3, $4), ($5, $6), ($7, $8), ($9, $10), ($11, $12)",
     )
     .bind(a)
     .bind(a_cancelled)
@@ -295,11 +307,13 @@ async fn test_load_parents_with_unproduced_terminal_children_ignores_produced_an
     .bind(b_completed)
     .bind(b)
     .bind(b_queued)
+    .bind(c)
+    .bind(c_failed)
     .execute(&test_db.pool)
     .await?;
 
     let holed = db
-        .load_parents_with_unproduced_terminal_children(&[a, b])
+        .load_parents_with_unproduced_terminal_children(&[a, b, c])
         .await?;
     assert_eq!(
         holed,
