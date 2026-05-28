@@ -1269,7 +1269,6 @@ impl DerivationState {
     /// be defensive against PG corruption / manual edits. On error,
     /// returns `(drv_hash, err)` so the caller can log without
     /// having cloned drv_hash up front.
-    // r[impl sched.retry.recovery-projection+2]
     pub(crate) fn from_recovery_row(
         row: crate::db::RecoveryDerivationRow,
         status: DerivationStatus,
@@ -1390,7 +1389,6 @@ impl DerivationState {
     /// poisoned_at))` so we compute `poisoned_at = Instant::now() -
     /// Duration::from_secs_f64(elapsed)` — approximate but good enough
     /// for a 24h TTL.
-    // r[impl sched.retry.recovery-projection+2]
     pub(crate) fn from_poisoned_row(
         row: crate::db::PoisonedDerivationRow,
     ) -> Result<Self, (String, rio_nix::store_path::StorePathError)> {
@@ -1777,7 +1775,7 @@ impl DerivationState {
         nodes
     }
 
-    // r[impl sched.retry.recovery-projection+2]
+    // r[impl sched.retry.recovery-projection+3]
     // r[impl sched.retry.failover-budget]
     /// Rebuild the in-memory retry view from the attempt-ledger fold
     /// over [`Self::attempt_history`]. Recovery calls this
@@ -1801,8 +1799,7 @@ impl DerivationState {
         budget: &crate::retry_policy::Budget,
         now_epoch_secs: crate::retry_policy::AbsTime,
     ) {
-        let decision =
-            crate::retry_policy::decide(&self.attempt_history, budget, now_epoch_secs, None);
+        let decision = crate::retry_policy::decide(&self.attempt_history, budget, now_epoch_secs);
         let c = decision.counters;
         let now = Instant::now();
         // Epoch-seconds → Instant conversions. Past timestamps clamp at

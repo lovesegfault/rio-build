@@ -3858,9 +3858,11 @@ async fn test_leader_lost_invalidates_kept_recovery_completion() -> TestResult {
 //         actor/tests/executor.rs.
 // ---------------------------------------------------------------------------
 
+// r[verify sched.retry.recovery-projection+3]
 /// Companion guard for T-1b.12b: recovery over an under-budget history
 /// poisons nothing (the mass-poison regression guard) — the node stays
-/// dispatchable with its recovered counters intact.
+/// dispatchable with its recovered counters intact (the fold of the
+/// reloaded attempt suffix).
 #[tokio::test]
 async fn phase1b_recovery_under_budget_history_poisons_nothing() -> TestResult {
     let drv_hash = "cvg-under-drv";

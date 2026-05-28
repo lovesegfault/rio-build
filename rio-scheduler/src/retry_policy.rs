@@ -15,7 +15,7 @@
 //!
 //! - it re-exports the kernel vocabulary under the names the actor and
 //!   db layers have always used (`Budget`, `Verdict`, `PoisonReason`,
-//!   `Placement`, `Counters`, `PersistedRetryColumns`, …), pinning the
+//!   `Placement`, `Counters`, …), pinning the
 //!   executor-identity parameter to the fold's `String` vocabulary;
 //! - [`decide`] projects the scheduler's [`AttemptRecord`] ledger rows
 //!   (UUIDs, error messages, f64 epoch timestamps, [`ExecutorId`]s) onto
@@ -50,10 +50,6 @@ pub(crate) use rio_retry_kernel::{Placement, placeable};
 /// (`rio_retry_kernel::Counters` pinned to the scheduler's
 /// instantiation).
 pub(crate) type Counters = rio_retry_kernel::Counters<String>;
-
-/// The `derivations` mirror columns (the transitional P5 legacy seed),
-/// in the fold's `String` executor-identity vocabulary.
-pub(crate) type PersistedRetryColumns = rio_retry_kernel::PersistedRetryColumns<String>;
 
 // The reference fold and its event/fleet vocabulary are consumed by the
 // hand-computed-history battery in `mod tests` below (production call
@@ -105,25 +101,18 @@ pub(crate) struct Decision {
 /// INCLUDING the row the calling site just appended — the verdict is the
 /// disposition produced by the last decision-bearing event. `now` is
 /// epoch seconds (the same clock as `AttemptRecord::occurred_at_epoch_secs`)
-/// and is consulted only for the poison-TTL downgrade. `legacy_seed` is
-/// the transitional P5 mixed-era floor; see
-/// [`rio_retry_kernel::decide`] for the full seed-merge semantics
-/// (`sched.retry.recovery-projection+2`) and the contract the kernel
-/// carries for the whole decision.
+/// and is consulted only for the poison-TTL downgrade. See
+/// [`rio_retry_kernel::decide`] for the contract the kernel carries for
+/// the whole decision.
 ///
 /// This shim only projects: [`AttemptRecord`] → [`rio_retry_kernel::LedgerRow`]
 /// (drop the fields the fold ignores, convert the f64 epoch timestamp to
 /// the abstract clock), delegate to the kernel, and lift the exclusion
 /// set back into [`ExecutorId`]s.
-pub(crate) fn decide(
-    history: &[AttemptRecord],
-    budget: &Budget,
-    now: AbsTime,
-    legacy_seed: Option<&PersistedRetryColumns>,
-) -> Decision {
+pub(crate) fn decide(history: &[AttemptRecord], budget: &Budget, now: AbsTime) -> Decision {
     let rows: Vec<rio_retry_kernel::LedgerRow<String>> =
         history.iter().map(record_to_row).collect();
-    let decision = rio_retry_kernel::decide(&rows, budget, now, legacy_seed);
+    let decision = rio_retry_kernel::decide(&rows, budget, now);
     Decision {
         verdict: decision.verdict,
         exclusion: decision
@@ -681,59 +670,6 @@ mod tests {
         assert_eq!(v, Verdict::Poison(PoisonReason::InfraBudget));
     }
 
-    /// The recovery projection: the four persisted counters come back,
-    /// `failure_count` is derived from the set, and the five in-memory
-    /// budgets are forgiven. The projection is not the fold of the
-    /// pre-failover history — that is the documented lossy
-    /// reconstruction, not a bug in either function.
-    #[test]
-    fn recovery_projection_is_the_documented_selective_forgiveness() {
-        // Live history: two same-worker transient failures (count=2,
-        // failure_count=2, one distinct builder), three infra failures,
-        // one timeout.
-        let h = [
-            t(100, "w1"),
-            t(200, "w1"),
-            infra(300, "w1", false, false),
-            infra(310, "w1", false, false),
-            infra(320, "w1", false, false),
-            AttemptEvent::WorkerTimeout {
-                at: 400,
-                executor: "w1".into(),
-            },
-        ];
-        let (live, _) = fold(&h, 400);
-        assert_eq!(live.count, 2);
-        assert_eq!(live.failure_count, 2);
-        assert_eq!(live.infra_count, 3);
-        assert_eq!(live.timeout_count, 1);
-
-        // What the mirror columns hold for that history: retry_count and
-        // failed_builders are mirrored per-event; the rest are not
-        // persisted at all.
-        let persisted = PersistedRetryColumns {
-            retry_count: live.count,
-            resubmit_cycles: live.resubmit_cycles,
-            failed_builders: live.failed_builders.clone(),
-            poisoned_at: None,
-        };
-        let recovered = Counters::recovery_projection(&persisted);
-        assert_eq!(recovered.count, 2, "recovered from the column");
-        assert_eq!(
-            recovered.failure_count, 1,
-            "derived as failed_builders.len(): same-worker repeats forgotten"
-        );
-        assert_eq!(recovered.infra_count, 0, "forgiven");
-        assert_eq!(recovered.timeout_count, 0, "forgiven");
-        assert_eq!(recovered.last_infra_failure_at, None, "forgiven");
-        assert_eq!(recovered.backoff_until, None, "forgiven");
-        assert!(
-            recovered.failure_count <= live.failure_count
-                && recovered.failed_builders == live.failed_builders,
-            "no fabrication: every recovered value is supported by a column"
-        );
-    }
-
     // -----------------------------------------------------------------
     // Phase-1b decision surface: decide() / classify() / placeable()
     // -----------------------------------------------------------------
@@ -775,19 +711,10 @@ mod tests {
     }
 
     fn decide_default(history: &[AttemptRecord], now: AbsTime) -> Decision {
-        decide(history, &Budget::default(), now, None)
+        decide(history, &Budget::default(), now)
     }
 
-    fn seed(retry_count: u32, resubmit_cycles: u32, failed: &[&str]) -> PersistedRetryColumns {
-        PersistedRetryColumns {
-            retry_count,
-            resubmit_cycles,
-            failed_builders: failed.iter().map(|s| s.to_string()).collect(),
-            poisoned_at: None,
-        }
-    }
-
-    /// An empty suffix with no seed is the default state: requeue,
+    /// An empty suffix is the default state: requeue,
     /// nothing excluded, no backoff.
     #[test]
     fn decide_empty_history_is_requeue() {
@@ -1064,72 +991,6 @@ mod tests {
         let d = decide_default(&h, 200);
         assert_eq!(d.counters.count, 0);
         assert_eq!(d.counters.backoff_until, Some(105), "clear() keeps backoff");
-    }
-
-    /// P5 legacy seed, degenerate case: an empty suffix with non-empty
-    /// mirror columns is exactly the documented recovery projection.
-    #[test]
-    fn decide_seed_only_degenerates_to_the_legacy_projection() {
-        let s = seed(2, 1, &["legacy-a", "legacy-b"]);
-        let d = decide(&[], &Budget::default(), 0, Some(&s));
-        assert_eq!(d.counters, Counters::recovery_projection(&s));
-        assert_eq!(d.verdict, Verdict::Requeue);
-        assert_eq!(d.exclusion.len(), 2);
-    }
-
-    /// P5 legacy seed + post-066 rows: the threshold, the exclusion set,
-    /// and the resubmit bound reflect both eras — a single new distinct
-    /// failure on top of two legacy-era distinct failures crosses the
-    /// distinct-worker threshold, and `count` is floored at the column
-    /// value (max, not sum).
-    #[test]
-    fn decide_seed_plus_attempts_reflect_both_eras() {
-        let s = seed(1, 1, &["legacy-a", "legacy-b"]);
-        let h = [worker_rec(OutcomeClass::Transient, "w-new", 100)];
-        let d = decide(&h, &Budget::default(), 100, Some(&s));
-        assert_eq!(
-            d.verdict,
-            Verdict::Poison(PoisonReason::Threshold),
-            "third distinct executor across the eras crosses the threshold"
-        );
-        assert_eq!(d.counters.failed_builders.len(), 3);
-        assert_eq!(d.exclusion.len(), 3);
-        assert!(d.exclusion.contains(&ExecutorId::from("legacy-a")));
-        assert!(d.exclusion.contains(&ExecutorId::from("w-new")));
-        assert_eq!(d.counters.resubmit_cycles, 1);
-        assert!(
-            d.counters.count >= 1,
-            "count is floored at the column value (max, not sum)"
-        );
-    }
-
-    /// P5 legacy seed: a suffix that contains a reset row ignores the
-    /// seed entirely (the reset clears within-cycle state under both
-    /// semantics and the reset row carries the cycle index itself).
-    #[test]
-    fn decide_seed_is_ignored_when_the_suffix_has_a_reset_row() {
-        let s = seed(2, 1, &["legacy-a", "legacy-b"]);
-        let h = [
-            reset_rec(OutcomeClass::ResubmitReset, 2, 400),
-            worker_rec(OutcomeClass::Transient, "w-new", 500),
-        ];
-        let d = decide(&h, &Budget::default(), 500, Some(&s));
-        assert_eq!(
-            d.counters.failed_builders.len(),
-            1,
-            "legacy executors do not leak past a reset row"
-        );
-        assert!(!d.exclusion.contains(&ExecutorId::from("legacy-a")));
-        assert_eq!(d.counters.resubmit_cycles, 2, "from the reset row");
-        assert_eq!(d.verdict, Verdict::Requeue);
-
-        // An all-default seed is also a no-op even without a reset row.
-        let empty = PersistedRetryColumns::default();
-        let h = [worker_rec(OutcomeClass::Transient, "w-new", 100)];
-        let with = decide(&h, &Budget::default(), 100, Some(&empty));
-        let without = decide(&h, &Budget::default(), 100, None);
-        assert_eq!(with.counters, without.counters);
-        assert_eq!(with.verdict, without.verdict);
     }
 
     /// classify() is total over the trigger alphabet and never lets a

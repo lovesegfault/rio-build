@@ -8,9 +8,10 @@
 // site-owned appending transaction. The nine cap-check entry points
 // (E1-E9 in docs/spec/models/retry-invariant-map.md) are callers of that
 // one fold; the ten in-memory `RetryState` counters are a fold-derived
-// cached view, not independently mutated state; the four per-counter PG
-// mirror columns and their writers are retired (the transitional
-// mixed-era legacy seed is code-level only, see WHAT IS NOT MODELED).
+// cached view, not independently mutated state; the per-counter PG
+// mirror columns, their writers, and the transitional mixed-era legacy
+// seed that read them are gone (migration 073 -- see WHAT IS NOT
+// MODELED for the retirement record).
 //
 // The pre-collapse (as-built) encoding was frozen at
 // `retryPolicyAsBuilt.qnt` for the Stage-C calibration corpus and was
@@ -116,11 +117,14 @@
 //     base).
 //
 // WHAT IS NOT MODELED (deliberate scope boundaries, each priced)
-//   - The transitional mixed-era legacy seed (decision P5 / design
-//     amendment A1): the mirror columns frozen at the Phase-1b cutover
-//     and merged into the fold as a floor for pre-066 histories. The
-//     upgrade boundary is code-level and covered by T-1b.12a's unit and
-//     recovery tests; this model starts every history at the ledger era.
+//   - (Retired scope boundary, kept as a record:) the transitional
+//     mixed-era legacy seed (decision P5 / design amendment A1) -- the
+//     mirror columns frozen at the Phase-1b cutover and merged into the
+//     fold as a floor for pre-066 histories -- was code-level only and
+//     never modeled here (every modeled history starts at the ledger
+//     era). Migration 073 dropped the columns and the seed machinery,
+//     so the boundary is now moot rather than priced: the code matches
+//     what this model always assumed.
 //   - The recovery-time verdict enforcement (T-1b.12b) as a separate
 //     arm: at model resolution the appending transaction is atomic, so a
 //     committed at-budget history always has its verdict persisted with
@@ -882,7 +886,7 @@ module retryPolicy {
   /// Failover preserves the poison set: a durable row that still says
   /// Poisoned (and is not TTL-expired) is reloaded as Poisoned -- the
   /// "poison set preserved exactly minus TTL-expired entries" clause of
-  /// sched.retry.recovery-projection+2. DCompleted is excluded from the
+  /// sched.retry.recovery-projection+3. DCompleted is excluded from the
   /// antecedent: a cache-hit clear can complete the node while the
   /// durable row update rides a later reconcile, and the gone-arm
   /// preserves the completion.
@@ -1950,7 +1954,7 @@ module retryPolicyPull {
   /// Leader failover, pull-mode shape: the cached counter view is lost
   /// and rebuilt by the fold over the durable attempt ledger exactly as
   /// on the stream path (sched.retry.failover-budget,
-  /// sched.retry.recovery-projection+2) — but the open pull-mode
+  /// sched.retry.recovery-projection+3) — but the open pull-mode
   /// attempt SURVIVES the failover (the assignments/executions rows are
   /// durable and the post-failover orphan reconcile skips
   /// dispatch_mode='pull' rows; the establishment sweep, not the orphan

@@ -603,35 +603,28 @@ in-memory dedup (`recently_disconnected`, `last_completed`) that previously
 enforced this retired with the session machinery; the property is unchanged
 and is what the re-targeted session model checks.
 
-#r("sched.retry.recovery-projection+2")[
+#r("sched.retry.recovery-projection+3")[
   After a leader change, each recovered derivation's retry state MUST equal
   the fold of its durable attempt-ledger suffix (the `drv_attempts` rows at
-  or after its most recent reset event), seeded --- transitionally, until
-  the legacy mirror columns are dropped --- by the legacy projection of
-  `derivations.{retry_count, failed_builders, resubmit_cycles}` whenever
-  those columns are non-empty and the loaded suffix contains no reset row:
-  `failed_builders` is the union of the fold's set and the column set,
-  `count` and `resubmit_cycles` take the maximum of fold and column, and
-  `failure_count` is floored at the merged set's size. A suffix that begins
-  with a reset row ignores the columns; an empty suffix degenerates to the
-  pure legacy projection (in which poisoned-row recovery never recovers
-  `count`). `poisoned_at` and the poisoned status still come from
+  or after its most recent reset event). `poisoned_at` and the poisoned
+  status still come from
   `derivations` (#rref("sched.poison.ttl-persist")), with rows past the
   24 h TTL cleared rather than reloaded; no recovered counter may exceed
-  what the durable attempt rows and the legacy columns together support.
+  what the durable attempt rows support.
 ]
 This is the Phase-1b recovery contract: the recovered view is the same
-seeded fold the live appending transactions compute, so every retry budget,
+fold the live appending transactions compute, so every retry budget,
 the 300 s window anchor, and the placement exclusion (including backstop-
-and crash-established entries that never had a per-counter column mirror)
+and crash-established entries)
 survive a leader change per #rref("sched.retry.failover-budget"). The
-legacy-column seed is the transitional mixed-era floor (its union/max
-semantics cannot double-count rows the legacy writers --- active until the
-T-1b.13 cutover froze the columns --- also mirrored); it is dropped in
-Phase 2 together with the columns. The previous
-revision of this rule pinned the pre-ledger selective forgiveness
-(4 recovered / 1 derived / 5 defaulted), which the as-built Stage-B model
-still encodes until the Phase-1c re-encode.
+`+2` revision additionally specified the transitional legacy-column seed
+(decision P5: the frozen `derivations.{retry_count, failed_builders,
+resubmit_cycles}` mirror columns floored the fold for failure histories
+predating the attempt ledger); migration 073 dropped those columns and the
+seed machinery with them, so the `+3` revision is the pure ledger fold. The
+`+1` revision pinned the pre-ledger selective forgiveness
+(4 recovered / 1 derived / 5 defaulted), retired with the Phase-1b
+collapse.
 
 #r("sched.retry.failover-budget")[
   Once the attempt history is durable (the Phase-1 attempt ledger), every

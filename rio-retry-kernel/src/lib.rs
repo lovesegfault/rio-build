@@ -39,7 +39,7 @@
 //! ## The exclusion-set representation is cfg(kani)-swapped
 //!
 //! Every executor-id set in the kernel (the per-executor exclusion set,
-//! the eligible fleet, the frozen mirror columns) is declared as
+//! the eligible fleet) is declared as
 //! [`IdSet`], an alias that resolves to `std::collections::BTreeSet`
 //! everywhere except under `cfg(kani)`, where it resolves to
 //! [`BoundedIdSet`] — a fixed-capacity array set whose operations are
@@ -148,7 +148,7 @@ pub type AbsTime = u64;
 //
 // Production code and the unit-test batteries use `std::collections::
 // BTreeSet` for every executor-id set (the per-executor exclusion set, the
-// eligible fleet, the frozen mirror columns). The CBMC proof harnesses do
+// eligible fleet). The CBMC proof harnesses do
 // not: a `BTreeSet` insert/lookup walks the b-tree node machinery
 // (`search_tree`, `find_key_index`, `insert_recursing`), and the symbolic
 // execution of that code — not SAT solving — is what kept the decision
@@ -675,85 +675,6 @@ impl<Id: Ord> Counters<Id> {
             ..Self::default()
         };
     }
-
-    // r[impl sched.retry.recovery-projection+2]
-    /// The pure legacy projection of the mirror columns — the
-    /// pre-ledger-era recovery contract, kept as an executable
-    /// definition because it is still load-bearing twice: it is the
-    /// degenerate result of the seeded fold for a derivation with an
-    /// empty attempt suffix (the `sched.retry.recovery-projection+2`
-    /// "pre-ledger fallback" clause), and it is what the as-built
-    /// Stage-B model's failover action and the calibration's G8 reverts
-    /// encode until the Phase-1c re-encode.
-    ///
-    /// Since T-1b.12a the live recovery path no longer USES this
-    /// projection as the recovered view: recovery runs [`decide`] over
-    /// the loaded suffix with the columns as the transitional legacy
-    /// seed (P5), so a non-empty suffix contributes everything the
-    /// columns never mirrored (the 5 formerly-forgiven counters,
-    /// backstop- and crash-established exclusions). The projection is
-    /// *not* the fold of the pre-failover history: `failure_count` both
-    /// forgets same-worker repeats (the live counter counts them) and
-    /// counts the permanent path's diagnostics-only `failed_builders`
-    /// insert (the live counter never charged it), and `failed_builders`
-    /// itself is missing every backstop-recorded failure (divergence
-    /// D4: E8 never mirrors its insert to PG). The no-fabrication bound
-    /// is that every recovered value is supported by a persisted column
-    /// — nothing is invented.
-    pub fn recovery_projection(persisted: &PersistedRetryColumns<Id>) -> Self
-    where
-        Id: Clone,
-    {
-        Self {
-            count: persisted.retry_count,
-            resubmit_cycles: persisted.resubmit_cycles,
-            failure_count: persisted.failed_builders.len() as u32,
-            failed_builders: persisted.failed_builders.clone(),
-            poisoned_at: persisted.poisoned_at,
-            ..Self::default()
-        }
-    }
-}
-
-/// The `derivations` columns that mirror retry state, as recovery reads
-/// them. `poisoned_at` is `None` for rows loaded by
-/// `load_nonterminal_derivations` (which filters out `poisoned`) and for
-/// poisoned rows whose TTL already expired during the downtime (recovery
-/// clears those instead of reloading them).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PersistedRetryColumns<Id> {
-    /// `derivations.retry_count`.
-    pub retry_count: u32,
-    /// `derivations.resubmit_cycles`.
-    pub resubmit_cycles: u32,
-    /// `derivations.failed_builders`.
-    pub failed_builders: IdSet<Id>,
-    /// `derivations.poisoned_at`, already converted to the abstract
-    /// clock and already filtered for TTL expiry.
-    pub poisoned_at: Option<AbsTime>,
-}
-
-impl<Id> Default for PersistedRetryColumns<Id> {
-    fn default() -> Self {
-        Self {
-            retry_count: 0,
-            resubmit_cycles: 0,
-            failed_builders: IdSet::new(),
-            poisoned_at: None,
-        }
-    }
-}
-
-impl<Id> PersistedRetryColumns<Id> {
-    /// Whether the mirror columns carry any pre-existing retry state at
-    /// all. An all-default row contributes nothing to the legacy seed
-    /// (decision P5), so [`decide`] skips the floor entirely for it.
-    pub fn is_empty(&self) -> bool {
-        self.retry_count == 0
-            && self.resubmit_cycles == 0
-            && self.failed_builders.is_empty()
-            && self.poisoned_at.is_none()
-    }
 }
 
 /// Which budget's exhaustion produced a `Poison` verdict. The production
@@ -839,10 +760,10 @@ pub fn reference_fold<Id: Ord + Clone>(
     fold_events(Counters::default(), history, now, budget, fleet)
 }
 
-/// The fold body shared by [`reference_fold`] (which always starts from
-/// the default counters) and [`decide`] (which may start from the
-/// transitional legacy seed): apply every event in order, then downgrade
-/// a stale poison to [`Verdict::TtlExpire`].
+/// The fold body shared by [`reference_fold`]: apply every event in
+/// order, then downgrade a stale poison to [`Verdict::TtlExpire`].
+/// ([`decide`] folds ledger rows directly through the same [`apply`]
+/// arms instead of materializing an event buffer.)
 fn fold_events<Id: Ord + Clone>(
     initial: Counters<Id>,
     history: &[AttemptEvent<Id>],
@@ -1378,24 +1299,15 @@ fn decide_verdict_partition_consistent<Id: Ord>(
 }
 
 /// Clause 2 of [`decide`]'s contract: a Requeue verdict never exceeds a
-/// budget cap — the per-cycle/infra/timeout caps hold over every history
-/// (the seed can lift `count` above `max_retries` only with evidence the
-/// frozen legacy column already holds), and the exempt cap holds over
-/// every history whose last event is exempt-charging.
+/// budget cap — the per-cycle/infra/timeout caps hold over every
+/// history, and the exempt cap holds over every history whose last
+/// event is exempt-charging.
 #[cfg(kani)]
 fn decide_requeue_within_caps<Id: Ord>(
     d: &Decision<Id>,
     history: &[LedgerRow<Id>],
     budget: &Budget,
-    legacy_seed: Option<&PersistedRetryColumns<Id>>,
 ) -> bool {
-    let has_reset = history
-        .iter()
-        .any(|r| r.event_kind == AttemptEventKind::Reset);
-    let seeded_count_floor = match legacy_seed {
-        Some(s) if !has_reset && !s.is_empty() => s.retry_count,
-        _ => 0,
-    };
     let last_is_exempt_charge = history.last().is_some_and(|r| {
         r.event_kind == AttemptEventKind::Attempt
             && ((r.reporting_party == ReportingParty::Worker
@@ -1405,7 +1317,7 @@ fn decide_requeue_within_caps<Id: Ord>(
                     && (r.outcome_class == OutcomeClass::ExemptInfra
                         || (r.outcome_class == OutcomeClass::Infra && r.floor_promoted))))
     });
-    d.counters.count <= budget.max_retries.max(seeded_count_floor)
+    d.counters.count <= budget.max_retries
         && d.counters.infra_count <= budget.max_infra_retries
         && d.counters.timeout_count <= budget.max_timeout_retries
         && (!matches!(d.verdict, Verdict::Requeue)
@@ -1414,19 +1326,17 @@ fn decide_requeue_within_caps<Id: Ord>(
 }
 
 /// Clause 3 of [`decide`]'s contract: the exclusion set contains the
-/// executor of every charged threshold attempt after the last reset row,
-/// plus every member the legacy seed holds when the seed applies.
+/// executor of every charged threshold attempt after the last reset row.
 #[cfg(kani)]
 fn decide_exclusion_covers_charged_attempts<Id: Ord>(
     d: &Decision<Id>,
     history: &[LedgerRow<Id>],
-    legacy_seed: Option<&PersistedRetryColumns<Id>>,
 ) -> bool {
     let last_reset = history
         .iter()
         .rposition(|r| r.event_kind == AttemptEventKind::Reset);
     let start = last_reset.map_or(0, |i| i + 1);
-    let charged_ok = history[start..].iter().all(|r| {
+    history[start..].iter().all(|r| {
         let charges_threshold = r.event_kind == AttemptEventKind::Attempt
             && matches!(
                 r.outcome_class,
@@ -1436,39 +1346,7 @@ fn decide_exclusion_covers_charged_attempts<Id: Ord>(
                     | OutcomeClass::ExecutorCrash
             );
         !charges_threshold || r.executor.as_ref().is_none_or(|e| d.exclusion.contains(e))
-    });
-    let seed_ok = match legacy_seed {
-        Some(s) if last_reset.is_none() && !s.is_empty() => {
-            s.failed_builders.iter().all(|w| d.exclusion.contains(w))
-        }
-        _ => true,
-    };
-    charged_ok && seed_ok
-}
-
-/// Clause 4 of [`decide`]'s contract: the legacy-seed merge never drops a
-/// counter below what the frozen mirror columns support (decision P5 /
-/// design amendment A1).
-#[cfg(kani)]
-fn decide_seed_floor_respected<Id: Ord>(
-    d: &Decision<Id>,
-    history: &[LedgerRow<Id>],
-    legacy_seed: Option<&PersistedRetryColumns<Id>>,
-) -> bool {
-    let has_reset = history
-        .iter()
-        .any(|r| r.event_kind == AttemptEventKind::Reset);
-    match legacy_seed {
-        Some(s) if !has_reset && !s.is_empty() => {
-            d.counters.count >= s.retry_count
-                && d.counters.resubmit_cycles >= s.resubmit_cycles
-                && d.counters.failure_count >= s.failed_builders.len() as u32
-                && s.failed_builders
-                    .iter()
-                    .all(|w| d.counters.failed_builders.contains(w))
-        }
-        _ => true,
-    }
+    })
 }
 
 /// Phase-1b decision function: fold a derivation's attempt-ledger suffix
@@ -1486,35 +1364,19 @@ fn decide_seed_floor_respected<Id: Ord>(
 /// against an empty fleet (never exhausted) and the call sites consume
 /// [`Decision::exclusion`] through [`placeable`] instead.
 ///
-/// `legacy_seed` is the **transitional** mixed-era input (decision P5 /
-/// design amendment A1, removed in Phase 2 with the mirror-column drop):
-/// when the derivation's `derivations.{retry_count, failed_builders,
-/// resubmit_cycles}` columns are non-empty and the suffix contains no
-/// reset row, the fold is floored by the legacy projection so a failure
-/// history that spans the 066 deployment keeps every counter that
-/// survives failover today. The floor semantics are union for
-/// `failed_builders`, max for `count` and `resubmit_cycles`, and
-/// `failure_count` seeded from the legacy set's size — never below what
-/// either era supports, and the set/threshold view cannot double-count
-/// because set inserts are idempotent. (`count`'s floor is applied after
-/// the fold, so the per-cycle transient cap check inside the fold sees
-/// only the post-066 rows during the transition; the distinct-worker
-/// threshold — the production-default bound — sees the merged set.) A
-/// suffix that begins with a reset row ignores the seed; an empty suffix
-/// degenerates to the pure legacy projection. This one function is the
-/// shared merge point for every fold input construction: the appending
-/// transactions read the columns on their own connection
-/// (`load_retry_seed_in_tx`), while recovery's retry-view rebuild and
-/// the dispatch-time fleet-exhaust check pass the floor carried on the
-/// node (`DerivationState::legacy_retry_floor`), so all of them apply
-/// exactly the same P5 semantics (`sched.retry.recovery-projection+2`).
+/// This is the design's frozen §5a-2 three-argument decision surface.
+/// (A fourth, transitional `legacy_seed` argument — the decision-P5
+/// mixed-era floor read from the `derivations` mirror columns — existed
+/// while pre-ledger failure histories could still be live; migration
+/// 073 dropped the columns and the seed machinery was retired with
+/// them.)
 //
 // ── Kani contracts ───────────────────────────────────────────────────
 // No requires clause: the contract holds over the full input domain.
 // Counter arithmetic cannot overflow at any reachable suffix length
 // (every per-event charge is +1 onto a u32 and the clock arithmetic is
 // saturating), so the harness bound on history length is a solver
-// budget, not a soundness precondition. The four ensures clauses are,
+// budget, not a soundness precondition. The three ensures clauses are,
 // in order: the verdict partition is consistent with the counters it
 // was computed from (each terminal verdict names a budget that really
 // is at its bound, the TTL downgrade only fires on a stamped expired
@@ -1524,67 +1386,34 @@ fn decide_seed_floor_respected<Id: Ord>(
 // the exempt cap over every history whose last event is exempt-charging
 // — the global form additionally needs the writer discipline that
 // poisoned nodes get no further attempt rows, which is upstream of the
-// fold); the exclusion set contains the executor of every charged
-// threshold attempt after the last reset row plus everything the legacy
-// seed holds; and the legacy-seed merge never drops a counter below
-// what the frozen mirror columns support (decision P5 / design
-// amendment A1). The clause bodies are the `decide_*` predicate
+// fold); and the exclusion set contains the executor of every charged
+// threshold attempt after the last reset row. The clause bodies are the
+// `decide_*` predicate
 // functions above (one source of truth); `check_decide_contract` in
 // `#[cfg(kani)] mod proofs` asserts those same predicates on the result
 // of a plain call rather than going through
 // `#[kani::proof_for_contract]`, whose contract-instrumented wrapper
 // around a fold this size does not converge inside the merge-gate
-// budget. The two-call properties (determinism, seed-vs-unseeded
-// monotonicity, the reset-row seed bypass) are the
-// `check_decide_deterministic` and `check_legacy_seed_merge_monotone`
-// harnesses.
+// budget. The two-call determinism property is the
+// `check_decide_deterministic` harness.
 #[cfg_attr(
     kani,
     kani::ensures(|d: &Decision<Id>| decide_verdict_partition_consistent(d, budget, now))
 )]
 #[cfg_attr(
     kani,
-    kani::ensures(|d: &Decision<Id>| decide_requeue_within_caps(d, history, budget, legacy_seed))
+    kani::ensures(|d: &Decision<Id>| decide_requeue_within_caps(d, history, budget))
 )]
 #[cfg_attr(
     kani,
-    kani::ensures(|d: &Decision<Id>| decide_exclusion_covers_charged_attempts(
-        d,
-        history,
-        legacy_seed
-    ))
-)]
-#[cfg_attr(
-    kani,
-    kani::ensures(|d: &Decision<Id>| decide_seed_floor_respected(d, history, legacy_seed))
+    kani::ensures(|d: &Decision<Id>| decide_exclusion_covers_charged_attempts(d, history))
 )]
 pub fn decide<Id: Ord + Clone + Default>(
     history: &[LedgerRow<Id>],
     budget: &Budget,
     now: AbsTime,
-    legacy_seed: Option<&PersistedRetryColumns<Id>>,
 ) -> Decision<Id> {
-    let has_reset = history
-        .iter()
-        .any(|r| r.event_kind == AttemptEventKind::Reset);
-    let seed = legacy_seed.filter(|s| !has_reset && !s.is_empty());
-
     let mut initial = Counters::default();
-    if let Some(s) = seed {
-        // Set-shaped state seeds up front so the distinct-worker
-        // threshold / exclusion checks inside the fold see both eras
-        // (idempotent inserts make double-counting impossible). The
-        // flat counters (`count`, `failure_count`) are deliberately NOT
-        // seeded: the still-active legacy writers mirror the current
-        // era into the columns too, so a pre-fold seed would count the
-        // suffix's own rows twice; their floors are applied after the
-        // fold instead (max / merged-set size — the P5 floor
-        // semantics). No event in a reset-free suffix touches
-        // `resubmit_cycles`, so seeding it equals the max() floor.
-        initial.failed_builders = s.failed_builders.clone();
-        initial.resubmit_cycles = s.resubmit_cycles;
-        initial.poisoned_at = s.poisoned_at;
-    }
     // A suffix that starts at a resubmit-reset row carries the new cycle
     // index on the row itself; seed the pre-fold counter so the reset
     // arm's `prior + 1` reproduces it (the loader cuts the suffix at the
@@ -1611,16 +1440,6 @@ pub fn decide<Id: Ord + Clone + Default>(
         }
     }
     let verdict = ttl_downgrade(&counters, verdict, now, budget);
-
-    if let Some(s) = seed {
-        // The legacy floors for the flat counters (P5): max, not sum —
-        // post-066 rows that the still-active legacy writers also
-        // mirrored into the columns must not count twice.
-        counters.count = counters.count.max(s.retry_count);
-        counters.failure_count = counters
-            .failure_count
-            .max(counters.failed_builders.len() as u32);
-    }
 
     Decision {
         verdict,
@@ -1895,8 +1714,8 @@ pub fn placeable<Id: Ord>(excluded: &IdSet<Id>, eligible: &IdSet<Id>) -> Placeme
 #[cfg(test)]
 mod tests {
     //! Crate-local smoke tests. The load-bearing behavioral battery for
-    //! the fold and the decision surface (31+ hand-computed histories,
-    //! the divergence reproducers, the seed-merge cases) lives in
+    //! the fold and the decision surface (the hand-computed histories
+    //! and the divergence reproducers) lives in
     //! `rio-scheduler/src/retry_policy.rs` and exercises these kernels
     //! through the production projection shim — that suite is the
     //! equivalence oracle for the extraction. The tests here only pin
@@ -1985,8 +1804,8 @@ mod tests {
     }
 
     #[test]
-    fn decide_empty_history_no_seed_is_default_requeue() {
-        let d = decide::<String>(&[], &Budget::default(), 0, None);
+    fn decide_empty_history_is_default_requeue() {
+        let d = decide::<String>(&[], &Budget::default(), 0);
         assert_eq!(d.verdict, Verdict::Requeue);
         assert!(d.exclusion.is_empty());
         assert_eq!(d.backoff_until, None);
@@ -2294,30 +2113,6 @@ mod proofs {
         }
     }
 
-    /// An arbitrary frozen-mirror-column row (the P5 legacy seed). The
-    /// flat counters are unconstrained u32 — the SQL loader bounds them
-    /// at `i32::MAX`, but the proof does not need that bound.
-    fn any_seed() -> PersistedRetryColumns<u8> {
-        let mut failed_builders = IdSet::new();
-        if kani::any() {
-            failed_builders.insert(1u8);
-        }
-        if kani::any() {
-            failed_builders.insert(2u8);
-        }
-        let poisoned_at = if kani::any() {
-            Some(small_time(8))
-        } else {
-            None
-        };
-        PersistedRetryColumns {
-            retry_count: kani::any(),
-            resubmit_cycles: kani::any(),
-            failed_builders,
-            poisoned_at,
-        }
-    }
-
     /// The proof-time set representation itself models set semantics
     /// over symbolic values: insert reports newness exactly when the
     /// value was absent, membership tracks exactly the inserted values,
@@ -2376,11 +2171,11 @@ mod proofs {
         assert_eq!(yielded, s.len());
     }
 
-    /// Verify [`decide`] against its four stated `kani::ensures`
-    /// clauses — the verdict partition, the Requeue cap bounds, the
-    /// exclusion-set superset, and the legacy-seed floor — for every
-    /// suffix of up to 4 arbitrary rows, every scaled budget, every
-    /// clock value up to 16, and every (or no) legacy seed. With
+    /// Verify [`decide`] against its three stated `kani::ensures`
+    /// clauses — the verdict partition, the Requeue cap bounds, and the
+    /// exclusion-set superset — for every
+    /// suffix of up to 4 arbitrary rows, every scaled budget, and every
+    /// clock value up to 16. With
     /// overflow checks on, the same run is the no-overflow proof for
     /// the fold's counter arithmetic over that domain.
     ///
@@ -2398,25 +2193,14 @@ mod proofs {
         let history = &rows[..n];
         let budget = any_small_budget();
         let now = small_time(16);
-        let seed = if kani::any() { Some(any_seed()) } else { None };
-        let d = decide(history, &budget, now, seed.as_ref());
+        let d = decide(history, &budget, now);
         assert!(decide_verdict_partition_consistent(&d, &budget, now));
-        assert!(decide_requeue_within_caps(
-            &d,
-            history,
-            &budget,
-            seed.as_ref()
-        ));
-        assert!(decide_exclusion_covers_charged_attempts(
-            &d,
-            history,
-            seed.as_ref()
-        ));
-        assert!(decide_seed_floor_respected(&d, history, seed.as_ref()));
+        assert!(decide_requeue_within_caps(&d, history, &budget));
+        assert!(decide_exclusion_covers_charged_attempts(&d, history));
     }
 
     /// The verdict partition is deterministic: two calls on the same
-    /// (history, budget, now, seed) quadruple return the same Decision
+    /// (history, budget, now) triple return the same Decision
     /// — no hidden state, no clock other than `now`, no dependence on
     /// set iteration order.
     #[kani::proof]
@@ -2426,71 +2210,9 @@ mod proofs {
         let history = &rows[..n];
         let budget = any_small_budget();
         let now = small_time(16);
-        let seed = if kani::any() { Some(any_seed()) } else { None };
-        let a = decide(history, &budget, now, seed.as_ref());
-        let b = decide(history, &budget, now, seed.as_ref());
+        let a = decide(history, &budget, now);
+        let b = decide(history, &budget, now);
         assert_eq!(a, b);
-    }
-
-    /// The P5 legacy-seed merge, two-call form. With a reset-free
-    /// suffix and a non-empty seed: the merge never drops legacy
-    /// evidence (count / resubmit_cycles / failure_count are floored at
-    /// the legacy projection and the exclusion set keeps every legacy
-    /// member — re-checked here against `Counters::recovery_projection`
-    /// so the floor and the projection stay in lockstep), never drops
-    /// suffix evidence (the unseeded fold's exclusion set, failure
-    /// count, and resubmit cycles are preserved), and never inflates a
-    /// channel budget (infra / timeout / exempt counts are exactly the
-    /// unseeded fold's). With a reset-bearing suffix or an empty legacy
-    /// row, the seed is ignored entirely. The per-cycle `count` is NOT
-    /// claimed monotone against the unseeded fold: a merged exclusion
-    /// set can reach the poison threshold earlier, and the threshold
-    /// arm poisons before the per-cycle charge — the evidence lands in
-    /// `failed_builders` instead (the design's "never below what either
-    /// era supports" floor is the legacy-projection half plus the
-    /// preserved suffix exclusions, which are asserted).
-    #[kani::proof]
-    #[kani::unwind(7)]
-    fn check_legacy_seed_merge_monotone() {
-        let (rows, n) = any_history::<3>();
-        let history = &rows[..n];
-        let budget = any_small_budget();
-        let now = small_time(16);
-        let seed = any_seed();
-        let seeded = decide(history, &budget, now, Some(&seed));
-        let unseeded = decide(history, &budget, now, None);
-        let has_reset = history
-            .iter()
-            .any(|r| r.event_kind == AttemptEventKind::Reset);
-        if has_reset || seed.is_empty() {
-            assert_eq!(seeded, unseeded);
-        } else {
-            // Legacy floor (the decide() ensures states this too; the
-            // projection cross-check is what this harness adds).
-            let proj = Counters::recovery_projection(&seed);
-            assert!(seeded.counters.count >= proj.count);
-            assert!(seeded.counters.resubmit_cycles >= proj.resubmit_cycles);
-            assert!(seeded.counters.failure_count >= proj.failure_count);
-            for w in proj.failed_builders.iter() {
-                assert!(seeded.counters.failed_builders.contains(w));
-            }
-            // Suffix evidence preserved.
-            assert!(seeded.counters.resubmit_cycles >= unseeded.counters.resubmit_cycles);
-            assert!(seeded.counters.failure_count >= unseeded.counters.failure_count);
-            for w in unseeded.counters.failed_builders.iter() {
-                assert!(seeded.counters.failed_builders.contains(w));
-            }
-            // Channel budgets are seed-independent.
-            assert_eq!(seeded.counters.infra_count, unseeded.counters.infra_count);
-            assert_eq!(
-                seeded.counters.timeout_count,
-                unseeded.counters.timeout_count
-            );
-            assert_eq!(
-                seeded.counters.exempt_infra_count,
-                unseeded.counters.exempt_infra_count
-            );
-        }
     }
 
     /// Verify [`classify`] against its partition contract for every

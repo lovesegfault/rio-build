@@ -244,7 +244,6 @@ impl DagActor {
                 &history,
                 &self.decision_budget(),
                 crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-                None,
             ),
         ))
     }
@@ -2706,7 +2705,6 @@ impl DagActor {
                 &history,
                 &self.decision_budget(),
                 crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-                None,
             );
             (decision, None)
         };
@@ -2986,7 +2984,6 @@ impl DagActor {
                     &history,
                     &self.decision_budget(),
                     crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime,
-                    None,
                 ),
                 None,
             )

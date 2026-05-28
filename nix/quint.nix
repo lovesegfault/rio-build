@@ -2812,7 +2812,7 @@ in
     # r[verify sched.retry.verdict-channel-invariant]
     # r[verify sched.poison.cascade-dependents]
     # r[verify sched.retry.failover-budget]
-    # r[verify sched.retry.recovery-projection+2]
+    # r[verify sched.retry.recovery-projection+3]
     quint-retry-policy-pull = mkQuintCheck {
       name = "retry-policy-pull";
       spec = "retryPolicy";

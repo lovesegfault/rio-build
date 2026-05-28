@@ -929,8 +929,7 @@ impl DagActor {
                 )
             })
             .filter_map(|(h, s)| {
-                let decision =
-                    crate::retry_policy::decide(s.attempt_history(), &budget, now_epoch, None);
+                let decision = crate::retry_policy::decide(s.attempt_history(), &budget, now_epoch);
                 match decision.verdict {
                     crate::retry_policy::Verdict::Poison(reason) => Some((h.into(), reason)),
                     _ => None,

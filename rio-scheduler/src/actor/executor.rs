@@ -57,7 +57,7 @@ impl DagActor {
                         .iter()
                         .map(crate::db::attempts::AttemptRow::to_record)
                         .collect();
-                    Ok(crate::retry_policy::decide(&history, &budget, now, None))
+                    Ok(crate::retry_policy::decide(&history, &budget, now))
                 }
                 .await;
                 match read {
@@ -66,11 +66,11 @@ impl DagActor {
                         warn!(drv_hash = %drv_hash, error = %e,
                               "reassign re-check: suffix read failed; folding the in-memory \
                                attempt history instead");
-                        crate::retry_policy::decide(state.attempt_history(), &budget, now, None)
+                        crate::retry_policy::decide(state.attempt_history(), &budget, now)
                     }
                 }
             }
-            None => crate::retry_policy::decide(state.attempt_history(), &budget, now, None),
+            None => crate::retry_policy::decide(state.attempt_history(), &budget, now),
         };
         matches!(
             decision.verdict,
@@ -142,8 +142,8 @@ impl DagActor {
             // itself never increments the count.
             //
             // E5, collapsed onto decide() (Phase 1b, T-1b.8): the
-            // threshold re-check folds the durable attempt suffix (plus
-            // the transitional legacy seed) instead of reading the RAM
+            // threshold re-check folds the durable attempt suffix
+            // instead of reading the RAM
             // counters; verdict-identical on every single-tenure history
             // reachable today. Kept rather than deleted (decision P2,
             // the narrowed b09c5b312-X6 disposition): the backstop's

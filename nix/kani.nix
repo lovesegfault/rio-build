@@ -216,32 +216,28 @@ in
   # each other by the kernel's differential unit tests plus the
   # set-semantics harness below.
   #
-  # Seven harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
+  # Six harnesses (in rio-retry-kernel/src/lib.rs `mod proofs`):
   #   - check_bounded_set_models_set_semantics: the proof-time bounded
   #     set obeys set semantics over symbolic values (insert newness,
   #     precise membership, distinct-count len, order-insensitivity,
   #     iter-yields-members) — the harness half of the representation
   #     equivalence pin.
-  #   - check_decide_contract: asserts decide()'s four stated ensures
+  #   - check_decide_contract: asserts decide()'s three stated ensures
   #     clauses (through their shared predicate bodies; the
   #     contract-instrumented proof_for_contract form of a fold this
   #     size exceeds the gate budget) over bounded arbitrary attempt
-  #     suffixes, scaled budgets, and optional legacy seeds — the
+  #     suffixes and scaled budgets — the
   #     verdict partition is consistent with the final counters (each
   #     terminal verdict names a budget really at its bound;
   #     fleet-exhaust is unreachable from decide()), a Requeue verdict
   #     never exceeds a budget cap, the exclusion set contains the
-  #     executor of every charged threshold attempt plus the legacy
-  #     seed's members, the seed floor never drops below the frozen
-  #     mirror columns, and (overflow checks on) the fold's counter
-  #     arithmetic cannot overflow over the domain.
+  #     executor of every charged threshold attempt, and (overflow
+  #     checks on) the fold's counter
+  #     arithmetic cannot overflow over the domain. (The legacy-seed
+  #     clauses and the seed-merge harness retired with the P5 seed —
+  #     migration 073 dropped the mirror columns it read.)
   #   - check_decide_deterministic: same inputs, two calls, equal
   #     Decisions.
-  #   - check_legacy_seed_merge_monotone: the P5 seed-vs-unseeded
-  #     two-call form — legacy and suffix evidence both preserved,
-  #     channel budgets seed-independent, reset-bearing suffixes ignore
-  #     the seed (the `sched.retry.recovery-projection+2` floor
-  #     semantics).
   #   - check_classify_contract: the classification partition iff per
   #     observed-failure variant; the exemption predicate is exactly
   #     promoted-or-CONCURRENT_PUTPATH on the worker channel and
@@ -256,13 +252,12 @@ in
   # r[verify sched.retry.transient-budget]
   # r[verify sched.retry.attempts-bounded+2]
   # r[verify sched.retry.exempt-infra-cap]
-  # r[verify sched.retry.recovery-projection+2]
   # r[verify sched.retry.per-executor-budget+3]
   # r[verify sched.dispatch.fleet-exhaust+4]
   # r[verify sched.state.poisoned-ttl]
   kani-rio-retry-kernel = mkKaniCheck {
     name = "rio-retry-kernel";
     crate = crateBuildKani.members.rio-retry-kernel;
-    expectedHarnesses = 7;
+    expectedHarnesses = 6;
   };
 }
