@@ -103,21 +103,38 @@ impl SchedulerDb {
             drv_content.push(r.drv_content.clone().unwrap_or_default());
         }
 
-        // r[impl sched.persist.recreate-refresh]
+        // r[impl sched.persist.recreate-refresh+2]
         // ON CONFLICT: refresh the full creation-time snapshot. Rows are
         // written only by submissions that (re)create the in-memory node
         // (sched.persist.creation-scoped) — joins never reach this query —
         // so last-write-wins on the declared identity (pname/system/
-        // required_features) and on status='created' simply mirrors the
+        // required_features), on the declared `drv_path` (recovery and
+        // dispatch read the .drv path from this row, so a displaced
+        // squatter's decoy path must not survive into the displacing
+        // definition), and on status='created' simply mirrors the
         // in-memory first-writer/displacement truth. The old "same
         // drv_hash → same content" justification is exactly what the
         // displacement path (sched.merge.authoritative-conflict)
         // invalidates: a displacing submission may carry a DIFFERENT
         // verifiable identity, and without the refresh a leader failover
         // would rebuild the node from the displaced squatter's identity.
+        //
         // Live accumulators (floor_*, poisoned_at, failed_builders,
-        // retry_count, resubmit_cycles) are NOT touched — they have their
-        // own writers (clear_poison/clear_poison_batch, floor updates).
+        // retry_count, resubmit_cycles) keep their own writers
+        // (clear_poison/clear_poison_batch, floor updates) and are NOT
+        // touched — EXCEPT on a definition change: when the row's prior
+        // creation persisted authoritative bytes and the incoming
+        // creation's content is not byte-identical (a store-backed
+        // takeover clearing the bytes, or a byte-different authoritative
+        // displacement), the accumulators were produced by a DIFFERENT
+        // definition's builder and must not carry over
+        // (sched.merge.displaced-failure-reset). Doing the reset in this
+        // statement makes it ride the merge transaction
+        // (sched.persist.atomic-activation) and means RETURNING already
+        // yields the reset floors, so the I-208 hydration needs no
+        // special-casing for takeover rows. Byte-identical authoritative
+        // resubmits and store-backed-origin rows (drv_content IS NULL)
+        // keep the floor-preserving semantics.
         //
         // wanted_output_names is the exception to last-write-wins: it is
         // NOT a function of drv_hash — it is a function of who CONSUMES
@@ -215,6 +232,7 @@ impl SchedulerDb {
             -- single-row clear_topdown_pruned_by_hash is mark-only).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
+                drv_path = EXCLUDED.drv_path,
                 pname = EXCLUDED.pname,
                 system = EXCLUDED.system,
                 required_features = EXCLUDED.required_features,
@@ -246,7 +264,44 @@ impl SchedulerDb {
                 -- join; hostile content is bounded by SubmitBuild
                 -- ingress validation plus node lifecycle, not by this
                 -- clear.
-                drv_content = EXCLUDED.drv_content
+                drv_content = EXCLUDED.drv_content,
+                -- r[impl sched.merge.displaced-failure-reset+2]
+                -- Definition-change reset: the prior creation was
+                -- authoritative (bytes persisted) and the incoming
+                -- creation's content differs (store-backed takeover or
+                -- byte-different authoritative displacement) — failure
+                -- attribution and reactive sizing must not cross the
+                -- definition boundary, so zero the accumulators in the
+                -- same statement (and therefore the same transaction).
+                -- All other re-creations preserve them.
+                poisoned_at = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN NULL ELSE derivations.poisoned_at END,
+                failed_builders = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN '{}'::text[] ELSE derivations.failed_builders END,
+                retry_count = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN 0 ELSE derivations.retry_count END,
+                resubmit_cycles = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN 0 ELSE derivations.resubmit_cycles END,
+                floor_mem_bytes = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN 0 ELSE derivations.floor_mem_bytes END,
+                floor_disk_bytes = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN 0 ELSE derivations.floor_disk_bytes END,
+                floor_deadline_secs = CASE
+                    WHEN derivations.drv_content IS NOT NULL
+                         AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
+                    THEN 0 ELSE derivations.floor_deadline_secs END
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,

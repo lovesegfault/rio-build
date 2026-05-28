@@ -2944,11 +2944,17 @@ fn matching_identity_joins_completed_authoritative_node(
 }
 
 // r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.merge.displaced-failure-reset+2]
 /// An UNDER-budget poisoned squat is still retriable on resubmit, so an
 /// identity-matching store-backed submission takes the normal
-/// resubmit-reset (interest carried, cycle accumulated, the squat's
-/// bytes replaced by the store-backed definition) — the
-/// match-displacement arm must not pre-empt it.
+/// resubmit-reset (interest carried, the squat's bytes replaced by the
+/// store-backed definition) — the match-displacement arm must not
+/// pre-empt it. Because the removed node was authoritative and the
+/// re-creating submission is store-backed, this is an authority
+/// takeover: the fresh node is a different definition, so it starts
+/// with a fresh poison-resubmit budget and is surfaced in
+/// `authority_takeovers` (so the actor skips the cycle-incrementing
+/// `clear_poison_batch` for it).
 #[test]
 fn matching_identity_resets_poisoned_under_budget_squat() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2964,7 +2970,7 @@ fn matching_identity_resets_poisoned_under_budget_squat() -> anyhow::Result<()> 
     {
         let n = dag.nodes.get_mut("under-budget").unwrap();
         n.set_status_for_test(DerivationStatus::Poisoned);
-        n.retry.resubmit_cycles = 0; // under POISON_RESUBMIT_RETRY_LIMIT
+        n.retry.resubmit_cycles = 1; // under POISON_RESUBMIT_RETRY_LIMIT
     }
 
     let mut same = make_node("under-budget", "x86_64-linux");
@@ -2980,12 +2986,80 @@ fn matching_identity_resets_poisoned_under_budget_squat() -> anyhow::Result<()> 
         "resubmit-reset, not displacement"
     );
     assert!(res.displaced.is_empty());
+    assert!(
+        res.authority_takeovers
+            .iter()
+            .any(|h| h.as_str() == "under-budget"),
+        "authoritative→store-backed flip surfaced as an authority takeover"
+    );
     let n = dag.node("under-budget").unwrap();
     assert!(n.interested_builds.contains(&squatter), "interest carried");
     assert!(n.interested_builds.contains(&resubmitter));
-    assert_eq!(n.retry.resubmit_cycles, 1, "poison budget accumulates");
+    assert_eq!(
+        n.retry.resubmit_cycles, 0,
+        "definition change: the squat's consumed poison budget does not carry over"
+    );
     assert!(n.drv_content.is_empty(), "store-backed definition adopted");
     assert!(!n.drv_content_authoritative);
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// Contrast pin for the authority-takeover carve-out: SAME-definition
+/// resubmits keep accumulating the poison-resubmit budget and are never
+/// reported as authority takeovers — a store-backed node resubmitted
+/// store-backed, and an authoritative node resubmitted with
+/// byte-identical content, both increment `resubmit_cycles` exactly as
+/// before.
+#[test]
+fn store_backed_resubmit_is_not_an_authority_takeover() -> anyhow::Result<()> {
+    // Store-backed → store-backed.
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+    dag.merge(b1, &[make_node("same-store", "x86_64-linux")], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("same-store").unwrap();
+        n.set_status_for_test(DerivationStatus::Failed);
+        n.retry.resubmit_cycles = 1;
+    }
+    let res = dag.merge(b2, &[make_node("same-store", "x86_64-linux")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "same-store")
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "store→store resubmit is not a takeover"
+    );
+    assert_eq!(
+        dag.node("same-store").unwrap().retry.resubmit_cycles,
+        2,
+        "same-definition resubmit keeps accumulating the budget"
+    );
+
+    // Authoritative → byte-identical authoritative.
+    let mut dag = DerivationDag::new();
+    let b3 = Uuid::new_v4();
+    let b4 = Uuid::new_v4();
+    dag.merge(b3, &[authoritative_node("same-auth", b"Derive-A")], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("same-auth").unwrap();
+        n.set_status_for_test(DerivationStatus::Failed);
+        n.retry.resubmit_cycles = 1;
+    }
+    let res = dag.merge(b4, &[authoritative_node("same-auth", b"Derive-A")], &[], "")?;
+    assert!(
+        res.reset_on_resubmit
+            .iter()
+            .any(|h| h.as_str() == "same-auth")
+    );
+    assert!(
+        res.authority_takeovers.is_empty(),
+        "byte-identical authoritative retry is not a takeover"
+    );
+    assert_eq!(dag.node("same-auth").unwrap().retry.resubmit_cycles, 2);
     Ok(())
 }
 

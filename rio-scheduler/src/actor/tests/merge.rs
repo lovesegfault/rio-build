@@ -8877,7 +8877,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "row no longer claims the squatter's terminal status (got {status})"
     );
 
-    // r[verify sched.persist.atomic-activation]
+    // r[verify sched.persist.atomic-activation+2]
     // The displacer's Pending→Active update committed in the same
     // transaction as the recreate-refresh — there is no window where the
     // row is refreshed but the displacing build is still pending.
@@ -8969,7 +8969,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
 /// keeps zeros (the I-208 hydration skips displaced hashes) and the
 /// persisted row's floors are zeroed (`reset_displaced_derivation`,
 /// not the floor-preserving `clear_poison`).
-// r[verify sched.merge.displaced-failure-reset]
+// r[verify sched.merge.displaced-failure-reset+2]
 #[tokio::test]
 async fn test_displacement_resets_resource_floor() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
@@ -9147,6 +9147,165 @@ async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResu
         query_status(&handle, victim).await?.state,
         rio_proto::types::BuildState::Succeeded as i32,
         "victim build completes on the displacing definition"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// An identity-matching store-backed resubmission of a parked (still
+/// retriable) authoritative claim takes the definition over through the
+/// resubmit-reset — an authority takeover, not a displacement. The
+/// takeover must not inherit the squat's failure accounting (bug class:
+/// merged_bug_001 round 12): the recreate-refresh's in-tx
+/// definition-change reset zeroes the row's poison/floor/budget columns
+/// (and RETURNING reports the reset floors, so the I-208 hydration sees
+/// zeros), the in-memory node starts at zero floors with a fresh
+/// poison-resubmit budget, and the cycle-incrementing
+/// `clear_poison_batch` is skipped for it.
+#[tokio::test]
+async fn test_matching_retriable_takeover_resets_row_accounting() -> TestResult {
+    let (db, handle, _task) = setup().await;
+    let out = test_store_path("takeoverA-out");
+
+    // The squatter: an authoritative content-bound claim declaring the
+    // same expected output path a store-backed submission of the
+    // derivation declares (the content evidence the takeover presents).
+    let squatter = Uuid::new_v4();
+    let mut squat = make_node("takeoverA");
+    squat.drv_content = b"Derive-takeoverA".to_vec();
+    squat.drv_content_authoritative = true;
+    squat.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Its failures ratcheted the persisted accumulators; park it
+    // Poisoned UNDER budget so it stays retriable on resubmit (the
+    // resubmit-reset path — the displacement arms must not fire).
+    sqlx::query(
+        "UPDATE derivations
+         SET floor_mem_bytes = 8589934592, floor_disk_bytes = 34359738368,
+             floor_deadline_secs = 86400, poisoned_at = now(),
+             failed_builders = ARRAY['w1','w2'], retry_count = 3,
+             resubmit_cycles = 1, status = 'poisoned'
+         WHERE drv_hash = $1",
+    )
+    .bind("takeoverA")
+    .execute(&db.pool)
+    .await?;
+    assert!(
+        handle.debug_force_poisoned("takeoverA", 1).await?,
+        "squat parked Poisoned under budget"
+    );
+
+    // The victim: a store-backed submission with the SAME verifiable
+    // identity (shared non-empty expected output path) → admitted
+    // through the resubmit-reset as an authority takeover.
+    let victim = Uuid::new_v4();
+    let mut victim_node = make_node("takeoverA");
+    victim_node.expected_output_paths = vec![out.clone()];
+    merge_dag(&handle, victim, vec![victim_node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // In-memory: fresh store-backed node, zero floors, fresh budget.
+    let info = expect_drv(&handle, "takeoverA").await;
+    assert_ne!(info.status, DerivationStatus::Poisoned, "squat reset");
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "takeover must not inherit the squat's mem floor"
+    );
+    assert_eq!(info.sched.resource_floor.disk_bytes, 0);
+    assert_eq!(info.sched.resource_floor.deadline_secs, 0);
+    assert_eq!(
+        info.retry.resubmit_cycles, 0,
+        "takeover starts with a fresh poison-resubmit budget"
+    );
+
+    // Persisted row: every failure-derived column reset by the merge
+    // transaction, and no clear_poison_batch +1 on top.
+    let (mem, disk, deadline, cycles, retries, poisoned, builders): (
+        i64,
+        i64,
+        i64,
+        i32,
+        i32,
+        bool,
+        Vec<String>,
+    ) = sqlx::query_as(
+        "SELECT floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+                resubmit_cycles, retry_count, poisoned_at IS NOT NULL,
+                failed_builders
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("takeoverA")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!((mem, disk, deadline), (0, 0, 0), "floors reset in-tx");
+    assert_eq!(
+        cycles, 0,
+        "no clear_poison_batch increment for the takeover row"
+    );
+    assert_eq!(retries, 0);
+    assert!(!poisoned, "poisoned_at cleared");
+    assert!(builders.is_empty(), "failed_builders cleared");
+    Ok(())
+}
+
+// r[verify sched.merge.displaced-failure-reset+2]
+/// The reaped-row variant of the authority takeover: the authoritative
+/// squat's in-memory node is long gone (reaped with its terminal build),
+/// but its row — ratcheted floors, consumed budget, stale authoritative
+/// bytes — still exists. A later store-backed submission of the same
+/// drv_hash is a plain fresh insert in memory; the row-level
+/// definition-change detector still fires (prior content present,
+/// incoming content NULL), so the row is reset in the same transaction
+/// and the fresh in-memory node is not hydrated with the squat's floors.
+#[tokio::test]
+async fn test_reaped_authoritative_squat_row_resets_on_fresh_store_backed_merge() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Pre-seed the authoritative-origin row directly (no in-memory node).
+    sqlx::query(
+        "INSERT INTO derivations
+             (drv_hash, drv_path, system, status, is_fixed_output, is_ca,
+              output_names, expected_output_paths, drv_content,
+              floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
+              poisoned_at, failed_builders, retry_count, resubmit_cycles)
+         VALUES ($1, $2, 'x86_64-linux', 'cancelled', false, true,
+                 ARRAY['out'], ARRAY[]::text[], $3,
+                 8589934592, 34359738368, 86400,
+                 now(), ARRAY['w1','w2'], 3, 2)",
+    )
+    .bind("reapedA")
+    .bind(test_drv_path("reapedA"))
+    .bind(b"Derive-reapedA".as_slice())
+    .execute(&db.pool)
+    .await?;
+
+    // Fresh store-backed submission for the same hash.
+    let build = Uuid::new_v4();
+    merge_dag(&handle, build, vec![make_node("reapedA")], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Row: reset by the definition-change detector inside the upsert.
+    let (mem, cycles, poisoned, content): (i64, i32, bool, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT floor_mem_bytes, resubmit_cycles, poisoned_at IS NOT NULL, drv_content
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind("reapedA")
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(mem, 0, "floor reset on the reaped-row takeover");
+    assert_eq!(cycles, 0, "budget reset");
+    assert!(!poisoned, "poisoned_at cleared");
+    assert_eq!(content, None, "stale authoritative bytes cleared");
+
+    // In-memory: the fresh node keeps zero floors (RETURNING already
+    // carries the reset values, so the I-208 hydration cannot resurrect
+    // the squat's sizing).
+    let info = expect_drv(&handle, "reapedA").await;
+    assert_eq!(
+        info.sched.resource_floor.mem_bytes, 0,
+        "fresh node not hydrated with the reaped squat's floors"
     );
     Ok(())
 }

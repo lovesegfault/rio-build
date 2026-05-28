@@ -1691,19 +1691,36 @@ carrying the prior builds' interest onto attacker-chosen content; with it,
 an authoritative claim can only ever adopt a definition it can prove it
 shares.
 
-#r("sched.merge.displaced-failure-reset")[
-  Displacement MUST reset every failure-derived column of the displaced
-  derivation's persisted row --- poison state, failed-builder set, retry
-  and resubmit counters, status, and the reactive resource floors --- and
-  the displacing definition's in-memory node MUST NOT inherit the displaced
-  node's resource floors. Administrative poison clears, TTL expiry, and
-  same-definition resubmits keep their floor-preserving semantics.
+#r("sched.merge.displaced-failure-reset+2")[
+  Any (re)creation of a derivation row whose previously persisted content
+  was authoritative and whose incoming content is not byte-identical to it
+  --- displacement, an identity-matching store-backed resubmission taking
+  over a parked authoritative claim, or a fresh re-creation after the
+  prior node was reaped --- MUST reset every failure-derived column of the
+  persisted row (poison state, failed-builder set, retry and resubmit
+  counters, status, and the reactive resource floors) in the same
+  transaction as the recreate-refresh, and the (re)creating definition's
+  in-memory node MUST NOT inherit the prior node's resource floors or its
+  consumed poison-resubmit budget. Administrative poison clears, TTL
+  expiry, and same-definition resubmits keep their floor-preserving
+  semantics.
 ]
 Failure attribution and reactive sizing must not cross the definition
-boundary: the floors were ratcheted by the displaced definition's failures,
-and letting the displacing definition inherit them would permanently
-dispatch the victim at ceiling sizes (the floors never decay and survive
-failover).
+boundary: the floors were ratcheted by the prior definition's failures, and
+letting the replacing definition inherit them would permanently dispatch
+the victim at ceiling sizes (the floors never decay and survive failover);
+the consumed resubmit budget and avoid-list would likewise charge the
+victim for the squat's deliberate failures. The detector is row-level ---
+prior content present and incoming content different --- so it covers every
+takeover path uniformly: displacement of a conflicting or poison-locked
+claim, the identity-matching resubmit takeover, and a re-creation of a
+reaped authoritative row, whether or not the in-memory node still existed.
+Doing the reset inside the recreate-refresh transaction (rather than as a
+post-commit step) means a leader crash cannot leave the squat's
+accumulators paired with the replacing definition's identity. Accepted
+cost: a hook-fallback definition later resubmitted store-backed re-learns
+its resource floor once (one extra failure-and-resize cycle); same-content
+authoritative resubmits and store-origin rows are unaffected.
 
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from
@@ -1718,38 +1735,46 @@ in-flight node's recovery row can no longer be overwritten --- or its
 authoritative inline content cleared --- by a submission that did not create
 it.
 
-#r("sched.persist.recreate-refresh")[
+#r("sched.persist.recreate-refresh+2")[
   A submission that (re)creates a derivation's in-memory node MUST refresh
   the persisted row's full creation-time snapshot --- declared identity
-  (pname, system, required features), output names, expected output paths,
-  content flags, inline content, and status --- and MUST NOT touch the
-  row's live accumulator columns (poison timestamps, failed builders, retry
-  and resubmit counters, resource floors), which have their own writers.
+  (pname, system, required features), the declared `.drv` store path,
+  output names, expected output paths, content flags, inline content, and
+  status --- and MUST NOT touch the row's live accumulator columns (poison
+  timestamps, failed builders, retry and resubmit counters, resource
+  floors), which have their own writers, except for the definition-change
+  reset required by #rref("sched.merge.displaced-failure-reset").
 ]
 Same `drv_hash` no longer implies same content: a displacing submission
 (#rref("sched.merge.authoritative-conflict")) carries a different verifiable
 identity, and without the snapshot refresh a leader failover would rebuild
 the node from the displaced squatter's identity, silently undoing the
-displacement. Reap-then-resubmit and crash-retry re-creations get the same
+displacement. The `.drv` store path is part of that snapshot: recovery and
+post-failover dispatch read the path from the row, so a squatter-declared
+decoy path surviving the refresh would leave the displacing definition
+undispatchable (workers would be told to fetch a `.drv` that exists in no
+store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
-#r("sched.persist.atomic-activation")[
-  The merge-time persistence of (re)created derivation rows,
-  build-derivation links, edges, and the durable displacement prune MUST
-  commit in the same transaction as the owning build's `pending` to
-  `active` status update. A merge that fails before that single commit
-  point MUST leave every pre-existing derivation row --- including
-  displaced and resubmit-reset nodes' status, identity, and authoritative
-  inline content --- exactly as its prior creation persisted it.
-  Best-effort accounting resets (poison clears, the displaced-row failure
-  reset) MUST run only after that commit.
+#r("sched.persist.atomic-activation+2")[
+  The merge-time persistence of (re)created derivation rows --- including
+  the definition-change accumulator reset of
+  #rref("sched.merge.displaced-failure-reset") --- build-derivation links,
+  edges, and the durable displacement prune MUST commit in the same
+  transaction as the owning build's `pending` to `active` status update. A
+  merge that fails before that single commit point MUST leave every
+  pre-existing derivation row --- including displaced and resubmit-reset
+  nodes' status, identity, authoritative inline content, and failure
+  accumulators --- exactly as its prior creation persisted it. Best-effort
+  accounting resets (same-definition poison clears, the redundant
+  displaced-row reset) MUST run only after that commit.
 ]
 With one commit point, "the build was accepted" and "its rows are durable"
 are the same event: a submission rejected late (or a leader that dies
 mid-merge) leaves either nothing or a `pending` build row that orphan
-handling already covers, never a half-committed displacement or a cleared
-authoritative blob for a build that was never activated, and recovery needs
-no compensating logic.
+handling already covers, never a half-committed displacement, a cleared
+authoritative blob, or a wiped failure history for a build that was never
+activated, and recovery needs no compensating logic.
 
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to

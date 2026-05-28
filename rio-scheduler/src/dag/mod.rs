@@ -176,8 +176,21 @@ pub struct MergeResult {
     /// (`Cancelled`/`Failed`/`DependencyFailed`/`Poisoned`-under-limit)
     /// removed and reinserted fresh by the resubmit-retry path. Surfaced
     /// so the actor can `db.clear_poison` them — `batch_upsert_derivations`'
-    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders`.
+    /// ON CONFLICT does not touch `poisoned_at`/`failed_builders` for
+    /// same-definition re-creations.
     pub reset_on_resubmit: Vec<DrvHash>,
+    /// Subset of `reset_on_resubmit` where the removed retriable node
+    /// carried authoritative inline content and the re-creating
+    /// submission is store-backed (an authority takeover through the
+    /// resubmit-reset, e.g. an identity-matching store-backed
+    /// resubmission of a parked authoritative claim). Disjoint from
+    /// `displaced`. These rows get the full definition-change
+    /// accumulator reset inside the recreate-refresh upsert
+    /// (`sched.merge.displaced-failure-reset`), and their in-memory
+    /// state starts with a fresh poison-resubmit budget — so the actor
+    /// must NOT also run `clear_poison_batch` on them (it would
+    /// re-increment `resubmit_cycles` in PG and diverge from memory).
+    pub authority_takeovers: Vec<DrvHash>,
     /// Subset of `newly_inserted` that DISPLACED a terminal authoritative
     /// node (`sched.merge.authoritative-conflict`): either its verifiable
     /// identity conflicted with this submission, or it matched but the
@@ -492,6 +505,7 @@ impl DerivationDag {
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
+        let mut authority_takeovers: Vec<DrvHash> = Vec::new();
         let mut displaced: Vec<DrvHash> = Vec::new();
         // Track newly-inserted edges for rollback (pairs of hashes)
         let mut new_edges: Vec<(DrvHash, DrvHash)> = Vec::new();
@@ -716,12 +730,22 @@ impl DerivationDag {
                 .is_some_and(DerivationState::is_retriable_on_resubmit)
             {
                 let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
+                // Authority takeover: the removed retriable node carried
+                // authoritative inline content and the re-creating
+                // submission is store-backed (the gate above only admits
+                // this shape on a verifiable identity match). The fresh
+                // node is the store-backed definition taking over the
+                // hash, so the squat's consumed poison budget must not
+                // carry over (sched.merge.displaced-failure-reset).
+                let authority_flip =
+                    old.drv_content_authoritative && !node.drv_content_authoritative;
                 let carry = (
                     old.interested_builds.clone(),
                     old.retry.resubmit_cycles,
                     old.wanted_output_names.clone(),
                     old.wanted_by_build.clone(),
                     old.closure_hole,
+                    authority_flip,
                 );
                 removed_retriable.push((drv_hash.clone(), old));
                 Some(carry)
@@ -838,16 +862,30 @@ impl DerivationDag {
                 // resubmitter's own entry authoritative. The closure-hole
                 // breadcrumb rides along too — the kept edges were not
                 // re-declared by this reset (see the carry site above).
+                //
+                // r[impl sched.merge.displaced-failure-reset+2]
+                // Exception: an authority takeover (the removed node was
+                // authoritative, the re-creating submission store-backed)
+                // is a definition change, not a retry of the prior
+                // definition — it starts with a fresh poison budget
+                // (cycles = 0, mirroring the in-tx row reset) and is
+                // surfaced in `authority_takeovers` so the actor skips
+                // the cycle-incrementing `clear_poison_batch` for it.
                 if let Some((
                     prior_interest,
                     prior_cycles,
                     prior_wanted,
                     prior_contributions,
                     prior_closure_hole,
+                    authority_flip,
                 )) = prior
                 {
                     state.interested_builds.extend(prior_interest);
-                    state.retry.resubmit_cycles = prior_cycles + 1;
+                    state.retry.resubmit_cycles =
+                        if authority_flip { 0 } else { prior_cycles + 1 };
+                    if authority_flip {
+                        authority_takeovers.push(drv_hash.clone());
+                    }
                     state.union_wanted(&prior_wanted);
                     for (b, w) in prior_contributions {
                         state.wanted_by_build.entry(b).or_insert(w);
@@ -937,6 +975,7 @@ impl DerivationDag {
         Ok(MergeResult {
             newly_inserted,
             reset_on_resubmit,
+            authority_takeovers,
             displaced,
             new_edges,
             interest_added,

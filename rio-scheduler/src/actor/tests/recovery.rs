@@ -5109,18 +5109,25 @@ async fn test_recovery_registers_realisation_for_authoritative_ca_fallback() -> 
 
 /// Displacement must survive leader failover: once a conflicting
 /// store-backed definition displaces a terminal authoritative squat, the
-/// persisted row carries the DISPLACING identity, so recovery rebuilds
-/// (and re-dispatches) that definition — not the squatter's — and without
-/// the squatter's stale authoritative bytes.
+/// persisted row carries the DISPLACING identity — including the
+/// displacing submission's `.drv` path, not the squatter's decoy path —
+/// so recovery rebuilds (and re-dispatches) that definition — not the
+/// squatter's — and without the squatter's stale authoritative bytes.
 // r[verify sched.merge.authoritative-conflict+3]
+// r[verify sched.persist.recreate-refresh+2]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
     let squatter = Uuid::new_v4();
     let displacer = Uuid::new_v4();
     let f = RecoveryFixture::run(async move |handle, _| {
         // Squatter: authoritative single-node build, completed by an
-        // x86_64 worker → node terminal.
+        // x86_64 worker → node terminal. It declares a DECOY .drv path
+        // (nothing binds drv_hash to drv_path for a direct submitter);
+        // the recreate-refresh must replace it with the displacing
+        // submission's real path or post-failover dispatch would tell
+        // workers to fetch a .drv that exists in no store.
         let mut squat = make_node("squat-recover");
+        squat.drv_path = test_drv_path("squat-recover-decoy");
         squat.drv_content = b"Derive-squat".to_vec();
         squat.drv_content_authoritative = true;
         merge_dag(&handle, squatter, vec![squat], vec![], false).await?;

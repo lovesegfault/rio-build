@@ -147,7 +147,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.displaced-failure-reset]
+// r[verify sched.merge.displaced-failure-reset+2]
 /// Column-set contrast between the two scalar resets: `clear_poison`
 /// (admin/TTL/same-definition) PRESERVES the reactive resource floors —
 /// sticky sizing memory for the same definition — while

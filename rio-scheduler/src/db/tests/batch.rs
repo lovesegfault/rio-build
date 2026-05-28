@@ -695,22 +695,60 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
     Ok(())
 }
 
-/// Displacement persistence: a later creation-scoped upsert of the same
-/// drv_hash refreshes the full creation-time snapshot — pname, system,
-/// required_features, status — so a leader failover rebuilds the node
-/// from the identity that won the merge (the displacing submission), not
-/// the squatter's. Live accumulators (poison/failure/floor columns) keep
-/// their own writers and must NOT be touched by the upsert.
-// r[verify sched.persist.recreate-refresh]
+/// Helper for the recreate-refresh tests: ratchet every live accumulator
+/// column on a row, simulating poison/floor history written by their own
+/// writers.
+async fn ratchet_accumulators(pool: &sqlx::PgPool, drv_hash: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE derivations
+         SET poisoned_at = now(), failed_builders = '{w1,w2}', retry_count = 2,
+             resubmit_cycles = 3, floor_mem_bytes = 4096,
+             floor_disk_bytes = 8192, floor_deadline_secs = 600
+         WHERE drv_hash = $1",
+    )
+    .bind(drv_hash)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Accumulator snapshot used by the recreate-refresh tests.
+async fn fetch_accumulators(
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+) -> anyhow::Result<(bool, Vec<String>, i32, i32, i64, i64, i64)> {
+    Ok(sqlx::query_as(
+        "SELECT poisoned_at IS NOT NULL, failed_builders, retry_count,
+                resubmit_cycles, floor_mem_bytes, floor_disk_bytes,
+                floor_deadline_secs
+         FROM derivations WHERE drv_hash = $1",
+    )
+    .bind(drv_hash)
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Re-creation persistence for SAME-definition shapes: a later
+/// creation-scoped upsert of the same drv_hash refreshes the full
+/// creation-time snapshot — pname, system, required_features, status, and
+/// the declared `.drv` path — so a leader failover rebuilds the node from
+/// the identity that won the merge. Live accumulators (poison/failure/
+/// floor columns) keep their own writers and must NOT be touched when the
+/// definition did not change: a store-origin row re-created store-backed,
+/// and an authoritative row re-created with byte-identical content, both
+/// preserve them (the definition-change reset is covered by
+/// `test_batch_upsert_resets_accumulators_on_definition_change`).
+// r[verify sched.persist.recreate-refresh+2]
 #[tokio::test]
 async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    let squatter = DerivationRow {
-        drv_hash: "displaced".into(),
-        drv_path: format!("/nix/store/{}-displaced.drv", "d".repeat(32)),
-        pname: Some("squat".into()),
+    // ── Store-origin row, re-created store-backed ─────────────────────
+    let first = DerivationRow {
+        drv_hash: "recreate-store".into(),
+        drv_path: format!("/nix/store/{}-recreate-store-old.drv", "d".repeat(32)),
+        pname: Some("old".into()),
         system: "x86_64-linux".into(),
         status: DerivationStatus::Completed,
         required_features: vec!["kvm".into()],
@@ -718,27 +756,154 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         output_names: vec!["out".into()],
         is_fixed_output: false,
         is_ca: true,
-        drv_content: Some(b"Derive-squat".to_vec()),
+        drv_content: None,
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[squatter]).await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[first]).await?;
+    tx.commit().await?;
+    ratchet_accumulators(&test_db.pool, "recreate-store").await?;
+
+    // The re-creating submission declares a different identity AND a
+    // different .drv path; both must win in the persisted snapshot.
+    let new_path = format!("/nix/store/{}-recreate-store-new.drv", "e".repeat(32));
+    let recreator = DerivationRow {
+        drv_hash: "recreate-store".into(),
+        drv_path: new_path.clone(),
+        pname: Some("new".into()),
+        system: "aarch64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: None,
+    };
+    let mut tx = db.pool().begin().await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreator]).await?;
     tx.commit().await?;
 
-    // Simulate live accumulator state written by other writers.
-    sqlx::query(
-        "UPDATE derivations
-         SET poisoned_at = now(), failed_builders = '{w1}', retry_count = 2,
-             resubmit_cycles = 3, floor_mem_bytes = 4096
-         WHERE drv_hash = 'displaced'",
+    let (pname, system, status, features, drv_path): (
+        Option<String>,
+        String,
+        String,
+        Vec<String>,
+        String,
+    ) = sqlx::query_as(
+        "SELECT pname, system, status, required_features, drv_path
+             FROM derivations WHERE drv_hash = 'recreate-store'",
     )
-    .execute(&test_db.pool)
+    .fetch_one(&test_db.pool)
     .await?;
+    assert_eq!(pname.as_deref(), Some("new"), "pname refreshed");
+    assert_eq!(system, "aarch64-linux", "system refreshed");
+    assert_eq!(status, "created", "status reset to the creation snapshot");
+    assert!(features.is_empty(), "required_features refreshed");
+    assert_eq!(
+        drv_path, new_path,
+        "drv_path refreshed to the re-creating submission's declared path"
+    );
 
-    // The displacing submission re-creates the node with a different
-    // verifiable identity.
-    let displacer = DerivationRow {
-        drv_hash: "displaced".into(),
-        drv_path: format!("/nix/store/{}-displaced.drv", "d".repeat(32)),
+    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, floor_disk, floor_deadline) =
+        fetch_accumulators(&test_db.pool, "recreate-store").await?;
+    assert!(has_poison, "poisoned_at untouched by a same-origin upsert");
+    assert_eq!(
+        failed,
+        vec!["w1".to_string(), "w2".to_string()],
+        "failed_builders untouched"
+    );
+    assert_eq!(retry_count, 2, "retry_count untouched");
+    assert_eq!(resubmit_cycles, 3, "resubmit_cycles untouched");
+    assert_eq!(
+        (floor_mem, floor_disk, floor_deadline),
+        (4096, 8192, 600),
+        "floor columns untouched"
+    );
+    // RETURNING carries the preserved floors so the I-208 hydration sees
+    // them.
+    let (_, returned_floor) = &id_map["recreate-store"];
+    assert_eq!(returned_floor.mem_bytes, 4096);
+    assert_eq!(returned_floor.disk_bytes, 8192);
+    assert_eq!(returned_floor.deadline_secs, 600);
+
+    // ── Authoritative row, re-created with byte-identical content ─────
+    let auth = |status: DerivationStatus| DerivationRow {
+        drv_hash: "recreate-auth".into(),
+        drv_path: format!("/nix/store/{}-recreate-auth.drv", "f".repeat(32)),
+        pname: Some("hook".into()),
+        system: "x86_64-linux".into(),
+        status,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: Some(b"Derive-same".to_vec()),
+    };
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Failed)]).await?;
+    tx.commit().await?;
+    ratchet_accumulators(&test_db.pool, "recreate-auth").await?;
+
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Created)]).await?;
+    tx.commit().await?;
+
+    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, _, _) =
+        fetch_accumulators(&test_db.pool, "recreate-auth").await?;
+    assert!(
+        has_poison,
+        "byte-identical authoritative re-creation keeps poisoned_at"
+    );
+    assert_eq!(failed.len(), 2, "failed_builders untouched");
+    assert_eq!(retry_count, 2);
+    assert_eq!(resubmit_cycles, 3, "resubmit budget keeps accumulating");
+    assert_eq!(floor_mem, 4096, "floors preserved for the same definition");
+    Ok(())
+}
+
+/// Definition-change accumulator reset (the in-tx half of
+/// `sched.merge.displaced-failure-reset`): when the row's prior creation
+/// persisted authoritative bytes and the incoming creation's content is
+/// not byte-identical — a store-backed takeover (displacement, the
+/// identity-matching resubmit takeover, or a re-creation of a reaped
+/// authoritative row) or a byte-different authoritative displacement —
+/// the upsert itself zeroes every failure-derived column in the same
+/// statement, refreshes the identity snapshot (including `drv_path`), and
+/// RETURNING already reports the reset floors so the I-208 hydration
+/// cannot resurrect the prior definition's sizing.
+// r[verify sched.merge.displaced-failure-reset+2]
+// r[verify sched.persist.recreate-refresh+2]
+#[tokio::test]
+async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let auth_row = |hash: &str, content: &[u8]| DerivationRow {
+        drv_hash: hash.into(),
+        drv_path: format!("/nix/store/{}-{hash}-squat.drv", "a".repeat(32)),
+        pname: Some("squat".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Poisoned,
+        required_features: vec!["kvm".into()],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: true,
+        drv_content: Some(content.to_vec()),
+    };
+
+    // ── (a) authoritative squat → store-backed re-creation ────────────
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth_row("defchange-store", b"Derive-squat")])
+        .await?;
+    tx.commit().await?;
+    ratchet_accumulators(&test_db.pool, "defchange-store").await?;
+
+    let victim_path = format!("/nix/store/{}-defchange-store.drv", "b".repeat(32));
+    let store_backed = DerivationRow {
+        drv_hash: "defchange-store".into(),
+        drv_path: victim_path.clone(),
         pname: Some("victim".into()),
         system: "aarch64-linux".into(),
         status: DerivationStatus::Created,
@@ -750,43 +915,72 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         drv_content: None,
     };
     let mut tx = db.pool().begin().await?;
-    SchedulerDb::batch_upsert_derivations(&mut tx, &[displacer]).await?;
+    let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[store_backed]).await?;
     tx.commit().await?;
 
-    let (pname, system, status, features): (Option<String>, String, String, Vec<String>) =
-        sqlx::query_as(
-            "SELECT pname, system, status, required_features
-             FROM derivations WHERE drv_hash = 'displaced'",
-        )
-        .fetch_one(&test_db.pool)
-        .await?;
-    assert_eq!(pname.as_deref(), Some("victim"), "pname refreshed");
-    assert_eq!(system, "aarch64-linux", "system refreshed");
-    assert_eq!(status, "created", "status reset to the creation snapshot");
-    assert!(features.is_empty(), "required_features refreshed");
-
-    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem): (
-        bool,
-        Vec<String>,
-        i32,
-        i32,
-        i64,
-    ) = sqlx::query_as(
-        "SELECT poisoned_at IS NOT NULL, failed_builders, retry_count,
-                resubmit_cycles, floor_mem_bytes
-         FROM derivations WHERE drv_hash = 'displaced'",
+    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, floor_disk, floor_deadline) =
+        fetch_accumulators(&test_db.pool, "defchange-store").await?;
+    assert!(!has_poison, "poisoned_at cleared on definition change");
+    assert!(failed.is_empty(), "failed_builders cleared");
+    assert_eq!(retry_count, 0, "retry_count reset");
+    assert_eq!(resubmit_cycles, 0, "poison-resubmit budget starts fresh");
+    assert_eq!(
+        (floor_mem, floor_disk, floor_deadline),
+        (0, 0, 0),
+        "reactive floors reset"
+    );
+    let (system, drv_path, content): (String, String, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT system, drv_path, drv_content FROM derivations WHERE drv_hash = 'defchange-store'",
     )
     .fetch_one(&test_db.pool)
     .await?;
-    assert!(has_poison, "poisoned_at untouched by the upsert");
-    assert_eq!(failed, vec!["w1".to_string()], "failed_builders untouched");
-    assert_eq!(retry_count, 2, "retry_count untouched");
-    assert_eq!(resubmit_cycles, 3, "resubmit_cycles untouched");
-    assert_eq!(floor_mem, 4096, "floor columns untouched");
+    assert_eq!(system, "aarch64-linux", "identity refreshed");
+    assert_eq!(drv_path, victim_path, "squatter's decoy path replaced");
+    assert_eq!(content, None, "authoritative bytes cleared");
+    // RETURNING reflects the reset, so the in-memory hydration of the
+    // displacing node sees zeros without any special-casing.
+    let (_, returned_floor) = &id_map["defchange-store"];
+    assert_eq!(returned_floor.mem_bytes, 0);
+    assert_eq!(returned_floor.disk_bytes, 0);
+    assert_eq!(returned_floor.deadline_secs, 0);
+
+    // ── (b) authoritative squat → byte-different authoritative ────────
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[auth_row("defchange-auth", b"Derive-squat")])
+        .await?;
+    tx.commit().await?;
+    ratchet_accumulators(&test_db.pool, "defchange-auth").await?;
+
+    let mut victim = auth_row("defchange-auth", b"Derive-victim");
+    victim.pname = Some("victim".into());
+    victim.status = DerivationStatus::Created;
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &[victim]).await?;
+    tx.commit().await?;
+
+    let (has_poison, failed, retry_count, resubmit_cycles, floor_mem, _, _) =
+        fetch_accumulators(&test_db.pool, "defchange-auth").await?;
+    assert!(
+        !has_poison,
+        "byte-different authoritative re-creation resets"
+    );
+    assert!(failed.is_empty());
+    assert_eq!(retry_count, 0);
+    assert_eq!(resubmit_cycles, 0);
+    assert_eq!(floor_mem, 0);
+    let (content,): (Option<Vec<u8>>,) =
+        sqlx::query_as("SELECT drv_content FROM derivations WHERE drv_hash = 'defchange-auth'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-victim".as_slice()),
+        "incoming bytes persisted"
+    );
     Ok(())
 }
 
-// r[verify sched.persist.atomic-activation]
+// r[verify sched.persist.atomic-activation+2]
 /// The merge-time persist transaction (derivation upsert + build links +
 /// the build's Pending→Active update) is one commit point: dropping the
 /// transaction before commit leaves a pre-existing row's recreate-refresh

@@ -258,7 +258,7 @@ impl SchedulerDb {
     /// edges — `sched.persist.atomic-activation`: "the build was accepted"
     /// and "its rows are durable" are one commit point. Plain runtime
     /// queries (no `query!`) so `.sqlx/` is unaffected.
-    // r[impl sched.persist.atomic-activation]
+    // r[impl sched.persist.atomic-activation+2]
     pub(crate) async fn update_build_status_tx(
         conn: &mut sqlx::PgConnection,
         build_id: Uuid,

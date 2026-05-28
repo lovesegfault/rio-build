@@ -282,9 +282,11 @@ impl SchedulerDb {
     /// Deliberately FLOOR-PRESERVING: the reactive resource floors
     /// (`floor_mem_bytes`/`floor_disk_bytes`/`floor_deadline_secs`) are
     /// same-definition sizing memory (M_044) and survive an admin/TTL
-    /// poison clear. A *displacement* replaces the definition itself, so
-    /// it uses [`Self::reset_displaced_derivation`] instead, which also
-    /// zeroes the floors.
+    /// poison clear. A *definition change* (displacement, or a
+    /// store-backed re-creation taking over an authoritative claim) is
+    /// handled by the recreate-refresh upsert's in-tx definition-change
+    /// reset (plus [`Self::reset_displaced_derivation`] as
+    /// belt-and-suspenders), which also zeroes the floors.
     pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations
@@ -316,6 +318,12 @@ impl SchedulerDb {
     /// `resubmit_cycles` (admin/TTL → full reset); this one increments
     /// it (resubmit → bound accumulates).
     ///
+    /// Scope: SAME-definition resubmit-resets only. Authority takeovers
+    /// (`MergeResult::authority_takeovers`) are excluded by the caller —
+    /// their rows already got the full definition-change reset inside the
+    /// recreate-refresh upsert, and incrementing `resubmit_cycles` here
+    /// would diverge from the fresh in-memory budget.
+    ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
     pub async fn clear_poison_batch(&self, drv_hashes: &[DrvHash]) -> Result<u64, sqlx::Error> {
@@ -336,7 +344,7 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    // r[impl sched.merge.displaced-failure-reset]
+    // r[impl sched.merge.displaced-failure-reset+2]
     /// Full failure-history reset for a DISPLACED derivation row
     /// (`sched.merge.authoritative-conflict`): the displacing submission
     /// is a different derivation definition, so nothing learned from the
@@ -347,6 +355,13 @@ impl SchedulerDb {
     /// reactive resource floors (`floor_*`) that
     /// [`Self::clear_poison`]/[`Self::clear_poison_batch`] deliberately
     /// preserve for same-definition resets.
+    ///
+    /// Since the definition-change reset moved into
+    /// `batch_upsert_derivations`' ON CONFLICT (riding the merge
+    /// transaction), this post-commit per-hash call is redundant
+    /// belt-and-suspenders for displaced rows whose persisted content had
+    /// drifted from the displaced in-memory definition; the in-tx reset
+    /// is the primary enforcement.
     pub async fn reset_displaced_derivation(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
             "UPDATE derivations

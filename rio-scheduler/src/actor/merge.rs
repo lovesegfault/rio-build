@@ -699,8 +699,9 @@ impl DagActor {
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
         // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
-        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count,
-        // so without this PG keeps stale poison fields. The status itself
+        // CONFLICT does NOT touch poisoned_at/failed_builders/retry_count
+        // for same-definition re-creations, so without this PG keeps
+        // stale poison fields. The status itself
         // is overwritten by `update_derivation_status_batch` below
         // (→ ready/queued), so recovery's `WHERE status='poisoned'` won't
         // resurrect it; this is about keeping failed_builders/poisoned_at
@@ -709,33 +710,50 @@ impl DagActor {
         // Best-effort, and strictly post-commit
         // (sched.persist.atomic-activation): a merge that failed above
         // never reaches these.
+        //
+        // Authority takeovers (an authoritative claim replaced by a
+        // store-backed re-creation through the resubmit-reset) are
+        // EXCLUDED: the recreate-refresh's definition-change reset
+        // already zeroed their accumulators inside the merge transaction
+        // (sched.merge.displaced-failure-reset), and their in-memory
+        // budget starts fresh — running the cycle-incrementing batch on
+        // them would diverge PG from memory.
         // r[impl sched.db.clear-poison-batch]
-        if let Err(e) = self
-            .db
-            .clear_poison_batch(&merge_result.reset_on_resubmit)
-            .await
-        {
+        let same_definition_resets: Vec<DrvHash> = merge_result
+            .reset_on_resubmit
+            .iter()
+            .filter(|h| {
+                !merge_result
+                    .authority_takeovers
+                    .iter()
+                    .any(|t| t.as_str() == h.as_str())
+            })
+            .cloned()
+            .collect();
+        if let Err(e) = self.db.clear_poison_batch(&same_definition_resets).await {
             warn!(
-                count = merge_result.reset_on_resubmit.len(),
+                count = same_definition_resets.len(),
                 error = %e,
                 "failed to clear poison in PG for resubmit-reset nodes"
             );
         }
 
-        // r[impl sched.merge.displaced-failure-reset]
+        // r[impl sched.merge.displaced-failure-reset+2]
         // Displaced authoritative squats (sched.merge.authoritative-conflict)
-        // get the FULL failure-history reset (`reset_displaced_derivation`,
-        // which zeroes `resubmit_cycles` AND the reactive resource floors),
-        // not `clear_poison_batch`: the fresh node is the verifiable
-        // store-backed definition taking over the hash (a conflicting
-        // identity, or the matching one evicting a poison-locked claim),
-        // not a retry of the squat, so it must not
-        // inherit the squat's failure history, consume its poison-resubmit
-        // budget, or be dispatched at the ceiling sizes the squat's
-        // deliberate failures ratcheted the floors up to (the
-        // same-definition resets above stay floor-preserving by design).
-        // Per-hash is fine — displacement is a rare, adversarial-only
-        // path. Best-effort like the batch above.
+        // get the FULL failure-history reset (zeroed `resubmit_cycles`
+        // AND reactive resource floors), not `clear_poison_batch`: the
+        // fresh node is the verifiable definition taking over the hash,
+        // not a retry of the squat, so it must not inherit the squat's
+        // failure history, consume its poison-resubmit budget, or be
+        // dispatched at the ceiling sizes the squat's deliberate failures
+        // ratcheted the floors up to (the same-definition resets above
+        // stay floor-preserving by design). PRIMARY enforcement is the
+        // definition-change reset inside the recreate-refresh upsert,
+        // which committed with the merge transaction; this per-hash
+        // post-commit loop is redundant belt-and-suspenders kept for the
+        // rare case where the row's persisted content did not reflect the
+        // displaced in-memory definition. Best-effort like the batch
+        // above.
         for drv_hash in &merge_result.displaced {
             if let Err(e) = self.db.reset_displaced_derivation(drv_hash).await {
                 warn!(
@@ -2238,12 +2256,13 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.persist.atomic-activation]
+        // r[impl sched.persist.atomic-activation+2]
         // The owning build's Pending→Active joins the same commit: if the
         // tx fails or the leader dies here, recovery sees either nothing
         // (plus a pending build row that orphan handling covers) or the
         // fully-committed Active build — never a half-committed
-        // recreate-refresh for a build that was never activated.
+        // recreate-refresh (or definition-change accumulator reset) for a
+        // build that was never activated.
         crate::db::SchedulerDb::update_build_status_tx(&mut tx, build_id, BuildState::Active, None)
             .await?;
 
@@ -2289,12 +2308,18 @@ impl DagActor {
         // downgrade. Per-dimension `.max()` only RAISES so a stale DB
         // row never demotes a higher in-memory floor.
         //
-        // r[impl sched.merge.displaced-failure-reset]
+        // r[impl sched.merge.displaced-failure-reset+2]
         // DISPLACED hashes are excluded: the row's floors were ratcheted
         // by the displaced definition's failures, and the displacing
         // submission is a different definition, so its fresh node keeps
-        // try_from_node's zeros regardless of whether the best-effort PG
-        // floor reset (post-commit, persist_and_activate) succeeds.
+        // try_from_node's zeros regardless of what the row carried.
+        // Authority-takeover rows need no exclusion of their own: the
+        // definition-change reset inside the upsert already zeroed their
+        // floors, so the RETURNING values hydrated here are zeros by
+        // construction. The explicit displaced exclusion is kept as
+        // defense-in-depth for a row whose persisted content drifted from
+        // the displaced in-memory definition (where the in-tx reset's
+        // row-level predicate could miss).
         for (hash, (db_id, floor)) in &id_map {
             if let Some(state) = self.dag.node_mut(hash) {
                 state.db_id = Some(*db_id);
