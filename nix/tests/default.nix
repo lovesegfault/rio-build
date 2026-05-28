@@ -843,13 +843,28 @@ in
   #   and the cancelled exec is charged nothing.
   vm-pull-canary-k3s = lifecyclePullCanaryMod.mkTest {
     name = "pull-canary";
-    subtests = [ "pull-canary" ];
+    subtests = [
+      "pull-canary"
+      # r[verify sched.executor.pull-transaction]
+      # r[verify sched.sla.fod-feature-derivation+3]
+      #   pull-fetcher (T-1c.2): fetcher-kind pull coverage for the 1c
+      #   gate's "pool kinds the canary did not cover". A kind=Fetcher
+      #   Pool with dispatchMode:Pull builds a network-free FOD on the
+      #   pull path (one open attempt minted by the pull, executes with
+      #   dispatch_mode=pull on a RIO_EXECUTOR_KIND=fetcher pod, charges
+      #   nothing) and the pod follows the OA3 one-pull default — it
+      #   completes after its single report instead of retaining a
+      #   session. Runs after pull-canary's cleanup (no Pools left).
+      "pull-fetcher"
+    ];
     # Budget: ~240s k3s bring-up + ~80s prelude + stream baseline ~160s
     # + pool swap & pull equivalence ~175s + cancel arm ~150s + preempt
     # arm ~200s + establishment arm ~400-470s (the ~300s window
-    # dominates) + cleanup ~30s ≈ 1300-1500s expected on a loaded KVM
-    # runner; 2100s leaves tail headroom without being open-ended.
-    globalTimeout = 2100;
+    # dominates) + fetcher pull arm ~150-220s (pool create + Job spawn +
+    # 15s FOD build + report + pod-completion wait + cleanup) + cleanup
+    # ~30s ≈ 1450-1700s expected on a loaded KVM runner; 2400s leaves
+    # tail headroom without being open-ended.
+    globalTimeout = 2400;
   };
 
   #

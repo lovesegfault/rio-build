@@ -3114,3 +3114,81 @@ the landed `vm-pull-canary-k3s` scenario (with the carve-outs named in
 their verdicts); the two PENDING-owner rows and those named carve-outs
 are the open 1b gate items remaining for the close-out; everything
 else in the v3 gate list is green in CI-wired form at this tree.
+
+## Phase-1c record (Slice 1c — fleet-wide pull-path readiness, development-time)
+
+Recorded by the slice-1c batch (Phase-1 plan v3, T-1c.1–T-1c.3;
+T-1c.2b is a separate task and is explicitly NOT covered by this
+record — see the open-items note at the end of the record). Under the
+2026-05-27 directive the production fleet flip and every observation
+read from it are deployment-time checklist rows (D0/D2/D3/D6); this
+record carries the development-time artifacts the deployment-time
+rows will consume, plus the development-time 1c gate evidence.
+
+### The deletion-gate observable and the deadline-horizon formula (T-1c.2; §4.5 choice instantiated)
+
+The §4.5 deletion-gate observable is the stream-registration gauge at
+zero for the computed deadline horizon. Instantiation:
+
+- **Gauge:** `rio_scheduler_workers_active` (stream registrations;
+  pull-mode pods never touch it). Pre-canned fleet-wide aggregate:
+  the recording rule `rio:scheduler_stream_registrations:max`
+  (= `max(rio_scheduler_workers_active)` across scheduler replicas),
+  added to `infra/helm/rio-build/templates/prometheusrule.yaml` under
+  the `rio.deletion-gate.rules` group (recording-only, no alert).
+- **Horizon formula:** `max(activeDeadlineSeconds over live intents)
+  + builder idle-timeout + report-flush slack`, where each input is
+  read at evaluation time as follows:
+  - `max(activeDeadlineSeconds over live intents)` — the maximum
+    `.spec.activeDeadlineSeconds` over the live builder/fetcher Jobs
+    in the executor namespaces (the controller renders it from the
+    solved intent deadline; the same basis ListOpenAttempts reports
+    as `deadline_secs`). With no live Jobs the term is 0.
+  - builder idle-timeout — the builder Config `idle_timeout`
+    (I-116; default 120 s, env `RIO_IDLE_SECS`), the bound for how
+    long an already-registered idle stream executor may linger
+    before exiting on its own.
+  - report-flush slack — the scheduler Config
+    `establishment_report_slack` (default 120 s), the slack the
+    establishment sweep itself grants late reports.
+- **Row-D6 evaluation shape:**
+  `max_over_time(rio:scheduler_stream_registrations:max[<horizon>]) == 0`
+  with `<horizon>` instantiated from the formula above at evaluation
+  time, on every environment sharing the scheduler. The observable
+  arms at deployment time (once a real fleet runs pull-mode); nothing
+  is evaluated during development.
+
+### The C3 busy-source statement (T-1c.2; the 1c gate text made explicit)
+
+Once stream registrations read zero, the busy source C3 (the
+orphan-running reap, I-165) consults is the **open-attempt view** —
+`AdminService.ListOpenAttempts`, the 1a busy-signal bridge
+(`covered_by_open_pull_attempt` in
+`rio-controller/src/reconcilers/pool/job.rs`). The `ListExecutors`
+arm remains consulted during coexistence but matches nothing once no
+executor registers; an **empty executor list does not disable the
+reap** — only an RPC failure does (fail-closed, either view), and the
+leader-age fail-closed arm also remains until 1d. The I-165
+stuck-pod coverage is therefore retained through the bridge rather
+than lost to the empty-list arm; the old ListExecutors consultation
+and the leader-age heuristic are removed only at 1d (T-1d.2), at
+which point the open-attempt view is the sole busy source. No
+coverage loss is being accepted at this slice.
+
+### Fetcher-kind pull coverage (T-1c.2; OA3 evidence input)
+
+`pull-fetcher` subtest added to `vm-pull-canary-k3s`
+(`nix/tests/scenarios/lifecycle/pull-fetcher.nix`): a `kind: Fetcher`
+Pool with `dispatchMode: Pull` builds a network-free fixed-output
+derivation end-to-end on the pull path — the FOD routes to the
+fetcher pool (FOD → `effective_features=[fetcher]` → only the
+Fetcher pool covers it), the spawned pod carries
+`RIO_EXECUTOR_KIND=fetcher` + `RIO_DISPATCH_MODE=pull`, exactly one
+open pull-mode attempt is minted while it builds, the clean build
+charges nothing, and the pod completes after its single report (the
+OA3 one-pull shape) instead of retaining a session. The chart-side
+plumbing for pool-kind dispatch-mode selection (the
+`pools[].dispatchMode` / `poolDefaults.dispatchMode` rendering in
+`templates/pool.yaml`) lands with the same task so values-driven
+fixtures and the deployment-time per-pool flip (row D0) have a
+first-class knob.

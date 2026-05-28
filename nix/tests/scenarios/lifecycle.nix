@@ -282,6 +282,28 @@ let
     sleepSecs = 60;
   };
 
+  # pull-fetcher (vm-pull-canary-k3s only): a network-free fixed-output
+  # derivation for the fetcher-kind pull arm. FOD-ness (outputHash) is
+  # what routes it to the kind=Fetcher pool; the builder just writes a
+  # known payload, so the flat sha256 is computable at eval time and the
+  # build needs no egress. The 15s sleep keeps the open attempt
+  # observable mid-build (same reasoning as pullDrv1).
+  pcFetcherFod = pkgs.writeText "drv-pc-fetcher-fod.nix" ''
+    { busybox }:
+    derivation {
+      name = "rio-test-pc-fetcher-fod";
+      system = builtins.currentSystem;
+      builder = "''${busybox}/bin/sh";
+      args = [ "-c" '''
+        ''${busybox}/bin/busybox sleep 15
+        ''${busybox}/bin/busybox printf '%s' pc-fetcher-payload > $out
+      ''' ];
+      outputHashMode = "flat";
+      outputHashAlgo = "sha256";
+      outputHash = builtins.hashString "sha256" "pc-fetcher-payload";
+    }
+  '';
+
   # gc-sweep's path_tenants proof. Distinct marker so DAG-dedup doesn't
   # reuse pinDrv/gcVictimDrv (those were built with the empty-comment
   # key → tenant_id=None → completion hook's filter_map drops → upsert
@@ -693,6 +715,7 @@ let
       pcCancelDrv
       pcPreemptDrv
       pcEstabDrv
+      pcFetcherFod
       tenantDrv
       rolloutPreDrv
       rolloutPostDrv
