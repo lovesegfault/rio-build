@@ -349,8 +349,8 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let _ = writeln!(out, "\n## Artifacts");
     let _ = writeln!(
         out,
-        "- results.jsonl, hydra.jsonl, warm.jsonl, batches.jsonl, buckets/<bucket>.jsonl, \
-         logs/<job>.log.zst next to this file"
+        "- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, \
+         buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file"
     );
     out
 }

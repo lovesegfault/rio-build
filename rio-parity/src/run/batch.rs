@@ -1,6 +1,6 @@
 //! Greedy batch assembly with the dual cap: batches are capped on BOTH job
 //! count and the estimated merged-closure drv node count, so a single
-//! `nix build` invocation never carries more derivations than the gateway
+//! batch submission never carries more derivations than the gateway
 //! comfortably ingests even when jobs share most of their closures. An
 //! oversized single job becomes a singleton batch rather than being dropped.
 

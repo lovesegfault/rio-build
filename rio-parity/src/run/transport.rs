@@ -1020,7 +1020,8 @@ impl DaemonChannel {
     }
 
     /// `wopQueryValidPaths`: which of `paths` does the target already have?
-    /// (`substitute = false`, mirroring `nix copy`.)
+    /// (`substitute = false` — the probe must never trigger daemon-side
+    /// substitution.)
     pub async fn query_valid_paths(
         &mut self,
         paths: &[String],

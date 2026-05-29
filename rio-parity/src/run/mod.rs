@@ -2,19 +2,19 @@
 //!
 //! Executes one parity campaign against one replay archive: plan the
 //! in-scope jobs, load each job's expected outcome from the archive's
-//! recorded truth, optionally warm upstream-built dependencies, submit
-//! batches to the rio cluster, collect and classify outcomes, and render
-//! the report. Campaign state is append-only JSONL on the pod volume
-//! (periodically synced to S3) so an interrupted run can resume without
-//! repeating terminal work.
+//! recorded truth, supply dependencies to the target (scheduler-side
+//! prefetch and client uploads), submit batches to the rio cluster, collect
+//! and classify outcomes, and render the report. Campaign state is
+//! append-only JSONL on the pod volume (periodically synced to S3) so an
+//! interrupted run can resume without repeating terminal work.
 //!
-//! [`run`] is the production entry point (gRPC, S3, and `nix`-child
-//! backends); [`run_with_backends`] is the orchestrator proper, taking
-//! every external surface behind the [`Backends`] traits so a whole
-//! campaign can execute against in-memory fakes (see the end-to-end test
-//! in this module). Stages are gated by done-markers in the state
-//! directory: plan → hydra-truth → warm (leaf mode) → submit ∥ collect ∥
-//! watchdog ∥ sync → report.
+//! [`run`] is the production entry point (gRPC, S3, and gateway
+//! worker-protocol backends); [`run_with_backends`] is the orchestrator
+//! proper, taking every external surface behind the [`Backends`] traits so
+//! a whole campaign can execute against in-memory fakes (see the
+//! end-to-end test in this module). Stages are gated by done-markers in
+//! the state directory: plan → hydra-truth/truth-load → supply →
+//! execute ∥ collect ∥ watchdog ∥ sync → report.
 
 pub mod archive_input;
 pub mod artifact;
@@ -27,7 +27,6 @@ pub mod grpc;
 pub mod hydra_truth;
 pub mod model;
 pub mod plan;
-pub mod reader;
 pub mod report;
 pub mod spec;
 pub mod state;
@@ -36,10 +35,9 @@ pub mod submit;
 pub mod submitter;
 pub mod supply;
 pub mod transport;
-pub mod warm;
 pub mod watchdog;
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -60,14 +58,16 @@ use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::hydra_truth::NarinfoSource;
 use self::model::{
-    BATCH_KIND_SUBMIT, Bucket, FailureKind, JobRecord, PauseState, RioOutcome, now_rfc3339,
-    rfc3339_to_unix,
+    BATCH_KIND_SUBMIT, Bucket, FailureKind, HydraEntry, JobRecord, PauseState, RioOutcome,
+    now_rfc3339, rfc3339_to_unix,
 };
-use self::reader::{GetBuildGraphReader, ResultReader};
-use self::spec::{CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, generate_campaign_id};
+use self::spec::{
+    CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, SupplyDependencies, generate_campaign_id,
+};
 use self::state::{StateDir, StateFile, latest_per_job};
 use self::submit::{SubmitTracker, run_submit_loop};
-use self::submitter::{ClientOpsSubmitter, Submitter, WarmNixSubmitter};
+use self::submitter::{ClientOpsSubmitter, Submitter};
+use self::supply::exec::{PoolSupplyTransport, SupplyInputs, SupplyTransport, run_supply_stage};
 use self::watchdog::{JobPhase, PollTick, StallKind, StallVerdict, Watchdog};
 
 /// CLI arguments for `rio-parity run`.
@@ -132,18 +132,14 @@ pub struct Backends {
     pub store: Arc<dyn StoreApi>,
     pub admin: Arc<dyn AdminApi>,
     pub cluster: Arc<dyn ClusterApi>,
-    /// Warm-stage read-back only: `run_warm` resolves per-root dispositions
-    /// from the build graph. The build-path collect loop reads in-band
-    /// per-root results from batches.jsonl instead and never touches this.
-    pub reader: Arc<dyn ResultReader>,
     /// Build-path submitter (the worker-protocol client-ops transport in
     /// production).
     pub submitter: Arc<dyn Submitter>,
-    /// Warm-stage prefetch submitter (the `nix` shell-out in leaf mode, kept
-    /// until the supply planner absorbs the warm stage). `None` in
-    /// self-hosted mode and in tests that don't exercise warm — the warm
-    /// stage then falls back to `submitter`.
-    pub warm_submitter: Option<Arc<dyn Submitter>>,
+    /// Supply-stage transport (validity probes, client uploads, prefetch
+    /// builds). `None` = construct the production [`PoolSupplyTransport`]
+    /// from the campaign spec when the supply stage runs; tests inject a
+    /// scripted fake instead.
+    pub supply_transport: Option<Arc<dyn SupplyTransport>>,
     pub narinfo: Arc<dyn NarinfoSource>,
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
@@ -173,11 +169,11 @@ pub struct Backends {
 ///   render. A supplied deadline that does not parse as RFC3339 is a
 ///   startup error.
 /// - **Image requirements:** the per-tenant SSH key files and the service
-///   HMAC key mounted at the paths named in the spec (the build path drives
-///   the gateway's worker protocol in-process), and `nix` plus an `ssh`
-///   client only for the leaf-mode warm-stage prefetch shell-out (until the
-///   supply planner absorbs that stage). The archive input needs no extra
-///   tools: the DwarFS image is opened in place.
+///   HMAC key mounted at the paths named in the spec. The engine drives the
+///   gateway's worker protocol in-process for builds, uploads, and the
+///   prefetch arm — no `nix` binary or `ssh` client is needed — and the
+///   archive input needs no extra tools either: the DwarFS image is opened
+///   in place.
 /// - **Resume:** re-running with the same state dir skips completed stages
 ///   and already-terminal jobs. Resuming on a *fresh* pod volume
 ///   additionally requires `spec.campaign_id` to be pinned (it names the
@@ -204,7 +200,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     };
     // The archive must be on local disk and open before the backends are
     // built (the client-ops submitter imports drv texts from it).
-    let (archive_path, archive) = ensure_archive(
+    let (_archive_path, archive) = ensure_archive(
         &state,
         args.archive.clone(),
         &spec,
@@ -223,13 +219,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
     // gateway's per-connection cap changed, or the connections knob is
     // wrong), not per-unit infra noise.
     let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
-    let host_key = spec
-        .cluster
-        .gateway_host_key
-        .clone()
-        .filter(|key| !key.trim().is_empty())
-        .context("cluster.gateway_host_key must be set for the client-ops transport")?;
-    let policy = transport::HostKeyPolicy::Pinned(host_key);
+    let policy = pinned_host_key_policy(&spec)?;
     let connections = spec
         .knobs
         .connections
@@ -240,10 +230,10 @@ pub async fn run(args: RunArgs) -> Result<()> {
         channels_per_connection = transport::CHANNELS_PER_CONNECTION,
         "gateway transport configured"
     );
-    // The warm stage's absent-upstream probe is pointed at the archive's
-    // declared substituters (target-side first, else the relay the recorder
-    // observed): truth never comes from this client, only warm-path
-    // upstream coverage does.
+    // The supply stage's absent-upstream coverage probe is pointed at the
+    // archive's declared substituters (target-side first, else the relay the
+    // recorder observed): truth never comes from this client, only
+    // prefetch-path upstream coverage does.
     let substituters = &archive.manifest().substituters;
     let probe_substituter = substituters
         .target
@@ -251,7 +241,7 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .or_else(|| substituters.relay.first())
         .cloned()
         .context(
-            "archive lists no substituters; cannot probe upstream coverage for the warm stage",
+            "archive lists no substituters; cannot probe upstream coverage for the supply stage",
         )?;
     // The substituter list is archive-supplied input: refuse to point the
     // live narinfo probe at anything but a public HTTPS cache (no
@@ -266,25 +256,16 @@ pub async fn run(args: RunArgs) -> Result<()> {
         )),
         admin: admin.clone(),
         cluster: admin,
-        reader: Arc::new(GetBuildGraphReader::new(GrpcAdminApi::new(
-            spec.cluster.scheduler_addr.clone(),
-            spec.cluster.service_hmac_key_path.as_deref(),
-        )?)),
         submitter: Arc::new(ClientOpsSubmitter {
             pool,
             archive: Arc::new(drv_import::DrvArchive::new(archive.clone())),
             op_timeout: Duration::from_secs(spec.knobs.op_timeout_secs),
             probe_chunk: spec.knobs.probe_chunk,
         }),
-        // The warm-stage prefetch keeps the nix shell-out until the supply
-        // planner absorbs it; self-hosted mode has no warm stage and carries
-        // no warm submitter. The shell-out's `nix copy` import source went
-        // away with the eval-set layout — it is pointed at the local archive
-        // path so a warm import failure names a real location, and the warm
-        // stage degrades to substitute-only coverage until the supply
-        // planner replaces it.
-        warm_submitter: (spec.mode == Mode::Leaf)
-            .then(|| Arc::new(WarmNixSubmitter::new(archive_path.clone())) as Arc<dyn Submitter>),
+        // Constructed from the spec when the supply stage actually runs (a
+        // resumed campaign whose supply marker is already set never dials
+        // the supply pools).
+        supply_transport: None,
         narinfo: Arc::new(crate::nixcache::NixCacheClient::new(
             &probe_substituter,
             &crate::user_agent(None),
@@ -292,6 +273,65 @@ pub async fn run(args: RunArgs) -> Result<()> {
         artifacts,
     };
     run_with_backends(args, spec, state, archive, backends).await
+}
+
+/// Resolve the SSH host-key policy every gateway pool the engine dials uses:
+/// the spec's pinned `cluster.gateway_host_key` is required — an absent or
+/// empty pin is an explicit error here, never an empty value passed
+/// downstream (which would disable host-key verification).
+fn pinned_host_key_policy(spec: &CampaignSpec) -> Result<transport::HostKeyPolicy> {
+    let host_key = spec
+        .cluster
+        .gateway_host_key
+        .clone()
+        .filter(|key| !key.trim().is_empty())
+        .context("cluster.gateway_host_key must be set for the client-ops transport")?;
+    Ok(transport::HostKeyPolicy::Pinned(host_key))
+}
+
+/// Construct the production supply-stage transport from the campaign spec: a
+/// build-tenant pool for validity probes and client uploads, plus a
+/// prefetch-tenant pool (dialed with `<cluster.ssh_key_dir>/<tenants.warm_tenant>`)
+/// when the effective supply policy includes the prefetch arm.
+fn build_supply_transport(spec: &CampaignSpec) -> Result<Arc<dyn SupplyTransport>> {
+    let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
+    let policy = pinned_host_key_policy(spec)?;
+    // The supply pools serve probe, upload, and prefetch traffic; deriving
+    // the default connection count from those worker budgets (the gateway
+    // caps channels per connection at 4) keeps channel supply ahead of the
+    // stage's demand.
+    let connections = spec.knobs.connections.unwrap_or_else(|| {
+        (spec.knobs.probe_concurrency + spec.knobs.upload_workers + spec.knobs.submit_concurrency)
+            .div_ceil(4)
+            .max(1)
+    });
+    let build = Arc::new(transport::GatewayPool::new(
+        endpoint.clone(),
+        policy.clone(),
+        connections,
+    )?);
+    let prefetch =
+        if spec.supply.effective_dependencies(spec.mode) == SupplyDependencies::Substituters {
+            let key_dir = spec.cluster.ssh_key_dir.as_deref().context(
+                "the supply prefetch arm requires cluster.ssh_key_dir (the per-tenant SSH key \
+             directory) so it can dial the gateway as the prefetch tenant",
+            )?;
+            let key = supply::exec::tenant_key_path(key_dir, &spec.tenants.warm_tenant)?;
+            let mut prefetch_endpoint = endpoint;
+            prefetch_endpoint.ssh_key_path = key;
+            Some(Arc::new(transport::GatewayPool::new(
+                prefetch_endpoint,
+                policy,
+                connections,
+            )?))
+        } else {
+            None
+        };
+    Ok(Arc::new(PoolSupplyTransport::new(
+        build,
+        prefetch,
+        &spec.knobs,
+    )))
 }
 
 /// SHA-256 (lowercase hex) and byte length of a local file, streamed in
@@ -797,8 +837,8 @@ async fn write_terminal_stall(
     Ok(())
 }
 
-/// The orchestrator: plan → hydra-truth → warm → (submit ∥ collect ∥
-/// watchdog ∥ sync) → report, with stage done-markers and resume.
+/// The orchestrator: plan → hydra-truth/truth-load → supply → (submit ∥
+/// collect ∥ watchdog ∥ sync) → report, with stage done-markers and resume.
 pub async fn run_with_backends(
     args: RunArgs,
     spec: CampaignSpec,
@@ -912,14 +952,15 @@ pub async fn run_with_backends(
         state.set_marker("plan")?;
     }
 
-    // The warm producer map is not persisted in campaign.json — recompute it.
+    // The dependency-output producer map is not persisted in campaign.json —
+    // recompute it.
     let warm_comp = plan::compute_warm_sets(&manifest, &dep_closure, &plan_output.in_scope);
 
     // ── Stage: hydra-truth ──────────────────────────────────────────────────
     // Per-unit expected outcomes come from the archive's recorded truth (no
     // outbound queries). The marker-gated sweep below only probes the
-    // warm-set paths' upstream coverage so the warm stage never submits a
-    // path its substituter cannot serve.
+    // prefetch-set paths' upstream coverage so the supply stage never asks
+    // the target to substitute a path its substituter cannot serve.
     let truth = hydra_truth::expected_outcomes_for_units(&archive, &manifest)?;
     if !state.marker_done("hydra-truth") {
         if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
@@ -936,7 +977,7 @@ pub async fn run_with_backends(
         state.set_marker("hydra-truth")?;
     }
 
-    // ── Stage: warm (leaf only) ─────────────────────────────────────────────
+    // ── Stage: supply ───────────────────────────────────────────────────────
     let batch_seq = Arc::new(AtomicU64::new(
         state
             .load_jsonl::<model::BatchRecord>(StateFile::Batches)?
@@ -945,38 +986,77 @@ pub async fn run_with_backends(
             .max()
             .unwrap_or(1),
     ));
-    if spec.mode == Mode::Leaf && !state.marker_done("warm") {
-        // The warm tenant's store URL is the gateway URL re-keyed with the
-        // warm tenant's SSH key from the per-tenant key directory.
-        let warm_url = warm::warm_store_url(
-            &spec.cluster.gateway_store_url,
-            spec.cluster
-                .ssh_key_dir
-                .as_deref()
-                .context("leaf mode requires cluster.ssh_key_dir")?,
-            &spec.tenants.warm_tenant,
-        )?;
-        let plan_valid: HashSet<String> = plan_output.cached_prior_paths.iter().cloned().collect();
-        // The warm stage submits through its own shell-out submitter; the
-        // fallback to the build-path submitter keeps fake-backend tests that
-        // only set `submitter` working.
-        let warm_submitter = backends
-            .warm_submitter
-            .clone()
-            .unwrap_or_else(|| backends.submitter.clone());
-        warm::run_warm(
+    if !state.marker_done("supply") {
+        let effective_dependencies = spec.supply.effective_dependencies(spec.mode);
+        // Outputs (and drvs) of the units that remain attemptable: those
+        // outputs are what the campaign measures, so they are never
+        // supplied; everything else in their closures is fair game for the
+        // supply ladder.
+        let attempt_excluded: HashSet<&str> = plan_output
+            .not_attemptable
+            .iter()
+            .chain(plan_output.cached_prior_jobs.iter())
+            .chain(divergent_in_scope.iter())
+            .map(String::as_str)
+            .collect();
+        let mut workload_drvs = BTreeSet::new();
+        let mut workload_outputs = BTreeSet::new();
+        for m in manifest.iter().filter(|m| {
+            in_scope.contains(m.job.as_str()) && !attempt_excluded.contains(m.job.as_str())
+        }) {
+            workload_drvs.insert(m.drv_path.clone());
+            workload_outputs.extend(m.outputs.values().cloned());
+        }
+        // The prefetch arm only exists under the substituters policy; the
+        // other policies deliver dependencies by client upload (or withhold
+        // them entirely).
+        let prefetch_paths: BTreeMap<String, Option<String>> =
+            if effective_dependencies == SupplyDependencies::Substituters {
+                plan_output
+                    .warm_set
+                    .iter()
+                    .map(|path| (path.clone(), warm_comp.producer.get(path).cloned()))
+                    .collect()
+            } else {
+                BTreeMap::new()
+            };
+        // Upstream coverage already probed by the hydra-truth sweep.
+        let target_coverage: BTreeSet<String> = state
+            .load_jsonl::<HydraEntry>(StateFile::Hydra)?
+            .into_iter()
+            .filter(|entry| entry.found)
+            .map(|entry| entry.path)
+            .collect();
+        let transport = match &backends.supply_transport {
+            Some(transport) => transport.clone(),
+            None => build_supply_transport(&spec)?,
+        };
+        let inputs = SupplyInputs {
+            workload_outputs,
+            workload_drvs,
+            prefetch_paths,
+            prior_valid: plan_output.cached_prior_paths.iter().cloned().collect(),
+            target_coverage,
+            archive: Some(archive.clone()),
+            target_substituters: spec.supply.target_substituters.clone(),
+            relay_substituters: archive.manifest().substituters.relay.clone(),
+            dependencies: effective_dependencies,
+            delivery: spec.supply.delivery,
+        };
+        // Production blocks on the prefetch-shortfall pause (the operator
+        // resumes by removing the PAUSE file); the report is persisted so
+        // the final report and resumed runs can re-read it.
+        let supply_report = run_supply_stage(
             state.clone(),
-            warm_submitter,
-            backends.reader.clone(),
-            &warm_url,
-            &plan_output.warm_set,
-            &warm_comp.producer,
-            &plan_valid,
+            transport,
+            inputs,
             &spec.knobs,
             batch_seq.clone(),
+            true,
         )
         .await?;
-        state.set_marker("warm")?;
+        state.write_json_atomic("supply-report.json", &supply_report)?;
+        state.set_marker("supply")?;
     }
 
     // ── Main loop: submit ∥ collect ∥ watchdog ∥ sync ───────────────────────
@@ -1568,13 +1648,12 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
-        DISPOSITION_NOT_FOUND_UPSTREAM, DISPOSITION_SUBSTITUTED, HydraOutcome, PathOutcome,
-        STATUS_COMPLETED, WarmEntry, build_status_name,
+        HydraOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED, SUPPLY_OUTCOME_UNAVAILABLE,
+        SupplyEntry, build_status_name,
     };
-    use crate::run::reader::DrvObservation;
-    use crate::run::reader::test_support::FakeReader;
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
+    use crate::run::supply::exec::test_support::FakeSupplyTransport;
     use rio_nix::protocol::build::BuildStatus;
 
     struct HealthyCluster;
@@ -1734,8 +1813,8 @@ mod tests {
     }
 
     /// The dependency of appB in the mini archive whose drv path contains
-    /// `needle`, as `(drv path, first output path)` — the warm stage's
-    /// producer/disposition assertions key on these.
+    /// `needle`, as `(drv path, first output path)` — the supply stage's
+    /// producer/outcome assertions key on these.
     fn app_b_dep(archive: &ReplayArchive, needle: &str) -> (String, String) {
         let units = load_units(archive).unwrap();
         let closures = load_closures(archive, &units).unwrap();
@@ -1765,23 +1844,21 @@ mod tests {
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
-        let (lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
         let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
 
-        // Warm-path upstream coverage: libA's output exists upstream, the
-        // stdenv dep does not (its narinfo lookup misses →
-        // not-found-upstream). Target truth never touches this map — it is
-        // baked into the archive's outcomes.
+        // Prefetch-path upstream coverage: libA's output exists upstream,
+        // the stdenv dep does not (its narinfo lookup misses → recorded
+        // unavailable). Target truth never touches this map — it is baked
+        // into the archive's outcomes.
         let mut narinfos = HashMap::new();
         narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
 
-        // Submitter script: the warm batch settles first, then the appA+appB
-        // submit batch. FakeSubmitter pops from the BACK: push the SUBMIT
-        // outcome first. The submit batch carries both roots' terminal
-        // outcomes in band (per-root results); only the warm stage still
-        // reads its dispositions back through the reader.
+        // Submitter script: one appA+appB submit batch carrying both roots'
+        // terminal outcomes in band (per-root results). The supply stage
+        // never touches the submitter — its prefetch and uploads go through
+        // the supply transport fake.
         let submitter = Arc::new(FakeSubmitter::default());
-        let warm_build = "0193e4a2-7c1b-7d20-9b3a-00000000aaaa";
         let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000bbbb";
         let built_result = |drv: &str| PathOutcome {
             drv_path: drv.to_string(),
@@ -1795,34 +1872,21 @@ mod tests {
             results: vec![built_result(&app_a.drv_path), built_result(&app_b.drv_path)],
             ..BatchOutcome::default()
         }));
-        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
-            build_id: Some(warm_build.into()),
-            ..BatchOutcome::default()
-        }));
-        let reader = Arc::new(FakeReader::default());
-        reader.set(
-            warm_build,
-            DrvObservation {
-                drv_path: lib_drv.clone(),
-                status: STATUS_COMPLETED.into(),
-                ..DrvObservation::default()
-            },
-        );
+        // Unscripted prefetch roots settle as Substituted, so libA's covered
+        // output is delegated to the target cluster.
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
 
         // Empty rio-store: nothing is valid at the plan snapshot (so both
         // app units are attemptable, not cached-prior); collect's NAR read
         // then finds no info and records the outputs without hashes
         // (not-comparable), which does not affect the bucket.
         let state_dir = tempfile::tempdir().unwrap();
-        // The same FakeSubmitter serves both the build path and the warm
-        // stage so the scripted warm outcome still applies.
         let backends = || Backends {
             store: Arc::new(FakeStoreApi::default()),
             admin: Arc::new(NoLogsAdmin),
             cluster: Arc::new(HealthyCluster),
-            reader: reader.clone(),
             submitter: submitter.clone(),
-            warm_submitter: Some(submitter.clone()),
+            supply_transport: Some(supply_transport.clone()),
             narinfo: Arc::new(MapNarinfo(narinfos.clone())),
             artifacts: None,
         };
@@ -1839,7 +1903,7 @@ mod tests {
 
         // Final state assertions.
         let state = StateDir::new(state_dir.path()).unwrap();
-        for marker in ["plan", "hydra-truth", "warm", "report"] {
+        for marker in ["plan", "hydra-truth", "supply", "report"] {
             assert!(state.marker_done(marker), "marker {marker} set");
         }
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
@@ -1848,13 +1912,31 @@ mod tests {
         assert_eq!(records["divergentC.x86_64-linux"].bucket, "eval-divergence");
         assert_eq!(records["kvmTest.x86_64-linux"].bucket, "skipped");
         assert_eq!(records["libA.aarch64-linux"].bucket, "skipped");
-        let warm_entries: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm).unwrap();
-        let by_path: HashMap<String, String> = warm_entries
-            .iter()
-            .map(|w| (w.path.clone(), w.disposition.clone()))
-            .collect();
-        assert_eq!(by_path[&lib_out], DISPOSITION_SUBSTITUTED);
-        assert_eq!(by_path[&stdenv_out], DISPOSITION_NOT_FOUND_UPSTREAM);
+        // Supply outcomes replace the old warm dispositions: the covered
+        // libA output is delegated to the target cluster (prefetch
+        // substitution), the uncovered stdenv output is recorded
+        // unavailable by the coverage probe, and the workload drv texts are
+        // delivered by client upload before execution.
+        let supply_entries: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply).unwrap();
+        let outcome_of = |path: &str| -> Vec<&str> {
+            supply_entries
+                .iter()
+                .filter(|entry| entry.path == path)
+                .map(|entry| entry.outcome.as_str())
+                .collect()
+        };
+        assert_eq!(outcome_of(&lib_out), vec![SUPPLY_OUTCOME_DELEGATED]);
+        assert_eq!(outcome_of(&stdenv_out), vec![SUPPLY_OUTCOME_UNAVAILABLE]);
+        assert!(
+            supply_transport
+                .uploaded_batches
+                .lock()
+                .unwrap()
+                .iter()
+                .flatten()
+                .any(|path| path == &app_b.drv_path),
+            "the supply stage uploads the workload drv texts"
+        );
         let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
         assert!(summary.contains("Build-outcome parity"));
         assert!(state.path("buckets/match-built.jsonl").exists());
@@ -1984,9 +2066,9 @@ mod tests {
     /// error text and no in-band results, the jobs are re-offered, and the
     /// resubmission's in-band Built results drain the campaign.
     ///
-    /// Nothing in the warm set exists upstream here, so the warm stage has
-    /// nothing to warm (no warm batch) and `warm_submitter: None` exercises
-    /// the build-submitter fallback for the warm call site.
+    /// Nothing in the prefetch set exists upstream here, so the supply
+    /// stage's prefetch arm has nothing to delegate and the stage reduces to
+    /// drv-text uploads through the supply transport fake.
     #[tokio::test(flavor = "multi_thread")]
     async fn transport_error_batches_are_reoffered_and_drain() {
         let (_archive_dir, archive, archive_id) = open_mini_archive();
@@ -2034,9 +2116,8 @@ mod tests {
                 store: Arc::new(FakeStoreApi::default()),
                 admin: Arc::new(NoLogsAdmin),
                 cluster: Arc::new(HealthyCluster),
-                reader: Arc::new(FakeReader::default()),
                 submitter: submitter.clone(),
-                warm_submitter: None,
+                supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
                 narinfo: Arc::new(MapNarinfo(HashMap::new())),
                 artifacts: None,
             },
@@ -2057,9 +2138,10 @@ mod tests {
         assert!(app_record.attempts >= 1, "{app_record:?}");
         assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
 
-        // Two build-path submissions were recorded (no warm batch exists —
-        // nothing was warmable): the first carries the engine submission
-        // error and an empty results array, the second the in-band results.
+        // Two build-path submissions were recorded (the supply stage's
+        // prefetch and uploads never touch batches.jsonl): the first carries
+        // the engine submission error and an empty results array, the second
+        // the in-band results.
         let state = StateDir::new(state_dir.path()).unwrap();
         let mut batches: Vec<model::BatchRecord> = state
             .load_jsonl::<model::BatchRecord>(StateFile::Batches)

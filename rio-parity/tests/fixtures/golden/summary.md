@@ -53,4 +53,4 @@ Signatures group byte-identical raw evidence (60-character message slugs); the s
 (none)
 
 ## Artifacts
-- results.jsonl, hydra.jsonl, warm.jsonl, batches.jsonl, buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file
+- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file

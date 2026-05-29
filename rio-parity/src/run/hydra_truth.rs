@@ -9,17 +9,17 @@
 //! performs no outbound queries.
 //!
 //! [`run_hydra_truth`] is the campaign-time narinfo sweep that backs the
-//! warm stage's absent-upstream pre-classification: the engine invokes it
-//! with an empty target-path list and the warm-set paths only (target truth
-//! comes from the archive, never from outbound queries). For every path it
-//! is given it fetches the upstream narinfo (presence, `NarHash`,
+//! supply stage's absent-upstream pre-classification: the engine invokes it
+//! with an empty target-path list and the prefetch-set paths only (target
+//! truth comes from the archive, never from outbound queries). For every
+//! path it is given it fetches the upstream narinfo (presence, `NarHash`,
 //! `NarSize`, `Deriver`) with bounded concurrency and per-path retries,
 //! appending each result to `hydra.jsonl` so an interrupted or resumed
-//! campaign never re-fetches a path it already has. Warm-set paths that are
-//! absent upstream are pre-classified `not-found-upstream` in `warm.jsonl`:
-//! the warm stage must never submit them, because substituting a path that
-//! upstream does not serve cannot succeed, and building it locally would
-//! mask exactly the work the campaign is trying to measure.
+//! campaign never re-fetches a path it already has. Prefetch-set paths that
+//! are absent upstream are pre-classified `unavailable` in `supply.jsonl`:
+//! the prefetch arm must never submit them, because substituting a path
+//! that upstream does not serve cannot succeed, and building it on the
+//! target would mask exactly the work the campaign is trying to measure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
@@ -33,8 +33,8 @@ use crate::archive::schema::ExpectedOutcome;
 
 use super::archive_input::ManifestEntry;
 use super::model::{
-    DISPOSITION_NOT_FOUND_UPSTREAM, HydraEntry, HydraOutcome, HydraOutput, HydraSide, WarmEntry,
-    now_rfc3339,
+    HydraEntry, HydraOutcome, HydraOutput, HydraSide, SUPPLY_MECHANISM_NONE,
+    SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, now_rfc3339,
 };
 use super::state::{StateDir, StateFile};
 
@@ -152,7 +152,8 @@ pub struct SweepStats {
 
 /// Run the narinfo sweep over `target_paths` ∪ `warm_paths`, appending new
 /// entries to `hydra.jsonl` (the disk cache) and pre-classifying warm-set
-/// paths that are absent upstream as `not-found-upstream` in `warm.jsonl`.
+/// (prefetch-set) paths that are absent upstream as `unavailable` in
+/// `supply.jsonl`.
 ///
 /// Each entry is appended as soon as its fetch completes, so an aborted sweep
 /// resumes from wherever it got to; paths already in `hydra.jsonl` are never
@@ -169,10 +170,10 @@ pub async fn run_hydra_truth(
     let existing: Vec<HydraEntry> = state.load_jsonl(StateFile::Hydra)?;
     let mut by_path: HashMap<String, HydraEntry> =
         existing.into_iter().map(|e| (e.path.clone(), e)).collect();
-    let already_warm_classified: HashSet<String> = state
-        .load_jsonl::<WarmEntry>(StateFile::Warm)?
+    let already_classified: HashSet<String> = state
+        .load_jsonl::<SupplyEntry>(StateFile::Supply)?
         .into_iter()
-        .map(|w| w.path)
+        .map(|entry| entry.path)
         .collect();
 
     let mut want: Vec<String> = Vec::new();
@@ -224,25 +225,28 @@ pub async fn run_hydra_truth(
         }
     }
 
-    // Warm pre-classification: a warm-set path with no upstream narinfo can
-    // never be substituted, so it is recorded up front and never submitted to
-    // the warm stage. Iteration is sorted so warm.jsonl appends are
-    // deterministic for a given input set.
+    // Prefetch pre-classification: a prefetch-set path with no upstream
+    // narinfo can never be substituted, so it is recorded up front and the
+    // prefetch arm never submits it. Iteration is sorted so supply.jsonl
+    // appends are deterministic for a given input set.
     let warm_set: BTreeSet<&String> = warm_paths.iter().collect();
     for path in warm_set {
-        if already_warm_classified.contains(path) {
+        if already_classified.contains(path) {
             continue;
         }
         if let Some(entry) = by_path.get(path)
             && !entry.found
         {
             state.append_jsonl(
-                StateFile::Warm,
-                &WarmEntry {
+                StateFile::Supply,
+                &SupplyEntry {
                     path: path.clone(),
-                    drv_path: None,
-                    disposition: DISPOSITION_NOT_FOUND_UPSTREAM.into(),
+                    source: SUPPLY_SOURCE_TARGET_SUBSTITUTER.into(),
+                    mechanism: SUPPLY_MECHANISM_NONE.into(),
+                    outcome: SUPPLY_OUTCOME_UNAVAILABLE.into(),
+                    detail: Some("no upstream narinfo".into()),
                     batch_id: None,
+                    bytes: None,
                     observed_at: now_rfc3339(),
                 },
             )?;
@@ -443,13 +447,16 @@ mod tests {
         assert_eq!(stats.found, 2);
         assert_eq!(stats.not_found, 1);
 
-        // hydra.jsonl has 3 entries; warm.jsonl pre-classified exactly the missing path.
+        // hydra.jsonl has 3 entries; supply.jsonl pre-classified exactly the missing path.
         let hydra: Vec<HydraEntry> = state.load_jsonl(StateFile::Hydra).unwrap();
         assert_eq!(hydra.len(), 3);
-        let warm: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm).unwrap();
-        assert_eq!(warm.len(), 1);
-        assert_eq!(warm[0].path, warm_missing);
-        assert_eq!(warm[0].disposition, DISPOSITION_NOT_FOUND_UPSTREAM);
+        let supply: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply).unwrap();
+        assert_eq!(supply.len(), 1);
+        assert_eq!(supply[0].path, warm_missing);
+        assert_eq!(supply[0].source, SUPPLY_SOURCE_TARGET_SUBSTITUTER);
+        assert_eq!(supply[0].mechanism, SUPPLY_MECHANISM_NONE);
+        assert_eq!(supply[0].outcome, SUPPLY_OUTCOME_UNAVAILABLE);
+        assert_eq!(supply[0].detail.as_deref(), Some("no upstream narinfo"));
 
         // Second sweep: everything served from the disk cache, zero new fetches.
         let before = source.fetches.load(Ordering::SeqCst);
@@ -466,9 +473,9 @@ mod tests {
         assert_eq!(stats2.fetched, 0);
         assert_eq!(stats2.cached, 3);
         assert_eq!(source.fetches.load(Ordering::SeqCst), before);
-        // No duplicate warm classification.
-        let warm2: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm).unwrap();
-        assert_eq!(warm2.len(), 1);
+        // No duplicate supply pre-classification.
+        let supply2: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply).unwrap();
+        assert_eq!(supply2.len(), 1);
     }
 
     #[tokio::test(start_paused = true)]

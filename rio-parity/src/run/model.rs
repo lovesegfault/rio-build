@@ -319,48 +319,6 @@ pub struct HydraEntry {
     pub fetched_at: String,
 }
 
-/// [`WarmEntry::disposition`] value for a warm-set path with no upstream
-/// narinfo. Written by the hydra-truth sweep; the warm stage never submits
-/// paths carrying it (they cannot be substituted, and building them locally
-/// would mask what the campaign measures).
-pub const DISPOSITION_NOT_FOUND_UPSTREAM: &str = "not-found-upstream";
-
-/// [`WarmEntry::disposition`] value for a warm-set path that was already
-/// valid in rio-store at the plan-time validity snapshot — nothing to warm.
-pub const DISPOSITION_ALREADY_PRESENT: &str = "already-present";
-
-/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
-/// completed without executing anything: the scheduler substituted it from
-/// an upstream cache.
-pub const DISPOSITION_SUBSTITUTED: &str = "substituted";
-
-/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
-/// ended in a failed terminal state after the scheduler's retries.
-pub const DISPOSITION_FAILED_AFTER_RETRIES: &str = "failed-after-retries";
-
-/// [`WarmEntry::disposition`] value for a warm-set path whose warm build
-/// completed by actually executing the producing derivation (substitution
-/// fell through and the scheduler built it as a fallback).
-pub const DISPOSITION_BUILT_FALLBACK: &str = "built-fallback";
-
-/// [`WarmEntry::disposition`] value for a warm-set path with no static
-/// producing derivation in the dep closure (content-addressed / floating
-/// outputs) — excluded from warming because there is no drv to submit.
-pub const DISPOSITION_NO_STATIC_PRODUCER: &str = "no-static-producer";
-
-/// One line of warm.jsonl — per-path warm-stage disposition.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct WarmEntry {
-    pub path: String,
-    pub drv_path: Option<String>,
-    /// One of the `DISPOSITION_*` constants in this module; warm.jsonl
-    /// writers must use the constants, never hand-typed literals.
-    pub disposition: String,
-    pub batch_id: Option<u64>,
-    pub observed_at: String,
-}
-
 /// [`SupplyEntry::source`] value for an output of a workload unit — never
 /// supplied by any mechanism, the campaign must produce it itself.
 pub const SUPPLY_SOURCE_WORKLOAD_OUTPUT: &str = "workload-output";
@@ -458,9 +416,6 @@ pub struct DispatchEntry {
 /// [`BatchRecord::kind`] value for build-stage submissions.
 pub const BATCH_KIND_SUBMIT: &str = "submit";
 
-/// [`BatchRecord::kind`] value for warm-stage submissions.
-pub const BATCH_KIND_WARM: &str = "warm";
-
 /// Per-root in-band build result captured from one BuildPathsWithResults
 /// submission (one entry per requested root, positional order preserved).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -534,9 +489,11 @@ pub fn build_status_from_name(name: &str) -> Option<BuildStatus> {
 #[serde(rename_all = "camelCase")]
 pub struct BatchRecord {
     pub batch_id: u64,
-    /// One of the `BATCH_KIND_*` constants in this module ("submit" |
-    /// "warm"); batches.jsonl writers must use the constants, never
-    /// hand-typed literals.
+    /// One of the `BATCH_KIND_*` constants in this module; batches.jsonl
+    /// writers must use the constants, never hand-typed literals. Records
+    /// written by earlier engine versions may carry kinds that no longer
+    /// have a writer (e.g. the retired warm stage's "warm"); they are kept
+    /// readable and skipped by the collect loop.
     pub kind: String,
     pub jobs: Vec<String>,
     pub root_drvs: Vec<String>,
@@ -682,33 +639,6 @@ mod tests {
     }
 
     #[test]
-    fn warm_disposition_vocabulary_is_fixed_and_distinct() {
-        let all = [
-            DISPOSITION_NOT_FOUND_UPSTREAM,
-            DISPOSITION_ALREADY_PRESENT,
-            DISPOSITION_SUBSTITUTED,
-            DISPOSITION_FAILED_AFTER_RETRIES,
-            DISPOSITION_BUILT_FALLBACK,
-            DISPOSITION_NO_STATIC_PRODUCER,
-        ];
-        // The wire strings are frozen: warm.jsonl is append-only across
-        // resumes, so renaming a disposition would orphan prior entries.
-        assert_eq!(
-            all,
-            [
-                "not-found-upstream",
-                "already-present",
-                "substituted",
-                "failed-after-retries",
-                "built-fallback",
-                "no-static-producer",
-            ]
-        );
-        let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
-        assert_eq!(unique.len(), all.len());
-    }
-
-    #[test]
     fn supply_entry_wire_strings() {
         // Frozen wire strings: supply.jsonl is append-only across resumes,
         // so renaming a value would orphan prior entries.
@@ -739,9 +669,9 @@ mod tests {
             observed_at: now_rfc3339(),
         };
         let value = serde_json::to_value(&entry).unwrap();
-        assert_eq!(value["source"], "relay");
-        assert_eq!(value["mechanism"], "upload-batch");
-        assert_eq!(value["outcome"], "delivered");
+        assert_eq!(value["source"], SUPPLY_SOURCE_RELAY);
+        assert_eq!(value["mechanism"], SUPPLY_MECHANISM_UPLOAD_BATCH);
+        assert_eq!(value["outcome"], SUPPLY_OUTCOME_DELIVERED);
         assert_eq!(value["batchId"], 3);
         assert_eq!(value["bytes"], 10);
         assert_eq!(value["observedAt"], entry.observed_at.as_str());
@@ -789,11 +719,9 @@ mod tests {
 
     #[test]
     fn batch_kind_vocabulary_is_fixed_and_distinct() {
-        // Frozen wire strings: batches.jsonl is append-only across resumes,
+        // Frozen wire string: batches.jsonl is append-only across resumes,
         // so renaming a kind would orphan prior entries.
         assert_eq!(BATCH_KIND_SUBMIT, "submit");
-        assert_eq!(BATCH_KIND_WARM, "warm");
-        assert_ne!(BATCH_KIND_SUBMIT, BATCH_KIND_WARM);
     }
 
     #[test]

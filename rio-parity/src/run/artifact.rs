@@ -156,12 +156,14 @@ const SYNCED_FILES: &[&str] = &[
     "progress.json",
     "results.jsonl",
     "hydra.jsonl",
-    "warm.jsonl",
+    "supply.jsonl",
+    "dispatch.jsonl",
     "batches.jsonl",
+    "supply-report.json",
     "report/summary.md",
     "markers/plan.done",
     "markers/hydra-truth.done",
-    "markers/warm.done",
+    "markers/supply.done",
     "markers/report.done",
 ];
 

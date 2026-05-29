@@ -1,5 +1,5 @@
 //! Submit stage: turns the attemptable, not-yet-terminal job set into
-//! batched `nix build` submissions. Runs concurrently with collect; the
+//! batched gateway submissions. Runs concurrently with collect; the
 //! two stages communicate only through results.jsonl/batches.jsonl and
 //! the in-memory [`SubmitTracker`]. Per-job requeue decisions belong to
 //! collect — this loop simply re-offers any job whose latest record is

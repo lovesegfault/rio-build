@@ -118,8 +118,8 @@ impl DrvArchive {
     /// memory (derivation texts are tiny, so per-entry payloads stay small;
     /// callers control how many entries they hold at once).
     ///
-    /// The path-info mirrors what `nix copy --derivation` registers for a
-    /// `.drv` store object: references are the derivation's input
+    /// The path-info mirrors what a client-side derivation copy registers
+    /// for a `.drv` store object: references are the derivation's input
     /// derivations and input sources, and the content address is the
     /// `text:sha256:` hash over the ATerm bytes.
     pub fn entry(&self, store_path: &str) -> Result<StoreEntry> {
@@ -222,7 +222,7 @@ mod tests {
         );
 
         // The upload entry round-trips the embedded ATerm text and carries
-        // the path-info `nix copy --derivation` would register.
+        // the path-info a client-side derivation copy would register.
         let entry = drv_archive.entry(&lib_a).unwrap();
         assert_eq!(entry.store_path, lib_a);
         let nar = match entry.nar {

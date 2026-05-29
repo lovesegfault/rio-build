@@ -33,7 +33,6 @@ use crate::run::model::JobRecord;
 pub enum StateFile {
     Results,
     Hydra,
-    Warm,
     Batches,
     Supply,
     Dispatch,
@@ -44,17 +43,15 @@ impl StateFile {
         match self {
             StateFile::Results => "results.jsonl",
             StateFile::Hydra => "hydra.jsonl",
-            StateFile::Warm => "warm.jsonl",
             StateFile::Batches => "batches.jsonl",
             StateFile::Supply => "supply.jsonl",
             StateFile::Dispatch => "dispatch.jsonl",
         }
     }
 
-    pub const ALL: [StateFile; 6] = [
+    pub const ALL: [StateFile; 5] = [
         StateFile::Results,
         StateFile::Hydra,
-        StateFile::Warm,
         StateFile::Batches,
         StateFile::Supply,
         StateFile::Dispatch,
@@ -280,7 +277,7 @@ mod tests {
     fn supply_and_dispatch_state_files_named() {
         assert_eq!(StateFile::Supply.file_name(), "supply.jsonl");
         assert_eq!(StateFile::Dispatch.file_name(), "dispatch.jsonl");
-        assert_eq!(StateFile::ALL.len(), 6);
+        assert_eq!(StateFile::ALL.len(), 5);
     }
 
     #[test]

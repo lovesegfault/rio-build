@@ -1,9 +1,8 @@
 //! Parsing of the gateway's relayed stderr lines — the `rio: build <uuid>`
 //! announcement and the per-derivation failure lines — captured as evidence
-//! by the client-ops build observer (and by the warm-stage `nix build -L`
-//! child's stderr reader), plus the classification of relayed scheduler
-//! reasons (infra vs. target vs. dependency) and the deterministic failure
-//! signatures used to group identical failures.
+//! by the client-ops build observer, plus the classification of relayed
+//! scheduler reasons (infra vs. target vs. dependency) and the deterministic
+//! failure signatures used to group identical failures.
 
 use std::collections::BTreeMap;
 use std::sync::LazyLock;
@@ -30,9 +29,9 @@ static DRV_FAILED_RE: LazyLock<Regex> =
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ParsedStderr {
     /// Build id from the gateway's `rio: build <uuid>` line. The gateway
-    /// emits exactly one such line per accepted `nix build` invocation, so
+    /// emits exactly one such line per accepted client submission, so
     /// the FIRST id seen wins; a later line carrying a different id is
-    /// ignored (with a warning) rather than re-keying the invocation
+    /// ignored (with a warning) rather than re-keying the submission
     /// mid-stream.
     pub build_id: Option<String>,
     /// drv path → reason (first occurrence wins; the scheduler emits one
@@ -47,9 +46,9 @@ pub fn parse_line(parsed: &mut ParsedStderr, line: &str) {
         let id = &c[1];
         match &parsed.build_id {
             None => parsed.build_id = Some(id.to_string()),
-            // One `nix build` invocation carries exactly one accepted rio
+            // One client submission carries exactly one accepted rio
             // build, so a second DISTINCT id means the stream is not what
-            // the engine assumes (e.g. two invocations' stderr concatenated).
+            // the engine assumes (e.g. two submissions' stderr concatenated).
             // Keep the first id — earlier failure lines belong to it — and
             // surface the anomaly instead of silently switching handles.
             Some(existing) if existing != id => {
@@ -207,10 +206,11 @@ fn slug60(text: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Captured-shape fixture: what a `nix build -L --store ssh-ng://…` run
-    /// against rio-gateway prints for a two-job batch where one drv fails on
-    /// the worker and a dependent cascades. Format strings verified against
-    /// rio-gateway/src/handler/build.rs and rio-scheduler/src/actor/*.rs.
+    /// Captured-shape fixture: the relayed stderr an ssh-ng client
+    /// submission against rio-gateway observes for a two-job batch where one
+    /// drv fails on the worker and a dependent cascades. Format strings
+    /// verified against rio-gateway/src/handler/build.rs and
+    /// rio-scheduler/src/actor/*.rs.
     const STDERR_FIXTURE: &str = concat!(
         "this derivation will be built:\n",
         "  /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv\n",

@@ -9,6 +9,12 @@
 //!   prefetch builds), implemented for production by
 //!   [`PoolSupplyTransport`] over the gateway SSH transport and by a
 //!   scripted fake in tests.
+//! - [`run_supply_stage`] is the stage orchestrator: it classifies the
+//!   prefetch set (already-present / unavailable / prefetchable), runs the
+//!   prefetch arm, drives the upload ladder over the workload union closure,
+//!   and gates execution on the prefetch shortfall (a shortfall above
+//!   `prefetch_shortfall_pause_pct` writes the campaign PAUSE file before
+//!   the execution clock starts).
 //! - [`prewarm_uploads`] pushes one upload plan in reference-safe order:
 //!   large NARs streamed individually, everything else as multi-path
 //!   upload batches fanned out over a small worker pool, with a single
@@ -32,12 +38,14 @@
 //! guard before [`Substituter::parse`] ever sees the URL.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result, anyhow};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use futures_util::future::join_all;
 use rio_nix::narinfo::NarInfo;
 use rio_nix::protocol::build::BuildStatus;
@@ -48,13 +56,14 @@ use tokio::sync::RwLock;
 
 use crate::archive::reader::ReplayArchive;
 use crate::run::model::{
-    PathOutcome, SUPPLY_MECHANISM_DELEGATE, SUPPLY_MECHANISM_UPLOAD_BATCH,
-    SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_DELEGATED, SUPPLY_OUTCOME_DELIVERED,
-    SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_RELAY,
+    PathOutcome, SUPPLY_MECHANISM_DELEGATE, SUPPLY_MECHANISM_NONE, SUPPLY_MECHANISM_UPLOAD_BATCH,
+    SUPPLY_MECHANISM_UPLOAD_STREAM, SUPPLY_OUTCOME_ALREADY_PRESENT, SUPPLY_OUTCOME_DELEGATED,
+    SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_FAILED, SUPPLY_OUTCOME_REFUSED,
+    SUPPLY_OUTCOME_UNAVAILABLE, SUPPLY_SOURCE_EMBEDDED, SUPPLY_SOURCE_NONE, SUPPLY_SOURCE_RELAY,
     SUPPLY_SOURCE_TARGET_SUBSTITUTER, SupplyEntry, build_status_from_name, build_status_name,
     now_rfc3339,
 };
-use crate::run::spec::{Knobs, SupplyDependencies};
+use crate::run::spec::{Knobs, SupplyDelivery, SupplyDependencies};
 use crate::run::state::{StateDir, StateFile};
 use crate::run::transport::{DaemonChannel, GatewayPool, TransportError};
 use crate::substituter::Substituter;
@@ -174,6 +183,42 @@ pub struct PrefetchArmStats {
     pub failed: usize,
 }
 
+/// Inputs to [`run_supply_stage`], assembled by the campaign orchestrator
+/// from the plan output, the open replay archive, and the campaign spec.
+pub struct SupplyInputs {
+    /// Output paths of the attemptable workload units (never supplied — the
+    /// campaign exists to measure the target building them).
+    pub workload_outputs: BTreeSet<String>,
+    /// Drv store paths of the attemptable workload units; the upload ladder
+    /// plans over the union of their dependency closures.
+    pub workload_drvs: BTreeSet<String>,
+    /// Paths the supply policy wants present before measurement, with their
+    /// producing drvs (the dependency-output prefetch set + producer map).
+    pub prefetch_paths: BTreeMap<String, Option<String>>,
+    /// Paths already valid in the target store at the plan snapshot.
+    pub prior_valid: BTreeSet<String>,
+    /// Upstream coverage already known per path (the coverage probe's
+    /// hydra.jsonl `found` entries); the supply stage's own narinfo probes
+    /// extend it for the upload ladder.
+    pub target_coverage: BTreeSet<String>,
+    /// The open replay archive (production always passes it; `None` degrades
+    /// the stage to the prefetch arm only and exists for unit tests).
+    pub archive: Option<Arc<ReplayArchive>>,
+    /// Operator-provided target substituter URLs
+    /// (`spec.supply.target_substituters`). Every entry must pass the
+    /// public-cache guard or the stage aborts; an empty list falls back to
+    /// the archive manifest's advisory target list, which — being archive
+    /// input — degrades with a warning instead.
+    pub target_substituters: Vec<String>,
+    /// Relay substituter URLs accepted from the archive manifest (https/s3
+    /// only; rejected entries degrade with a warning).
+    pub relay_substituters: Vec<String>,
+    /// Effective dependency policy applied by the source ladder.
+    pub dependencies: SupplyDependencies,
+    /// When planned supply is delivered relative to execution.
+    pub delivery: SupplyDelivery,
+}
+
 /// Parse a substituter URL provided by the campaign spec
 /// (`supply.target_substituters`) or by the archive manifest, applying the
 /// public-cache guard BEFORE the URL reaches [`Substituter::parse`]: only
@@ -184,6 +229,27 @@ pub struct PrefetchArmStats {
 pub async fn admit_substituter(url: &str) -> Result<Substituter> {
     crate::nixcache::validate_supply_substituter(url)?;
     Substituter::parse(url).await
+}
+
+/// Per-tenant SSH private-key path under the campaign's key directory
+/// (`<ssh_key_dir>/<tenant>`), used to dial the gateway as that tenant.
+///
+/// The tenant name becomes a single path component under the key directory,
+/// so it is restricted to a plain file-name alphabet (ASCII alphanumerics,
+/// `-`, `_`); anything else — path separators, `..`, an empty name — is
+/// rejected so a crafted tenant value can never point the key path outside
+/// the directory. The key file itself is deliberately not checked for
+/// existence here: this only derives the path.
+pub fn tenant_key_path(ssh_key_dir: &Path, tenant: &str) -> Result<PathBuf> {
+    anyhow::ensure!(
+        !tenant.is_empty()
+            && tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "invalid tenant name {tenant:?}: must be non-empty and contain only ASCII \
+         alphanumerics, '-' or '_'"
+    );
+    Ok(ssh_key_dir.join(tenant))
 }
 
 /// Run-wide supply-ladder context shared by the upload and top-up arms:
@@ -1535,6 +1601,478 @@ pub async fn topup_for_roots(
     Ok(())
 }
 
+/// Append one bookkeeping-only supply.jsonl line (no batch, no bytes).
+fn append_supply_entry(
+    state: &StateDir,
+    path: &str,
+    source: &str,
+    mechanism: &str,
+    outcome: &str,
+    detail: Option<String>,
+) -> Result<()> {
+    state.append_jsonl(
+        StateFile::Supply,
+        &SupplyEntry {
+            path: path.to_string(),
+            source: source.to_string(),
+            mechanism: mechanism.to_string(),
+            outcome: outcome.to_string(),
+            detail,
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        },
+    )
+}
+
+/// Probe `paths` against `substituters` in order (first hit wins), at most
+/// `concurrency` paths in flight. Returns path → (canonical substituter URL,
+/// narinfo) for the hits and folds per-cache probe-error counts into
+/// `probe_errors` (warning once per cache). A probe error is never a miss:
+/// the path simply falls through to the next substituter or ladder rung.
+async fn probe_substituter_narinfos(
+    substituters: &[&Substituter],
+    paths: &[String],
+    concurrency: usize,
+    probe_errors: &mut BTreeMap<String, u64>,
+) -> HashMap<String, (String, NarInfo)> {
+    let mut hits = HashMap::new();
+    if substituters.is_empty() || paths.is_empty() {
+        return hits;
+    }
+    let mut probes = futures_util::stream::iter(paths.iter().map(|path| async move {
+        let mut errored: Vec<String> = Vec::new();
+        let hash_part = match rio_nix::store_path::StorePath::parse(path) {
+            Ok(parsed) => parsed.hash_part(),
+            Err(err) => {
+                tracing::warn!(
+                    path = %path,
+                    error = %err,
+                    "skipping the narinfo probe for an unparseable store path"
+                );
+                return (path.clone(), None, errored);
+            }
+        };
+        for substituter in substituters {
+            match substituter.narinfo(&hash_part).await {
+                Ok(Some(narinfo)) => {
+                    return (path.clone(), Some((substituter.url(), narinfo)), errored);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(
+                        path = %path,
+                        substituter = %substituter.url(),
+                        error = %format!("{err:#}"),
+                        "narinfo probe error; this substituter's coverage of the path is unknown"
+                    );
+                    errored.push(substituter.url());
+                }
+            }
+        }
+        (path.clone(), None, errored)
+    }))
+    .buffer_unordered(concurrency.max(1));
+    while let Some((path, hit, errored)) = probes.next().await {
+        for cache in errored {
+            let count = probe_errors.entry(cache.clone()).or_insert(0);
+            if *count == 0 {
+                tracing::warn!(
+                    substituter = %cache,
+                    "narinfo probes against this substituter are erroring; probe errors are \
+                     never treated as misses, the affected paths fall through the supply ladder"
+                );
+            }
+            *count += 1;
+        }
+        if let Some((url, narinfo)) = hit {
+            hits.insert(path, (url, narinfo));
+        }
+    }
+    hits
+}
+
+/// The archive-backed half of the supply stage: walk the workload union
+/// closure, extend target coverage with live substituter probes, resolve
+/// every needed path through the source ladder, and deliver the resulting
+/// upload plan (prewarm uploads, or an explicit deferral record under
+/// inline delivery). Folds its outcomes into `report`.
+async fn run_upload_ladder(
+    state: &StateDir,
+    transport: &dyn SupplyTransport,
+    archive: &Arc<ReplayArchive>,
+    inputs: &SupplyInputs,
+    knobs: &Knobs,
+    report: &mut SupplyStageReport,
+) -> Result<()> {
+    let roots: Vec<String> = inputs.workload_drvs.iter().cloned().collect();
+    if roots.is_empty() {
+        return Ok(());
+    }
+    // The closure walk reads and parses derivation texts (or adjacency
+    // records) — keep the synchronous work off the async runtime.
+    let closure = {
+        let archive = Arc::clone(archive);
+        let roots = roots.clone();
+        tokio::task::spawn_blocking(move || walk_closure(&archive, &roots))
+            .await
+            .context("the supply closure walk task panicked or was cancelled")??
+    };
+
+    // Re-probe target validity for the whole closure: resume costs
+    // re-probing, never correctness — nothing already present is re-sent.
+    let to_probe: Vec<String> = closure.all_paths.iter().cloned().collect();
+    let valid = transport
+        .query_valid(&to_probe)
+        .await
+        .context("probe target validity for the workload union closure")?;
+
+    let mut ctx = SupplyContext::new(inputs.dependencies);
+    ctx.workload_outputs = inputs.workload_outputs.clone();
+    ctx.target_coverage = inputs.target_coverage.clone();
+    *ctx.target_valid.get_mut() = valid.clone();
+
+    let closure_drvs: BTreeSet<&str> = closure
+        .topo
+        .iter()
+        .map(|node| node.drv_path.as_str())
+        .collect();
+    let input_srcs: BTreeSet<String> = closure
+        .topo
+        .iter()
+        .flat_map(|node| node.input_srcs.iter().cloned())
+        .collect();
+    // Paths the ladder still has to place: non-derivation closure members
+    // not already valid on the target.
+    let needed: Vec<String> = closure
+        .all_paths
+        .iter()
+        .filter(|path| !closure_drvs.contains(path.as_str()) && !valid.contains(*path))
+        .cloned()
+        .collect();
+
+    // Live coverage probes (target-substituter rung). Operator-provided
+    // URLs are admitted as hard errors; the archive manifest's advisory
+    // target list degrades like any other archive-sourced URL.
+    if inputs.dependencies == SupplyDependencies::Substituters {
+        let mut target_subs: Vec<Substituter> = Vec::new();
+        if inputs.target_substituters.is_empty() {
+            for url in &archive.manifest().substituters.target {
+                match admit_substituter(url).await {
+                    Ok(substituter) => target_subs.push(substituter),
+                    Err(err) => tracing::warn!(
+                        substituter = %url,
+                        error = %format!("{err:#}"),
+                        "rejecting target substituter from the archive manifest; coverage it \
+                         could have provided is not probed"
+                    ),
+                }
+            }
+        } else {
+            for url in &inputs.target_substituters {
+                let substituter = admit_substituter(url).await.with_context(|| {
+                    format!("supply.target_substituters entry {url:?} was rejected")
+                })?;
+                target_subs.push(substituter);
+            }
+        }
+        let unprobed: Vec<String> = needed
+            .iter()
+            .filter(|path| {
+                !ctx.workload_outputs.contains(*path) && !ctx.target_coverage.contains(*path)
+            })
+            .cloned()
+            .collect();
+        let target_refs: Vec<&Substituter> = target_subs.iter().collect();
+        let hits = probe_substituter_narinfos(
+            &target_refs,
+            &unprobed,
+            knobs.narinfo_concurrency,
+            &mut report.probe_errors,
+        )
+        .await;
+        ctx.target_coverage.extend(hits.into_keys());
+    }
+
+    // Relay substituters (archive-sourced) are admitted through the
+    // public-cache guard and announced before any relay traffic; paths only
+    // a rejected substituter could provide degrade to unavailable.
+    let admitted = ctx.add_relay_substituters(&inputs.relay_substituters).await;
+    if !admitted.is_empty() {
+        tracing::info!(
+            relay_substituters = ?admitted,
+            "accepted relay substituters for the supply ladder"
+        );
+        let relay_candidates: Vec<String> = needed
+            .iter()
+            .filter(|path| {
+                // Workload outputs are never supplied; embedded paths take
+                // the archive rung before relay is ever consulted.
+                if ctx.workload_outputs.contains(*path) || archive.has_embedded(path) {
+                    return false;
+                }
+                // The target-substituter rung wins under the substituters
+                // policy, so covered paths need no relay probe.
+                if inputs.dependencies == SupplyDependencies::Substituters
+                    && ctx.target_coverage.contains(*path)
+                {
+                    return false;
+                }
+                // Under the `none` policy only input sources may be relayed;
+                // dependency outputs are withheld.
+                inputs.dependencies != SupplyDependencies::None || input_srcs.contains(*path)
+            })
+            .cloned()
+            .collect();
+        let relay_hits = {
+            let urls = ctx.relay_urls();
+            let relay_refs: Vec<&Substituter> = urls
+                .iter()
+                .filter_map(|url| ctx.relay_substituter(url))
+                .collect();
+            probe_substituter_narinfos(
+                &relay_refs,
+                &relay_candidates,
+                knobs.narinfo_concurrency,
+                &mut report.probe_errors,
+            )
+            .await
+        };
+        ctx.relay_narinfos = relay_hits;
+    }
+
+    // Resolve every needed path through the source ladder. Paths the
+    // resolution itself withholds or cannot place are recorded here, from
+    // the resolution — the planner's skip list cannot distinguish a
+    // policy-withheld dependency output from a path nothing has.
+    let mut sources: HashMap<String, PathSource> = HashMap::new();
+    for path in &needed {
+        let source = resolve_source(
+            path,
+            &ctx.workload_outputs,
+            &ctx.target_coverage,
+            &input_srcs,
+            |candidate| archive.has_embedded(candidate),
+            &ctx.relay_narinfos,
+            ctx.dependencies,
+        );
+        if source == (PathSource::NotSupplied { workload: false })
+            // Prefetch-set paths already carry their own bookkeeping (the
+            // upstream-coverage probe and the prefetch classification).
+            && !inputs.prefetch_paths.contains_key(path)
+        {
+            let detail = if inputs.dependencies == SupplyDependencies::None
+                && !input_srcs.contains(path)
+            {
+                "dependency output withheld by the supply policy (dependencies = \"none\")"
+            } else {
+                "no target substituter, archive member, or relay substituter can provide this path"
+            };
+            append_supply_entry(
+                state,
+                path,
+                SUPPLY_SOURCE_NONE,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_UNAVAILABLE,
+                Some(detail.to_string()),
+            )?;
+            report.unavailable += 1;
+        }
+        sources.insert(path.clone(), source);
+    }
+
+    let plan = plan_uploads(
+        &closure,
+        &sources,
+        &valid,
+        archive,
+        knobs.large_nar_threshold_mib.saturating_mul(1024 * 1024),
+    )?;
+
+    match inputs.delivery {
+        SupplyDelivery::Prewarm => {
+            let claims = UploadClaims::new();
+            let upload =
+                prewarm_uploads(transport, Some(archive), &ctx, &plan, knobs, state, &claims)
+                    .await?;
+            report.delivered = upload.delivered;
+            report.refused = upload.refused;
+            report.failed += upload.failed;
+            report.uploaded_bytes = upload.uploaded_bytes;
+            report.upload_secs = upload.upload_secs;
+            report.upload_mib_per_s = upload.upload_mib_per_s;
+        }
+        SupplyDelivery::Inline => {
+            // Inline delivery defers planned uploads to the per-submission
+            // top-up; the deferral is recorded so the report shows what was
+            // deliberately not delivered before execution.
+            for item in plan.large.iter().chain(plan.batch.iter()) {
+                append_supply_entry(
+                    state,
+                    &item.store_path,
+                    entry_source(item),
+                    SUPPLY_MECHANISM_NONE,
+                    SUPPLY_OUTCOME_UNAVAILABLE,
+                    Some("deferred to inline top-up".to_string()),
+                )?;
+                report.unavailable += 1;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run the whole supply stage: classify the prefetch set, delegate covered
+/// paths to the target cluster via the prefetch arm, drive the upload ladder
+/// over the workload union closure when an archive is available, and gate
+/// execution on the prefetch shortfall.
+///
+/// Resume costs re-probing, never correctness: prior `supply.jsonl` content
+/// is reporting-only and never read for decisions — validity is re-probed on
+/// every run, already-valid paths are recorded `already-present`, and a
+/// re-run after a crash re-converges without re-sending anything.
+///
+/// When the planned-but-missing prefetch fraction exceeds
+/// `knobs.prefetch_shortfall_pause_pct`, the campaign PAUSE file is written
+/// before returning; with `wait_for_resume` the call blocks (polling every
+/// `cluster_status_poll_secs`) until an operator removes the file, so the
+/// execution clock never starts on a silently under-supplied campaign.
+pub async fn run_supply_stage(
+    state: Arc<StateDir>,
+    transport: Arc<dyn SupplyTransport>,
+    inputs: SupplyInputs,
+    knobs: &Knobs,
+    batch_seq: Arc<AtomicU64>,
+    wait_for_resume: bool,
+) -> Result<SupplyStageReport> {
+    let mut report = SupplyStageReport::default();
+
+    // ── Prefetch classification ─────────────────────────────────────────
+    let prefetch_candidates: Vec<String> = inputs
+        .prefetch_paths
+        .keys()
+        .filter(|path| !inputs.prior_valid.contains(*path))
+        .cloned()
+        .collect();
+    let probe_valid = transport
+        .query_valid(&prefetch_candidates)
+        .await
+        .context("probe target validity for the prefetch set")?;
+
+    let mut prefetch_roots: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for (path, producer) in &inputs.prefetch_paths {
+        if inputs.prior_valid.contains(path) || probe_valid.contains(path) {
+            append_supply_entry(
+                &state,
+                path,
+                SUPPLY_SOURCE_NONE,
+                SUPPLY_MECHANISM_NONE,
+                SUPPLY_OUTCOME_ALREADY_PRESENT,
+                None,
+            )?;
+            report.already_present += 1;
+            continue;
+        }
+        let covered = inputs.target_coverage.contains(path);
+        match (covered, producer) {
+            // Not covered upstream: a prefetch submission could not
+            // substitute it. With a producer the upload ladder below may
+            // still deliver it; without one nothing can.
+            (false, Some(_)) => {}
+            (false, None) => {
+                append_supply_entry(
+                    &state,
+                    path,
+                    SUPPLY_SOURCE_TARGET_SUBSTITUTER,
+                    SUPPLY_MECHANISM_NONE,
+                    SUPPLY_OUTCOME_UNAVAILABLE,
+                    Some(
+                        "not covered by a target substituter and no static producing \
+                         derivation to prefetch"
+                            .to_string(),
+                    ),
+                )?;
+                report.unavailable += 1;
+            }
+            // Covered but with no static producing derivation
+            // (content-addressed / floating outputs): there is no drv to
+            // submit for it, so it cannot be prefetched.
+            (true, None) => {
+                append_supply_entry(
+                    &state,
+                    path,
+                    SUPPLY_SOURCE_TARGET_SUBSTITUTER,
+                    SUPPLY_MECHANISM_NONE,
+                    SUPPLY_OUTCOME_UNAVAILABLE,
+                    Some("no static producing derivation to prefetch".to_string()),
+                )?;
+                report.unavailable += 1;
+            }
+            (true, Some(drv)) => {
+                prefetch_roots
+                    .entry(drv.clone())
+                    .or_default()
+                    .push(path.clone());
+            }
+        }
+    }
+    report.planned_prefetch = prefetch_roots.values().map(Vec::len).sum();
+
+    // ── Prefetch arm (delegate covered paths to the target cluster) ─────
+    let stats = prefetch_arm(
+        transport.as_ref(),
+        &prefetch_roots,
+        knobs,
+        &state,
+        &batch_seq,
+    )
+    .await?;
+    report.delegated = stats.delegated;
+    report.prefetch_missing = stats.failed;
+    report.failed += stats.failed;
+
+    // ── Upload ladder over the workload union closure ───────────────────
+    if let Some(archive) = inputs.archive.clone() {
+        run_upload_ladder(
+            &state,
+            transport.as_ref(),
+            &archive,
+            &inputs,
+            knobs,
+            &mut report,
+        )
+        .await?;
+    }
+
+    // ── Prefetch shortfall gate ─────────────────────────────────────────
+    if report.planned_prefetch > 0 {
+        let shortfall_pct = report.prefetch_missing as f64 / report.planned_prefetch as f64 * 100.0;
+        report.shortfall_pct = Some(shortfall_pct);
+        if shortfall_pct > knobs.prefetch_shortfall_pause_pct {
+            let pause = state.path("PAUSE");
+            std::fs::write(&pause, b"prefetch shortfall\n")
+                .with_context(|| format!("write {}", pause.display()))?;
+            tracing::error!(
+                prefetch_missing = report.prefetch_missing,
+                planned_prefetch = report.planned_prefetch,
+                shortfall_pct,
+                threshold_pct = knobs.prefetch_shortfall_pause_pct,
+                "prefetch shortfall above the pause threshold; the campaign is paused before \
+                 execution — remove the PAUSE file to accept the shortfall and resume, or abort"
+            );
+            if wait_for_resume {
+                let poll = Duration::from_secs(knobs.cluster_status_poll_secs.max(1));
+                while state.path("PAUSE").exists() {
+                    tokio::time::sleep(poll).await;
+                }
+                tracing::info!("PAUSE file removed; resuming after the prefetch shortfall");
+            }
+        }
+    }
+
+    Ok(report)
+}
+
 /// Resident-set size of this process in MiB, read from `/proc/self/status`
 /// (`VmRSS`); `None` when the file or the field is unavailable.
 pub fn current_rss_mib() -> Option<u64> {
@@ -2010,5 +2548,233 @@ mod tests {
         // the engine targets); both fields parse to a non-zero MiB value.
         assert!(current_rss_mib().unwrap() > 0);
         assert!(peak_rss_mib().unwrap() > 0);
+    }
+
+    #[test]
+    fn tenant_key_path_joins_only_plain_file_names() {
+        // The tenant name is joined onto the key directory as a path
+        // component; traversal sequences, separators, and empty names must
+        // never reach that join.
+        assert_eq!(
+            tenant_key_path(std::path::Path::new("/etc/rio/parity-ssh"), "parity-warm").unwrap(),
+            std::path::PathBuf::from("/etc/rio/parity-ssh/parity-warm")
+        );
+        for bad in ["../evil", "a/b", "", "warm tenant"] {
+            let err = tenant_key_path(std::path::Path::new("/keys"), bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid tenant name") && err.contains(bad),
+                "tenant {bad:?} must be rejected with an error naming it: {err}"
+            );
+        }
+    }
+
+    /// Supply inputs for the prefetch-shortfall tests: `paths` prefetch
+    /// paths, every one covered by a target substituter and produced by its
+    /// own drv (`drv-of(path)`), no archive (the stage degrades to the
+    /// prefetch arm only).
+    fn prefetch_only_inputs(paths: &[String]) -> SupplyInputs {
+        SupplyInputs {
+            workload_outputs: BTreeSet::new(),
+            workload_drvs: BTreeSet::new(),
+            prefetch_paths: paths
+                .iter()
+                .map(|path| (path.clone(), Some(producing_drv(path))))
+                .collect(),
+            prior_valid: BTreeSet::new(),
+            target_coverage: paths.iter().cloned().collect(),
+            archive: None,
+            target_substituters: Vec::new(),
+            relay_substituters: Vec::new(),
+            dependencies: SupplyDependencies::Substituters,
+            delivery: crate::run::spec::SupplyDelivery::Prewarm,
+        }
+    }
+
+    /// Deterministic fake producing drv for one prefetch path.
+    fn producing_drv(path: &str) -> String {
+        let name = path.rsplit('-').next().unwrap_or("x");
+        format!("/nix/store/{:032}-{name}.drv", name.len())
+    }
+
+    #[tokio::test]
+    async fn run_supply_stage_prefetches_covered_paths_and_pauses_on_shortfall() {
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        // Ten prefetch-planned paths; the producing drvs of two of them are
+        // scripted to fail, so 2/10 = 20% of the planned prefetch set is
+        // missing at the end of the stage.
+        let paths: Vec<String> = (0..10)
+            .map(|index| format!("/nix/store/{:032}-prefetch{index}", index))
+            .collect();
+        {
+            let mut scripted = fake.prefetch_results.lock().unwrap();
+            for path in paths.iter().take(2) {
+                scripted.insert(
+                    producing_drv(path),
+                    build_status_name(BuildStatus::PermanentFailure).to_string(),
+                );
+            }
+        }
+        let knobs = Knobs {
+            prefetch_shortfall_pause_pct: 10.0,
+            ..Knobs::default()
+        };
+        let mut inputs = prefetch_only_inputs(&paths);
+        // One extra path already valid at the plan snapshot and one covered
+        // path with no producing derivation: both are bookkeeping-only and
+        // never join the planned prefetch set.
+        let prior = "/nix/store/pppppppppppppppppppppppppppppppp-prior".to_string();
+        let no_producer = "/nix/store/qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqq-noproducer".to_string();
+        inputs.prior_valid.insert(prior.clone());
+        inputs.prefetch_paths.insert(prior.clone(), None);
+        inputs.target_coverage.insert(prior.clone());
+        inputs.prefetch_paths.insert(no_producer.clone(), None);
+        inputs.target_coverage.insert(no_producer.clone());
+
+        let report = run_supply_stage(
+            state.clone(),
+            fake.clone(),
+            inputs,
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            // Tests never block on the operator: the PAUSE file is asserted
+            // on directly instead of being waited for.
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.planned_prefetch, 10);
+        assert_eq!(report.prefetch_missing, 2);
+        assert_eq!(report.shortfall_pct, Some(20.0));
+        assert_eq!(report.delegated, 8);
+        assert_eq!(report.already_present, 1);
+        assert_eq!(report.unavailable, 1);
+        assert!(
+            state.path("PAUSE").exists(),
+            "a 20% shortfall above the 10% threshold must create the PAUSE file"
+        );
+        let entries = entries(&state);
+        assert_eq!(
+            entry_for(&entries, &prior).outcome,
+            SUPPLY_OUTCOME_ALREADY_PRESENT
+        );
+        assert_eq!(
+            entry_for(&entries, &no_producer).outcome,
+            SUPPLY_OUTCOME_UNAVAILABLE
+        );
+
+        // Shortfall zero (every prefetch succeeds): no PAUSE file.
+        let (_dir2, state2) = state2();
+        let state2 = Arc::new(state2);
+        let healthy = Arc::new(FakeSupplyTransport::default());
+        let report = run_supply_stage(
+            state2.clone(),
+            healthy,
+            prefetch_only_inputs(&paths),
+            &knobs,
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(report.prefetch_missing, 0);
+        assert_eq!(report.shortfall_pct, Some(0.0));
+        assert!(
+            !state2.path("PAUSE").exists(),
+            "no shortfall, no PAUSE file"
+        );
+    }
+
+    /// Second state-dir helper for tests that need two independent campaigns.
+    fn state2() -> (tempfile::TempDir, StateDir) {
+        state()
+    }
+
+    #[tokio::test]
+    async fn run_supply_stage_uploads_drv_texts_and_records_policy_withheld() {
+        // Self-hosted-shaped policy (`dependencies: none`) over the mini
+        // archive: derivation texts are still uploaded, but dependency
+        // outputs are withheld by policy and recorded as such from the
+        // resolution itself (not as a generic planner skip).
+        let archive_dir = tempfile::tempdir().unwrap();
+        crate::run::archive_input::write_mini_archive(archive_dir.path());
+        let archive =
+            Arc::new(crate::archive::reader::ReplayArchive::open(archive_dir.path()).unwrap());
+        let units = crate::run::archive_input::load_units(&archive).unwrap();
+        let app_b = units
+            .iter()
+            .find(|unit| unit.job == "appB.x86_64-linux")
+            .unwrap();
+
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        let inputs = SupplyInputs {
+            workload_outputs: app_b.outputs.values().cloned().collect(),
+            workload_drvs: BTreeSet::from([app_b.drv_path.clone()]),
+            prefetch_paths: BTreeMap::new(),
+            prior_valid: BTreeSet::new(),
+            target_coverage: BTreeSet::new(),
+            archive: Some(archive.clone()),
+            target_substituters: Vec::new(),
+            relay_substituters: Vec::new(),
+            dependencies: SupplyDependencies::None,
+            delivery: crate::run::spec::SupplyDelivery::Prewarm,
+        };
+
+        let report = run_supply_stage(
+            state.clone(),
+            fake.clone(),
+            inputs,
+            &Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // The closure's three derivation texts (appB → libA → stdenv) were
+        // uploaded; appB's own outputs are never supplied and never recorded.
+        assert_eq!(report.delivered, 3);
+        let entries = entries(&state);
+        assert_eq!(
+            entry_for(&entries, &app_b.drv_path).outcome,
+            SUPPLY_OUTCOME_DELIVERED
+        );
+        for output in app_b.outputs.values() {
+            assert!(
+                entries.iter().all(|entry| &entry.path != output),
+                "workload output {output} must not get a supply entry"
+            );
+        }
+        // The two dependency outputs (libA's and stdenv's) are withheld by
+        // the `none` dependency policy, recorded unavailable with a detail
+        // naming the policy, and counted in the report.
+        let withheld: Vec<&SupplyEntry> = entries
+            .iter()
+            .filter(|entry| entry.outcome == SUPPLY_OUTCOME_UNAVAILABLE)
+            .collect();
+        assert_eq!(withheld.len(), 2, "{withheld:?}");
+        assert_eq!(report.unavailable, 2);
+        for entry in withheld {
+            assert_eq!(entry.source, crate::run::model::SUPPLY_SOURCE_NONE);
+            assert_eq!(entry.mechanism, crate::run::model::SUPPLY_MECHANISM_NONE);
+            assert!(
+                entry
+                    .detail
+                    .as_deref()
+                    .unwrap_or_default()
+                    .contains("policy"),
+                "{entry:?}"
+            );
+        }
+        // No prefetch was planned, so the shortfall gate does not apply.
+        assert_eq!(report.planned_prefetch, 0);
+        assert_eq!(report.shortfall_pct, None);
+        assert!(!state.path("PAUSE").exists());
     }
 }

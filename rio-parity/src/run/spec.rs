@@ -83,7 +83,10 @@ pub struct ClusterEndpoints {
     pub gateway_store_url: String,
     /// Directory holding one passphrase-less SSH private key per campaign
     /// tenant, file name = tenant name; the prefetch arm dials the gateway
-    /// with `<ssh_key_dir>/<tenants.warm_tenant>`.
+    /// with `<ssh_key_dir>/<tenants.warm_tenant>`. Required whenever the
+    /// effective supply policy includes the prefetch arm — leaf mode (and
+    /// any spec with `supply.dependencies = "substituters"`) cannot run
+    /// its supply stage without it.
     pub ssh_key_dir: Option<PathBuf>,
     /// Scheduler AdminService address, e.g. `rio-scheduler.rio-system.svc:9001`.
     pub scheduler_addr: String,
@@ -459,9 +462,9 @@ impl CampaignSpec {
             self.knobs.connections != Some(0),
             "campaign spec field knobs.connections must be nonzero"
         );
-        // The batch timeout becomes the per-child kill deadline; zero, NaN,
-        // or a negative value would kill every `nix build` child the moment
-        // it spawns.
+        // The batch timeout becomes the per-submission abandon deadline;
+        // zero, NaN, or a negative value would cancel every submission the
+        // moment it starts.
         anyhow::ensure!(
             self.knobs.batch_timeout_hours.is_finite() && self.knobs.batch_timeout_hours > 0.0,
             "campaign spec field knobs.batch_timeout_hours must be a positive finite number of hours"
@@ -1034,8 +1037,8 @@ mod tests {
 
     #[test]
     fn timed_knob_validation() {
-        // Base valid spec: same shape the post-Plan-3 spec tests use (archive
-        // pin instead of an eval set; the digest is any 64-char lowercase hex).
+        // Base valid spec: an archive pin (any 64-char lowercase-hex digest)
+        // plus the required cluster and tenant blocks.
         let base = r#"{
             "mode": "leaf",
             "archive": {"digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
