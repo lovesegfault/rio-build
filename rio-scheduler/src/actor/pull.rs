@@ -155,7 +155,7 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
         // flight, or a retry waiting to requeue. Never `Gone` (the
         // reap→respawn churn loop), never a write.
         S::Created | S::Queued | S::Substituting | S::Failed => PullDecision::NotYetReady,
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Ready but marked must-substitute (topdown-pruned with Broken
         // closure evidence): never serve it from source. Refuse the
         // mint — NotYetReady, no write, and deliberately NOT a
@@ -515,7 +515,7 @@ mod kernel_tests {
         }
     }
 
-    // r[verify sched.merge.substitute-topdown+10]
+    // r[verify sched.merge.substitute-topdown+11]
     /// A Ready node marked must-substitute (topdown-pruned with Broken
     /// closure evidence) is refused: NotYetReady — not DeliverNew (it
     /// must never be served from source) and not Gone (it is still

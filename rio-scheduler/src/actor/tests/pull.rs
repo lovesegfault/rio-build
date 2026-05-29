@@ -164,7 +164,7 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+11]
 /// A Ready node that may only complete via substitution (topdown-pruned
 /// with Broken closure evidence — childless here) is never served from
 /// source by the pull path: the pull answers NotYetReady, mints nothing

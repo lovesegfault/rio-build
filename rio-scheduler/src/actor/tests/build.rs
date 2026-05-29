@@ -399,7 +399,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+10]
+// r[verify sched.merge.substitute-topdown+11]
 /// The reap-time survivor re-evaluation must NOT fail-fast a marked,
 /// holed, walk-spent survivor that is Assigned/Running — an open
 /// attempt in flight gets its verdict from the worker report, the

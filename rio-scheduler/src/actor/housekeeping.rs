@@ -331,7 +331,7 @@ impl DagActor {
     /// meant a blip left in-mem gone → scan never finds it again →
     /// PG clear deferred to next scheduler restart).
     async fn tick_process_expired_poisons(&mut self, expired_poisons: Vec<DrvHash>) {
-        // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.merge.substitute-topdown+11]
         // Surviving parents of the removed children, collected across
         // the loop for one batched closure-hole stamp below — the
         // TTL-sweep twin of the admin ClearPoison stamp and of the

@@ -1065,7 +1065,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+10")[
+#r("sched.merge.substitute-topdown+11")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1110,7 +1110,16 @@ submitted after the failover record contributions as usual).
   inline nor routed to substitution at dispatch time, the scheduler MUST
   fail every interested build with a resubmit-directing error --- the
   dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
-  --- and this MUST hold across leader failover.
+  --- and this MUST hold across leader failover. Pull admission MUST refuse
+  to mint a from-source attempt for a Ready node in this state ---
+  `NotYetReady`, no attempt row, no status change, and deliberately not a
+  fail-fast (the pull carries no store verdict) --- leaving settlement to the
+  dispatch sweep's probe/walk/fail-fast arms; and the reap-time
+  re-evaluation of surviving parents MUST skip survivors whose walk has not
+  yet been tried and survivors that are `Substituting`/`Assigned`/`Running`
+  --- an in-flight walk or open attempt keeps its chance to settle the node,
+  and the pull-admission refusal is what keeps new from-source attempts from
+  opening on it meanwhile.
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the
