@@ -1381,6 +1381,17 @@ is intentionally unimplemented and appears in `tracey query uncovered`.
   A cancelled build's orphan task is benign: its fetch still populates the
   store, the `SubstituteComplete` is dropped by the not-Substituting guard.
 ]
+The recovery reset above is an in-memory re-derivation, not a durable one:
+seed-time status writes cover only the DependencyFailed short-circuit
+targets, so a node re-derived to Ready/Queued keeps PG
+`status='substituting'` (or `'queued'`) until some later status write ---
+durable status therefore cannot be read as "a walk is in flight", and no
+durable reset is required because the next status-bearing transition
+overwrites it. "The spawned task is gone" holds for the new leader's process;
+on a failover with the old replica still alive, the old tenure's walk keeps
+running and ingesting into the store (benign --- the store is content
+addressed) and its late `SubstituteComplete` is dropped by that replica's own
+leader gate (#rref("sched.substitute.leader-gate")).
 
 #r("sched.substitute.fanout-bound")[
   `RIO_SUBSTITUTE_MAX_CONCURRENT` (default 256) bounds in-flight detached tokio
