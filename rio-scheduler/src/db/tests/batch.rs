@@ -276,6 +276,8 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             wanted_output_names: wanted.iter().map(|s| s.to_string()).collect(),
             topdown_pruned: false,
             closure_hole: false,
+            drv_content: None,
+            ca_modular_hash: None,
         };
         let mut tx = db.pool().begin().await?;
         SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
@@ -370,6 +372,8 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         wanted_output_names: vec![],
         topdown_pruned: pruned,
         closure_hole: false,
+        drv_content: None,
+        ca_modular_hash: None,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
         let mut tx = db.pool().begin().await?;
@@ -460,6 +464,8 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         // What every production merge binds — the upsert is never a
         // stamping site for the breadcrumb.
         closure_hole: false,
+        drv_content: None,
+        ca_modular_hash: None,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<()> {
         let mut tx = db.pool().begin().await?;
@@ -635,6 +641,9 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
         is_ca: true,
         drv_content: content,
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let aterm = b"Derive([(\"out\",\"\",\"r:sha256\",\"\")],[],[],\"x86_64-linux\",\"/bin/sh\",[\"-c\",\"echo hi\"],[(\"out\",\"\")])".to_vec();
 
@@ -762,6 +771,9 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, &[first]).await?;
@@ -784,6 +796,9 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[recreator]).await?;
@@ -846,6 +861,9 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: Some(b"Derive-same".to_vec()),
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, &[auth(DerivationStatus::Failed)]).await?;
@@ -899,6 +917,9 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: Some(content.to_vec()),
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
 
     // ── (a) authoritative squat → store-backed re-creation ────────────
@@ -922,6 +943,9 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
     let id_map = SchedulerDb::batch_upsert_derivations(&mut tx, &[store_backed]).await?;
@@ -1016,6 +1040,9 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: Some(b"Derive-squat".to_vec()),
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let mut tx = db.pool().begin().await?;
     SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&squat)).await?;
@@ -1046,6 +1073,9 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
 
     // Run the merge-persist statement set in one tx, then DROP it
@@ -1318,6 +1348,9 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
         is_ca: true,
         drv_content: None,
         ca_modular_hash: ca_hash,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
     };
     let fetch = |hash: &'static str| {
         let pool = test_db.pool.clone();

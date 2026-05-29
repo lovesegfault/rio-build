@@ -662,6 +662,8 @@ impl DerivationDag {
                                 &new_edges,
                                 &interest_added,
                                 &traceparent_upgraded,
+                                &wanted_grown,
+                                &contributions_recorded,
                                 build_id,
                                 removed_retriable,
                                 displaced_scrubbed_edges,
@@ -721,6 +723,8 @@ impl DerivationDag {
                                 &new_edges,
                                 &interest_added,
                                 &traceparent_upgraded,
+                                &wanted_grown,
+                                &contributions_recorded,
                                 build_id,
                                 removed_retriable,
                                 displaced_scrubbed_edges,
@@ -754,6 +758,8 @@ impl DerivationDag {
                         &new_edges,
                         &interest_added,
                         &traceparent_upgraded,
+                        &wanted_grown,
+                        &contributions_recorded,
                         build_id,
                         removed_retriable,
                         displaced_scrubbed_edges,
@@ -985,8 +991,7 @@ impl DerivationDag {
                 )) = prior
                 {
                     state.interested_builds.extend(prior_interest);
-                    state.retry.resubmit_cycles =
-                        if authority_flip { 0 } else { prior_cycles + 1 };
+                    state.retry.resubmit_cycles = if authority_flip { 0 } else { prior_cycles + 1 };
                     if authority_flip {
                         authority_takeovers.push(drv_hash.clone());
                     }

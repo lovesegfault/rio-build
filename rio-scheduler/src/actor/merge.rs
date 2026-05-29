@@ -2374,9 +2374,14 @@ impl DagActor {
         // failure here aborts the whole merge (derivation upserts incl.
         // the topdown_pruned stamps, links, edges) instead of leaving
         // committed side effects behind for a build the caller is about
-        // to reject and roll back in memory. The in-memory BuildInfo
-        // transition happens in `persist_and_activate` only after this
-        // commit succeeds.
+        // to reject and roll back in memory. Recovery therefore sees
+        // either nothing (plus a pending build row that orphan handling
+        // covers) or the fully-committed Active build — never a
+        // half-committed recreate-refresh or definition-change
+        // accumulator reset for a build that was never activated. The
+        // in-memory BuildInfo transition happens in `persist_and_activate`
+        // only after this commit succeeds.
+        // r[impl sched.persist.atomic-activation+2]
         crate::db::SchedulerDb::activate_build_tx(&mut tx, build_id).await?;
 
         // r[verify sched.db.tx-commit-before-mutate]
@@ -2395,16 +2400,6 @@ impl DagActor {
                 );
             }
         }
-
-        // r[impl sched.persist.atomic-activation+2]
-        // The owning build's Pending→Active joins the same commit: if the
-        // tx fails or the leader dies here, recovery sees either nothing
-        // (plus a pending build row that orphan handling covers) or the
-        // fully-committed Active build — never a half-committed
-        // recreate-refresh (or definition-change accumulator reset) for a
-        // build that was never activated.
-        crate::db::SchedulerDb::update_build_status_tx(&mut tx, build_id, BuildState::Active, None)
-            .await?;
 
         tx.commit().await?;
 
