@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result};
+use anyhow::{Context as _, Result, ensure};
 
 use super::batch::{Batch, PendingJob, assemble_batches};
 use super::model::{
@@ -120,14 +120,29 @@ pub fn warm_work(
 /// gateway URL with its `ssh-key` query parameter re-pointed at
 /// `<ssh_key_dir>/<warm_tenant>`. Tenant selection on the gateway is by SSH
 /// key, not by URL, so everything else about the URL is kept as-is.
+///
+/// The tenant name becomes a single path component under the key directory,
+/// so it is restricted to a plain file-name alphabet (ASCII alphanumerics,
+/// `-`, `_`); anything else — path separators, `..`, an empty name — is
+/// rejected so a crafted tenant value can never point the key path outside
+/// the directory. The key file itself is deliberately not checked for
+/// existence here: this only derives the URL string.
 pub fn warm_store_url(
     gateway_store_url: &str,
     ssh_key_dir: &std::path::Path,
     warm_tenant: &str,
-) -> String {
+) -> Result<String> {
+    ensure!(
+        !warm_tenant.is_empty()
+            && warm_tenant
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "invalid warm tenant name {warm_tenant:?}: must be non-empty and contain only \
+         ASCII alphanumerics, '-' or '_'"
+    );
     let key = ssh_key_dir.join(warm_tenant);
     let key = key.display();
-    match gateway_store_url.split_once('?') {
+    Ok(match gateway_store_url.split_once('?') {
         Some((base, query)) => {
             let mut params: Vec<&str> = query
                 .split('&')
@@ -138,7 +153,7 @@ pub fn warm_store_url(
             format!("{base}?{}", params.join("&"))
         }
         None => format!("{gateway_store_url}?ssh-key={key}"),
-    }
+    })
 }
 
 /// Map a warm root drv's observed scheduler status to the per-path
@@ -400,7 +415,8 @@ mod tests {
                 "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-leaf",
                 std::path::Path::new("/etc/rio/parity-ssh"),
                 "parity-warm",
-            ),
+            )
+            .unwrap(),
             "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-warm"
         );
         // A gateway URL with no query string still gains the warm key.
@@ -409,9 +425,26 @@ mod tests {
                 "ssh-ng://rio@gw:22",
                 std::path::Path::new("/keys"),
                 "parity-warm"
-            ),
+            )
+            .unwrap(),
             "ssh-ng://rio@gw:22?ssh-key=/keys/parity-warm"
         );
+    }
+
+    #[test]
+    fn warm_store_url_rejects_tenant_names_outside_the_file_name_alphabet() {
+        // The tenant name is joined onto the key directory as a path
+        // component; traversal sequences, separators, and empty names must
+        // never reach that join.
+        for bad in ["../evil", "a/b", "", "warm tenant"] {
+            let err = warm_store_url("ssh-ng://rio@gw:22", std::path::Path::new("/keys"), bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("invalid warm tenant name") && err.contains(bad),
+                "tenant {bad:?} must be rejected with an error naming it: {err}"
+            );
+        }
     }
 
     #[test]

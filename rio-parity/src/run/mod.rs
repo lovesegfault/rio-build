@@ -954,7 +954,7 @@ pub async fn run_with_backends(
                 .as_deref()
                 .context("leaf mode requires cluster.ssh_key_dir")?,
             &spec.tenants.warm_tenant,
-        );
+        )?;
         let plan_valid: HashSet<String> = plan_output.cached_prior_paths.iter().cloned().collect();
         // The warm stage submits through its own shell-out submitter; the
         // fallback to the build-path submitter keeps fake-backend tests that
