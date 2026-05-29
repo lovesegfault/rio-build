@@ -1223,9 +1223,10 @@ impl DagActor {
         //    build whose node IS buildable once those children land.
         //  - Broken (childless or closure-holed): the child set must
         //    not vouch for a from-source dispatch — a closure-holed
-        //    node's post-reap children are not representative of the
-        //    pruned input closure, so neither the lazy clear nor the
-        //    suppression may trust them. Take the fail-fast arm below
+        //    node's surviving children (left by a reap, a poison-clear
+        //    removal, or a recovery edge-drop) are not representative
+        //    of the pruned input closure, so neither the lazy clear nor
+        //    the suppression may trust them. Take the fail-fast arm below
         //    (the bounded resubmit-directing outcome, never the doomed
         //    from-source dispatch a Ready revert would produce).
         //

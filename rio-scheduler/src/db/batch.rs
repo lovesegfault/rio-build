@@ -129,14 +129,16 @@ impl SchedulerDb {
         // closure_hole is OR-combined too, for the symmetric reason: the
         // merge bind is ALWAYS false (the upsert is never a stamping
         // site — the breadcrumb is set via `set_closure_hole_by_hashes`
-        // by the leader's reap hook and by the recovery-time stamp in
-        // `load_dag_from_rows`), and a pruned / single-node
-        // re-merge of the same drv does not re-declare its edges, so it
-        // must not launder the persisted truncation evidence through the
-        // upsert. The only merge-side clear is the explicit heal in
-        // `handle_merge_dag` (`clear_closure_hole_by_hashes`, edge
-        // parents of a full merge); the batched mark-clear helper below
-        // drops it together with `topdown_pruned`, while the single-row
+        // by the leader's reap hook, by the recovery-time stamp in
+        // `load_dag_from_rows`, and by the poison-clear paths — admin
+        // ClearPoison and the poison-TTL sweep), and a pruned /
+        // single-node re-merge of the same drv does not re-declare its
+        // edges, so it must not launder the persisted truncation
+        // evidence through the upsert. The only merge-side clear is
+        // the explicit heal in `handle_merge_dag`
+        // (`clear_closure_hole_by_hashes`, edge parents of a full
+        // merge); the batched mark-clear helper below drops it
+        // together with `topdown_pruned`, while the single-row
         // `clear_topdown_pruned_by_hash` is mark-only (the fail-fast
         // retains the breadcrumb for the directed resubmit).
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
@@ -181,9 +183,10 @@ impl SchedulerDb {
             -- produced) and by clear_topdown_pruned_by_hash (lazy
             -- walk-failure clear; fail-fast consumed it).
             --
-            -- closure_hole: OR — set by the leader's reap hook and the
-            -- recovery-time stamp in load_dag_from_rows (merges always
-            -- bind false); this upsert never clears it.
+            -- closure_hole: OR — set by the leader's reap hook, the
+            -- recovery-time stamp in load_dag_from_rows, and the
+            -- poison-clear paths (merges always bind false); this
+            -- upsert never clears it.
             -- Cleared by the merge-time heal
             -- (clear_closure_hole_by_hashes) and alongside the mark by
             -- the batched clear_topdown_pruned_by_hashes helper (the
@@ -405,18 +408,23 @@ impl SchedulerDb {
     }
 
     /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, on
-    /// the pool (outside any transaction). Two callers: the leader-gated
-    /// survivor hook in `handle_cleanup_terminal_build`, for the parents
-    /// the terminal-build reap just holed (`ReapOutcome::holed_parents`)
-    /// — run BEFORE the per-parent verdict loop so a survivor that loop
-    /// immediately fail-fasts converges back to false via
-    /// [`Self::clear_topdown_pruned_by_hash`] — and the recovery-time
-    /// stamp in `load_dag_from_rows`, for recovered parents whose
-    /// un-produced terminal children's edges the recovery load dropped
-    /// (the recovery-side analogue of the reap). The in-memory
-    /// breadcrumb is set by the reap itself on leaders and standbys
-    /// alike or by that recovery stamp on the just-acquired leader; only
-    /// a leader persists it (`r[sched.lease.standby-drops-writes]`).
+    /// the pool (outside any transaction). Four callers, one per
+    /// production removal of an un-produced child out from under a
+    /// surviving parent: the leader-gated survivor hook in
+    /// `handle_cleanup_terminal_build`, for the parents the
+    /// terminal-build reap just holed (`ReapOutcome::holed_parents`);
+    /// the recovery-time stamp in `load_dag_from_rows`, for recovered
+    /// parents whose un-produced terminal children's edges the recovery
+    /// load dropped (the recovery-side analogue of the reap); and the
+    /// two poison-clear paths — admin ClearPoison
+    /// (`handle_clear_poison`) and the poison-TTL sweep
+    /// (`tick_process_expired_poisons`) — for the surviving parents of
+    /// the Poisoned (by definition un-produced) child they remove. All
+    /// four share the same posture: the write runs only on the leader
+    /// (hook gate, recovery, admin leader guard, standby tick no-op —
+    /// `r[sched.lease.standby-drops-writes]`) and the in-memory
+    /// breadcrumb is stamped at the removal site itself, independently
+    /// of this write.
     /// Returns the number of rows actually stamped. The caller warns and
     /// continues on error — losing the write costs durability of the
     /// breadcrumb across a failover (the already-accepted best-effort

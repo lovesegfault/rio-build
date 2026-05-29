@@ -67,6 +67,7 @@ pub struct DebugDerivationInfo {
     pub sched: crate::state::SchedHint,
     pub substitute_tried: bool,
     pub topdown_pruned: bool,
+    pub closure_hole: bool,
 }
 
 /// Handle for sending commands to the actor.

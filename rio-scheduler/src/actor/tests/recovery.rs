@@ -4173,16 +4173,19 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
 /// and the merge-time heal keep honoring "an un-produced child was
 /// reaped out from under this node" across a leader failover.
 ///
-/// The restore is asserted through the merge-time heal, because the
-/// debug surface does not expose the breadcrumb directly: the heal's
-/// best-effort PG clear is keyed on the IN-MEMORY breadcrumb value
-/// captured before the heal flips it, so the persisted column flipping
-/// true→false after a post-failover full merge re-declares the node's
-/// edges proves both halves at once — the new leader restored the
-/// breadcrumb from PG, and the heal cleared the persisted copy for
-/// exactly the nodes that carried it (had recovery reset it to false,
-/// the heal would have had nothing to clear and the column would have
-/// stayed true).
+/// Two pins, one per half. The restore itself is observed DIRECTLY:
+/// right after recovery (before any merge) the debug surface must show
+/// the in-memory breadcrumb true — that is `from_recovery_row` carrying
+/// the persisted column into the restored state. The heal half is then
+/// pinned on the persisted column: a post-failover full merge
+/// re-declares the node's edges and the persisted breadcrumb flips
+/// true→false while the still-unvouched mark stays. The heal is TOTAL —
+/// it pushes the PG clear for every edge parent it re-declares, keyed
+/// on the persisted column only, never on the pre-clear in-memory value
+/// (the heal-totality test in merge.rs stages exactly that divergence) —
+/// so the column flip pins the heal + persistence round-trip, not the
+/// restore; the direct post-recovery assert is what catches a restore
+/// regression.
 #[tokio::test]
 async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrumb() -> TestResult {
     let f = RecoveryFixture::run(async |handle, pool| {
@@ -4219,6 +4222,15 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
         expect_drv(&handle, "chrec-root").await.topdown_pruned,
         "fixture premise: the restored topdown_pruned mark survives recovery"
     );
+    // The restore observed directly: `from_recovery_row` must carry the
+    // persisted breadcrumb into the in-memory state instead of resetting
+    // it to false the way the pre-064 code did. The heal below is total
+    // (keyed on the persisted column, not on this bit), so without this
+    // assert a restore regression would be invisible to this test.
+    assert!(
+        expect_drv(&handle, "chrec-root").await.closure_hole,
+        "recovery must restore the in-memory closure_hole breadcrumb from the persisted column"
+    );
     // Nothing between the backdate and the heal may clear the persisted
     // breadcrumb: recovery only restores it.
     let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
@@ -4233,8 +4245,8 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
 
     // A post-failover FULL merge re-declares the node's edges: its child
     // set is representative of its closure again, so the heal drops the
-    // breadcrumb in memory and pushes the clear to PG for the nodes
-    // whose restored state carried it.
+    // breadcrumb in memory and pushes the PG clear for every edge parent
+    // it re-declares (total — not keyed on the restored in-memory value).
     merge_dag(
         &handle,
         Uuid::new_v4(),
@@ -4253,7 +4265,7 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
     assert!(
         !pg_hole,
         "a full merge re-declaring the node's edges must clear the persisted closure_hole \
-         restored at recovery (restore + heal keying)"
+         restored at recovery (the heal is total over the re-declared edge parents)"
     );
     assert!(
         pg_pruned,

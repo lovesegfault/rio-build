@@ -180,6 +180,7 @@ impl DagActor {
             sched: s.sched.clone(),
             substitute_tried: s.substitute_tried,
             topdown_pruned: s.topdown_pruned,
+            closure_hole: s.closure_hole,
         })
     }
 

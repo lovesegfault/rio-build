@@ -117,19 +117,23 @@ pub struct ReapOutcome {
 /// `Broken` means "the current child set must NOT vouch for a
 /// from-source dispatch": the node is absent, has no children at all
 /// (a fired prune dropped its closure from the submission, or every
-/// child was reaped), or carries the `closure_hole` breadcrumb — the
-/// terminal-build reap removed an un-produced child out from under it
-/// (see the breadcrumb loop in
-/// [`DerivationDag::remove_build_interest_and_reap`]) or leader-failover
-/// recovery dropped the edge to one (the recovery-time stamp in
-/// `load_dag_from_rows`), so whatever children survive are a truncated
-/// view of its input closure.
+/// child was reaped), or carries the `closure_hole` breadcrumb — an
+/// un-produced child was removed out from under it, by the
+/// terminal-build reap (see the breadcrumb loop in
+/// [`DerivationDag::remove_build_interest_and_reap`]), by a
+/// poison-clear removal (admin ClearPoison or the poison-TTL sweep), or
+/// by leader-failover recovery dropping the edge to one (the
+/// recovery-time stamp in `load_dag_from_rows`) — so whatever children
+/// survive are a truncated view of its input closure.
 /// The breadcrumb survives the node's own completion or skip (those
-/// transitions do not repair the truncation); it is dropped only by the
-/// merge-time heal when a full merge re-declares the node's edges (the
-/// post-reconciliation pass in `handle_merge_dag`), by the mark-clear /
-/// fail-fast consumption of the `topdown_pruned` mark it qualifies, or
-/// by a resubmit/rollback rebuild of the node state.
+/// transitions do not repair the truncation), is carried across a
+/// resubmit-reset of the node (a `rollback_merge` restores the prior
+/// state wholesale), and is NOT consumed by the mark-clear / fail-fast
+/// handling of the `topdown_pruned` mark it qualifies (the fail-fast is
+/// mark-only, so the breadcrumb survives to re-stamp the directed
+/// resubmit); it is dropped only by the merge-time heal when a full
+/// merge re-declares the node's edges (the post-reconciliation pass in
+/// `handle_merge_dag`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClosureEvidence {
     /// At least one child, every child produced (Completed/Skipped),

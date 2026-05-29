@@ -844,12 +844,16 @@ impl DagActor {
         // The new leader's recovery owns these survivors.
         if self.leader.is_leader() {
             // Persist the closure-hole breadcrumbs this reap just set
-            // (`migrations/064`), BEFORE the per-parent verdict loop: a
-            // survivor that loop immediately fail-fasts has the stamp
-            // superseded by the fail-fast's mark clear (which drops both
-            // bits), so stamp-then-clear converges to false; stamping
-            // after the loop would resurrect a persisted hole for a node
-            // already parked. Best-effort: a lost write only costs the
+            // (`migrations/064`), before the per-parent verdict loop. A
+            // survivor that loop immediately fail-fasts KEEPS the hole —
+            // the fail-fast's PG clear is mark-only — so the stamp's
+            // position relative to the loop no longer changes the
+            // outcome: the persisted hole stays set either way until a
+            // later full merge re-declares the parent's edges. That
+            // persistence is intended — the directed resubmit the
+            // fail-fast solicits re-prunes, and its stamp gates need the
+            // breadcrumb so the produced survivors cannot pass for
+            // Vouched. Best-effort: a lost write only costs the
             // breadcrumb's durability across a failover (the in-memory
             // hole — set by the reap above on leader and standby alike —
             // still guards this tenure), never the cleanup itself.

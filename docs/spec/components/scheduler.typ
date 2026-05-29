@@ -894,9 +894,10 @@ submitted after the failover record contributions as usual).
   verifiable path, or on any other uncertainty (store unreachable,
   floating-CA demanded node). A `topdown_pruned` node whose current DAG
   children no longer cover its pruned input closure --- childless, or left
-  with a closure hole because the cleanup of a terminal interested build
-  reaped an un-produced child out from under it --- MUST NOT be dispatched
-  as a from-source build: when its deferred fetch fails
+  with a closure hole because an un-produced child was removed out from
+  under it (reaped by a terminal interested build's cleanup, removed by a
+  poison clear, or dropped at recovery as a lost edge) --- MUST NOT be
+  dispatched as a from-source build: when its deferred fetch fails
   (`SubstituteComplete{ok=false}`), when the reap itself strands it with an
   already-spent walk, or when its wanted outputs can neither be completed
   inline nor routed to substitution at dispatch time, the scheduler MUST
@@ -943,10 +944,14 @@ never vouched for can be definitively missing at dispatch time; without the
 restored flag the node would be left Ready and handed a doomed from-source
 dispatch whose `inputDrvs` were never merged. The closure-hole breadcrumb is
 persisted alongside the mark (migration 064, OR-on-conflict, written
-best-effort by the leader's terminal-build reap hook --- and by recovery
-itself when it drops an edge to an un-produced terminal child of a restored
-parent, the recovery-side analogue of that reap --- restored at recovery,
-and cleared with the mark or by the merge-time heal) so the recovery-time
+best-effort by the leader's terminal-build reap hook, by the poison-clear
+paths --- the admin clear and the poison-TTL sweep, whose removal of a
+Poisoned child is the same truncation --- and by recovery itself when it
+drops an edge to an un-produced terminal child of a restored parent, the
+recovery-side analogue of that reap; restored at recovery, and cleared
+alongside a produced-children mark clear or by the merge-time heal --- the
+fail-fast consumes only the mark and leaves the breadcrumb for the resubmit
+it directs) so the recovery-time
 gate keeps refusing to treat a reap-truncated persisted child set as
 produced-closure evidence: the reaped un-produced child's own row and edge
 can be GC'd before the failover, and without the durable breadcrumb the

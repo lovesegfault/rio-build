@@ -912,10 +912,11 @@ pub struct DerivationState {
     /// across failover re-arms the doomed from-source dispatch.
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb: an un-produced child of this node
-    /// (status not Completed/Skipped at reap time) was reaped out from
-    /// under it by a terminal build's cleanup
-    /// (`remove_build_interest_and_reap`), so its current DAG children
-    /// no longer represent its pruned input closure. Every
+    /// (status not Completed/Skipped at removal time) was removed out
+    /// from under it — by a terminal build's cleanup reap
+    /// (`remove_build_interest_and_reap`), a poison-clear removal, or a
+    /// recovery-time edge drop — so its current DAG children no longer
+    /// represent its pruned input closure. Every
     /// children-keyed `topdown_pruned` verdict treats this as
     /// childless-equivalent: the reap-hook fail-fast arm fires for a
     /// holed survivor, and the walk-failure children gate, the

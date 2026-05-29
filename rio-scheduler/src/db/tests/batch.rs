@@ -421,18 +421,19 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
 
 // r[verify sched.merge.substitute-topdown+10]
 /// `closure_hole` (`migrations/064`) column semantics: stamped only via
-/// `set_closure_hole_by_hashes` (the leader's reap hook and the
-/// recovery-time stamp in `load_dag_from_rows`; merge upserts always
-/// bind false), preserved across a later re-upsert by the
+/// `set_closure_hole_by_hashes` (the leader's reap hook, the
+/// recovery-time stamp in `load_dag_from_rows`, and the poison-clear
+/// paths; merge upserts always bind false), preserved across a later
+/// re-upsert by the
 /// OR-on-conflict SET (a non-edge-declaring merge must not launder the
 /// truncation evidence), carried by the recovery SELECT so a new leader
 /// can restore it, cleared on its own by the merge-heal helper
 /// `clear_closure_hole_by_hashes`, and dropped together with the mark
-/// by the batched `clear_topdown_pruned_by_hashes` helper (including a
-/// markless leftover hole, via its widened WHERE) — while the
-/// single-row `clear_topdown_pruned_by_hash` is mark-only: the topdown
-/// fail-fast consumes the mark but retains the hole for the directed
-/// resubmit it solicits (bug_006/round-23).
+/// by the batched `clear_topdown_pruned_by_hashes` helper (whose
+/// widened WHERE would also catch a markless leftover hole — not
+/// exercised here) — while the single-row `clear_topdown_pruned_by_hash`
+/// is mark-only: the topdown fail-fast consumes the mark but retains
+/// the hole for the directed resubmit it solicits (bug_006/round-23).
 #[tokio::test]
 async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -480,8 +481,8 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         "merge upserts must not stamp the breadcrumb"
     );
 
-    // 2. The stamp helper (shared by the reap hook and the recovery-time
-    //    stamp) sets it.
+    // 2. The stamp helper (shared by the reap hook, the recovery-time
+    //    stamp, and the poison-clear paths) sets it.
     assert_eq!(
         db.set_closure_hole_by_hashes(&hashes).await?,
         1,

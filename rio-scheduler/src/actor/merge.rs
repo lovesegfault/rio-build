@@ -157,8 +157,8 @@ impl DagActor {
         // Closure-hole healing comes FIRST: a full merge that
         // re-declares a node's edges re-supplies its inputDrvs, so its
         // child set is representative of its closure again — drop the
-        // reap-time `closure_hole` breadcrumb for every edge parent of
-        // this submission before judging the clear. A pruned merge has
+        // `closure_hole` breadcrumb for every edge parent of this
+        // submission before judging the clear. A pruned merge has
         // no edges (`edge_parent_hashes` is empty), so it never heals a
         // hole. Candidates that are NOT edge parents of this submission
         // (e.g. pre-existing DAG parents of a cache hit) keep their
@@ -1942,12 +1942,17 @@ impl DagActor {
                     topdown_pruned: topdown_pruned_parents.contains(node.drv_hash.as_str())
                         && !self.closure_vouched(&node.drv_hash),
                     // Always false: a merge never creates a closure hole
-                    // (holes are reap-time only, stamped in PG by the
-                    // leader's reap hook), and binding the in-memory
-                    // value here would turn the upsert into a second
-                    // stamping site. The OR-on-conflict SET keeps any
-                    // existing persisted hole; the only merge-side clear
-                    // is the explicit heal in `handle_merge_dag`.
+                    // (holes are stamped in PG via
+                    // `set_closure_hole_by_hashes` by the leader's reap
+                    // hook, the recovery-time stamp in
+                    // `load_dag_from_rows`, and the poison-clear paths —
+                    // admin ClearPoison and the poison-TTL sweep), and
+                    // binding the in-memory value here would turn the
+                    // upsert into a second stamping site. The
+                    // OR-on-conflict SET keeps any existing persisted
+                    // hole; the merge-side clears are the explicit heal
+                    // in `handle_merge_dag` and the both-bits batched
+                    // mark clear it runs for Vouched parents.
                     closure_hole: false,
                 }
             })

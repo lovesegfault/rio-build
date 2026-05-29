@@ -402,13 +402,17 @@ pub(crate) struct DerivationRow {
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb (`migrations/064`). Merge-time rows
     /// always bind `false` — the upsert is never a stamping site for
-    /// the breadcrumb (the setters are the leader-gated reap hook and
-    /// the recovery-time stamp in `load_dag_from_rows`, both via
-    /// `set_closure_hole_by_hashes`) — and the OR-on-conflict SET
-    /// keeps any persisted hole, so a later merge of the same drv can
-    /// never launder it away. Cleared together with `topdown_pruned`
-    /// by the extended `clear_topdown_pruned_by_hash{,es}` helpers and
-    /// on its own by the merge-time heal (`clear_closure_hole_by_hashes`).
+    /// the breadcrumb (the setters, all via
+    /// `set_closure_hole_by_hashes`, are the leader-gated reap hook,
+    /// the recovery-time stamp in `load_dag_from_rows`, and the
+    /// poison-clear paths — admin ClearPoison and the poison-TTL
+    /// sweep) — and the OR-on-conflict SET keeps any persisted hole,
+    /// so a later merge of the same drv can never launder it away.
+    /// Cleared together with `topdown_pruned` by the batched
+    /// Vouched-keyed `clear_topdown_pruned_by_hashes` helper and on
+    /// its own by the merge-time heal (`clear_closure_hole_by_hashes`);
+    /// the single-row `clear_topdown_pruned_by_hash` is mark-only, so
+    /// the topdown fail-fast retains the hole it leaves behind.
     pub closure_hole: bool,
 }
 
