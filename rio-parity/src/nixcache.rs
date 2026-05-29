@@ -318,9 +318,9 @@ mod tests {
     /// real hello-2.12.3 store path; hash values are SYNTHETIC — the
     /// real upstream values are deliberately not asserted offline),
     /// one narinfo whose NarHash uses an unsupported algorithm (md5),
-    /// one always-broken path, and 404s everything else. Requests
-    /// without the rio-parity User-Agent get 406 so a politeness
-    /// regression fails these tests.
+    /// one 200 body that is not a narinfo at all, one always-broken
+    /// path, and 404s everything else. Requests without the rio-parity
+    /// User-Agent get 406 so a politeness regression fails these tests.
     async fn spawn_fake_cache() -> (String, tokio::task::JoinHandle<()>) {
         use axum::response::IntoResponse;
         use axum::routing::get;
@@ -371,6 +371,15 @@ NarSize: 4242
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/x-nix-narinfo")],
                     body,
+                )
+                    .into_response()
+            } else if file == "gggggggggggggggggggggggggggggggg.narinfo" {
+                // A 200 response whose body does not parse as a narinfo at
+                // all (e.g. a captive portal or a misrouted error page) —
+                // the "found but no usable identity" case.
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/html")],
+                    "<html><body>storage gateway maintenance page</body></html>",
                 )
                     .into_response()
             } else if file == "cccccccccccccccccccccccccccccccc.narinfo" {
@@ -465,6 +474,24 @@ NarSize: 4242
             "an md5 NarHash cannot be converted to a hex sha256"
         );
         assert_eq!(fact.nar_size, Some(4242), "NarSize is still usable");
+    }
+
+    #[tokio::test]
+    async fn sweep_records_unparseable_narinfo_body_as_found_without_identity() {
+        // A 200 body that fails narinfo parsing entirely still proves the
+        // path exists upstream, so it is recorded as found — but with no
+        // NAR identity at all, which keeps the recorder's outcome mapping
+        // at `built` without an output-hash entry rather than `unknown`.
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let garbled = "/nix/store/gggggggggggggggggggggggggggggggg-garbled-1.0".to_string();
+        let facts = sweep_narinfos(&c, std::slice::from_ref(&garbled), 1, 2)
+            .await
+            .unwrap();
+        let fact = &facts[&garbled];
+        assert!(fact.found, "a 200 body counts as present upstream");
+        assert!(fact.nar_hash_hex.is_none(), "no parseable NarHash");
+        assert!(fact.nar_size.is_none(), "no parseable NarSize");
     }
 
     #[tokio::test]
