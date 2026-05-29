@@ -1196,6 +1196,38 @@ truncated edges and carries the breadcrumb with them), and the heal is total
 relative to a reaped-and-reinserted or recovered-as-stub in-memory node whose
 field sits at its `false` default.
 
+#r("sched.evidence.durability")[
+  The `topdown_pruned` stamp MUST be written inside the same transaction that
+  persists the pruned merge --- the row upsert, the edge and
+  `build_derivations` inserts, and the Pending→Active build activation as the
+  final statement --- so a rejected merge leaves no durable stamp and a
+  committed merge cannot lose it; the in-memory stamp MUST be applied only
+  after that transaction commits. Every other durable evidence write --- the
+  Vouched-keyed both-bits clear, the mark-only clear, the closure-hole stamp,
+  and the heal --- is best-effort: a single pool-level statement outside any
+  transaction, issued after the corresponding in-memory mutation, whose
+  failure is logged and MUST NOT fail the surrounding operation. The merge
+  upsert MUST be monotone for both evidence columns (OR-on-conflict): no
+  merge --- pruned or not --- may clear `topdown_pruned` or `closure_hole`
+  through the upsert, and the persisted wanted-output union MUST only grow
+  (empty-saturating, #rref("sched.merge.wanted-outputs")). Best-effort loss
+  is acceptable only in the stale-true direction (PG retains a mark or hole
+  the in-memory state already cleared): a write whose loss would leave PG
+  missing evidence the in-memory state relies on MUST either be transactional
+  with the state it describes (the stamp) or be re-derivable at the next
+  recovery (the closure-hole stamp, re-derived from the un-produced child's
+  persisted row and edges).
+]
+A lost clear is absorbed by the next recovery's produced-children gate or
+costs at most one bounded resubmit-directing fail-fast after a failover ---
+never a doomed from-source dispatch --- which is why the clears may be
+best-effort while the stamp may not. The asymmetry is the load-bearing
+durability decision of the evidence design: stale-true evidence makes the
+scheduler conservative (refuse from-source work, at worst fail a build with
+the resubmit-directing error), stale-false evidence would make it permissive
+(dispatch a node whose closure was never merged), so only the former is
+tolerated outside the merge transaction.
+
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream

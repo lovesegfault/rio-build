@@ -1017,6 +1017,7 @@ async fn test_topdown_pruned_root_substitute_fail_does_not_dispatch_build() -> T
 /// produced** clears the column via the post-reconciliation clear pass
 /// after the merge is reconciled (a merge adding only unbuilt children
 /// keeps it — see the reap-hazard test below).
+// r[verify sched.evidence.durability]
 #[tokio::test]
 async fn test_topdown_pruned_persisted_to_pg_and_cleared_when_children_added() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -5394,6 +5395,7 @@ async fn test_topdown_pruned_kept_when_merge_child_is_stale_completed() -> TestR
 /// `persist_and_activate`) errors; nothing in steps 0–4 reads pname,
 /// so the merge reaches step 5 intact (the Database-error assertion
 /// plus the prune counter pin that down).
+// r[verify sched.evidence.durability]
 #[tokio::test]
 async fn test_topdown_stamp_not_leaked_when_merge_fails_at_persist() -> TestResult {
     let recorder = CountingRecorder::default();

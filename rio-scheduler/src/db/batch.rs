@@ -114,6 +114,7 @@ impl SchedulerDb {
         // effective set (`effective_wanted`, in-memory per-build
         // contributions) and only falls back to this column.
         //
+        // r[impl sched.evidence.durability]
         // topdown_pruned is OR-combined on conflict for the same reason:
         // an unrelated, non-pruned merge of the same drv elsewhere must
         // never clear a prior pruned merge's marker through the upsert.

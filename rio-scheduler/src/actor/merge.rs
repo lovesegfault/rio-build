@@ -561,6 +561,7 @@ impl DagActor {
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.evidence.durability]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -1900,6 +1901,7 @@ impl DagActor {
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
+    // r[impl sched.evidence.durability]
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
