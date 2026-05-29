@@ -1,11 +1,10 @@
-//! Eval-set construction.
+//! Evaluation recording.
 //!
-//! Everything needed to reproduce a Hydra evaluation locally and
-//! package the result: the eval recipe, the evaluator run, the drvPath
-//! fidelity gate, dependency-closure enumeration, the derivation
-//! archive, and the eval-set key/metadata.
+//! Everything needed to reproduce a Hydra evaluation locally and record
+//! it as a v1 replay archive: the eval recipe, the evaluator run, the
+//! drvPath fidelity gate, closure-adjacency extraction, expected-outcome
+//! mapping, archive staging, and the recipe key.
 
-pub mod archive;
 pub mod artifacts;
 pub mod depclosure;
 pub mod evaluator;
@@ -15,12 +14,12 @@ pub mod outcomes;
 pub mod package;
 pub mod recipe;
 
-/// What part of the Hydra evaluation an eval set covers.
+/// What part of the Hydra evaluation a recording covers.
 ///
 /// The serde encoding (kebab-case `kind` tag, snake_case fields) feeds
-/// [`key::EvalSetKey::digest`] and is embedded verbatim in
-/// `evalset.json`, so changing it changes every eval-set key digest —
-/// treat it as frozen (the digest's golden test pins it).
+/// [`key::EvalSetKey::digest`] and is embedded verbatim in the archive
+/// provenance (`recipe`/`scope`), so changing it changes every recipe
+/// digest — treat it as frozen (the digest's golden test pins it).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Scope {

@@ -1,23 +1,25 @@
-//! Eval-set identity: the key digest and the evalset.json metadata.
+//! The reproduction-recipe key: every input that determines what the
+//! recorder evaluates, hashed into the recipe digest.
 //!
-//! An eval set is addressed as `<hydra-eval-id>/<key-digest>`: the
-//! digest covers the jobset coordinates, the requested systems, the
+//! The digest covers the jobset coordinates, the requested systems, the
 //! evaluation scope, and the eval-logic version (engine version, nix
 //! and nix-eval-jobs versions, and the hash of the generated
-//! entry-point/args expression). The same evaluation built with the
-//! same recipe therefore lands on the same — write-once — prefix,
-//! while any recipe or tooling change yields a new digest and a new
-//! prefix alongside the old one.
+//! entry-point/args expression). It is the recorder's idempotency
+//! handle: it names the local output directory, is recorded in the
+//! archive provenance as `recipe_digest`, and keys the by-recipe
+//! pointer that lets a re-run find the archive an identical recipe
+//! already produced. Any recipe or tooling change yields a new digest.
 
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
 use crate::evalset::Scope;
 
-/// Identity of one eval set: every input that determines its contents.
+/// Identity of one reproduction recipe: every input that determines
+/// what gets evaluated and recorded.
 /// Hashed by [`EvalSetKey::digest`]; the SHORT form of that digest
 /// ([`EvalSetKey::short_digest`], first 16 hex chars) is what names the
-/// S3 prefix and the local output directory.
+/// local output directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EvalSetKey {
     pub hydra_eval_id: u64,
@@ -26,7 +28,7 @@ pub struct EvalSetKey {
     /// Systems in scope, sorted and deduplicated (callers normalize CLI
     /// input through [`EvalSetKey::normalize_systems`]) so that
     /// `--systems` argument order or repetition can never fork the
-    /// digest of an otherwise identical eval set.
+    /// digest of an otherwise identical recipe.
     pub systems: Vec<String>,
     pub scope: Scope,
     pub engine_version: String,
@@ -41,8 +43,9 @@ pub struct EvalSetKey {
     /// the same work and output directories — not across machines or
     /// operators.
     pub args_expr_sha256: String,
-    /// Set by `--force`: salts the digest so a forced rebuild lands in
-    /// a NEW prefix instead of overwriting the write-once one.
+    /// Set by `--force`: salts the digest so a forced re-record is a
+    /// new recipe (new by-recipe pointer, new archive) instead of being
+    /// skipped as already recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub forced_at: Option<String>,
 }
@@ -62,65 +65,21 @@ impl EvalSetKey {
     /// That encoding is part of the identity: fields serialize in
     /// declaration order with their snake_case names, and [`Scope`]
     /// keeps its kebab-case `kind` tag with snake_case fields — the
-    /// same casing the rest of the eval-set artifacts (fidelity.json,
-    /// evalset.json) use; only manifest.jsonl mirrors nix-eval-jobs'
-    /// camelCase. Changing any serde attribute here or on [`Scope`]
-    /// changes every digest and orphans every existing S3 prefix, so
-    /// the golden test below pins the current encoding.
+    /// same casing the recorder's other JSON artifacts (fidelity.json,
+    /// the provenance block) use. Changing any serde attribute here or
+    /// on [`Scope`] changes every digest, orphaning every existing
+    /// by-recipe pointer and provenance `recipe_digest`, so the golden
+    /// test below pins the current encoding.
     pub fn digest(&self) -> String {
         let canonical = serde_json::to_vec(self).expect("EvalSetKey serializes");
         hex::encode(sha2::Sha256::digest(&canonical))
     }
 
-    /// First 16 hex chars of [`EvalSetKey::digest`] — used in S3
-    /// prefixes and Job names.
+    /// First 16 hex chars of [`EvalSetKey::digest`] — used in the local
+    /// output directory name and operator-facing identifiers.
     pub fn short_digest(&self) -> String {
         self.digest()[..16].to_string()
     }
-}
-
-/// Per-set statistics recorded in evalset.json.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct EvalSetStats {
-    pub in_scope_jobs: usize,
-    pub manifest_records: usize,
-    pub eval_errors: usize,
-    pub aggregates_excluded: usize,
-    pub dep_closure_records: usize,
-    pub ca_outputs: usize,
-    pub hydra_requests_used: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub archive_bytes: Option<u64>,
-}
-
-/// Contents of `evalset.json`: the key and its digests, the resolved
-/// nixpkgs revision/source, the jobset configuration as fetched from
-/// Hydra, the exact evaluator invocation (including the derived
-/// revCount/shortRev), the systems and scope, per-set statistics, and
-/// the fidelity verdict — everything needed to audit how the eval set
-/// was produced without re-deriving it.
-#[derive(Debug, Clone, Serialize)]
-pub struct EvalSetMeta {
-    pub key: EvalSetKey,
-    pub key_digest: String,
-    pub key_short_digest: String,
-    pub hydra_eval_id: u64,
-    pub nixpkgs_revision: String,
-    pub project: String,
-    pub jobset: String,
-    /// Raw jobset config JSON as fetched from Hydra.
-    pub jobset_config: serde_json::Value,
-    pub source_store_path: String,
-    pub rev_count: u64,
-    pub short_rev: String,
-    pub evaluator_program: String,
-    pub evaluator_argv: Vec<String>,
-    pub systems: Vec<String>,
-    pub scope: Scope,
-    pub dry_run: bool,
-    pub fidelity_divergent: bool,
-    pub stats: EvalSetStats,
-    pub created_at: String,
 }
 
 #[cfg(test)]
@@ -212,38 +171,14 @@ mod tests {
     }
 
     #[test]
-    fn evalset_meta_keeps_scope_encoding_in_sync_with_the_key() {
-        // evalset.json embeds the scope twice (inside `key` and at top
-        // level); both must use the exact encoding the digest was
-        // computed over — kebab-case `kind` tag, snake_case fields — so
-        // the document can never disagree with the prefix it lives
-        // under.
-        let key = key();
-        let meta = EvalSetMeta {
-            key: key.clone(),
-            key_digest: key.digest(),
-            key_short_digest: key.short_digest(),
-            hydra_eval_id: key.hydra_eval_id,
-            nixpkgs_revision: "68d8aa3d661f0e6bd5862291b5bb263b2a6595c9".into(),
-            project: key.project.clone(),
-            jobset: key.jobset.clone(),
-            jobset_config: serde_json::json!({"enabled": 1}),
-            source_store_path: "/nix/store/gay80fqbpm2wakbsyd4in44gx0cwx3h5-source".into(),
-            rev_count: 975402,
-            short_rev: "68d8aa3d661f".into(),
-            evaluator_program: "nix-eval-jobs".into(),
-            evaluator_argv: vec!["--meta".into()],
-            systems: key.systems.clone(),
-            scope: key.scope.clone(),
-            dry_run: false,
-            fidelity_divergent: false,
-            stats: EvalSetStats::default(),
-            created_at: "2026-05-26T12:00:00Z".into(),
-        };
-        let v = serde_json::to_value(&meta).unwrap();
-        assert_eq!(v["scope"], v["key"]["scope"]);
+    fn scope_serialization_keeps_the_digest_encoding() {
+        // The scope is embedded verbatim in the archive provenance
+        // (inside `recipe` and at top level); both must use the exact
+        // encoding the digest was computed over — kebab-case `kind` tag,
+        // snake_case fields — so the recorded documents can never
+        // disagree with the digest they are filed under.
         assert_eq!(
-            v["scope"],
+            serde_json::to_value(&key().scope).unwrap(),
             serde_json::json!({"kind": "jobs", "jobs": ["nixpkgs.hello.x86_64-linux"]})
         );
         // The Constituents variant's field stays snake_case too.
@@ -254,9 +189,5 @@ mod tests {
             .unwrap(),
             serde_json::json!({"kind": "constituents", "aggregate_job": "tested"})
         );
-        // Stats keep their snake_case names and omit the absent archive
-        // size instead of writing null.
-        assert_eq!(v["stats"]["in_scope_jobs"], 0);
-        assert!(v["stats"].get("archive_bytes").is_none());
     }
 }

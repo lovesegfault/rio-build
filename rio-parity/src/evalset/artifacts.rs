@@ -1,22 +1,20 @@
-//! Local eval-set artifact directory layout and JSON/JSONL writers.
+//! Local recorder output directory and JSON/JSONL writers.
 //!
-//! One directory per eval set, holding the same files (and filenames)
-//! the S3 prefix layout uses, so a local build and an uploaded build
-//! are byte-for-byte comparable.
+//! One directory per recording (named by the Hydra eval id and the
+//! recipe short digest), holding the locally kept artifacts: the
+//! drvPath fidelity report, the evaluator's stderr log, the staged
+//! archive directory, the packed image with its standalone manifest,
+//! and — on a dry run — the provenance document.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context as _;
 
-/// Filenames inside an eval-set prefix (local dir and S3 alike).
-pub const MANIFEST_FILE: &str = "manifest.jsonl";
-pub const EVAL_ERRORS_FILE: &str = "eval-errors.jsonl";
+/// Filename of the drvPath fidelity report, kept in the local output
+/// directory and staged verbatim into the archive as an extra member.
 pub const FIDELITY_FILE: &str = "fidelity.json";
-pub const DEP_CLOSURE_FILE: &str = "dep-closure.jsonl";
-pub const DRVS_ARCHIVE_FILE: &str = "drvs.tar.zst";
-pub const EVALSET_FILE: &str = "evalset.json";
 
-/// Local output directory for one eval set.
+/// Local output directory for one recording.
 #[derive(Debug, Clone)]
 pub struct EvalSetDir {
     pub root: PathBuf,
@@ -87,7 +85,7 @@ mod tests {
                 error: "bang".into(),
             },
         ];
-        let path = dir.write_jsonl(EVAL_ERRORS_FILE, &records).unwrap();
+        let path = dir.write_jsonl("records.jsonl", &records).unwrap();
         let text = std::fs::read_to_string(path).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 2);

@@ -1,15 +1,17 @@
-//! `rio-parity eval` — build an eval set from a Hydra evaluation: the
-//! job manifest, the drvPath fidelity report, the dependency closure,
-//! and the packed derivation archive.
+//! `rio-parity eval` — record a v1 replay archive from a Hydra
+//! evaluation: reproduce the evaluation locally, gate it on drvPath
+//! fidelity, sweep upstream truth, and publish the packed archive.
 //!
 //! Phases: Hydra structural fetches → source prep (tarball download,
 //! unpack, `nix store add-path`) → scoped nix-eval-jobs run → drvPath
-//! fidelity gate → dep-closure enumeration → drv archive →
-//! evalset.json → optional S3 upload. `--dry-run` stops after the
-//! fidelity gate: no dep-closure, no archive, no upload (evalset.json
-//! is still written locally, marked `dry_run`, so the run is
-//! auditable).
+//! fidelity gate → closure adjacency + drv members → truth sweep
+//! (cache.nixos.org narinfo presence + Hydra buildstatus) → archive
+//! staging + mkdwarfs pack → S3 upload with by-recipe idempotency.
+//! `--dry-run` stops after the fidelity gate: no closure pass, no truth
+//! sweep, no archive, no upload (fidelity.json and a dry-run-marked
+//! provenance.json are still written locally, so the run is auditable).
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Args;
@@ -24,16 +26,16 @@ use crate::evalset::Scope;
 ///
 /// Explicit job lists (`jobs:`/`jobs-file:`) are sorted and
 /// deduplicated here, so listing the same jobs in a different order or
-/// with repetitions cannot fork the eval-set key digest, issue
-/// duplicate per-job Hydra requests, or define the same selection.nix
-/// attribute twice (a Nix "attribute already defined" eval failure).
+/// with repetitions cannot fork the recipe key digest, issue duplicate
+/// per-job Hydra requests, or define the same selection.nix attribute
+/// twice (a Nix "attribute already defined" eval failure).
 ///
 /// Aggregate jobs (e.g. `tested`) must be requested via
 /// `constituents:<job>`, never listed under `jobs:`/`jobs-file:`:
 /// scoped evaluations run nix-eval-jobs without `--constituents`, so a
 /// hand-fed aggregate evaluates as a plain job whose drvPath cannot
 /// match the constituent-rewritten derivation Hydra stores, and the
-/// eval set would always come out divergent.
+/// recording would always come out divergent.
 pub fn parse_scope(s: &str) -> anyhow::Result<Scope> {
     if s == "full" {
         return Ok(Scope::Full);
@@ -87,7 +89,7 @@ pub struct EvalArgs {
     /// `constituents:<job>`, never listed under `jobs:`/`jobs-file:`.
     /// Scoped evaluations run without `--constituents`, so a hand-fed
     /// aggregate evaluates as a plain job whose drvPath can never match
-    /// Hydra's rewritten aggregate derivation and the eval set would
+    /// Hydra's rewritten aggregate derivation and the recording would
     /// always be marked divergent.
     #[arg(long)]
     pub scope: String,
@@ -102,11 +104,11 @@ pub struct EvalArgs {
     pub systems: Vec<String>,
 
     /// Local output directory; artifacts land in
-    /// `<out-dir>/<hydra-eval>/<key-digest>/`.
+    /// `<out-dir>/<hydra-eval>/<recipe-short-digest>/`.
     #[arg(long)]
     pub out_dir: PathBuf,
 
-    /// Scratch directory (tarball download, unpack, gc-roots, drv layout).
+    /// Scratch directory (tarball download, unpack, gc-roots).
     /// Default: `<out-dir>/work`.
     #[arg(long)]
     pub work_dir: Option<PathBuf>,
@@ -119,12 +121,14 @@ pub struct EvalArgs {
     #[arg(long, default_value = "parity")]
     pub s3_prefix: String,
 
-    /// Stop after the fidelity gate: no dep-closure, no drv archive, no upload.
+    /// Stop after the fidelity gate: no closure pass, no truth sweep, no
+    /// archive, no upload.
     #[arg(long)]
     pub dry_run: bool,
 
-    /// Build under a new key digest even if an eval set for the same
-    /// key already exists (eval sets are write-once).
+    /// Record under a new recipe digest even if this recipe has already
+    /// been recorded (published archives are write-once; the salted
+    /// digest also bypasses the by-recipe idempotency skip).
     #[arg(long)]
     pub force: bool,
 
@@ -133,10 +137,17 @@ pub struct EvalArgs {
     #[arg(long, default_value = "https://hydra.nixos.org")]
     pub hydra_url: String,
 
-    /// Binary cache base URL (reserved; unused for scoped eval sets —
-    /// building an eval set never queries the binary cache).
+    /// Binary cache swept for narinfo presence at recording time (the
+    /// truth baked into the archive's expected outcomes) and recorded in
+    /// the archive as the relay substituter. Must be an https:// URL.
     #[arg(long, default_value = "https://cache.nixos.org")]
     pub cache_url: String,
+
+    /// Concurrent narinfo fetches during the truth sweep against
+    /// `--cache-url`. The cache sits behind a CDN, so this is a
+    /// politeness bound rather than a request budget.
+    #[arg(long, default_value_t = 64)]
+    pub narinfo_concurrency: usize,
 
     /// Contact string appended to the User-Agent (politeness).
     #[arg(long, env = "RIO_PARITY_CONTACT")]
@@ -163,7 +174,7 @@ pub struct EvalArgs {
     #[arg(long)]
     pub version_job: Option<String>,
 
-    /// `nix` binary used for the store-add, derivation-show, and copy
+    /// `nix` binary used for the store-add and derivation-show
     /// subprocesses.
     #[arg(long, default_value = "nix")]
     pub nix_bin: String,
@@ -180,29 +191,58 @@ pub struct EvalArgs {
     #[arg(long, default_value_t = 4096)]
     pub eval_max_memory_mb: u64,
     /// Sample size for full-scope fidelity (reserved; unused for scoped
-    /// eval sets, whose fidelity gate compares every job).
+    /// recordings, whose fidelity gate compares every job).
     #[arg(long, default_value_t = 100)]
     pub fidelity_samples: usize,
 }
 
-pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
-    use std::collections::BTreeMap;
+/// Per-path retry budget for the truth sweep. cache.nixos.org sits
+/// behind a CDN, so transient 5xx/reset errors are common enough that a
+/// single-shot fetch would abort large sweeps spuriously, while five
+/// attempts with the sweep's exponential backoff stays well under a
+/// minute per path worst-case.
+const NARINFO_SWEEP_MAX_ATTEMPTS: u32 = 5;
 
+/// Derive the per-job Hydra buildstatus map from the builds fetched
+/// during scope resolution. Only finished builds carry a meaningful
+/// status — an unfinished build's code describes a build that is still
+/// queued or running — so entries without `finished == 1` or without a
+/// status are dropped and the affected job's expected outcome falls back
+/// to narinfo presence alone.
+fn buildstatus_from_builds(builds: &[crate::hydra::HydraBuild]) -> BTreeMap<String, i64> {
+    builds
+        .iter()
+        .filter(|build| build.finished == Some(1))
+        .filter_map(|build| build.buildstatus.map(|status| (build.job.clone(), status)))
+        .collect()
+}
+
+pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
-    use crate::evalset::artifacts::{
-        DEP_CLOSURE_FILE, DRVS_ARCHIVE_FILE, EVAL_ERRORS_FILE, EVALSET_FILE, EvalSetDir,
-        FIDELITY_FILE, MANIFEST_FILE,
-    };
-    use crate::evalset::{archive, depclosure, evaluator, fidelity, key, recipe};
+    use crate::evalset::artifacts::{EvalSetDir, FIDELITY_FILE};
+    use crate::evalset::{depclosure, evaluator, fidelity, key, outcomes, package, recipe};
+    use crate::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveS3, ByRecipePointer};
 
     let scope = parse_scope(&args.scope)?;
     // Sorted + deduplicated once up front: the same normalized list
-    // feeds the constituents system filter, the eval-set key (where
-    // `--systems` argument order must not fork the digest), and
-    // evalset.json.
+    // feeds the constituents system filter, the recipe key (where
+    // `--systems` argument order must not fork the digest), and the
+    // archive provenance.
     let systems = key::EvalSetKey::normalize_systems(args.systems.clone());
     let ua = crate::user_agent(args.contact.as_deref());
+    // The cache URL is both the truth-sweep target and the archive's
+    // relay substituter; the archive format only allows https:// (or
+    // s3://) relays and the sweep itself fetches narinfos over HTTPS, so
+    // anything else would only fail late — after the evaluation — at
+    // archive staging time. Refuse it before any work is done.
+    anyhow::ensure!(
+        args.cache_url.starts_with("https://"),
+        "--cache-url must be an https:// URL (got {:?}): it is recorded in the archive as the \
+         relay substituter, which allows only https:// or s3:// URLs, and the recorder's narinfo \
+         truth sweep fetches from it over HTTPS",
+        args.cache_url
+    );
 
     // ── Phase 1: Hydra structural fetches (eval, project/jobset, jobset config, scope) ──
     let scope_job_count = match &scope {
@@ -257,7 +297,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     };
     let jobset = hydra.get_jobset(&project, &jobset_name).await?;
     // Snapshot of the jobset configuration the recipe was derived from,
-    // recorded verbatim in evalset.json for auditability.
+    // recorded verbatim in the archive provenance for auditability.
     let jobset_config = serde_json::json!({
         "project": project,
         "name": jobset_name,
@@ -272,7 +312,8 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
 
     // Resolve the scope into the in-scope job list, Hydra's ground
     // truth (job → drvpath) for the fidelity gate, and the builds whose
-    // names can be mined for versionSuffix recovery.
+    // names can be mined for versionSuffix recovery (the same builds
+    // later feed the per-job buildstatus half of the truth sweep).
     let mut ground_truth: BTreeMap<String, String> = BTreeMap::new();
     let mut sampled_builds: Vec<crate::hydra::HydraBuild> = Vec::new();
     let in_scope_jobs: Vec<String> = match &scope {
@@ -313,11 +354,11 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
             jobs.clone()
         }
         Scope::Full => {
-            // Full-evaluation sets need the sampling-based fidelity
-            // gate and node sizing that land with the campaign-runner
-            // work; refuse rather than silently build an unvalidated
-            // set. The full-scope evaluator argv builder already exists
-            // in `recipe::evaluator_argv_full`.
+            // Full-evaluation recordings need the sampling-based
+            // fidelity gate and node sizing that land with the
+            // campaign-runner work; refuse rather than silently record
+            // an unvalidated archive. The full-scope evaluator argv
+            // builder already exists in `recipe::evaluator_argv_full`.
             anyhow::bail!("--scope full is not supported yet; use constituents:<job> or jobs:…");
         }
     };
@@ -432,8 +473,10 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         args.eval_max_memory_mb,
     );
 
-    // Eval-set identity (names the output directory): tool versions
-    // plus a hash of the exact evaluator argv and selection expression.
+    // Recipe identity (names the output directory, the provenance
+    // `recipe_digest`, and the by-recipe idempotency pointer): tool
+    // versions plus a hash of the exact evaluator argv and selection
+    // expression.
     let nix_version = recipe::tool_version(&args.nix_bin).await?;
     let nej_version = recipe::tool_version(&args.nix_eval_jobs_bin).await?;
     let args_expr_sha256 = {
@@ -457,9 +500,15 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         args_expr_sha256,
         forced_at: args.force.then(|| jiff::Timestamp::now().to_string()),
     };
-    let digest = set_key.short_digest();
-    let dir = EvalSetDir::create(&args.out_dir.join(args.hydra_eval.to_string()).join(&digest))?;
-    tracing::info!(dir = %dir.root.display(), "eval-set output directory");
+    let recipe_digest = set_key.digest();
+    let short_digest = set_key.short_digest();
+    let dir = EvalSetDir::create(
+        &args
+            .out_dir
+            .join(args.hydra_eval.to_string())
+            .join(&short_digest),
+    )?;
+    tracing::info!(dir = %dir.root.display(), "recorder output directory");
 
     let eval_out = evaluator::run_evaluator(
         &args.nix_eval_jobs_bin,
@@ -468,22 +517,22 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
     )
     .await?;
     let mut manifest = eval_out.manifest;
-    dir.write_jsonl(MANIFEST_FILE, &manifest)?;
-    dir.write_jsonl(EVAL_ERRORS_FILE, &eval_out.errors)?;
+    let eval_errors = eval_out.errors;
+    let aggregates = eval_out.aggregates;
     tracing::info!(
         manifest = manifest.len(),
-        eval_errors = eval_out.errors.len(),
-        aggregates = eval_out.aggregates.len(),
+        eval_errors = eval_errors.len(),
+        aggregates = aggregates.len(),
         "evaluation complete"
     );
 
-    // ── Phase 4: fidelity gate (exhaustive — scoped sets compare every job) ──
+    // ── Phase 4: fidelity gate (exhaustive — scoped recordings compare every job) ──
     let report = fidelity::compare_drv_paths(&manifest, &ground_truth, fidelity::MODE_EXHAUSTIVE);
     dir.write_json(FIDELITY_FILE, &report)?;
     if report.divergent {
         tracing::error!(
             mismatches = report.mismatches.len(),
-            "fidelity gate FAILED: locally produced drvPaths diverge from Hydra's; the eval set will be marked divergent"
+            "fidelity gate FAILED: locally produced drvPaths diverge from Hydra's; the archive will be marked divergent"
         );
     } else {
         tracing::info!(
@@ -493,106 +542,278 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
         );
     }
 
-    // ── Phase 5/6: dep-closure + drv archive (skipped on --dry-run) ──
-    let mut stats = key::EvalSetStats {
-        in_scope_jobs: in_scope_jobs.len(),
-        manifest_records: manifest.len(),
-        eval_errors: eval_out.errors.len(),
-        aggregates_excluded: eval_out.aggregates.len(),
-        dep_closure_records: 0,
-        ca_outputs: 0,
-        hydra_requests_used: hydra.requests_used().await,
-        archive_bytes: None,
+    // The provenance block carried verbatim in the archive manifest (and,
+    // for --dry-run, written locally as provenance.json): the full
+    // reproduction recipe and its digest, where the evaluation came from,
+    // how the evaluator was invoked, the fidelity verdict, and recording
+    // statistics. Counts that only exist once the closure pass and the
+    // packer have run are passed in by the caller; `mkdwarfs_version` is
+    // None on a dry run, where no image is packed.
+    let manifest_records = manifest.len();
+    let build_provenance = |closure_drvs: usize,
+                            ca_outputs: usize,
+                            hydra_requests_used: u32,
+                            mkdwarfs_version: Option<&str>,
+                            dry_run: bool|
+     -> serde_json::Value {
+        let mut provenance = serde_json::json!({
+            "recorder": "rio-parity-eval",
+            "recorder_version": env!("CARGO_PKG_VERSION"),
+            "recipe_digest": &recipe_digest,
+            "recipe": &set_key,
+            "source": {
+                "kind": "hydra",
+                "hydra_eval_id": args.hydra_eval,
+                "project": &project,
+                "jobset": &jobset_name,
+                "nixpkgs_revision": &revision,
+                "rev_count": rev_count,
+                "short_rev": &short_rev,
+                "source_store_path": &source_store_path,
+                "jobset_config": &jobset_config,
+            },
+            "evaluator": {
+                "program": &args.nix_eval_jobs_bin,
+                "argv": &argv,
+            },
+            "fidelity": {
+                "mode": &report.mode,
+                "checked": report.checked,
+                "matched": report.matched,
+                "mismatch_count": report.mismatches.len(),
+                "divergent": report.divergent,
+            },
+            "stats": {
+                "in_scope_jobs": in_scope_jobs.len(),
+                "manifest_records": manifest_records,
+                "eval_errors": eval_errors.len(),
+                "aggregates_excluded": aggregates.len(),
+                "closure_drvs": closure_drvs,
+                "ca_outputs": ca_outputs,
+                "hydra_requests_used": hydra_requests_used,
+            },
+            "systems": &systems,
+            "scope": &scope,
+            "mkdwarfs_version": mkdwarfs_version,
+        });
+        if dry_run {
+            provenance["dry_run"] = serde_json::Value::Bool(true);
+        }
+        provenance
     };
-    if !args.dry_run {
-        // One `nix derivation show -r` per manifest target: emits the
-        // dep-closure record and backfills the manifest record's
-        // requiredFeatures from the derivation's requiredSystemFeatures.
+
+    if args.dry_run {
+        // Stop after the fidelity gate; the locally written fidelity
+        // report plus a dry-run-marked provenance document keep the run
+        // auditable without staging an archive.
+        let hydra_requests_used = hydra.requests_used().await;
+        let provenance = build_provenance(0, 0, hydra_requests_used, None, true);
+        let provenance_path = dir.write_json("provenance.json", &provenance)?;
+        tracing::info!(
+            provenance = %provenance_path.display(),
+            "--dry-run: stopping after the fidelity gate (no closure pass, no truth sweep, no archive, no upload)"
+        );
+    } else {
+        // ── Phase 5: closure adjacency + drv members ──
+        // One `nix derivation show -r` per workload unit; the per-target
+        // adjacency views merge key-by-key into one union over the whole
+        // scope (a derivation reached from several targets yields
+        // identical records, so insert-overwrite is a no-op for repeats).
         let total = manifest.len();
         tracing::info!(
             targets = total,
-            "enumerating dependency closures (one `nix derivation show -r` per manifest record)"
+            "extracting closure adjacency (one `nix derivation show -r` per workload unit)"
         );
-        let mut dep_records = Vec::with_capacity(manifest.len());
+        let mut adjacency = depclosure::ClosureAdjacency::default();
         for (idx, rec) in manifest.iter_mut().enumerate() {
             let show = depclosure::run_derivation_show(&args.nix_bin, &rec.drv_path).await?;
-            let (dep, features) =
-                depclosure::dep_closure_from_show_json(&show, &rec.drv_path, &rec.job)?;
-            rec.required_features = features;
-            stats.ca_outputs += dep.ca_outputs.len();
-            dep_records.push(dep);
+            let target = depclosure::closure_adjacency_from_show_json(&show)?;
+            adjacency.records.extend(target.records);
+            adjacency.impure_env.extend(target.impure_env);
+            adjacency
+                .required_system_features
+                .extend(target.required_system_features);
+            // Backfill the unit's requiredFeatures from the derivation's
+            // own requiredSystemFeatures declaration (nix-eval-jobs does
+            // not emit it).
+            rec.required_features = adjacency
+                .required_system_features
+                .get(&rec.drv_path)
+                .cloned();
             // Each record is one subprocess, so a large scope spends a
             // long time in this loop; log every 25 records (and at the
             // end) so an operator can see it is still moving.
             let done = idx + 1;
             if done % 25 == 0 || done == total {
-                tracing::info!(done, total, job = %rec.job, "dep-closure progress");
+                tracing::info!(done, total, job = %rec.job, "closure adjacency progress");
             }
         }
-        dir.write_jsonl(DEP_CLOSURE_FILE, &dep_records)?;
-        // Re-write the manifest now that requiredFeatures is backfilled.
-        dir.write_jsonl(MANIFEST_FILE, &manifest)?;
-        stats.dep_closure_records = dep_records.len();
+        let closure_drvs = adjacency.records.len();
+        let ca_outputs: usize = adjacency
+            .records
+            .values()
+            .map(|rec| rec.outputs.values().filter(|path| path.is_none()).count())
+            .sum();
+        tracing::info!(closure_drvs, ca_outputs, "closure adjacency union complete");
 
-        let layout_dir = work.join("drv-layout");
-        let drvs: Vec<String> = manifest.iter().map(|r| r.drv_path.clone()).collect();
-        archive::export_drv_closure(&args.nix_bin, &drvs, &layout_dir).await?;
-        let archive_path = dir.path(DRVS_ARCHIVE_FILE);
-        // pack_layout_to_tar_zst is blocking (tar subprocess + zstd
-        // encode); run it off the async executor.
-        let bytes = tokio::task::spawn_blocking(move || {
-            archive::pack_layout_to_tar_zst(&layout_dir, &archive_path)
-        })
-        .await
-        .context("join archive-pack task")??;
-        stats.archive_bytes = Some(bytes);
-    }
-
-    // ── Phase 7: evalset.json (always written; records dry_run + the verdict) ──
-    let key_digest = set_key.digest();
-    let meta = key::EvalSetMeta {
-        key_digest,
-        key_short_digest: digest.clone(),
-        key: set_key,
-        hydra_eval_id: args.hydra_eval,
-        nixpkgs_revision: revision,
-        project,
-        jobset: jobset_name,
-        jobset_config,
-        source_store_path,
-        rev_count,
-        short_rev,
-        evaluator_program: args.nix_eval_jobs_bin.clone(),
-        evaluator_argv: argv,
-        systems,
-        scope,
-        dry_run: args.dry_run,
-        fidelity_divergent: report.divergent,
-        stats,
-        created_at: jiff::Timestamp::now().to_string(),
-    };
-    dir.write_json(EVALSET_FILE, &meta)?;
-    tracing::info!(evalset = %dir.path(EVALSET_FILE).display(), "evalset.json written");
-
-    // ── Phase 8: S3 upload (skipped on --dry-run or when no bucket is configured) ──
-    if args.dry_run {
+        // ── Phase 6: truth sweep (cache narinfo presence + Hydra buildstatus) ──
+        let buildstatus = buildstatus_from_builds(&sampled_builds);
+        let output_paths: Vec<String> = manifest
+            .iter()
+            .flat_map(|rec| rec.outputs.values().cloned())
+            .collect();
+        let cache_client = crate::nixcache::NixCacheClient::new(&args.cache_url, &ua)?;
+        let truth_swept_at = jiff::Timestamp::now();
         tracing::info!(
-            "--dry-run: stopping after the fidelity gate (no dep-closure, no archive, no upload)"
+            paths = output_paths.len(),
+            cache = %args.cache_url,
+            "sweeping upstream narinfo presence for expected outcomes"
         );
-    } else if let Some(bucket) = &args.s3_bucket {
-        let client = rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
-        let layout = crate::s3::EvalSetS3::new(bucket, &args.s3_prefix);
-        let uploaded = layout
-            .upload_eval_set(&client, &dir, args.hydra_eval, &digest)
-            .await?;
-        tracing::info!(objects = uploaded.len(), bucket = %bucket, "eval set uploaded");
-    } else {
-        tracing::info!("no --s3-bucket configured; eval set is local-only");
+        let facts = crate::nixcache::sweep_narinfos(
+            &cache_client,
+            &output_paths,
+            args.narinfo_concurrency,
+            NARINFO_SWEEP_MAX_ATTEMPTS,
+        )
+        .await?;
+        let outcome_records: Vec<_> = manifest
+            .iter()
+            .map(|rec| {
+                outcomes::expected_outcome_for_unit(
+                    &rec.drv_path,
+                    &rec.outputs,
+                    &facts,
+                    buildstatus.get(&rec.job).copied(),
+                )
+            })
+            .collect();
+
+        // ── Phase 7: archive staging + mkdwarfs pack ──
+        let mkdwarfs_version = package::mkdwarfs_version().await?;
+        let hydra_requests_used = hydra.requests_used().await;
+        let provenance = build_provenance(
+            closure_drvs,
+            ca_outputs,
+            hydra_requests_used,
+            Some(mkdwarfs_version.as_str()),
+            false,
+        );
+        let staging_dir = dir.path("archive");
+        let stage_inputs = package::StageInputs {
+            manifest: &manifest,
+            eval_errors: &eval_errors,
+            aggregates: &aggregates,
+            adjacency: &adjacency,
+            outcomes: outcome_records,
+            fidelity: &report,
+            provenance,
+            relay_substituters: vec![args.cache_url.clone()],
+            truth_swept_at,
+            drv_text_overrides: BTreeMap::new(),
+        };
+        let staged = package::stage_archive(&staging_dir, &stage_inputs)
+            .await
+            .context("stage the v1 replay archive from the evaluation outputs")?;
+        tracing::info!(
+            archive_id = %staged.archive_id,
+            staging = %staged.dir.display(),
+            "archive staged"
+        );
+
+        let image_path = dir.path(ARCHIVE_IMAGE_OBJECT);
+        {
+            // mkdwarfs is a long-running external process driven
+            // synchronously by the packer; run it off the async executor.
+            let staging = staging_dir.clone();
+            let image = image_path.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::archive::writer::pack_with_mkdwarfs(&staging, &image)
+            })
+            .await
+            .context("join the mkdwarfs packing task")??;
+        }
+        // The standalone manifest copy next to the image is what the S3
+        // publish reads (and what operators inspect without mounting the
+        // image).
+        let local_manifest = dir.path(ARCHIVE_MANIFEST_OBJECT);
+        std::fs::copy(
+            staging_dir.join(crate::archive::MANIFEST_MEMBER),
+            &local_manifest,
+        )
+        .with_context(|| format!("copy the staged manifest to {}", local_manifest.display()))?;
+        tracing::info!(image = %image_path.display(), "archive packed");
+
+        // ── Phase 8: S3 upload with by-recipe idempotency (skipped when no bucket is configured) ──
+        if let Some(bucket) = &args.s3_bucket {
+            let client =
+                rio_common::s3::default_client(rio_common::s3::DEFAULT_S3_MAX_ATTEMPTS).await;
+            let layout = ArchiveS3::new(bucket, &args.s3_prefix);
+            // Idempotency: a recipe that already produced a published
+            // archive is not re-uploaded. --force salts the recipe key, so
+            // a forced re-record looks up (and later writes) a different
+            // pointer and never trips this skip. A pointer that does not
+            // actually name an archive (drift-tolerated reads turn garbage
+            // into empty fields) is ignored and overwritten by re-recording.
+            let already_recorded = if args.force {
+                false
+            } else {
+                match layout
+                    .read_by_recipe_pointer(&client, &recipe_digest)
+                    .await?
+                {
+                    Some(pointer) if pointer.names_archive() => {
+                        let exists = layout
+                            .archive_exists(&client, &pointer.archive_id_short)
+                            .await?;
+                        if exists {
+                            tracing::info!(
+                                archive_id = %pointer.archive_id,
+                                archive_id_short = %pointer.archive_id_short,
+                                "recipe already recorded; skipping upload"
+                            );
+                        }
+                        exists
+                    }
+                    _ => false,
+                }
+            };
+            if !already_recorded {
+                let uploader = format!("rio-parity-eval/{}", env!("CARGO_PKG_VERSION"));
+                let uploaded = layout
+                    .upload_archive(
+                        &client,
+                        &dir.root,
+                        &staged.archive_id,
+                        &staged.archive_id_short,
+                        &uploader,
+                    )
+                    .await?;
+                tracing::info!(
+                    objects = uploaded.len(),
+                    bucket = %bucket,
+                    archive_id_short = %staged.archive_id_short,
+                    "archive uploaded"
+                );
+                // The pointer is written only after the publish succeeded:
+                // it must never name an archive whose complete.json is not
+                // in place.
+                let pointer = ByRecipePointer {
+                    archive_id: staged.archive_id.clone(),
+                    archive_id_short: staged.archive_id_short.clone(),
+                    recorded_at: jiff::Timestamp::now().to_string(),
+                };
+                layout
+                    .write_by_recipe_pointer(&client, &recipe_digest, &pointer)
+                    .await?;
+            }
+        } else {
+            tracing::info!("no --s3-bucket configured; the archive is local-only");
+        }
     }
 
     if report.divergent {
         anyhow::bail!(
-            "eval set built but DIVERGENT: {} drvPath mismatches (see {})",
+            "evaluation DIVERGENT: {} drvPath mismatches (see {})",
             report.mismatches.len(),
             dir.path(FIDELITY_FILE).display()
         );
@@ -602,6 +823,8 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use super::*;
 
     #[test]
@@ -630,8 +853,8 @@ mod tests {
     #[test]
     fn job_list_scopes_are_sorted_and_deduplicated() {
         // Repetition or ordering of the same job list must not fork the
-        // eval-set key digest, double up per-job Hydra requests, or
-        // define the same selection.nix attribute twice.
+        // recipe key digest, double up per-job Hydra requests, or define
+        // the same selection.nix attribute twice.
         assert_eq!(
             parse_scope(
                 "jobs:nixpkgs.jq.x86_64-linux,nixpkgs.hello.x86_64-linux,nixpkgs.jq.x86_64-linux"
@@ -704,10 +927,52 @@ mod tests {
         assert_eq!(t.eval.hydra_eval, 1824219);
         assert_eq!(t.eval.s3_prefix, "parity");
         assert_eq!(t.eval.eval_workers, 4);
+        assert_eq!(t.eval.narinfo_concurrency, 64);
         assert_eq!(
             t.eval.systems,
             vec!["x86_64-linux".to_string(), "aarch64-linux".to_string()]
         );
         assert!(!t.eval.dry_run);
+    }
+
+    /// A Hydra build record with only the fields the buildstatus map
+    /// derivation looks at varying; everything else is fixed filler.
+    fn build(
+        job: &str,
+        buildstatus: Option<i64>,
+        finished: Option<i64>,
+    ) -> crate::hydra::HydraBuild {
+        crate::hydra::HydraBuild {
+            id: 1,
+            project: None,
+            jobset: None,
+            job: job.to_string(),
+            system: Some("x86_64-linux".to_string()),
+            drvpath: format!("/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-{job}.drv"),
+            buildoutputs: BTreeMap::new(),
+            buildstatus,
+            finished,
+            nixname: None,
+            releasename: None,
+            jobsetevals: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn buildstatus_map_from_sampled_builds_only_uses_finished_builds() {
+        let builds = vec![
+            build("hello.x86_64-linux", Some(0), Some(1)),
+            build("jq.x86_64-linux", Some(1), Some(1)),
+            build("running.x86_64-linux", Some(0), Some(0)),
+            build("queued.x86_64-linux", None, Some(1)),
+            build("no-finished.x86_64-linux", Some(2), None),
+        ];
+        let map = buildstatus_from_builds(&builds);
+        assert_eq!(map.len(), 2, "only finished builds with a status survive");
+        assert_eq!(map["hello.x86_64-linux"], 0);
+        assert_eq!(map["jq.x86_64-linux"], 1);
+        assert!(!map.contains_key("running.x86_64-linux"));
+        assert!(!map.contains_key("queued.x86_64-linux"));
+        assert!(!map.contains_key("no-finished.x86_64-linux"));
     }
 }

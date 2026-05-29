@@ -798,27 +798,22 @@
     {
       "path": "cmd/eval.rs",
       "depth": 1,
-      "doc": "`rio-parity eval` — build an eval set from a Hydra evaluation: the"
+      "doc": "`rio-parity eval` — record a v1 replay archive from a Hydra"
     },
     {
       "path": "evalset/",
       "depth": 0,
-      "doc": "Eval-set construction."
-    },
-    {
-      "path": "evalset/archive.rs",
-      "depth": 1,
-      "doc": "drvs.tar.zst — the eval set's derivation-closure archive."
+      "doc": "Evaluation recording."
     },
     {
       "path": "evalset/artifacts.rs",
       "depth": 1,
-      "doc": "Local eval-set artifact directory layout and JSON/JSONL writers."
+      "doc": "Local recorder output directory and JSON/JSONL writers."
     },
     {
       "path": "evalset/depclosure.rs",
       "depth": 1,
-      "doc": "Per-target dependency closures from `nix derivation show -r` output."
+      "doc": "Closure adjacency extraction from `nix derivation show -r` output."
     },
     {
       "path": "evalset/evaluator.rs",
@@ -833,7 +828,7 @@
     {
       "path": "evalset/key.rs",
       "depth": 1,
-      "doc": "Eval-set identity: the key digest and the evalset.json metadata."
+      "doc": "The reproduction-recipe key: every input that determines what the"
     },
     {
       "path": "evalset/outcomes.rs",

@@ -15,8 +15,8 @@ struct Cli {
 #[allow(clippy::large_enum_variant)]
 #[derive(Subcommand)]
 enum Cmd {
-    /// Build an eval set (manifest, fidelity report, drv-closure
-    /// archive) from a Hydra evaluation.
+    /// Record a v1 replay archive (workload units, expected outcomes,
+    /// closures, derivations) from a Hydra evaluation.
     Eval(rio_parity::cmd::eval::EvalArgs),
     /// Run a parity campaign against a previously built eval set.
     Run(rio_parity::run::RunArgs),
