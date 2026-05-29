@@ -768,9 +768,23 @@ impl DagActor {
                 // view of the pruned closure, so they must not vouch
                 // for a from-source dispatch any more than an empty
                 // set would.
+                //
+                // Skipped while the survivor is Substituting (a walk in
+                // flight keeps its chance — its own SubstituteComplete
+                // settles it) AND while it is Assigned/Running (an open
+                // attempt in flight keeps its chance the same way: its
+                // verdict arrives via the worker report, the
+                // controller-synthesized verdict, or the establishment
+                // sweep). Failing it here would cancel an in-flight
+                // node out from under its open attempt; the
+                // pull-admission guard (`admit_pull` refuses to mint
+                // for `must_substitute` nodes) keeps new from-source
+                // attempts from opening on it.
                 if self.must_substitute(&parent)
                     && substitute_tried
                     && status != DerivationStatus::Substituting
+                    && status != DerivationStatus::Assigned
+                    && status != DerivationStatus::Running
                 {
                     self.fail_fast_topdown_pruned_root(
                         &parent,

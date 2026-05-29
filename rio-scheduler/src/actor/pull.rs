@@ -93,6 +93,13 @@ pub(crate) struct PullInputs<'a> {
     pub auth_intent: Option<&'a str>,
     /// The derivation's current status; `None` if the DAG has no node.
     pub status: Option<DerivationStatus>,
+    /// Whether the node may only complete via substitution: it carries
+    /// the roots-only-prune marker (`topdown_pruned`) and its closure
+    /// evidence is Broken — childless or closure-holed — so its dep
+    /// closure was never merged (or the surviving children are a
+    /// reap-truncated view of it) and a from-source build is doomed.
+    /// Computed by the caller via [`DagActor::must_substitute`].
+    pub must_substitute: bool,
     /// The open attempt bound to the derivation, if any:
     /// (executor identity, exec_id).
     pub open_attempt: Option<(&'a ExecutorId, Uuid)>,
@@ -148,6 +155,15 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
         // flight, or a retry waiting to requeue. Never `Gone` (the
         // reap→respawn churn loop), never a write.
         S::Created | S::Queued | S::Substituting | S::Failed => PullDecision::NotYetReady,
+        // r[impl sched.merge.substitute-topdown+10]
+        // Ready but marked must-substitute (topdown-pruned with Broken
+        // closure evidence): never serve it from source. Refuse the
+        // mint — NotYetReady, no write, and deliberately NOT a
+        // fail-fast: the pull carries no store verdict, so the node is
+        // left for the Tick sweep's probe/walk/reap arms, which own the
+        // definitive outcomes (inline-complete, route to substitution,
+        // or the resubmit-directing fail-fast).
+        S::Ready if inputs.must_substitute => PullDecision::NotYetReady,
         // Ready: deliverable now — mint a fresh attempt.
         S::Ready => PullDecision::DeliverNew,
         // Already open on some executor: idempotent re-delivery only
@@ -213,11 +229,15 @@ impl DagActor {
                     .map(|(executor, exec_id)| (executor.clone(), exec_id)),
             ),
         };
+        // The §carry of the deleted dispatch-time guard: a marked node
+        // with Broken closure evidence is never minted for pull.
+        let must_substitute = self.must_substitute(intent_id);
 
         let decision = admit_pull(&PullInputs {
             intent_id,
             auth_intent,
             status,
+            must_substitute,
             open_attempt: open_attempt.as_ref().map(|(e, x)| (e, *x)),
             pulling_identity: &pulling_identity,
             serving_generation,
@@ -436,6 +456,7 @@ mod kernel_tests {
             intent_id: "drv-x",
             auth_intent: Some("drv-x"),
             status,
+            must_substitute: false,
             open_attempt: open,
             pulling_identity: pulling,
             serving_generation: 3,
@@ -492,6 +513,24 @@ mod kernel_tests {
                 "an attempt open on another executor is never re-delivered or re-pointed"
             );
         }
+    }
+
+    // r[verify sched.merge.substitute-topdown+10]
+    /// A Ready node marked must-substitute (topdown-pruned with Broken
+    /// closure evidence) is refused: NotYetReady — not DeliverNew (it
+    /// must never be served from source) and not Gone (it is still
+    /// wanted; the sweep's substitution / fail-fast arms settle it).
+    #[test]
+    fn admit_pull_must_substitute_refuses_mint() {
+        let me = ExecutorId::from("drv-x");
+        let mut inputs = base_inputs(Some(DerivationStatus::Ready), &me, None);
+        inputs.must_substitute = true;
+        assert_eq!(admit_pull(&inputs), PullDecision::NotYetReady);
+        // The flag only parks deliverable-from-source work: a terminal
+        // node still answers Gone.
+        let mut inputs = base_inputs(Some(DerivationStatus::Completed), &me, None);
+        inputs.must_substitute = true;
+        assert_eq!(admit_pull(&inputs), PullDecision::Gone);
     }
 
     /// The token binding and the generation fence dominate everything.

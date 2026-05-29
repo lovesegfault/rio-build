@@ -399,6 +399,151 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+10]
+/// The reap-time survivor re-evaluation must NOT fail-fast a marked,
+/// holed, walk-spent survivor that is Assigned/Running — an open
+/// attempt in flight gets its verdict from the worker report, the
+/// controller-synthesized verdict, or the establishment sweep, exactly
+/// as a Substituting survivor's verdict arrives via SubstituteComplete.
+/// Forced shape (debug handles): the same staging as the fail-fast
+/// test in tests/merge.rs (pruned root, failed walk, unbuilt children
+/// from a second build, second build cancelled and reaped) but with the
+/// survivor forced Running before the reap. The reap must stamp the
+/// closure hole and otherwise leave the in-flight node alone: no
+/// fail-fast, the surviving build stays Active, the mark is retained.
+#[tokio::test]
+async fn cleanup_reap_skips_marked_holed_survivor_with_open_attempt() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park B1's detached fetch so R stays Substituting until the
+    // failure verdict is injected.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless).
+    let r_out = rio_test_support::fixtures::test_store_path("rsk-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("rsk-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("rsk-dep");
+        n.expected_output_paths = vec![rio_test_support::fixtures::test_store_path("rsk-dep-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep()],
+        vec![make_test_edge("rsk-r", "rsk-dep")],
+        false,
+    )
+    .await?;
+    assert!(
+        expect_drv(&handle, "rsk-r").await.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+
+    // B2: a full merge that gives R an unbuilt child; the mark survives.
+    let mut app = make_node("rsk-app");
+    app.expected_output_paths = vec![rio_test_support::fixtures::test_store_path("rsk-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep()],
+        vec![
+            make_test_edge("rsk-app", "rsk-r"),
+            make_test_edge("rsk-r", "rsk-dep"),
+        ],
+        false,
+    )
+    .await?;
+
+    // R's parked walk fails while dep is still attached: the handler
+    // suppresses the fail-fast, keeps the mark, parks R Queued with the
+    // one-shot flag spent.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "rsk-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let mid = expect_drv(&handle, "rsk-r").await;
+    assert!(mid.topdown_pruned && mid.substitute_tried);
+
+    // Force the open-attempt shape: R is in flight on a worker
+    // (Assigned/Running with an open pull attempt) at reap time.
+    assert!(
+        handle
+            .debug_force_status("rsk-r", DerivationStatus::Running)
+            .await?
+    );
+
+    // Cancel B2 and reap its sole-interest nodes (dep, app). R is
+    // shared with B1 and survives, losing its un-produced child.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("rsk-dep").await?.is_none(),
+        "B2's sole-interest dep must be reaped"
+    );
+
+    // The reap recorded the truncation (closure hole persisted) …
+    let (pg_hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'rsk-r'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert!(
+        pg_hole,
+        "the reap must stamp the closure-hole breadcrumb on the survivor"
+    );
+
+    // … but the in-flight survivor is NOT fail-fasted: it keeps its
+    // status, its mark, and its build.
+    let r = expect_drv(&handle, "rsk-r").await;
+    assert_eq!(
+        r.status,
+        DerivationStatus::Running,
+        "an Assigned/Running survivor with an open attempt must not be          cancelled or re-parked by the reap-time re-evaluation"
+    );
+    assert!(
+        r.topdown_pruned,
+        "the mark is retained — only a definitive verdict consumes it"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "the surviving build must stay Active; its verdict arrives from          the open attempt's report path, not the reap"
+    );
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Build not-found paths
 // ---------------------------------------------------------------------------

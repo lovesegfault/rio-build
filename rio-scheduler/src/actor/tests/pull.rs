@@ -164,6 +164,71 @@ async fn pull_unbuilt_deps_returns_not_yet_ready() -> TestResult {
     Ok(())
 }
 
+// r[verify sched.merge.substitute-topdown+10]
+/// A Ready node that may only complete via substitution (topdown-pruned
+/// with Broken closure evidence — childless here) is never served from
+/// source by the pull path: the pull answers NotYetReady, mints nothing
+/// (no assignments / drv_executions rows, no Ready→Assigned
+/// transition), and the node is settled by the sweep arms instead — in
+/// this fixture the store says the wanted output is definitively
+/// missing and not substitutable, so the next Tick's batch probe takes
+/// the resubmit-directing fail-fast (the pull itself never does).
+#[tokio::test]
+async fn pull_must_substitute_node_refused_and_settled_by_sweep() -> TestResult {
+    let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // A childless target whose output is not in the store and not
+    // substitutable; the merge seeds it Ready.
+    let mut node = make_node("pull-tdms");
+    node.expected_output_paths = vec![rio_test_support::fixtures::test_store_path("pull-tdms-out")];
+    let build_id = Uuid::new_v4();
+    // Hold the event receiver: the test-build orphan watcher (zero
+    // grace) auto-cancels an unwatched Active build on the second Tick.
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+
+    // Stage the post-prune / post-failover shape: childless + marked.
+    assert!(handle.debug_set_topdown_pruned("pull-tdms", true).await?);
+
+    // The pull refuses the mint: NotYetReady, nothing written, no
+    // Ready→Assigned transition, no exec minted.
+    let outcome = pull(&handle, "pull-tdms", Some("pull-tdms")).await;
+    assert!(
+        matches!(outcome, Ok(PullOutcome::NotYetReady { .. })),
+        "a must-substitute node must not be served from source; got {outcome:?}"
+    );
+    let (assignments, executions) = row_counts(&db.pool, "pull-tdms").await;
+    assert_eq!(
+        (assignments, executions),
+        (0, 0),
+        "the refused pull writes nothing"
+    );
+    let d = expect_drv(&handle, "pull-tdms").await;
+    assert_eq!(
+        d.status,
+        crate::state::DerivationStatus::Ready,
+        "the refused pull must not move the node out of Ready"
+    );
+
+    // The node is settled by the sweep, not by the pull: the next
+    // Tick's batch probe finds the wanted output definitively missing
+    // and unsubstitutable and takes the resubmit-directing fail-fast.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let s = query_status(&handle, build_id).await?;
+    assert_eq!(
+        s.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the sweep's fail-fast settles the node; got error={:?}",
+        s.error_summary
+    );
+    assert!(
+        s.error_summary.contains("resubmit"),
+        "the fail-fast carries the resubmit-directing error; got {:?}",
+        s.error_summary
+    );
+    Ok(())
+}
+
 // r[verify sched.executor.pull-transaction]
 /// (d) The generation fence: a pull whose serving generation is below
 /// the durable claims floor creates no row and is rejected with the

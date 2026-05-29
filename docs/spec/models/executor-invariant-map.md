@@ -3938,6 +3938,26 @@ lines. Scoped to `rio-scheduler/src`: 52 files, +1791/−23526 — net
 Per-commit figures are in the deletion commits' messages
 (A: −14771, B: −5886, C: −1982).
 
+#### Post-main-rebase carry: the dispatch-time must-substitute guard (2026-05-29)
+
+main's topdown-prune/closure-evidence work (its `sched.merge.substitute-topdown+10`
+re-statement) added a per-node guard inside `try_dispatch_one`/`ready_check_or_spawn`
+("a topdown-pruned root with Broken closure evidence must never be handed to a
+worker; with no store verdict, defer it for the next pass"). Those hosts were
+deleted by deletion commit B, so the property is re-expressed on the pull side:
+`admit_pull` takes a `must_substitute` input (loaded from the DAG by
+`pull_assignment_inner`) and answers `NotYetReady` for a Ready node with the
+predicate set — a refusal, never a fail-fast (the pull carries no store
+verdict; the Tick sweep's `batch_probe_cached_ready`/walk/reap arms own the
+definitive outcomes). The reap-time survivor re-evaluation in
+`handle_cleanup_terminal_build` additionally skips Assigned/Running survivors —
+an open attempt's verdict arrives via the worker report, the synthesized
+verdict, or the establishment sweep, the same way a Substituting survivor's
+arrives via SubstituteComplete. Pinned by
+`admit_pull_must_substitute_refuses_mint` (kernel),
+`pull_must_substitute_node_refused_and_settled_by_sweep` (actor), and
+`cleanup_reap_skips_marked_holed_survivor_with_open_attempt` (reap skip).
+
 ### T-1c'.8 — the 1c' scheduler.typ spec sweep (the deferred retire/re-state batch)
 
 Recorded by the slice-1c' spec-sweep batch. This is the scheduler.typ
