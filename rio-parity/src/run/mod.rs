@@ -1576,10 +1576,12 @@ async fn collect_pass_with(
             continue;
         }
         let view = BatchView {
+            kind: batch.kind.clone(),
             build_id: batch.build_id.clone(),
             results: batch.results.clone(),
             reasons: batch.reasons.clone(),
             engine_cancelled: batch.engine_cancelled,
+            interruption_drvs: batch.interruption_drvs.clone(),
             submitted_at: Some(batch.started_at.clone()),
         };
         // prior_requeues carries each job's TOTAL engine resubmission count

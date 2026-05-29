@@ -169,6 +169,7 @@ pub async fn submit_one_batch(
         reasons: BTreeMap::new(),
         stderr_tail: None,
         engine_cancelled: false,
+        interruption_drvs: Vec::new(),
     };
     match outcome {
         Ok(o) => {

@@ -165,6 +165,15 @@ pub enum Bucket {
     BothFailed,
     EvalError,
     Skipped,
+    /// Timed mode only: the recorded interruption (cancellation or client
+    /// disconnect) was reproduced at its recorded offset — the channel was
+    /// abandoned and the unit did not complete, exactly as recorded. No
+    /// outcome comparison is attempted.
+    InterruptionReplayed,
+    /// Timed mode only: the replayed build completed before the recorded
+    /// interruption offset (the target was faster than the recording).
+    /// Informational timing divergence, not a correctness defect.
+    InterruptionNotReproduced,
 }
 
 impl Bucket {
@@ -185,10 +194,12 @@ impl Bucket {
             Bucket::BothFailed => "both-failed",
             Bucket::EvalError => "eval-error",
             Bucket::Skipped => "skipped",
+            Bucket::InterruptionReplayed => "interruption-replayed",
+            Bucket::InterruptionNotReproduced => "interruption-not-reproduced",
         }
     }
 
-    pub const ALL: [Bucket; 15] = [
+    pub const ALL: [Bucket; 17] = [
         Bucket::MatchBuilt,
         Bucket::RioOnlyFailure,
         Bucket::RioDependencyFailure,
@@ -204,6 +215,8 @@ impl Bucket {
         Bucket::BothFailed,
         Bucket::EvalError,
         Bucket::Skipped,
+        Bucket::InterruptionReplayed,
+        Bucket::InterruptionNotReproduced,
     ];
 }
 
@@ -416,6 +429,12 @@ pub struct DispatchEntry {
 /// [`BatchRecord::kind`] value for build-stage submissions.
 pub const BATCH_KIND_SUBMIT: &str = "submit";
 
+/// [`BatchRecord::kind`] value for submissions made by the timed dispatcher
+/// (one recorded request per batch). Members of timed batches are never
+/// re-offered to the timeless pending pool — the timed dispatcher owns its
+/// own retries.
+pub const BATCH_KIND_TIMED: &str = "timed";
+
 /// Per-root in-band build result captured from one BuildPathsWithResults
 /// submission (one entry per requested root, positional order preserved).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -511,6 +530,11 @@ pub struct BatchRecord {
     /// True when the engine itself killed/cancelled this batch (timeout, abort).
     #[serde(default)]
     pub engine_cancelled: bool,
+    /// Root drvs in this submission for which a recorded interruption
+    /// (cancellation or client disconnect) was armed by the timed
+    /// dispatcher. Empty for every non-timed batch.
+    #[serde(default)]
+    pub interruption_drvs: Vec<String>,
 }
 
 /// Cross-component pause flags: a manual operator pause and the
@@ -556,7 +580,7 @@ mod tests {
             Bucket::UpstreamSourceUnavailable.as_str(),
             "upstream-source-unavailable"
         );
-        assert_eq!(Bucket::ALL.len(), 15);
+        assert_eq!(Bucket::ALL.len(), 17);
         // serde uses the same kebab-case names
         assert_eq!(
             serde_json::to_string(&Bucket::CachedPrior).unwrap(),
@@ -564,6 +588,31 @@ mod tests {
         );
         let b: Bucket = serde_json::from_str("\"rio-infra-failure\"").unwrap();
         assert_eq!(b, Bucket::RioInfraFailure);
+    }
+
+    #[test]
+    fn timed_bucket_strings() {
+        assert_eq!(
+            Bucket::InterruptionReplayed.as_str(),
+            "interruption-replayed"
+        );
+        assert_eq!(
+            Bucket::InterruptionNotReproduced.as_str(),
+            "interruption-not-reproduced"
+        );
+        assert_eq!(Bucket::ALL.len(), 17);
+        for bucket in [
+            Bucket::InterruptionReplayed,
+            Bucket::InterruptionNotReproduced,
+        ] {
+            let json = serde_json::to_string(&bucket).unwrap();
+            assert_eq!(json, format!("\"{}\"", bucket.as_str()));
+            let back: Bucket = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, bucket);
+        }
+        // A replayed interruption is a final observation for its job.
+        assert!(is_terminal_bucket("interruption-replayed"));
+        assert!(is_terminal_bucket("interruption-not-reproduced"));
     }
 
     #[test]
@@ -719,9 +768,11 @@ mod tests {
 
     #[test]
     fn batch_kind_vocabulary_is_fixed_and_distinct() {
-        // Frozen wire string: batches.jsonl is append-only across resumes,
+        // Frozen wire strings: batches.jsonl is append-only across resumes,
         // so renaming a kind would orphan prior entries.
         assert_eq!(BATCH_KIND_SUBMIT, "submit");
+        assert_eq!(BATCH_KIND_TIMED, "timed");
+        assert_ne!(BATCH_KIND_SUBMIT, BATCH_KIND_TIMED);
     }
 
     #[test]
@@ -775,6 +826,7 @@ mod tests {
             reasons: BTreeMap::new(),
             stderr_tail: None,
             engine_cancelled: false,
+            interruption_drvs: Vec::new(),
         };
         let json = serde_json::to_string(&rec).unwrap();
         assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
@@ -786,10 +838,13 @@ mod tests {
 
         // A batches.jsonl line written before the client-ops cutover (no
         // `results` key, a stale `exitCode` key) still deserializes: the
-        // array defaults to empty and the unknown key is ignored.
+        // array defaults to empty and the unknown key is ignored. Lines
+        // written before timed scheduling existed lack `interruptionDrvs`
+        // the same way; it defaults to empty.
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
+        assert!(parsed.interruption_drvs.is_empty());
         assert_eq!(parsed.batch_id, 3);
         assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }

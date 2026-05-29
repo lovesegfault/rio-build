@@ -3,18 +3,35 @@
 //! and the headline arithmetic. No I/O, no clocks — everything here is
 //! deterministic and exhaustively testable.
 //!
-//! Precedence rationale: operator skips and evaluation failures are
-//! dispositive on their own, so they are honored before any build evidence
-//! is consulted; infrastructure failures and upstream source rot say
-//! nothing about parity (the build never got a fair attempt), so they are
-//! pulled out before the Hydra-keyed cross product that actually scores
-//! agreement.
+//! Precedence rationale: a replayed (or out-raced) recorded interruption is
+//! its own final observation — the unit's recorded outcome was an
+//! interruption, so no other comparison is meaningful and the timed flag is
+//! honored before everything else. After that, operator skips and
+//! evaluation failures are dispositive on their own, so they are honored
+//! before any build evidence is consulted; infrastructure failures and
+//! upstream source rot say nothing about parity (the build never got a fair
+//! attempt), so they are pulled out before the Hydra-keyed cross product
+//! that actually scores agreement.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::model::{Bucket, FailureKind, HydraOutcome, RioOutcome, RootCauseKind};
+
+/// How a recorded interruption (cancellation or client disconnect) played
+/// out when the timed dispatcher replayed it for a unit. Only ever set for
+/// members of timed batches; the wire form is kebab-case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TimedInterruption {
+    /// The interruption was reproduced: the channel was abandoned at the
+    /// recorded offset and the unit did not complete, as recorded.
+    Replayed,
+    /// The replayed build completed before the recorded interruption offset
+    /// (the target was faster than the recording).
+    NotReproduced,
+}
 
 /// Auxiliary flags resolved before classification (plan output + resolve-unknown).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -36,6 +53,11 @@ pub struct AuxFlags {
     /// divergence), Some(false) = resolved and the drv matches. None when
     /// resolution has not run (the default).
     pub resolve_unknown_divergent: Option<bool>,
+    /// How the timed dispatcher's interruption replay played out for this
+    /// unit. None outside timed mode (and for timed units with no recorded
+    /// interruption armed).
+    #[serde(default)]
+    pub timed_interruption: Option<TimedInterruption>,
 }
 
 /// Classification result: the bucket plus whether the job is a cascaded
@@ -48,17 +70,27 @@ pub struct Classification {
     pub cascaded: bool,
 }
 
-/// THE classifier. Precedence (highest first): skipped → eval-error →
-/// not-attemptable → not-attempted → completed-without-execution
-/// (cached-prior / target-substituted) → infra and upstream-source-rot
-/// failures including their cascaded dependents → the remaining cross
-/// product, keyed by the Hydra outcome first.
+/// THE classifier. Precedence (highest first): timed-interruption flag →
+/// skipped → eval-error → not-attemptable → not-attempted →
+/// completed-without-execution (cached-prior / target-substituted) → infra
+/// and upstream-source-rot failures including their cascaded dependents →
+/// the remaining cross product, keyed by the Hydra outcome first.
 pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Classification {
     let plain = |bucket| Classification {
         bucket,
         cascaded: false,
     };
 
+    // 0. timed interruption replay: the recorded outcome was an
+    // interruption, so the replay (or the build out-racing it) is the final
+    // observation — no other rule applies.
+    match flags.timed_interruption {
+        Some(TimedInterruption::Replayed) => return plain(Bucket::InterruptionReplayed),
+        Some(TimedInterruption::NotReproduced) => {
+            return plain(Bucket::InterruptionNotReproduced);
+        }
+        None => {}
+    }
     // 1. skipped
     if flags.skipped.is_some() {
         return plain(Bucket::Skipped);
@@ -257,6 +289,19 @@ mod tests {
 
     /// Spot rows straight out of the classification table + precedence list.
     #[rstest]
+    // timed-interruption flags outrank every other rule: any (hydra, rio)
+    // pair classifies into the interruption bucket, including over `skipped`
+    // (the previous precedence head).
+    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
+           AuxFlags { timed_interruption: Some(TimedInterruption::Replayed), ..flags() },
+           Bucket::InterruptionReplayed, false)]
+    #[case(HydraOutcome::Failed, failed(FailureKind::Genuine),
+           AuxFlags { timed_interruption: Some(TimedInterruption::NotReproduced), ..flags() },
+           Bucket::InterruptionNotReproduced, false)]
+    #[case(HydraOutcome::Built, RioOutcome::NotAttempted,
+           AuxFlags { timed_interruption: Some(TimedInterruption::Replayed),
+                      skipped: Some("system".into()), ..flags() },
+           Bucket::InterruptionReplayed, false)]
     // precedence head: skipped/eval-error/not-attemptable/not-attempted
     #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
            AuxFlags { skipped: Some("system".into()), ..flags() }, Bucket::Skipped, false)]
@@ -422,6 +467,11 @@ mod tests {
         ];
         let bools = [false, true];
         let resolve = [None, Some(false), Some(true)];
+        let timed = [
+            None,
+            Some(TimedInterruption::Replayed),
+            Some(TimedInterruption::NotReproduced),
+        ];
         let mut grid = 0usize;
         for hydra in &hydras {
             for rio in &rios {
@@ -430,50 +480,66 @@ mod tests {
                         for not_attemptable in &bools {
                             for snapshot_valid in &bools {
                                 for rud in &resolve {
-                                    let aux = AuxFlags {
-                                        skipped: skipped.then(|| "filtered".to_string()),
-                                        eval_error: *eval_error,
-                                        plan_not_attemptable: *not_attemptable,
-                                        plan_snapshot_valid: *snapshot_valid,
-                                        resolve_unknown_divergent: *rud,
-                                    };
-                                    grid += 1;
-                                    let c = classify(hydra, rio, &aux);
-                                    let ctx = format!("hydra={hydra:?} rio={rio:?} aux={aux:?}");
-                                    // Total: as_str never panics, bucket is one of ALL.
-                                    assert!(Bucket::ALL.contains(&c.bucket), "{ctx}");
-                                    // Precedence assertions.
-                                    if aux.skipped.is_some() {
-                                        assert_eq!(c.bucket, Bucket::Skipped, "{ctx}");
-                                    } else if aux.eval_error {
-                                        assert_eq!(c.bucket, Bucket::EvalError, "{ctx}");
-                                    } else if aux.plan_not_attemptable {
-                                        assert_eq!(c.bucket, Bucket::NotAttemptable, "{ctx}");
-                                    } else if matches!(rio, RioOutcome::NotAttempted) {
-                                        assert_eq!(c.bucket, Bucket::NotAttempted, "{ctx}");
-                                    }
-                                    // Headline buckets only ever come from executed builds
-                                    // or genuine failures.
-                                    if c.bucket == Bucket::MatchBuilt {
-                                        assert!(
-                                            matches!(rio, RioOutcome::Built { executed: true }),
-                                            "{ctx}"
-                                        );
-                                    }
-                                    // Cascaded is only ever set for dependency failures
-                                    // with infra/source-rot roots.
-                                    if c.cascaded {
-                                        assert!(
-                                            matches!(
-                                                rio,
-                                                RioOutcome::DependencyFailed {
-                                                    root: RootCauseKind::Infra
-                                                        | RootCauseKind::SourceRot,
-                                                    ..
+                                    for ti in &timed {
+                                        let aux = AuxFlags {
+                                            skipped: skipped.then(|| "filtered".to_string()),
+                                            eval_error: *eval_error,
+                                            plan_not_attemptable: *not_attemptable,
+                                            plan_snapshot_valid: *snapshot_valid,
+                                            resolve_unknown_divergent: *rud,
+                                            timed_interruption: *ti,
+                                        };
+                                        grid += 1;
+                                        let c = classify(hydra, rio, &aux);
+                                        let ctx =
+                                            format!("hydra={hydra:?} rio={rio:?} aux={aux:?}");
+                                        // Total: as_str never panics, bucket is one of ALL.
+                                        assert!(Bucket::ALL.contains(&c.bucket), "{ctx}");
+                                        // Precedence assertions: the timed-interruption flag
+                                        // wins over everything else, then the plan-time flags.
+                                        if let Some(ti) = aux.timed_interruption {
+                                            let expected = match ti {
+                                                TimedInterruption::Replayed => {
+                                                    Bucket::InterruptionReplayed
                                                 }
-                                            ),
-                                            "{ctx}"
-                                        );
+                                                TimedInterruption::NotReproduced => {
+                                                    Bucket::InterruptionNotReproduced
+                                                }
+                                            };
+                                            assert_eq!(c.bucket, expected, "{ctx}");
+                                            assert!(!c.cascaded, "{ctx}");
+                                        } else if aux.skipped.is_some() {
+                                            assert_eq!(c.bucket, Bucket::Skipped, "{ctx}");
+                                        } else if aux.eval_error {
+                                            assert_eq!(c.bucket, Bucket::EvalError, "{ctx}");
+                                        } else if aux.plan_not_attemptable {
+                                            assert_eq!(c.bucket, Bucket::NotAttemptable, "{ctx}");
+                                        } else if matches!(rio, RioOutcome::NotAttempted) {
+                                            assert_eq!(c.bucket, Bucket::NotAttempted, "{ctx}");
+                                        }
+                                        // Headline buckets only ever come from executed builds
+                                        // or genuine failures.
+                                        if c.bucket == Bucket::MatchBuilt {
+                                            assert!(
+                                                matches!(rio, RioOutcome::Built { executed: true }),
+                                                "{ctx}"
+                                            );
+                                        }
+                                        // Cascaded is only ever set for dependency failures
+                                        // with infra/source-rot roots.
+                                        if c.cascaded {
+                                            assert!(
+                                                matches!(
+                                                    rio,
+                                                    RioOutcome::DependencyFailed {
+                                                        root: RootCauseKind::Infra
+                                                            | RootCauseKind::SourceRot,
+                                                        ..
+                                                    }
+                                                ),
+                                                "{ctx}"
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -484,7 +550,7 @@ mod tests {
         }
         assert_eq!(
             grid,
-            3 * 11 * 2 * 2 * 2 * 2 * 3,
+            3 * 11 * 2 * 2 * 2 * 2 * 3 * 3,
             "grid covered every combination"
         );
     }
@@ -582,6 +648,23 @@ mod tests {
             }),
             NAR_EQUAL
         );
+    }
+
+    /// The headline numerator/denominator are an explicit bucket list, so
+    /// the timed-only interruption buckets never enter either side.
+    #[test]
+    fn headline_ignores_interruption_buckets() {
+        let mut counts = BTreeMap::new();
+        counts.insert(Bucket::MatchBuilt.as_str().to_string(), 90);
+        counts.insert(Bucket::RioOnlyFailure.as_str().to_string(), 7);
+        counts.insert(Bucket::RioDependencyFailure.as_str().to_string(), 3);
+        let without = headline(&counts, 80, 85);
+        counts.insert(Bucket::InterruptionReplayed.as_str().to_string(), 5);
+        counts.insert(Bucket::InterruptionNotReproduced.as_str().to_string(), 2);
+        let with = headline(&counts, 80, 85);
+        assert_eq!(with.numerator, without.numerator);
+        assert_eq!(with.denominator, without.denominator);
+        assert_eq!(with.headline_pct, without.headline_pct);
     }
 
     #[test]

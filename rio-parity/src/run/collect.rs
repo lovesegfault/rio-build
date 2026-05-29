@@ -24,11 +24,11 @@ use anyhow::Result;
 use rio_nix::protocol::build::BuildStatus;
 
 use super::artifact::ArtifactStore;
-use super::classify::{AuxFlags, OutputHashes, classify, compare_output};
+use super::classify::{AuxFlags, OutputHashes, TimedInterruption, classify, compare_output};
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
-    Bucket, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome, RioOutcome, RioSide,
-    RootCauseKind, build_status_from_name, now_rfc3339,
+    BATCH_KIND_TIMED, Bucket, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome,
+    RioOutcome, RioSide, RootCauseKind, build_status_from_name, now_rfc3339,
 };
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
@@ -138,6 +138,10 @@ pub fn resolve_failure_kind(
 /// Inputs about the batch the job rode in (from its [`super::model::BatchRecord`]).
 #[derive(Debug, Clone, Default)]
 pub struct BatchView {
+    /// The batch record's kind (one of the `BATCH_KIND_*` constants).
+    /// Members of timed batches are never re-offered to the timeless
+    /// pending pool — the timed dispatcher owns its own retries.
+    pub kind: String,
     pub build_id: Option<String>,
     /// In-band per-root results returned by the submission (one entry per
     /// requested root). Together with `build_id` this distinguishes an
@@ -147,7 +151,36 @@ pub struct BatchView {
     /// drv → relayed reason line (the Signal-1 fallback).
     pub reasons: BTreeMap<String, String>,
     pub engine_cancelled: bool,
+    /// Root drvs for which the timed dispatcher armed a recorded
+    /// interruption (empty for every non-timed batch).
+    pub interruption_drvs: Vec<String>,
     pub submitted_at: Option<String>,
+}
+
+/// Derive the timed-interruption flag for one root of a settled batch:
+/// `Some(Replayed)` when an interruption was armed for the drv and the
+/// engine cancelled the submission (the channel was abandoned at the
+/// recorded offset), `Some(NotReproduced)` when an interruption was armed
+/// but the root completed successfully in band before the abandon deadline,
+/// `None` otherwise — including for every batch that is not a
+/// timed-dispatcher submission, so the flag can never leak into timeless
+/// classification.
+pub fn timed_interruption_for(
+    batch: &BatchView,
+    drv: &str,
+    in_band_success: Option<bool>,
+) -> Option<TimedInterruption> {
+    let armed = batch.kind == BATCH_KIND_TIMED && batch.interruption_drvs.iter().any(|d| d == drv);
+    if !armed {
+        return None;
+    }
+    if batch.engine_cancelled {
+        return Some(TimedInterruption::Replayed);
+    }
+    if in_band_success == Some(true) {
+        return Some(TimedInterruption::NotReproduced);
+    }
+    None
 }
 
 /// Decide the verdict for one job given its in-band per-root result and the
@@ -330,12 +363,19 @@ pub fn build_record(
     first_active_at: Option<String>,
     log_tail: Option<&str>,
 ) -> JobRecord {
+    // "Success" for the interruption rule means the in-band result settled
+    // with any success status (built, substituted, already valid) — the root
+    // completed before the armed abandon deadline could fire.
+    let in_band_success = target
+        .and_then(|t| build_status_from_name(&t.status))
+        .map(|s| s.is_success());
     let aux = AuxFlags {
         skipped: None,
         eval_error: false,
         plan_not_attemptable: ctx.plan_not_attemptable,
         plan_snapshot_valid: ctx.plan_snapshot_valid,
         resolve_unknown_divergent: None,
+        timed_interruption: timed_interruption_for(batch, &ctx.drv_path, in_band_success),
     };
     let classification = classify(&ctx.hydra_outcome, rio_outcome, &aux);
     let reason = batch.reasons.get(&ctx.drv_path).cloned();
@@ -449,18 +489,31 @@ pub async fn process_settled_batch(
     first_active: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     let mut requeue = Vec::new();
-    if batch.results.is_empty() && batch.build_id.is_none() {
+    // Members of timed batches are never re-offered to the timeless pending
+    // pool: the timed dispatcher owns its own retries (confirmation
+    // re-submissions), and whatever stays unresolved is covered by the
+    // end-of-run not-attempted backfill.
+    let timed = batch.kind == BATCH_KIND_TIMED;
+    if batch.results.is_empty() && batch.build_id.is_none() && !(timed && batch.engine_cancelled) {
         // Neither in-band results nor a build id: an engine-side submission
         // failure (channel open, drv import, the build op erroring before
         // any result arrived). Every member job is re-offered to the submit
-        // loop.
+        // loop — except for a timed batch, whose members are simply left to
+        // the timed dispatcher. (A timed batch the engine cancelled with no
+        // results falls through instead, so its armed interruptions are
+        // still recorded below.)
         tracing::info!(
             jobs = batch_jobs.len(),
             engine_cancelled = batch.engine_cancelled,
+            timed,
             "batch has no in-band results and no build id (engine-side submission failure); \
-             re-offering its jobs"
+             re-offering its jobs unless the batch is timed"
         );
-        return Ok(batch_jobs.to_vec());
+        return Ok(if timed {
+            Vec::new()
+        } else {
+            batch_jobs.to_vec()
+        });
     }
     let results_by_drv: HashMap<&str, &PathOutcome> = batch
         .results
@@ -541,8 +594,39 @@ pub async fn process_settled_batch(
             log_signal_text.as_deref(),
         ) {
             Verdict::Requeue { why } => {
-                tracing::info!(job, why, "re-queueing");
-                requeue.push(job.clone());
+                if timed {
+                    // Never re-offered (the timed dispatcher owns retries).
+                    // An armed interruption the engine did cancel is the
+                    // recorded outcome reproduced, so it still gets its
+                    // terminal record here; every other requeue-shaped
+                    // member stays outstanding for a later
+                    // confirmation-retry batch or the end-of-run backfill.
+                    if timed_interruption_for(batch, &ctx.drv_path, None)
+                        == Some(TimedInterruption::Replayed)
+                    {
+                        let record = build_record(
+                            ctx,
+                            &RioOutcome::NotAttempted,
+                            None,
+                            target,
+                            batch,
+                            &poisoned,
+                            &HashMap::new(),
+                            mode,
+                            store_url,
+                            prior + 1,
+                            None,
+                            first_active.get(job).cloned(),
+                            None,
+                        );
+                        state.append_jsonl(StateFile::Results, &record)?;
+                    } else {
+                        tracing::info!(job, why, "timed batch member is not re-offered");
+                    }
+                } else {
+                    tracing::info!(job, why, "re-queueing");
+                    requeue.push(job.clone());
+                }
             }
             Verdict::Terminal { rio, evidence } => {
                 // Evidence capture: NAR hashes for successes, log tail for
@@ -643,7 +727,7 @@ mod tests {
     use crate::run::artifact::LocalDirArtifactStore;
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{GraphSnapshot, PoisonedView};
-    use crate::run::model::build_status_name;
+    use crate::run::model::{BATCH_KIND_SUBMIT, build_status_name};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(job: &str, drv: &str, deps: &[&str], hydra: HydraOutcome) -> JobContext {
@@ -1305,6 +1389,179 @@ mod tests {
         }
     }
 
+    /// Flag derivation for interruption-armed roots of timed batches: armed +
+    /// engine-cancelled carries Replayed, armed + in-band success carries
+    /// NotReproduced, armed + failure without a cancellation carries no flag,
+    /// and the flag is never derived outside timed batches. The derived flag
+    /// drives the bucket through the AuxFlags built in [`build_record`].
+    #[test]
+    fn timed_interruption_flag_derivation() {
+        let job_ctx = ctx("app.x86_64-linux", T, &[], HydraOutcome::Built);
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        let no_paths: HashMap<String, Option<(String, u64)>> = HashMap::new();
+        let record = |batch: &BatchView, rio: &RioOutcome, target: Option<&PathOutcome>| {
+            build_record(
+                &job_ctx,
+                rio,
+                None,
+                target,
+                batch,
+                &no_poison,
+                &no_paths,
+                "leaf",
+                "ssh-ng://x",
+                1,
+                None,
+                None,
+                None,
+            )
+        };
+
+        // Armed + engine-cancelled (the channel was abandoned at the recorded
+        // offset): Replayed, and the record classifies interruption-replayed.
+        let cancelled = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            interruption_drvs: vec![T.to_string()],
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        assert_eq!(
+            timed_interruption_for(&cancelled, T, None),
+            Some(TimedInterruption::Replayed)
+        );
+        let rec = record(&cancelled, &RioOutcome::NotAttempted, None);
+        assert_eq!(rec.bucket, Bucket::InterruptionReplayed.as_str());
+
+        // Armed + in-band success (the build out-raced the recorded
+        // interruption): NotReproduced.
+        let built = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            interruption_drvs: vec![T.to_string()],
+            results: vec![po(T, BuildStatus::Built, "")],
+            ..BatchView::default()
+        };
+        assert_eq!(
+            timed_interruption_for(&built, T, Some(true)),
+            Some(TimedInterruption::NotReproduced)
+        );
+        let rec = record(
+            &built,
+            &RioOutcome::Built { executed: true },
+            Some(&built.results[0]),
+        );
+        assert_eq!(rec.bucket, Bucket::InterruptionNotReproduced.as_str());
+
+        // Armed + failure without a cancellation: no flag — the failure
+        // classifies on its own evidence.
+        let failed = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            interruption_drvs: vec![T.to_string()],
+            results: vec![po(
+                T,
+                BuildStatus::PermanentFailure,
+                "builder failed with exit code 2",
+            )],
+            ..BatchView::default()
+        };
+        assert_eq!(timed_interruption_for(&failed, T, Some(false)), None);
+        let rec = record(
+            &failed,
+            &RioOutcome::TargetFailed {
+                kind: FailureKind::Genuine,
+            },
+            Some(&failed.results[0]),
+        );
+        assert_eq!(rec.bucket, Bucket::RioOnlyFailure.as_str());
+
+        // An unarmed root of the same cancelled batch carries no flag, and a
+        // non-timed batch never carries one.
+        assert_eq!(timed_interruption_for(&cancelled, DEP, None), None);
+        let submit_batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            interruption_drvs: vec![T.to_string()],
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        assert_eq!(timed_interruption_for(&submit_batch, T, None), None);
+    }
+
+    /// A settled timed batch never re-offers its members to the timeless
+    /// pending pool: the armed root the engine cancelled gets its
+    /// interruption-replayed record, while the unarmed member with no
+    /// in-band result is neither re-queued nor recorded (the timed
+    /// dispatcher owns its own retries; the end-of-run backfill covers the
+    /// rest).
+    #[tokio::test]
+    async fn timed_batch_members_are_never_reoffered() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let contexts: HashMap<String, JobContext> = [
+            (
+                "armed.x86_64-linux".to_string(),
+                ctx("armed.x86_64-linux", T, &[], HydraOutcome::Built),
+            ),
+            (
+                "mate.x86_64-linux".to_string(),
+                ctx("mate.x86_64-linux", DEP, &[], HydraOutcome::Built),
+            ),
+        ]
+        .into();
+        // The channel was abandoned at the interruption deadline: no in-band
+        // results, no observed build id, engine_cancelled set.
+        let batch = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            engine_cancelled: true,
+            interruption_drvs: vec![T.to_string()],
+            ..BatchView::default()
+        };
+        let requeue = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["armed.x86_64-linux".into(), "mate.x86_64-linux".into()],
+            &batch,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(requeue.is_empty(), "{requeue:?}");
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].job, "armed.x86_64-linux");
+        assert_eq!(records[0].bucket, Bucket::InterruptionReplayed.as_str());
+        assert_eq!(records[0].rio.outcome, "not-attempted");
+
+        // An engine-side submission failure (no results, no build id, not
+        // cancelled) on a timed batch is not re-offered either.
+        let failed_submission = BatchView {
+            kind: BATCH_KIND_TIMED.to_string(),
+            ..BatchView::default()
+        };
+        let requeue = process_settled_batch(
+            &state,
+            &LogAdmin::default(),
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["mate.x86_64-linux".into()],
+            &failed_submission,
+            &HashMap::new(),
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(requeue.is_empty(), "{requeue:?}");
+    }
+
     /// An engine-cancelled batch (channel abandoned at the batch deadline)
     /// settles with no in-band results: every member is re-offered via the
     /// engine-cancelled rule regardless of how much retry budget it has
@@ -1368,6 +1625,7 @@ mod tests {
         ]
         .into();
         let batch = BatchView {
+            kind: BATCH_KIND_SUBMIT.to_string(),
             build_id: Some(build_id.to_string()),
             results: vec![
                 po(T, BuildStatus::Built, ""),
@@ -1393,6 +1651,7 @@ mod tests {
                 ),
             ]),
             engine_cancelled: false,
+            interruption_drvs: Vec::new(),
             submitted_at: Some("2026-05-26T01:00:00Z".into()),
         };
         let requeue = process_settled_batch(
