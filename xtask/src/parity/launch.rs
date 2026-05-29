@@ -244,6 +244,7 @@ fn build_campaign_spec(
     eval_set: &EvalSetLocation,
     bucket: &str,
     hmac_present: bool,
+    gateway_host_key: &str,
     preflight: Option<&PreflightOutcome>,
 ) -> CampaignSpec {
     let mode = a.mode.engine();
@@ -272,10 +273,7 @@ fn build_campaign_spec(
             scheduler_addr: scheduler_addr(),
             store_addr: store_addr(),
             service_hmac_key_path: hmac_present.then(|| PathBuf::from(jobs::HMAC_KEY_MOUNT_PATH)),
-            // Gateway SSH host-key pin for the engine's transport. Launch does
-            // not derive it from the gateway host-key Secret yet, so it is
-            // left unset here.
-            gateway_host_key: None,
+            gateway_host_key: Some(gateway_host_key.to_owned()),
         },
         tenants: TenantBlock {
             build_tenant: mode.expected_build_tenant().to_owned(),
@@ -354,6 +352,22 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         copy_hmac_secret(&client)
     })
     .await?;
+    // The engine pins the gateway's SSH host key (the spec field is
+    // required by engine validation), so launch must be able to read it
+    // from the deployed chart — independently of --skip-preflight.
+    let gateway_host_key = ui::step("gateway SSH host-key pin", || async {
+        match gateway_host_key_pin(&client).await? {
+            Some(pin) => Ok(pin),
+            None => bail!(
+                "the deployed rio-gateway runs on an auto-generated (emptyDir) SSH host key, so \
+                 there is nothing to pin and the campaign engine refuses to run without a pinned \
+                 host key. Redeploy with a persistent host key — `cargo xtask k8s -p eks up \
+                 --deploy --deploy-parity` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
+                 (Secret data key `host_key`) — then re-run launch."
+            ),
+        }
+    })
+    .await?;
 
     // Pre-flight: the deployed cluster — not this tree — is what the
     // campaign measures, so verify it before submitting anything.
@@ -383,6 +397,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         &eval_set,
         &bucket,
         hmac_present,
+        &gateway_host_key,
         preflight_outcome.as_ref(),
     );
     spec.validate()
@@ -709,6 +724,93 @@ async fn copy_hmac_secret(client: &kclient::Client) -> Result<bool> {
     Ok(present)
 }
 
+/// Chart-defined name of the gateway pod volume holding the SSH host key
+/// (`infra/helm/rio-build/templates/gateway.yaml`): a `secret` volume named
+/// by `gateway.ssh.hostKeySecret` when that value is set, an `emptyDir`
+/// (auto-generated key) otherwise.
+const GATEWAY_STATE_VOLUME: &str = "gateway-state";
+
+/// Data key holding the OpenSSH private host key inside the gateway
+/// host-key Secret (mounted by the chart at /var/lib/rio/gateway/host_key).
+const GATEWAY_HOST_KEY_DATA_KEY: &str = "host_key";
+
+/// Read the gateway SSH host-key pin from the deployed cluster: find the
+/// host-key Secret the rio-gateway Deployment mounts (its
+/// [`GATEWAY_STATE_VOLUME`] volume is a `secret` volume when the chart's
+/// `gateway.ssh.hostKeySecret` is set) and derive the OpenSSH public-key
+/// line from the private key it holds. Returns `Ok(None)` when the gateway
+/// runs on the auto-generated emptyDir host key (nothing stable to pin);
+/// errors reading the Deployment or the Secret are returned as errors.
+async fn gateway_host_key_pin(client: &kclient::Client) -> Result<Option<String>> {
+    use k8s_openapi::api::apps::v1::Deployment;
+
+    let api: Api<Deployment> = Api::namespaced(client.clone(), crate::k8s::NS);
+    let deployment = api
+        .get_opt("rio-gateway")
+        .await
+        .with_context(|| format!("read Deployment {}/rio-gateway", crate::k8s::NS))?
+        .with_context(|| {
+            format!(
+                "Deployment {}/rio-gateway not found — deploy the rio-build chart before \
+                 launching a campaign",
+                crate::k8s::NS
+            )
+        })?;
+    let volumes = deployment
+        .spec
+        .and_then(|spec| spec.template.spec)
+        .and_then(|pod| pod.volumes)
+        .unwrap_or_default();
+    let Some(state_volume) = volumes
+        .iter()
+        .find(|volume| volume.name == GATEWAY_STATE_VOLUME)
+    else {
+        return Ok(None);
+    };
+    let Some(secret_name) = state_volume
+        .secret
+        .as_ref()
+        .and_then(|source| source.secret_name.as_deref())
+    else {
+        // emptyDir (or anything that is not a secret volume): the host key
+        // is auto-generated per pod and cannot be pinned.
+        return Ok(None);
+    };
+    let bytes = shared::secret_bytes(secret_name, GATEWAY_HOST_KEY_DATA_KEY)
+        .await?
+        .with_context(|| {
+            format!(
+                "the rio-gateway Deployment mounts host-key Secret {}/{secret_name}, but that \
+                 Secret does not exist (is the external-secrets sync healthy?)",
+                crate::k8s::NS
+            )
+        })?;
+    let private_key = String::from_utf8(bytes).with_context(|| {
+        format!(
+            "Secret {}/{secret_name} data key {GATEWAY_HOST_KEY_DATA_KEY:?} is not UTF-8 — \
+             expected an OpenSSH private key",
+            crate::k8s::NS
+        )
+    })?;
+    let line = derive_openssh_public_key_line(&private_key).with_context(|| {
+        format!(
+            "derive the gateway host-key pin from Secret {}/{secret_name} (data key \
+             {GATEWAY_HOST_KEY_DATA_KEY:?})",
+            crate::k8s::NS
+        )
+    })?;
+    Ok(Some(line))
+}
+
+/// Derive the OpenSSH public-key line (`ssh-ed25519 AAAA…`) from an
+/// OpenSSH-format private key — the pin recorded in the campaign spec.
+/// Pure so the derivation is unit-testable without a cluster.
+fn derive_openssh_public_key_line(private_key_pem: &str) -> Result<String> {
+    let key = ssh_key::PrivateKey::from_openssh(private_key_pem)
+        .context("parse the gateway host key as an OpenSSH private key")?;
+    Ok(key.public_key().to_openssh()?)
+}
+
 /// Launch pre-flight: deployed gateway/scheduler image tags vs this tree,
 /// gateway build-policy entries for the campaign tenants, per-tenant
 /// upstream sets, and the QueryDerivationStatuses probe. Runs ALL checks
@@ -835,6 +937,10 @@ mod tests {
     use super::*;
     use rio_parity::run::spec::Mode as EngineMode;
     use serde_json::json;
+
+    /// Fixture gateway host-key pin (what `gateway_host_key_pin` derives
+    /// from the deployed host-key Secret on a real launch).
+    const HOST_KEY_PIN: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder rio-gateway";
 
     fn args(mode: Mode) -> LaunchArgs {
         LaunchArgs {
@@ -969,6 +1075,21 @@ mod tests {
     }
 
     #[test]
+    fn derive_openssh_public_key_line_round_trips() {
+        // Same generation path the gateway uses for its own host key.
+        let (private, public) = ssh::generate("rio-gateway").unwrap();
+        let line = derive_openssh_public_key_line(&private).unwrap();
+        assert!(line.starts_with("ssh-ed25519 "), "{line}");
+        // Key material matches the public half (comments may differ — the
+        // transport compares key material only).
+        let derived = ssh_key::PublicKey::from_openssh(&line).unwrap();
+        let expected = ssh_key::PublicKey::from_openssh(public.trim()).unwrap();
+        assert_eq!(derived.key_data(), expected.key_data());
+        // Garbage is rejected with a parse error, never a bogus pin.
+        assert!(derive_openssh_public_key_line("not a private key").is_err());
+    }
+
+    #[test]
     fn campaign_spec_round_trips_through_the_engine_types() {
         let spec = build_campaign_spec(
             &args(Mode::Leaf),
@@ -976,6 +1097,7 @@ mod tests {
             &eval_loc(),
             "rio-build-chunks-deadbeef",
             true,
+            HOST_KEY_PIN,
             Some(&outcome()),
         );
         // What the engine does on startup: parse + validate.
@@ -1019,6 +1141,10 @@ mod tests {
             parsed.cluster.service_hmac_key_path,
             Some(PathBuf::from("/etc/rio/hmac/service-hmac.key"))
         );
+        assert_eq!(
+            parsed.cluster.gateway_host_key.as_deref(),
+            Some(HOST_KEY_PIN)
+        );
         assert_eq!(parsed.tenants.build_tenant, "parity-leaf");
         assert_eq!(parsed.tenants.warm_tenant, "parity-warm");
         assert!(parsed.tenants.upstreams_verified);
@@ -1054,9 +1180,11 @@ mod tests {
             &eval_loc(),
             "rio-build-chunks-deadbeef",
             false,
+            HOST_KEY_PIN,
             None,
         );
         spec.validate().unwrap();
+        assert_eq!(spec.cluster.gateway_host_key.as_deref(), Some(HOST_KEY_PIN));
         assert_eq!(spec.mode, EngineMode::SelfHosted);
         assert_eq!(spec.tenants.build_tenant, "parity-selfhosted");
         assert_eq!(
