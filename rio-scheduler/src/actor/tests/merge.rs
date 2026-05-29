@@ -7334,7 +7334,7 @@ async fn suffix_classes(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<&'static str
         .unwrap_or_default()
 }
 
-// r[verify sched.merge.substitute-topdown+4]
+// r[verify sched.merge.substitute-topdown+10]
 /// Top-down: deps pruned from this build are NOT in the global DAG,
 /// so a later build that needs them triggers its own cache-check.
 ///

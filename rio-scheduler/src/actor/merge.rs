@@ -383,7 +383,7 @@ impl DagActor {
         // unreachable, partial demand-set cache, CA demanded nodes).
         // The fetch itself is deferred
         // (`r[sched.substitute.detached+5]`); on fetch failure the
-        // build fails fast (`r[sched.merge.substitute-topdown]` —
+        // build fails fast (`r[sched.merge.substitute-topdown+10]` —
         // resubmit re-probes). The existing check_cached_outputs at
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.

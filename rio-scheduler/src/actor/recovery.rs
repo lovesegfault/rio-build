@@ -693,7 +693,7 @@ impl DagActor {
     ///
     /// `failed_dep_parents`: short-circuited to `DependencyFailed`
     /// BEFORE `compute_initial_states` — see
-    /// `r[sched.recovery.failed-dep-cascade]`.
+    /// `r[sched.recovery.failed-dep-cascade+2]`.
     async fn seed_ready_queue(&mut self, failed_dep_parents: &HashSet<DrvHash>) {
         // --- Recompute priorities (critical-path sweep) ---
         // est_duration is recomputed from the SLA cache (refreshed on

@@ -811,6 +811,72 @@ against the merged tree:
   substitution-adjacent rows remain the `cache_hit_clear` resets already
   described above; their contents and no-charge semantics are untouched.
 
+### 2026-05-29 re-validation: main rebase — the closure-evidence/topdown-prune lifecycle and its substitution-walk changes
+
+The rebase onto main (`dfe9a5569`) brings in the 69 genuinely-new commits of
+main's scheduler campaign: persisted `topdown_pruned` (migration 063) and
+`closure_hole` (064) markers, the closure-evidence classifier
+(`DerivationDag::closure_evidence` → Vouched/Pending/Broken with the
+`must_substitute` predicate), the dispatch-time and reap-time fail-fast arms
+(`fail_fast_topdown_pruned_root`, the leader-gated survivor re-evaluation in
+`handle_cleanup_terminal_build`), the recovery/poison-clear closure-hole
+stamps, and the explicitly-requested prune retention. The branch's own carry
+adds the pull-admission refusal (`admit_pull` answers NotYetReady for
+`must_substitute` nodes) and the reap-time skip of Assigned/Running
+survivors. Re-checked against the merged tree:
+
+- **(a) E5 and the fold's charging semantics: unaffected.** The 69-commit
+  delta touches none of `rio-retry-kernel/`, `retry_policy.rs`,
+  `actor/executor.rs` (the report-intake successor paths), or
+  `db/attempts.rs` (`git diff 5b0023a6c origin/main` is empty for all
+  four), and conflict resolution introduced no new caller of the ledger
+  writers: the only `INSERT INTO drv_attempts` sites remain
+  `db/attempts.rs` plus tests, and `poison_and_cascade` keeps exactly its
+  three pre-rebase callers (pull intake, report intake, recovery) — none of
+  the new fail-fast/reap/poison-clear/recovery arms call it. The fail-fast
+  teardown path (`fail_fast_topdown_pruned_root` →
+  `cancel_build_derivations` → `transition_build_to_failed`) writes
+  derivation/build status, stamps `drv_executions` via the terminal log
+  epilogue, clears `never_forgive_paths` and the consumed `topdown_pruned`
+  mark — and appends **no** `drv_attempts` row, mutates no `RetryState`,
+  writes no backoff, mints no exec, so the cascade it triggers is
+  charge-free trivially. Open pull attempts on nodes it cancels are settled
+  only by the existing controller-synthesized verdict
+  (`close_pull_attempt_uncharged`, charge-free) with the establishment
+  sweep as the unchanged backstop. The reap-time arm cannot fire on a
+  survivor holding an open attempt: the §4-i widening skips
+  Assigned/Running survivors (pinned by
+  `cleanup_reap_skips_marked_holed_survivor_with_open_attempt`), and the
+  pull-admission refusal keeps a `must_substitute` node from acquiring an
+  open from-source attempt in the first place
+  (`pull_must_substitute_node_refused_and_settled_by_sweep`).
+- **(b) Substitution-delta notes: one addition, no contradictions.** The
+  in-flight-walk skip (`status != Substituting` in the reap arm) and the
+  closure-evidence routing in `handle_substitute_complete` change *when*
+  the established fail-fast/requeue arms run, not what they charge; the
+  walk's late `SubstituteComplete{ok}` verdict still lands in the
+  not-Substituting guard / `admit_pull` status table, so a late verdict
+  cannot race a re-opened attempt for the same node into a double charge
+  (the node leaves Substituting only through the verdict itself or a
+  cancel, and `admit_pull` refuses non-Ready nodes). The chain-scoping
+  notes stand: the fail-fast's `never_forgive_paths.clear()` is a chain
+  ending exactly like the pre-existing walk-failure endings, and the
+  one-shot `substitute_tried` consumption is unchanged. Notes (1)–(7) and
+  the 2026-05-25/26 amendments stand as written.
+- **(c) Attempt ledger: nothing new recorded.** `handle_substitute_complete`
+  and the new arms call none of `append_attempt` / `append_attempts_batch`
+  / `record_attempt_with_poison` / `append_attempt_standalone`;
+  `substitution` remains absent from the `OutcomeClass` alphabet
+  (Transient/Infra/ExemptInfra/Timeout/Permanent/Cascade/Backstop/
+  Disconnected). The closure-hole stamps (`set_closure_hole_by_hashes`)
+  and mark clears are derivation-row column writes, not ledger events.
+
+The substitution carve-out therefore holds in the merged tree; the
+closure-evidence lifecycle itself (mark/hole stamping, clearing, and the
+failover round-trip) remains example-tested rather than modeled and stays
+on the VERIFY-LATER list as the closure-evidence/topdown-prune lifecycle
+candidate.
+
 ## Stage-C calibration: the historical-fix corpus replayed against the model
 
 The 45-commit fix corpus (inventory §5, eight families G1–G8) replayed
