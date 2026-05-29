@@ -266,16 +266,21 @@ impl<'a> NarIngestHold<'a> {
 }
 
 /// How the NAR was persisted. Batch uses this to pick the right
-/// `complete_manifest_*_in_tx` variant inside its atomic tx.
+/// `complete_manifest_*_in_tx` variant inside its atomic tx. Both
+/// variants carry the [`cas::ParsedNar`] derived at staging time so
+/// the commit transaction can write the castore index (boxed — the
+/// entry list + DAG for a large output is non-trivial and this enum
+/// sits in a per-output accumulator).
 pub(in crate::grpc) enum NarPersist {
     /// `nar_data.len() < INLINE_THRESHOLD` (or no chunk backend).
-    /// Bytes carried so the batch tx can write `inline_blob`.
-    Inline(Bytes),
+    /// Carries the **blob stream** (regular-file contents in walk
+    /// order, not the NAR) so the batch tx can write `inline_blob`.
+    Inline(Bytes, Box<cas::ParsedNar>),
     /// `nar_data.len() >= INLINE_THRESHOLD` and a chunk backend is
     /// configured. Chunks already uploaded + their rows written via
-    /// [`cas::stage_chunked`]; only the `status='complete'` flip
-    /// remains.
-    ChunkedStaged,
+    /// [`cas::stage_chunked`]; the `status='complete'` flip and the
+    /// castore index write remain.
+    ChunkedStaged(Box<cas::ParsedNar>),
 }
 
 /// The ingest write authority — produced ONLY by
@@ -1204,6 +1209,11 @@ impl StoreServiceImpl {
         .map_err(|e| match e {
             ingest::PersistError::Chunked(e) => storage_error(ctx_label, e),
             ingest::PersistError::Inline(e) => putpath_metadata_status(ctx_label, e),
+            // Hash matched but the bytes are not a structurally valid
+            // NAR — a client bug, not a storage failure. Non-retryable.
+            ingest::PersistError::Malformed(e) => {
+                Status::invalid_argument(format!("{ctx_label}: {e:#}"))
+            }
         })?;
         Ok(chunked)
     }
@@ -1223,6 +1233,15 @@ impl StoreServiceImpl {
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
     ) -> Result<NarPersist, Status> {
+        // Same parse-once as `ingest::persist_nar` — the batch's atomic
+        // commit needs the castore representation per output, and the
+        // chunked staging needs the per-file content ranges.
+        let parsed = cas::cpu_bound(|| cas::ParsedNar::parse(&nar_data)).map_err(|e| {
+            Status::invalid_argument(format!(
+                "PutPathBatch: NAR for {} failed structural validation: {e:#}",
+                info.store_path.as_str()
+            ))
+        })?;
         if let Some(backend) = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()) {
             let stats = cas::stage_chunked(
                 &self.pool,
@@ -1230,14 +1249,16 @@ impl StoreServiceImpl {
                 info,
                 claim,
                 &nar_data,
+                &parsed,
                 self.chunk_upload_max_concurrent,
             )
             .await
             .map_err(|e| storage_error("PutPathBatch: stage_chunked", e))?;
             metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
-            Ok(NarPersist::ChunkedStaged)
+            Ok(NarPersist::ChunkedStaged(Box::new(parsed)))
         } else {
-            Ok(NarPersist::Inline(Bytes::from(nar_data)))
+            let blob = parsed.blob_stream(&nar_data);
+            Ok(NarPersist::Inline(Bytes::from(blob), Box::new(parsed)))
         }
     }
 }

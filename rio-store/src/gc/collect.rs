@@ -365,8 +365,20 @@ pub(crate) static COLLECT_BATCH_SELECT_SQL: LazyLock<String> = LazyLock::new(|| 
 /// the structural predicate pin exercise this exact statement).
 // r[impl store.chunk.lock-order+2]
 pub(crate) static COLLECT_BATCH_UPDATE_SQL: LazyLock<String> = LazyLock::new(|| {
+    // The tombstone MUST clear BOTH S3-presence assertions
+    // (`uploaded_at`, `durable`): the resurrection upserts
+    // (`insert_pending_chunks`, `upgrade_manifest_to_chunked`,
+    // `commit_chunked_output_in_conn`) deliberately leave both columns
+    // untouched, so a swept-then-re-uploaded chunk re-uploads
+    // (`needs_upload`) and stays invisible to `HasChunks` until a new
+    // complete manifest re-flips `durable` after the object provably
+    // exists again. A tombstone that left `durable = TRUE` would let a
+    // resurrection instantly satisfy `HasChunks`' `durable AND NOT
+    // deleted` predicate before its S3 PutObject lands — the I-201 lie
+    // through the GC round-trip.
+    // r[impl store.chunk.durable-flag]
     format!(
-        "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, deleted_at = now() \
+        "UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, durable = FALSE, deleted_at = now() \
      WHERE blake3_hash = ANY($1) AND {not_deleted} \
        AND {grace} \
      RETURNING blake3_hash, size",

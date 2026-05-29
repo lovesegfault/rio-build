@@ -108,6 +108,58 @@ pub fn is_hw_class_name(s: &str) -> bool {
 /// an unbounded number of per-output accumulation buffers on the server.
 pub const MAX_BATCH_OUTPUTS: usize = 16;
 
+/// FastCDC content-defined-chunking parameters (ADR-022, `store.typ`
+/// "size parameters"). Live here — not in rio-store — because P0586
+/// moves the chunking to the builder: rio-builder's fused output walk
+/// and rio-store's legacy `chunk_nar` MUST use identical parameters or
+/// the same bytes chunked on either side produce different digests and
+/// dedup silently drops to zero.
+///
+/// - **min**: FastCDC won't cut before this. Very small chunks mean
+///   many S3 objects + large manifests for little dedup gain.
+/// - **avg**: the target boundary spacing.
+/// - **max**: hard cap — FastCDC forces a cut even with no
+///   content-defined boundary (a long high-entropy run would otherwise
+///   yield one giant chunk with bad dedup and S3 characteristics).
+pub const FASTCDC_MIN_BYTES: usize = 16 * 1024;
+/// See [`FASTCDC_MIN_BYTES`].
+pub const FASTCDC_AVG_BYTES: usize = 64 * 1024;
+/// See [`FASTCDC_MIN_BYTES`]. Also the per-entry size bound a
+/// `PutPathChunkedBegin.outputs[*].chunk_manifest` entry may claim.
+pub const FASTCDC_MAX_BYTES: usize = 256 * 1024;
+
+/// Maximum number of distinct `Directory` bodies in a single
+/// `PutPathChunkedBegin`. Matches `rio_nix`'s `MAX_DIRECTORY_ENTRIES`
+/// (the per-directory child cap) — a single output tree cannot have
+/// more distinct directories than the NAR walk admits entries, and the
+/// bodies are content-deduplicated across outputs before sending.
+/// Memory at the cap is bounded by the gRPC message size limit
+/// (`DEFAULT_MAX_MESSAGE_SIZE` = 256 MiB, NOT tonic's 4 MiB default —
+/// a fully-decoded `Begin` frame can expand to several × that in heap),
+/// not this count; the count bounds the validator's reachability walk.
+pub const MAX_DIR_NODES: usize = 1_048_576;
+
+/// Castore `Directory` entry bounds, mirroring the NAR reader's
+/// (`rio_nix`'s `MAX_NAME_LEN` / `MAX_TARGET_LEN` /
+/// `MAX_DIRECTORY_ENTRIES`). A `Directory` body is the *same tree* a
+/// NAR encodes — an entry the NAR reader would reject must also be
+/// rejected at the castore validation boundary, or the store commits a
+/// path whose regenerated NAR its own reader (and Nix's) refuses to
+/// import. The name bound also caps the per-entry framing the NAR
+/// regeneration buffers between content pieces.
+pub const MAX_CASTORE_NAME_BYTES: usize = 256;
+/// See [`MAX_CASTORE_NAME_BYTES`].
+pub const MAX_CASTORE_TARGET_BYTES: usize = 4096;
+/// Per-`Directory` total entry count (directories + files + symlinks).
+/// See [`MAX_CASTORE_NAME_BYTES`].
+pub const MAX_CASTORE_DIR_ENTRIES: usize = 1_048_576;
+
+/// Maximum number of input-closure paths in a single
+/// `PutPathChunkedBegin`. The closure is the refscan candidate set;
+/// matches [`MAX_SUBSTITUTE_CLOSURE`] (the same "how big can one
+/// build's closure be" bound, enforced at a different RPC).
+pub const MAX_INPUT_CLOSURE: usize = MAX_SUBSTITUTE_CLOSURE;
+
 /// Maximum number of DAG nodes in a single SubmitBuild request.
 ///
 /// Protects the scheduler from unbounded DAG merges. Matches

@@ -98,8 +98,7 @@ pub struct MockStoreCalls {
     /// tests proving the builder uses one batch RPC per BFS layer
     /// (not N per-path RPCs).
     pub batch_qpi_calls: Arc<AtomicU32>,
-    /// Number of `batch_get_manifest` calls received. For I-110c
-    /// tests proving the builder calls it once before the warm loop.
+    /// Number of `batch_get_manifest` calls received.
     pub batch_manifest_calls: Arc<AtomicU32>,
     /// Number of `find_missing_paths` calls received (incremented on
     /// entry, before the fail-injection check). For I-163 tests
@@ -119,10 +118,6 @@ pub struct MockStoreCalls {
     /// quota tests count ADMITTED candidates per tick from the request
     /// paths themselves instead of trusting scheduler-side bookkeeping.
     pub find_missing_paths_log: Arc<RwLock<Vec<Vec<String>>>>,
-    /// `manifest_hint` from each `get_path` call (None if unset).
-    /// I-110c: lets tests assert the FUSE fetch carried the primed
-    /// hint.
-    pub get_path_hints: Arc<RwLock<Vec<Option<types::ManifestHint>>>>,
     /// Number of `get_path` calls received. Incremented on entry,
     /// BEFORE the `fail_get_path` early-return — distinguishes "client
     /// never reached the RPC" from "RPC returned Unavailable". For
@@ -312,11 +307,11 @@ impl MockStore {
     /// Seed a path AND its chunked manifest. Splits `nar` into fixed
     /// `chunk_size` pieces (the real store uses FastCDC; fixed-size is
     /// fine for the mock — chunks are addressed by content hash, not
-    /// boundary), populates `self.state.chunks`, and stores the chunk list
-    /// alongside the inline blob so `batch_get_manifest` can return it.
+    /// boundary), populates `self.state.chunks`, and seeds the path's
+    /// PathInfo + NAR via [`Self::seed`].
     ///
-    /// Returns the `Vec<ChunkRef>` so tests can prime the builder's
-    /// hint cache directly.
+    /// Returns the `Vec<ChunkRef>` (per-chunk digest + size) so tests
+    /// can assert against `ChunkService.GetChunk`.
     pub fn seed_chunked(
         &self,
         info: ValidatedPathInfo,
@@ -406,6 +401,25 @@ impl ChunkService for MockStore {
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
         )))
+    }
+
+    /// Durable-presence probe (P0586). The mock has no WAL window —
+    /// a chunk in `state.chunks` is "durable". Bit i set ⇔ digests[i]
+    /// is present, LSB-first within each byte (the `HasBitmap`
+    /// contract shared with HasDirectories/HasBlobs).
+    async fn has_chunks(
+        &self,
+        request: Request<types::HasChunksRequest>,
+    ) -> Result<Response<types::HasBitmap>, Status> {
+        let digests = request.into_inner().digests;
+        let chunks = self.state.chunks.read().unwrap();
+        let mut bitmap = vec![0u8; digests.len().div_ceil(8)];
+        for (i, d) in digests.iter().enumerate() {
+            if chunks.contains_key(d) {
+                bitmap[i / 8] |= 1 << (i % 8);
+            }
+        }
+        Ok(Response::new(types::HasBitmap { bitmap }))
     }
 }
 
@@ -743,8 +757,7 @@ impl StoreService for MockStore {
     ) -> Result<Response<Self::GetPathStream>, Status> {
         // Count BEFORE any fault-injection early-return so tests can
         // assert "client never contacted gRPC" (== 0) vs "client did
-        // and got Unavailable" (> 0). `get_path_hints` below is pushed
-        // only on the success path so it can't serve this purpose.
+        // and got Unavailable" (> 0).
         self.calls.get_path_calls.fetch_add(1, Ordering::SeqCst);
         if self.faults.fail_get_path.load(Ordering::SeqCst) {
             return Err(Status::unavailable("mock: injected get_path failure"));
@@ -757,13 +770,6 @@ impl StoreService for MockStore {
             self.faults.get_path_gate.notified().await;
         }
         let req = request.into_inner();
-        // I-110c: record the hint (or its absence) so tests can assert
-        // the FUSE fetch carried what `prefetch_manifests` primed.
-        self.calls
-            .get_path_hints
-            .write()
-            .unwrap()
-            .push(req.manifest_hint);
         let store_path = req.store_path;
         // Garbage mode: return a stream with valid PathInfo but garbage NAR
         // bytes, so collect_nar_stream succeeds but nar::parse fails.
@@ -924,14 +930,12 @@ impl StoreService for MockStore {
             .store_paths
             .into_iter()
             .map(|store_path| {
-                // MockStore stores whole NARs in-memory — represent
-                // as inline (no chunking in the mock).
+                // PathInfo only — mirrors the real store, which never
+                // returns manifest content from BatchGetManifest.
                 let hint = paths
                     .get(&store_path)
-                    .map(|(info, nar)| types::ManifestHint {
+                    .map(|(info, _nar)| types::ManifestHint {
                         info: Some(info.clone()),
-                        chunks: Vec::new(),
-                        inline_blob: nar.clone(),
                     });
                 types::ManifestEntry { store_path, hint }
             })
@@ -1165,6 +1169,17 @@ impl StoreService for MockStore {
         _request: Request<types::GetNarIndexBatchRequest>,
     ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
         Err(Status::unimplemented("MockStore: GetNarIndexBatch (P0552)"))
+    }
+
+    // TODO(P0586): grows a real implementation (record the Begin frame,
+    // store the chunks, mirror the real store's novel-order/digest
+    // validation) when the builder's upload path switches to
+    // PutPathChunked and its unit tests need to drive it.
+    async fn put_path_chunked(
+        &self,
+        _request: Request<Streaming<types::PutPathChunkedRequest>>,
+    ) -> Result<Response<types::PutPathChunkedResponse>, Status> {
+        Err(Status::unimplemented("MockStore: PutPathChunked (P0586)"))
     }
 }
 

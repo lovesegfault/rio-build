@@ -665,7 +665,6 @@ pub(crate) async fn grpc_get_path(
             store_path,
             GRPC_STREAM_TIMEOUT,
             MAX_NAR_SIZE,
-            None,
             &md,
         )
         .await

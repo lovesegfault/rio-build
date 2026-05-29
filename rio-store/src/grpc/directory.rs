@@ -27,6 +27,7 @@ use rio_proto::types::{
     ReadBlobRequest, StatBlobRequest, StatBlobResponse,
 };
 
+use super::drain_with_timeout;
 use crate::cas::ChunkCache;
 
 /// BFS frontier batch cap. ~33 round trips for a chromium-scale
@@ -54,6 +55,17 @@ const GET_DIRECTORY_CHANNEL_DEPTH: usize = 8;
 /// Hard ceiling on directories streamed by one recursive walk. A
 /// chromium-scale closure is ~8k dirs; 256k means a pathological DAG
 /// (or a bug). Past it the stream errors `RESOURCE_EXHAUSTED`.
+///
+/// TODO: this cap is not derived from the ingest-side bounds
+/// (`r[store.ingest.tree-bounds]`): ingest accepts up to `MAX_DIR_NODES`
+/// (1_048_576) distinct directory bodies per path, and the one production
+/// consumer of `recursive=true` — the builder's FUSE mount-time prefetch
+/// (`rio-builder/src/castore_fuse/tree.rs`) — walks a whole *input
+/// closure* in a single call, so no per-path constant can make "ingest
+/// accepts ⇒ the closure mounts" structural here. Real closures are ~8k
+/// distinct dirs, leaving ~32× margin today. Closing the gap means paging
+/// the recursive walk (continuation tokens, or one walk per root);
+/// raising this cap alone only moves the cliff.
 const GET_DIRECTORY_MAX_RESULTS: usize = 262_144;
 
 /// Cap on the request digest list for `HasDirectories`/`HasBlobs`.
@@ -99,44 +111,74 @@ impl DirectoryServiceImpl {
     }
 
     /// Resolve the caller's tenant: JWT extension (gateway path),
-    /// else HMAC assignment-token `claims.tenant` (builder path). No
-    /// tenant → `UNAUTHENTICATED`; never fall back to anonymous.
+    /// else HMAC assignment-token `claims.tenant` (builder path), via
+    /// the shared [`super::resolve_tenant_id`] mapping (the write side
+    /// uses the same one, so a path committed by a builder is readable
+    /// by that builder's tenant). No tenant → `UNAUTHENTICATED`; never
+    /// fall back to anonymous.
     // r[impl store.castore.tenant-scope]
     fn castore_tenant_id<T>(&self, request: &Request<T>) -> Result<uuid::Uuid, Status> {
-        if let Some(jwt) = request
-            .extensions()
-            .get::<rio_auth::jwt::TenantClaims>()
-            .map(|c| c.sub)
-        {
-            return Ok(jwt);
-        }
-        let tok = request
-            .metadata()
-            .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
-            .and_then(|v| v.to_str().ok());
-        if let (Some(verifier), Some(tok)) = (&self.hmac_verifier, tok) {
-            return match verifier.verify::<rio_auth::hmac::AssignmentClaims>(tok) {
-                Ok(claims) => match claims.tenant.as_deref() {
-                    None => Err(Status::unauthenticated(
-                        "assignment token has no tenant claim",
-                    )),
-                    Some(t) => t.parse().map_err(|_| {
-                        Status::unauthenticated("assignment token tenant is not a UUID")
-                    }),
-                },
-                // Don't echo why the token failed — sig-vs-expiry is an
-                // oracle. The legitimate caller's fix is the same.
-                Err(_) => Err(Status::unauthenticated("assignment token rejected")),
-            };
-        }
-        Err(Status::unauthenticated(
+        match caller_identity(
+            request,
+            self.hmac_verifier.as_ref(),
             "DirectoryService requires a tenant: send a JWT or an HMAC \
              assignment token",
-        ))
+        )? {
+            CallerIdentity::Jwt(sub) => Ok(sub),
+            CallerIdentity::Hmac(claims) => super::resolve_tenant_id(None, Some(&claims))
+                .ok_or_else(|| {
+                    Status::unauthenticated(
+                        "assignment token has no usable tenant claim (missing or not a UUID)",
+                    )
+                }),
+        }
     }
 }
 
-fn parse_digest(d: &[u8]) -> Result<[u8; 32], Status> {
+/// A verified caller identity: the gateway's JWT extension or a
+/// builder's HMAC assignment token. Shared with `ChunkService`
+/// (chunk.rs) so the two auth ladders can't drift on what counts as
+/// "authenticated"; each caller decides what to do with the identity
+/// (DirectoryService resolves a tenant, HasChunks only needs proof).
+pub(super) enum CallerIdentity {
+    /// `TenantClaims.sub` from the gateway's JWT interceptor.
+    Jwt(uuid::Uuid),
+    /// Verified builder assignment-token claims.
+    Hmac(rio_auth::hmac::AssignmentClaims),
+}
+
+/// JWT request extension (gateway path), else `ASSIGNMENT_TOKEN_HEADER`
+/// verified against `verifier` (builder path). `missing` is the
+/// `UNAUTHENTICATED` message when neither identity is present — callers
+/// name themselves so the error stays actionable.
+pub(super) fn caller_identity<T>(
+    request: &Request<T>,
+    verifier: Option<&Arc<rio_auth::hmac::HmacVerifier>>,
+    missing: &'static str,
+) -> Result<CallerIdentity, Status> {
+    if let Some(jwt) = request
+        .extensions()
+        .get::<rio_auth::jwt::TenantClaims>()
+        .map(|c| c.sub)
+    {
+        return Ok(CallerIdentity::Jwt(jwt));
+    }
+    let tok = request
+        .metadata()
+        .get(rio_proto::ASSIGNMENT_TOKEN_HEADER)
+        .and_then(|v| v.to_str().ok());
+    if let (Some(verifier), Some(tok)) = (verifier, tok) {
+        return match verifier.verify::<rio_auth::hmac::AssignmentClaims>(tok) {
+            Ok(claims) => Ok(CallerIdentity::Hmac(claims)),
+            // Don't echo why the token failed — sig-vs-expiry is an
+            // oracle. The legitimate caller's fix is the same.
+            Err(_) => Err(Status::unauthenticated("assignment token rejected")),
+        };
+    }
+    Err(Status::unauthenticated(missing))
+}
+
+pub(super) fn parse_digest(d: &[u8]) -> Result<[u8; 32], Status> {
     d.try_into()
         .map_err(|_| Status::invalid_argument(format!("digest must be 32 bytes, got {}", d.len())))
 }
@@ -152,8 +194,9 @@ fn parse_digests(ds: &[Vec<u8>]) -> Result<Vec<[u8; 32]>, Status> {
 }
 
 /// Bit `i` set ⇔ `requested[i]` ∈ `present`. LSB-first within each
-/// byte; trailing bits zeroed.
-fn build_bitmap(requested: &[[u8; 32]], present: &HashSet<[u8; 32]>) -> Vec<u8> {
+/// byte; trailing bits zeroed. Shared with `HasChunks` (chunk.rs) so
+/// the three presence probes can't drift on bit order.
+pub(super) fn build_bitmap(requested: &[[u8; 32]], present: &HashSet<[u8; 32]>) -> Vec<u8> {
     let mut bitmap = vec![0u8; requested.len().div_ceil(8)];
     for (i, d) in requested.iter().enumerate() {
         if present.contains(d) {
@@ -246,8 +289,8 @@ impl DirectoryService for DirectoryServiceImpl {
             let mut seen: HashSet<[u8; 32]> = frontier.iter().copied().collect();
             let mut frontier: Vec<[u8; 32]> = seen.iter().copied().collect();
             let mut sent = 0usize;
-            // Like get_path: a stalled client otherwise pins this task
-            // (and the buffered Directory bodies) forever.
+            // A stalled client would pin the buffered Directory bodies;
+            // `drain_with_timeout` is the backstop.
             let walk = async {
                 while !frontier.is_empty() {
                     let mut next: Vec<[u8; 32]> = Vec::new();
@@ -344,17 +387,11 @@ impl DirectoryService for DirectoryServiceImpl {
                 metrics::histogram!("rio_store_directory_get_seconds")
                     .record(started.elapsed().as_secs_f64());
             };
-            if tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, walk)
+            if drain_with_timeout("GetDirectory", &tx, walk)
                 .await
-                .is_err()
+                .is_none()
             {
-                warn!(
-                    timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                    sent, "GetDirectory stream timed out"
-                );
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded("stream timeout")))
-                    .await;
+                warn!(sent, "GetDirectory stream timed out");
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -367,13 +404,13 @@ impl DirectoryService for DirectoryServiceImpl {
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let tenant = self.castore_tenant_id(&request)?;
-        let digests = parse_digests(&request.into_inner().digests)?;
-        metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasDirectories")
-            .record(digests.len() as f64);
-        let present = self.has_in(HasTable::Directories, &digests, tenant).await?;
-        Ok(Response::new(HasBitmap {
-            bitmap: build_bitmap(&digests, &present),
-        }))
+        self.has_response(
+            &request.into_inner().digests,
+            HAS_DIRECTORIES_SQL,
+            "HasDirectories",
+            tenant,
+        )
+        .await
     }
 
     /// Presence bitmap over `file_blobs` × `path_tenants`. The join is
@@ -387,13 +424,13 @@ impl DirectoryService for DirectoryServiceImpl {
     ) -> Result<Response<HasBitmap>, Status> {
         rio_proto::interceptor::link_parent(&request);
         let tenant = self.castore_tenant_id(&request)?;
-        let digests = parse_digests(&request.into_inner().digests)?;
-        metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => "HasBlobs")
-            .record(digests.len() as f64);
-        let present = self.has_in(HasTable::FileBlobs, &digests, tenant).await?;
-        Ok(Response::new(HasBitmap {
-            bitmap: build_bitmap(&digests, &present),
-        }))
+        self.has_response(
+            &request.into_inner().digests,
+            HAS_BLOBS_SQL,
+            "HasBlobs",
+            tenant,
+        )
+        .await
     }
 
     /// Stream a regular file's bytes by `file_digest`.
@@ -466,25 +503,18 @@ impl DirectoryService for DirectoryServiceImpl {
         let (tx, rx) = tokio::sync::mpsc::channel(READ_BLOB_CHANNEL_DEPTH);
         rio_common::task::spawn_monitored("read-blob-stream", async move {
             let stream_fut = stream_blob(&tx, plan, digest);
-            match tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, stream_fut).await {
-                Err(_) => {
-                    warn!(
-                        timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                        file_size = end - nar_offset,
-                        "ReadBlob stream timed out"
-                    );
-                    let _ = tx
-                        .send(Err(Status::deadline_exceeded("stream timeout")))
-                        .await;
+            match drain_with_timeout("ReadBlob", &tx, stream_fut).await {
+                None => {
+                    warn!(file_size = end - nar_offset, "ReadBlob stream timed out");
                 }
                 // Record only on a clean stream so DATA_LOSS and
                 // disconnect timings don't skew the histogram. Same
                 // policy as get_directory and get_path.
-                Ok(true) => {
+                Some(true) => {
                     metrics::histogram!("rio_store_directory_read_seconds")
                         .record(started.elapsed().as_secs_f64());
                 }
-                Ok(false) => {}
+                Some(false) => {}
             }
         });
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -760,36 +790,45 @@ async fn send_piece(tx: &FrameTx, hasher: &mut blake3::Hasher, piece: &[u8]) -> 
     .is_ok()
 }
 
-/// Closed enum of `has_in` join targets. Keeps the table+junction
-/// fragment off the request path so the `format!` inside `has_in` can
-/// never become an injection sink under refactoring.
-#[derive(Clone, Copy)]
-enum HasTable {
-    Directories,
-    FileBlobs,
-}
+/// `HasDirectories` presence query: a directory digest is present iff
+/// at least one tenant-readable store path contains it.
+const HAS_DIRECTORIES_SQL: &str = "SELECT DISTINCT d.digest FROM directories d \
+     JOIN directory_paths dp ON dp.digest = d.digest \
+     JOIN path_tenants t ON t.store_path_hash = dp.store_path_hash \
+     WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2";
 
-impl HasTable {
-    const fn join_clause(self) -> &'static str {
-        match self {
-            Self::Directories => {
-                "directories d \
-                 JOIN directory_paths dp ON dp.digest = d.digest \
-                 JOIN path_tenants t ON t.store_path_hash = dp.store_path_hash"
-            }
-            Self::FileBlobs => {
-                "file_blobs d JOIN path_tenants t ON t.store_path_hash = d.store_path_hash"
-            }
-        }
-    }
-}
+/// `HasBlobs` presence query: same shape over `file_blobs`, whose
+/// junction to `path_tenants` is direct (no `directory_paths` hop).
+const HAS_BLOBS_SQL: &str = "SELECT DISTINCT d.digest FROM file_blobs d \
+     JOIN path_tenants t ON t.store_path_hash = d.store_path_hash \
+     WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2";
 
 impl DirectoryServiceImpl {
+    /// Shared `HasDirectories`/`HasBlobs` body: parse digests → record
+    /// the batch-size histogram → presence query → bitmap. The two RPCs
+    /// differ only in the SQL and the `rpc` metric label.
+    async fn has_response(
+        &self,
+        raw: &[Vec<u8>],
+        sql: &'static str,
+        rpc: &'static str,
+        tenant: uuid::Uuid,
+    ) -> Result<Response<HasBitmap>, Status> {
+        let digests = parse_digests(raw)?;
+        metrics::histogram!("rio_store_directory_has_batch_size", "rpc" => rpc)
+            .record(digests.len() as f64);
+        let present = self.has_in(sql, &digests, tenant).await?;
+        Ok(Response::new(HasBitmap {
+            bitmap: build_bitmap(&digests, &present),
+        }))
+    }
+
     /// `SELECT DISTINCT d.digest FROM <table×junction> WHERE digest =
-    /// ANY($1) AND tenant_id = $2`.
+    /// ANY($1) AND tenant_id = $2` — `sql` is one of
+    /// [`HAS_DIRECTORIES_SQL`] / [`HAS_BLOBS_SQL`].
     async fn has_in(
         &self,
-        table: HasTable,
+        sql: &'static str,
         digests: &[[u8; 32]],
         tenant: uuid::Uuid,
     ) -> Result<HashSet<[u8; 32]>, Status> {
@@ -797,19 +836,12 @@ impl DirectoryServiceImpl {
             return Ok(HashSet::new());
         }
         let slices: Vec<&[u8]> = digests.iter().map(|d| d.as_slice()).collect();
-        // AssertSqlSafe: `from` is a `&'static str` from the closed
-        // `HasTable` enum above — no request-derived data reaches the
-        // format string; the digests and tenant id are bind parameters.
-        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-            "SELECT DISTINCT d.digest FROM {from} \
-             WHERE d.digest = ANY($1::bytea[]) AND t.tenant_id = $2",
-            from = table.join_clause(),
-        )))
-        .bind(&slices)
-        .bind(tenant)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(internal)?;
+        let rows: Vec<(Vec<u8>,)> = sqlx::query_as(sql)
+            .bind(&slices)
+            .bind(tenant)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(internal)?;
         Ok(rows
             .into_iter()
             .filter_map(|(d,)| d.try_into().ok())

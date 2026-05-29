@@ -320,20 +320,28 @@ pub(crate) async fn release_placeholder_in_place(
     Ok(released)
 }
 
-/// Finalize an inline upload: fill real narinfo + store the NAR in
-/// `manifests.inline_blob` + flip status to 'complete'.
+/// Finalize an inline upload: fill real narinfo + store the **blob
+/// stream** (regular-file contents in NAR walk order — NOT the NAR;
+/// the framing is regenerated from the castore index on read) in
+/// `manifests.inline_blob` + flip status to 'complete' + write the
+/// castore index.
 ///
 /// Single transaction: either the path becomes fully visible to
 /// `query_path_info` or it stays a placeholder. No partial-complete state.
-#[instrument(skip(pool, info, nar_data), fields(store_path = %info.store_path.as_str(), nar_size = nar_data.len()))]
+///
+/// `castore` is `None` only in metadata-layer tests that seed
+/// non-NAR placeholder bytes; such paths are not GetPath-servable.
+#[instrument(skip(pool, info, blob_stream, castore), fields(store_path = %info.store_path.as_str(), blob_len = blob_stream.len()))]
 pub(crate) async fn complete_manifest_inline(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
-    nar_data: Bytes,
+    blob_stream: Bytes,
+    castore: Option<&crate::cas::ParsedNar>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, Some(nar_data.as_ref())).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, Some(blob_stream.as_ref()), castore)
+        .await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())

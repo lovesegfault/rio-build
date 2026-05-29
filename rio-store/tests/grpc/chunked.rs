@@ -47,15 +47,18 @@ async fn test_chunked_large_nar_chunks() -> TestResult {
     let created = put_path(&mut s.client, info, nar).await?;
     assert!(created);
 
-    // Chunk backend should have chunks (1 MiB / 64 KiB avg ≈ 16).
+    // Chunk backend should have chunks. Chunks are per-file content
+    // runs (ADR-022 §6) and the fixture's arithmetic byte pattern
+    // produces no content-defined boundaries, so FastCDC cuts every
+    // chunk at CHUNK_MAX: a 1 MiB file is exactly 4 × 256 KiB.
     let chunk_count = backend.len();
     assert!(
         chunk_count > 0,
         "large NAR should reach chunk backend, got {chunk_count} chunks"
     );
     assert!(
-        chunk_count > 4,
-        "1 MiB at 64 KiB avg should be >4 chunks, got {chunk_count}"
+        chunk_count >= 4,
+        "1 MiB of content at 256 KiB CHUNK_MAX is at least 4 chunks, got {chunk_count}"
     );
 
     // inline_blob should be NULL (chunked marker).
@@ -117,7 +120,7 @@ async fn test_chunked_dedup_across_uploads() -> TestResult {
     let (nar_a, info_a, _) = make_large_nar(5, 1024 * 1024);
     put_path(&mut s.client, info_a, nar_a).await?;
     let chunks_after_a = backend.len();
-    assert!(chunks_after_a > 4);
+    assert!(chunks_after_a >= 4);
 
     // Second NAR: same seed = same payload = same chunks.
     // Different store_path (different name arg) so it's a fresh PutPath.
@@ -688,10 +691,11 @@ async fn gt13_batch_chunked_happy_path() -> TestResult {
         "both outputs flipped to status='complete' via complete_manifest_in_conn"
     );
 
-    // Backend received chunks (2× 512 KiB at ~64 KiB avg ≈ 16 chunks).
+    // Backend received chunks: 2 × 512 KiB of boundary-free content
+    // = 2 × 2 chunks at CHUNK_MAX.
     assert!(
-        backend.len() > 4,
-        "chunk backend should hold >4 chunks, got {}",
+        backend.len() >= 4,
+        "chunk backend should hold >=4 chunks, got {}",
         backend.len()
     );
 

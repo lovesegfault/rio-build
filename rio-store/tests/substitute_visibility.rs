@@ -235,7 +235,7 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     // ── C trusts only K2 → NotFound on EVERY tenant-facing read RPC ────
     // r[verify store.api.hash-part+2]
     // r[verify store.api.batch-query+2]
-    // r[verify store.api.batch-manifest+2]
+    // r[verify store.api.batch-manifest+3]
     // r[verify store.substitute.find-missing-gated]
     // Pre-fix: only QueryPathInfo was gated; the other five leaked.
     switch.set(Some(tid_c));
@@ -268,7 +268,6 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
     let err = client
         .get_path(GetPathRequest {
             store_path: path.clone(),
-            manifest_hint: None,
         })
         .await
         .expect_err("GetPath: C doesn't trust K1 → gate-hidden");

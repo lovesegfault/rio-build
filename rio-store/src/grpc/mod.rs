@@ -49,6 +49,7 @@ mod directory;
 mod get_path;
 mod put_path;
 mod put_path_batch;
+mod put_path_chunked;
 mod queries;
 mod sign;
 
@@ -184,6 +185,64 @@ pub(crate) fn putpath_metadata_status(context: &str, e: metadata::MetadataError)
         metrics::counter!("rio_store_putpath_retries_total", "reason" => reason).increment(1);
     }
     metadata_status(context, e)
+}
+
+/// Resolve the caller's tenant from a verified identity: gateway JWT
+/// (`TenantClaims.sub`) first, else the HMAC assignment token's
+/// `tenant` claim parsed as a UUID. `None` when neither carries a
+/// tenant (dev mode, service-token caller) or the claim does not
+/// parse.
+///
+/// This is the ONE mapping from caller identity to tenant, shared by
+/// the castore read side ([`directory::DirectoryServiceImpl`]'s
+/// `castore_tenant_id`) and the upload write side (`PutPathChunked`'s
+/// `path_tenants` junction inserts) — the read queries join
+/// `path_tenants` on exactly the tenant resolved here, so a write side
+/// that resolved the tenant differently (e.g. JWT-only) would commit
+/// paths its own uploader cannot read back.
+// r[impl store.castore.tenant-scope]
+fn resolve_tenant_id(
+    jwt_sub: Option<uuid::Uuid>,
+    hmac_claims: Option<&rio_auth::hmac::AssignmentClaims>,
+) -> Option<uuid::Uuid> {
+    jwt_sub.or_else(|| hmac_claims?.tenant.as_deref()?.parse().ok())
+}
+
+/// Drive a streaming-RPC drain future to completion, bounded by
+/// [`rio_common::grpc::GRPC_STREAM_TIMEOUT`].
+///
+/// Every server-streaming RPC spawns its producer task and hands tonic
+/// the channel receiver. A half-open client otherwise parks that task
+/// on `tx.send()` forever, pinning whatever the producer has buffered —
+/// `tonic_builder()` sets no h2 keepalive, so this stream timeout is
+/// the only backstop. On timeout: warn (RPC name + timeout) and push a
+/// `DEADLINE_EXCEEDED` into the stream for a client that is still
+/// reading.
+///
+/// Returns `Some(output)` when the drain completed within the timeout,
+/// `None` when it timed out — callers layer site-specific logging or
+/// success-path metrics on top.
+pub(super) async fn drain_with_timeout<T, F: Future>(
+    rpc: &'static str,
+    tx: &tokio::sync::mpsc::Sender<Result<T, Status>>,
+    fut: F,
+) -> Option<F::Output> {
+    match tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, fut).await {
+        Ok(out) => Some(out),
+        Err(_) => {
+            tracing::warn!(
+                rpc,
+                timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
+                "stream timed out"
+            );
+            let _ = tx
+                .send(Err(Status::deadline_exceeded(format!(
+                    "{rpc} stream timeout"
+                ))))
+                .await;
+            None
+        }
+    }
 }
 
 /// The StoreService gRPC server.
@@ -570,7 +629,7 @@ impl StoreServiceImpl {
     }
 
     // r[impl store.api.batch-query+2]
-    // r[impl store.api.batch-manifest+2]
+    // r[impl store.api.batch-manifest+3]
     /// Reject gateway-forwarded end-user tenant tokens on the
     /// builder-internal batch RPCs (`BatchQueryPathInfo`,
     /// `BatchGetManifest`). These intentionally skip
@@ -753,6 +812,16 @@ impl StoreService for StoreServiceImpl {
         request: Request<Streaming<PutPathBatchRequest>>,
     ) -> Result<Response<PutPathBatchResponse>, Status> {
         self.put_path_batch_impl(request).await
+    }
+
+    /// ADR-022 §6 chunked output upload. See the `put_path_chunked`
+    /// module for the validate → verify → commit flow.
+    #[instrument(skip(self, request), fields(rpc = "PutPathChunked"))]
+    async fn put_path_chunked(
+        &self,
+        request: Request<Streaming<rio_proto::types::PutPathChunkedRequest>>,
+    ) -> Result<Response<rio_proto::types::PutPathChunkedResponse>, Status> {
+        self.put_path_chunked_impl(request).await
     }
 
     type GetPathStream = get_path::GetPathStream;
@@ -962,11 +1031,12 @@ impl StoreService for StoreServiceImpl {
         Ok(Response::new(()))
     }
 
-    /// PG hit → return; miss → synchronous recompute
-    /// (`r[store.index.sync-on-miss]`, bounded by
-    /// [`crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES`]) write-through.
-    /// `NotFound` if the path has no complete manifest. Builder-internal
-    /// like `BatchGetManifest`: the response carries `file_digest`
+    /// Pure PG read. The index is written atomically with the
+    /// manifest-complete flip (ADR-022 §6) and cannot be recomputed
+    /// from the stored per-file chunks, so a `'complete'` path with no
+    /// index row is `DATA_LOSS`, not a cache miss. `NotFound` if the
+    /// path has no complete manifest. Builder-internal like
+    /// `BatchGetManifest`: the response carries `file_digest`
     /// capability tokens, so end-user tenants are refused.
     // r[impl store.index.rpc]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndex"))]
@@ -976,7 +1046,7 @@ impl StoreService for StoreServiceImpl {
     ) -> Result<Response<rio_proto::types::NarIndex>, Status> {
         self.reject_end_user_tenant(&request, "GetNarIndex")?;
         let nar_hash = parse_nar_hash(&request.into_inner().nar_hash)?;
-        let bytes = self.lookup_or_compute_nar_index(&nar_hash).await?;
+        let bytes = self.lookup_nar_index(&nar_hash).await?;
         let index = crate::nar_index::decode_entries(&bytes)
             .map_err(|e| Status::data_loss(format!("corrupt nar_index row: {e}")))?;
         Ok(Response::new(index))
@@ -985,10 +1055,11 @@ impl StoreService for StoreServiceImpl {
     type GetNarIndexBatchStream =
         tokio_stream::wrappers::ReceiverStream<Result<rio_proto::types::NarIndexResponse, Status>>;
 
-    /// Per-`nar_hash` responses, request order preserved. PG-hit only —
-    /// no sync-on-miss recompute (a wide miss set would block the RPC
-    /// for minutes); `index` absent for misses, `indexer_loop` fills
-    /// them within ~5 s. Builder-internal: end-user tenants refused.
+    /// Per-`nar_hash` responses, request order preserved. `index` is
+    /// absent for unknown or incomplete paths — every complete path
+    /// has its index from the moment it becomes visible (written in
+    /// the same transaction as the status flip). Builder-internal:
+    /// end-user tenants refused.
     // r[impl store.index.rpc]
     #[instrument(skip(self, request), fields(rpc = "GetNarIndexBatch"))]
     async fn get_nar_index_batch(
@@ -1006,9 +1077,8 @@ impl StoreService for StoreServiceImpl {
         }
         let pool = self.pool.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(16);
-        // Like get_path: a half-open client otherwise parks this task
-        // on `tx.send()` forever. The timeout also bounds a max-batch
-        // request (`max_batch_paths` serial PG round trips).
+        // The drain timeout also bounds a max-batch request
+        // (`max_batch_paths` serial PG round trips).
         rio_common::task::spawn_monitored("get-nar-index-batch", async move {
             let drain = async {
                 for raw in req.nar_hashes {
@@ -1046,20 +1116,7 @@ impl StoreService for StoreServiceImpl {
                     }
                 }
             };
-            if tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, drain)
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    timeout = ?rio_common::grpc::GRPC_STREAM_TIMEOUT,
-                    "GetNarIndexBatch stream timed out"
-                );
-                let _ = tx
-                    .send(Err(Status::deadline_exceeded(
-                        "GetNarIndexBatch stream timeout",
-                    )))
-                    .await;
-            }
+            let _ = drain_with_timeout("GetNarIndexBatch", &tx, drain).await;
         });
         Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
             rx,
@@ -1075,9 +1132,13 @@ fn parse_nar_hash(raw: &[u8]) -> Result<[u8; 32], Status> {
 }
 
 impl StoreServiceImpl {
-    /// `nar_index` PG read with sync-on-miss recompute. Shared by
-    /// `GetNarIndex`; the batch RPC takes the PG-hit-only fast path.
-    async fn lookup_or_compute_nar_index(&self, nar_hash: &[u8; 32]) -> Result<Vec<u8>, Status> {
+    /// `nar_index` PG read for `GetNarIndex`. No recompute path: the
+    /// index is written in the same transaction that makes the
+    /// manifest `'complete'`, and the source material for a recompute
+    /// (the NAR byte stream) is not persisted. A complete path with a
+    /// missing row is therefore storage corruption (`DATA_LOSS`), and
+    /// an unknown `nar_hash` is `NOT_FOUND`.
+    async fn lookup_nar_index(&self, nar_hash: &[u8; 32]) -> Result<Vec<u8>, Status> {
         if let Some(b) = metadata::get_nar_index(&self.pool, nar_hash)
             .await
             .map_err(|e| metadata_status("GetNarIndex", e))?
@@ -1089,24 +1150,11 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| metadata_status("GetNarIndex", e))?
             .ok_or_else(|| Status::not_found("no complete manifest for nar_hash"))?;
-        crate::nar_index::compute(
-            &self.pool,
-            self.chunk_cache.as_ref(),
-            &store_path,
-            crate::nar_index::NAR_INDEX_SYNC_MAX_BYTES,
-            Some(&self.nar_bytes_budget),
-        )
-        .await
-        .map_err(|e| {
-            // Over-cap is a deferral, not a failure: the indexer loop
-            // will pick it up; tell the client to retry, not give up.
-            if e.is::<crate::nar_index::OverSyncCap>() {
-                return Status::resource_exhausted(e.to_string());
-            }
-            // Log the cause server-side; don't echo it to the client.
-            error!(store_path, error = %e, "GetNarIndex sync-on-miss compute failed");
-            Status::internal("nar_index compute failed")
-        })
+        error!(store_path, "complete path has no nar_index row");
+        Err(Status::data_loss(format!(
+            "no nar_index row for {store_path}: the index is written with the \
+             complete transaction and cannot be recomputed"
+        )))
     }
 }
 

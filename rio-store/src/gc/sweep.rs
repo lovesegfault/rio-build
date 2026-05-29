@@ -199,24 +199,18 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
     Ok(out)
 }
 
-/// Per-path castore digests, read BEFORE the manifest CASCADE removes
-/// `nar_index`. The batch loop accumulates these so the directory
-/// decrement is one btree-ordered UPDATE (`r[store.chunk.lock-order]`).
-#[derive(Default)]
-struct SweptCastoreRefs {
-    /// Distinct `dir_digest`s referenced by this path's index.
-    dirs: Vec<[u8; 32]>,
-}
-
 /// Delete one swept path's metadata: realisations + path_tenants +
 /// narinfo (CASCADE → manifests/manifest_data). Runs inside the
 /// caller's batch transaction.
 ///
 /// `None` if narinfo was already gone (defensive; shouldn't happen
-/// under FOR UPDATE), else the castore digests its `nar_index`
-/// referenced. Chunk state is not touched at all (chunk GC is the
-/// collect cycle's job) — this only touches the path-keyed tables;
-/// directory refcount handling is the caller's responsibility.
+/// under FOR UPDATE), else the distinct `dir_digest`s its `nar_index`
+/// referenced — read BEFORE the manifest CASCADE removes the row. The
+/// batch loop accumulates these so the directory decrement is one
+/// btree-ordered UPDATE (`r[store.chunk.lock-order]`). Chunk state is
+/// not touched at all (chunk GC is the collect cycle's job) — this
+/// only touches the path-keyed tables; directory refcount handling is
+/// the caller's responsibility.
 // r[impl store.realisation.gc-sweep]
 // r[impl store.gc.sweep-path-tenants+1]
 // r[impl store.gc.evidence-outlives-bytes]
@@ -224,7 +218,7 @@ struct SweptCastoreRefs {
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
-) -> Result<Option<SweptCastoreRefs>, sqlx::Error> {
+) -> Result<Option<Vec<[u8; 32]>>, sqlx::Error> {
     // Round-9 WO-S1-4 (evidence-outlives-bytes, signed Q3): copy the
     // dying registration/identity records into the append-only
     // tombstone tables INSIDE this batch tx, BEFORE the deletes — a
@@ -292,23 +286,23 @@ async fn delete_swept_path(
     // Step 2a'': read castore digests before the CASCADE removes the
     // row. Decode failure logs and leaks one path's refcounts rather
     // than wedging GC.
-    let castore_refs = {
+    let dirs = {
         let entries: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT entries FROM nar_index WHERE store_path_hash = $1")
                 .bind(store_path_hash)
                 .fetch_optional(&mut **tx)
                 .await?;
         match entries.as_deref().map(crate::nar_index::digests_from_index) {
-            Some(Ok(d)) => SweptCastoreRefs { dirs: d.dirs },
+            Some(Ok(dirs)) => dirs,
             Some(Err(e)) => {
                 warn!(
                     store_path_hash = %hex::encode(store_path_hash),
                     error = %e,
                     "nar_index.entries decode failed at GC; directory refcounts leak for this path"
                 );
-                SweptCastoreRefs::default()
+                Vec::new()
             }
-            None => SweptCastoreRefs::default(),
+            None => Vec::new(),
         }
     };
 
@@ -318,7 +312,7 @@ async fn delete_swept_path(
         .bind(store_path_hash)
         .execute(&mut **tx)
         .await?;
-    Ok((deleted.rows_affected() > 0).then_some(castore_refs))
+    Ok((deleted.rows_affected() > 0).then_some(dirs))
 }
 
 /// Decrement `directories.refcount` for the batch's swept paths and
@@ -897,7 +891,7 @@ async fn sweep_one_batch(
             continue;
         }
 
-        let Some(refs) = delete_swept_path(&mut tx, store_path_hash).await? else {
+        let Some(dirs) = delete_swept_path(&mut tx, store_path_hash).await? else {
             // narinfo already gone (concurrent sweep? shouldn't
             // happen under FOR UPDATE).
             continue;
@@ -908,7 +902,7 @@ async fn sweep_one_batch(
         // shadow collect's simulated-sweep input, bug_199).
         swept.push((*store_path_hash).clone());
 
-        for d in refs.dirs {
+        for d in dirs {
             *dir_counts.entry(d).or_default() += 1;
         }
     }
@@ -1041,9 +1035,7 @@ mod tests {
         let mk_dag = |dirs: &[[u8; 32]]| crate::castore::DirectoryDag {
             directories: dirs.iter().map(|d| (*d, b"body".to_vec())).collect(),
             file_blobs: vec![(shared_blob, 0, 8)],
-            root_node: vec![],
-            root_digest: vec![],
-            dir_digests: vec![],
+            ..Default::default()
         };
 
         let mut hashes = Vec::new();
@@ -1063,9 +1055,11 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .unwrap();
-            crate::metadata::set_nar_index(&db.pool, &h, None, &mk_entries(dirs), &mk_dag(dirs))
+            let mut tx = db.pool.begin().await.unwrap();
+            crate::metadata::set_nar_index_in_conn(&mut tx, &h, &mk_entries(dirs), &mk_dag(dirs))
                 .await
                 .unwrap();
+            tx.commit().await.unwrap();
             hashes.push(h_vec);
         }
 

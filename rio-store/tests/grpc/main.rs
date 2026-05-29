@@ -146,6 +146,26 @@ impl StoreSession {
         let s = Self::build(|pool| StoreServiceImpl::new(pool).with_chunk_cache(cache)).await?;
         Ok((s, backend))
     }
+
+    /// Chunk backend AND assignment-token verifier. `PutPathChunked`
+    /// hard-requires a chunk backend, so the HMAC enforcement tests
+    /// for it can't use [`Self::new_with_hmac`] (inline-only).
+    pub async fn new_chunked_with_hmac(
+        key: Vec<u8>,
+    ) -> anyhow::Result<(Self, Arc<MemoryChunkBackend>)> {
+        let backend = mem_backend();
+        let cache = Arc::new(rio_store::cas::ChunkCache::new(
+            Arc::clone(&backend) as Arc<dyn ChunkBackend>
+        ));
+        let verifier = rio_auth::hmac::HmacVerifier::from_key(key);
+        let s = Self::build(|pool| {
+            StoreServiceImpl::new(pool)
+                .with_chunk_cache(cache)
+                .with_hmac_verifier(Arc::new(verifier))
+        })
+        .await?;
+        Ok((s, backend))
+    }
 }
 
 impl Drop for StoreSession {
@@ -251,6 +271,7 @@ mod directory;
 mod hash_part;
 mod hmac;
 mod nar_index;
+mod put_path_chunked;
 mod realisations;
 mod reassembly;
 mod registration;

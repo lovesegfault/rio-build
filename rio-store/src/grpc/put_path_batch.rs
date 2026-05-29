@@ -414,7 +414,11 @@ impl StoreServiceImpl {
     /// degradation visible — alert if sustained nonzero.
     ///
     /// `None` iff signing is disabled entirely.
-    async fn resolve_batch_signer(
+    ///
+    /// Shared with `put_path_chunked` — both RPCs carry a whole
+    /// derivation's outputs under one JWT, so both resolve the signer
+    /// once per stream.
+    pub(super) async fn resolve_batch_signer(
         &self,
         tenant_id: Option<uuid::Uuid>,
     ) -> Option<(crate::signing::Signer, bool)> {
@@ -455,8 +459,48 @@ impl StoreServiceImpl {
             .await
             .map_err(|e| rio_common::grpc::internal("PutPathBatch: begin transaction", e))?;
 
+        // r[impl store.chunk.lock-order]
+        // Batch-wide chunk pre-lock: each completion below flips its
+        // output's chunks `durable` (`mark_manifest_chunks_durable`),
+        // and without one up-front sorted FOR UPDATE over the union the
+        // cross-output lock order would follow output index — an ABBA
+        // window against any concurrent sorted `chunks` writer. The
+        // helper also proves every staged chunk is still claimable
+        // (not GC-swept since phase-2 staging); an unproven chunk means
+        // the object may already be drained, so abort retryably rather
+        // than commit a manifest that lies about S3 presence.
+        let staged_hashes: Vec<Vec<u8>> = outputs
+            .values()
+            .filter(|a| !a.already_complete)
+            .map(|a| a.store_path_hash.clone())
+            .collect();
+        match metadata::lock_staged_chunks_for_commit(&mut tx, &staged_hashes).await {
+            Ok(unproven) if unproven.is_empty() => {}
+            Ok(unproven) => {
+                drop(tx);
+                metrics::counter!("rio_store_putpath_verify_unavailable_total").increment(1);
+                return Err(Status::unavailable(format!(
+                    "PutPathBatch: {} staged chunk(s) were reclaimed by GC during the upload \
+                     (first: {}); retry",
+                    unproven.len(),
+                    hex::encode(&unproven[0]),
+                )));
+            }
+            Err(e) => {
+                drop(tx);
+                return Err(putpath_metadata_status("PutPathBatch: lock chunks", e));
+            }
+        }
+
         let max_idx = *outputs.keys().last().expect("non-empty: checked by caller") as usize;
         let mut created = vec![false; max_idx + 1];
+        // Lock-order dependency: each `complete_manifest_in_conn` below
+        // row-locks its output's chunks (`mark_manifest_chunks_durable`)
+        // in output-index order, which is only deadlock-safe because
+        // `lock_staged_chunks_for_commit` above already holds every one
+        // of those row locks from one sorted FOR UPDATE. Nothing asserts
+        // that wiring — keep the pre-lock as the first statement of this
+        // transaction.
         for (idx, accum) in outputs.iter_mut() {
             if accum.already_complete {
                 continue;
@@ -466,16 +510,21 @@ impl StoreServiceImpl {
             if let Some((signer, was_tenant)) = resolved_signer {
                 self.sign_with_resolved(signer, *was_tenant, &mut info);
             }
-            let inline_blob = match accum.staged.take().expect("staged in phase 2") {
-                NarPersist::Inline(data) => Some(data),
-                NarPersist::ChunkedStaged => None,
+            let (inline_blob, castore) = match accum.staged.take().expect("staged in phase 2") {
+                NarPersist::Inline(data, parsed) => (Some(data), parsed),
+                NarPersist::ChunkedStaged(parsed) => (None, parsed),
             };
             let claim = accum
                 .claim
                 .expect("set in phase-2 for non-already_complete");
-            if let Err(e) =
-                metadata::complete_manifest_in_conn(&mut tx, &info, claim, inline_blob.as_deref())
-                    .await
+            if let Err(e) = metadata::complete_manifest_in_conn(
+                &mut tx,
+                &info,
+                claim,
+                inline_blob.as_deref(),
+                Some(&castore),
+            )
+            .await
             {
                 drop(tx);
                 return Err(putpath_metadata_status(

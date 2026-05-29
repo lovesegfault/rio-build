@@ -2454,6 +2454,11 @@ impl Substituter {
                 .map_err(|e| match e {
                     PersistError::Chunked(e) => SubstituteError::Ingest(e.to_string()),
                     PersistError::Inline(e) => SubstituteError::Ingest(e.to_string()),
+                    // The upstream served bytes that hash to the
+                    // advertised NarHash but aren't a NAR. Treat as an
+                    // upstream data problem, same bucket as a hash
+                    // mismatch.
+                    PersistError::Malformed(e) => SubstituteError::Ingest(format!("{e:#}")),
                 })
             };
             match tokio::time::timeout(tail_envelope.remaining(), tail).await {

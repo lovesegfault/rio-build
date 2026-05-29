@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use rio_proto::types::{
     AddSignaturesRequest, AddSignaturesResponse, BatchGetManifestRequest, BatchGetManifestResponse,
-    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, ChunkRef, FindMissingPathsRequest,
+    BatchQueryPathInfoRequest, BatchQueryPathInfoResponse, FindMissingPathsRequest,
     FindMissingPathsResponse, ManifestEntry, ManifestHint, PathInfo, PathInfoEntry,
     QueryPathFromHashPartRequest, QueryPathInfoRequest, QueryRealisationRequest, Realisation,
     RegisterRealisationRequest, RegisterRealisationResponse, TenantQuotaRequest,
@@ -18,7 +18,7 @@ use rio_proto::types::{
 use rio_common::grpc::StatusExt;
 use rio_common::tenant::NormalizedName;
 
-use crate::metadata::{self, ManifestKind};
+use crate::metadata;
 use crate::realisations;
 
 use super::sign::{self, PathVisible};
@@ -69,16 +69,10 @@ impl StoreServiceImpl {
         &self,
         _builder_internal: EndUserRejected,
         store_paths: &[String],
-    ) -> Result<
-        Vec<(
-            String,
-            Option<(rio_proto::validated::ValidatedPathInfo, ManifestKind)>,
-        )>,
-        Status,
-    > {
-        metadata::get_manifest_batch(&self.pool, store_paths)
+    ) -> Result<Vec<(String, Option<rio_proto::validated::ValidatedPathInfo>)>, Status> {
+        metadata::query_path_info_batch(&self.pool, store_paths)
             .await
-            .map_err(|e| metadata_status("BatchGetManifest: get_manifest_batch", e))
+            .map_err(|e| metadata_status("BatchGetManifest: query_path_info_batch", e))
     }
 
     /// The realisation write step: a [`ServiceCallerOk`] witness is
@@ -202,12 +196,12 @@ impl StoreServiceImpl {
         Ok(Response::new(BatchQueryPathInfoResponse { entries }))
     }
 
-    /// Batch (PathInfo, manifest) lookup for many paths in ≤2 PG round-trips.
+    /// Batch PathInfo lookup for many paths in one PG round-trip.
     ///
-    /// I-110c: builder FUSE-warm prefetch. Local-only — same caveats as
-    /// `batch_query_path_info` (no upstream substitution, no
-    /// sig-visibility gate; end-user tenant tokens rejected).
-    // r[impl store.api.batch-manifest+2]
+    /// Local-only — same caveats as `batch_query_path_info` (no
+    /// upstream substitution, no sig-visibility gate; end-user tenant
+    /// tokens rejected).
+    // r[impl store.api.batch-manifest+3]
     pub(super) async fn batch_get_manifest_impl(
         &self,
         request: Request<BatchGetManifestRequest>,
@@ -222,26 +216,14 @@ impl StoreServiceImpl {
             .builder_internal_manifest_batch(builder_internal, &req.store_paths)
             .await?
             .into_iter()
-            .map(|(store_path, found)| {
-                let hint = found.map(|(info, kind)| {
-                    let (chunks, inline_blob) = match kind {
-                        ManifestKind::Inline(b) => (Vec::new(), b.to_vec()),
-                        ManifestKind::Chunked(entries) => (
-                            entries
-                                .into_iter()
-                                .map(|(hash, size)| ChunkRef {
-                                    hash: hash.to_vec(),
-                                    size,
-                                })
-                                .collect(),
-                            Vec::new(),
-                        ),
-                    };
-                    ManifestHint {
-                        info: Some(info.into()),
-                        chunks,
-                        inline_blob,
-                    }
+            .map(|(store_path, info)| {
+                // ADR-022 §6: PathInfo only — manifest content is
+                // never returned (chunks are per-file content runs;
+                // the NAR framing lives in the Directory DAG). Clients
+                // that want the NAR call GetPath, which regenerates
+                // the framing server-side.
+                let hint = info.map(|info| ManifestHint {
+                    info: Some(info.into()),
                 });
                 ManifestEntry { store_path, hint }
             })

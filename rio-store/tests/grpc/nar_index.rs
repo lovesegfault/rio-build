@@ -37,28 +37,21 @@ fn make_dir_nar(name: &str, payload: &[u8]) -> (Vec<u8>, [u8; 32], String) {
 }
 
 /// PutPath a multi-entry NAR → `GetNarIndex` returns all entries with
-/// `file_digest` populated for regular files only. Second call is a
-/// cache hit (no recompute) — verified structurally via the
-/// `manifests.nar_indexed` flag flipping after the first call.
+/// `file_digest` populated for regular files only. The index is
+/// written eagerly in the manifest-complete transaction (ADR-022 §6 /
+/// P0557) — it cannot be recomputed from blob-aligned chunks later —
+/// so the RPC is a pure PG read.
 // r[verify store.index.rpc]
-// r[verify store.index.sync-on-miss]
 #[tokio::test]
-async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
+async fn get_nar_index_returns_eagerly_written_index() -> TestResult {
     let mut s = StoreSession::new().await?;
     let (nar, nar_hash, path) = make_dir_nar("nar-index-rt", b"hello nar index");
     let info = make_path_info(&path, &nar, nar_hash);
     put_path(&mut s.client, info, nar).await?;
 
-    // Pre-condition: PutPath does NOT eagerly index (P0557 not landed).
-    let indexed: bool = sqlx::query_scalar("SELECT nar_indexed FROM manifests LIMIT 1")
-        .fetch_one(&s.db.pool)
-        .await?;
-    assert!(
-        !indexed,
-        "PutPath should leave the path unindexed (eager = P0557)"
-    );
-
-    // Sync-on-miss: first call recomputes and write-throughs.
+    // First call: PG hit (no recompute path exists for indexed paths).
+    // The eager-write DB-state assertions live in
+    // `put_path_writes_castore_index_atomically`.
     let idx = s
         .client
         .get_nar_index(GetNarIndexRequest {
@@ -90,19 +83,6 @@ async fn get_nar_index_sync_on_miss_then_cache_hit() -> TestResult {
     let c = by_name[b"c".as_slice()];
     assert!(c.executable);
     assert_eq!(c.file_digest, blake3::hash(b"executable").as_bytes());
-
-    // Write-through: nar_index row exists, manifest flagged.
-    let indexed: bool = sqlx::query_scalar("SELECT nar_indexed FROM manifests LIMIT 1")
-        .fetch_one(&s.db.pool)
-        .await?;
-    assert!(
-        indexed,
-        "sync-on-miss should write-through and flip nar_indexed"
-    );
-    let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_index")
-        .fetch_one(&s.db.pool)
-        .await?;
-    assert_eq!(rows, 1);
 
     // Second call: PG hit, identical result.
     let idx2 = s
@@ -141,9 +121,9 @@ async fn get_nar_index_not_found_and_bad_arg() -> TestResult {
     Ok(())
 }
 
-/// `GetNarIndexBatch`: hit + miss in request order. PG-hit-only — no
-/// sync-on-miss — so a path with no `nar_index` row returns
-/// `index = None`, not a recompute.
+/// `GetNarIndexBatch`: hit + miss in request order. A `nar_hash` the
+/// store has no complete path for returns `index = None` in its slot;
+/// the hit is unaffected by the neighboring miss.
 // r[verify store.index.rpc]
 #[tokio::test]
 async fn get_nar_index_batch_order_and_misses() -> TestResult {
@@ -207,27 +187,72 @@ async fn get_nar_index_batch_rejects_oversized() -> TestResult {
     Ok(())
 }
 
+/// The complete transaction writes the whole castore index — nar_index
+/// + directories + directory_paths + file_blobs — atomically with the
+/// status flip, and file_blobs carries BLOB-stream offsets (the file's
+/// position in the concatenation of regular-file contents in walk
+/// order), not NAR offsets. A `'complete'` path therefore always has
+/// the rows GetPath's framing regeneration and ReadBlob/StatBlob's
+/// window math depend on.
+// r[verify store.index.authoritative]
 #[tokio::test]
-async fn compute_rejects_over_sync_cap() -> TestResult {
-    use rio_store::nar_index::{OverSyncCap, compute};
-
+async fn put_path_writes_castore_index_atomically() -> TestResult {
     let mut s = StoreSession::new().await?;
-    let (nar, nar_hash, path) = make_dir_nar("nar-index-cap", b"x");
-    let total = nar.len() as u64;
+    // dir { a (15-byte regular), b (symlink), c (10-byte regular) }.
+    let (nar, nar_hash, path) = make_dir_nar("nar-index-eager", b"hello nar index");
     let info = make_path_info(&path, &nar, nar_hash);
     put_path(&mut s.client, info, nar).await?;
 
-    // 1 byte over the cap → OverSyncCap.
-    let err = compute(&s.db.pool, None, &path, total - 1, None)
-        .await
-        .unwrap_err();
-    assert!(err.is::<OverSyncCap>(), "{err}");
+    let status: String = sqlx::query_scalar("SELECT status::text FROM manifests LIMIT 1")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(status, "complete");
 
-    // Exactly at the cap → allowed (`>`, not `>=`).
-    let r = compute(&s.db.pool, None, &path, total, None).await;
+    let nar_index_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM nar_index")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(nar_index_rows, 1, "nar_index written in the complete tx");
+    let root_node: Option<Vec<u8>> = sqlx::query_scalar("SELECT root_node FROM nar_index LIMIT 1")
+        .fetch_one(&s.db.pool)
+        .await?;
     assert!(
-        r.as_ref().err().is_none_or(|e| !e.is::<OverSyncCap>()),
-        "{r:?}"
+        root_node.is_some_and(|r| !r.is_empty()),
+        "root_node populated"
     );
+
+    // One distinct directory body (the root dir), refcount 1, junction
+    // row present.
+    let dirs: i64 = sqlx::query_scalar("SELECT count(*) FROM directories")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(dirs, 1, "one distinct Directory body");
+    let junctions: i64 = sqlx::query_scalar("SELECT count(*) FROM directory_paths")
+        .fetch_one(&s.db.pool)
+        .await?;
+    assert_eq!(junctions, 1);
+
+    // file_blobs: two regular files at BLOB offsets 0 and 15 (a's
+    // contents are 15 bytes; c starts where a ends — no NAR framing in
+    // between).
+    let blobs: Vec<(Vec<u8>, i64, i64)> =
+        sqlx::query_as("SELECT digest, nar_offset, size FROM file_blobs ORDER BY nar_offset")
+            .fetch_all(&s.db.pool)
+            .await?;
+    assert_eq!(blobs.len(), 2, "two distinct regular files");
+    assert_eq!(
+        (blobs[0].1, blobs[0].2),
+        (0, 15),
+        "first file at blob offset 0"
+    );
+    assert_eq!(
+        (blobs[1].1, blobs[1].2),
+        (15, 10),
+        "second file immediately after the first in the blob stream"
+    );
+    assert_eq!(
+        blobs[0].0,
+        blake3::hash(b"hello nar index").as_bytes().to_vec()
+    );
+    assert_eq!(blobs[1].0, blake3::hash(b"executable").as_bytes().to_vec());
     Ok(())
 }

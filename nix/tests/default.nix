@@ -68,6 +68,7 @@ let
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
+  mountd = import ./scenarios/mountd.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
   # SLA-sizing fixture: one worker with RIO_BUILDER_SCRIPT pointing at
@@ -477,6 +478,23 @@ in
   #   plant battery is misc-checks `quota-volume-select`.
   vm-ami-variant-quota = import ./scenarios/ami-variant-quota.nix { inherit pkgs; };
 
+  # ── rio-mountd (P0567): the privileged broker, end-to-end ───────────
+  # The real rio-mountd binary against an XFS-prjquota staging loopback,
+  # driven over the SOCK_SEQPACKET protocol by spike_mountd_client.
+  # Subtest map and why perf is printed-not-gated: the scenario header.
+  # r[verify builder.mountd.fuse-handoff]
+  # r[verify builder.mountd.backing-broker]
+  # r[verify builder.mountd.concurrency]
+  # r[verify builder.mountd.build-id-validated]
+  # r[verify builder.mountd.uid-bound]
+  # r[verify builder.mountd.build-id-unique]
+  # r[verify builder.mountd.one-mount]
+  # r[verify builder.mountd.staging-quota]
+  # r[verify builder.mountd.promote-verified]
+  # r[verify builder.mountd.promote-bounded-copy]
+  # r[verify builder.mountd.orphan-scan]
+  vm-mountd = mountd { inherit pkgs common; };
+
   # r[verify gw.conn.exit-status+3]
   #   nom-exit subtest: client ssh_config has ControlMaster auto +
   #   ControlPersist 600. `timeout 60 nom build` must exit 0 (gateway
@@ -621,7 +639,7 @@ in
   #   sigs in narinfo.signatures.
   # r[verify store.substitute.tenant-sig-visibility+2]
   # r[verify store.substitute.find-missing-gated]
-  # r[verify store.api.batch-manifest+2]
+  # r[verify store.api.batch-manifest+3]
   #   substitute-cross-tenant-gate: tenant C (untrusted key) → the
   #   typed FailedPrecondition refusal via QueryPathInfo/GetPath
   #   (merged_bug_005: C's own upstream serves the narinfo but C's
@@ -815,7 +833,6 @@ in
           "overlay-readdir"
           # r[verify builder.fuse.canonical-metadata+2]
           "canonical-meta"
-          # r[verify store.inline.threshold]
           # r[verify obs.metric.transfer-volume]
           "chunks"
           "cgroup"
