@@ -169,7 +169,23 @@ impl DrvArchive {
             "narinfo for {store_path} has a non-relative NAR URL {:?}",
             info.url
         );
-        let nar_file = self.dir.join(&info.url);
+        // The lexical check above is only the cheap early error: a symlink
+        // planted inside the archive can still redirect the joined path
+        // elsewhere, so resolve both sides and require containment before
+        // opening the payload.
+        let root = self
+            .dir
+            .canonicalize()
+            .with_context(|| format!("canonicalize drv archive dir {}", self.dir.display()))?;
+        let nar_file = root
+            .join(&info.url)
+            .canonicalize()
+            .with_context(|| format!("resolve NAR URL {:?} for {store_path}", info.url))?;
+        ensure!(
+            nar_file.starts_with(&root),
+            "narinfo for {store_path} has a NAR URL {:?} that escapes the archive root",
+            info.url
+        );
         let bytes = std::fs::read(&nar_file)
             .with_context(|| format!("read NAR payload {} for {store_path}", nar_file.display()))?;
         ensure!(
@@ -419,6 +435,38 @@ mod tests {
         let err = entry_err(&archive, A_DRV);
         assert!(
             err.contains("Compression") && err.contains("zstd"),
+            "got: {err}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn entry_rejects_nar_urls_that_escape_the_archive_root() -> anyhow::Result<()> {
+        let (tmp, layout, _a_nar, _b_nar) = two_path_layout();
+        // A payload OUTSIDE the archive root, reachable from inside it via a
+        // symlink: the lexical URL checks cannot see this — only the
+        // post-resolution containment check can. The narinfo itself is
+        // well-formed (correct NarSize/NarHash for the outside payload) so
+        // the rejection is purely about escaping the root.
+        let outside = tmp.path().join("outside-payload");
+        std::fs::write(&outside, b"not part of the archive").unwrap();
+        std::os::unix::fs::symlink(&outside, layout.join("nar").join("evil.nar")).unwrap();
+
+        let evil_drv = "/nix/store/ffffffffffffffffffffffffffffffff-evil.drv";
+        let hash_part = StorePath::parse(evil_drv).unwrap().hash_part();
+        let payload = std::fs::read(&outside).unwrap();
+        let narinfo = format!(
+            "StorePath: {evil_drv}\nURL: nar/evil.nar\nCompression: none\n\
+             NarHash: sha256:{}\nNarSize: {}\nReferences:\n",
+            nixbase32::encode(&Sha256::digest(&payload)),
+            payload.len()
+        );
+        std::fs::write(layout.join(format!("{hash_part}.narinfo")), narinfo).unwrap();
+
+        let archive = DrvArchive::open(&layout)?;
+        let err = entry_err(&archive, evil_drv);
+        assert!(
+            err.contains("escapes the archive root") && err.contains(evil_drv),
             "got: {err}"
         );
         Ok(())
