@@ -841,6 +841,11 @@
       "doc": "Maps the recorder's truth sources — cache.nixos.org narinfo presence"
     },
     {
+      "path": "evalset/package.rs",
+      "depth": 1,
+      "doc": "Stages the eval pipeline's outputs as a v1 replay archive."
+    },
+    {
       "path": "evalset/recipe.rs",
       "depth": 1,
       "doc": "Hydra-faithful eval recipe."
