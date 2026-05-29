@@ -1272,6 +1272,7 @@ async fn test_silent_tcp_connection_is_reaped() -> anyhow::Result<()> {
 }
 
 // r[verify gw.conn.exit-status+3]
+// r[verify gw.conn.force-close]
 /// bug_004: a peer that sends its SSH banner, never completes the key
 /// exchange, and keeps sending small transport packets (`SSH_MSG_IGNORE`)
 /// is the worst pre-auth squatter: russh only drains server-queued
@@ -1509,6 +1510,7 @@ async fn spawn_socket_holding_proxy(
 }
 
 // r[verify gw.conn.exit-status+3]
+// r[verify gw.conn.force-close]
 /// The post-auth squatter: an authenticated, exec-less peer that simply
 /// never closes its socket after the empty-connection grace disconnect.
 /// russh queues the `SSH_MSG_DISCONNECT`, half-closes its write side, and
@@ -1702,6 +1704,7 @@ async fn spawn_ssh_server_with_tenant_auth(
 }
 
 // r[verify gw.conn.exit-status+3]
+// r[verify gw.conn.force-close]
 /// Authentication that completes only AFTER the auth-timeout disconnect was
 /// queued, from a peer that then ignores that disconnect and holds its
 /// socket open. Auth processing (key check + ResolveTenant) can straddle

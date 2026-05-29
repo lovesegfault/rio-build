@@ -1288,6 +1288,63 @@ backstop only for connections the gateway has not (yet) decided to
 disconnect, and `TCP_USER_TIMEOUT` as the equally-sized backstop for a
 peer that wedges the transport itself by refusing to read.
 
+#r("gw.conn.force-close")[
+  Every decision that a connection must go away MUST arm a transport-level
+  force-close deadline at the decision point itself, at most
+  `FORCE_CLOSE_SLACK` (5 s) in the future. The covered decisions are the
+  polite disconnects (authentication timeout, empty-connection grace
+  expiry) and the wedged-transport conclusions (a response send or
+  close-out that exhausted its #rref("gw.conn.send-deadline") budget).
+  Arming MUST keep the earliest deadline already armed --- a repeat
+  decision can only tighten the bound --- and the deadline MUST never be
+  disarmed. Once the armed deadline has passed, every subsequent read or
+  write poll of that connection's transport MUST fail, and a read or
+  write that parked while the deadline was already pending MUST be woken
+  and failed when it arrives, so the SSH session loop (or its
+  post-disconnect drain loop) ends and the connection's permit, fd,
+  gauges, and tasks release through the normal drop paths with no further
+  cooperation from the peer.
+]
+
+Decide-then-enforce is the load-bearing shape: the polite
+`SSH_MSG_DISCONNECT` rides the per-connection russh handle queue, which the
+peer can park (a key exchange held open) or ignore (never closing its
+socket), and an authentication that completes after the auth-timeout
+disconnect was queued escapes the pre-auth deadline's reach --- so the
+decision itself must fix the kill instant rather than relying on the
+disconnect being delivered or on a later poll happening to re-check. Two
+scope notes keep the rule honest about what the in-process wrapper can do:
+`poll_shutdown` is never gated (tearing the connection down is never itself
+blocked by a deadline), and a force-close armed only *after* a write has
+already parked cannot be enforced in-process (nothing re-polls a parked
+write) --- the kernel-level `TCP_USER_TIMEOUT` set at accept (\~300 s,
+aligned with the keepalive bound) is the backstop for exactly that case.
+
+#r("gw.conn.send-deadline")[
+  Every per-session response-data send and the end-of-session close-out
+  (`exit-status`/`eof`/`close`) MUST be bounded by the write-path budget
+  `HANDLE_SEND_TIMEOUT` (300 s) --- a budget sized so that congestion
+  alone cannot exhaust it. A send still pending when its budget expires
+  MUST be treated as a wedged transport, not a slow one: the session's
+  capacity MUST be released no later than that point (release never waits
+  on the peer taking further output), a close-out still pending is
+  abandoned, and the connection's force-close MUST be armed per
+  #rref("gw.conn.force-close") rather than waiting any longer on the
+  peer.
+]
+
+The budget exists because both things a send legitimately waits on are
+peer-paced --- the shared per-connection handle queue (drained only between
+key exchanges) and the client-granted SSH channel window --- so without a
+bound a peer that stops taking output pins the session's permit, gauge slot,
+buffers, and tasks until the pod restarts, and the empty-connection grace
+never steps in because the wedged session itself keeps the live-session
+count positive. 300 s matches the keepalive and `TCP_USER_TIMEOUT` tolerance
+for an unresponsive peer: a client that is actually draining, however
+slowly, clears a 32 KiB chunk with orders of magnitude to spare, so expiry
+is evidence the peer has stopped taking output entirely, and the response is
+connection-level (the force-close arm), not merely session-level.
+
 #r("gw.conn.session-error-visible")[
   Any error propagated from an SSH handler method (via `?`) is logged at
   `error!` and increments #(refs.metric)("rio_gateway_errors_total")`{type="session"}`. The russh

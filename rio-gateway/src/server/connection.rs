@@ -235,6 +235,7 @@ impl EmptyConnectionTimer {
                 // with zero further cooperation from the peer. Arming
                 // before the send also keeps this task bounded if the
                 // handle queue itself is parked full.
+                // r[impl gw.conn.force-close]
                 timer.force_close.arm_within(super::FORCE_CLOSE_SLACK);
                 // Err = the connection already ended for another
                 // reason — nothing left to disconnect.
@@ -340,6 +341,7 @@ impl Drop for SessionGuard {
     }
 }
 
+// r[impl gw.conn.send-deadline]
 /// How long the gateway waits for the SSH client to take a single send —
 /// a response-data chunk in [`pump_session_responses`] (sent through the
 /// channel's window-aware write half), or the end-of-session close-out
@@ -429,6 +431,7 @@ async fn finish_channel_session(
             warn!(channel = ?channel_id, error = ?e, "failed to close SSH channel");
         }
     };
+    // r[impl gw.conn.send-deadline]
     if tokio::time::timeout(close_out_timeout, close_out)
         .await
         .is_err()
@@ -445,6 +448,7 @@ async fn finish_channel_session(
         // deadline end the connection without any further cooperation
         // from the peer, instead of leaving a transport that can no
         // longer deliver anything to keep wedging future sessions.
+        // r[impl gw.conn.force-close]
         force_close.arm_within(super::FORCE_CLOSE_SLACK);
     }
     // Reap the pump rather than wait for it: the session is over (on the
@@ -565,6 +569,7 @@ async fn pump_session_responses(
             Ok(n) => {
                 metrics::counter!("rio_gateway_bytes_total", "direction" => "tx")
                     .increment(n as u64);
+                // r[impl gw.conn.send-deadline]
                 match tokio::time::timeout(send_timeout, sink.send(buf[..n].to_vec())).await {
                     Ok(Ok(())) => {}
                     Ok(Err(())) => {
@@ -590,6 +595,7 @@ async fn pump_session_responses(
                         );
                         metrics::counter!("rio_gateway_errors_total", "type" => "ssh_send_stall")
                             .increment(1);
+                        // r[impl gw.conn.force-close]
                         force_close.arm_within(super::FORCE_CLOSE_SLACK);
                         break;
                     }
@@ -2000,6 +2006,7 @@ mod tests {
     }
 
     // r[verify gw.conn.exit-status+3]
+    // r[verify gw.conn.send-deadline]
     /// The close-out sends themselves MUST be bounded: with the handle
     /// queue parked full, `finish_channel_session` gives up after its
     /// close-out timeout instead of parking the response task forever
@@ -2050,6 +2057,8 @@ mod tests {
     }
 
     // r[verify gw.conn.session-cap+2]
+    // r[verify gw.conn.send-deadline]
+    // r[verify gw.conn.force-close]
     /// A peer that parks the handle queue must not be able to pin session
     /// capacity through the response pump: each send is bounded by
     /// [`HANDLE_SEND_TIMEOUT`], and when that bound expires the
@@ -2148,6 +2157,8 @@ mod tests {
     }
 
     // r[verify gw.conn.session-cap+2]
+    // r[verify gw.conn.send-deadline]
+    // r[verify gw.conn.force-close]
     /// A client that keeps the transport healthy but never grants channel
     /// window must not be able to pin session capacity through the
     /// response pump: the data send parks on the never-granted window, and
@@ -2224,6 +2235,8 @@ mod tests {
     }
 
     // r[verify gw.conn.exit-status+3]
+    // r[verify gw.conn.send-deadline]
+    // r[verify gw.conn.force-close]
     /// The close-out budget must tolerate congestion and only condemn the
     /// transport once it is exhausted. A session ending is normal on a
     /// healthy multiplexed connection (one build of many finishing while

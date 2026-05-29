@@ -619,6 +619,7 @@ impl GatewayServer {
                                 "connection did not authenticate within the deadline; \
                                  disconnecting"
                             );
+                            // r[impl gw.conn.force-close]
                             force_close.arm_within(FORCE_CLOSE_SLACK);
                             let _ = session
                                 .handle()
@@ -639,6 +640,7 @@ impl GatewayServer {
     }
 }
 
+// r[impl gw.conn.force-close]
 /// Transport force-close deadline for one connection, shared between the
 /// [`ConnDeadline`] stream wrapper (which enforces it) and every site that
 /// decides the connection must go away (which arms it). Created in
@@ -714,6 +716,7 @@ impl ForceClose {
 }
 
 // r[impl gw.conn.exit-status+3]
+// r[impl gw.conn.force-close]
 /// Transport wrapper that enforces the gateway's deadlines at the stream
 /// level, on both the read and the write path — the only lever that works
 /// without the peer's cooperation. russh 0.61 only drains handle messages
@@ -1231,6 +1234,7 @@ mod conn_cap_tests {
 }
 
 // r[verify gw.conn.exit-status+3]
+// r[verify gw.conn.force-close]
 #[cfg(test)]
 mod conn_deadline_tests {
     use super::*;
