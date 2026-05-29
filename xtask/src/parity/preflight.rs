@@ -1,16 +1,13 @@
 //! Launch pre-flight checks for the nixpkgs-parity campaign.
 //!
 //! Verifies the deployed rio-gateway/rio-scheduler image tags, the
-//! gateway build-policy entries for the campaign tenants, the per-mode
-//! tenant upstream sets, and probes the scheduler AdminService for the
-//! `QueryDerivationStatuses` RPC the engine prefers for narinfo-presence
-//! checks. Pure helpers are split from the I/O so they unit-test
-//! without a cluster; the cluster-reading halves run at launch time
-//! (operator step), never in CI.
+//! gateway build-policy entries for the campaign tenants, and the
+//! per-mode tenant upstream sets. Pure helpers are split from the I/O
+//! so they unit-test without a cluster; the cluster-reading halves run
+//! at launch time (operator step), never in CI.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::apps::v1::Deployment;
@@ -146,77 +143,6 @@ pub async fn read_build_policy(client: &kclient::Client) -> Result<Option<String
     kclient::get_configmap_key(client, crate::k8s::NS, "rio-gateway-config", "gateway.toml").await
 }
 
-/// Whether a gRPC status is consistent with the method existing on the
-/// server. `Unimplemented` is the only "definitely absent" answer;
-/// anything else (InvalidArgument, Unauthenticated, PermissionDenied, …)
-/// means the method was routed. Statuses the client transport can also
-/// produce on its own mid-call (Unavailable, Cancelled, an Internal
-/// from a broken stream, …) are conservatively classified as "present"
-/// — the pre-flight only refuses on positive proof of absence.
-pub fn method_present_from(code: tonic::Code) -> bool {
-    code != tonic::Code::Unimplemented
-}
-
-/// Probe deadlines: a wedged scheduler port-forward (the socket accepts
-/// but the backend never answers) must fail the pre-flight in seconds,
-/// not hang it. The connect budget bounds the TCP connect; connect plus
-/// call is the overall budget for handshake + RPC.
-const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-const PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// Probe the scheduler AdminService for the `QueryDerivationStatuses`
-/// RPC without depending on its (not-yet-generated) message types: send
-/// an empty unary request to the full method path and classify the
-/// status. `sched_addr` is `host:port` of a port-forwarded scheduler.
-pub async fn probe_query_derivation_statuses(sched_addr: &str) -> Result<bool> {
-    probe_query_derivation_statuses_with(sched_addr, PROBE_CONNECT_TIMEOUT, PROBE_CALL_TIMEOUT)
-        .await
-}
-
-/// [`probe_query_derivation_statuses`] with explicit deadlines (the
-/// unit test uses short ones against a deliberately wedged listener).
-///
-/// The endpoint's connect timeout bounds the TCP connect; the overall
-/// `tokio::time::timeout` additionally bounds the HTTP/2 handshake and
-/// the RPC itself. A blown deadline is an error ("could not determine"),
-/// NOT fed through [`method_present_from`] — a wedged port-forward must
-/// surface as a pre-flight failure, not pass as "present".
-async fn probe_query_derivation_statuses_with(
-    sched_addr: &str,
-    connect_timeout: Duration,
-    call_timeout: Duration,
-) -> Result<bool> {
-    let endpoint = tonic::transport::Channel::from_shared(format!("http://{sched_addr}"))
-        .context("scheduler address")?
-        .connect_timeout(connect_timeout);
-    let overall = connect_timeout + call_timeout;
-    let probe = async {
-        let channel = endpoint
-            .connect()
-            .await
-            .with_context(|| format!("connect to scheduler at {sched_addr}"))?;
-        let mut grpc = tonic::client::Grpc::new(channel);
-        grpc.ready().await.context("grpc ready")?;
-        // () is a prost::Message that encodes to zero bytes — good enough to
-        // make the server route (and then reject) the call.
-        let codec: tonic_prost::ProstCodec<(), ()> = tonic_prost::ProstCodec::default();
-        let path =
-            http::uri::PathAndQuery::from_static("/rio.admin.AdminService/QueryDerivationStatuses");
-        match grpc.unary(tonic::Request::new(()), path, codec).await {
-            Ok(_) => Ok(true),
-            Err(status) => Ok(method_present_from(status.code())),
-        }
-    };
-    tokio::time::timeout(overall, probe)
-        .await
-        .with_context(|| {
-            format!(
-                "QueryDerivationStatuses probe to {sched_addr} did not finish within {overall:?} — \
-             is the scheduler port-forward wedged?"
-            )
-        })?
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -305,54 +231,5 @@ force_build_roots = false
         for needle in ["rio-scheduler", "abc123", "def456", "--deploy-parity"] {
             assert!(err.contains(needle), "{err}");
         }
-    }
-
-    #[test]
-    fn unimplemented_means_absent_everything_else_means_present() {
-        assert!(!method_present_from(tonic::Code::Unimplemented));
-        for present in [
-            tonic::Code::InvalidArgument,
-            tonic::Code::Unauthenticated,
-            tonic::Code::PermissionDenied,
-            tonic::Code::Internal,
-            tonic::Code::Ok,
-            // Client-transport statuses (mid-call timeouts, dropped
-            // connections) are conservatively "present" — only a routed
-            // Unimplemented proves absence.
-            tonic::Code::Unavailable,
-            tonic::Code::Cancelled,
-            tonic::Code::DeadlineExceeded,
-        ] {
-            assert!(method_present_from(present), "{present:?}");
-        }
-    }
-
-    #[tokio::test]
-    async fn probe_times_out_against_a_wedged_listener() {
-        // Simulate a wedged port-forward: the socket accepts connections
-        // but never speaks HTTP/2. The probe must fail within its
-        // deadlines instead of hanging the pre-flight.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let _hold = tokio::spawn(async move {
-            let mut held = Vec::new();
-            while let Ok((sock, _)) = listener.accept().await {
-                held.push(sock); // keep the connection open, say nothing
-            }
-        });
-        let started = std::time::Instant::now();
-        let err = probe_query_derivation_statuses_with(
-            &addr,
-            Duration::from_millis(200),
-            Duration::from_millis(200),
-        )
-        .await
-        .unwrap_err();
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "probe took {:?}",
-            started.elapsed()
-        );
-        assert!(format!("{err:#}").contains(&addr), "{err:#}");
     }
 }

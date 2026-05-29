@@ -72,11 +72,6 @@ pub struct LaunchArgs {
     /// and the run is low-confidence).
     #[arg(long)]
     pub allow_version_skew: bool,
-    /// Fail if the QueryDerivationStatuses AdminService RPC is absent
-    /// (its absence is otherwise only a warning; collect falls back to
-    /// GetBuildGraph under the 4,500-node batch cap).
-    #[arg(long)]
-    pub require_qds: bool,
     /// Rollout-restart the gateway after merging the campaign tenant
     /// keys instead of waiting ~70s for the authorized_keys hot reload.
     #[arg(long)]
@@ -812,10 +807,10 @@ fn derive_openssh_public_key_line(private_key_pem: &str) -> Result<String> {
 }
 
 /// Launch pre-flight: deployed gateway/scheduler image tags vs this tree,
-/// gateway build-policy entries for the campaign tenants, per-tenant
-/// upstream sets, and the QueryDerivationStatuses probe. Runs ALL checks
-/// and reports every failure at once — a red pre-flight should hand the
-/// operator the complete fix list, not its first item.
+/// gateway build-policy entries for the campaign tenants, and per-tenant
+/// upstream sets. Runs ALL checks and reports every failure at once — a
+/// red pre-flight should hand the operator the complete fix list, not its
+/// first item.
 async fn preflight_checks(
     client: &kclient::Client,
     cli: &CliCtx,
@@ -891,25 +886,6 @@ async fn preflight_checks(
         }
     }
 
-    // 4. QueryDerivationStatuses presence: warning unless --require-qds,
-    //    in which case both "absent" and "could not determine" refuse.
-    match preflight::probe_query_derivation_statuses(&cli.sched_addr()).await {
-        Ok(true) => tracing::info!("AdminService.QueryDerivationStatuses: present"),
-        Ok(false) if a.require_qds => failures.push(
-            "AdminService.QueryDerivationStatuses is not implemented on the deployed scheduler \
-             (required by --require-qds; deploy that RPC first or drop the flag)"
-                .to_string(),
-        ),
-        Ok(false) => tracing::warn!(
-            "AdminService.QueryDerivationStatuses not implemented — collect falls back to \
-             GetBuildGraph under the 4,500-node batch cap"
-        ),
-        Err(e) if a.require_qds => failures.push(format!(
-            "QueryDerivationStatuses probe failed: {e:#} (presence required by --require-qds)"
-        )),
-        Err(e) => tracing::warn!("QueryDerivationStatuses probe failed ({e:#}); continuing"),
-    }
-
     if !failures.is_empty() {
         let list = failures
             .iter()
@@ -951,7 +927,6 @@ mod tests {
             limit: Some(50),
             engine_args: vec![],
             allow_version_skew: false,
-            require_qds: false,
             restart_gateway: false,
             skip_preflight: false,
             log_level: "info".into(),

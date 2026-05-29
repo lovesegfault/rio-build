@@ -115,13 +115,6 @@ impl CliCtx {
             sh::try_read(cmd!(sh, "cargo run -q -p rio-cli -- {args...}"))
         }
     }
-
-    /// `host:port` of the port-forwarded scheduler — used by the parity
-    /// pre-flight to issue raw gRPC probes on the same tunnel rio-cli
-    /// uses.
-    pub fn sched_addr(&self) -> String {
-        format!("localhost:{}", self.sched)
-    }
 }
 
 /// Minimal self-contained derivation (busybox FOD + raw derivation).
