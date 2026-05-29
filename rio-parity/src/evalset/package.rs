@@ -275,34 +275,84 @@ fn json_kind(value: &serde_json::Value) -> &'static str {
     }
 }
 
-/// Probe the `mkdwarfs` version string for the archive provenance: the
-/// first line of `mkdwarfs --version`, trimmed. The packer itself is
-/// [`crate::archive::writer::pack_with_mkdwarfs`]; this only records
-/// which tool produced the published image.
+/// Probe the `mkdwarfs` version string for the archive provenance. The
+/// packer itself is [`crate::archive::writer::pack_with_mkdwarfs`]; this
+/// only records which tool produced the published image.
+///
+/// `mkdwarfs --version` is tried first, but dwarfs 0.14.x rejects the
+/// flag (exit 1, "unrecognised option"), so the probe falls back to the
+/// `--help` output, whose banner carries the same `mkdwarfs (vX.Y.Z)`
+/// line a few rows below the ASCII-art header. Only when neither output
+/// contains that banner line does the probe error.
 pub async fn mkdwarfs_version() -> anyhow::Result<String> {
-    let out = tokio::process::Command::new("mkdwarfs")
-        .arg("--version")
+    // Non-UTF-8 probe output is treated as carrying no banner line (empty
+    // text) rather than as an error: the fallback below and the final bail
+    // already cover "nothing usable came out".
+    let version_out = run_mkdwarfs(&["--version"]).await?;
+    let version_stdout = std::str::from_utf8(&version_out.stdout).unwrap_or_default();
+    if let Some(version) = version_out
+        .status
+        .success()
+        .then(|| parse_mkdwarfs_version_banner(version_stdout))
+        .flatten()
+    {
+        return Ok(version);
+    }
+
+    let help_out = run_mkdwarfs(&["--help"]).await?;
+    let help_stdout = std::str::from_utf8(&help_out.stdout).unwrap_or_default();
+    let help_stderr = std::str::from_utf8(&help_out.stderr).unwrap_or_default();
+    if let Some(version) = parse_mkdwarfs_version_banner(help_stdout)
+        .or_else(|| parse_mkdwarfs_version_banner(help_stderr))
+    {
+        return Ok(version);
+    }
+
+    let help_text = if help_stdout.trim().is_empty() {
+        help_stderr
+    } else {
+        help_stdout
+    };
+    anyhow::bail!(
+        "could not determine the mkdwarfs version: `mkdwarfs --version` exited {} ({}) and the \
+         `mkdwarfs --help` output (exit {}) carries no `mkdwarfs (...)` banner line: {}",
+        version_out.status,
+        crate::body_snippet(
+            std::str::from_utf8(&version_out.stderr).unwrap_or("<non-utf8 stderr>")
+        ),
+        help_out.status,
+        crate::body_snippet(help_text),
+    );
+}
+
+/// Run `mkdwarfs` with `args` and capture its output. Used only by the
+/// version probe; packing goes through the archive writer's packer.
+async fn run_mkdwarfs(args: &[&str]) -> anyhow::Result<std::process::Output> {
+    tokio::process::Command::new("mkdwarfs")
+        .args(args)
         // Cancelling the caller drops this future; kill_on_drop keeps that
         // from orphaning a still-running mkdwarfs process.
         .kill_on_drop(true)
         .output()
         .await
-        .context("spawn mkdwarfs --version (is the dwarfs package in the environment?)")?;
-    anyhow::ensure!(
-        out.status.success(),
-        "mkdwarfs --version failed ({}): {}",
-        out.status,
-        crate::body_snippet(std::str::from_utf8(&out.stderr).unwrap_or("<non-utf8 stderr>")),
-    );
-    let version = std::str::from_utf8(&out.stdout)
-        .context("mkdwarfs --version stdout is not UTF-8")?
+        .with_context(|| {
+            format!(
+                "spawn mkdwarfs {} (is the dwarfs package in the environment?)",
+                args.join(" ")
+            )
+        })
+}
+
+/// Pick the version line out of `mkdwarfs` output: the first line that
+/// starts with `mkdwarfs (`, trimmed. Releases that support `--version`
+/// print it as the first output line; 0.14.x only prints it inside the
+/// `--help` banner, below the ASCII-art header.
+fn parse_mkdwarfs_version_banner(output: &str) -> Option<String> {
+    output
         .lines()
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    anyhow::ensure!(!version.is_empty(), "mkdwarfs --version printed nothing");
-    Ok(version)
+        .map(str::trim)
+        .find(|line| line.starts_with("mkdwarfs ("))
+        .map(str::to_string)
 }
 
 #[cfg(test)]
@@ -676,5 +726,38 @@ mod tests {
         );
         assert!(err.contains(DEP_DRV), "got: {err}");
         assert!(err.contains("local store"), "got: {err}");
+    }
+
+    #[test]
+    fn mkdwarfs_version_banner_parses_both_output_shapes() {
+        // Releases that support `--version` print the version as the first
+        // output line.
+        assert_eq!(
+            parse_mkdwarfs_version_banner("mkdwarfs (v0.12.4)\nbuilt for x86_64 Linux\n"),
+            Some("mkdwarfs (v0.12.4)".to_string())
+        );
+        // dwarfs 0.14.0 rejects `--version`; its `--help` banner carries the
+        // version line below the ASCII-art header.
+        let help_banner = r#"     ___                  ___ ___
+    |   \__ __ ____ _ _ _| __/ __|         Deduplicating Warp-speed
+    | |) \ V  V / _` | '_| _|\__ \      Advanced Read-only File System
+    |___/ \_/\_/\__,_|_| |_| |___/         by Marcus Holland-Moritz
+
+mkdwarfs (v0.14.0)
+built for x86_64 Linux using GNU 15.2.0
+
+Usage: mkdwarfs [OPTIONS...]
+"#;
+        assert_eq!(
+            parse_mkdwarfs_version_banner(help_banner),
+            Some("mkdwarfs (v0.14.0)".to_string())
+        );
+        // Output with no banner line at all (the 0.14.0 `--version` error)
+        // yields nothing instead of a fabricated version.
+        assert_eq!(
+            parse_mkdwarfs_version_banner("error: unrecognised option '--version'\n"),
+            None
+        );
+        assert_eq!(parse_mkdwarfs_version_banner(""), None);
     }
 }
