@@ -966,8 +966,8 @@ impl DagActor {
     ///  - `handle_substitute_complete` on a failed/downgraded detached
     ///    fetch (`SubstituteComplete{ok=false}` after the
     ///    closure-evidence gate), the original home of this block;
-    ///  - the dispatch-time probes (`batch_probe_cached_ready`,
-    ///    `ready_check_or_spawn`) when a marked node with Broken
+    ///  - the dispatch-time probe (`batch_probe_cached_ready`) when a
+    ///    marked node with Broken
     ///    evidence can neither complete inline nor be routed to
     ///    substitution — the post-failover shape, where the recovered
     ///    (wider) wanted union contains an output that is genuinely

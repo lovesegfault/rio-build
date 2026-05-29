@@ -1874,8 +1874,8 @@ impl DagActor {
     /// doomed (the worker ENOENTs on inputDrvs that were never merged).
     ///
     /// This is the single predicate behind the dispatch-time carve-out
-    /// and fail-fast arms (`try_dispatch_one`,
-    /// `batch_probe_cached_ready`, `ready_check_or_spawn`), the
+    /// and fail-fast arms (`batch_probe_cached_ready`, the
+    /// pull-admission refusal in `admit_pull`), the
     /// downgrade re-spawn key in `handle_substitute_complete`, and the
     /// reap-hook fail-fast in `handle_cleanup_terminal_build` — a
     /// closure-holed survivor is treated exactly like a childless node
