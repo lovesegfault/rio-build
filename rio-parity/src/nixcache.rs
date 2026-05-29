@@ -6,6 +6,7 @@
 //! concurrency politely.
 
 use std::collections::{BTreeMap, HashSet};
+use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::Context as _;
 use futures_util::StreamExt;
@@ -115,6 +116,60 @@ impl NixCacheClient {
             }
         }
     }
+}
+
+/// Validate a substituter URL taken from a replay archive's manifest
+/// (the `substituters.target` / `substituters.relay` lists) before the
+/// campaign engine points a [`NixCacheClient`] at it for live narinfo
+/// probing.
+///
+/// The archive is external input, so the substituter it nominates must not
+/// be able to steer the engine's HTTP client at internal endpoints. A URL is
+/// accepted only if it parses, its scheme is exactly `https`, and — when the
+/// host is an IP literal — the address is not loopback, link-local
+/// (169.254.0.0/16, fe80::/10), or RFC 1918 private space (10.0.0.0/8,
+/// 172.16.0.0/12, 192.168.0.0/16). IPv4-mapped IPv6 literals are unwrapped
+/// so `[::ffff:10.0.0.1]` cannot bypass the IPv4 ranges. The check is purely
+/// syntactic: hostnames are never resolved, so a DNS name that happens to
+/// resolve to a private address is out of scope here.
+pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(url).with_context(|| {
+        format!(
+            "archive substituter {url:?} is not a valid URL; refusing to probe narinfos from it"
+        )
+    })?;
+    anyhow::ensure!(
+        parsed.scheme() == "https",
+        "archive substituter {url:?} uses scheme {:?}: archive substituters used for live \
+         narinfo probing must be public HTTPS caches",
+        parsed.scheme()
+    );
+    let host = parsed
+        .host_str()
+        .with_context(|| format!("archive substituter {url:?} has no host"))?;
+    // IP-literal screening only (no DNS resolution). `host_str` keeps the
+    // square brackets around IPv6 literals, so strip them before parsing;
+    // anything that does not parse as an address is a hostname and passes.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if let Ok(ip) = bare.parse::<IpAddr>() {
+        let private_v4 = |v4: Ipv4Addr| v4.is_loopback() || v4.is_link_local() || v4.is_private();
+        let private = match ip {
+            IpAddr::V4(v4) => private_v4(v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => private_v4(v4),
+                None => v6.is_loopback() || v6.is_unicast_link_local(),
+            },
+        };
+        anyhow::ensure!(
+            !private,
+            "archive substituter {url:?} points at the non-public address {ip}: archive \
+             substituters used for live narinfo probing must be public HTTPS caches"
+        );
+    }
+    Ok(())
 }
 
 /// Upstream narinfo facts for one store path, as collected by
@@ -312,6 +367,47 @@ mod tests {
         );
         assert!(narhash_to_hex("sha256:short").is_err());
         assert!(narhash_to_hex("md5:abcd").is_err());
+    }
+
+    #[test]
+    fn probe_substituter_validation_accepts_public_https_caches() {
+        validate_probe_substituter("https://cache.nixos.org").unwrap();
+        // Path/query suffixes (Nix substituters often carry ?priority=N) and
+        // public IP literals are fine — only the scheme and address class
+        // are screened.
+        validate_probe_substituter("https://cache.example.org/prefix?priority=10").unwrap();
+        validate_probe_substituter("https://151.101.65.55").unwrap();
+    }
+
+    #[test]
+    fn probe_substituter_validation_rejects_non_https_and_non_public_hosts() {
+        let rejected = [
+            // Wrong scheme: the probe only ever talks HTTPS.
+            "http://cache.nixos.org",
+            "s3://nix-cache-bucket",
+            "file:///var/lib/nix-cache",
+            // Loopback, link-local, and RFC 1918 IP literals (including the
+            // IPv4-mapped IPv6 spelling of a private address).
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://169.254.169.254/latest/meta-data",
+            "https://[fe80::1]",
+            "https://10.0.0.1",
+            "https://172.16.0.1:8443",
+            "https://192.168.1.5",
+            "https://[::ffff:10.0.0.1]",
+            // Not a URL at all.
+            "not-a-url",
+        ];
+        for url in rejected {
+            let err = validate_probe_substituter(url)
+                .expect_err(&format!("{url} must be rejected as a probe substituter"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("archive substituter") && msg.contains(url),
+                "error for {url} must name the archive-substituter origin and the URL: {msg}"
+            );
+        }
     }
 
     /// Loopback fake binary cache: serves one canned narinfo (for the

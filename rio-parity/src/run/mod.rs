@@ -252,6 +252,12 @@ pub async fn run(args: RunArgs) -> Result<()> {
         .context(
             "archive lists no substituters; cannot probe upstream coverage for the warm stage",
         )?;
+    // The substituter list is archive-supplied input: refuse to point the
+    // live narinfo probe at anything but a public HTTPS cache (no
+    // http/s3/file schemes, no loopback/link-local/private IP literals)
+    // before any client is constructed, so a hostile or misbuilt archive
+    // fails here instead of driving requests at internal endpoints.
+    crate::nixcache::validate_probe_substituter(&probe_substituter)?;
     let backends = Backends {
         store: Arc::new(GrpcStoreApi::new(
             spec.cluster.store_addr.clone(),
