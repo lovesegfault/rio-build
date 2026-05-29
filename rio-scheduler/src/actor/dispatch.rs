@@ -1044,6 +1044,7 @@ impl DagActor {
             // reap-truncated survivor set from vouching) or full-merges
             // (children all produced ⇒ cleared).
             s.topdown_pruned = false;
+            // r[impl sched.evidence.closure-hole]
             // Deliberately do NOT clear `closure_hole`: the directed
             // resubmit this fail-fast solicits goes through the
             // resubmit-reset, which keeps the (possibly truncated)

@@ -732,6 +732,7 @@ impl DagActor {
         // delayed cleanup timer posts it via `self_tx` after lease loss).
         // The new leader's recovery owns these survivors.
         if self.leader.is_leader() {
+            // r[impl sched.evidence.closure-hole]
             // Persist the closure-hole breadcrumbs this reap just set
             // (`migrations/064`), before the per-parent verdict loop. A
             // survivor that loop immediately fail-fasts KEEPS the hole —

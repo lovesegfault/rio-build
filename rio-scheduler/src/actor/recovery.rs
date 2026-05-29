@@ -495,6 +495,7 @@ impl DagActor {
         }
 
         // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.evidence.closure-hole]
         // Closure-hole stamp for the edges this load dropped to
         // UN-PRODUCED terminal children (`poisoned`/`dependency_failed`/
         // `cancelled`): the recovery-side analogue of the reap, which

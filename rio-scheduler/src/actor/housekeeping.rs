@@ -379,6 +379,7 @@ impl DagActor {
             // Remove (not reset) — same rationale as handle_clear_poison.
             self.dag.remove_node(&drv_hash);
         }
+        // r[impl sched.evidence.closure-hole]
         // Stamp the surviving parents (skipping any that were themselves
         // removed above): in memory first, then one best-effort PG write.
         holed_parents.sort();

@@ -2554,6 +2554,7 @@ impl DagActor {
         // even after the node (and its `failed_count` contribution) is gone.
         //
         // r[impl sched.merge.substitute-topdown+10]
+        // r[impl sched.evidence.closure-hole]
         // Capture the parents BEFORE `remove_node` scrubs the edge maps:
         // a Poisoned child is by definition un-produced, so removing it
         // truncates each surviving parent's child set relative to the

@@ -560,6 +560,7 @@ impl DerivationDag {
                 // resubmitter's own entry authoritative. The closure-hole
                 // breadcrumb rides along too — the kept edges were not
                 // re-declared by this reset (see the carry site above).
+                // r[impl sched.evidence.closure-hole]
                 if let Some((
                     prior_interest,
                     prior_cycles,
@@ -1339,6 +1340,7 @@ impl DerivationDag {
         // exist) so only true survivors are reported.
         surviving_parents.retain(|p| self.nodes.contains_key(p));
         holed_parents.retain(|p| self.nodes.contains_key(p));
+        // r[impl sched.evidence.closure-hole]
         // Breadcrumb the survivors whose reaped children include an
         // un-produced one: their child set is no longer representative of
         // their input closure (see `DerivationState::closure_hole`).

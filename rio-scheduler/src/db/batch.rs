@@ -345,6 +345,7 @@ impl SchedulerDb {
     /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
     /// warns and continues — the in-memory clear already happened and
     /// the merge outcome must not depend on this write.
+    // r[impl sched.evidence.closure-hole]
     pub(crate) async fn clear_topdown_pruned_by_hashes(
         &self,
         drv_hashes: &[String],
@@ -390,6 +391,7 @@ impl SchedulerDb {
     /// Callers treat an error as warn-and-continue — the in-memory
     /// clear already happened and the build verdict must not depend on
     /// this write.
+    // r[impl sched.evidence.closure-hole]
     pub(crate) async fn clear_topdown_pruned_by_hash(
         &self,
         drv_hash: &str,
@@ -429,6 +431,7 @@ impl SchedulerDb {
     /// continues on error — losing the write costs durability of the
     /// breadcrumb across a failover (the already-accepted best-effort
     /// window), never this tenure's correctness.
+    // r[impl sched.evidence.closure-hole]
     pub(crate) async fn set_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],
@@ -460,6 +463,7 @@ impl SchedulerDb {
     /// actually cleared. The caller warns and continues on error — a
     /// stale persisted hole errs toward the bounded fail-fast after a
     /// later failover, never the doomed from-source dispatch.
+    // r[impl sched.evidence.closure-hole]
     pub(crate) async fn clear_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],

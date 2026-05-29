@@ -2921,6 +2921,7 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
 /// so the column flip pins the heal + persistence round-trip, not the
 /// restore; the direct post-recovery assert is what catches a restore
 /// regression.
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrumb() -> TestResult {
     let f = RecoveryFixture::run(async |handle, pool| {
@@ -3552,6 +3553,7 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
 /// from-source-dispatchable Ready (assigned as soon as worker capacity
 /// frees) and B1 stayed Active instead of failing with the
 /// resubmit-directing error.
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_terminal_child()
 -> TestResult {

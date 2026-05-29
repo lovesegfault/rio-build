@@ -1161,6 +1161,41 @@ can be GC'd before the failover, and without the durable breadcrumb the
 surviving produced siblings would launder the clear and re-arm exactly that
 doomed dispatch.
 
+#r("sched.evidence.closure-hole")[
+  The `closure_hole` breadcrumb records that an un-produced child was removed
+  out from under a surviving parent, leaving that parent's remaining child set
+  a truncated view of its pruned input closure. Every production removal of an
+  un-produced child from a surviving parent MUST set the breadcrumb on that
+  parent --- in memory at the removal site and best-effort in PG: the
+  terminal-build reap, the admin poison clear, the poison-TTL sweep, and the
+  recovery-time drop of an edge to an un-produced terminal child. A node
+  carrying the breadcrumb MUST classify as Broken closure evidence
+  (#rref("sched.merge.substitute-topdown")): its child set MUST NOT vouch for
+  a from-source dispatch, exempt it from the `topdown_pruned` stamp, or
+  launder a mark clear, however many of its surviving children are produced.
+  The breadcrumb MUST be persisted OR-on-conflict alongside the mark
+  (migration 064), restored at leader-failover recovery, carried across a
+  resubmit-reset of the node, and retained across the node's own completion.
+  It MUST be cleared only by the merge-time heal --- a full merge that
+  re-declares the node's edges, applied to every edge parent of that
+  submission regardless of the in-memory bit --- or together with the mark by
+  the Vouched-keyed both-bits clear, whose statement also mops up a markless
+  leftover persisted hole; the mark-only clears (the fail-fast consume and the
+  lazy walk-failure clear) MUST retain it. The removal sites do not filter on
+  `topdown_pruned`: the breadcrumb MAY be set on unmarked parents, where it
+  MUST stay inert for dispatch decisions (every consumer also requires the
+  mark) and only withholds the stamp-time Vouched exemption from a later
+  pruned merge of that node.
+]
+The breadcrumb exists because the produced survivors of a truncated child set
+look exactly like a vouched closure to every children-keyed judgment; the
+fail-fast retains it so the directed resubmit it solicits re-stamps the node
+instead of reading those survivors as Vouched (the resubmit-reset keeps the
+truncated edges and carries the breadcrumb with them), and the heal is total
+--- not keyed on the in-memory bit --- because the persisted copy can be stale
+relative to a reaped-and-reinserted or recovered-as-stub in-memory node whose
+field sits at its `false` default.
+
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream

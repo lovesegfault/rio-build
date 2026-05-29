@@ -180,6 +180,7 @@ impl DagActor {
         // earlier heal's best-effort write may simply have failed. The
         // helper's `AND closure_hole` WHERE keeps the statement a
         // no-op for rows that never carried the hole.
+        // r[impl sched.evidence.closure-hole]
         for hash in &ingest.edge_parent_hashes {
             if let Some(s) = self.dag.node_mut(hash) {
                 s.closure_hole = false;

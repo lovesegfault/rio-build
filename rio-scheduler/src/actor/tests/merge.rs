@@ -3775,6 +3775,7 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
 /// mark AND breadcrumb), and the next dispatch pass cut a doomed
 /// from-source assignment. The fail-fast consumes the mark only; the
 /// hole survives for the directed resubmit — see bug_006/round-23.
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -4069,6 +4070,7 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
 /// worker from source even though its pruned closure was never merged.
 /// That closing fail-fast consumes the mark only; the hole survives for
 /// the directed resubmit — see bug_006/round-23.
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -4372,6 +4374,7 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
 /// re-stamp, and the second walk failure took the generic revert to
 /// Ready — handing R to a worker from source even though its pruned
 /// closure was never merged.
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -4672,6 +4675,7 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
 /// child set read as Vouched at the walk failure, the lazy clear
 /// dropped the mark, and R reverted to Ready — the doomed from-source
 /// dispatch of a node whose pruned closure was never merged.
+// r[verify sched.evidence.closure-hole]
 #[rstest::rstest]
 #[case::admin_clear(false)]
 #[case::ttl_expiry(true)]
@@ -4949,6 +4953,7 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
 /// merge, and the next failover restores it as permanently-Broken
 /// closure evidence (wrongful resubmit-directing fail-fast for a node
 /// whose closure was in fact fully re-merged).
+// r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_full_remerge_heals_persisted_closure_hole_after_node_completion() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
