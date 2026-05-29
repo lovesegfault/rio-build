@@ -276,7 +276,7 @@ fn build_campaign_spec(
         },
         cluster: ClusterEndpoints {
             gateway_store_url: gateway_store_url(mode.expected_build_tenant()),
-            warm_store_url: matches!(a.mode, Mode::Leaf).then(|| gateway_store_url(TENANT_WARM)),
+            ssh_key_dir: Some(PathBuf::from(jobs::SSH_KEY_MOUNT_DIR)),
             scheduler_addr: scheduler_addr(),
             store_addr: store_addr(),
             service_hmac_key_path: hmac_present.then(|| PathBuf::from(jobs::HMAC_KEY_MOUNT_PATH)),
@@ -1268,10 +1268,8 @@ mod tests {
             "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-leaf"
         );
         assert_eq!(
-            parsed.cluster.warm_store_url.as_deref(),
-            Some(
-                "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-warm"
-            )
+            parsed.cluster.ssh_key_dir.as_deref(),
+            Some(std::path::Path::new("/etc/rio/parity-ssh"))
         );
         assert_eq!(
             parsed.cluster.scheduler_addr,
@@ -1310,7 +1308,8 @@ mod tests {
 
     #[test]
     fn self_hosted_or_skipped_preflight_spec_shape() {
-        // Self-hosted: no warm store URL, the self-hosted build tenant.
+        // Self-hosted: the self-hosted build tenant, same per-tenant SSH key
+        // directory as leaf (the field is mode-independent).
         // hmac_present=false and no pre-flight outcome (--skip-preflight):
         // tokenless Admin reads, tenants recorded as unverified, no
         // cluster_versions claim.
@@ -1331,7 +1330,10 @@ mod tests {
             spec.cluster.gateway_store_url,
             gateway_store_url("parity-selfhosted")
         );
-        assert!(spec.cluster.warm_store_url.is_none());
+        assert_eq!(
+            spec.cluster.ssh_key_dir.as_deref(),
+            Some(std::path::Path::new("/etc/rio/parity-ssh"))
+        );
         assert!(spec.cluster.service_hmac_key_path.is_none());
         assert!(!spec.tenants.upstreams_verified);
         assert_eq!(spec.tenants.upstreams_verified_at, None);
