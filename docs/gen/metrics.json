@@ -655,7 +655,7 @@
       {
         "name": "rio_mountd_promote_reject_total",
         "kind": "counter",
-        "help": "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/other)"
+        "help": "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/backlog/other)"
       },
       {
         "name": "rio_mountd_request_seconds",

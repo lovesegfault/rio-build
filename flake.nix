@@ -225,6 +225,18 @@
                 cargo = rustNightly;
               };
 
+              # Vendored workspace deps for the derivations that bypass
+              # crate2nix and drive cargo directly (deny, hakari-drift,
+              # mutants). Git dependencies need an explicit NAR hash here;
+              # crate2nix gets the same hash from crate-hashes.json. Update
+              # both when bumping the fuser pin in Cargo.toml.
+              workspaceCargoVendor = rustPlatformStable.importCargoLock {
+                lockFile = ./Cargo.lock;
+                outputHashes = {
+                  "fuser-0.17.0" = "sha256-iBSHT73HH6KpqMUtAvbpJcGQNeR3ss8RYajGq08NNl4=";
+                };
+              };
+
               # Source root for filesets
               unfilteredRoot = ./.;
 
@@ -513,6 +525,7 @@
                   stubTargetFiles
                   rustStable
                   rustPlatformStable
+                  workspaceCargoVendor
                   traceyPkg
                   subcharts
                   dockerImages
@@ -700,6 +713,7 @@
                     stubTargetFiles
                     rustStable
                     rustPlatformStable
+                    workspaceCargoVendor
                     sysCrateEnv
                     goldenTestEnv
                     ;

@@ -290,7 +290,7 @@ impl ChunkService for ChunkServiceImpl {
     /// answer is not tenant-scoped — chunk dedup is global by design,
     /// and that cross-tenant presence disclosure to *authenticated
     /// builders* is an accepted trade-off — but the caller must prove
-    /// an identity (see [`Self::require_caller_identity`]).
+    /// an identity (see `Self::require_caller_identity`).
     // r[impl store.chunk.has-chunks-durable]
     #[instrument(skip(self, request), fields(rpc = "HasChunks"))]
     async fn has_chunks(
