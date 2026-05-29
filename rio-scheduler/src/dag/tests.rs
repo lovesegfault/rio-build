@@ -103,6 +103,13 @@ fn test_merge_unions_wanted_outputs_on_existing_node() -> anyhow::Result<()> {
     let mut a = make_node("hashWA", "x86_64-linux");
     a.wanted_output_names = vec!["out".into()];
     dag.merge(Uuid::new_v4(), &[a.clone()], &[], "")?;
+    // The resident parent must be edge-admissible under the
+    // creation-scoped edge rule (sched.merge.edge-creation-scoped) for
+    // the joining submission's hashWA→hashWB edge to land at all (a
+    // foreign-parent edge would be skipped, no cycle would form, and
+    // the merge would succeed) — same staging as
+    // test_cycle_via_new_edge_between_existing_nodes.
+    dag.nodes.get_mut("hashWA").unwrap().topdown_pruned = true;
     let mut b = make_node("hashWB", "x86_64-linux");
     b.wanted_output_names = vec![];
     a.wanted_output_names = vec!["dev".into()];

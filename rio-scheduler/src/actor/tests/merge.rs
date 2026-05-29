@@ -3145,35 +3145,14 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
         n
     };
 
-    // BC: full merge R → D. D's output is already present upstream, so
+    // B2: full merge app → R → {D, E}. B2 CREATES R (so R's full child
+    // set, including the never-built E, is declared by R's creating
+    // submission — under sched.merge.edge-creation-scoped a later join
+    // could not extend it). D's output is already present upstream, so
     // it cache-hits to Completed at merge; R's output is neither
     // present nor substitutable yet, so no prune fires and R carries no
-    // mark. BC keeps R and D alive across B2's reap below.
+    // mark. E (unbuilt) and app are B2's sole interest.
     store.seed_with_content(&d_out, b"d-out");
-    let bc = Uuid::new_v4();
-    let _evc = merge_dag(
-        &handle,
-        bc,
-        vec![mk_r(), mk_d()],
-        vec![make_test_edge("tdsh-r", "tdsh-d")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-    assert!(
-        matches!(
-            expect_drv(&handle, "tdsh-d").await.status,
-            DerivationStatus::Completed | DerivationStatus::Skipped
-        ),
-        "fixture premise: D is produced at BC's merge"
-    );
-    assert!(
-        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
-        "fixture premise: no prune has fired for R yet"
-    );
-
-    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
-    // sole interest.
     let mut app = make_node("tdsh-app");
     app.expected_output_paths = vec![test_store_path("tdsh-app-out")];
     let b2 = Uuid::new_v4();
@@ -3190,6 +3169,31 @@ async fn test_topdown_stamp_fires_for_closure_holed_node_with_produced_survivors
     )
     .await?;
     barrier(&handle).await;
+
+    // BC: later full merge of R → D only — joins the resident R and D
+    // (duplicate edge is a no-op) and keeps them alive across B2's reap
+    // below.
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdsh-r", "tdsh-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdsh-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced before the reap"
+    );
+    assert!(
+        !expect_drv(&handle, "tdsh-r").await.topdown_pruned,
+        "fixture premise: no prune has fired for R yet"
+    );
 
     // Cancel B2 and reap its sole-interest nodes: E — never produced —
     // is reaped out from under R (closure hole), app goes with it; D
@@ -6011,7 +6015,19 @@ async fn test_topdown_pruned_root_dep_topup_production_order() -> TestResult {
         DerivationStatus::Queued,
         "R falls through to Queued behind its (incomplete) new dependency"
     );
-    assert!(!post.topdown_pruned, "flag cleared once R gained children");
+    // The mark itself is RETAINED while the topped-up children are
+    // still unbuilt: the closure classifier only lets the mark go once
+    // the children are produced (completion-time
+    // `clear_topdown_pruned_for_produced_parents`, or the
+    // post-reconciliation pass once Vouched) — an unbuilt top-up keeps
+    // the guard in place in case those children are reaped unbuilt.
+    // The protections this test cares about are asserted above: no
+    // fail-fast fired (closure evidence is Pending, not Broken), and R
+    // proceeds bottom-up behind its new dependency.
+    assert!(
+        post.topdown_pruned,
+        "mark retained while the topped-up children are unbuilt (cleared only once produced)"
+    );
     Ok(())
 }
 
