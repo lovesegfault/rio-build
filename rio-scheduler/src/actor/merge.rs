@@ -706,21 +706,6 @@ impl DagActor {
                 |e| error!(build_id = %build_id, error = %e, "merge DB persistence failed; rolling back"),
             )?;
 
-        // In-memory Pending→Active, strictly after the commit
-        // (sched.db.tx-commit-before-mutate). Always a valid transition
-        // for a fresh Pending build; debug_assert rather than branch
-        // (a rejection here would be a BuildInfo::transition bug, not a
-        // recoverable error). No events or metrics fire on Active, so
-        // this is exactly what `transition_build` did minus the separate
-        // pool-based DB write that used to race the committed merge.
-        if let Some(build) = self.builds.get_mut(&build_id) {
-            let outcome = build.transition(BuildState::Active);
-            debug_assert!(
-                outcome.is_ok(),
-                "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
-            );
-        }
-
         // I-169: PG-side poison clear for nodes that were reset by the
         // resubmit-retry path (Poisoned/Cancelled/Failed/DependencyFailed
         // → fresh state in `dag.merge`). `batch_upsert_derivations`' ON
