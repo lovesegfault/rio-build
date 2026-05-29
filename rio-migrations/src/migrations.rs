@@ -1104,9 +1104,17 @@ pub const M_063: () = ();
 /// in-memory only, justified by "PG still holds the un-produced child's
 /// terminal row" — but the orphan-terminal GC
 /// (`gc_orphan_terminal_derivations`) deletes exactly that row and its
-/// edges, after which a leader failover saw only the produced
-/// survivors, cleared the restored mark, and re-armed the doomed
-/// from-source dispatch the mark exists to prevent.
+/// edges once nothing links it, after which a leader failover would see
+/// only the produced survivors, clear the restored mark, and re-arm the
+/// doomed from-source dispatch the mark exists to prevent. That erasure
+/// is narrower than this paragraph originally implied: the GC skips any
+/// row still carrying a `build_derivations` link, links are removed
+/// only when a builds row is deleted, and the only in-tree deleter of
+/// builds rows is the failed-merge rollback — so the laundering shape
+/// additionally requires an external/manual builds-row purge before the
+/// next recovery (which otherwise re-derives the hole from the child's
+/// still-present row). The breadcrumb closes the shape regardless of
+/// how the row disappears.
 ///
 /// Written `true` **best-effort** by the leader-gated survivor hook in
 /// `actor/build.rs::handle_cleanup_terminal_build` (the in-memory hole
@@ -1144,7 +1152,11 @@ pub const M_063: () = ();
 /// mark those sites clear); the singular `clear_topdown_pruned_by_hash`
 /// (the lazy walk-failure clear and the fail-fast consume) is
 /// mark-only, so the fail-fast retains the breadcrumb for the directed
-/// resubmit it solicits. Restored by `from_recovery_row`
+/// resubmit it solicits. The frozen `.sql` header still lists "when the
+/// fail-fast consumes the mark" among the clears — that wording is
+/// historical (the retention shipped later); like `M_063`, the frozen
+/// header is not the record, this doc-const is.
+/// Restored by `from_recovery_row`
 /// (`from_poisoned_row` keeps `false`) and consulted by the
 /// recovery-time produced-children gate: a holed flagged parent is
 /// never enrolled as a clear candidate, so it keeps the restored mark
