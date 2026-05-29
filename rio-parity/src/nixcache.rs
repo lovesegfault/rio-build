@@ -126,12 +126,14 @@ impl NixCacheClient {
 /// The archive is external input, so the substituter it nominates must not
 /// be able to steer the engine's HTTP client at internal endpoints. A URL is
 /// accepted only if it parses, its scheme is exactly `https`, and — when the
-/// host is an IP literal — the address is not loopback, link-local
-/// (169.254.0.0/16, fe80::/10), or RFC 1918 private space (10.0.0.0/8,
-/// 172.16.0.0/12, 192.168.0.0/16). IPv4-mapped IPv6 literals are unwrapped
-/// so `[::ffff:10.0.0.1]` cannot bypass the IPv4 ranges. The check is purely
-/// syntactic: hostnames are never resolved, so a DNS name that happens to
-/// resolve to a private address is out of scope here.
+/// host is an IP literal — the address is not unspecified (0.0.0.0, ::),
+/// loopback, link-local (169.254.0.0/16, fe80::/10), RFC 1918 private space
+/// (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), CGNAT shared space
+/// (100.64.0.0/10), or IPv6 unique-local (fc00::/7). IPv4-mapped IPv6
+/// literals are unwrapped so `[::ffff:10.0.0.1]` cannot bypass the IPv4
+/// ranges. The check is purely syntactic: hostnames are never resolved, so a
+/// DNS name that happens to resolve to a private address is out of scope
+/// here.
 pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
     let parsed = reqwest::Url::parse(url).with_context(|| {
         format!(
@@ -155,12 +157,24 @@ pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
         .and_then(|h| h.strip_suffix(']'))
         .unwrap_or(host);
     if let Ok(ip) = bare.parse::<IpAddr>() {
-        let private_v4 = |v4: Ipv4Addr| v4.is_loopback() || v4.is_link_local() || v4.is_private();
+        let private_v4 = |v4: Ipv4Addr| {
+            // 100.64.0.0/10 is the RFC 6598 carrier-grade NAT shared address space.
+            let cgnat = (u32::from(v4) & 0xffc0_0000) == 0x6440_0000;
+            v4.is_unspecified()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_private()
+                || cgnat
+        };
         let private = match ip {
             IpAddr::V4(v4) => private_v4(v4),
             IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
                 Some(v4) => private_v4(v4),
-                None => v6.is_loopback() || v6.is_unicast_link_local(),
+                None => {
+                    // fc00::/7 is the RFC 4193 unique-local address (ULA) range.
+                    let ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
+                    v6.is_unspecified() || v6.is_loopback() || v6.is_unicast_link_local() || ula
+                }
             },
         };
         anyhow::ensure!(
@@ -396,6 +410,11 @@ mod tests {
             "https://172.16.0.1:8443",
             "https://192.168.1.5",
             "https://[::ffff:10.0.0.1]",
+            // Unspecified, IPv6 unique-local, and CGNAT shared-space literals.
+            "https://0.0.0.0",
+            "https://[::]",
+            "https://[fd12:3456:789a::1]",
+            "https://100.64.0.1",
             // Not a URL at all.
             "not-a-url",
         ];
