@@ -9,7 +9,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 /// One submittable job (target drv + its dependency drv closure, from
-/// dep-closure.jsonl). Closure sizing is always done on the merged-batch
+/// the replay archive). Closure sizing is always done on the merged-batch
 /// union inside [`assemble_batches`], never per job — shared dependencies
 /// must only count once.
 #[derive(Debug, Clone, Serialize, Deserialize)]
