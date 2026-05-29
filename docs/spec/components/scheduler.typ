@@ -1262,6 +1262,30 @@ deliberately deferred until the closure-evidence campaign's stale-tenure
 model evidence is in (`docs/spec/models/closure-evidence-invariant-map.md`);
 this paragraph records the as-built posture and is not a requirement.
 
+Accepted residuals of the evidence lifecycle, recorded so operators have the
+recovery answer (in every shape it is: resubmit the build --- the
+resubmitting merge re-probes, re-prunes, or full-merges as appropriate).
+(a) Expired-at-load poison: a Poisoned row already past its 24 h TTL when a
+recovery loads it is reset to `created` before the recovery hole-stamp query
+runs, so a parent whose only truncation evidence was that row recovers
+without the breadcrumb; reachable only when no leader ran for longer than
+the TTL. (b) Lost hole stamp: losing the best-effort closure-hole write alone
+is self-healing --- the next recovery re-derives the hole from the
+un-produced child's still-linked row --- and erasing that re-derivable
+evidence requires, in addition, every linking builds row to be removed (an
+external builds-row purge; no in-tree path deletes a terminal build's builds
+row) and the row GC to run before the next recovery
+(#rref("sched.db.derivations-gc")). (c) GC after vouch: outputs that
+justified a clear, a heal, or a successful walk are not pinned at that
+moment, so the store GC may remove them later. A walk-completed node whose
+outputs are lost is re-detected by the stale-completed verify at the next
+merge that touches it (#rref("sched.merge.stale-completed-verify")) or by a
+dependent's builder ENOENT and retry; a mark or hole cleared on
+children-produced evidence whose children outputs are later GC'd has no
+probe-time re-detection (the dispatch probe checks only the node's own
+wanted outputs), and surfaces as a generic builder ENOENT/retry/poison
+failure rather than the resubmit-directing error.
+
 #r("sched.evidence.settlement")[
   Every derivation that carries the `topdown_pruned` mark with Broken closure
   evidence and at least one live interested build MUST settle within the
