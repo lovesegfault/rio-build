@@ -1379,6 +1379,16 @@ this paragraph records the as-built posture and is not a requirement.
   (test-only), `batch_probe_cached_ready` early-returns without stamping; the
   gate is moot and disabled.
 ]
+The spawn-intent producer does not consult `must_substitute`: a Ready
+topdown-pruned node with Broken closure evidence still yields a SpawnIntent
+once probed, the controller spawns a pod for it, and that pod's pull is then
+refused `NotYetReady` (#rref("sched.merge.substitute-topdown")). This
+refusal/spawn churn is accepted as-built: it is bounded by the probed-gate
+above and reaped by `reap_stale_for_intents`, and settlement of the refused
+node is owned by the dispatch sweep's probe/walk/fail-fast arms
+(#rref("sched.evidence.settlement")), not by the spawn path --- filtering
+intents on `must_substitute` is a possible future refinement, not a current
+requirement.
 
 #r("sched.dispatch.substitute-complete-inline+2")[
   `handle_substitute_complete{ok=true}` MUST run the Ready-set store
