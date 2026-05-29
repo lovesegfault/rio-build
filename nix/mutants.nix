@@ -40,6 +40,9 @@
   stubTargetFiles,
   rustStable,
   rustPlatformStable,
+  # importCargoLock over the workspace Cargo.lock (defined once in
+  # flake.nix so the git-dependency outputHashes live in one place).
+  workspaceCargoVendor,
   sysCrateEnv,
   goldenTestEnv,
   # inputs.nix.packages.${system}.nix — test-time dep (baseline run hits
@@ -87,9 +90,7 @@ let
           ];
         };
 
-        cargoDeps = rustPlatformStable.importCargoLock {
-          lockFile = ../Cargo.lock;
-        };
+        cargoDeps = workspaceCargoVendor;
 
         nativeBuildInputs =
           with pkgs;

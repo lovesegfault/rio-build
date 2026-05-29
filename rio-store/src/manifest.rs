@@ -41,7 +41,7 @@
 //! Version 1 (server-side FastCDC over the whole NAR byte stream,
 //! framing included) is **not readable** — `deserialize` rejects it.
 //! The format changed under the ADR-022 §6 cutover; deployments are
-//! greenfield (`docs/src/runbooks/castore-fuse-cutover.md`), so there
+//! greenfield (see the castore-FUSE cutover runbook), so there
 //! is no migration path and no dual-format read code.
 //!
 //! # Why `u32` for size

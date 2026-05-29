@@ -1,10 +1,12 @@
 //! Per-build overlayfs management.
 //!
 //! Each build gets its own overlayfs mount with:
-//! - Lower layer: FUSE mount (presents store paths at its root)
-//! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from FUSE)
+//! - Lower layer: the build's castore-FUSE mountpoint
+//!   (`/var/rio/castore/{build_id}`, served by `castore_fuse::session`)
+//! - Upper layer: `{upper}/nix/store/` on local SSD (separate FS from the lower)
 // r[impl builder.overlay.per-build]
 // r[impl builder.overlay.stacked-lower+2]
+// r[impl builder.overlay.castore-lower]
 //! - Work directory: required by overlayfs (same filesystem as upper)
 //! - Merged: mounted at `{build_dir}/nix/store`. nix-daemon runs with
 //!   `--store local?root={build_dir}` so it reads this as its
@@ -201,12 +203,13 @@ impl Drop for OverlayMount {
 ///
 /// # Single lower layer
 ///
-/// The overlay's lower is the FUSE mount only — lazy-fetched build inputs
-/// from rio-store. The host `/nix/store` is NOT in the lowerdir (I-060):
-/// nix-daemon runs in the builder's namespace with `--store
-/// local?root={build_dir}`, so its binary + libs come from the host
-/// store directly. The per-build store contains exactly `{inputs} ∪
-/// {outputs}`; the daemon's runtime closure is structurally separate.
+/// The overlay's lower is the build's castore-FUSE mountpoint only —
+/// the closure's Directory DAG served lazily from rio-store. The host
+/// `/nix/store` is NOT in the lowerdir (I-060): nix-daemon runs in the
+/// builder's namespace with `--store local?root={build_dir}`, so its
+/// binary + libs come from the host store directly. The per-build store
+/// contains exactly `{inputs} ∪ {outputs}`; the daemon's runtime
+/// closure is structurally separate.
 ///
 /// # Important
 ///
@@ -316,8 +319,14 @@ pub fn setup_overlay(
     // redirect_dir here: it's auto-selected (on in init-userns, forced
     // nofollow in non-init), and an explicit `=on` would EPERM the
     // mount under hostUsers:false.
+    // `userxattr`: under hostUsers:false the mount runs in a non-init
+    // user namespace where trusted.overlay.* xattrs cannot be written;
+    // userxattr switches overlayfs to user.overlay.* so opaque-dir /
+    // copy-up bookkeeping works (the castore lower replies ENODATA to
+    // every getxattr, which overlayfs treats as "no state"). Spec'd as
+    // part of the castore mount string (`r[builder.fs.castore-stack]`).
     let mount_data = format!(
-        "lowerdir={},upperdir={},workdir={}",
+        "userxattr,lowerdir={},upperdir={},workdir={}",
         lower.display(),
         store_upper.display(),
         work.display()

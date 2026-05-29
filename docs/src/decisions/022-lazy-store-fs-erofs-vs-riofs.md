@@ -129,6 +129,18 @@ The handler negotiates `FUSE_PASSTHROUGH` at `init` (with `max_stack_depth = 1`;
 
 The FUSE `read` op exists only for case (3)'s streaming window; in steady state every open is passthrough.
 
+r[builder.fs.open-read-only]
+
+`open()` MUST reject any access mode other than `O_RDONLY` — and any mutating flag (`O_TRUNC`, `O_APPEND`) — with `EROFS`, before brokering a backing fd.
+
+This is a security boundary, not POSIX hygiene. On a passthrough open the kernel opens the **backing** cache file with the FUSE **caller's** flags under the BACKING_OPEN **broker's** credentials — rio-mountd, root — and performs no DAC check of its own (`fuse_passthrough_open` → `backing_file_open` → `vfs_open`; [fs/fuse/passthrough.c](https://github.com/torvalds/linux/blob/master/fs/fuse/passthrough.c), [fs/backing-file.c](https://github.com/torvalds/linux/blob/master/fs/backing-file.c)). The mount's `default_permissions` stops build uids from write-opening the 0444 cache entries, but not a root process on the node (CAP_DAC_OVERRIDE): without this rejection, root's `open(O_WRONLY)` on a cache-hit file gets a passthrough fd whose `write(2)` lands in `/var/rio/cache/<digest>` — the node-shared backing cache served to every build on the node.
+
+r[builder.fs.write-ops-erofs]
+
+Every namespace- or data-mutating FUSE operation (`unlink`, `rmdir`, `mkdir`, `mknod`, `create`, `rename`, `link`, `symlink`, `setattr`, `setxattr`, `removexattr`, `fallocate`, `write`) MUST be answered with `EROFS`.
+
+`EROFS` is the errno POSIX prescribes for a read-only filesystem. fuser's defaults — `ENOSYS` for most of these, `EPERM` for `symlink`/`link` — are wrong here: `ENOSYS` is not a legal errno for `unlink(2)`/`mkdir(2)` and breaks callers that branch on errno, and `EPERM` invites a privileged retry that cannot succeed either.
+
 r[builder.fs.shared-backing-cache]
 
 The FUSE **mount point** is per-build (`/var/rio/castore/{build_id}/`, §2.5) for cross-pod isolation. The **backing cache** (`/var/rio/cache/ab/<digest>`) is shared node-SSD, **owned by `rio-mountd` and read-only to builder pods** (mode 0755/0444). Builders cannot write the cache directly — a sandbox-escaped build writing poisoned bytes there would otherwise be passthrough-read by the next build unverified (the same lateral-movement surface §2.8 rejects for a cluster-wide cache).

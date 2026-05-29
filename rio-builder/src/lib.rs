@@ -1,8 +1,8 @@
-//! Build executor with FUSE store for rio-build.
+//! Build executor with a per-build castore-FUSE store for rio-build.
 //!
 //! Receives build assignments from the scheduler, runs builds using
-//! nix-daemon within an overlayfs+FUSE environment, and uploads
-//! results to the store.
+//! nix-daemon within an overlayfs-over-castore-FUSE environment, and
+//! uploads results to the store.
 //!
 //! # Architecture
 //!
@@ -11,18 +11,17 @@
 //! +-- gRPC clients
 //! |   +-- ExecutorService.BuildExecution (bidi stream to scheduler)
 //! |   +-- ExecutorService.Heartbeat (periodic to scheduler)
-//! |   +-- StoreService (fetch inputs, upload outputs)
-//! +-- FUSE daemon (fuse/)
-//! |   +-- Mount /nix/store via fuser 0.17
-//! |   +-- lookup/getattr -> StoreService.QueryPathInfo
-//! |   +-- read/readdir -> SSD cache or StoreService.GetPath
-//! |   +-- Ephemeral local-disk cache (cache.rs)
-//! +-- Build executor (executor.rs)
-//! |   +-- Overlay management (overlay.rs)
+//! |   +-- Store/Directory/ChunkService (fetch inputs, upload outputs)
+//! +-- Castore-FUSE (castore_fuse/), one session per build
+//! |   +-- rio-mountd UDS handshake (/dev/fuse fd handoff)
+//! |   +-- lookup/getattr/readdir from the prefetched Directory DAG
+//! |   +-- open() -> node-SSD backing cache + kernel passthrough
+//! +-- Build executor (executor/)
+//! |   +-- Overlay management (overlay.rs, lower = castore mountpoint)
 //! |   +-- Synthetic DB generation (synth_db.rs)
 //! |   +-- Log streaming (log_stream.rs)
-//! |   +-- Output upload (upload.rs)
-//! +-- Heartbeat loop (runtime.rs, 10s interval)
+//! |   +-- Output upload (upload/)
+//! +-- Heartbeat loop (runtime/, 10s interval)
 //! ```
 
 pub(crate) mod banner;
@@ -32,7 +31,6 @@ pub mod config;
 pub mod executor;
 #[cfg(feature = "test-fixtures")]
 pub mod fixture;
-pub mod fuse;
 pub mod health;
 pub mod hw_bench;
 pub mod hw_class;
@@ -82,16 +80,6 @@ pub const HISTOGRAM_BUCKETS: &[(&str, &[f64])] = &[
     (
         "rio_builder_upload_references_count",
         REFERENCES_COUNT_BUCKETS,
-    ),
-    (
-        // I-212 size-cap → JIT path means GB-scale NARs are fetched on
-        // demand; fuse/fetch/mod.rs documents 60-127s for those. The
-        // [0.005..10.0] default would put every >10s sample in {le="+Inf"}
-        // and saturate `histogram_quantile(0.99,…)` at 10.0. Mirrors
-        // rio-store SUBSTITUTE_DURATION_BUCKETS — same operation
-        // (NAR fetch + drain), opposite end.
-        "rio_builder_fuse_fetch_duration_seconds",
-        &[0.01, 0.05, 0.1, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0],
     ),
     (
         // Spans five decades: BackingOpen/BackingClose are a single
@@ -156,20 +144,6 @@ pub fn describe_metrics() {
         "Per-derivation build time"
     );
     describe_counter!(
-        "rio_builder_fuse_jit_lookup_total",
-        "Top-level FUSE lookup outcomes under JIT fetch (I-043 redesign), \
-         labeled by outcome: reject (not in registered input set → fast \
-         ENOENT, no store contact), fetch (registered input materialized), \
-         eio (registered input fetch FAILED → EIO so overlay can't \
-         negative-cache). reject/fetch ratio ≈ closure utilization; eio \
-         nonzero = store degraded."
-    );
-    describe_gauge!(
-        "rio_builder_jit_inputs_registered",
-        "Size of the JIT FUSE allowlist (known_inputs.len()) at daemon spawn. \
-         Equals compute_input_closure's output count for this build."
-    );
-    describe_counter!(
         "rio_builder_log_lines_suppressed_total",
         "Log lines dropped by rate suppression (log_rate_limit). Build \
          continues with a `[rio: N lines suppressed …]` marker. Nonzero is \
@@ -187,40 +161,14 @@ pub fn describe_metrics() {
         "rio_builder_input_materialization_failures_total",
         "Daemon MiscFailure reclassified as InfrastructureFailure because the \
          missing path is in the build's input closure (I-178). Sustained \
-         nonzero = JIT_MIN_THROUGHPUT_BPS is set above actual store→builder \
-         throughput; lower the floor."
-    );
-    describe_counter!(
-        "rio_builder_fuse_cache_hits_total",
-        "FUSE cache hits (local symlink_metadata succeeded)"
-    );
-    describe_counter!(
-        "rio_builder_fuse_cache_misses_total",
-        "FUSE cache misses (fetch from remote store required)"
-    );
-    describe_histogram!(
-        "rio_builder_fuse_fetch_duration_seconds",
-        "Store path fetch latency (gRPC GetPath + stream drain)"
+         nonzero = closure inputs are failing to materialize from the \
+         castore-FUSE lower (store fetch errors, integrity failures, or a \
+         tripped fetch circuit breaker); correlate with \
+         rio_builder_castore_fuse_eio_total and rio-store health."
     );
     describe_counter!(
         "rio_builder_overlay_teardown_failures_total",
         "Overlay unmount failures (leaked mount); alert if rate > 0"
-    );
-    describe_counter!(
-        "rio_builder_prefetch_total",
-        "PrefetchHint outcomes. result=fetched|already_cached|already_in_flight|not_input|size_cap|error|malformed|panic. \
-         error = store fetch failed (debug-only log; build's own FUSE ops surface \
-         the real problem if store is flaky)."
-    );
-    describe_counter!(
-        "rio_builder_prefetch_filtered_total",
-        "PrefetchHint paths skipped by the I-212 filter, by reason. \
-         reason=not_input: JIT allowlist armed and path is not a declared \
-         input (build can never read it). reason=size_cap: warm-gate batch \
-         (allowlist not yet armed) and QueryPathInfo.nar_size exceeds the cap — \
-         scheduler over-includes sibling outputs (e.g., 2.9 GB clang-debug); \
-         the build fetches it on-demand via JIT lookup if it turns out to be \
-         a real input."
     );
     describe_counter!(
         "rio_builder_upload_bytes_total",
@@ -238,31 +186,12 @@ pub fn describe_metrics() {
          derivations (race or CA early-cutoff). This counter measures \
          the worker-side disk-read + chunk-stream savings."
     );
-    describe_counter!(
-        "rio_builder_fuse_fetch_bytes_total",
-        "Bytes fetched from store via FUSE misses (nar_data.len())"
-    );
-    describe_counter!(
-        "rio_builder_fuse_fallback_reads_total",
-        "Userspace read() callbacks served. When passthrough is ON (default), \
-         the kernel handles reads directly and this counter stays near zero — \
-         nonzero means open_backing() failed for some file. When passthrough \
-         is OFF (RIO_FUSE_PASSTHROUGH=false), every read comes through here. \
-         Sustained nonzero rate with passthrough ON = investigate open_backing."
-    );
-    describe_counter!(
-        "rio_builder_fuse_index_divergence_total",
-        "FUSE cache index/disk divergences detected and self-healed. Nonzero \
-         means something rm'd cache files out from under the in-memory index \
-         (manual debugging, disk cleanup scripts, interrupted extract). \
-         The path is purged and re-fetched; investigate if sustained."
-    );
     describe_gauge!(
         "rio_builder_fuse_circuit_open",
-        "1.0 when the FUSE fetch circuit breaker is open (store unreachable \
-         or degraded). Opens after 5 consecutive fetch failures OR 720s since \
-         last successful fetch with ≥1 failure since. Half-open after 30s \
-         (one probe fetch allowed)."
+        "1.0 when the castore-FUSE fetch circuit breaker is open (store \
+         unreachable or degraded). Opens after 5 consecutive fetch failures \
+         OR 720s since last successful fetch with ≥1 failure since. Half-open \
+         after 30s (one probe fetch allowed)."
     );
     describe_gauge!(
         "rio_builder_cpu_fraction",

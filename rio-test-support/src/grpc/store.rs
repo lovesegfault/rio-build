@@ -64,6 +64,13 @@ pub struct MockStoreState {
     /// BLAKE3 digest → chunk bytes. dataplane2: backs the in-memory
     /// `ChunkService.GetChunk` impl. Seed via [`MockStore::seed_chunked`].
     pub chunks: Arc<RwLock<HashMap<Vec<u8>, Vec<u8>>>>,
+    /// nar_hash → NAR index. Backs `GetNarIndex`/`GetNarIndexBatch` —
+    /// the builder's castore root-node fallback for closure paths the
+    /// scheduler dispatched without a `root_node`. Seed via
+    /// [`MockStore::seed_nar_index`]; an unseeded hash is reported as
+    /// "no index" (NotFound / `index: None`), which is exactly the
+    /// indexer-lag case the fallback's error path guards.
+    pub nar_indexes: Arc<RwLock<HashMap<Vec<u8>, types::NarIndex>>>,
 }
 
 /// One recorded `PutPathChunked` call: the assignment-token header (if
@@ -124,6 +131,13 @@ pub struct MockStoreCalls {
 pub struct MockStoreFaults {
     /// If > 0, put_path decrements and returns Unavailable. For retry tests.
     pub fail_next_puts: Arc<AtomicU32>,
+    /// If > 0, put_path_chunked decrements and returns
+    /// `FailedPrecondition` — a deterministic rejection, matching the
+    /// real store's "PutPathChunked requires a chunk backend" gate on
+    /// an inline-only deployment. The remaining count after the call
+    /// is the structural attempt counter for asserting the builder
+    /// does NOT burn its retry budget on a non-retryable status.
+    pub reject_next_chunked_puts: Arc<AtomicU32>,
     /// If > 0, put_path decrements and returns `Aborted("concurrent
     /// PutPath in progress for this path; retry")` — matching the real
     /// store's placeholder-contention response (`put_path.rs`). For
@@ -301,6 +315,16 @@ impl MockStore {
         drop(chunks);
         self.seed(info, nar);
         refs
+    }
+
+    /// Seed a NAR index for `nar_hash`, served by `GetNarIndex` /
+    /// `GetNarIndexBatch`.
+    pub fn seed_nar_index(&self, nar_hash: [u8; 32], index: types::NarIndex) {
+        self.state
+            .nar_indexes
+            .write()
+            .unwrap()
+            .insert(nar_hash.to_vec(), index);
     }
 }
 
@@ -1140,23 +1164,52 @@ impl StoreService for MockStore {
         Ok(Response::new(()))
     }
 
-    // TODO(P0552): no consumers yet — castore-FUSE `tree::build_tree`
-    // (P0559) prefetches via GetDirectory, not GetNarIndex.
     async fn get_nar_index(
         &self,
-        _request: Request<types::GetNarIndexRequest>,
+        request: Request<types::GetNarIndexRequest>,
     ) -> Result<Response<types::NarIndex>, Status> {
-        Err(Status::unimplemented("MockStore: GetNarIndex (P0552)"))
+        let nar_hash = request.into_inner().nar_hash;
+        self.state
+            .nar_indexes
+            .read()
+            .unwrap()
+            .get(&nar_hash)
+            .cloned()
+            .map(Response::new)
+            .ok_or_else(|| Status::not_found("mock: no NAR index for that hash"))
     }
 
     type GetNarIndexBatchStream =
         tokio_stream::wrappers::ReceiverStream<Result<types::NarIndexResponse, Status>>;
 
+    /// One `NarIndexResponse` per requested hash, request order
+    /// preserved; `index: None` for unseeded hashes — same "absent =
+    /// not indexed yet" contract as the real handler, which is what
+    /// the builder's root-node fallback error path keys on.
     async fn get_nar_index_batch(
         &self,
-        _request: Request<types::GetNarIndexBatchRequest>,
+        request: Request<types::GetNarIndexBatchRequest>,
     ) -> Result<Response<Self::GetNarIndexBatchStream>, Status> {
-        Err(Status::unimplemented("MockStore: GetNarIndexBatch (P0552)"))
+        let hashes = request.into_inner().nar_hashes;
+        // Scope the read guard so it is dropped before the awaits below
+        // (the guard is not Send and the future must be).
+        let responses: Vec<types::NarIndexResponse> = {
+            let indexes = self.state.nar_indexes.read().unwrap();
+            hashes
+                .into_iter()
+                .map(|nar_hash| types::NarIndexResponse {
+                    index: indexes.get(&nar_hash).cloned(),
+                    nar_hash,
+                })
+                .collect()
+        };
+        let (tx, rx) = tokio::sync::mpsc::channel(responses.len().max(1));
+        for resp in responses {
+            let _ = tx.send(Ok(resp)).await;
+        }
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 
     /// PutPathChunked (P0586 builder upload path). Mirrors the real
@@ -1195,6 +1248,21 @@ impl StoreService for MockStore {
             .is_ok()
         {
             return Err(Status::unavailable("mock: injected chunked put failure"));
+        }
+        // Deterministic-rejection knob: the real store's chunk-backend
+        // gate (FAILED_PRECONDITION before reading any frame). One
+        // decrement per RPC so tests can count attempts structurally.
+        if self
+            .faults
+            .reject_next_chunked_puts
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                (n > 0).then(|| n - 1)
+            })
+            .is_ok()
+        {
+            return Err(Status::failed_precondition(
+                "mock: PutPathChunked requires a chunk backend",
+            ));
         }
 
         let token = request

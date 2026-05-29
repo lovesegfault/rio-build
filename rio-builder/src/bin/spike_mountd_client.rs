@@ -1,14 +1,21 @@
 //! VM-test client for the production `rio-mountd` daemon (P0567).
 //!
-//! Stands in for the builder side of the UDS protocol until P0559's
-//! `castore_fuse/mount.rs` exists: connects to the daemon's
-//! `SOCK_SEQPACKET` socket, speaks `mountd_proto`, and serves a minimal
-//! FUSE filesystem on the handed-off `/dev/fuse` fd so `BACKING_OPEN`
-//! has a passthrough-negotiated connection to register against. Each
+//! Exercises the daemon from a separate, unprivileged process inside
+//! the `vm-mountd` NixOS test: connects as different uids/gids, holds
+//! and drops connections on cue, and serves a minimal FUSE filesystem
+//! on the handed-off `/dev/fuse` fd so `BACKING_OPEN` has a
+//! passthrough-negotiated connection to register against. Protocol
+//! calls go through the builder's in-process [`MountdClient`]; only
+//! the `concurrency` subcommand keeps a raw seq-correlated receive
+//! loop, because its assertion is about on-the-wire reply order, which
+//! the typed client's per-seq dispatch deliberately hides. Each
 //! subcommand is one `vm-mountd` subtest; results are printed as
 //! `RESULT key=value` / `PERF key=value` lines the test driver greps.
 //!
-//! NOT production code. The real client is in-process in the builder.
+//! NOT production code. The real client is in-process in the builder —
+//! the `serve-castore` subcommand drives exactly that in-process
+//! assembly ([`rio_builder::castore_fuse::session`]) end-to-end, while
+//! everything else here is bespoke test scaffolding.
 
 use std::io;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -22,7 +29,21 @@ use fuser::{
     ReplyAttr, ReplyDirectory, Request as FuseRequest, Session, SessionACL,
 };
 use nix::sys::socket::{AddressFamily, SockFlag, SockType, UnixAddr, connect, socket};
+use rio_builder::castore_fuse::circuit::CircuitBreaker;
+use rio_builder::castore_fuse::mountd_client::{MountdClient, MountdError};
 use rio_builder::castore_fuse::mountd_proto::{self as proto, ErrKind, Reply, Req, Request, Resp};
+use rio_builder::castore_fuse::open::OpenerConfig;
+use rio_builder::castore_fuse::session::{
+    CastoreSettings, mount_and_serve, root_node_from_nar_index,
+};
+use rio_builder::store_fetch::StoreClients;
+use rio_proto::types::{GetNarIndexRequest, InputRoot, QueryPathInfoRequest};
+
+/// Generous per-request timeout: the VM test runs under TCG where the
+/// production latency targets are off by 10-100×, so a tight timeout
+/// would turn a slow daemon into a confusing client-side failure. The
+/// test driver's globalTimeout is the real backstop.
+const RPC_TIMEOUT: Duration = Duration::from_secs(300);
 
 // ─── Empty FUSE filesystem ─────────────────────────────────────────────
 //
@@ -91,7 +112,17 @@ impl Filesystem for EmptyFs {
     }
 }
 
-// ─── Connection ────────────────────────────────────────────────────────
+// ─── Raw wire connection (concurrency subtest only) ───────────────────
+//
+// The `concurrency` subtest asserts on the *arrival order* of replies:
+// at least one BackingOpen reply lands on the wire before the Promote
+// reply. `MountdClient` dispatches each reply to its per-seq waiter
+// from a dedicated reader thread, so a multi-threaded reformulation of
+// the count ("was the promote thread still running when my reply came
+// back?") races on thread wakeup — under a serialized daemon the two
+// replies arrive back-to-back and the ordering observation degrades to
+// a coin flip. Keeping a single-threaded recv loop here preserves the
+// exact wire-order observation. Everything else uses the typed client.
 
 struct Conn {
     fd: OwnedFd,
@@ -135,26 +166,6 @@ impl Conn {
             bail!("reply seq {} != request seq {seq}", reply.seq);
         }
         Ok((reply.resp, reply_fds))
-    }
-}
-
-/// `Mount{build_id}` and unpack the success reply into the quota and the
-/// handed-off `/dev/fuse` fd.
-fn mount(conn: &mut Conn, build_id: &str) -> anyhow::Result<(u64, OwnedFd)> {
-    let (resp, mut fds) = conn.call(
-        Req::Mount {
-            build_id: build_id.to_owned(),
-        },
-        &[],
-    )?;
-    match resp {
-        Resp::Mounted {
-            staging_quota_bytes,
-        } => {
-            let fd = fds.pop().context("Mounted reply carried no fd")?;
-            Ok((staging_quota_bytes, fd))
-        }
-        other => bail!("Mount failed: {other:?}"),
     }
 }
 
@@ -242,8 +253,9 @@ enum Cmd {
         #[arg(long)]
         expect: String,
     },
-    /// Assert the daemon drops the connection without answering the
-    /// first request (gid gate, uid-bound rejection).
+    /// Assert the connection is refused: connect(2) fails outright
+    /// (socket-file DAC) or the daemon drops it without answering the
+    /// first request (uid-bound rejection).
     ExpectRejected,
     /// Mount twice on one connection; assert the second is
     /// `AlreadyMounted`.
@@ -310,6 +322,54 @@ enum Cmd {
         #[arg(long, default_value_t = 256)]
         give_up_mib: usize,
     },
+    /// Mount the castore-FUSE for one build via the production
+    /// `castore_fuse::session` assembly: resolve each store path's
+    /// castore root node from the store, prefetch the Directory DAGs,
+    /// serve on the handed-off `/dev/fuse` fd, write the ready file,
+    /// then run until SIGTERM/SIGINT and exit 0.
+    ServeCastore(ServeCastoreArgs),
+}
+
+#[derive(clap::Args)]
+struct ServeCastoreArgs {
+    #[arg(long)]
+    build_id: String,
+    /// rio-store gRPC endpoint as `host:port` (plaintext).
+    #[arg(long)]
+    store_addr: String,
+    /// File holding the HMAC assignment token presented on every store
+    /// RPC. Sign it with the store's `hmac_key_path` key and a `tenant`
+    /// claim that owns the seeded paths — without it the tenant-scoped
+    /// DirectoryService refuses both the prefetch and every fetch.
+    #[arg(long)]
+    assignment_token_file: Option<PathBuf>,
+    /// Store path to serve at the mount root (repeatable). Exactly the
+    /// listed paths are mounted — there is no closure walk here, so
+    /// list every path the test wants visible.
+    #[arg(long = "store-path", required = true)]
+    store_paths: Vec<String>,
+    /// Shared node backing cache (rio-mountd's cache dir).
+    #[arg(long)]
+    cache_dir: PathBuf,
+    /// Shared node chunk cache (rio-mountd's chunks dir).
+    #[arg(long)]
+    chunks_dir: PathBuf,
+    /// Staging root (rio-mountd's staging dir); the per-build dir under
+    /// it is created and quota'd by the daemon at Mount time.
+    #[arg(long)]
+    staging_root: PathBuf,
+    /// Per-build mountpoint root (rio-mountd's castore dir); the daemon
+    /// mounts the handed-off fd at `{castore_dir}/{build_id}`.
+    #[arg(long, default_value = "/var/rio/castore")]
+    castore_dir: PathBuf,
+    /// Cache misses larger than this stream during a background fill
+    /// instead of blocking `open()` on the whole-file fetch.
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
+    stream_threshold: u64,
+    /// Written (with `quota=<bytes>`) once mounted, prefetched, and
+    /// serving — the mountpoint is safe to read after this appears.
+    #[arg(long)]
+    ready_file: PathBuf,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -359,6 +419,7 @@ fn main() -> anyhow::Result<()> {
             staging_root,
             give_up_mib,
         } => fill_staging(&args.socket, &build_id, &staging_root, give_up_mib),
+        Cmd::ServeCastore(serve_args) => serve_castore(&args.socket, serve_args),
     }
 }
 
@@ -377,70 +438,58 @@ fn start_fuse(fuse_fd: OwnedFd) -> anyhow::Result<fuser::BackgroundSession> {
 }
 
 fn serve(socket: &Path, build_id: &str, ready_file: &Path) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
-    let (quota, fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (quota, fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let bg = start_fuse(fuse_fd)?;
     println!("RESULT mount=ok quota={quota}");
     std::fs::write(ready_file, format!("quota={quota}\n")).context("write ready file")?;
     // Hold the UDS connection (teardown fires when it closes) and the
-    // FUSE session until the test driver kills us.
+    // FUSE session until the test driver kills us. `client` stays in
+    // scope for exactly that reason.
     bg.join()?;
+    drop(client);
     Ok(())
 }
 
 fn expect_mount_err(socket: &Path, build_id: &str, expect: &str) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
-    let (resp, _) = conn.call(
-        Req::Mount {
-            build_id: build_id.to_owned(),
-        },
-        &[],
-    )?;
-    match resp {
-        Resp::Err(kind) if kind_name(&kind) == expect => {
+    let client = MountdClient::connect(socket)?;
+    match client.mount(build_id, RPC_TIMEOUT) {
+        Err(MountdError::Rejected(kind)) if kind_name(&kind) == expect => {
             println!("RESULT mount=err kind={expect}");
             Ok(())
         }
-        other => bail!("expected Err({expect}), got {other:?}"),
+        Ok(_) => bail!("expected Err({expect}), got Mounted"),
+        Err(other) => bail!("expected Err({expect}), got {other}"),
     }
 }
 
 fn expect_rejected(socket: &Path) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
+    let client = MountdClient::connect(socket)?;
     // The daemon closes rejected connections before reading a frame, so
-    // the send may race the close (EPIPE) or land in the kernel buffer
-    // and never be answered (EOF on the reply read). Both prove the
-    // rejection; a Reply of any kind disproves it.
-    let sent = conn.send(
-        Req::Mount {
-            build_id: "rejected".to_owned(),
-        },
-        &[],
-    );
-    if let Err(e) = sent {
-        println!("RESULT rejected=at-send err={e:#}");
-        return Ok(());
-    }
-    match conn.recv() {
-        Err(e) => {
-            println!("RESULT rejected=at-recv err={e:#}");
+    // the Mount either fails at send (EPIPE → Frame) or its reply read
+    // sees EOF (→ Closed). Both prove the rejection; a reply of any
+    // kind — success or a typed error — disproves it.
+    match client.mount("rejected", RPC_TIMEOUT) {
+        Err(e @ (MountdError::Closed | MountdError::Frame(_))) => {
+            println!("RESULT rejected=dropped err={e}");
             Ok(())
         }
-        Ok((reply, _)) => bail!("expected the daemon to drop the connection, got {reply:?}"),
+        Ok(_) => bail!("expected the daemon to drop the connection, got Mounted"),
+        Err(other) => bail!("expected the daemon to drop the connection, got {other}"),
     }
 }
 
 fn double_mount(socket: &Path, build_id: &str) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (_, _fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let second = format!("{build_id}-second");
-    let (resp, _) = conn.call(Req::Mount { build_id: second }, &[])?;
-    match resp {
-        Resp::Err(ErrKind::AlreadyMounted) => {
+    match client.mount(&second, RPC_TIMEOUT) {
+        Err(MountdError::Rejected(ErrKind::AlreadyMounted)) => {
             println!("RESULT second_mount=AlreadyMounted");
             Ok(())
         }
-        other => bail!("expected AlreadyMounted, got {other:?}"),
+        Ok(_) => bail!("expected AlreadyMounted, got Mounted"),
+        Err(other) => bail!("expected AlreadyMounted, got {other}"),
     }
 }
 
@@ -451,8 +500,8 @@ fn promote(
     size_mib: usize,
     corrupt: bool,
 ) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (_, _fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let content = gen_content(0, size_mib << 20);
     // A corrupted stage claims a digest the content does not hash to:
     // the digest of the content with its first byte flipped.
@@ -465,10 +514,10 @@ fn promote(
     };
     stage(staging_root, build_id, &claimed, &content)?;
     let start = Instant::now();
-    let (resp, _) = conn.call(Req::Promote { digest: claimed }, &[])?;
+    let result = client.promote(claimed, RPC_TIMEOUT);
     let elapsed = start.elapsed();
-    match resp {
-        Resp::Ok => {
+    match result {
+        Ok(()) => {
             println!(
                 "RESULT promote=ok digest={} bytes={} elapsed_ms={}",
                 hex::encode(claimed),
@@ -481,7 +530,7 @@ fn promote(
                 content.len()
             );
         }
-        Resp::Err(kind) => {
+        Err(MountdError::Rejected(kind)) => {
             println!(
                 "RESULT promote=err kind={} digest={}",
                 kind_name(&kind),
@@ -491,7 +540,7 @@ fn promote(
                 bail!("promote of well-formed content failed: {kind}");
             }
         }
-        other => bail!("unexpected promote reply: {other:?}"),
+        Err(other) => bail!("unexpected promote reply: {other}"),
     }
     Ok(())
 }
@@ -506,8 +555,8 @@ fn append_promote(
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let mut conn = Conn::connect(socket)?;
-    let (_, _fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (_, _fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let content = gen_content(0xA99E4D, size_mib << 20);
     let digest = *blake3::hash(&content).as_bytes();
     let path = stage(staging_root, build_id, &digest, &content)?;
@@ -529,26 +578,26 @@ fn append_promote(
             appended
         })
     };
-    let result = conn.call(Req::Promote { digest }, &[]);
+    let result = client.promote(digest, RPC_TIMEOUT);
     stop.store(true, Ordering::Relaxed);
     let appended = appender.join().unwrap_or(0);
-    match result?.0 {
+    match result {
         // Copy finished before the first append landed: published entry
         // is exactly `content` (the driver re-hashes it).
-        Resp::Ok => println!(
+        Ok(()) => println!(
             "RESULT append_promote=ok digest={} bytes={} appended={appended}",
             hex::encode(digest),
             content.len()
         ),
         // Bounded copy read appended bytes inside its st_size window:
         // rejected, nothing published.
-        Resp::Err(ErrKind::DigestMismatch) => {
+        Err(MountdError::Rejected(ErrKind::DigestMismatch)) => {
             println!(
                 "RESULT append_promote=mismatch digest={} appended={appended}",
                 hex::encode(digest)
             );
         }
-        other => bail!("unexpected append-promote reply: {other:?}"),
+        Err(other) => bail!("unexpected append-promote reply: {other}"),
     }
     Ok(())
 }
@@ -559,8 +608,8 @@ fn backing_bench(
     backing_file: &Path,
     iters: usize,
 ) -> anyhow::Result<()> {
-    let mut conn = Conn::connect(socket)?;
-    let (_, fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (_, fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let _bg = start_fuse(fuse_fd)?;
 
     let mut rtts = Vec::with_capacity(iters);
@@ -568,16 +617,13 @@ fn backing_bench(
         let f = std::fs::File::open(backing_file)
             .with_context(|| format!("open {}", backing_file.display()))?;
         let start = Instant::now();
-        let (resp, _) = conn.call(Req::BackingOpen, &[f.as_raw_fd()])?;
-        let id = match resp {
-            Resp::BackingId(id) => id,
-            other => bail!("BackingOpen failed: {other:?}"),
-        };
+        let id = client
+            .backing_open(f.as_raw_fd(), RPC_TIMEOUT)
+            .context("BackingOpen")?;
         rtts.push(start.elapsed());
-        let (resp, _) = conn.call(Req::BackingClose { backing_id: id }, &[])?;
-        if !matches!(resp, Resp::Ok) {
-            bail!("BackingClose failed: {resp:?}");
-        }
+        client
+            .backing_close(id, RPC_TIMEOUT)
+            .context("BackingClose")?;
     }
     rtts.sort_unstable();
     println!(
@@ -598,8 +644,22 @@ fn concurrency(
     promote_mib: usize,
     iters: usize,
 ) -> anyhow::Result<()> {
+    // Raw wire connection, not MountdClient: the count below is defined
+    // by reply *arrival order* on the socket, which needs a single
+    // receive loop (see the Conn comment). The Mount has to ride the
+    // same connection — the daemon binds one connection per uid and the
+    // backing/promote requests must belong to this mount.
     let mut conn = Conn::connect(socket)?;
-    let (_, fuse_fd) = mount(&mut conn, build_id)?;
+    let (resp, mut fds) = conn.call(
+        Req::Mount {
+            build_id: build_id.to_owned(),
+        },
+        &[],
+    )?;
+    let fuse_fd = match resp {
+        Resp::Mounted { .. } => fds.pop().context("Mounted reply carried no fd")?,
+        other => bail!("Mount failed: {other:?}"),
+    };
     let _bg = start_fuse(fuse_fd)?;
 
     let content = gen_content(0xC04C44, promote_mib << 20);
@@ -685,8 +745,8 @@ fn fill_staging(
 ) -> anyhow::Result<()> {
     use std::io::Write;
 
-    let mut conn = Conn::connect(socket)?;
-    let (quota, _fuse_fd) = mount(&mut conn, build_id)?;
+    let client = MountdClient::connect(socket)?;
+    let (quota, _fuse_fd) = client.mount(build_id, RPC_TIMEOUT)?;
     let path = staging_root.join(build_id).join("fill");
     let mut f =
         std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
@@ -716,4 +776,127 @@ fn fill_staging(
             Err(e) => return Err(e).context("write to staging"),
         }
     }
+}
+
+// ─── serve-castore (production session assembly) ──────────────────────
+
+/// Mount + prefetch + serve via [`mount_and_serve`], then park until
+/// SIGTERM/SIGINT. Exiting `main` normally (status 0) matters twice
+/// over: the UDS close on process exit is what triggers mountd's
+/// teardown (detach mount, reap staging), and atexit handlers — the
+/// LLVM profraw flush in coverage builds — only run on a normal exit,
+/// not under SIGTERM's default disposition.
+fn serve_castore(socket: &Path, args: ServeCastoreArgs) -> anyhow::Result<()> {
+    let assignment_token = match &args.assignment_token_file {
+        Some(path) => std::fs::read_to_string(path)
+            .with_context(|| format!("read {}", path.display()))?
+            .trim()
+            .to_owned(),
+        None => String::new(),
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("build tokio runtime")?;
+
+    // Register the SIGTERM/SIGINT handler before the slow startup phase
+    // (store connect, root resolution, mount): a signal arriving in that
+    // window must still take the graceful path — under the default
+    // disposition the process dies with exit 143 and never runs atexit
+    // handlers (no profraw flush in coverage builds).
+    let shutdown = runtime.block_on(async { rio_common::signal::shutdown_signal() });
+
+    let (clients, input_roots) = runtime.block_on(async {
+        let channel = rio_proto::client::connect_channel(&args.store_addr)
+            .await
+            .with_context(|| format!("connect to store at {}", args.store_addr))?;
+        let clients = StoreClients::from_channel(channel);
+        let roots = resolve_input_roots(clients.store.clone(), &args.store_paths).await?;
+        anyhow::Ok((clients, roots))
+    })?;
+
+    let session = mount_and_serve(
+        &CastoreSettings {
+            mountd_socket: socket.to_path_buf(),
+            castore_dir: args.castore_dir,
+            staging_root: args.staging_root,
+            cache_dir: args.cache_dir,
+            chunks_dir: args.chunks_dir,
+            dag_prefetch_timeout: RPC_TIMEOUT,
+            circuit: std::sync::Arc::new(CircuitBreaker::default()),
+            // A handful of threads so a cold open mid-fetch does not
+            // stall concurrent metadata lookups; the VM test runs under
+            // TCG, so there is nothing to gain from going wide.
+            fuse_threads: 4,
+            opener: OpenerConfig {
+                stream_threshold: args.stream_threshold,
+                mountd_request_timeout: RPC_TIMEOUT,
+                fetch_timeout: RPC_TIMEOUT,
+                max_backing_ids: 512,
+                disable_passthrough: false,
+            },
+        },
+        &args.build_id,
+        &assignment_token,
+        &clients,
+        &input_roots,
+        runtime.handle().clone(),
+    )?;
+    let quota = session.staging_quota_bytes;
+    println!("RESULT mount=ok quota={quota} roots={}", input_roots.len());
+    // Write-then-rename so a poller never observes the ready file
+    // existing but still empty.
+    let ready_tmp = {
+        let mut p = args.ready_file.clone().into_os_string();
+        p.push(".tmp");
+        PathBuf::from(p)
+    };
+    std::fs::write(&ready_tmp, format!("quota={quota}\n")).context("write ready file")?;
+    std::fs::rename(&ready_tmp, &args.ready_file).context("rename ready file into place")?;
+
+    // Park until SIGTERM/SIGINT (handler registered above), then return
+    // so `main` exits 0.
+    runtime.block_on(shutdown.cancelled());
+    drop(session);
+    println!("RESULT serve_castore=done");
+    Ok(())
+}
+
+/// Resolve each store path's castore root node from the store:
+/// `QueryPathInfo` for the path's `nar_hash`, then `GetNarIndex`, whose
+/// root entry / `root_digest` carries everything a [`RootNode`] needs.
+/// The production builder receives root nodes pre-resolved in
+/// `WorkAssignment.input_roots`; resolving them client-side here means
+/// the VM test only has to name store paths.
+async fn resolve_input_roots(
+    mut store: rio_proto::StoreServiceClient<tonic::transport::Channel>,
+    store_paths: &[String],
+) -> anyhow::Result<Vec<InputRoot>> {
+    let mut roots = Vec::with_capacity(store_paths.len());
+    for path in store_paths {
+        let info = store
+            .query_path_info(QueryPathInfoRequest {
+                store_path: path.clone(),
+            })
+            .await
+            .with_context(|| format!("QueryPathInfo {path}"))?
+            .into_inner();
+
+        let index = store
+            .get_nar_index(GetNarIndexRequest {
+                nar_hash: info.nar_hash.clone(),
+            })
+            .await
+            .with_context(|| format!("GetNarIndex for {path}"))?
+            .into_inner();
+
+        let root_node = root_node_from_nar_index(&index)
+            .with_context(|| format!("resolve castore root node for {path}"))?;
+        roots.push(InputRoot {
+            store_path: path.clone(),
+            root_node: Some(root_node),
+        });
+    }
+    Ok(roots)
 }

@@ -1,6 +1,12 @@
-//! FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on
-//! fuser's thread pool, NOT in a tokio context (see fetch.rs SYNC comment
-//! on `fetch_extract_insert`). No tokio primitives; no `.await`.
+//! Castore-FUSE fetch circuit breaker. **std::sync ONLY** — FUSE
+//! callbacks run on fuser's thread pool, NOT in a tokio context. No
+//! tokio primitives; no `.await`.
+//!
+//! One instance per process, shared by every build session's `open()`
+//! path (so cross-build evidence of a store outage accumulates) and by
+//! the heartbeat loop (`store_degraded`). The opener gates every remote
+//! fetch on [`CircuitBreaker::check`] and reports every outcome to
+//! [`CircuitBreaker::record`].
 //!
 //! Two trip conditions — EITHER opens the circuit:
 //!   (a) `threshold` (default 5) consecutive `ensure_cached` fetch failures
@@ -82,10 +88,10 @@ struct OpenState {
     probing: bool,
 }
 
-/// Three-state circuit breaker for the FUSE fetch path.
+/// Three-state circuit breaker for the castore-FUSE fetch path.
 ///
-/// Shared across all fuser threads (`Arc<CircuitBreaker>` on
-/// `NixStoreFs`). All methods take `&self` — interior mutability
+/// Shared across all fuser threads (`Arc<CircuitBreaker>` on the
+/// `Opener`). All methods take `&self` — interior mutability
 /// via `AtomicU32` + `std::sync::Mutex` (not tokio's mutex).
 pub struct CircuitBreaker<C: Clock = SystemClock> {
     /// Consecutive fetch failures. Reset to 0 on any success. Relaxed

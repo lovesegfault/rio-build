@@ -50,7 +50,7 @@
     {
       "path": "castore_fuse/circuit.rs",
       "depth": 1,
-      "doc": "FUSE fetch circuit breaker. **std::sync ONLY** — FUSE callbacks run on"
+      "doc": "Castore-FUSE fetch circuit breaker. **std::sync ONLY** — FUSE"
     },
     {
       "path": "castore_fuse/mountd.rs",
@@ -86,6 +86,11 @@
       "path": "castore_fuse/sweep.rs",
       "depth": 1,
       "doc": "Disk-pressure LRU sweep over the mountd-owned shared caches."
+    },
+    {
+      "path": "castore_fuse/testing.rs",
+      "depth": 1,
+      "doc": "Test scaffolding shared by the castore-FUSE unit tests."
     },
     {
       "path": "castore_fuse/tree.rs",
@@ -148,46 +153,6 @@
       "doc": "`RIO_BUILDER_SCRIPT` test fixture (feature `test-fixtures`)."
     },
     {
-      "path": "fuse/",
-      "depth": 0,
-      "doc": "FUSE store daemon for rio-builder."
-    },
-    {
-      "path": "fuse/attr.rs",
-      "depth": 1,
-      "doc": "FUSE attribute helpers."
-    },
-    {
-      "path": "fuse/cache.rs",
-      "depth": 1,
-      "doc": "Local cache for FUSE store paths backed by the pod's emptyDir."
-    },
-    {
-      "path": "fuse/circuit.rs",
-      "depth": 1,
-      "doc": "Re-export of the fetch circuit breaker, which moved to"
-    },
-    {
-      "path": "fuse/fetch/",
-      "depth": 1,
-      "doc": "Fetch and materialize store paths into the local cache."
-    },
-    {
-      "path": "fuse/inode.rs",
-      "depth": 1,
-      "doc": "Inode-to-path bidirectional map with kernel lookup refcounting."
-    },
-    {
-      "path": "fuse/ops.rs",
-      "depth": 1,
-      "doc": "FUSE `Filesystem` trait implementation for `NixStoreFs`."
-    },
-    {
-      "path": "fuse/read.rs",
-      "depth": 1,
-      "doc": "File content serving and prefetch for the FUSE store."
-    },
-    {
       "path": "health.rs",
       "depth": 0,
       "doc": "HTTP health endpoints for K8s probes."
@@ -205,7 +170,7 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "Build executor with FUSE store for rio-build."
+      "doc": "Build executor with a per-build castore-FUSE store for rio-build."
     },
     {
       "path": "log_stream.rs",
@@ -245,7 +210,7 @@
     {
       "path": "runtime/prefetch.rs",
       "depth": 1,
-      "doc": "PrefetchHint handling: warm the FUSE cache and ACK the scheduler."
+      "doc": "PrefetchHint handling: ACK the scheduler's warm-gate."
     },
     {
       "path": "runtime/result.rs",
@@ -265,7 +230,7 @@
     {
       "path": "store_fetch.rs",
       "depth": 0,
-      "doc": "Store-fetch primitives shared by the old FUSE (`fuse::fetch`) and"
+      "doc": "Store-fetch primitives shared by the executor and the castore-FUSE."
     },
     {
       "path": "synth_db.rs",
@@ -1847,11 +1812,6 @@
       "path": "k8s/qa/scenarios/i114_liveness_kill.rs",
       "depth": 3,
       "doc": "I-114: liveness probe kills CPU-pegged builders mid-build."
-    },
-    {
-      "path": "k8s/qa/scenarios/i115_temp_suffix_fastpath.rs",
-      "depth": 3,
-      "doc": "I-115: nix-daemon's sandbox temp probes (`.chroot`/`.lock`/`.check`)"
     },
     {
       "path": "k8s/qa/scenarios/i116_idle_exit.rs",

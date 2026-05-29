@@ -15,6 +15,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
@@ -38,6 +39,19 @@ const LOW_WATER_PCT: u64 = 10;
 /// percentage. The gap above [`LOW_WATER_PCT`] is hysteresis: a single
 /// threshold would evict one file, refill, and evict again every tick.
 const HIGH_WATER_PCT: u64 = 20;
+
+/// Prefix of the quarantine name a doomed staging tree is renamed to
+/// before deletion. It contains `.`, which the build-id character class
+/// excludes, so no live or future `Mount` can ever claim or collide
+/// with a quarantined name.
+const REAP_PREFIX: &str = ".reap.";
+
+/// Monotonic suffix for quarantine names, so a tree whose removal
+/// failed (e.g. an `EBUSY` from an unmount race) never blocks
+/// quarantining a later tree of the same `build_id`. Uniqueness only
+/// matters within one daemon: the startup orphan scan empties
+/// `staging/` — quarantined or not — before any connection exists.
+static REAP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// One cache entry that could be evicted, oldest-first.
 #[derive(Debug)]
@@ -69,12 +83,7 @@ pub(super) async fn run(
         let staging = staging_dir.clone();
         let live = Arc::clone(&live_build_ids);
         let res = tokio::task::spawn_blocking(move || {
-            // Snapshot the live set once per tick. `Mount` inserts the
-            // build_id BEFORE mkdir-ing its staging dir, so any
-            // on-disk dir absent from this snapshot was already dead
-            // when the snapshot was taken.
-            let snapshot = live.lock().ignore_poison().clone();
-            reap_dead_staging(&staging, &snapshot);
+            reap_dead_staging(&staging, &live);
             sweep_once(&cache, &chunks, &staging);
         })
         .await;
@@ -94,9 +103,7 @@ fn sweep_once(cache_dir: &Path, chunks_dir: &Path, staging_dir: &Path) {
     if let Some((free, _)) = fs_free(cache_dir) {
         metrics::gauge!("rio_mountd_cache_free_bytes").set(free as f64);
     }
-    let Some(deficit) = max_deficit(&[cache_dir, chunks_dir, staging_dir]) else {
-        return;
-    };
+    let deficit = max_deficit(&[cache_dir, chunks_dir, staging_dir]);
     if deficit == 0 {
         return;
     }
@@ -145,31 +152,32 @@ fn fs_free(path: &Path) -> Option<(u64, u64)> {
 
 /// The largest "bytes to free" requirement across the swept roots:
 /// for each filesystem under [`LOW_WATER_PCT`], how many bytes short
-/// of [`HIGH_WATER_PCT`] it is. `Some(0)` means every root is above
-/// the low watermark. Returns the max rather than the sum because the
-/// production layout puts all three roots on one bind-mounted XFS —
-/// summing would triple-count the same deficit.
-fn max_deficit(roots: &[&Path]) -> Option<u64> {
+/// of [`HIGH_WATER_PCT`] it is. `0` means every root that could be
+/// statted is above the low watermark. Returns the max rather than the
+/// sum because the production layout puts all three roots on one
+/// bind-mounted XFS — summing would triple-count the same deficit.
+fn max_deficit(roots: &[&Path]) -> u64 {
     let mut worst = 0u64;
-    let mut any = false;
     for root in roots {
         let Some((free, total)) = fs_free(root) else {
             continue;
         };
-        any = true;
         if total == 0 || free * 100 >= total * LOW_WATER_PCT {
             continue;
         }
         worst = worst.max((total / 100 * HIGH_WATER_PCT).saturating_sub(free));
     }
-    any.then_some(worst)
+    worst
 }
 
 /// Every evictable entry under `root/<shard>/`, oldest-first.
-/// `.promoting`/`.tmp` placeholders are skipped — they are owned by a
-/// live promote's copy loop, and unlinking one out from under it makes
-/// the final `rename` fail and the build error. (Leaked placeholders
-/// from a crashed promote are the startup orphan scan's job.)
+/// `.promoting`/`.tmp` placeholders are skipped — both belong to a live
+/// promote: the `.tmp` is its verify-copy destination (and the rename
+/// source at publication, so unlinking it fails the promote), and the
+/// `.promoting` is the flock-held claim that serializes concurrent
+/// promotes of one digest (unlinking it costs a racer a duplicate
+/// copy). Eviction has no business touching either; leaked placeholders
+/// from a crashed daemon are the startup orphan scan's job.
 fn collect_candidates(root: &Path) -> Vec<Candidate> {
     let mut out = Vec::new();
     for shard in list_dir(root) {
@@ -225,17 +233,80 @@ fn evict_from(candidates: Vec<Candidate>, bytes_needed: u64) -> u64 {
     freed
 }
 
-/// Remove staging trees whose `build_id` is not in the live set.
-fn reap_dead_staging(staging_dir: &Path, live: &HashSet<String>) {
-    for name in list_dir(staging_dir) {
-        if live.contains(&name) {
-            continue;
-        }
-        let path = staging_dir.join(&name);
-        match std::fs::remove_dir_all(&path) {
-            Ok(()) => info!(staging = %path.display(), "reaped dead staging dir"),
+/// Remove staging trees whose `build_id` is not (or no longer) live.
+///
+/// Connection teardown is the primary cleanup path; this is the
+/// backstop for trees it leaked (e.g. a `remove_dir_all` lost to an
+/// unmount-race `EBUSY`). Deleting a *live* build's staging tree fails
+/// every fetch, stage and `Promote` that build has in flight, so each
+/// deletion must be provably safe at the moment it happens — never
+/// judged against a point-in-time snapshot a concurrent `Mount` may
+/// have raced past:
+///
+/// 1. Liveness is checked per entry, under the same lock `Mount` uses
+///    to register a `build_id` (and `Mount` registers BEFORE mkdir-ing
+///    its staging dir), so while the check holds the lock no Mount can
+///    sit between "registered" and "directory created".
+/// 2. A dir that fails the check is renamed to a quarantine name while
+///    the lock is still held. A later `Mount` reusing the same
+///    `build_id` then mkdirs a fresh dir at the original name and is
+///    untouched by the deletion.
+/// 3. The (slow) recursive delete runs on the quarantine name outside
+///    the lock. Quarantine names contain `.`, which
+///    [`super::mountd::validate_build_id`] rejects, so nothing live can
+///    ever appear under one.
+fn reap_dead_staging(staging_dir: &Path, live: &Mutex<HashSet<String>>) {
+    reap_dead_staging_inner(staging_dir, live, || {});
+}
+
+/// [`reap_dead_staging`] with a test seam: `after_listing` runs after
+/// the staging root has been listed and before any liveness decision —
+/// the point where a concurrent `Mount` is most adversarial.
+fn reap_dead_staging_inner(
+    staging_dir: &Path,
+    live: &Mutex<HashSet<String>>,
+    after_listing: impl FnOnce(),
+) {
+    let names = list_dir(staging_dir);
+    after_listing();
+    for name in names {
+        let doomed = if name.starts_with(REAP_PREFIX) {
+            // Quarantine leftover from a removal that failed on an
+            // earlier tick; by construction it has no live owner.
+            staging_dir.join(&name)
+        } else {
+            let guard = live.lock().ignore_poison();
+            if guard.contains(&name) {
+                continue;
+            }
+            let quarantine = staging_dir.join(format!(
+                "{REAP_PREFIX}{}.{name}",
+                REAP_SEQ.fetch_add(1, Ordering::Relaxed)
+            ));
+            // The rename happens while the lock is still held —
+            // intentionally. It is a metadata-only syscall (no data is
+            // copied), so it does not extend the critical section
+            // meaningfully; moving it outside the lock would re-open the
+            // window where a Mount registers this build_id between the
+            // liveness check and the rename and then loses its tree.
+            match std::fs::rename(staging_dir.join(&name), &quarantine) {
+                Ok(()) => {}
+                // Teardown won the race and already removed it.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => {
+                    warn!(staging = %name, error = %e, "dead staging dir not quarantined");
+                    continue;
+                }
+            }
+            drop(guard);
+            quarantine
+        };
+        match std::fs::remove_dir_all(&doomed) {
+            Ok(()) => info!(staging = %doomed.display(), "reaped dead staging dir"),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => warn!(staging = %path.display(), error = %e, "dead staging dir not removed"),
+            Err(e) => {
+                warn!(staging = %doomed.display(), error = %e, "dead staging dir not removed")
+            }
         }
     }
 }
@@ -292,9 +363,11 @@ mod tests {
         assert!(new.exists(), "eviction must stop once the target is met");
     }
 
-    /// A `.promoting` placeholder is a live promote's destination;
-    /// unlinking it makes that promote's final `rename` fail and the
-    /// build error out. The sweep must never treat one as evictable.
+    /// `.promoting`/`.tmp` entries belong to a live promote — its claim
+    /// and its verify-copy destination. Unlinking the `.tmp` fails that
+    /// promote's publish rename; unlinking the `.promoting` hands the
+    /// digest's claim to a racer mid-copy. The sweep must never treat
+    /// either as evictable.
     #[test]
     fn placeholders_and_subdirs_are_not_candidates() {
         let tmp = tempfile::tempdir().unwrap();
@@ -308,6 +381,31 @@ mod tests {
         assert_eq!(cands[0].path, real);
     }
 
+    /// A `Mount` that registers while a sweep tick is already in flight
+    /// must not be reaped: its staging dir is on disk by the time the
+    /// staging root is listed (e.g. leaked by a previous owner of the
+    /// same `build_id`), so judging it against liveness data older than
+    /// the listing deletes a live build's staging tree and fails every
+    /// fetch/stage/Promote it has in flight. Liveness must be decided
+    /// per entry, at deletion time.
+    #[test]
+    fn staging_reap_spares_build_registered_mid_tick() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir_all(tmp.path().join("late-build/chunks")).unwrap();
+        let live = Mutex::new(HashSet::new());
+
+        reap_dead_staging_inner(tmp.path(), &live, || {
+            // The Mount lands after the listing: registered in the live
+            // set; its mkdir finds the leaked dir already present.
+            live.lock().ignore_poison().insert("late-build".to_string());
+        });
+
+        assert!(
+            tmp.path().join("late-build").exists(),
+            "sweep must not delete a staging tree owned by a build that registered mid-tick"
+        );
+    }
+
     /// Deleting a live build's staging tree fails every fetch that
     /// build has in flight. The live-set check is the only thing
     /// standing between the sweep and that outcome.
@@ -318,11 +416,25 @@ mod tests {
         fs::create_dir_all(tmp.path().join("dead-build/chunks")).unwrap();
         fs::write(tmp.path().join("dead-build/chunks/x"), b"x").unwrap();
 
-        let live = HashSet::from(["live-build".to_string()]);
+        let live = Mutex::new(HashSet::from(["live-build".to_string()]));
         reap_dead_staging(tmp.path(), &live);
 
         assert!(tmp.path().join("live-build").exists());
         assert!(!tmp.path().join("dead-build").exists());
+    }
+
+    /// A quarantine left behind by a removal that failed (`EBUSY` from
+    /// an unmount race) must be deleted on a later tick rather than
+    /// accumulating until the next daemon restart.
+    #[test]
+    fn staging_reap_removes_quarantine_leftovers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let leftover = format!("{REAP_PREFIX}0.gone-build");
+        fs::create_dir_all(tmp.path().join(&leftover).join("chunks")).unwrap();
+
+        reap_dead_staging(tmp.path(), &Mutex::new(HashSet::new()));
+
+        assert!(!tmp.path().join(&leftover).exists());
     }
 
     /// Above the low watermark the sweep must be a no-op: a tick that
@@ -340,6 +452,6 @@ mod tests {
             eprintln!("skipping: test host filesystem is under the low watermark");
             return;
         }
-        assert_eq!(max_deficit(&[tmp.path()]), Some(0));
+        assert_eq!(max_deficit(&[tmp.path()]), 0);
     }
 }

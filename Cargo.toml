@@ -96,8 +96,13 @@ aws-config = { version = "1", default-features = false, features = [
   "sso",
 ] }
 
-# FUSE
-fuser = "0.17"
+# FUSE. Pinned to master for ReplyOpen::wrap_backing/BackingId::into_raw:
+# the unprivileged castore-FUSE replies open() with a backing_id allocated
+# by rio-mountd's privileged BACKING_OPEN ioctl, and 0.17.0 can only mint
+# a BackingId by doing that ioctl itself (EPERM in the builder). Drop the
+# pin at the first release containing cberner/fuser@a664f194. NAR hashes
+# for the pinned tree: crate-hashes.json + workspaceCargoVendor (flake.nix).
+fuser = { git = "https://github.com/cberner/fuser", rev = "2bdfbc53a116b9b4af5c91d20ab6a4f9b9004645" }
 
 # Linux syscalls
 nix = { version = "0.31", features = [
@@ -109,6 +114,10 @@ nix = { version = "0.31", features = [
   "process",
   "signal",
   "socket",
+  # setrlimit(RLIMIT_NOFILE) at builder startup — passthrough backing
+  # fds + chunk-cache fds scale with max_backing_ids and overflow the
+  # 1024 default soft limit.
+  "resource",
 ] }
 # raw_os_error()/raise()/errno constants where the `nix` crate is
 # overkill. Used as a normal dep in rio-gateway (EMFILE/ENFILE accept
