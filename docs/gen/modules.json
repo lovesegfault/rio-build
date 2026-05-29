@@ -973,7 +973,7 @@
     {
       "path": "s3.rs",
       "depth": 0,
-      "doc": "Write-once S3 layout writer for eval-set artifacts."
+      "doc": "Recorder-facing S3 layer: archive publication plus the by-recipe pointer."
     }
   ],
   "rio-proto": [
