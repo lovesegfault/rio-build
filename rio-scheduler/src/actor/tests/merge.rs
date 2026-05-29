@@ -5941,7 +5941,6 @@ async fn test_topdown_stamp_rolled_back_when_activation_fails() -> TestResult {
     Ok(())
 }
 
-
 // r[verify sched.merge.edge-creation-scoped]
 // r[verify sched.merge.substitute-topdown+10]
 /// Production-order variant of the topdown-pruned dependency top-up: B1's
@@ -6015,7 +6014,6 @@ async fn test_topdown_pruned_root_dep_topup_production_order() -> TestResult {
     assert!(!post.topdown_pruned, "flag cleared once R gained children");
     Ok(())
 }
-
 
 // r[verify sched.merge.substitute-topdown+10]
 /// Top-down negative: root NOT substitutable → fall through to

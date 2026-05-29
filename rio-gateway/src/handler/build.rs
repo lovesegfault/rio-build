@@ -1572,9 +1572,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     if build_result.status.is_success() {
         let enrich_from: Option<Derivation> = match &full_drv {
             Ok(drv) => Some(drv.clone()),
-            Err(_) if basic_drv.is_content_addressed() => {
-                Some(Derivation::from_basic(&basic_drv))
-            }
+            Err(_) if basic_drv.is_content_addressed() => Some(Derivation::from_basic(&basic_drv)),
             Err(_) => None,
         };
         if let Some(drv) = enrich_from {
