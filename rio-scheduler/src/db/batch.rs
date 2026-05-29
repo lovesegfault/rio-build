@@ -523,6 +523,40 @@ impl SchedulerDb {
         Ok(())
     }
 
+    /// Transaction-scoped `topdown_pruned` stamp for kept nodes a pruned
+    /// merge merely JOINED. The derivations upsert is creation-scoped
+    /// (`sched.persist.creation-scoped`): only nodes the merge (re)creates
+    /// reach Batch 1, so a pre-existing node kept by a top-down prune
+    /// never gets the row-bind stamp — without this statement the
+    /// demand-set guard (`sched.merge.substitute-topdown`) would be
+    /// memory-only for exactly those nodes and vanish on leader failover.
+    /// Runs inside the merge transaction (Batch 1b in
+    /// `persist_merge_to_db`), so the stamp commits or rolls back with the
+    /// rest of the merge. The caller applies the same gate as the row
+    /// bind (parents of the pruned submission's edges, minus nodes whose
+    /// existing children the closure classifier vouches for). Clearing is
+    /// unchanged (`clear_topdown_pruned_by_hashes` and friends).
+    /// Plain runtime query — no `.sqlx/` impact.
+    pub(crate) async fn stamp_topdown_pruned_tx(
+        tx: &mut PgConnection,
+        drv_hashes: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if drv_hashes.is_empty() {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            r#"
+            UPDATE derivations
+            SET topdown_pruned = true, updated_at = now()
+            WHERE drv_hash = ANY($1) AND NOT topdown_pruned
+            "#,
+        )
+        .bind(drv_hashes)
+        .execute(&mut *tx)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
     /// on the pool (outside any transaction). Callers: the
     /// post-reconciliation clear pass in `handle_merge_dag` (unique

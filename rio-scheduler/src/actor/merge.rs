@@ -2175,6 +2175,25 @@ impl DagActor {
         // drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
+        // Batch 1b: persist the topdown_pruned stamp for kept nodes this
+        // merge merely JOINED. Batch 1 is creation-scoped
+        // (sched.persist.creation-scoped), so a pruned merge that keeps a
+        // pre-existing node never reaches its row above; without this
+        // statement the demand-set guard would be memory-only for exactly
+        // those nodes and disappear on leader failover
+        // (sched.merge.substitute-topdown). Same gate as the row bind:
+        // parents of the ORIGINAL submission's edges, minus nodes whose
+        // existing children the closure classifier vouches for.
+        let joined_stamped: Vec<String> = topdown_pruned_parents
+            .iter()
+            .filter(|h| !newly_inserted.contains(h.as_str()))
+            .filter(|h| !self.closure_vouched(h.as_str()))
+            .cloned()
+            .collect();
+        if !joined_stamped.is_empty() {
+            crate::db::SchedulerDb::stamp_topdown_pruned_tx(&mut tx, &joined_stamped).await?;
+        }
+
         // Batch 2: link ALL submitted nodes to this build — newly-created
         // ones via this tx's id_map, pre-existing live nodes via the
         // db_id their creating merge committed (their rows are not
