@@ -1533,6 +1533,26 @@ reasons=[Drifted]` on `rio-general`), so AMI drift never auto-evicts gateway
 pods; the operator runs `cargo xtask k8s rotate-general` during a quiet window
 to roll those nodes onto a new AMI under the same 1 h drain budget.
 
+== Operator surface
+
+Descriptive, not normative: this records the closed world the lifecycle
+rules above operate in. The gateway exposes exactly three listeners --- the
+SSH ingress, the gRPC health endpoint, and the metrics endpoint. There is no
+admin RPC to list sessions, kill a connection, or force a drain; the only
+operator inputs that affect established connections are process signals
+(SIGTERM enters the #rref("gw.drain.three-stage") drain; SIGKILL abandons it
+and leaves recovery to the scheduler/store backstops) and the rollout
+machinery built on them. Readiness and metrics scrapes are read-only
+observations. Edits to `authorized_keys` are picked up by the
+#rref("gw.keys.hot-reload") poll and apply to *future* authentication
+attempts only: revoking a key never terminates an established connection or
+its sessions, and a live session's JWT re-mint
+(#rref("gw.jwt.refresh-on-expiry+2")) reuses the claims cached at
+authentication, so revocation takes effect at the next new connection, not
+before. Anything that must end a live connection without the peer's
+cooperation therefore goes through the gateway's own deadlines and
+#rref("gw.conn.force-close") --- there is no operator lever for it.
+
 = STDERR Message Types
 
 #r("gw.stderr.message-types")[
