@@ -4171,7 +4171,12 @@ no deviation to record under the §4.5 honesty rule.
   retry-campaign owned). Blocker note:
   `~/tmp/rio-formal-verification/executor-1d-blocker-p12.md`; the
   `sched.retry.per-executor-budget+3` vehicle-list and key-clause
-  re-statement land with that work.
+  re-statement land with that work. **Closed by the retry-campaign
+  coda:** the kernel's event identity is `Option<Id>`, the shim's
+  fold-input projection keys rows on `source_node` only, and
+  `sched.retry.per-executor-budget+4` carries the re-stated key clause
+  and vehicle list (record: the retry map's coda section; the blocker
+  note carries the disposition).
 
 #### Deferred items (Phase 2 / cross-campaign, restated)
 
@@ -4185,7 +4190,9 @@ no deviation to record under the §4.5 honesty rule.
    stays typechecking; consider a periodic manual re-run recipe) and
    the MBT revisit if the pull handlers' pure core warrants it.
 4. P12 completion + the per-executor-budget re-statement (the blocker
-   note above; co-owned with the retry campaign).
+   note above; co-owned with the retry campaign). **Done — closed by
+   the retry-campaign coda** (`sched.retry.per-executor-budget+4`; the
+   retry map's coda section is the record).
 5. Pool `dispatchMode: Stream` and the per-pod `RIO_DISPATCH_MODE`
    discriminators: the CRD value and the controller-side gates remain
    (out of the 1d plan's scope) even though the builder always pulls;
@@ -4822,8 +4829,9 @@ had.
   the only pod-terminal channel; the scheduler gained no informer.
 - **AD2** (node-keyed exclusion, exhaustion survives re-keyed):
   landed on both halves at 1b with migration 071; both keys carried
-  through coexistence; the legacy pod-name key drop is the open P12
-  item (deferred, retry-campaign co-owned).
+  through coexistence; the legacy pod-name key drop (P12) has since
+  landed via the retry-campaign coda — the exclusion key is the source
+  node only.
 - **AD3** (pull = Ready→Running, leader-served, idempotent): as
   landed (`sched.executor.pull-transaction`); re-pulls idempotent;
   `Gone` charge-free.
@@ -4877,7 +4885,7 @@ development tree; all of them gate the staged rollout.
 
 | Item | Owner | Condition / where recorded |
 |---|---|---|
-| P12: drop the legacy pod-name exclusion key; re-state `sched.retry.per-executor-budget+3`'s establishment-vehicle list and key clause | Retry campaign (co-owned with this campaign's owner) | Blocked on hoisting the retry kernel's placeholder identity to a first-class optional identity (event alphabet + CBMC contracts); blocker note `~/tmp/rio-formal-verification/executor-1d-blocker-p12.md`; the fold meanwhile keys legacy stream-era rows by pod name (mixed-era handling per AD2 stays correct) |
+| P12: drop the legacy pod-name exclusion key; re-state `sched.retry.per-executor-budget+3`'s establishment-vehicle list and key clause | Retry campaign (co-owned with this campaign's owner) | **Done (retry-campaign coda):** the kernel event identity is `Option<Id>`, the fold keys rows on `source_node` only, and `sched.retry.per-executor-budget+4` carries the re-stated key clause and vehicle list; record in the retry map's coda section, disposition noted in the blocker file |
 | Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side gates | Campaign owner | Retire once a deprecation path for existing CRs is chosen (CRD version bump + pod.rs/job.rs gates + helm knob); until then the value is selectable but the builder always pulls |
 | Deployment-time validation checklist rows D0–D7 | Operator / campaign owner at deployment time | The finalized table below; the D6/D7 signal-shape note (the gauge and stub-counter series exist only on pre-deletion-stage releases — evaluate against the release being upgraded FROM; the 1d-stage watch falls back to error rates and gateway unknown-method observability) is part of row D6/D7 |
 | Controller-map counter-signatures (the 1b re-audit entry and the 1d delta entry) and the owner's G6/G7 signatures | Controller-campaign owner / campaign owner (same person, recorded as self-issued) | At the close-out review; nothing in the records is provisional on them beyond the signature itself |
@@ -4988,9 +4996,10 @@ only as retirement records, contradiction history, and this map's
 Stage-A/B/C sections, which is intentional. `sched.backpressure.
 hysteresis+2` and the reactive-floor rule were re-derived for the
 pull-only protocol at 1d; the phase-binding/path-length rules are
-retired with their surface. The known remaining stale text is the
-retry-owned `sched.retry.per-executor-budget+3` vehicle list (the P12
-deferral above). The deployment checklist above supersedes the plan
+retired with their surface. The known remaining stale text at this
+close-out was the retry-owned `sched.retry.per-executor-budget+3`
+vehicle list (the P12 deferral above) — since corrected by the
+retry-campaign coda's `+4` re-statement. The deployment checklist above supersedes the plan
 document's copy as the operator-facing version; the
 `hung-node-manual-reap` runbook's row-D3 reference is consistent with
 it. `tracey query stale` is empty and `tracey query validate` reports

@@ -2043,6 +2043,40 @@ What this phase records instead:
 
 The `// TODO:` at `load_retry_seed_in_tx` (db/derivations.rs) is the
 code-side anchor for this decision and now points at this subsection.
+
+**Status (retry-campaign coda): landed.** The drop shipped — as
+migration 073, not the reserved 067: 068–072 landed while the drop was
+deferred, and taking a lower number than already-shipped migrations
+would have re-ordered the applied chain relative to the authored one
+for no benefit (M_073/M_068 in `rio-migrations/src/migrations.rs`
+record the numbering; the 067 gap is permanent). The trigger is the
+deployment-model clarification of 2026-05-27 (no staged rollouts, no
+existing cluster or live database — every eventual deployment is
+fresh), exactly the trigger migration 070's record cites: a fresh
+database never carries a pre-066 failure history, so the drain
+condition this subsection gated on is satisfied vacuously and the
+operational drain probe above is retained as history only. The sweep
+took the retirement checklist in full: `load_retry_seed_in_tx` (and
+its TODO), the reset paths' column zeroing, the recovery loaders'
+column reads, `DerivationState::legacy_retry_floor` and its
+construction sites, and the `load_poisoned_display` legacy union are
+gone; the seed machinery itself followed in the next commit —
+`decide()` is back to the frozen §5a-2 three-argument shape,
+`PersistedRetryColumns` / `Counters::recovery_projection` and the
+contracts' seed clauses are deleted, the `check_legacy_seed_merge_monotone`
+harness is retired (the `kani-rio-retry-kernel` harness-count tripwire
+is now 6; all six harnesses VERIFY), and
+`sched.retry.recovery-projection+3`,
+`sched.merge.poisoned-resubmit-bounded+4` and
+`sched.db.clear-poison-batch+3` re-state the rules whose bodies named
+the columns. The legacy-seed scope-boundary entry in `retryPolicy.qnt`
+is re-worded as a retirement record (the seed was never modeled; the
+wired pull-regime check and witnesses re-verified green, state counts
+unchanged — figures in the introducing commit messages). The deleted
+seed tests' coverage disposition is recorded in the introducing
+commits (no silent weakening: the behavior they pinned is the behavior
+removed).
+
 ### Retirement of the as-built model and the calibration corpus
 
 Design §5's Phase-2 row and the Phase-2 hand-off both schedule the
@@ -2227,6 +2261,9 @@ each handler also gains a durable write).
 - The mirror-column DROP, the legacy-floor removal, and the frozen
   three-argument `decide()` — behind the drain condition, with the
   operational probe recorded (the mirror-column subsection above).
+  **Closed by the retry-campaign coda** (migration 073 + the seed
+  retirement; see that subsection's status paragraph — the fresh-only
+  deployment directive made the drain condition vacuous).
 - A real ledger GC policy (P8): the compile-time retention-floor
   assertion and the suffix bound stand in; a sweep is future work and
   must respect the recorded retention floor (≥ the poison TTL).
@@ -2353,3 +2390,51 @@ all in code unreachable from it), and the re-built
 `quint-retry-policy-pull` check reports the same distinct-state count
 and depth as the pre-retirement build (figures in the introducing
 commit message and the check transcripts).
+
+## The retry-campaign coda (the two recorded follow-ups, executed)
+
+Performed by the retry campaign after the executor-lifecycle campaign's
+close-out, once the deployment model was clarified as fresh-only
+(2026-05-27/28 directives: no staged rollouts, no live databases). Both
+deferral entries this map carried are closed; the figures live in the
+introducing commit messages and the check transcripts.
+
+1. **Mirror-column drop + legacy-seed retirement (the Phase-2
+   deferral).** Migration 073 (not the reserved 067 — see the status
+   paragraph in the mirror-column subsection and M_073) drops
+   `derivations.{retry_count, failed_builders, resubmit_cycles}`; the
+   reader/writer sweep and the seed retirement follow. `decide()` is
+   the frozen §5a-2 three-argument surface again; the contracts' seed
+   clauses, `check_legacy_seed_merge_monotone` and `any_seed` are
+   retired (the `kani-rio-retry-kernel` harness-count tripwire is 6 and
+   all six harnesses VERIFY); `sched.retry.recovery-projection+3`,
+   `sched.merge.poisoned-resubmit-bounded+4` and
+   `sched.db.clear-poison-batch+3` re-state the rules whose bodies
+   named the columns; the pull-regime check and witnesses re-verified
+   green with unchanged state counts.
+
+2. **P12 — the pod-name exclusion-key drop (the executor campaign's
+   deferred item, retry-co-owned).** The kernel's event identity is
+   `Option<Id>`: the four threshold-charging arms insert into the
+   exclusion set only when an identity is present, and the scheduler
+   shim's fold-input projection keys rows on
+   `drv_attempts.source_node` alone (the `or_else(executor_id)`
+   fallback is deleted). An identity-less row — a pull attempt whose
+   binding ack never landed, or a pre-pull legacy row — charges the
+   flat `failure_count` but occupies no distinct-source slot and leaks
+   no non-schedulable key into placement; such histories are bounded
+   by the per-cycle caps (and the flat-count mode), not by the
+   distinct-source threshold — the threshold-semantics question the
+   blocker note left open is resolved that way and stated normatively
+   in `sched.retry.per-executor-budget+4`, which also shrinks the
+   establishment-vehicle list to the establishment sweep. Red-first
+   coverage: `exclusion_keys_are_source_nodes_only` (the successor of
+   the mixed-era both-keys test) plus the five actor-test conversions
+   recorded in the introducing commit. The kani contracts re-verified
+   over the new alphabet (6/6); the pull-regime model is untouched by
+   the change (its exclusion inputs were node-keyed from the start).
+
+The deliberately-open items (A7 uniform backoff, A10 fencepost
+unification, A8 poison-reason strings, the ledger GC policy, the MBT
+omission with its reconsideration triggers) are unchanged by this coda
+and remain the campaign's only open list.
