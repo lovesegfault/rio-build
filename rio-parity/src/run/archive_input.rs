@@ -5,7 +5,7 @@
 //! The plan stage keeps consuming the same in-memory shapes it used for
 //! the legacy eval-set artifacts ([`ManifestEntry`], [`DepClosureEntry`]);
 //! these adapters fill those shapes from an open
-//! [`ReplayArchive`](crate::archive::reader::ReplayArchive) instead:
+//! [`ReplayArchive`] instead:
 //! `units.jsonl` records become manifest entries, the per-derivation
 //! adjacency in `closures.jsonl` is expanded into per-unit transitive
 //! dependency closures, and `exclusions.jsonl` feeds the plan-time
