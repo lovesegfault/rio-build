@@ -3312,24 +3312,21 @@ async fn test_topdown_pruned_holed_survivor_fails_fast_at_dispatch_not_assigned_
         "fixture premise: R is still marked when it reaches Ready"
     );
 
-    // A builder is available — the doomed from-source dispatch has
-    // somewhere to go if the dispatch-time guards ignore the hole.
-    let mut worker_rx = connect_executor(&handle, "tdhd-w", "x86_64-linux").await?;
+    // A puller is available — the doomed from-source delivery has
+    // somewhere to go if the guards ignore the hole.
     tick(&handle).await?;
 
     // Designed outcome: R's wanted `debug` output is missing upstream
     // and not substitutable, so the probes can neither complete it
     // inline nor route it to substitution — the holed survivor must
     // take the resubmit-directing fail-fast, NOT a from-source
-    // assignment over the reap-truncated child set.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a marked closure-holed survivor must never be dispatched from source \
-             (its pruned closure was never merged — the worker would ENOENT)"
-        );
-    }
+    // delivery over the reap-truncated child set.
+    let pull = try_pull_attempt(&handle, "tdhd-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a marked closure-holed survivor must never be dispatched from source \
+         (its pruned closure was never merged — the worker would ENOENT); got {pull:?}"
+    );
     let r = expect_drv(&handle, "tdhd-r").await;
     assert!(
         !matches!(
@@ -3460,10 +3457,9 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
         "fixture premise: R is unmarked (no prune ever fired for it)"
     );
 
-    // A builder connects; the next dispatch pass must hand R to it.
-    let mut worker_rx = connect_executor(&handle, "tdnm-w", "x86_64-linux").await?;
+    // A builder pulls; the pull path must hand R to it.
     tick(&handle).await?;
-    let assn = recv_assignment(&mut worker_rx).await;
+    let assn = pull_attempt(&handle, "tdnm-r").await;
     assert_eq!(
         assn.drv_path,
         test_drv_path("tdnm-r"),
@@ -3472,8 +3468,8 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     );
     assert_eq!(
         expect_drv(&handle, "tdnm-r").await.status,
-        DerivationStatus::Assigned,
-        "R must be assigned to the worker, not deferred or fail-fasted"
+        DerivationStatus::Running,
+        "R must be handed to the worker (pull mint), not deferred or fail-fasted"
     );
     assert_eq!(
         query_status(&handle, bc).await?.state,
@@ -3979,10 +3975,9 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
          closure_hole={pg_hole})"
     );
 
-    // A builder is available — the doomed from-source dispatch has
-    // somewhere to go if the truncated child set is wrongly judged
+    // A puller is available throughout — the doomed from-source delivery
+    // has somewhere to go if the truncated child set is wrongly judged
     // Vouched after the walk failure.
-    let mut worker_rx = connect_executor(&handle, "tdcr-w", "x86_64-linux").await?;
 
     // The re-spawned walk genuinely fails (upstream advertised the
     // path but could not deliver). R's surviving children ({dep2}) are
@@ -4018,15 +4013,13 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     // No from-source dispatch may follow: drive a dispatch pass and
     // assert R was neither left dispatchable nor handed to the worker.
     tick(&handle).await?;
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a marked closure-holed root must never be dispatched from source after \
-             its walk fails (its pruned closure was never merged — the worker would \
-             ENOENT)"
-        );
-    }
+    let pull = try_pull_attempt(&handle, "tdcr-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a marked closure-holed root must never be dispatched from source after \
+         its walk fails (its pruned closure was never merged — the worker would \
+         ENOENT); got {pull:?}"
+    );
     let r = expect_drv(&handle, "tdcr-r").await;
     assert!(
         !matches!(
@@ -4290,10 +4283,9 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
          (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
     );
 
-    // A builder is available — the doomed from-source dispatch has
-    // somewhere to go if the laundered child set were wrongly trusted
-    // after the walk failure.
-    let mut worker_rx = connect_executor(&handle, "tdrr-w", "x86_64-linux").await?;
+    // A puller is available throughout — the doomed from-source delivery
+    // has somewhere to go if the laundered child set were wrongly
+    // trusted after the walk failure.
 
     // The re-spawned walk genuinely fails (upstream advertised the
     // path but could not deliver). The re-stamped, still-holed R must
@@ -4324,15 +4316,13 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     // No from-source dispatch may follow: drive a dispatch pass and
     // assert R was neither left dispatchable nor handed to the worker.
     tick(&handle).await?;
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a re-pruned closure-holed root must never be dispatched from source after \
-             its walk fails (its pruned closure was never merged — the worker would \
-             ENOENT)"
-        );
-    }
+    let pull = try_pull_attempt(&handle, "tdrr-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a re-pruned closure-holed root must never be dispatched from source after \
+         its walk fails (its pruned closure was never merged — the worker would \
+         ENOENT); got {pull:?}"
+    );
     let r = expect_drv(&handle, "tdrr-r").await;
     assert!(
         !matches!(
@@ -4523,9 +4513,8 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
          the reap (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
     );
 
-    // A builder is available throughout — a from-source dispatch of R
+    // A puller is available throughout — a from-source delivery of R
     // would have somewhere to land at every later step.
-    let mut worker_rx = connect_executor(&handle, "tdfk-w", "x86_64-linux").await?;
 
     // R's parked walk genuinely FAILS: the closure evidence is Broken
     // (hole over the produced survivor), so the verdict takes the
@@ -4641,14 +4630,12 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     // No from-source dispatch may ever have been cut for R: drive a
     // dispatch pass and drain everything the worker was sent.
     tick(&handle).await?;
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a closure-holed pruned root must never be dispatched from source — its \
-             pruned closure was never merged (the worker would ENOENT)"
-        );
-    }
+    let pull = try_pull_attempt(&handle, "tdfk-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a closure-holed pruned root must never be dispatched from source — its \
+         pruned closure was never merged (the worker would ENOENT); got {pull:?}"
+    );
     let r = expect_drv(&handle, "tdfk-r").await;
     assert!(
         !matches!(
@@ -4701,10 +4688,9 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
         .query_path_info_gate_armed
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // A builder is available throughout — dep1 needs a real dispatch to
-    // be poisoned via PermanentFailure, and a from-source dispatch of R
-    // would have somewhere to land at every later step.
-    let mut worker_rx = connect_executor(&handle, "pcs-w", "x86_64-linux").await?;
+    // dep1 needs a real delivery to be poisoned via PermanentFailure,
+    // and a from-source delivery of R would have somewhere to land at
+    // every later step.
 
     // B1: root → dep1 with the root's wanted output substitutable
     // upstream → the prune fires, keeps {R} (stamped, childless),
@@ -4789,7 +4775,7 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
         true,
     )
     .await?;
-    let assignment = recv_assignment(&mut worker_rx).await;
+    let assignment = pull_attempt(&handle, "pcs-dep1").await;
     assert!(
         assignment.drv_path.contains("pcs-dep1"),
         "fixture premise: the only dispatchable node is dep1; got {:?}",
@@ -4799,10 +4785,9 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     // dep1 permanently fails → Poisoned. The cascade skips the
     // Substituting R (a walk in flight keeps its chance), so R keeps
     // its mark and its parked walk; keep_going B2 stays Active.
-    complete_failure(
+    pull_complete_failure(
         &handle,
-        "pcs-w",
-        &test_drv_path("pcs-dep1"),
+        "pcs-dep1",
         rio_proto::types::BuildResultStatus::PermanentFailure,
         "permanent failure",
     )
@@ -4925,14 +4910,12 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     // dispatch pass and drain everything the worker was sent (dep1's
     // own assignment was already consumed above).
     tick(&handle).await?;
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a closure-holed pruned root must never be dispatched from source — its \
-             pruned closure was never merged (the worker would ENOENT)"
-        );
-    }
+    let pull = try_pull_attempt(&handle, "pcs-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a closure-holed pruned root must never be dispatched from source — its \
+         pruned closure was never merged (the worker would ENOENT); got {pull:?}"
+    );
     let r = expect_drv(&handle, "pcs-r").await;
     assert!(
         !matches!(

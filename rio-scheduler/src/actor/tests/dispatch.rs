@@ -3190,22 +3190,19 @@ async fn topdown_pruned_childless_node_not_dispatched_when_probe_fails_open() ->
         .fail_find_missing
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    // A builder is available — the fail-open dispatch has somewhere to
-    // go if the carve-out is missing.
-    let mut rx = connect_executor(&handle, "tdfo-w", "x86_64-linux").await?;
+    // A puller is available — the fail-open path has somewhere to go if
+    // the carve-out is missing.
     tick(&handle).await?;
     tick(&handle).await?;
 
-    // No WorkAssignment for the flagged childless node on a fail-open
-    // pass.
-    while let Ok(m) = rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a childless topdown-pruned node must not be dispatched from source \
-             on a fail-open (probe error) pass"
-        );
-    }
+    // No from-source delivery for the flagged childless node on a
+    // fail-open pass: a pull for it must not deliver.
+    let pull = try_pull_attempt(&handle, "tdfo-r").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a childless topdown-pruned node must not be dispatched from source \
+         on a fail-open (probe error) pass; got {pull:?}"
+    );
     // The node is merely deferred — still schedulable once the store
     // answers again — and the build is still alive.
     let d = expect_drv(&handle, "tdfo-r").await;
@@ -3265,14 +3262,10 @@ async fn topdown_fail_fast_does_not_resurrect_node_terminalized_by_prior_iterati
     assert!(handle.debug_set_topdown_pruned("tdm-a", true).await?);
     assert!(handle.debug_set_topdown_pruned("tdm-b", true).await?);
 
-    // A worker is connected so the pass exercises the same path as
-    // production. The connect-time inline dispatch runs at the current
-    // probe generation (no re-probe), so drive a fresh heartbeat+Tick:
-    // the Tick advances the probe generation and drains the dirty flag,
-    // and that batch probe finds both wanted outputs missing and
-    // unsubstitutable → both roots take the fail-fast in ONE pass.
-    let mut rx = connect_executor(&handle, "tdm-w", "x86_64-linux").await?;
-    send_heartbeat(&handle, "tdm-w", "x86_64-linux").await?;
+    // Drive a fresh Tick: it advances the probe generation, and that
+    // batch probe finds both wanted outputs missing and unsubstitutable
+    // → both roots take the fail-fast in ONE pass.
+    tick(&handle).await?;
     barrier(&handle).await;
 
     // The build fails exactly once, with the resubmit-directing error.
@@ -3318,12 +3311,13 @@ async fn topdown_fail_fast_does_not_resurrect_node_terminalized_by_prior_iterati
              back to a schedulable status"
         );
     }
-    // No spurious dispatch of either node happened along the way.
-    while let Ok(m) = rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
+    // No spurious from-source delivery of either node happened: a pull
+    // for either must not deliver.
+    for tag in ["tdm-a", "tdm-b"] {
+        let pull = try_pull_attempt(&handle, tag).await;
         assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "neither failed-fast root may be dispatched from source"
+            !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+            "neither failed-fast root may be dispatched from source; {tag} got {pull:?}"
         );
     }
     Ok(())

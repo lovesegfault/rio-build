@@ -2482,20 +2482,17 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     .await?;
     let handle = f.handle;
 
-    // A builder is available — the doomed from-source dispatch has
+    // A puller is available — the doomed from-source delivery has
     // somewhere to go if the restore+guard are missing.
-    let mut worker_rx = connect_executor(&handle, "fov-w", "x86_64-linux").await?;
     tick(&handle).await?;
 
-    // No WorkAssignment is ever sent for the dep-less node.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "childless topdown-pruned root must never be dispatched from source \
-             after failover (its inputDrvs were never merged — worker would ENOENT)"
-        );
-    }
+    // No from-source delivery ever happens for the dep-less node.
+    let pull = try_pull_attempt(&handle, "fov-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "childless topdown-pruned root must never be dispatched from source \
+         after failover (its inputDrvs were never merged — worker would ENOENT); got {pull:?}"
+    );
     let d = expect_drv(&handle, "fov-root").await;
     assert!(
         !matches!(
@@ -2616,7 +2613,6 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
     let (handle3, _task3) = setup_actor_with_store(db.pool.clone(), Some(store_client));
     handle3.send_unchecked(ActorCommand::LeaderAcquired).await?;
     barrier(&handle3).await;
-    let mut rx = connect_executor(&handle3, "ffc-w", "x86_64-linux").await?;
     tick(&handle3).await?;
 
     let s2 = query_status(&handle3, build2).await?;
@@ -2627,7 +2623,7 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
          (stale topdown_pruned re-armed the guard); error={:?}",
         s2.error_summary
     );
-    let a = recv_assignment(&mut rx).await;
+    let a = pull_attempt(&handle3, "ffc-root").await;
     assert_eq!(
         a.drv_path,
         test_drv_path("ffc-root"),
@@ -2716,9 +2712,8 @@ async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> Tes
     .await?;
     let handle = f.handle;
 
-    // A builder is available — the parent should dispatch to it from
+    // A puller is available — the parent should be deliverable from
     // source once the stale mark is dropped.
-    let mut rx = connect_executor(&handle, "tdcp-w", "x86_64-linux").await?;
     tick(&handle).await?;
 
     // Not the wrongful fail-fast: the build stays alive...
@@ -2732,7 +2727,7 @@ async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> Tes
     );
     // ...and the parent dispatches from source (`debug` is missing and
     // not substitutable, so source is the only way to produce it).
-    let a = recv_assignment(&mut rx).await;
+    let a = pull_attempt(&handle, "tdcp-root").await;
     assert_eq!(
         a.drv_path,
         test_drv_path("tdcp-root"),
@@ -2865,21 +2860,18 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     .await?;
     let handle = f.handle;
 
-    // A builder is available — the doomed from-source dispatch has
+    // A puller is available — the doomed from-source delivery has
     // somewhere to go if the kept mark fails to gate it.
-    let mut worker_rx = connect_executor(&handle, "tdhist-w", "x86_64-linux").await?;
     tick(&handle).await?;
 
-    // No WorkAssignment is ever sent for the parent: its closure was
-    // never merged for B1, so a from-source dispatch would ENOENT.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a pruned root whose produced children belong to a terminal build \
-             must not be dispatched from source after failover"
-        );
-    }
+    // No from-source delivery ever happens for the parent: its closure
+    // was never merged for B1, so a from-source build would ENOENT.
+    let pull = try_pull_attempt(&handle, "tdhist-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a pruned root whose produced children belong to a terminal build \
+         must not be dispatched from source after failover; got {pull:?}"
+    );
     let d = expect_drv(&handle, "tdhist-root").await;
     assert!(
         !matches!(
@@ -3096,21 +3088,19 @@ async fn test_failover_keeps_topdown_pruned_when_closure_hole_recorded() -> Test
     .await?;
     let handle = f.handle;
 
-    // A builder is available — the doomed from-source dispatch has
+    // A puller is available — the doomed from-source delivery has
     // somewhere to go if the produced survivor launders the clear.
-    let mut worker_rx = connect_executor(&handle, "tdvh-w", "x86_64-linux").await?;
     tick(&handle).await?;
 
-    // No WorkAssignment is ever sent for the parent: its pruned closure
-    // was truncated by the reap, so a from-source dispatch would ENOENT.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a closure-holed pruned root must not be dispatched from source after \
-             failover, however produced its surviving persisted children look"
-        );
-    }
+    // No from-source delivery ever happens for the parent: its pruned
+    // closure was truncated by the reap, so a from-source build would
+    // ENOENT.
+    let pull = try_pull_attempt(&handle, "tdvh-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a closure-holed pruned root must not be dispatched from source after \
+         failover, however produced its surviving persisted children look; got {pull:?}"
+    );
     let d = expect_drv(&handle, "tdvh-root").await;
     assert!(
         !matches!(
@@ -3280,24 +3270,21 @@ async fn test_failover_pruned_build_completes_via_substitution_despite_other_bui
          of a healthy pruning build"
     );
 
-    // A worker is available — a wrongful from-source dispatch would have
+    // A puller is available — a wrongful from-source delivery would have
     // somewhere to land.
-    let mut worker_rx = connect_executor(&handle, "bug9s-w", "x86_64-linux").await?;
     tick(&handle).await?;
     // Deterministic end state: the kept mark routes the node through the
     // substitution carve-out and the detached fetch completes it.
     wait_for_status(&handle, "bug9s-root", DerivationStatus::Completed).await;
 
-    // No WorkAssignment was ever sent for the parent (substitution, not
-    // a from-source dispatch).
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "the parent must complete via substitution, never via a from-source \
-             dispatch (its closure was never merged for B1)"
-        );
-    }
+    // No from-source delivery ever happened for the parent (substitution,
+    // not a from-source build).
+    let pull = try_pull_attempt(&handle, "bug9s-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "the parent must complete via substitution, never via a from-source \
+         dispatch (its closure was never merged for B1); got {pull:?}"
+    );
     // Not condemned in PG either.
     let (pg_status,): (String,) =
         sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'bug9s-root'")
@@ -3392,21 +3379,18 @@ async fn test_failover_pruned_build_gets_resubmit_error_not_dependency_failure_f
     .await?;
     let handle = f.handle;
 
-    // A builder is available — the doomed from-source dispatch has
+    // A puller is available — the doomed from-source delivery has
     // somewhere to go if the kept mark fails to gate it.
-    let mut worker_rx = connect_executor(&handle, "bug9f-w", "x86_64-linux").await?;
     tick(&handle).await?;
 
-    // No WorkAssignment is ever sent for the parent: its closure was
-    // never merged for B1, so a from-source dispatch would ENOENT.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "a pruned root with an unsatisfiable wanted set must take the bounded \
-             fail-fast, never a from-source dispatch"
-        );
-    }
+    // No from-source delivery ever happens for the parent: its closure
+    // was never merged for B1, so a from-source build would ENOENT.
+    let pull = try_pull_attempt(&handle, "bug9f-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "a pruned root with an unsatisfiable wanted set must take the bounded \
+         fail-fast, never a from-source dispatch; got {pull:?}"
+    );
     let d = expect_drv(&handle, "bug9f-root").await;
     assert!(
         !matches!(
@@ -3504,11 +3488,10 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
          of a healthy unflagged build"
     );
 
-    // The node recovered childless and unmarked → it dispatches from
-    // source to the connected worker.
-    let mut worker_rx = connect_executor(&handle, "bug9u-w", "x86_64-linux").await?;
+    // The node recovered childless and unmarked → it is deliverable from
+    // source through the pull path.
     tick(&handle).await?;
-    let a = recv_assignment(&mut worker_rx).await;
+    let a = pull_attempt(&handle, "bug9u-root").await;
     assert_eq!(
         a.drv_path,
         test_drv_path("bug9u-root"),
@@ -3672,9 +3655,8 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     // A worker is available: C1 builds from source under its own build,
     // and a wrongful from-source dispatch of P would have somewhere to
     // land.
-    let mut worker_rx = connect_executor(&handle, "bug6t3-w", "x86_64-linux").await?;
     tick(&handle).await?;
-    let a = recv_assignment(&mut worker_rx).await;
+    let a = pull_attempt(&handle, "bug6t3-keep").await;
     assert_eq!(
         a.drv_path,
         test_drv_path("bug6t3-keep"),
@@ -3689,13 +3671,7 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     // second Tick would trip the cfg(test) zero-grace orphan-watcher
     // sweep on these unwatched recovered builds and cancel B1 for an
     // unrelated reason).
-    complete_success(
-        &handle,
-        "bug6t3-w",
-        &test_drv_path("bug6t3-keep"),
-        &keep_out,
-    )
-    .await?;
+    pull_complete_success(&handle, "bug6t3-keep", &keep_out).await?;
     barrier(&handle).await;
     assert_eq!(
         expect_drv(&handle, "bug6t3-keep").await.status,
@@ -3703,17 +3679,15 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
         "fixture premise: the surviving sibling completed under its live build"
     );
 
-    // No from-source WorkAssignment is ever sent for P: its pruned
-    // closure was truncated at recovery, so a from-source dispatch would
-    // ENOENT on the never-produced subtree.
-    while let Ok(m) = worker_rx.try_recv() {
-        use rio_proto::types::scheduler_message::Msg;
-        assert!(
-            !matches!(m.msg, Some(Msg::Assignment(_))),
-            "the surviving sibling's completion must not launder the mark of a \
-             parent whose un-produced terminal child was dropped at recovery"
-        );
-    }
+    // No from-source delivery ever happens for P: its pruned closure was
+    // truncated at recovery, so a from-source build would ENOENT on the
+    // never-produced subtree.
+    let pull = try_pull_attempt(&handle, "bug6t3-root").await;
+    assert!(
+        !matches!(pull, Ok(crate::actor::pull::PullOutcome::Deliver(_))),
+        "the surviving sibling's completion must not launder the mark of a \
+         parent whose un-produced terminal child was dropped at recovery; got {pull:?}"
+    );
     let p = expect_drv(&handle, "bug6t3-root").await;
     assert!(
         !matches!(
