@@ -945,11 +945,16 @@ pub async fn run_with_backends(
             .unwrap_or(1),
     ));
     if spec.mode == Mode::Leaf && !state.marker_done("warm") {
-        let warm_url = spec
-            .cluster
-            .warm_store_url
-            .clone()
-            .context("leaf mode requires cluster.warm_store_url")?;
+        // The warm tenant's store URL is the gateway URL re-keyed with the
+        // warm tenant's SSH key from the per-tenant key directory.
+        let warm_url = warm::warm_store_url(
+            &spec.cluster.gateway_store_url,
+            spec.cluster
+                .ssh_key_dir
+                .as_deref()
+                .context("leaf mode requires cluster.ssh_key_dir")?,
+            &spec.tenants.warm_tenant,
+        );
         let plan_valid: HashSet<String> = plan_output.cached_prior_paths.iter().cloned().collect();
         // The warm stage submits through its own shell-out submitter; the
         // fallback to the build-path submitter keeps fake-backend tests that
@@ -1633,7 +1638,7 @@ mod tests {
               "mode": "leaf",
               "archive": {{"digest": "{archive_digest}"}},
               "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
-                          "warm_store_url": "ssh-ng://rio@gw:22?ssh-key=/w",
+                          "ssh_key_dir": "/keys",
                           "scheduler_addr": "s:9001", "store_addr": "st:9002"}},
               "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
                           "upstreams_verified": true}},

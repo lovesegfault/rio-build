@@ -116,6 +116,31 @@ pub fn warm_work(
     Ok(work)
 }
 
+/// Derive the warm-tenant store URL the warm stage dials: the build-tenant
+/// gateway URL with its `ssh-key` query parameter re-pointed at
+/// `<ssh_key_dir>/<warm_tenant>`. Tenant selection on the gateway is by SSH
+/// key, not by URL, so everything else about the URL is kept as-is.
+pub fn warm_store_url(
+    gateway_store_url: &str,
+    ssh_key_dir: &std::path::Path,
+    warm_tenant: &str,
+) -> String {
+    let key = ssh_key_dir.join(warm_tenant);
+    let key = key.display();
+    match gateway_store_url.split_once('?') {
+        Some((base, query)) => {
+            let mut params: Vec<&str> = query
+                .split('&')
+                .filter(|p| !p.is_empty() && !p.starts_with("ssh-key="))
+                .collect();
+            let warm_key = format!("ssh-key={key}");
+            params.push(&warm_key);
+            format!("{base}?{}", params.join("&"))
+        }
+        None => format!("{gateway_store_url}?ssh-key={key}"),
+    }
+}
+
 /// Map a warm root drv's observed scheduler status to the per-path
 /// disposition; `None` for a status that is not terminal yet.
 pub fn disposition_for(status: &str, exec_id_present: bool) -> Option<&'static str> {
@@ -364,6 +389,29 @@ mod tests {
         // The paths still to warm have no disposition yet.
         assert_eq!(disposition_of(p("p1")), None);
         assert_eq!(disposition_of(p("p4")), None);
+    }
+
+    #[test]
+    fn warm_store_url_repoints_the_ssh_key_at_the_warm_tenant() {
+        // The launch-written gateway URL keeps every parameter except the
+        // ssh-key, which moves to the warm tenant's key file.
+        assert_eq!(
+            warm_store_url(
+                "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-leaf",
+                std::path::Path::new("/etc/rio/parity-ssh"),
+                "parity-warm",
+            ),
+            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-warm"
+        );
+        // A gateway URL with no query string still gains the warm key.
+        assert_eq!(
+            warm_store_url(
+                "ssh-ng://rio@gw:22",
+                std::path::Path::new("/keys"),
+                "parity-warm"
+            ),
+            "ssh-ng://rio@gw:22?ssh-key=/keys/parity-warm"
+        );
     }
 
     #[test]

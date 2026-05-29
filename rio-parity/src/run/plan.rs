@@ -235,8 +235,8 @@ pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<
             spec.tenants.warm_tenant
         );
     }
-    if spec.mode == Mode::Leaf && spec.cluster.warm_store_url.is_none() {
-        bail!("leaf mode requires cluster.warm_store_url (parity-warm ssh-ng URL)");
+    if spec.mode == Mode::Leaf && spec.cluster.ssh_key_dir.is_none() {
+        bail!("leaf mode requires cluster.ssh_key_dir (per-tenant gateway SSH key directory)");
     }
     if !spec.tenants.upstreams_verified {
         if !allow_unverified {
@@ -399,7 +399,7 @@ mod tests {
         let mut spec: CampaignSpec = serde_json::from_str(
             r#"{
               "mode": "leaf",
-              "cluster": {"gateway_store_url": "ssh-ng://x", "warm_store_url": "ssh-ng://w",
+              "cluster": {"gateway_store_url": "ssh-ng://x", "ssh_key_dir": "/keys",
                           "scheduler_addr": "s:9001", "store_addr": "st:9002"},
               "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
                           "upstreams_verified": true}

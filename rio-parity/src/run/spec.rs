@@ -81,8 +81,10 @@ pub struct ClusterEndpoints {
     /// ssh-ng URL for the build tenant (parity-leaf / parity-selfhosted),
     /// e.g. `ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/parity-leaf`.
     pub gateway_store_url: String,
-    /// ssh-ng URL for the parity-warm tenant (leaf mode only).
-    pub warm_store_url: Option<String>,
+    /// Directory holding one passphrase-less SSH private key per campaign
+    /// tenant, file name = tenant name; the prefetch arm dials the gateway
+    /// with `<ssh_key_dir>/<tenants.warm_tenant>`.
+    pub ssh_key_dir: Option<PathBuf>,
     /// Scheduler AdminService address, e.g. `rio-scheduler.rio-system.svc:9001`.
     pub scheduler_addr: String,
     /// Store StoreService address, e.g. `rio-store.rio-store.svc:9002`.
@@ -175,6 +177,41 @@ pub struct Knobs {
     /// Channels held for validity probing. Reserved for the supply planner;
     /// nothing reads it yet — the submitter probes on its own channel.
     pub probe_concurrency: usize,
+    /// Planned-but-missing prefetch paths above this percentage of the
+    /// planned prefetch set pause the campaign before execution starts;
+    /// below it the shortfall is recorded as a low-confidence flag. The
+    /// default is a starting point, not a calibrated value.
+    pub prefetch_shortfall_pause_pct: f64,
+    /// Concurrently admitted requests in timed mode (= concurrently held
+    /// build channels under the dispatcher's FIFO admission).
+    pub max_sessions: usize,
+    /// Floor in minutes on a timed request's build deadline; it applies
+    /// when the archive records no durations for the request's units.
+    pub build_timeout_floor_mins: u64,
+    /// Cap in hours on a timed request's build deadline.
+    pub build_timeout_cap_hours: f64,
+    /// Re-confirmation budget for unexpected failures in timed mode: total
+    /// submission attempts for a unit whose expected outcome is built but
+    /// whose replayed result is a failure.
+    pub confirm_attempts: u32,
+    /// Minutes a timed request waits on another request's upload claim for
+    /// a shared path before re-claiming it once.
+    pub claim_wait_mins: u64,
+    /// Recorded request offsets are divided by this factor when building
+    /// the timed schedule; must be finite and positive.
+    pub speedup: f64,
+    /// Reproduce recorded cancellations/disconnects in timed mode by
+    /// abandoning the build channel at the recorded relative time.
+    pub replay_interruptions: bool,
+    /// Worker tasks in the prewarm/client-upload pool.
+    pub upload_workers: usize,
+    /// Byte cap in MiB on one client upload batch.
+    pub upload_batch_max_mib: u64,
+    /// Entry cap on one client upload batch.
+    pub upload_batch_max_entries: usize,
+    /// NARs at or above this many MiB are streamed individually via
+    /// `AddToStoreNar` instead of riding a multi-path upload batch.
+    pub large_nar_threshold_mib: u64,
 }
 
 impl Default for Knobs {
@@ -209,7 +246,98 @@ impl Default for Knobs {
             op_timeout_secs: 120,
             probe_chunk: 2000,
             probe_concurrency: 3,
+            prefetch_shortfall_pause_pct: 10.0,
+            max_sessions: 32,
+            build_timeout_floor_mins: 30,
+            build_timeout_cap_hours: 2.0,
+            confirm_attempts: 3,
+            claim_wait_mins: 10,
+            speedup: 1.0,
+            replay_interruptions: true,
+            upload_workers: 8,
+            upload_batch_max_mib: 256,
+            upload_batch_max_entries: 500,
+            large_nar_threshold_mib: 64,
         }
+    }
+}
+
+/// When submissions happen: queue-driven (timeless) or at the recorded
+/// request offsets (timed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ScheduleMode {
+    /// Queue-driven dispatch: attemptable units are packed into batches and
+    /// submitted as capacity allows, ignoring recorded timing.
+    #[default]
+    Timeless,
+    /// Recorded requests fire at their recorded offsets divided by the
+    /// `speedup` knob, under FIFO admission capped at `max_sessions`.
+    Timed,
+}
+
+/// Scheduling block of the campaign spec; part of the campaign's identity
+/// and recorded in the comparability block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SchedulingBlock {
+    pub mode: ScheduleMode,
+}
+
+/// Where dependency outputs may come from (the supply planner's source
+/// ladder policy).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplyDependencies {
+    /// Full ladder: target substituters first, then archive-embedded
+    /// content, then relay from recorded source substituters.
+    Substituters,
+    /// Hermetic replay: skip the target-substituter rung — even paths the
+    /// target's substituters could provide are uploaded from the archive
+    /// or relayed.
+    EmbeddedOnly,
+    /// Self-hosted measurement: no dependency outputs are delivered by any
+    /// mechanism; only derivation texts and embedded input sources are
+    /// uploaded, and the target builds the entire closure itself.
+    None,
+}
+
+/// When planned supply is delivered relative to execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SupplyDelivery {
+    /// All planned supply is delivered before the execution clock starts
+    /// (required for timed runs).
+    #[default]
+    Prewarm,
+    /// Client uploads happen per submission as gaps are discovered; allowed
+    /// only for timeless runs.
+    Inline,
+}
+
+/// Supply policy block of the campaign spec; part of the campaign's
+/// identity and recorded in the comparability block.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SupplyBlock {
+    /// None = derived from the campaign mode (leaf → substituters,
+    /// self-hosted → none).
+    pub dependencies: Option<SupplyDependencies>,
+    pub delivery: SupplyDelivery,
+    /// Target-cluster substituter URLs the planner probes for ladder rung 1.
+    /// Empty = use the archive manifest's advisory target-substituter list.
+    pub target_substituters: Vec<String>,
+}
+
+impl SupplyBlock {
+    /// The dependency policy in effect: the explicit spec value when set,
+    /// otherwise derived from the campaign mode (leaf → substituters,
+    /// self-hosted → none).
+    pub fn effective_dependencies(&self, mode: Mode) -> SupplyDependencies {
+        self.dependencies.unwrap_or(match mode {
+            Mode::Leaf => SupplyDependencies::Substituters,
+            Mode::SelfHosted => SupplyDependencies::None,
+        })
     }
 }
 
@@ -224,6 +352,8 @@ pub struct CampaignSpec {
     pub cluster: ClusterEndpoints,
     pub tenants: TenantBlock,
     pub filters: Filters,
+    pub scheduling: SchedulingBlock,
+    pub supply: SupplyBlock,
     pub knobs: Knobs,
     /// Deployed image versions verified by launch pre-flight (recorded verbatim).
     pub cluster_versions: Option<serde_json::Value>,
@@ -241,6 +371,8 @@ impl Default for CampaignSpec {
             cluster: ClusterEndpoints::default(),
             tenants: TenantBlock::default(),
             filters: Filters::default(),
+            scheduling: SchedulingBlock::default(),
+            supply: SupplyBlock::default(),
             knobs: Knobs::default(),
             cluster_versions: None,
             deadline: None,
@@ -334,6 +466,106 @@ impl CampaignSpec {
             self.knobs.batch_timeout_hours.is_finite() && self.knobs.batch_timeout_hours > 0.0,
             "campaign spec field knobs.batch_timeout_hours must be a positive finite number of hours"
         );
+        // Recorded offsets are divided by the speedup; zero, NaN, infinity,
+        // or a negative value would collapse or invert the schedule.
+        anyhow::ensure!(
+            self.knobs.speedup.is_finite() && self.knobs.speedup > 0.0,
+            "campaign spec field knobs.speedup must be a positive finite number"
+        );
+        // The build-deadline cap is a duration; it must be a usable number
+        // of hours for the same reason as the batch timeout above.
+        anyhow::ensure!(
+            self.knobs.build_timeout_cap_hours.is_finite()
+                && self.knobs.build_timeout_cap_hours > 0.0,
+            "campaign spec field knobs.build_timeout_cap_hours must be a positive finite number of hours"
+        );
+        // Zero would disable the supply/upload arms or produce zero-length
+        // deadlines and empty admission windows downstream.
+        let nonzero_supply_knobs = [
+            ("knobs.max_sessions", self.knobs.max_sessions as u64),
+            (
+                "knobs.confirm_attempts",
+                u64::from(self.knobs.confirm_attempts),
+            ),
+            ("knobs.upload_workers", self.knobs.upload_workers as u64),
+            (
+                "knobs.upload_batch_max_mib",
+                self.knobs.upload_batch_max_mib,
+            ),
+            (
+                "knobs.upload_batch_max_entries",
+                self.knobs.upload_batch_max_entries as u64,
+            ),
+            (
+                "knobs.large_nar_threshold_mib",
+                self.knobs.large_nar_threshold_mib,
+            ),
+            (
+                "knobs.build_timeout_floor_mins",
+                self.knobs.build_timeout_floor_mins,
+            ),
+        ];
+        for (field, value) in nonzero_supply_knobs {
+            anyhow::ensure!(value != 0, "campaign spec field {field} must be nonzero");
+        }
+        // Timed-only knobs silently do nothing in timeless mode, so a
+        // non-default value there is a configuration mistake worth refusing
+        // rather than ignoring.
+        if self.scheduling.mode == ScheduleMode::Timeless {
+            let defaults = Knobs::default();
+            let timed_only_overridden = [
+                (
+                    "max_sessions",
+                    self.knobs.max_sessions != defaults.max_sessions,
+                ),
+                (
+                    "confirm_attempts",
+                    self.knobs.confirm_attempts != defaults.confirm_attempts,
+                ),
+                (
+                    "claim_wait_mins",
+                    self.knobs.claim_wait_mins != defaults.claim_wait_mins,
+                ),
+                ("speedup", self.knobs.speedup != defaults.speedup),
+                (
+                    "build_timeout_floor_mins",
+                    self.knobs.build_timeout_floor_mins != defaults.build_timeout_floor_mins,
+                ),
+                (
+                    "build_timeout_cap_hours",
+                    self.knobs.build_timeout_cap_hours != defaults.build_timeout_cap_hours,
+                ),
+            ];
+            for (name, overridden) in timed_only_overridden {
+                anyhow::ensure!(
+                    !overridden,
+                    "campaign spec knob knobs.{name} is only meaningful in timed mode \
+                     (scheduling.mode = \"timed\")"
+                );
+            }
+        }
+        // Timed runs deliver all planned supply before the clock starts;
+        // inline top-up during execution would corrupt the recorded timing.
+        if self.scheduling.mode == ScheduleMode::Timed {
+            anyhow::ensure!(
+                self.supply.delivery == SupplyDelivery::Prewarm,
+                "campaign spec field supply.delivery must be \"prewarm\" when scheduling.mode is \"timed\""
+            );
+        }
+        // The dependency policy must not contradict what the campaign mode
+        // measures: self-hosted builds the whole closure itself, leaf
+        // measures against upstream-substituted dependencies.
+        match (self.mode, self.supply.dependencies) {
+            (Mode::SelfHosted, Some(SupplyDependencies::Substituters)) => anyhow::bail!(
+                "campaign spec field supply.dependencies = \"substituters\" contradicts \
+                 mode \"self-hosted\" (the self-hosted measurement builds the entire closure itself)"
+            ),
+            (Mode::Leaf, Some(SupplyDependencies::None)) => anyhow::bail!(
+                "campaign spec field supply.dependencies = \"none\" contradicts mode \"leaf\" \
+                 (the leaf measurement substitutes dependencies from the target's upstreams)"
+            ),
+            _ => {}
+        }
         Ok(())
     }
 }
@@ -747,6 +979,128 @@ mod tests {
         // its camelCase wire form unchanged.
         let re: ArchivePin = serde_json::from_value(v).unwrap();
         assert_eq!(re, pin);
+    }
+
+    #[test]
+    fn phase4_knob_defaults_match_design() {
+        let k = Knobs::default();
+        assert_eq!(k.prefetch_shortfall_pause_pct, 10.0);
+        assert_eq!(k.max_sessions, 32);
+        assert_eq!(k.connections, None);
+        assert_eq!(k.op_timeout_secs, 120);
+        assert_eq!(k.build_timeout_floor_mins, 30);
+        assert_eq!(k.build_timeout_cap_hours, 2.0);
+        assert_eq!(k.confirm_attempts, 3);
+        assert_eq!(k.claim_wait_mins, 10);
+        assert_eq!(k.speedup, 1.0);
+        assert!(k.replay_interruptions);
+        assert_eq!(k.upload_workers, 8);
+        assert_eq!(k.upload_batch_max_mib, 256);
+        assert_eq!(k.upload_batch_max_entries, 500);
+        assert_eq!(k.large_nar_threshold_mib, 64);
+        assert_eq!(k.probe_chunk, 2000);
+        assert_eq!(k.probe_concurrency, 3);
+    }
+
+    #[test]
+    fn scheduling_and_supply_blocks_default_and_roundtrip() {
+        let spec: CampaignSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(spec.scheduling.mode, ScheduleMode::Timeless);
+        assert_eq!(spec.supply.dependencies, None);
+        assert_eq!(spec.supply.delivery, SupplyDelivery::Prewarm);
+        assert!(spec.supply.target_substituters.is_empty());
+        // Mode-derived effective dependencies.
+        assert_eq!(
+            spec.supply.effective_dependencies(Mode::Leaf),
+            SupplyDependencies::Substituters
+        );
+        assert_eq!(
+            spec.supply.effective_dependencies(Mode::SelfHosted),
+            SupplyDependencies::None
+        );
+        let json = r#"{"scheduling":{"mode":"timed"},
+                       "supply":{"dependencies":"embedded-only","delivery":"prewarm",
+                                 "target_substituters":["https://cache.nixos.org"]}}"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(spec.scheduling.mode, ScheduleMode::Timed);
+        assert_eq!(
+            spec.supply.dependencies,
+            Some(SupplyDependencies::EmbeddedOnly)
+        );
+        let re: CampaignSpec =
+            serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
+        assert_eq!(re.scheduling.mode, ScheduleMode::Timed);
+    }
+
+    #[test]
+    fn timed_knob_validation() {
+        // Base valid spec: same shape the post-Plan-3 spec tests use (archive
+        // pin instead of an eval set; the digest is any 64-char lowercase hex).
+        let base = r#"{
+            "mode": "leaf",
+            "archive": {"digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
+                        "store_addr": "rio-store.rio-store.svc:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
+            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}"#;
+        // Non-positive speedup rejected outright.
+        let spec: CampaignSpec =
+            serde_json::from_str(&format!("{base}, \"knobs\": {{\"speedup\": 0.0}}}}")).unwrap();
+        assert!(spec.validate().unwrap_err().to_string().contains("speedup"));
+        // Zero upload sizing knob rejected outright.
+        let spec: CampaignSpec =
+            serde_json::from_str(&format!("{base}, \"knobs\": {{\"upload_workers\": 0}}}}"))
+                .unwrap();
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("upload_workers")
+        );
+        // Timed-only knob set to a non-default value in a timeless spec is rejected, naming the knob.
+        let spec: CampaignSpec =
+            serde_json::from_str(&format!("{base}, \"knobs\": {{\"max_sessions\": 16}}}}"))
+                .unwrap();
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("max_sessions") && err.contains("timed"),
+            "{err}"
+        );
+        // The same value with scheduling.mode=timed is accepted.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \"knobs\": {{\"max_sessions\": 16}}}}"
+        ))
+        .unwrap();
+        spec.validate().unwrap();
+        // Inline delivery is rejected in timed mode.
+        let spec: CampaignSpec = serde_json::from_str(&format!(
+            "{base}, \"scheduling\": {{\"mode\": \"timed\"}}, \"supply\": {{\"delivery\": \"inline\"}}}}"
+        ))
+        .unwrap();
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("delivery")
+        );
+        // Self-hosted + explicit substituters dependencies contradiction is rejected.
+        let json = r#"{
+            "mode": "self-hosted",
+            "archive": {"digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"},
+            "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
+            "tenants": {"build_tenant": "parity-selfhosted", "upstreams_verified": true},
+            "supply": {"dependencies": "substituters"}}"#;
+        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+        assert!(
+            spec.validate()
+                .unwrap_err()
+                .to_string()
+                .contains("dependencies")
+        );
     }
 
     #[test]
