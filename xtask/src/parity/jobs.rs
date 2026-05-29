@@ -38,14 +38,17 @@ use crate::k8s::client as kube;
 pub const SSH_SECRET_NAME: &str = "rio-parity-ssh";
 
 /// Where the campaign Job mounts [`SSH_SECRET_NAME`]. The launch-written
-/// campaign spec points its ssh-ng store URLs at `<dir>/<tenant>` via the
-/// `ssh-key=` query parameter (see [`ssh_key_path`]).
+/// campaign spec records this directory as `cluster.ssh_key_dir` (the engine
+/// derives per-tenant key paths from it) and points the build tenant's
+/// ssh-ng store URL at `<dir>/<tenant>` via the `ssh-key=` query parameter
+/// (see [`ssh_key_path`]).
 pub const SSH_KEY_MOUNT_DIR: &str = "/etc/rio/parity-ssh";
 
 /// Per-tenant SSH private-key path inside the campaign pod: the
 /// [`SSH_SECRET_NAME`] data key for `tenant`, mounted under
-/// [`SSH_KEY_MOUNT_DIR`] — what the launch-written spec records in each
-/// store URL's `ssh-key=` query parameter.
+/// [`SSH_KEY_MOUNT_DIR`] — what the launch-written spec records in the build
+/// tenant's store URL `ssh-key=` query parameter (other tenants' keys are
+/// resolved by the engine from `cluster.ssh_key_dir`).
 pub fn ssh_key_path(tenant: &str) -> String {
     format!("{SSH_KEY_MOUNT_DIR}/{tenant}")
 }
