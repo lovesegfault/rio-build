@@ -21,6 +21,7 @@ pub mod artifact;
 pub mod batch;
 pub mod classify;
 pub mod collect;
+pub mod drv_import;
 pub mod evalset_input;
 pub mod glob;
 pub mod grpc;

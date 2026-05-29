@@ -896,6 +896,11 @@
       "doc": "Collect stage: turn per-(build, drv) observations, captured stderr"
     },
     {
+      "path": "run/drv_import.rs",
+      "depth": 1,
+      "doc": "Derivation-closure import source backed by the eval set's drv archive."
+    },
+    {
       "path": "run/evalset_input.rs",
       "depth": 1,
       "doc": "Readers for the eval-set artifacts the campaign consumes:"
