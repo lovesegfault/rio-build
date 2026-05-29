@@ -362,6 +362,7 @@ mod tests {
     /// `sessions_shutdown`, then waits CANCEL_GRACE. The token cancel
     /// is what reaches every proto_task's `cancel_active_builds`.
     // r[verify gw.conn.session-drain]
+    // r[verify gw.drain.three-stage]
     #[tokio::test(start_paused = true)]
     async fn session_drain_timeout_cancels_then_graces() {
         let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(1));
