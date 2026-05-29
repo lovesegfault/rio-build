@@ -55,6 +55,9 @@ russh = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+# Error taxonomy of the supply-execution transport seam (a daemon refusal
+# is retried once on a fresh channel, anything else is a failure).
+thiserror = { workspace = true }
 tokio = { workspace = true }
 # StreamReader: adapts the reqwest byte stream into the AsyncRead the
 # substituter's streaming NAR decoder consumes.

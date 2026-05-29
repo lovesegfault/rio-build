@@ -961,6 +961,16 @@
       "doc": "Batch submission to the rio gateway."
     },
     {
+      "path": "run/supply/",
+      "depth": 1,
+      "doc": ""
+    },
+    {
+      "path": "run/supply/exec.rs",
+      "depth": 2,
+      "doc": "Supply execution arms — the transport seam and the machinery that"
+    },
+    {
       "path": "run/supply.rs",
       "depth": 1,
       "doc": "Supply planning — what the target must build vs what the campaign"

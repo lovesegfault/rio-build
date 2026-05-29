@@ -149,41 +149,97 @@ pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
     let host = parsed
         .host_str()
         .with_context(|| format!("archive substituter {url:?} has no host"))?;
-    // IP-literal screening only (no DNS resolution). `host_str` keeps the
-    // square brackets around IPv6 literals, so strip them before parsing;
-    // anything that does not parse as an address is a hostname and passes.
-    let bare = host
-        .strip_prefix('[')
-        .and_then(|h| h.strip_suffix(']'))
-        .unwrap_or(host);
-    if let Ok(ip) = bare.parse::<IpAddr>() {
-        let private_v4 = |v4: Ipv4Addr| {
-            // 100.64.0.0/10 is the RFC 6598 carrier-grade NAT shared address space.
-            let cgnat = (u32::from(v4) & 0xffc0_0000) == 0x6440_0000;
-            v4.is_unspecified()
-                || v4.is_loopback()
-                || v4.is_link_local()
-                || v4.is_private()
-                || cgnat
-        };
-        let private = match ip {
-            IpAddr::V4(v4) => private_v4(v4),
-            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-                Some(v4) => private_v4(v4),
-                None => {
-                    // fc00::/7 is the RFC 4193 unique-local address (ULA) range.
-                    let ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
-                    v6.is_unspecified() || v6.is_loopback() || v6.is_unicast_link_local() || ula
-                }
-            },
-        };
-        anyhow::ensure!(
-            !private,
+    if let Some(ip) = non_public_ip_literal(host) {
+        anyhow::bail!(
             "archive substituter {url:?} points at the non-public address {ip}: archive \
              substituters used for live narinfo probing must be public HTTPS caches"
         );
     }
     Ok(())
+}
+
+/// Validate a substituter URL provided by the campaign spec
+/// (`supply.target_substituters`) or by a replay archive's manifest before
+/// the supply stage hands it to the engine's binary-cache client
+/// ([`crate::substituter::Substituter`]).
+///
+/// Accepted forms:
+///
+/// - `https://` caches whose host passes the same non-public-address screen
+///   as [`validate_probe_substituter`];
+/// - `s3://bucket[/prefix]` caches — object access goes through the AWS
+///   endpoint resolved from the ambient configuration, and URL parameters
+///   that would redirect it (`endpoint`, `scheme`, `profile`) are rejected
+///   by the substituter client itself.
+///
+/// Everything else — plain `http://`, `file://`, loopback or private-address
+/// HTTPS hosts — is rejected: these URLs are external input and must not be
+/// able to steer the engine's HTTP client at internal endpoints. Like the
+/// probe validator, the check is purely syntactic (no DNS resolution).
+pub fn validate_supply_substituter(url: &str) -> anyhow::Result<()> {
+    let parsed = reqwest::Url::parse(url)
+        .with_context(|| format!("supply substituter {url:?} is not a valid URL"))?;
+    match parsed.scheme() {
+        "https" => {
+            let host = parsed
+                .host_str()
+                .with_context(|| format!("supply substituter {url:?} has no host"))?;
+            if let Some(ip) = non_public_ip_literal(host) {
+                anyhow::bail!(
+                    "supply substituter {url:?} points at the non-public address {ip}: \
+                     substituter URLs from the campaign spec or an archive manifest must be \
+                     public HTTPS caches or s3:// buckets"
+                );
+            }
+            Ok(())
+        }
+        "s3" => {
+            anyhow::ensure!(
+                parsed.host_str().is_some_and(|bucket| !bucket.is_empty()),
+                "supply substituter {url:?} has no S3 bucket name"
+            );
+            Ok(())
+        }
+        other => anyhow::bail!(
+            "supply substituter {url:?} uses scheme {other:?}: substituter URLs from the \
+             campaign spec or an archive manifest must be public HTTPS caches or s3:// buckets"
+        ),
+    }
+}
+
+/// IP-literal screening shared by the substituter URL validators (no DNS
+/// resolution). `host` is a URL host as returned by `Url::host_str`, which
+/// keeps the square brackets around IPv6 literals, so they are stripped
+/// before parsing; anything that does not parse as an address is a hostname
+/// and passes (`None`). Returns the parsed address when it is unspecified
+/// (0.0.0.0, ::), loopback, link-local (169.254.0.0/16, fe80::/10), RFC 1918
+/// private space (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16), CGNAT shared
+/// space (100.64.0.0/10), or IPv6 unique-local (fc00::/7). IPv4-mapped IPv6
+/// literals are unwrapped so `[::ffff:10.0.0.1]` cannot bypass the IPv4
+/// ranges.
+fn non_public_ip_literal(host: &str) -> Option<IpAddr> {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    let ip = bare.parse::<IpAddr>().ok()?;
+    let private_v4 = |v4: Ipv4Addr| {
+        // 100.64.0.0/10 is the RFC 6598 carrier-grade NAT shared address space.
+        let cgnat = (u32::from(v4) & 0xffc0_0000) == 0x6440_0000;
+        v4.is_unspecified() || v4.is_loopback() || v4.is_link_local() || v4.is_private() || cgnat
+    };
+    let private = match ip {
+        IpAddr::V4(v4) => private_v4(v4),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => private_v4(v4),
+            None => {
+                // fc00::/7 is the RFC 4193 unique-local address (ULA) range.
+                let ula = (v6.segments()[0] & 0xfe00) == 0xfc00;
+                v6.is_unspecified() || v6.is_loopback() || v6.is_unicast_link_local() || ula
+            }
+        },
+    };
+    private.then_some(ip)
 }
 
 /// Upstream narinfo facts for one store path, as collected by
@@ -425,6 +481,52 @@ mod tests {
             assert!(
                 msg.contains("archive substituter") && msg.contains(url),
                 "error for {url} must name the archive-substituter origin and the URL: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn supply_substituter_validation_accepts_public_https_and_s3() {
+        validate_supply_substituter("https://cache.nixos.org").unwrap();
+        validate_supply_substituter("https://cache.example.org/prefix?priority=10").unwrap();
+        validate_supply_substituter("https://151.101.65.55").unwrap();
+        // S3 caches are reached through the AWS endpoint, not an attacker
+        // chosen host, so bucket URLs (with or without prefix/region) pass.
+        validate_supply_substituter("s3://nix-cache-bucket").unwrap();
+        validate_supply_substituter("s3://nix-cache-bucket/prefix?region=eu-central-1").unwrap();
+    }
+
+    #[test]
+    fn supply_substituter_validation_rejects_http_file_and_non_public_hosts() {
+        let rejected = [
+            // Plaintext HTTP and local files are never acceptable for
+            // spec/archive-provided caches.
+            "http://cache.nixos.org",
+            "http://127.0.0.1:8080",
+            "file:///var/lib/nix-cache",
+            // Loopback, link-local, RFC 1918, CGNAT, ULA, and unspecified
+            // HTTPS hosts: same screen as the probe validator.
+            "https://127.0.0.1",
+            "https://[::1]",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.1",
+            "https://172.16.0.1:8443",
+            "https://192.168.1.5",
+            "https://[::ffff:10.0.0.1]",
+            "https://100.64.0.1",
+            "https://[fd12:3456:789a::1]",
+            "https://0.0.0.0",
+            // An s3 URL with no bucket, and garbage.
+            "s3://",
+            "not-a-url",
+        ];
+        for url in rejected {
+            let err = validate_supply_substituter(url)
+                .expect_err(&format!("{url} must be rejected as a supply substituter"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("supply substituter") && msg.contains(url),
+                "error for {url} must name the supply-substituter origin and the URL: {msg}"
             );
         }
     }

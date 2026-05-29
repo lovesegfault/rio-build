@@ -25,6 +25,8 @@
 //! materialized here are derivation ATerm texts (tiny, and already read for
 //! the closure walk).
 
+pub mod exec;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;

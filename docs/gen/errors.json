@@ -876,6 +876,20 @@
       "doc": ""
     },
     {
+      "enum": "SupplyTransportError",
+      "name": "Other",
+      "crate": "rio-parity",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": "Transport, timeout, or channel-open failure."
+    },
+    {
+      "enum": "SupplyTransportError",
+      "name": "Refused",
+      "crate": "rio-parity",
+      "msg": "daemon refused: {0}",
+      "doc": "The daemon refused the upload (or refused it in a way that raced session teardown)."
+    },
+    {
       "enum": "NarCollectError",
       "name": "Io",
       "crate": "rio-proto",
@@ -1428,6 +1442,11 @@
       "name": "WireError",
       "crate": "rio-nix",
       "doc": ""
+    },
+    {
+      "name": "SupplyTransportError",
+      "crate": "rio-parity",
+      "doc": "Errors the upload arms distinguish: a daemon refusal (retry once on a fresh channel, then mark refused) vs. everything else (failed)."
     },
     {
       "name": "TransportError",
