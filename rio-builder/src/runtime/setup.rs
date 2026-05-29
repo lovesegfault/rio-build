@@ -1,8 +1,10 @@
 //! Cold-start wiring: identity, host-arch validation, cgroup init,
-//! upstream connect, FUSE mount, build context.
+//! upstream connect, build context.
 //!
 //! Everything `main()` does before the pull loop. Produces a
-//! [`BuilderRuntime`] consumed by [`run`](super::run).
+//! [`BuilderRuntime`] consumed by [`run`](super::run). The castore-FUSE
+//! itself is mounted per build by the executor (`mount_and_serve`);
+//! setup only assembles the [`CastoreSettings`] it will use.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -14,6 +16,8 @@ use rio_proto::types::ExecutorKind;
 
 use super::slot::BuildSlot;
 use super::{BuildSpawnContext, BuilderRuntime};
+use crate::castore_fuse::open::OpenerConfig;
+use crate::castore_fuse::session::CastoreSettings;
 use crate::config::{Config, detect_system};
 use crate::executor::BuildTaskMessage;
 use crate::store_fetch::StoreClients;
@@ -28,8 +32,8 @@ pub(super) type BalanceGuards = (
     Option<rio_proto::client::balance::BalancedChannel>,
 );
 
-/// Wire up cgroups, health server, gRPC clients, FUSE mount, and the
-/// build context. Everything `main()` does before the pull loop.
+/// Wire up cgroups, health server, gRPC clients, and the build context.
+/// Everything `main()` does before the pull loop.
 ///
 /// Returns `None` if shutdown fired during cold-start connect — caller
 /// exits cleanly (nothing started, never connected). Returns `Err`
@@ -69,7 +73,7 @@ pub async fn setup(
         connect_upstreams(&cfg, &shutdown).await?
     else {
         // Shutdown fired during cold-start connect. Clean exit —
-        // nothing to drain (never connected), no FUSE mounted yet.
+        // nothing to drain (never connected), nothing mounted yet.
         return Ok(None);
     };
     info!(
@@ -102,9 +106,9 @@ pub async fn setup(
     // CPU-bound microbench in a blocking thread.
     //
     // The whole resolve→bench chain is SPAWNED so it runs concurrently
-    // with the FUSE mount below — `POLL_BOUND=30s` was
-    // sized assuming overlap with the ~30s FUSE cold-start, so an
-    // annotator outage adds 0s (not 30s) to startup. Both products
+    // with the first `PullAssignment` wait — `POLL_BOUND=30s` overlaps
+    // the wait for the first assignment, so an annotator outage adds 0s
+    // (not 30s) to startup. Both products
     // (`hw_class` string + bench `factor`) are consumed only at first
     // WorkAssignment (`spawn_build_task` takes `BuildSpawnContext::
     // hw_bench`); the store gates `AppendHwPerfSample` on the
@@ -126,45 +130,34 @@ pub async fn setup(
         (hw_class, factor)
     });
 
-    // Set up FUSE cache and mount. Arc so the executor's manifest-prime
-    // / JIT-allowlist path can share it with the FUSE threads.
-    let fuse_cache_dir = cfg.fuse_cache_dir.clone();
-    let cache = Arc::new(crate::fuse::cache::Cache::new(cfg.fuse_cache_dir)?);
-    let executor_cache = Arc::clone(&cache);
-    let runtime = tokio::runtime::Handle::current();
-    // FUSE fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT (300s).
-    // FUSE is the build-critical path; a stalled fetch blocks a fuser
-    // thread. See config.rs fuse_fetch_timeout for the full rationale.
-    let fuse_fetch_timeout = cfg.fuse_fetch_timeout;
-
     // ─── Startup rootfs writes (readOnlyRootFilesystem audit) ─────
     //
     // Pool kind: Fetcher forces readOnlyRootFilesystem:true (ADR-019
     // §Sandbox hardening — reconcilers/pool/pod.rs).
-    // Every write below MUST land on an emptyDir mount from
+    // Every write below MUST land on an emptyDir/hostPath mount from
     // reconcilers/common/sts.rs, or the pod CrashLoops with EROFS.
     //
     //   path                        | covering mount (sts.rs)
     //   ──────────────────────────────────────────────────────────
-    //   cfg.fuse_mount_point        | `fuse-store` emptyDir
-    //     (/var/rio/fuse-store)     |   (readOnlyRoot only)
     //   cfg.overlay_base_dir        | `overlays` emptyDir
     //     (/var/rio/overlays)       |   (always)
     //   /nix/var/{nix,log}/**       | `nix-var` emptyDir
     //                               |   (readOnlyRoot only)
     //   /tmp (tempfile crate)       | `tmp` emptyDir, 64Mi tmpfs
     //                               |   (readOnlyRoot only)
-    //   cfg.fuse_cache_dir          | `fuse-cache` emptyDir
-    //     (/var/rio/cache —         |   (always)
-    //      Cache::new above)        |
     //   /sys/fs/cgroup/**           | cgroupfs, not rootfs —
     //     (cgroup.rs)               |   remounted rw at cgroup.rs
     //                               |   ns-root-remount
     //
+    // The castore dirs (cfg.{castore,staging,cache,chunks}_dir under
+    // /var/rio) are node-level hostPaths owned by rio-mountd; the
+    // builder never creates them — a missing mount surfaces as a
+    // mountd connect/Mount error at the first build, not a startup
+    // write.
+    //
     // Adding a new startup write? Extend BOTH this table AND the
     // `if p.read_only_root_fs` blocks in common/sts.rs (Volume +
     // VolumeMount pair). vm-fetcher-split-k3s catches misses.
-    std::fs::create_dir_all(&cfg.fuse_mount_point)?;
     std::fs::create_dir_all(&cfg.overlay_base_dir)?;
     // nix's `LocalStore` (chroot-store via `--store local?root=X`)
     // refuses to open if any ancestor of X is world-writable. The k8s
@@ -186,20 +179,40 @@ pub async fn setup(
         }
     }
 
-    let (fuse_session, fuse_circuit) = crate::fuse::mount_fuse_background(
-        &cfg.fuse_mount_point,
-        cache,
-        store_clients.clone(),
-        runtime,
-        cfg.fuse_passthrough,
-        cfg.fuse_threads,
-        fuse_fetch_timeout,
-    )?;
+    // Castore-FUSE per-build sessions hold one fd per registered
+    // passthrough backing plus one per cache/staging file mid-fill;
+    // with max_backing_ids (default 4096) that far exceeds the
+    // container default soft limit of 1024 once the gRPC sockets and
+    // log pipes are added. Raise the soft NOFILE limit to the hard
+    // limit so a wide build doesn't fail open() with EMFILE.
+    raise_nofile_limit();
 
-    info!(
-        mount_point = %cfg.fuse_mount_point.display(),
-        "FUSE store mounted"
-    );
+    // Per-build castore-FUSE settings. The circuit breaker is shared
+    // between every build's opener and the runtime's completion stamp
+    // (`store_degraded`) so a store outage observed mid-build is
+    // visible to the scheduler in the report.
+    let fuse_circuit = Arc::new(crate::castore_fuse::circuit::CircuitBreaker::default());
+    let castore = CastoreSettings {
+        mountd_socket: cfg.mountd_socket.clone(),
+        castore_dir: cfg.castore_dir.clone(),
+        staging_root: cfg.staging_dir.clone(),
+        cache_dir: cfg.cache_dir.clone(),
+        chunks_dir: cfg.chunks_dir.clone(),
+        dag_prefetch_timeout: cfg.dag_prefetch_timeout,
+        fuse_threads: cfg.fuse_threads as usize,
+        opener: OpenerConfig {
+            stream_threshold: cfg.stream_threshold,
+            mountd_request_timeout: MOUNTD_REQUEST_TIMEOUT,
+            // Base fetch timeout (60s default) — NOT GRPC_STREAM_TIMEOUT
+            // (300s). The open() fetch is the build-critical path; a
+            // stalled fetch blocks a fuser thread. Scaled per file size
+            // via jit_fetch_timeout. See config.rs fuse_fetch_timeout.
+            fetch_timeout: cfg.fuse_fetch_timeout,
+            max_backing_ids: cfg.max_backing_ids as usize,
+            disable_passthrough: cfg.disable_passthrough,
+        },
+        circuit: Arc::clone(&fuse_circuit),
+    };
 
     // ---- The build-task sink ----
     //
@@ -228,9 +241,12 @@ pub async fn setup(
     // Shared context for spawning build tasks (clones done once per assignment
     // inside spawn_build_task, not here).
     let build_ctx = BuildSpawnContext {
-        store_clients: store_clients.clone(),
+        store_clients,
         executor_id,
-        fuse_mount_point: cfg.fuse_mount_point,
+        // Per-build castore-FUSE settings (mountd socket, dirs, fetch
+        // budgets, shared circuit breaker) — the executor passes them to
+        // mount_and_serve with each assignment's build id + token.
+        castore,
         overlay_base_dir: cfg.overlay_base_dir,
         // The permanent sink, NOT a per-connection gRPC channel.
         // Build tasks' sends never fail on scheduler failover.
@@ -240,18 +256,11 @@ pub async fn setup(
             rate_lines_per_sec: cfg.log_rate_limit,
             total_bytes: cfg.log_size_limit,
         },
-        fuse_cache_dir,
         daemon_timeout: cfg.daemon_timeout,
         max_silent_time: cfg.max_silent_time.as_secs(),
         cgroup_parent,
         executor_kind: cfg.executor_kind,
         systems,
-        // I-110c: same Arc as the FUSE mount — executor primes
-        // manifest hints + JIT allowlist, FUSE threads consume them.
-        fuse_cache: executor_cache,
-        // Base per-path fetch timeout; JIT lookup scales it with
-        // nar_size (I-178).
-        fuse_fetch_timeout,
         // Empty (non-k8s / VM tests) → None: proto3 optional string
         // semantics — absent on the wire, scheduler reads "unknown hw".
         node_name: (!cfg.node_name.is_empty()).then(|| cfg.node_name.clone()),
@@ -272,7 +281,6 @@ pub async fn setup(
     Ok(Some(BuilderRuntime {
         scheduler_client,
         shutdown,
-        fuse_session,
         slot,
         build_ctx,
         intent_id: cfg.intent_id.clone(),
@@ -282,6 +290,29 @@ pub async fn setup(
         idle_timeout: cfg.idle_timeout,
         _balance_guard,
     }))
+}
+
+/// Ceiling on every mountd UDS round-trip except `Promote` (which gets
+/// a size-proportional budget on top, see `OpenerConfig`). Mount /
+/// BackingOpen / BackingClose are a handful of syscalls daemon-side; 10s
+/// only ever matters when the daemon is wedged, and then failing the
+/// build fast (infra-retry) beats waiting out a longer deadline.
+const MOUNTD_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Raise the soft `RLIMIT_NOFILE` to the hard limit. Best-effort: a
+/// failure is logged and the build proceeds with the default soft
+/// limit (a wide build may then hit EMFILE on `open()`, which is
+/// visible in `rio_builder_castore_fuse_eio_total`).
+fn raise_nofile_limit() {
+    use nix::sys::resource::{Resource, getrlimit, setrlimit};
+    match getrlimit(Resource::RLIMIT_NOFILE) {
+        Ok((soft, hard)) if soft < hard => match setrlimit(Resource::RLIMIT_NOFILE, hard, hard) {
+            Ok(()) => info!(soft, hard, "raised RLIMIT_NOFILE soft limit to hard limit"),
+            Err(e) => warn!(error = %e, soft, hard, "could not raise RLIMIT_NOFILE"),
+        },
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "could not read RLIMIT_NOFILE"),
+    }
 }
 
 /// Resolve executor_id / systems / features from config + environment.

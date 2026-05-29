@@ -6289,6 +6289,7 @@
         "mman",
         "mount",
         "process",
+        "resource",
         "sched",
         "signal",
         "socket",

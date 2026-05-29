@@ -924,7 +924,8 @@ mod tests {
     #[test]
     fn bool_env_var_true_and_false() {
         // The RIO_ env layer parses bool-ish strings. Guard: make sure
-        // "true"/"false" actually work (important for RIO_FUSE_PASSTHROUGH).
+        // "true"/"false" actually work (important for bool knobs like
+        // RIO_DISABLE_PASSTHROUGH).
         crate::test_jail::Jail::expect_with(|jail| {
             jail.set_env("RIO_DEBUG", "true");
             let cfg: TestConfig =

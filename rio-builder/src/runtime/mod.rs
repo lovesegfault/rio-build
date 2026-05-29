@@ -1,13 +1,14 @@
 //! Worker runtime: the pull-mode lifecycle and build-task spawning.
 //!
-//! Glue between main.rs's bootstrap and the executor/FUSE/upload
-//! subsystems. `setup` wires up cgroups, gRPC clients, FUSE mount and
-//! the build context; [`run`] hands off to the pull loop (pull → build
-//! → report → exit).
+//! Glue between main.rs's bootstrap and the executor/castore-FUSE/upload
+//! subsystems. `setup` wires up cgroups, gRPC clients, and the build
+//! context; [`run`] hands off to the pull loop (pull → build → report →
+//! exit). The castore-FUSE itself is mounted per build inside
+//! `executor::execute_build`.
 //!
 //! Submodules (each a clean extraction with no cross-cutting state):
 //! - `slot`: single-build occupancy + cancel target
-//! - `setup`: cold-start wiring (identity, cgroup, connect, FUSE)
+//! - `setup`: cold-start wiring (identity, cgroup, connect)
 //! - `pull`: the pull client loop (the runtime entry)
 //! - `result`: completion construction + the send chokepoint
 
@@ -75,13 +76,15 @@ pub type HwBenchHandle = Arc<
 pub struct BuildSpawnContext {
     /// `StoreService` over the balanced channel. `.store` goes to
     /// `execute_build` (drv fetch, upload, query); the full bundle is
-    /// held by `NixStoreFs` (set at FUSE mount) so the JIT `lookup`
-    /// callback can reach it.
+    /// also what each build's castore-FUSE opener fetches through.
     pub store_clients: crate::store_fetch::StoreClients,
     /// This pod's executor identity, echoed in every report.
     pub executor_id: String,
-    /// Mount point of the FUSE store view builds read inputs from.
-    pub fuse_mount_point: PathBuf,
+    /// Process-level castore-FUSE settings (mountd socket, dirs, fetch
+    /// budgets, shared circuit breaker). Threaded into each spawned
+    /// task's `ExecutorEnv`; the executor mounts the per-build session
+    /// from them.
+    pub castore: crate::castore_fuse::session::CastoreSettings,
     /// Base directory for per-build overlayfs upper/work dirs.
     pub overlay_base_dir: PathBuf,
     /// The process-lifetime build-task sink: the spawned build task
@@ -96,9 +99,6 @@ pub struct BuildSpawnContext {
     /// task is cheap. Worker-wide (set once at startup from config), not
     /// per-assignment — the limits are a worker policy, not a build option.
     pub log_limits: log_stream::LogLimits,
-    /// FUSE cache directory (from `Config.fuse_cache_dir`) — the H9″
-    /// occupancy instrument's statvfs target (live_057-d).
-    pub fuse_cache_dir: std::path::PathBuf,
     /// nix-daemon subprocess timeout (from `Config.daemon_timeout_secs`).
     /// Ceiling-bounded BY TYPE (bug_117): the bound travels with the
     /// value from parse to the stderr-loop deadline add.
@@ -122,14 +122,6 @@ pub struct BuildSpawnContext {
     /// matches the resolved identity — a drv routed for `i686-linux`
     /// is then accepted by the x86_64 daemon.
     pub systems: Arc<[String]>,
-    /// Handle to the FUSE local cache. Threaded into `ExecutorEnv` so
-    /// the executor can `register_inputs` (JIT allowlist) before
-    /// daemon spawn.
-    pub fuse_cache: Arc<crate::fuse::cache::Cache>,
-    /// Base per-fetch gRPC timeout for the FUSE cache's `GetPath`.
-    /// JIT lookup scales it per path via `jit_fetch_timeout(this,
-    /// nar_size)` (I-178).
-    pub fuse_fetch_timeout: Duration,
     /// k8s `spec.nodeName` (from `Config.node_name`, downward API).
     /// Attached to every `CompletionReport` for ADR-023's hw_class
     /// join. `None` outside k8s (empty config string).
@@ -166,7 +158,7 @@ pub struct BuildSpawnContext {
     /// store-degraded when the breaker is open at completion OR
     /// tripped during the build (bug_408 — the mid-build signal a
     /// one-shot pod's fresh-closed breaker would otherwise hide).
-    pub fuse_circuit: Arc<crate::fuse::circuit::CircuitBreaker>,
+    pub fuse_circuit: Arc<crate::castore_fuse::circuit::CircuitBreaker>,
 }
 
 impl BuildSpawnContext {
@@ -244,11 +236,10 @@ impl BuildSpawnContext {
     /// here, not at every `execute_build` call site.
     pub fn executor_env(&self, cancelled: Arc<AtomicBool>) -> executor::ExecutorEnv {
         executor::ExecutorEnv {
-            fuse_mount_point: self.fuse_mount_point.clone(),
+            castore: self.castore.clone(),
             overlay_base_dir: self.overlay_base_dir.clone(),
             executor_id: self.executor_id.clone(),
             log_limits: self.log_limits,
-            fuse_cache_dir: self.fuse_cache_dir.clone(),
             daemon_timeout: self.daemon_timeout,
             max_silent_time: self.max_silent_time,
             cgroup_parent: self.cgroup_parent.clone(),
@@ -267,8 +258,6 @@ impl BuildSpawnContext {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone(),
-            fuse_cache: Some(Arc::clone(&self.fuse_cache)),
-            fuse_fetch_timeout: self.fuse_fetch_timeout,
             cancelled,
         }
     }
@@ -818,10 +807,6 @@ pub async fn spawn_build_task(
 pub struct BuilderRuntime {
     scheduler_client: WorkerClient,
     shutdown: rio_common::signal::Token,
-    /// FUSE mount session. Dropped explicitly in [`run_teardown`]
-    /// (NOT here) so the abort-then-sleep ordering in `r[builder.shutdown.fuse-abort]`
-    /// stays adjacent to the comment that explains it.
-    fuse_session: crate::fuse::FuseMount,
     slot: Arc<BuildSlot>,
     build_ctx: BuildSpawnContext,
     /// `RIO_EXECUTOR_TOKEN` — presented on every pull/report unary
@@ -850,53 +835,22 @@ pub struct BuilderRuntime {
 }
 
 /// Drive the pull lifecycle (pull → build → report → exit), then run
-/// exit teardown (FUSE abort). Pull is the only delivery path — the
-/// stream session client (registration, heartbeat, bidi dispatch
-/// stream, relay/drain machinery) was removed with the
-/// executor-lifecycle collapse; SIGTERM/SIGINT abort semantics live in
-/// the pull loop (`r[builder.shutdown.sigint+5]`).
+/// exit teardown. Pull is the only delivery path — the stream session
+/// client (registration, heartbeat, bidi dispatch stream, relay/drain
+/// machinery) was removed with the executor-lifecycle collapse;
+/// SIGTERM/SIGINT abort semantics live in the pull loop
+/// (`r[builder.shutdown.sigint+5]`).
 pub async fn run(rt: BuilderRuntime) -> anyhow::Result<()> {
     pull::run_pull(rt).await
 }
 
-/// Exit teardown: FUSE abort + drop. By now the single build (if any)
-/// has returned its permit and the report phase is over.
-fn run_teardown(rt: BuilderRuntime) {
-    info!("teardown: aborting FUSE session and exiting");
-
-    // r[impl builder.shutdown.fuse-abort]
-    // I-165: abort the FUSE connection FIRST. The builder both serves
-    // this mount (fuser threads) and consumes it (spawn_blocking
-    // symlink_metadata from the warm loop). If warm-stat threads are
-    // parked in the kernel's FUSE request queue when the runtime tears
-    // down, they're uninterruptible — exit_group() can't reap them and
-    // the process hangs (observed: main zombie + 4× D-state stat
-    // threads). The fusectl abort makes the kernel return ECONNABORTED
-    // to all pending requests, so the D-state threads wake BEFORE the
-    // session drops and the runtime exits. Then:
-    //   - drop the inner Mount → fusermount -u (lazy MNT_DETACH; with
-    //     no pending requests this completes immediately)
-    //   - detached fuser-bg thread sees ENODEV on /dev/fuse read
-    //     → Session::run() returns → Filesystem::destroy() runs
-    //     (flushes passthrough-failure stats, profraw)
-    //
-    // The race: main thread can reach libc exit() before the detached
-    // FUSE thread processes DESTROY → destroy() never runs → profraw
-    // lost for that code. The short sleep gives the FUSE thread time
-    // to process DESTROY in the common case. It's best-effort — if the
-    // mount is busy (fusermount fails EBUSY) or the FUSE thread is
-    // stuck on a slow request, destroy() won't run. That's fine:
-    // kernel unmounts on process death anyway (the fd closes); a
-    // missed flush only loses profraw for this one build.
-    //
-    // Why not umount_and_join()? It takes self by value — if it
-    // blocks (busy mount → join never returns), there's no clean way
-    // to fall back to the Drop path without fuse_session ownership
-    // gymnastics. The Drop path is already correct for shutdown
-    // (mount cleaned up, process exits); it's only the profraw
-    // flush we're optimizing for, and a sleep is sufficient.
-    drop(rt.fuse_session);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+/// Exit teardown. By now the single build (if any) has returned its
+/// permit and the report phase is over; the build's own teardown
+/// already dropped its overlay and castore session. Dropping
+/// `BuilderRuntime` here releases the balanced-channel guards (their
+/// probe loops stop).
+fn run_teardown(_rt: BuilderRuntime) {
+    info!("teardown: exiting");
 }
 #[cfg(test)]
 mod tests {
@@ -1292,7 +1246,7 @@ mod tests {
     /// is the lesser evil — a build the scheduler already cancelled
     /// has no client waiting on its real outcome.
     ///
-    // r[verify builder.cancel.pre-cgroup-deferred+2]
+    // r[verify builder.cancel.pre-cgroup-deferred+3]
     #[test]
     fn cancel_build_cgroup_missing_keeps_flag() {
         // Path that definitely doesn't exist. tmpdir/nonexistent so

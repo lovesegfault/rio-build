@@ -149,7 +149,9 @@ fn fold_error_evidence(e: &ExecutorError, evidence: &mut StoreEvidenceSet) {
         // else is build content, daemon-local, node-local, or
         // control flow.
         E::Overlay(_)
-        | E::OverlayTaskPanic(_)
+        | E::BlockingTaskPanic(_)
+        | E::CastoreMount(_)
+        | E::InputRoots { .. }
         | E::SynthDb(_)
         | E::NixConf(_)
         | E::DaemonSpawn(_)

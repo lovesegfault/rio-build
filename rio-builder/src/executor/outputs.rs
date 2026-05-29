@@ -76,11 +76,12 @@ pub(super) async fn collect_outputs(
     assignment_token: &str,
 ) -> Result<BuildOutputs, ExecutorError> {
     if !build_result.status.is_success() {
-        // I-178: daemon ENOENT on a closure input is worker-local
-        // materialization failure (warm timeout / FUSE EIO / I-043
-        // negative-dentry), NOT a build defect. Reclassify so the
-        // scheduler retries instead of poisoning. Checked BEFORE the
-        // generic BuildResultStatus::from collapse (MiscFailure →
+        // Daemon EIO/ENOENT on a closure input is a worker-local
+        // materialization failure (castore-FUSE fetch failure or
+        // tripped circuit breaker → EIO; a path missing from the
+        // mounted tree → ENOENT), NOT a build defect. Reclassify so
+        // the scheduler retries instead of poisoning. Checked BEFORE
+        // the generic BuildResultStatus::from collapse (MiscFailure →
         // PermanentFailure).
         if is_input_materialization_failure(
             build_result.status,
@@ -92,15 +93,12 @@ pub(super) async fn collect_outputs(
             tracing::warn!(
                 drv_path = %drv_path,
                 error = %build_result.error_msg,
-                "daemon ENOENT on closure input — reclassifying MiscFailure → \
-                 InfrastructureFailure (warm timeout / FUSE EIO / I-043 race)"
+                "daemon EIO/ENOENT on closure input — reclassifying MiscFailure → \
+                 InfrastructureFailure (castore fetch failure / circuit breaker)"
             );
             return Ok(BuildOutputs::failed(
                 BuildResultStatus::InfrastructureFailure,
-                format!(
-                    "input materialization failed (I-043/I-178): {}",
-                    build_result.error_msg
-                ),
+                format!("input materialization failed: {}", build_result.error_msg),
             ));
         }
         tracing::warn!(
@@ -319,17 +317,20 @@ pub(super) async fn collect_outputs(
 }
 
 /// True iff the daemon's `MiscFailure` is `getting attributes of path
-/// '<p>': No such file or directory` where `<p>` is in the build's
-/// input closure.
+/// '<p>': <strerror>` (or one of the sibling phrasings below) where
+/// `<p>` is in the build's input closure.
 ///
-/// I-178: that pattern means the daemon's sandbox-setup `lstat(input)`
-/// hit overlay → FUSE → ENOENT (warm timeout, FUSE EIO, or the I-043
-/// negative-dentry race). The input was verified present in rio-store
-/// by `compute_input_closure` (BatchQueryPathInfo only returns found
-/// paths); its absence at sandbox-setup is a worker-local
-/// materialization failure, NOT a build defect. Reporting
-/// `PermanentFailure` poisons the derivation; `InfrastructureFailure`
-/// lets the scheduler retry on a fresh worker.
+/// That pattern means the daemon's sandbox-setup `lstat(input)`/`open`
+/// hit overlay → castore-FUSE → EIO (fetch failure, integrity
+/// mismatch, tripped circuit breaker — `r[builder.fs.fetch-circuit]`)
+/// or ENOENT (path missing from the mounted tree). The input was
+/// verified present in rio-store by `compute_input_closure`
+/// (BatchQueryPathInfo only returns found paths); its absence or
+/// unreadability at sandbox-setup is a worker-local materialization
+/// failure, NOT a build defect. Reporting `PermanentFailure` poisons
+/// the derivation; `InfrastructureFailure` lets the scheduler retry on
+/// a fresh worker. (I-178 established the reclassification for the
+/// pre-castore JIT FUSE; the failure mode survives the cutover.)
 ///
 /// String-matching the daemon's error is brittle but the message is
 /// stable since Nix 2.3 (`libstore/posix-fs-canonicalise.cc`). The
@@ -346,7 +347,7 @@ pub(super) async fn collect_outputs(
 /// matched: ENOENT (`No such file or directory`) and EIO (`Input/output
 /// error`, see I-179) are both worker-local materialization failures.
 ///
-// r[impl builder.result.input-enoent-is-infra+2]
+// r[impl builder.result.input-eio-is-infra]
 pub(crate) fn is_input_materialization_failure(
     nix_status: rio_nix::protocol::build::BuildStatus,
     error_msg: &str,
@@ -412,7 +413,7 @@ mod tests {
     ///
     /// I-178b: the live cluster message is ANSI-colored and reports the
     /// OVERLAY path, not the store path. Strip ANSI; match by basename.
-    // r[verify builder.result.input-enoent-is-infra+2]
+    // r[verify builder.result.input-eio-is-infra]
     #[test]
     fn test_is_input_materialization_failure() {
         use rio_nix::protocol::build::BuildStatus as Nix;

@@ -39,7 +39,11 @@ struct Args {
     /// Per-Promote size ceiling in bytes.
     #[arg(long, default_value_t = DEFAULT_MAX_PROMOTE_BYTES)]
     max_promote_bytes: u64,
-    /// SO_PEERCRED gid allowed to connect (the builder pods' fsGroup).
+    /// Group that owns the UDS (created 0660 root:<gid>). The socket
+    /// file's permissions are the only access control — there is no
+    /// peer-credential check; executor pods reach the socket via the
+    /// controller-mounted hostPath dir and connect with a matching
+    /// runAsGroup.
     #[arg(long)]
     allowed_gid: u32,
     /// Prometheus exporter listen address.

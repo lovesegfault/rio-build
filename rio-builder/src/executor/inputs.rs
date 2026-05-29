@@ -322,6 +322,140 @@ pub(super) async fn compute_input_closure(
     Ok(metadata)
 }
 
+/// Resolve the castore root node for every closure path the build's
+/// `/nix/store` must serve, combining the scheduler-attested
+/// `WorkAssignment.input_roots` (P0588) with a `GetNarIndexBatch`
+/// fallback for paths dispatched without a `root_node` (indexer lag,
+/// scheduler PG blip) or not dispatched at all (closure-compute
+/// timeout → empty `input_roots`).
+///
+/// The path universe is `input_roots ∪ input_metadata`: the synth-DB
+/// `ValidPaths` set (`input_metadata`, from [`compute_input_closure`])
+/// is what nix-daemon will `lstat` at sandbox setup, so every one of
+/// those paths must resolve in the castore tree; scheduler-sent roots
+/// outside the local closure are kept as-is (harmless extras). A path
+/// that needs the fallback but has no locally-known `nar_hash` (i.e.
+/// it is not in the local closure either) is dropped with a warning —
+/// the daemon never asks for it.
+///
+/// Errors are infrastructure failures: a closure path with no NAR
+/// index cannot be served lazily, so the build is re-queued instead of
+/// failing as a build defect.
+pub(super) async fn resolve_castore_roots(
+    store_client: &StoreServiceClient<Channel>,
+    assignment_roots: &[rio_proto::types::InputRoot],
+    input_metadata: &[ValidatedPathInfo],
+) -> Result<Vec<rio_proto::types::InputRoot>, ExecutorError> {
+    use std::collections::{HashMap, HashSet};
+
+    let nar_hash_by_path: HashMap<&str, [u8; 32]> = input_metadata
+        .iter()
+        .map(|m| (m.store_path.as_str(), m.nar_hash))
+        .collect();
+
+    let mut resolved: Vec<rio_proto::types::InputRoot> = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+    // (store_path, nar_hash) pairs still needing a GetNarIndexBatch
+    // round-trip.
+    let mut needs: Vec<(String, [u8; 32])> = Vec::new();
+
+    for root in assignment_roots {
+        seen.insert(root.store_path.as_str());
+        if root.root_node.is_some() {
+            resolved.push(root.clone());
+        } else if let Some(hash) = nar_hash_by_path.get(root.store_path.as_str()) {
+            needs.push((root.store_path.clone(), *hash));
+        } else {
+            // Scheduler closure entry the local BFS never saw (path not
+            // in the store yet) and no root_node either — nothing to
+            // mount, and the daemon won't ask for it (it's not in the
+            // synth DB). Drop with a warning so scheduler/indexer skew
+            // is visible.
+            tracing::warn!(
+                store_path = %root.store_path,
+                "input root has no root_node and no local nar_hash; dropping from castore tree"
+            );
+        }
+    }
+    for info in input_metadata {
+        if !seen.contains(info.store_path.as_str()) {
+            needs.push((info.store_path.to_string(), info.nar_hash));
+        }
+    }
+
+    if needs.is_empty() {
+        return Ok(resolved);
+    }
+
+    // One batch RPC for every unresolved path (I-110: never one unary
+    // RPC per path — the fallback can be the whole closure when the
+    // scheduler's closure compute timed out).
+    let mut client = store_client.clone();
+    let request = rio_proto::types::GetNarIndexBatchRequest {
+        nar_hashes: needs.iter().map(|(_, h)| h.to_vec()).collect(),
+    };
+    let infra = |path: &str, msg: String| ExecutorError::InputRoots {
+        path: path.to_owned(),
+        reason: msg,
+    };
+    let consume = async {
+        let mut stream = client
+            .get_nar_index_batch(request)
+            .await
+            .map_err(|status| ExecutorError::MetadataFetch {
+                path: needs[0].0.clone(),
+                source: status,
+            })?
+            .into_inner();
+        let mut by_hash: HashMap<Vec<u8>, Option<rio_proto::types::NarIndex>> = HashMap::new();
+        while let Some(resp) =
+            stream
+                .message()
+                .await
+                .map_err(|status| ExecutorError::MetadataFetch {
+                    path: needs[0].0.clone(),
+                    source: status,
+                })?
+        {
+            by_hash.insert(resp.nar_hash, resp.index);
+        }
+        Ok::<_, ExecutorError>(by_hash)
+    };
+    let by_hash = tokio::time::timeout(rio_common::grpc::GRPC_STREAM_TIMEOUT, consume)
+        .await
+        .map_err(|_| {
+            infra(
+                &needs[0].0,
+                "GetNarIndexBatch timed out resolving castore root nodes".to_string(),
+            )
+        })??;
+
+    for (path, hash) in &needs {
+        let index = by_hash.get(hash.as_slice()).and_then(|i| i.as_ref());
+        let Some(index) = index else {
+            // The path is in the store (compute_input_closure saw it)
+            // but has no NAR index row, so the castore-FUSE cannot
+            // serve it. Eager indexing at PutPath (P0557) makes this
+            // unreachable for freshly-uploaded paths; hitting it means
+            // pre-P0557 data or a store-side regression.
+            return Err(infra(
+                path,
+                "store has no NAR index for this path — was it uploaded before eager \
+                 indexing (P0557), or is the index backfill still running?"
+                    .to_string(),
+            ));
+        };
+        let root_node = crate::castore_fuse::session::root_node_from_nar_index(index)
+            .map_err(|e| infra(path, format!("corrupt NAR index: {e}")))?;
+        resolved.push(rio_proto::types::InputRoot {
+            store_path: path.clone(),
+            root_node: Some(root_node),
+        });
+    }
+
+    Ok(resolved)
+}
+
 /// Fetch one BFS layer's metadata via `BatchQueryPathInfo` (one RPC
 /// for the whole layer — I-110).
 async fn query_layer(
@@ -917,6 +1051,124 @@ mod tests {
             );
         }
 
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_castore_roots (WorkAssignment.input_roots + GetNarIndex fallback)
+    // -----------------------------------------------------------------------
+
+    use rio_proto::castore::root_node;
+    use rio_proto::types::{InputRoot, NarEntryKind, NarIndex, NarIndexEntry};
+
+    /// A minimal directory-rooted NAR index whose root_digest is `fill`.
+    fn dir_index(fill: u8) -> NarIndex {
+        NarIndex {
+            root_digest: vec![fill; 32],
+            entries: vec![NarIndexEntry {
+                path: Vec::new(),
+                kind: NarEntryKind::Directory.into(),
+                dir_digest: vec![fill; 32],
+                ..Default::default()
+            }],
+        }
+    }
+
+    fn dir_root_node(fill: u8) -> rio_proto::castore::RootNode {
+        rio_proto::castore::RootNode {
+            node: Some(root_node::Node::DirDigest(vec![fill; 32])),
+        }
+    }
+
+    /// Pre-resolved scheduler roots pass through untouched; roots the
+    /// scheduler sent without a `root_node` AND closure paths the
+    /// scheduler did not send at all are resolved via GetNarIndexBatch.
+    /// Guards the real failure mode of the cutover: a path missing from
+    /// the castore tree is an ENOENT at sandbox setup.
+    #[tokio::test]
+    async fn test_resolve_castore_roots_merges_assignment_and_fallback() -> anyhow::Result<()> {
+        let (store, client) = spawn_and_connect().await?;
+        let (p_pre, p_unrooted, p_local_only) =
+            (tp("pre-resolved"), tp("unrooted"), tp("local-only"));
+
+        // Local closure metadata: nar_hash is what keys the fallback.
+        let (nar_a, hash_a) = make_nar(b"a");
+        let (nar_b, hash_b) = make_nar(b"b");
+        let (nar_c, hash_c) = make_nar(b"c");
+        let metadata = vec![
+            make_path_info(&p_pre, &nar_a, hash_a),
+            make_path_info(&p_unrooted, &nar_b, hash_b),
+            make_path_info(&p_local_only, &nar_c, hash_c),
+        ];
+        store.seed_nar_index(hash_b, dir_index(2));
+        store.seed_nar_index(hash_c, dir_index(3));
+
+        let assignment_roots = vec![
+            InputRoot {
+                store_path: p_pre.clone(),
+                root_node: Some(dir_root_node(1)),
+            },
+            InputRoot {
+                store_path: p_unrooted.clone(),
+                root_node: None,
+            },
+            // p_local_only deliberately absent from the assignment.
+        ];
+
+        let roots = resolve_castore_roots(&client, &assignment_roots, &metadata).await?;
+        let by_path: std::collections::HashMap<_, _> = roots
+            .iter()
+            .map(|r| (r.store_path.as_str(), r.root_node.clone()))
+            .collect();
+        assert_eq!(by_path.len(), 3, "all three closure paths resolved");
+        assert_eq!(
+            by_path[p_pre.as_str()],
+            Some(dir_root_node(1)),
+            "scheduler-resolved root passes through verbatim (no extra RPC)"
+        );
+        assert_eq!(
+            by_path[p_unrooted.as_str()],
+            Some(dir_root_node(2)),
+            "root_node:None falls back to the path's NAR index"
+        );
+        assert_eq!(
+            by_path[p_local_only.as_str()],
+            Some(dir_root_node(3)),
+            "closure path the scheduler omitted is resolved too"
+        );
+        Ok(())
+    }
+
+    /// A closure path with NO NAR index (pre-P0557 upload, backfill
+    /// lag) cannot be served by the castore-FUSE — the resolver must
+    /// fail with an actionable infra error, not silently mount a tree
+    /// missing an input.
+    #[tokio::test]
+    async fn test_resolve_castore_roots_unindexed_path_is_infra_error() -> anyhow::Result<()> {
+        let (_store, client) = spawn_and_connect().await?;
+        let p = tp("unindexed");
+        let (nar, hash) = make_nar(b"content");
+        let metadata = vec![make_path_info(&p, &nar, hash)];
+        // NOT seeding a nar_index for `hash`.
+
+        let err = resolve_castore_roots(&client, &[], &metadata)
+            .await
+            .expect_err("missing index must fail the mount, not drop the path");
+        match &err {
+            ExecutorError::InputRoots { path, reason } => {
+                assert_eq!(path, &p);
+                assert!(
+                    reason.contains("NAR index"),
+                    "error must say what is missing: {reason}"
+                );
+            }
+            other => panic!("expected InputRoots, got {other:?}"),
+        }
+        assert!(
+            !err.is_permanent(),
+            "indexer lag is node/store-state, not derivation-intrinsic — must stay \
+             InfrastructureFailure so the scheduler retries instead of poisoning"
+        );
         Ok(())
     }
 

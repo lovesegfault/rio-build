@@ -49,30 +49,66 @@
         },
         "default": []
       },
-      "fuse_mount_point": {
-        "description": "FUSE mount point. Never `/nix/store` --- that would shadow the host store.",
+      "mountd_socket": {
+        "description": "rio-mountd UDS socket path. The DaemonSet (P0567) listens here;\nevery build's castore-FUSE mount starts with a `Mount{build_id}`\nhandshake on this socket.",
         "type": "string",
-        "default": "/var/rio/fuse-store"
+        "default": "/run/rio-mountd.sock"
       },
-      "fuse_cache_dir": {
-        "description": "Local SSD cache directory for the FUSE cache.",
+      "castore_dir": {
+        "description": "Per-build castore-FUSE mountpoint root. mountd mounts each\nbuild's handed-off `/dev/fuse` fd at `{castore_dir}/{build_id}`;\nthe builder uses that path as the overlay lowerdir. Must match\nthe mountd DaemonSet's `--castore-dir`.",
+        "type": "string",
+        "default": "/var/rio/castore"
+      },
+      "staging_dir": {
+        "description": "Per-build staging root (mountd-owned, builder-writable per-build\nsubdirs). Must match the mountd DaemonSet's `--staging-dir`.",
+        "type": "string",
+        "default": "/var/rio/staging"
+      },
+      "cache_dir": {
+        "description": "Shared node file-digest backing cache (mountd-owned, read-only\nto the builder). Must match the mountd DaemonSet's `--cache-dir`.",
         "type": "string",
         "default": "/var/rio/cache"
       },
+      "chunks_dir": {
+        "description": "Shared node chunk cache (mountd-owned, read-only to the\nbuilder). Must match the mountd DaemonSet's `--chunks-dir`.",
+        "type": "string",
+        "default": "/var/rio/chunks"
+      },
+      "dag_prefetch_timeout_secs": {
+        "description": "Budget (seconds) for the mount-time `GetDirectory(recursive)`\nDirectory-DAG prefetch. Expiry is an infrastructure failure\n(re-queue), never a wedged mount. Env:\n`RIO_DAG_PREFETCH_TIMEOUT_SECS`.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 30
+      },
+      "stream_threshold": {
+        "description": "Castore-FUSE `open()` cache misses larger than this (bytes) take\nthe streaming-open path (reply at the first chunk, fill in the\nbackground) instead of a whole-file fetch.",
+        "type": "integer",
+        "format": "uint64",
+        "minimum": 0,
+        "default": 8388608
+      },
+      "max_backing_ids": {
+        "description": "Ceiling on concurrently registered passthrough backing ids per\nbuild. The kernel never reclaims a backing slot until\n`BACKING_CLOSE`, so a build leaking opens would otherwise grow\nmountd's IDR without bound; at the ceiling, opens of new digests\ndegrade to userspace `FOPEN_KEEP_CACHE` reads instead of\nregistering more backings.",
+        "type": "integer",
+        "format": "uint32",
+        "minimum": 0,
+        "default": 4096
+      },
+      "disable_passthrough": {
+        "description": "Escape hatch: reply plain `FOPEN_KEEP_CACHE` and serve `read()`\nfrom userspace instead of registering kernel passthrough\nbackings. Adds a userspace copy per read (~2× per-build\nlatency) — only for debugging passthrough itself.",
+        "type": "boolean",
+        "default": false
+      },
       "fuse_threads": {
-        "description": "Number of FUSE daemon threads.",
+        "description": "Number of FUSE event-loop threads per build session.",
         "type": "integer",
         "format": "uint32",
         "minimum": 0,
         "default": 4
       },
-      "fuse_passthrough": {
-        "description": "Defaults to `true`. NOT the serde bool default — see `default_true`.\nA drift here (`false`) would silently disable kernel passthrough,\nadding a userspace copy per FUSE read and ~2× per-build latency.",
-        "type": "boolean",
-        "default": true
-      },
       "fuse_fetch_timeout_secs": {
-        "description": "Timeout (seconds) for FUSE-initiated `GetPath` fetches. Default 60.\nNOT the global `GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR\nuploads and passthrough. FUSE fetches are the build-critical path;\na stalled fetch blocks a fuser thread, and a few stalls freeze the\nwhole mount.\n\nI-211: this is an IDLE bound — 60s without a stream message — not\na wall-clock bound on the whole fetch. A stuck store (no chunks\narriving) still trips at 60s; a healthy store streaming a 2.9 GB\nNAR completes regardless of total duration. Preserves the I-165\ncircuit-breaker tuning: a genuinely stalled fetch fails at 60s, so\n60s × 5 threshold failures = 300s to circuit-open (matching\n`GRPC_STREAM_TIMEOUT`), and detached warm-stat threads unpark\nwithin 60s. Pre-I-211, the wall-clock bound aborted a 2.9 GB\n`clang-21.1.8-debug` mid-stream → daemon EIO → build failure on a\nhealthy store. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.",
+        "description": "Base timeout (seconds) for castore-FUSE `open()` store fetches\n(`ReadBlob`/`GetChunks`). Default 60. NOT the global\n`GRPC_STREAM_TIMEOUT` (300s) — that's for large-NAR uploads.\nopen() fetches are the build-critical path; a stalled fetch\nblocks a fuser thread. Scaled per file size via\n`jit_fetch_timeout` (I-178) so multi-GB inputs get a\nsize-proportional budget. Env: `RIO_FUSE_FETCH_TIMEOUT_SECS`.",
         "type": "integer",
         "format": "uint64",
         "minimum": 0,
@@ -206,10 +242,16 @@
     },
     "systems": [],
     "features": [],
-    "fuse_mount_point": "/var/rio/fuse-store",
-    "fuse_cache_dir": "/var/rio/cache",
+    "mountd_socket": "/run/rio-mountd.sock",
+    "castore_dir": "/var/rio/castore",
+    "staging_dir": "/var/rio/staging",
+    "cache_dir": "/var/rio/cache",
+    "chunks_dir": "/var/rio/chunks",
+    "dag_prefetch_timeout_secs": 30,
+    "stream_threshold": 8388608,
+    "max_backing_ids": 4096,
+    "disable_passthrough": false,
     "fuse_threads": 4,
-    "fuse_passthrough": true,
     "fuse_fetch_timeout_secs": 60,
     "overlay_base_dir": "/var/rio/overlays",
     "metrics_addr": "[::]:9093",

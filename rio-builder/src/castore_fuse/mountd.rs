@@ -20,18 +20,21 @@
 //! `Semaphore(num_cpus)` permit and run their copy+hash loop on
 //! `spawn_blocking`, replying out-of-order via the connection's writer
 //! channel — a multi-second promote never blocks the same build's
-//! `BackingOpen` traffic.
+//! `BackingOpen` traffic. A per-connection slot pool
+//! (`MAX_INFLIGHT_PROMOTES_PER_CONN`) bounds how many promote batches
+//! one build can have outstanding, so a frame-pipelining client cannot
+//! queue unbounded privileged copy work.
 // r[impl builder.mountd.concurrency]
 
 use std::collections::HashSet;
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
-use nix::fcntl::{AtFlags, OFlag, openat};
+use nix::fcntl::{AtFlags, Flock, FlockArg, OFlag, openat};
 use nix::libc;
 use nix::mount::{MntFlags, MsFlags, mount, umount2};
 use nix::sys::socket::{
@@ -40,6 +43,7 @@ use nix::sys::socket::{
 };
 use nix::sys::stat::{Mode, fstatat, mkdirat};
 use nix::unistd::{Gid, Uid, UnlinkatFlags, fchownat, unlinkat};
+use rio_common::limits::FASTCDC_MAX_BYTES;
 use tokio::io::Interest;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::mpsc;
@@ -65,15 +69,15 @@ pub const DEFAULT_MAX_PROMOTE_BYTES: u64 = 4 << 30;
 /// with [`ErrKind::RaceTimeout`].
 const PROMOTE_RACE_WAIT: Duration = Duration::from_secs(2);
 
-/// A `.promoting` placeholder older than this is a leak from a crashed
-/// promote (the owning task can no longer be running) and is reclaimed.
-/// Sized as `DEFAULT_MAX_PROMOTE_BYTES / MIN_PROMOTE_THROUGHPUT
-/// (50 MiB/s)` — any live promote finishes well inside it.
-const PROMOTE_STALE_AFTER: Duration = Duration::from_secs(90);
-
 /// Copy-loop buffer. 64 KiB amortizes syscall overhead without holding
 /// a large allocation per concurrent promote.
 const PROMOTE_BUF: usize = 64 * 1024;
+
+/// Distinguishes concurrent promotes' temp destinations. Names only
+/// need to be unique within one daemon: a single mountd owns the cache
+/// directories, and leftovers from a crashed daemon are removed by the
+/// next incarnation's startup orphan scan before it serves connections.
+static PROMOTE_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Daemon configuration. The binary populates this from clap; tests
 /// populate it from a tempdir.
@@ -99,8 +103,13 @@ pub struct MountdConfig {
     pub staging_quota_bytes: u64,
     /// Per-`Promote` size ceiling ([`ErrKind::TooLarge`] above it).
     pub max_promote_bytes: u64,
-    /// `SO_PEERCRED.gid` allowed to connect. Connections from any other
-    /// gid are dropped before a single frame is read.
+    /// Group that owns the listening socket: `bind_socket` chowns the
+    /// UDS to `root:allowed_gid` mode 0660. That socket-file DAC check
+    /// at `connect(2)` is the entire access-control contract — mountd
+    /// performs no peer-credential check after accept. Executor pods
+    /// reach the socket only through the controller-mounted hostPath
+    /// directory, and their `runAsGroup` matches this gid so the
+    /// connect succeeds.
     pub allowed_gid: u32,
 }
 
@@ -204,21 +213,20 @@ fn backing_close(fuse_fd: BorrowedFd<'_>, id: u32) -> std::io::Result<()> {
 
 // ─── Promote ───────────────────────────────────────────────────────────
 
-/// Unlinks the `.promoting` placeholder on drop unless defused. Every
-/// error and panic path through a promote must leave no placeholder
-/// behind — a leaked one makes every future promote of that digest wait
-/// out [`PROMOTE_STALE_AFTER`] before reclaiming it.
-struct PromotingGuard<'a> {
+/// Unlinks `name` (relative to `dir`) on drop. A promote arms two of
+/// these: one for the `.promoting` claim placeholder (always removed
+/// when the promote ends — the published entry is a different inode)
+/// and one for the unique temp destination (removed on every error and
+/// panic path; on success the rename has already consumed the name and
+/// the unlink is a harmless no-op).
+struct UnlinkOnDrop<'a> {
     dir: BorrowedFd<'a>,
     name: &'a str,
-    defused: bool,
 }
 
-impl Drop for PromotingGuard<'_> {
+impl Drop for UnlinkOnDrop<'_> {
     fn drop(&mut self) {
-        if !self.defused {
-            let _ = unlinkat(self.dir, self.name, UnlinkatFlags::NoRemoveDir);
-        }
+        let _ = unlinkat(self.dir, self.name, UnlinkatFlags::NoRemoveDir);
     }
 }
 
@@ -238,8 +246,11 @@ fn shard(digest: &[u8; 32]) -> String {
 /// The copy re-hashes every byte and compares against `digest` before
 /// the destination becomes visible — this is the integrity boundary
 /// that keeps the node-shared cache trustworthy against a compromised
-/// builder. The destination is created `0444` under a `.promoting`
-/// name and `renameat`ed into place only after the hash matches.
+/// builder. The destination is a fresh mountd-owned temp file created
+/// `0444` under a per-promote unique name; only that inode — the one
+/// this call wrote and hashed — is `renameat`ed to the final name, and
+/// only after the hash matches. The `.promoting` placeholder is purely
+/// the claim that serializes concurrent promotes of one digest.
 // r[impl builder.mountd.promote-verified]
 // r[impl builder.mountd.promote-bounded-copy]
 pub(crate) fn promote_one(
@@ -247,6 +258,20 @@ pub(crate) fn promote_one(
     dest_root: BorrowedFd<'_>,
     digest: &[u8; 32],
     max_bytes: u64,
+) -> Result<u64, ErrKind> {
+    promote_one_hooked(staging, dest_root, digest, max_bytes, || {})
+}
+
+/// [`promote_one`] with a test seam: `before_publish` runs after the
+/// verify-copy has been written and synced, immediately before
+/// publication — the widest window in which a concurrent promote of the
+/// same digest can interleave. Production passes a no-op.
+fn promote_one_hooked(
+    staging: BorrowedFd<'_>,
+    dest_root: BorrowedFd<'_>,
+    digest: &[u8; 32],
+    max_bytes: u64,
+    before_publish: impl FnOnce(),
 ) -> Result<u64, ErrKind> {
     use std::io::{Read, Write};
     use std::os::unix::fs::PermissionsExt;
@@ -299,33 +324,76 @@ pub(crate) fn promote_one(
         Err(e) => return Err(ErrKind::Retryable(format!("open {ab}/: {e}"))),
     };
 
-    // ── Claim the digest with an O_EXCL `.promoting` placeholder.
-    // Loser of the race waits for the winner, then reports Promoted
-    // without copying (content-addressed: any winner wrote the same
-    // bytes).
+    // ── Claim the digest with an O_EXCL `.promoting` placeholder, held
+    // under an exclusive flock for the lifetime of this promote. The
+    // placeholder is only a claim marker: the loser of a race waits for
+    // the winner instead of doing a duplicate copy (content-addressed:
+    // any winner writes the same bytes). Owner liveness is judged by the
+    // lock state — see `wait_for_concurrent_promote`. The data itself
+    // goes into a unique temp file below.
     let promoting = format!("{hex_name}.promoting");
-    let dst = loop {
+    let _claim = loop {
         match openat(
             &ab_dir,
             promoting.as_str(),
             OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
             Mode::from_bits_truncate(0o444),
         ) {
-            Ok(fd) => break fd,
+            Ok(fd) => match Flock::lock(std::fs::File::from(fd), FlockArg::LockExclusiveNonblock) {
+                Ok(lock) => break lock,
+                // Either a concurrent promote probed the gap between our
+                // create and our flock and is reclaiming the name, or
+                // the flock itself failed (e.g. EINTR). Drop the claim
+                // we just created before retrying so a non-theft failure
+                // does not leave an orphan claim that costs the next
+                // promoter of this digest a reclaim round.
+                Err(_) => {
+                    let _ = unlinkat(&ab_dir, promoting.as_str(), UnlinkatFlags::NoRemoveDir);
+                    continue;
+                }
+            },
             Err(nix::errno::Errno::EEXIST) => {
                 match wait_for_concurrent_promote(ab_dir.as_fd(), &hex_name, &promoting) {
                     RaceOutcome::AlreadyPromoted => return Ok(0),
-                    RaceOutcome::StaleReclaimed => continue,
+                    RaceOutcome::ClaimReleased => continue,
                     RaceOutcome::TimedOut => return Err(ErrKind::RaceTimeout),
                 }
             }
             Err(e) => return Err(ErrKind::Retryable(format!("create {promoting}: {e}"))),
         }
     };
-    let mut guard = PromotingGuard {
+    // The claim is removed when this promote ends — success or failure —
+    // because the published entry is a different inode. If a racer
+    // wrongly reclaimed this claim mid-promote, this unlink at worst
+    // removes a successor's live claim — costing a duplicate verify-copy
+    // of identical bytes, never corruption (publication only renames the
+    // temp inode below).
+    let _claim_cleanup = UnlinkOnDrop {
         dir: ab_dir.as_fd(),
         name: &promoting,
-        defused: false,
+    };
+
+    // ── Destination: a unique mountd-owned temp file. Publication below
+    // renames only this inode — the one this promote writes and hashes —
+    // so no concurrent promote of the same digest can get its bytes
+    // published by us, no matter what happens to the shared `.promoting`
+    // name in the meantime.
+    let tmp_name = format!(
+        "{hex_name}.{}.tmp",
+        PROMOTE_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let dst = match openat(
+        &ab_dir,
+        tmp_name.as_str(),
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o444),
+    ) {
+        Ok(fd) => fd,
+        Err(e) => return Err(ErrKind::Retryable(format!("create {tmp_name}: {e}"))),
+    };
+    let _tmp_cleanup = UnlinkOnDrop {
+        dir: ab_dir.as_fd(),
+        name: &tmp_name,
     };
 
     // ── Bounded verify-copy. The builder owns the source inode and can
@@ -353,7 +421,7 @@ pub(crate) fn promote_one(
         };
         hasher.update(&buf[..n]);
         if let Err(e) = dst_f.write_all(&buf[..n]) {
-            return Err(ErrKind::Retryable(format!("write {ab}/{promoting}: {e}")));
+            return Err(ErrKind::Retryable(format!("write {ab}/{tmp_name}: {e}")));
         }
         copied += n as u64;
     }
@@ -365,19 +433,19 @@ pub(crate) fn promote_one(
     // builder uids that need to open it for BACKING_OPEN. Set the final
     // mode explicitly on the still-open fd.
     if let Err(e) = dst_f.set_permissions(std::fs::Permissions::from_mode(0o444)) {
-        return Err(ErrKind::Retryable(format!("fchmod {ab}/{promoting}: {e}")));
+        return Err(ErrKind::Retryable(format!("fchmod {ab}/{tmp_name}: {e}")));
     }
     if let Err(e) = dst_f.sync_all() {
-        return Err(ErrKind::Retryable(format!("fsync {ab}/{promoting}: {e}")));
+        return Err(ErrKind::Retryable(format!("fsync {ab}/{tmp_name}: {e}")));
     }
     drop(dst_f);
 
-    // ── Publish.
-    if let Err(e) = nix::fcntl::renameat(&ab_dir, promoting.as_str(), &ab_dir, hex_name.as_str()) {
-        return Err(ErrKind::Retryable(format!("rename {promoting}: {e}")));
+    before_publish();
+
+    // ── Publish the inode this promote wrote and verified.
+    if let Err(e) = nix::fcntl::renameat(&ab_dir, tmp_name.as_str(), &ab_dir, hex_name.as_str()) {
+        return Err(ErrKind::Retryable(format!("rename {tmp_name}: {e}")));
     }
-    guard.defused = true;
-    drop(guard);
     // Source is no longer needed; failure to unlink is not a promote
     // failure (the staging dir is removed wholesale at teardown).
     let _ = unlinkat(staging, hex_name.as_str(), UnlinkatFlags::NoRemoveDir);
@@ -386,17 +454,31 @@ pub(crate) fn promote_one(
 
 enum RaceOutcome {
     AlreadyPromoted,
-    StaleReclaimed,
+    /// The `.promoting` claim is gone (its owner finished or failed and
+    /// cleaned up) or was reclaimed from a provably dead owner. The
+    /// caller retries the claim.
+    ClaimReleased,
     TimedOut,
 }
 
-/// Another promote of the same digest holds the `.promoting`
-/// placeholder. Poll for the final name to appear (the winner's
-/// `renameat`); if the placeholder is older than
-/// [`PROMOTE_STALE_AFTER`] it is a leak from a crashed daemon and is
-/// reclaimed. A poll loop replaces the planned inotify watch — at a
-/// 50 ms period the added latency is bounded by one period and the
-/// code does not need an inotify fd per in-flight race.
+/// Another promote of the same digest holds the `.promoting` claim.
+/// Poll for the final name to appear (the winner publishing); give up
+/// with [`RaceOutcome::TimedOut`] after [`PROMOTE_RACE_WAIT`].
+///
+/// A claim whose owner no longer holds its exclusive flock has no live
+/// owner (within a live daemon every promote unlinks its claim on every
+/// exit path; an unheld claim is a leftover of a daemon that died
+/// before its successor's orphan scan) and is reclaimed. Liveness is
+/// judged ONLY by the lock state — never by the placeholder's age,
+/// which says nothing about whether the owner is still running. The
+/// flip side: there is no time-based reclaim of a live-but-wedged
+/// owner — recovery from a promote that is truly stuck while still
+/// holding its flock is a daemon restart, observable as
+/// `rio_mountd_promote_inflight` staying high.
+///
+/// A poll loop replaces the planned inotify watch — at a 50 ms period
+/// the added latency is bounded by one period and the code does not
+/// need an inotify fd per in-flight race.
 fn wait_for_concurrent_promote(
     ab_dir: BorrowedFd<'_>,
     final_name: &str,
@@ -407,22 +489,39 @@ fn wait_for_concurrent_promote(
         if fstatat(ab_dir, final_name, AtFlags::AT_SYMLINK_NOFOLLOW).is_ok() {
             return RaceOutcome::AlreadyPromoted;
         }
-        match fstatat(ab_dir, promoting, AtFlags::AT_SYMLINK_NOFOLLOW) {
-            Err(_) => {
-                // Placeholder vanished without the final name appearing:
-                // the winner failed and cleaned up. Retry the claim.
-                return RaceOutcome::StaleReclaimed;
-            }
-            Ok(st) => {
-                let age = std::time::SystemTime::now()
-                    .duration_since(
-                        std::time::UNIX_EPOCH + Duration::from_secs(st.st_mtime.max(0) as u64),
-                    )
-                    .unwrap_or_default();
-                if age > PROMOTE_STALE_AFTER {
-                    let _ = unlinkat(ab_dir, promoting, UnlinkatFlags::NoRemoveDir);
-                    return RaceOutcome::StaleReclaimed;
+        match openat(
+            ab_dir,
+            promoting,
+            OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        ) {
+            // Claim gone without the final name appearing: the owner
+            // failed and cleaned up. Retry the claim.
+            Err(_) => return RaceOutcome::ClaimReleased,
+            Ok(probe) => {
+                if let Ok(lock) =
+                    Flock::lock(std::fs::File::from(probe), FlockArg::LockExclusiveNonblock)
+                {
+                    // Nobody holds the claim. Reclaim it — but only if
+                    // the name still refers to the inode we locked, so a
+                    // claim a new owner created after our open is left
+                    // alone.
+                    let same_inode = match (
+                        nix::sys::stat::fstat(&*lock),
+                        fstatat(ab_dir, promoting, AtFlags::AT_SYMLINK_NOFOLLOW),
+                    ) {
+                        (Ok(ours), Ok(named)) => {
+                            ours.st_dev == named.st_dev && ours.st_ino == named.st_ino
+                        }
+                        _ => false,
+                    };
+                    if same_inode {
+                        let _ = unlinkat(ab_dir, promoting, UnlinkatFlags::NoRemoveDir);
+                        return RaceOutcome::ClaimReleased;
+                    }
                 }
+                // The lock is held (or the claim was just replaced): a
+                // live promote owns it — keep waiting for its publish.
             }
         }
         if std::time::Instant::now() >= deadline {
@@ -476,6 +575,10 @@ struct ConnState {
     /// looping on `BackingOpen` would OOM-kill the broker for every
     /// build on the node. See [`MAX_LIVE_BACKING_IDS`].
     live_backing_ids: u32,
+    /// Permits for promote batches accepted from this connection but
+    /// not yet answered; an exhausted pool rejects the request instead
+    /// of queueing it. See [`MAX_INFLIGHT_PROMOTES_PER_CONN`].
+    promote_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Per-connection ceiling on live `BACKING_OPEN` registrations. The
@@ -486,6 +589,18 @@ struct ConnState {
 /// kernel memory per registration the worst case is 64 MiB per
 /// connection, which the DaemonSet's memory limit must budget for.
 const MAX_LIVE_BACKING_IDS: u32 = 1 << 20;
+
+/// Per-connection ceiling on `Promote`/`PromoteChunks` batches accepted
+/// but not yet answered. The legitimate client awaits every promote it
+/// issues, so its in-flight count is bounded by its own concurrency
+/// (FUSE worker threads plus active streaming fills — single digits in
+/// practice). Without a cap, a client can pipeline ~40-byte Promote
+/// frames faster than the broker verify-copies them: each queued frame
+/// is up to `max_promote_bytes` of privileged read+hash+write, so the
+/// backlog starves co-located builds' promotes past their request
+/// timeout and grows the broker's memory without bound — the same abuse
+/// class [`MAX_LIVE_BACKING_IDS`] closes for `BackingOpen`.
+const MAX_INFLIGHT_PROMOTES_PER_CONN: usize = 64;
 
 // ─── Daemon entrypoint ─────────────────────────────────────────────────
 
@@ -564,8 +679,11 @@ pub async fn run(cfg: MountdConfig) -> anyhow::Result<()> {
 }
 
 /// `SOCK_SEQPACKET` listener at `cfg.socket_path`, mode 0660, group
-/// `cfg.allowed_gid`. A stale socket from a previous incarnation is
-/// unlinked first (the DaemonSet is the only writer of this path).
+/// `cfg.allowed_gid`. The socket file's owner/mode is the daemon's only
+/// access control: a peer that can `connect(2)` is in the allowed group
+/// (or has DAC override) and is served. A stale socket from a previous
+/// incarnation is unlinked first (the DaemonSet is the only writer of
+/// this path).
 fn bind_socket(cfg: &MountdConfig) -> anyhow::Result<OwnedFd> {
     let _ = std::fs::remove_file(&cfg.socket_path);
     let fd = socket(
@@ -657,16 +775,15 @@ pub(super) fn list_dir(path: &Path) -> Vec<String> {
 type ReplyTx = mpsc::UnboundedSender<(Reply, Option<OwnedFd>)>;
 
 async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
-    // ── Peer-credential gate, before any frame is read.
+    // Access control already happened at connect(2): the socket file is
+    // root:allowed_gid mode 0660 (see `bind_socket`), and executor pods
+    // reach it only through the controller-mounted hostPath directory.
+    // No peer-credential check here — SO_PEERCRED is read for the
+    // accepted-connection log line, the one-connection-per-uid binding
+    // below, and the ownership operations (staging chown, fuse mount
+    // `user_id`/`group_id`), which the kernel interprets as host-side
+    // credentials.
     let creds = getsockopt(&fd, sockopt::PeerCredentials).context("SO_PEERCRED")?;
-    if creds.gid() != shared.cfg.allowed_gid {
-        warn!(
-            uid = creds.uid(),
-            gid = creds.gid(),
-            "rejecting connection: wrong gid"
-        );
-        return Ok(());
-    }
     // Every fallible setup step happens BEFORE the uid is registered:
     // an early `?` between registration and the teardown call at the
     // bottom would leave the uid in `live_uids` forever, permanently
@@ -700,6 +817,7 @@ async fn handle_conn(shared: Arc<Shared>, fd: OwnedFd) -> anyhow::Result<()> {
         staging_chunks_dirfd: None,
         projid: None,
         live_backing_ids: 0,
+        promote_slots: Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PROMOTES_PER_CONN)),
     };
 
     let result = loop {
@@ -835,10 +953,8 @@ async fn handle_frame(
             } else {
                 match frame.fds.first() {
                     None => Resp::Err(ErrKind::Retryable("BackingOpen frame carried no fd".into())),
-                    // The client's fd is never registered directly: it
-                    // is re-opened O_RDONLY first, so the kernel-side
-                    // registration can never carry write access to the
-                    // shared cache (see `reopen_backing_readonly`).
+                    // Never register the client's fd directly — see
+                    // `reopen_backing_readonly`.
                     Some(client_fd) => match reopen_backing_readonly(client_fd.as_fd())
                         .map_err(|e| format!("backing fd reopen: {e}"))
                         .and_then(|readonly| {
@@ -879,16 +995,20 @@ async fn handle_frame(
                 reply(Resp::Err(ErrKind::Retryable("not mounted".into())), None);
                 return;
             };
+            let Some(slot) = claim_promote_slot(state, &reply) else {
+                return;
+            };
             spawn_promote(
                 shared,
                 reply_tx.clone(),
-                seq,
-                staging,
-                BaseDir::Cache,
-                vec![digest],
-                shared.cfg.max_promote_bytes,
-                timer,
-                op,
+                PromoteJob {
+                    seq,
+                    staging,
+                    dest: BaseDir::Cache,
+                    digests: vec![digest],
+                    timer,
+                    slot,
+                },
             );
             return;
         }
@@ -901,20 +1021,20 @@ async fn handle_frame(
                 reply(Resp::Err(ErrKind::Retryable("not mounted".into())), None);
                 return;
             };
+            let Some(slot) = claim_promote_slot(state, &reply) else {
+                return;
+            };
             spawn_promote(
                 shared,
                 reply_tx.clone(),
-                seq,
-                staging_chunks,
-                BaseDir::Chunks,
-                chunk_digests,
-                // Chunks are FastCDC outputs; anything larger than the
-                // chunker's max is bogus. Reuse the configured promote
-                // ceiling rather than importing the chunker constant —
-                // the store re-verifies chunk sizes on upload anyway.
-                shared.cfg.max_promote_bytes,
-                timer,
-                op,
+                PromoteJob {
+                    seq,
+                    staging: staging_chunks,
+                    dest: BaseDir::Chunks,
+                    digests: chunk_digests,
+                    timer,
+                    slot,
+                },
             );
             return;
         }
@@ -923,28 +1043,92 @@ async fn handle_frame(
         .record(timer.elapsed().as_secs_f64());
 }
 
+/// Per-connection backpressure for promote work: take an in-flight slot
+/// or reject the request. Returns `None` after queueing the rejection
+/// reply — the caller just returns.
+fn claim_promote_slot(
+    state: &ConnState,
+    reply: &impl Fn(Resp, Option<OwnedFd>),
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    match Arc::clone(&state.promote_slots).try_acquire_owned() {
+        Ok(slot) => Some(slot),
+        Err(_) => {
+            metrics::counter!("rio_mountd_promote_reject_total", "reason" => "backlog")
+                .increment(1);
+            reply(
+                Resp::Err(ErrKind::Retryable(format!(
+                    "promote backlog cap reached ({MAX_INFLIGHT_PROMOTES_PER_CONN} in flight)"
+                ))),
+                None,
+            );
+            None
+        }
+    }
+}
+
 /// Which shared destination a promote writes into.
 enum BaseDir {
     Cache,
     Chunks,
 }
 
-/// Run a promote batch on the blocking pool, bounded by the process-wide
-/// semaphore, and push the single batch reply when it finishes.
-#[allow(clippy::too_many_arguments)]
-fn spawn_promote(
-    shared: &Arc<Shared>,
-    reply_tx: ReplyTx,
+impl BaseDir {
+    /// The `op` label of the request that targets this destination,
+    /// for `rio_mountd_request_seconds`.
+    fn op(&self) -> &'static str {
+        match self {
+            BaseDir::Cache => "promote",
+            BaseDir::Chunks => "promote_chunks",
+        }
+    }
+}
+
+/// One accepted promote batch travelling from [`handle_frame`] to the
+/// spawned worker task.
+struct PromoteJob {
     seq: u32,
+    /// Per-build staging directory holding the sources (files or
+    /// chunks, matching `dest`).
     staging: Arc<OwnedFd>,
     dest: BaseDir,
     digests: Vec<[u8; 32]>,
-    max_bytes: u64,
+    /// Started when the request frame was decoded; recorded when the
+    /// batch reply is queued.
     timer: std::time::Instant,
-    op: &'static str,
-) {
+    /// Held until the reply is queued so the per-connection cap counts
+    /// queued and running work alike.
+    slot: tokio::sync::OwnedSemaphorePermit,
+}
+
+/// Run a promote batch on the blocking pool, bounded by the process-wide
+/// semaphore, and push the single batch reply when it finishes.
+fn spawn_promote(shared: &Arc<Shared>, reply_tx: ReplyTx, job: PromoteJob) {
     let shared = Arc::clone(shared);
+    let PromoteJob {
+        seq,
+        staging,
+        dest,
+        digests,
+        timer,
+        slot,
+    } = job;
+    let op = dest.op();
+    // Whole files are bounded by the configured promote ceiling. Chunks
+    // are bounded much tighter, at the chunker's hard cap: every
+    // legitimate chunk is a FastCDC output, so anything above
+    // `FASTCDC_MAX_BYTES` is bogus — and the tighter bound keeps the
+    // privileged copy work one accepted `PromoteChunks` batch can demand
+    // at `PROMOTE_CHUNKS_MAX × FASTCDC_MAX_BYTES` (16 MiB) instead of
+    // `PROMOTE_CHUNKS_MAX × max_promote_bytes` (256 GiB at the default
+    // ceiling).
+    let max_bytes = match dest {
+        BaseDir::Cache => shared.cfg.max_promote_bytes,
+        BaseDir::Chunks => shared.cfg.max_promote_bytes.min(FASTCDC_MAX_BYTES as u64),
+    };
     tokio::spawn(async move {
+        // The connection's in-flight slot is released only when this
+        // task ends, i.e. after the reply has been queued.
+        let _slot = slot;
         let _permit = shared
             .promote_sem
             .clone()
@@ -1223,7 +1407,7 @@ pub fn describe_metrics() {
     );
     describe_counter!(
         "rio_mountd_promote_reject_total",
-        "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/other)"
+        "Rejected promotes (labeled by reason: mismatch/not-regular/too-large/race-timeout/backlog/other)"
     );
     describe_gauge!(
         "rio_mountd_promote_inflight",
@@ -1404,6 +1588,22 @@ mod tests {
             promote_one(staging.as_fd(), cache.as_fd(), digest, max)
         }
 
+        fn promote_hooked(
+            &self,
+            digest: &[u8; 32],
+            before_publish: impl FnOnce(),
+        ) -> Result<u64, ErrKind> {
+            let staging = dirfd(&self.staging);
+            let cache = dirfd(&self.cache);
+            promote_one_hooked(
+                staging.as_fd(),
+                cache.as_fd(),
+                digest,
+                DEFAULT_MAX_PROMOTE_BYTES,
+                before_publish,
+            )
+        }
+
         fn staged(&self, digest: &[u8; 32]) -> PathBuf {
             self.staging.join(hex::encode(digest))
         }
@@ -1557,21 +1757,314 @@ mod tests {
         assert!(matches!(r, Ok(0)), "got {r:?}");
     }
 
-    /// A `.promoting` placeholder with no live owner and no published
-    /// result times the loser out rather than hanging forever.
+    /// A `.promoting` claim nobody holds a flock on has no live owner
+    /// (a leftover of a crashed daemon): it is reclaimed so promotes of
+    /// that digest do not stay blocked until the next daemon restart.
     #[test]
-    fn promote_race_timeout_on_abandoned_placeholder() {
+    fn promote_reclaims_claim_with_no_live_owner() {
         let fx = Fx::new();
-        let digest = fx.stage(b"contended");
-        // Fresh placeholder (mtime = now) → not stale → the racer waits
-        // the full window and times out.
+        let content = b"contended";
+        let digest = fx.stage(content);
         std::fs::create_dir_all(fx.placeholder(&digest).parent().unwrap()).unwrap();
         std::fs::write(fx.placeholder(&digest), b"").unwrap();
 
+        let r = fx.promote(&digest);
+
+        assert!(matches!(r, Ok(n) if n == content.len() as u64), "got {r:?}");
+        assert_eq!(std::fs::read(fx.published(&digest)).unwrap(), content);
+        assert!(
+            !fx.placeholder(&digest).exists(),
+            "reclaimed claim must not leak"
+        );
+    }
+
+    /// Whatever happens to the shared `.promoting` claim while a
+    /// promote is mid-flight (a concurrent promote wrongly deciding it
+    /// is stale, reclaiming it, and writing its own in-progress bytes
+    /// under that name), the entry published under the final cache name
+    /// must be exactly the bytes this promote verified — never someone
+    /// else's unverified file.
+    // r[verify builder.mountd.promote-verified]
+    #[test]
+    fn promote_publishes_only_the_inode_it_verified() {
+        let fx = Fx::new();
+        let content = b"verified payload".repeat(1024);
+        let digest = fx.stage(&content);
+
+        let placeholder = fx.placeholder(&digest);
+        let r = fx.promote_hooked(&digest, || {
+            // A racer that decided our claim was stale: it unlinks the
+            // placeholder and re-creates it as its own (unverified,
+            // partially written) destination.
+            std::fs::remove_file(&placeholder).unwrap();
+            std::fs::write(&placeholder, b"racer's unverified partial bytes").unwrap();
+        });
+
+        assert!(matches!(r, Ok(n) if n == content.len() as u64), "got {r:?}");
+        assert_eq!(
+            std::fs::read(fx.published(&digest)).unwrap(),
+            content,
+            "published entry must be the verified bytes, not the racer's"
+        );
+    }
+
+    /// A live promote may spend arbitrarily long inside a single read,
+    /// write or fsync (contended disk, cgroup IO throttling) without
+    /// ever touching its `.promoting` claim. A concurrent promote of
+    /// the same digest must keep waiting (and eventually time out) — it
+    /// must never reclaim the claim of an owner that is still alive,
+    /// however old the placeholder looks.
+    // r[verify builder.mountd.promote-verified]
+    #[test]
+    fn promote_waits_for_live_owner_regardless_of_claim_age() {
+        let fx = Fx::new();
+        let digest = fx.stage(b"contended");
+        std::fs::create_dir_all(fx.placeholder(&digest).parent().unwrap()).unwrap();
+        std::fs::write(fx.placeholder(&digest), b"").unwrap();
+        // Simulate the live-but-stalled owner: an exclusive flock held
+        // on the claim for the whole test. Make the claim look ancient
+        // so any age-based heuristic would (wrongly) reclaim it.
+        let owner = std::fs::File::open(fx.placeholder(&digest)).unwrap();
+        let _owner_lock =
+            nix::fcntl::Flock::lock(owner, nix::fcntl::FlockArg::LockExclusive).unwrap();
+        age_path(&fx.placeholder(&digest), 600);
+
         let start = std::time::Instant::now();
         let r = fx.promote(&digest);
+
         assert!(matches!(r, Err(ErrKind::RaceTimeout)), "got {r:?}");
-        assert!(start.elapsed() >= PROMOTE_RACE_WAIT);
+        assert!(
+            start.elapsed() >= PROMOTE_RACE_WAIT,
+            "the loser must wait the full race window for the live owner"
+        );
+        assert!(
+            fx.placeholder(&digest).exists(),
+            "a live owner's claim must not be reclaimed"
+        );
+        assert!(!fx.published(&digest).exists());
+    }
+
+    /// Everything needed to drive [`handle_frame`] directly: a tempdir
+    ///-backed [`Shared`], a mounted-looking [`ConnState`], and the
+    /// reply channel the connection task would own. `promote_permits`
+    /// sizes the process-wide copy semaphore — `0` parks every accepted
+    /// promote before it does any work, a non-zero count lets promotes
+    /// run to completion.
+    struct ConnFx {
+        _tmp: tempfile::TempDir,
+        shared: Arc<Shared>,
+        state: ConnState,
+        reply_tx: ReplyTx,
+        reply_rx: mpsc::UnboundedReceiver<(Reply, Option<OwnedFd>)>,
+    }
+
+    impl ConnFx {
+        fn new(promote_permits: usize) -> Self {
+            let tmp = tempfile::tempdir().unwrap();
+            let sub = |name: &str| {
+                let p = tmp.path().join(name);
+                std::fs::create_dir_all(&p).unwrap();
+                p
+            };
+            let staging_dir = sub("staging");
+            std::fs::create_dir_all(staging_dir.join("chunks")).unwrap();
+            let cfg = MountdConfig {
+                socket_path: tmp.path().join("mountd.sock"),
+                castore_dir: sub("castore"),
+                staging_dir,
+                cache_dir: sub("cache"),
+                chunks_dir: sub("chunks"),
+                staging_quota_bytes: 0,
+                max_promote_bytes: DEFAULT_MAX_PROMOTE_BYTES,
+                allowed_gid: 0,
+            };
+            let shared = Arc::new(Shared {
+                castore_base: dirfd(&cfg.castore_dir),
+                staging_base: dirfd(&cfg.staging_dir),
+                cache_base: dirfd(&cfg.cache_dir),
+                chunks_base: dirfd(&cfg.chunks_dir),
+                live_uids: Mutex::new(HashSet::new()),
+                live_build_ids: Arc::new(Mutex::new(HashSet::new())),
+                next_projid: AtomicU32::new(1),
+                promote_sem: Arc::new(tokio::sync::Semaphore::new(promote_permits)),
+                cfg,
+            });
+            let state = ConnState {
+                peer_uid: 0,
+                peer_gid: 0,
+                // Any fd satisfies the mounted-connection check; Promote
+                // never touches it.
+                kept: Some(dirfd(tmp.path())),
+                build_id: None,
+                staging_dirfd: Some(Arc::new(dirfd(&shared.cfg.staging_dir))),
+                staging_chunks_dirfd: Some(Arc::new(dirfd(&shared.cfg.staging_dir.join("chunks")))),
+                projid: None,
+                live_backing_ids: 0,
+                promote_slots: Arc::new(tokio::sync::Semaphore::new(
+                    MAX_INFLIGHT_PROMOTES_PER_CONN,
+                )),
+            };
+            let (reply_tx, reply_rx) = mpsc::unbounded_channel();
+            Self {
+                _tmp: tmp,
+                shared,
+                state,
+                reply_tx,
+                reply_rx,
+            }
+        }
+    }
+
+    fn promote_frame(seq: u32, digest: [u8; 32]) -> proto::RecvFrame {
+        proto::RecvFrame {
+            bytes: proto::encode(&Request {
+                seq,
+                req: Req::Promote { digest },
+            })
+            .unwrap(),
+            fds: Vec::new(),
+        }
+    }
+
+    fn promote_chunks_frame(seq: u32, chunk_digests: Vec<[u8; 32]>) -> proto::RecvFrame {
+        proto::RecvFrame {
+            bytes: proto::encode(&Request {
+                seq,
+                req: Req::PromoteChunks { chunk_digests },
+            })
+            .unwrap(),
+            fds: Vec::new(),
+        }
+    }
+
+    /// Requests beyond the per-connection in-flight cap must be
+    /// rejected immediately instead of queued — see
+    /// [`MAX_INFLIGHT_PROMOTES_PER_CONN`] for the abuse class this
+    /// closes.
+    #[tokio::test]
+    async fn promote_backlog_cap_rejects_pipelined_floods() {
+        // Zero permits: every accepted promote parks before doing any
+        // work, holding the connection's backlog at its maximum
+        // deterministically (no timing involved).
+        let mut fx = ConnFx::new(0);
+
+        for seq in 0..MAX_INFLIGHT_PROMOTES_PER_CONN as u32 {
+            handle_frame(
+                &fx.shared,
+                &mut fx.state,
+                promote_frame(seq, [seq as u8; 32]),
+                &fx.reply_tx,
+            )
+            .await;
+        }
+        assert!(
+            fx.reply_rx.try_recv().is_err(),
+            "requests inside the cap must be accepted, not answered inline"
+        );
+
+        handle_frame(
+            &fx.shared,
+            &mut fx.state,
+            promote_frame(9999, [0xAA; 32]),
+            &fx.reply_tx,
+        )
+        .await;
+        let (reply, _fd) = fx
+            .reply_rx
+            .try_recv()
+            .expect("the request beyond the cap must be rejected immediately");
+        assert_eq!(reply.seq, 9999);
+        assert!(
+            matches!(reply.resp, Resp::Err(ErrKind::Retryable(_))),
+            "got {:?}",
+            reply.resp
+        );
+    }
+
+    /// The per-connection cap bounds *in-flight* work, not lifetime
+    /// work: a slot taken when a promote is accepted must be released
+    /// once its reply is queued. With slots leaking, a well-behaved
+    /// connection that promotes more than the cap over its lifetime
+    /// would start seeing phantom backlog rejections.
+    #[tokio::test]
+    async fn promote_slot_released_when_reply_is_queued() {
+        // A real permit so every accepted promote runs to completion.
+        let mut fx = ConnFx::new(1);
+
+        for seq in 0..(MAX_INFLIGHT_PROMOTES_PER_CONN + 1) as u32 {
+            // A fresh source per request: each promote is real work
+            // that succeeds, so any non-Ok reply means a slot leaked
+            // and the cap misfired as a backlog rejection.
+            let content = seq.to_le_bytes();
+            let digest = *blake3::hash(&content).as_bytes();
+            std::fs::write(fx.shared.cfg.staging_dir.join(hex::encode(digest)), content).unwrap();
+
+            handle_frame(
+                &fx.shared,
+                &mut fx.state,
+                promote_frame(seq, digest),
+                &fx.reply_tx,
+            )
+            .await;
+            let (reply, _fd) = fx.reply_rx.recv().await.expect("promote reply");
+            assert_eq!(reply.seq, seq);
+            assert!(
+                matches!(reply.resp, Resp::Ok),
+                "promote {seq} got {:?}",
+                reply.resp
+            );
+        }
+    }
+
+    /// A staged chunk above `FASTCDC_MAX_BYTES` must be rejected even
+    /// though it is far below the whole-file ceiling — see the chunk
+    /// bound rationale in [`spawn_promote`].
+    #[tokio::test]
+    async fn promote_chunks_rejects_chunk_above_chunker_max() {
+        let mut fx = ConnFx::new(1);
+        let content = vec![0xCD; FASTCDC_MAX_BYTES + 1];
+        let digest = *blake3::hash(&content).as_bytes();
+        std::fs::write(
+            fx.shared
+                .cfg
+                .staging_dir
+                .join("chunks")
+                .join(hex::encode(digest)),
+            &content,
+        )
+        .unwrap();
+
+        handle_frame(
+            &fx.shared,
+            &mut fx.state,
+            promote_chunks_frame(7, vec![digest]),
+            &fx.reply_tx,
+        )
+        .await;
+        let (reply, _fd) = fx.reply_rx.recv().await.expect("promote_chunks reply");
+        assert_eq!(reply.seq, 7);
+        assert!(
+            matches!(reply.resp, Resp::Err(ErrKind::TooLarge)),
+            "got {:?}",
+            reply.resp
+        );
+    }
+
+    /// Set a path's mtime/atime `age` seconds into the past.
+    fn age_path(path: &Path, age: u64) {
+        let t = nix::sys::time::TimeSpec::from_duration(
+            (std::time::SystemTime::now() - Duration::from_secs(age))
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap(),
+        );
+        nix::sys::stat::utimensat(
+            nix::fcntl::AT_FDCWD,
+            path,
+            &t,
+            &t,
+            nix::sys::stat::UtimensatFlags::NoFollowSymlink,
+        )
+        .unwrap();
     }
 
     /// Re-promoting an already-published digest succeeds: the fresh
@@ -1590,9 +2083,10 @@ mod tests {
         assert_eq!(std::fs::read(fx.published(&digest)).unwrap(), content);
     }
 
-    /// An error mid-promote must not leak the `.promoting` placeholder
-    /// (a leak blocks every future promote of that digest for
-    /// PROMOTE_STALE_AFTER).
+    /// An error mid-promote must leak neither the `.promoting` claim
+    /// nor the temp destination (a leaked claim makes every future
+    /// promote of that digest spend the race window before reclaiming
+    /// it; a leaked temp wastes cache disk until the next restart).
     #[test]
     fn promote_failure_leaves_no_placeholder() {
         let fx = Fx::new();

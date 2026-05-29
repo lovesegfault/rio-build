@@ -18,6 +18,9 @@
   stubTargetFiles,
   rustStable,
   rustPlatformStable,
+  # importCargoLock over the workspace Cargo.lock (defined once in
+  # flake.nix so the git-dependency outputHashes live in one place).
+  workspaceCargoVendor,
   traceyPkg,
   subcharts,
   dockerImages,
@@ -80,9 +83,7 @@ in
         manifestsFileset
       ];
     };
-    cargoDeps = rustPlatformStable.importCargoLock {
-      lockFile = ../Cargo.lock;
-    };
+    cargoDeps = workspaceCargoVendor;
     nativeBuildInputs = with pkgs; [
       cargo-deny
       rustStable
@@ -153,9 +154,7 @@ in
         workspaceFileset
       ];
     };
-    cargoDeps = rustPlatformStable.importCargoLock {
-      lockFile = ../Cargo.lock;
-    };
+    cargoDeps = workspaceCargoVendor;
     nativeBuildInputs = with pkgs; [
       cargo-hakari
       rustStable
