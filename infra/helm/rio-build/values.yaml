@@ -227,8 +227,19 @@ store:
     # NO static AWS keys.
     annotations: {}
   chunkBackend:
-    # inline = NARs in PG (works out of the box, doesn't scale).
-    # s3 requires bucket (+ endpoint/region/creds via env or IRSA).
+    # Chunk storage backend:
+    #   s3         — requires bucket (+ endpoint/region/creds via env or IRSA).
+    #   filesystem — chunks under baseDir on the rio-store-chunks PVC.
+    #                Single-replica only (the PVC is ReadWriteOnce):
+    #                keep store.replicas=1 and componentScaler.store.
+    #                enabled=false. Used by the airgapped VM-test
+    #                profile (values/vmtest-full.yaml — no MinIO/Rook).
+    #   inline     — NARs in PG, NO chunk backend. Builders upload
+    #                exclusively via PutPathChunked, which the store
+    #                rejects with FAILED_PRECONDITION when no chunk
+    #                backend is configured — an inline store CANNOT
+    #                accept builder uploads. Use only for stores that
+    #                never receive builder uploads.
     kind: s3
     bucket: ""
     # Bucket-level prefix prepended to ALL rio keys (chunks/, logs/).
@@ -238,6 +249,18 @@ store:
     prefix: ""
     # For Rook RGW in dev: http://rook-ceph-rgw-rio-store.rook-ceph:80
     endpoint: ""
+    # filesystem backend only: directory inside the store container
+    # where chunks live. The chart mounts the rio-store-chunks PVC here
+    # (the store pod runs with readOnlyRootFilesystem, so an unmounted
+    # base_dir would be unwritable). Set when kind=filesystem, e.g.
+    # /var/lib/rio/chunks.
+    baseDir: ""
+    persistence:
+      # filesystem backend only: rio-store-chunks PVC size. A PVC (not
+      # emptyDir) because uploaded chunks are recorded durable=TRUE in
+      # PG and must survive store pod restarts/rollouts. The cluster's
+      # default StorageClass provisions it (k3s: local-path).
+      size: 2Gi
   # For Rook RGW dev: AWS_ACCESS_KEY_ID etc. Prod uses IRSA (no extra env).
   extraEnv: []
   # Upstream binary-cache egress allowlist. Each entry opens 443/TCP
@@ -991,14 +1014,17 @@ karpenter:
   # Root volume (/dev/xvda — single root, NixOS doesn't split OS/data).
   # boot.growPartition expands / to fill on first boot. MUST cover the
   # largest pod ephemeral-storage request a NodeClaim can carry:
-  # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1), poolDefaults.fuseCacheBytes)
-  #   = maxDisk × 1.95 + fuseCacheBytes + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request)
-  #   = 200×1.95 + 50 + 1 = 441Gi
+  # pod_ephemeral_request(sla.maxDisk, headroom(n_eff=1))
+  #   = maxDisk × 1.95 + 1Gi   (worst-case headroom; jobs.rs::pod_ephemeral_request)
+  #   = 200×1.95 + 1 = 391Gi
   # `max_node_disk` is dataVolumeSize × 0.9 (kubelet eviction/image-cache
-  # reserve), so the binding inequality is 500×0.9 = 450 ≥ 441 — only ~9Gi
-  # of slack. Bumping `maxDisk` or `fuseCacheBytes` will trip
-  # 14-disk-ceiling.sh; raise `dataVolumeSize` first. nvme hw-classes
-  # ignore this (instance-store provides ephemeral-storage).
+  # reserve), so the binding inequality is 500×0.9 = 450 ≥ 391. The
+  # node-level /var/rio castore caches (mountd-owned, P0571
+  # watermark-evicted) do NOT draw from this volume: on EBS classes
+  # they live on the dedicated rioVolume below, on nvme classes on the
+  # instance-store stripe (which also provides ephemeral-storage, so
+  # nvme classes ignore this knob). Neither appears in any per-pod
+  # request.
   dataVolumeSize: 500Gi
   # gp3 provisioned IOPS+throughput (max for gp3). Build workloads are
   # IOPS-bound; baseline 3000 throttles -j32+. gp3 has no separate
@@ -1007,6 +1033,29 @@ karpenter:
   # (L-B3A130E6) lands.
   dataVolumeIops: 16000
   dataVolumeThroughputMiBps: 1000
+  # Dedicated /var/rio volume (/dev/xvdb) on rio-default/rio-metal —
+  # XFS with prjquota, formatted+mounted by the AMI's rio-ebs-mount
+  # unit when the node has no instance-store NVMe. rio-mountd needs a
+  # prjquota filesystem to apply the per-build staging quota
+  # (mountd.stagingQuotaBytes, 50Gi default) and rejects every Mount
+  # without one, so this volume is what makes EBS-backed and metal
+  # node classes able to run builds/fetches at all. Sizing: the
+  # node-shared cache/chunks dirs are watermark-managed (mountd's
+  # free-space sweep evicts them — a smaller volume just re-fetches
+  # more), but per-build staging is NOT watermark-managed (the sweep
+  # never touches staging dirs), so the hard bound to budget for is
+  # concurrent builds per node × stagingQuotaBytes, on top of cache
+  # headroom.
+  rioVolumeSize: 200Gi
+  # Same gp3 max IOPS/throughput as the root volume: the castore read
+  # path and staging writes are the same IOPS-bound build I/O. Cost
+  # knob: lower these (and the size) if EBS classes are only overflow
+  # capacity. Note that instance-store (d-type) instance types landing
+  # in the rio-default/rio-metal classes leave this volume entirely
+  # unused — rio-nvme-mount claims /var/rio there — so on those nodes
+  # it is pure cost.
+  rioVolumeIops: 16000
+  rioVolumeThroughputMiBps: 1000
 
   # AWS bare-metal instance-size suffixes, c/m/r gen6+. Single source
   # for the metal/virtualized partition (I-205). New `metal-*` size →
@@ -1190,32 +1239,12 @@ poolDefaults:
   enabled: false
   features: []
   image: rio-builder
-  # 50Gi. Reconciler adds this verbatim to every BUILDER pod's
-  # ephemeral-storage request/limit AND the fuse-cache emptyDir
-  # sizeLimit. Single-sourced through controller.toml
-  # `[nodeclaim_pool].fuse_cache_bytes` — NOT the per-Pool CRD spec
-  # (CEL-rejected for BOTH kinds since r35; see
-  # docs/spec/components/controller.typ). Controller fallback when unset
-  # is 8Gi (`BUILDER_FUSE_CACHE_BYTES`) — the safe minimum so non-helm
-  # Pools schedule on small-disk nodes; prod overrides UP here. Raising
-  # this grows EVERY builder pod's ephemeral-storage request — check
-  # node capacity headroom before bumping.
-  fuseCacheBytes: 53687091200
-  # 4Gi. Fetcher-pod analogue of fuseCacheBytes
-  # (`[nodeclaim_pool].fetcher_fuse_cache_bytes`). A FOD's FUSE cache
-  # only ever holds the fetch script's input closure (curl/git/JDK-class
-  # toolchains), not the artifact it downloads — that lands in the
-  # overlay emptyDir, which is sized from the intent's disk_bytes and
-  # grows via the scheduler's reactive disk floor on eviction. Unlike
-  # the overlay, this dimension does NOT escalate on eviction: a FOD
-  # whose input closure exceeds it retries to exhaustion and poisons,
-  # so raise it HERE if a fetcher toolchain outgrows it. Controller
-  # fallback when unset is 4Gi (`FETCHER_FUSE_CACHE_BYTES`).
-  fetcherFuseCacheBytes: 4294967296
-  # privileged:true is an ESCAPE HATCH for clusters whose containerd
-  # lacks base_runtime_spec device injection. It disables seccomp
-  # entirely (ADR-012) and is unacceptable for multi-tenant.
-  # Production on EKS/GKE should NOT need this.
+  # privileged:true is an ESCAPE HATCH for clusters that cannot deliver
+  # /dev/kvm via containerd base_runtime_spec, lack the node-baked
+  # Localhost seccomp profile, or lack idmap-mount support for
+  # hostUsers:false. It disables seccomp entirely (ADR-012) and is
+  # unacceptable for multi-tenant. Production on EKS/GKE should NOT
+  # need this.
   #
   # privileged=false + seccompProfile=Localhost: containerd's
   # RuntimeDefault seccomp profile omits pivot_root from the
@@ -1242,6 +1271,41 @@ poolDefaults:
       effect: NoSchedule
   nodeSelector:
     rio.build/node-role: builder
+
+# ──────────────────────────────────────────────────────────────────────────
+# rio-mountd (ADR-022 P0567) — per-node privileged broker for the
+# castore-FUSE lazy /nix/store. One DaemonSet pod per builder/fetcher
+# node; builder pods reach it over /run/rio-mountd/rio-mountd.sock.
+# ──────────────────────────────────────────────────────────────────────────
+mountd:
+  # REQUIRED for builds since P0560: every build (and fetch) mounts its
+  # input closure through the castore-FUSE, and the per-build mount
+  # handshake starts at this DaemonSet's socket — a builder/fetcher
+  # node without mountd cannot run any build. Disable only for
+  # control-plane-only installs that run no builds; NOTES.txt warns
+  # when pools are enabled with mountd off.
+  enabled: true
+  # The rio-builder image already ships /bin/rio-mountd (every [[bin]] of
+  # the rio-builder crate lands in the image); the DS overrides command.
+  image: rio-builder
+  # The UDS group (`--allowed-gid`) is hard-coded to 990 in
+  # templates/mountd-ds.yaml, matching the controller's
+  # EXECUTOR_RUN_AS_GROUP. mountd creates the socket root:990 mode 0660
+  # and that file permission is the only access control (no
+  # peer-credential check) — deliberately not a values knob, because a
+  # mismatch fails every castore mount connect (total build outage).
+
+  # Per-build staging quota (XFS project quota, kernel-enforced ENOSPC).
+  # Bounds how much a build can write to /var/rio/staging before Promote.
+  stagingQuotaBytes: 53687091200 # 50Gi
+  # Per-file Promote size cap (DoS bound on the verify-copy).
+  maxPromoteBytes: 4294967296 # 4Gi
+  resources:
+    requests: {cpu: 100m, memory: 128Mi}
+    # Promote verify-copies run on a Semaphore(num_cpus) of blocking
+    # tasks; the limit caps how much node CPU cache promotion can steal
+    # from builds.
+    limits: {cpu: "2", memory: 512Mi}
 
 # ──────────────────────────────────────────────────────────────────────────
 # Conditional subchart: PG (dev only). From nixhelm (FOD), not vendored.

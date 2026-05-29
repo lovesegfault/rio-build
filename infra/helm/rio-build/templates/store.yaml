@@ -1,5 +1,7 @@
 {{- if .Values.store.enabled }}
 {{- $s := .Values.store -}}
+{{- $cb := $s.chunkBackend | default dict -}}
+{{- $fsChunks := eq ($cb.kind | default "") "filesystem" -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -8,6 +10,16 @@ metadata:
   labels:
     {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
 spec:
+  {{- if $fsChunks }}
+  # filesystem chunk backend: the chunks PVC is ReadWriteOnce and the
+  # provisioned PV is node-pinned, so a RollingUpdate surge pod could
+  # only schedule onto the same node (capacity permitting) and would
+  # write the same chunk dir concurrently. Recreate swaps the pod
+  # instead — brief downtime is acceptable for the single-replica
+  # dev/VM-test shape this backend is for.
+  strategy:
+    type: Recreate
+  {{- end }}
   {{- if not .Values.componentScaler.store.enabled }}
   # Stateless at runtime (PG + S3 hold everything). sqlx::migrate! takes
   # a PG advisory lock, so concurrent replica startup is safe.
@@ -50,7 +62,7 @@ spec:
               containerPort: 9092
           env:
             {{- include "rio.rustLogEnv" . | nindent 12 }}
-            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "env" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
             - name: RIO_LISTEN_ADDR
               value: "[::]:9002"
             # P0542: s3.dualstack.{region}.amazonaws.com has AAAA;
@@ -86,6 +98,10 @@ spec:
             - name: RIO_CHUNK_BACKEND__KIND
               value: {{ .kind | quote }}
             {{- end }}
+            {{- if .baseDir }}
+            - name: RIO_CHUNK_BACKEND__BASE_DIR
+              value: {{ .baseDir | quote }}
+            {{- end }}
             {{- if .bucket }}
             - name: RIO_CHUNK_BACKEND__BUCKET
               value: {{ .bucket | quote }}
@@ -103,7 +119,14 @@ spec:
             {{- toYaml . | nindent 12 }}
             {{- end }}
           volumeMounts:
-            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 12 }}
+            {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 12 }}
+            {{- if $fsChunks }}
+            # readOnlyRootFilesystem (rio.containerSecurityContext)
+            # makes the image filesystem immutable — the filesystem
+            # chunk backend needs a writable mount at base_dir.
+            - name: chunks
+              mountPath: {{ required "store.chunkBackend.baseDir is required when chunkBackend.kind=filesystem" $cb.baseDir }}
+            {{- end }}
           # tonic-health set_serving() runs AFTER migrations in main.rs —
           # "PG connected + migrations done" = Ready.
           readinessProbe:
@@ -119,7 +142,34 @@ spec:
           resources:
             {{- toYaml $s.resources | nindent 12 }}
       volumes:
-        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac")) | nindent 8 }}
+        {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtVerify" "serviceHmac" "assignmentHmac")) | nindent 8 }}
+        {{- if $fsChunks }}
+        - name: chunks
+          persistentVolumeClaim:
+            claimName: rio-store-chunks
+        {{- end }}
+{{- if $fsChunks }}
+---
+# Chunk storage for chunkBackend.kind=filesystem. A PVC (NOT emptyDir):
+# uploaded chunks are recorded durable=TRUE in PG, so they must survive
+# store pod restarts/rollouts (the lifecycle VM scenarios roll the store
+# and expect previously-uploaded paths to stay servable). ReadWriteOnce
+# — filesystem mode is single-replica (see values.yaml chunkBackend).
+# k3s local-path node-pins the volume on first consumption, so a
+# replacement pod lands back on the node that holds the chunks.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rio-store-chunks
+  namespace: {{ .Values.namespaces.store.name }}
+  labels:
+    {{- include "rio.labels" (dict "root" . "name" "rio-store" "component" "store") | nindent 4 }}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: {{ dig "persistence" "size" "2Gi" $cb }}
+{{- end }}
 # ClusterIP + headless pair (see rio.grpcServicePair). Builders/fetchers
 # resolve the headless name to pod IPs and p2c across them — a sticky
 # single-channel against the ClusterIP means scaling rio-store doesn't

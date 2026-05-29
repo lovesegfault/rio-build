@@ -227,6 +227,23 @@ pkgs.testers.runNixOSTest {
             "nvme-Amazon_EC2_NVMe_Instance_Storage"
         ), f"udevadm settle missing or after device glob:\n{script}"
 
+    # ADR-022 P0567: rio-mountd enforces the per-build staging cap as an
+    # XFS project quota under /var/rio, so the bind mount that puts
+    # /var/rio on the prjquota XFS must happen AFTER that XFS is
+    # mounted. Same structural-assert-on-the-rendered-script approach as
+    # above (the unit Condition-skips in QEMU). The booted-node check
+    # below covers the tmpfiles half: the dirs the mountd DaemonSet
+    # hostPath-mounts with type:Directory must exist even on nodes where
+    # the NVMe unit skipped.
+    with subtest("rio-nvme-mount binds /var/rio onto the prjquota XFS"):
+        assert script.index("prjquota") < script.index(
+            "mount --bind /var/lib/kubelet/.rio /var/rio"
+        ), f"/var/rio bind mount missing or before the prjquota mount:\n{script}"
+        node.succeed(
+            "test -d /var/rio/castore -a -d /var/rio/staging"
+            " -a -d /var/rio/cache -a -d /var/rio/chunks"
+        )
+
     # rio-nvme-mount script failure (mdadm/mkfs/mount) must NOT be
     # fail-open: with only before= ordering + wantedBy=sysinit.target,
     # tmpfiles would create /var/lib/kubelet on root EBS, kubelet
@@ -242,6 +259,47 @@ pkgs.testers.runNixOSTest {
             f"failure would be fail-open (Ready node on root EBS). {deps}"
         )
         node.succeed("systemctl is-active kubelet.service")
+
+    # ADR-022: nodes WITHOUT instance-store NVMe (rio-default/rio-metal)
+    # get their prjquota /var/rio from the dedicated EBS volume via
+    # rio-ebs-mount — without it mountd rejects every Mount and no
+    # build/fetch can run on the EBS/fetcher/metal classes. QEMU is not
+    # an EC2 host (DMI sys_vendor), so the unit must exit 0 here (it
+    # must not block non-EC2 boots); the device handling is asserted
+    # structurally on the rendered script, same approach as the
+    # rio-nvme-mount checks.
+    with subtest("rio-ebs-mount provides prjquota /var/rio on EBS-only nodes"):
+        ebs_script = node.succeed(
+            "cat $(systemctl show -P ExecStart rio-ebs-mount.service "
+            "| grep -oE '/nix/store/[^ ;]+')"
+        )
+        assert ebs_script.index("udevadm settle") < ebs_script.index(
+            "nvme-Amazon_Elastic_Block_Store_"
+        ), f"udevadm settle missing or after the EBS device scan:\n{ebs_script}"
+        assert "PKNAME" in ebs_script and "findmnt -nvo SOURCE /" in ebs_script, (
+            f"root-disk exclusion missing — the unit must never format "
+            f"the volume backing /:\n{ebs_script}"
+        )
+        assert 'mount -o prjquota,noatime "$target" /var/rio' in ebs_script, (
+            f"prjquota mount of /var/rio missing:\n{ebs_script}"
+        )
+        node.succeed("systemctl is-active rio-ebs-mount.service")
+        ebs_deps = node.succeed("systemctl show -p Requires kubelet.service")
+        assert "rio-ebs-mount.service" in ebs_deps, (
+            f"kubelet does not Requires=rio-ebs-mount — a /var/rio on the "
+            f"unquota'd root fs would be fail-open (every build rejected "
+            f"at the mountd handshake). {ebs_deps}"
+        )
+        # Requires= does NOT imply ordering (systemd.unit(5)): the
+        # prjquota mount must also be ordered before kubelet, or kubelet
+        # can register while /var/rio is still the root fs.
+        kubelet_after = node.succeed("systemctl show -p After kubelet.service")
+        assert "rio-ebs-mount.service" in kubelet_after, (
+            f"kubelet is not ordered After=rio-ebs-mount: {kubelet_after}"
+        )
+        assert "rio-nvme-mount.service" in kubelet_after, (
+            f"kubelet is not ordered After=rio-nvme-mount: {kubelet_after}"
+        )
 
     # bug_054: pause import previously had `|| true` and lacked --local.
     # With sandbox=localhost/kubernetes/pause there is no registry

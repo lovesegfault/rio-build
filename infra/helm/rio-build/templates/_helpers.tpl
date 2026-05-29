@@ -75,6 +75,19 @@ Families:
              on dispatch-time FindMissingPaths/QueryPathInfo so the
              store honours x-rio-probe-tenant-id
              (r[sched.dispatch.fod-substitute]); store verifies.
+  assignmentHmac  always-on. SCHEDULER (signer) + STORE (verifier).
+             Secret rio-hmac → /etc/rio/assignment-hmac/hmac.key, env
+             RIO_HMAC_KEY_PATH (scheduler hmac_key_path / store
+             hmac_key_path — same key file both sides). SEPARATE
+             Secret from rio-service-hmac so a leaked assignment key
+             cannot mint service tokens (and vice versa). Without the
+             mount the scheduler falls back to unsigned assignment
+             tokens, the store's tenant-scoped castore RPCs reject the
+             builder ("DirectoryService requires a tenant"), and every
+             post-cutover build fails after max_infra_retries. The
+             Secret comes from the k3s fixture manifest (VM tests) or
+             the rio-hmac ExternalSecret (EKS) — same contract as the
+             standalone fixture's RIO_HMAC_KEY_PATH wiring.
   cov        .Values.coverage.enabled. hostPath /var/lib/rio/cov for
              LLVM profraw atexit flush. POD_NAME in the filename: pods
              share the hostPath and all run PID 1, so %p alone does NOT
@@ -114,6 +127,12 @@ Families:
         "src"  (dict "secret" (dict "secretName" "rio-service-hmac"))
         "env"  (list
           (dict "name" "RIO_SERVICE_HMAC_KEY_PATH" "value" "/etc/rio/hmac/service-hmac.key")))
+      "assignmentHmac" (dict
+        "on"   true
+        "vol"  "assignment-hmac" "path" "/etc/rio/assignment-hmac" "ro" true
+        "src"  (dict "secret" (dict "secretName" "rio-hmac"))
+        "env"  (list
+          (dict "name" "RIO_HMAC_KEY_PATH" "value" "/etc/rio/assignment-hmac/hmac.key")))
 -}}
 {{- range .want }}
 {{- $f := get $fams . }}

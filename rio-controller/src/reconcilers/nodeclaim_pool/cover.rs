@@ -249,8 +249,8 @@ pub fn cells_round_robin(mut cells: Vec<Cell>, tick: u64) -> Vec<Cell> {
 }
 
 /// Caps for [`sizing`]: per-NodeClaim ceilings on each axis, plus the
-/// fleet-wide core budget remaining and the per-tick cell cap. The
-/// fuse-cache budget is here so [`sizing`] computes the same
+/// fleet-wide core budget remaining and the per-tick cell cap.
+/// [`sizing`] computes the same
 /// [`intent_pod_footprint`](crate::reconcilers::pool::jobs::intent_pod_footprint)
 /// triple FFD and `apply_intent_resources` will use.
 pub struct SizingCfg {
@@ -259,7 +259,6 @@ pub struct SizingCfg {
     pub max_node_disk: u64,
     pub per_tick_cap: u32,
     pub budget: u32,
-    pub fuse_cache_bytes: u64,
 }
 
 /// Per-claim `(cores, mem, ephemeral-storage)` requests covering `u`'s
@@ -311,11 +310,11 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     // (controller `hw_classes` ≠ scheduler's) or a producer bypassing
     // `solve_intent_for` entirely.
     let (fits, over): (Vec<&SpawnIntent>, Vec<&SpawnIntent>) = u.iter().copied().partition(|i| {
-        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+        let (ic, im, id) = intent_pod_footprint(i);
         ic <= cfg.max_node_cores && im <= cfg.max_node_mem && id <= cfg.max_node_disk
     });
     for i in &over {
-        let (ic, im, id) = intent_pod_footprint(i, cfg.fuse_cache_bytes);
+        let (ic, im, id) = intent_pod_footprint(i);
         tracing::warn!(
             intent_id = %i.intent_id, cell = %cell, footprint = ?(ic, im, id),
             cap = ?(cfg.max_node_cores, cfg.max_node_mem, cfg.max_node_disk),
@@ -332,10 +331,8 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
     if fits.is_empty() {
         return (Vec::new(), f64::MAX);
     }
-    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) = fits
-        .iter()
-        .map(|i| intent_pod_footprint(i, cfg.fuse_cache_bytes))
-        .fold(
+    let (sum_c, sum_m, sum_d, max_c, max_m, max_d) =
+        fits.iter().map(|i| intent_pod_footprint(i)).fold(
             (0u32, 0u64, 0u64, 0u32, 0u64, 0u64),
             |(c, m, d, mc, mm, md), (ic, im, id)| {
                 (c + ic, m + im, d + id, mc.max(ic), mm.max(im), md.max(id))
@@ -360,7 +357,7 @@ pub fn sizing(cell: &Cell, u: &[&SpawnIntent], cfg: &SizingCfg) -> (Vec<(u32, u6
         "n_lo {n_lo} > n_hi {n_hi} after over-cap filter"
     );
     let n_pack = (n_lo..=n_hi)
-        .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n, cfg.fuse_cache_bytes))
+        .find(|&n| super::ffd::sim_packs(cell, &fits, claim_at(n), n))
         .unwrap_or(n_hi);
     let (chunk, mem, disk) = claim_at(n_pack);
     if cfg.budget < chunk {
@@ -663,7 +660,6 @@ mod tests {
             max_node_disk: 450 * GI,
             per_tick_cap,
             budget,
-            fuse_cache_bytes: 50 * GI,
         }
     }
 
@@ -688,9 +684,9 @@ mod tests {
             .map(|k| intent_hd(&format!("i{k}"), 8, 8 * GI, 5 * GI, Some(true)))
             .collect();
         let refs: Vec<&SpawnIntent> = u.iter().collect();
-        // Σc=80, n_lo=⌈80/32⌉=3; sim_packs finds n_pack=5 (disk-bound:
-        // each pod's footprint.d = 5×1.5+50+1 ≈ 58.5Gi; 3 bins of
-        // ⌈Σd/3⌉≈195Gi fit 3 each = 9 < 10).
+        // Σc=80, n_lo=⌈80/32⌉=3; sim_packs finds n_pack=5 (cores-bound:
+        // bins of ⌈80/3⌉=27c fit ⌊27/8⌋=3 intents each = 9 < 10, and
+        // ⌈80/4⌉=20c fits 2 each = 8 < 10; only n=5's 16c × 2 = 10).
         let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 8, 200));
         assert_eq!(c.len(), 5, "n_pack binds");
         let (c, _) = sizing(&h_spot(), &refs, &cfg(32, 2, 200));
@@ -718,12 +714,7 @@ mod tests {
     /// (`ffd::tests::node` here sets `node_name=Some`, `created_secs`;
     /// sim_packs's inline literal doesn't). Uniform claims only
     /// (sizing's output is `vec![bin; n]`).
-    fn oracle_places_all(
-        cell: &Cell,
-        intents: &[SpawnIntent],
-        claims: &[(u32, u64, u64)],
-        fuse: u64,
-    ) -> bool {
+    fn oracle_places_all(cell: &Cell, intents: &[SpawnIntent], claims: &[(u32, u64, u64)]) -> bool {
         use super::super::ffd;
         let Some(&bin) = claims.first() else {
             return intents.is_empty();
@@ -747,7 +738,6 @@ mod tests {
             &nodes,
             &CellSketches::default(),
             &std::collections::HashMap::new(),
-            fuse,
             |_, _, _| true,
         )
         .1
@@ -771,7 +761,7 @@ mod tests {
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
             let (claims, _) = sizing(&h_spot(), &refs, &scfg);
             assert!(
-                oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
+                oracle_places_all(&h_spot(), &intents, &claims),
                 "{name}: FFD-oracle leaves unplaced; claims={claims:?}"
             );
             for (k, &(c, m, d)) in claims.iter().enumerate() {
@@ -839,12 +829,11 @@ mod tests {
             max_node_disk: 450 * GI,
             per_tick_cap: u32::MAX,
             budget: u32::MAX,
-            fuse_cache_bytes: 50 * GI,
         };
         let refs: Vec<&SpawnIntent> = u.iter().collect();
         let (claims, _) = sizing(&h_spot(), &refs, &scfg);
         assert!(
-            oracle_places_all(&h_spot(), &u, &claims, scfg.fuse_cache_bytes),
+            oracle_places_all(&h_spot(), &u, &claims),
             "mixed-ready FFD-oracle leaves unplaced; claims={claims:?}"
         );
     }
@@ -901,12 +890,7 @@ mod tests {
             assert_eq!(claims.len(), 1, "Σc(fits)=32 at cap=32 → n=1");
             assert_eq!(claims[0].0, 32);
             assert!(
-                oracle_places_all(
-                    &h_spot(),
-                    &[f0.clone(), f1.clone()],
-                    &claims,
-                    scfg.fuse_cache_bytes
-                ),
+                oracle_places_all(&h_spot(), &[f0.clone(), f1.clone()], &claims),
                 "fits-only must pack"
             );
             assert_eq!(dropped_count(&rec), Some(DebugValue::Counter(1)));
@@ -958,7 +942,7 @@ mod tests {
             let refs: Vec<&SpawnIntent> = intents.iter().collect();
             let (claims, _) = sizing(&h_spot(), &refs, &scfg);
             assert!(
-                oracle_places_all(&h_spot(), &intents, &claims, scfg.fuse_cache_bytes),
+                oracle_places_all(&h_spot(), &intents, &claims),
                 "case {case}: FFD leaves unplaced; len={len} claims={claims:?}"
             );
             for &(c, m, d) in &claims {

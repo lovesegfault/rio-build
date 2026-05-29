@@ -30,7 +30,7 @@ helm template rio . -f values/vmtest-full.yaml
 |---|---|---|---|---|---|
 | `values.yaml` (default) | on | external | external | 2 | `cargo xtask k8s -p eks up --deploy` |
 | `values/dev.yaml` | off | bitnami subchart | Rook Ceph RGW | 1 | `cargo xtask k8s -p k3s up` (local k3s) |
-| `values/vmtest-full.yaml` | on | bitnami subchart | inline | 1-2 | `nix/helm-render.nix` → VM tests |
+| `values/vmtest-full.yaml` | on | bitnami subchart | filesystem (local-path PVC) | 1-2 | `nix/helm-render.nix` → VM tests |
 
 ## CRDs
 
