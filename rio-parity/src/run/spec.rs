@@ -56,6 +56,19 @@ pub struct EvalSetRef {
     pub s3_prefix: Option<String>,
 }
 
+/// Which replay archive the campaign runs against.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ArchiveRef {
+    /// S3 bucket holding `parity/archives/...` (None = same bucket as `s3.bucket`).
+    pub s3_bucket: Option<String>,
+    /// Full key prefix of the archive, e.g. `parity/archives/<archive_id_short>`.
+    pub s3_prefix: Option<String>,
+    /// The full 64-hex archive id (lowercase hex SHA-256 of the archive's
+    /// `manifest.json` bytes).
+    pub digest: String,
+}
+
 /// Where campaign artifacts are synced.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -402,6 +415,15 @@ pub struct EvalSetPin {
     pub manifest_sha256: String,
 }
 
+/// The replay archive a campaign ran against, pinned by the full archive id
+/// and its 16-char short form (the short id names the archive's S3 prefix).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ArchivePin {
+    pub archive_id: String,
+    pub archive_id_short: String,
+}
+
 pub const ENGINE_VERSION: &str = env!("CARGO_PKG_VERSION");
 /// Bumped when the failure-signature rules change. The current table
 /// captures raw evidence only (no signature normalization yet).
@@ -559,6 +581,41 @@ mod tests {
             spec.knobs.s3_sync_interval_secs,
             defaults.s3_sync_interval_secs
         );
+    }
+
+    #[test]
+    fn archive_ref_round_trips_and_validates() {
+        let json = serde_json::json!({
+            "s3_bucket": "rio-chunks",
+            "s3_prefix": "parity/archives/0123456789abcdef",
+            "digest": "ab".repeat(32),
+        });
+        let r: ArchiveRef = serde_json::from_value(json).unwrap();
+        assert_eq!(r.digest.len(), 64);
+        assert!(ArchiveRef::default().digest.is_empty());
+        // Round-trips through serialization without losing the pin fields.
+        let re: ArchiveRef = serde_json::from_str(&serde_json::to_string(&r).unwrap()).unwrap();
+        assert_eq!(re.digest, r.digest);
+        assert_eq!(re.s3_bucket.as_deref(), Some("rio-chunks"));
+        assert_eq!(
+            re.s3_prefix.as_deref(),
+            Some("parity/archives/0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn archive_pin_serializes_camel_case() {
+        let pin = ArchivePin {
+            archive_id: "ab".repeat(32),
+            archive_id_short: "ab".repeat(8),
+        };
+        let v = serde_json::to_value(&pin).unwrap();
+        assert!(v.get("archiveId").is_some());
+        assert!(v.get("archiveIdShort").is_some());
+        // campaign.json is re-read on resume, so the pin must come back from
+        // its camelCase wire form unchanged.
+        let re: ArchivePin = serde_json::from_value(v).unwrap();
+        assert_eq!(re, pin);
     }
 
     #[test]
