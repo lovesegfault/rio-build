@@ -194,10 +194,10 @@ fn container_security() -> serde_json::Value {
 ///   pod-level deadline would kill the pod mid-drain instead of letting
 ///   the partial report render.
 /// - `restartPolicy: OnFailure` restarts the container in the SAME pod,
-///   so the /work emptyDir (state dir, eval set, caches) survives engine
-///   crashes; only a reschedule loses it, and the S3 sync + pinned
-///   campaign id cover that. The generous `backoffLimit` keeps node loss
-///   from failing the Job outright.
+///   so the /work emptyDir (state dir, downloaded replay archive, caches)
+///   survives engine crashes; only a reschedule loses it, and the S3
+///   sync plus the pinned campaign id cover that. The generous
+///   `backoffLimit` keeps node loss from failing the Job outright.
 /// - `karpenter.sh/do-not-disrupt` + the general node role keep
 ///   Karpenter from consolidating the node under a multi-day pod.
 pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> Result<Job> {
@@ -266,8 +266,8 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
     Ok(job)
 }
 
-/// Eval Job: one-shot eval-set build. Scoped (M1/M2) shape by default;
-/// `full_scale` sizes for a full nixpkgs/NixOS evaluation
+/// Eval Job: one-shot replay-archive recording. Scoped (M1/M2) shape by
+/// default; `full_scale` sizes for a full nixpkgs/NixOS evaluation
 /// (r8a.48xlarge-class: ~160 vCPU / 1.2Ti, ephemeral-storage capped at
 /// 400Gi of the 500Gi node root volume).
 ///

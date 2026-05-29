@@ -4,12 +4,16 @@
 //! prefix (own IRSA policy, infra/eks/parity.tf):
 //!
 //! ```text
-//! parity/evals/<hydra-eval-id>/<key-digest>/…              (eval sets)
+//! parity/archives/<archive-id-short>/{archive.dwarfs,manifest.json,
+//!   complete.json}                                         (replay archives)
+//! parity/archives/by-recipe/<recipe-digest>.json           (recorder pointers)
 //! parity/campaigns/<campaign-id>/{campaign.json,progress.json,
 //!   results.jsonl,buckets/,logs/,report/summary.md,…}      (campaigns)
 //! ```
 
 use anyhow::{Context, Result};
+use rio_parity::archive::s3::ARCHIVES_PREFIX_SEGMENT;
+use rio_parity::s3::BY_RECIPE_SEGMENT;
 
 use super::S3_PREFIX;
 use crate::k8s::eks::TF_DIR;
@@ -23,17 +27,33 @@ pub fn campaign_key(campaign_id: &str, rel: &str) -> String {
     format!("{S3_PREFIX}/campaigns/{campaign_id}/{rel}")
 }
 
-/// Prefix all eval sets for one Hydra eval live under (the eval CLI
-/// appends its own `<key-digest>/` segment per eval set).
-pub fn evals_prefix(hydra_eval_id: u64) -> String {
-    format!("{S3_PREFIX}/evals/{hydra_eval_id}/")
+/// Prefix every published replay archive lives under
+/// (`parity/archives/`): one [`archive_prefix`] per archive, plus the
+/// recorder-owned [`by_recipe_prefix`] pointer tree. Matches the
+/// recorder's `ArchiveS3` layout with the engine's default `parity` root.
+pub fn archives_prefix() -> String {
+    format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/")
+}
+
+/// Key prefix of one published archive (no trailing slash):
+/// `parity/archives/<archive-id-short>` — holds `archive.dwarfs`,
+/// `manifest.json` and the `complete.json` upload marker.
+pub fn archive_prefix(archive_id_short: &str) -> String {
+    format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/{archive_id_short}")
+}
+
+/// Prefix of the recorder-owned by-recipe idempotency pointers
+/// (`parity/archives/by-recipe/`): one `<recipe-digest>.json` per recorded
+/// recipe, written after the archive's `complete.json`.
+pub fn by_recipe_prefix() -> String {
+    format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/{BY_RECIPE_SEGMENT}/")
 }
 
 /// List the immediate "subdirectory" segment names under `prefix` (which
 /// must end with `/`): one ListObjectsV2 delimiter walk, returning each
 /// CommonPrefix with the leading `prefix` and trailing `/` stripped.
-/// `parity launch` uses it to discover the per-eval-set `<key-digest>/`
-/// prefixes under [`evals_prefix`].
+/// `parity launch` uses it to discover the per-archive
+/// `<archive-id-short>/` prefixes under [`archives_prefix`].
 pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Result<Vec<String>> {
     let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
     let mut out = Vec::new();
@@ -132,7 +152,20 @@ mod tests {
     }
 
     #[test]
-    fn evals_prefix_layout_matches_design() {
-        assert_eq!(evals_prefix(1824219), "parity/evals/1824219/");
+    fn archive_prefix_layout_matches_design() {
+        assert_eq!(archives_prefix(), "parity/archives/");
+        assert_eq!(
+            archive_prefix("0123456789abcdef"),
+            "parity/archives/0123456789abcdef"
+        );
+        assert_eq!(by_recipe_prefix(), "parity/archives/by-recipe/");
+        // The pointer key launch GETs must be exactly the key the recorder
+        // writes (rio_parity::s3::by_recipe_key under the same `parity`
+        // root) — a drift here makes every by-recipe lookup miss.
+        let digest = "ab".repeat(32);
+        assert_eq!(
+            format!("{}{digest}.json", by_recipe_prefix()),
+            rio_parity::s3::by_recipe_key(super::S3_PREFIX, &digest)
+        );
     }
 }

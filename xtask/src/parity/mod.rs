@@ -74,8 +74,8 @@ pub struct ParityArgs {
 
 #[derive(Subcommand)]
 enum ParityCmd {
-    /// Build (or reuse) an eval set: apply the parity-eval Job for one
-    /// Hydra evaluation (writes under `parity/evals/<id>/…` in S3).
+    /// Record (or reuse) a replay archive: apply the parity-eval Job for
+    /// one Hydra evaluation (publishes under `parity/archives/…` in S3).
     Eval(eval::EvalArgs),
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
     /// and apply the campaign Job.

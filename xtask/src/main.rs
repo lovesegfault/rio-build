@@ -56,7 +56,7 @@ enum Cmd {
     NewMigration(migration::MigrationArgs),
     /// Kubernetes deploy (--provider {k3s,eks}).
     K8s(k8s::K8sArgs),
-    /// nixpkgs-parity validation campaign: build eval sets, launch
+    /// nixpkgs-parity validation campaign: record replay archives, launch
     /// campaigns, watch progress, render reports; repro/abort/cleanup
     /// are stubs for a later milestone (M2).
     Parity(parity::ParityArgs),

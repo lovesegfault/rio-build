@@ -44,8 +44,10 @@ pub struct LaunchArgs {
     #[arg(long)]
     pub eval: u64,
     /// Recipe digest (or unambiguous prefix) to pin when more than one
-    /// archive exists for --eval. Discover them with
-    /// `aws s3 ls s3://<chunk-bucket>/parity/archives/`.
+    /// archive exists for --eval. A full 64-hex digest is resolved
+    /// directly via the recorder's by-recipe pointer; a shorter value
+    /// narrows the listing under `parity/archives/`. Discover candidates
+    /// with `aws s3 ls s3://<chunk-bucket>/parity/archives/`.
     #[arg(long)]
     pub eval_digest: Option<String>,
     /// Dependency mode: leaf = dependencies substituted from
@@ -173,13 +175,21 @@ pub fn engine_args(a: &LaunchArgs) -> Vec<String> {
 }
 
 /// Correlation annotations for the campaign Job: which Hydra eval / replay
-/// archive it consumes and which dependency mode it runs, so a Job seen in
-/// `kubectl` can be tied back to its inputs without reading the spec
-/// ConfigMap.
-pub fn campaign_annotations(eval: u64, short_digest: &str, mode: Mode) -> BTreeMap<String, String> {
+/// archive (by its 16-char short id) it consumes and which dependency mode
+/// it runs, so a Job seen in `kubectl` can be tied back to its inputs
+/// without reading the spec ConfigMap. The `rio.build/eval-set` annotation
+/// key keeps its historical name; its value is the archive id short form.
+pub fn campaign_annotations(
+    eval: u64,
+    archive_id_short: &str,
+    mode: Mode,
+) -> BTreeMap<String, String> {
     BTreeMap::from([
         ("rio.build/hydra-eval-id".to_string(), eval.to_string()),
-        ("rio.build/eval-set".to_string(), short_digest.to_string()),
+        (
+            "rio.build/eval-set".to_string(),
+            archive_id_short.to_string(),
+        ),
         ("rio.build/mode".to_string(), mode.as_str().to_string()),
     ])
 }
@@ -475,99 +485,52 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
 
 /// One archive prefix found under `parity/archives/`, with the provenance
 /// fields candidate filtering reads from its manifest.json.
+#[derive(Debug)]
 struct ArchiveCandidate {
     archive_id_short: String,
     s3_prefix: String,
     archive_id: String,
     recipe_digest: String,
     hydra_eval_id: u64,
+    created_at: String,
 }
 
-/// Find the replay archive recorded for `eval` under `parity/archives/` in
-/// the chunk bucket: list the per-archive prefixes, read each candidate's
-/// `manifest.json` provenance, keep the ones recorded from `eval` (and
-/// matching `--eval-digest` as a recipe-digest prefix when given), and
-/// require exactly one. The chosen prefix must carry `complete.json` —
-/// the recorder uploads it last, so its absence means the upload has not
-/// finished.
-// TODO: add the by-recipe fast path (GET parity/archives/by-recipe/<full
-// 64-hex recipe digest>.json straight to the archive prefix) so a fully
-// pinned --eval-digest avoids listing and reading every candidate
-// manifest, and factor the candidate filtering into a pure function for
-// finer-grained ambiguity tests.
+/// Whether `--eval-digest` is a full lowercase-hex recipe digest (64
+/// chars) — the form the recorder keys its by-recipe pointers by. Shorter
+/// values are treated as digest prefixes and resolved by listing.
+fn is_full_recipe_digest(digest: &str) -> bool {
+    digest.len() == 64
+        && digest
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// Find the replay archive recorded for `eval` under `parity/archives/`
+/// in the chunk bucket. A full 64-hex `--eval-digest` takes the by-recipe
+/// fast path (one GET of the recorder's idempotency pointer names the
+/// archive prefix directly); otherwise the per-archive prefixes are
+/// listed and each candidate's `manifest.json` provenance is read. Either
+/// way [`pick_candidate`] must keep exactly one candidate, and the chosen
+/// prefix must carry `complete.json` — the recorder uploads it last, so
+/// its absence means the upload has not finished.
 async fn resolve_archive(
     region: &str,
     bucket: &str,
     eval: u64,
     requested_digest: Option<&str>,
 ) -> Result<ArchiveLocation> {
-    let archives_prefix = format!("{}/archives/", super::S3_PREFIX);
-    let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
-    let mut candidates: Vec<ArchiveCandidate> = Vec::new();
-    for short in shorts {
-        // The recorder-owned idempotency pointers live under by-recipe/;
-        // they are not archive prefixes.
-        if short == "by-recipe" {
-            continue;
+    let candidates = match requested_digest {
+        Some(digest) if is_full_recipe_digest(digest) => {
+            by_recipe_candidates(region, bucket, eval, digest).await?
         }
-        let prefix = format!("{archives_prefix}{short}");
-        let manifest_key = format!("{prefix}/manifest.json");
-        let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
-            // No standalone manifest yet: an upload in flight (or a foreign
-            // prefix); never a candidate.
-            continue;
-        };
-        let manifest: serde_json::Value = serde_json::from_str(&text)
-            .with_context(|| format!("parse s3://{bucket}/{manifest_key}"))?;
-        let provenance = &manifest["provenance"];
-        candidates.push(ArchiveCandidate {
-            archive_id_short: short,
-            s3_prefix: prefix,
-            archive_id: sha256_hex(text.as_bytes()),
-            recipe_digest: provenance["recipe_digest"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            hydra_eval_id: provenance["source"]["hydra_eval_id"].as_u64().unwrap_or(0),
-        });
-    }
-    let mut matches: Vec<ArchiveCandidate> = candidates
-        .into_iter()
-        .filter(|c| c.hydra_eval_id == eval)
-        .filter(|c| match requested_digest {
-            Some(want) => c.recipe_digest.starts_with(want),
-            None => true,
-        })
-        .collect();
-    match matches.len() {
-        0 => bail!(
-            "no replay archive recorded from hydra eval {eval}{} under \
-             s3://{bucket}/{archives_prefix} — run `cargo xtask parity eval --eval {eval} …` \
-             first and wait for its Job to complete",
-            requested_digest
-                .map(|d| format!(" with recipe digest {d}…"))
-                .unwrap_or_default()
-        ),
-        1 => {}
-        n => {
-            let listing: Vec<String> = matches
-                .iter()
-                .map(|c| {
-                    format!(
-                        "{} (recipe {}…)",
-                        c.archive_id_short,
-                        &c.recipe_digest[..c.recipe_digest.len().min(16)]
-                    )
-                })
-                .collect();
-            bail!(
-                "{n} replay archives were recorded from hydra eval {eval} ({}) — pass \
-                 --eval-digest <recipe digest prefix> to pick one",
-                listing.join(", ")
-            );
-        }
-    }
-    let chosen = matches.remove(0);
+        _ => listed_candidates(region, bucket).await?,
+    };
+    let chosen = pick_candidate(&candidates, eval, requested_digest).with_context(|| {
+        format!(
+            "resolve a replay archive in s3://{bucket}/{}",
+            s3::archives_prefix()
+        )
+    })?;
     // complete.json is uploaded last: without it the prefix is a partial
     // upload and the engine would refuse it anyway.
     let complete_key = format!("{}/complete.json", chosen.s3_prefix);
@@ -578,12 +541,155 @@ async fn resolve_archive(
         chosen.s3_prefix
     );
     Ok(ArchiveLocation {
-        archive_id: chosen.archive_id,
-        archive_id_short: chosen.archive_id_short,
-        s3_prefix: chosen.s3_prefix,
-        recipe_digest: chosen.recipe_digest,
+        archive_id: chosen.archive_id.clone(),
+        archive_id_short: chosen.archive_id_short.clone(),
+        s3_prefix: chosen.s3_prefix.clone(),
+        recipe_digest: chosen.recipe_digest.clone(),
         hydra_eval_id: chosen.hydra_eval_id,
     })
+}
+
+/// Read one archive prefix's standalone `manifest.json` and extract the
+/// fields candidate filtering needs. `Ok(None)` when the manifest is not
+/// there yet (an upload in flight, or a foreign prefix).
+async fn read_candidate(
+    region: &str,
+    bucket: &str,
+    archive_id_short: &str,
+) -> Result<Option<ArchiveCandidate>> {
+    let prefix = s3::archive_prefix(archive_id_short);
+    let manifest_key = format!("{prefix}/manifest.json");
+    let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
+        return Ok(None);
+    };
+    let manifest: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse s3://{bucket}/{manifest_key}"))?;
+    let provenance = &manifest["provenance"];
+    Ok(Some(ArchiveCandidate {
+        archive_id_short: archive_id_short.to_string(),
+        s3_prefix: prefix,
+        // The archive id is the SHA-256 over the manifest.json bytes; the
+        // engine re-verifies it against the spec pin and the downloaded
+        // complete.json marker before planning anything.
+        archive_id: sha256_hex(text.as_bytes()),
+        recipe_digest: provenance["recipe_digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+        hydra_eval_id: provenance["source"]["hydra_eval_id"].as_u64().unwrap_or(0),
+        created_at: manifest["created_at"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string(),
+    }))
+}
+
+/// Listing path: every per-archive prefix under `parity/archives/` whose
+/// standalone manifest is already uploaded becomes a candidate.
+async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCandidate>> {
+    let archives_prefix = s3::archives_prefix();
+    let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
+    let mut candidates = Vec::new();
+    for short in shorts {
+        // The recorder-owned idempotency pointers live under by-recipe/;
+        // they are not archive prefixes.
+        if short == rio_parity::s3::BY_RECIPE_SEGMENT {
+            continue;
+        }
+        if let Some(candidate) = read_candidate(region, bucket, &short).await? {
+            candidates.push(candidate);
+        }
+    }
+    Ok(candidates)
+}
+
+/// By-recipe fast path: a full recipe digest names the recorder's
+/// idempotency pointer (`parity/archives/by-recipe/<digest>.json`)
+/// directly, so resolution costs one GET for the pointer plus one for the
+/// archive's manifest instead of listing and reading every candidate.
+async fn by_recipe_candidates(
+    region: &str,
+    bucket: &str,
+    eval: u64,
+    recipe_digest: &str,
+) -> Result<Vec<ArchiveCandidate>> {
+    let pointer_key = format!("{}{recipe_digest}.json", s3::by_recipe_prefix());
+    let Some(text) = s3::get_text(region, bucket, &pointer_key).await? else {
+        bail!(
+            "recipe {recipe_digest} has not been recorded: s3://{bucket}/{pointer_key} does not \
+             exist — run `cargo xtask parity eval --eval {eval} …` first and wait for its Job to \
+             complete (the recorder writes the by-recipe pointer after publishing the archive)"
+        );
+    };
+    let pointer: serde_json::Value = serde_json::from_str(&text)
+        .with_context(|| format!("parse s3://{bucket}/{pointer_key}"))?;
+    let short = pointer["archive_id_short"].as_str().unwrap_or_default();
+    // A pointer that does not actually name an archive (garbage or empty
+    // fields) is unusable — never probe a malformed archive prefix off it.
+    ensure!(
+        !short.is_empty(),
+        "s3://{bucket}/{pointer_key} does not name an archive — re-record with \
+         `cargo xtask parity eval --eval {eval} … --force`, or pass --eval-digest as a shorter \
+         prefix to resolve by listing instead"
+    );
+    let candidate = read_candidate(region, bucket, short)
+        .await?
+        .with_context(|| {
+            format!(
+                "the by-recipe pointer s3://{bucket}/{pointer_key} names archive {short}, but \
+                 s3://{bucket}/{}/manifest.json does not exist — re-record with \
+                 `cargo xtask parity eval --eval {eval} … --force`",
+                s3::archive_prefix(short)
+            )
+        })?;
+    Ok(vec![candidate])
+}
+
+/// Choose exactly one archive among `cands` for `--eval` and the optional
+/// `--eval-digest` recipe-digest prefix. Pure so the single / zero /
+/// ambiguous outcomes are unit-testable without S3.
+fn pick_candidate<'a>(
+    cands: &'a [ArchiveCandidate],
+    eval: u64,
+    eval_digest: Option<&str>,
+) -> Result<&'a ArchiveCandidate> {
+    let matches: Vec<&ArchiveCandidate> = cands
+        .iter()
+        .filter(|c| c.hydra_eval_id == eval)
+        .filter(|c| match eval_digest {
+            Some(want) => c.recipe_digest.starts_with(want),
+            None => true,
+        })
+        .collect();
+    match matches.len() {
+        0 => bail!(
+            "no replay archive recorded from hydra eval {eval}{} under {} — run \
+             `cargo xtask parity eval --eval {eval} …` first and wait for its Job to complete",
+            eval_digest
+                .map(|d| format!(" with recipe digest {d}…"))
+                .unwrap_or_default(),
+            s3::archives_prefix()
+        ),
+        1 => Ok(matches[0]),
+        n => {
+            let listing: Vec<String> = matches
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} (recipe {}…, created {})",
+                        c.archive_id_short,
+                        &c.recipe_digest[..c.recipe_digest.len().min(16)],
+                        c.created_at
+                    )
+                })
+                .collect();
+            bail!(
+                "{n} replay archives were recorded from hydra eval {eval} ({}) — pass \
+                 --eval-digest <recipe digest prefix> to pick one",
+                listing.join(", ")
+            );
+        }
+    }
 }
 
 /// Lowercase-hex SHA-256 of a byte slice — the archive id is this hash over
@@ -978,11 +1084,29 @@ mod tests {
         let archive_id = "deadbeef".repeat(8);
         let archive_id_short = archive_id[..16].to_string();
         ArchiveLocation {
-            s3_prefix: format!("parity/archives/{archive_id_short}"),
+            s3_prefix: s3::archive_prefix(&archive_id_short),
             archive_id,
             archive_id_short,
             recipe_digest: "feedc0de".repeat(8),
             hydra_eval_id: 1824219,
+        }
+    }
+
+    /// Candidate fixture for the pure archive-filtering tests; `archive_id`
+    /// is irrelevant to filtering and left obviously fake.
+    fn candidate(
+        short: &str,
+        eval: u64,
+        recipe_digest: &str,
+        created_at: &str,
+    ) -> ArchiveCandidate {
+        ArchiveCandidate {
+            archive_id_short: short.to_string(),
+            s3_prefix: s3::archive_prefix(short),
+            archive_id: "ab".repeat(32),
+            recipe_digest: recipe_digest.to_string(),
+            hydra_eval_id: eval,
+            created_at: created_at.to_string(),
         }
     }
 
@@ -1241,6 +1365,92 @@ mod tests {
                 .unwrap(),
             "self-hosted"
         );
+    }
+
+    #[test]
+    fn full_recipe_digests_take_the_by_recipe_fast_path() {
+        // Exactly 64 lowercase hex characters — the recorder's pointer key.
+        assert!(is_full_recipe_digest(&"ab".repeat(32)));
+        // Anything else resolves by listing: prefixes, uppercase hex,
+        // non-hex, wrong length.
+        assert!(!is_full_recipe_digest("ab12"));
+        assert!(!is_full_recipe_digest(&"AB".repeat(32)));
+        assert!(!is_full_recipe_digest(&"zz".repeat(32)));
+        assert!(!is_full_recipe_digest(&"ab".repeat(33)));
+        assert!(!is_full_recipe_digest(""));
+    }
+
+    #[test]
+    fn pick_candidate_requires_exactly_one_match() {
+        let cands = vec![
+            candidate(
+                "aaaaaaaaaaaaaaaa",
+                1824219,
+                &"11".repeat(32),
+                "2026-05-01T00:00:00Z",
+            ),
+            candidate(
+                "bbbbbbbbbbbbbbbb",
+                1824219,
+                &"22".repeat(32),
+                "2026-05-02T00:00:00Z",
+            ),
+            candidate(
+                "cccccccccccccccc",
+                999,
+                &"33".repeat(32),
+                "2026-05-03T00:00:00Z",
+            ),
+        ];
+
+        // Single match: an eval recorded exactly once needs no digest.
+        let only = pick_candidate(&cands, 999, None).unwrap();
+        assert_eq!(only.archive_id_short, "cccccccccccccccc");
+
+        // A recipe-digest prefix narrows same-eval candidates down to one.
+        let narrowed = pick_candidate(&cands, 1824219, Some("22")).unwrap();
+        assert_eq!(narrowed.archive_id_short, "bbbbbbbbbbbbbbbb");
+        // The full digest narrows the same way (the by-recipe fast path
+        // hands pick_candidate a single candidate, but the filter must
+        // still hold for it).
+        let full = pick_candidate(&cands, 1824219, Some(&"22".repeat(32))).unwrap();
+        assert_eq!(full.archive_id_short, "bbbbbbbbbbbbbbbb");
+
+        // Zero matches: the error names the eval, the listing prefix, and
+        // the recorder command that produces an archive.
+        let err = format!("{:#}", pick_candidate(&cands, 4242, None).unwrap_err());
+        assert!(
+            err.contains("no replay archive recorded from hydra eval 4242"),
+            "{err}"
+        );
+        assert!(err.contains("parity/archives/"), "{err}");
+        assert!(err.contains("cargo xtask parity eval --eval 4242"), "{err}");
+        // Zero matches because the digest narrowed everything away: the
+        // requested digest is named so the typo is visible.
+        let err = format!(
+            "{:#}",
+            pick_candidate(&cands, 1824219, Some("ff")).unwrap_err()
+        );
+        assert!(err.contains("recipe digest ff"), "{err}");
+
+        // Ambiguity: every match is listed with its short id, recipe-digest
+        // prefix and creation time, plus the --eval-digest way out.
+        let err = format!("{:#}", pick_candidate(&cands, 1824219, None).unwrap_err());
+        assert!(err.contains("2 replay archives"), "{err}");
+        assert!(
+            err.contains("aaaaaaaaaaaaaaaa") && err.contains("bbbbbbbbbbbbbbbb"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&"11".repeat(8)) && err.contains(&"22".repeat(8)),
+            "{err}"
+        );
+        assert!(
+            err.contains("2026-05-01T00:00:00Z") && err.contains("2026-05-02T00:00:00Z"),
+            "{err}"
+        );
+        assert!(err.contains("--eval-digest"), "{err}");
+        assert!(!err.contains("cccccccccccccccc"), "{err}");
     }
 
     #[test]

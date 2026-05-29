@@ -1,11 +1,12 @@
-//! `cargo xtask parity eval` — apply the eval-set Job for one Hydra evaluation.
+//! `cargo xtask parity eval` — apply the recorder Job for one Hydra evaluation.
 //!
 //! The in-cluster engine (`rio-parity eval`) does the actual work and
-//! writes the eval set under
-//! `s3://<chunk-bucket>/parity/evals/<hydra-eval-id>/<key-digest>/`;
-//! xtask only verifies prerequisites (image pushed, namespace + IRSA
-//! ServiceAccount) and applies the one-shot Job built by
-//! [`super::jobs::eval_job`].
+//! publishes a v1 replay archive under
+//! `s3://<chunk-bucket>/parity/archives/<archive-id-short>/` (plus the
+//! recorder's by-recipe idempotency pointer under
+//! `parity/archives/by-recipe/`); xtask only verifies prerequisites
+//! (image pushed, namespace + IRSA ServiceAccount) and applies the
+//! one-shot Job built by [`super::jobs::eval_job`].
 
 use anyhow::Result;
 use clap::Args;
@@ -16,11 +17,12 @@ use crate::k8s::client as kclient;
 use crate::k8s::eks::{TF_DIR, push};
 use crate::{git, tofu, ui};
 
-/// In-pod output directory for the engine's eval-set artifacts, on the
-/// eval Job's `/work` scratch emptyDir ([`jobs::WORK_DIR`]). The engine
-/// appends `<hydra-eval-id>/<key-digest>/` itself and uploads the
-/// finished set to the bucket named by the Job's `RIO_PARITY_S3_BUCKET`
-/// env.
+/// In-pod output directory for the recorder's local artifacts (staging
+/// directory, fidelity report, packed `archive.dwarfs`), on the eval
+/// Job's `/work` scratch emptyDir ([`jobs::WORK_DIR`]). The engine
+/// appends `<hydra-eval-id>/<recipe-short-digest>/` itself and publishes
+/// the packed archive to the bucket named by the Job's
+/// `RIO_PARITY_S3_BUCKET` env.
 const ENGINE_OUT_DIR: &str = "/work/evalsets";
 
 #[derive(Args)]
@@ -46,12 +48,14 @@ pub struct EvalArgs {
     /// (r8a.48xlarge-class: ~160 vCPU / 1.2Ti / 400Gi scratch).
     #[arg(long)]
     pub full_scale: bool,
-    /// Tell the engine to write a new eval set even if one already
-    /// exists for this key (the engine salts the key digest, so the new
-    /// set lands under a fresh S3 prefix). The Job name does NOT change:
-    /// re-running an identical request while the previous Job still
-    /// exists collides on it deliberately (delete that Job or wait for
-    /// its 24h TTL) so double-evaluations are always explicit.
+    /// Tell the engine to record a new archive even if this recipe has
+    /// already been recorded (the engine salts the recipe digest, which
+    /// bypasses the by-recipe idempotency skip; published archives are
+    /// write-once, so the re-record lands under a fresh archive id). The
+    /// Job name does NOT change: re-running an identical request while
+    /// the previous Job still exists collides on it deliberately (delete
+    /// that Job or wait for its 24h TTL) so double-evaluations are always
+    /// explicit.
     #[arg(long)]
     pub force: bool,
     /// RUST_LOG for the eval pod.
@@ -144,14 +148,15 @@ pub async fn run(a: EvalArgs) -> Result<()> {
     .await?;
 
     let ns = super::NS_PARITY;
-    let prefix = super::s3::evals_prefix(a.eval);
+    let prefix = super::s3::archives_prefix();
     tracing::info!(
         "eval Job applied.\n  \
          follow logs:     kubectl -n {ns} logs -f job/{name}\n  \
          wait for it:     kubectl -n {ns} wait --for=condition=complete job/{name} --timeout=3h\n  \
-         eval sets land under s3://{bucket}/{prefix}\n  \
-         find the digest: aws s3 ls s3://{bucket}/{prefix} — the <key-digest>/ prefix (written \
-         only once the set is complete) is what `parity launch --eval {} [--eval-digest …]` consumes\n  \
+         archives land under s3://{bucket}/{prefix}\n  \
+         find it: aws s3 ls s3://{bucket}/{prefix} — a prefix is complete once complete.json \
+         exists; `parity launch --eval {}` discovers it from the archive's provenance (use \
+         --eval-digest <recipe digest> to disambiguate)\n  \
          full-scope evals need ~1-2h on an r8a.48xlarge-class node (~$15-31), and with \
          --full-scale the pod sits Pending for a few minutes while Karpenter provisions that \
          node — that is normal; scoped evals take minutes",
@@ -206,8 +211,8 @@ mod tests {
 
     #[test]
     fn engine_out_dir_is_on_the_scratch_volume() {
-        // The eval set (drv archive included) must land on the sized
-        // /work emptyDir, not the container layer.
+        // The recorder's staging directory and packed archive image must
+        // land on the sized /work emptyDir, not the container layer.
         assert!(ENGINE_OUT_DIR.starts_with(&format!("{}/", jobs::WORK_DIR)));
     }
 

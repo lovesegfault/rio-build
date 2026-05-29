@@ -2103,7 +2103,7 @@
     {
       "path": "parity/eval.rs",
       "depth": 1,
-      "doc": "`cargo xtask parity eval` — apply the eval-set Job for one Hydra evaluation."
+      "doc": "`cargo xtask parity eval` — apply the recorder Job for one Hydra evaluation."
     },
     {
       "path": "parity/jobs.rs",
