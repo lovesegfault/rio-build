@@ -3,7 +3,9 @@
 //! Executes one parity campaign against one replay archive: plan the
 //! in-scope jobs, load each job's expected outcome from the archive's
 //! recorded truth, supply dependencies to the target (scheduler-side
-//! prefetch and client uploads), submit batches to the rio cluster, collect
+//! prefetch and client uploads), submit the workload to the rio cluster —
+//! queue-driven batches in timeless mode, or the recorded request schedule
+//! via the timed dispatcher when `spec.scheduling.mode` is timed — collect
 //! and classify outcomes, and render the report. Campaign state is
 //! append-only JSONL on the pod volume (periodically synced to S3) so an
 //! interrupted run can resume without repeating terminal work.
@@ -41,7 +43,7 @@ pub mod watchdog;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -50,7 +52,7 @@ use sha2::Digest as _;
 
 use crate::archive::reader::ReplayArchive;
 use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, CompleteMarker};
-use crate::archive::schema::MemberDigest;
+use crate::archive::schema::{ExpectedOutcome, MemberDigest, OutcomeRecord, RequestRecord};
 
 use self::artifact::{
     ArtifactStore, S3ArtifactStore, SyncTracker, download_state_if_missing, sync_state,
@@ -63,13 +65,20 @@ use self::model::{
     RioOutcome, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
-    CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, SupplyDependencies, generate_campaign_id,
+    CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, ScheduleMode, SupplyDependencies,
+    generate_campaign_id,
 };
 use self::state::{StateDir, StateFile, latest_per_job};
 use self::submit::{SubmitTracker, run_submit_loop};
 use self::submitter::{ClientOpsSubmitter, Submitter};
 use self::supply::exec::{PoolSupplyTransport, SupplyInputs, SupplyTransport, run_supply_stage};
-use self::watchdog::{JobPhase, PollTick, StallKind, StallVerdict, Watchdog};
+use self::timeline::{
+    RecordedRequest, RecordedTarget, RecordedTiming, ScheduledRequest, SharedTimingLookup,
+    TimelineConfig, build_schedule, run_timed_dispatch,
+};
+use self::watchdog::{
+    COMPONENT_DISPATCH, COMPONENT_PAUSE, JobPhase, PollTick, StallKind, StallVerdict, Watchdog,
+};
 
 /// CLI arguments for `rio-parity run`.
 #[derive(Debug, Args)]
@@ -126,6 +135,13 @@ const INFRA_RATE_MIN_SAMPLE: usize = 20;
 /// the logs.
 const HEARTBEAT_EVERY_TICKS: u64 = 10;
 
+/// Upper bound (one year, in seconds) on recorded request offsets and stop
+/// offsets accepted from an archive. No real recording window comes close;
+/// the cap exists so corrupt or absurd recorded values can neither panic
+/// the schedule's duration math nor park a request unreachably far in the
+/// future.
+const MAX_RECORDED_OFFSET_S: f64 = 365.0 * 24.0 * 3600.0;
+
 /// Every external surface the engine touches, behind traits so the whole
 /// run can execute against fakes (see the `mini_campaign_end_to_end_and_resume`
 /// test).
@@ -155,7 +171,15 @@ pub struct Backends {
 ///   (batches already running keep going); removing the file resumes. The
 ///   file is polled once per watchdog tick
 ///   (`knobs.cluster_status_poll_secs`, default 60s), so a pause or
-///   unpause takes up to one tick to take effect.
+///   unpause takes up to one tick to take effect. In timed scheduling mode
+///   the file (and the engine's backpressure conditions) never gates
+///   dispatch — warping the recorded cadence would destroy the property a
+///   timed run measures — it is only recorded as a suspension window and
+///   surfaces as dispatch lateness plus a timing-degraded flag; the
+///   infra-failure threshold likewise becomes an abort recommendation
+///   instead of a pause. The prefetch-shortfall pause of the supply stage
+///   is unaffected (it acts before the execution clock starts in either
+///   mode).
 /// - **Exit code:** `0` both when the campaign drained completely and when
 ///   it stopped at the deadline with an explicitly-partial report —
 ///   consumers must read the `partial` flag in progress.json / summary.md,
@@ -838,8 +862,94 @@ async fn write_terminal_stall(
     Ok(())
 }
 
-/// The orchestrator: plan → hydra-truth/truth-load → supply → (submit ∥
+/// Inputs the timed scheduling arm needs, prepared once from the open
+/// archive at the wiring point: the built schedule, the per-`(session, drv)`
+/// timing lookup, the drv → job mapping for batch bookkeeping, and the
+/// dispatcher tuning.
+struct TimedInputs {
+    schedule: Vec<ScheduledRequest>,
+    timing: SharedTimingLookup,
+    job_of_drv: Arc<BTreeMap<String, String>>,
+    config: TimelineConfig,
+}
+
+/// What the poller does with this tick's backpressure conditions, by
+/// scheduling mode: `(set the backpressure pause, recommend an abort)`.
+///
+/// Timeless campaigns pause new submissions on any condition (dispatch gap,
+/// queue depth, infra-failure rate), exactly as before. Timed campaigns
+/// never gate dispatch on them — pausing a timed run would destroy the
+/// cadence it exists to measure — so the conditions stay advisory: the
+/// infra-failure rate becomes an abort recommendation for the operator and
+/// the rest only feed the watchdog's suspension windows.
+fn pause_decision(
+    mode: ScheduleMode,
+    dispatch_pause: bool,
+    queue_depth_pause: bool,
+    infra_pause: bool,
+) -> (bool, bool) {
+    match mode {
+        ScheduleMode::Timeless => (dispatch_pause || queue_depth_pause || infra_pause, false),
+        ScheduleMode::Timed => (false, infra_pause),
+    }
+}
+
+/// Convert one archive request record into the engine-owned schedule input,
+/// sanitizing the recorded offset: non-finite values collapse to zero (the
+/// request still replays, just without meaningful timing) and finite values
+/// clamp into `[0, MAX_RECORDED_OFFSET_S]` so schedule construction can
+/// never panic on a corrupt recording.
+fn recorded_request_from(record: &RequestRecord) -> RecordedRequest {
+    let offset_s = if record.offset_s.is_finite() {
+        record.offset_s.clamp(0.0, MAX_RECORDED_OFFSET_S)
+    } else {
+        tracing::warn!(
+            session = record.session,
+            offset_s = record.offset_s,
+            "recorded request offset is not finite; treating it as zero"
+        );
+        0.0
+    };
+    RecordedRequest {
+        session: record.session,
+        offset_s,
+        targets: record
+            .targets
+            .iter()
+            .map(|target| RecordedTarget {
+                drv: target.drv.clone(),
+                outputs: target.outputs.clone(),
+            })
+            .collect(),
+    }
+}
+
+/// Convert one archive expected-outcome record into the per-unit timing
+/// truth the timed schedule consumes. Non-finite (or, for durations,
+/// negative) recorded values are dropped rather than poisoning the deadline
+/// and disconnect math; oversized stop offsets are dropped too so the
+/// disconnect timer falls back to its default delay instead of effectively
+/// never firing.
+fn recorded_timing_from(record: &OutcomeRecord) -> RecordedTiming {
+    RecordedTiming {
+        duration_s: record
+            .duration_s
+            .filter(|duration| duration.is_finite() && *duration >= 0.0),
+        stop_offset_s: record
+            .stop_offset_s
+            .filter(|stop| stop.is_finite() && *stop <= MAX_RECORDED_OFFSET_S),
+        interrupted: matches!(
+            record.outcome,
+            ExpectedOutcome::Cancelled | ExpectedOutcome::Disconnected
+        ),
+        expected_built: record.outcome == ExpectedOutcome::Built,
+    }
+}
+
+/// The orchestrator: plan → hydra-truth/truth-load → supply → (execute ∥
 /// collect ∥ watchdog ∥ sync) → report, with stage done-markers and resume.
+/// The execute stage is the timeless submit loop or the timed dispatcher,
+/// chosen by `spec.scheduling.mode`.
 pub async fn run_with_backends(
     args: RunArgs,
     spec: CampaignSpec,
@@ -851,6 +961,39 @@ pub async fn run_with_backends(
     if let Some(limit) = args.limit {
         spec.filters.limit = Some(limit);
     }
+
+    // ── Scheduling-mode capability gating ───────────────────────────────────
+    // Checked before any stage marker or campaign record is written: a timed
+    // campaign needs the archive's per-request offsets, and interruption
+    // replay needs at least one recorded interruption to reproduce. The
+    // effective replay flag (knob, possibly degraded here) drives schedule
+    // construction below; the degradation is recorded as a low-confidence
+    // comparability flag when the campaign record is first written.
+    let mut replay_interruptions = spec.knobs.replay_interruptions;
+    let mut scheduling_low_confidence: Vec<String> = Vec::new();
+    if spec.scheduling.mode == ScheduleMode::Timed {
+        anyhow::ensure!(
+            archive.capabilities().timed,
+            "scheduling.mode is \"timed\" but the archive does not declare the timed capability \
+             (per-request offsets); record a timed archive or run the campaign timeless"
+        );
+        if replay_interruptions
+            && !archive.outcomes().values().any(|record| {
+                matches!(
+                    record.outcome,
+                    ExpectedOutcome::Cancelled | ExpectedOutcome::Disconnected
+                )
+            })
+        {
+            replay_interruptions = false;
+            scheduling_low_confidence.push("replay-interruptions-disabled".to_string());
+            tracing::warn!(
+                "the archive records no cancellations or client disconnects; interruption \
+                 replay is disabled for this campaign and the report is flagged low-confidence"
+            );
+        }
+    }
+
     // The CLI deadline wins over the spec's; a supplied-but-unparsable value
     // is a startup error rather than a silently unbounded campaign.
     let deadline_raw = args.deadline.clone().or_else(|| spec.deadline.clone());
@@ -918,6 +1061,13 @@ pub async fn run_with_backends(
                 result.pin.clone(),
             );
             record.comparability.low_confidence = result.low_confidence.clone();
+            // Scheduling-mode degradations decided at bootstrap (currently
+            // only forced-off interruption replay) join the plan-time flags
+            // on the first campaign.json write.
+            record
+                .comparability
+                .low_confidence
+                .extend(scheduling_low_confidence.iter().cloned());
             // Recorder-side exclusions (eval errors, aggregates) never become
             // workload units, so they enter the comparability accounting here
             // and are merged — never overwritten — by the report-time refresh.
@@ -1131,6 +1281,14 @@ pub async fn run_with_backends(
         Arc::new(plan_output.in_scope.iter().cloned().collect());
 
     let pause = Arc::new(PauseState::default());
+    // Timed-mode pause semantics: the poller never gates dispatch on
+    // backpressure, it only latches an abort recommendation (infra-failure
+    // rate) and a timing-degraded flag (a pause/dispatch suspension window
+    // closed while the schedule was executing). Both are written by the
+    // poller and read when the timed run statistics are assembled; they stay
+    // false for timeless campaigns.
+    let abort_recommended = Arc::new(AtomicBool::new(false));
+    let timing_degraded = Arc::new(AtomicBool::new(false));
     let tracker = Arc::new(SubmitTracker::default());
     let results = Arc::new(tokio::sync::Mutex::new(latest_per_job(
         state.load_jsonl(StateFile::Results)?,
@@ -1167,6 +1325,9 @@ pub async fn run_with_backends(
         let contexts = contexts.clone();
         let in_scope_jobs = in_scope_jobs.clone();
         let mode = spec.mode.as_str().to_string();
+        let schedule_mode = spec.scheduling.mode;
+        let abort_recommended = abort_recommended.clone();
+        let timing_degraded = timing_degraded.clone();
         let store_url = spec.cluster.gateway_store_url.clone();
         let mut stop_rx = stop_rx.clone();
         tokio::spawn(async move {
@@ -1254,8 +1415,35 @@ pub async fn run_with_backends(
                     (terminal_in_scope, infra_rate_pct)
                 };
                 let infra_pause = infra_rate_pct.is_some_and(|rate| rate > knobs.infra_pause_pct);
-                let backpressure = outcome.dispatch_pause || queue_depth_pause || infra_pause;
+                let (backpressure, recommend_abort) = pause_decision(
+                    schedule_mode,
+                    outcome.dispatch_pause,
+                    queue_depth_pause,
+                    infra_pause,
+                );
                 pause.set_backpressure(backpressure);
+                if recommend_abort && !abort_recommended.swap(true, Ordering::SeqCst) {
+                    tracing::error!(
+                        infra_rate_pct,
+                        threshold_pct = knobs.infra_pause_pct,
+                        "infra-failure rate exceeds the pause threshold; pausing would distort \
+                         the recorded cadence, so the campaign keeps dispatching — aborting it \
+                         is recommended if the failures persist"
+                    );
+                }
+                // A pause or dispatch-gap suspension window that closed while
+                // the timed schedule was executing means recorded cadence was
+                // not honored for its duration: the timing-fidelity numbers
+                // are degraded.
+                if schedule_mode == ScheduleMode::Timed
+                    && let Some(window) = &outcome.closed_window
+                    && window
+                        .components
+                        .iter()
+                        .any(|c| c == COMPONENT_PAUSE || c == COMPONENT_DISPATCH)
+                {
+                    timing_degraded.store(true, Ordering::SeqCst);
+                }
                 // Heartbeat: one info! line on a fixed cadence so a long but
                 // healthy quiet stretch is distinguishable from a wedge.
                 if ticks.is_multiple_of(HEARTBEAT_EVERY_TICKS) {
@@ -1270,6 +1458,7 @@ pub async fn run_with_backends(
                         queue_depth_pause,
                         infra_pause,
                         infra_rate_pct,
+                        abort_recommended = abort_recommended.load(Ordering::SeqCst),
                         "campaign heartbeat"
                     );
                 }
@@ -1396,9 +1585,63 @@ pub async fn run_with_backends(
         })
     };
 
-    // Outer drain loop: submit until drained, run a final synchronous collect
-    // pass to catch the tail, and repeat while that pass re-queued work and
-    // the deadline has not fired. The body is wrapped so the stop signal and
+    // Timed scheduling inputs: the recorded requests, their timing truth,
+    // the drv → job mapping, and the dispatcher tuning, prepared once from
+    // the archive. Timeless campaigns need none of this. Recorded values are
+    // sanitized at this conversion point so corrupt offsets can never reach
+    // the schedule math.
+    let timed_inputs = match spec.scheduling.mode {
+        ScheduleMode::Timeless => None,
+        ScheduleMode::Timed => {
+            let requests: Vec<RecordedRequest> = archive
+                .requests()
+                .iter()
+                .map(recorded_request_from)
+                .collect();
+            let timing: SharedTimingLookup = {
+                let archive = archive.clone();
+                Arc::new(move |session, drv| {
+                    archive
+                        .expected_outcome(session, drv)
+                        .map(recorded_timing_from)
+                })
+            };
+            let schedule = build_schedule(
+                &requests,
+                &|session, drv| timing(session, drv),
+                spec.knobs.speedup,
+                spec.filters.limit,
+                replay_interruptions,
+            );
+            let job_of_drv: BTreeMap<String, String> = manifest
+                .iter()
+                .map(|m| (m.drv_path.clone(), m.job.clone()))
+                .collect();
+            let mut config = TimelineConfig::from_knobs(&spec.knobs);
+            config.replay_interruptions = replay_interruptions;
+            tracing::info!(
+                requests = requests.len(),
+                scheduled = schedule.len(),
+                speedup = spec.knobs.speedup,
+                replay_interruptions,
+                max_sessions = config.max_sessions,
+                "timed scheduling mode: replaying the recorded request schedule"
+            );
+            Some(TimedInputs {
+                schedule,
+                timing,
+                job_of_drv: Arc::new(job_of_drv),
+                config,
+            })
+        }
+    };
+
+    // Outer drain loop. Timeless mode submits until drained, runs a final
+    // synchronous collect pass to catch the tail, and repeats while that
+    // pass re-queued work and the deadline has not fired. Timed mode runs
+    // the dispatcher exactly once (the timeline drains itself and owns its
+    // own retries) and shares the final collect pass and the
+    // deadline-partial backfill. The body is wrapped so the stop signal and
     // the background-task joins below run on EVERY exit path — success,
     // deadline, or an error mid-loop.
     let drain_result: Result<bool> = async {
@@ -1420,20 +1663,52 @@ pub async fn run_with_backends(
                      (its join error is logged below); aborting the run"
                 );
             }
-            let terminal_seed = terminal_set(&*results.lock().await);
-            run_submit_loop(
-                state.clone(),
-                backends.submitter.clone(),
-                tracker.clone(),
-                pause.clone(),
-                attemptable.clone(),
-                terminal_view(results.clone(), terminal_seed),
-                deadline_reached,
-                spec.cluster.gateway_store_url.clone(),
-                spec.knobs.clone(),
-                batch_seq.clone(),
-            )
-            .await?;
+            match &timed_inputs {
+                None => {
+                    let terminal_seed = terminal_set(&*results.lock().await);
+                    run_submit_loop(
+                        state.clone(),
+                        backends.submitter.clone(),
+                        tracker.clone(),
+                        pause.clone(),
+                        attemptable.clone(),
+                        terminal_view(results.clone(), terminal_seed),
+                        deadline_reached,
+                        spec.cluster.gateway_store_url.clone(),
+                        spec.knobs.clone(),
+                        batch_seq.clone(),
+                    )
+                    .await?;
+                }
+                Some(inputs) => {
+                    // Requests whose every target is already terminal (a
+                    // resumed run) are skipped from this snapshot; the
+                    // dispatcher never consults the pause state.
+                    let terminal = terminal_set(&*results.lock().await);
+                    let mut stats = run_timed_dispatch(
+                        state.clone(),
+                        backends.submitter.clone(),
+                        tracker.clone(),
+                        inputs.schedule.clone(),
+                        inputs.job_of_drv.clone(),
+                        inputs.timing.clone(),
+                        spec.cluster.gateway_store_url.clone(),
+                        inputs.config.clone(),
+                        spec.knobs.clone(),
+                        batch_seq.clone(),
+                        deadline_reached,
+                        None,
+                        Arc::new(tokio::sync::Mutex::new(terminal)),
+                    )
+                    .await?;
+                    // A pause/dispatch suspension window during execution
+                    // degrades timing fidelity exactly like a resume does;
+                    // the persisted statistics feed the report.
+                    stats.timing_degraded =
+                        stats.timing_degraded || timing_degraded.load(Ordering::SeqCst);
+                    state.write_json_atomic("timed-stats.json", &stats)?;
+                }
+            }
             // Final synchronous pass to catch the tail (and any requeues).
             let final_backends = CollectBackends {
                 admin: backends.admin.clone(),
@@ -1463,7 +1738,10 @@ pub async fn run_with_backends(
                 partial = true;
                 break;
             }
-            if requeued == 0 {
+            // The timed schedule drains in a single pass (the dispatcher
+            // owns its retries); the timeless loop repeats while the collect
+            // pass re-queued work.
+            if timed_inputs.is_some() || requeued == 0 {
                 break;
             }
         }
@@ -1652,12 +1930,14 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::run::archive_input::{load_closures, load_units, write_mini_archive};
+    use crate::run::archive_input::{
+        load_closures, load_units, write_mini_archive, write_mini_timed_archive,
+    };
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
-        HydraOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED, SUPPLY_OUTCOME_UNAVAILABLE,
-        SupplyEntry, build_status_name,
+        DispatchEntry, HydraOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
+        SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry, build_status_name,
     };
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
@@ -1709,6 +1989,36 @@ mod tests {
     impl NarinfoSource for MapNarinfo {
         async fn fetch_narinfo_text(&self, store_path: &str) -> Result<Option<String>> {
             Ok(self.0.get(store_path).cloned())
+        }
+    }
+
+    /// Scripted submitter keyed by each batch's first root drv. The timed
+    /// dispatcher submits concurrently dispatched requests from independent
+    /// tasks, so an order-scripted [`FakeSubmitter`] could pop the wrong
+    /// outcome under scheduler jitter; keying by root removes the order
+    /// dependence. Unscripted roots settle with a default (empty) outcome.
+    #[derive(Default)]
+    struct KeyedSubmitter {
+        outcomes: std::sync::Mutex<HashMap<String, BatchOutcome>>,
+        submitted: std::sync::Mutex<Vec<batch::Batch>>,
+    }
+
+    #[async_trait]
+    impl Submitter for KeyedSubmitter {
+        async fn submit_batch(
+            &self,
+            _store_url: &str,
+            batch: &batch::Batch,
+            _timeout: Duration,
+        ) -> Result<BatchOutcome> {
+            self.submitted.lock().unwrap().push(batch.clone());
+            Ok(self
+                .outcomes
+                .lock()
+                .unwrap()
+                .get(&batch.root_drvs[0])
+                .cloned()
+                .unwrap_or_default())
         }
     }
 
@@ -2145,6 +2455,373 @@ mod tests {
         );
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(records[job].bucket, Bucket::InterruptionReplayed.as_str());
+    }
+
+    /// The poller's pause decision across scheduling modes: in timeless mode
+    /// any backpressure condition (dispatch gap, queue depth, infra rate)
+    /// pauses submission exactly as before; in timed mode none of them gates
+    /// dispatch — the infra-rate condition becomes an abort recommendation
+    /// instead.
+    #[test]
+    fn infra_pause_is_advisory_in_timed_mode() {
+        // Timed: infra rate above the threshold recommends an abort, never a
+        // pause; dispatch-gap and queue-depth conditions are advisory too.
+        assert_eq!(
+            pause_decision(ScheduleMode::Timed, false, false, true),
+            (false, true)
+        );
+        assert_eq!(
+            pause_decision(ScheduleMode::Timed, true, true, false),
+            (false, false)
+        );
+        assert_eq!(
+            pause_decision(ScheduleMode::Timed, false, false, false),
+            (false, false)
+        );
+        // Timeless: unchanged — each condition pauses submission and no
+        // abort is ever recommended.
+        assert_eq!(
+            pause_decision(ScheduleMode::Timeless, false, false, true),
+            (true, false)
+        );
+        assert_eq!(
+            pause_decision(ScheduleMode::Timeless, true, false, false),
+            (true, false)
+        );
+        assert_eq!(
+            pause_decision(ScheduleMode::Timeless, false, true, false),
+            (true, false)
+        );
+        assert_eq!(
+            pause_decision(ScheduleMode::Timeless, false, false, false),
+            (false, false)
+        );
+    }
+
+    /// Recorded offsets and timing values from an archive are sanitized at
+    /// the conversion point: non-finite values can never reach the schedule
+    /// math (where they would panic the duration conversion) and absurdly
+    /// large finite offsets clamp to the cap instead of parking a request
+    /// unreachably far in the future.
+    #[test]
+    fn recorded_inputs_sanitize_non_finite_offsets() {
+        use crate::archive::schema::RequestTarget;
+
+        let target = RequestTarget {
+            drv: format!("/nix/store/{}-x.drv", "a".repeat(32)),
+            outputs: vec!["*".to_string()],
+        };
+        let req = |offset_s: f64| RequestRecord {
+            session: 7,
+            offset_s,
+            targets: vec![target.clone()],
+        };
+        assert_eq!(recorded_request_from(&req(f64::INFINITY)).offset_s, 0.0);
+        assert_eq!(recorded_request_from(&req(f64::NAN)).offset_s, 0.0);
+        assert_eq!(recorded_request_from(&req(-4.0)).offset_s, 0.0);
+        assert_eq!(
+            recorded_request_from(&req(1.0e30)).offset_s,
+            MAX_RECORDED_OFFSET_S
+        );
+        assert_eq!(recorded_request_from(&req(12.5)).offset_s, 12.5);
+        // The sanitized requests survive schedule construction (a raw +inf
+        // offset would panic the due-time conversion).
+        let requests: Vec<timeline::RecordedRequest> = [f64::INFINITY, 3.0]
+            .iter()
+            .map(|offset| recorded_request_from(&req(*offset)))
+            .collect();
+        let schedule = timeline::build_schedule(&requests, &|_, _| None, 1.0, None, true);
+        assert_eq!(schedule.len(), 2);
+
+        let outcome = |outcome, duration_s, stop_offset_s| OutcomeRecord {
+            session: None,
+            drv: target.drv.clone(),
+            outcome,
+            detail: None,
+            duration_s,
+            stop_offset_s,
+            outputs: BTreeMap::new(),
+        };
+        // Non-finite durations/stop offsets are dropped rather than
+        // poisoning the deadline and disconnect math; the interruption and
+        // expected-built flags derive from the recorded outcome.
+        let disconnected = recorded_timing_from(&outcome(
+            ExpectedOutcome::Disconnected,
+            Some(f64::NAN),
+            Some(f64::INFINITY),
+        ));
+        assert_eq!(disconnected.duration_s, None);
+        assert_eq!(disconnected.stop_offset_s, None);
+        assert!(disconnected.interrupted && !disconnected.expected_built);
+        let built =
+            recorded_timing_from(&outcome(ExpectedOutcome::Built, Some(120.0), Some(130.0)));
+        assert_eq!(built.duration_s, Some(120.0));
+        assert_eq!(built.stop_offset_s, Some(130.0));
+        assert!(!built.interrupted && built.expected_built);
+        let cancelled = recorded_timing_from(&outcome(ExpectedOutcome::Cancelled, None, Some(2.0)));
+        assert!(cancelled.interrupted && !cancelled.expected_built);
+    }
+
+    /// A timed campaign over an archive that does not declare the `timed`
+    /// capability is refused at bootstrap, before any stage marker or
+    /// campaign record is written.
+    #[tokio::test]
+    async fn timed_mode_requires_timed_capability() {
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        assert!(!archive.capabilities().timed);
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: Arc::new(FakeSubmitter::default()),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Arc::new(MapNarinfo(HashMap::new())),
+            artifacts: None,
+        };
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("timed") && msg.contains("capability"), "{msg}");
+        let state = StateDir::new(state_dir.path()).unwrap();
+        for marker in ["plan", "hydra-truth", "supply", "report"] {
+            assert!(
+                !state.marker_done(marker),
+                "marker {marker} must not be set"
+            );
+        }
+        assert!(
+            state
+                .read_json::<CampaignRecord>("campaign.json")
+                .unwrap()
+                .is_none(),
+            "no campaign record is written before the refusal"
+        );
+    }
+
+    /// A timed campaign over a timed-capable archive with no recorded
+    /// interruptions degrades `replay_interruptions` to off: the forced-off
+    /// knob is recorded as the `replay-interruptions-disabled`
+    /// low-confidence flag in campaign.json, and the dispatcher arms no
+    /// interruption on any batch.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replay_interruptions_forced_off_without_interruption_records() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), false);
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        // Both recorded requests settle Built in band, keyed by root drv so
+        // the concurrent timed dispatch tasks cannot pop each other's script.
+        let built_result = |drv: &str| PathOutcome {
+            drv_path: drv.to_string(),
+            status: build_status_name(BuildStatus::Built).into(),
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
+        let submitter = Arc::new(KeyedSubmitter::default());
+        for drv in [&app_a.drv_path, &app_b.drv_path] {
+            submitter.outcomes.lock().unwrap().insert(
+                drv.clone(),
+                BatchOutcome {
+                    results: vec![built_result(drv)],
+                    ..BatchOutcome::default()
+                },
+            );
+        }
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Arc::new(MapNarinfo(narinfos)),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        assert!(
+            campaign
+                .comparability
+                .low_confidence
+                .iter()
+                .any(|flag| flag == "replay-interruptions-disabled"),
+            "{:?}",
+            campaign.comparability.low_confidence
+        );
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(!batches.is_empty());
+        assert!(
+            batches.iter().all(|b| b.interruption_drvs.is_empty()),
+            "no interruption is armed when the archive records none"
+        );
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
+        assert_eq!(records["appB.x86_64-linux"].bucket, "match-built");
+    }
+
+    /// Timed campaign end to end over a mini timed archive: the supply stage
+    /// runs, both recorded requests are dispatched on the recorded schedule,
+    /// the recorded disconnect is replayed (engine cancellation classified
+    /// `interruption-replayed`), and the report renders.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn mini_timed_campaign_end_to_end() {
+        let archive_dir = tempfile::tempdir().unwrap();
+        let built = write_mini_timed_archive(archive_dir.path(), true);
+        let archive = Arc::new(ReplayArchive::open(archive_dir.path()).unwrap());
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let (_lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let mut narinfos = HashMap::new();
+        narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
+
+        // appA settles Built in band; appB's submission is engine-cancelled,
+        // reproducing the recorded disconnect.
+        let submitter = Arc::new(KeyedSubmitter::default());
+        submitter.outcomes.lock().unwrap().insert(
+            app_a.drv_path.clone(),
+            BatchOutcome {
+                build_id: Some("0193e4a2-7c1b-7d20-9b3a-00000000cccc".into()),
+                results: vec![PathOutcome {
+                    drv_path: app_a.drv_path.clone(),
+                    status: build_status_name(BuildStatus::Built).into(),
+                    error_msg: String::new(),
+                    start_time: 0,
+                    stop_time: 0,
+                }],
+                ..BatchOutcome::default()
+            },
+        );
+        submitter.outcomes.lock().unwrap().insert(
+            app_b.drv_path.clone(),
+            BatchOutcome {
+                engine_cancelled: true,
+                ..BatchOutcome::default()
+            },
+        );
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let mut spec = leaf_spec(&built.archive_id);
+        spec.scheduling.mode = ScheduleMode::Timed;
+        spec.knobs.speedup = 1000.0;
+        let backends = Backends {
+            store: Arc::new(FakeStoreApi::default()),
+            admin: Arc::new(NoLogsAdmin),
+            cluster: Arc::new(HealthyCluster),
+            submitter: submitter.clone(),
+            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            narinfo: Arc::new(MapNarinfo(narinfos)),
+            artifacts: None,
+        };
+        run_with_backends(
+            run_args(state_dir.path()),
+            spec,
+            StateDir::new(state_dir.path()).unwrap(),
+            archive,
+            backends,
+        )
+        .await
+        .unwrap();
+
+        let state = StateDir::new(state_dir.path()).unwrap();
+        assert!(state.marker_done("supply"), "supply stage marker set");
+        // One dispatch entry per recorded request; the appB request carries
+        // the armed-and-fired interruption.
+        let dispatch: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert_eq!(dispatch.len(), 2);
+        assert!(
+            dispatch
+                .iter()
+                .any(|entry| entry.interruption_armed && entry.interruption_fired),
+            "{dispatch:?}"
+        );
+        // Every submission is a timed batch; the armed one names the drv.
+        let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
+        assert!(!batches.is_empty());
+        assert!(batches.iter().all(|b| b.kind == BATCH_KIND_TIMED));
+        assert!(
+            batches
+                .iter()
+                .any(|b| b.engine_cancelled && b.interruption_drvs == vec![app_b.drv_path.clone()])
+        );
+        // Exactly one unit matched its recorded build and one reproduced its
+        // recorded interruption.
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        let bucket_count = |bucket: &str| {
+            records
+                .values()
+                .filter(|record| record.bucket == bucket)
+                .count()
+        };
+        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
+        assert_eq!(
+            records["appB.x86_64-linux"].bucket,
+            Bucket::InterruptionReplayed.as_str()
+        );
+        assert_eq!(bucket_count("match-built"), 1);
+        assert_eq!(bucket_count(Bucket::InterruptionReplayed.as_str()), 1);
+        // The dispatcher's run statistics are persisted for the report.
+        let stats: timeline::TimedRunStats = state
+            .read_json("timed-stats.json")
+            .unwrap()
+            .expect("timed-stats.json written by the timed arm");
+        assert_eq!(stats.requests_total, 2);
+        assert_eq!(stats.dispatched, 2);
+        assert_eq!(stats.interruptions_replayed, 1);
+        assert!(!stats.timing_degraded);
+        let progress: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
+                .unwrap();
+        assert_eq!(progress["stage"], "done");
+        let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
+        assert!(summary.contains("Build-outcome parity"));
     }
 
     /// Transport-error path end to end: the first submission fails

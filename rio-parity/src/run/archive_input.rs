@@ -531,6 +531,211 @@ pub(crate) fn write_mini_archive(dir: &std::path::Path) -> MiniArchive {
     }
 }
 
+/// Write a tiny synthetic directory-form v1 TIMED replay archive into `dir`:
+/// two workload units (`appA.x86_64-linux` requested at offset 0.0 s,
+/// `appB.x86_64-linux` at offset 1.0 s), appB depending on one
+/// dependency-only derivation (libA), expected outcomes `built` for appA
+/// (1.0 s recorded duration) and — when `with_interruption` — `disconnected`
+/// for appB with a recorded stop offset of 2.0 s (`built` like appA
+/// otherwise), `closures.jsonl` adjacency for all three derivations, and
+/// synthetic ATerm members. Capabilities: `timed`, `expected_outcomes`,
+/// `dependency_closures`.
+#[cfg(test)]
+pub(crate) fn write_mini_timed_archive(
+    dir: &std::path::Path,
+    with_interruption: bool,
+) -> MiniArchive {
+    use crate::archive::schema::{
+        Capabilities, ExpectedOutcome, OutcomeRecord, RequestRecord, RequestTarget, Substituters,
+    };
+    use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+    let drv = |name: &str| {
+        format!(
+            "/nix/store/{}-{name}.drv",
+            fake_hash(&format!("{name}-drv"))
+        )
+    };
+    let out = |name: &str| format!("/nix/store/{}-{name}", fake_hash(&format!("{name}-out")));
+
+    let app_a_drv = drv("appA-1.0");
+    let app_a_out = out("appA-1.0");
+    let app_b_drv = drv("appB-1.0");
+    let app_b_out = out("appB-1.0");
+    let lib_a_drv = drv("libA-1.0");
+    let lib_a_out = out("libA-1.0");
+
+    let writer = ArchiveWriter::create(dir).unwrap();
+
+    // nix/store/*.drv — synthetic ATerms; appB's input edge on libA mirrors
+    // the closures.jsonl adjacency below.
+    writer
+        .add_drv(
+            &app_a_drv,
+            &synth_aterm(&[("out", app_a_out.as_str())], &[], "x86_64-linux"),
+        )
+        .unwrap();
+    writer
+        .add_drv(
+            &app_b_drv,
+            &synth_aterm(
+                &[("out", app_b_out.as_str())],
+                &[lib_a_drv.as_str()],
+                "x86_64-linux",
+            ),
+        )
+        .unwrap();
+    writer
+        .add_drv(
+            &lib_a_drv,
+            &synth_aterm(&[("out", lib_a_out.as_str())], &[], "x86_64-linux"),
+        )
+        .unwrap();
+
+    // units.jsonl — the two workload units.
+    writer
+        .write_units(&[
+            UnitRecord {
+                drv: app_a_drv.clone(),
+                label: Some("appA.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), app_a_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            },
+            UnitRecord {
+                drv: app_b_drv.clone(),
+                label: Some("appB.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), app_b_out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            },
+        ])
+        .unwrap();
+
+    // requests.jsonl — one recorded client request per unit, on distinct
+    // sessions, with the timed offsets the dispatcher tests rely on.
+    writer
+        .write_requests(&[
+            RequestRecord {
+                session: 1,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: app_a_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            },
+            RequestRecord {
+                session: 2,
+                offset_s: 1.0,
+                targets: vec![RequestTarget {
+                    drv: app_b_drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            },
+        ])
+        .unwrap();
+
+    // outcomes.jsonl — session-less recorded truth: appA built in 1.0 s;
+    // appB disconnected at recorded offset 2.0 s when an interruption is
+    // requested, otherwise built like appA.
+    let app_b_outcome = if with_interruption {
+        OutcomeRecord {
+            session: None,
+            drv: app_b_drv.clone(),
+            outcome: ExpectedOutcome::Disconnected,
+            detail: None,
+            duration_s: None,
+            stop_offset_s: Some(2.0),
+            outputs: BTreeMap::new(),
+        }
+    } else {
+        OutcomeRecord {
+            session: None,
+            drv: app_b_drv.clone(),
+            outcome: ExpectedOutcome::Built,
+            detail: None,
+            duration_s: Some(1.0),
+            stop_offset_s: None,
+            outputs: BTreeMap::new(),
+        }
+    };
+    writer
+        .write_outcomes(&[
+            OutcomeRecord {
+                session: None,
+                drv: app_a_drv.clone(),
+                outcome: ExpectedOutcome::Built,
+                detail: None,
+                duration_s: Some(1.0),
+                stop_offset_s: None,
+                outputs: BTreeMap::new(),
+            },
+            app_b_outcome,
+        ])
+        .unwrap();
+
+    // closures.jsonl — direct adjacency for every derivation.
+    writer
+        .write_closures(&[
+            ClosureRecord {
+                drv: app_a_drv.clone(),
+                inputs: Vec::new(),
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(app_a_out.clone()))]),
+            },
+            ClosureRecord {
+                drv: app_b_drv.clone(),
+                inputs: vec![lib_a_drv.clone()],
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(app_b_out.clone()))]),
+            },
+            ClosureRecord {
+                drv: lib_a_drv.clone(),
+                inputs: Vec::new(),
+                srcs: Vec::new(),
+                outputs: BTreeMap::from([("out".to_string(), Some(lib_a_out.clone()))]),
+            },
+        ])
+        .unwrap();
+
+    // manifest.json — a timed recording with expected outcomes and
+    // dependency closures; fixed timestamps keep the fixture deterministic.
+    let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+    let mut provenance = serde_json::Map::new();
+    provenance.insert(
+        "recorder".to_string(),
+        serde_json::Value::from("mini-timed-archive-fixture"),
+    );
+    let finalized = writer
+        .finalize(ManifestSeed {
+            created_at: stamp,
+            from: stamp,
+            to: stamp,
+            capabilities: Capabilities {
+                timed: true,
+                expected_outcomes: true,
+                output_hashes: false,
+                embedded_store_paths: false,
+                impure_env: false,
+                dependency_closures: true,
+            },
+            substituters: Substituters {
+                relay: vec!["https://cache.example.org".to_string()],
+                target: Vec::new(),
+            },
+            fat: false,
+            provenance,
+        })
+        .unwrap();
+    let archive_id_short = crate::archive::identity::short_id(&finalized.archive_id);
+    MiniArchive {
+        archive_id: finalized.archive_id,
+        archive_id_short,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

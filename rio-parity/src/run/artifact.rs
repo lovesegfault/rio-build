@@ -160,6 +160,7 @@ const SYNCED_FILES: &[&str] = &[
     "dispatch.jsonl",
     "batches.jsonl",
     "supply-report.json",
+    "timed-stats.json",
     "report/summary.md",
     "markers/plan.done",
     "markers/hydra-truth.done",
