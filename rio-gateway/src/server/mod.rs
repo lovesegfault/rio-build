@@ -473,6 +473,7 @@ impl GatewayServer {
                 }
                 r = socket.accept() => match r {
                     Ok(pair) => pair,
+                    // r[impl gw.conn.accept-resilience]
                     Err(e) => {
                         warn!(error = %e, "SSH accept failed; retrying");
                         metrics::counter!("rio_gateway_errors_total", "type" => "accept")
@@ -952,6 +953,7 @@ enum AcceptErrAction {
     RetryAfter(Duration),
 }
 
+// r[impl gw.conn.accept-resilience]
 /// Classify an `accept()` error. Separate fn for unit testability —
 /// can't inject ECONNABORTED into a real `TcpListener`.
 ///
@@ -1415,6 +1417,7 @@ mod tcp_user_timeout_tests {
 }
 
 // r[verify gw.conn.session-drain]
+// r[verify gw.conn.accept-resilience]
 #[cfg(test)]
 mod accept_err_tests {
     use super::*;

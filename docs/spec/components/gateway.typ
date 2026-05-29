@@ -1885,6 +1885,23 @@ derivation without the full DAG context.
   `stage=auth-attempted`.
 ]
 
+#r("gw.conn.accept-resilience")[
+  A failed `accept()` on the SSH listener MUST NOT terminate the accept loop
+  or the process. The error is logged and counted
+  (#(refs.metric)("rio_gateway_errors_total")`{type="accept"}`);
+  fd-exhaustion classes (`EMFILE`/`ENFILE`) back off briefly (100 ms) so
+  in-flight sessions can release descriptors before the retry, every other
+  error class retries immediately, and the accept loop leaves the accepting
+  state only on `serve_shutdown`.
+]
+
+tokio's `TcpListener::accept()` only retries `WouldBlock` internally:
+`ECONNABORTED` (a client RST between SYN-ACK and userspace accept),
+`EMFILE`/`ENFILE` (fd exhaustion --- which happens precisely when many
+sessions are live), and `ENOMEM`/`ENOBUFS` all surface to the caller, and
+treating any of them as fatal would let a transient resource spike take down
+every established session on the instance with it.
+
 #r("gw.store.transient-retry")[
   Gateway→store RPCs that traverse #rref("store.substitute.admission")
   (`QueryPathInfo`, `GetPath`) MUST retry on transient gRPC status
