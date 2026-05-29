@@ -238,7 +238,7 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
 /// are `io::copy`'d in fixed-size pieces — peak heap is O(chunk size),
 /// not O(NAR size). **Semantically equivalent to
 /// `extract_to_path(&parse(r)?, dest)`** without the intermediate
-/// [`NarNode`] tree.
+/// [`NarNode`](super::NarNode) tree.
 ///
 /// Unlike [`parse`](super::parse), there is no per-file `MAX_CONTENT_SIZE`
 /// cap — the caller bounds total size upstream (e.g., `MAX_NAR_SIZE` on the

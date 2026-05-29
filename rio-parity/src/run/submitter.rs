@@ -20,6 +20,7 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::batch::Batch;
+use super::model::PathOutcome;
 use super::stderrparse::{ParsedStderr, parse_line};
 
 /// Result of one batch submission attempt (one `nix build` child process).
@@ -30,6 +31,9 @@ pub struct BatchOutcome {
     /// Child exit code (`None` = killed by a signal, including the engine's
     /// own batch timeout).
     pub exit_code: Option<i32>,
+    /// In-band per-root results (one entry per requested root); empty for
+    /// submitters that have none.
+    pub results: Vec<PathOutcome>,
     /// drv path → relayed failure reason, captured live from stderr.
     pub reasons: BTreeMap<String, String>,
     /// Last ~200 stderr lines, kept verbatim as raw evidence for
@@ -265,6 +269,9 @@ impl NixSubmitter {
         Ok(BatchOutcome {
             build_id: parsed.build_id,
             exit_code: status.code(),
+            // The nix-CLI child reports nothing in-band; per-root results
+            // stay empty for this submitter.
+            results: Vec::new(),
             reasons: parsed.reasons,
             stderr_tail: Vec::from(tail).join("\n"),
             engine_cancelled,

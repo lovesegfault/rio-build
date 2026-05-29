@@ -956,7 +956,7 @@ fn poisons_channel(err: &TransportError, upload: bool) -> bool {
 /// [`GatewayPool::open_channel`].
 ///
 /// After an error that desyncs the wire (a timeout, a transport failure, or
-/// a refused upload — see [`poisons_channel`]) the channel cannot be
+/// a refused upload — see `poisons_channel`) the channel cannot be
 /// resynchronized; it remembers the failure and every subsequent op fails
 /// fast with an error saying to open a fresh channel. A clean daemon refusal
 /// on a non-upload op leaves the protocol position known and the channel

@@ -12,6 +12,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use rio_nix::protocol::build::BuildStatus;
 use serde::{Deserialize, Serialize};
 
 /// Wall-clock now as RFC3339 (UTC). Single helper so records stay uniform.
@@ -360,6 +361,69 @@ pub const BATCH_KIND_SUBMIT: &str = "submit";
 /// [`BatchRecord::kind`] value for warm-stage submissions.
 pub const BATCH_KIND_WARM: &str = "warm";
 
+/// Per-root in-band build result captured from one BuildPathsWithResults
+/// submission (one entry per requested root, positional order preserved).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct PathOutcome {
+    pub drv_path: String,
+    /// BuildStatus name as produced by [`build_status_name`] (e.g. "Built",
+    /// "PermanentFailure"); writers must use that helper, never literals.
+    pub status: String,
+    pub error_msg: String,
+    pub start_time: u64,
+    pub stop_time: u64,
+}
+
+/// The recorded name of a worker-protocol [`BuildStatus`]: exactly the Rust
+/// variant identifier (e.g. "Built", "PermanentFailure").
+/// [`PathOutcome::status`] writers must go through this helper — never
+/// hand-typed literals — so recorded statuses can never drift from the enum
+/// vocabulary.
+pub fn build_status_name(status: BuildStatus) -> &'static str {
+    match status {
+        BuildStatus::Built => "Built",
+        BuildStatus::Substituted => "Substituted",
+        BuildStatus::AlreadyValid => "AlreadyValid",
+        BuildStatus::PermanentFailure => "PermanentFailure",
+        BuildStatus::InputRejected => "InputRejected",
+        BuildStatus::OutputRejected => "OutputRejected",
+        BuildStatus::TransientFailure => "TransientFailure",
+        BuildStatus::CachedFailure => "CachedFailure",
+        BuildStatus::TimedOut => "TimedOut",
+        BuildStatus::MiscFailure => "MiscFailure",
+        BuildStatus::DependencyFailed => "DependencyFailed",
+        BuildStatus::LogLimitExceeded => "LogLimitExceeded",
+        BuildStatus::NotDeterministic => "NotDeterministic",
+        BuildStatus::ResolvesToAlreadyValid => "ResolvesToAlreadyValid",
+        BuildStatus::NoSubstituters => "NoSubstituters",
+    }
+}
+
+/// Inverse of [`build_status_name`]: the [`BuildStatus`] a recorded status
+/// string names, or `None` for anything the helper never writes (readers
+/// treat unknown strings defensively, as a failure).
+pub fn build_status_from_name(name: &str) -> Option<BuildStatus> {
+    Some(match name {
+        "Built" => BuildStatus::Built,
+        "Substituted" => BuildStatus::Substituted,
+        "AlreadyValid" => BuildStatus::AlreadyValid,
+        "PermanentFailure" => BuildStatus::PermanentFailure,
+        "InputRejected" => BuildStatus::InputRejected,
+        "OutputRejected" => BuildStatus::OutputRejected,
+        "TransientFailure" => BuildStatus::TransientFailure,
+        "CachedFailure" => BuildStatus::CachedFailure,
+        "TimedOut" => BuildStatus::TimedOut,
+        "MiscFailure" => BuildStatus::MiscFailure,
+        "DependencyFailed" => BuildStatus::DependencyFailed,
+        "LogLimitExceeded" => BuildStatus::LogLimitExceeded,
+        "NotDeterministic" => BuildStatus::NotDeterministic,
+        "ResolvesToAlreadyValid" => BuildStatus::ResolvesToAlreadyValid,
+        "NoSubstituters" => BuildStatus::NoSubstituters,
+        _ => return None,
+    })
+}
+
 /// One line of batches.jsonl — engine-internal bookkeeping for resume and
 /// build_id recovery (not part of the per-job results schema).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -377,6 +441,10 @@ pub struct BatchRecord {
     pub started_at: String,
     pub finished_at: Option<String>,
     pub exit_code: Option<i32>,
+    /// In-band per-root results from the submission; empty for submitters
+    /// that have none and on records written before this field existed.
+    #[serde(default)]
+    pub results: Vec<PathOutcome>,
     /// drv path → relayed failure reason (captured live from nix stderr).
     pub reasons: BTreeMap<String, String>,
     pub stderr_tail: Option<String>,
@@ -544,6 +612,75 @@ mod tests {
         assert_eq!(BATCH_KIND_SUBMIT, "submit");
         assert_eq!(BATCH_KIND_WARM, "warm");
         assert_ne!(BATCH_KIND_SUBMIT, BATCH_KIND_WARM);
+    }
+
+    #[test]
+    fn build_status_name_round_trips_every_variant() {
+        let all = [
+            BuildStatus::Built,
+            BuildStatus::Substituted,
+            BuildStatus::AlreadyValid,
+            BuildStatus::PermanentFailure,
+            BuildStatus::InputRejected,
+            BuildStatus::OutputRejected,
+            BuildStatus::TransientFailure,
+            BuildStatus::CachedFailure,
+            BuildStatus::TimedOut,
+            BuildStatus::MiscFailure,
+            BuildStatus::DependencyFailed,
+            BuildStatus::LogLimitExceeded,
+            BuildStatus::NotDeterministic,
+            BuildStatus::ResolvesToAlreadyValid,
+            BuildStatus::NoSubstituters,
+        ];
+        for status in all {
+            assert_eq!(
+                build_status_from_name(build_status_name(status)),
+                Some(status),
+                "{status:?}"
+            );
+        }
+        assert_eq!(build_status_from_name("nonsense"), None);
+    }
+
+    #[test]
+    fn path_outcome_serializes_camel_case() {
+        let drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv";
+        let rec = BatchRecord {
+            batch_id: 7,
+            kind: BATCH_KIND_SUBMIT.to_string(),
+            jobs: vec!["x.x86_64-linux".into()],
+            root_drvs: vec![drv.into()],
+            est_nodes: 1,
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+            started_at: "2026-05-26T00:00:00Z".into(),
+            finished_at: Some("2026-05-26T00:05:00Z".into()),
+            exit_code: Some(0),
+            results: vec![PathOutcome {
+                drv_path: drv.into(),
+                status: build_status_name(BuildStatus::Built).into(),
+                error_msg: "".into(),
+                start_time: 1,
+                stop_time: 2,
+            }],
+            reasons: BTreeMap::new(),
+            stderr_tail: None,
+            engine_cancelled: false,
+        };
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains(r#""results":[{"drvPath":"#), "{json}");
+        assert!(json.contains(r#""status":"Built""#), "{json}");
+        assert!(json.contains(r#""errorMsg":"""#), "{json}");
+        assert!(json.contains(r#""startTime":1"#), "{json}");
+        assert!(json.contains(r#""stopTime":2"#), "{json}");
+        assert!(!json.contains("drv_path"), "{json}");
+
+        // A batches.jsonl line written before the field existed (no
+        // `results` key) still deserializes; the array defaults to empty.
+        let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
+        let parsed: BatchRecord = serde_json::from_str(old).unwrap();
+        assert!(parsed.results.is_empty());
+        assert_eq!(parsed.exit_code, Some(1));
     }
 
     #[test]

@@ -166,6 +166,7 @@ pub async fn submit_one_batch(
         started_at,
         finished_at: Some(now_rfc3339()),
         exit_code: None,
+        results: Vec::new(),
         reasons: BTreeMap::new(),
         stderr_tail: None,
         engine_cancelled: false,
@@ -174,6 +175,7 @@ pub async fn submit_one_batch(
         Ok(o) => {
             record.build_id = o.build_id;
             record.exit_code = o.exit_code;
+            record.results = o.results;
             record.reasons = o.reasons;
             record.stderr_tail = Some(o.stderr_tail);
             record.engine_cancelled = o.engine_cancelled;
@@ -356,8 +358,10 @@ pub async fn run_submit_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::run::model::{PathOutcome, build_status_name};
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
+    use rio_nix::protocol::build::BuildStatus;
 
     fn pj(name: &str, deps: usize) -> PendingJob {
         PendingJob {
@@ -390,9 +394,17 @@ mod tests {
         let state = StateDir::new(dir.path()).unwrap();
         let tracker = SubmitTracker::default();
         let submitter = FakeSubmitter::default();
+        let scripted_result = PathOutcome {
+            drv_path: "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string(),
+            status: build_status_name(BuildStatus::PermanentFailure).into(),
+            error_msg: "builder failed with exit code 2".into(),
+            start_time: 100,
+            stop_time: 200,
+        };
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
             exit_code: Some(1),
+            results: vec![scripted_result.clone()],
             reasons: BTreeMap::from([(
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string(),
                 "failed on every eligible worker".to_string(),
@@ -429,12 +441,15 @@ mod tests {
             Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
         );
         assert_eq!(rec.exit_code, Some(1));
+        // The submitter's in-band per-root results ride the batch record.
+        assert_eq!(rec.results, vec![scripted_result.clone()]);
         assert!(!tracker.in_flight.lock().await.contains("x.x86_64-linux"));
         // The settled job enters the post-settlement cool-down.
         assert!(tracker.cooling_jobs().await.contains("x.x86_64-linux"));
         let on_disk: Vec<BatchRecord> = state.load_jsonl(StateFile::Batches).unwrap();
         assert_eq!(on_disk.len(), 1);
         assert_eq!(on_disk[0].reasons.len(), 1);
+        assert_eq!(on_disk[0].results, vec![scripted_result]);
     }
 
     /// A submitter `Err` (engine-side submission failure) is evidence, not a
