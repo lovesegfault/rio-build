@@ -56,7 +56,7 @@
 //     two collector actions (production holds only the GC advisory lock
 //     across the phases, which excludes other collectors, never
 //     writers).
-//   - `chunks.last_referenced_at` (migration 068) joins the per-chunk
+//   - `chunks.last_referenced_at` (migration 070) joins the per-chunk
 //     state as `refAge` — ticks since the most recent reference event
 //     (row insert or upsert touch), the model image of
 //     GREATEST(created_at, last_referenced_at). The upgrade action's

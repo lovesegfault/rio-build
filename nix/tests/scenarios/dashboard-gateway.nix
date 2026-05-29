@@ -36,8 +36,7 @@ pkgs.testers.runNixOSTest {
   skipTypeCheck = true;
 
   # Bring-up ~4min + Cilium Gateway reconcile ~30s + curl <10s
-  # (+nginx subtests ~90s and a scheduler scale-to-1 convergence wait
-  # of up to 90s when withDashboardCurls).
+  # (+nginx subtests ~90s when withDashboardCurls).
   globalTimeout = 900 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;

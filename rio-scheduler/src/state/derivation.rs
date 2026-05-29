@@ -537,7 +537,7 @@ pub struct RetryState {
 
 db_str_enum! {
     /// Row kind in the durable attempt ledger (`drv_attempts.event_kind`,
-    /// migration 066): an observed attempt/charge event, or a reset event
+    /// migration 068): an observed attempt/charge event, or a reset event
     /// (resubmit reset, cache-hit clear, poison clear) that starts a new
     /// suffix for the fold.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -551,7 +551,7 @@ db_str_enum! {
 
 db_str_enum! {
     /// Outcome classification of one attempt-ledger row
-    /// (`drv_attempts.outcome_class`, migration 066). This is the
+    /// (`drv_attempts.outcome_class`, migration 068). This is the
     /// `classify()` alphabet: the CHECK constraint in the migration and
     /// this enum MUST stay in lockstep — extending the alphabet is a new
     /// migration plus a variant here, verified by the
@@ -605,7 +605,7 @@ db_str_enum! {
 
 db_str_enum! {
     /// Which party observed/reported the event behind an attempt-ledger
-    /// row (`drv_attempts.reporting_party`, migration 066).
+    /// row (`drv_attempts.reporting_party`, migration 068).
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ReportingParty {
         /// Worker `CompletionReport`.
@@ -1333,7 +1333,7 @@ impl DerivationState {
             // `rebuild_retry_view_from_ledger` once the suffix is
             // loaded, so budgets survive failover
             // (`sched.retry.failover-budget`). The attempt ledger is the
-            // only failure-history record (migration 073 dropped the
+            // only failure-history record (migration 075 dropped the
             // mirror columns); a node with no attempt rows recovers the
             // default (empty) retry state.
             retry: RetryState::default(),

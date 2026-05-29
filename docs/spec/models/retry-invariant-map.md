@@ -652,8 +652,8 @@ wanted-outputs plumbing they build on (`91e8daae4`, `18d6c257d`,
   campaign added (base-id intersection is empty; `tracey-validate` is the
   mechanical check).
 - **Migration number.** The integrated tree's migration sequence is
-  `062_derivation_wanted_outputs` (harden-subst), `063_leader_generation_claims`,
-  `064_log_chunks`, `065_drop_drv_logs`. The retry-formal attempt-ledger
+  `062_derivation_wanted_outputs` (harden-subst), `065_leader_generation_claims`,
+  `066_log_chunks`, `067_drop_drv_logs`. The retry-formal attempt-ledger
   migration (Phase 1a) takes **066**.
 
 ### What did change: the substitution-failure adjacent decider
@@ -762,7 +762,7 @@ gateway connection-bounding and KEDA commits touch nothing under
 - **Phase-1a ledger rows: nothing new recorded for substitution
   failures.** `handle_substitute_complete` still has no append site, and
   `substitution` is deliberately absent from the `OutcomeClass` alphabet
-  (migration 066). The only substitution-adjacent ledger writes remain the
+  (migration 068). The only substitution-adjacent ledger writes remain the
   `cache_hit_clear` reset rows in the cached-hit / re-probe lanes; their
   trigger predicate now evaluates the live effective set, so *when* such a
   reset fires can shift (a terminal build's wide wants no longer pin a
@@ -911,7 +911,7 @@ distinct).
 | `891a6520d` (unchanged), build-summary half | poisoned drvs missing from recovery's id_to_hash → spurious Succeeded in the build summary | NOT-ENC | — (build-level summary accounting not modeled); the poison-set-preservation half of the same commit is the G8 row below | — | n/a |
 | `d91df7e9f` (unchanged) | DAG-removal paths forgot derivation_hashes pruning → keep_going build hung | NOT-ENC | — (build-level totals/derivation_hashes not modeled) | — | n/a |
 | `e45f2d966` (unchanged), dep-failed-seed half | merge-time transitive DependencyFailed seeding at depth > 1 missing | NOT-ENC | — (no merge action, single dependent at depth 1) | — | n/a |
-| `33b1f855c` (unchanged) | cascaded dependency failures didn't finalize retained exec logs | SUBS | — the in-scheduler log-buffer/`drv_logs` machinery this patched was deleted by harden-logs (LogService owns logs; 065_drop_drv_logs) | — | n/a |
+| `33b1f855c` (unchanged) | cascaded dependency failures didn't finalize retained exec logs | SUBS | — the in-scheduler log-buffer/`drv_logs` machinery this patched was deleted by harden-logs (LogService owns logs; 067_drop_drv_logs) | — | n/a |
 | `699ad52e1` (unchanged), drv_name-cascade-key part | the cascade walk keyed by name instead of hash | NOT-ENC | — (derivation identity is structural in the model; no name/hash distinction) | — | n/a |
 
 #### G4 — poison state desynced between memory and PG, or never cleared (8 commits)
@@ -1882,7 +1882,7 @@ by-construction.
 | `891a6520d` build-summary half (spurious Succeeded) | OUTSIDE | Build-summary accounting; `sched.recovery.poisoned-failed-count` + recovery tests. |
 | `d91df7e9f` (derivation_hashes pruning, hung keep-going build) | OUTSIDE | Build-level totals; keep-going tests. |
 | `e45f2d966` dep-failed-seed half (merge-time transitive seeding) | OUTSIDE | `sched.merge.dep-failed-transitive` + merge tests. |
-| `33b1f855c` (cascade didn't finalize retained exec logs) | SUBS | Subject deleted by the log campaign (LogService owns logs; 065_drop_drv_logs). |
+| `33b1f855c` (cascade didn't finalize retained exec logs) | SUBS | Subject deleted by the log campaign (LogService owns logs; 067_drop_drv_logs). |
 | `699ad52e1` drv_name-cascade-key part | OUTSIDE | Identity plumbing; the cascade walk keys on the DAG node, covered by the cascade tests. |
 
 #### G4 — poison state desynced between memory and PG, or never cleared
@@ -1982,14 +1982,14 @@ the removal of the legacy floor (`decide()`'s `legacy_seed` argument,
 `load_poisoned_display` legacy union), restoring the frozen §5a-2
 three-argument `decide()`. `poisoned_at` is not part of the drop — it
 is the poison-lifecycle carve-out (`sched.poison.ttl-persist`), not a
-counter mirror. Decision: **deferred — no migration 067 ships in this
+counter mirror. Decision: **deferred — no migration 069 ships in this
 phase, and the legacy-seed code path stays.**
 
 Why: the drop is gated (T-1b.13, decision P5) on the drain condition —
 no non-terminal or poisoned derivation has non-empty mirror columns
 together with a reset-free attempt suffix. At the release boundary that
 ships Phases 1+2 this condition is unmet *by definition*: every
-deployment that upgrades through migration 066 still carries pre-066
+deployment that upgrades through migration 068 still carries pre-068
 failure histories whose only record is the mirror columns, and those
 histories stay live until each such derivation completes, passes
 through a durable reset (resubmit, cache-hit clear, poison clear), or
@@ -2032,12 +2032,12 @@ What this phase records instead:
   ```
 
   When this returns 0 (or the operator explicitly accepts forgetting
-  the residual rows it returns), a later release ships migration 067:
+  the residual rows it returns), a later release ships migration 069:
   DROP the three columns; delete `load_retry_seed_in_tx`, the
   `legacy_seed` argument and the P5 floor block in `decide()` (the
   contracts' seed clauses go with them), `legacy_retry_floor` and its
   construction sites, and the `load_poisoned_display` legacy union;
-  frozen-migration rules apply (M_067 commentary in
+  frozen-migration rules apply (M_069 commentary in
   `rio-migrations/src/migrations.rs`, new PINNED checksum, the regen
   umbrella).
 
@@ -2045,15 +2045,15 @@ The `// TODO:` at `load_retry_seed_in_tx` (db/derivations.rs) is the
 code-side anchor for this decision and now points at this subsection.
 
 **Status (retry-campaign coda): landed.** The drop shipped — as
-migration 073, not the reserved 067: 068–072 landed while the drop was
+migration 075, not the reserved 069: 070–074 landed while the drop was
 deferred, and taking a lower number than already-shipped migrations
 would have re-ordered the applied chain relative to the authored one
-for no benefit (M_073/M_068 in `rio-migrations/src/migrations.rs`
-record the numbering; the 067 gap is permanent). The trigger is the
+for no benefit (M_075/M_070 in `rio-migrations/src/migrations.rs`
+record the numbering; the 069 gap is permanent). The trigger is the
 deployment-model clarification of 2026-05-27 (no staged rollouts, no
 existing cluster or live database — every eventual deployment is
-fresh), exactly the trigger migration 070's record cites: a fresh
-database never carries a pre-066 failure history, so the drain
+fresh), exactly the trigger migration 072's record cites: a fresh
+database never carries a pre-068 failure history, so the drain
 condition this subsection gated on is satisfied vacuously and the
 operational drain probe above is retained as history only. The sweep
 took the retirement checklist in full: `load_retry_seed_in_tx` (and
@@ -2261,7 +2261,7 @@ each handler also gains a durable write).
 - The mirror-column DROP, the legacy-floor removal, and the frozen
   three-argument `decide()` — behind the drain condition, with the
   operational probe recorded (the mirror-column subsection above).
-  **Closed by the retry-campaign coda** (migration 073 + the seed
+  **Closed by the retry-campaign coda** (migration 075 + the seed
   retirement; see that subsection's status paragraph — the fresh-only
   deployment directive made the drain condition vacuous).
 - A real ledger GC policy (P8): the compile-time retention-floor
@@ -2401,7 +2401,7 @@ introducing commit messages and the check transcripts.
 
 1. **Mirror-column drop + legacy-seed retirement (the Phase-2
    deferral).** Migration 073 (not the reserved 067 — see the status
-   paragraph in the mirror-column subsection and M_073) drops
+   paragraph in the mirror-column subsection and M_075) drops
    `derivations.{retry_count, failed_builders, resubmit_cycles}`; the
    reader/writer sweep and the seed retirement follow. `decide()` is
    the frozen §5a-2 three-argument surface again; the contracts' seed

@@ -233,7 +233,7 @@ pub(crate) struct PoisonedDerivationRow {
 /// columns from `batch_upsert_derivations` plus live-state fields
 /// (assigned_builder_id, the persisted resource floor, the active
 /// exec_id). Retry counters are not derivations columns (the attempt
-/// ledger is the only failure-history record since migration 073);
+/// ledger is the only failure-history record since migration 075);
 /// recovery rebuilds the retry view from the ledger fold after the
 /// suffix load.
 #[derive(Debug, sqlx::FromRow)]

@@ -1,4 +1,4 @@
-//! The durable attempt ledger — `drv_attempts` table (migration 066).
+//! The durable attempt ledger — `drv_attempts` table (migration 068).
 //!
 //! One row per attempt or reset event in a derivation's failure
 //! history, keyed by the DAG key (`derivations.derivation_id`). The

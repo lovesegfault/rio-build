@@ -205,7 +205,7 @@ pkgs.testers.runNixOSTest {
     # requires the latest attempt's (exec_id, builder_id) to match the
     # header + claims. drv_executions seeds the latest-exec resolution
     # (its drv_hash is the BARE 32-char form — a different column, a
-    # different format, per M_064).
+    # different format, per M_066).
     with subtest("seed assignment + execution rows"):
         psql(control,
             "INSERT INTO derivations "

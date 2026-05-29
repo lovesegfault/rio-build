@@ -180,7 +180,7 @@ pub(crate) async fn upgrade_manifest_to_chunked(
     // S3 PutObject is idempotent (same key, same bytes), so the
     // duplicate write is wasted bandwidth, not a correctness hazard.
     //
-    // `last_referenced_at = now()` (the touch, migration 068): exists
+    // `last_referenced_at = now()` (the touch, migration 070): exists
     // for the lazy chunk collector's mark-snapshot race — a manifest
     // that commits after a collect cycle's mark snapshot but
     // re-references an old chunk is invisible to that cycle's mark;

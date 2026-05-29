@@ -306,7 +306,7 @@ impl SchedulerDb {
     /// Clear poison state: NULL `poisoned_at`, status='created'. Used
     /// by ClearPoison admin RPC + TTL expiry in `handle_tick`. The
     /// retry/poison counters themselves are not derivations columns any
-    /// more (migration 073 dropped the frozen mirror columns) — the
+    /// more (migration 075 dropped the frozen mirror columns) — the
     /// budget reset is carried by the `poison_cleared` / `resubmit_reset`
     /// ledger row appended in the same transaction, which starts a fresh
     /// fold suffix.
@@ -334,7 +334,7 @@ impl SchedulerDb {
     /// blocked heartbeat/dispatch for 500 sequential PG round-trips.
     /// Same shape as [`update_derivation_status_batch`].
     ///
-    /// Same column set as [`clear_poison`] since migration 073 dropped
+    /// Same column set as [`clear_poison`] since migration 075 dropped
     /// the frozen mirror columns; the two stay separate functions
     /// because the batch form is the hot-path vehicle and the scalar
     /// form owns its own connection.
@@ -481,7 +481,7 @@ impl SchedulerDb {
     /// `(drv_path, failed_executors, poisoned_secs_ago)` per poisoned
     /// derivation, with `failed_executors` aggregated from the attempt
     /// ledger (the legacy `failed_builders` column union retired with
-    /// migration 073 — the ledger is the only failure-history record).
+    /// migration 075 — the ledger is the only failure-history record).
     /// Only the ledger classes whose fold arm charges the exclusion set
     /// (`transient`, `permanent`, `backstop`, `executor_crash`) are
     /// aggregated, so the displayed set keeps the as-built meaning of

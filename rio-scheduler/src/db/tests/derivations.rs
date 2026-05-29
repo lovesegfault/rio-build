@@ -72,7 +72,7 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
 /// rows_affected count (N hashes in → N rows touched, single statement)
 /// and the column set: the poison lifecycle state is cleared
 /// (status='created', poisoned_at NULL). The retry counters are not
-/// derivations columns (migration 073) — the budget reset is carried by
+/// derivations columns (migration 075) — the budget reset is carried by
 /// the `resubmit_reset` ledger row appended in the same transaction by
 /// the production caller.
 #[tokio::test]
@@ -98,7 +98,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
 
     // Poison lifecycle state cleared: status='created', poisoned_at
     // NULL. Nothing else on the derivations row carries retry state any
-    // more (migration 073 dropped the mirror columns).
+    // more (migration 075 dropped the mirror columns).
     assert!(db.load_poisoned_derivations().await?.is_empty());
     let (n_created, n_clean): (i64, i64) = sqlx::query_as(
         "SELECT

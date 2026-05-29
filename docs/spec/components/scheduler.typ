@@ -633,7 +633,7 @@ survive a leader change per #rref("sched.retry.failover-budget"). The
 `+2` revision additionally specified the transitional legacy-column seed
 (decision P5: the frozen `derivations.{retry_count, failed_builders,
 resubmit_cycles}` mirror columns floored the fold for failure histories
-predating the attempt ledger); migration 073 dropped those columns and the
+predating the attempt ledger); migration 075 dropped those columns and the
 seed machinery with them, so the `+3` revision is the pure ledger fold. The
 `+1` revision pinned the pre-ledger selective forgiveness
 (4 recovered / 1 derived / 5 defaulted), retired with the Phase-1b
@@ -1567,7 +1567,7 @@ Queue-level preemption is fully supported:
   `ClearPoison` admin RPC to override).
 ]
 The `+4` revision dropped the frozen `derivations.resubmit_cycles` mirror
-column from the durability clause: migration 073 removed the column, and the
+column from the durability clause: migration 075 removed the column, and the
 attempt-ledger reset row has been the only carrier of the cycle index since
 the Phase-1b cutover froze the column.
 
@@ -1838,7 +1838,7 @@ persisting any assignment leaves no trace in `assignments` at all
 A floor that _ties_ the entry generation is exceeded unless the claims ledger
 shows this holder's own row there, because assignment rows carry no
 scheduler-holder identity and the assignment history written before the claims
-ledger existed (migration 063 ships no backfill) has no claim rows at all ---
+ledger existed (migration 065 ships no backfill) has no claim rows at all ---
 so on the first post-upgrade acquisition, and after a predecessor that
 proceeded unclaimed, the floor cannot be assumed to be ours. A failed ledger
 read counts as "not shown" and is likewise exceeded; the conservative cost is
@@ -2537,7 +2537,7 @@ backoff. This prevents unbounded request queueing at the gateway layer.
 ]
 The `+3` revision dropped the frozen-mirror-column clause (the batch variant
 used to be distinguished by leaving `derivations.resubmit_cycles` untouched);
-migration 073 removed the mirror columns, so the two variants now differ only
+migration 075 removed the mirror columns, so the two variants now differ only
 in call shape, not column set.
 
 == Schema (pseudo-DDL)

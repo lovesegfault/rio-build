@@ -2794,7 +2794,7 @@ record.
 
 - Wave 1a-A (scheduler/proto/migration): the four unaries
   (`PullAssignment`, `ReportOutcome`, `ReportAttemptOutcome`,
-  `ListOpenAttempts`) with the new spec rules; migration 071
+  `ListOpenAttempts`) with the new spec rules; migration 073
   (`source_node` on `drv_attempts`/`drv_executions`,
   `drv_executions.dispatch_mode`); the ledger-backed open pull-attempt
   view and the `rio_scheduler_open_attempts` gauge; the fenced pull
@@ -4327,7 +4327,7 @@ attempts past deadline + report-slack.
 | `e7b8ee91a` (heartbeat RPC timeout ≥ interval, bug_044) | CONSTRUCTION | No heartbeat RPC. Per-unary timeouts are B8's trivial successor (the pull/report clients use bounded per-call timeouts inside the retry loops — `builder.pull.retry-loop+2`). |
 | `d12b31027` (heartbeat task + DrainExecutor not aborted on ephemeral exit, I-142) | CONSTRUCTION | Neither call exists in the pull runtime; process exit is the one-shot exit path (`sched.executor.one-shot+2` impl at the builder pull loop). |
 | `f9c89bb92` (ephemeral idle-timeout exit, I-116) | CHECKED | The idle exit survives transformed as the bounded NotYetReady retry → charge-free exit 0, reusing the same `idle_timeout` value (OA6 consequence 2): `NotYetReadyIsInert` + `quint-executor-session-witness-idle-exit` (wired), the builder pull-loop idle tests, and `sched.executor.pull-not-ready`. |
-| `99a17cd2f` (authoritative_binding map for detect_hung_nodes) | CHECKED (successor) | The heartbeat-fed detector and its in-memory binding map are deleted (commit A); node attribution for the successor comes from the durable `source_node` column written from the spawn-ack binding (AD2c, migration 071) with the controller's own bound-intent map as fallback — `ctrl.nodeclaim.wedge-cluster` (rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs) + its unit battery. |
+| `99a17cd2f` (authoritative_binding map for detect_hung_nodes) | CHECKED (successor) | The heartbeat-fed detector and its in-memory binding map are deleted (commit A); node attribution for the successor comes from the durable `source_node` column written from the spawn-ack binding (AD2c, migration 073) with the controller's own bound-intent map as fallback — `ctrl.nodeclaim.wedge-cluster` (rio-controller/src/reconcilers/nodeclaim_pool/wedge.rs) + its unit battery. |
 | `468900350` (tenant_of keyed on auth_intent) | CHECKED (successor) | Per-tenant keying is no longer part of the wedge signal: the successor clusters per source node over attempt-deadline expiries for ≥2 distinct derivations, so a single tenant's mis-keying cannot hide a wedge; wedge.rs tests + the T-1a.12 establishment-cluster alert (per-node, tenant-agnostic). |
 | `9699ac8b2` (key on auth_intent, floor 2, TTL-only retain) | CHECKED (successor) | The ≥2-distinct-derivations floor and the 30-minute clustering window are the successor's analogues, unit-tested in wedge.rs; the per-tick dead-reap cap bounds the blast radius exactly as before (the consumption shape through `reap_unhealthy`'s Dead arm is unchanged — Model N untouched). |
 | `6b152ee22` (repeats across ticks; clear_persisted_state half) | CHECKED (successor) | The successor recomputes the cluster from the open-attempt ledger every reconcile pass (no in-memory accumulation to clear or repeat); an open-attempt RPC failure only skips the wedge pass for that tick (fail-closed), per the wedge.rs tests. |
@@ -4613,7 +4613,7 @@ open; they are listed under deferred items.
   correction recorded; the 0e frozen contract (unary signatures,
   frozen invariant list, finalized disposition table, Model J/N
   obligation table, lease-seam note, OA decisions) and the go.
-- **Slice 1a** (additive): the four unaries, migration 071, the
+- **Slice 1a** (additive): the four unaries, migration 073, the
   open-attempt view and gauge, the fenced pull transaction with
   `admit_pull`, the idempotent report intakes, the establishment sweep
   and report-slack config, the §4.5 option-(b) busy bridge, the
@@ -4828,7 +4828,7 @@ had.
   designed — `ReportAttemptOutcome` + the no-attempt no-op rule are
   the only pod-terminal channel; the scheduler gained no informer.
 - **AD2** (node-keyed exclusion, exhaustion survives re-keyed):
-  landed on both halves at 1b with migration 071; both keys carried
+  landed on both halves at 1b with migration 073; both keys carried
   through coexistence; the legacy pod-name key drop (P12) has since
   landed via the retry-campaign coda — the exclusion key is the source
   node only.

@@ -4,13 +4,13 @@
 // (Phase 1b of the retry-formal campaign, re-encoded by Phase 1c): every
 // budget verdict comes from `decide()` — the reference fold
 // (rio-scheduler/src/retry_policy.rs) — over the durable attempt ledger
-// (`drv_attempts`, migration 066), evaluated and persisted inside the
+// (`drv_attempts`, migration 068), evaluated and persisted inside the
 // site-owned appending transaction. The nine cap-check entry points
 // (E1-E9 in docs/spec/models/retry-invariant-map.md) are callers of that
 // one fold; the ten in-memory `RetryState` counters are a fold-derived
 // cached view, not independently mutated state; the per-counter PG
 // mirror columns, their writers, and the transitional mixed-era legacy
-// seed that read them are gone (migration 073 -- see WHAT IS NOT
+// seed that read them are gone (migration 075 -- see WHAT IS NOT
 // MODELED for the retirement record).
 //
 // The pre-collapse (as-built) encoding was frozen at

@@ -564,7 +564,7 @@ impl AdminService for AdminServiceImpl {
         // reconstructs Instant from elapsed_secs at startup but doesn't
         // store the original timestamp for display). `failed_executors`
         // is the attempt-ledger aggregate (the only failure-history
-        // record since migration 073), so poisons list the executors
+        // record since migration 075), so poisons list the executors
         // whose failures charged them.
         let db = crate::db::SchedulerDb::new(self.pool.clone());
         let rows = db

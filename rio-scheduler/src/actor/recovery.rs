@@ -1471,7 +1471,7 @@ impl DagActor {
                     // ledger cannot affirm it is ours: another holder's
                     // claim row, an assignments-only floor with no
                     // claim row at all (pre-claim-ledger assignment
-                    // history from before migration 063, or a
+                    // history from before migration 065, or a
                     // predecessor that proceeded unclaimed), or a
                     // failed ledger read. Treat it as foreign and
                     // exceed it.

@@ -235,7 +235,7 @@ in
   #     checks on) the fold's counter
   #     arithmetic cannot overflow over the domain. (The legacy-seed
   #     clauses and the seed-merge harness retired with the P5 seed —
-  #     migration 073 dropped the mirror columns it read.)
+  #     migration 075 dropped the mirror columns it read.)
   #   - check_decide_deterministic: same inputs, two calls, equal
   #     Decisions.
   #   - check_classify_contract: the classification partition iff per

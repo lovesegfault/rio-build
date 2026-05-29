@@ -1132,7 +1132,7 @@ fn apply<Id: Ord + Clone>(
 // ---------------------------------------------------------------------------
 
 /// Row kind in the durable attempt ledger (`drv_attempts.event_kind`,
-/// migration 066): an observed attempt/charge event, or a reset event
+/// migration 068): an observed attempt/charge event, or a reset event
 /// (resubmit reset, cache-hit clear, poison clear) that starts a new
 /// suffix for the fold.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1144,7 +1144,7 @@ pub enum AttemptEventKind {
 }
 
 /// Outcome classification of one attempt-ledger row
-/// (`drv_attempts.outcome_class`, migration 066). This is the
+/// (`drv_attempts.outcome_class`, migration 068). This is the
 /// [`classify`] alphabet — the kernel-side mirror of the scheduler's
 /// `OutcomeClass` db enum (which owns the SQL string round-trip and the
 /// migration CHECK-constraint lockstep test).
@@ -1190,7 +1190,7 @@ pub enum OutcomeClass {
 }
 
 /// Which party observed/reported the event behind an attempt-ledger
-/// row (`drv_attempts.reporting_party`, migration 066) — the kernel-side
+/// row (`drv_attempts.reporting_party`, migration 068) — the kernel-side
 /// mirror of the scheduler's `ReportingParty` db enum.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReportingParty {

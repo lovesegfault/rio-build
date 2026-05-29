@@ -1579,8 +1579,8 @@ restated as facts of the landed tree):
 ## Release B record (plan T-1b.1–T-1b.5; Phase 1b landing close-out)
 
 Release B landed as five commits on the integration branch
-(`refcount-rel-b`): migration 069 (the `chunks_refcount_nonneg` CHECK
-and `idx_chunks_gc` drops, PINNED via the failing-test flow, M_069
+(`refcount-rel-b`): migration 071 (the `chunks_refcount_nonneg` CHECK
+and `idx_chunks_gc` drops, PINNED via the failing-test flow, M_071
 commentary carrying the §4.5 ordering), the writer/token deletion
 (T-1b.2 — the upsert stops writing the counter, DEC-1 and the
 `PlaceholderToken` are gone, the rollback is the claim-gated
@@ -1642,7 +1642,7 @@ runbook copy.
 - Migration 069 is append-only, PINNED, and drops exactly the CHECK and
   the partial index; the column drop was reserved for 070 at this
   landing with its deployment-time application constraint (checklist
-  row D7). 070 has since landed in-tree — see the migration 070
+  row D7). 072 has since landed in-tree — see the migration 072
   landing record in the close-out.
 - After the writer deletion, production rio-store issues no SQL that
   names `chunks.refcount`; the only remaining writers anywhere are the
@@ -1663,7 +1663,7 @@ runbook copy.
   Migration 070's application was a deployment-time obligation
   (checklist row D7) at this landing; 070 has since landed in-tree per
   the 2026-05-27 owner clarification and row D7 reduces to the
-  ordinary "migrations run on deploy" statement (see the migration 070
+  ordinary "migrations run on deploy" statement (see the migration 072
   landing record in the close-out).
 
 ## Phase-2 assurance layer
@@ -1959,7 +1959,7 @@ non-progress.
 
 | Lesson | Replacement verdict | Mechanism / checker |
 |---|---|---|
-| M_023 — under-counts are never sanctioned (the CHECK was the only runtime enforcement of the counter's meaning) | CONSTRUCTION | The quantity the CHECK constrained no longer exists; there is no maintained aggregate whose under-count could make a referenced chunk eligible. The equivalent hazard — a referenced chunk missing from the mark set — is what the fail-closed mark forbids: `quint-chunk-collect-parse-skip-falsifies-cr1` shows the skip polarity is the data-loss path, the corrupt-regime CR-1 + `noReferencedChunkSwept` HOLD with fail-closed in place, and `mark_expansion_matches_rust_parser` (the differential pinning test) holds the SQL expansion to the Rust definition of a manifest's chunk set. 069's M_069 commentary records why the CHECK had to go first at deployment time. |
+| M_023 — under-counts are never sanctioned (the CHECK was the only runtime enforcement of the counter's meaning) | CONSTRUCTION | The quantity the CHECK constrained no longer exists; there is no maintained aggregate whose under-count could make a referenced chunk eligible. The equivalent hazard — a referenced chunk missing from the mark set — is what the fail-closed mark forbids: `quint-chunk-collect-parse-skip-falsifies-cr1` shows the skip polarity is the data-loss path, the corrupt-regime CR-1 + `noReferencedChunkSwept` HOLD with fail-closed in place, and `mark_expansion_matches_rust_parser` (the differential pinning test) holds the SQL expansion to the Rust definition of a manifest's chunk set. 071's M_071 commentary records why the CHECK had to go first at deployment time. |
 | M_033 — presence is `uploaded_at`, never the liveness signal | CHECKED | `store.chunk.liveness-not-presence` (rule), CR-4 exhaustive in both models, the upsert-RETURNING test set, the i201 probe re-point (Phase 1-pre, consumer-audit row 1), and the i040 selector re-point (Release B, row 2) — no probe or production path infers presence from a liveness signal anywhere in the tree. |
 
 #### Summary
@@ -2203,7 +2203,7 @@ its EXPLAIN/structural guards, the collector test set, and the
 enlarged upsert/rollback test modules). Schema: one column added
 (068), one CHECK and one partial index dropped (069), and the
 `refcount` column itself dropped (070, landed after this close-out —
-see the migration 070 landing record below).
+see the migration 072 landing record below).
 
 The deletions the design predicted did land — the decrement/zero/
 enqueue family, the token and its rollback, the chunk-aware reap
@@ -2244,7 +2244,7 @@ disposition.
 
 | Item | Owner | Condition / where recorded |
 |---|---|---|
-| Migration 070 (`DROP COLUMN chunks.refcount`) — authoring and the seeder/comment sweep | **Landed** (2026-05-27 close-out update) | No longer deferred: the owner clarified (2026-05-27) that there is no staged rollout and no existing cluster or live database — eventual deployments are fresh — so the drop is ordinary development work. The landing carries migration 070 (PINNED), the seeder sweep this row scoped to it (`test_helpers.rs::ChunkSeed`, the admin VerifyChunks test seeds, the bench fixture), and the still-existing-column comment sweep; checklist row D7 reduces to the ordinary "migrations run on deploy" statement. See the migration 070 landing record below. |
+| Migration 072 (`DROP COLUMN chunks.refcount`) — authoring and the seeder/comment sweep | **Landed** (2026-05-27 close-out update) | No longer deferred: the owner clarified (2026-05-27) that there is no staged rollout and no existing cluster or live database — eventual deployments are fresh — so the drop is ordinary development work. The landing carries migration 072 (PINNED), the seeder sweep this row scoped to it (`test_helpers.rs::ChunkSeed`, the admin VerifyChunks test seeds, the bench fixture), and the still-existing-column comment sweep; checklist row D7 reduces to the ordinary "migrations run on deploy" statement. See the migration 072 landing record below. |
 | Deployment-time validation checklist D0–D7 | Operator/owner at deployment time | The plan's checklist and its operator copy in `docs/ops/gc-enablement.typ`; D1 (production-class cycle timing, formerly gate (a)), D2 (drift window), D3 (alert quietness), D4 (backlog drain), D5 (integrity spot-checks) precede the Release-B stage; D6/D7 follow it. The Wave-A1 instrumentation is the deliverable that makes these executable. |
 | Retiring the as-built `chunkLiveness.qnt` (model-of-record flip) and re-pointing the three surviving `quint-refcount-calib-*` checks at `chunkCollect.qnt` | Whoever picks up the deferred Phase-2 items | Do together, after the deployment-time checklist has validated the live collector (retiring the as-built encoding before then would discard the only model of the still-deployable previous release); the retry campaign's retirement section is the template (preserve non-vacuity anchors when removing checks). |
 | MBT-lite trace-derived integration tests (design §5 Phase-2 option) | Same | Optional; revisit only if the collector's PG-side behavior grows beyond what the postgres-backed structural tests pin. |
@@ -2263,7 +2263,7 @@ bench (whose figures are lower bounds), no observed drift window, no
 alert-quietness window, no observed one-time reclamation drain, no
 GetPath/VerifyChunks integrity observation, no mixed-fleet rollout
 exercised (the §4.5 orderings are reviewed at construction level
-only), and no application of migration 070 (landed in-tree at the
+only), and no application of migration 072 (landed in-tree at the
 close-out, never applied anywhere). Those observations are
 exactly rows D0–D7 of the deployment-time validation checklist and
 remain open until the completed workstream deploys. The model
@@ -2285,7 +2285,7 @@ the counter are historical narration (migration history and
 `migrations.rs` commentary, incident records in module docs, the
 Stage-A/B/C sections of this map) and the test seeders that exercised
 the still-existing column — the latter were swept when 070 landed
-(see the migration 070 landing record below). The stale
+(see the migration 072 landing record below). The stale
 production-facing prose found by this check — two
 metric help strings crediting the retired enqueue paths and the
 dropped CHECK, the LogService sweep-cadence comparison, and the
@@ -2307,9 +2307,9 @@ What landed (one change set on top of the close-out):
 - Migration 070 (`ALTER TABLE chunks DROP COLUMN IF EXISTS refcount`,
   metadata-only), PINNED via the failing-test flow (the red
   `unpinned migration` panic and its hex-SHA are quoted in the landing
-  commit message). M_070 commentary carries the §4.5 (ii) ordering
+  commit message). M_072 commentary carries the §4.5 (ii) ordering
   rationale (why the drop is a separate migration from 069 at all) and
-  the in-tree landing rationale; M_069/M_071 commentary and the PINNED
+  the in-tree landing rationale; M_071/M_073 commentary and the PINNED
   comment no longer describe 070 as reserved.
 - The seeder/comment sweep the deferred-items row above scoped to the
   070 change set: `ChunkSeed` (field, builder, INSERT), the admin

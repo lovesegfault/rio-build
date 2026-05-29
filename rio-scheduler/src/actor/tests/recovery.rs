@@ -993,7 +993,7 @@ async fn test_recovery_other_holder_at_our_generation_bumps() -> TestResult {
 /// An assignments-only floor that ties the entry generation, with NO
 /// claim row at all, must be exceeded — the ledger cannot affirm the
 /// floor is ours. This is the first post-upgrade handover (assignment
-/// history written before the claims ledger existed, migration 063
+/// history written before the claims ledger existed, migration 065
 /// ships no backfill) and the unclaimed-proceed-predecessor case:
 /// assignment rows carry no scheduler-holder identity, so a silent
 /// ledger at our generation reads as foreign. Retaining here would let
@@ -1755,7 +1755,7 @@ async fn test_recovery_loads_poisoned_derivations() -> TestResult {
 /// Drive the resubmit bound to LIMIT, restart the scheduler, resubmit →
 /// bound MUST hold. The cross-cycle counter's durable carrier is the
 /// `resubmit_reset` attempt-ledger row (the mirror column it once also
-/// lived in was dropped by migration 073), so the seed here is the
+/// lived in was dropped by migration 075), so the seed here is the
 /// ledger row the production resubmit path appends — recovery rebuilds
 /// the counter from the ledger fold.
 // r[verify sched.merge.poisoned-resubmit-bounded+4]

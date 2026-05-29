@@ -1,4 +1,4 @@
-//! Attempt-ledger (`drv_attempts`, migration 066) integration tests:
+//! Attempt-ledger (`drv_attempts`, migration 068) integration tests:
 //! append/fill/load round-trips, the exec_id one-row-per-execution
 //! schema property, the suffix cut at the last reset row, and the
 //! alphabet⇄CHECK-constraint lockstep.

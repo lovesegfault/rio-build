@@ -88,7 +88,7 @@ pub const EXEC_STATUS_TERMINAL: &[&str] = &[
 ///
 /// `drv_hash` is the `drv_log_hash()` form (32-char bare hash,
 /// CHAR(32)/`bpchar`) — NOT `derivations.drv_hash` (the DAG key,
-/// TEXT). Nothing joins the two; see M_061/M_064.
+/// TEXT). Nothing joins the two; see M_061/M_066.
 ///
 /// Timestamps are epoch seconds via `EXTRACT(EPOCH FROM …)::bigint`
 /// at the query site — keeps this module chrono-free (the `TenantRow`

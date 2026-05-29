@@ -2583,7 +2583,7 @@ async fn permanent_failure_terminals_assignment_and_records_executor() -> TestRe
     // I-209: the executor that produced the permanent failure is
     // recorded durably on the attempt row and surfaced through the
     // operator listing (the attempt-ledger aggregate is the only
-    // failure-history surface — migration 073 dropped the legacy
+    // failure-history surface — migration 075 dropped the legacy
     // `failed_builders` column). On the pull path the
     // attempt's executor identity is the attested intent id.
     let sched_db = crate::db::SchedulerDb::new(db.pool.clone());
@@ -4210,7 +4210,7 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
     );
     // (The pre-073 revision of this test additionally asserted the
     // frozen legacy retry_count mirror column stayed at its default;
-    // migration 073 dropped the column, so "the per-cycle count lives
+    // migration 075 dropped the column, so "the per-cycle count lives
     // in the ledger rows alone" is now structural.)
     Ok(())
 }

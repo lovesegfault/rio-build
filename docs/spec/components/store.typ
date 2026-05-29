@@ -178,7 +178,7 @@ aggregate. The table schema:
 
 (The historical `chunks.refcount` column, its `CHECK`, and the `idx_chunks_gc`
 partial index belong to the retired counter machinery: the CHECK and index are
-dropped by migration 069 and the column itself by migration 070; none of them
+dropped by migration 071 and the column itself by migration 072; none of them
 exist in the live schema.)
 
 #r("store.chunk.refcount-txn+2")[
@@ -246,7 +246,7 @@ the refcount-formal campaign. Liveness is derived from the manifests at
 collect time (#rref("store.chunk.liveness-derived"),
 #rref("store.gc.chunk-collect")), which makes the old equality true by
 construction with no maintained aggregate left to drift; the historical
-`chunks.refcount` column is dropped by migration 070. The retirement record
+`chunks.refcount` column is dropped by migration 072. The retirement record
 (what each rule required, what replaced it, and the calibration evidence)
 lives in `docs/spec/models/refcount-invariant-map.md`.
 
@@ -325,7 +325,7 @@ under-counted-refcount bug classes --- there is no stored aggregate left to
 drift --- while #rref("store.chunk.no-live-collect") (unchanged) remains the
 data-loss obligation the recomputation must satisfy. The rule is
 deliberately silent on the historical counter column itself (written by
-pre-cutover pods for mixed-fleet safety until migration 070 dropped it); what
+pre-cutover pods for mixed-fleet safety until migration 072 dropped it); what
 is forbidden is deciding eligibility from any such aggregate.
 
 #r("store.gc.chunk-collect")[
