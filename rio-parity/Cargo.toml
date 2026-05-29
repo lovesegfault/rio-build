@@ -28,6 +28,9 @@ rio-nix = { workspace = true }
 rio-proto = { workspace = true }
 
 anyhow = { workspace = true }
+# Streaming NAR decompression (zstd/xz/bzip2/gzip/brotli) for the
+# substituter client's relay fetches.
+async-compression = { workspace = true }
 async-trait = { workspace = true }
 aws-config = { workspace = true }
 aws-sdk-s3 = { workspace = true }
@@ -43,7 +46,9 @@ hex = { workspace = true }
 # workspace-hack.
 jiff = { workspace = true, features = ["serde"] }
 regex = { workspace = true }
-reqwest = { workspace = true }
+# `stream` for bytes_stream() on NAR fetch responses — the substituter
+# client streams large NARs instead of buffering whole bodies.
+reqwest = { workspace = true, features = ["stream"] }
 # In-process SSH client for the gateway worker-protocol transport
 # (run::transport's GatewayPool / DaemonChannel).
 russh = { workspace = true }
@@ -51,6 +56,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tokio = { workspace = true }
+# StreamReader: adapts the reqwest byte stream into the AsyncRead the
+# substituter's streaming NAR decoder consumes.
+tokio-util = { workspace = true }
 tonic = { workspace = true }
 tracing = { workspace = true }
 uuid = { workspace = true }

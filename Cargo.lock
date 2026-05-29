@@ -6372,6 +6372,7 @@ name = "rio-parity"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-compression",
  "async-trait",
  "aws-config",
  "aws-sdk-s3",
@@ -6396,6 +6397,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
+ "tokio-util",
  "tonic",
  "tracing",
  "uuid",

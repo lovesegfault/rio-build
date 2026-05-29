@@ -979,6 +979,11 @@
       "path": "s3.rs",
       "depth": 0,
       "doc": "Recorder-facing S3 layer: archive publication plus the by-recipe pointer."
+    },
+    {
+      "path": "substituter.rs",
+      "depth": 0,
+      "doc": "Binary-cache (substituter) client — narinfo probing and NAR fetching"
     }
   ],
   "rio-proto": [

@@ -20220,6 +20220,10 @@
           "packageId": "anyhow"
         },
         {
+          "name": "async-compression",
+          "packageId": "async-compression"
+        },
+        {
           "name": "async-trait",
           "packageId": "async-trait"
         },
@@ -20294,6 +20298,10 @@
         {
           "name": "tokio",
           "packageId": "tokio"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
         },
         {
           "name": "tonic",

@@ -11,6 +11,7 @@ pub mod hydra;
 pub mod nixcache;
 pub mod run;
 pub mod s3;
+pub mod substituter;
 
 /// Canonical public repository URL, embedded in [`user_agent`].
 ///
