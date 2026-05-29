@@ -961,6 +961,11 @@
       "doc": "Batch submission to the rio gateway."
     },
     {
+      "path": "run/supply.rs",
+      "depth": 1,
+      "doc": "Supply planning — what the target must build vs what the campaign"
+    },
+    {
       "path": "run/transport.rs",
       "depth": 1,
       "doc": "In-process SSH transport for the gateway's nix-daemon worker protocol."

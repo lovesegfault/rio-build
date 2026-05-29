@@ -34,6 +34,7 @@ pub mod state;
 pub mod stderrparse;
 pub mod submit;
 pub mod submitter;
+pub mod supply;
 pub mod transport;
 pub mod warm;
 pub mod watchdog;
