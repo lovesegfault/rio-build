@@ -5008,3 +5008,111 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
     );
     Ok(())
 }
+
+/// The §6.3 attested input closure (`WorkAssignment.input_closure` /
+/// `AssignmentClaims.input_closure_digest`) must never be silently
+/// NARROWER than the build's true input closure. The builder uses it
+/// as the reference-scan candidate set and cannot widen it (the store
+/// checks the digest), so a missing path means the uploaded narinfo
+/// silently drops references — GC can then collect still-referenced
+/// paths and substituted closures come back incomplete.
+///
+/// Recovery is the degraded case: `from_recovery_row` clears
+/// `drv_content`/`input_srcs` and `load_edges_for_derivations` drops
+/// edges to children that completed BEFORE the restart, so a seed set
+/// built from in-memory DAG state alone omits those inputs while still
+/// being non-empty (the post-restart child contributes its output).
+///
+/// Scenario: parent ← {d1, d2}, d2 ← d1. d1 completes pre-restart;
+/// d2 completes post-restart; parent dispatches post-restart. The
+/// assignment's `input_closure` must either contain d1's output or be
+/// empty (explicit "no attestation" — the builder then computes its
+/// own drv-parsed closure, which is complete by construction). A
+/// non-empty closure that omits d1's output is the silent-narrowing
+/// bug this test pins down.
+// r[verify sched.dispatch.input-roots+2]
+#[tokio::test]
+async fn test_recovery_never_attests_partial_input_closure() -> TestResult {
+    let build_id = Uuid::new_v4();
+    let d1_out = test_store_path("recattest-d1-out");
+    let d2_out = test_store_path("recattest-d2-out");
+
+    let f = RecoveryFixture::run(async |handle, _| {
+        // One worker; d1 is the only initially-Ready leaf (d2 depends
+        // on it), so the pre-restart completion is deterministic.
+        let mut rx = connect_executor(&handle, "recattest-w-pre", "x86_64-linux").await?;
+
+        // Recomputed locally (deterministic) so the async closure does
+        // not borrow from the enclosing test frame.
+        let d1_out = test_store_path("recattest-d1-out");
+        let d2_out = test_store_path("recattest-d2-out");
+        let mut d1 = make_node("recattest-d1");
+        d1.expected_output_paths = vec![d1_out.clone()];
+        let mut d2 = make_node("recattest-d2");
+        d2.expected_output_paths = vec![d2_out.clone()];
+        let parent = make_node("recattest-parent");
+        let _ev = merge_dag(
+            &handle,
+            build_id,
+            vec![d1, d2, parent],
+            vec![
+                make_test_edge("recattest-parent", "recattest-d1"),
+                make_test_edge("recattest-parent", "recattest-d2"),
+                make_test_edge("recattest-d2", "recattest-d1"),
+            ],
+            false,
+        )
+        .await?;
+
+        // d1 dispatches and completes BEFORE the restart. Its PG row
+        // goes terminal, so recovery will not load it into the DAG.
+        let a1 = recv_assignment(&mut rx).await;
+        assert!(a1.drv_path.contains("recattest-d1"), "d1 dispatches first");
+        complete_success(&handle, "recattest-w-pre", "recattest-d1", &d1_out).await?;
+        // The pre-restart worker is one-shot (draining after its
+        // completion), so d2 stays Ready in PG across the restart.
+        barrier(&handle).await;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // d2 recovered as Ready (its only dep, d1, is terminal in PG).
+    assert_eq!(
+        expect_drv(&handle, "recattest-d2").await.status,
+        DerivationStatus::Ready,
+        "fixture premise: d2 recovers as Ready"
+    );
+
+    // Complete d2 post-restart so the parent becomes Ready.
+    let mut rx = connect_executor(&handle, "recattest-w-d2", "x86_64-linux").await?;
+    let a2 = recv_assignment(&mut rx).await;
+    assert!(
+        a2.drv_path.contains("recattest-d2"),
+        "d2 dispatches after recovery"
+    );
+    complete_success(&handle, "recattest-w-d2", "recattest-d2", &d2_out).await?;
+
+    // Parent dispatches to a fresh worker (the d2 worker is one-shot).
+    let mut rx = connect_executor(&handle, "recattest-w-parent", "x86_64-linux").await?;
+    let asgn = recv_assignment(&mut rx).await;
+    assert!(
+        asgn.drv_path.contains("recattest-parent"),
+        "parent dispatches last"
+    );
+
+    // The invariant: never silently narrower. Empty = explicit
+    // fallback (builder computes its own closure) and is fine; a
+    // non-empty attested closure MUST contain the pre-restart-completed
+    // child's output even though that child is no longer in the DAG.
+    if !asgn.input_closure.is_empty() {
+        assert!(
+            asgn.input_closure.contains(&d1_out),
+            "attested input_closure silently dropped the pre-restart-completed \
+             child's output {d1_out}: {:?}",
+            asgn.input_closure
+        );
+    }
+
+    Ok(())
+}
