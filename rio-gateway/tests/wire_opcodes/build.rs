@@ -671,7 +671,7 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
-    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    // No .drv uploaded — resolve_derivation fails, single-node fallback.
     let drv_path = "/nix/store/00000000000000000000000000000005-inline-fod.drv";
 
     // The declared path must be the one the declared hash derives to —
@@ -684,6 +684,10 @@ async fn test_build_derivation_inline_fod_unresolvable_accepted() -> anyhow::Res
         rio_nix::store_path::StorePath::make_fixed_output("inline-fod", &nix_hash, false, &[])?
             .as_str()
             .to_owned();
+    // The produced output must be present in the store for the post-build
+    // result verification (gw.opcode.build-results-honest); the .drv stays
+    // absent so the single-node fallback path is still what's exercised.
+    h.store.seed_with_content(&honest_path, b"fod-out");
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -765,8 +769,35 @@ async fn test_build_derivation_inline_floating_ca_unresolvable_inlines_content()
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
-    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    // No .drv uploaded — resolve_derivation fails, single-node fallback.
     let drv_path = "/nix/store/0000000000000000000000000000000g-inline-ca.drv";
+
+    // Post-build verification (gw.opcode.build-results-honest) resolves the
+    // floating-CA output through the realisations table and then requires
+    // the realised path to be present in the store — model the scheduler
+    // having built and registered it. The realisation key is the modular
+    // hash over the inline derivation (same construction as the
+    // fallback-returns-built-outputs test below).
+    let aterm = r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","")])"#;
+    let drv = rio_nix::derivation::Derivation::parse(aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/66666666666666666666666666666666-inline-ca-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+    h.store.seed_with_content(realised_out, b"inline-ca-out");
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -826,7 +857,7 @@ async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
-    // Store stays EMPTY — resolve_derivation fails, fallback path. The
+    // No .drv uploaded — resolve_derivation fails, fallback path. The
     // realisation key is the modular hash over the *inline* derivation
     // (equal to hashing the same ATerm: it has no inputDrvs).
     let drv_path = "/nix/store/0000000000000000000000000000000h-fallback-ca.drv";
@@ -849,6 +880,9 @@ async fn test_build_derivation_inline_floating_ca_fallback_returns_built_outputs
             signatures: vec![],
         },
     );
+    // The realised output must also be PRESENT in the store — the gateway
+    // verifies it via FindMissingPaths before reporting success.
+    h.store.seed_with_content(realised_out, b"fallback-ca-out");
 
     wire_send!(&mut h.stream;
         u64: 36,
@@ -961,11 +995,38 @@ async fn test_build_derivation_inline_fallback_midsize_accepted() -> anyhow::Res
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
-    // Store is EMPTY — single-node fallback path.
+    // No .drv uploaded — single-node fallback path.
     let drv_path = "/nix/store/0000000000000000000000000000000m-inline-mid.drv";
     // ~320 KiB env value: above the old 256 KiB scheduler bound, well
     // under the 1 MiB fallback cap.
     let mid_env = "x".repeat(320 * 1024);
+
+    // Post-build verification (gw.opcode.build-results-honest) needs the
+    // floating-CA output realised and the realised path present in the
+    // store; the realisation key is the modular hash over the inline
+    // derivation exactly as the gateway computes it.
+    let aterm = format!(
+        r#"Derive([("out","","r:sha256","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("big","{mid_env}")])"#
+    );
+    let drv = rio_nix::derivation::Derivation::parse(&aterm)?;
+    let hash = rio_nix::derivation::hash_derivation_modulo(
+        &drv,
+        drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )?;
+    let realised_out = "/nix/store/55555555555555555555555555555555-inline-mid-out";
+    h.store.state.realisations.write().unwrap().insert(
+        (hash.to_vec(), "out".into()),
+        rio_proto::types::Realisation {
+            drv_hash: hash.to_vec(),
+            output_name: "out".into(),
+            output_path: realised_out.into(),
+            output_hash: vec![0u8; 32],
+            signatures: vec![],
+        },
+    );
+    h.store.seed_with_content(realised_out, b"inline-mid-out");
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -1489,6 +1550,16 @@ async fn test_build_paths_md5_fod_substitutable_submitted() -> anyhow::Result<()
         .write()
         .unwrap()
         .push("/nix/store/ffffffffffffffffffffffffffffffff-fetched".to_string());
+    // After the scheduler's substitute lane completes the build the fetched
+    // output IS in the store, so promote the substitutable path to present
+    // once the exemption probe (the first FindMissingPaths call) has seen
+    // it as missing-but-substitutable — the post-build result verification
+    // (gw.opcode.build-results-honest) then sees what a real store would
+    // contain.
+    h.store
+        .state
+        .promote_substitutable_after_fmp
+        .store(1, std::sync::atomic::Ordering::SeqCst);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -3662,29 +3733,36 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
 // cover exactly the wanted outputs, and a target whose outputs ARE present
 // is not blanket-failed by an unrelated failure elsewhere in the batch.
 //
-// Fixtures use REALISTIC (parseable) output store paths — unlike
-// TEST_DRV_ATERM's `/nix/store/zzz-output`, which is not a valid store path
-// and therefore cannot be asked of the store at all (verification defers to
-// the scheduler outcome for such paths, which is what keeps the older tests
+// Fixtures use REALISTIC output store paths — parseable AND derivable:
+// the declared paths are exactly what each ATerm derives to via
+// `input_addressed_output_paths`, because the gateway's IA output-path
+// binding gate rejects submissions whose declared paths don't match the
+// derivation before the store verification is ever reached. (Recompute the
+// paths with `input_addressed_output_paths` if an ATerm's
+// system/builder/args/env ever changes.) This is unlike TEST_DRV_ATERM's
+// `/nix/store/zzz-output`, which is not a valid store path and therefore
+// cannot be asked of the store at all (verification defers to the
+// scheduler outcome for such paths, which is what keeps the older tests
 // above byte-for-byte unchanged).
 
 use rio_nix::protocol::build::{BuildResult, BuildStatus, read_build_result};
 use rio_nix::protocol::handshake::PROTOCOL_VERSION;
 
-/// Single-output IA derivation "honest-a" with a parseable output path.
-const HONEST_A_OUT: &str = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out";
+/// Single-output IA derivation "honest-a"; declared path == derived path.
+const HONEST_A_OUT: &str = "/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a";
 const HONEST_A_DRV: &str = "/nix/store/00000000000000000000000000000111-honest-a.drv";
-const HONEST_A_ATERM: &str = r#"Derive([("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo a"],[("out","/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-honest-a-out")])"#;
+const HONEST_A_ATERM: &str = r#"Derive([("out","/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo a"],[("out","/nix/store/w98s7msla41laac5m7d91f0gb8g87gdi-honest-a")])"#;
 
-/// Single-output IA derivation "honest-b" with a parseable output path.
-const HONEST_B_OUT: &str = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out";
+/// Single-output IA derivation "honest-b"; declared path == derived path.
+const HONEST_B_OUT: &str = "/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b";
 const HONEST_B_DRV: &str = "/nix/store/00000000000000000000000000000222-honest-b.drv";
-const HONEST_B_ATERM: &str = r#"Derive([("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-honest-b-out")])"#;
+const HONEST_B_ATERM: &str = r#"Derive([("out","/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo b"],[("out","/nix/store/65gi8gfmx546lr7jdxyxj066nm6hgdab-honest-b")])"#;
 
-/// Two-output (dev, out) IA derivation for the wanted-only builtOutputs test.
-const MULTI_OUT: &str = "/nix/store/ffffffffffffffffffffffffffffffff-multi-out";
+/// Two-output (dev, out) IA derivation for the wanted-only builtOutputs
+/// test; declared paths == derived paths.
+const MULTI_OUT: &str = "/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi";
 const MULTI_DRV: &str = "/nix/store/00000000000000000000000000000333-multi.drv";
-const MULTI_ATERM: &str = r#"Derive([("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev","",""),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("dev","/nix/store/dddddddddddddddddddddddddddddddd-multi-dev"),("out","/nix/store/ffffffffffffffffffffffffffffffff-multi-out")])"#;
+const MULTI_ATERM: &str = r#"Derive([("dev","/nix/store/0wkcfl7grhnj4mnxwcfbcgfvvqzg67vg-multi-dev","",""),("out","/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("dev","/nix/store/0wkcfl7grhnj4mnxwcfbcgfvvqzg67vg-multi-dev"),("out","/nix/store/wgv1r5kbp8njwab846hzhsik8l4mj1ln-multi")])"#;
 
 /// Floating-CA derivation (declared output path empty) for the
 /// no-realisation case.
