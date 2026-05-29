@@ -1194,6 +1194,86 @@ impl DagActor {
             }
         }
 
+        // ADR-022 castore-FUSE (P0588): resolve the transitive input
+        // closure + castore root nodes. On PG failure or timeout we
+        // send empty input_roots and the builder falls back to
+        // QueryPathInfo BFS. Timeout-bounded like every other
+        // actor-blocking PG await on this path (I-139): a slow
+        // recursive CTE must not stall the mailbox.
+        //
+        // Seeds come from `attested_input_seeds` (the parsed drv's
+        // exact direct inputs), NOT `approx_input_closure`: this
+        // closure is signed into the assignment token (P0589) and is
+        // the builder's refscan candidate set, so it must never be
+        // narrower than the true input closure. `None` (recovered
+        // node without drv_content, .drv not inlined, or an inputDrv
+        // whose outputs aren't known) → no attestation; the builder
+        // computes its own drv-parsed closure — the same degradation
+        // as the PG-failure arms below.
+        //
+        // Build-only: a Materialization pull has no .drv to refscan
+        // (the worker materialises an already-built closure), so the
+        // attested closure is structurally empty there → the
+        // empty-digest "no attestation" sentinel that validate_begin
+        // (P0586) already treats as scheduler-couldn't-compute.
+        // r[impl sched.dispatch.input-roots+2]
+        let (input_root_rows, input_closure, input_closure_digest) = match attempt_kind {
+            rio_evidence_kernel::pull::PullKind::Build => {
+                let input_root_rows =
+                    match crate::assignment::attested_input_seeds(&self.dag, drv_hash) {
+                        None => {
+                            debug!(drv_hash = %drv_hash,
+                                   "input closure not attestable from scheduler state; \
+                                    builder falls back to its own drv-parsed closure");
+                            Vec::new()
+                        }
+                        Some(seeds) if seeds.is_empty() => Vec::new(),
+                        Some(seeds) => {
+                            match tokio::time::timeout(
+                                self.grpc_timeout,
+                                self.db.compute_input_roots(&seeds),
+                            )
+                            .await
+                            {
+                                Ok(Ok(rows)) => rows,
+                                Ok(Err(e)) => {
+                                    warn!(drv_hash = %drv_hash, error = %e,
+                                          "input_roots closure compute failed; \
+                                           builder falls back to QueryPathInfo BFS");
+                                    Vec::new()
+                                }
+                                Err(_) => {
+                                    warn!(drv_hash = %drv_hash, timeout = ?self.grpc_timeout,
+                                          "input_roots closure compute timed out; \
+                                           builder falls back to QueryPathInfo BFS");
+                                    Vec::new()
+                                }
+                            }
+                        }
+                    };
+                // Cloned once: reused for digest and WorkAssignment.input_closure.
+                let input_closure: Vec<String> = input_root_rows
+                    .iter()
+                    .map(|r| r.store_path.clone())
+                    .collect();
+                // Wire-compat: a non-empty digest is serialized in the token;
+                // a pre-P0589 store rejects it on deny_unknown_fields. The
+                // store fleet must roll before the scheduler singleton (or
+                // wipe deploy) — see r[common.hmac.claims].
+                let input_closure_digest = if input_closure.is_empty() {
+                    // Empty = no attestation. validate_begin (P0586) treats it
+                    // as "scheduler couldn't compute", not "closure was empty".
+                    String::new()
+                } else {
+                    rio_auth::hmac::AssignmentClaims::digest_input_closure(&input_closure)
+                };
+                (input_root_rows, input_closure, input_closure_digest)
+            }
+            rio_evidence_kernel::pull::PullKind::Materialization => {
+                (Vec::new(), Vec::new(), String::new())
+            }
+        };
+
         let state = self.dag.node(drv_hash)?;
         let build_opts = self.build_options_for_derivation(drv_hash);
 
@@ -1267,6 +1347,7 @@ impl DagActor {
                 // safe to set unconditionally since fb096e50f's `skip_serializing_if`
                 // + `#[serde(default)]` cover both rolling-upgrade skew directions.
                 tenant: state.attributed_tenant(&self.builds).map(|u| u.to_string()),
+                input_closure_digest,
             })
         } else {
             // Legacy unsigned: format-string. Store with
@@ -1322,6 +1403,28 @@ impl DagActor {
             job_id: materialization_job
                 .map(|u| u.to_string())
                 .unwrap_or_default(),
+            input_closure,
+            input_roots: input_root_rows
+                .into_iter()
+                .map(|r| {
+                    // Corrupt RootNode blob → treat as unindexed and log.
+                    // Indexer/scheduler encoding skew would otherwise
+                    // surface only as the builder always GetNarIndex'ing.
+                    let root_node = r.root_node.and_then(|bytes| {
+                        prost::Message::decode(bytes.as_slice())
+                            .map_err(|e| {
+                                warn!(store_path = %r.store_path, error = %e,
+                                      "corrupt nar_index.root_node; \
+                                       sending without root");
+                            })
+                            .ok()
+                    });
+                    rio_proto::types::InputRoot {
+                        store_path: r.store_path,
+                        root_node,
+                    }
+                })
+                .collect(),
         })
     }
 
@@ -1531,7 +1634,6 @@ impl DagActor {
             &drv_path,
             FETCH_TIMEOUT,
             MAX_DRV_NAR_SIZE,
-            None,
             &[],
         )
         .await;

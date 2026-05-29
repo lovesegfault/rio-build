@@ -49,6 +49,8 @@ fn sign_claims_tenant(
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
         is_ca,
         tenant: tenant.map(String::from),
+        role: rio_auth::hmac::TokenRole::Builder,
+        input_closure_digest: String::new(),
     };
     HmacSigner::from_key(TEST_KEY.to_vec()).sign(&claims)
 }
@@ -258,6 +260,8 @@ async fn hmac_wrong_key_signed_rejected() -> TestResult {
         expiry_unix: now_unix() + 60,
         is_ca: false,
         tenant: None,
+        role: rio_auth::hmac::TokenRole::Builder,
+        input_closure_digest: String::new(),
     };
     let bad_token = HmacSigner::from_key(wrong_key.to_vec()).sign(&claims);
 

@@ -284,6 +284,62 @@ async fn test_pin_unpin_live_inputs_lifecycle() -> TestResult {
     Ok(())
 }
 
+/// Normal-path attestation: a parent whose `.drv` was inlined at merge
+/// gets a non-empty `WorkAssignment.input_closure` derived from its
+/// parsed direct inputs — the completed child's realized output AND
+/// the drv's `inputSrcs` entry. Guards the positive half of the
+/// attested-closure rule (the recovery test in `recovery.rs` covers
+/// the degraded half: no attestation rather than a narrower one).
+// r[verify sched.dispatch.input-roots+2]
+#[tokio::test]
+async fn test_dispatch_attests_input_closure_from_parsed_drv() -> TestResult {
+    let (_db, handle, _task, mut rx) = setup_with_worker("attest-w1", "x86_64-linux").await?;
+
+    let child_drv_path = test_drv_path("attest-child");
+    let child_out = test_store_path("attest-child-out");
+    let src = test_store_path("attest-src");
+    let parent_out = test_store_path("attest-parent-out");
+
+    let mut child = make_node("attest-child");
+    child.expected_output_paths = vec![child_out.clone()];
+    let mut parent = make_node("attest-parent");
+    parent.drv_content = format!(
+        r#"Derive([("out","{parent_out}","","")],[("{child_drv_path}",["out"])],["{src}"],"x86_64-linux","/bin/sh",[],[("out","{parent_out}")])"#
+    )
+    .into_bytes();
+
+    let _ev = merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![child, parent],
+        vec![make_test_edge("attest-parent", "attest-child")],
+        false,
+    )
+    .await?;
+
+    // Child (leaf) dispatches first; complete it with a realized path.
+    let a1 = recv_assignment(&mut rx).await;
+    assert!(a1.drv_path.contains("attest-child"), "child first: {a1:?}");
+    complete_success(&handle, "attest-w1", "attest-child", &child_out).await?;
+
+    // Parent dispatches to a fresh worker (executors are one-shot).
+    let mut rx2 = connect_executor(&handle, "attest-w2", "x86_64-linux").await?;
+    let a2 = recv_assignment(&mut rx2).await;
+    assert!(a2.drv_path.contains("attest-parent"), "parent: {a2:?}");
+
+    assert!(
+        a2.input_closure.contains(&child_out),
+        "attested closure must contain the child's realized output: {:?}",
+        a2.input_closure
+    );
+    assert!(
+        a2.input_closure.contains(&src),
+        "attested closure must contain the drv's inputSrcs entry: {:?}",
+        a2.input_closure
+    );
+    Ok(())
+}
+
 // -----------------------------------------------------------------------------
 // CA recovery-resolve: fetch ATerm from store when drv_content empty
 // -----------------------------------------------------------------------------

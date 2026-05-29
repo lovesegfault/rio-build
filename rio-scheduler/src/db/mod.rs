@@ -23,6 +23,7 @@ pub(crate) mod attempts;
 mod batch;
 mod builds;
 pub(crate) use builds::BuildTerminalRow;
+mod closure;
 pub(crate) mod confirm_fences;
 mod derivations;
 pub(crate) use derivations::{ReplayResidual, StatusReplay};
@@ -38,6 +39,8 @@ pub(crate) mod wanted;
 
 #[cfg(test)]
 mod tests;
+
+pub use closure::InputRootRow;
 
 pub use history::{BuildSampleRow, SlaOverrideRow};
 

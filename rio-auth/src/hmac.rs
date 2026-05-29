@@ -150,6 +150,44 @@ pub struct AssignmentClaims {
     /// upgrade of this struct.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// What the holder may do. Scheduler sets `Builder`; the store
+    /// gates `PutPath` and `Begin` on it (ADR-022 §6.3). The gateway
+    /// uses [`ServiceClaims`] instead.
+    ///
+    /// Wire-compat (bug_011): `default` makes a missing key parse as
+    /// `Builder`; `skip_serializing_if` keeps a default-valued token
+    /// byte-identical to the pre-P0589 shape so an unrolled store's
+    /// `deny_unknown_fields` still accepts it.
+    #[serde(default, skip_serializing_if = "TokenRole::is_default")]
+    pub role: TokenRole,
+    /// `blake3(sorted(input_closure).join("\n"))` over the closure the
+    /// scheduler computed at dispatch (`WorkAssignment.input_closure`).
+    /// The store's `Begin` handler recomputes from the builder's echoed
+    /// closure and compares: an attestation that the closure the
+    /// refscan validates against is the one the builder was given.
+    ///
+    /// Hex so the JSON body stays readable. Empty = no attestation
+    /// (scheduler couldn't compute the closure; refscan falls back).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub input_closure_digest: String,
+}
+
+impl AssignmentClaims {
+    /// `blake3(closure.join("\n"))` as lowercase hex. `closure` must
+    /// already be sorted (both producers emit sorted output).
+    ///
+    /// One definition shared by the scheduler (sign) and the store
+    /// (verify); drift here is a silent attestation bypass.
+    pub fn digest_input_closure(closure: &[String]) -> String {
+        let mut hasher = blake3::Hasher::new();
+        for (i, p) in closure.iter().enumerate() {
+            if i > 0 {
+                hasher.update(b"\n");
+            }
+            hasher.update(p.as_bytes());
+        }
+        hasher.finalize().to_hex().to_string()
+    }
 }
 
 impl HmacClaims for AssignmentClaims {
@@ -158,6 +196,28 @@ impl HmacClaims for AssignmentClaims {
     }
     fn set_expiry_unix(&mut self, expiry_unix: u64) {
         self.expiry_unix = expiry_unix;
+    }
+}
+
+/// What an [`AssignmentClaims`] token authorizes its holder to do.
+///
+/// Today every assignment token is `Builder`; the enum exists so the
+/// store's `PutPath` and `Begin` gates have something to check. Closed
+/// (no `#[non_exhaustive]`) so the gates can't grow `_ =>` arms.
+// r[impl common.hmac.claims]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TokenRole {
+    /// Dispatched build assignment. May `PutPath` its
+    /// `expected_outputs`, `Begin`/refscan, read its `input_closure`.
+    #[default]
+    Builder,
+}
+
+impl TokenRole {
+    /// `skip_serializing_if` predicate (serde wants a path, not an
+    /// inline expr). Wire-compat rationale on the `role` field above.
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
@@ -679,7 +739,92 @@ mod tests {
             is_ca: false,
             expiry_unix: (now as i64 + expiry_offset_secs).max(0) as u64,
             tenant: None,
+            role: TokenRole::Builder,
+            input_closure_digest: String::new(),
         }
+    }
+
+    /// Pre-P0589 tokens lack `role` / `input_closure_digest`. They
+    /// must still parse: missing keys default, no rejection. The
+    /// converse — defaulted fields are NOT serialized — keeps the
+    /// wire body byte-identical to the pre-P0589 shape so a defaulted
+    /// new token also passes a pre-P0589 store's `deny_unknown_fields`.
+    // r[verify common.hmac.claims]
+    #[test]
+    fn old_token_without_p0589_fields_parses() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let claims = test_claims(3600);
+        let token = signer.sign(&claims);
+
+        // Default-valued role/digest/tenant must be elided so a
+        // pre-P0589 deny_unknown_fields store still parses the body.
+        let json: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(token.split('.').next().unwrap())
+                .unwrap(),
+        )
+        .unwrap();
+        let obj = json.as_object().unwrap();
+        for absent in ["role", "input_closure_digest", "tenant"] {
+            assert!(
+                !obj.contains_key(absent),
+                "{absent}: default-valued field must be elided from wire body"
+            );
+        }
+        assert_eq!(obj.len(), 5, "exactly the five pre-P0589 keys remain");
+
+        // Old token (pre-P0589 field set) → new store still parses.
+        let old_json = serde_json::json!({
+            "executor_id": "test-builder",
+            "drv_hash": "abc123",
+            "expected_outputs": ["/nix/store/aaa-hello"],
+            "is_ca": false,
+            "expiry_unix": claims.expiry_unix,
+        });
+        let old_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(&old_json).unwrap());
+        // Re-sign over the old claims body: HmacVerifier hashes the
+        // raw claims bytes, so we can't reuse the original signature.
+        let mut mac = HmacSha256::new_from_slice(TEST_KEY).unwrap();
+        mac.update(serde_json::to_vec(&old_json).unwrap().as_slice());
+        let old_sig =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        let parsed = verifier
+            .verify::<AssignmentClaims>(&format!("{old_b64}.{old_sig}"))
+            .expect("pre-P0589 token must still parse");
+        assert_eq!(parsed.role, TokenRole::Builder);
+        assert!(parsed.input_closure_digest.is_empty());
+        assert!(parsed.tenant.is_none());
+    }
+
+    /// `digest_input_closure` is order-sensitive over its newline-join
+    /// — the spec says "sorted closure" because the scheduler and the
+    /// store must produce the same bytes from the same set.
+    // r[verify common.hmac.claims]
+    #[test]
+    fn closure_digest_deterministic_and_order_sensitive() {
+        let a = vec![
+            "/nix/store/aaa-foo".to_string(),
+            "/nix/store/bbb-bar".to_string(),
+        ];
+        let b = vec![
+            "/nix/store/bbb-bar".to_string(),
+            "/nix/store/aaa-foo".to_string(),
+        ];
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&a),
+            AssignmentClaims::digest_input_closure(&a),
+        );
+        assert_ne!(
+            AssignmentClaims::digest_input_closure(&a),
+            AssignmentClaims::digest_input_closure(&b),
+        );
+        // Empty closure → digest of empty input, NOT "".
+        assert_eq!(
+            AssignmentClaims::digest_input_closure(&[]),
+            blake3::hash(b"").to_hex().to_string(),
+        );
     }
 
     #[test]

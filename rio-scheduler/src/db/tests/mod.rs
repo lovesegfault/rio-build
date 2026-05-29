@@ -13,6 +13,7 @@ mod assignments;
 mod attempts;
 mod batch;
 mod builds;
+mod closure;
 mod confirm_fences;
 mod derivations;
 mod fence_coverage;
