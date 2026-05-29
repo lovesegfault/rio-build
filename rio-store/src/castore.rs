@@ -9,15 +9,24 @@ use prost::Message;
 use rio_nix::nar::{NarEntryKind, NarLsEntry};
 use rio_proto::castore::{Directory, DirectoryEntry, FileEntry, RootNode, SymlinkEntry, root_node};
 
-/// Output of [`build`]: directory DAG state for `set_nar_index`.
+/// Output of [`build`]: directory DAG state for `set_nar_index_in_conn`.
 pub struct DirectoryDag {
     /// Distinct `(dir_digest, encoded Directory body)`, sorted so the
     /// UPSERT and GC decrement take row locks in the same order
     /// (`r[store.chunk.lock-order]`).
     pub directories: Vec<([u8; 32], Vec<u8>)>,
-    /// Distinct `(file_digest, nar_offset, size)`, digest-sorted.
+    /// Distinct `(file_digest, blob_offset, size)`, digest-sorted.
     /// First occurrence's offset wins; size is content-derived so
     /// duplicates always agree.
+    ///
+    /// `blob_offset` is the file's offset in the **blob stream** — the
+    /// concatenation of every regular file's contents in NAR walk
+    /// order — NOT its offset in the NAR byte stream. The blob stream
+    /// is what a version-2 `manifest_data.chunk_list` reassembles to
+    /// (per-file chunks, no framing), so the `StatBlob`/`ReadBlob`
+    /// cumsum over chunk sizes maps these offsets to exact chunk
+    /// windows. Persisted in the `file_blobs.nar_offset` column (the
+    /// column name predates the ADR-022 §6 format change).
     pub file_blobs: Vec<([u8; 32], u64, u64)>,
     /// Encoded [`RootNode`] for `nar_index.root_node`.
     pub root_node: Vec<u8>,
@@ -120,13 +129,19 @@ pub fn build(entries: &[NarLsEntry]) -> DirectoryDag {
         Vec::new()
     };
 
-    // Distinct file_digest → (nar_offset, size), first occurrence wins.
+    // Distinct file_digest → (blob_offset, size), first occurrence
+    // wins. The blob offset is the running total of every preceding
+    // regular file's size in walk order — entries are DFS pre-order,
+    // which is exactly the order the per-file chunk runs appear in a
+    // version-2 manifest.
     let mut file_blobs_map: HashMap<[u8; 32], (u64, u64)> = HashMap::new();
+    let mut blob_offset: u64 = 0;
     for e in entries {
         if e.kind == NarEntryKind::Regular {
             file_blobs_map
                 .entry(e.file_digest)
-                .or_insert((e.nar_offset, e.size));
+                .or_insert((blob_offset, e.size));
+            blob_offset += e.size;
         }
     }
 
@@ -236,6 +251,15 @@ mod tests {
         };
         let inner_bytes = inner.encode_to_vec();
         let inner_digest = *blake3::hash(&inner_bytes).as_bytes();
+        // The shared digest helper (what the builder-side walk and the
+        // PutPathChunked validator both call) MUST agree with the
+        // bottom-up pass's inline computation — a split here is a
+        // silent dedup-namespace split between builder-uploaded and
+        // store-indexed paths.
+        assert_eq!(
+            rio_proto::castore_util::directory_digest(&inner),
+            inner_digest
+        );
 
         // Outer (root) has dir `b`, file `a`, symlink `c` — in that
         // proto-field order, names sorted within each list.
@@ -316,8 +340,10 @@ mod tests {
         // 1 distinct file content.
         assert_eq!(dag.file_blobs.len(), 1);
         assert_eq!(dag.file_blobs[0].0, [9u8; 32]);
-        // First occurrence's offset retained, size carried through.
-        assert_eq!(dag.file_blobs[0].1, 100);
+        // First occurrence's BLOB offset retained (a/x is the first
+        // regular file in walk order → offset 0), size carried through.
+        // b/x's occurrence (blob offset 4) loses the or_insert race.
+        assert_eq!(dag.file_blobs[0].1, 0);
         assert_eq!(dag.file_blobs[0].2, 4);
     }
 
@@ -329,7 +355,9 @@ mod tests {
         let dag = build(&entries);
         assert!(dag.directories.is_empty());
         assert!(dag.root_digest.is_empty());
-        assert_eq!(dag.file_blobs, vec![([3u8; 32], 96, 7)]);
+        // Blob offset 0 — the root file is the only (and first) regular
+        // file regardless of where its contents sat in the NAR.
+        assert_eq!(dag.file_blobs, vec![([3u8; 32], 0, 7)]);
         let rn = RootNode::decode(dag.root_node.as_slice()).unwrap();
         match rn.node.unwrap() {
             root_node::Node::File(f) => {

@@ -20,7 +20,10 @@ use tracing::{debug, instrument, warn};
 
 use rio_proto::validated::ValidatedPathInfo;
 
+use rio_nix::nar::{NarEntryKind, NarLsEntry, nar_ls};
+
 use crate::backend::ChunkBackend;
+use crate::castore::DirectoryDag;
 use crate::chunker;
 use crate::manifest::{self, Manifest, ManifestEntry};
 use crate::metadata;
@@ -125,6 +128,98 @@ pub(crate) async fn heartbeat_uploading(pool: &PgPool, store_path_hash: &[u8], c
     .await;
 }
 
+/// The castore representation of a NAR, derived once at ingest and
+/// threaded through to the manifest-complete transaction.
+///
+/// ADR-022 §6 stores every path as a Directory DAG plus the **blob
+/// stream** (regular-file contents in canonical NAR walk order); the
+/// NAR framing is regenerated from the DAG on read. The DAG cannot be
+/// derived from blob-aligned chunks after the fact (the framing is
+/// gone), so it MUST be computed here, while the original NAR bytes
+/// are in hand, and written in the same transaction that makes the
+/// manifest visible.
+pub struct ParsedNar {
+    /// `nar_ls` output: one entry per node in DFS pre-order. Regular
+    /// entries carry the content range within the source NAR
+    /// (`nar_offset..nar_offset+size`) the per-file chunker and the
+    /// blob-stream extraction slice on.
+    pub entries: Vec<NarLsEntry>,
+    /// The Directory DAG (`castore::build` output): distinct bodies,
+    /// blob-offset file map, encoded root node.
+    pub dag: DirectoryDag,
+    /// The encoded `rio.types.NarIndex` for the `nar_index.entries`
+    /// column.
+    pub encoded_entries: Vec<u8>,
+}
+
+impl ParsedNar {
+    /// Parse + index a whole NAR. CPU-bound (BLAKE3 over every file's
+    /// contents + a prost encode per directory) — call under
+    /// `cpu_bound`.
+    ///
+    /// Fails on a structurally invalid NAR (unsorted entries, bad
+    /// names, truncation, whole-archive bounds) — `nar_ls` is the
+    /// structural validator the ingest path already relied on
+    /// implicitly via the NAR's SHA-256; now it gates ingest
+    /// explicitly. Input the parser does not consume entirely is also
+    /// rejected: the claimed nar_hash/nar_size cover every received
+    /// byte, but only the canonical content reachable from the root
+    /// node is persisted, so trailing junk would commit a path whose
+    /// regenerated NAR can never hash back to its narinfo — DATA_LOSS
+    /// on every GetPath, with the corrective re-upload idempotently
+    /// skipped as AlreadyComplete.
+    // r[impl store.ingest.tree-bounds+2]
+    pub fn parse(nar_data: &[u8]) -> anyhow::Result<Self> {
+        let mut cursor = std::io::Cursor::new(nar_data);
+        let entries = nar_ls(&mut cursor)?;
+        let consumed = cursor.position();
+        if consumed != nar_data.len() as u64 {
+            anyhow::bail!(
+                "{} trailing byte(s) after the NAR root node",
+                nar_data.len() as u64 - consumed
+            );
+        }
+        let dag = crate::castore::build(&entries);
+        let encoded_entries = crate::nar_index::encode_entries(&entries, &dag);
+        Ok(Self {
+            entries,
+            dag,
+            encoded_entries,
+        })
+    }
+
+    /// Total blob-stream length: the sum of every regular entry's size.
+    /// This is what a version-2 manifest's `total_size()` and the
+    /// inline blob's length equal — NOT `nar_size`.
+    pub fn blob_len(&self) -> u64 {
+        self.entries
+            .iter()
+            .filter(|e| e.kind == NarEntryKind::Regular)
+            .map(|e| e.size)
+            .sum()
+    }
+
+    /// Extract the blob stream from the source NAR: every regular
+    /// file's content range concatenated in walk order. This is what
+    /// `manifests.inline_blob` stores for sub-threshold paths.
+    pub fn blob_stream(&self, nar_data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(usize::try_from(self.blob_len()).unwrap_or(0));
+        for e in &self.entries {
+            if e.kind == NarEntryKind::Regular && e.size > 0 {
+                out.extend_from_slice(&nar_data[content_range(e)]);
+            }
+        }
+        out
+    }
+}
+
+/// A regular entry's content byte range within its source NAR.
+/// `nar_ls` guarantees `nar_offset + size <= nar.len()` (it read the
+/// contents to digest them), so the slice cannot panic.
+fn content_range(e: &NarLsEntry) -> std::ops::Range<usize> {
+    e.nar_offset as usize..(e.nar_offset + e.size) as usize
+}
+
 /// Result of `put_chunked`.
 #[derive(Debug)]
 pub struct PutChunkedStats {
@@ -167,13 +262,14 @@ impl PutChunkedStats {
 /// 2. **Upgrade write-ahead**: add manifest_data + increment refcounts
 ///    to the existing 'uploading' placeholder. One tx.
 /// 3. **Upload new chunks**: step 2 atomically returns which hashes
-///    need upload (RETURNING refcount=1). Parallel S3 PUTs for those only.
+///    need upload (`uploaded_at IS NULL`). Parallel S3 PUTs for those only.
+/// 4. **Mark uploaded**: stamp `uploaded_at` for the hashes that reached S3.
 /// 5. **Complete**: fill narinfo + flip status='complete'.
 ///
 /// On error in 3-5: `delete_manifest_chunked_uploading` rolls back
 /// refcounts + placeholders. Caller doesn't need to clean up (we consumed
 /// their placeholder; we clean up our own mess).
-#[instrument(skip(pool, backend, info, nar_data), fields(
+#[instrument(skip(pool, backend, info, nar_data, parsed), fields(
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
 ))]
@@ -183,12 +279,13 @@ pub async fn put_chunked(
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     nar_data: &[u8],
+    parsed: &ParsedNar,
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
-    let stats = stage_chunked(pool, backend, info, claim, nar_data, max_concurrent).await?;
+    let stats = stage_chunked(pool, backend, info, claim, nar_data, parsed, max_concurrent).await?;
 
     // --- Step 5: Complete ---
-    if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim).await {
+    if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim, Some(parsed)).await {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one decrements refcounts →
         // GC-eligible. We DON'T delete from S3 — GC sweep's job.
@@ -227,7 +324,7 @@ pub async fn put_chunked(
 /// together. On batch-tx failure, `abort_batch` → `reap_one` (chunk-
 /// aware) decrements the staged refcounts; S3 blobs orphan and GC
 /// sweeps them.
-#[instrument(skip(pool, backend, info, nar_data), fields(
+#[instrument(skip(pool, backend, info, nar_data, parsed), fields(
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
 ))]
@@ -237,11 +334,21 @@ pub async fn stage_chunked(
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     nar_data: &[u8],
+    parsed: &ParsedNar,
     max_concurrent: usize,
 ) -> anyhow::Result<PutChunkedStats> {
     let store_path_hash = &info.store_path_hash;
 
     // --- Step 1: Chunk ---
+    // Per-regular-file FastCDC over each file's content range, in walk
+    // order (ADR-022 §6.1). NAR framing is never chunked — the chunk
+    // list reassembles to the blob stream, and GetPath regenerates the
+    // framing from the Directory DAG. Restarting FastCDC at every file
+    // boundary means a file's chunk run is identical wherever that
+    // file appears (a different NAR, a different offset), which is
+    // what makes cross-path dedup and the StatBlob exact-window
+    // property work.
+    //
     // Borrows from nar_data — zero-copy. The slices stay valid until
     // after step 4's uploads (nar_data outlives this function body).
     //
@@ -251,18 +358,31 @@ pub async fn stage_chunked(
     // scheduled on that worker. spawn_blocking would require
     // nar_data: 'static (it's a borrow); block_in_place keeps the
     // borrow and tells the runtime to hand off other work.
-    let chunks = cpu_bound(|| chunker::chunk_nar(nar_data));
-    debug!(chunks = chunks.len(), "NAR chunked");
+    let chunks = cpu_bound(|| {
+        let mut chunks = Vec::new();
+        for e in &parsed.entries {
+            if e.kind == NarEntryKind::Regular && e.size > 0 {
+                chunks.extend(chunker::chunk_nar(&nar_data[content_range(e)]));
+            }
+        }
+        chunks
+    });
+    debug!(chunks = chunks.len(), "NAR chunked (per-file)");
 
     // Trust-boundary guard: reject before any PG/S3 commit. MAX_CHUNKS
-    // is sized ≥ MAX_NAR_SIZE/CHUNK_MIN (compile-asserted in
-    // manifest.rs), so this can only fire on a NAR that already
-    // violated MAX_NAR_SIZE — but enforcing here means a future limit
-    // bump can't silently produce a manifest that deserialize rejects.
+    // covers the worst case any accepted NAR can produce — per-file
+    // FastCDC emits at least one chunk per non-empty regular file, so
+    // it is sized from BOTH the bytes dimension (MAX_NAR_SIZE /
+    // CHUNK_MIN) and the file-count dimension (MAX_NAR_ENTRIES); see
+    // the derivation and compile assert in manifest.rs. It can only
+    // fire on input that already violated those limits — but enforcing
+    // here means a future limit bump can't silently produce a manifest
+    // that deserialize rejects.
     if chunks.len() > manifest::MAX_CHUNKS {
         anyhow::bail!(
-            "NAR produced {} chunks, exceeds MAX_CHUNKS {} \
-             (likely adversarial CHUNK_MIN-forcing input)",
+            "NAR produced {} chunks, exceeds MAX_CHUNKS {} (per-file chunking emits at \
+             least one chunk per non-empty regular file, so this NAR carries more \
+             regular files or content than any accepted NAR can)",
             chunks.len(),
             manifest::MAX_CHUNKS,
         );
@@ -526,6 +646,36 @@ async fn rollback(
     }
 }
 
+#[cfg(test)]
+mod parsed_nar_tests {
+    use super::*;
+    use rio_nix::nar::dump_path_streaming;
+
+    /// A structurally valid NAR followed by trailing junk must be
+    /// rejected (bug_009) — see [`ParsedNar::parse`]'s doc for the
+    /// DATA_LOSS chain an accepted one causes. Rejecting here routes it
+    /// through the PersistError::Malformed → INVALID_ARGUMENT gate.
+    // r[verify store.ingest.tree-bounds+2]
+    #[test]
+    fn parse_rejects_trailing_bytes_after_root_node() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("f"), b"hello").unwrap();
+        let mut nar = Vec::new();
+        dump_path_streaming(&root, &mut nar).unwrap();
+
+        ParsedNar::parse(&nar).expect("the unmodified NAR parses");
+
+        let mut with_junk = nar.clone();
+        with_junk.extend_from_slice(&[0u8; 8]);
+        assert!(
+            ParsedNar::parse(&with_junk).is_err(),
+            "trailing bytes after the NAR root node must be rejected"
+        );
+    }
+}
+
 // ============================================================================
 // ChunkCache: read-path caching + singleflight + verification
 // ============================================================================
@@ -659,14 +809,8 @@ impl ChunkCache {
     ///    - No fetch → spawn one, insert into map, await it.
     /// 3. Verify the bytes (regardless of where they came from).
     /// 4. Insert into LRU (only if verify passed — don't cache corruption).
-    /// 5. Remove from singleflight map.
-    ///
-    /// # Singleflight lifecycle
-    ///
-    /// The inflight entry is removed AFTER the fetch completes (success
-    /// or error). A failed fetch removes the entry so the next caller
-    /// retries cleanly — if we left the error in the map, all subsequent
-    /// callers would see the same stale error even after S3 recovered.
+    /// 5. Remove from singleflight map (lifecycle rationale at the
+    ///    `inflight.remove` call in `singleflight_fetch`).
     #[instrument(skip(self), fields(hash = hex::encode(hash)))]
     pub async fn get_verified(&self, hash: &[u8; 32]) -> Result<Bytes, ChunkError> {
         // --- Layer 1: LRU ---
@@ -740,20 +884,9 @@ impl ChunkCache {
             .or_insert_with(|| {
                 let backend = Arc::clone(&self.backend);
                 let h = *hash;
-                // Spawn + map + boxed + shared:
-                // - spawn: fetch survives first-caller cancellation
-                // - map: JoinHandle's Result<Opt,JoinError> → Opt (JoinError
-                //   isn't Clone, so Shared can't hold it; .ok().flatten()
-                //   turns panic → None, same as backend error → None)
-                // - boxed: erase the unnamable Map<JoinHandle,closure> type
-                //   so it fits InflightFetch
-                // - shared: N callers await the same result
-                //
-                // Error is logged inside the task. None here conflates
-                // "not found" with "backend error" with "task panicked"
-                // — all three mean "couldn't get the chunk"; the log
-                // distinguishes them for operators. Callers retry
-                // uniformly (inflight cleanup below runs either way).
+                // The spawn → map → boxed → shared pipeline and the
+                // None-conflation semantics are documented on the
+                // `inflight` field; this is that shape.
                 tokio::spawn(async move {
                     match backend.get(&h).await {
                         Ok(opt) => opt,

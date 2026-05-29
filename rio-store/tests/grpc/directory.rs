@@ -15,7 +15,7 @@ use sha2::Digest as _;
 use tokio_stream::StreamExt;
 use tonic::transport::{Channel, Server};
 
-use rio_auth::hmac::{AssignmentClaims, HmacSigner, HmacVerifier, TokenRole};
+use rio_auth::hmac::{AssignmentClaims, HmacSigner, HmacVerifier};
 use rio_proto::DirectoryServiceServer;
 use rio_proto::castore::{Directory, DirectoryEntry, FileEntry};
 use rio_proto::store::directory_service_client::DirectoryServiceClient;
@@ -42,7 +42,6 @@ fn token(tenant: uuid::Uuid) -> String {
         is_ca: false,
         expiry_unix: 9_999_999_999,
         tenant: Some(tenant.to_string()),
-        role: TokenRole::Builder,
         input_closure_digest: String::new(),
     })
 }
@@ -175,15 +174,23 @@ impl Drop for Fixture {
 }
 
 async fn fixture() -> Fixture {
+    fixture_with_chunk_cache(true).await
+}
+
+/// Like [`fixture`] but lets the test choose whether the server gets a
+/// chunk backend. `Fixture.chunks` is always populated (tests seed it
+/// directly); only the server-side `ChunkCache` wiring is optional.
+async fn fixture_with_chunk_cache(with_cache: bool) -> Fixture {
     let db = TestDb::new(&MIGRATOR).await;
     let tenant_a = seed_tenant(&db.pool, "dir-a").await;
     let tenant_b = seed_tenant(&db.pool, "dir-b").await;
     let chunks = Arc::new(MemoryChunkBackend::new());
-    let cache = Arc::new(ChunkCache::new(Arc::clone(&chunks) as Arc<dyn ChunkBackend>));
+    let cache =
+        with_cache.then(|| Arc::new(ChunkCache::new(Arc::clone(&chunks) as Arc<dyn ChunkBackend>)));
     let svc = DirectoryServiceImpl::new(
         db.pool.clone(),
         Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
-        Some(cache),
+        cache,
     );
     let router = Server::builder().add_service(DirectoryServiceServer::new(svc));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
@@ -492,14 +499,11 @@ async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usiz
     .unwrap();
 
     if let Some(chunk_size) = chunk_size {
-        sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, nar_indexed) \
-             VALUES ($1, 'complete', TRUE)",
-        )
-        .bind(&path_hash)
-        .execute(&f.db.pool)
-        .await
-        .unwrap();
+        sqlx::query("INSERT INTO manifests (store_path_hash, status) VALUES ($1, 'complete')")
+            .bind(&path_hash)
+            .execute(&f.db.pool)
+            .await
+            .unwrap();
         let mut entries = Vec::new();
         for piece in b.nar.chunks(chunk_size) {
             let hash: [u8; 32] = blake3::hash(piece).into();
@@ -521,8 +525,8 @@ async fn seed_blob(f: &Fixture, name: &str, b: &BlobNar, chunk_size: Option<usiz
             .unwrap();
     } else {
         sqlx::query(
-            "INSERT INTO manifests (store_path_hash, status, inline_blob, nar_indexed) \
-             VALUES ($1, 'complete', $2, TRUE)",
+            "INSERT INTO manifests (store_path_hash, status, inline_blob) \
+             VALUES ($1, 'complete', $2)",
         )
         .bind(&path_hash)
         .bind(&b.nar)
@@ -666,30 +670,7 @@ async fn read_blob_zero_byte_file() {
 // r[verify store.castore.blob-read]
 #[tokio::test]
 async fn read_blob_chunked_no_backend_failed_precondition() {
-    let db = TestDb::new(&MIGRATOR).await;
-    let tenant_a = seed_tenant(&db.pool, "rb-noc-a").await;
-    let tenant_b = seed_tenant(&db.pool, "rb-noc-b").await;
-    let chunks = Arc::new(MemoryChunkBackend::new());
-    let svc = DirectoryServiceImpl::new(
-        db.pool.clone(),
-        Some(Arc::new(HmacVerifier::from_key(KEY.to_vec()))),
-        None, // no chunk backend
-    );
-    let router = Server::builder().add_service(DirectoryServiceServer::new(svc));
-    let (addr, server) = rio_test_support::grpc::spawn_grpc_server_layered(router).await;
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
-    let mut f = Fixture {
-        db,
-        client: DirectoryServiceClient::new(channel),
-        server,
-        tenant_a,
-        tenant_b,
-        chunks,
-    };
+    let mut f = fixture_with_chunk_cache(false).await;
 
     // Inline still resolves without a backend.
     let b_inline = make_blob_nar(8, 6);

@@ -21,6 +21,32 @@ use rio_proto::types::GetChunkRequest;
 use rio_store::cas::ChunkCache;
 use rio_store::grpc::ChunkServiceImpl;
 
+/// HMAC key for the `HasChunks` caller-identity gate. The probe is
+/// not tenant-scoped, but it must not be anonymous — see
+/// `ChunkServiceImpl::require_caller_identity`.
+const CHUNK_HMAC_KEY: &[u8] = b"chunk-service-test-key-32-bytes!";
+
+/// A `HasChunksRequest` carrying a valid builder assignment token.
+fn authed_has_chunks(digests: Vec<Vec<u8>>) -> tonic::Request<HasChunksRequest> {
+    let tok = rio_auth::hmac::HmacSigner::from_key(CHUNK_HMAC_KEY.to_vec()).sign(
+        &rio_auth::hmac::AssignmentClaims {
+            executor_id: "test".into(),
+            drv_hash: "00".repeat(32),
+            expected_outputs: vec![],
+            is_ca: false,
+            expiry_unix: 9_999_999_999,
+            tenant: Some(uuid::Uuid::nil().to_string()),
+            input_closure_digest: String::new(),
+        },
+    );
+    let mut r = tonic::Request::new(HasChunksRequest { digests });
+    r.metadata_mut().insert(
+        rio_proto::ASSIGNMENT_TOKEN_HEADER,
+        tok.parse().expect("token is ASCII"),
+    );
+    r
+}
+
 /// Harness with both StoreService AND ChunkService sharing one cache.
 /// Mirrors `StoreSession` (main.rs) — `Drop` aborts the server so
 /// tests don't need `server.abort()` boilerplate.
@@ -49,7 +75,13 @@ impl ChunkSession {
 
         let store_service =
             StoreServiceImpl::new(db.pool.clone()).with_chunk_cache(Arc::clone(&cache));
-        let chunk_service = ChunkServiceImpl::new(Some(cache));
+        let chunk_service = ChunkServiceImpl::new(
+            db.pool.clone(),
+            Some(cache),
+            Some(Arc::new(rio_auth::hmac::HmacVerifier::from_key(
+                CHUNK_HMAC_KEY.to_vec(),
+            ))),
+        );
 
         let router = Server::builder()
             .add_service(StoreServiceServer::new(store_service))
@@ -157,7 +189,8 @@ async fn test_getchunk_bad_digest_length() -> TestResult {
 #[tokio::test]
 async fn test_chunkservice_no_cache_failed_precondition() -> TestResult {
     // Construct with cache=None explicitly.
-    let chunk_service = ChunkServiceImpl::new(None);
+    let db = TestDb::new(&MIGRATOR).await;
+    let chunk_service = ChunkServiceImpl::new(db.pool.clone(), None, None);
 
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
@@ -218,10 +251,7 @@ async fn test_shared_cache_warms_across_services() -> TestResult {
     // the SHARED moka. Drain the stream fully so all chunk reads run.
     let mut stream = s
         .store
-        .get_path(GetPathRequest {
-            store_path,
-            manifest_hint: None,
-        })
+        .get_path(GetPathRequest { store_path })
         .await?
         .into_inner();
     while stream.message().await?.is_some() {}
@@ -306,8 +336,11 @@ async fn collect_get_chunks(
 async fn test_getchunks_batched_round_trip() -> TestResult {
     let mut s = ChunkSession::new().await?;
 
+    // Chunks carry file CONTENT bytes only (ADR-022 §6) — the sum of
+    // chunk sizes is the payload length, not the NAR length (which
+    // adds ~112 bytes of framing).
+    let content_size = (768 * 1024) as i64;
     let (nar, info, _) = make_large_nar(70, 768 * 1024);
-    let nar_size = nar.len() as i64;
     put_path(&mut s.store, info, nar).await?;
 
     let hashes: Vec<Vec<u8>> =
@@ -335,7 +368,10 @@ async fn test_getchunks_batched_round_trip() -> TestResult {
         );
         total += data.len() as i64;
     }
-    assert_eq!(total, nar_size, "sum of chunk sizes == NAR size");
+    assert_eq!(
+        total, content_size,
+        "sum of chunk sizes == file content size (framing is never chunked)"
+    );
     Ok(())
 }
 
@@ -373,7 +409,8 @@ async fn test_getchunks_not_found_aborts() -> TestResult {
 /// guard is shared so the two RPCs can't drift apart.
 #[tokio::test]
 async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
-    let chunk_service = ChunkServiceImpl::new(None);
+    let db = TestDb::new(&MIGRATOR).await;
+    let chunk_service = ChunkServiceImpl::new(db.pool.clone(), None, None);
     let router = Server::builder().add_service(ChunkServiceServer::new(chunk_service));
     let (addr, server) = rio_test_support::grpc::spawn_grpc_server(router).await;
     let channel = Channel::from_shared(format!("http://{addr}"))?
@@ -387,5 +424,180 @@ async fn test_getchunks_no_cache_failed_precondition() -> TestResult {
     assert_eq!(err.code(), tonic::Code::FailedPrecondition);
 
     server.abort();
+    Ok(())
+}
+
+// ===========================================================================
+// HasChunks (P0586) — durable-presence probe
+// ===========================================================================
+
+use rio_proto::types::HasChunksRequest;
+
+/// Insert a bare `chunks` row in a given (refcount, durable, deleted)
+/// state. The WAL-window state (`refcount=1, durable=false`) is what a
+/// SIGKILL between the refcount bump and the S3 PutObject leaves
+/// behind — the I-201 hazard HasChunks must treat as absent.
+async fn seed_chunk_row(
+    pool: &sqlx::PgPool,
+    hash: &[u8],
+    durable: bool,
+    deleted: bool,
+) -> TestResult {
+    sqlx::query(
+        "INSERT INTO chunks (blake3_hash, refcount, size, durable, deleted) \
+         VALUES ($1, 1, 1024, $2, $3)",
+    )
+    .bind(hash)
+    .bind(durable)
+    .bind(deleted)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+// r[verify store.chunk.has-chunks-durable]
+/// The I-201 regression: a refcount-1-but-not-durable chunk (the
+/// SIGKILL-mid-upload state) MUST read as absent, alongside the
+/// straightforward durable/deleted/absent cases.
+#[tokio::test]
+async fn test_has_chunks_durable_only_presence() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+
+    let durable = vec![0xD0u8; 32];
+    let wal_window = vec![0xD1u8; 32]; // refcount 1, durable false
+    let dead = vec![0xD2u8; 32]; // durable but deleted
+    let absent = vec![0xD3u8; 32]; // no row at all
+    seed_chunk_row(&s.db.pool, &durable, true, false).await?;
+    seed_chunk_row(&s.db.pool, &wal_window, false, false).await?;
+    seed_chunk_row(&s.db.pool, &dead, true, true).await?;
+
+    let resp = s
+        .chunk
+        .has_chunks(authed_has_chunks(vec![
+            durable.clone(),
+            wal_window.clone(),
+            dead.clone(),
+            absent.clone(),
+        ]))
+        .await?
+        .into_inner();
+    // Only bit 0 (durable, not deleted) is set.
+    assert_eq!(resp.bitmap, vec![0b0000_0001]);
+    Ok(())
+}
+
+/// Malformed digest → INVALID_ARGUMENT; empty request → empty bitmap.
+#[tokio::test]
+async fn test_has_chunks_validation() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+
+    let err = s
+        .chunk
+        .has_chunks(authed_has_chunks(vec![vec![0xEE; 7]]))
+        .await
+        .expect_err("short digest must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    let resp = s
+        .chunk
+        .has_chunks(authed_has_chunks(Vec::new()))
+        .await?
+        .into_inner();
+    assert!(resp.bitmap.is_empty(), "empty probe → empty bitmap");
+    Ok(())
+}
+
+/// An anonymous (or forged-token) HasChunks probe is rejected before
+/// the digest list is even parsed. Presence is one bit the caller
+/// cannot compute themselves; for a file under FASTCDC_MIN_BYTES the
+/// whole file is one chunk, so an unauthenticated probe would be a
+/// content-existence oracle over offline candidate guesses ("has
+/// anyone built a config containing exactly this secret?"). The
+/// retrieval RPCs stay anonymous — their response discloses nothing
+/// the digest didn't already prove.
+// r[verify store.chunk.has-chunks-authenticated]
+#[tokio::test]
+async fn test_has_chunks_rejects_anonymous_and_forged_callers() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+    let durable = vec![0xD0u8; 32];
+    seed_chunk_row(&s.db.pool, &durable, true, false).await?;
+
+    // No token at all.
+    let err = s
+        .chunk
+        .has_chunks(HasChunksRequest {
+            digests: vec![durable.clone()],
+        })
+        .await
+        .expect_err("anonymous probe must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // A token signed with the wrong key.
+    let forged = rio_auth::hmac::HmacSigner::from_key(b"not-the-server-key-aaaaaaaaaaaaa".to_vec())
+        .sign(&rio_auth::hmac::AssignmentClaims {
+            executor_id: "evil".into(),
+            drv_hash: "00".repeat(32),
+            expected_outputs: vec![],
+            is_ca: false,
+            expiry_unix: 9_999_999_999,
+            tenant: Some(uuid::Uuid::nil().to_string()),
+            input_closure_digest: String::new(),
+        });
+    let mut req = tonic::Request::new(HasChunksRequest {
+        digests: vec![durable.clone()],
+    });
+    req.metadata_mut().insert(
+        rio_proto::ASSIGNMENT_TOKEN_HEADER,
+        forged.parse().expect("token is ASCII"),
+    );
+    let err = s
+        .chunk
+        .has_chunks(req)
+        .await
+        .expect_err("forged token must be rejected");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+
+    // Vacuity sentinel: the same digest IS reported present to an
+    // authenticated caller, so the rejections above are the auth gate
+    // firing, not the chunk being absent.
+    let resp = s
+        .chunk
+        .has_chunks(authed_has_chunks(vec![durable]))
+        .await?
+        .into_inner();
+    assert_eq!(resp.bitmap, vec![0b0000_0001]);
+    Ok(())
+}
+
+// r[verify store.chunk.durable-flag]
+/// End-to-end: a chunked PutPath flips its chunks to durable when the
+/// manifest completes, and HasChunks then reports them present. Before
+/// the upload completes nothing is durable (the WAL window).
+#[tokio::test]
+async fn test_has_chunks_after_putpath_complete() -> TestResult {
+    let mut s = ChunkSession::new().await?;
+
+    let (nar, info, _) = make_large_nar(60, 512 * 1024);
+    put_path(&mut s.store, info, nar).await?;
+
+    let hashes: Vec<Vec<u8>> = sqlx::query_scalar("SELECT blake3_hash FROM chunks")
+        .fetch_all(&s.db.pool)
+        .await?;
+    assert!(hashes.len() >= 2, "512 KiB NAR must chunk into >1 chunk");
+
+    let resp = s
+        .chunk
+        .has_chunks(authed_has_chunks(hashes.clone()))
+        .await?
+        .into_inner();
+    // Every chunk of the completed manifest is durable → every bit set.
+    for (i, h) in hashes.iter().enumerate() {
+        assert_ne!(
+            resp.bitmap[i / 8] & (1 << (i % 8)),
+            0,
+            "chunk {} of a completed manifest must be durable",
+            hex::encode(h)
+        );
+    }
     Ok(())
 }

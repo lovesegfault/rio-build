@@ -51,8 +51,11 @@ pub(crate) mod upstreams;
 // `pub use chunked::*` etc.) so dead items in submodules
 // surface as `unused` instead of being silently exported.
 pub(crate) use chunked::{
-    PlaceholderToken, complete_manifest_chunked, delete_manifest_chunked_uploading,
-    mark_chunks_uploaded, upgrade_manifest_to_chunked,
+    PlaceholderToken, commit_chunked_output_in_conn, complete_manifest_chunked,
+    delete_manifest_chunked_uploading, insert_path_tenant_in_conn,
+    insert_path_tenant_skipping_deleted_in_tx, insert_pending_chunks, is_deleted_tenant_fk,
+    lock_chunks_for_commit, lock_staged_chunks_for_commit, mark_chunks_uploaded,
+    mark_chunks_uploaded_in_conn, upgrade_manifest_to_chunked,
 };
 pub(crate) use cluster_key_history::load_cluster_key_history;
 pub(crate) use inline::{
@@ -61,10 +64,14 @@ pub(crate) use inline::{
 #[cfg(test)]
 pub(crate) use inline::{delete_manifest_uploading, manifest_uploading_age};
 pub(crate) use queries::{
-    append_signatures, bump_nar_index_retry, find_missing_paths, get_manifest, get_manifest_batch,
-    get_manifest_for_index, get_nar_index, list_nar_index_pending, path_by_nar_hash,
-    query_by_hash_part, query_path_info, query_path_info_batch, set_nar_index,
+    CastoreDagRows, append_signatures, find_missing_paths, get_manifest_with_dag, get_nar_index,
+    path_by_nar_hash, query_by_hash_part, query_path_info, query_path_info_batch,
 };
+// The production caller is `complete_manifest_in_conn` below (via the
+// `queries::` path); the GC sweep's castore-refcount test seeds index
+// rows through this re-export.
+#[cfg(test)]
+pub(crate) use queries::set_nar_index_in_conn;
 pub(crate) use tenant_keys::get_active_signer;
 pub(crate) use upstreams::{SigMode, Upstream};
 
@@ -125,35 +132,24 @@ where
     }
 }
 
-/// How a NAR's content is stored. Returned by [`get_manifest`].
+/// How a NAR's content is stored. Returned by [`get_manifest_with_dag`].
 ///
 /// This is the one place callers branch on inline-vs-chunked. GetPath reads
 /// this; the binary cache HTTP server reads this; future GC reads this.
 /// Encapsulating the branch here means the "check inline_blob FIRST, only
 /// then query manifest_data" rule lives in exactly one SQL query.
+///
+/// Both variants hold the **blob stream** (regular-file contents in NAR
+/// walk order, ADR-022 §6), not the NAR — so neither sums to
+/// `narinfo.nar_size`; the NAR length is only known after the framing
+/// has been regenerated from the Directory DAG.
 #[derive(Debug)]
 pub(crate) enum ManifestKind {
-    /// Whole NAR stored in `manifests.inline_blob`.
+    /// Whole blob stream stored in `manifests.inline_blob`.
     Inline(Bytes),
-    /// NAR chunked; reassemble from this ordered list.
+    /// Blob stream chunked per-file; reassemble from this ordered list.
     /// Each entry is `(blake3_digest, chunk_size_bytes)`.
     Chunked(Vec<([u8; 32], u32)>),
-}
-
-impl ManifestKind {
-    /// Total NAR size in bytes this manifest will reassemble to.
-    ///
-    /// Inline = blob length. Chunked = sum of chunk sizes (u64 — see
-    /// [`crate::manifest::Manifest::total_size`] for the u32-overflow
-    /// rationale). GetPath checks this against `narinfo.nar_size`
-    /// before streaming so manifest/narinfo drift fails fast with
-    /// DATA_LOSS instead of delivering garbage.
-    pub(crate) fn total_size(&self) -> u64 {
-        match self {
-            ManifestKind::Inline(bytes) => bytes.len() as u64,
-            ManifestKind::Chunked(entries) => entries.iter().map(|(_, size)| *size as u64).sum(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -305,6 +301,7 @@ pub(crate) async fn complete_manifest_in_conn(
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     inline_blob: Option<&[u8]>,
+    castore: Option<&crate::cas::ParsedNar>,
 ) -> Result<()> {
     // Flip status. inline_blob stays NULL in the chunked case — that's
     // what makes get_manifest() return Chunked instead of Inline.
@@ -329,8 +326,8 @@ pub(crate) async fn complete_manifest_in_conn(
             sqlx::query(
                 r#"
                 UPDATE manifests SET
-                    status     = 'complete',
-                    updated_at = now()
+                    status      = 'complete',
+                    updated_at  = now()
                 WHERE store_path_hash = $1 AND claim_id = $2
                 "#,
             )
@@ -356,6 +353,85 @@ pub(crate) async fn complete_manifest_in_conn(
             store_path: info.store_path.to_string(),
         });
     }
+    if inline_blob.is_none() {
+        mark_manifest_chunks_durable(conn, info).await?;
+    }
+    // Eager castore index: nar_index + directories + directory_paths +
+    // file_blobs (blob offsets), atomic with the visibility flip — a
+    // `'complete'` path always has its index, and GetPath's framing
+    // regeneration depends on that. The index cannot be recomputed
+    // later (the NAR byte stream is not persisted), so this is the
+    // only point it can be written. `None` is for tests that exercise
+    // the metadata layer with non-NAR placeholder bytes; every
+    // production ingest path passes `Some`.
+    // r[impl store.index.putpath-eager]
+    // r[impl store.index.authoritative]
+    if let Some(parsed) = castore {
+        queries::set_nar_index_in_conn(
+            conn,
+            &info.store_path_hash,
+            &parsed.encoded_entries,
+            &parsed.dag,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+/// Flip `chunks.durable = TRUE` for every chunk of a manifest that just
+/// transitioned to `'complete'`, inside the caller's transaction.
+///
+/// `durable` is the `HasChunks` presence predicate (`r[store.chunk.
+/// has-chunks-durable]`): a chunk may only read as present once some
+/// `'complete'` manifest references it, because the refcount bump and
+/// the S3 PutObject happen *before* completion — a SIGKILL in that
+/// window leaves a refcount-1 row whose object may not exist (I-201).
+/// Flipping here, in the same transaction as the status flip, makes
+/// "manifest is complete" and "its chunks answer present" atomic.
+///
+/// Inline manifests carry no chunks; the caller skips this call for
+/// them. `AND NOT durable` keeps the UPDATE from re-locking rows a
+/// prior manifest already flipped (a shared chunk is flipped once, by
+/// whichever referencing manifest completes first).
+// r[impl store.chunk.durable-flag]
+async fn mark_manifest_chunks_durable(
+    conn: &mut sqlx::PgConnection,
+    info: &ValidatedPathInfo,
+) -> Result<()> {
+    let chunk_list: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT chunk_list FROM manifest_data WHERE store_path_hash = $1")
+            .bind(&info.store_path_hash)
+            .fetch_optional(&mut *conn)
+            .await?;
+    let Some(chunk_list) = chunk_list else {
+        return Ok(());
+    };
+    let manifest = crate::manifest::Manifest::deserialize(&chunk_list).map_err(|e| {
+        // The row was written by `upgrade_manifest_to_chunked` from a
+        // `Manifest::serialize` we produced — a parse failure here is
+        // corruption, not client input. Failing the complete (rather
+        // than warn-and-skip) keeps the invariant "complete ⇒ chunks
+        // durable" airtight; the uploader retries.
+        MetadataError::InvariantViolation(format!(
+            "manifest_data.chunk_list for {} is corrupt at complete time: {e}",
+            info.store_path
+        ))
+    })?;
+    // Dedup + sort: a manifest may repeat a chunk (identical content
+    // blocks), and every `chunks` writer takes row locks in ascending
+    // hash order (`r[store.chunk.lock-order]`).
+    let mut hashes: Vec<Vec<u8>> = manifest
+        .entries
+        .iter()
+        .map(|e| e.hash.to_vec())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    hashes.sort_unstable();
+    sqlx::query("UPDATE chunks SET durable = TRUE WHERE blake3_hash = ANY($1) AND NOT durable")
+        .bind(&hashes)
+        .execute(&mut *conn)
+        .await?;
     Ok(())
 }
 
@@ -499,6 +575,7 @@ mod tests {
             &info,
             uuid::Uuid::new_v4(),
             Bytes::from_static(b"nar"),
+            None,
         )
         .await
         .expect_err("should fail without placeholder");
@@ -538,6 +615,7 @@ mod tests {
             &bad,
             uuid::Uuid::new_v4(),
             Bytes::from_static(b"nar"),
+            None,
         )
         .await
         .expect_err("foreign claim must fail");
@@ -559,7 +637,7 @@ mod tests {
         assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
 
         // Real claim → Ok; status flipped, OUR signatures landed.
-        complete_manifest_inline(&db.pool, &info, claim_a, Bytes::from_static(b"nar"))
+        complete_manifest_inline(&db.pool, &info, claim_a, Bytes::from_static(b"nar"), None)
             .await
             .unwrap();
         let (status, sigs): (String, Vec<String>) = sqlx::query_as(

@@ -205,26 +205,20 @@ async fn select_sweep_order(conn: &mut sqlx::PgConnection) -> Result<Vec<Vec<u8>
     Ok(out)
 }
 
-/// Per-path castore digests, read BEFORE the manifest CASCADE removes
-/// `nar_index`. The batch loop accumulates these so the directory
-/// decrement is one btree-ordered UPDATE (`r[store.chunk.lock-order]`).
-#[derive(Default)]
-struct SweptCastoreRefs {
-    /// Distinct `dir_digest`s referenced by this path's index.
-    dirs: Vec<[u8; 32]>,
-}
-
 /// Delete one swept path's metadata (realisations + path_tenants +
 /// narinfo CASCADE). `None` if narinfo was already gone, else the
-/// castore digests its `nar_index` referenced. Chunk and directory
-/// refcount handling is the caller's responsibility.
+/// distinct `dir_digest`s its `nar_index` referenced — read BEFORE the
+/// manifest CASCADE removes the row. The batch loop accumulates these
+/// so the directory decrement is one btree-ordered UPDATE
+/// (`r[store.chunk.lock-order]`). Chunk and directory refcount
+/// handling is the caller's responsibility.
 // r[impl store.realisation.gc-sweep]
 // r[impl store.gc.sweep-path-tenants]
 // r[impl store.castore.gc]
 async fn delete_swept_path(
     tx: &mut Transaction<'_, Postgres>,
     store_path_hash: &[u8],
-) -> Result<Option<SweptCastoreRefs>, sqlx::Error> {
+) -> Result<Option<Vec<[u8; 32]>>, sqlx::Error> {
     // Step 2a: DELETE realisations. NOT via CASCADE — realisations has
     // NO FK to narinfo (002_store.sql:134). Without this, dangling
     // realisations rows point to swept paths → wopQueryRealisation
@@ -255,23 +249,23 @@ async fn delete_swept_path(
     // Step 2a'': read castore digests before the CASCADE removes the
     // row. Decode failure logs and leaks one path's refcounts rather
     // than wedging GC.
-    let castore_refs = {
+    let dirs = {
         let entries: Option<Vec<u8>> =
             sqlx::query_scalar("SELECT entries FROM nar_index WHERE store_path_hash = $1")
                 .bind(store_path_hash)
                 .fetch_optional(&mut **tx)
                 .await?;
         match entries.as_deref().map(crate::nar_index::digests_from_index) {
-            Some(Ok(d)) => SweptCastoreRefs { dirs: d.dirs },
+            Some(Ok(dirs)) => dirs,
             Some(Err(e)) => {
                 warn!(
                     store_path_hash = %hex::encode(store_path_hash),
                     error = %e,
                     "nar_index.entries decode failed at GC; directory refcounts leak for this path"
                 );
-                SweptCastoreRefs::default()
+                Vec::new()
             }
-            None => SweptCastoreRefs::default(),
+            None => Vec::new(),
         }
     };
 
@@ -281,7 +275,7 @@ async fn delete_swept_path(
         .bind(store_path_hash)
         .execute(&mut **tx)
         .await?;
-    Ok((deleted.rows_affected() > 0).then_some(castore_refs))
+    Ok((deleted.rows_affected() > 0).then_some(dirs))
 }
 
 /// Decrement `directories.refcount` for the batch's swept paths and
@@ -729,13 +723,13 @@ async fn sweep_one_batch(
             continue;
         }
 
-        let Some(refs) = delete_swept_path(&mut tx, store_path_hash).await? else {
+        let Some(dirs) = delete_swept_path(&mut tx, store_path_hash).await? else {
             // narinfo already gone (concurrent sweep? shouldn't
             // happen under FOR UPDATE). Skip chunk handling.
             continue;
         };
         delta.paths_deleted += 1;
-        for d in refs.dirs {
+        for d in dirs {
             *dir_counts.entry(d).or_default() += 1;
         }
 
@@ -923,17 +917,14 @@ async fn sweep_orphan_batch(
     // No FOR UPDATE needed on the outer SELECT: the UPDATE's WHERE
     // clause IS the guard. PG's row-level locking for UPDATE
     // serializes against the PutPath UPSERT on the same blake3_hash.
-    let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        r#"
-        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL
-         WHERE blake3_hash = ANY($1)
-           AND refcount = 0 AND deleted = FALSE
-        RETURNING blake3_hash, size
-        "#,
-    )
-    .bind(hashes)
-    .fetch_all(&mut *tx)
-    .await?;
+    //
+    // The shared tombstone helper clears `uploaded_at` and `durable`
+    // along with `deleted` — both assert "the S3 object exists" and
+    // the drain is about to delete it. See
+    // [`super::tombstone_zero_refcount_chunks`] for the resurrection
+    // contract; using the one helper keeps this site and the path-GC
+    // route (`decrement_hashes_and_enqueue`) from diverging.
+    let zeroed = super::tombstone_zero_refcount_chunks(&mut tx, hashes).await?;
 
     let zd = zeroed.len() as u64;
     let bf = zeroed.iter().map(|(_, s)| *s as u64).sum::<u64>();
@@ -1087,9 +1078,7 @@ mod tests {
         let mk_dag = |dirs: &[[u8; 32]]| crate::castore::DirectoryDag {
             directories: dirs.iter().map(|d| (*d, b"body".to_vec())).collect(),
             file_blobs: vec![(shared_blob, 0, 8)],
-            root_node: vec![],
-            root_digest: vec![],
-            dir_digests: vec![],
+            ..Default::default()
         };
 
         let mut hashes = Vec::new();
@@ -1109,9 +1098,11 @@ mod tests {
                 .execute(&db.pool)
                 .await
                 .unwrap();
-            crate::metadata::set_nar_index(&db.pool, &h, None, &mk_entries(dirs), &mk_dag(dirs))
+            let mut tx = db.pool.begin().await.unwrap();
+            crate::metadata::set_nar_index_in_conn(&mut tx, &h, &mk_entries(dirs), &mk_dag(dirs))
                 .await
                 .unwrap();
+            tx.commit().await.unwrap();
             hashes.push(h_vec);
         }
 
@@ -2427,6 +2418,62 @@ mod tests {
                 .unwrap();
         assert_eq!(refcount, 1);
         assert!(!deleted, "inner UPDATE rejected (not skipped)");
+    }
+
+    // r[verify store.chunk.durable-flag]
+    /// Regression: the sweep MUST clear `durable` along with
+    /// `uploaded_at` when it marks a chunk deleted. `durable` means
+    /// "the S3 object provably exists and a complete manifest
+    /// references it" — both halves become false the moment the sweep
+    /// enqueues the S3 delete. If the flag survives, a later upload
+    /// that resurrects the row (`ON CONFLICT … SET refcount+1,
+    /// deleted=false`) instantly satisfies HasChunks' `durable AND NOT
+    /// deleted` predicate *before* its S3 PutObject lands; a builder
+    /// that trusts that answer omits the chunk from its upload and the
+    /// digest is stranded — the exact I-201 race `durable` exists to
+    /// close, reopened through the GC round-trip.
+    #[tokio::test]
+    async fn sweep_clears_durable_so_resurrection_starts_non_durable() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // A durable, S3-confirmed, complete-manifest-referenced chunk
+        // whose last referencing manifest has since been GC'd
+        // (refcount back to 0, past grace).
+        let hash = seed_orphan_chunk(&db.pool, 0xD7, 4096, 200).await;
+        sqlx::query("UPDATE chunks SET durable = TRUE, uploaded_at = now() WHERE blake3_hash = $1")
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+
+        let (deleted, _) = sweep_orphan_chunks(&db.pool, None, 100).await.unwrap();
+        assert_eq!(deleted, 1, "the orphan chunk must be reaped");
+
+        // Simulate the resurrection upsert
+        // (`upgrade_manifest_to_chunked`'s ON CONFLICT branch).
+        sqlx::query(
+            "UPDATE chunks SET refcount = refcount + 1, deleted = false \
+             WHERE blake3_hash = $1",
+        )
+        .bind(hash.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        // The HasChunks predicate over the resurrected row: it must
+        // answer ABSENT until a new complete manifest re-flips
+        // `durable` after the S3 object provably exists again.
+        let visible: bool =
+            sqlx::query_scalar("SELECT durable AND NOT deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(hash.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            !visible,
+            "a swept-then-resurrected chunk must not satisfy HasChunks' \
+             durable-presence predicate before its S3 object is re-uploaded"
+        );
     }
 
     /// Regression: concurrent orphan-chunk sweep vs another chunk

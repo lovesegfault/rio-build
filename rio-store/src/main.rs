@@ -203,8 +203,11 @@ async fn main() -> anyhow::Result<()> {
 
     // ChunkServiceImpl: same cache Arc. None → FAILED_PRECONDITION
     // on GetChunk, which is correct for an inline-only store (there
-    // ARE no chunks to get).
-    let chunk_service = ChunkServiceImpl::new(chunk_cache.clone());
+    // ARE no chunks to get). The pool is for HasChunks' durable-
+    // presence probe — a pure PG read that works without a cache. The
+    // verifier is HasChunks' caller-identity gate.
+    let chunk_service =
+        ChunkServiceImpl::new(pool.clone(), chunk_cache.clone(), hmac_verifier_arc.clone());
 
     // Tenant-scoped via JWT or HMAC assignment-token claim — see
     // grpc/directory.rs. ReadBlob shares the chunk cache.
@@ -242,11 +245,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(backend) = chunk_backend_for_gc {
         rio_store::gc::drain::spawn_drain_task(pool.clone(), backend, shutdown.clone());
     }
-    // NAR indexer: drains the `WHERE NOT nar_indexed` work-queue for
-    // paths the eager PutPath path skipped. Same disposition as the GC
-    // tasks: panics logged, shutdown-on-cancel.
-    rio_store::nar_index::spawn_indexer_loop(pool.clone(), chunk_cache.clone(), shutdown.clone());
-
     let max_msg_size = rio_common::grpc::max_message_size();
 
     let addr = cfg.listen_addr;

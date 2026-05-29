@@ -12,7 +12,7 @@
 use super::*;
 use sqlx::PgPool;
 use std::collections::HashSet;
-use tracing::{debug, instrument};
+use tracing::{debug, instrument, warn};
 
 /// Opaque generation token for an `'uploading'` placeholder, captured
 /// at [`upgrade_manifest_to_chunked`] time and checked at
@@ -61,13 +61,6 @@ pub(crate) type PlaceholderToken = f64;
 /// The tradeoff: if the upload fails and we forget to decrement, refcounts
 /// are leaked. The orphan scanner (future phase) catches this via stale
 /// 'uploading' manifests.
-///
-/// # Refcount UPSERT
-///
-/// `INSERT ... ON CONFLICT DO UPDATE` is row-level atomic — no explicit
-/// SELECT FOR UPDATE needed. Two concurrent PutPaths referencing the same
-/// chunk both increment correctly (PG resolves the conflict, second one
-/// sees the first's row and runs the UPDATE clause).
 #[instrument(skip(pool, chunk_list, chunk_hashes, chunk_sizes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
 pub(crate) async fn upgrade_manifest_to_chunked(
     pool: &PgPool,
@@ -138,9 +131,8 @@ pub(crate) async fn upgrade_manifest_to_chunked(
         )));
     }
 
-    // Refcount UPSERT. UNNEST over parallel arrays; lengths are asserted
-    // equal above (the co-sort `zip` below would silently truncate to
-    // the shorter input otherwise — there is NO PG-side length check).
+    // Refcount UPSERT. UNNEST over parallel arrays (lengths asserted
+    // equal above — there is NO PG-side length check).
     //
     // The array-of-1s for initial refcount: can't use a literal `1` in
     // the UNNEST position (not an array). Materializing N×1 is mildly
@@ -227,6 +219,26 @@ pub(crate) async fn upgrade_manifest_to_chunked(
 // r[impl store.cas.chunk-upload-committed]
 #[instrument(skip(pool, hashes), fields(count = hashes.len()))]
 pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    mark_chunks_uploaded_in_conn(&mut conn, hashes).await
+}
+
+/// In-transaction variant of [`mark_chunks_uploaded`] for callers that
+/// must record S3 presence atomically with the rest of their commit
+/// (`PutPathChunked`'s single commit transaction).
+///
+/// `AND deleted = FALSE`: a row the orphan sweep tombstoned between
+/// the caller's S3 PUT and this stamp (possible for the pool-level
+/// [`mark_chunks_uploaded`] call from `cas::stage_chunked`, which runs
+/// outside any chunk row lock) must NOT get `uploaded_at` — the drain
+/// may already be deleting the object, and a stamped-then-resurrected
+/// row would skip the re-PUT and let a manifest point at a drained
+/// object.
+// r[impl store.cas.chunk-upload-committed]
+pub(crate) async fn mark_chunks_uploaded_in_conn(
+    conn: &mut sqlx::PgConnection,
+    hashes: &[Vec<u8>],
+) -> Result<()> {
     if hashes.is_empty() {
         return Ok(());
     }
@@ -234,30 +246,33 @@ pub(crate) async fn mark_chunks_uploaded(pool: &PgPool, hashes: &[Vec<u8>]) -> R
     sorted.sort_unstable();
     sqlx::query(
         "UPDATE chunks SET uploaded_at = now() \
-         WHERE blake3_hash = ANY($1) AND uploaded_at IS NULL",
+         WHERE blake3_hash = ANY($1) AND uploaded_at IS NULL AND deleted = FALSE",
     )
     .bind(&sorted)
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(())
 }
 
-/// Finalize a chunked upload: fill real narinfo + flip status to 'complete'.
+/// Finalize a chunked upload: fill real narinfo + flip status to
+/// 'complete' + write the castore index.
 ///
 /// Does NOT write inline_blob (stays NULL — that's the chunked marker).
 /// Does NOT touch manifest_data (already written at uploading time).
 /// Does NOT touch refcounts (already incremented at uploading time).
 ///
-/// Just the narinfo UPDATE + status flip. Same atomic guarantees as the
-/// inline variant.
-#[instrument(skip(pool, info), fields(store_path = %info.store_path.as_str()))]
+/// `castore` is `None` only in metadata-layer tests that seed fake
+/// chunk lists; such paths are not GetPath-servable. Production
+/// (`cas::put_chunked`) always passes `Some`.
+#[instrument(skip(pool, info, castore), fields(store_path = %info.store_path.as_str()))]
 pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
+    castore: Option<&crate::cas::ParsedNar>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, None).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, None, castore).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
@@ -270,16 +285,9 @@ pub(crate) async fn complete_manifest_chunked(
 /// would corrupt refcounts. The caller (cas.rs) holds the Manifest
 /// across the upload, so this invariant is easy to maintain.
 ///
-/// Safety: opens with `SELECT … FOR UPDATE` on the `'uploading'`
-/// placeholder gated on `token` (the [`PlaceholderToken`] captured at
-/// [`upgrade_manifest_to_chunked`] time) and returns `Ok(())` if it
-/// doesn't match — so if the orphan reaper reclaimed our placeholder
-/// and a re-uploader has since inserted a fresh one (whether
-/// `'uploading'` or `'complete'`), the refcount decrement and
-/// `manifest_data` DELETE below can't clobber the re-uploader's state.
-/// The `manifests`/`narinfo` deletes additionally carry
-/// `status='uploading'` / `nar_size=0` guards (defense-in-depth, same
-/// as the inline variant).
+/// `token` gates the whole rollback on still owning the placeholder —
+/// see the ownership-lock comment in
+/// `delete_manifest_chunked_uploading_inner` for the race it closes.
 #[instrument(skip(pool, chunk_hashes), fields(store_path_hash = hex::encode(store_path_hash), chunks = chunk_hashes.len()))]
 pub(crate) async fn delete_manifest_chunked_uploading(
     pool: &PgPool,
@@ -404,10 +412,678 @@ async fn delete_manifest_chunked_uploading_inner(
     Ok(())
 }
 
+/// Write-ahead `chunks` rows for `PutPathChunked` (ADR-022 §6.2):
+/// every digest the builder is about to stream gets a
+/// `refcount = 0, uploaded_at = NULL, durable = FALSE` row **before**
+/// the first S3 `PutObject`. This row is what makes a crash-orphaned
+/// S3 object findable by the `r[store.chunk.grace-ttl]` sweep; without
+/// it, a verify task that dies between `backend.put` and the commit
+/// transaction leaves S3 objects no GC pass can enumerate.
+///
+/// Refcounts are NOT bumped here — that happens in the commit
+/// transaction, per referencing output. A pre-existing **refcount-0**
+/// row (left by a prior failed attempt, or claimed by the GC sweep
+/// between the builder's `HasChunks` probe and now) gets its grace
+/// clock restarted and its `deleted` mark cleared: the upload is about
+/// to re-PUT the object, and clearing `deleted` makes the drain's
+/// re-check skip the pending S3 delete instead of racing the new
+/// `PutObject`. Rows with `refcount > 0` are live under another
+/// manifest and are left alone. Hashes are sorted ascending before
+/// binding (`r[store.chunk.lock-order]`).
+///
+/// The grace clock is NOT refreshed again during the verify walk, so
+/// an upload that takes longer than `CHUNK_GRACE_SECS` and straddles a
+/// sweep run finds its rows re-claimed at commit time and aborts
+/// `UNAVAILABLE` (see [`lock_chunks_for_commit`]) — a retryable error,
+/// not corruption.
+// TODO: fold a `chunks.created_at = now()` refresh for the pending set
+// into the placeholder guard's heartbeat so a >CHUNK_GRACE_SECS upload
+// cannot collide with the orphan sweep at all.
+// r[impl store.put.wal-manifest]
+#[instrument(skip(pool, chunks), fields(count = chunks.len()))]
+pub(crate) async fn insert_pending_chunks(pool: &PgPool, chunks: &[([u8; 32], u32)]) -> Result<()> {
+    if chunks.is_empty() {
+        return Ok(());
+    }
+    let mut sorted: Vec<([u8; 32], u32)> = chunks.to_vec();
+    sorted.sort_unstable_by_key(|(d, _)| *d);
+    let (hashes, sizes): (Vec<Vec<u8>>, Vec<i64>) = sorted
+        .into_iter()
+        .map(|(h, s)| (h.to_vec(), i64::from(s)))
+        .unzip();
+    sqlx::query(
+        r#"
+        INSERT INTO chunks (blake3_hash, refcount, size)
+        SELECT u.hash, 0, u.size FROM UNNEST($1::bytea[], $2::bigint[]) AS u(hash, size)
+        ON CONFLICT (blake3_hash) DO UPDATE
+            SET deleted = FALSE, created_at = now()
+            WHERE chunks.refcount = 0
+        "#,
+    )
+    .bind(&hashes)
+    .bind(&sizes)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Lock every chunk a multi-statement commit transaction will touch
+/// and return the digests whose S3 object cannot be proven to exist.
+///
+/// Run FIRST in the commit transaction. This is THE lock-acquisition
+/// helper for `chunks` rows in commit transactions — every later
+/// statement in the same transaction (refcount UPSERTs, the `durable`
+/// flip in `mark_manifest_chunks_durable`,
+/// `mark_chunks_uploaded_in_conn`) must only touch rows this call
+/// already locked, which is why it takes the COMPLETE set: `digests`
+/// (the union of every non-skipped output's manifest digests) **plus**
+/// every digest in `uploaded_by_this_stream` (novel chunks this stream
+/// PUT, including ones whose only manifest occurrence is in an
+/// idempotent-skipped output — `mark_chunks_uploaded_in_conn` still
+/// stamps those). The union is sorted internally, so callers cannot
+/// get the order or the set wrong. Two jobs:
+///
+/// 1. **Lock order** (`r[store.chunk.lock-order]`): one sorted
+///    `FOR UPDATE` acquires every `chunks` row lock the transaction
+///    will need, so the statements that follow only touch already-held
+///    rows regardless of their relative order — locking a row outside
+///    this set after the sorted batch would re-open the ABBA window
+///    with a concurrent sorted writer. This also serializes against
+///    the GC drain's `FOR UPDATE` re-check: whichever side locks
+///    first, the other observes its committed outcome.
+/// 2. **Presence proof** (`r[store.chunk.durable-flag]`): the commit
+///    is about to flip `durable = TRUE` and/or stamp `uploaded_at` for
+///    these digests, which asserts "the S3 object exists". A chunk is
+///    provably present iff its row exists, is not `deleted` (the sweep
+///    has not claimed it for the drain since the verify walk obtained
+///    its bytes), and either has `uploaded_at` set (a prior commit
+///    confirmed the object) or was `PutObject`'d by **this** stream
+///    (`uploaded_by_this_stream`). Anything else — a missing row, a
+///    sweep-claimed row, a never-confirmed row served from a cache —
+///    is returned so the caller can abort with `UNAVAILABLE` instead
+///    of committing a manifest that points at an object the drain may
+///    already have deleted (the I-201 lie, through the GC round-trip).
+// TODO: r[store.chunk.lock-order]'s spec text only asks for sorted
+// per-statement lock acquisition; the discipline this helper (and
+// lock_staged_chunks_for_commit) now enforces is stronger — the FULL
+// union of every chunk row a commit transaction will touch is locked
+// up front in one sorted FOR UPDATE. Tighten the rule text to match in
+// a follow-up spec pass (with `tracey bump`) so the spec states the
+// guarantee the code actually relies on.
+// r[impl store.chunk.lock-order]
+pub(crate) async fn lock_chunks_for_commit(
+    conn: &mut sqlx::PgConnection,
+    digests: &[Vec<u8>],
+    uploaded_by_this_stream: &std::collections::HashSet<[u8; 32]>,
+) -> Result<Vec<Vec<u8>>> {
+    // Union + dedup + sort in one pass: BTreeSet iteration is
+    // ascending, which is exactly the lock order the rule requires.
+    let lock_set: Vec<Vec<u8>> = digests
+        .iter()
+        .cloned()
+        .chain(uploaded_by_this_stream.iter().map(|d| d.to_vec()))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if lock_set.is_empty() {
+        return Ok(Vec::new());
+    }
+    let rows: Vec<(Vec<u8>, bool, bool)> = sqlx::query_as(
+        r#"
+        SELECT blake3_hash, deleted, uploaded_at IS NOT NULL
+          FROM chunks
+         WHERE blake3_hash = ANY($1)
+         ORDER BY blake3_hash
+           FOR UPDATE
+        "#,
+    )
+    .bind(&lock_set)
+    .fetch_all(&mut *conn)
+    .await?;
+    let by_hash: std::collections::HashMap<&[u8], (bool, bool)> = rows
+        .iter()
+        .map(|(h, deleted, uploaded)| (h.as_slice(), (*deleted, *uploaded)))
+        .collect();
+    let unproven = lock_set
+        .iter()
+        .filter(|d| {
+            let ours = <&[u8; 32]>::try_from(d.as_slice())
+                .is_ok_and(|a| uploaded_by_this_stream.contains(a));
+            match by_hash.get(d.as_slice()) {
+                Some((deleted, uploaded)) => *deleted || !(*uploaded || ours),
+                None => true,
+            }
+        })
+        .cloned()
+        .collect();
+    Ok(unproven)
+}
+
+/// `PutPathBatch` pre-lock: the batch's phase-3 transaction completes
+/// N staged outputs in output-index order, and each completion's
+/// `mark_manifest_chunks_durable` row-locks that output's chunks — so
+/// without a batch-wide pre-lock the cross-output acquisition order
+/// follows output index, not digest order, and two concurrent batches
+/// sharing freshly-staged chunks can ABBA-deadlock (40P01) after their
+/// NAR verification already succeeded. This reads the staged
+/// `manifest_data.chunk_list` for every output in the batch (written
+/// by `cas::stage_chunked` in phase 2) and feeds the digest union
+/// through [`lock_chunks_for_commit`] — the same single lock helper
+/// the chunked-upload commit uses — so the per-output `durable` flips
+/// only touch already-held rows.
+///
+/// Returns the unproven set (see [`lock_chunks_for_commit`]); a
+/// non-empty result means a staged chunk was reclaimed by GC between
+/// staging and commit and the batch must abort retryably instead of
+/// flipping `durable` for an object the drain may already have
+/// deleted. Inline outputs have no `manifest_data` row and contribute
+/// nothing.
+// r[impl store.chunk.lock-order]
+pub(crate) async fn lock_staged_chunks_for_commit(
+    conn: &mut sqlx::PgConnection,
+    store_path_hashes: &[Vec<u8>],
+) -> Result<Vec<Vec<u8>>> {
+    if store_path_hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    let chunk_lists: Vec<Vec<u8>> =
+        sqlx::query_scalar("SELECT chunk_list FROM manifest_data WHERE store_path_hash = ANY($1)")
+            .bind(store_path_hashes)
+            .fetch_all(&mut *conn)
+            .await?;
+    let mut digests: std::collections::BTreeSet<Vec<u8>> = std::collections::BTreeSet::new();
+    for chunk_list in &chunk_lists {
+        // The staged chunk_list was serialized by `stage_chunked` from
+        // a `Manifest` we produced; a parse failure here is the same
+        // corruption `mark_manifest_chunks_durable` would hit one
+        // statement later — fail the commit rather than skip the lock.
+        let manifest = crate::manifest::Manifest::deserialize(chunk_list).map_err(|e| {
+            MetadataError::InvariantViolation(format!(
+                "staged manifest_data.chunk_list is corrupt at batch commit time: {e}"
+            ))
+        })?;
+        digests.extend(manifest.entries.iter().map(|e| e.hash.to_vec()));
+    }
+    let digests: Vec<Vec<u8>> = digests.into_iter().collect();
+    lock_chunks_for_commit(conn, &digests, &std::collections::HashSet::new()).await
+}
+
+/// Commit one `PutPathChunked` output inside the caller's transaction:
+/// `manifest_data` insert, chunk refcount bump, then the status flip,
+/// narinfo, and castore index via [`super::complete_manifest_in_conn`],
+/// and finally the `path_tenants` junction.
+///
+/// Ordering matters: `complete_manifest_in_conn`'s
+/// `mark_manifest_chunks_durable` reads `manifest_data.chunk_list`
+/// for this path, so the `manifest_data` insert MUST precede it in the
+/// same transaction. The refcount bump precedes the durable flip for
+/// the same reason every other writer's does: `durable = TRUE` asserts
+/// "some complete manifest references this chunk", which is only true
+/// once the refcount reflects that reference.
+///
+/// `chunk_hashes`/`chunk_sizes` are the output's **distinct** digests
+/// (one refcount per unique chunk per manifest, matching the GC
+/// decrement) and MUST be pre-sorted ascending
+/// (`r[store.chunk.lock-order]`).
+// r[impl store.chunk.refcount-txn]
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn commit_chunked_output_in_conn(
+    conn: &mut sqlx::PgConnection,
+    info: &ValidatedPathInfo,
+    claim: uuid::Uuid,
+    manifest_bytes: &[u8],
+    chunk_hashes: &[Vec<u8>],
+    chunk_sizes: &[i64],
+    parsed: &crate::cas::ParsedNar,
+    tenant_id: Option<uuid::Uuid>,
+) -> Result<()> {
+    if chunk_hashes.len() != chunk_sizes.len() {
+        return Err(MetadataError::InvariantViolation(format!(
+            "chunk_hashes/chunk_sizes length mismatch: {} vs {}",
+            chunk_hashes.len(),
+            chunk_sizes.len()
+        )));
+    }
+    // The placeholder claimed in phase A wrote no manifest_data row,
+    // and a reaped placeholder CASCADEs its manifest_data away — a
+    // surviving row here means a double-commit, which PG surfaces as a
+    // PK conflict (same contract as `upgrade_manifest_to_chunked`).
+    sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+        .bind(&info.store_path_hash)
+        .bind(manifest_bytes)
+        .execute(&mut *conn)
+        .await?;
+
+    // Same UNNEST upsert shape as `upgrade_manifest_to_chunked`, minus
+    // the `RETURNING needs_upload` (the §6.3 verify walk already
+    // decided what to upload from `Begin.novel`). `deleted = false`
+    // resurrects a chunk the GC sweep marked between the builder's
+    // HasChunks probe and now.
+    if !chunk_hashes.is_empty() {
+        sqlx::query(
+            r#"
+            INSERT INTO chunks (blake3_hash, refcount, size)
+            SELECT * FROM UNNEST($1::bytea[], $2::bigint[], $3::bigint[]) AS t(hash, one, size)
+            ON CONFLICT (blake3_hash) DO UPDATE
+                SET refcount = chunks.refcount + 1, deleted = false
+            "#,
+        )
+        .bind(chunk_hashes)
+        .bind(vec![1i64; chunk_hashes.len()])
+        .bind(chunk_sizes)
+        .execute(&mut *conn)
+        .await?;
+    }
+
+    // Status flip + narinfo + chunks.durable + nar_index/directories/
+    // directory_paths/file_blobs. Reads the manifest_data row inserted
+    // above.
+    super::complete_manifest_in_conn(conn, info, claim, None, Some(parsed)).await?;
+
+    // Tolerant variant: an assignment token can name a tenant deleted
+    // while the build was in flight; that must skip the junction write,
+    // not abort the commit transaction this output just completed in.
+    insert_path_tenant_skipping_deleted_in_tx(conn, &info.store_path_hash, tenant_id).await
+}
+
+/// `path_tenants` junction insert (`r[store.castore.tenant-scope]`).
+/// Idempotent; a `None` tenant (dev mode, service-token caller) writes
+/// nothing. Runs for idempotent-skipped outputs too — the prior commit
+/// may have been via legacy `PutPath`, which didn't write the row.
+// r[impl store.castore.tenant-scope]
+pub(crate) async fn insert_path_tenant_in_conn(
+    conn: &mut sqlx::PgConnection,
+    store_path_hash: &[u8],
+    tenant_id: Option<uuid::Uuid>,
+) -> Result<()> {
+    let Some(tenant_id) = tenant_id else {
+        return Ok(());
+    };
+    sqlx::query(
+        "INSERT INTO path_tenants (store_path_hash, tenant_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(store_path_hash)
+    .bind(tenant_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// The PG-generated name of `path_tenants.tenant_id`'s foreign key to
+/// `tenants` (012_path_tenants.sql). PG includes it verbatim in the
+/// 23503 error message, which is how [`is_deleted_tenant_fk`]
+/// recognizes the violation without matching any other conflict.
+const PATH_TENANTS_TENANT_FK: &str = "path_tenants_tenant_id_fkey";
+
+/// True iff `err` is the foreign-key violation raised by a
+/// `path_tenants` junction insert whose tenant row no longer exists —
+/// an assignment token minted for a tenant that was deleted while the
+/// build was in flight. [`MetadataError::Conflict`] is only produced
+/// for SQLSTATE 23503/23505 and carries PG's primary message, which
+/// for an FK violation names the constraint; requiring the full
+/// `violates foreign key constraint "<name>"` phrase means a unique
+/// violation (23505) or an FK violation on any other constraint never
+/// matches.
+pub(crate) fn is_deleted_tenant_fk(err: &MetadataError) -> bool {
+    matches!(
+        err,
+        MetadataError::Conflict(msg)
+            if msg.contains(&format!(
+                "violates foreign key constraint \"{PATH_TENANTS_TENANT_FK}\""
+            ))
+    )
+}
+
+/// [`insert_path_tenant_in_conn`] for callers inside a multi-statement
+/// commit transaction, tolerating a tenant deleted while the build was
+/// in flight: the insert runs under a savepoint, and the FK violation
+/// on `path_tenants_tenant_id_fkey` (and ONLY that error — see
+/// [`is_deleted_tenant_fk`]) rolls back to the savepoint and skips the
+/// junction write instead of failing the upload that already verified.
+/// A junction row for a deleted tenant is meaningless — the content
+/// commit stays valid and the un-pinned path simply ages out via
+/// normal GC retention. The savepoint is what keeps the surrounding
+/// transaction usable after PG aborts the failed statement, so callers
+/// MUST be inside a transaction (the §6.2 commit transaction is the
+/// only one today).
+// r[impl store.castore.tenant-scope]
+pub(crate) async fn insert_path_tenant_skipping_deleted_in_tx(
+    conn: &mut sqlx::PgConnection,
+    store_path_hash: &[u8],
+    tenant_id: Option<uuid::Uuid>,
+) -> Result<()> {
+    if tenant_id.is_none() {
+        return Ok(());
+    }
+    sqlx::query("SAVEPOINT path_tenant_junction")
+        .execute(&mut *conn)
+        .await?;
+    match insert_path_tenant_in_conn(conn, store_path_hash, tenant_id).await {
+        Err(e) if is_deleted_tenant_fk(&e) => {
+            warn!(
+                store_path_hash = hex::encode(store_path_hash),
+                tenant_id = %tenant_id.expect("checked non-None above"),
+                "path_tenants junction skipped: tenant was deleted while the build was in flight"
+            );
+            sqlx::query("ROLLBACK TO SAVEPOINT path_tenant_junction")
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+        Ok(()) => {
+            sqlx::query("RELEASE SAVEPOINT path_tenant_junction")
+                .execute(&mut *conn)
+                .await?;
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use rio_test_support::TestDb;
+
+    /// The commit-time presence proof: a chunk is committable iff its
+    /// row exists, is not GC-claimed (`deleted`), and either a prior
+    /// commit confirmed its S3 object (`uploaded_at`) or this stream
+    /// just PUT it. Everything else must surface as unproven so the
+    /// caller aborts instead of flipping `durable = TRUE` for an
+    /// object the drain may already have deleted.
+    // r[verify store.chunk.durable-flag]
+    #[tokio::test]
+    async fn lock_chunks_for_commit_rejects_unprovable_objects() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Five digests, sorted by construction (0x01 < … < 0x05).
+        let healthy = vec![0x01u8; 32]; // uploaded_at set, not deleted
+        let swept = vec![0x02u8; 32]; // deleted = TRUE (GC claimed it)
+        let unconfirmed = vec![0x03u8; 32]; // uploaded_at NULL, not ours
+        let ours = vec![0x04u8; 32]; // uploaded_at NULL, PUT by this stream
+        let missing = vec![0x05u8; 32]; // no row at all
+        for (hash, deleted, uploaded) in [
+            (&healthy, false, true),
+            (&swept, true, false),
+            (&unconfirmed, false, false),
+            (&ours, false, false),
+        ] {
+            sqlx::query(
+                "INSERT INTO chunks (blake3_hash, refcount, size, deleted, uploaded_at) \
+                 VALUES ($1, 0, 64, $2, CASE WHEN $3 THEN now() END)",
+            )
+            .bind(hash)
+            .bind(deleted)
+            .bind(uploaded)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+
+        let all = vec![
+            healthy.clone(),
+            swept.clone(),
+            unconfirmed.clone(),
+            ours.clone(),
+            missing.clone(),
+        ];
+        let uploaded_by_stream = std::collections::HashSet::from([[0x04u8; 32]]);
+
+        let mut conn = db.pool.acquire().await.unwrap();
+        let unproven = lock_chunks_for_commit(&mut conn, &all, &uploaded_by_stream)
+            .await
+            .unwrap();
+        assert_eq!(
+            unproven,
+            vec![swept, unconfirmed, missing],
+            "healthy and just-uploaded chunks are provable; GC-claimed, \
+             never-confirmed, and missing rows are not"
+        );
+    }
+
+    /// Assert the given chunk row is currently row-locked by another
+    /// transaction: a fresh connection's `FOR UPDATE NOWAIT` must fail
+    /// with SQLSTATE 55P03 (lock_not_available).
+    async fn assert_chunk_row_locked(pool: &PgPool, hash: &[u8]) {
+        let mut probe = pool.acquire().await.unwrap();
+        let err = sqlx::query("SELECT 1 FROM chunks WHERE blake3_hash = $1 FOR UPDATE NOWAIT")
+            .bind(hash)
+            .fetch_optional(&mut *probe)
+            .await
+            .expect_err("chunk row should be locked by the in-flight commit transaction");
+        let code = match &err {
+            sqlx::Error::Database(e) => e.code().map(|c| c.to_string()),
+            _ => None,
+        };
+        assert_eq!(
+            code.as_deref(),
+            Some("55P03"),
+            "expected lock_not_available probing {}, got {err:?}",
+            hex::encode(hash)
+        );
+    }
+
+    // r[verify store.chunk.lock-order]
+    /// The commit transaction's final statement stamps `uploaded_at`
+    /// for every chunk this stream PUT — including digests whose only
+    /// manifest occurrence is in an idempotent-skipped output and which
+    /// therefore appear in `uploaded_by_this_stream` but NOT in the
+    /// manifest-digest union. Those rows MUST be part of the up-front
+    /// sorted FOR UPDATE: locking them for the first time at the end of
+    /// the transaction breaks the sorted acquisition order and re-opens
+    /// the ABBA-deadlock window against concurrent sorted writers.
+    #[tokio::test]
+    async fn lock_chunks_for_commit_locks_uploaded_only_digests() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let manifest_digest = [0x0Du8; 32]; // referenced by a non-skipped output
+        let uploaded_only = [0x0Cu8; 32]; // PUT by this stream; skipped-output only
+        for hash in [&manifest_digest, &uploaded_only] {
+            sqlx::query("INSERT INTO chunks (blake3_hash, refcount, size) VALUES ($1, 0, 64)")
+                .bind(hash.as_slice())
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let unproven = lock_chunks_for_commit(
+            &mut tx,
+            &[manifest_digest.to_vec()],
+            &std::collections::HashSet::from([uploaded_only, manifest_digest]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            unproven.is_empty(),
+            "both digests were PUT by this stream, got {unproven:?}"
+        );
+
+        // From a second connection, BOTH rows must already be locked —
+        // the manifest digest and the uploaded-only one.
+        assert_chunk_row_locked(&db.pool, manifest_digest.as_slice()).await;
+        assert_chunk_row_locked(&db.pool, uploaded_only.as_slice()).await;
+        tx.rollback().await.unwrap();
+    }
+
+    // r[verify store.chunk.lock-order]
+    /// `PutPathBatch`'s phase-3 pre-lock: the union of every staged
+    /// output's `manifest_data` chunk digests is locked up front in one
+    /// sorted FOR UPDATE, so the per-output `durable` flips that follow
+    /// only touch already-held rows (cross-output completion order is
+    /// output-index order, not digest order — without the pre-lock two
+    /// concurrent batches sharing freshly-staged chunks can
+    /// ABBA-deadlock after verification already succeeded). Healthy
+    /// staged chunks (uploaded_at set, not deleted) are proven; a
+    /// GC-claimed one is reported unproven so the batch aborts
+    /// retryably instead of committing a manifest that lies about S3
+    /// presence.
+    #[tokio::test]
+    async fn lock_staged_chunks_for_commit_locks_batch_union() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        // Two staged outputs with overlapping chunk lists, in the state
+        // phase-2 staging leaves them: uploaded (uploaded_at set), not
+        // yet durable.
+        let chunk_w = [0x21u8; 32];
+        let chunk_x = [0x22u8; 32];
+        let chunk_y = [0x23u8; 32];
+        for hash in [&chunk_w, &chunk_x, &chunk_y] {
+            sqlx::query(
+                "INSERT INTO chunks (blake3_hash, refcount, size, uploaded_at) \
+                 VALUES ($1, 1, 64, now())",
+            )
+            .bind(hash.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        }
+        let sph_a = vec![0x31u8; 32];
+        let sph_b = vec![0x32u8; 32];
+        for (sph, chunks) in [(&sph_a, [chunk_w, chunk_x]), (&sph_b, [chunk_x, chunk_y])] {
+            seed_placeholder(&db.pool, sph).await;
+            let list = crate::manifest::Manifest {
+                entries: chunks
+                    .iter()
+                    .map(|h| crate::manifest::ManifestEntry { hash: *h, size: 64 })
+                    .collect(),
+            }
+            .serialize();
+            sqlx::query("INSERT INTO manifest_data (store_path_hash, chunk_list) VALUES ($1, $2)")
+                .bind(sph)
+                .bind(&list)
+                .execute(&db.pool)
+                .await
+                .unwrap();
+        }
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let unproven = lock_staged_chunks_for_commit(&mut tx, &[sph_a.clone(), sph_b.clone()])
+            .await
+            .unwrap();
+        assert!(
+            unproven.is_empty(),
+            "healthy staged chunks are provable, got {unproven:?}"
+        );
+        // Every chunk referenced by EITHER output is row-locked before
+        // any per-output completion runs.
+        assert_chunk_row_locked(&db.pool, chunk_w.as_slice()).await;
+        assert_chunk_row_locked(&db.pool, chunk_x.as_slice()).await;
+        assert_chunk_row_locked(&db.pool, chunk_y.as_slice()).await;
+        tx.rollback().await.unwrap();
+
+        // A staged chunk the GC claimed between staging and commit is
+        // reported unproven.
+        sqlx::query("UPDATE chunks SET deleted = TRUE, uploaded_at = NULL WHERE blake3_hash = $1")
+            .bind(chunk_y.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let mut tx2 = db.pool.begin().await.unwrap();
+        let unproven = lock_staged_chunks_for_commit(&mut tx2, &[sph_a, sph_b])
+            .await
+            .unwrap();
+        assert_eq!(
+            unproven,
+            vec![chunk_y.to_vec()],
+            "a GC-claimed staged chunk must abort the batch commit"
+        );
+    }
+
+    /// `insert_pending_chunks` must restart the grace clock and clear a
+    /// GC claim on a refcount-0 row it is about to re-upload — without
+    /// that, a retry of a swept upload re-PUTs the S3 object but leaves
+    /// the row `deleted = TRUE`, so the commit-time presence check can
+    /// never pass and the upload livelocks. A live (refcount > 0) row
+    /// is left alone.
+    #[tokio::test]
+    async fn insert_pending_chunks_resurrects_swept_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let swept = [0x0Au8; 32];
+        let live = [0x0Bu8; 32];
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted, created_at) \
+             VALUES ($1, 0, 64, TRUE, now() - interval '1 hour'), \
+                    ($2, 3, 64, FALSE, now() - interval '1 hour')",
+        )
+        .bind(swept.as_slice())
+        .bind(live.as_slice())
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        insert_pending_chunks(&db.pool, &[(swept, 64), (live, 64)])
+            .await
+            .unwrap();
+
+        let (deleted, fresh): (bool, bool) = sqlx::query_as(
+            "SELECT deleted, created_at > now() - interval '1 minute' \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(swept.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!deleted, "the GC claim must be cleared for a re-upload");
+        assert!(fresh, "the grace clock must restart for a re-upload");
+
+        let (live_deleted, live_fresh): (bool, bool) = sqlx::query_as(
+            "SELECT deleted, created_at > now() - interval '1 minute' \
+             FROM chunks WHERE blake3_hash = $1",
+        )
+        .bind(live.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(!live_deleted);
+        assert!(
+            !live_fresh,
+            "a refcount > 0 row is owned by other manifests; leave it alone"
+        );
+    }
+
+    /// `mark_chunks_uploaded` must not stamp `uploaded_at` on a row the
+    /// orphan sweep tombstoned mid-staging: the drain may already be
+    /// deleting the S3 object, and a stamped-then-resurrected row would
+    /// skip the re-PUT and let a manifest point at a drained object. A
+    /// live (not-deleted) row in the same batch is still stamped.
+    // r[verify store.cas.chunk-upload-committed]
+    #[tokio::test]
+    async fn mark_chunks_uploaded_skips_tombstoned_rows() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let tombstoned = vec![0xE1u8; 32];
+        let live = vec![0xE2u8; 32];
+        sqlx::query(
+            "INSERT INTO chunks (blake3_hash, refcount, size, deleted) \
+             VALUES ($1, 0, 64, TRUE), ($2, 0, 64, FALSE)",
+        )
+        .bind(&tombstoned)
+        .bind(&live)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+
+        mark_chunks_uploaded(&db.pool, &[tombstoned.clone(), live.clone()])
+            .await
+            .unwrap();
+
+        let stamped: Vec<(Vec<u8>, bool)> = sqlx::query_as(
+            "SELECT blake3_hash, uploaded_at IS NOT NULL FROM chunks \
+             WHERE blake3_hash = ANY($1) ORDER BY blake3_hash",
+        )
+        .bind(vec![tombstoned.clone(), live.clone()])
+        .fetch_all(&db.pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            stamped,
+            vec![(tombstoned, false), (live, true)],
+            "a sweep-tombstoned row keeps uploaded_at NULL; the live row is stamped"
+        );
+    }
 
     /// PG constraint: duplicate hashes in the UNNEST batch → PG error
     /// "ON CONFLICT DO UPDATE command cannot affect row a second time".
@@ -1134,7 +1810,7 @@ mod tests {
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
         let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
         info.store_path_hash = sph.clone();
-        complete_manifest_chunked(&db.pool, &info, claim_b)
+        complete_manifest_chunked(&db.pool, &info, claim_b, None)
             .await
             .unwrap();
 
@@ -1160,12 +1836,13 @@ mod tests {
                 .unwrap();
         assert!(md.is_some(), "B's manifest_data row survives");
 
-        let kind = crate::metadata::queries::get_manifest(&db.pool, &path)
+        let kind = crate::metadata::queries::get_manifest_with_dag(&db.pool, &path)
             .await
-            .unwrap();
+            .unwrap()
+            .map(|(kind, _dag)| kind);
         assert!(
             matches!(kind, Some(crate::metadata::ManifestKind::Chunked(_))),
-            "get_manifest still resolves B's chunked manifest, got {kind:?}"
+            "get_manifest_with_dag still resolves B's chunked manifest, got {kind:?}"
         );
     }
 
@@ -1344,5 +2021,94 @@ mod tests {
             elapsed >= Duration::from_millis(50),
             "upgrade should block on competing FOR UPDATE; elapsed={elapsed:?}"
         );
+    }
+
+    // r[verify store.chunk.durable-flag]
+    /// `durable` flips exactly when the manifest completes — never at
+    /// staging time (the WAL window is the I-201 hazard HasChunks
+    /// guards against), and a second manifest sharing the chunk leaves
+    /// the flag set (no un-flip, no error from the `AND NOT durable`
+    /// no-op).
+    #[tokio::test]
+    async fn durable_flips_on_complete_not_on_stage() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+
+        let chunk = vec![0x6Du8; 32];
+        let one_chunk = std::slice::from_ref(&chunk);
+        let chunk_list = crate::manifest::Manifest {
+            entries: vec![crate::manifest::ManifestEntry {
+                hash: chunk.as_slice().try_into().unwrap(),
+                size: 1024,
+            }],
+        }
+        .serialize();
+        let durable = |pool: &PgPool, h: &[u8]| {
+            let pool = pool.clone();
+            let h = h.to_vec();
+            async move {
+                sqlx::query_scalar::<_, bool>("SELECT durable FROM chunks WHERE blake3_hash = $1")
+                    .bind(&h)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap()
+            }
+        };
+
+        // --- Manifest A: stage → not durable; complete → durable. ---
+        let path_a = rio_test_support::fixtures::test_store_path("durable-a");
+        let sph_a = rio_nix::store_path::StorePath::parse(&path_a)
+            .unwrap()
+            .sha256_digest()
+            .to_vec();
+        let claim_a = crate::metadata::insert_manifest_uploading(&db.pool, &sph_a, &path_a, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph_a, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        assert!(
+            !durable(&db.pool, &chunk).await,
+            "staged-but-not-complete chunk must NOT be durable (I-201 WAL window)"
+        );
+
+        let mut info_a =
+            rio_test_support::fixtures::make_path_info(&path_a, &[0u8; 1024], [0x55; 32]);
+        info_a.store_path_hash = sph_a.clone();
+        complete_manifest_chunked(&db.pool, &info_a, claim_a, None)
+            .await
+            .unwrap();
+        assert!(
+            durable(&db.pool, &chunk).await,
+            "completing the manifest must flip its chunks durable"
+        );
+
+        // --- Manifest B shares the chunk: completing it is a no-op
+        //     on the already-durable row, not an error. ---
+        let path_b = rio_test_support::fixtures::test_store_path("durable-b");
+        let sph_b = rio_nix::store_path::StorePath::parse(&path_b)
+            .unwrap()
+            .sha256_digest()
+            .to_vec();
+        let claim_b = crate::metadata::insert_manifest_uploading(&db.pool, &sph_b, &path_b, &[])
+            .await
+            .unwrap()
+            .unwrap();
+        upgrade_manifest_to_chunked(&db.pool, &sph_b, &chunk_list, one_chunk, &[1024])
+            .await
+            .unwrap();
+        let mut info_b =
+            rio_test_support::fixtures::make_path_info(&path_b, &[0u8; 1024], [0x66; 32]);
+        info_b.store_path_hash = sph_b.clone();
+        complete_manifest_chunked(&db.pool, &info_b, claim_b, None)
+            .await
+            .unwrap();
+        assert!(durable(&db.pool, &chunk).await, "still durable after B");
+        let rc: i32 = sqlx::query_scalar("SELECT refcount FROM chunks WHERE blake3_hash = $1")
+            .bind(&chunk)
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(rc, 2, "refcount unaffected by the durable flip");
     }
 }

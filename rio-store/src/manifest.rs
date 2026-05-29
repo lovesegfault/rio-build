@@ -1,14 +1,14 @@
 //! Chunk manifest serialization.
 //!
 //! A manifest is the ordered list of (BLAKE3 hash, size) pairs that
-//! describes how to reassemble a chunked NAR. It's stored in PG
+//! describes a chunked store path's content. It's stored in PG
 //! (`manifest_data.chunk_list` BYTEA) and read on every GetPath.
 // r[impl store.manifest.format]
 //!
 //! # Format
 //!
 //! ```text
-//! [version: u8 = 1] [entry: 36 bytes]*
+//! [version: u8 = 2] [entry: 36 bytes]*
 //!   where entry = [blake3: 32 bytes] [size: u32 LE]
 //! ```
 //!
@@ -19,6 +19,31 @@
 //! - A 10 GB NAR at 64 KB chunks is ~160k entries × 36 bytes = ~5.6 MB of
 //!   manifest; the format overhead is negligible either way
 //!
+//! # What the chunks reassemble to
+//!
+//! Chunks are per-regular-file FastCDC over file *content* bytes, in
+//! canonical NAR walk order — NAR framing is never chunked (ADR-022
+//! §6.1). Concatenating every chunk yields the **blob stream**: each
+//! reachable regular file's contents back to back, with a file that
+//! appears N times in the tree contributing its run N times. File
+//! boundaries are always chunk boundaries, so:
+//!
+//! - `total_size()` is the total content byte count, NOT `nar_size`;
+//! - a file's chunk window (`StatBlob`) is an exact entry range — no
+//!   first/last-chunk slicing;
+//! - `file_blobs.nar_offset` holds the file's offset *in the blob
+//!   stream*, and the cumsum over entry sizes maps those offsets to
+//!   entry indices;
+//! - `GetPath` regenerates the NAR framing from the path's
+//!   `nar_index.root_node` + `directories` rows and splices chunk
+//!   contents in between.
+//!
+//! Version 1 (server-side FastCDC over the whole NAR byte stream,
+//! framing included) is **not readable** — `deserialize` rejects it.
+//! The format changed under the ADR-022 §6 cutover; deployments are
+//! greenfield (`docs/src/runbooks/castore-fuse-cutover.md`), so there
+//! is no migration path and no dual-format read code.
+//!
 //! # Why `u32` for size
 //!
 //! CHUNK_MAX is 256 KiB = fits in u32 with 16k× headroom. u64 would double
@@ -28,33 +53,56 @@
 
 use thiserror::Error;
 
-/// Format version. Bump for incompatible changes; add a new `deserialize`
-/// branch that handles the old version for migration.
-const VERSION: u8 = 1;
+/// Format version. 2 = per-file blob-stream chunks (ADR-022 §6); 1 was
+/// whole-NAR-stream chunks and is rejected on read. Bump for
+/// incompatible changes.
+const VERSION: u8 = 2;
 
 /// Bytes per entry: 32 (BLAKE3) + 4 (u32 size).
 const ENTRY_SIZE: usize = 36;
 
-/// Upper bound on chunk count. Derived from the worst case:
-/// `MAX_NAR_SIZE / CHUNK_MIN = 4 GiB / 16 KiB = 262_144`, rounded up.
-/// Any accepted (MAX_NAR_SIZE-gated) NAR's chunk list MUST round-trip
-/// through `serialize` → `deserialize` — the prior 200_000 bound was
-/// below the worst case (the "above 10 GiB / CHUNK_MIN too" comment was
-/// arithmetically false), so an adversarial CHUNK_MIN-forcing input could
-/// commit a manifest that `deserialize` rejects on read.
+/// Upper bound on chunk count, derived from the worst case any accepted
+/// NAR can produce under per-file FastCDC (ADR-022 §6.1):
+///
+/// - **bytes dimension**: `MAX_NAR_SIZE / CHUNK_MIN = 4 GiB / 16 KiB =
+///   262_144` — within one file, every chunk except the last is at
+///   least `CHUNK_MIN`;
+/// - **file-count dimension**: the chunker restarts at every regular
+///   file, so each non-empty file contributes at least one chunk
+///   regardless of its size. The file count is bounded by
+///   `rio_nix::nar::MAX_NAR_ENTRIES` (the whole-archive entry cap every
+///   ingest entry point enforces, `r[store.ingest.tree-bounds]`), not
+///   by `MAX_NAR_SIZE`.
+///
+/// Any accepted NAR's chunk list MUST round-trip through `serialize` →
+/// `deserialize`; deriving the cap from the same limits ingest enforces
+/// keeps "accepted ⇒ storable" structurally true. (The previous
+/// bytes-only derivation predates per-file chunking — under it a >262k
+/// regular-file NAR, well within every other limit, was rejected with an
+/// error blaming "adversarial CHUNK_MIN-forcing input".) At the cap the
+/// manifest blob is ~45 MiB — well inside PG bytea limits — and
+/// `deserialize` still bounds its preallocation by this constant.
 ///
 /// `stage_chunked` enforces this at the trust boundary (after
-/// `chunk_nar`, before any PG/S3 commit). The `deserialize` check is
+/// `chunk_nar`, before any PG/S3 commit); `validate_begin` enforces it
+/// per `PutPathChunked` output. The `deserialize` check is
 /// defense-in-depth against a corrupt/hostile blob: don't preallocate
-/// 300k × 36 B = ~10 MB just because the length field says so.
-pub const MAX_CHUNKS: usize = 300_000;
+/// ~45 MiB just because the length field says so.
+// r[impl store.ingest.tree-bounds+2]
+pub const MAX_CHUNKS: usize = (rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64)
+    as usize
+    + rio_nix::nar::MAX_NAR_ENTRIES;
 
-/// Compile-time tripwire: rio-store already depends on rio-common and on
-/// chunker (same crate), so there is no dep-cycle. Future drift to either
-/// constant fails the build.
+/// Compile-time tripwire: rio-store already depends on rio-common,
+/// rio-nix, and chunker (same crate), so there is no dep-cycle. If the
+/// derivation above is ever replaced by a literal, this keeps the SUM of
+/// both dimensions covered (a single accepted NAR can max out both at
+/// once) or fails the build.
 const _: () = assert!(
-    MAX_CHUNKS as u64 >= rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64,
-    "MAX_CHUNKS must cover MAX_NAR_SIZE / CHUNK_MIN"
+    MAX_CHUNKS as u64
+        >= rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64
+            + rio_nix::nar::MAX_NAR_ENTRIES as u64,
+    "MAX_CHUNKS must cover the bytes-derived plus the file-count-derived worst case"
 );
 
 /// A single manifest entry.
@@ -126,8 +174,8 @@ impl Manifest {
         let count = body.len() / ENTRY_SIZE;
         if count > MAX_CHUNKS {
             // Check BEFORE Vec::with_capacity — don't let a corrupt length
-            // field make us preallocate 7 MB (or worse, if a future format
-            // change widens entries).
+            // field make us preallocate ~45 MiB (or worse, if a future
+            // format change widens entries).
             return Err(ManifestError::TooManyChunks(count));
         }
 
@@ -195,15 +243,27 @@ mod tests {
         assert_eq!(parsed, m);
     }
 
-    /// Worst-case accepted input: a `MAX_NAR_SIZE` NAR chunked entirely
-    /// at `CHUNK_MIN` boundaries produces 262_144 entries. `serialize`
-    /// → `deserialize` MUST round-trip — the prior `MAX_CHUNKS=200_000`
-    /// rejected on read with `TooManyChunks`, so an adversarial input
-    /// could commit a permanently-unreadable manifest.
+    /// Worst-case accepted input under per-file FastCDC (ADR-022 §6.1):
+    /// the chunker restarts at every regular file, so the chunk count is
+    /// the bytes-derived bound (`MAX_NAR_SIZE / CHUNK_MIN`, every chunk
+    /// but a file's last is ≥ `CHUNK_MIN`) plus one chunk per non-empty
+    /// regular file (bounded by `MAX_NAR_ENTRIES`, not by size). A
+    /// manifest at exactly that count MUST round-trip through `serialize`
+    /// → `deserialize`: an undersized `MAX_CHUNKS` either rejects a
+    /// legitimately accepted high-file-count path at ingest (bug_007,
+    /// blamed on "adversarial input") or — as with the historical
+    /// `MAX_CHUNKS=200_000` — lets one commit and then rejects it with
+    /// `TooManyChunks` on every read.
+    // r[verify store.ingest.tree-bounds+2]
     #[test]
     fn roundtrip_at_worst_case_chunk_count() {
-        let n = (rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64) as usize;
-        assert!(n <= MAX_CHUNKS, "const-assert should guarantee this");
+        let n = (rio_common::limits::MAX_NAR_SIZE / crate::chunker::CHUNK_MIN as u64) as usize
+            + rio_nix::nar::MAX_NAR_ENTRIES;
+        assert!(
+            n <= MAX_CHUNKS,
+            "MAX_CHUNKS ({MAX_CHUNKS}) must cover the two-dimension worst case ({n}): \
+             the bytes-derived bound plus one chunk per non-empty regular file"
+        );
         let m = Manifest {
             entries: (0..n)
                 .map(|i| ManifestEntry {
@@ -218,7 +278,6 @@ mod tests {
         };
         let bytes = m.serialize();
         let parsed = Manifest::deserialize(&bytes).expect("worst-case must round-trip");
-        assert_eq!(parsed.entries.len(), n);
         assert_eq!(parsed, m);
     }
 
@@ -359,10 +418,8 @@ mod tests {
 
     #[test]
     fn deserialize_rejects_too_many_chunks() {
-        // MAX_CHUNKS + 1 entries. Don't actually allocate 7.2 MB for the
-        // test — construct the minimum viable over-limit manifest.
-        // Actually, (MAX_CHUNKS + 1) * 36 ≈ 7.2 MB — that IS big but fine
-        // for a test; it's transient and doesn't hit PG or S3.
+        // MAX_CHUNKS + 1 entries: (MAX_CHUNKS + 1) × 36 ≈ 47 MB — big but
+        // transient, and it never hits PG or S3.
         let over_limit = vec![0u8; 1 + (MAX_CHUNKS + 1) * ENTRY_SIZE];
         let mut data = over_limit;
         data[0] = VERSION;

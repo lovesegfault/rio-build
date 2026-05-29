@@ -367,14 +367,14 @@ pub fn internal(ctx: &str, e: impl Display) -> Status {
 ///   can briefly saturate even 8×200=1600 conns. Drains in <1s.
 /// - `Aborted` — store's retryable PG conflict (Serialization, Deadlock
 ///   — see `rio-store::metadata`). The store says "retry" via Aborted
-///   (I-189); without it the builder's no-manifest-hint fallback path
-///   EIOs immediately on PG contention instead of backing off.
+///   (I-189); without it the builder's JIT GetPath fetch EIOs
+///   immediately on PG contention instead of backing off.
 ///
 /// `DeadlineExceeded` is deliberately NOT transient: that's the caller's
 /// own timeout firing — the peer hung past `fetch_timeout`. Retrying
 /// with the same timeout won't help, and on a FUSE-thread caller the
 /// next retry would compound the wait.
-// r[impl builder.fuse.retry-jitter]
+// r[impl builder.fuse.retry-jitter+2]
 pub fn is_transient(code: tonic::Code) -> bool {
     matches!(
         code,
@@ -464,7 +464,7 @@ mod tests {
 
     /// I-189: store returns `Aborted` for retryable PG conflicts
     /// (Serialization, Deadlock). Callers must retry, not surface EIO.
-    // r[verify builder.fuse.retry-jitter]
+    // r[verify builder.fuse.retry-jitter+2]
     #[test]
     fn test_is_transient_classification() {
         assert!(is_transient(tonic::Code::Aborted));

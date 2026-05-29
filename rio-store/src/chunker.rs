@@ -29,14 +29,18 @@
 use fastcdc::v2020::FastCDC;
 
 /// Minimum chunk size. FastCDC won't cut before this many bytes.
-pub const CHUNK_MIN: usize = 16 * 1024;
+///
+/// Aliases the workspace-wide constant: P0586 moved chunking to the
+/// builder, so rio-builder's per-file FastCDC and this whole-NAR
+/// chunker must agree or dedup silently drops to zero.
+pub const CHUNK_MIN: usize = rio_common::limits::FASTCDC_MIN_BYTES;
 
 /// Average chunk size. The "expected" boundary spacing.
-pub const CHUNK_AVG: usize = 64 * 1024;
+pub const CHUNK_AVG: usize = rio_common::limits::FASTCDC_AVG_BYTES;
 
 /// Maximum chunk size. Hard cap — FastCDC forces a cut at this length
 /// even if no content-defined boundary is found.
-pub const CHUNK_MAX: usize = 256 * 1024;
+pub const CHUNK_MAX: usize = rio_common::limits::FASTCDC_MAX_BYTES;
 
 /// A single chunk: its BLAKE3 hash and a borrowed slice into the source.
 ///
