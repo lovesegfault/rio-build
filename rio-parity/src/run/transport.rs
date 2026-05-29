@@ -60,6 +60,14 @@ const DAEMON_COMMAND: &str = "nix-daemon --stdio";
 /// move the same failure later.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Deadline for dialing one SSH connection: TCP connect, key exchange, and
+/// publickey auth against the in-cluster gateway Service. Bounded so a
+/// blackholed or half-dead endpoint fails the dial instead of wedging
+/// `open_channel` (and the per-connection lock the dial holds) indefinitely;
+/// 30s is far above a healthy in-cluster dial and matches the gateway's own
+/// setup budget.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Client→gateway keepalive ping interval. The gateway pings every 30s from
 /// its side; this detects a dead gateway from ours.
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
@@ -223,8 +231,16 @@ pub enum TransportError {
     /// raced session teardown). The request should be retried once on a fresh
     /// channel and otherwise reported as an upload/build rejection.
     Refused(String),
-    /// The operation exceeded its deadline.
-    Timeout(Duration),
+    /// The operation exceeded its deadline. The wire position is unknown
+    /// afterwards — the channel must not be reused.
+    Timeout {
+        /// Operation that timed out (e.g. `QueryValidPaths (2000 paths)`).
+        op: String,
+        /// Pool index of the SSH connection the channel ran on.
+        connection: usize,
+        /// The per-op deadline that elapsed.
+        deadline: Duration,
+    },
     /// Transport or protocol failure; the channel/connection is unusable.
     Other(anyhow::Error),
 }
@@ -233,7 +249,14 @@ impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(msg) => write!(f, "daemon refused: {msg}"),
-            Self::Timeout(deadline) => write!(f, "operation timed out after {deadline:?}"),
+            Self::Timeout {
+                op,
+                connection,
+                deadline,
+            } => write!(
+                f,
+                "{op} on gateway connection {connection} timed out after {deadline:?}"
+            ),
             Self::Other(err) => std::fmt::Display::fmt(err, f),
         }
     }
@@ -242,7 +265,7 @@ impl std::fmt::Display for TransportError {
 impl std::error::Error for TransportError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
-            Self::Refused(_) | Self::Timeout(_) => None,
+            Self::Refused(_) | Self::Timeout { .. } => None,
             // Mirror thiserror's `#[error(transparent)]`: delegate to the
             // wrapped error's source so the chain is not duplicated.
             Self::Other(err) => {
@@ -280,16 +303,23 @@ fn map_client_op_error(err: ClientOpError, op: &str, upload: bool) -> TransportE
 }
 
 /// Run one rio-nix client op under a deadline and map its outcome.
+/// `connection` is the pool index of the SSH connection the channel runs on,
+/// carried into timeout errors for triage.
 async fn run_op<T>(
     op_future: impl Future<Output = std::result::Result<T, ClientOpError>>,
     deadline: Duration,
     op: &str,
+    connection: usize,
     upload: bool,
 ) -> std::result::Result<T, TransportError> {
     match tokio::time::timeout(deadline, op_future).await {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(err)) => Err(map_client_op_error(err, op, upload)),
-        Err(_elapsed) => Err(TransportError::Timeout(deadline)),
+        Err(_elapsed) => Err(TransportError::Timeout {
+            op: op.to_string(),
+            connection,
+            deadline,
+        }),
     }
 }
 
@@ -484,7 +514,29 @@ impl GatewayPool {
     /// [`DaemonChannel`] drops. Connections the gateway has closed in the
     /// meantime (it disconnects whenever a connection's last channel closes)
     /// are skipped and re-dialed lazily.
+    ///
+    /// One channel-open race is absorbed internally: when the exec/open step
+    /// lands on a connection the gateway had already closed, or the gateway
+    /// rejects the exec because it has not finished processing an earlier
+    /// channel close (both routine at saturation — closes are processed
+    /// asynchronously), the open is retried once on a freshly acquired slot
+    /// before the error is surfaced.
     pub async fn open_channel(&self) -> Result<DaemonChannel> {
+        match self.open_channel_once().await {
+            Err(err) if err.downcast_ref::<ChannelOpenRace>().is_some() => {
+                tracing::debug!(
+                    error = %format!("{err:#}"),
+                    "channel open raced a gateway-side close or budget rejection; retrying once on a fresh slot"
+                );
+                self.open_channel_once().await
+            }
+            other => other,
+        }
+    }
+
+    /// One attempt at [`Self::open_channel`]: acquire a slot, exec the
+    /// daemon, run the handshake.
+    async fn open_channel_once(&self) -> Result<DaemonChannel> {
         let (connection, slot) = self.acquire_slot().await?;
 
         let setup = async {
@@ -527,6 +579,7 @@ impl GatewayPool {
             writer,
             negotiated_version: handshake.negotiated_version(),
             connection_index: connection.index,
+            poisoned: None,
             _slot: slot,
         })
     }
@@ -658,7 +711,9 @@ impl GatewayPool {
     /// Make sure `connection` has a live SSH connection, dialing it if it has
     /// never been dialed or the gateway has dropped it. Concurrent callers
     /// serialize on the connection's write lock; whoever loses that race
-    /// finds a fresh handle and skips its own dial.
+    /// finds a fresh handle and skips its own dial. The write lock is held
+    /// across the dial, but the dial itself is bounded by [`DIAL_TIMEOUT`],
+    /// so the lock can never be held across an unbounded await.
     async fn ensure_open(&self, connection: &PoolConnection) -> Result<()> {
         if connection
             .handle
@@ -686,6 +741,9 @@ impl GatewayPool {
                 connection.index, self.endpoint
             )
         })?);
+        // Slot permits still held by DaemonChannels from the previous
+        // incarnation keep the re-dialed connection under-utilized until
+        // those stale channels error out and drop.
         Ok(())
     }
 
@@ -715,62 +773,94 @@ impl GatewayPool {
     /// channel closes).
     async fn dial(&self, index: usize) -> Result<russh::client::Handle<TransportHandler>> {
         let key = self.load_key().await?;
-        let config = Arc::new(russh::client::Config {
-            keepalive_interval: Some(KEEPALIVE_INTERVAL),
-            keepalive_max: KEEPALIVE_MAX,
-            nodelay: true,
-            ..Default::default()
-        });
-        let handler = TransportHandler {
-            policy: self.policy.clone(),
-            host: self.endpoint.host.clone(),
-            port: self.endpoint.port,
-        };
-        let mut handle = russh::client::connect(
-            config,
-            (self.endpoint.host.as_str(), self.endpoint.port),
-            handler,
-        )
-        .await
-        .with_context(|| {
-            format!(
-                "failed to establish SSH connection {index} to {}",
-                self.endpoint
-            )
-        })?;
-
-        // The gateway only advertises publickey auth. For RSA keys ask which
-        // rsa-sha2 variant the server supports; for anything else (ed25519 in
-        // practice) the hash parameter is ignored.
-        let hash_alg = if key.algorithm().is_rsa() {
-            handle
-                .best_supported_rsa_hash()
-                .await
-                .context("failed to query the gateway's supported RSA signature hashes")?
-                .flatten()
-        } else {
-            None
-        };
-        let auth = handle
-            .authenticate_publickey(
-                self.endpoint.user.as_str(),
-                PrivateKeyWithHashAlg::new(key.clone(), hash_alg),
+        let connect_and_auth = async {
+            let config = Arc::new(russh::client::Config {
+                keepalive_interval: Some(KEEPALIVE_INTERVAL),
+                keepalive_max: KEEPALIVE_MAX,
+                nodelay: true,
+                ..Default::default()
+            });
+            let handler = TransportHandler {
+                policy: self.policy.clone(),
+                host: self.endpoint.host.clone(),
+                port: self.endpoint.port,
+            };
+            let mut handle = russh::client::connect(
+                config,
+                (self.endpoint.host.as_str(), self.endpoint.port),
+                handler,
             )
             .await
             .with_context(|| {
                 format!(
-                    "publickey authentication failed on connection {index} to {}",
+                    "failed to establish SSH connection {index} to {}",
                     self.endpoint
                 )
             })?;
-        ensure!(
-            auth.success(),
-            "the gateway rejected the SSH key {} — its public half must be in the gateway's \
-             authorized keys with the key comment naming the campaign's tenant",
-            self.endpoint.ssh_key_path.display()
-        );
+
+            // The gateway only advertises publickey auth. For RSA keys ask
+            // which rsa-sha2 variant the server supports; for anything else
+            // (ed25519 in practice) the hash parameter is ignored.
+            let hash_alg = if key.algorithm().is_rsa() {
+                handle
+                    .best_supported_rsa_hash()
+                    .await
+                    .context("failed to query the gateway's supported RSA signature hashes")?
+                    .flatten()
+            } else {
+                None
+            };
+            let auth = handle
+                .authenticate_publickey(
+                    self.endpoint.user.as_str(),
+                    PrivateKeyWithHashAlg::new(key.clone(), hash_alg),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "publickey authentication failed on connection {index} to {}",
+                        self.endpoint
+                    )
+                })?;
+            ensure!(
+                auth.success(),
+                "the gateway rejected the SSH key {} — its public half must be in the gateway's \
+                 authorized keys with the key comment naming the campaign's tenant",
+                self.endpoint.ssh_key_path.display()
+            );
+            Ok::<_, anyhow::Error>(handle)
+        };
+        // Bounded so a blackholed endpoint (or a half-dead gateway that
+        // accepts TCP but never finishes the SSH exchange) fails the dial
+        // instead of wedging the caller — and the per-connection write lock
+        // ensure_open holds across this call — indefinitely.
+        let handle = tokio::time::timeout(DIAL_TIMEOUT, connect_and_auth)
+            .await
+            .map_err(|_| {
+                anyhow!(
+                    "dialing SSH connection {index} to {} timed out after {}s \
+                     (TCP connect + key exchange + publickey auth)",
+                    self.endpoint,
+                    DIAL_TIMEOUT.as_secs()
+                )
+            })??;
         tracing::debug!(index, endpoint = %self.endpoint, "gateway SSH connection authenticated");
         Ok(handle)
+    }
+}
+
+/// Marker context attached to exec/channel-open failures caused by the
+/// gateway having already closed the connection (it disconnects a connection
+/// whenever its last channel closes) or not yet having processed an earlier
+/// channel close when it re-checked its per-connection budget — both routine
+/// races at saturation. [`GatewayPool::open_channel`] absorbs exactly one
+/// such failure by retrying on a freshly acquired slot.
+#[derive(Debug, Clone, Copy)]
+struct ChannelOpenRace;
+
+impl std::fmt::Display for ChannelOpenRace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("channel open raced a gateway connection close or channel-budget rejection")
     }
 }
 
@@ -778,6 +868,10 @@ impl GatewayPool {
 /// wait for the gateway to confirm it. `exec` only sends the request; the
 /// accept/reject verdict arrives as a channel message (the gateway re-checks
 /// its 4-channel budget at exec time).
+///
+/// Failures caused by the connection having been closed under us, or by the
+/// gateway rejecting the exec, carry the [`ChannelOpenRace`] context so
+/// [`GatewayPool::open_channel`] can absorb them with one retry.
 async fn exec_daemon(
     connection: &PoolConnection,
     endpoint: &GatewayEndpoint,
@@ -791,21 +885,24 @@ async fn exec_daemon(
             );
         };
         if handle.is_closed() {
-            bail!(
+            return Err(anyhow!(
                 "SSH connection {} to {endpoint} is closed (gateway disconnect or keepalive \
                  timeout)",
                 connection.index
-            );
+            )
+            .context(ChannelOpenRace));
         }
         handle
             .channel_open_session()
             .await
-            .context("failed to open an SSH session channel")?
+            .context("failed to open an SSH session channel")
+            .context(ChannelOpenRace)?
     };
     channel
         .exec(true, DAEMON_COMMAND)
         .await
-        .context("failed to send the nix-daemon exec request")?;
+        .context("failed to send the nix-daemon exec request")
+        .context(ChannelOpenRace)?;
     // Bailing on any arm below (or later, before the handshake completes)
     // does not leak the server-side slot: our dropped channel sends an SSH
     // close, and the gateway's own 30s handshake reaper tears down sessions
@@ -813,22 +910,42 @@ async fn exec_daemon(
     loop {
         match channel.wait().await {
             Some(russh::ChannelMsg::Success) => return Ok(channel),
-            Some(russh::ChannelMsg::Failure) => bail!(
-                "gateway refused `{DAEMON_COMMAND}` on a new channel \
-                 (per-connection channel budget exhausted?)"
-            ),
+            Some(russh::ChannelMsg::Failure) => {
+                return Err(anyhow!(
+                    "gateway refused `{DAEMON_COMMAND}` on a new channel \
+                     (per-connection channel budget exhausted?)"
+                )
+                .context(ChannelOpenRace));
+            }
             // Flow-control noise can arrive ahead of the exec verdict.
             Some(russh::ChannelMsg::WindowAdjusted { .. }) => continue,
             Some(other) => bail!(
                 "unexpected SSH channel message while waiting for the exec verdict: {other:?}"
             ),
-            None => bail!("SSH channel closed before the gateway confirmed the exec request"),
+            None => {
+                return Err(anyhow!(
+                    "SSH channel closed before the gateway confirmed the exec request"
+                )
+                .context(ChannelOpenRace));
+            }
         }
     }
 }
 
 /// The bidirectional byte stream of one exec'd gateway channel.
 type GatewayStream = russh::ChannelStream<russh::client::Msg>;
+
+/// Whether an op error leaves the channel's wire position unknown, making
+/// the channel unusable for further ops: timeouts (the op was cut off
+/// mid-read/-write) and transport failures always do; a refusal does only
+/// for upload ops, which may have started writing a framed payload before
+/// the daemon refused.
+fn poisons_channel(err: &TransportError, upload: bool) -> bool {
+    match err {
+        TransportError::Refused(_) => upload,
+        TransportError::Timeout { .. } | TransportError::Other(_) => true,
+    }
+}
 
 /// One `nix-daemon --stdio` session over an SSH channel, handshake done.
 ///
@@ -837,10 +954,12 @@ type GatewayStream = russh::ChannelStream<russh::client::Msg>;
 /// a time. Run independent operations on separate channels from
 /// [`GatewayPool::open_channel`].
 ///
-/// After any error ([`TransportError`]) the channel should be dropped (or
-/// [abandoned](Self::abandon)) and a fresh one opened: a refused upload or a
-/// timed-out read leaves the wire position unknown and it cannot be
-/// resynchronized.
+/// After an error that desyncs the wire (a timeout, a transport failure, or
+/// a refused upload — see [`poisons_channel`]) the channel cannot be
+/// resynchronized; it remembers the failure and every subsequent op fails
+/// fast with an error saying to open a fresh channel. A clean daemon refusal
+/// on a non-upload op leaves the protocol position known and the channel
+/// usable.
 ///
 /// Dropping the channel (with or without `abandon`) releases its pool slot
 /// and makes russh send a best-effort SSH channel close; the gateway treats
@@ -852,6 +971,9 @@ pub struct DaemonChannel {
     negotiated_version: u64,
     /// Index of the pool connection this channel runs on (for triage logs).
     connection_index: usize,
+    /// Set to a short description of the first wire-desyncing failure; once
+    /// set, every further op fails fast (see [`poisons_channel`]).
+    poisoned: Option<String>,
     /// Slot on the owning connection; released on drop.
     _slot: OwnedSemaphorePermit,
 }
@@ -868,6 +990,34 @@ impl DaemonChannel {
         self.connection_index
     }
 
+    /// Fail fast when an earlier op left the wire position unknown.
+    fn ensure_usable(&self, op: &str) -> std::result::Result<(), TransportError> {
+        match &self.poisoned {
+            None => Ok(()),
+            Some(reason) => Err(TransportError::Other(anyhow!(
+                "daemon channel on gateway connection {} is unusable after an earlier error \
+                 ({reason}); open a new channel instead of retrying {op} on this one",
+                self.connection_index
+            ))),
+        }
+    }
+
+    /// Record an op outcome, poisoning the channel when the error leaves the
+    /// wire position unknown. The first poisoning failure wins.
+    fn note_outcome<T>(
+        &mut self,
+        op: &str,
+        upload: bool,
+        result: &std::result::Result<T, TransportError>,
+    ) {
+        if let Err(err) = result
+            && poisons_channel(err, upload)
+            && self.poisoned.is_none()
+        {
+            self.poisoned = Some(format!("{err} during {op}"));
+        }
+    }
+
     /// `wopQueryValidPaths`: which of `paths` does the target already have?
     /// (`substitute = false`, mirroring `nix copy`.)
     pub async fn query_valid_paths(
@@ -876,13 +1026,17 @@ impl DaemonChannel {
         timeout: Duration,
     ) -> std::result::Result<BTreeSet<String>, TransportError> {
         let op = format!("QueryValidPaths ({} paths)", paths.len());
-        run_op(
+        self.ensure_usable(&op)?;
+        let result = run_op(
             client_query_valid_paths(&mut self.reader, &mut self.writer, paths, false),
             timeout,
             &op,
+            self.connection_index,
             false,
         )
-        .await
+        .await;
+        self.note_outcome(&op, false, &result);
+        result
     }
 
     /// `wopQueryPathInfo`: one path's [`ValidPathInfo`], `None` if absent.
@@ -892,13 +1046,17 @@ impl DaemonChannel {
         timeout: Duration,
     ) -> std::result::Result<Option<ValidPathInfo>, TransportError> {
         let op = format!("QueryPathInfo {path}");
-        run_op(
+        self.ensure_usable(&op)?;
+        let result = run_op(
             client_query_path_info(&mut self.reader, &mut self.writer, path),
             timeout,
             &op,
+            self.connection_index,
             false,
         )
-        .await
+        .await;
+        self.note_outcome(&op, false, &result);
+        result
     }
 
     /// `wopAddMultipleToStore`: upload a batch of store paths in one framed
@@ -909,13 +1067,17 @@ impl DaemonChannel {
         timeout: Duration,
     ) -> std::result::Result<(), TransportError> {
         let op = format!("AddMultipleToStore ({} entries)", entries.len());
-        run_op(
+        self.ensure_usable(&op)?;
+        let result = run_op(
             client_add_multiple_to_store(&mut self.reader, &mut self.writer, false, true, entries),
             timeout,
             &op,
+            self.connection_index,
             true,
         )
-        .await
+        .await;
+        self.note_outcome(&op, true, &result);
+        result
     }
 
     /// `wopAddToStoreNar`: upload one store path with its NAR serialization
@@ -926,13 +1088,17 @@ impl DaemonChannel {
         timeout: Duration,
     ) -> std::result::Result<(), TransportError> {
         let op = format!("AddToStoreNar {}", entry.store_path);
-        run_op(
+        self.ensure_usable(&op)?;
+        let result = run_op(
             client_add_to_store_nar(&mut self.reader, &mut self.writer, entry, false, true),
             timeout,
             &op,
+            self.connection_index,
             true,
         )
-        .await
+        .await;
+        self.note_outcome(&op, true, &result);
+        result
     }
 
     /// `wopBuildPathsWithResults`: build the given derived paths and collect
@@ -943,8 +1109,9 @@ impl DaemonChannel {
         timeout: Duration,
     ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
         let op = format!("BuildPathsWithResults ({} paths)", derived.len());
+        self.ensure_usable(&op)?;
         let negotiated_version = self.negotiated_version;
-        run_op(
+        let result = run_op(
             client_build_paths_with_results(
                 &mut self.reader,
                 &mut self.writer,
@@ -953,9 +1120,12 @@ impl DaemonChannel {
             ),
             timeout,
             &op,
+            self.connection_index,
             false,
         )
-        .await
+        .await;
+        self.note_outcome(&op, false, &result);
+        result
     }
 
     /// Drop the channel abruptly without a daemon-level goodbye — the
@@ -1233,5 +1403,43 @@ mod tests {
             }
             other => panic!("wire error during upload must map to Refused, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn timeout_error_names_op_and_connection() {
+        let err = TransportError::Timeout {
+            op: "QueryValidPaths (2000 paths)".into(),
+            connection: 3,
+            deadline: Duration::from_secs(120),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("QueryValidPaths (2000 paths)"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("connection 3"), "{rendered}");
+        assert!(rendered.contains("120"), "{rendered}");
+    }
+
+    #[test]
+    fn op_errors_poison_the_channel_per_wire_position_rules() {
+        let refused = TransportError::Refused("path not allowed".into());
+        let timeout = TransportError::Timeout {
+            op: "AddMultipleToStore (10 entries)".into(),
+            connection: 0,
+            deadline: Duration::from_secs(5),
+        };
+        let other = TransportError::Other(anyhow!("broken pipe"));
+
+        // A clean refusal leaves the protocol position known on query/build
+        // ops (no poison) but not on upload ops, which may have started a
+        // framed payload.
+        assert!(!poisons_channel(&refused, false));
+        assert!(poisons_channel(&refused, true));
+        // Timeouts and transport failures always desync the wire.
+        assert!(poisons_channel(&timeout, false));
+        assert!(poisons_channel(&timeout, true));
+        assert!(poisons_channel(&other, false));
+        assert!(poisons_channel(&other, true));
     }
 }
