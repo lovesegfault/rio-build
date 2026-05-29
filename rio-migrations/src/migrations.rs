@@ -1112,16 +1112,22 @@ pub const M_063: () = ();
 /// `actor/build.rs::handle_cleanup_terminal_build` (the in-memory hole
 /// is set by `remove_build_interest_and_reap` on leaders and standbys
 /// alike; only the leader persists it, before the per-parent verdict
-/// loop, so a survivor that same loop fail-fasts converges back to
-/// false via the extended clear) and by the recovery-time stamp in
-/// `actor/recovery.rs::load_dag_from_rows` when the new leader drops an
-/// edge to an un-produced terminal child of a recovered parent — the
-/// recovery-side analogue of the same removal, which sets the in-memory
-/// breadcrumb and persists it in one place. A crash or lease loss
-/// between the reap and the stamp loses the persisted breadcrumb — same
-/// accepted best-effort posture as every `topdown_pruned` clear; the
-/// recovery-time stamp narrows that window by re-deriving the hole from
-/// the dropped child's still-present row at the next failover.
+/// loop — a survivor that loop immediately fail-fasts keeps the
+/// breadcrumb, since the fail-fast consume is mark-only), by the
+/// recovery-time stamp in `actor/recovery.rs::load_dag_from_rows` when
+/// the new leader drops an edge to an un-produced terminal child of a
+/// recovered parent — the recovery-side analogue of the same removal,
+/// which sets the in-memory breadcrumb and persists it in one place —
+/// and by the poison-clear paths
+/// (`actor/completion.rs::handle_clear_poison`,
+/// `actor/housekeeping.rs::tick_process_expired_poisons`) for the
+/// surviving parents of the Poisoned (by definition un-produced) child
+/// they remove, both leader-only by construction (admin leader guard /
+/// standby tick no-op). A crash or lease loss between the removal and
+/// the stamp loses the persisted breadcrumb — same accepted best-effort
+/// posture as every `topdown_pruned` clear; the recovery-time stamp
+/// narrows that window by re-deriving the hole from the dropped child's
+/// still-present row at the next failover.
 /// The hook does not filter on `topdown_pruned`, so the column may
 /// also be set for surviving parents that are not (yet) marked; it is
 /// inert there because every consumer requires the mark (a hole on an
@@ -1133,9 +1139,12 @@ pub const M_063: () = ();
 /// the same drv can never clear it through the upsert. Cleared by the
 /// merge-time heal (`clear_closure_hole_by_hashes` — a full merge
 /// re-declares the node's edges, so its child set is representative
-/// again), by every `clear_topdown_pruned_by_hash{,es}` site (the
-/// breadcrumb travels with the mark it qualifies, including when the
-/// fail-fast consumes it). Restored by `from_recovery_row`
+/// again) and by the batched Vouched-keyed mark clears
+/// (`clear_topdown_pruned_by_hashes` — the breadcrumb travels with the
+/// mark those sites clear); the singular `clear_topdown_pruned_by_hash`
+/// (the lazy walk-failure clear and the fail-fast consume) is
+/// mark-only, so the fail-fast retains the breadcrumb for the directed
+/// resubmit it solicits. Restored by `from_recovery_row`
 /// (`from_poisoned_row` keeps `false`) and consulted by the
 /// recovery-time produced-children gate: a holed flagged parent is
 /// never enrolled as a clear candidate, so it keeps the restored mark

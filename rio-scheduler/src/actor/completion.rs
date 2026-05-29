@@ -2125,8 +2125,42 @@ impl DagActor {
         // derivation_hashes here. The sticky `error_summary` set by
         // `handle_derivation_failure` keeps such builds on track to Fail
         // even after the node (and its `failed_count` contribution) is gone.
+        //
+        // r[impl sched.merge.substitute-topdown+10]
+        // Capture the parents BEFORE `remove_node` scrubs the edge maps:
+        // a Poisoned child is by definition un-produced, so removing it
+        // truncates each surviving parent's child set relative to the
+        // parent's declared closure — the same truncation the
+        // terminal-build reap breadcrumbs (`remove_build_interest_and_reap`
+        // + the survivor hook in `handle_cleanup_terminal_build`). The
+        // closure-hole stamp below keeps the parent's children-keyed
+        // `topdown_pruned` verdicts at Broken, so a truncated
+        // all-produced child set can never vouch for a from-source
+        // dispatch or launder a mark clear.
+        let holed_parents = self.dag.get_parents(drv_hash);
         self.prune_interested_keep_going(drv_hash);
         self.dag.remove_node(drv_hash);
+        let mut holed: Vec<String> = Vec::new();
+        for parent in &holed_parents {
+            if let Some(state) = self.dag.node_mut(parent) {
+                state.closure_hole = true;
+                holed.push(parent.to_string());
+            }
+        }
+        if !holed.is_empty() {
+            // Best-effort PG counterpart of the in-memory stamp above
+            // (`migrations/064`). Leader-only by construction — the only
+            // production caller is the admin ClearPoison RPC, which is
+            // leader-guarded at the gRPC layer (`ensure_leader`), the
+            // same posture the `clear_poison` PG write above already
+            // relies on — so no redundant gate here. A lost write costs
+            // only the breadcrumb's durability across a failover; the
+            // in-memory stamp covers this tenure.
+            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
+                warn!(drv_hash = %drv_hash, count = holed.len(), error = %e,
+                      "failed to persist closure_hole after admin poison clear (continuing)");
+            }
+        }
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
     }

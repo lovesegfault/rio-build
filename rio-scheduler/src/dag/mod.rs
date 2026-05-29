@@ -1267,10 +1267,13 @@ impl DerivationDag {
     /// leader-gated survivor hook) so a standby's DAG — which loses the
     /// children all the same — carries it too; the PG persistence of
     /// the breadcrumb (`migrations/064`) is leader-class and lives in
-    /// the hook, fed by `holed_parents`. Known residual: the poison-TTL
-    /// sweep and admin ClearPoison delete children via
-    /// [`Self::remove_node`] without setting the breadcrumb (see the
-    /// field's doc).
+    /// the hook, fed by `holed_parents`. The poison-TTL sweep and admin
+    /// ClearPoison perform the same capture-stamp-persist sequence at
+    /// their own call sites when they delete a Poisoned (by definition
+    /// un-produced) child via [`Self::remove_node`] — `remove_node`
+    /// itself stays parent-agnostic. The one truncation still left
+    /// un-stamped is the expired-at-load poison shape at recovery (see
+    /// the field's doc).
     ///
     /// This prevents unbounded DAG growth for long-running schedulers.
     /// Non-terminal orphaned nodes are preserved (they may be mid-build for

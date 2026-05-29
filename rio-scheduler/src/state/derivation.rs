@@ -935,7 +935,13 @@ pub struct DerivationState {
     /// best-effort in PG) in `load_dag_from_rows` when the edge load
     /// drops an un-produced terminal child of a recovered parent — the
     /// recovery-side analogue of the reap, covering the reap-then-
-    /// failover window above. `from_recovery_row` restores it so the
+    /// failover window above. The poison-clear paths — admin
+    /// `ClearPoison` (`handle_clear_poison`) and the poison-TTL sweep
+    /// (`tick_process_expired_poisons`) — set it the same way (in
+    /// memory, best-effort in PG) for the surviving parents of the
+    /// Poisoned (by definition un-produced) child they remove; both run
+    /// only on the leader by construction (admin leader guard / standby
+    /// tick no-op). `from_recovery_row` restores it so the
     /// recovery-time produced-children gate never clears a holed
     /// flagged parent on the strength of the surviving produced
     /// children (the un-produced child's own row and edge may have been
@@ -964,12 +970,20 @@ pub struct DerivationState {
     /// explicitly (memory + PG) only when a later full merge
     /// re-declares the node's edges (its child set is representative
     /// again; the heal pushes the PG clear for every re-declared edge
-    /// parent) and when the mark-clear / fail-fast helpers consume the
-    /// `topdown_pruned` mark it qualifies
-    /// (`clear_topdown_pruned_by_hash{,es}` drop both bits). Known
-    /// residual: the poison-TTL sweep and admin ClearPoison delete
-    /// children through `remove_node` without setting this breadcrumb
-    /// (same accepted class as the GC residual).
+    /// parent) and when a Vouched-keyed clear pass consumes the
+    /// `topdown_pruned` mark it qualifies (the batched
+    /// `clear_topdown_pruned_by_hashes` drops both bits; the singular
+    /// `clear_topdown_pruned_by_hash` — the lazy walk-failure clear and
+    /// the fail-fast consume — is mark-only, so the fail-fast retains
+    /// the breadcrumb for the directed resubmit it solicits). Known
+    /// residual: a poison row already past its TTL when a new leader
+    /// recovers is reset to `'created'` (and not loaded) before the
+    /// recovery stamp query runs, so a parent whose only truncation
+    /// evidence was that row recovers without the breadcrumb — the
+    /// expired-at-load shape, reachable only when no leader is up to
+    /// run the in-tenure sweep before the TTL lapses (same accepted
+    /// class as the GC residual; see
+    /// `load_parents_with_unproduced_terminal_children`).
     pub closure_hole: bool,
     /// Output paths that have already triggered a forgiven-seed-became-
     /// wanted DOWNGRADE of a substitute completion for this node

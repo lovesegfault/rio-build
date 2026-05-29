@@ -4821,6 +4821,285 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
 }
 
 // r[verify sched.merge.substitute-topdown+10]
+/// Both poison-removal paths — admin `ClearPoison` and the poison-TTL
+/// sweep — must stamp the closure-hole breadcrumb on surviving parents
+/// when they remove a Poisoned (by definition un-produced) child,
+/// exactly like the terminal-build reap and the recovery edge-drop
+/// (bughunter round-23 bug_009). Staging: B1's prune stamps R and parks
+/// its detached fetch; BC produces dep2; B2 (keep_going — the report's
+/// CI-build shape) full-merges app→R→{dep1 unbuilt, dep2 produced};
+/// dep1 is dispatched and permanently fails → Poisoned (the cascade
+/// skips the Substituting R, so its parked walk stays in flight); the
+/// operator clears the poison (or the cfg(test) 100ms TTL expires and
+/// the sweep clears it) → dep1 is removed from the DAG, truncating R's
+/// children to the produced {dep2}. The removal must leave
+/// `closure_hole` on R (asserted in PG; the in-memory copy has no debug
+/// surface yet — it is observed through the bounded outcome below,
+/// which `closure_evidence` keys on). R's parked walk then fails: the
+/// Broken (holed) evidence must take the bounded resubmit-directing
+/// fail-fast — B1 fails with the "topdown … resubmit" error, no
+/// from-source Assignment is ever cut for R, and R does not end up
+/// Ready/Assigned/Running. Pre-fix neither poison path stamped the
+/// breadcrumb: PG `closure_hole` stayed false, the truncated {dep2}
+/// child set read as Vouched at the walk failure, the lazy clear
+/// dropped the mark, and R reverted to Ready — the doomed from-source
+/// dispatch of a node whose pruned closure was never merged.
+#[rstest::rstest]
+#[case::admin_clear(false)]
+#[case::ttl_expiry(true)]
+#[tokio::test]
+async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
+    #[case] via_ttl: bool,
+) -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park every detached fetch on the QPI gate (never released) so the
+    // walk verdict is injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // A builder is available throughout — dep1 needs a real dispatch to
+    // be poisoned via PermanentFailure, and a from-source dispatch of R
+    // would have somewhere to land at every later step.
+    let mut worker_rx = connect_executor(&handle, "pcs-w", "x86_64-linux").await?;
+
+    // B1: root → dep1 with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless),
+    // drops dep1, and parks R's detached fetch.
+    let r_out = test_store_path("pcs-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("pcs-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("pcs-dep1");
+        n.expected_output_paths = vec![test_store_path("pcs-dep1-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("pcs-r", "pcs-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "pcs-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // BC: dep2 is produced (cache-hit at merge) before B2 attaches it
+    // to R, so R's post-removal child set is all-produced.
+    let dep2_out = test_store_path("pcs-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("pcs-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evbc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "pcs-dep2").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep2 is produced before B2 attaches it to R"
+    );
+
+    // B2: keep_going full merge app→R→{dep1 unbuilt, dep2 produced}.
+    // The mark survives (children not all produced); dep1 — the only
+    // dispatchable node — goes to the connected worker.
+    let mut app = make_node("pcs-app");
+    app.expected_output_paths = vec![test_store_path("pcs-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("pcs-app", "pcs-r"),
+            make_test_edge("pcs-r", "pcs-dep1"),
+            make_test_edge("pcs-r", "pcs-dep2"),
+        ],
+        true,
+    )
+    .await?;
+    let assignment = recv_assignment(&mut worker_rx).await;
+    assert!(
+        assignment.drv_path.contains("pcs-dep1"),
+        "fixture premise: the only dispatchable node is dep1; got {:?}",
+        assignment.drv_path
+    );
+
+    // dep1 permanently fails → Poisoned. The cascade skips the
+    // Substituting R (a walk in flight keeps its chance), so R keeps
+    // its mark and its parked walk; keep_going B2 stays Active.
+    complete_failure(
+        &handle,
+        "pcs-w",
+        &test_drv_path("pcs-dep1"),
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "permanent failure",
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "pcs-dep1").await.status,
+        DerivationStatus::Poisoned,
+        "fixture premise: dep1 poisoned by the permanent failure"
+    );
+    let r_mid = expect_drv(&handle, "pcs-r").await;
+    assert_eq!(
+        r_mid.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the poison cascade must not settle a parent whose walk is in flight"
+    );
+    assert!(
+        r_mid.topdown_pruned,
+        "fixture premise: R keeps the mark while dep1 is merely poisoned"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'pcs-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && !pg_hole,
+        "fixture premise: before the poison-clear removal R is marked and un-holed \
+         (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
+    );
+
+    // Remove the poisoned dep1: admin ClearPoison or the cfg(test)
+    // 100ms poison TTL + a Tick. Both paths truncate R's children to
+    // the produced {dep2} and must stamp the closure-hole breadcrumb
+    // on R.
+    if via_ttl {
+        // 100ms cfg(test) TTL with margin for loaded CI hosts —
+        // poisoned_at is a std Instant, which paused tokio time can't
+        // mock, so a real sleep is the only option.
+        tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(250)).await;
+        tick(&handle).await?;
+    } else {
+        let (tx, rx) = oneshot::channel();
+        handle
+            .send_unchecked(ActorCommand::ClearPoison {
+                drv_hash: "pcs-dep1".into(),
+                reply: tx,
+            })
+            .await?;
+        assert!(rx.await?, "ClearPoison → cleared=true");
+    }
+    assert!(
+        handle.debug_query_derivation("pcs-dep1").await?.is_none(),
+        "the poisoned dep1 must be removed from the DAG"
+    );
+    let holed = expect_drv(&handle, "pcs-r").await;
+    assert_eq!(
+        holed.status,
+        DerivationStatus::Substituting,
+        "the poison-clear removal must not settle the surviving parent"
+    );
+    assert!(
+        holed.topdown_pruned,
+        "the poison-clear removal must not consume the mark"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'pcs-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_hole,
+        "removing the un-produced poisoned child must stamp the closure-hole breadcrumb \
+         on the surviving parent (closure_hole={pg_hole}); without it the truncated \
+         all-produced child set launders the topdown_pruned guard"
+    );
+    assert!(
+        pg_pruned,
+        "the persisted mark must survive the poison-clear removal (topdown_pruned={pg_pruned})"
+    );
+
+    // R's parked walk genuinely FAILS: with the breadcrumb the closure
+    // evidence is Broken (hole over the produced survivor), so the
+    // verdict must take the resubmit-directing fail-fast instead of the
+    // lazy Vouched clear + revert-to-Ready (the doomed from-source
+    // dispatch — dep1's output was never produced).
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "pcs-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B1 must fail via the resubmit-directing fail-fast when the walk fails"
+    );
+    assert!(
+        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
+        "B1's error summary should direct resubmit; got {:?}",
+        s1.error_summary
+    );
+    // B2 is also interested in R; the fail-fast terminates it too (its
+    // sticky error summary stays the dep1 poison failure).
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the keep_going build must also terminate instead of hanging on the parked R"
+    );
+
+    // No from-source dispatch may ever have been cut for R: drive a
+    // dispatch pass and drain everything the worker was sent (dep1's
+    // own assignment was already consumed above).
+    tick(&handle).await?;
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a closure-holed pruned root must never be dispatched from source — its \
+             pruned closure was never merged (the worker would ENOENT)"
+        );
+    }
+    let r = expect_drv(&handle, "pcs-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "R must not be dispatchable from source after the fail-fast; got {:?}",
+        r.status
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
 /// The merge-time heal must clear the PERSISTED closure-hole breadcrumb
 /// for every edge parent it re-declares, even when the in-memory copy
 /// of the breadcrumb is GONE (bughunter round-21 merged_bug_001;
