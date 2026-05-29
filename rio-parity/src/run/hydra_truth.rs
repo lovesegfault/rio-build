@@ -1,15 +1,23 @@
-//! Hydra-truth stage: per-path upstream ground truth from cache.nixos.org
-//! narinfos.
+//! Per-unit expected-outcome truth for the campaign, plus the upstream
+//! narinfo sweep that backs warm-set pre-classification.
 //!
-//! For every in-scope target output path and every warm-set path, the sweep
-//! fetches the upstream narinfo (presence, `NarHash`, `NarSize`, `Deriver`)
-//! with bounded concurrency and per-path retries, appending each result to
-//! `hydra.jsonl` so an interrupted or resumed campaign never re-fetches a
-//! path it already has. Warm-set paths that are absent upstream are
-//! pre-classified `not-found-upstream` in `warm.jsonl`: the warm stage must
-//! never submit them, because substituting a path that upstream does not
-//! serve cannot succeed, and building it locally would mask exactly the
-//! work the campaign is trying to measure.
+//! [`expected_outcomes_for_units`] loads each unit's expected outcome (and,
+//! where the recorder captured them, expected per-output NAR identities)
+//! from an open replay archive's `outcomes.jsonl`, collapsing the neutral
+//! outcome vocabulary onto the engine's [`HydraOutcome`] / [`HydraSide`]
+//! shapes. Truth is baked in when the archive is recorded, so this path
+//! performs no outbound queries.
+//!
+//! [`run_hydra_truth`] is the campaign-time narinfo sweep: for every target
+//! output path and warm-set path it is given, it fetches the upstream
+//! narinfo (presence, `NarHash`, `NarSize`, `Deriver`) with bounded
+//! concurrency and per-path retries, appending each result to `hydra.jsonl`
+//! so an interrupted or resumed campaign never re-fetches a path it already
+//! has. Warm-set paths that are absent upstream are pre-classified
+//! `not-found-upstream` in `warm.jsonl`: the warm stage must never submit
+//! them, because substituting a path that upstream does not serve cannot
+//! succeed, and building it locally would mask exactly the work the
+//! campaign is trying to measure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
@@ -18,8 +26,13 @@ use anyhow::Result;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 
+use crate::archive::reader::ReplayArchive;
+use crate::archive::schema::ExpectedOutcome;
+
+use super::archive_input::ManifestEntry;
 use super::model::{
-    DISPOSITION_NOT_FOUND_UPSTREAM, HydraEntry, HydraOutcome, WarmEntry, now_rfc3339,
+    DISPOSITION_NOT_FOUND_UPSTREAM, HydraEntry, HydraOutcome, HydraOutput, HydraSide, WarmEntry,
+    now_rfc3339,
 };
 use super::state::{StateDir, StateFile};
 
@@ -267,6 +280,124 @@ pub fn hydra_outcome_for_job(
     }
 }
 
+/// Expected truth for one campaign unit, loaded from the replay archive:
+/// the engine-side outcome plus the Hydra-side record fragment (expected
+/// per-output NAR identity) the classifier and the report consume.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnitTruth {
+    pub outcome: HydraOutcome,
+    pub side: HydraSide,
+}
+
+/// Collapse the archive's neutral expected-outcome vocabulary onto the
+/// engine's three-valued [`HydraOutcome`]: `built` maps to `Built`,
+/// `failed` and `resource-exhausted` map to `Failed`, and every
+/// interrupted or evidence-less value (`cancelled`, `disconnected`,
+/// `indeterminate`, `unknown`) maps to `Unknown`. The collapse keeps the
+/// bucket classifier and the headline denominator count-preserving; a
+/// richer treatment of interrupted truth belongs to a later
+/// comparison-model change.
+fn engine_outcome_for(expected: ExpectedOutcome) -> HydraOutcome {
+    match expected {
+        ExpectedOutcome::Built => HydraOutcome::Built,
+        ExpectedOutcome::Failed | ExpectedOutcome::ResourceExhausted => HydraOutcome::Failed,
+        ExpectedOutcome::Cancelled
+        | ExpectedOutcome::Disconnected
+        | ExpectedOutcome::Indeterminate
+        | ExpectedOutcome::Unknown => HydraOutcome::Unknown,
+    }
+}
+
+/// Truth entry for a unit with no usable outcome record: outcome unknown,
+/// every declared output carried with no expected NAR identity.
+fn unknown_truth(unit: &ManifestEntry) -> UnitTruth {
+    UnitTruth {
+        outcome: HydraOutcome::Unknown,
+        side: HydraSide {
+            outcome: HydraOutcome::Unknown.as_str().to_string(),
+            buildstatus: None,
+            outputs: unit
+                .outputs
+                .keys()
+                .map(|name| (name.clone(), HydraOutput::default()))
+                .collect(),
+        },
+    }
+}
+
+/// Load the expected outcome of every campaign unit from the open replay
+/// archive's recorded truth, keyed by job name.
+///
+/// Truth is baked into the archive when it is recorded, so this performs
+/// no outbound queries. Each unit's record is looked up by derivation
+/// through the reader's session fallback — the exact `(session, drv)`
+/// entry first, then the session-less `(null, drv)` form that session-less
+/// recorders write; duplicate records keep the last occurrence.
+///
+/// The mapped [`HydraSide`] carries, for every output the unit declares,
+/// the expected NAR identity from the record when one was recorded for
+/// that output, and an empty [`HydraOutput`] otherwise. A `built` record
+/// may carry hashes for all, some, or none of its outputs depending on
+/// what the recorder could observe; a hash-less output is merely not
+/// comparable and never changes the outcome. `buildstatus` is always
+/// `None`: native source status codes stay in the record's free-form
+/// detail and are never engine input.
+///
+/// Units with no outcome record, and every unit of an archive recorded
+/// without the `expected_outcomes` capability, map to
+/// [`HydraOutcome::Unknown`] with no expected output identities.
+pub fn expected_outcomes_for_units(
+    archive: &ReplayArchive,
+    units: &[ManifestEntry],
+) -> Result<BTreeMap<String, UnitTruth>> {
+    if !archive.capabilities().expected_outcomes {
+        tracing::warn!(
+            "archive lacks the expected_outcomes capability; treating every unit's truth as unknown"
+        );
+        return Ok(units
+            .iter()
+            .map(|unit| (unit.job.clone(), unknown_truth(unit)))
+            .collect());
+    }
+    let mut truth = BTreeMap::new();
+    for unit in units {
+        // The timeless engine treats the whole archive as one session-less
+        // workload, so the probe session is 0; the reader falls back to the
+        // session-less record, which is the form session-less recorders
+        // write for every unit.
+        let entry = match archive.expected_outcome(0, &unit.drv_path) {
+            None => unknown_truth(unit),
+            Some(record) => {
+                let outcome = engine_outcome_for(record.outcome);
+                UnitTruth {
+                    outcome,
+                    side: HydraSide {
+                        outcome: outcome.as_str().to_string(),
+                        buildstatus: None,
+                        outputs: unit
+                            .outputs
+                            .keys()
+                            .map(|name| {
+                                let output = record.outputs.get(name).map_or_else(
+                                    HydraOutput::default,
+                                    |hash| HydraOutput {
+                                        narinfo_present: true,
+                                        nar_hash: Some(hash.nar_hash_hex.clone()),
+                                        nar_size: Some(hash.nar_size),
+                                    },
+                                );
+                                (name.clone(), output)
+                            })
+                            .collect(),
+                    },
+                }
+            }
+        };
+        truth.insert(unit.job.clone(), entry);
+    }
+    Ok(truth)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,5 +613,66 @@ mod tests {
             hydra_outcome_for_job(&outputs, &by_path, Some(1)),
             HydraOutcome::Failed
         );
+    }
+
+    #[test]
+    fn archive_outcomes_map_onto_engine_truth() {
+        let tmp = tempfile::tempdir().unwrap();
+        crate::run::archive_input::write_mini_archive(tmp.path());
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        let units = crate::run::archive_input::load_units(&archive).unwrap();
+        let truth = expected_outcomes_for_units(&archive, &units).unwrap();
+        assert_eq!(truth.len(), units.len(), "every unit gets a truth entry");
+
+        let app_a = &truth["appA.x86_64-linux"];
+        assert_eq!(app_a.outcome, HydraOutcome::Built);
+        // per-output expected NAR identity carried into HydraSide
+        let out = app_a.side.outputs.get("out").unwrap();
+        assert!(out.narinfo_present);
+        assert!(out.nar_hash.as_deref().unwrap().len() == 64);
+        assert!(out.nar_size.is_some());
+
+        // A built record may carry hashes for only some outputs or none at
+        // all; the outcome stays built and the hash-less outputs are simply
+        // not comparable.
+        let app_b = &truth["appB.x86_64-linux"];
+        assert_eq!(app_b.outcome, HydraOutcome::Built);
+        assert!(app_b.side.outputs.values().all(|o| !o.narinfo_present));
+        assert!(app_b.side.outputs.values().all(|o| o.nar_hash.is_none()));
+
+        // a unit with an `unknown` (or absent) outcome record stays Unknown
+        assert_eq!(
+            truth["divergentC.x86_64-linux"].outcome,
+            HydraOutcome::Unknown
+        );
+        let kvm = &truth["kvmTest.x86_64-linux"];
+        assert_eq!(kvm.outcome, HydraOutcome::Unknown);
+        assert!(!kvm.side.outputs["out"].narinfo_present);
+        assert!(kvm.side.outputs["out"].nar_hash.is_none());
+    }
+
+    #[test]
+    fn failure_class_outcomes_map_to_failed_and_interrupted_to_unknown() {
+        // Pure mapping table, no archive needed.
+        assert_eq!(
+            engine_outcome_for(ExpectedOutcome::Built),
+            HydraOutcome::Built
+        );
+        assert_eq!(
+            engine_outcome_for(ExpectedOutcome::Failed),
+            HydraOutcome::Failed
+        );
+        assert_eq!(
+            engine_outcome_for(ExpectedOutcome::ResourceExhausted),
+            HydraOutcome::Failed
+        );
+        for v in [
+            ExpectedOutcome::Cancelled,
+            ExpectedOutcome::Disconnected,
+            ExpectedOutcome::Indeterminate,
+            ExpectedOutcome::Unknown,
+        ] {
+            assert_eq!(engine_outcome_for(v), HydraOutcome::Unknown);
+        }
     }
 }

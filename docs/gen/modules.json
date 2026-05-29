@@ -913,7 +913,7 @@
     {
       "path": "run/hydra_truth.rs",
       "depth": 1,
-      "doc": "Hydra-truth stage: per-path upstream ground truth from cache.nixos.org"
+      "doc": "Per-unit expected-outcome truth for the campaign, plus the upstream"
     },
     {
       "path": "run/model.rs",
