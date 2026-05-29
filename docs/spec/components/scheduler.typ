@@ -2013,8 +2013,10 @@ report is bound to its intent by the HMAC-attested token
 (#rref("sec.executor.identity-token") applied per-unary), attempts are keyed
 by `exec_id`, and a stale or duplicate report finds the attempt row already
 terminal (#rref("sched.executor.report-idempotent")). The retired
-stale-epoch calibration witness remains re-runnable against the frozen
-as-built model (`executorSessionAsBuilt.qnt`) as historical evidence.
+stale-epoch calibration witness and the frozen as-built model
+(`executorSessionAsBuilt.qnt`) it ran against were deleted by the
+2026-05-29 as-built retirement; the executor invariant map's Stage-C
+tables and git history remain the historical evidence.
 
 #r("sched.dispatch.fod-to-fetcher+2")[
   Per ADR-019, fixed-output derivations route ONLY to fetcher-kind executors

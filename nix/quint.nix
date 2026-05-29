@@ -2570,10 +2570,11 @@ in
     # lease from leaderElection.qnt (see the model header's
     # assume-guarantee checklist).
     #
-    # The Stage-B AS-BUILT encoding of the stream session machinery is
-    # frozen, unwired, as executorSessionAsBuilt.qnt (P14); the
-    # deletion-wave revert would re-wire it. Its retired checks and the
-    # disposition of every retired witness/calibration check are
+    # The Stage-B AS-BUILT encoding of the stream session machinery was
+    # frozen, unwired, as executorSessionAsBuilt.qnt (P14) and retired
+    # on 2026-05-29 — the file is deleted, git history is the archive
+    # (the invariant map's retirement record). Its retired checks and
+    # the disposition of every retired witness/calibration check are
     # recorded in the invariant map's Phase-1c' re-target record.
     #
     # Model D (executorDelivery.qnt) was retired with the 1d builder
@@ -2747,9 +2748,11 @@ in
     #     Job lifecycle and the establishment window own liveness),
     #   - quint-executor-calib-f5-closed-stream (closed-stream dispatch
     #     exclusion — no scheduler-side placement decision exists).
-    # Their override modules stay under calibration/ as evidence over
-    # the frozen executorSessionAsBuilt.qnt, re-runnable with the
-    # README recipe. F4 re-encodes against the re-targeted model below;
+    # Their override modules stayed under calibration/ as evidence over
+    # the frozen executorSessionAsBuilt.qnt until the 2026-05-29
+    # as-built retirement deleted both (git history is the archive; the
+    # invariant map's retirement record has the dispositions). F4
+    # re-encodes against the re-targeted model below;
     # F2d (Model D, builder half) retired with Model D at the 1d builder
     # collapse — the machinery it pinned (completion_pending arming, the
     # half-close flush) no longer exists, so the state is

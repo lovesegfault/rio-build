@@ -6,8 +6,9 @@
 // session machinery the Stage-B as-built encoding modeled —
 // registration, heartbeat, the bidi dispatch stream, disconnect/reap,
 // the recently_disconnected correlation — was deleted by the 1c'
-// deletion commits; that encoding is frozen, unwired, as
-// executorSessionAsBuilt.qnt (P14). This file is the live Model S:
+// deletion commits; the as-built encoding (executorSessionAsBuilt.qnt,
+// P14) was retired on 2026-05-29 — see git history and the invariant
+// map's retirement record. This file is the live Model S:
 // the scheduler side of `PullAssignment` / `ReportOutcome` /
 // `ReportAttemptOutcome` plus the establishment sweep over the durable
 // open-attempt view, and the pod's own bounded lifecycle around them.

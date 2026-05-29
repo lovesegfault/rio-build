@@ -4889,7 +4889,7 @@ development tree; all of them gate the staged rollout.
 | Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side gates | Campaign owner | Retire once a deprecation path for existing CRs is chosen (CRD version bump + pod.rs/job.rs gates + helm knob); until then the value is selectable but the builder always pulls |
 | Deployment-time validation checklist rows D0–D7 | Operator / campaign owner at deployment time | The finalized table below; the D6/D7 signal-shape note (the gauge and stub-counter series exist only on pre-deletion-stage releases — evaluate against the release being upgraded FROM; the 1d-stage watch falls back to error rates and gateway unknown-method observability) is part of row D6/D7 |
 | Controller-map counter-signatures (the 1b re-audit entry and the 1d delta entry) and the owner's G6/G7 signatures | Controller-campaign owner / campaign owner (same person, recorded as self-issued) | At the close-out review; nothing in the records is provisional on them beyond the signature itself |
-| Retire `executorSessionAsBuilt.qnt` + the as-built calibration evidence modules; re-point or drop the calibration README recipe | Whoever picks up the post-deployment items | After the deployment-time checklist passes through row D7 (the retained-at-close-out decision above); the retry campaign's retirement section is the template (preserve any non-vacuity anchor a live invariant still needs) |
+| Retire `executorSessionAsBuilt.qnt` + the as-built calibration evidence modules; re-point or drop the calibration README recipe | Whoever picks up the post-deployment items | **Done (2026-05-29, owner decision — retired ahead of the D7 condition):** the modeled stream machinery is deleted (1c'/1d), the revert-chain obligation ended at the campaign close-out, and git history is the archive; the post-close-out retirement record below has the file list and dispositions. The retry campaign's retirement section was the template, and the non-vacuity condition is satisfied by the live stack — the re-targeted Model S's 12 wired witnesses plus the re-encoded F4 falsification (`quint-executor-calib-f4-establishment-window`) carry every pin a live invariant needs |
 | Kani harness for the pull kernels | Whoever next touches `admit_pull`/`fold_report` | Only on the recorded reconsideration triggers (loops/collections/counter arithmetic in the kernels, an extraction, or a changed floor-comparison shape); the rio-retry-kernel bounded-representation pattern is the template |
 | MBT over the pull handlers | Same | Only if a pure protocol core worth driving emerges (the retry campaign's omission triggers transfer); the quint-connect machinery is in-tree |
 | OA4/OA5 dashboard follow-ups: the fleet-view repoint ask and any future BuildPhase carrier | Dashboard owner | Recorded asks from 1b/1d; the Executors page works against the re-pointed RPCs today; DrainButton removal was acknowledged as the recorded fallback at the 1d landing review |
@@ -5014,3 +5014,53 @@ spawn-side kind/arch tests for the former, the uncharged-requeue
 batteries for the latter) is open follow-up for the campaign owner's
 next touch of those rules, recorded here rather than silently left to
 the untested query.
+
+## Post-close-out — retirement of the frozen as-built model and the calibration evidence corpus (2026-05-29)
+
+Owner decision, 2026-05-29: retire now rather than waiting for the
+deployment-time checklist to pass through row D7 (the condition the
+close-out's deferred-items table parked this behind). Rationale: the
+modeled stream machinery is deleted (the 1c' deletion commits and the
+1d builder collapse), the revert-chain obligation ended at the campaign
+close-out (the revert-cleanliness section above), and git history is
+the archive — the same disposition the retry campaign's retirement
+section took for `retryPolicyAsBuilt.qnt` and its corpus.
+
+Deleted by this retirement (git history is the archive):
+
+- `docs/spec/models/executorSessionAsBuilt.qnt` — the frozen Stage-B
+  as-built Model S (P14), unwired since the T-1c'.5 re-target (no
+  nix/quint.nix check built it).
+- The ten as-built calibration evidence modules under
+  `docs/spec/models/calibration/`: `executor-f1-hijack-accept`,
+  `executor-f1-stale-epoch`, `executor-f2-no-adopt`,
+  `executor-f2-phantom-no-drain`, `executor-f3-reap-strikes`,
+  `executor-f3-stall-no-credit`, `executor-f4-entry-not-mid-build`,
+  `executor-f4-establish-early`, `executor-f5-offer-closed-stream`,
+  `executor-f6-deposed-reassign` (all `.qnt`) — none wired as a check;
+  all imported the frozen as-built model.
+
+Kept, unchanged: `executorSession.qnt` (the re-targeted live Model S)
+and its wired stack — the two exhaustive regimes
+(`quint-executor-session-base`, `quint-executor-session-fault-leader`),
+the 12 expect-violation witnesses, and the re-encoded F4 calibration
+flip (`quint-executor-calib-f4-establishment-window` over
+`calibration/executor-f4-pull-establish-early.qnt`, which imports the
+live model only). The wired check set is untouched by this retirement.
+
+Where the evidence lives now: this map's Stage-B (0c) record, the
+Stage-C calibration tables (0d), and the T-1c'.5 re-target record keep
+the per-override verdicts, depths and state counts as valid statements
+about the retired artifacts as they existed at the freeze; the files
+themselves are recoverable from git history. Non-vacuity is carried by
+the live stack: the retired modules' falsifications were evidence about
+the as-built encoding, not pins for live invariants — the live Model
+S's contended states are pinned by its 12 wired witnesses, and the one
+historical-fix reproduction that is load-bearing for the pull path (the
+F4 establishment-window double-charge precondition) stays wired as the
+expect-violation `quint-executor-calib-f4-establishment-window` check.
+The calibration README now describes the wired pull-era override only;
+the comment references in nix/quint.nix, `executorSession.qnt`,
+`executor-f4-pull-establish-early.qnt` and scheduler.typ's
+session-epoch retirement note were re-worded to past tense by the
+retiring commit.

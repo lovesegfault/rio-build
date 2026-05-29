@@ -4,9 +4,11 @@
 // attribution — the dedup-state lifecycle), re-encoded against the
 // RE-TARGETED pull-protocol Model S at 1c' (the as-built F4
 // representatives executor-f4-entry-not-mid-build.qnt and
-// executor-f4-establish-early.qnt stay as evidence modules over the
-// frozen executorSessionAsBuilt.qnt). The analogous contended state in
-// the pull protocol is the establishment window: the establishment
+// executor-f4-establish-early.qnt were evidence modules over the
+// frozen executorSessionAsBuilt.qnt until the 2026-05-29 as-built
+// retirement deleted them — git history is the archive, the invariant
+// map's Stage-C tables hold their verdicts). The analogous contended
+// state in the pull protocol is the establishment window: the establishment
 // sweep (tick_sweep_open_pull_attempts) may charge an open attempt as
 // an unreported executor crash only once the attempt's dispatch-time
 // deadline plus the report slack has elapsed — never while the

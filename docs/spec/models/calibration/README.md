@@ -5,18 +5,22 @@ One file per fix family of the controller-formal calibration corpus
 `nodeclaimLifecycle.qnt`; the families whose every member is NOT-ENCODED
 have no file), one file per fix family of the refcount corpus
 (`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), and —
-the executor-lifecycle campaign's variant of the layout — one file per
-*representative* of the executor corpus
-(`executor-<family>-<slug>.qnt` over `executorSessionAsBuilt.qnt`; a
-family with two falsifying representatives has two files — the
-`executor-f2d-*.qnt` pair over the retired `executorDelivery.qnt` was
-deleted with Model D at the 1d builder collapse, see the invariant
-map's retirement record). Each module instantiates the as-built model, defines a
+the executor-lifecycle campaign — the single re-encoded pull-era
+override (`executor-f4-pull-establish-early.qnt`, over the re-targeted
+live `executorSession.qnt` rather than a frozen as-built encoding). The
+executor corpus's as-built representatives
+(`executor-<family>-<slug>.qnt` over `executorSessionAsBuilt.qnt`) were
+retired with the as-built model on 2026-05-29, and the
+`executor-f2d-*.qnt` pair over `executorDelivery.qnt` was deleted with
+Model D at the 1d builder collapse — git history is the archive; the
+executor invariant map's Stage-C tables and retirement records hold
+their verdicts. Each module instantiates the model it names, defines a
 local PRE-FIX variant of one action (the behavior the named
 historical fix removed), and exposes it through a `calibStep`. The
-violation latches inside the pre-fix action keep the AS-BUILT oracle: the
-behavior vals are reverted, the violation vals are not, so a
-falsification means the as-built invariant set re-finds that bug class.
+violation latches inside the pre-fix action keep the instantiated
+model's oracle: the behavior vals are reverted, the violation vals are
+not, so a falsification means that model's invariant set re-finds that
+bug class.
 
 Run an override (serially — the bundled Apalache server port is shared):
 
