@@ -35,6 +35,8 @@ pub enum StateFile {
     Hydra,
     Warm,
     Batches,
+    Supply,
+    Dispatch,
 }
 
 impl StateFile {
@@ -44,14 +46,18 @@ impl StateFile {
             StateFile::Hydra => "hydra.jsonl",
             StateFile::Warm => "warm.jsonl",
             StateFile::Batches => "batches.jsonl",
+            StateFile::Supply => "supply.jsonl",
+            StateFile::Dispatch => "dispatch.jsonl",
         }
     }
 
-    pub const ALL: [StateFile; 4] = [
+    pub const ALL: [StateFile; 6] = [
         StateFile::Results,
         StateFile::Hydra,
         StateFile::Warm,
         StateFile::Batches,
+        StateFile::Supply,
+        StateFile::Dispatch,
     ];
 }
 
@@ -268,6 +274,13 @@ mod tests {
         drop(f);
         let res: Result<Vec<JobRecord>> = state.load_jsonl(StateFile::Results);
         assert!(res.is_err(), "mid-file corruption must error");
+    }
+
+    #[test]
+    fn supply_and_dispatch_state_files_named() {
+        assert_eq!(StateFile::Supply.file_name(), "supply.jsonl");
+        assert_eq!(StateFile::Dispatch.file_name(), "dispatch.jsonl");
+        assert_eq!(StateFile::ALL.len(), 6);
     }
 
     #[test]

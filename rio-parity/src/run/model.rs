@@ -1,7 +1,8 @@
 //! Shared campaign data model: per-job records (results.jsonl),
-//! hydra-truth cache entries, warm dispositions, batch records, and the
-//! engine's pause state. Wire field names are camelCase, matching the
-//! rest of the campaign artifacts.
+//! hydra-truth cache entries, warm dispositions, per-path supply
+//! outcomes (supply.jsonl), timed dispatch records (dispatch.jsonl),
+//! batch records, and the engine's pause state. Wire field names are
+//! camelCase, matching the rest of the campaign artifacts.
 //!
 //! Convention: the stringly-typed `bucket`/`outcome` fields in the JSONL
 //! record structs stay `String` on the wire, but they MUST be written via
@@ -360,6 +361,100 @@ pub struct WarmEntry {
     pub observed_at: String,
 }
 
+/// [`SupplyEntry::source`] value for an output of a workload unit — never
+/// supplied by any mechanism, the campaign must produce it itself.
+pub const SUPPLY_SOURCE_WORKLOAD_OUTPUT: &str = "workload-output";
+
+/// [`SupplyEntry::source`] value for a path the target cluster's own
+/// substituters cover (the cluster fetches it; the engine does not upload).
+pub const SUPPLY_SOURCE_TARGET_SUBSTITUTER: &str = "target-substituter";
+
+/// [`SupplyEntry::source`] value for a path whose bytes come from the
+/// replay archive itself (embedded NAR or derivation text).
+pub const SUPPLY_SOURCE_EMBEDDED: &str = "embedded";
+
+/// [`SupplyEntry::source`] value for a path fetched from a relay
+/// substituter listed by the archive and re-uploaded by the engine.
+pub const SUPPLY_SOURCE_RELAY: &str = "relay";
+
+/// [`SupplyEntry::source`] value for a path no source could provide (or
+/// that the supply policy deliberately withholds).
+pub const SUPPLY_SOURCE_NONE: &str = "none";
+
+/// [`SupplyEntry::mechanism`] value for delivery delegated to the target
+/// scheduler (prefetch submission / substitution) instead of an engine upload.
+pub const SUPPLY_MECHANISM_DELEGATE: &str = "delegate";
+
+/// [`SupplyEntry::mechanism`] value for an engine upload as part of a
+/// multi-path AddMultipleToStore batch.
+pub const SUPPLY_MECHANISM_UPLOAD_BATCH: &str = "upload-batch";
+
+/// [`SupplyEntry::mechanism`] value for an engine upload of one large NAR
+/// streamed individually via AddToStoreNar.
+pub const SUPPLY_MECHANISM_UPLOAD_STREAM: &str = "upload-stream";
+
+/// [`SupplyEntry::mechanism`] value when nothing was (or could be) sent
+/// for the path.
+pub const SUPPLY_MECHANISM_NONE: &str = "none";
+
+/// [`SupplyEntry::outcome`] value for a path the engine uploaded and the
+/// daemon accepted.
+pub const SUPPLY_OUTCOME_DELIVERED: &str = "delivered";
+
+/// [`SupplyEntry::outcome`] value for a path that was already valid in the
+/// target store — nothing to deliver.
+pub const SUPPLY_OUTCOME_ALREADY_PRESENT: &str = "already-present";
+
+/// [`SupplyEntry::outcome`] value for a path the target cluster supplied
+/// itself (prefetch substitution or fallback build).
+pub const SUPPLY_OUTCOME_DELEGATED: &str = "delegated";
+
+/// [`SupplyEntry::outcome`] value for an upload the daemon refused even
+/// after the single fresh-channel retry.
+pub const SUPPLY_OUTCOME_REFUSED: &str = "refused";
+
+/// [`SupplyEntry::outcome`] value for a path no source could provide, so
+/// nothing was delivered.
+pub const SUPPLY_OUTCOME_UNAVAILABLE: &str = "unavailable";
+
+/// [`SupplyEntry::outcome`] value for a delivery attempt that failed
+/// (transport error, relay fetch failure, failed prefetch build).
+pub const SUPPLY_OUTCOME_FAILED: &str = "failed";
+
+/// One line of supply.jsonl — per-path supply outcome from the supply stage.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SupplyEntry {
+    pub path: String,
+    /// One of the `SUPPLY_SOURCE_*` constants.
+    pub source: String,
+    /// One of the `SUPPLY_MECHANISM_*` constants.
+    pub mechanism: String,
+    /// One of the `SUPPLY_OUTCOME_*` constants.
+    pub outcome: String,
+    pub detail: Option<String>,
+    pub batch_id: Option<u64>,
+    pub bytes: Option<u64>,
+    pub observed_at: String,
+}
+
+/// One line of dispatch.jsonl — per recorded request, written by the timed dispatcher.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DispatchEntry {
+    pub request_index: usize,
+    pub session: i64,
+    pub due_offset_s: f64,
+    pub dispatched_at: String,
+    pub dispatch_lateness_ms: u64,
+    pub deadline_secs: u64,
+    pub interruption_armed: bool,
+    pub interruption_fired: bool,
+    pub attempts: u32,
+    pub batch_ids: Vec<u64>,
+    pub drvs: Vec<String>,
+}
+
 /// [`BatchRecord::kind`] value for build-stage submissions.
 pub const BATCH_KIND_SUBMIT: &str = "submit";
 
@@ -611,6 +706,85 @@ mod tests {
         );
         let unique: std::collections::BTreeSet<&str> = all.iter().copied().collect();
         assert_eq!(unique.len(), all.len());
+    }
+
+    #[test]
+    fn supply_entry_wire_strings() {
+        // Frozen wire strings: supply.jsonl is append-only across resumes,
+        // so renaming a value would orphan prior entries.
+        assert_eq!(SUPPLY_SOURCE_WORKLOAD_OUTPUT, "workload-output");
+        assert_eq!(SUPPLY_SOURCE_TARGET_SUBSTITUTER, "target-substituter");
+        assert_eq!(SUPPLY_SOURCE_EMBEDDED, "embedded");
+        assert_eq!(SUPPLY_SOURCE_RELAY, "relay");
+        assert_eq!(SUPPLY_SOURCE_NONE, "none");
+        assert_eq!(SUPPLY_MECHANISM_DELEGATE, "delegate");
+        assert_eq!(SUPPLY_MECHANISM_UPLOAD_BATCH, "upload-batch");
+        assert_eq!(SUPPLY_MECHANISM_UPLOAD_STREAM, "upload-stream");
+        assert_eq!(SUPPLY_MECHANISM_NONE, "none");
+        assert_eq!(SUPPLY_OUTCOME_DELIVERED, "delivered");
+        assert_eq!(SUPPLY_OUTCOME_ALREADY_PRESENT, "already-present");
+        assert_eq!(SUPPLY_OUTCOME_DELEGATED, "delegated");
+        assert_eq!(SUPPLY_OUTCOME_REFUSED, "refused");
+        assert_eq!(SUPPLY_OUTCOME_UNAVAILABLE, "unavailable");
+        assert_eq!(SUPPLY_OUTCOME_FAILED, "failed");
+
+        let entry = SupplyEntry {
+            path: "/nix/store/x".into(),
+            source: SUPPLY_SOURCE_RELAY.into(),
+            mechanism: SUPPLY_MECHANISM_UPLOAD_BATCH.into(),
+            outcome: SUPPLY_OUTCOME_DELIVERED.into(),
+            detail: None,
+            batch_id: Some(3),
+            bytes: Some(10),
+            observed_at: now_rfc3339(),
+        };
+        let value = serde_json::to_value(&entry).unwrap();
+        assert_eq!(value["source"], "relay");
+        assert_eq!(value["mechanism"], "upload-batch");
+        assert_eq!(value["outcome"], "delivered");
+        assert_eq!(value["batchId"], 3);
+        assert_eq!(value["bytes"], 10);
+        assert_eq!(value["observedAt"], entry.observed_at.as_str());
+        let back: SupplyEntry = serde_json::from_value(value).unwrap();
+        assert_eq!(back.path, entry.path);
+        assert_eq!(back.source, entry.source);
+        assert_eq!(back.mechanism, entry.mechanism);
+        assert_eq!(back.outcome, entry.outcome);
+        assert_eq!(back.detail, entry.detail);
+        assert_eq!(back.batch_id, entry.batch_id);
+        assert_eq!(back.bytes, entry.bytes);
+        assert_eq!(back.observed_at, entry.observed_at);
+    }
+
+    #[test]
+    fn dispatch_entry_uses_camel_case_wire_names() {
+        let entry = DispatchEntry {
+            request_index: 4,
+            session: 7,
+            due_offset_s: 12.5,
+            dispatched_at: "2026-05-28T00:00:00Z".into(),
+            dispatch_lateness_ms: 250,
+            deadline_secs: 1800,
+            interruption_armed: true,
+            interruption_fired: false,
+            attempts: 2,
+            batch_ids: vec![11, 12],
+            drvs: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".into()],
+        };
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(json.contains(r#""requestIndex":4"#), "{json}");
+        assert!(json.contains(r#""dueOffsetS":12.5"#), "{json}");
+        assert!(json.contains(r#""dispatchLatenessMs":250"#), "{json}");
+        assert!(json.contains(r#""deadlineSecs":1800"#), "{json}");
+        assert!(json.contains(r#""interruptionArmed":true"#), "{json}");
+        assert!(json.contains(r#""interruptionFired":false"#), "{json}");
+        assert!(json.contains(r#""batchIds":[11,12]"#), "{json}");
+        assert!(!json.contains("request_index"), "{json}");
+        let back: DispatchEntry = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.request_index, 4);
+        assert_eq!(back.session, 7);
+        assert_eq!(back.attempts, 2);
+        assert_eq!(back.batch_ids, vec![11, 12]);
     }
 
     #[test]
