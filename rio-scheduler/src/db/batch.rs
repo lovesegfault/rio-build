@@ -135,8 +135,10 @@ impl SchedulerDb {
         // must not launder the persisted truncation evidence through the
         // upsert. The only merge-side clear is the explicit heal in
         // `handle_merge_dag` (`clear_closure_hole_by_hashes`, edge
-        // parents of a full merge); the mark-clear helpers below drop it
-        // together with `topdown_pruned`.
+        // parents of a full merge); the batched mark-clear helper below
+        // drops it together with `topdown_pruned`, while the single-row
+        // `clear_topdown_pruned_by_hash` is mark-only (the fail-fast
+        // retains the breadcrumb for the directed resubmit).
         let result: Vec<(String, Uuid, i64, i64, i64)> = sqlx::query_as(
             r#"
             INSERT INTO derivations
@@ -184,7 +186,8 @@ impl SchedulerDb {
             -- bind false); this upsert never clears it.
             -- Cleared by the merge-time heal
             -- (clear_closure_hole_by_hashes) and alongside the mark by
-            -- the clear_topdown_pruned_by_hash{,es} helpers.
+            -- the batched clear_topdown_pruned_by_hashes helper (the
+            -- single-row clear_topdown_pruned_by_hash is mark-only).
             ON CONFLICT (drv_hash) DO UPDATE SET
                 updated_at = now(),
                 expected_output_paths = EXCLUDED.expected_output_paths,
@@ -359,16 +362,28 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    /// Best-effort single-row `topdown_pruned` clear, keyed by
-    /// `drv_hash`, outside any transaction. Two callers: the topdown
-    /// fail-fast when it parks a node (the marker it just consumed must
-    /// not survive in PG, or the next leader restores it onto a
-    /// childless node and the fail-fast re-arms after every failover),
-    /// and the lazy clear in `handle_substitute_complete` when the
-    /// node's children are all already produced at walk-failure time.
-    /// Resets `closure_hole` together with the mark, mirroring the
-    /// in-memory consumption (the fail-fast drops both bits) — see
-    /// `clear_topdown_pruned_by_hashes` for the widened WHERE.
+    /// Best-effort single-row, mark-only `topdown_pruned` clear, keyed
+    /// by `drv_hash`, outside any transaction. Never touches the
+    /// `closure_hole` breadcrumb (unlike `clear_topdown_pruned_by_hashes`,
+    /// whose callers are all keyed on produced/vouched children). Two
+    /// callers, and mark-only is correct at both:
+    ///  - the topdown fail-fast when it parks a node: the marker it
+    ///    just consumed must not survive in PG (or the next leader
+    ///    restores it onto a childless node and the fail-fast re-arms
+    ///    after every failover), but the breadcrumb is deliberately
+    ///    retained — the directed resubmit the fail-fast solicits goes
+    ///    through the resubmit-reset, which keeps the truncated child
+    ///    edges and carries the breadcrumb, so the re-pruning merge's
+    ///    stamp gates re-stamp the node instead of reading its produced
+    ///    survivors as Vouched (round-23 bug_006);
+    ///  - the lazy clear in `handle_substitute_complete` when the
+    ///    node's children are all already produced at walk-failure
+    ///    time: that arm fires only on `Vouched` closure evidence,
+    ///    which requires the in-memory hole to be false — there is no
+    ///    in-memory hole consumption to mirror, and a persisted-only
+    ///    leftover (a lost heal write) is the next full merge's heal to
+    ///    drop, not this helper's.
+    ///
     /// Callers treat an error as warn-and-continue — the in-memory
     /// clear already happened and the build verdict must not depend on
     /// this write.
@@ -379,8 +394,8 @@ impl SchedulerDb {
         sqlx::query(
             r#"
             UPDATE derivations
-            SET topdown_pruned = false, closure_hole = false, updated_at = now()
-            WHERE drv_hash = $1 AND (topdown_pruned OR closure_hole)
+            SET topdown_pruned = false, updated_at = now()
+            WHERE drv_hash = $1 AND topdown_pruned
             "#,
         )
         .bind(drv_hash)

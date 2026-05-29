@@ -2688,7 +2688,9 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
 /// so a children-keyed lazy clear would drop the mark and revert R to
 /// Ready — but that child set is a reap-truncated view of the pruned
 /// closure (dep1 was never produced). The verdict must take the
-/// resubmit-directing fail-fast instead.
+/// resubmit-directing fail-fast instead. The fail-fast consumes the
+/// mark only; the hole survives for the directed resubmit — see
+/// bug_006/round-23.
 #[tokio::test]
 async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_produced_child_survives_reversed()
 -> TestResult {
@@ -2888,17 +2890,20 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         !r.topdown_pruned,
         "the fail-fast consumes (clears) the mark it acted on"
     );
-    // The fail-fast's persisted clear drops the breadcrumb together with
-    // the mark it qualifies — a stale persisted hole would otherwise
-    // re-arm the conservative arm after every later failover.
+    // The fail-fast's persisted clear drops the mark it consumed but
+    // retains the breadcrumb: the truncated child edges survive the
+    // park, so the hole stays the evidence that protects the directed
+    // resubmit (an unmarked node's hole has no consumer that can
+    // mis-fire).
     let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
         "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdmr-r'",
     )
     .fetch_one(&db.pool)
     .await?;
     assert!(
-        !pg_pruned && !pg_hole,
-        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+        !pg_pruned && pg_hole,
+        "the fail-fast consumes the mark only; the hole survives for the directed \
+         resubmit — see bug_006/round-23 (topdown_pruned={pg_pruned}, \
          closure_hole={pg_hole})"
     );
     Ok(())
@@ -3931,7 +3936,8 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
 /// source. Pre-fix the completion dropped the in-memory hole, the lazy
 /// clear judged the truncated set Vouched (laundering the persisted
 /// mark AND breadcrumb), and the next dispatch pass cut a doomed
-/// from-source assignment.
+/// from-source assignment. The fail-fast consumes the mark only; the
+/// hole survives for the directed resubmit — see bug_006/round-23.
 #[tokio::test]
 async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -4199,8 +4205,9 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     .fetch_one(&db.pool)
     .await?;
     assert!(
-        !pg_pruned && !pg_hole,
-        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+        !pg_pruned && pg_hole,
+        "the fail-fast consumes the mark only; the hole survives for the directed \
+         resubmit — see bug_006/round-23 (topdown_pruned={pg_pruned}, \
          closure_hole={pg_hole})"
     );
     Ok(())
@@ -4226,6 +4233,8 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
 /// survivor read as Vouched, both stamp gates skipped the mark, and the
 /// walk failure took the generic revert to Ready — handing R to a
 /// worker from source even though its pruned closure was never merged.
+/// That closing fail-fast consumes the mark only; the hole survives for
+/// the directed resubmit — see bug_006/round-23.
 #[tokio::test]
 async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -4502,9 +4511,311 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     .fetch_one(&db.pool)
     .await?;
     assert!(
-        !pg_pruned && !pg_hole,
-        "the fail-fast must clear both persisted bits (topdown_pruned={pg_pruned}, \
+        !pg_pruned && pg_hole,
+        "the fail-fast consumes the mark only; the hole survives for the directed \
+         resubmit — see bug_006/round-23 (topdown_pruned={pg_pruned}, \
          closure_hole={pg_hole})"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.substitute-topdown+10]
+/// The topdown fail-fast must consume the MARK only and retain the
+/// closure-hole breadcrumb, so the directed resubmit it solicits stays
+/// protected (bughunter round-23 bug_006). Staging: B1's prune stamps R
+/// and parks its detached fetch; BC produces dep2; B2 full-merges
+/// app→R→{dep1 unbuilt, dep2 produced}; B2's cancel+cleanup reaps the
+/// un-produced dep1 out from under R (closure hole set in memory,
+/// persisted by the leader's reap hook). R's parked walk then FAILS:
+/// the fail-fast fires (B1 fails with the resubmit-directing error) and
+/// consumes the mark — but the breadcrumb must survive, because the
+/// truncated child edge R→{dep2} also survives the park. B3 then
+/// follows the error message and resubmits the same target through
+/// another pruned merge inside B1's cleanup window: the resubmit-reset
+/// carries the retained hole, the re-pruning merge's stamp gates see
+/// Broken closure evidence over the produced survivor and re-stamp R,
+/// and the second walk failure repeats the bounded resubmit-directing
+/// outcome. Pre-fix the fail-fast cleared the hole together with the
+/// mark (memory + PG), the resubmit-reset carried the laundered false,
+/// the produced survivor read as Vouched, the re-prune skipped the
+/// re-stamp, and the second walk failure took the generic revert to
+/// Ready — handing R to a worker from source even though its pruned
+/// closure was never merged.
+#[tokio::test]
+async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park every detached fetch on the QPI gate (never released) so
+    // walk verdicts are injected manually below.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // B1: root → dep1 with the root's wanted output substitutable
+    // upstream → the prune fires, keeps {R} (stamped, childless),
+    // drops dep1, and parks R's detached fetch.
+    let r_out = test_store_path("tdfk-r-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(r_out.clone());
+    let mk_r = || {
+        let mut n = make_node("tdfk-r");
+        n.expected_output_paths = vec![r_out.clone()];
+        n
+    };
+    let mk_dep1 = || {
+        let mut n = make_node("tdfk-dep1");
+        n.expected_output_paths = vec![test_store_path("tdfk-dep1-out")];
+        n
+    };
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(
+        &handle,
+        b1,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdfk-r", "tdfk-dep1")],
+        false,
+    )
+    .await?;
+    assert_eq!(
+        query_status(&handle, b1).await?.total_derivations,
+        1,
+        "fixture premise: B1 took the roots-only prune path"
+    );
+    let pre = expect_drv(&handle, "tdfk-r").await;
+    assert!(
+        pre.topdown_pruned,
+        "fixture premise: R stamped by the prune"
+    );
+    assert_eq!(
+        pre.status,
+        DerivationStatus::Substituting,
+        "fixture premise: R's detached fetch is parked on the QPI gate"
+    );
+
+    // BC: dep2 is produced (cache-hit at merge) and kept alive by BC's
+    // interest across B2's later reap.
+    let dep2_out = test_store_path("tdfk-dep2-out");
+    store.seed_with_content(&dep2_out, b"dep2-out");
+    let mk_dep2 = || {
+        let mut n = make_node("tdfk-dep2");
+        n.expected_output_paths = vec![dep2_out.clone()];
+        n
+    };
+    let bc = Uuid::new_v4();
+    let _evbc = merge_dag(&handle, bc, vec![mk_dep2()], vec![], false).await?;
+    barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdfk-dep2").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: dep2 is produced before B2 attaches it to R"
+    );
+
+    // B2: full merge app→R→{dep1 unbuilt, dep2 produced}; the mark
+    // survives (children not all produced).
+    let mut app = make_node("tdfk-app");
+    app.expected_output_paths = vec![test_store_path("tdfk-app-out")];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        b2,
+        vec![app, mk_r(), mk_dep1(), mk_dep2()],
+        vec![
+            make_test_edge("tdfk-app", "tdfk-r"),
+            make_test_edge("tdfk-r", "tdfk-dep1"),
+            make_test_edge("tdfk-r", "tdfk-dep2"),
+        ],
+        false,
+    )
+    .await?;
+
+    // Cancel B2 and reap its sole-interest nodes WHILE R's walk is
+    // still parked: dep1 — never produced — is reaped out from under R
+    // (closure hole set in memory, persisted by the leader's reap
+    // hook); dep2 survives via BC's interest, R via B1's.
+    let (ctx, crx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id: b2,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: ctx,
+        })
+        .await?;
+    assert!(crx.await??, "B2 cancel must be accepted");
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: b2 })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("tdfk-dep1").await?.is_none(),
+        "B2's sole-interest unbuilt dep1 must be reaped (closure hole on R)"
+    );
+    assert!(
+        handle.debug_query_derivation("tdfk-dep2").await?.is_some(),
+        "dep2 must survive the reap (BC still holds interest in it)"
+    );
+    let holed = expect_drv(&handle, "tdfk-r").await;
+    assert_eq!(
+        holed.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the reap must not settle a survivor whose walk is in flight"
+    );
+    assert!(
+        holed.topdown_pruned,
+        "fixture premise: the mark survives the reap of an un-produced child"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdfk-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "fixture premise: the mark and the closure-hole breadcrumb are persisted after \
+         the reap (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
+    );
+
+    // A builder is available throughout — a from-source dispatch of R
+    // would have somewhere to land at every later step.
+    let mut worker_rx = connect_executor(&handle, "tdfk-w", "x86_64-linux").await?;
+
+    // R's parked walk genuinely FAILS: the closure evidence is Broken
+    // (hole over the produced survivor), so the verdict takes the
+    // resubmit-directing fail-fast and B1 fails.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdfk-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B1 must fail via the resubmit-directing fail-fast when the walk fails"
+    );
+    assert!(
+        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
+        "B1's error summary should direct resubmit; got {:?}",
+        s1.error_summary
+    );
+    // The discriminating post-fail-fast state: the mark is consumed,
+    // the breadcrumb is NOT — the truncated child edge R→{dep2}
+    // survives the park, so the hole is the only remaining evidence
+    // that the child set under-states R's pruned closure. Pre-fix the
+    // fail-fast cleared both bits here.
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdfk-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        !pg_pruned,
+        "the fail-fast must consume the persisted mark (topdown_pruned={pg_pruned})"
+    );
+    assert!(
+        pg_hole,
+        "the fail-fast must retain the persisted closure-hole breadcrumb for the \
+         directed resubmit it solicits (closure_hole={pg_hole})"
+    );
+
+    // B3 follows the error message and resubmits the same target inside
+    // B1's TERMINAL_CLEANUP_DELAY window. R's wanted output is still
+    // substitutable upstream, so the prune fires again and the
+    // DependencyFailed R goes through the merge-time resubmit-reset
+    // while its reap-truncated child set ({dep2}, produced) survives
+    // un-re-declared. The carried breadcrumb keeps that child set
+    // Broken, so the stamp gates must re-stamp the kept node.
+    let b3 = Uuid::new_v4();
+    let _ev3 = merge_dag(
+        &handle,
+        b3,
+        vec![mk_r(), mk_dep1()],
+        vec![make_test_edge("tdfk-r", "tdfk-dep1")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, b3).await?.total_derivations,
+        1,
+        "fixture premise: B3 took the roots-only prune path"
+    );
+    let reset = expect_drv(&handle, "tdfk-r").await;
+    assert_eq!(
+        reset.status,
+        DerivationStatus::Substituting,
+        "fixture premise: the resubmitted R is re-routed to the detached fetch"
+    );
+    assert!(
+        reset.topdown_pruned,
+        "the resubmit-reset must carry the retained closure hole so the re-pruning \
+         merge re-stamps R (was: the fail-fast had erased the hole, the produced \
+         survivor read as Vouched, and both stamp gates skipped the mark)"
+    );
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdfk-r'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        pg_pruned && pg_hole,
+        "the persisted mark must be re-stamped and the breadcrumb still set after B3's \
+         pruned merge (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
+    );
+
+    // The resubmitted walk fails again: the bounded resubmit-directing
+    // outcome must repeat — never the doomed from-source dispatch.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdfk-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let s3 = query_status(&handle, b3).await?;
+    assert_eq!(
+        s3.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "B3 must fail via the resubmit-directing fail-fast when the resubmitted walk \
+         fails (was: the unmarked R took the generic revert to Ready and stayed \
+         dispatchable from source)"
+    );
+    assert!(
+        s3.error_summary.contains("topdown") && s3.error_summary.contains("resubmit"),
+        "B3's error summary should direct resubmit; got {:?}",
+        s3.error_summary
+    );
+
+    // No from-source dispatch may ever have been cut for R: drive a
+    // dispatch pass and drain everything the worker was sent.
+    tick(&handle).await?;
+    while let Ok(m) = worker_rx.try_recv() {
+        use rio_proto::types::scheduler_message::Msg;
+        assert!(
+            !matches!(m.msg, Some(Msg::Assignment(_))),
+            "a closure-holed pruned root must never be dispatched from source — its \
+             pruned closure was never merged (the worker would ENOENT)"
+        );
+    }
+    let r = expect_drv(&handle, "tdfk-r").await;
+    assert!(
+        !matches!(
+            r.status,
+            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
+        ),
+        "R must not be dispatchable from source after the second fail-fast; got {:?}",
+        r.status
     );
     Ok(())
 }

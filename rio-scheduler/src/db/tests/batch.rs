@@ -428,8 +428,11 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
 /// truncation evidence), carried by the recovery SELECT so a new leader
 /// can restore it, cleared on its own by the merge-heal helper
 /// `clear_closure_hole_by_hashes`, and dropped together with the mark
-/// by both extended `clear_topdown_pruned_by_hash{,es}` helpers
-/// (including a markless leftover hole, via the widened WHERE).
+/// by the batched `clear_topdown_pruned_by_hashes` helper (including a
+/// markless leftover hole, via its widened WHERE) — while the
+/// single-row `clear_topdown_pruned_by_hash` is mark-only: the topdown
+/// fail-fast consumes the mark but retains the hole for the directed
+/// resubmit it solicits (bug_006/round-23).
 #[tokio::test]
 async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -524,15 +527,26 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         "clearing the mark must drop the breadcrumb that qualifies it"
     );
 
-    // 7. The extended single-row clear also resets a markless leftover
-    //    hole (lost-heal residue) — the widened WHERE.
+    // 7. The single-row clear is mark-only: it consumes the mark but
+    //    deliberately retains the breadcrumb (the topdown fail-fast
+    //    solicits a directed resubmit that needs the hole — see
+    //    bug_006/round-23), and it does not mop up a markless leftover
+    //    hole either (lost-heal residue waits for the next full-merge
+    //    heal).
+    upsert(mk(true)).await?;
     db.set_closure_hole_by_hashes(&hashes).await?;
-    assert_eq!(read().await?, (false, true));
+    assert_eq!(read().await?, (true, true));
     db.clear_topdown_pruned_by_hash(drv_hash).await?;
     assert_eq!(
         read().await?,
-        (false, false),
-        "the single-row clear must reset a leftover hole even when the mark is already gone"
+        (false, true),
+        "the single-row clear must consume the mark and retain the breadcrumb"
+    );
+    db.clear_topdown_pruned_by_hash(drv_hash).await?;
+    assert_eq!(
+        read().await?,
+        (false, true),
+        "a markless leftover hole is not the single-row clear's to reset"
     );
 
     Ok(())

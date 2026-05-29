@@ -1533,13 +1533,21 @@ impl DagActor {
             // could build from source. Clearing loses nothing: after
             // the park there is no surviving interest, and a
             // resubmitted genuinely-pruned root either re-prunes
-            // (re-stamped) or full-merges (children all produced ⇒
-            // cleared).
+            // (re-stamped — the retained breadcrumb below keeps a
+            // reap-truncated survivor set from vouching) or full-merges
+            // (children all produced ⇒ cleared).
             s.topdown_pruned = false;
-            // The closure-hole breadcrumb is consumed with the mark it
-            // qualifies: after the park nothing children-keyed is left
-            // to mislead, and a resubmit rebuilds the node fresh.
-            s.closure_hole = false;
+            // Deliberately do NOT clear `closure_hole`: the directed
+            // resubmit this fail-fast solicits goes through the
+            // resubmit-reset, which keeps the (possibly truncated)
+            // child edges and carries the breadcrumb, and the
+            // re-pruning merge's stamp gates need it to avoid reading
+            // produced survivors as Vouched — erasing it here would
+            // launder that resubmit into the doomed from-source
+            // dispatch one lifecycle step later (round-23 bug_006). An
+            // unmarked node's hole has no consumer that can mis-fire
+            // (every consumer also requires the mark); a later full
+            // merge that re-declares the edges heals it.
             if let Err(e) = s.transition(DerivationStatus::Queued) {
                 warn!(%drv_hash, %e, "topdown fail-fast: transition to Queued rejected");
             }
@@ -1553,7 +1561,9 @@ impl DagActor {
         if parked {
             self.persist_status(drv_hash, DerivationStatus::Queued, None)
                 .await;
-            // Best-effort PG counterpart of the in-memory clear above.
+            // Best-effort PG counterpart of the in-memory mark clear
+            // above (mark-only: the persisted closure_hole breadcrumb
+            // is deliberately left set, mirroring the retention above).
             // A failure costs at most one more wrongful fail-fast cycle
             // after a later failover — never fail the actor command
             // over it.
