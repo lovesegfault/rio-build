@@ -977,7 +977,7 @@
     {
       "path": "db/attempts.rs",
       "depth": 1,
-      "doc": "The durable attempt ledger — `drv_attempts` table (migration 066)."
+      "doc": "The durable attempt ledger — `drv_attempts` table (migration 068)."
     },
     {
       "path": "db/batch.rs",
