@@ -544,12 +544,14 @@ rec {
   # ── nixpkgs-parity campaign engine ─────────────────────────────────────
   # Engine binary plus the external tools it shells out to: `nix`
   # (drv import from the eval-set archive + ssh-ng submission through
-  # rio-gateway), `nix-eval-jobs` (eval-set production), and the OpenSSH
-  # client (`nix … --store ssh-ng://` spawns `ssh`). GNU tar + zstd are
-  # REQUIRED: the engine runs `tar --zstd -xf` on the drvs.tar.zst
-  # eval-set archive (and a plain `tar -cf` when packing one — the
-  # compression side is in-process); gzip covers the `tar -xzf` unpack
-  # of the nixpkgs source tarball during eval-set production;
+  # rio-gateway), `nix-eval-jobs` (recorder evaluation), and the OpenSSH
+  # client (`nix … --store ssh-ng://` spawns `ssh`). dwarfs provides
+  # `mkdwarfs`, which the recorder (`rio-parity eval`) shells out to
+  # when packing its staged replay archive into the published .dwarfs
+  # image. GNU tar + zstd are REQUIRED while the campaign engine
+  # (`rio-parity run`) still unpacks legacy drvs.tar.zst eval-set
+  # archives with `tar --zstd -xf`; gzip covers the `tar -xzf` unpack
+  # of the nixpkgs source tarball during recorder evaluation;
   # coreutils/bash cover the rest of the pack/unpack plumbing.
   # cacert/tzdata come from baseContents (Hydra and cache.nixos.org are
   # HTTPS); RIO_LOG_FORMAT=json + SSL_CERT_FILE from baseEnv. git is NOT
@@ -577,6 +579,7 @@ rec {
         pkgs.gnutar
         pkgs.gzip
         pkgs.zstd
+        pkgs.dwarfs
       ];
     in
     mkImage {
