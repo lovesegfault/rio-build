@@ -124,6 +124,7 @@ let
     "opcode_parsing"
     "derivation_parsing"
     "nar_parsing"
+    "nar_ls"
     "derived_path_parsing"
     "narinfo_parsing"
     "build_result_parsing"
