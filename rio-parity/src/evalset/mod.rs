@@ -11,6 +11,7 @@ pub mod depclosure;
 pub mod evaluator;
 pub mod fidelity;
 pub mod key;
+pub mod outcomes;
 pub mod recipe;
 
 /// What part of the Hydra evaluation an eval set covers.

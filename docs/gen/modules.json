@@ -836,6 +836,11 @@
       "doc": "Eval-set identity: the key digest and the evalset.json metadata."
     },
     {
+      "path": "evalset/outcomes.rs",
+      "depth": 1,
+      "doc": "Maps the recorder's truth sources — cache.nixos.org narinfo presence"
+    },
+    {
       "path": "evalset/recipe.rs",
       "depth": 1,
       "doc": "Hydra-faithful eval recipe."

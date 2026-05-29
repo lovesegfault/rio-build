@@ -260,6 +260,23 @@ pub enum ExpectedOutcome {
     Unknown,
 }
 
+impl ExpectedOutcome {
+    /// The wire string of this outcome — the kebab-case form written to
+    /// `outcomes.jsonl` — for callers that need it without a serde round
+    /// trip (log fields, golden assertions, report buckets).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ExpectedOutcome::Built => "built",
+            ExpectedOutcome::Failed => "failed",
+            ExpectedOutcome::ResourceExhausted => "resource-exhausted",
+            ExpectedOutcome::Cancelled => "cancelled",
+            ExpectedOutcome::Disconnected => "disconnected",
+            ExpectedOutcome::Indeterminate => "indeterminate",
+            ExpectedOutcome::Unknown => "unknown",
+        }
+    }
+}
+
 /// One `closures.jsonl` record: direct dependency adjacency for one
 /// derivation in the union requisite closure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,6 +361,7 @@ mod tests {
             );
             let parsed: ExpectedOutcome = serde_json::from_value(json!(wire)).unwrap();
             assert_eq!(parsed, variant, "parse of {wire:?}");
+            assert_eq!(variant.as_str(), wire, "as_str of {variant:?}");
         }
     }
 

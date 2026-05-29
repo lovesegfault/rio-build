@@ -317,6 +317,7 @@ mod tests {
     /// Loopback fake binary cache: serves one canned narinfo (for the
     /// real hello-2.12.3 store path; hash values are SYNTHETIC — the
     /// real upstream values are deliberately not asserted offline),
+    /// one narinfo whose NarHash uses an unsupported algorithm (md5),
     /// one always-broken path, and 404s everything else. Requests
     /// without the rio-parity User-Agent get 406 so a politeness
     /// regression fails these tests.
@@ -350,6 +351,22 @@ NarSize: 226504
 References: 10s5j3mfdg22k1597x580qrhprnzcjwb-hello-2.12.3 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-glibc-2.40
 Deriver: 7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv
 Sig: cache.nixos.org-1:c2lnbmF0dXJlLWJ5dGVzLW5vdC1yZWFsLWp1c3QtZml4dHVyZQ==
+";
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                    body,
+                )
+                    .into_response()
+            } else if file == "mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm.narinfo" {
+                // Parses as a narinfo, but the NarHash algorithm is one the
+                // sweep cannot convert to hex — the "found but hash
+                // unusable" case.
+                let body = "\
+StorePath: /nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-md5hashed-1.0
+URL: nar/1111111111111111111111111111111111111111111111111111.nar.xz
+Compression: xz
+NarHash: md5:0123456789abcdef0123456789abcdef
+NarSize: 4242
 ";
                 (
                     [(axum::http::header::CONTENT_TYPE, "text/x-nix-narinfo")],
@@ -431,6 +448,23 @@ Sig: cache.nixos.org-1:c2lnbmF0dXJlLWJ5dGVzLW5vdC1yZWFsLWp1c3QtZml4dHVyZQ==
         let gone = &facts[&absent];
         assert!(!gone.found);
         assert!(gone.nar_hash_hex.is_none());
+    }
+
+    #[tokio::test]
+    async fn sweep_records_unusable_narhash_as_found_without_hash() {
+        let (base, _srv) = spawn_fake_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let unusable = "/nix/store/mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm-md5hashed-1.0".to_string();
+        let facts = sweep_narinfos(&c, std::slice::from_ref(&unusable), 1, 2)
+            .await
+            .unwrap();
+        let fact = &facts[&unusable];
+        assert!(fact.found, "the cache served a narinfo, so the path exists");
+        assert!(
+            fact.nar_hash_hex.is_none(),
+            "an md5 NarHash cannot be converted to a hex sha256"
+        );
+        assert_eq!(fact.nar_size, Some(4242), "NarSize is still usable");
     }
 
     #[tokio::test]
