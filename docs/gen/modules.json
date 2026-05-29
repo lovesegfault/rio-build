@@ -971,6 +971,11 @@
       "doc": "Supply planning — what the target must build vs what the campaign"
     },
     {
+      "path": "run/timeline.rs",
+      "depth": 1,
+      "doc": "Timed-replay schedule construction: when each recorded request fires."
+    },
+    {
       "path": "run/transport.rs",
       "depth": 1,
       "doc": "In-process SSH transport for the gateway's nix-daemon worker protocol."
