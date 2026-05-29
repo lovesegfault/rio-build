@@ -893,7 +893,7 @@
     {
       "path": "run/collect.rs",
       "depth": 1,
-      "doc": "Collect stage: turn per-(build, drv) observations, captured stderr"
+      "doc": "Collect stage: turn in-band per-root build results, captured stderr"
     },
     {
       "path": "run/drv_import.rs",
@@ -933,7 +933,7 @@
     {
       "path": "run/reader.rs",
       "depth": 1,
-      "doc": "`ResultReader` — the trait collect uses to learn per-(build, drv) status"
+      "doc": "`ResultReader` — the warm stage's read-back surface: per-(build, drv)"
     },
     {
       "path": "run/report.rs",

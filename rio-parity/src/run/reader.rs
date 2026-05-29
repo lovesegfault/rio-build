@@ -1,10 +1,12 @@
-//! `ResultReader` — the trait collect uses to learn per-(build, drv) status
-//! and exec_id. Two implementations: [`GetBuildGraphReader`] (one
-//! `GetBuildGraph` call per build plus a `ListPoisoned` sweep, valid only
-//! while merged batch DAGs fit the 5000-node dashboard cap) and
-//! [`QueryDerivationStatusesReader`] (a batched per-drv status RPC, chunked
-//! at [`DRV_STATUS_CHUNK`] paths per call, for campaigns whose merged DAGs
-//! outgrow that cap; its tonic adapter lands together with the RPC itself).
+//! `ResultReader` — the warm stage's read-back surface: per-(build, drv)
+//! status and exec_id for the warm prefetch's roots-only builds.
+//!
+//! The build-path collect loop does NOT use this module: collection is
+//! driven by the in-band per-root results each submission returns
+//! ([`super::model::PathOutcome`] on the batch record). The warm stage
+//! still shells out to `nix build` and reads its dispositions back from
+//! the build graph here; the supply planner absorbs that prefetch (and
+//! this read-back with it) in a later phase.
 
 use std::collections::{HashMap, HashSet};
 
@@ -14,7 +16,7 @@ use async_trait::async_trait;
 use super::grpc::{AdminApi, GraphSnapshot};
 use super::model::STATUS_POISONED;
 
-/// Per-(build, drv) observation, normalized across both readers.
+/// Per-(build, drv) observation, normalized from the build-graph read.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct DrvObservation {
     pub drv_path: String,
@@ -28,13 +30,12 @@ pub struct DrvObservation {
     /// None = evidence unavailable, e.g. poison-TTL decay or an RPC gap).
     pub failed_builders: Option<Vec<String>>,
     pub poisoned_secs_ago: Option<u64>,
-    /// Known only from the per-drv status reader (None from the
-    /// build-graph reader).
+    /// Never reported by the build-graph reader (always None).
     pub is_fixed_output: Option<bool>,
 }
 
-/// The read surface collect drives to learn what happened to each drv of a
-/// settled batch.
+/// The read surface the warm stage drives to learn what happened to each
+/// root of a settled warm batch.
 #[async_trait]
 pub trait ResultReader: Send + Sync {
     /// Observations for `drv_paths` within `build_id`'s DAG. Paths absent
@@ -44,9 +45,10 @@ pub trait ResultReader: Send + Sync {
 }
 
 /// Reader backed by `GetBuildGraph` + `ListPoisoned`: one graph snapshot per
-/// build, with the poisoned sweep filling `failed_builders` for poisoned
-/// nodes (same-day evidence — `ListPoisoned` rows decay with the
-/// scheduler's poison TTL).
+/// warm build, with the poisoned sweep filling `failed_builders` for
+/// poisoned nodes (same-day evidence — `ListPoisoned` rows decay with the
+/// scheduler's poison TTL). Warm batches are roots-only merges, so they sit
+/// far below the dashboard's graph-size cap.
 pub struct GetBuildGraphReader<A: AdminApi> {
     pub admin: A,
 }
@@ -114,14 +116,14 @@ impl<A: AdminApi> ResultReader for GetBuildGraphReader<A> {
     ) -> Result<Vec<DrvObservation>> {
         let graph = self.admin.get_build_graph(build_id).await?;
         if graph.truncated {
-            // The batch node cap keeps merged DAGs under the dashboard's
-            // 5000-node limit; a truncated response means the cap was
-            // misconfigured — surface it loudly rather than silently
-            // mis-classifying the missing nodes as "no derivation rows".
+            // Warm batches are roots-only merges sized well under the
+            // dashboard's graph cap; a truncated response means the batch
+            // sizing was misconfigured — surface it loudly rather than
+            // silently mis-classifying the missing nodes as "no derivation
+            // rows".
             anyhow::bail!(
                 "GetBuildGraph({build_id}) truncated at {} nodes — merged DAG exceeds the \
-                 dashboard cap; lower batch_max_nodes or switch to the batched \
-                 QueryDerivationStatuses reader",
+                 dashboard cap; lower batch_max_nodes",
                 graph.total_nodes
             );
         }
@@ -136,103 +138,16 @@ impl<A: AdminApi> ResultReader for GetBuildGraphReader<A> {
     }
 }
 
-// ───────────────────── Batched per-drv status reader ───────────────────────
-
-/// Row shape of the batched per-drv status RPC (`QueryDerivationStatuses`,
-/// PG-backed fields only). The tonic adapter is added once the scheduler
-/// grows the RPC; until then the reader is exercised through this trait.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct DrvStatusRow {
-    pub drv_path: String,
-    pub status: String,
-    pub retry_count: u32,
-    /// Scheduler-side resubmission cycles for this drv — distinct from the
-    /// engine's own campaign resubmissions counted in each job record's
-    /// `attempts`.
-    pub resubmit_cycles: u32,
-    pub failed_builders: Vec<String>,
-    pub poisoned_secs_ago: Option<u64>,
-    pub assigned_executor: Option<String>,
-    pub is_fixed_output: bool,
-    /// exec_id from the build's derivation rows for the supplied build_id
-    /// (None ⇒ no execution observed by that build).
-    pub exec_id: Option<String>,
-}
-
-/// The batched per-drv status query surface.
-#[async_trait]
-pub trait DerivationStatusApi: Send + Sync {
-    /// Query statuses for `drv_paths` within `build_id`. Callers keep each
-    /// call at or under [`DRV_STATUS_CHUNK`] paths — chunking is the
-    /// reader's job, one RPC per chunk.
-    async fn query(&self, build_id: &str, drv_paths: &[String]) -> Result<Vec<DrvStatusRow>>;
-}
-
-/// Max drv_paths per `QueryDerivationStatuses` call, keeping each request
-/// comfortably inside message-size limits (same sizing rationale as
-/// [`super::grpc::BATCH_QUERY_CHUNK`]).
-pub const DRV_STATUS_CHUNK: usize = 500;
-
-/// Reader backed by the batched per-drv status RPC; scales past the
-/// build-graph reader's 5000-node cap because it never materializes the
-/// whole DAG.
-pub struct QueryDerivationStatusesReader<D: DerivationStatusApi> {
-    pub api: D,
-}
-
-impl<D: DerivationStatusApi> QueryDerivationStatusesReader<D> {
-    pub fn new(api: D) -> Self {
-        Self { api }
-    }
-}
-
-#[async_trait]
-impl<D: DerivationStatusApi> ResultReader for QueryDerivationStatusesReader<D> {
-    async fn read_build(
-        &self,
-        build_id: &str,
-        drv_paths: &[String],
-    ) -> Result<Vec<DrvObservation>> {
-        let mut by_path: HashMap<String, DrvObservation> = HashMap::new();
-        for chunk in drv_paths.chunks(DRV_STATUS_CHUNK) {
-            for row in self.api.query(build_id, chunk).await? {
-                by_path.insert(
-                    row.drv_path.clone(),
-                    DrvObservation {
-                        drv_path: row.drv_path,
-                        status: row.status,
-                        exec_id: row.exec_id.filter(|e| !e.is_empty()),
-                        assigned_executor: row.assigned_executor,
-                        failed_builders: Some(row.failed_builders),
-                        poisoned_secs_ago: row.poisoned_secs_ago,
-                        is_fixed_output: Some(row.is_fixed_output),
-                    },
-                );
-            }
-        }
-        Ok(drv_paths
-            .iter()
-            .map(|p| {
-                by_path.remove(p).unwrap_or_else(|| DrvObservation {
-                    drv_path: p.clone(),
-                    ..DrvObservation::default()
-                })
-            })
-            .collect())
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    /// Scripted [`ResultReader`] for collect-stage tests: observations are
+    /// Scripted [`ResultReader`] for warm-stage tests: observations are
     /// keyed by (build_id, drv_path); paths with no scripted observation
     /// come back as the default (empty-status) observation, mirroring the
-    /// real readers' missing-path behavior. Setting `error` makes every
-    /// `read_build` call fail with that message instead (collect's
-    /// reader-failure paths).
+    /// real reader's missing-path behavior. Setting `error` makes every
+    /// `read_build` call fail with that message instead.
     #[derive(Default)]
     pub struct FakeReader {
         /// build_id → drv_path → observation
@@ -286,7 +201,6 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
     use crate::run::grpc::{GraphNodeView, GraphSnapshot, PoisonedView};
-    use std::sync::Mutex;
 
     struct FakeAdmin {
         graph: GraphSnapshot,
@@ -398,60 +312,11 @@ mod tests {
         assert!(err.to_string().contains("truncated"), "{err}");
     }
 
-    struct FakeStatusApi {
-        rows: Vec<DrvStatusRow>,
-        calls: Mutex<Vec<usize>>,
-    }
-
-    #[async_trait]
-    impl DerivationStatusApi for FakeStatusApi {
-        async fn query(&self, _build_id: &str, drv_paths: &[String]) -> Result<Vec<DrvStatusRow>> {
-            self.calls.lock().unwrap().push(drv_paths.len());
-            Ok(self
-                .rows
-                .iter()
-                .filter(|r| drv_paths.contains(&r.drv_path))
-                .cloned()
-                .collect())
-        }
-    }
-
-    #[tokio::test]
-    async fn query_derivation_statuses_reader_chunks_and_maps() {
-        let mk = |i: usize| format!("/nix/store/{i:0>32}-p{i}.drv");
-        let rows: Vec<DrvStatusRow> = (0..(DRV_STATUS_CHUNK + 10))
-            .map(|i| DrvStatusRow {
-                drv_path: mk(i),
-                status: "completed".into(),
-                exec_id: (i % 2 == 0).then(|| format!("e{i}")),
-                is_fixed_output: i % 3 == 0,
-                ..DrvStatusRow::default()
-            })
-            .collect();
-        let api = FakeStatusApi {
-            rows,
-            calls: Mutex::new(vec![]),
-        };
-        let reader = QueryDerivationStatusesReader::new(api);
-        let paths: Vec<String> = (0..(DRV_STATUS_CHUNK + 10)).map(mk).collect();
-        let obs = reader.read_build("b1", &paths).await.unwrap();
-        assert_eq!(obs.len(), DRV_STATUS_CHUNK + 10);
-        assert_eq!(obs[0].exec_id.as_deref(), Some("e0"));
-        assert_eq!(obs[1].exec_id, None);
-        assert_eq!(obs[0].is_fixed_output, Some(true));
-        let calls = reader.api.calls.lock().unwrap();
-        assert_eq!(
-            calls.as_slice(),
-            &[DRV_STATUS_CHUNK, 10],
-            "chunked at {DRV_STATUS_CHUNK}"
-        );
-    }
-
     /// Pin the [`test_support::FakeReader`] scripting contract the
-    /// collect-stage tests rely on: scripted observations come back for
+    /// warm-stage tests rely on: scripted observations come back for
     /// their (build_id, drv_path) key, unscripted paths come back as
     /// the default empty-status observation — the same missing-path shape
-    /// the real readers produce — and an injected error fails every read
+    /// the real reader produces — and an injected error fails every read
     /// until it is cleared.
     #[tokio::test]
     async fn fake_reader_returns_scripted_and_default_observations() {

@@ -1,35 +1,35 @@
-//! Collect stage: turn per-(build, drv) observations, captured stderr
+//! Collect stage: turn in-band per-root build results, captured stderr
 //! reasons, and scheduler poison evidence into terminal per-job records.
 //!
-//! For every settled batch the stage reads the per-drv observations of the
-//! batch's build, decides one [`Verdict`] per member job (terminal,
-//! re-queue, or still running), captures evidence — NAR hashes via the
-//! store for successes, a compressed log tail for failures — and appends
-//! terminal [`JobRecord`]s to results.jsonl.
+//! For every settled batch the stage reads the per-root [`PathOutcome`]s the
+//! submission returned in band, decides one [`Verdict`] per member job
+//! (terminal or re-queue), captures evidence — NAR hashes via the store for
+//! successes, a compressed log tail for failures — and appends terminal
+//! [`JobRecord`]s to results.jsonl.
 //!
-//! Failure attribution combines two independent signals: the relayed
-//! stderr reason captured at submission time (Signal 1) and the
-//! scheduler's failed-builder poison evidence (Signal 2). Only their
-//! agreement counts a failure as infrastructure; ambiguous, contradictory,
-//! or decayed evidence defaults to a genuine target failure so rio is
-//! never given the benefit of the doubt. A `dependency_failed` job is
-//! re-attributed through its own dependency closure: a failing drv inside
-//! the closure is a real blocked dependency, while a failing drv outside
-//! it means the job was merely a fail-fast batch-mate and is re-queued.
+//! Failure attribution combines two independent signals: the failing root's
+//! in-band error message, falling back to the relayed stderr reason captured
+//! at submission time (Signal 1), and the scheduler's failed-builder poison
+//! evidence from `ListPoisoned` (Signal 2). Only their agreement counts a
+//! failure as infrastructure; ambiguous, contradictory, or decayed evidence
+//! defaults to a genuine target failure so rio is never given the benefit of
+//! the doubt. A dependency-failed root is re-attributed through its own
+//! dependency closure: a failing drv inside the closure is a real blocked
+//! dependency, while a failing drv outside it means the job was merely a
+//! fail-fast batch-mate and is re-queued.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use anyhow::Result;
+use rio_nix::protocol::build::BuildStatus;
 
 use super::artifact::ArtifactStore;
 use super::classify::{AuxFlags, OutputHashes, classify, compare_output};
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
-    Bucket, FailureKind, HydraOutcome, HydraSide, JobRecord, RioOutcome, RioSide, RootCauseKind,
-    STATUS_CANCELLED, STATUS_COMPLETED, STATUS_DEPENDENCY_FAILED, STATUS_POISONED, STATUS_SKIPPED,
-    now_rfc3339,
+    Bucket, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome, RioOutcome, RioSide,
+    RootCauseKind, build_status_from_name, now_rfc3339,
 };
-use super::reader::{DrvObservation, ResultReader};
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
 use super::stderrparse::{ReasonClass, classify_reason, signature_for};
@@ -54,6 +54,11 @@ pub struct JobContext {
 }
 
 /// What collect decided for one job after looking at one settled batch.
+///
+/// In-band per-root results are terminal by construction (the build call
+/// does not return until every requested root has an outcome), so there is
+/// no still-running verdict: every member of a settled batch is either
+/// terminal or re-offered.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Verdict {
     /// Terminal outcome — write the results.jsonl record.
@@ -62,10 +67,8 @@ pub enum Verdict {
         evidence: Option<String>,
     },
     /// Non-terminal: re-offer to the submit loop (fail-fast batch-mate,
-    /// engine-cancelled batch, infra auto-retry, no-rows first attempt).
+    /// engine-cancelled batch, infra auto-retry, missing in-band result).
     Requeue { why: &'static str },
-    /// Still running — only update activity timestamps.
-    StillRunning,
 }
 
 /// Failure-kind resolution from the two signals (+ optional fixed-output
@@ -135,18 +138,31 @@ pub fn resolve_failure_kind(
 #[derive(Debug, Clone, Default)]
 pub struct BatchView {
     pub build_id: Option<String>,
-    /// Child exit code recorded for the batch (None = killed by a signal or
-    /// never ran). Together with `build_id` this distinguishes an
-    /// engine-side submission failure from a lost `rio: build` line.
-    pub exit_code: Option<i32>,
-    /// drv → relayed reason (Signal 1).
+    /// In-band per-root results returned by the submission (one entry per
+    /// requested root). Together with `build_id` this distinguishes an
+    /// engine-side submission failure (neither present) from a settled
+    /// build.
+    pub results: Vec<PathOutcome>,
+    /// drv → relayed reason line (the Signal-1 fallback).
     pub reasons: BTreeMap<String, String>,
     pub engine_cancelled: bool,
     pub submitted_at: Option<String>,
 }
 
-/// Decide the verdict for one job given its target-drv observation and the
-/// observations of every drv in the batch (for root-cause lookup).
+/// Decide the verdict for one job given its in-band per-root result and the
+/// batch-wide poison snapshot.
+///
+/// `target` is this root's [`PathOutcome`] (None = the submission returned
+/// no result for it). `poisoned` is the batch's `ListPoisoned` snapshot
+/// (drv → failed executors) — Signal 2; a drv absent from the map means the
+/// evidence is unavailable, not that no builder failed it.
+///
+/// Signal-1 source order is binding: the root's own in-band `error_msg` is
+/// primary and the captured relayed reason line for that drv is the
+/// fallback. The wire collapses several scheduler-side terminal causes into
+/// coarse statuses (e.g. infrastructure failures and cancellations both
+/// arrive as `TransientFailure`), so attribution always goes through the
+/// message text + poison evidence, never the status alone.
 ///
 /// `prior_requeues` is the engine's TOTAL resubmission count for this job so
 /// far — every requeue reason (fail-fast batch-mate, engine-cancelled batch,
@@ -157,160 +173,154 @@ pub struct BatchView {
 /// the budget can never multiply across requeue reasons.
 pub fn decide(
     ctx: &JobContext,
-    target: &DrvObservation,
-    all_observations: &HashMap<String, DrvObservation>,
+    target: Option<&PathOutcome>,
     batch: &BatchView,
+    poisoned: &HashMap<String, Vec<String>>,
     prior_requeues: u32,
     knobs: &Knobs,
     log_tail: Option<&str>,
 ) -> Verdict {
-    let reason = batch.reasons.get(&ctx.drv_path).map(String::as_str);
-    match target.status.as_str() {
-        // A build-scoped exec_id decides built-vs-substituted; the
-        // completed-without-execution discriminator (cached-prior vs
-        // target-substituted) is the classifier's job, driven by the
-        // plan-snapshot flag.
-        STATUS_COMPLETED | STATUS_SKIPPED => Verdict::Terminal {
-            rio: RioOutcome::Built {
-                executed: target.exec_id.is_some(),
+    let relayed = batch.reasons.get(&ctx.drv_path).map(String::as_str);
+    let Some(target) = target else {
+        // No in-band result for this root. An engine-cancelled batch
+        // (deadline/abort: the channel was abandoned before results arrived)
+        // is always re-offered; otherwise a missing result is a transport
+        // defect — one auto-retry, then an infra failure.
+        if batch.engine_cancelled {
+            return Verdict::Requeue {
+                why: "engine-cancelled",
+            };
+        }
+        if prior_requeues < knobs.max_auto_retries {
+            return Verdict::Requeue {
+                why: "no-inband-result",
+            };
+        }
+        return Verdict::Terminal {
+            rio: RioOutcome::TargetFailed {
+                kind: FailureKind::Infra,
             },
+            evidence: Some("no-inband-result".to_string()),
+        };
+    };
+    // Signal 1: the root's own error message first, the relayed line second.
+    let signal1 = Some(target.error_msg.as_str())
+        .filter(|m| !m.is_empty())
+        .or(relayed);
+    let Some(status) = build_status_from_name(&target.status) else {
+        // Defensive: writers go through `build_status_name`, so an
+        // unrecognized status string cannot normally appear. Treat it as a
+        // failure and surface the raw string as evidence.
+        let (kind, _) = resolve_failure_kind(
+            signal1,
+            poisoned.get(&ctx.drv_path).map(Vec::as_slice),
+            None,
+            log_tail,
+        );
+        return Verdict::Terminal {
+            rio: RioOutcome::TargetFailed { kind },
+            evidence: Some(format!("unrecognized in-band status: {}", target.status)),
+        };
+    };
+    if status == BuildStatus::Built {
+        return Verdict::Terminal {
+            rio: RioOutcome::Built { executed: true },
             evidence: None,
-        },
-        STATUS_POISONED => {
-            let (kind, evidence) = resolve_failure_kind(
-                reason,
-                target.failed_builders.as_deref(),
-                target.is_fixed_output,
-                log_tail,
-            );
-            if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
-                return Verdict::Requeue {
-                    why: "infra-auto-retry",
-                };
-            }
-            Verdict::Terminal {
-                rio: RioOutcome::TargetFailed { kind },
-                evidence,
-            }
-        }
-        STATUS_DEPENDENCY_FAILED => {
-            // Find the trigger drv: prefer the relayed reason, fall back to a
-            // poisoned node among this job's dependency closure.
-            let trigger = reason
-                .map(classify_reason)
-                .and_then(|c| match c {
-                    ReasonClass::Dependency { failing_drv } => Some(failing_drv),
-                    _ => None,
-                })
-                .or_else(|| {
-                    // Fallback closure scan when no relayed reason names the
-                    // trigger. Tie-break: with several poisoned deps in the
-                    // closure, the lexicographically smallest drv path wins —
-                    // an arbitrary but deterministic rule, so re-running
-                    // collect over the same observations always attributes
-                    // the same trigger (set iteration order must never pick
-                    // it).
-                    ctx.dep_drvs
-                        .iter()
-                        .filter(|d| {
-                            all_observations
-                                .get(*d)
-                                .is_some_and(|o| o.status == STATUS_POISONED)
-                        })
-                        .min()
-                        .cloned()
-                });
-            let Some(trigger) = trigger else {
-                // No identifiable trigger: treat as a fail-fast batch-mate.
-                return Verdict::Requeue {
-                    why: "dependency-failed-no-trigger",
-                };
+        };
+    }
+    if status.is_success() {
+        // Substituted / AlreadyValid / ResolvesToAlreadyValid: completed
+        // without execution; the completed-without-execution discriminator
+        // (cached-prior vs target-substituted) is the classifier's job,
+        // driven by the plan-snapshot flag.
+        return Verdict::Terminal {
+            rio: RioOutcome::Built { executed: false },
+            evidence: None,
+        };
+    }
+    if status == BuildStatus::DependencyFailed {
+        // The trigger drv comes from the dependency-shaped Signal-1 message
+        // (`dependency '<drv>' failed: …`).
+        let trigger = signal1.map(classify_reason).and_then(|c| match c {
+            ReasonClass::Dependency { failing_drv } => Some(failing_drv),
+            _ => None,
+        });
+        let Some(trigger) = trigger else {
+            // No identifiable trigger: treat as a fail-fast batch-mate.
+            return Verdict::Requeue {
+                why: "dependency-failed-no-trigger",
             };
-            if !ctx.dep_drvs.contains(&trigger) && trigger != ctx.drv_path {
-                // Fail-fast marks unrelated batch-mates dependency_failed —
-                // the trigger is not in this job's own closure, so the job
-                // never got a fair attempt and is re-queued instead of being
-                // charged with a dependency failure.
-                return Verdict::Requeue {
-                    why: "failfast-batch-mate",
-                };
-            }
-            // Root-cause classification of the trigger, so dependents of an
-            // infra-poisoned or source-rotted dependency cascade out of the
-            // headline instead of being charged as rio failures.
-            let trigger_obs = all_observations.get(&trigger);
-            let trigger_reason = batch.reasons.get(&trigger).map(String::as_str);
-            let (kind, evidence) = resolve_failure_kind(
-                trigger_reason,
-                trigger_obs.and_then(|o| o.failed_builders.as_deref()),
-                trigger_obs.and_then(|o| o.is_fixed_output),
-                None,
-            );
-            let root = match kind {
-                FailureKind::Infra => RootCauseKind::Infra,
-                FailureKind::SourceRot => RootCauseKind::SourceRot,
-                _ => RootCauseKind::Genuine,
+        };
+        if !ctx.dep_drvs.contains(&trigger) && trigger != ctx.drv_path {
+            // Fail-fast marks unrelated batch-mates dependency-failed — the
+            // trigger is not in this job's own closure, so the job never got
+            // a fair attempt and is re-queued instead of being charged with
+            // a dependency failure.
+            return Verdict::Requeue {
+                why: "failfast-batch-mate",
             };
-            Verdict::Terminal {
-                rio: RioOutcome::DependencyFailed {
-                    root,
-                    failing_drv: trigger,
-                },
-                evidence,
-            }
         }
-        STATUS_CANCELLED => {
-            if batch.engine_cancelled {
-                Verdict::Requeue {
-                    why: "engine-cancelled",
-                }
-            } else {
-                // A cancellation the engine did not request is the
-                // scheduler/operator cutting the build short — counted as a
-                // timeout against rio rather than excused.
-                Verdict::Terminal {
-                    rio: RioOutcome::TargetFailed {
-                        kind: FailureKind::Timeout,
-                    },
-                    evidence: None,
-                }
-            }
-        }
-        // No derivation rows for this drv in the build (empty status from
-        // the reader): one auto-retry, then an infra failure — the build
-        // never even recorded the drv, which is not the target's fault.
-        "" => {
-            if prior_requeues < knobs.max_auto_retries {
-                Verdict::Requeue {
-                    why: "no-derivation-rows",
-                }
-            } else {
-                Verdict::Terminal {
-                    rio: RioOutcome::TargetFailed {
-                        kind: FailureKind::Infra,
-                    },
-                    evidence: Some("no-derivation-rows".to_string()),
-                }
-            }
-        }
-        // created/queued/ready/assigned/running/substituting/failed (the
-        // scheduler retries `failed` internally) — not settled yet.
-        _ => Verdict::StillRunning,
+        // Root-cause classification of the trigger, so dependents of an
+        // infra-poisoned or source-rotted dependency cascade out of the
+        // headline instead of being charged as rio failures.
+        let trigger_signal1 = batch.reasons.get(&trigger).map(String::as_str);
+        let (kind, evidence) = resolve_failure_kind(
+            trigger_signal1,
+            poisoned.get(&trigger).map(Vec::as_slice),
+            None,
+            None,
+        );
+        let root = match kind {
+            FailureKind::Infra => RootCauseKind::Infra,
+            FailureKind::SourceRot => RootCauseKind::SourceRot,
+            _ => RootCauseKind::Genuine,
+        };
+        return Verdict::Terminal {
+            rio: RioOutcome::DependencyFailed {
+                root,
+                failing_drv: trigger,
+            },
+            evidence,
+        };
+    }
+    // Every other failure status (PermanentFailure, TransientFailure,
+    // TimedOut, MiscFailure, CachedFailure, LogLimitExceeded,
+    // NotDeterministic, OutputRejected, InputRejected, NoSubstituters): the
+    // two-signal rule decides the kind; positively-identified infra gets the
+    // single auto-retry while budget remains.
+    let (kind, evidence) = resolve_failure_kind(
+        signal1,
+        poisoned.get(&ctx.drv_path).map(Vec::as_slice),
+        None,
+        log_tail,
+    );
+    if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
+        return Verdict::Requeue {
+            why: "infra-auto-retry",
+        };
+    }
+    Verdict::Terminal {
+        rio: RioOutcome::TargetFailed { kind },
+        evidence,
     }
 }
 
 /// Assemble the final [`JobRecord`] for a terminal verdict.
 ///
 /// `log_tail` is the captured failure-log text (when any was fetched); it
-/// only feeds the failure-signature fallback, so failures whose relayed
-/// reason was lost can still be grouped by their log evidence.
+/// only feeds the failure-signature fallback, so failures whose Signal-1
+/// text was lost can still be grouped by their log evidence. The signature
+/// key follows the Signal-1 source order (in-band `error_msg` first, the
+/// relayed line second); the relayed line itself is retained verbatim on
+/// the record as evidence.
 #[allow(clippy::too_many_arguments)]
 pub fn build_record(
     ctx: &JobContext,
     rio_outcome: &RioOutcome,
     evidence: Option<String>,
-    target: &DrvObservation,
+    target: Option<&PathOutcome>,
     batch: &BatchView,
+    poisoned: &HashMap<String, Vec<String>>,
     rio_paths: &HashMap<String, Option<(String, u64)>>,
     mode: &str,
     store_url: &str,
@@ -328,6 +338,10 @@ pub fn build_record(
     };
     let classification = classify(&ctx.hydra_outcome, rio_outcome, &aux);
     let reason = batch.reasons.get(&ctx.drv_path).cloned();
+    let signal1 = target
+        .map(|t| t.error_msg.clone())
+        .filter(|m| !m.is_empty())
+        .or_else(|| reason.clone());
 
     let mut rio_outputs = BTreeMap::new();
     let mut nar_compare = BTreeMap::new();
@@ -361,14 +375,14 @@ pub fn build_record(
     };
     let rio_side = RioSide {
         outcome: rio_outcome.outcome_str().to_string(),
-        status: (!target.status.is_empty()).then(|| target.status.clone()),
-        exec_id: target.exec_id.clone(),
+        status: target.map(|t| t.status.clone()),
+        exec_id: None,
         failing_drv: match rio_outcome {
             RioOutcome::DependencyFailed { failing_drv, .. } => Some(failing_drv.clone()),
             _ => None,
         },
         reason: reason.clone(),
-        failed_builders: target.failed_builders.clone().unwrap_or_default(),
+        failed_builders: poisoned.get(&ctx.drv_path).cloned().unwrap_or_default(),
         durations: super::model::Durations {
             submitted_at: batch.submitted_at.clone(),
             first_active_at,
@@ -390,7 +404,7 @@ pub fn build_record(
         cascaded: classification.cascaded,
         signature: match rio_outcome {
             RioOutcome::Built { .. } => None,
-            _ => signature_for(reason.as_deref(), log_tail),
+            _ => signature_for(signal1.as_deref(), log_tail),
         },
         log_key,
         repro: repro_command(store_url, &ctx.drv_path),
@@ -409,9 +423,10 @@ fn lossy_log_text(bytes: &[u8]) -> String {
     String::from_utf8_lossy(bytes).into_owned()
 }
 
-/// Process one settled batch end-to-end: read observations, decide each job,
-/// capture evidence (log tails for failures, NAR hashes for successes),
-/// append terminal records, and return the jobs that must be re-queued.
+/// Process one settled batch end-to-end: take its in-band per-root results,
+/// decide each job, capture evidence (log tails for failures, NAR hashes
+/// for successes), append terminal records, and return the jobs that must
+/// be re-queued.
 ///
 /// `prior_requeues` carries each job's TOTAL engine resubmission count so
 /// far (every requeue reason counts, not just infra retries) — see
@@ -420,7 +435,6 @@ fn lossy_log_text(bytes: &[u8]) -> String {
 #[allow(clippy::too_many_arguments)]
 pub async fn process_settled_batch(
     state: &StateDir,
-    reader: &dyn ResultReader,
     admin: &dyn AdminApi,
     store: &dyn StoreApi,
     artifacts: Option<(&dyn ArtifactStore, String)>,
@@ -434,78 +448,76 @@ pub async fn process_settled_batch(
     first_active: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     let mut requeue = Vec::new();
-    let Some(build_id) = &batch.build_id else {
-        // No build id was ever observed for this batch. The structured
-        // batch fields tell the cases apart (never the stderr text): an
-        // engine-side submission failure (ssh/spawn/import) or a child that
-        // was killed by a signal (including the engine's own batch deadline)
-        // leaves BOTH build_id and exit_code unset, while a lost
-        // `rio: build` line still records the child's exit code. Either way
-        // the engine cannot read per-drv observations without a build id,
-        // so every member job is re-offered to the submit loop.
-        if batch.exit_code.is_none() {
-            tracing::info!(
-                jobs = batch_jobs.len(),
-                engine_cancelled = batch.engine_cancelled,
-                "batch has no build id and no exit code (engine-side submission failure or a \
-                 signal-killed child, e.g. at the engine's batch deadline); re-offering its jobs"
-            );
-        } else {
-            tracing::warn!(
-                jobs = batch_jobs.len(),
-                exit_code = batch.exit_code,
-                "batch exited without an observed `rio: build` line; re-offering its jobs"
-            );
-        }
+    if batch.results.is_empty() && batch.build_id.is_none() {
+        // Neither in-band results nor a build id: an engine-side submission
+        // failure (channel open, drv import, the build op erroring before
+        // any result arrived). Every member job is re-offered to the submit
+        // loop.
+        tracing::info!(
+            jobs = batch_jobs.len(),
+            engine_cancelled = batch.engine_cancelled,
+            "batch has no in-band results and no build id (engine-side submission failure); \
+             re-offering its jobs"
+        );
         return Ok(batch_jobs.to_vec());
-    };
-    // Read the union of every member job's target + dep drvs (for root-cause
-    // lookup), in one read.
-    let mut want: Vec<String> = Vec::new();
-    for job in batch_jobs {
-        if let Some(ctx) = contexts.get(job) {
-            want.push(ctx.drv_path.clone());
-            want.extend(ctx.dep_drvs.iter().cloned());
-        }
     }
-    want.sort();
-    want.dedup();
-    let observations: HashMap<String, DrvObservation> = reader
-        .read_build(build_id, &want)
-        .await?
-        .into_iter()
-        .map(|o| (o.drv_path.clone(), o))
+    let results_by_drv: HashMap<&str, &PathOutcome> = batch
+        .results
+        .iter()
+        .map(|r| (r.drv_path.as_str(), r))
         .collect();
+    // Signal 2: one ListPoisoned snapshot per batch, fetched only when at
+    // least one member's in-band status is a non-success (successes never
+    // need poison evidence). An RPC failure degrades to an empty map —
+    // evidence unavailable, never fatal to the pass.
+    let any_failure = batch_jobs.iter().any(|job| {
+        contexts.get(job).is_some_and(|ctx| {
+            results_by_drv
+                .get(ctx.drv_path.as_str())
+                .is_some_and(|r| !build_status_from_name(&r.status).is_some_and(|s| s.is_success()))
+        })
+    });
+    let poisoned: HashMap<String, Vec<String>> = if any_failure {
+        match admin.list_poisoned().await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|p| (p.drv_path, p.failed_executors))
+                .collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %format!("{e:#}"),
+                    "ListPoisoned failed; classifying this batch without poison evidence"
+                );
+                HashMap::new()
+            }
+        }
+    } else {
+        HashMap::new()
+    };
 
     for job in batch_jobs {
         let Some(ctx) = contexts.get(job) else {
             tracing::warn!(job, "batch member has no job context; skipping");
             continue;
         };
-        let target = observations
-            .get(&ctx.drv_path)
-            .cloned()
-            .unwrap_or_else(|| DrvObservation {
-                drv_path: ctx.drv_path.clone(),
-                ..DrvObservation::default()
-            });
+        let target = results_by_drv.get(ctx.drv_path.as_str()).copied();
         let prior = prior_requeues.get(job).copied().unwrap_or(0);
-        // Evidence-age gate: when a poisoned drv has neither a relayed
-        // reason (Signal 1) nor failed-builder evidence (Signal 2 — the
-        // scheduler's poison rows decay with its evidence TTL, mirrored by
-        // `knobs.evidence_ttl_hours`), fetch the log tail as the third
-        // signal; the record then carries the "log-tail-only" evidence flag
-        // from [`resolve_failure_kind`].
-        let needs_log_signal = target.status == STATUS_POISONED
+        // Evidence-age gate: when a failed root carries neither an in-band
+        // error message nor a relayed reason (Signal 1) and has no
+        // ListPoisoned entry (Signal 2 — the scheduler's poison rows decay
+        // with its evidence TTL, mirrored by `knobs.evidence_ttl_hours`),
+        // fetch the log tail as the third signal; the record then carries
+        // the "log-tail-only" evidence flag from [`resolve_failure_kind`].
+        let target_status = target.and_then(|t| build_status_from_name(&t.status));
+        let target_is_failure = target.is_some() && !target_status.is_some_and(|s| s.is_success());
+        let needs_log_signal = target_is_failure
+            && target_status != Some(BuildStatus::DependencyFailed)
+            && target.is_some_and(|t| t.error_msg.is_empty())
             && !batch.reasons.contains_key(&ctx.drv_path)
-            && target.failed_builders.is_none();
+            && !poisoned.contains_key(&ctx.drv_path);
         let mut log_signal_bytes = if needs_log_signal {
             admin
-                .log_tail(
-                    &ctx.drv_path,
-                    target.exec_id.as_deref(),
-                    knobs.log_tail_bytes,
-                )
+                .log_tail(&ctx.drv_path, None, knobs.log_tail_bytes)
                 .await
                 .ok()
         } else {
@@ -520,14 +532,13 @@ pub async fn process_settled_batch(
             .map(lossy_log_text);
         match decide(
             ctx,
-            &target,
-            &observations,
+            target,
             batch,
+            &poisoned,
             prior,
             knobs,
             log_signal_text.as_deref(),
         ) {
-            Verdict::StillRunning => {}
             Verdict::Requeue { why } => {
                 tracing::info!(job, why, "re-queueing");
                 requeue.push(job.clone());
@@ -560,11 +571,7 @@ pub async fn process_settled_batch(
                     let tail = match log_signal_bytes.take() {
                         Some(bytes) => Some(bytes),
                         None => match admin
-                            .log_tail(
-                                &ctx.drv_path,
-                                target.exec_id.as_deref(),
-                                knobs.log_tail_bytes,
-                            )
+                            .log_tail(&ctx.drv_path, None, knobs.log_tail_bytes)
                             .await
                         {
                             Ok(tail) => Some(tail),
@@ -611,8 +618,9 @@ pub async fn process_settled_batch(
                     ctx,
                     &rio,
                     evidence,
-                    &target,
+                    target,
                     batch,
+                    &poisoned,
                     &rio_paths,
                     mode,
                     store_url,
@@ -634,7 +642,8 @@ mod tests {
     use crate::run::artifact::LocalDirArtifactStore;
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{GraphSnapshot, PoisonedView};
-    use crate::run::reader::test_support::FakeReader;
+    use crate::run::model::build_status_name;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(job: &str, drv: &str, deps: &[&str], hydra: HydraOutcome) -> JobContext {
         JobContext {
@@ -654,20 +663,13 @@ mod tests {
         }
     }
 
-    fn obs(
-        drv: &str,
-        status: &str,
-        exec: Option<&str>,
-        builders: Option<Vec<String>>,
-    ) -> DrvObservation {
-        DrvObservation {
+    fn po(drv: &str, status: BuildStatus, error: &str) -> PathOutcome {
+        PathOutcome {
             drv_path: drv.to_string(),
-            status: status.to_string(),
-            exec_id: exec.map(String::from),
-            assigned_executor: None,
-            failed_builders: builders,
-            poisoned_secs_ago: None,
-            is_fixed_output: None,
+            status: build_status_name(status).to_string(),
+            error_msg: error.to_string(),
+            start_time: 0,
+            stop_time: 0,
         }
     }
 
@@ -676,33 +678,44 @@ mod tests {
     const OTHER: &str = "/nix/store/cccccccccccccccccccccccccccccccc-other.drv";
 
     /// Scripted AdminApi for evidence capture: the build graph is never read
-    /// (the reader is faked), every log tail is the same configurable text
-    /// (a short gcc error by default), and the log_tail calls are counted so
-    /// the Signal-3 reuse (one fetch serving both classification and
-    /// evidence capture) can be asserted.
+    /// (collection is in-band), `list_poisoned` returns a configurable
+    /// snapshot (or fails) and counts its calls so the once-per-batch /
+    /// only-on-failure gating can be asserted, and every log tail is the
+    /// same configurable text (a short gcc error by default) with the calls
+    /// counted so the Signal-3 reuse (one fetch serving both classification
+    /// and evidence capture) can be asserted.
     struct LogAdmin {
-        log_calls: std::sync::atomic::AtomicUsize,
+        log_calls: AtomicUsize,
+        poisoned_calls: AtomicUsize,
         tail: Vec<u8>,
+        poisoned: Vec<PoisonedView>,
+        fail_poisoned: bool,
     }
     impl Default for LogAdmin {
         fn default() -> Self {
             Self {
-                log_calls: std::sync::atomic::AtomicUsize::new(0),
+                log_calls: AtomicUsize::new(0),
+                poisoned_calls: AtomicUsize::new(0),
                 tail: b"gcc: fatal error\n".to_vec(),
+                poisoned: Vec::new(),
+                fail_poisoned: false,
             }
         }
     }
     #[async_trait::async_trait]
     impl AdminApi for LogAdmin {
         async fn get_build_graph(&self, _b: &str) -> Result<GraphSnapshot> {
-            unreachable!("reader is faked")
+            unreachable!("collection is in-band; collect never reads the build graph")
         }
         async fn list_poisoned(&self) -> Result<Vec<PoisonedView>> {
-            Ok(vec![])
+            self.poisoned_calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail_poisoned {
+                anyhow::bail!("ListPoisoned: scheduler unavailable");
+            }
+            Ok(self.poisoned.clone())
         }
         async fn log_tail(&self, _d: &str, _e: Option<&str>, _m: usize) -> Result<Vec<u8>> {
-            self.log_calls
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.log_calls.fetch_add(1, Ordering::SeqCst);
             Ok(self.tail.clone())
         }
         async fn list_builds(&self, _t: &str, _l: u32) -> Result<Vec<(String, Option<String>)>> {
@@ -812,19 +825,19 @@ mod tests {
     }
 
     #[test]
-    fn decide_covers_status_matrix() {
+    fn decide_covers_in_band_status_matrix() {
         let knobs = Knobs::default();
         let c = ctx("app.x86_64-linux", T, &[DEP], HydraOutcome::Built);
         let batch = BatchView::default();
-        let none: HashMap<String, DrvObservation> = HashMap::new();
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
 
-        // Completed with exec → Built{executed}.
+        // Built → executed.
         assert_eq!(
             decide(
                 &c,
-                &obs(T, "completed", Some("e1"), None),
-                &none,
+                Some(&po(T, BuildStatus::Built, "")),
                 &batch,
+                &no_poison,
                 0,
                 &knobs,
                 None
@@ -834,50 +847,66 @@ mod tests {
                 evidence: None
             }
         );
-        // Completed without exec → Built{executed:false} (classifier
-        // discriminates cached-prior vs target-substituted).
+        // Substituted / AlreadyValid / ResolvesToAlreadyValid → completed
+        // without execution (classifier discriminates cached-prior vs
+        // target-substituted via the plan-snapshot flag).
+        for status in [
+            BuildStatus::Substituted,
+            BuildStatus::AlreadyValid,
+            BuildStatus::ResolvesToAlreadyValid,
+        ] {
+            assert_eq!(
+                decide(
+                    &c,
+                    Some(&po(T, status, "")),
+                    &batch,
+                    &no_poison,
+                    0,
+                    &knobs,
+                    None
+                ),
+                Verdict::Terminal {
+                    rio: RioOutcome::Built { executed: false },
+                    evidence: None
+                },
+                "{status:?}"
+            );
+        }
+        // Failure with an infra reason and corroborating poison evidence
+        // (entry with no failed builders): auto-retry once, then terminal
+        // infra. The wire collapses infra causes into TransientFailure, so
+        // the message text drives the attribution, not the status.
+        let infra = po(
+            T,
+            BuildStatus::TransientFailure,
+            "max_infra_retries=3 exhausted after infrastructure failures: x",
+        );
+        let poisoned_no_builders: HashMap<String, Vec<String>> =
+            HashMap::from([(T.to_string(), vec![])]);
         assert_eq!(
             decide(
                 &c,
-                &obs(T, "completed", None, None),
-                &none,
+                Some(&infra),
                 &batch,
+                &poisoned_no_builders,
                 0,
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
-                rio: RioOutcome::Built { executed: false },
-                evidence: None
-            }
-        );
-        // Skipped (CA early cutoff) is terminal completed-without-execution.
-        assert_eq!(
-            decide(
-                &c,
-                &obs(T, "skipped", None, None),
-                &none,
-                &batch,
-                0,
-                &knobs,
-                None
-            ),
-            Verdict::Terminal {
-                rio: RioOutcome::Built { executed: false },
-                evidence: None
-            }
-        );
-        // Poisoned, infra-positive, first attempt → auto-retry requeue;
-        // second → terminal infra.
-        let infra_obs = obs(T, "poisoned", None, Some(vec![]));
-        assert_eq!(
-            decide(&c, &infra_obs, &none, &batch, 0, &knobs, None),
             Verdict::Requeue {
                 why: "infra-auto-retry"
             }
         );
         assert!(matches!(
-            decide(&c, &infra_obs, &none, &batch, 1, &knobs, None),
+            decide(
+                &c,
+                Some(&infra),
+                &batch,
+                &poisoned_no_builders,
+                1,
+                &knobs,
+                None
+            ),
             Verdict::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Infra
@@ -885,13 +914,16 @@ mod tests {
                 ..
             }
         ));
-        // Poisoned with worker evidence → genuine, terminal immediately.
+        // Same infra reason but contradicting worker evidence → genuine,
+        // terminal immediately (the two signals must agree).
+        let poisoned_with_builders: HashMap<String, Vec<String>> =
+            HashMap::from([(T.to_string(), vec!["b1".to_string()])]);
         assert!(matches!(
             decide(
                 &c,
-                &obs(T, "poisoned", Some("e2"), Some(vec!["b1".into()])),
-                &none,
+                Some(&infra),
                 &batch,
+                &poisoned_with_builders,
                 0,
                 &knobs,
                 None
@@ -903,20 +935,45 @@ mod tests {
                 ..
             }
         ));
-        // Cancelled: engine-cancelled → requeue; otherwise timeout.
-        let cancelled = obs(T, "cancelled", None, None);
-        let engine_batch = BatchView {
-            engine_cancelled: true,
-            ..BatchView::default()
-        };
-        assert_eq!(
-            decide(&c, &cancelled, &none, &engine_batch, 0, &knobs, None),
-            Verdict::Requeue {
-                why: "engine-cancelled"
-            }
-        );
+        // A permanent failure with a worker reason is genuine, terminal
+        // immediately.
         assert!(matches!(
-            decide(&c, &cancelled, &none, &batch, 0, &knobs, None),
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::PermanentFailure,
+                    "builder failed with exit code 2"
+                )),
+                &batch,
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
+            Verdict::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // TimedOut with the scheduler's timeout reason keeps the timeout
+        // kind (status adds texture; the reason text decides).
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(
+                    T,
+                    BuildStatus::TimedOut,
+                    "max_timeout_retries=2 exhausted (DeadlineExceeded backstop)"
+                )),
+                &batch,
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
             Verdict::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Timeout
@@ -924,35 +981,104 @@ mod tests {
                 ..
             }
         ));
-        // No rows: requeue once, then infra.
-        let missing = obs(T, "", None, None);
+        // Unrecognized status string (defensive): a terminal failure
+        // carrying the raw status as evidence.
+        let bogus = PathOutcome {
+            drv_path: T.to_string(),
+            status: "bogus-status".to_string(),
+            ..PathOutcome::default()
+        };
+        match decide(&c, Some(&bogus), &batch, &no_poison, 0, &knobs, None) {
+            Verdict::Terminal {
+                rio: RioOutcome::TargetFailed { .. },
+                evidence,
+            } => assert!(evidence.unwrap().contains("bogus-status")),
+            other => panic!("expected a terminal failure, got {other:?}"),
+        }
+        // Missing in-band result: engine-cancelled wins regardless of the
+        // budget; otherwise one requeue, then terminal infra with the
+        // missing-result evidence.
+        let cancelled_batch = BatchView {
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
         assert_eq!(
-            decide(&c, &missing, &none, &batch, 0, &knobs, None),
+            decide(&c, None, &cancelled_batch, &no_poison, 5, &knobs, None),
             Verdict::Requeue {
-                why: "no-derivation-rows"
+                why: "engine-cancelled"
             }
         );
-        assert!(matches!(
-            decide(&c, &missing, &none, &batch, 1, &knobs, None),
-            Verdict::Terminal {
-                rio: RioOutcome::TargetFailed {
-                    kind: FailureKind::Infra
-                },
-                ..
-            }
-        ));
-        // Running → StillRunning.
         assert_eq!(
+            decide(&c, None, &batch, &no_poison, 0, &knobs, None),
+            Verdict::Requeue {
+                why: "no-inband-result"
+            }
+        );
+        match decide(&c, None, &batch, &no_poison, 1, &knobs, None) {
+            Verdict::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                evidence,
+            } => assert_eq!(evidence.as_deref(), Some("no-inband-result")),
+            other => panic!("expected terminal infra, got {other:?}"),
+        }
+    }
+
+    /// Signal-1 source order is binding: the root's own in-band error
+    /// message wins over the captured relayed line; the relayed line is the
+    /// fallback when the in-band message is empty.
+    #[test]
+    fn signal1_prefers_error_msg_then_relayed_reason() {
+        let knobs = Knobs::default();
+        let c = ctx("app.x86_64-linux", T, &[], HydraOutcome::Built);
+        let poisoned: HashMap<String, Vec<String>> = HashMap::from([(T.to_string(), vec![])]);
+        let batch = BatchView {
+            reasons: BTreeMap::from([(
+                T.to_string(),
+                "max_infra_retries=3 exhausted after infrastructure failures: x".to_string(),
+            )]),
+            ..BatchView::default()
+        };
+        // Relayed line says infra, in-band error says worker failure: the
+        // in-band message wins → genuine, no auto-retry.
+        assert!(matches!(
             decide(
                 &c,
-                &obs(T, "running", None, None),
-                &none,
+                Some(&po(
+                    T,
+                    BuildStatus::PermanentFailure,
+                    "builder failed with exit code 2"
+                )),
                 &batch,
+                &poisoned,
                 0,
                 &knobs,
                 None
             ),
-            Verdict::StillRunning
+            Verdict::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Genuine
+                },
+                ..
+            }
+        ));
+        // Empty in-band message: the relayed line is the fallback → infra
+        // auto-retry.
+        assert_eq!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::TransientFailure, "")),
+                &batch,
+                &poisoned,
+                0,
+                &knobs,
+                None
+            ),
+            Verdict::Requeue {
+                why: "infra-auto-retry"
+            }
         );
     }
 
@@ -960,70 +1086,75 @@ mod tests {
     fn dependency_failed_reattribution_via_closure_membership() {
         let knobs = Knobs::default();
         let c = ctx("app.x86_64-linux", T, &[DEP], HydraOutcome::Built);
-        // Trigger in the closure (from the relayed reason) → terminal
-        // dependency failure with a genuine root.
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+
+        // Trigger in the closure (named by the in-band error message), with
+        // worker evidence on the trigger → terminal dependency failure with
+        // a genuine root.
         let batch = BatchView {
             reasons: BTreeMap::from([(
-                T.to_string(),
-                format!(
-                    "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker failures"
-                ),
+                DEP.to_string(),
+                "poison threshold reached after 3 distinct-worker failures".to_string(),
             )]),
             ..BatchView::default()
         };
-        let mut all = HashMap::new();
-        all.insert(
-            DEP.to_string(),
-            obs(DEP, "poisoned", Some("e1"), Some(vec!["b1".into()])),
+        let target = po(
+            T,
+            BuildStatus::DependencyFailed,
+            &format!(
+                "dependency '{DEP}' failed: poison threshold reached after 3 distinct-worker failures"
+            ),
         );
-        let v = decide(
+        let poisoned_genuine: HashMap<String, Vec<String>> =
+            HashMap::from([(DEP.to_string(), vec!["b1".to_string()])]);
+        match decide(
             &c,
-            &obs(T, "dependency_failed", None, None),
-            &all,
+            Some(&target),
             &batch,
+            &poisoned_genuine,
             0,
             &knobs,
             None,
-        );
-        assert!(matches!(
-            v,
+        ) {
             Verdict::Terminal {
-                rio: RioOutcome::DependencyFailed {
-                    root: RootCauseKind::Genuine,
-                    ..
-                },
+                rio: RioOutcome::DependencyFailed { root, failing_drv },
                 ..
+            } => {
+                assert_eq!(failing_drv, DEP);
+                assert_eq!(root, RootCauseKind::Genuine);
             }
-        ));
-        // Infra-poisoned shared dependency → cascaded infra root.
-        let mut all_infra = HashMap::new();
-        all_infra.insert(DEP.to_string(), obs(DEP, "poisoned", None, Some(vec![])));
+            other => panic!("expected a terminal dependency failure, got {other:?}"),
+        }
+
+        // Infra-poisoned shared dependency (the trigger's relayed reason
+        // says infra, its poison entry has no failed builders) → cascaded
+        // infra root.
         let batch_infra = BatchView {
-            reasons: BTreeMap::from([
-                (
-                    T.to_string(),
-                    format!(
-                        "dependency '{DEP}' failed: max_infra_retries=3 exhausted after infrastructure failures: x"
-                    ),
-                ),
-                (
-                    DEP.to_string(),
-                    "max_infra_retries=3 exhausted after infrastructure failures: x".to_string(),
-                ),
-            ]),
+            reasons: BTreeMap::from([(
+                DEP.to_string(),
+                "max_infra_retries=3 exhausted after infrastructure failures: x".to_string(),
+            )]),
             ..BatchView::default()
         };
-        let v = decide(
-            &c,
-            &obs(T, "dependency_failed", None, None),
-            &all_infra,
-            &batch_infra,
-            0,
-            &knobs,
-            None,
+        let target_infra = po(
+            T,
+            BuildStatus::DependencyFailed,
+            &format!(
+                "dependency '{DEP}' failed: max_infra_retries=3 exhausted after infrastructure failures: x"
+            ),
         );
+        let poisoned_infra: HashMap<String, Vec<String>> =
+            HashMap::from([(DEP.to_string(), vec![])]);
         assert!(matches!(
-            v,
+            decide(
+                &c,
+                Some(&target_infra),
+                &batch_infra,
+                &poisoned_infra,
+                0,
+                &knobs,
+                None
+            ),
             Verdict::Terminal {
                 rio: RioOutcome::DependencyFailed {
                     root: RootCauseKind::Infra,
@@ -1032,87 +1163,66 @@ mod tests {
                 ..
             }
         ));
-        // Trigger NOT in the closure (fail-fast batch-mate) → requeue.
-        let batch_other = BatchView {
+
+        // The relayed line is the fallback trigger source when the in-band
+        // message is empty.
+        let batch_relayed = BatchView {
             reasons: BTreeMap::from([(
                 T.to_string(),
-                format!(
-                    "dependency '{OTHER}' failed: poison threshold reached after 3 distinct-worker failures"
-                ),
+                format!("dependency '{DEP}' failed: poison threshold reached"),
             )]),
             ..BatchView::default()
         };
-        let v = decide(
-            &c,
-            &obs(T, "dependency_failed", None, None),
-            &HashMap::new(),
-            &batch_other,
-            0,
-            &knobs,
-            None,
+        assert!(matches!(
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::DependencyFailed, "")),
+                &batch_relayed,
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
+            Verdict::Terminal {
+                rio: RioOutcome::DependencyFailed { .. },
+                ..
+            }
+        ));
+
+        // Trigger NOT in the closure (fail-fast batch-mate) → requeue.
+        let mate = po(
+            T,
+            BuildStatus::DependencyFailed,
+            &format!("dependency '{OTHER}' failed: poison threshold reached"),
         );
         assert_eq!(
-            v,
+            decide(
+                &c,
+                Some(&mate),
+                &BatchView::default(),
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
             Verdict::Requeue {
                 why: "failfast-batch-mate"
             }
         );
-    }
 
-    /// With no relayed reason the trigger comes from the closure scan; with
-    /// several poisoned deps the lexicographically smallest drv path is the
-    /// documented deterministic tie-break. With no poisoned dep at all the
-    /// job is re-queued instead of being charged a dependency failure.
-    #[test]
-    fn dependency_failed_fallback_scans_closure_deterministically() {
-        let knobs = Knobs::default();
-        let c = ctx("app.x86_64-linux", T, &[DEP, OTHER], HydraOutcome::Built);
-        let batch = BatchView::default();
-
-        // Two poisoned deps in the closure, no relayed reason: the
-        // lexicographically smallest drv path (DEP < OTHER) is the trigger.
-        let mut all = HashMap::new();
-        all.insert(
-            DEP.to_string(),
-            obs(DEP, "poisoned", None, Some(vec!["b1".into()])),
-        );
-        all.insert(
-            OTHER.to_string(),
-            obs(OTHER, "poisoned", None, Some(vec!["b2".into()])),
-        );
-        let v = decide(
-            &c,
-            &obs(T, "dependency_failed", None, None),
-            &all,
-            &batch,
-            0,
-            &knobs,
-            None,
-        );
-        match v {
-            Verdict::Terminal {
-                rio: RioOutcome::DependencyFailed { failing_drv, root },
-                ..
-            } => {
-                assert_eq!(failing_drv, DEP, "smallest candidate drv path wins");
-                assert_eq!(root, RootCauseKind::Genuine);
-            }
-            other => panic!("expected a terminal dependency failure, got {other:?}"),
-        }
-
-        // No poisoned dep in the closure and no relayed reason → no
-        // identifiable trigger → re-queued.
-        let v = decide(
-            &c,
-            &obs(T, "dependency_failed", None, None),
-            &HashMap::new(),
-            &batch,
-            0,
-            &knobs,
-            None,
-        );
+        // No identifiable trigger (no dependency-shaped message from either
+        // Signal-1 source) → re-queued instead of being charged a
+        // dependency failure.
         assert_eq!(
-            v,
+            decide(
+                &c,
+                Some(&po(T, BuildStatus::DependencyFailed, "")),
+                &BatchView::default(),
+                &no_poison,
+                0,
+                &knobs,
+                None
+            ),
             Verdict::Requeue {
                 why: "dependency-failed-no-trigger"
             }
@@ -1121,23 +1231,16 @@ mod tests {
 
     /// End-to-end through process_settled_batch with fakes: one success (NAR
     /// hash captured), one genuine failure (log tail uploaded), one batch-mate
-    /// requeued.
+    /// requeued — all driven by the batch's in-band per-root results.
     #[tokio::test]
     async fn process_settled_batch_writes_records_and_requeues() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
         let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
 
         let ok_job = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
         let bad_job = ctx("bad.x86_64-linux", DEP, &[], HydraOutcome::Built);
         let mate_job = ctx("mate.x86_64-linux", OTHER, &[], HydraOutcome::Built);
-        reader.set(build_id, obs(T, "completed", Some("e1"), None));
-        reader.set(
-            build_id,
-            obs(DEP, "poisoned", Some("e2"), Some(vec!["b1".into()])),
-        );
-        reader.set(build_id, obs(OTHER, "dependency_failed", None, None));
 
         let mut store = FakeStoreApi::default();
         store
@@ -1145,6 +1248,14 @@ mod tests {
             .insert(ok_job.outputs["out"].clone(), ("ab".repeat(32), 7));
         let artifacts_dir = tempfile::tempdir().unwrap();
         let artifacts = LocalDirArtifactStore::new(artifacts_dir.path());
+        let admin = LogAdmin {
+            poisoned: vec![PoisonedView {
+                drv_path: DEP.to_string(),
+                failed_executors: vec!["b1".into()],
+                poisoned_secs_ago: 60,
+            }],
+            ..LogAdmin::default()
+        };
 
         let contexts: HashMap<String, JobContext> = [
             ("ok.x86_64-linux".to_string(), ok_job),
@@ -1154,7 +1265,19 @@ mod tests {
         .into();
         let batch = BatchView {
             build_id: Some(build_id.to_string()),
-            exit_code: Some(1),
+            results: vec![
+                po(T, BuildStatus::Built, ""),
+                po(
+                    DEP,
+                    BuildStatus::PermanentFailure,
+                    "failed on every eligible worker",
+                ),
+                po(
+                    OTHER,
+                    BuildStatus::DependencyFailed,
+                    &format!("dependency '{T}' failed: failed on every eligible worker"),
+                ),
+            ],
             reasons: BTreeMap::from([
                 (
                     DEP.to_string(),
@@ -1170,8 +1293,7 @@ mod tests {
         };
         let requeue = process_settled_batch(
             &state,
-            &reader,
-            &LogAdmin::default(),
+            &admin,
             &store,
             Some((&artifacts, "parity/campaigns/c1".to_string())),
             &contexts,
@@ -1192,10 +1314,17 @@ mod tests {
 
         // mate's trigger (T) is not in its dep closure → requeued.
         assert_eq!(requeue, vec!["mate.x86_64-linux".to_string()]);
+        // The poison snapshot is fetched exactly once for the whole batch.
+        assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 2);
         let ok = records.iter().find(|r| r.job == "ok.x86_64-linux").unwrap();
         assert_eq!(ok.bucket, "match-built");
+        assert_eq!(ok.rio.status.as_deref(), Some("Built"));
+        assert_eq!(
+            ok.rio.exec_id, None,
+            "exec id is null under in-band collection"
+        );
         assert_eq!(
             ok.rio.outputs["out"].nar_hash.as_deref(),
             Some("ab".repeat(32).as_str())
@@ -1207,6 +1336,7 @@ mod tests {
             .unwrap();
         assert_eq!(bad.bucket, "rio-only-failure");
         assert_eq!(bad.signature.as_deref(), Some("failed-every-worker"));
+        assert_eq!(bad.rio.failed_builders, vec!["b1".to_string()]);
         assert!(
             bad.log_key
                 .as_deref()
@@ -1219,10 +1349,10 @@ mod tests {
                 .join("parity/campaigns/c1/logs/bad.x86_64-linux.log.zst")
                 .exists()
         );
-        // No build_id → whole batch re-offered.
+        // Neither in-band results nor a build id → engine-side submission
+        // failure → whole batch re-offered.
         let r = process_settled_batch(
             &state,
-            &reader,
             &LogAdmin::default(),
             &store,
             None,
@@ -1240,15 +1370,13 @@ mod tests {
         assert_eq!(r, vec!["ok.x86_64-linux".to_string()]);
     }
 
-    /// A reader failure (RPC error, truncated graph) propagates out of
-    /// process_settled_batch without writing any records, so the engine
-    /// loop can retry the whole batch on a later collect tick.
+    /// A batch whose in-band results are all successes never fetches the
+    /// ListPoisoned snapshot — there is no failure to attribute.
     #[tokio::test]
-    async fn process_settled_batch_propagates_reader_failures() {
+    async fn all_success_batch_skips_the_poison_snapshot() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
-        reader.fail_with("GetBuildGraph(b1) truncated at 7000 nodes");
+        let admin = LogAdmin::default();
         let contexts: HashMap<String, JobContext> = [(
             "ok.x86_64-linux".to_string(),
             ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built),
@@ -1256,12 +1384,12 @@ mod tests {
         .into();
         let batch = BatchView {
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::Substituted, "")],
             ..BatchView::default()
         };
-        let err = process_settled_batch(
+        let requeue = process_settled_batch(
             &state,
-            &reader,
-            &LogAdmin::default(),
+            &admin,
             &FakeStoreApi::default(),
             None,
             &contexts,
@@ -1274,10 +1402,64 @@ mod tests {
             &HashMap::new(),
         )
         .await
-        .unwrap_err();
-        assert!(err.to_string().contains("truncated"), "{err}");
+        .unwrap();
+        assert!(requeue.is_empty());
+        assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
-        assert!(records.is_empty(), "no records on a failed read");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bucket, "target-substituted");
+        assert_eq!(records[0].rio.status.as_deref(), Some("Substituted"));
+    }
+
+    /// A ListPoisoned RPC failure degrades to "no poison evidence" (warning
+    /// only): the batch still classifies and the pass never errors out.
+    #[tokio::test]
+    async fn list_poisoned_failure_degrades_to_no_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let admin = LogAdmin {
+            fail_poisoned: true,
+            ..LogAdmin::default()
+        };
+        let contexts: HashMap<String, JobContext> = [(
+            "bad.x86_64-linux".to_string(),
+            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+        )]
+        .into();
+        let batch = BatchView {
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(
+                T,
+                BuildStatus::TransientFailure,
+                "max_infra_retries=3 exhausted after infrastructure failures: x",
+            )],
+            ..BatchView::default()
+        };
+        // Budget already consumed → terminal; with Signal 2 unavailable the
+        // infra reason still resolves to infra.
+        let prior: HashMap<String, u32> = [("bad.x86_64-linux".to_string(), 1)].into();
+        let requeue = process_settled_batch(
+            &state,
+            &admin,
+            &FakeStoreApi::default(),
+            None,
+            &contexts,
+            &["bad.x86_64-linux".into()],
+            &batch,
+            &prior,
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://x",
+            &HashMap::new(),
+        )
+        .await
+        .unwrap();
+        assert!(requeue.is_empty());
+        assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
+        let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].bucket, "rio-infra-failure");
+        assert!(records[0].rio.failed_builders.is_empty());
     }
 
     /// A store query failure on a success must not lose the terminal record:
@@ -1287,9 +1469,6 @@ mod tests {
     async fn store_failure_records_success_without_nar_identity() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
-        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
-        reader.set(build_id, obs(T, "completed", Some("e1"), None));
         let store = FakeStoreApi::default();
         store.fail_with("BatchQueryPathInfo: store unavailable");
         let mut ok_job = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
@@ -1304,13 +1483,12 @@ mod tests {
         let contexts: HashMap<String, JobContext> =
             [("ok.x86_64-linux".to_string(), ok_job)].into();
         let batch = BatchView {
-            build_id: Some(build_id.to_string()),
-            exit_code: Some(0),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::Built, "")],
             ..BatchView::default()
         };
         let requeue = process_settled_batch(
             &state,
-            &reader,
             &LogAdmin::default(),
             &store,
             None,
@@ -1333,20 +1511,15 @@ mod tests {
         assert_eq!(records[0].nar_compare["out"], "not-comparable");
     }
 
-    /// A poisoned target with no relayed reason and no failed-builder
-    /// evidence (both signals lost) pulls the log tail as the third signal.
-    /// The same fetch is reused for evidence capture (one log_tail call, not
-    /// two), the record carries the log-tail-only flag, and the signature is
-    /// derived from the tail so these failures still group.
+    /// A failed root with no in-band error message, no relayed reason, and
+    /// no poison entry (both signals lost) pulls the log tail as the third
+    /// signal. The same fetch is reused for evidence capture (one log_tail
+    /// call, not two), the record carries the log-tail-only flag, and the
+    /// signature is derived from the tail so these failures still group.
     #[tokio::test]
     async fn log_tail_only_failure_reuses_one_fetch_and_groups_by_tail() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
-        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
-        // failed_builders None = the poison evidence already decayed; the
-        // batch carries no relayed reason for this drv either.
-        reader.set(build_id, obs(T, "poisoned", None, None));
         let admin = LogAdmin::default();
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
@@ -1354,13 +1527,12 @@ mod tests {
         )]
         .into();
         let batch = BatchView {
-            build_id: Some(build_id.to_string()),
-            exit_code: Some(1),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::MiscFailure, "")],
             ..BatchView::default()
         };
         let requeue = process_settled_batch(
             &state,
-            &reader,
             &admin,
             &FakeStoreApi::default(),
             None,
@@ -1381,7 +1553,8 @@ mod tests {
         let rec = &records[0];
         assert_eq!(rec.bucket, "rio-only-failure");
         assert_eq!(rec.evidence.as_deref(), Some("log-tail-only"));
-        // No relayed reason: the signature falls back to the captured tail.
+        // No reason from either Signal-1 source: the signature falls back to
+        // the captured tail.
         assert_eq!(rec.signature.as_deref(), Some("log:gcc--fatal-error"));
         assert_eq!(
             rec.log_key.as_deref(),
@@ -1389,7 +1562,7 @@ mod tests {
         );
         assert!(state.path("logs/bad.x86_64-linux.log.zst").exists());
         // The Signal-3 fetch doubled as the evidence capture: one call only.
-        assert_eq!(admin.log_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(admin.log_calls.load(Ordering::SeqCst), 1);
     }
 
     /// An EMPTY Signal-3 log tail is no evidence: the record must not carry
@@ -1400,11 +1573,8 @@ mod tests {
     async fn empty_log_tail_is_not_used_as_a_signature() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
-        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
         // Both signals lost, exactly like the log-tail-only case above — but
         // the scheduler has no log bytes left either.
-        reader.set(build_id, obs(T, "poisoned", None, None));
         let admin = LogAdmin {
             tail: Vec::new(),
             ..LogAdmin::default()
@@ -1415,13 +1585,12 @@ mod tests {
         )]
         .into();
         let batch = BatchView {
-            build_id: Some(build_id.to_string()),
-            exit_code: Some(1),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(T, BuildStatus::MiscFailure, "")],
             ..BatchView::default()
         };
         process_settled_batch(
             &state,
-            &reader,
             &admin,
             &FakeStoreApi::default(),
             None,
@@ -1453,20 +1622,18 @@ mod tests {
     async fn failed_log_upload_still_records_the_log_key() {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
-        let reader = FakeReader::default();
-        let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
-        reader.set(
-            build_id,
-            obs(T, "poisoned", Some("e2"), Some(vec!["b1".into()])),
-        );
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
             ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
         )]
         .into();
         let batch = BatchView {
-            build_id: Some(build_id.to_string()),
-            exit_code: Some(1),
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".to_string()),
+            results: vec![po(
+                T,
+                BuildStatus::PermanentFailure,
+                "failed on every eligible worker",
+            )],
             reasons: BTreeMap::from([(
                 T.to_string(),
                 "failed on every eligible worker".to_string(),
@@ -1475,7 +1642,6 @@ mod tests {
         };
         process_settled_batch(
             &state,
-            &reader,
             &LogAdmin::default(),
             &FakeStoreApi::default(),
             Some((&FailingArtifacts, "parity/campaigns/c1".to_string())),

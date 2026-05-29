@@ -127,6 +127,9 @@ pub struct Backends {
     pub store: Arc<dyn StoreApi>,
     pub admin: Arc<dyn AdminApi>,
     pub cluster: Arc<dyn ClusterApi>,
+    /// Warm-stage read-back only: `run_warm` resolves per-root dispositions
+    /// from the build graph. The build-path collect loop reads in-band
+    /// per-root results from batches.jsonl instead and never touches this.
     pub reader: Arc<dyn ResultReader>,
     pub submitter: Arc<dyn Submitter>,
     pub narinfo: Arc<dyn NarinfoSource>,
@@ -1084,7 +1087,6 @@ pub async fn run_with_backends(
         let store_url = spec.cluster.gateway_store_url.clone();
         let prefix = artifact_prefix.clone();
         let backends_collect = CollectBackends {
-            reader: backends.reader.clone(),
             admin: backends.admin.clone(),
             store: backends.store.clone(),
             artifacts: backends.artifacts.clone(),
@@ -1174,7 +1176,6 @@ pub async fn run_with_backends(
             .await?;
             // Final synchronous pass to catch the tail (and any requeues).
             let final_backends = CollectBackends {
-                reader: backends.reader.clone(),
                 admin: backends.admin.clone(),
                 store: backends.store.clone(),
                 artifacts: backends.artifacts.clone(),
@@ -1287,7 +1288,6 @@ pub async fn run_with_backends(
 /// Collect-loop backend bundle (subset of [`Backends`], clonable into the
 /// background collect task).
 struct CollectBackends {
-    reader: Arc<dyn ResultReader>,
     admin: Arc<dyn AdminApi>,
     store: Arc<dyn StoreApi>,
     artifacts: Option<Arc<dyn ArtifactStore>>,
@@ -1318,7 +1318,7 @@ async fn collect_pass_with(
         }
         let view = BatchView {
             build_id: batch.build_id.clone(),
-            exit_code: batch.exit_code,
+            results: batch.results.clone(),
             reasons: batch.reasons.clone(),
             engine_cancelled: batch.engine_cancelled,
             submitted_at: Some(batch.started_at.clone()),
@@ -1335,9 +1335,9 @@ async fn collect_pass_with(
                 .collect()
         };
         // first_active_at: approximation — the batch's started_at (the job
-        // became Active when its batch went in flight); per-drv
-        // assigned/running timestamps arrive with the batched per-drv
-        // status reader.
+        // became Active when its batch went in flight); the in-band per-root
+        // results carry scheduler-side start/stop times, not a first-active
+        // timestamp.
         let first_active: HashMap<String, String> = batch
             .jobs
             .iter()
@@ -1349,7 +1349,6 @@ async fn collect_pass_with(
             .zip(artifact_prefix.map(String::from));
         let requeue = process_settled_batch(
             state,
-            backends.reader.as_ref(),
             backends.admin.as_ref(),
             backends.store.as_ref(),
             artifacts_pair,
@@ -1390,13 +1389,14 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
-        DISPOSITION_NOT_FOUND_UPSTREAM, DISPOSITION_SUBSTITUTED, HydraOutcome, STATUS_COMPLETED,
-        WarmEntry,
+        DISPOSITION_NOT_FOUND_UPSTREAM, DISPOSITION_SUBSTITUTED, HydraOutcome, PathOutcome,
+        STATUS_COMPLETED, WarmEntry, build_status_name,
     };
     use crate::run::reader::DrvObservation;
     use crate::run::reader::test_support::FakeReader;
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
+    use rio_nix::protocol::build::BuildStatus;
 
     struct HealthyCluster;
     #[async_trait]
@@ -1586,13 +1586,22 @@ mod tests {
 
         // Submitter script: the warm batch settles first, then the appB
         // submit batch. FakeSubmitter pops from the BACK: push the SUBMIT
-        // outcome first.
+        // outcome first. The submit batch carries appB's terminal outcome
+        // in band (per-root results); only the warm stage still reads its
+        // dispositions back through the reader.
         let submitter = Arc::new(FakeSubmitter::default());
         let warm_build = "0193e4a2-7c1b-7d20-9b3a-00000000aaaa";
         let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000bbbb";
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(submit_build.into()),
             exit_code: Some(0),
+            results: vec![PathOutcome {
+                drv_path: app.drv_path.clone(),
+                status: build_status_name(BuildStatus::Built).into(),
+                error_msg: String::new(),
+                start_time: 0,
+                stop_time: 0,
+            }],
             ..BatchOutcome::default()
         }));
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
@@ -1606,15 +1615,6 @@ mod tests {
             DrvObservation {
                 drv_path: lib.drv_path.clone(),
                 status: STATUS_COMPLETED.into(),
-                ..DrvObservation::default()
-            },
-        );
-        reader.set(
-            submit_build,
-            DrvObservation {
-                drv_path: app.drv_path.clone(),
-                status: STATUS_COMPLETED.into(),
-                exec_id: Some("e1".into()),
                 ..DrvObservation::default()
             },
         );

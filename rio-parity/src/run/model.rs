@@ -233,8 +233,13 @@ pub struct RioSide {
     /// plan-time exclusion value ("skipped", "not-attemptable",
     /// "cached-prior", "eval-error").
     pub outcome: String,
-    /// Raw scheduler derivations.status for the target drv, when observed.
+    /// Terminal status recorded for the target drv, when observed: the
+    /// worker-protocol BuildStatus name from the in-band per-root result
+    /// (e.g. "Built", "PermanentFailure"), written via [`build_status_name`].
     pub status: Option<String>,
+    /// Execution id for the target drv. Nullable: the in-band collection
+    /// path does not observe per-execution ids — it is populated only when
+    /// a build-graph dump is taken for triage.
     pub exec_id: Option<String>,
     pub failing_drv: Option<String>,
     /// Captured relayed stderr reason line (durable copy that outlives the
