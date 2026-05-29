@@ -68,8 +68,6 @@
           "sketch_halflife_secs": 21600,
           "max_node_disk": 483183820800,
           "metal_sizes": [],
-          "fuse_cache_bytes": 8589934592,
-          "fetcher_fuse_cache_bytes": 4294967296,
           "kube_build_scheduler_enabled": true
         }
       },
@@ -225,20 +223,6 @@
             },
             "default": []
           },
-          "fuse_cache_bytes": {
-            "description": "FUSE-cache budget added to every builder pod's\n`ephemeral-storage` request (the `fuse-cache` emptyDir). Single\nsource for ALL Builder-pool callers via\n[`pool::pod::BUILDER_FUSE_CACHE`] — the NodeClaim's\n`ephemeral-storage` floor and the pod's actual request both read\nthis so FFD/cover/stamp agree (§Simulator-shares-accounting).\nHelm: `poolDefaults.fuseCacheBytes` (50Gi prod). Default is the\ncontroller-config fallback `pool::pod::BUILDER_FUSE_CACHE_BYTES`\n(8Gi).",
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0,
-            "default": 8589934592
-          },
-          "fetcher_fuse_cache_bytes": {
-            "description": "FUSE-cache budget for FETCHER pods (the `fuse-cache` emptyDir\nsizeLimit and the matching `ephemeral-storage` addend). A FOD's\nFUSE cache only ever holds the fetch script's input closure\n(curl/git/JDK-class toolchains), not the downloaded artifact\n(that lands in the overlay emptyDir, sized from `disk_bytes`,\nwhich grows via the reactive disk floor on eviction) — so this\nis a small static bound, not the builder budget. Single source\nfor all Fetcher callers via [`pool::pod::FETCHER_FUSE_CACHE`]\n(§Simulator-shares-accounting). This dimension has NO eviction\nescalation path: a FOD whose input closure exceeds it retries to\nexhaustion, so raise it here rather than relying on retry. Helm:\n`poolDefaults.fetcherFuseCacheBytes`. Default is\n`pool::pod::FETCHER_FUSE_CACHE_BYTES` (4Gi).",
-            "type": "integer",
-            "format": "uint64",
-            "minimum": 0,
-            "default": 4294967296
-          },
           "kube_build_scheduler_enabled": {
             "description": "`true` ⟺ the `kube-build-scheduler` Deployment is rendered\n(`buildScheduler.enabled`). r40 bug_018: builder pods get\n`schedulerName=kube-build-scheduler` only when BOTH the\nNodeClaim CRD is present (Karpenter installed) AND this flag is\nset — otherwise the pod targets a scheduler that doesn't exist\nand the default kube-scheduler ignores it (permanent Pending,\nzero alerts: the `KubeBuildScheduler*` alerts are gated off by\nthe same `buildScheduler.enabled` toggle). Helm:\n`buildScheduler.enabled`. Default: `true` (matches the chart's\ndefault).",
             "type": "boolean",
@@ -281,8 +265,6 @@
       "sketch_halflife_secs": 21600,
       "max_node_disk": 483183820800,
       "metal_sizes": [],
-      "fuse_cache_bytes": 8589934592,
-      "fetcher_fuse_cache_bytes": 4294967296,
       "kube_build_scheduler_enabled": true
     },
     "service_hmac_key_path": null,

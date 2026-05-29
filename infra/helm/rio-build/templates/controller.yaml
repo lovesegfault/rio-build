@@ -1,8 +1,8 @@
 {{- /* Named template so the ConfigMap body and the checksum annotation
        hash the SAME rendered string. bug_022: hashing a hand-maintained
        list of input keys (`.scheduler.sla`, `.karpenter.nodeclaimPool`)
-       missed `poolDefaults.fuseCacheBytes` + `karpenter.metalSizes` —
-       the ConfigMap re-rendered, the (subPath-mounted) pod did not roll.
+       missed keys added later (e.g. `karpenter.metalSizes`) — the
+       ConfigMap re-rendered, the (subPath-mounted) pod did not roll.
        `define` must be at top level (not inside `if`). */}}
 {{- define "rio.controllerToml" -}}
 {{- with .Values.scheduler.sla -}}
@@ -25,8 +25,6 @@ max_lead_time = {{ printf "%.1f" (float64 .maxLeadTime) }}
 {{- /* `dataVolumeSize` is a k8s Quantity ("500Gi"); approximate
        allocatable as 90% (kubelet eviction threshold + image cache). */}}
 max_node_disk = {{ mulf 0.9 (include "rio.quantityBytes" $.Values.karpenter.dataVolumeSize) | int64 }}
-fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fuseCacheBytes }}
-fetcher_fuse_cache_bytes = {{ int64 $.Values.poolDefaults.fetcherFuseCacheBytes }}
 metal_sizes = {{ toJson $.Values.karpenter.metalSizes }}
 {{- with .maxConsolidationTime }}
 max_consolidation_time = {{ printf "%.1f" (float64 .) }}

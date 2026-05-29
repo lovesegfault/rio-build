@@ -74,12 +74,9 @@ spec:
             k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
             k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
-    {{- with .Values.networkPolicy.builderS3Cidr }}
-    # S3 VPC endpoint CIDR — builder reads chunks via presigned URL.
-    # toCIDR (not toEndpoints) — S3 endpoint is outside the cluster.
-    - toCIDR: [{{ . | quote }}]
-      toPorts: [{ports: [{port: "443", protocol: TCP}]}]
-    {{- end }}
+  # No S3 egress: the presigned-URL chunk-fetch path is gone (ADR-022
+  # P0560) — builders read inputs through the castore-FUSE backed by
+  # rio-mountd + rio-store gRPC only.
   # Explicit IMDS deny — second independent control alongside
   # httpPutResponseHopLimit: 1 (karpenter.yaml). Cilium deny rules take
   # precedence over allow at the same L3/L4 scope. Builders have no
@@ -412,6 +409,36 @@ spec:
         - matchName: {{ .host | quote }}
         {{- end }}
       toPorts: [{ports: [{port: "443", protocol: TCP}]}]
+{{- end }}
+{{- if .Values.mountd.enabled }}
+---
+# rio-mountd: the most privileged pod in the cluster (privileged: true
+# for FUSE mount propagation) and the one with the smallest network
+# footprint — its entire job is a unix socket and local syscalls. Deny
+# all egress explicitly (`all` entity, not just default-deny — a later
+# allow rule from another policy cannot silently widen it). Ingress
+# only on the metrics port: the kubelet's tcpSocket liveness probe
+# (`host`) and Prometheus (`cluster`) — same entity set as every other
+# component's metrics rule. The UDS socket builders dial is not
+# network; Cilium never sees it.
+apiVersion: cilium.io/v2
+kind: CiliumNetworkPolicy
+metadata:
+  name: rio-mountd
+  namespace: {{ $ns.builders.name }}
+  labels:
+    app.kubernetes.io/part-of: rio-build
+spec:
+  endpointSelector:
+    matchLabels:
+      app.kubernetes.io/name: rio-mountd
+  ingress:
+    - fromEntities: [host, remote-node, cluster]
+      toPorts:
+        - ports:
+            - {port: "9095", protocol: TCP}
+  egressDeny:
+    - toEntities: [all]
 {{- end }}
 {{- if .Values.dashboard.enabled }}
 ---

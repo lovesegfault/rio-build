@@ -321,7 +321,6 @@ pub fn simulate(
     live: &[LiveNode],
     sketches: &CellSketches,
     bound: &HashMap<String, String>,
-    fuse_cache_bytes: u64,
     hw_admits: impl Fn(&str, Option<&str>, &[String]) -> bool,
 ) -> (Vec<Placement>, Vec<SpawnIntent>) {
     use crate::reconcilers::pool::jobs::intent_pod_footprint;
@@ -375,7 +374,7 @@ pub fn simulate(
             placeable.push((i, nc_name.to_string(), !registered));
             continue;
         }
-        let (ic, im, id) = intent_pod_footprint(&i, fuse_cache_bytes);
+        let (ic, im, id) = intent_pod_footprint(&i);
         let open = a_open(&i, sketches);
         // hw-agnostic (`hw_class_names=[]`): eligible on any node
         // whose hw-class admits the intent (arch + features — see
@@ -447,13 +446,7 @@ pub fn simulate(
 /// `sketches.lead_time(cell)` — `assign_to_cells` already gated each
 /// intent's openness on `cell`, so the lead-time check is redundant in
 /// this synthetic env.
-pub(super) fn sim_packs(
-    cell: &Cell,
-    u: &[&SpawnIntent],
-    bin: (u32, u64, u64),
-    n: u32,
-    fuse_cache_bytes: u64,
-) -> bool {
+pub(super) fn sim_packs(cell: &Cell, u: &[&SpawnIntent], bin: (u32, u64, u64), n: u32) -> bool {
     let intents: Vec<SpawnIntent> = u
         .iter()
         .map(|i| SpawnIntent {
@@ -481,7 +474,6 @@ pub(super) fn sim_packs(
         &nodes,
         &CellSketches::default(),
         &HashMap::new(),
-        fuse_cache_bytes,
         |_, _, _| true,
     )
     .1
@@ -800,18 +792,16 @@ pub(crate) mod tests {
         true
     }
 
-    /// `simulate` with `bound`/`fuse_cache_bytes` defaulted (no
-    /// already-bound short-circuit; `fuse=0` so footprint disk ==
-    /// `disk_bytes×headroom + LOG_BUDGET` ≈ raw `disk_bytes` for tests
-    /// that don't exercise the disk axis). Tests that DO care call
-    /// `simulate` directly.
+    /// `simulate` with `bound` defaulted (no already-bound
+    /// short-circuit; footprint disk == `disk_bytes×headroom +
+    /// LOG_BUDGET` ≈ raw `disk_bytes` for tests that don't exercise
+    /// the disk axis). Tests that DO care call `simulate` directly.
     fn sim(intents: &[SpawnIntent], live: &[LiveNode]) -> (Vec<Placement>, Vec<SpawnIntent>) {
         simulate(
             intents,
             live,
             &CellSketches::default(),
             &HashMap::new(),
-            0,
             any_admit,
         )
     }
@@ -821,7 +811,7 @@ pub(crate) mod tests {
         live: &[LiveNode],
         sk: &CellSketches,
     ) -> (Vec<Placement>, Vec<SpawnIntent>) {
-        simulate(intents, live, sk, &HashMap::new(), 0, any_admit)
+        simulate(intents, live, sk, &HashMap::new(), any_admit)
     }
 
     // --- LiveNode parsing ----------------------------------------------
@@ -975,14 +965,8 @@ pub(crate) mod tests {
         // other node available it goes to unplaced — `cover_deficit`
         // pre-mints the replacement so it's warm by eviction time.
         let bound: HashMap<String, String> = [("a".to_string(), "node-dying".to_string())].into();
-        let (placeable, unplaced) = simulate(
-            &[i],
-            &[dying],
-            &CellSketches::default(),
-            &bound,
-            0,
-            any_admit,
-        );
+        let (placeable, unplaced) =
+            simulate(&[i], &[dying], &CellSketches::default(), &bound, any_admit);
         assert!(
             placeable.is_empty(),
             "bound-to-terminating falls through, does not short-circuit to placed"
@@ -1314,14 +1298,7 @@ pub(crate) mod tests {
             agn("u", ""), // unmappable → unplaced
         ];
         let none = HashMap::new();
-        let (p, u) = simulate(
-            &intents,
-            &nodes,
-            &CellSketches::default(),
-            &none,
-            0,
-            hw_admits,
-        );
+        let (p, u) = simulate(&intents, &nodes, &CellSketches::default(), &none, hw_admits);
         assert_eq!(p.len(), 2);
         assert_eq!(placed_on(&p, "x"), "nx");
         assert_eq!(placed_on(&p, "a"), "na");
@@ -1333,7 +1310,6 @@ pub(crate) mod tests {
             &nodes[1..],
             &CellSketches::default(),
             &none,
-            0,
             hw_admits,
         );
         assert!(p.is_empty());
@@ -1390,7 +1366,6 @@ pub(crate) mod tests {
             &nodes,
             &CellSketches::default(),
             &none,
-            0,
             hw_admits,
         );
         assert_eq!(p.len(), 1, "kvm intent placed (on metal)");
@@ -1403,7 +1378,6 @@ pub(crate) mod tests {
             &nodes,
             &CellSketches::default(),
             &none,
-            0,
             hw_admits,
         );
         assert_eq!(p.len(), 1);
@@ -1416,7 +1390,6 @@ pub(crate) mod tests {
             &nodes[..1],
             &CellSketches::default(),
             &none,
-            0,
             hw_admits,
         );
         assert!(p.is_empty(), "kvm intent must NOT place on non-metal node");
@@ -1462,7 +1435,6 @@ pub(crate) mod tests {
             &nodes,
             &CellSketches::default(),
             &none,
-            0,
             hw_admits,
         );
         assert_eq!(
@@ -1478,7 +1450,7 @@ pub(crate) mod tests {
         let mut iu = i.clone();
         iu.intent_id = "unmappable".into();
         iu.system = "darwin-pdp11".into();
-        let (p, u) = simulate(&[iu], &nodes, &CellSketches::default(), &none, 0, hw_admits);
+        let (p, u) = simulate(&[iu], &nodes, &CellSketches::default(), &none, hw_admits);
         assert!(
             p.is_empty(),
             "featureless arch-unmappable intent has no constraint axis"
@@ -1491,14 +1463,7 @@ pub(crate) mod tests {
         iff.required_features = vec!["fetcher".into()];
         let feat_admits =
             |h: &str, _a: Option<&str>, f: &[String]| h == "h-x86" && f == ["fetcher"];
-        let (p, u) = simulate(
-            &[iff],
-            &nodes,
-            &CellSketches::default(),
-            &none,
-            0,
-            feat_admits,
-        );
+        let (p, u) = simulate(&[iff], &nodes, &CellSketches::default(), &none, feat_admits);
         assert_eq!(p.len(), 1, "builtin FOD must place by feature");
         assert_eq!(placed_on(&p, "fod"), "nx");
         assert!(u.is_empty());
@@ -1516,38 +1481,30 @@ pub(crate) mod tests {
 
     /// mb_019(A): FFD compares against the SAME `(c,m,d)` triple the
     /// pod will request — `intent_pod_footprint` (= `disk×headroom +
-    /// fuse + log`), NOT raw `disk_bytes`. Node 200Gi free; 4 intents
-    /// each `disk_bytes=1Gi headroom=1.5` with `fuse=50Gi` → footprint
-    /// ≈52.5Gi each → only 3 fit. With raw `disk_bytes` FFD would pack
-    /// all 4 (decrementing 1Gi each); kube-scheduler binds 3, the 4th
-    /// sits Pending with no covering NodeClaim.
+    /// log`), NOT raw `disk_bytes`. Node 200Gi free; 4 intents each
+    /// `disk_bytes=60Gi headroom=1.5` → footprint 91Gi each → only 2
+    /// fit. With raw `disk_bytes` FFD would pack 3 (decrementing 60Gi
+    /// each); kube-scheduler binds 2, the 3rd sits Pending with no
+    /// covering NodeClaim.
     #[test]
     fn ffd_disk_uses_pod_footprint() {
         let n = node("n", "h", CapacityType::Spot, 32, 64 * GI, 200 * GI);
         let intents: Vec<_> = (0..4)
             .map(|k| {
                 let mut i = intent(&format!("i{k}"), 4, GI, &[("h", CapacityType::Spot)]);
-                i.disk_bytes = GI;
+                i.disk_bytes = 60 * GI;
                 i.disk_headroom_factor = Some(1.5);
                 i
             })
             .collect();
-        let fuse = 50 * GI;
-        let (p, u) = simulate(
-            &intents,
-            &[n],
-            &CellSketches::default(),
-            &HashMap::new(),
-            fuse,
-            any_admit,
-        );
-        // footprint = 1×1.5 + 50 + 1 (log) = 52.5Gi → ⌊200/52.5⌋ = 3.
+        let (p, u) = sim(&intents, &[n]);
+        // footprint = 60×1.5 + 1 (log) = 91Gi → ⌊200/91⌋ = 2.
         assert_eq!(
             p.len(),
-            3,
-            "footprint-based fit (was 4 with raw disk_bytes)"
+            2,
+            "footprint-based fit (would be 3 with raw disk_bytes)"
         );
-        assert_eq!(u.len(), 1);
+        assert_eq!(u.len(), 2);
     }
 
     /// bug_069: an intent already bound (PodRequestedCache saw its pod
@@ -1574,7 +1531,6 @@ pub(crate) mod tests {
             std::slice::from_ref(&n),
             &CellSketches::default(),
             &bound,
-            0,
             any_admit,
         );
         assert_eq!(p.len(), 1, "bound intent placeable on its actual node");
@@ -1589,7 +1545,6 @@ pub(crate) mod tests {
             std::slice::from_ref(&n),
             &CellSketches::default(),
             &stale,
-            0,
             any_admit,
         );
         assert!(p.is_empty(), "stale bound → falls through to fit-check");

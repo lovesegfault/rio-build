@@ -31,6 +31,29 @@ test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-default")
   exit 1
 }
 
+# Dedicated /var/rio volume (/dev/xvdb): rio-default and rio-metal MUST
+# map it (the AMI's rio-ebs-mount fails the boot on EC2 hosts when it's
+# missing, so dropping it bricks every EBS/metal build), rio-nvme MUST
+# NOT (the instance-store RAID0 hosts /var/rio there).
+for nc in rio-default rio-metal; do
+  count="$(yq "select(.kind==\"EC2NodeClass\" and .metadata.name==\"$nc\")
+               | .spec.blockDeviceMappings | length" "$karp")"
+  test "$count" = 2 || {
+    echo "FAIL: $nc EC2NodeClass has $count blockDeviceMappings, want 2 (root + /dev/xvdb)" >&2
+    exit 1
+  }
+  yq "select(.kind==\"EC2NodeClass\" and .metadata.name==\"$nc\")
+      | .spec.blockDeviceMappings[].deviceName" "$karp" | grep -x /dev/xvdb >/dev/null || {
+    echo "FAIL: $nc EC2NodeClass blockDeviceMappings missing /dev/xvdb (the /var/rio volume)" >&2
+    exit 1
+  }
+done
+test "$(yq 'select(.kind=="EC2NodeClass" and .metadata.name=="rio-nvme")
+            | .spec.blockDeviceMappings | length' "$karp")" = 1 || {
+  echo "FAIL: rio-nvme EC2NodeClass should map only the root volume (instance store hosts /var/rio)" >&2
+  exit 1
+}
+
 # No Bottlerocket functionality in the karpenter render — the cutover
 # deletes the fallback entirely. Check for functional markers (amiAlias
 # key, Bottlerocket TOML settings sections, the canary NodeClass), not

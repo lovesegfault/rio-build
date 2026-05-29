@@ -59,35 +59,12 @@ spec:
                 items:
                   type: string
                 type: array
-              fuseCacheBytes:
-                description: |-
-                  `fuse-cache` emptyDir sizeLimit AND the matching addend to the
-                  container's `ephemeral-storage` request/limit (kubelet sums
-                  disk-backed emptyDirs against that limit, so the two MUST agree).
-                  CEL-rejected for BOTH kinds — all pools single-source from
-                  controller `[nodeclaim_pool].fuse_cache_bytes` so FFD/cover/stamp
-                  agree (§Simulator-shares-accounting). Builder: mb_035. Fetcher:
-                  r35 merged_bug_024, after §13e routed Fetcher Pools through the
-                  same NodeClaim accounting path. Pre-CEL CRs setting it are
-                  ignored with a Warning event (`*FuseCacheBytesIgnored`).
-                format: uint64
-                minimum: 0.0
-                nullable: true
-                type: integer
-              fusePassthrough:
-                description: |-
-                  FUSE passthrough mode (kernel handles reads directly, no
-                  userspace copy). Maps to `RIO_FUSE_PASSTHROUGH`. `None` =
-                  worker default (`true`). Set `false` only as a diagnostic
-                  escape hatch — disabling adds ~2x per-build latency.
-                  Requires kernel >= 6.9 + `CAP_SYS_ADMIN`. Builder-only.
-                nullable: true
-                type: boolean
               fuseThreads:
                 description: |-
-                  FUSE dispatcher thread count. Maps to `RIO_FUSE_THREADS`.
-                  `None` = worker default (4). Tune up for NAR-heavy build
-                  profiles where FUSE readahead is the bottleneck. Builder-only.
+                  Castore-FUSE event-loop thread count per build session. Maps to
+                  `RIO_FUSE_THREADS`. `None` = worker default (4). Tune up for
+                  NAR-heavy build profiles where FUSE dispatch is the bottleneck.
+                  Builder-only.
                 format: uint32
                 minimum: 0.0
                 nullable: true
@@ -248,23 +225,12 @@ spec:
                 kind=Fetcher forbids seccompProfile — the reconciler forces Localhost
                 operator/rio-fetcher.json (ADR-019)
               rule: self.kind != 'Fetcher' || !has(self.seccompProfile)
-            - message: >-
-                kind=Fetcher forbids FUSE tuning knobs — fetches are network-bound, not
-                FUSE-bound
-              rule: self.kind != 'Fetcher' || (!has(self.fuseThreads) && !has(self.fusePassthrough))
+            - message: kind=Fetcher forbids fuseThreads — fetches are network-bound, not FUSE-bound
+              rule: self.kind != 'Fetcher' || !has(self.fuseThreads)
             - message: >-
                 kind=Fetcher forbids spec.features — the controller derives [fetcher] from kind
                 (§13e)
               rule: self.kind != 'Fetcher' || !has(self.features) || size(self.features) == 0
-            - message: >-
-                kind=Builder forbids fuseCacheBytes — Builder pools single-source from
-                controller [nodeclaim_pool].fuse_cache_bytes so FFD/cover/stamp agree (mb_035)
-              rule: self.kind != 'Builder' || !has(self.fuseCacheBytes)
-            - message: >-
-                kind=Fetcher forbids fuseCacheBytes — §13e routes Fetcher Pools through
-                nodeclaim_pool; per-pool override would diverge FFD from the stamped pod request (r35
-                merged_bug_024)
-              rule: self.kind != 'Fetcher' || !has(self.fuseCacheBytes)
             - message: "kind=Fetcher: nodeSelector['rio.build/fetcher'] is reconciler-owned and may only be 'true' — the dedicated-node constraint is universal and cannot be weakened (r35 bug_044)"
               rule: >-
                 self.kind != 'Fetcher' || !has(self.nodeSelector) || !('rio.build/fetcher' in
