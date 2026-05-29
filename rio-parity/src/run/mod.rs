@@ -1749,6 +1749,115 @@ mod tests {
         assert_eq!(records2["appB.x86_64-linux"].bucket, "match-built");
     }
 
+    /// Transport-error path end to end: the first submission fails
+    /// engine-side (channel open refused), the batch is recorded with the
+    /// error text and no in-band results, the job is re-offered, and the
+    /// resubmission's in-band Built result drains the campaign.
+    ///
+    /// Only appB's own outputs exist upstream here, so the warm stage has
+    /// nothing to warm (no warm batch) and `warm_submitter: None` exercises
+    /// the build-submitter fallback for the warm call site.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn transport_error_batches_are_reoffered_and_drain() {
+        let eval_dir = tempfile::tempdir().unwrap();
+        write_mini_eval_set(eval_dir.path());
+        let manifest = evalset_input::load_manifest(eval_dir.path()).unwrap();
+        let app = manifest
+            .iter()
+            .find(|m| m.job == "appB.x86_64-linux")
+            .unwrap()
+            .clone();
+        let mut narinfos = HashMap::new();
+        for p in app.outputs.values() {
+            narinfos.insert(p.clone(), narinfo_text(p));
+        }
+
+        // FakeSubmitter pops from the BACK: the FIRST submission fails at the
+        // transport (engine-side error), the SECOND carries appB's terminal
+        // outcome in band.
+        let submitter = Arc::new(FakeSubmitter::default());
+        let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000cccc";
+        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
+            build_id: Some(submit_build.into()),
+            results: vec![PathOutcome {
+                drv_path: app.drv_path.clone(),
+                status: build_status_name(BuildStatus::Built).into(),
+                error_msg: String::new(),
+                start_time: 0,
+                stop_time: 0,
+            }],
+            ..BatchOutcome::default()
+        }));
+        submitter.outcomes.lock().unwrap().push(Err(anyhow::anyhow!(
+            "channel open failed: connection refused"
+        )));
+
+        let state_dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(state_dir.path()).unwrap();
+        run_with_backends(
+            run_args(state_dir.path(), eval_dir.path()),
+            leaf_spec(),
+            state,
+            eval_dir.path().to_path_buf(),
+            Backends {
+                store: Arc::new(FakeStoreApi::default()),
+                admin: Arc::new(NoLogsAdmin),
+                cluster: Arc::new(HealthyCluster),
+                reader: Arc::new(FakeReader::default()),
+                submitter: submitter.clone(),
+                warm_submitter: None,
+                narinfo: Arc::new(MapNarinfo(narinfos)),
+                artifacts: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // The job was attempted at least twice (transport failure, then the
+        // successful resubmission) and ends match-built.
+        let records = latest_per_job(
+            StateDir::new(state_dir.path())
+                .unwrap()
+                .load_jsonl(StateFile::Results)
+                .unwrap(),
+        );
+        let app_record = &records["appB.x86_64-linux"];
+        assert_eq!(app_record.bucket, "match-built");
+        assert!(app_record.attempts >= 1, "{app_record:?}");
+
+        // Two build-path submissions were recorded (no warm batch exists —
+        // nothing was warmable): the first carries the engine submission
+        // error and an empty results array, the second the in-band result.
+        let state = StateDir::new(state_dir.path()).unwrap();
+        let mut batches: Vec<model::BatchRecord> = state
+            .load_jsonl::<model::BatchRecord>(StateFile::Batches)
+            .unwrap();
+        batches.sort_by_key(|b| b.batch_id);
+        assert!(
+            batches.iter().all(|b| b.kind == BATCH_KIND_SUBMIT),
+            "{batches:?}"
+        );
+        assert!(batches.len() >= 2, "{batches:?}");
+        assert_eq!(batches[0].build_id, None);
+        assert!(batches[0].results.is_empty());
+        assert!(
+            batches[0]
+                .stderr_tail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("channel open failed: connection refused"),
+            "{:?}",
+            batches[0].stderr_tail
+        );
+        assert_eq!(batches[1].build_id.as_deref(), Some(submit_build));
+        assert_eq!(batches[1].results.len(), 1);
+        assert_eq!(batches[1].results[0].drv_path, app.drv_path);
+        assert_eq!(
+            batches[1].results[0].status,
+            build_status_name(BuildStatus::Built)
+        );
+    }
+
     /// Drives the watchdog with a fake clock (tick timestamps) through the
     /// stall-action policy: first ActiveStall → single auto-retry (in-flight
     /// reservation released, resubmission counted, no record); second

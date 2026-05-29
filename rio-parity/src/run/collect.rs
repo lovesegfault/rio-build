@@ -1229,6 +1229,109 @@ mod tests {
         );
     }
 
+    /// One settled multi-root batch whose in-band results mix a success, an
+    /// infra failure, and a missing entry: each root is classified on its own
+    /// result — the completed sibling is never dragged down by the failing
+    /// one, the infra root spends the auto-retry budget before going
+    /// terminal, and the missing root follows the requeue-then-infra rule.
+    #[test]
+    fn mixed_multi_root_batch_classifies_each_root_independently() {
+        let knobs = Knobs::default();
+        let job1 = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
+        let job2 = ctx("infra.x86_64-linux", DEP, &[], HydraOutcome::Built);
+        let job3 = ctx("missing.x86_64-linux", OTHER, &[], HydraOutcome::Built);
+        let batch = BatchView {
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+            results: vec![
+                po(T, BuildStatus::Built, ""),
+                po(
+                    DEP,
+                    BuildStatus::PermanentFailure,
+                    "max_infra_retries=3 exhausted after infrastructure failures",
+                ),
+                // job3's drv (OTHER) deliberately has no entry.
+            ],
+            ..BatchView::default()
+        };
+        // Signal 2 corroborates the infra reason: job2's drv is poisoned with
+        // no failed builders recorded.
+        let poisoned: HashMap<String, Vec<String>> = HashMap::from([(DEP.to_string(), vec![])]);
+        let target_for = |drv: &str| batch.results.iter().find(|r| r.drv_path == drv);
+
+        // First pass (no prior requeues): success terminal, infra auto-retry,
+        // missing result requeued.
+        assert_eq!(
+            decide(&job1, target_for(T), &batch, &poisoned, 0, &knobs, None),
+            Verdict::Terminal {
+                rio: RioOutcome::Built { executed: true },
+                evidence: None
+            }
+        );
+        assert_eq!(
+            decide(&job2, target_for(DEP), &batch, &poisoned, 0, &knobs, None),
+            Verdict::Requeue {
+                why: "infra-auto-retry"
+            }
+        );
+        assert_eq!(
+            decide(&job3, target_for(OTHER), &batch, &poisoned, 0, &knobs, None),
+            Verdict::Requeue {
+                why: "no-inband-result"
+            }
+        );
+
+        // Second pass (one prior requeue each): both budget-consuming rows go
+        // terminal infra; the missing root carries the missing-result
+        // evidence.
+        assert!(matches!(
+            decide(&job2, target_for(DEP), &batch, &poisoned, 1, &knobs, None),
+            Verdict::Terminal {
+                rio: RioOutcome::TargetFailed {
+                    kind: FailureKind::Infra
+                },
+                ..
+            }
+        ));
+        match decide(&job3, target_for(OTHER), &batch, &poisoned, 1, &knobs, None) {
+            Verdict::Terminal {
+                rio:
+                    RioOutcome::TargetFailed {
+                        kind: FailureKind::Infra,
+                    },
+                evidence,
+            } => assert_eq!(evidence.as_deref(), Some("no-inband-result")),
+            other => panic!("expected terminal infra for the missing root, got {other:?}"),
+        }
+    }
+
+    /// An engine-cancelled batch (channel abandoned at the batch deadline)
+    /// settles with no in-band results: every member is re-offered via the
+    /// engine-cancelled rule regardless of how much retry budget it has
+    /// already spent.
+    #[test]
+    fn engine_cancelled_batch_requeues_members_without_results() {
+        let knobs = Knobs::default();
+        let batch = BatchView {
+            build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
+            results: vec![],
+            engine_cancelled: true,
+            ..BatchView::default()
+        };
+        let no_poison: HashMap<String, Vec<String>> = HashMap::new();
+        for (job, prior_requeues) in [
+            (ctx("a.x86_64-linux", T, &[], HydraOutcome::Built), 0),
+            (ctx("b.x86_64-linux", DEP, &[], HydraOutcome::Built), 5),
+        ] {
+            assert_eq!(
+                decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None),
+                Verdict::Requeue {
+                    why: "engine-cancelled"
+                },
+                "prior_requeues = {prior_requeues}"
+            );
+        }
+    }
+
     /// End-to-end through process_settled_batch with fakes: one success (NAR
     /// hash captured), one genuine failure (log tail uploaded), one batch-mate
     /// requeued — all driven by the batch's in-band per-root results.
