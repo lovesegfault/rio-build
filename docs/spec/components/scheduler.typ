@@ -1253,6 +1253,34 @@ deliberately deferred until the closure-evidence campaign's stale-tenure
 model evidence is in (`docs/spec/models/closure-evidence-invariant-map.md`);
 this paragraph records the as-built posture and is not a requirement.
 
+#r("sched.evidence.settlement")[
+  Every derivation that carries the `topdown_pruned` mark with Broken closure
+  evidence and at least one live interested build MUST settle within the
+  current tenure: the scheduler MUST keep a settling step armed for it ---
+  complete it inline from the store, route it to a substitution walk, or take
+  the resubmit-directing fail-fast --- rather than leaving it parked Ready
+  while pull admission refuses to mint for it. In particular, a marked Broken
+  node whose walk has already been tried (`substitute_tried`) and whose
+  wanted outputs the store probe reports present MUST NOT be left with no
+  action by the dispatch sweep: it MUST either be completed (with its closure
+  re-verified) or fail-fasted with the resubmit-directing error.
+]
+This is the settlement obligation adopted for the closure-evidence campaign
+(its D16 finding). As built, the dispatch probe's present-but-tried cell
+violates it: such a node takes the probe partition's all-present branch and
+gets no action --- not completed inline (already tried), not routed to a walk
+(already tried), not fail-fasted (that arm is the else of the missing branch)
+--- while `admit_pull` keeps refusing it `NotYetReady`, and when its hole came
+from a poison-clear path there is no reap-hook survivor pass to re-evaluate
+it; it sits Ready until a new merge, completion, or failover changes its
+state. The settling arm is deliberately NOT chosen here: completing inline
+would trust an output-present view that `substitute_tried` exists to
+distrust, and an unconditional fail-fast could be wrongful after a transient
+walk failure --- which arm satisfies the campaign's wrongful-failure bounds
+is what the model adjudicates, and the fix lands with that evidence
+(`docs/spec/models/closure-evidence-invariant-map.md`). Until then this rule
+is intentionally unimplemented and appears in `tracey query uncovered`.
+
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
