@@ -1228,6 +1228,27 @@ the resubmit-directing error), stale-false evidence would make it permissive
 (dispatch a node whose closure was never merged), so only the former is
 tolerated outside the merge transaction.
 
+Fencing posture for evidence writes, as built: every evidence write above is
+guarded by entry-time leader checks only --- the reap hook's leader-gated
+block, the substitute-complete and Tick handlers' entry gates, recovery
+running only on the just-acquired leader, and the admin paths' gRPC leader
+guard --- and none of it carries a SQL generation fence; the only
+generation-fenced statements in the scheduler are the three attempt-ledger
+transactions (the pull mint, the establishment charge, and the
+synthesized/uncharged close, #rref("sched.lease.generation-fence")). The
+MergeDag handler itself has no leader check at all: leadership is checked
+once at SubmitBuild enqueue time, so a replica deposed after the enqueue (or
+across the merge handler's awaits) still executes its merge transaction ---
+stamp and build activation included --- plus the post-merge heal and clear
+pass, racing the new leader's recovery gate and recovery hole stamp. A
+deposed believer can therefore keep issuing evidence writes for up to the
+lease self-fence interval plus whatever handler work was already in flight
+(#rref("sched.lease.self-fence")). Whether evidence writes should be
+tenure-fenced --- and if so which statements --- is an owner decision
+deliberately deferred until the closure-evidence campaign's stale-tenure
+model evidence is in (`docs/spec/models/closure-evidence-invariant-map.md`);
+this paragraph records the as-built posture and is not a requirement.
+
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream
