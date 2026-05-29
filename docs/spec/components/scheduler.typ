@@ -2571,7 +2571,7 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   `DerivationStatus::is_terminal()` MUST stay in sync (drift-tested).
 ]
 
-#r("sched.db.derivations-gc+2")[
+#r("sched.db.derivations-gc+3")[
   Terminal `derivations` rows with no `build_derivations` link and no ACTIVE
   (`pending`/`acknowledged`) `assignments` row are deleted by a periodic
   Tick-driven sweep (batched `LIMIT 1000` per pass). The same statement deletes
@@ -2583,7 +2583,18 @@ backoff. This prevents unbounded request queueing at the gateway layer.
   `assignments` rows (closed by #rref("sched.db.assignment-terminal-on-status"))
   do not block: migration 034 made the FK `ON DELETE CASCADE`. Without the
   sweep, `dependency_failed` rows from large failed closures accumulate
-  unboundedly --- I-169.2 observed 1.16M rows.
+  unboundedly --- I-169.2 observed 1.16M rows. The sweep is coupled to the
+  closure-evidence lifecycle: deleting an un-produced terminal child row (and
+  its edges) removes the persisted child-set evidence that the recovery-time
+  closure-hole stamp re-derives a parent's truncation from, leaving the
+  surviving parent's persisted `closure_hole` breadcrumb (migration 064,
+  #rref("sched.evidence.closure-hole")) as the only durable record of it ---
+  the no-`build_derivations`-link victim filter MUST be retained, because the
+  link is what keeps a reaped un-produced child's row re-derivable until its
+  builds rows are deleted, which no in-tree path does for a build that merely
+  ran to terminal (the failed-merge rollback is the only production deleter
+  of `builds` rows), so erasing the re-derivable evidence requires an
+  external builds-row purge in addition to this sweep.
 ]
 
 #r("sched.db.assignment-terminal-on-status+2")[

@@ -373,7 +373,7 @@ impl SchedulerDb {
         Ok(result.rows_affected())
     }
 
-    // r[impl sched.db.derivations-gc+2]
+    // r[impl sched.db.derivations-gc+3]
     /// Delete up to `limit` orphan-terminal `derivations` rows: status
     /// is terminal AND no `build_derivations` link AND no `assignments`
     /// row. Returns rows deleted.

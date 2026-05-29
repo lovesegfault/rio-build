@@ -117,7 +117,7 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc+2]
+// r[verify sched.db.derivations-gc+3]
 /// I-169.2: orphan-terminal rows are deleted; rows with a live
 /// `build_derivations` link, an `assignments` row, or non-terminal
 /// status are kept. LIMIT respected.
@@ -256,7 +256,7 @@ async fn test_gc_orphan_terminal_derivations() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.db.derivations-gc+2]
+// r[verify sched.db.derivations-gc+3]
 /// LIMIT batches the sweep: 5 orphans, limit=2 → 2, 2, 1, 0.
 #[tokio::test]
 async fn test_gc_orphan_terminal_derivations_limit() -> anyhow::Result<()> {
