@@ -44,6 +44,8 @@ pub mod cas;
 #[cfg(feature = "server")]
 pub mod castore;
 #[cfg(feature = "server")]
+pub mod castore_nar;
+#[cfg(feature = "server")]
 pub(crate) mod chunker;
 #[cfg(feature = "server")]
 pub mod config;
@@ -217,6 +219,32 @@ pub fn describe_metrics() {
         "PutPath rejections by HMAC assignment-token check (labeled by reason)"
     );
     describe_counter!(
+        "rio_store_narhash_mismatch_total",
+        "PutPathChunked verify failures where the server-recomputed NAR \
+         SHA-256 (or size, or a file's whole-file BLAKE3, or a deduped \
+         chunk's length) differs from the builder's claim. A builder \
+         NAR-framing bug or a compromised builder — alert-worthy and \
+         approximately never."
+    );
+    describe_counter!(
+        "rio_store_refs_mismatch_total",
+        "PutPathChunked verify failures where the server-side reference \
+         scan over the regenerated NAR disagrees with the builder's \
+         claimed reference set."
+    );
+    describe_counter!(
+        "rio_store_putpath_incomplete_total",
+        "PutPathChunked streams that ended before every Begin.novel chunk \
+         arrived (builder crash mid-upload or transport failure). \
+         Infra-retry condition, not an alert."
+    );
+    describe_counter!(
+        "rio_store_putpath_verify_unavailable_total",
+        "PutPathChunked verify walks aborted by a transient CAS failure \
+         (S3 fault, or a deduped chunk GC'd between the builder's \
+         HasChunks probe and the verify fetch). The builder retries."
+    );
+    describe_counter!(
         "rio_store_service_token_accepted_total",
         "PutPath HMAC checks bypassed via x-rio-service-token (labeled by caller)"
     );
@@ -367,16 +395,10 @@ pub fn describe_metrics() {
     );
 
     describe_counter!(
-        "rio_store_nar_index_compute_total",
-        "NAR-index computations (eager PutPath + indexer_loop + sync-on-miss)"
-    );
-    describe_histogram!(
-        "rio_store_nar_index_compute_seconds",
-        "Per-path NAR reassemble + nar_ls + persist (indexer_loop only)"
-    );
-    describe_counter!(
         "rio_store_nar_index_cache_hits_total",
-        "GetNarIndex requests served from the nar_index table without recompute"
+        "GetNarIndex/GetNarIndexBatch requests served from the nar_index table \
+         (the index is written eagerly in the manifest-complete transaction; \
+         there is no recompute path)"
     );
 
     // ADR-022 castore RPC surface (P0573 / P0577).
@@ -386,7 +408,7 @@ pub fn describe_metrics() {
     );
     describe_histogram!(
         "rio_store_directory_has_batch_size",
-        "Digest-list length per HasDirectories/HasBlobs call (labeled rpc)"
+        "Digest-list length per HasDirectories/HasBlobs/HasChunks call (labeled rpc)"
     );
     describe_histogram!(
         "rio_store_directory_read_seconds",

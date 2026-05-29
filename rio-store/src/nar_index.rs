@@ -1,173 +1,54 @@
 //! Derived per-path NAR file/dir/symlink listing (`nar_index` table).
 //!
-//! `compute()` reassembles the NAR, runs `nar_ls`, and persists the
-//! encoded `rio.types.NarIndex`. Non-authoritative: regenerable from
-//! the stored NAR, so a missing row triggers sync-on-miss recompute
-//! (capped) or [`spawn_indexer_loop`] (uncapped).
-
-use std::io::Cursor;
-use std::sync::Arc;
-use std::time::Duration;
+//! Encode/decode helpers for the `nar_index.entries` BYTEA. The index
+//! is written exactly once, inside the manifest-complete transaction
+//! (`metadata::set_nar_index_in_conn`, fed by `cas::ParsedNar`), and
+//! is authoritative from that moment: the NAR byte stream is not
+//! persisted (ADR-022 §6), so the index cannot be recomputed from the
+//! stored per-file chunks after the fact. A `'complete'` path with no
+//! index row is data loss, not a cache miss.
 
 use prost::Message;
-use sqlx::PgPool;
-use tracing::{debug, instrument, warn};
 
-use rio_nix::nar::{NarEntryKind, NarLsEntry, nar_ls};
-use rio_nix::store_path::StorePath;
+use rio_nix::nar::{NarEntryKind, NarLsEntry};
 use rio_proto::types::{NarEntryKind as ProtoNarEntryKind, NarIndex, NarIndexEntry};
 
-use crate::cas::ChunkCache;
-use crate::castore::{self, DirectoryDag};
-use crate::metadata::{self, ManifestKind};
+use crate::castore::DirectoryDag;
 
-/// Poll interval; worst-case PutPath → index latency when eager
-/// indexing was skipped.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Worst-case encoded bytes of one [`NarIndexEntry`] *excluding* the
+/// `path` and `target` content bytes (those are bounded across the
+/// whole index by `MAX_NAR_INDEX_BYTES`). Every field number is ≤ 15,
+/// so each tag is 1 byte; per field, tag + worst-case payload as
+/// [`to_proto_entry`] encodes it:
+///
+/// - repeated-`entries` wrapper: 1 + 5 (message-length varint)
+/// - `path`: 1 + 5 (length varint; content charged to the index cap)
+/// - `kind`: 1 + 1
+/// - `size`: 1 + 10 (u64 varint)
+/// - `executable`: 1 + 1
+/// - `nar_offset`: 1 + 10
+/// - `target`: 1 + 2 (length varint ≤ 4096; content charged to the cap)
+/// - `file_digest`: 1 + 1 + 32
+/// - `dir_digest`: 1 + 1 + 32 (mutually exclusive with `file_digest`
+///   in [`to_proto_entry`], but counted anyway so the bound does not
+///   depend on that invariant)
+const MAX_ENTRY_FIXED_OVERHEAD: usize = 6 + 6 + 2 + 11 + 2 + 11 + 3 + 34 + 34;
 
-/// Drain batch size. `compute()` runs serially so peak RAM is one NAR;
-/// 32 just amortizes the PG round-trip.
-const POLL_BATCH: i64 = 32;
-
-/// Synchronous (RPC-path) recompute size cap. Sync-on-miss reassembles
-/// the NAR before replying; oversize paths return `RESOURCE_EXHAUSTED`
-/// and the `indexer_loop` (no cap) picks them up within ~5 s.
-// r[impl store.index.sync-on-miss]
-pub const NAR_INDEX_SYNC_MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-
-/// Marker error for over-cap NARs: the RPC path downcasts this to
-/// `RESOURCE_EXHAUSTED` so clients retry against the indexer loop
-/// instead of treating it as a non-retryable `INTERNAL`.
-#[derive(Debug, thiserror::Error)]
-#[error("NAR is {total} bytes (cap {cap}); deferred to indexer_loop")]
-pub struct OverSyncCap {
-    pub total: u64,
-    pub cap: u64,
-}
-
-/// Compute, persist, and return the encoded `NarIndex` for one path.
-/// `max_bytes` is [`NAR_INDEX_SYNC_MAX_BYTES`] on the RPC path,
-/// `u64::MAX` from the background loop. `budget` is the process-global
-/// NAR-bytes semaphore (the one PutPath/substitute share); the RPC path
-/// passes it so a burst of cache misses can't allocate `N × 4 GiB`
-/// outside the budget. The serial indexer loop passes `None`.
-// r[impl store.index.non-authoritative]
-#[instrument(skip(pool, cache, budget))]
-pub async fn compute(
-    pool: &PgPool,
-    cache: Option<&Arc<ChunkCache>>,
-    store_path: &str,
-    max_bytes: u64,
-    budget: Option<&Arc<tokio::sync::Semaphore>>,
-) -> anyhow::Result<Vec<u8>> {
-    let hash = StorePath::parse(store_path)?.sha256_digest();
-    // `claim_id` is read with the manifest contents so `set_nar_index`
-    // can fence against a GC + re-upload racing the reassemble window
-    // below.
-    let (manifest, claim_id) = metadata::get_manifest_for_index(pool, store_path)
-        .await?
-        .ok_or_else(|| anyhow::anyhow!("no complete manifest for {store_path}"))?;
-    let total = manifest.total_size();
-    if total > max_bytes {
-        return Err(OverSyncCap {
-            total,
-            cap: max_bytes,
-        }
-        .into());
-    }
-    // Hold permits for the lifetime of `nar` (the reassembly buffer).
-    // `min(u32::MAX)` underaccounts by 1 byte for a NAR exactly at the
-    // 4 GiB cap — negligible against a 32 GiB default budget.
-    let _permit = match budget {
-        Some(s) => Some(
-            s.acquire_many(u32::try_from(total).unwrap_or(u32::MAX))
-                .await?,
-        ),
-        None => None,
-    };
-
-    let nar = reassemble(cache, manifest, total).await?;
-    // nar_ls (BLAKE3 over all file content) + castore::build is
-    // multi-second CPU work for a 4 GiB NAR; run it off the async
-    // worker.
-    let (encoded, dag) = crate::cas::cpu_bound(|| -> anyhow::Result<_> {
-        let entries = nar_ls(Cursor::new(&nar))?;
-        let dag = castore::build(&entries);
-        Ok((encode_entries(&entries, &dag), dag))
-    })?;
-    metadata::set_nar_index(pool, &hash, claim_id, &encoded, &dag).await?;
-    metrics::counter!("rio_store_nar_index_compute_total").increment(1);
-    Ok(encoded)
-}
-
-/// Reassemble a NAR from its manifest. Chunked paths fetch through the
-/// shared moka cache (BLAKE3 verify per-chunk; cross-warm with GetPath).
-async fn reassemble(
-    cache: Option<&Arc<ChunkCache>>,
-    manifest: ManifestKind,
-    total: u64,
-) -> anyhow::Result<Vec<u8>> {
-    Ok(match manifest {
-        ManifestKind::Inline(b) => b.to_vec(),
-        ManifestKind::Chunked(entries) => {
-            let cache = cache
-                .ok_or_else(|| anyhow::anyhow!("chunked manifest but no chunk cache configured"))?;
-            // unwrap_or(0): a >usize::MAX NAR can't exist on a 64-bit
-            // host; on 32-bit (unsupported) degrade to organic growth
-            // rather than panic on a usize::MAX allocation.
-            let mut buf = Vec::with_capacity(usize::try_from(total).unwrap_or(0));
-            for (h, _size) in entries {
-                buf.extend_from_slice(&cache.get_verified(&h).await?);
-            }
-            buf
-        }
-    })
-}
-
-/// Background work-queue drain: polls `manifests_nar_index_pending_idx`,
-/// indexes each path, sleeps when empty.
-// r[impl store.index.putpath-bg-warm]
-pub fn spawn_indexer_loop(
-    pool: PgPool,
-    cache: Option<Arc<ChunkCache>>,
-    shutdown: rio_common::signal::Token,
-) -> tokio::task::JoinHandle<()> {
-    rio_common::task::spawn_periodic("nar-indexer", POLL_INTERVAL, shutdown, move || {
-        let pool = pool.clone();
-        let cache = cache.clone();
-        async move {
-            let pending = match metadata::list_nar_index_pending(&pool, POLL_BATCH).await {
-                Ok(p) => p,
-                Err(e) => {
-                    warn!(error = %e, "nar_index pending poll failed");
-                    return;
-                }
-            };
-            if pending.is_empty() {
-                return;
-            }
-            debug!(count = pending.len(), "indexing pending paths");
-            for (hash, path) in pending {
-                let timer = std::time::Instant::now();
-                match compute(&pool, cache.as_ref(), &path, u64::MAX, None).await {
-                    Ok(_) => {
-                        metrics::histogram!("rio_store_nar_index_compute_seconds")
-                            .record(timer.elapsed().as_secs_f64());
-                    }
-                    Err(e) => {
-                        warn!(store_path = %path, error = %e, "nar_index compute failed");
-                        // Rotate to the back of the `ORDER BY updated_at`
-                        // queue so 32 permanently-failing paths can't
-                        // starve everything behind them.
-                        if let Err(e) = metadata::bump_nar_index_retry(&pool, &hash).await {
-                            warn!(store_path = %path, error = %e, "nar_index retry bump failed");
-                        }
-                    }
-                }
-            }
-        }
-    })
-}
+// The ingest caps are sized so the worst-case accepted NAR's encoded
+// `nar_index` still fits one `GetNarIndex` response at the default gRPC
+// message ceiling: fixed per-entry overhead × the entry cap, plus the
+// path/target bytes the index-byte cap bounds, plus the one-off
+// `root_digest` field (1 tag + 1 length + 32 bytes). Operators can lower
+// `RIO_GRPC_MAX_MESSAGE_SIZE` below the default at runtime; staying
+// servable under such a reduced ceiling is their concern, not this
+// invariant's.
+const _: () = assert!(
+    MAX_ENTRY_FIXED_OVERHEAD * rio_nix::nar::MAX_NAR_ENTRIES
+        + rio_nix::nar::MAX_NAR_INDEX_BYTES as usize
+        + 34
+        <= rio_common::grpc::DEFAULT_MAX_MESSAGE_SIZE,
+    "a maximal accepted NAR's encoded nar_index must fit one GetNarIndex response"
+);
 
 /// Encode a `nar_ls` entry list as the `nar_index.entries` BYTEA, with
 /// per-entry `dir_digest` from `dag`.
@@ -188,33 +69,21 @@ pub fn decode_entries(bytes: &[u8]) -> anyhow::Result<NarIndex> {
     Ok(NarIndex::decode(bytes)?)
 }
 
-/// Distinct, sorted digest sets — the per-path contribution to
-/// `directories.refcount` is one per unique digest.
-pub struct IndexDigests {
-    pub dirs: Vec<[u8; 32]>,
-    pub files: Vec<[u8; 32]>,
-}
-
-/// Castore digest sets from `nar_index.entries`; the GC sweep reads
-/// this before the CASCADE removes the row.
+/// Distinct, sorted `dir_digest`s from `nar_index.entries` — the
+/// per-path contribution to `directories.refcount` is one per unique
+/// digest. The GC sweep reads this before the CASCADE removes the row.
 // r[impl store.castore.gc]
-pub fn digests_from_index(bytes: &[u8]) -> anyhow::Result<IndexDigests> {
+pub fn digests_from_index(bytes: &[u8]) -> anyhow::Result<Vec<[u8; 32]>> {
     let idx = decode_entries(bytes)?;
     let mut dirs: Vec<[u8; 32]> = Vec::new();
-    let mut files: Vec<[u8; 32]> = Vec::new();
     for e in &idx.entries {
         if e.dir_digest.len() == 32 {
             dirs.push(e.dir_digest.as_slice().try_into().expect("len checked"));
         }
-        if e.file_digest.len() == 32 {
-            files.push(e.file_digest.as_slice().try_into().expect("len checked"));
-        }
     }
     dirs.sort_unstable();
     dirs.dedup();
-    files.sort_unstable();
-    files.dedup();
-    Ok(IndexDigests { dirs, files })
+    Ok(dirs)
 }
 
 /// `NarLsEntry` → wire `NarIndexEntry`. The in-memory `[0; 32]`
@@ -249,44 +118,14 @@ fn to_proto_entry(e: &NarLsEntry, dir_digest: &[u8; 32]) -> NarIndexEntry {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::castore;
     use rio_nix::nar::NarEntryKind;
 
-    /// Proto contract: dirs/symlinks carry an EMPTY `file_digest` (not
-    /// 32 zeros), files/symlinks carry an EMPTY `dir_digest`.
-    #[test]
-    fn proto_entry_empty_digest_for_nonregular() {
-        let dir = NarLsEntry {
-            path: b"sub".to_vec(),
-            kind: NarEntryKind::Directory,
-            size: 0,
-            executable: false,
-            nar_offset: 0,
-            target: Vec::new(),
-            file_digest: [0u8; 32],
-        };
-        let p = to_proto_entry(&dir, &[5u8; 32]);
-        assert!(p.file_digest.is_empty());
-        assert_eq!(p.dir_digest, vec![5u8; 32]);
-        assert_eq!(p.kind, ProtoNarEntryKind::Directory as i32);
-
-        let reg = NarLsEntry {
-            path: b"f".to_vec(),
-            kind: NarEntryKind::Regular,
-            size: 4,
-            executable: true,
-            nar_offset: 96,
-            target: Vec::new(),
-            file_digest: [7u8; 32],
-        };
-        let p = to_proto_entry(&reg, &[5u8; 32]);
-        assert_eq!(p.file_digest, vec![7u8; 32]);
-        assert!(p.dir_digest.is_empty());
-        assert_eq!(p.kind, ProtoNarEntryKind::Regular as i32);
-        assert_eq!(p.nar_offset, 96);
-    }
-
     /// Encode/decode round-trip preserves order, content, and the
-    /// per-entry `dir_digest` + `root_digest`.
+    /// per-entry `dir_digest` + `root_digest`. Also pins the proto
+    /// contract: dirs/symlinks carry an EMPTY `file_digest` (not 32
+    /// zeros), files/symlinks carry an EMPTY `dir_digest`, and the
+    /// `kind` enum survives as its i32 wire value.
     #[test]
     fn encode_decode_roundtrip() {
         let entries = vec![
@@ -303,7 +142,7 @@ mod tests {
                 path: b"a".to_vec(),
                 kind: NarEntryKind::Regular,
                 size: 3,
-                executable: false,
+                executable: true,
                 nar_offset: 100,
                 target: Vec::new(),
                 file_digest: [1u8; 32],
@@ -323,9 +162,13 @@ mod tests {
         let decoded = decode_entries(&bytes).unwrap();
         assert_eq!(decoded.entries.len(), 3);
         assert_eq!(decoded.entries[0].path, b"");
+        assert_eq!(decoded.entries[0].kind, ProtoNarEntryKind::Directory as i32);
         assert_eq!(decoded.entries[0].dir_digest, dag.dir_digests[0].to_vec());
+        assert_eq!(decoded.entries[1].kind, ProtoNarEntryKind::Regular as i32);
         assert_eq!(decoded.entries[1].file_digest, vec![1u8; 32]);
         assert_eq!(decoded.entries[1].nar_offset, 100);
+        assert!(decoded.entries[1].executable);
+        assert_eq!(decoded.entries[2].kind, ProtoNarEntryKind::Symlink as i32);
         assert_eq!(decoded.entries[2].target, b"a");
         assert!(decoded.entries[0].file_digest.is_empty());
         assert!(decoded.entries[1].dir_digest.is_empty());
@@ -334,8 +177,7 @@ mod tests {
         assert_eq!(decoded.root_digest, dag.root_digest);
 
         // r[verify store.castore.gc]
-        let d = digests_from_index(&bytes).unwrap();
-        assert_eq!(d.dirs, vec![dag.dir_digests[0]]);
-        assert_eq!(d.files, vec![[1u8; 32]]);
+        let dirs = digests_from_index(&bytes).unwrap();
+        assert_eq!(dirs, vec![dag.dir_digests[0]]);
     }
 }

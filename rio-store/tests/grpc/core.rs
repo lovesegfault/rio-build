@@ -63,24 +63,21 @@ async fn test_batch_query_path_info() -> TestResult {
     Ok(())
 }
 
-/// I-110c: BatchGetManifest round-trip + GetPath honors the hint.
-///
-/// The hint test deletes the narinfo+manifests rows AFTER fetching the
-/// hint, then issues GetPath WITH the hint — if the store skips PG it
-/// still streams the NAR (inline blob from the hint); without the hint
-/// the same GetPath is NotFound.
+/// ADR-022 §6: BatchGetManifest returns PathInfo + complete-manifest
+/// availability only — it never carries manifest content (a per-file
+/// chunk list cannot reassemble a NAR without the Directory DAG).
 #[tokio::test]
-async fn test_batch_get_manifest_and_hint() -> TestResult {
-    use rio_proto::types::{BatchGetManifestRequest, GetPathRequest};
+async fn test_batch_get_manifest() -> TestResult {
+    use rio_proto::types::BatchGetManifestRequest;
 
     let mut s = StoreSession::new().await?;
     let path = test_store_path("batch-mfst");
     let nar = make_nar(b"batch manifest content").0;
     let info = make_path_info_for_nar(&path, &nar);
-    put_path(&mut s.client, info, nar.clone()).await?;
+    put_path(&mut s.client, info, nar).await?;
 
-    // Round-trip: present path returns hint with inline blob == NAR;
-    // absent path returns hint=None.
+    // Round-trip: present path returns its PathInfo; absent path
+    // returns hint=None.
     let resp = s
         .client
         .batch_get_manifest(BatchGetManifestRequest {
@@ -98,43 +95,7 @@ async fn test_batch_get_manifest_and_hint() -> TestResult {
         hint.info.as_ref().map(|i| i.store_path.as_str()),
         Some(path.as_str())
     );
-    assert_eq!(hint.inline_blob, nar, "small NAR stored inline");
-    assert!(hint.chunks.is_empty(), "inline → no chunks");
     assert!(resp.entries[1].hint.is_none(), "absent → hint=None");
-
-    // Delete the PG rows so a no-hint GetPath would NotFound.
-    sqlx::query("DELETE FROM narinfo WHERE store_path = $1")
-        .bind(&path)
-        .execute(&s.db.pool)
-        .await?;
-
-    // GetPath WITH hint → still streams the NAR (PG skipped).
-    let mut stream = s
-        .client
-        .get_path(GetPathRequest {
-            store_path: path.clone(),
-            manifest_hint: Some(hint),
-        })
-        .await?
-        .into_inner();
-    let mut got_nar = Vec::new();
-    while let Some(msg) = stream.message().await? {
-        if let Some(rio_proto::types::get_path_response::Msg::NarChunk(c)) = msg.msg {
-            got_nar.extend_from_slice(&c);
-        }
-    }
-    assert_eq!(got_nar, nar, "hint path streams NAR with PG rows deleted");
-
-    // GetPath WITHOUT hint → NotFound (proves the hint was load-bearing).
-    let err = s
-        .client
-        .get_path(GetPathRequest {
-            store_path: path.clone(),
-            manifest_hint: None,
-        })
-        .await
-        .expect_err("no-hint GetPath after delete should NotFound");
-    assert_eq!(err.code(), tonic::Code::NotFound);
 
     // Malformed path → InvalidArgument (whole batch rejected).
     let err = s
@@ -216,7 +177,6 @@ async fn test_put_get_roundtrip() -> TestResult {
         .client
         .get_path(GetPathRequest {
             store_path: store_path.clone(),
-            manifest_hint: None,
         })
         .await
         .context("get should succeed")?
@@ -252,7 +212,6 @@ async fn test_get_path_nonexistent_returns_not_found() -> TestResult {
         .client
         .get_path(GetPathRequest {
             store_path: test_store_path("never-uploaded"),
-            manifest_hint: None,
         })
         .await;
 
@@ -308,10 +267,7 @@ async fn test_get_path_corrupted_blob_returns_data_loss() -> TestResult {
     // 3. GetPath — stream should deliver chunks then DATA_LOSS at the end.
     let mut stream = s
         .client
-        .get_path(GetPathRequest {
-            store_path,
-            manifest_hint: None,
-        })
+        .get_path(GetPathRequest { store_path })
         .await
         .context("get_path call should succeed (error comes in stream)")?
         .into_inner();
@@ -918,9 +874,14 @@ async fn test_connection_error_is_unavailable_and_hides_sqlx_details() -> TestRe
     Ok(())
 }
 
-/// GetPath on a path where narinfo.nar_size disagrees with the manifest's
-/// summed size should fail fast with DATA_LOSS — before streaming any
-/// bytes. Catches manifest/narinfo drift (PutPath bug, manual DB surgery).
+/// GetPath on a path where narinfo.nar_size disagrees with the
+/// regenerated NAR's length must fail with DATA_LOSS. The manifest no
+/// longer sums to nar_size (it sums to the blob-stream length —
+/// framing is regenerated, not stored), so the only place the full
+/// NAR length is known is after the stream has been produced: the
+/// drift surfaces as a terminal stream error instead of a pre-flight
+/// rejection. Catches manifest/narinfo drift (PutPath bug, manual DB
+/// surgery).
 // r[verify store.get.size-sanity-check]
 #[tokio::test]
 async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
@@ -939,9 +900,8 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
         .context("put should succeed")?;
     assert!(created);
 
-    // 2. Corrupt narinfo.nar_size to disagree with manifests.inline_blob
-    // length. The manifest's total_size() = blob.len() = real_size;
-    // narinfo now says real_size + 1 → mismatch.
+    // 2. Corrupt narinfo.nar_size so the post-stream byte-count check
+    // fails while the SHA-256 still matches.
     sqlx::query("UPDATE narinfo SET nar_size = $1 WHERE store_path = $2")
         .bind((real_size + 1) as i64)
         .bind(&store_path)
@@ -949,32 +909,27 @@ async fn test_get_path_size_mismatch_returns_data_loss() -> TestResult {
         .await
         .context("corrupt narinfo.nar_size")?;
 
-    // 3. GetPath — should return DATA_LOSS synchronously (pre-flight
-    // check, before the streaming task spawns). No chunks, no PathInfo.
-    let result = s
+    // 3. GetPath — the stream opens (the drift is only detectable
+    // after the framing has been regenerated) and terminates with
+    // DATA_LOSS instead of a clean end-of-stream.
+    let mut stream = s
         .client
-        .get_path(GetPathRequest {
-            store_path,
-            manifest_hint: None,
-        })
-        .await;
+        .get_path(GetPathRequest { store_path })
+        .await
+        .context("stream opens; the drift is detected at the end")?
+        .into_inner();
 
-    let status = result.expect_err("size mismatch should fail GetPath synchronously");
+    let status = loop {
+        match stream.message().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("stream ended cleanly despite the nar_size drift"),
+            Err(status) => break status,
+        }
+    };
     assert_eq!(
         status.code(),
         tonic::Code::DataLoss,
         "manifest/narinfo drift must be DATA_LOSS: {status:?}"
-    );
-    assert!(
-        status.message().contains("size mismatch"),
-        "error should name the check: {}",
-        status.message()
-    );
-    assert!(
-        status.message().contains(&real_size.to_string())
-            && status.message().contains(&(real_size + 1).to_string()),
-        "error should include both sizes for debugging: {}",
-        status.message()
     );
 
     Ok(())

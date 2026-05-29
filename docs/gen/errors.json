@@ -72,6 +72,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "BlockingTaskPanic",
+      "crate": "rio-builder",
+      "msg": "blocking setup task panicked: {0}",
+      "doc": "A `spawn_blocking` setup/teardown task (castore mount, overlay mount/unmount, FOD verify) panicked instead of returning."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "BuildFailed",
       "crate": "rio-builder",
       "msg": "build failed: {0}",
@@ -83,6 +90,13 @@
       "crate": "rio-builder",
       "msg": "build cancelled before cgroup creation",
       "doc": "Cancel flag observed before the per-build cgroup exists. I-166: distinct from the post-cgroup path (cgroup.kill → daemon EOF → `Wire(Io(UnexpectedEof))`) so `is_daemon_transient` doesn't retry it. `spawn_build_task` maps any `Err` with `cancelled=true` to `BuildResultStatus::Cancelled` regardless of variant; this variant just makes the pre-cgroup abort explicit in logs."
+    },
+    {
+      "enum": "ExecutorError",
+      "name": "CastoreMount",
+      "crate": "rio-builder",
+      "msg": "castore-FUSE mount failed: {0}",
+      "doc": "Castore-FUSE mount/serve failed (mountd handshake, DAG prefetch, FUSE_INIT). The build never started; node-local or store-side condition, so the scheduler re-queues (`InfrastructureFailure`)."
     },
     {
       "enum": "ExecutorError",
@@ -128,6 +142,13 @@
     },
     {
       "enum": "ExecutorError",
+      "name": "InputRoots",
+      "crate": "rio-builder",
+      "msg": "castore root resolution failed for {path}: {reason}",
+      "doc": "A closure path's castore root node could not be resolved (missing or corrupt NAR index). Store-state, not derivation-intrinsic — `InfrastructureFailure`."
+    },
+    {
+      "enum": "ExecutorError",
       "name": "InvalidDerivation",
       "crate": "rio-builder",
       "msg": "invalid derivation: {0}",
@@ -152,13 +173,6 @@
       "name": "Overlay",
       "crate": "rio-builder",
       "msg": "overlay setup failed: {0}",
-      "doc": ""
-    },
-    {
-      "enum": "ExecutorError",
-      "name": "OverlayTaskPanic",
-      "crate": "rio-builder",
-      "msg": "overlay setup task panicked: {0}",
       "doc": ""
     },
     {
@@ -316,6 +330,27 @@
       "doc": ""
     },
     {
+      "enum": "SessionError",
+      "name": "Fuse",
+      "crate": "rio-builder",
+      "msg": "FUSE session on the handed-off fd: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "SessionError",
+      "name": "Mountd",
+      "crate": "rio-builder",
+      "msg": "mountd: {0}",
+      "doc": ""
+    },
+    {
+      "enum": "SessionError",
+      "name": "Prefetch",
+      "crate": "rio-builder",
+      "msg": "DAG prefetch: {0}",
+      "doc": ""
+    },
+    {
       "enum": "TreeError",
       "name": "BadDigestLen",
       "crate": "rio-builder",
@@ -383,7 +418,14 @@
       "name": "UploadExhausted",
       "crate": "rio-builder",
       "msg": "upload failed after {MAX_UPLOAD_RETRIES} retries for {path}: {source}",
-      "doc": ""
+      "doc": "Every attempt in the retry budget failed with a retryable status. NOTE: `nix/tests/scenarios/chaos.nix` greps journald for the literal `upload failed after` substring to detect retry exhaustion — keep that substring if rewording."
+    },
+    {
+      "enum": "UploadError",
+      "name": "UploadRejected",
+      "crate": "rio-builder",
+      "msg": "upload rejected (terminal, not retried) for {path}: {source}",
+      "doc": "The store rejected the upload with a deterministic status (`InvalidArgument`, `FailedPrecondition`, `PermissionDenied`, …) or local preparation (store-path parse, output walk) failed. Retrying would fail identically, so at most one attempt was made — kept distinct from [`UploadError::UploadExhausted`] so triage can tell \"the store said no\" from \"the store kept being unreachable\"."
     },
     {
       "enum": "NameError",
@@ -411,7 +453,7 @@
       "name": "InvalidSpec",
       "crate": "rio-controller",
       "msg": "invalid spec: {0}",
-      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a bad Quantity string (fuseCacheSize that doesn't parse) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
+      "doc": "Failed to build a K8s object (Job, PodSpec) from the CRD spec. Usually a missing metadata field (namespace, uid) or some spec field we can't translate. These are OPERATOR errors — fix the CRD and reconcile retries. Not transient."
     },
     {
       "enum": "Error",
@@ -723,6 +765,13 @@
     },
     {
       "enum": "NarError",
+      "name": "IndexBytesTooLarge",
+      "crate": "rio-nix",
+      "msg": "cumulative entry path/target bytes {0} exceed maximum {MAX_NAR_INDEX_BYTES} (archive expands to an index larger than the store can persist or serve)",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
       "name": "InvalidEntryName",
       "crate": "rio-nix",
       "msg": "invalid NAR entry name: {name:?}",
@@ -789,6 +838,13 @@
       "name": "TooManyEntries",
       "crate": "rio-nix",
       "msg": "directory entry count {0} exceeds maximum {MAX_DIRECTORY_ENTRIES}",
+      "doc": ""
+    },
+    {
+      "enum": "NarError",
+      "name": "TooManyTotalEntries",
+      "crate": "rio-nix",
+      "msg": "total archive entry count {0} exceeds maximum {MAX_NAR_ENTRIES}",
       "doc": ""
     },
     {
@@ -996,6 +1052,13 @@
     },
     {
       "enum": "DirectoryError",
+      "name": "BadTarget",
+      "crate": "rio-proto",
+      "msg": "symlink {0:?} target is {1} bytes, exceeds {MAX_CASTORE_TARGET_BYTES} (or empty)",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
       "name": "DuplicateName",
       "crate": "rio-proto",
       "msg": "duplicate entry name {0:?} across the directory's kind lists",
@@ -1006,6 +1069,20 @@
       "name": "InvalidName",
       "crate": "rio-proto",
       "msg": "entry name {0:?} is not a valid single path component",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "NameTooLong",
+      "crate": "rio-proto",
+      "msg": "entry name {0:?} is {1} bytes, exceeds {MAX_CASTORE_NAME_BYTES}",
+      "doc": ""
+    },
+    {
+      "enum": "DirectoryError",
+      "name": "TooManyEntries",
+      "crate": "rio-proto",
+      "msg": "{0} entries in one directory, exceeds {MAX_CASTORE_DIR_ENTRIES}",
       "doc": ""
     },
     {
@@ -1486,10 +1563,24 @@
     },
     {
       "enum": "WalkError",
+      "name": "IndexBytesTooLarge",
+      "crate": "rio-store",
+      "msg": "cumulative entry path/target bytes {seen} exceed maximum {max}",
+      "doc": "The cumulative materialized index bytes (joined entry paths plus symlink targets) of the expanded tree exceed [`rio_nix::nar::MAX_NAR_INDEX_BYTES`]."
+    },
+    {
+      "enum": "WalkError",
       "name": "MissingDirectory",
       "crate": "rio-store",
       "msg": "directory {0} referenced but not supplied",
       "doc": "A `DirectoryEntry.digest` reachable from the root has no body in the supplied map. For `PutPathChunked` this means the builder omitted a body from `Begin.directories`."
+    },
+    {
+      "enum": "WalkError",
+      "name": "TooDeep",
+      "crate": "rio-store",
+      "msg": "directory nesting depth {depth} exceeds maximum {max}",
+      "doc": "The walk reached a node nested deeper than [`rio_nix::nar::MAX_NAR_DEPTH`]. Every NAR reader (rio's own re-ingest and gateway restore, stock Nix `parseDump`) rejects such a tree, so it must never be committable — see `r[store.ingest.tree-bounds]`."
     },
     {
       "enum": "WalkError",
@@ -1531,6 +1622,16 @@
       "doc": "Errors from overlay setup and teardown. Distinct from `anyhow::Error` so `ExecutorError::Overlay(#[from])` only catches overlay failures — a bare `?` on an unrelated `anyhow::Result` elsewhere in `execute_build` no longer silently becomes an \"overlay setup failed\" message."
     },
     {
+      "name": "SessionError",
+      "crate": "rio-builder",
+      "doc": "Errors from the mount/serve sequence. Every variant means the build never started — callers classify them as infrastructure failures (re-queue), not build failures."
+    },
+    {
+      "name": "StreamBlobError",
+      "crate": "rio-builder",
+      "doc": "Why one `ReadBlob` attempt failed: `Transient` (Unavailable/Unknown transport class) is retried by [`Opener::fetch_into`]; `Fatal` maps straight to the FUSE errno."
+    },
+    {
       "name": "TreeError",
       "crate": "rio-builder",
       "doc": "Errors from DAG prefetch / tree construction. All of them mean the build never started — the caller classifies every variant as an infrastructure failure and re-queues."
@@ -1538,7 +1639,7 @@
     {
       "name": "UploadError",
       "crate": "rio-builder",
-      "doc": "Errors from upload operations. NAR serialization happens inside the retry loop (each retry is a fresh disk read), so NAR errors surface as `UploadExhausted` wrapping a `tonic::Status::internal(\"NAR serialization failed...\")`."
+      "doc": "Errors from upload operations. Transient store errors that survive the whole retry budget surface as `UploadExhausted`; deterministic store rejections and local prep failures (path parse, output walk) surface as `UploadRejected`. Both carry the underlying `tonic::Status`."
     },
     {
       "name": "NameError",

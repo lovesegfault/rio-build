@@ -162,6 +162,12 @@ pub enum PersistError {
     /// `complete_manifest_inline` failed. Caller still OWNS the
     /// placeholder and MUST `abort_placeholder`.
     Inline(MetadataError),
+    /// The NAR is structurally invalid (`nar_ls` rejected it) — the
+    /// bytes hash to the claimed `nar_hash` but are not a NAR. Caller
+    /// still OWNS the placeholder and MUST `abort_placeholder`. Maps
+    /// to INVALID_ARGUMENT, not a storage error: the client sent
+    /// garbage, retrying won't help.
+    Malformed(anyhow::Error),
 }
 
 /// Persist a validated, hash-verified NAR for ONE output. Branches on
@@ -182,6 +188,20 @@ pub async fn persist_nar(
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
 ) -> Result<(), PersistError> {
+    // Derive the castore representation (entries + Directory DAG +
+    // encoded index) ONCE, while the NAR bytes are in hand. Both
+    // branches thread it to the manifest-complete transaction; the
+    // chunked branch additionally chunks each file's content range.
+    // This is also the structural-validity gate: a byte string that
+    // SHA-256s to the claimed nar_hash but isn't a NAR is rejected
+    // here instead of being stored unservable.
+    let parsed = cas::cpu_bound(|| cas::ParsedNar::parse(&nar_data)).map_err(|e| {
+        PersistError::Malformed(e.context(format!(
+            "{}: NAR for {} failed structural validation",
+            hooks.ctx_label,
+            info.store_path.as_str()
+        )))
+    })?;
     if let Some(backend) = cas::should_chunk(chunk_backend, nar_data.len()) {
         let stats = cas::put_chunked(
             pool,
@@ -189,6 +209,7 @@ pub async fn persist_nar(
             info,
             claim,
             &nar_data,
+            &parsed,
             chunk_upload_max_concurrent,
         )
         .await
@@ -202,7 +223,8 @@ pub async fn persist_nar(
         );
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
-        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(nar_data))
+        let blob = parsed.blob_stream(&nar_data);
+        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(blob), Some(&parsed))
             .await
             .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);

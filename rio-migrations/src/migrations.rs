@@ -1222,6 +1222,19 @@ pub const M_066: () = ();
 /// sides — GC of either parent removes the row).
 pub const M_067: () = ();
 
+/// 068 — drop `manifests.nar_indexed` + `manifests_nar_index_pending_idx`.
+///
+/// Both were the background NAR indexer's work-queue state (065/P0551):
+/// the partial index `WHERE NOT nar_indexed AND status = 'complete'`
+/// fed the indexer's drain query, and the flag flipped once a path's
+/// castore index was written. The background indexer is gone — the
+/// castore index is now written eagerly in the same transaction that
+/// completes the manifest (`complete_manifest_in_conn` →
+/// `set_nar_index_in_conn`), so the flag was write-only and the partial
+/// index had zero readers while still being maintained on every
+/// `manifests` UPDATE.
+pub const M_068: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

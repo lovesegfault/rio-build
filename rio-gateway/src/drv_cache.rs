@@ -339,10 +339,14 @@ mod tests {
         }
 
         // Structural proof: rejection happened BEFORE fetch. MockStore
-        // records every GetPath's manifest_hint — empty ⇒ never called.
-        assert!(
-            store.calls.get_path_hints.read().unwrap().is_empty(),
-            "gate must reject BEFORE any GetPath — pre-fix this was non-empty \
+        // counts every GetPath on entry — zero ⇒ never called.
+        assert_eq!(
+            store
+                .calls
+                .get_path_calls
+                .load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "gate must reject BEFORE any GetPath — pre-fix this was non-zero \
              (fetch happened, then insert_drv_bounded errored)"
         );
     }

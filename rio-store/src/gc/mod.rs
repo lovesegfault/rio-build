@@ -132,21 +132,13 @@ pub(crate) const GRACE_HOURS_CAP: u32 = 24 * 365;
 ///
 /// # Advisory lock choreography
 ///
-/// One session-scoped lock, one pool connection:
-///
-/// **[`GC_LOCK_ID`]** (`pg_try_advisory_lock`): serializes GC-vs-GC.
-/// Held for the full run. Non-blocking — second caller gets a `false`
-/// back → "already running" terminal progress msg.
-///
-/// Uses `scopeguard::guard(conn, |c| c.detach())` so ANY exit (error,
-/// task cancellation, panic) detaches the pool connection → PG
-/// auto-releases on connection close. The happy path DEFUSES the
-/// guard (`ScopeGuard::into_inner`) and explicitly unlocks (cheaper
-/// than detach — returns conn to pool).
-///
-/// There is no mark-vs-PutPath lock (I-192) — sweep's per-path
-/// reference re-check is the sole concurrency guard. PutPath runs
-/// freely throughout mark and sweep.
+/// One session-scoped lock ([`GC_LOCK_ID`], `pg_try_advisory_lock`)
+/// serializes GC-vs-GC, held on one pool connection for the full run;
+/// a scopeguard detach keeps it released on every exit path (see the
+/// inline comments at the acquire/guard sites). There is no
+/// mark-vs-PutPath lock (I-192) — sweep's per-path reference re-check
+/// is the sole concurrency guard. PutPath runs freely throughout mark
+/// and sweep.
 ///
 /// # Errors
 ///
@@ -164,13 +156,7 @@ pub async fn run_gc(
     shutdown: &rio_common::signal::Token,
 ) -> Result<Option<GcStats>, Status> {
     // --- Concurrency guard: pg_try_advisory_lock ---
-    // Two TriggerGC calls → two concurrent mark+sweep.
-    // Correctness is OK (FOR UPDATE + rows_affected checks
-    // in sweep) but it wastes work, produces misleading
-    // stats (GC2 finds everything already swept), and
-    // creates lock contention. One-at-a-time via advisory
-    // lock; second caller gets an immediate "already
-    // running" response.
+    // GC-vs-GC serialization rationale: see the GC_LOCK_ID doc.
     //
     // Session-level advisory locks are CONNECTION-scoped;
     // pool.acquire() holds one connection for lock/unlock.
@@ -225,12 +211,9 @@ pub async fn run_gc(
     });
 
     // --- Mark phase ---
-    // No mark-vs-PutPath lock (I-192). Mark's CTE takes a point-in-time
-    // MVCC snapshot; a PutPath placeholder that commits after the
-    // snapshot is invisible to mark but visible to sweep's per-path
-    // re-check (fresh READ-COMMITTED snapshot over ALL narinfo). The
-    // re-check is the load-bearing guard; the lock added nothing on
-    // top — it was released before sweep anyway.
+    // No mark-vs-PutPath lock (I-192, see GC_LOCK_ID doc). A placeholder
+    // committing after mark's MVCC snapshot is invisible to mark but
+    // visible to sweep's per-path re-check — the load-bearing guard.
     let unreachable =
         match mark::compute_unreachable(pool, params.grace_hours, &params.extra_roots).await {
             Ok(u) => u,
@@ -463,6 +446,49 @@ pub(super) async fn decrement_and_enqueue(
     decrement_hashes_and_enqueue(tx, &unique_hashes, &counts, backend).await
 }
 
+/// Tombstone every refcount-0, not-yet-deleted chunk among `hashes`:
+/// `deleted = TRUE` plus clearing BOTH S3-presence assertions
+/// (`uploaded_at`, `durable`) — the row is now claimed for the drain
+/// and the object is about to stop existing. The resurrection upserts
+/// (`insert_pending_chunks`, `upgrade_manifest_to_chunked`,
+/// `commit_chunked_output_in_conn`) deliberately leave both columns
+/// untouched, so a swept-then-re-uploaded chunk re-uploads
+/// (`needs_upload`) and stays invisible to `HasChunks` until a new
+/// complete manifest re-flips `durable` after the object provably
+/// exists again. This is the ONE tombstone statement — both the
+/// path-GC route ([`decrement_hashes_and_enqueue`]) and the orphan
+/// sweep ([`sweep`]'s `sweep_orphan_batch`) go through it, so the two
+/// sites cannot diverge on which columns a tombstone clears (a
+/// divergence here is the I-201 lie through the GC round-trip).
+///
+/// `hashes` SHOULD be sorted by the caller (`r[store.chunk.lock-order]`
+/// — both callers already sort). The sort is what keeps this writer
+/// aligned with the chunk lock-order discipline; a bare `ANY($1)`
+/// UPDATE makes no acquisition-order promise of its own (the hard
+/// guarantee lives in the sorted-input + `ORDER BY … FOR UPDATE`
+/// pre-lock pattern the commit paths use, see `lock_chunks_for_commit`).
+/// Returns `(blake3_hash, size)` for the rows that actually flipped.
+// r[impl store.chunk.durable-flag]
+pub(super) async fn tombstone_zero_refcount_chunks(
+    conn: &mut sqlx::PgConnection,
+    hashes: &[Vec<u8>],
+) -> Result<Vec<(Vec<u8>, i64)>, sqlx::Error> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+    sqlx::query_as(
+        r#"
+        UPDATE chunks SET deleted = TRUE, uploaded_at = NULL, durable = FALSE
+         WHERE blake3_hash = ANY($1)
+           AND refcount = 0 AND deleted = FALSE
+        RETURNING blake3_hash, size
+        "#,
+    )
+    .bind(hashes)
+    .fetch_all(conn)
+    .await
+}
+
 /// Deserialize a manifest's `chunk_list` and return its dedup'd hashes.
 /// A corrupt `chunk_list` is logged and yields empty (the narinfo
 /// DELETE has already CASCADEd the manifest away; worst case is leaked
@@ -491,8 +517,9 @@ pub(super) fn parse_unique_chunk_hashes(chunk_list: &[u8]) -> Vec<[u8; 32]> {
 /// `refcount += 1`, so each manifest delete must do `refcount -= 1`;
 /// collapsing N references into one decrement under-counts and leaks
 /// the chunk forever — see `r[store.chunk.refcount-txn]`).
-/// `r[store.chunk.lock-order]` still holds: ONE statement per tx, PG
-/// drives the `unnest` join through a btree scan on `blake3_hash`.
+/// `r[store.chunk.lock-order]`: the batch is sorted below before the
+/// single `unnest` UPDATE — the statement itself makes no
+/// acquisition-order promise, the sorted input is the discipline.
 /// Single-path callers use [`decrement_and_enqueue`] (parse + counts=1).
 pub(super) async fn decrement_hashes_and_enqueue(
     tx: &mut Transaction<'_, Postgres>,
@@ -507,12 +534,12 @@ pub(super) async fn decrement_hashes_and_enqueue(
     }
 
     // r[impl store.chunk.lock-order]
-    // Defense-in-depth only: PG drives the unnest join through a btree
-    // scan on blake3_hash regardless of array order, so this sort is
-    // NOT independently observable (see decrement_and_enqueue_no_deadlock).
-    // The load-bearing lock-order discipline for chunk-hash writers is
-    // `with_sorted_retry`'s sort at the per-row contender boundary.
-    // Kept for clarity and so any future per-row rewrite stays safe.
+    // Sort the batch before the single unnest UPDATE: a multi-row
+    // UPDATE makes no acquisition-order promise of its own, so the
+    // sorted input is what keeps this writer consistent with the other
+    // sorted chunk-hash writers (and what any future per-row rewrite
+    // would rely on). The contender coverage is
+    // decrement_and_enqueue_no_deadlock.
     let mut pairs: Vec<(Vec<u8>, i64)> = unique_hashes
         .iter()
         .cloned()
@@ -524,7 +551,7 @@ pub(super) async fn decrement_hashes_and_enqueue(
     // r[impl store.chunk.refcount-txn]
     // Decrement by count: a chunk shared by N swept paths is
     // decremented by N. unnest preserves single-statement semantics
-    // (one btree-scan-order lock acquisition).
+    // (one UPDATE over the sorted batch).
     sqlx::query(
         r#"
         UPDATE chunks c SET refcount = c.refcount - d.n
@@ -537,22 +564,12 @@ pub(super) async fn decrement_hashes_and_enqueue(
     .execute(&mut **tx)
     .await?;
 
-    // Mark refcount=0 as deleted, return hashes + sizes for stats.
-    // Only rows we JUST touched (ANY) AND now at 0. `uploaded_at =
-    // NULL` so a later resurrection (PutPath upsert flips
-    // deleted→false) re-uploads — drain may have already removed the
-    // S3 object by then.
-    let zeroed: Vec<(Vec<u8>, i64)> = sqlx::query_as(
-        r#"
-        UPDATE chunks SET deleted = true, uploaded_at = NULL
-         WHERE blake3_hash = ANY($1) AND refcount = 0
-           AND deleted = false
-        RETURNING blake3_hash, size
-        "#,
-    )
-    .bind(&unique_hashes)
-    .fetch_all(&mut **tx)
-    .await?;
+    // Tombstone the rows we JUST decremented to 0 via the shared
+    // helper — `deleted = TRUE`, `uploaded_at`/`durable` cleared so a
+    // later resurrection (PutPath upsert flips deleted→false)
+    // re-uploads and stays invisible to HasChunks; the drain may have
+    // already removed the S3 object by then.
+    let zeroed = tombstone_zero_refcount_chunks(tx, &unique_hashes).await?;
 
     stats.chunks_zeroed = zeroed.len() as u64;
     stats.bytes_freed = zeroed.iter().map(|(_, s)| *s as u64).sum();
@@ -695,6 +712,74 @@ mod tests {
                 .unwrap();
         assert_eq!(s3_key, backend.key_for(&h));
         assert_eq!(blake3, h.to_vec());
+    }
+
+    // r[verify store.chunk.durable-flag]
+    /// Regression: the path-GC route (`decrement_and_enqueue`, the way
+    /// essentially every durable chunk is reaped — durable chunks are
+    /// referenced by complete manifests, so they reach refcount 0 via a
+    /// path sweep, not the orphan sweep) MUST clear `durable` and
+    /// `uploaded_at` when it tombstones a chunk. The resurrection
+    /// upserts deliberately leave both untouched, so a tombstone that
+    /// keeps `durable = TRUE` makes a later re-upload of the same chunk
+    /// read `{durable: TRUE, deleted: false}` for the whole upload
+    /// window — `HasChunks` answers present before the S3 object exists
+    /// again (the I-201 lie through the GC round-trip).
+    #[tokio::test]
+    async fn path_gc_tombstone_clears_durable_and_uploaded() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        // A durable, S3-confirmed chunk whose last referencing complete
+        // manifest is being swept (refcount 1 → 0 in this call).
+        let h = seed_chunk(&db.pool, 0xD6, 1, 4096).await;
+        sqlx::query("UPDATE chunks SET durable = TRUE, uploaded_at = now() WHERE blake3_hash = $1")
+            .bind(h.as_slice())
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        let manifest = make_manifest(&[h]);
+        let backend: Arc<dyn ChunkBackend> = mem_backend();
+
+        let mut tx = db.pool.begin().await.unwrap();
+        let stats = decrement_and_enqueue(&mut tx, &manifest, Some(&backend))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(stats.chunks_zeroed, 1);
+
+        let (deleted, durable, uploaded): (bool, bool, bool) = sqlx::query_as(
+            "SELECT deleted, durable, (uploaded_at IS NOT NULL) FROM chunks \
+             WHERE blake3_hash = $1",
+        )
+        .bind(h.as_slice())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        assert!(deleted, "zeroed chunk is tombstoned");
+        assert!(
+            !durable,
+            "path-GC tombstone must clear durable — a resurrection upsert \
+             does not, so HasChunks would lie until the next complete manifest"
+        );
+        assert!(!uploaded, "path-GC tombstone must clear uploaded_at");
+
+        // Resurrection (the PutPathChunked write-ahead) must therefore
+        // start non-durable: HasChunks' `durable AND NOT deleted`
+        // predicate stays false until a new complete manifest re-flips
+        // it after the object provably exists again.
+        crate::metadata::insert_pending_chunks(&db.pool, &[(h, 4096)])
+            .await
+            .unwrap();
+        let present: bool =
+            sqlx::query_scalar("SELECT durable AND NOT deleted FROM chunks WHERE blake3_hash = $1")
+                .bind(h.as_slice())
+                .fetch_one(&db.pool)
+                .await
+                .unwrap();
+        assert!(
+            !present,
+            "a swept-then-resurrected chunk must not satisfy HasChunks \
+             before its S3 object is re-uploaded and a manifest completes"
+        );
     }
 
     /// Manifest can repeat chunk hashes (duplicate content blocks in

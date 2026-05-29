@@ -286,6 +286,11 @@
       "path": "upload/single.rs",
       "depth": 1,
       "doc": "Per-output `PutPath` upload with retry + concurrent-put adoption."
+    },
+    {
+      "path": "upload/walk.rs",
+      "depth": 1,
+      "doc": "Fused output walk (ADR-022 §6.1, P0586)."
     }
   ],
   "rio-cli": [
@@ -1363,6 +1368,26 @@
       "path": "grpc/put_path_batch.rs",
       "depth": 1,
       "doc": "PutPathBatch: atomic multi-output upload."
+    },
+    {
+      "path": "grpc/put_path_chunked/",
+      "depth": 1,
+      "doc": "`PutPathChunked` (ADR-022 §6): builder-side chunked output upload."
+    },
+    {
+      "path": "grpc/put_path_chunked/commit.rs",
+      "depth": 2,
+      "doc": "Commit-side assembly for `PutPathChunked` (ADR-022 §6.2)."
+    },
+    {
+      "path": "grpc/put_path_chunked/validate.rs",
+      "depth": 2,
+      "doc": "`Begin`-frame validation for `PutPathChunked` (ADR-022 §6.2)."
+    },
+    {
+      "path": "grpc/put_path_chunked/verify.rs",
+      "depth": 2,
+      "doc": "The §6.3 sequential verify walk for `PutPathChunked`."
     },
     {
       "path": "grpc/queries.rs",
