@@ -871,6 +871,11 @@
       "doc": "`rio-parity run` — the parity campaign engine."
     },
     {
+      "path": "run/archive_input.rs",
+      "depth": 1,
+      "doc": "Adapters from an open replay archive to the engine's plan inputs"
+    },
+    {
       "path": "run/artifact.rs",
       "depth": 1,
       "doc": "Campaign artifact storage (S3 or a local directory) plus state sync."

@@ -16,6 +16,7 @@
 //! directory: plan → hydra-truth → warm (leaf mode) → submit ∥ collect ∥
 //! watchdog ∥ sync → report.
 
+pub mod archive_input;
 pub mod artifact;
 pub mod batch;
 pub mod classify;
