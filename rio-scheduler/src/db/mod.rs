@@ -263,10 +263,12 @@ pub(crate) struct RecoveryDerivationRow {
     /// `load_parents_with_all_children_produced`).
     pub topdown_pruned: bool,
     /// Closure-hole breadcrumb (`migrations/064`): an un-produced child
-    /// was reaped out from under the node by a terminal build's
-    /// cleanup, so its persisted children are a truncated view of its
-    /// pruned input closure. Written best-effort by the leader's reap
-    /// hook, restored verbatim by `from_recovery_row`
+    /// was removed out from under the node (a terminal build's cleanup
+    /// reap, a poison-clear removal, or a recovery-time edge drop), so
+    /// its persisted children are a truncated view of its pruned input
+    /// closure. Written best-effort via `set_closure_hole_by_hashes`
+    /// (the leader's reap hook, the recovery-time stamp, and the two
+    /// poison-clear paths), restored verbatim by `from_recovery_row`
     /// (`from_poisoned_row` keeps `false`), and consulted by the
     /// recovery-time gate: a flagged row that also carries the
     /// breadcrumb is never enrolled as a clear candidate, so the

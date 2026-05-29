@@ -4833,8 +4833,8 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
 /// operator clears the poison (or the cfg(test) 100ms TTL expires and
 /// the sweep clears it) → dep1 is removed from the DAG, truncating R's
 /// children to the produced {dep2}. The removal must leave
-/// `closure_hole` on R (asserted in PG; the in-memory copy has no debug
-/// surface yet — it is observed through the bounded outcome below,
+/// `closure_hole` on R (asserted directly in memory via the debug
+/// surface and in PG, and exercised through the bounded outcome below,
 /// which `closure_evidence` keys on). R's parked walk then fails: the
 /// Broken (holed) evidence must take the bounded resubmit-directing
 /// fail-fast — B1 fails with the "topdown … resubmit" error, no
@@ -5026,6 +5026,11 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     assert!(
         holed.topdown_pruned,
         "the poison-clear removal must not consume the mark"
+    );
+    assert!(
+        holed.closure_hole,
+        "removing the un-produced poisoned child must stamp the in-memory closure-hole \
+         breadcrumb on the surviving parent"
     );
     let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
         "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'pcs-r'",

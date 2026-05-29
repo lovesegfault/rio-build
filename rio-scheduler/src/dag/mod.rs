@@ -896,11 +896,12 @@ impl DerivationDag {
     /// `validate_and_ingest` / `persist_merge_to_db`, the
     /// produced-children clear sites, and the dispatch-time / reap-time
     /// guards) judges the child set through this one classifier so no
-    /// site can drift into trusting a reap-truncated child set. The
-    /// hole input is set by [`Self::remove_build_interest_and_reap`]
-    /// and by the recovery-time stamp in `load_dag_from_rows` (an edge
-    /// to an un-produced terminal child dropped at load), and healed by
-    /// the merge-time edge re-declaration.
+    /// site can drift into trusting a removal-truncated child set. The
+    /// hole input is set by [`Self::remove_build_interest_and_reap`],
+    /// by the recovery-time stamp in `load_dag_from_rows` (an edge to
+    /// an un-produced terminal child dropped at load), and by the
+    /// poison-clear removals (admin `ClearPoison` and the poison-TTL
+    /// sweep), and healed by the merge-time edge re-declaration.
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
         let Some(node) = self.nodes.get(drv_hash) else {
             return ClosureEvidence::Broken;
