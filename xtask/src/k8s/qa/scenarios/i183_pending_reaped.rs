@@ -37,7 +37,7 @@ impl Scenario for PendingReaped {
         tokio::time::sleep(Duration::from_secs(10)).await;
 
         // Cancel: aborting the bg JoinHandle drops the ssh client
-        // → cancel-on-disconnect (r[gw.conn.cancel-on-disconnect+2]).
+        // → cancel-on-disconnect (r[gw.conn.cancel-on-disconnect+3]).
         bg.abort();
 
         // Observed 39s/59s/93s/106s across runs — variance is the

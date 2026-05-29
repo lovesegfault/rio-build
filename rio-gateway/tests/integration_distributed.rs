@@ -254,7 +254,7 @@ async fn test_cancel_build_recorded_by_mock_scheduler() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.cancel-on-disconnect+2]
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// P0444: idle-timeout exit path must call cancel_active_builds.
 ///
 /// Bughunter finding: run_protocol has four exit paths; three called
@@ -367,7 +367,7 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.cancel-on-disconnect+2]
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// bug_386: the catch-all `Ok(Err(e))` opcode-read arm (non-EOF wire
 /// error: malformed wire, ConnectionReset, etc) must call
 /// `cancel_active_builds` like every other session-exit path. Pre-fix

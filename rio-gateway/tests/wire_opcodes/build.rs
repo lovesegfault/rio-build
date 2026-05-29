@@ -1993,6 +1993,7 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
     Ok(())
 }
 
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// P0331: mid-opcode client disconnect must trigger CancelBuild.
 ///
 /// Scenario: client sends wopBuildPathsWithResults, scheduler starts
@@ -2099,7 +2100,7 @@ async fn test_mid_opcode_disconnect_cancels_build() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.cancel-on-disconnect+2]
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// P0335: graceful-shutdown signal lets the cancel-on-disconnect
 /// machinery run — task is NOT aborted.
 ///
@@ -2253,7 +2254,7 @@ async fn test_shutdown_signal_cancels_active_builds() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify gw.conn.cancel-on-disconnect+2]
+// r[verify gw.conn.cancel-on-disconnect+3]
 /// I-157: shutdown token mid-build with NO pipe break — the
 /// `wait_for_session_drain` timeout scenario.
 ///

@@ -1153,6 +1153,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     //
     // Transport/EofWithoutTerminal errors still remove: scheduler is
     // down, client is alive, cancel would have nowhere to go anyway.
+    // r[impl gw.conn.cancel-on-disconnect+3]
     if !matches!(outcome, Err(StreamProcessError::Wire(_))) {
         active_build_ids.remove(&build_id);
     }

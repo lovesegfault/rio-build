@@ -1351,7 +1351,7 @@ connection-level (the force-close arm), not merely session-level.
   default swallows these silently.
 ]
 
-#r("gw.conn.cancel-on-disconnect+2")[
+#r("gw.conn.cancel-on-disconnect+3")[
   The gateway MUST send `CancelBuild` to the scheduler for every build in
   `active_build_ids` when an SSH channel drops, via ALL disconnect shapes: (1)
   clean EOF between opcodes --- `session.rs` opcode-read returns
@@ -1361,9 +1361,25 @@ connection-level (the force-close arm), not merely session-level.
   --- `session.rs` idle-timer fires after 600s with no opcode, runs the same
   cancel loop before returning. All three paths MUST complete the cancel loop
   before the protocol task exits; hard `abort()` on the task handle defeats
-  this. Builds not cancelled run on with no watcher until the scheduler's
-  orphan-watcher auto-cancel (#rref("sched.backstop.orphan-watcher")).
+  this. The `active_build_ids` tracking policy is itself normative: a build
+  MUST leave the map only once a terminal outcome for it has been processed
+  or its build-event stream has failed with a non-wire (scheduler-side)
+  error, never merely because the session is ending, and a wire
+  (client-side) stream failure MUST keep it tracked so the cancel loop above
+  has something to cancel. Builds not cancelled run on with no watcher until
+  the scheduler's orphan-watcher auto-cancel
+  (#rref("sched.backstop.orphan-watcher")).
 ]
+
+The non-wire removal arm is a deliberate trade-off, not an oversight: a
+build-event stream that fails with a scheduler-side error class normally
+means the client is still connected (it receives the failure result) and the
+scheduler is the party that is unreachable --- a `CancelBuild` fired at that
+moment would have nowhere useful to go, so the gateway drops the id instead
+of carrying it. When that heuristic is wrong (the stream died of reconnect
+exhaustion against a client that is in fact gone too), the build runs
+unwatched until the orphan-watcher backstop named above --- a bounded,
+accepted leak, not a cancellation guarantee.
 
 #r("gw.conn.channel-limit+4")[
   A single SSH connection may have at most `max_channels_per_connection`

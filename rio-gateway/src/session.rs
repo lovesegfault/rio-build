@@ -283,7 +283,7 @@ where
     }
 
     loop {
-        // r[impl gw.conn.cancel-on-disconnect+2]
+        // r[impl gw.conn.cancel-on-disconnect+3]
         // Select over shutdown-signal + opcode-read. `biased` polls
         // shutdown first: when BOTH are ready on the same poll (TCP RST
         // → russh fires channel_eof AND channel_close near-simultaneously
