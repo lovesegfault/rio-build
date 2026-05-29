@@ -59,8 +59,8 @@ use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::hydra_truth::NarinfoSource;
 use self::model::{
-    BATCH_KIND_SUBMIT, Bucket, FailureKind, HydraEntry, JobRecord, PauseState, RioOutcome,
-    now_rfc3339, rfc3339_to_unix,
+    BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Bucket, FailureKind, HydraEntry, JobRecord, PauseState,
+    RioOutcome, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, SupplyDependencies, generate_campaign_id,
@@ -1553,11 +1553,12 @@ struct CollectBackends {
     artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
-/// One collect pass over every settled, not-yet-processed submit batch:
-/// classify each batch's jobs via [`process_settled_batch`], count an
-/// engine resubmission for every re-queued job, and persist the
-/// processed-batch set (collected.json) so resume never re-processes a
-/// batch. Returns how many job re-queues the pass produced.
+/// One collect pass over every settled, not-yet-processed build batch
+/// (submit-loop and timed-dispatcher kinds alike): classify each batch's
+/// jobs via [`process_settled_batch`], count an engine resubmission for
+/// every re-queued job, and persist the processed-batch set
+/// (collected.json) so resume never re-processes a batch. Returns how many
+/// job re-queues the pass produced.
 #[allow(clippy::too_many_arguments)]
 async fn collect_pass_with(
     state: &StateDir,
@@ -1573,7 +1574,11 @@ async fn collect_pass_with(
     let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches)?;
     let mut requeued = 0usize;
     for batch in batches {
-        if batch.kind != BATCH_KIND_SUBMIT || processed.contains(&batch.batch_id) {
+        // Both build-batch kinds are collected here: the timeless submit
+        // loop's batches and the timed dispatcher's. Anything else (e.g. a
+        // kind written by an older engine version) is skipped, never failed.
+        let collectable = matches!(batch.kind.as_str(), BATCH_KIND_SUBMIT | BATCH_KIND_TIMED);
+        if !collectable || processed.contains(&batch.batch_id) {
             continue;
         }
         let view = BatchView {
@@ -2062,6 +2067,84 @@ mod tests {
             err.to_string().contains("campaign.json pins archive"),
             "{err:#}"
         );
+    }
+
+    /// The collect pass processes timed-dispatcher batches, not just the
+    /// submit loop's: a settled timed batch with an armed interruption that
+    /// the engine cancelled is classified (interruption-replayed) and marked
+    /// processed instead of being silently skipped by the batch-kind filter,
+    /// and its members are never re-offered to the timeless pending pool.
+    #[tokio::test]
+    async fn collect_pass_processes_timed_batches() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = StateDir::new(dir.path()).unwrap();
+        let drv = format!("/nix/store/{}-timed-app.drv", "f".repeat(32));
+        let job = "timedApp.x86_64-linux";
+        state
+            .append_jsonl(
+                StateFile::Batches,
+                &model::BatchRecord {
+                    batch_id: 41,
+                    kind: BATCH_KIND_TIMED.to_string(),
+                    jobs: vec![job.to_string()],
+                    root_drvs: vec![drv.clone()],
+                    est_nodes: 1,
+                    build_id: None,
+                    started_at: now_rfc3339(),
+                    finished_at: Some(now_rfc3339()),
+                    results: Vec::new(),
+                    reasons: BTreeMap::new(),
+                    stderr_tail: None,
+                    engine_cancelled: true,
+                    interruption_drvs: vec![drv.clone()],
+                },
+            )
+            .unwrap();
+        let contexts: HashMap<String, JobContext> = HashMap::from([(
+            job.to_string(),
+            JobContext {
+                job: job.to_string(),
+                system: "x86_64-linux".into(),
+                drv_path: drv.clone(),
+                outputs: BTreeMap::from([(
+                    "out".to_string(),
+                    format!("{}-out", drv.trim_end_matches(".drv")),
+                )]),
+                dep_drvs: HashSet::new(),
+                hydra_outcome: HydraOutcome::Built,
+                hydra_outputs: BTreeMap::new(),
+                hydra_buildstatus: None,
+                plan_not_attemptable: false,
+                plan_snapshot_valid: false,
+            },
+        )]);
+        let backends = CollectBackends {
+            admin: Arc::new(NoLogsAdmin),
+            store: Arc::new(FakeStoreApi::default()),
+            artifacts: None,
+        };
+        let tracker = SubmitTracker::default();
+        let mut processed = HashSet::new();
+        let requeued = collect_pass_with(
+            &state,
+            &backends,
+            &contexts,
+            &tracker,
+            &mut processed,
+            &Knobs::default(),
+            "leaf",
+            "ssh-ng://test",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(requeued, 0, "timed batch members are never re-offered");
+        assert!(
+            processed.contains(&41),
+            "the timed batch is marked processed"
+        );
+        let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records[job].bucket, Bucket::InterruptionReplayed.as_str());
     }
 
     /// Transport-error path end to end: the first submission fails

@@ -973,7 +973,7 @@
     {
       "path": "run/timeline.rs",
       "depth": 1,
-      "doc": "Timed-replay schedule construction: when each recorded request fires."
+      "doc": "Timed-replay scheduling: schedule construction and the timed dispatcher."
     },
     {
       "path": "run/transport.rs",

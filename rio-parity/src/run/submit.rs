@@ -137,6 +137,10 @@ pub fn pending_wave(
 /// reservation (starting the `cooldown` re-offer damper), and appends the
 /// [`BatchRecord`]. Returns the recorded batch.
 ///
+/// `interruption_drvs` names the root drvs for which the timed dispatcher
+/// armed a recorded interruption; it is written verbatim onto the batch
+/// record (timeless callers pass an empty vector).
+///
 /// A submitter `Err` (ssh/spawn/import failure) is evidence, not a fatal
 /// error: it is recorded on the batch record with no build id and the jobs
 /// are re-offered on a later wave; only state-dir I/O failures propagate.
@@ -153,6 +157,7 @@ pub async fn submit_one_batch(
     batch: Batch,
     timeout: Duration,
     cooldown: Duration,
+    interruption_drvs: Vec<String>,
 ) -> Result<BatchRecord> {
     let started_at = now_rfc3339();
     let outcome = submitter.submit_batch(store_url, &batch, timeout).await;
@@ -169,7 +174,7 @@ pub async fn submit_one_batch(
         reasons: BTreeMap::new(),
         stderr_tail: None,
         engine_cancelled: false,
-        interruption_drvs: Vec::new(),
+        interruption_drvs,
     };
     match outcome {
         Ok(o) => {
@@ -342,6 +347,7 @@ pub async fn run_submit_loop(
                 batch,
                 timeout,
                 cooldown,
+                Vec::new(),
             )
             .await
         });
@@ -430,6 +436,7 @@ mod tests {
             batch,
             Duration::from_secs(60),
             Duration::from_secs(60),
+            Vec::new(),
         )
         .await
         .unwrap();
@@ -485,6 +492,7 @@ mod tests {
             batch,
             timeout,
             Duration::from_secs(60),
+            Vec::new(),
         )
         .await
         .unwrap();
