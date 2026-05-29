@@ -262,14 +262,31 @@ const MAX_BUILD_LOG_STDERR_MESSAGES: usize = 10_000_000;
 pub async fn drain_stderr_typed<R: AsyncRead + Unpin>(
     r: &mut R,
 ) -> std::result::Result<(), ClientOpError> {
-    drain_stderr_typed_bounded(r, MAX_BUILD_LOG_STDERR_MESSAGES).await
+    drain_stderr_with_observer(r, None).await
 }
 
-/// [`drain_stderr_typed`] with an explicit message-count ceiling. Returns a
-/// [`ClientOpError::Wire`] I/O error if more than `max_messages` messages
-/// arrive without `STDERR_LAST`.
+/// [`drain_stderr_typed`] with a log-line observer: `STDERR_NEXT` payloads
+/// are passed to `observer` (when present) as display text — relayed daemon
+/// log lines, never wire-parse data — instead of being discarded. The
+/// observer cannot fail the drain. Bounds, error mapping, and the handling
+/// of every other STDERR message kind are identical to
+/// [`drain_stderr_typed`], including the caller-supplied-deadline
+/// expectation.
+pub async fn drain_stderr_with_observer<R: AsyncRead + Unpin>(
+    r: &mut R,
+    observer: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> std::result::Result<(), ClientOpError> {
+    drain_stderr_typed_bounded(r, observer, MAX_BUILD_LOG_STDERR_MESSAGES).await
+}
+
+/// Single implementation behind [`drain_stderr_typed`] and
+/// [`drain_stderr_with_observer`]: drain with an explicit message-count
+/// ceiling, handing `STDERR_NEXT` payloads to `observer` when present.
+/// Returns a [`ClientOpError::Wire`] I/O error if more than `max_messages`
+/// messages arrive without `STDERR_LAST`.
 async fn drain_stderr_typed_bounded<R: AsyncRead + Unpin>(
     r: &mut R,
+    mut observer: Option<&mut (dyn FnMut(&str) + Send)>,
     max_messages: usize,
 ) -> std::result::Result<(), ClientOpError> {
     for _ in 0..max_messages {
@@ -289,8 +306,12 @@ async fn drain_stderr_typed_bounded<R: AsyncRead + Unpin>(
                     ),
                 ))));
             }
-            StderrMessage::Next(_)
-            | StderrMessage::StartActivity { .. }
+            StderrMessage::Next(line) => {
+                if let Some(observer) = observer.as_mut() {
+                    observer(&line);
+                }
+            }
+            StderrMessage::StartActivity { .. }
             | StderrMessage::StopActivity { .. }
             | StderrMessage::Result { .. } => continue,
         }
@@ -452,12 +473,14 @@ pub struct KeyedBuildResult {
 /// opaque store path) and collect the daemon's per-path [`BuildResult`]s.
 ///
 /// Build logs and activities arrive on the STDERR loop and are discarded by
-/// the typed drain; after `STDERR_LAST` the daemon replies with a count
-/// followed by one (echoed derived path, [`BuildResult`]) entry per requested
-/// path, in submission order. Correlate results with the submitted slice
-/// positionally (and check the returned length matches) rather than parsing
-/// or matching the echoed string — against non-rio daemons the echo may be a
-/// re-serialization of the parsed path, not a byte-identical copy.
+/// the typed drain (use [`client_build_paths_with_results_observed`] to
+/// receive the relayed log lines instead); after `STDERR_LAST` the daemon
+/// replies with a count followed by one (echoed derived path,
+/// [`BuildResult`]) entry per requested path, in submission order. Correlate
+/// results with the submitted slice positionally (and check the returned
+/// length matches) rather than parsing or matching the echoed string —
+/// against non-rio daemons the echo may be a re-serialization of the parsed
+/// path, not a byte-identical copy.
 ///
 /// `negotiated_version` comes from [`client_handshake`]; it gates
 /// version-dependent [`BuildResult`] fields (e.g. cpu stats at >= 1.37).
@@ -472,12 +495,62 @@ where
     W: AsyncWrite + Unpin,
     S: AsRef<str>,
 {
+    client_build_paths_with_results_inner(reader, writer, derived_paths, negotiated_version, None)
+        .await
+}
+
+/// [`client_build_paths_with_results`] with a log-line observer: every
+/// `STDERR_NEXT` payload the daemon relays while the build runs (e.g. the
+/// gateway's `rio: build <uuid>` announcement and the relayed
+/// `derivation '<drv>' failed:` lines) is passed to `observer` as display
+/// text — never wire-parse data — and the observer cannot fail the
+/// operation. Everything else is identical to the unobserved op: request
+/// layout, response parsing, the caller-supplied-deadline expectation, and
+/// the contract that the channel must be abandoned after any error from an
+/// op that started writing a framed payload.
+pub async fn client_build_paths_with_results_observed<R, W, S>(
+    reader: &mut R,
+    writer: &mut W,
+    derived_paths: &[S],
+    negotiated_version: u64,
+    observer: &mut (dyn FnMut(&str) + Send),
+) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: AsRef<str>,
+{
+    client_build_paths_with_results_inner(
+        reader,
+        writer,
+        derived_paths,
+        negotiated_version,
+        Some(observer),
+    )
+    .await
+}
+
+/// Single wire implementation behind [`client_build_paths_with_results`] and
+/// [`client_build_paths_with_results_observed`]; the observer only changes
+/// what happens to `STDERR_NEXT` payloads during the drain.
+async fn client_build_paths_with_results_inner<R, W, S>(
+    reader: &mut R,
+    writer: &mut W,
+    derived_paths: &[S],
+    negotiated_version: u64,
+    observer: Option<&mut (dyn FnMut(&str) + Send)>,
+) -> std::result::Result<Vec<KeyedBuildResult>, ClientOpError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+    S: AsRef<str>,
+{
     wire::write_u64(writer, WorkerOp::BuildPathsWithResults as u64).await?;
     wire::write_strings(writer, derived_paths).await?;
     wire::write_u64(writer, BuildMode::Normal as u64).await?;
     writer.flush().await.map_err(WireError::Io)?;
 
-    drain_stderr_typed(reader).await?;
+    drain_stderr_with_observer(reader, observer).await?;
 
     let count = wire::read_u64(reader).await?;
     if count > wire::MAX_COLLECTION_COUNT {
@@ -1382,7 +1455,7 @@ mod tests {
             }
         }
 
-        let err = drain_stderr_typed_bounded(&mut std::io::Cursor::new(buf), 3)
+        let err = drain_stderr_typed_bounded(&mut std::io::Cursor::new(buf), None, 3)
             .await
             .expect_err("exceeding the message ceiling must abort the drain");
         assert!(matches!(err, ClientOpError::Wire(_)), "got: {err:?}");
@@ -1767,6 +1840,87 @@ mod tests {
                 .await?;
         assert!(results.is_empty());
         server.await??;
+        Ok(())
+    }
+
+    /// The observed variant hands every relayed `STDERR_NEXT` log line (the
+    /// gateway's `rio: build <uuid>` announcement, the relayed
+    /// `derivation '<drv>' failed:` lines) to the caller's observer verbatim,
+    /// and parses the same response bytes into the same results as the
+    /// unobserved op.
+    #[tokio::test]
+    async fn client_build_paths_with_results_observed_captures_log_lines() -> anyhow::Result<()> {
+        let dp = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv!*";
+        let build_id_line = "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
+        let failed_line =
+            "derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv' failed: builder failed";
+
+        // The same scripted server bytes back both the observed and the
+        // unobserved op so their parsed results can be compared directly.
+        let spawn_server = |server_stream: tokio::io::DuplexStream| {
+            tokio::spawn(async move {
+                let (mut sr, mut sw) = tokio::io::split(server_stream);
+                let op = wire::read_u64(&mut sr).await?;
+                assert_eq!(op, WorkerOp::BuildPathsWithResults as u64);
+                let paths = wire::read_strings(&mut sr).await?;
+                assert_eq!(paths, vec![dp.to_string()]);
+                let mode = wire::read_u64(&mut sr).await?;
+                assert_eq!(mode, BuildMode::Normal as u64);
+
+                // Relayed build-log lines stream on the STDERR loop first.
+                wire::write_u64(&mut sw, STDERR_NEXT).await?;
+                wire::write_string(&mut sw, build_id_line).await?;
+                wire::write_u64(&mut sw, STDERR_NEXT).await?;
+                wire::write_string(&mut sw, failed_line).await?;
+                wire::write_u64(&mut sw, STDERR_LAST).await?;
+                // Then the one-entry result list.
+                wire::write_u64(&mut sw, 1).await?;
+                wire::write_string(&mut sw, dp).await?;
+                write_build_result(
+                    &mut sw,
+                    &BuildResult::failure(BuildStatus::PermanentFailure, "builder failed"),
+                    PROTOCOL_VERSION,
+                )
+                .await?;
+                sw.flush().await?;
+                anyhow::Ok(())
+            })
+        };
+
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = spawn_server(server_stream);
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let mut seen: Vec<String> = Vec::new();
+        let observed = client_build_paths_with_results_observed(
+            &mut cr,
+            &mut cw,
+            &[dp],
+            PROTOCOL_VERSION,
+            &mut |line| seen.push(line.to_string()),
+        )
+        .await?;
+        server.await??;
+
+        assert_eq!(
+            seen,
+            vec![build_id_line.to_string(), failed_line.to_string()],
+            "observer must receive every relayed log line verbatim"
+        );
+
+        // Same bytes through the unobserved op: identical parsed results.
+        let (client_stream, server_stream) = tokio::io::duplex(8192);
+        let server = spawn_server(server_stream);
+        let (mut cr, mut cw) = tokio::io::split(client_stream);
+        let unobserved =
+            client_build_paths_with_results(&mut cr, &mut cw, &[dp], PROTOCOL_VERSION).await?;
+        server.await??;
+
+        assert_eq!(observed.len(), unobserved.len());
+        assert_eq!(observed[0].derived_path, unobserved[0].derived_path);
+        assert_eq!(
+            observed[0].result, unobserved[0].result,
+            "observation must not change how the response bytes are parsed"
+        );
         Ok(())
     }
 

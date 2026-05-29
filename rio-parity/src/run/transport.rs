@@ -32,8 +32,9 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use rio_nix::protocol::client::{
     ClientOpError, KeyedBuildResult, StoreEntry, client_add_multiple_to_store,
-    client_add_to_store_nar, client_build_paths_with_results, client_handshake,
-    client_query_path_info, client_query_valid_paths,
+    client_add_to_store_nar, client_build_paths_with_results,
+    client_build_paths_with_results_observed, client_handshake, client_query_path_info,
+    client_query_valid_paths,
 };
 use rio_nix::protocol::pathinfo::ValidPathInfo;
 use russh::keys::ssh_key::Fingerprint;
@@ -1117,6 +1118,39 @@ impl DaemonChannel {
                 &mut self.writer,
                 derived,
                 negotiated_version,
+            ),
+            timeout,
+            &op,
+            self.connection_index,
+            false,
+        )
+        .await;
+        self.note_outcome(&op, false, &result);
+        result
+    }
+
+    /// [`Self::build_paths_with_results`] with a stderr log-line observer:
+    /// every relayed daemon log line is passed to `observer` while the build
+    /// runs, so the engine can capture the gateway's `rio: build <uuid>`
+    /// announcement and the relayed `derivation '<drv>' failed:` lines as
+    /// evidence. Deadline handling and error mapping are identical to the
+    /// unobserved method.
+    pub async fn build_paths_with_results_observed(
+        &mut self,
+        derived: &[String],
+        timeout: Duration,
+        observer: &mut (dyn FnMut(&str) + Send),
+    ) -> std::result::Result<Vec<KeyedBuildResult>, TransportError> {
+        let op = format!("BuildPathsWithResults ({} paths)", derived.len());
+        self.ensure_usable(&op)?;
+        let negotiated_version = self.negotiated_version;
+        let result = run_op(
+            client_build_paths_with_results_observed(
+                &mut self.reader,
+                &mut self.writer,
+                derived,
+                negotiated_version,
+                observer,
             ),
             timeout,
             &op,
