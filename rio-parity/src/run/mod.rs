@@ -1,12 +1,12 @@
 //! `rio-parity run` — the parity campaign engine.
 //!
-//! Executes one parity campaign against one eval set: plan the in-scope
-//! jobs, sweep cache.nixos.org for Hydra's per-job ground truth,
-//! optionally warm upstream-built dependencies, submit batches to the
-//! rio cluster, collect and classify outcomes, and render the report.
-//! Campaign state is append-only JSONL on the pod volume (periodically
-//! synced to S3) so an interrupted run can resume without repeating
-//! terminal work.
+//! Executes one parity campaign against one replay archive: plan the
+//! in-scope jobs, load each job's expected outcome from the archive's
+//! recorded truth, optionally warm upstream-built dependencies, submit
+//! batches to the rio cluster, collect and classify outcomes, and render
+//! the report. Campaign state is append-only JSONL on the pod volume
+//! (periodically synced to S3) so an interrupted run can resume without
+//! repeating terminal work.
 //!
 //! [`run`] is the production entry point (gRPC, S3, and `nix`-child
 //! backends); [`run_with_backends`] is the orchestrator proper, taking
@@ -22,7 +22,6 @@ pub mod batch;
 pub mod classify;
 pub mod collect;
 pub mod drv_import;
-pub mod evalset_input;
 pub mod glob;
 pub mod grpc;
 pub mod hydra_truth;
@@ -40,23 +39,28 @@ pub mod warm;
 pub mod watchdog;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use clap::Args;
+use sha2::Digest as _;
+
+use crate::archive::reader::ReplayArchive;
+use crate::archive::s3::{ARCHIVE_IMAGE_OBJECT, ARCHIVE_MANIFEST_OBJECT, CompleteMarker};
+use crate::archive::schema::MemberDigest;
 
 use self::artifact::{
     ArtifactStore, S3ArtifactStore, SyncTracker, download_state_if_missing, sync_state,
 };
 use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
-use self::hydra_truth::{NarinfoSource, hydra_outcome_for_job};
+use self::hydra_truth::NarinfoSource;
 use self::model::{
-    BATCH_KIND_SUBMIT, Bucket, FailureKind, HydraEntry, JobRecord, PauseState, RioOutcome,
-    now_rfc3339, rfc3339_to_unix,
+    BATCH_KIND_SUBMIT, Bucket, FailureKind, JobRecord, PauseState, RioOutcome, now_rfc3339,
+    rfc3339_to_unix,
 };
 use self::reader::{GetBuildGraphReader, ResultReader};
 use self::spec::{CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, generate_campaign_id};
@@ -74,10 +78,10 @@ pub struct RunArgs {
     /// Local state directory (pod emptyDir). Created if missing.
     #[arg(long, default_value = "./parity-state")]
     pub state_dir: PathBuf,
-    /// Local directory containing the downloaded+untarred eval set.
-    /// When absent the engine downloads it from S3 per the spec.
+    /// Local replay archive (a .dwarfs image or a directory-form archive);
+    /// skips the S3 fetch.
     #[arg(long)]
-    pub eval_set_dir: Option<PathBuf>,
+    pub archive: Option<PathBuf>,
     /// Override the spec's job limit (smoke runs).
     #[arg(long)]
     pub limit: Option<usize>,
@@ -144,7 +148,7 @@ pub struct Backends {
 }
 
 /// Entry point for `rio-parity run`: load and validate the spec,
-/// materialize the eval set on local disk, build the production backends,
+/// materialize and open the replay archive, build the production backends,
 /// and hand off to [`run_with_backends`].
 ///
 /// # Operational contract
@@ -157,7 +161,7 @@ pub struct Backends {
 /// - **Exit code:** `0` both when the campaign drained completely and when
 ///   it stopped at the deadline with an explicitly-partial report —
 ///   consumers must read the `partial` flag in progress.json / summary.md,
-///   not the exit code. Non-zero means an error (invalid spec or eval set,
+///   not the exit code. Non-zero means an error (invalid spec or archive,
 ///   unreachable backends, state-dir I/O failure, or a dead background
 ///   task).
 /// - **Deadline:** `--deadline` (or `spec.deadline`) stops *new*
@@ -169,16 +173,16 @@ pub struct Backends {
 ///   startup error.
 /// - **Image requirements:** the per-tenant SSH key files and the service
 ///   HMAC key mounted at the paths named in the spec (the build path drives
-///   the gateway's worker protocol in-process), GNU `tar` + `zstd` for the
-///   drv-archive unpack, and `nix` plus an `ssh` client only for the
-///   leaf-mode warm-stage prefetch shell-out (until the supply planner
-///   absorbs that stage).
+///   the gateway's worker protocol in-process), and `nix` plus an `ssh`
+///   client only for the leaf-mode warm-stage prefetch shell-out (until the
+///   supply planner absorbs that stage). The archive input needs no extra
+///   tools: the DwarFS image is opened in place.
 /// - **Resume:** re-running with the same state dir skips completed stages
 ///   and already-terminal jobs. Resuming on a *fresh* pod volume
 ///   additionally requires `spec.campaign_id` to be pinned (it names the
 ///   S3 prefix the synced state is restored from) and S3 to be configured.
-/// - **S3 layout:** the eval set is read from
-///   `<eval_set.s3_bucket or s3.bucket>/<eval_set.s3_prefix>/…`; campaign
+/// - **S3 layout:** the replay archive is read from
+///   `<archive.s3_bucket or s3.bucket>/<archive.s3_prefix>/…`; campaign
 ///   artifacts are synced to `<s3.bucket>/<s3.prefix>/<campaign-id>/…`
 ///   (default prefix `parity/campaigns`).
 pub async fn run(args: RunArgs) -> Result<()> {
@@ -189,22 +193,21 @@ pub async fn run(args: RunArgs) -> Result<()> {
         (Some(bucket), false) => Some(Arc::new(S3ArtifactStore::new(bucket.clone()).await)),
         _ => None,
     };
-    // The eval set may live in a different bucket than the campaign
-    // artifacts; honor `eval_set.s3_bucket` when it names one.
-    let eval_store: Option<Arc<dyn ArtifactStore>> = match &spec.eval_set.s3_bucket {
+    // The archive may live in a different bucket than the campaign
+    // artifacts; honor `archive.s3_bucket` when it names one.
+    let archive_store: Option<Arc<dyn ArtifactStore>> = match &spec.archive.s3_bucket {
         Some(bucket) if !args.no_s3 && Some(bucket) != spec.s3.bucket.as_ref() => {
             Some(Arc::new(S3ArtifactStore::new(bucket.clone()).await))
         }
         _ => artifacts.clone(),
     };
-    // The eval set + drv archive must be on local disk before the backends
-    // are built (the client-ops submitter imports drv closures from it; the
-    // warm-stage shell-out's `nix copy` reads the same layout).
-    let (eval_dir, archive_dir) = ensure_eval_set(
+    // The archive must be on local disk and open before the backends are
+    // built (the client-ops submitter imports drv texts from it).
+    let (archive_path, archive) = ensure_archive(
         &state,
-        args.eval_set_dir.clone(),
+        args.archive.clone(),
         &spec,
-        eval_store.as_deref(),
+        archive_store.as_deref(),
     )
     .await?;
     let admin = Arc::new(GrpcAdminApi::new(
@@ -236,6 +239,19 @@ pub async fn run(args: RunArgs) -> Result<()> {
         channels_per_connection = transport::CHANNELS_PER_CONNECTION,
         "gateway transport configured"
     );
+    // The warm stage's absent-upstream probe is pointed at the archive's
+    // declared substituters (target-side first, else the relay the recorder
+    // observed): truth never comes from this client, only warm-path
+    // upstream coverage does.
+    let substituters = &archive.manifest().substituters;
+    let probe_substituter = substituters
+        .target
+        .first()
+        .or_else(|| substituters.relay.first())
+        .cloned()
+        .context(
+            "archive lists no substituters; cannot probe upstream coverage for the warm stage",
+        )?;
     let backends = Backends {
         store: Arc::new(GrpcStoreApi::new(
             spec.cluster.store_addr.clone(),
@@ -249,116 +265,203 @@ pub async fn run(args: RunArgs) -> Result<()> {
         )?)),
         submitter: Arc::new(ClientOpsSubmitter {
             pool,
-            archive: Arc::new(drv_import::DrvArchive::open(&archive_dir)?),
+            archive: Arc::new(drv_import::DrvArchive::new(archive.clone())),
             op_timeout: Duration::from_secs(spec.knobs.op_timeout_secs),
             probe_chunk: spec.knobs.probe_chunk,
         }),
-        // The warm-stage prefetch keeps the nix shell-out (and the drv
-        // archive on disk) until the supply planner absorbs it; self-hosted
-        // mode has no warm stage and carries no warm submitter.
+        // The warm-stage prefetch keeps the nix shell-out until the supply
+        // planner absorbs it; self-hosted mode has no warm stage and carries
+        // no warm submitter. The shell-out's `nix copy` import source went
+        // away with the eval-set layout — it is pointed at the local archive
+        // path so a warm import failure names a real location, and the warm
+        // stage degrades to substitute-only coverage until the supply
+        // planner replaces it.
         warm_submitter: (spec.mode == Mode::Leaf)
-            .then(|| Arc::new(WarmNixSubmitter::new(archive_dir.clone())) as Arc<dyn Submitter>),
+            .then(|| Arc::new(WarmNixSubmitter::new(archive_path.clone())) as Arc<dyn Submitter>),
         narinfo: Arc::new(crate::nixcache::NixCacheClient::new(
-            &spec.hydra.cache_url,
-            &spec.hydra.user_agent,
+            &probe_substituter,
+            &crate::user_agent(None),
         )?),
         artifacts,
     };
-    run_with_backends(args, spec, state, eval_dir, backends).await
+    run_with_backends(args, spec, state, archive, backends).await
 }
 
-/// Locate (or fetch and untar) the eval set. Returns the eval-set
-/// directory and the untarred drv-archive directory.
-pub async fn ensure_eval_set(
+/// SHA-256 (lowercase hex) and byte length of a local file, streamed in
+/// 64 KiB chunks so multi-gigabyte archive images never load into memory.
+fn file_sha256_and_size(path: &Path) -> Result<(String, u64)> {
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    let mut size = 0u64;
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("read {}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        size += n as u64;
+        hasher.update(&buf[..n]);
+    }
+    Ok((hex::encode(hasher.finalize()), size))
+}
+
+/// Download one object listed by the completion marker into `target`,
+/// verifying its SHA-256 and size against the marker entry. An existing
+/// local file that already matches is kept (resume on the same volume).
+async fn fetch_archive_object(
+    store: &dyn ArtifactStore,
+    prefix: &str,
+    object: &str,
+    expected: &MemberDigest,
+    target: &Path,
+) -> Result<()> {
+    if target.exists() {
+        let (sha256, size) = file_sha256_and_size(target)?;
+        if sha256 == expected.sha256 && size == expected.size {
+            return Ok(());
+        }
+        tracing::warn!(
+            object,
+            "previously downloaded archive object does not match the completion marker; \
+             re-downloading"
+        );
+    }
+    let key = format!("{prefix}/{object}");
+    let bytes = store
+        .get_bytes(&key)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("archive object missing in S3: {key}"))?;
+    let sha256 = hex::encode(sha2::Sha256::digest(&bytes));
+    anyhow::ensure!(
+        sha256 == expected.sha256 && bytes.len() as u64 == expected.size,
+        "archive object {object} does not match its completion marker (marker sha256 {} size {}, \
+         downloaded sha256 {sha256} size {})",
+        expected.sha256,
+        expected.size,
+        bytes.len()
+    );
+    std::fs::write(target, bytes).with_context(|| format!("write {}", target.display()))?;
+    Ok(())
+}
+
+/// Locate (or fetch) the replay archive and open it. Returns the local
+/// archive path (image or directory form) and the open reader.
+///
+/// Without `--archive`, the archive is fetched from
+/// `<archive.s3_prefix>/`: `complete.json` first (the upload marker —
+/// without it the archive is incomplete), then every object it lists,
+/// each verified against the marker's digests, and the standalone
+/// `manifest.json` must hash to both the marker's archive id and the
+/// spec's pinned digest before the image is opened.
+pub async fn ensure_archive(
     state: &StateDir,
-    explicit_dir: Option<PathBuf>,
+    explicit: Option<PathBuf>,
     spec: &CampaignSpec,
     artifacts: Option<&dyn ArtifactStore>,
-) -> Result<(PathBuf, PathBuf)> {
-    let eval_dir = match explicit_dir {
-        Some(dir) => dir,
+) -> Result<(PathBuf, Arc<ReplayArchive>)> {
+    let mut expected_id: Option<String> = None;
+    let local = match explicit {
+        Some(path) => path,
         None => {
-            let dest = state.path("evalset");
-            std::fs::create_dir_all(&dest)
-                .with_context(|| format!("create eval-set dir {}", dest.display()))?;
             let Some(store) = artifacts else {
-                bail!("--eval-set-dir not given and no S3 configured to fetch the eval set from");
+                bail!("--archive not given and no S3 configured to fetch the archive from");
             };
-            let prefix = spec.eval_set.s3_prefix.clone().ok_or_else(|| {
+            let prefix = spec
+                .archive
+                .s3_prefix
+                .clone()
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "spec.archive.s3_prefix is required when --archive is not given"
+                    )
+                })?
+                .trim_matches('/')
+                .to_string();
+            let dest = state.path("archive");
+            std::fs::create_dir_all(&dest)
+                .with_context(|| format!("create archive dir {}", dest.display()))?;
+            let marker_key = format!("{prefix}/{}", crate::archive::s3::ARCHIVE_COMPLETE_OBJECT);
+            let marker_bytes = store.get_bytes(&marker_key).await?.ok_or_else(|| {
                 anyhow::anyhow!(
-                    "spec.eval_set.s3_prefix is required when --eval-set-dir is not given"
+                    "archive completion marker missing in S3: {marker_key} — the recorder uploads \
+                     it last, so the archive is still uploading or the upload failed"
                 )
             })?;
-            for name in [
-                "evalset.json",
-                "manifest.jsonl",
-                "dep-closure.jsonl",
-                "drvs.tar.zst",
-            ] {
-                let target = dest.join(name);
-                if target.exists() {
-                    // Already downloaded by a previous run on this volume; a
-                    // torn earlier download is caught loudly downstream (JSON
-                    // parse / manifest digest / tar failure), never trusted
-                    // silently.
-                    continue;
-                }
-                let key = format!("{prefix}/{name}");
-                if let Some(bytes) = store.get_bytes(&key).await? {
-                    std::fs::write(&target, bytes)
-                        .with_context(|| format!("write {}", target.display()))?;
-                } else if name != "dep-closure.jsonl" {
-                    bail!("eval set object missing in S3: {key}");
-                }
+            let marker: CompleteMarker = serde_json::from_slice(&marker_bytes)
+                .with_context(|| format!("parse {marker_key}"))?;
+            for (object, digest) in &marker.objects {
+                // The marker is remote input: only plain basenames may be
+                // joined onto the local archive directory.
+                anyhow::ensure!(
+                    !object.is_empty()
+                        && !object.contains('/')
+                        && !object.contains('\\')
+                        && object != "..",
+                    "completion marker {marker_key} lists a non-basename object name {object:?}; \
+                     refusing to write outside {}",
+                    dest.display()
+                );
+                fetch_archive_object(store, &prefix, object, digest, &dest.join(object)).await?;
             }
-            dest
+            let manifest_path = dest.join(ARCHIVE_MANIFEST_OBJECT);
+            let manifest_bytes = std::fs::read(&manifest_path)
+                .with_context(|| format!("read {}", manifest_path.display()))?;
+            let manifest_id = hex::encode(sha2::Sha256::digest(&manifest_bytes));
+            anyhow::ensure!(
+                manifest_id == marker.archive_id,
+                "downloaded manifest.json hashes to {manifest_id} but the completion marker says \
+                 the archive id is {}",
+                marker.archive_id
+            );
+            anyhow::ensure!(
+                manifest_id == spec.archive.digest,
+                "archive manifest digest mismatch: spec pins {}, fetched {manifest_id}",
+                spec.archive.digest
+            );
+            expected_id = Some(marker.archive_id.clone());
+            dest.join(ARCHIVE_IMAGE_OBJECT)
         }
     };
-    // Untar the drv archive once (idempotent: skip when the marker exists).
-    let archive_dir = eval_dir.join("drv-archive");
-    let tarball = eval_dir.join("drvs.tar.zst");
-    if !archive_dir.join(".untarred").exists() {
-        if tarball.exists() {
-            std::fs::create_dir_all(&archive_dir)
-                .with_context(|| format!("create {}", archive_dir.display()))?;
-            let status = tokio::process::Command::new("tar")
-                .args(["--zstd", "-xf"])
-                .arg(&tarball)
-                .arg("-C")
-                .arg(&archive_dir)
-                .kill_on_drop(true)
-                .status()
-                .await
-                .context("spawn tar (the rio-parity image must ship GNU tar + zstd)")?;
-            if !status.success() {
-                bail!("untar of {} failed with {status}", tarball.display());
-            }
-            let marker = archive_dir.join(".untarred");
-            std::fs::write(&marker, b"ok")
-                .with_context(|| format!("write {}", marker.display()))?;
-        } else {
-            // Local development and tests run without the archive (the
-            // FakeSubmitter never imports anything); a real campaign against
-            // an empty archive fails loudly at the first import.
-            std::fs::create_dir_all(&archive_dir)
-                .with_context(|| format!("create {}", archive_dir.display()))?;
-        }
+    // Opening a DwarFS image is blocking work (directory-form archives are
+    // cheap, but the call is uniform).
+    let open_path = local.clone();
+    let archive = tokio::task::spawn_blocking(move || ReplayArchive::open(&open_path))
+        .await
+        .context("archive open task panicked or was cancelled")?
+        .with_context(|| format!("open replay archive {}", local.display()))?;
+    if let Some(expected) = expected_id {
+        // The manifest member inside the image is the identity; it must be
+        // the same bytes the standalone manifest.json carried.
+        anyhow::ensure!(
+            archive.archive_id() == Some(expected.as_str()),
+            "the downloaded archive image's manifest member hashes to {:?} but the standalone \
+             manifest.json (and completion marker) say {expected}",
+            archive.archive_id()
+        );
     }
-    Ok((eval_dir, archive_dir))
+    Ok((local, Arc::new(archive)))
 }
 
 /// Plan-time excluded jobs carry their exclusion as `rio.outcome` with no
 /// build/exec fields: write their terminal records right after planning.
 /// The exclusion vocabulary equals the bucket names, so both fields are
 /// written via [`Bucket::as_str`] (never hand-typed literals).
+/// `divergent_in_scope` lists the in-scope jobs the recorder marked
+/// identity-divergent: their evaluation here cannot be compared against the
+/// recorded truth, so they are retired up front under the eval-divergence
+/// bucket instead of being submitted.
 fn write_plan_time_records(
     state: &StateDir,
-    manifest: &[evalset_input::ManifestEntry],
+    manifest: &[archive_input::ManifestEntry],
     plan: &PlanOutput,
+    divergent_in_scope: &[String],
     mode: &str,
     existing: &BTreeMap<String, JobRecord>,
 ) -> Result<()> {
-    let by_job: HashMap<&str, &evalset_input::ManifestEntry> =
+    let by_job: HashMap<&str, &archive_input::ManifestEntry> =
         manifest.iter().map(|m| (m.job.as_str(), m)).collect();
     let emit = |job: &str, bucket: Bucket| -> Result<()> {
         if existing.contains_key(job) {
@@ -404,6 +507,9 @@ fn write_plan_time_records(
     for job in &plan.cached_prior_jobs {
         emit(job, Bucket::CachedPrior)?;
     }
+    for job in divergent_in_scope {
+        emit(job, Bucket::EvalDivergence)?;
+    }
     Ok(())
 }
 
@@ -413,12 +519,12 @@ fn write_plan_time_records(
 /// counts sum to the in-scope total. Returns how many were written.
 fn write_not_attempted_records(
     state: &StateDir,
-    manifest: &[evalset_input::ManifestEntry],
+    manifest: &[archive_input::ManifestEntry],
     plan: &PlanOutput,
     mode: &str,
     existing: &BTreeMap<String, JobRecord>,
 ) -> Result<usize> {
-    let by_job: HashMap<&str, &evalset_input::ManifestEntry> =
+    let by_job: HashMap<&str, &archive_input::ManifestEntry> =
         manifest.iter().map(|m| (m.job.as_str(), m)).collect();
     let mut written = 0usize;
     for job in &plan.in_scope {
@@ -690,7 +796,7 @@ pub async fn run_with_backends(
     args: RunArgs,
     spec: CampaignSpec,
     state: StateDir,
-    eval_dir: PathBuf,
+    archive: Arc<ReplayArchive>,
     backends: Backends,
 ) -> Result<()> {
     let mut spec = spec;
@@ -734,16 +840,25 @@ pub async fn run_with_backends(
     }
 
     // ── Stage: plan ─────────────────────────────────────────────────────────
+    let archive_id = archive
+        .archive_id()
+        .context("the campaign engine requires a v1 archive (this archive has no archive id)")?
+        .to_string();
     let mut campaign = match state.read_json::<CampaignRecord>("campaign.json")? {
         Some(existing) => {
-            plan::verify_manifest_digest(&eval_dir, &existing.eval_set.manifest_sha256)?;
+            // Resume gate: one campaign must never mix two archives.
+            anyhow::ensure!(
+                existing.archive.archive_id == archive_id,
+                "campaign.json pins archive {} but the provided archive is {archive_id}",
+                existing.archive.archive_id
+            );
             tracing::info!(campaign_id = %existing.campaign_id, "resuming an existing campaign");
             existing
         }
         None => {
             let result = plan::run_plan(
                 &spec,
-                &eval_dir,
+                &archive,
                 backends.store.as_ref(),
                 args.allow_unverified_tenants,
             )
@@ -755,6 +870,10 @@ pub async fn run_with_backends(
                 result.pin.clone(),
             );
             record.comparability.low_confidence = result.low_confidence.clone();
+            // Recorder-side exclusions (eval errors, aggregates) never become
+            // workload units, so they enter the comparability accounting here
+            // and are merged — never overwritten — by the report-time refresh.
+            record.comparability.excluded = archive_input::exclusion_counts(&archive);
             record.plan = Some(result.output.clone());
             state.write_json_atomic("campaign.json", &record)?;
             record
@@ -764,14 +883,22 @@ pub async fn run_with_backends(
         .plan
         .clone()
         .context("campaign.json has no plan output")?;
-    let manifest = evalset_input::load_manifest(&eval_dir)?;
-    let dep_closure = evalset_input::load_dep_closure(&eval_dir)?;
+    let manifest = archive_input::load_units(&archive)?;
+    let dep_closure = archive_input::load_closures(&archive, &manifest)?;
+    let in_scope: HashSet<&str> = plan_output.in_scope.iter().map(String::as_str).collect();
+    // Identity-divergent units that made it into scope are retired at plan
+    // time (eval-divergence) and never offered to the submit loop.
+    let divergent_in_scope: Vec<String> = archive_input::identity_divergent_units(&archive)?
+        .into_iter()
+        .filter(|job| in_scope.contains(job.as_str()))
+        .collect();
     let existing_records = latest_per_job(state.load_jsonl(StateFile::Results)?);
     if !state.marker_done("plan") {
         write_plan_time_records(
             &state,
             &manifest,
             &plan_output,
+            &divergent_in_scope,
             spec.mode.as_str(),
             &existing_records,
         )?;
@@ -782,29 +909,25 @@ pub async fn run_with_backends(
     let warm_comp = plan::compute_warm_sets(&manifest, &dep_closure, &plan_output.in_scope);
 
     // ── Stage: hydra-truth ──────────────────────────────────────────────────
-    let in_scope: HashSet<&str> = plan_output.in_scope.iter().map(String::as_str).collect();
-    let target_paths: Vec<String> = manifest
-        .iter()
-        .filter(|m| in_scope.contains(m.job.as_str()))
-        .flat_map(|m| m.outputs.values().cloned())
-        .collect();
+    // Per-unit expected outcomes come from the archive's recorded truth (no
+    // outbound queries). The marker-gated sweep below only probes the
+    // warm-set paths' upstream coverage so the warm stage never submits a
+    // path its substituter cannot serve.
+    let truth = hydra_truth::expected_outcomes_for_units(&archive, &manifest)?;
     if !state.marker_done("hydra-truth") {
-        hydra_truth::run_hydra_truth(
-            &state,
-            backends.narinfo.as_ref(),
-            &target_paths,
-            &plan_output.warm_set,
-            spec.knobs.narinfo_concurrency,
-            NARINFO_SWEEP_ATTEMPTS,
-        )
-        .await?;
+        if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
+            hydra_truth::run_hydra_truth(
+                &state,
+                backends.narinfo.as_ref(),
+                &[],
+                &plan_output.warm_set,
+                spec.knobs.narinfo_concurrency,
+                NARINFO_SWEEP_ATTEMPTS,
+            )
+            .await?;
+        }
         state.set_marker("hydra-truth")?;
     }
-    let hydra_by_path: HashMap<String, HydraEntry> = state
-        .load_jsonl::<HydraEntry>(StateFile::Hydra)?
-        .into_iter()
-        .map(|e| (e.path.clone(), e))
-        .collect();
 
     // ── Stage: warm (leaf only) ─────────────────────────────────────────────
     let batch_seq = Arc::new(AtomicU64::new(
@@ -845,15 +968,6 @@ pub async fn run_with_backends(
     }
 
     // ── Main loop: submit ∥ collect ∥ watchdog ∥ sync ───────────────────────
-    let buildstatus: HashMap<String, i64> = match &spec.hydra.buildstatus_file {
-        Some(path) => {
-            let text = std::fs::read_to_string(path)
-                .with_context(|| format!("read buildstatus file {}", path.display()))?;
-            serde_json::from_str(&text)
-                .with_context(|| format!("parse buildstatus file {}", path.display()))?
-        }
-        None => HashMap::new(),
-    };
     let job_closures = plan::job_closures(&dep_closure);
     let cached_prior_jobs: HashSet<&str> = plan_output
         .cached_prior_jobs
@@ -865,29 +979,26 @@ pub async fn run_with_backends(
         .iter()
         .map(String::as_str)
         .collect();
+    let divergent: HashSet<&str> = divergent_in_scope.iter().map(String::as_str).collect();
     let mut contexts: HashMap<String, JobContext> = HashMap::new();
     let mut attemptable: Vec<batch::PendingJob> = Vec::new();
     for m in manifest
         .iter()
         .filter(|m| in_scope.contains(m.job.as_str()))
     {
-        let hydra_outcome =
-            hydra_outcome_for_job(&m.outputs, &hydra_by_path, buildstatus.get(&m.job).copied());
-        let hydra_outputs = m
-            .outputs
-            .iter()
-            .map(|(name, path)| {
-                let entry = hydra_by_path.get(path);
-                (
-                    name.clone(),
-                    model::HydraOutput {
-                        narinfo_present: entry.map(|e| e.found).unwrap_or(false),
-                        nar_hash: entry.and_then(|e| e.nar_hash.clone()),
-                        nar_size: entry.and_then(|e| e.nar_size),
-                    },
-                )
-            })
-            .collect();
+        // Expected truth comes from the archive; a unit the loader produced
+        // no entry for (cannot happen for units it was given) degrades to
+        // unknown rather than panicking.
+        let unit_truth = truth
+            .get(&m.job)
+            .cloned()
+            .unwrap_or_else(|| hydra_truth::UnitTruth {
+                outcome: model::HydraOutcome::Unknown,
+                side: model::HydraSide {
+                    outcome: model::HydraOutcome::Unknown.as_str().to_string(),
+                    ..Default::default()
+                },
+            });
         let (target_drv, dep_drvs) = job_closures
             .get(&m.job)
             .cloned()
@@ -900,14 +1011,18 @@ pub async fn run_with_backends(
                 drv_path: m.drv_path.clone(),
                 outputs: m.outputs.clone(),
                 dep_drvs: dep_drvs.clone(),
-                hydra_outcome,
-                hydra_outputs,
-                hydra_buildstatus: buildstatus.get(&m.job).copied(),
+                hydra_outcome: unit_truth.outcome,
+                hydra_outputs: unit_truth.side.outputs.clone(),
+                // Native source status codes stay in the archive's detail
+                // strings; they are never engine input.
+                hydra_buildstatus: None,
                 plan_not_attemptable: not_attemptable.contains(m.job.as_str()),
                 plan_snapshot_valid: cached_prior_jobs.contains(m.job.as_str()),
             },
         );
-        if !not_attemptable.contains(m.job.as_str()) && !cached_prior_jobs.contains(m.job.as_str())
+        if !not_attemptable.contains(m.job.as_str())
+            && !cached_prior_jobs.contains(m.job.as_str())
+            && !divergent.contains(m.job.as_str())
         {
             attemptable.push(batch::PendingJob {
                 job: m.job.clone(),
@@ -1437,7 +1552,7 @@ mod tests {
 
     use async_trait::async_trait;
 
-    use crate::run::evalset_input::test_fixtures::write_mini_eval_set;
+    use crate::run::archive_input::{load_closures, load_units, write_mini_archive};
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
@@ -1505,21 +1620,21 @@ mod tests {
         )
     }
 
-    fn leaf_spec() -> CampaignSpec {
-        let mut spec: CampaignSpec = serde_json::from_str(
-            r#"{
+    fn leaf_spec(archive_digest: &str) -> CampaignSpec {
+        let mut spec: CampaignSpec = serde_json::from_str(&format!(
+            r#"{{
               "campaign_id": "c-e2e",
               "mode": "leaf",
-              "eval_set": {"hydra_eval_id": 1824219, "key_digest": "deadbeef"},
-              "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+              "archive": {{"digest": "{archive_digest}"}},
+              "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                           "warm_store_url": "ssh-ng://rio@gw:22?ssh-key=/w",
-                          "scheduler_addr": "s:9001", "store_addr": "st:9002"},
-              "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
-                          "upstreams_verified": true},
-              "filters": {"systems": ["x86_64-linux"], "exclude_features": ["kvm"]},
-              "s3": {"prefix": "parity/campaigns"}
-            }"#,
-        )
+                          "scheduler_addr": "s:9001", "store_addr": "st:9002"}},
+              "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                          "upstreams_verified": true}},
+              "filters": {{"systems": ["x86_64-linux"], "exclude_features": ["kvm"]}},
+              "s3": {{"prefix": "parity/campaigns"}}
+            }}"#
+        ))
         .unwrap();
         // Tight loop intervals so the end-to-end test finishes fast.
         spec.knobs.collect_poll_secs = 1;
@@ -1528,16 +1643,25 @@ mod tests {
         spec
     }
 
-    fn run_args(state_dir: &Path, eval_dir: &Path) -> RunArgs {
+    fn run_args(state_dir: &Path) -> RunArgs {
         RunArgs {
             spec: PathBuf::from("/dev/null"),
             state_dir: state_dir.to_path_buf(),
-            eval_set_dir: Some(eval_dir.to_path_buf()),
+            archive: None,
             limit: None,
             deadline: None,
             allow_unverified_tenants: false,
             no_s3: true,
         }
+    }
+
+    /// Write the mini replay archive into a tempdir and open it, returning
+    /// the directory guard, the open reader handle, and the archive id.
+    fn open_mini_archive() -> (tempfile::TempDir, Arc<ReplayArchive>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let built = write_mini_archive(dir.path());
+        let archive = Arc::new(ReplayArchive::open(dir.path()).unwrap());
+        (dir, archive, built.archive_id)
     }
 
     /// Minimal terminal (match-built) record for tests that only need a
@@ -1597,62 +1721,66 @@ mod tests {
         assert_eq!(view(), live);
     }
 
-    /// The synthetic stdenv dependency output of `job` from the mini eval
-    /// set's dep-closure.jsonl (the dep that is NOT libA's own output).
-    fn stdenv_dep_path(eval_dir: &Path, job: &str) -> String {
-        let entries = evalset_input::load_dep_closure(eval_dir).unwrap();
-        let entry = entries.iter().find(|d| d.job == job).unwrap();
-        entry
+    /// The dependency of appB in the mini archive whose drv path contains
+    /// `needle`, as `(drv path, first output path)` — the warm stage's
+    /// producer/disposition assertions key on these.
+    fn app_b_dep(archive: &ReplayArchive, needle: &str) -> (String, String) {
+        let units = load_units(archive).unwrap();
+        let closures = load_closures(archive, &units).unwrap();
+        let entry = closures
+            .iter()
+            .find(|d| d.job == "appB.x86_64-linux")
+            .unwrap();
+        let dep = entry
             .deps
             .iter()
-            .flat_map(|d| d.output_paths.clone())
-            .find(|p| p.contains("stdenv"))
-            .expect("mini eval set has a stdenv dep")
+            .find(|d| d.drv_path.contains(needle))
+            .expect("mini archive has the dependency");
+        (dep.drv_path.clone(), dep.output_paths[0].clone())
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn mini_campaign_end_to_end_and_resume() {
-        let eval_dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(eval_dir.path());
-        let manifest = evalset_input::load_manifest(eval_dir.path()).unwrap();
-        let app = manifest
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
             .iter()
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
-        let lib = manifest
-            .iter()
-            .find(|m| m.job == "libA.x86_64-linux")
-            .unwrap()
-            .clone();
-        let lib_out = lib.outputs["out"].clone();
-        let stdenv_out = stdenv_dep_path(eval_dir.path(), &app.job);
+        let (lib_drv, lib_out) = app_b_dep(&archive, "-libA-");
+        let (_stdenv_drv, stdenv_out) = app_b_dep(&archive, "-stdenv-");
 
-        // Hydra: appB's outputs + libA's out exist upstream; the stdenv dep
-        // does not (its narinfo lookup misses → not-found-upstream).
+        // Warm-path upstream coverage: libA's output exists upstream, the
+        // stdenv dep does not (its narinfo lookup misses →
+        // not-found-upstream). Target truth never touches this map — it is
+        // baked into the archive's outcomes.
         let mut narinfos = HashMap::new();
-        for p in app.outputs.values() {
-            narinfos.insert(p.clone(), narinfo_text(p));
-        }
         narinfos.insert(lib_out.clone(), narinfo_text(&lib_out));
 
-        // Submitter script: the warm batch settles first, then the appB
+        // Submitter script: the warm batch settles first, then the appA+appB
         // submit batch. FakeSubmitter pops from the BACK: push the SUBMIT
-        // outcome first. The submit batch carries appB's terminal outcome
-        // in band (per-root results); only the warm stage still reads its
-        // dispositions back through the reader.
+        // outcome first. The submit batch carries both roots' terminal
+        // outcomes in band (per-root results); only the warm stage still
+        // reads its dispositions back through the reader.
         let submitter = Arc::new(FakeSubmitter::default());
         let warm_build = "0193e4a2-7c1b-7d20-9b3a-00000000aaaa";
         let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000bbbb";
+        let built_result = |drv: &str| PathOutcome {
+            drv_path: drv.to_string(),
+            status: build_status_name(BuildStatus::Built).into(),
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(submit_build.into()),
-            results: vec![PathOutcome {
-                drv_path: app.drv_path.clone(),
-                status: build_status_name(BuildStatus::Built).into(),
-                error_msg: String::new(),
-                start_time: 0,
-                stop_time: 0,
-            }],
+            results: vec![built_result(&app_a.drv_path), built_result(&app_b.drv_path)],
             ..BatchOutcome::default()
         }));
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
@@ -1663,16 +1791,16 @@ mod tests {
         reader.set(
             warm_build,
             DrvObservation {
-                drv_path: lib.drv_path.clone(),
+                drv_path: lib_drv.clone(),
                 status: STATUS_COMPLETED.into(),
                 ..DrvObservation::default()
             },
         );
 
-        // Empty rio-store: nothing is valid at the plan snapshot (so appB is
-        // attemptable, not cached-prior); collect's NAR read then finds no
-        // info and records the outputs without hashes (not-comparable),
-        // which does not affect the bucket.
+        // Empty rio-store: nothing is valid at the plan snapshot (so both
+        // app units are attemptable, not cached-prior); collect's NAR read
+        // then finds no info and records the outputs without hashes
+        // (not-comparable), which does not affect the bucket.
         let state_dir = tempfile::tempdir().unwrap();
         // The same FakeSubmitter serves both the build path and the warm
         // stage so the scripted warm outcome still applies.
@@ -1688,10 +1816,10 @@ mod tests {
         };
         let state = StateDir::new(state_dir.path()).unwrap();
         run_with_backends(
-            run_args(state_dir.path(), eval_dir.path()),
-            leaf_spec(),
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
             state,
-            eval_dir.path().to_path_buf(),
+            archive.clone(),
             backends(),
         )
         .await
@@ -1703,8 +1831,9 @@ mod tests {
             assert!(state.marker_done(marker), "marker {marker} set");
         }
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
+        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
         assert_eq!(records["appB.x86_64-linux"].bucket, "match-built");
-        assert_eq!(records["libA.x86_64-linux"].bucket, "not-attemptable");
+        assert_eq!(records["divergentC.x86_64-linux"].bucket, "eval-divergence");
         assert_eq!(records["kvmTest.x86_64-linux"].bucket, "skipped");
         assert_eq!(records["libA.aarch64-linux"].bucket, "skipped");
         let warm_entries: Vec<WarmEntry> = state.load_jsonl(StateFile::Warm).unwrap();
@@ -1721,16 +1850,26 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
                 .unwrap();
         assert_eq!(progress["stage"], "done");
+        // campaign.json pins the archive and carries the recorder-side
+        // exclusion counts alongside the engine's own plan-time exclusions.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        assert_eq!(campaign.archive.archive_id, archive_id);
+        assert_eq!(
+            campaign.comparability.eval_set,
+            campaign.archive.archive_id_short
+        );
+        assert_eq!(campaign.comparability.excluded.get("eval-error"), Some(&1));
+        assert_eq!(campaign.comparability.excluded.get("skipped"), Some(&2));
 
         // Resume: same state dir, no scripted submitter outcomes left → must
         // not submit anything new and must finish with identical buckets.
         let submitted_before = submitter.submitted.lock().unwrap().len();
         let state2 = StateDir::new(state_dir.path()).unwrap();
         run_with_backends(
-            run_args(state_dir.path(), eval_dir.path()),
-            leaf_spec(),
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
             state2,
-            eval_dir.path().to_path_buf(),
+            archive.clone(),
             backends(),
         )
         .await
@@ -1747,45 +1886,125 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(records2["appB.x86_64-linux"].bucket, "match-built");
+
+        // A different archive may not resume this campaign: the stored pin
+        // refuses it before any stage runs. A one-unit archive is enough —
+        // only its (different) identity matters.
+        let other = tempfile::tempdir().unwrap();
+        let other_id = {
+            use crate::archive::schema::{
+                Capabilities, RequestRecord, RequestTarget, Substituters, UnitRecord,
+            };
+            use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+            let drv = format!(
+                "/nix/store/{}-other-1.0.drv",
+                crate::run::archive_input::fake_hash("other-drv")
+            );
+            let out = format!(
+                "/nix/store/{}-other-1.0",
+                crate::run::archive_input::fake_hash("other-out")
+            );
+            let writer = ArchiveWriter::create(other.path()).unwrap();
+            writer
+                .add_drv(
+                    &drv,
+                    &format!(
+                        r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{out}")])"#
+                    ),
+                )
+                .unwrap();
+            writer
+                .write_units(&[UnitRecord {
+                    drv: drv.clone(),
+                    label: Some("other.x86_64-linux".to_string()),
+                    system: Some("x86_64-linux".to_string()),
+                    outputs: BTreeMap::from([("out".to_string(), out)]),
+                    required_features: Vec::new(),
+                    identity_divergent: false,
+                }])
+                .unwrap();
+            writer
+                .write_requests(&[RequestRecord {
+                    session: 0,
+                    offset_s: 0.0,
+                    targets: vec![RequestTarget {
+                        drv,
+                        outputs: vec!["*".to_string()],
+                    }],
+                }])
+                .unwrap();
+            let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+            writer
+                .finalize(ManifestSeed {
+                    created_at: stamp,
+                    from: stamp,
+                    to: stamp,
+                    capabilities: Capabilities::default(),
+                    substituters: Substituters {
+                        relay: vec!["https://cache.example.org".to_string()],
+                        target: Vec::new(),
+                    },
+                    fat: false,
+                    provenance: serde_json::Map::new(),
+                })
+                .unwrap()
+                .archive_id
+        };
+        assert_ne!(other_id, archive_id);
+        let other_archive = Arc::new(ReplayArchive::open(other.path()).unwrap());
+        let err = run_with_backends(
+            run_args(state_dir.path()),
+            leaf_spec(&other_id),
+            StateDir::new(state_dir.path()).unwrap(),
+            other_archive,
+            backends(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("campaign.json pins archive"),
+            "{err:#}"
+        );
     }
 
     /// Transport-error path end to end: the first submission fails
     /// engine-side (channel open refused), the batch is recorded with the
-    /// error text and no in-band results, the job is re-offered, and the
-    /// resubmission's in-band Built result drains the campaign.
+    /// error text and no in-band results, the jobs are re-offered, and the
+    /// resubmission's in-band Built results drain the campaign.
     ///
-    /// Only appB's own outputs exist upstream here, so the warm stage has
+    /// Nothing in the warm set exists upstream here, so the warm stage has
     /// nothing to warm (no warm batch) and `warm_submitter: None` exercises
     /// the build-submitter fallback for the warm call site.
     #[tokio::test(flavor = "multi_thread")]
     async fn transport_error_batches_are_reoffered_and_drain() {
-        let eval_dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(eval_dir.path());
-        let manifest = evalset_input::load_manifest(eval_dir.path()).unwrap();
-        let app = manifest
+        let (_archive_dir, archive, archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let app_a = manifest
+            .iter()
+            .find(|m| m.job == "appA.x86_64-linux")
+            .unwrap()
+            .clone();
+        let app_b = manifest
             .iter()
             .find(|m| m.job == "appB.x86_64-linux")
             .unwrap()
             .clone();
-        let mut narinfos = HashMap::new();
-        for p in app.outputs.values() {
-            narinfos.insert(p.clone(), narinfo_text(p));
-        }
 
         // FakeSubmitter pops from the BACK: the FIRST submission fails at the
-        // transport (engine-side error), the SECOND carries appB's terminal
-        // outcome in band.
+        // transport (engine-side error), the SECOND carries both roots'
+        // terminal outcomes in band.
         let submitter = Arc::new(FakeSubmitter::default());
         let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000cccc";
+        let built_result = |drv: &str| PathOutcome {
+            drv_path: drv.to_string(),
+            status: build_status_name(BuildStatus::Built).into(),
+            error_msg: String::new(),
+            start_time: 0,
+            stop_time: 0,
+        };
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(submit_build.into()),
-            results: vec![PathOutcome {
-                drv_path: app.drv_path.clone(),
-                status: build_status_name(BuildStatus::Built).into(),
-                error_msg: String::new(),
-                start_time: 0,
-                stop_time: 0,
-            }],
+            results: vec![built_result(&app_a.drv_path), built_result(&app_b.drv_path)],
             ..BatchOutcome::default()
         }));
         submitter.outcomes.lock().unwrap().push(Err(anyhow::anyhow!(
@@ -1795,10 +2014,10 @@ mod tests {
         let state_dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(state_dir.path()).unwrap();
         run_with_backends(
-            run_args(state_dir.path(), eval_dir.path()),
-            leaf_spec(),
+            run_args(state_dir.path()),
+            leaf_spec(&archive_id),
             state,
-            eval_dir.path().to_path_buf(),
+            archive.clone(),
             Backends {
                 store: Arc::new(FakeStoreApi::default()),
                 admin: Arc::new(NoLogsAdmin),
@@ -1806,15 +2025,15 @@ mod tests {
                 reader: Arc::new(FakeReader::default()),
                 submitter: submitter.clone(),
                 warm_submitter: None,
-                narinfo: Arc::new(MapNarinfo(narinfos)),
+                narinfo: Arc::new(MapNarinfo(HashMap::new())),
                 artifacts: None,
             },
         )
         .await
         .unwrap();
 
-        // The job was attempted at least twice (transport failure, then the
-        // successful resubmission) and ends match-built.
+        // The jobs were attempted at least twice (transport failure, then
+        // the successful resubmission) and end match-built.
         let records = latest_per_job(
             StateDir::new(state_dir.path())
                 .unwrap()
@@ -1824,10 +2043,11 @@ mod tests {
         let app_record = &records["appB.x86_64-linux"];
         assert_eq!(app_record.bucket, "match-built");
         assert!(app_record.attempts >= 1, "{app_record:?}");
+        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
 
         // Two build-path submissions were recorded (no warm batch exists —
         // nothing was warmable): the first carries the engine submission
-        // error and an empty results array, the second the in-band result.
+        // error and an empty results array, the second the in-band results.
         let state = StateDir::new(state_dir.path()).unwrap();
         let mut batches: Vec<model::BatchRecord> = state
             .load_jsonl::<model::BatchRecord>(StateFile::Batches)
@@ -1850,11 +2070,19 @@ mod tests {
             batches[0].stderr_tail
         );
         assert_eq!(batches[1].build_id.as_deref(), Some(submit_build));
-        assert_eq!(batches[1].results.len(), 1);
-        assert_eq!(batches[1].results[0].drv_path, app.drv_path);
-        assert_eq!(
-            batches[1].results[0].status,
-            build_status_name(BuildStatus::Built)
+        assert_eq!(batches[1].results.len(), 2);
+        let result_drvs: Vec<&str> = batches[1]
+            .results
+            .iter()
+            .map(|r| r.drv_path.as_str())
+            .collect();
+        assert!(result_drvs.contains(&app_a.drv_path.as_str()));
+        assert!(result_drvs.contains(&app_b.drv_path.as_str()));
+        assert!(
+            batches[1]
+                .results
+                .iter()
+                .all(|r| r.status == build_status_name(BuildStatus::Built))
         );
     }
 
@@ -2035,30 +2263,29 @@ mod tests {
     /// in-scope job with no record yet, so bucket counts sum to in-scope.
     #[test]
     fn partial_report_backfills_not_attempted_to_in_scope_total() {
-        let eval_dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(eval_dir.path());
-        let manifest = evalset_input::load_manifest(eval_dir.path()).unwrap();
+        let (_archive_dir, archive, _archive_id) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
         let state_dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(state_dir.path()).unwrap();
 
-        // In scope: appB + libA. libA already has a terminal plan-time
+        // In scope: appA + appB. appA already has a terminal plan-time
         // record (not-attemptable); appB never produced one (deadline hit
         // first).
         let plan = PlanOutput {
-            in_scope: vec!["appB.x86_64-linux".into(), "libA.x86_64-linux".into()],
+            in_scope: vec!["appA.x86_64-linux".into(), "appB.x86_64-linux".into()],
             ..PlanOutput::default()
         };
-        let lib = manifest
+        let app_a = manifest
             .iter()
-            .find(|m| m.job == "libA.x86_64-linux")
+            .find(|m| m.job == "appA.x86_64-linux")
             .unwrap();
         state
             .append_jsonl(
                 StateFile::Results,
                 &JobRecord {
-                    job: lib.job.clone(),
-                    system: lib.system.clone(),
-                    drv_path: lib.drv_path.clone(),
+                    job: app_a.job.clone(),
+                    system: app_a.system.clone(),
+                    drv_path: app_a.drv_path.clone(),
                     mode: "leaf".into(),
                     attempts: 0,
                     build_ids: vec![],

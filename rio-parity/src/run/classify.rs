@@ -21,7 +21,8 @@ use super::model::{Bucket, FailureKind, HydraOutcome, RioOutcome, RootCauseKind}
 pub struct AuxFlags {
     /// Job was filtered out / unsupported system or feature (reason string).
     pub skipped: Option<String>,
-    /// Attr failed local evaluation (eval-set eval-errors.jsonl).
+    /// Attr failed local evaluation (recorded as an eval-error exclusion
+    /// in the archive).
     pub eval_error: bool,
     /// Job is in the plan-time not-attemptable set: in leaf mode its own
     /// outputs sit inside another in-scope job's dependency closure, so

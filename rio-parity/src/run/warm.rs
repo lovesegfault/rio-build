@@ -170,7 +170,7 @@ pub async fn run_warm(
     // One PendingJob per producing drv, node estimate 1 (roots-only merge:
     // no dependency drvs ride along, so the merged-DAG estimate is just the
     // root count). The "job" name of a warm pending job is its drv path —
-    // warm roots have no eval-set job name of their own.
+    // warm roots have no workload-unit job name of their own.
     let jobs: Vec<PendingJob> = work
         .by_drv
         .keys()

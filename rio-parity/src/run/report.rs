@@ -161,6 +161,14 @@ pub fn comparability_with_counts(
             excluded.insert(b.as_str().to_string(), *n);
         }
     }
+    // Merge, never overwrite: the base block carries exclusion counts the
+    // job records cannot reproduce (the archive's recorder-side eval errors
+    // and aggregates never become workload units), so any reason already
+    // recorded there and not re-derived from bucket counts above survives
+    // the refresh.
+    for (reason, count) in &base.excluded {
+        excluded.entry(reason.clone()).or_insert(*count);
+    }
     block.excluded = excluded;
     let terminal = terminal_job_count(&agg.bucket_counts);
     block.completeness_pct = if block.in_scope > 0 {
@@ -518,10 +526,9 @@ mod tests {
             "c-test".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            crate::run::spec::EvalSetPin {
-                hydra_eval_id: 1,
-                key_digest: "k".into(),
-                manifest_sha256: "m".into(),
+            crate::run::spec::ArchivePin {
+                archive_id: "ab".repeat(32),
+                archive_id_short: "ab".repeat(8),
             },
         );
         let mut records = BTreeMap::new();
@@ -540,7 +547,7 @@ mod tests {
         assert_eq!(one, two, "byte-identical re-render");
         assert!(one.contains("PARTIAL REPORT"));
         assert!(one.contains("Build-outcome parity"));
-        assert!(one.contains("| eval set | 1/k |"));
+        assert!(one.contains(&format!("| eval set | {} |", "ab".repeat(8))));
     }
 
     #[test]
@@ -551,10 +558,9 @@ mod tests {
             "c-test".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            crate::run::spec::EvalSetPin {
-                hydra_eval_id: 1,
-                key_digest: "k".into(),
-                manifest_sha256: "m".into(),
+            crate::run::spec::ArchivePin {
+                archive_id: "ab".repeat(32),
+                archive_id_short: "ab".repeat(8),
             },
         );
         campaign.plan = Some(crate::run::spec::PlanOutput {
@@ -592,7 +598,7 @@ mod tests {
             "c-empty".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            crate::run::spec::EvalSetPin::default(),
+            crate::run::spec::ArchivePin::default(),
         );
         let p = build_progress(
             &campaign,
@@ -614,7 +620,7 @@ mod tests {
             "c-trunc".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            crate::run::spec::EvalSetPin::default(),
+            crate::run::spec::ArchivePin::default(),
         );
         // Three distinct signatures and three NAR-divergent jobs, rendered
         // with top_n = 2 → both lists are truncated and must say so.
@@ -674,7 +680,7 @@ mod tests {
             "c-test".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            crate::run::spec::EvalSetPin::default(),
+            crate::run::spec::ArchivePin::default(),
         );
         let suspension = SuspensionSummary::default();
 

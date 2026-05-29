@@ -28,12 +28,14 @@ struct RawEvalLine {
     constituents: Vec<String>,
 }
 
-/// manifest.jsonl record:
-/// `{job, system, attr, drvPath, outputs, requiredFeatures?}`.
+/// One in-scope job as the evaluator produced it:
+/// `{job, system, attr, drvPath, outputs, requiredFeatures?}` (camelCase on
+/// the wire). These records become the archive's `units.jsonl` workload
+/// units when the eval pipeline stages a replay archive.
 ///
 /// `requiredFeatures` is not part of the nix-eval-jobs output; it is
-/// backfilled later from the derivation's `requiredSystemFeatures`
-/// before the manifest is written out for a campaign.
+/// backfilled later from the derivation's `requiredSystemFeatures` before
+/// the records are handed to the archive staging step.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ManifestRecord {
     pub job: String,
@@ -46,7 +48,9 @@ pub struct ManifestRecord {
     pub required_features: Option<Vec<String>>,
 }
 
-/// eval-errors.jsonl record: one per attribute that failed to evaluate.
+/// One attribute that failed to evaluate. These records become the
+/// archive's `exclusions.jsonl` eval-error entries when the eval pipeline
+/// stages a replay archive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EvalErrorRecord {
     pub attr: String,
@@ -234,7 +238,7 @@ mod tests {
             required_features: None,
         };
         let json = serde_json::to_value(&rec).unwrap();
-        // manifest.jsonl field names: {job, system, attr, drvPath,
+        // Manifest-record field names: {job, system, attr, drvPath,
         // outputs, requiredFeatures?} — camelCase on the wire.
         assert!(json.get("drvPath").is_some());
         assert!(json.get("drv_path").is_none());

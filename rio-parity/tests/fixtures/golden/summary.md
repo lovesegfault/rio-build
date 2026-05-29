@@ -5,8 +5,8 @@ Generated: 2026-05-26T12:00:00Z
 ## Comparability
 | field | value |
 |---|---|
-| eval set | 1824219/deadbeef |
-| manifest sha256 | abc123 |
+| eval set | 8b919129046e0f60 |
+| manifest sha256 | 8b919129046e0f608b919129046e0f608b919129046e0f608b919129046e0f60 |
 | mode | leaf |
 | build tenant | parity-leaf |
 | systems | x86_64-linux |

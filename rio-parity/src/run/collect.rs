@@ -35,15 +35,16 @@ use super::state::{StateDir, StateFile};
 use super::stderrparse::{ReasonClass, classify_reason, signature_for};
 use super::submitter::repro_command;
 
-/// Static per-job context assembled from the eval set + plan output.
+/// Static per-job context assembled from the archive's workload units,
+/// recorded truth, and plan output.
 #[derive(Debug, Clone)]
 pub struct JobContext {
     pub job: String,
     pub system: String,
     pub drv_path: String,
-    /// Output name → store path (from the eval-set manifest).
+    /// Output name → store path (from the archive's unit record).
     pub outputs: BTreeMap<String, String>,
-    /// Dependency drv closure (from dep-closure.jsonl) — used for the
+    /// Dependency drv closure (from the archive's closure records) — used for the
     /// fail-fast re-attribution rule.
     pub dep_drvs: HashSet<String>,
     pub hydra_outcome: HydraOutcome,

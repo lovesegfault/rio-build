@@ -898,12 +898,7 @@
     {
       "path": "run/drv_import.rs",
       "depth": 1,
-      "doc": "Derivation-closure import source backed by the eval set's drv archive."
-    },
-    {
-      "path": "run/evalset_input.rs",
-      "depth": 1,
-      "doc": "Readers for the eval-set artifacts the campaign consumes:"
+      "doc": "Derivation-text import source backed by the open replay archive."
     },
     {
       "path": "run/glob.rs",

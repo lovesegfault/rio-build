@@ -133,7 +133,8 @@ impl HydraClient {
         })
     }
 
-    /// Requests issued so far (recorded into evalset.json).
+    /// Requests issued so far (recorded into the archive provenance's
+    /// `stats.hydra_requests_used` audit field).
     pub async fn requests_used(&self) -> u32 {
         self.state.lock().await.used
     }

@@ -543,15 +543,16 @@ rec {
 
   # ── nixpkgs-parity campaign engine ─────────────────────────────────────
   # Engine binary plus the external tools it shells out to: `nix`
-  # (drv import from the eval-set archive + ssh-ng submission through
-  # rio-gateway), `nix-eval-jobs` (recorder evaluation), and the OpenSSH
-  # client (`nix … --store ssh-ng://` spawns `ssh`). dwarfs provides
+  # (the leaf-mode warm-stage prefetch only — build-path submission and
+  # drv-text import drive the gateway worker protocol in-process),
+  # `nix-eval-jobs` (recorder evaluation), and the OpenSSH client
+  # (`nix … --store ssh-ng://` spawns `ssh`). dwarfs provides
   # `mkdwarfs`, which the recorder (`rio-parity eval`) shells out to
   # when packing its staged replay archive into the published .dwarfs
-  # image. GNU tar + zstd are REQUIRED while the campaign engine
-  # (`rio-parity run`) still unpacks legacy drvs.tar.zst eval-set
-  # archives with `tar --zstd -xf`; gzip covers the `tar -xzf` unpack
-  # of the nixpkgs source tarball during recorder evaluation;
+  # image; the campaign engine opens that image in place and needs no
+  # unpack tools. GNU tar + gzip cover the `tar -xzf` unpack of the
+  # nixpkgs source tarball during recorder evaluation; zstd is kept for
+  # operator-side inspection of the engine's .zst log artifacts;
   # coreutils/bash cover the rest of the pack/unpack plumbing.
   # cacert/tzdata come from baseContents (Hydra and cache.nixos.org are
   # HTTPS); RIO_LOG_FORMAT=json + SSL_CERT_FILE from baseEnv. git is NOT

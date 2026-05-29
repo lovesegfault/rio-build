@@ -4,8 +4,8 @@
 //! stages stay unit-testable against a scripted in-memory fake.
 //! [`ClientOpsSubmitter`] is the build-path implementation: it drives the
 //! gateway's nix-daemon worker protocol in-process over the SSH channel
-//! pool — per batch it imports the batch's drv closure from the eval-set
-//! drv archive, then issues one `BuildPathsWithResults` call whose per-root
+//! pool — per batch it imports the batch's drv closure from the replay
+//! archive, then issues one `BuildPathsWithResults` call whose per-root
 //! results become the batch outcome; relayed stderr lines are captured as
 //! evidence only (build id, failure reasons, tail). [`WarmNixSubmitter`] is
 //! the `nix` shell-out submitter, now scoped to the leaf-mode warm-stage
@@ -171,7 +171,7 @@ struct ChildCapture {
 /// it is removed once the supply planner takes over that stage. Build-path
 /// batches go through [`ClientOpsSubmitter`] instead.
 pub struct WarmNixSubmitter {
-    /// Untarred eval-set drv archive (an uncompressed `file://` binary-cache
+    /// Drv-archive directory (an uncompressed `file://` binary-cache
     /// layout) used to import each batch's drv closures into the local store
     /// before submission.
     pub drv_archive_dir: PathBuf,
@@ -399,7 +399,7 @@ fn upload_deadline(base: Duration, payload_bytes: u64) -> Duration {
 }
 
 /// Submitter that drives the gateway's worker protocol directly: per batch
-/// it imports the batch's drv closure from the eval-set drv archive
+/// it imports the batch's drv closure from the replay archive
 /// (a `QueryValidPaths` probe + `AddMultipleToStore` of the missing texts in
 /// reference order), then issues one `BuildPathsWithResults` call whose
 /// per-root results become the batch outcome. Relayed stderr lines are
@@ -408,7 +408,7 @@ pub struct ClientOpsSubmitter {
     /// SSH channel pool to the gateway; one channel is held per in-flight
     /// submission.
     pub pool: Arc<GatewayPool>,
-    /// Untarred eval-set drv archive the drv closure is imported from.
+    /// Open replay archive the drv texts are imported from.
     pub archive: Arc<DrvArchive>,
     /// Per-op deadline for the probe and upload calls
     /// (`knobs.op_timeout_secs`); the build call uses the batch timeout.
@@ -506,7 +506,7 @@ impl Submitter for ClientOpsSubmitter {
             .await
             .context("open a gateway daemon channel for the batch submission")?;
 
-        // ── Import: the batch's drv closure from the eval-set archive ──────
+        // ── Import: the batch's drv closure from the replay archive ────────
         let closure = self.archive.closure(&batch.root_drvs)?;
         let mut valid: BTreeSet<String> = BTreeSet::new();
         for chunk in closure.chunks(self.probe_chunk.max(1)) {

@@ -1,18 +1,19 @@
 //! Plan stage: scope selection, warm / not-attemptable computation, the
 //! plan-time validity snapshot, tenant-mode consistency checks, and the
-//! eval-set pin recorded in campaign.json.
+//! archive pin recorded in campaign.json.
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use super::evalset_input::{DepClosureEntry, ManifestEntry};
+use crate::archive::reader::ReplayArchive;
+
+use super::archive_input::{DepClosureEntry, ManifestEntry};
 use super::glob::glob_match;
 use super::grpc::StoreApi;
 use super::model::now_rfc3339;
 use super::spec::{
-    CampaignSpec, EvalSetPin, Filters, Mode, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+    ArchivePin, CampaignSpec, Filters, Mode, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
     PlanOutput, WARM_TENANT,
 };
 
@@ -137,7 +138,7 @@ pub struct WarmComputation {
 /// dependency closure is not attemptable (warming it would mask the build).
 ///
 /// Memory posture: the warm set and producer map own their Strings, sized
-/// for the scoped (constituents / explicit job-list) eval sets the engine
+/// for the scoped (constituents / explicit job-list) archives the engine
 /// runs today. A full-evaluation campaign needs an interning or streaming
 /// pass before it is attempted.
 pub fn compute_warm_sets(
@@ -255,64 +256,37 @@ pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<
 #[derive(Debug)]
 pub struct PlanResult {
     pub output: PlanOutput,
-    pub pin: EvalSetPin,
+    pub pin: ArchivePin,
     pub low_confidence: Vec<String>,
     /// Output path → producing drv for warm-root resolution (not persisted in
-    /// campaign.json — recomputed on resume from dep-closure.jsonl).
+    /// campaign.json — recomputed on resume from the archive's closures).
     pub warm_producer: BTreeMap<String, String>,
 }
 
-/// Run the plan stage against an already-downloaded eval-set directory.
+/// Run the plan stage against an already-opened replay archive.
 pub async fn run_plan(
     spec: &CampaignSpec,
-    eval_dir: &Path,
+    archive: &ReplayArchive,
     store: &dyn StoreApi,
     allow_unverified_tenants: bool,
 ) -> Result<PlanResult> {
-    let meta = super::evalset_input::load_meta(eval_dir)?;
-    if meta.hydra_eval_id != spec.eval_set.hydra_eval_id {
+    let archive_id = archive
+        .archive_id()
+        .context("the campaign engine requires a v1 archive (this archive has no archive id)")?
+        .to_string();
+    // A non-empty spec digest must name the archive actually opened — the
+    // S3 fetch path verifies this before download, but a local --archive can
+    // point anywhere, so the mismatch is caught again here.
+    if !spec.archive.digest.is_empty() && spec.archive.digest != archive_id {
         bail!(
-            "eval set mismatch: spec wants hydra eval {} but evalset.json says {}",
-            spec.eval_set.hydra_eval_id,
-            meta.hydra_eval_id
-        );
-    }
-    if !spec.eval_set.key_digest.is_empty() && meta.key_digest != spec.eval_set.key_digest {
-        bail!(
-            "eval set key-digest mismatch: spec {} vs evalset.json {}",
-            spec.eval_set.key_digest,
-            meta.key_digest
-        );
-    }
-    let manifest_sha = super::evalset_input::manifest_sha256(eval_dir)?;
-    if let Some(recorded) = &meta.manifest_sha256
-        && recorded != &manifest_sha
-    {
-        bail!(
-            "manifest.jsonl digest mismatch: evalset.json records {recorded}, computed {manifest_sha}"
+            "campaign spec pins archive digest {} but the provided archive is {archive_id}",
+            spec.archive.digest
         );
     }
     let low_confidence = check_tenants(spec, allow_unverified_tenants)?;
 
-    let manifest = super::evalset_input::load_manifest(eval_dir)?;
-    let dep_closure = super::evalset_input::load_dep_closure(eval_dir)?;
-    if spec.mode == Mode::Leaf && dep_closure.is_empty() {
-        bail!("leaf mode requires dep-closure.jsonl in the eval set (warm-all + not-attemptable)");
-    }
-    // Loud format guard: an eval set produced with a pre-adjacency flat
-    // format (`depOutputPaths` only, no `deps`) would otherwise yield an empty
-    // warm set and a silently-wrong leaf campaign.
-    if spec.mode == Mode::Leaf
-        && dep_closure
-            .iter()
-            .any(|d| d.deps.is_empty() && !d.legacy_dep_output_paths.is_empty())
-    {
-        bail!(
-            "eval set was produced with an incompatible dep-closure format (flat depOutputPaths \
-             without the deps adjacency); re-run rio-parity eval with a version that emits \
-             {{\"deps\":[{{\"drvPath\",\"outputPaths\"}}]}} records"
-        );
-    }
+    let manifest = super::archive_input::load_units(archive)?;
+    let dep_closure = super::archive_input::load_closures(archive, &manifest)?;
 
     let jobs_file_contents = match &spec.filters.jobs_file {
         Some(p) => Some(
@@ -336,7 +310,7 @@ pub async fn run_plan(
             String::new()
         };
         bail!(
-            "jobs file {} lists {} job(s) not present in the eval-set manifest \
+            "jobs file {} lists {} job(s) not present in the archive's workload units \
              (operator typo or stale file?): {}{}",
             spec.filters
                 .jobs_file
@@ -383,28 +357,13 @@ pub async fn run_plan(
     };
     Ok(PlanResult {
         output,
-        pin: EvalSetPin {
-            hydra_eval_id: meta.hydra_eval_id,
-            key_digest: meta.key_digest,
-            manifest_sha256: manifest_sha,
+        pin: ArchivePin {
+            archive_id_short: crate::archive::identity::short_id(&archive_id),
+            archive_id,
         },
         low_confidence,
         warm_producer: warm.producer,
     })
-}
-
-/// Resume gate: refuse to continue (or report) when the eval set on disk no
-/// longer hashes to the manifest digest recorded in campaign.json — one
-/// campaign must never mix two eval sets.
-pub fn verify_manifest_digest(eval_dir: &Path, recorded: &str) -> Result<()> {
-    let computed = super::evalset_input::manifest_sha256(eval_dir)?;
-    if computed != recorded {
-        bail!(
-            "manifest digest mismatch on resume: campaign.json records {recorded} but the eval set \
-             on disk hashes to {computed} — refusing to mix eval sets in one campaign"
-        );
-    }
-    Ok(())
 }
 
 /// Build the per-job dep-drv lookup used by batch assembly and closure
@@ -433,14 +392,13 @@ pub fn job_closures(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::evalset_input::test_fixtures::write_mini_eval_set;
+    use crate::run::archive_input::{load_units, write_mini_archive};
     use crate::run::grpc::test_support::FakeStoreApi;
 
     fn leaf_spec() -> CampaignSpec {
         let mut spec: CampaignSpec = serde_json::from_str(
             r#"{
               "mode": "leaf",
-              "eval_set": {"hydra_eval_id": 1824219, "key_digest": "deadbeef"},
               "cluster": {"gateway_store_url": "ssh-ng://x", "warm_store_url": "ssh-ng://w",
                           "scheduler_addr": "s:9001", "store_addr": "st:9002"},
               "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
@@ -453,11 +411,23 @@ mod tests {
         spec
     }
 
+    /// Mini archive opened for a plan test: the directory guard, the open
+    /// reader, and the identity returned by the fixture writer.
+    fn open_mini_archive() -> (
+        tempfile::TempDir,
+        ReplayArchive,
+        crate::run::archive_input::MiniArchive,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let built = write_mini_archive(dir.path());
+        let archive = ReplayArchive::open(dir.path()).unwrap();
+        (dir, archive, built)
+    }
+
     #[test]
     fn filters_apply_systems_features_globs_limit() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        let manifest = crate::run::evalset_input::load_manifest(dir.path()).unwrap();
+        let (_dir, archive, _built) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
 
         let mut filters = Filters {
             systems: vec!["x86_64-linux".into()],
@@ -467,34 +437,42 @@ mod tests {
         let scope = apply_filters(&manifest, &filters, None);
         assert_eq!(
             scope.in_scope,
-            vec!["appB.x86_64-linux", "libA.x86_64-linux"]
+            vec![
+                "appA.x86_64-linux",
+                "appB.x86_64-linux",
+                "divergentC.x86_64-linux"
+            ]
         );
         assert_eq!(scope.skipped["kvmTest.x86_64-linux"], SKIP_FEATURE);
         assert_eq!(scope.skipped["libA.aarch64-linux"], SKIP_SYSTEM);
 
         filters.include_globs = vec!["app*".into()];
         let scope = apply_filters(&manifest, &filters, None);
-        assert_eq!(scope.in_scope, vec!["appB.x86_64-linux"]);
-        assert_eq!(scope.skipped["libA.x86_64-linux"], SKIP_GLOB);
+        assert_eq!(
+            scope.in_scope,
+            vec!["appA.x86_64-linux", "appB.x86_64-linux"]
+        );
+        assert_eq!(scope.skipped["divergentC.x86_64-linux"], SKIP_GLOB);
 
         filters.include_globs.clear();
         filters.limit = Some(1);
         let scope = apply_filters(&manifest, &filters, None);
-        assert_eq!(scope.in_scope, vec!["appB.x86_64-linux"]);
-        assert_eq!(scope.skipped["libA.x86_64-linux"], SKIP_LIMIT);
+        assert_eq!(scope.in_scope, vec!["appA.x86_64-linux"]);
+        assert_eq!(scope.skipped["appB.x86_64-linux"], SKIP_LIMIT);
+        assert_eq!(scope.skipped["divergentC.x86_64-linux"], SKIP_LIMIT);
 
         // Explicit jobs file overrides globs.
         filters.limit = None;
-        let scope = apply_filters(&manifest, &filters, Some("libA.x86_64-linux\n# comment\n"));
-        assert_eq!(scope.in_scope, vec!["libA.x86_64-linux"]);
-        assert_eq!(scope.skipped["appB.x86_64-linux"], SKIP_JOBS_FILE);
+        let scope = apply_filters(&manifest, &filters, Some("appB.x86_64-linux\n# comment\n"));
+        assert_eq!(scope.in_scope, vec!["appB.x86_64-linux"]);
+        assert_eq!(scope.skipped["appA.x86_64-linux"], SKIP_JOBS_FILE);
         assert!(scope.unmatched_jobs_file.is_empty());
 
-        // Jobs-file entries naming nothing in the manifest are surfaced.
+        // Jobs-file entries naming nothing in the workload units are surfaced.
         let scope = apply_filters(
             &manifest,
             &filters,
-            Some("libA.x86_64-linux\nzzz.x86_64-linux\naaa.x86_64-linux\n"),
+            Some("appB.x86_64-linux\nzzz.x86_64-linux\naaa.x86_64-linux\n"),
         );
         assert_eq!(
             scope.unmatched_jobs_file,
@@ -504,60 +482,113 @@ mod tests {
 
     #[test]
     fn warm_and_not_attemptable_from_dep_closure() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        let manifest = crate::run::evalset_input::load_manifest(dir.path()).unwrap();
-        let depc = crate::run::evalset_input::load_dep_closure(dir.path()).unwrap();
+        let (_dir, archive, _built) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        let depc = crate::run::archive_input::load_closures(&archive, &manifest).unwrap();
         let in_scope = vec![
+            "appA.x86_64-linux".to_string(),
             "appB.x86_64-linux".to_string(),
-            "libA.x86_64-linux".to_string(),
         ];
         let comp = compute_warm_sets(&manifest, &depc, &in_scope);
-        // appB depends on libA's output and stdenv's output → both in the warm set.
+        // appB depends on libA's output and (transitively) stdenv's output →
+        // both in the warm set; appA has no dependencies.
         assert_eq!(comp.warm_set.len(), 2);
-        // libA's own output is inside appB's closure → libA is not-attemptable.
-        assert_eq!(
-            comp.not_attemptable.iter().collect::<Vec<_>>(),
-            vec!["libA.x86_64-linux"]
-        );
-        // Producer map points the libA output at the libA drv.
-        let lib_a = manifest
+        // No in-scope unit's own output sits inside another unit's closure in
+        // the mini archive (libA and stdenv are dependency-only derivations).
+        assert!(comp.not_attemptable.is_empty());
+        // Producer map points each warm path at the drv that builds it.
+        let app_b_deps = &depc
             .iter()
-            .find(|m| m.job == "libA.x86_64-linux")
+            .find(|d| d.job == "appB.x86_64-linux")
+            .unwrap()
+            .deps;
+        let lib_a_dep = app_b_deps
+            .iter()
+            .find(|d| d.drv_path.contains("-libA-"))
             .unwrap();
-        let lib_a_out = lib_a.outputs["out"].clone();
-        assert_eq!(comp.producer[&lib_a_out], lib_a.drv_path);
-        // Restricting scope to libA only → empty warm set (no deps).
-        let comp2 = compute_warm_sets(&manifest, &depc, &["libA.x86_64-linux".to_string()]);
+        assert_eq!(
+            comp.producer[&lib_a_dep.output_paths[0]],
+            lib_a_dep.drv_path
+        );
+        // Restricting scope to a dependency-less unit → empty warm set.
+        let comp2 = compute_warm_sets(&manifest, &depc, &["appA.x86_64-linux".to_string()]);
         assert!(comp2.warm_set.is_empty());
         assert!(comp2.not_attemptable.is_empty());
+
+        // The not-attemptable rule itself: an in-scope unit whose own output
+        // is inside another in-scope unit's dependency closure must be
+        // excluded from the attemptable set (warming it would mask the build).
+        let unit = |job: &str, drv: &str, out: &str| ManifestEntry {
+            job: job.to_string(),
+            system: "x86_64-linux".to_string(),
+            attr: job.to_string(),
+            drv_path: drv.to_string(),
+            outputs: BTreeMap::from([("out".to_string(), out.to_string())]),
+            required_features: Vec::new(),
+        };
+        let dep_drv = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-depUnit.drv";
+        let dep_out = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-depUnit";
+        let top_drv = "/nix/store/cccccccccccccccccccccccccccccccc-topUnit.drv";
+        let synth_units = vec![
+            unit("depUnit.x86_64-linux", dep_drv, dep_out),
+            unit(
+                "topUnit.x86_64-linux",
+                top_drv,
+                "/nix/store/dddddddddddddddddddddddddddddddd-topUnit",
+            ),
+        ];
+        let synth_closure = vec![
+            DepClosureEntry {
+                job: "depUnit.x86_64-linux".to_string(),
+                drv_path: dep_drv.to_string(),
+                deps: vec![],
+            },
+            DepClosureEntry {
+                job: "topUnit.x86_64-linux".to_string(),
+                drv_path: top_drv.to_string(),
+                deps: vec![crate::run::archive_input::DepDrvOutputs {
+                    drv_path: dep_drv.to_string(),
+                    output_paths: vec![dep_out.to_string()],
+                }],
+            },
+        ];
+        let in_scope = vec![
+            "depUnit.x86_64-linux".to_string(),
+            "topUnit.x86_64-linux".to_string(),
+        ];
+        let comp = compute_warm_sets(&synth_units, &synth_closure, &in_scope);
+        assert_eq!(comp.warm_set.iter().collect::<Vec<_>>(), vec![dep_out]);
+        assert_eq!(
+            comp.not_attemptable.iter().collect::<Vec<_>>(),
+            vec!["depUnit.x86_64-linux"]
+        );
     }
 
     #[tokio::test]
     async fn plan_stage_end_to_end_with_fake_store() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        let manifest = crate::run::evalset_input::load_manifest(dir.path()).unwrap();
-        // libA's output is already valid in rio-store → cached-prior.
-        let lib_a_out = manifest
+        let (_dir, archive, built) = open_mini_archive();
+        let manifest = load_units(&archive).unwrap();
+        // appA's output is already valid in rio-store → cached-prior.
+        let app_a_out = manifest
             .iter()
-            .find(|m| m.job == "libA.x86_64-linux")
+            .find(|m| m.job == "appA.x86_64-linux")
             .unwrap()
             .outputs["out"]
             .clone();
         let mut store = FakeStoreApi::default();
         store
             .valid
-            .insert(lib_a_out.clone(), ("ab".repeat(32), 123));
+            .insert(app_a_out.clone(), ("ab".repeat(32), 123));
 
         let spec = leaf_spec();
-        let result = run_plan(&spec, dir.path(), &store, false).await.unwrap();
-        assert_eq!(result.pin.hydra_eval_id, 1824219);
-        assert_eq!(result.pin.manifest_sha256.len(), 64);
-        assert_eq!(result.output.in_scope.len(), 2);
-        assert_eq!(result.output.counts["attemptable"], 1); // appB only
-        assert!(result.output.cached_prior_paths.contains(&lib_a_out));
-        assert_eq!(result.output.cached_prior_jobs, vec!["libA.x86_64-linux"]);
+        let result = run_plan(&spec, &archive, &store, false).await.unwrap();
+        assert_eq!(result.pin.archive_id, built.archive_id);
+        assert_eq!(result.pin.archive_id_short, built.archive_id_short);
+        // x86_64 minus kvm: appA, appB, divergentC.
+        assert_eq!(result.output.in_scope.len(), 3);
+        assert_eq!(result.output.counts["attemptable"], 3);
+        assert!(result.output.cached_prior_paths.contains(&app_a_out));
+        assert_eq!(result.output.cached_prior_jobs, vec!["appA.x86_64-linux"]);
         assert!(result.low_confidence.is_empty());
         // The validity snapshot is one batched StoreApi query, not one per job.
         assert_eq!(*store.calls.lock().unwrap(), 1);
@@ -565,48 +596,39 @@ mod tests {
 
     #[tokio::test]
     async fn plan_refuses_bad_tenants_and_digest() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
+        let (_dir, archive, built) = open_mini_archive();
         let store = FakeStoreApi::default();
 
         // Wrong tenant for the mode.
         let mut spec = leaf_spec();
         spec.tenants.build_tenant = "parity-selfhosted".into();
-        let err = run_plan(&spec, dir.path(), &store, false)
-            .await
-            .unwrap_err();
+        let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
         assert!(err.to_string().contains("requires build tenant"), "{err}");
 
         // Unverified upstreams refused unless overridden.
         let mut spec = leaf_spec();
         spec.tenants.upstreams_verified = false;
-        let err = run_plan(&spec, dir.path(), &store, false)
-            .await
-            .unwrap_err();
+        let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
         assert!(err.to_string().contains("upstreams_verified"), "{err}");
-        let ok = run_plan(&spec, dir.path(), &store, true).await.unwrap();
+        let ok = run_plan(&spec, &archive, &store, true).await.unwrap();
         assert_eq!(ok.low_confidence, vec!["tenant-upstreams-unverified"]);
 
-        // Resume digest gate.
-        let good = crate::run::evalset_input::manifest_sha256(dir.path()).unwrap();
-        verify_manifest_digest(dir.path(), &good).unwrap();
-        assert!(verify_manifest_digest(dir.path(), "0000").is_err());
-
-        // Wrong eval id.
+        // A spec pinning a different archive digest than the one opened is
+        // refused; pinning the right digest (or none) plans normally.
         let mut spec = leaf_spec();
-        spec.eval_set.hydra_eval_id = 1;
-        let err = run_plan(&spec, dir.path(), &store, false)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("eval set mismatch"), "{err}");
+        spec.archive.digest = "0".repeat(64);
+        let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
+        assert!(err.to_string().contains("pins archive digest"), "{err}");
+        spec.archive.digest = built.archive_id.clone();
+        run_plan(&spec, &archive, &store, false).await.unwrap();
     }
 
     #[tokio::test]
-    async fn plan_refuses_jobs_file_entries_missing_from_manifest() {
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
+    async fn plan_refuses_jobs_file_entries_missing_from_units() {
+        let (_dir, archive, _built) = open_mini_archive();
         let store = FakeStoreApi::default();
-        let jobs_file = dir.path().join("jobs.txt");
+        let jobs_dir = tempfile::tempdir().unwrap();
+        let jobs_file = jobs_dir.path().join("jobs.txt");
         std::fs::write(
             &jobs_file,
             "appB.x86_64-linux\nnoSuchJob.x86_64-linux\n# comment\n",
@@ -615,9 +637,7 @@ mod tests {
         let mut spec = leaf_spec();
         spec.filters.jobs_file = Some(jobs_file.clone());
 
-        let err = run_plan(&spec, dir.path(), &store, false)
-            .await
-            .unwrap_err();
+        let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("noSuchJob.x86_64-linux"), "{msg}");
         assert!(msg.contains("jobs file"), "{msg}");
@@ -628,75 +648,84 @@ mod tests {
 
         // The same file with only real jobs plans normally.
         std::fs::write(&jobs_file, "appB.x86_64-linux\n").unwrap();
-        let ok = run_plan(&spec, dir.path(), &store, false).await.unwrap();
+        let ok = run_plan(&spec, &archive, &store, false).await.unwrap();
         assert_eq!(ok.output.in_scope, vec!["appB.x86_64-linux"]);
     }
 
     #[tokio::test]
-    async fn plan_refuses_recorded_digest_key_digest_and_missing_dep_closure() {
+    async fn plan_refuses_archives_without_dependency_closures() {
+        use crate::archive::schema::{Capabilities, RequestRecord, RequestTarget, Substituters};
+        use crate::archive::writer::{ArchiveWriter, ManifestSeed};
+
+        // A minimal v1 archive with one workload unit but no closures.jsonl
+        // (dependency_closures = false): the plan stage cannot compute warm
+        // sets or attemptability and must refuse loudly.
+        let dir = tempfile::tempdir().unwrap();
+        let drv = format!(
+            "/nix/store/{}-solo-1.0.drv",
+            crate::run::archive_input::fake_hash("solo-drv")
+        );
+        let out = format!(
+            "/nix/store/{}-solo-1.0",
+            crate::run::archive_input::fake_hash("solo-out")
+        );
+        let writer = ArchiveWriter::create(dir.path()).unwrap();
+        writer
+            .add_drv(
+                &drv,
+                &format!(
+                    r#"Derive([("out","{out}","","")],[],[],"x86_64-linux","/bin/sh",["-c","true"],[("out","{out}")])"#
+                ),
+            )
+            .unwrap();
+        writer
+            .write_units(&[crate::archive::schema::UnitRecord {
+                drv: drv.clone(),
+                label: Some("solo.x86_64-linux".to_string()),
+                system: Some("x86_64-linux".to_string()),
+                outputs: BTreeMap::from([("out".to_string(), out.clone())]),
+                required_features: Vec::new(),
+                identity_divergent: false,
+            }])
+            .unwrap();
+        writer
+            .write_requests(&[RequestRecord {
+                session: 0,
+                offset_s: 0.0,
+                targets: vec![RequestTarget {
+                    drv: drv.clone(),
+                    outputs: vec!["*".to_string()],
+                }],
+            }])
+            .unwrap();
+        let stamp: jiff::Timestamp = "2026-05-28T00:00:00Z".parse().unwrap();
+        writer
+            .finalize(ManifestSeed {
+                created_at: stamp,
+                from: stamp,
+                to: stamp,
+                capabilities: Capabilities {
+                    timed: false,
+                    expected_outcomes: false,
+                    output_hashes: false,
+                    embedded_store_paths: false,
+                    impure_env: false,
+                    dependency_closures: false,
+                },
+                substituters: Substituters {
+                    relay: vec!["https://cache.example.org".to_string()],
+                    target: Vec::new(),
+                },
+                fat: false,
+                provenance: serde_json::Map::new(),
+            })
+            .unwrap();
+        let archive = ReplayArchive::open(dir.path()).unwrap();
+
         let store = FakeStoreApi::default();
-
-        // evalset.json records a manifest_sha256 that doesn't match the bytes
-        // on disk.
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        let meta_path = dir.path().join("evalset.json");
-        let mut meta: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&meta_path).unwrap()).unwrap();
-        meta["manifest_sha256"] = serde_json::Value::String("0".repeat(64));
-        std::fs::write(&meta_path, serde_json::to_vec_pretty(&meta).unwrap()).unwrap();
-        let err = run_plan(&leaf_spec(), dir.path(), &store, false)
+        let err = run_plan(&leaf_spec(), &archive, &store, false)
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("manifest.jsonl digest mismatch"),
-            "{err}"
-        );
-
-        // Spec pins a different eval-set key digest than evalset.json records.
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        let mut spec = leaf_spec();
-        spec.eval_set.key_digest = "feedface".into();
-        let err = run_plan(&spec, dir.path(), &store, false)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("key-digest mismatch"), "{err}");
-
-        // Leaf mode without dep-closure.jsonl cannot compute the warm set.
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        std::fs::remove_file(dir.path().join("dep-closure.jsonl")).unwrap();
-        let err = run_plan(&leaf_spec(), dir.path(), &store, false)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("requires dep-closure.jsonl"),
-            "{err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn plan_refuses_legacy_flat_dep_closure_format() {
-        use std::io::Write;
-        let dir = tempfile::tempdir().unwrap();
-        write_mini_eval_set(dir.path());
-        // Overwrite dep-closure.jsonl with a legacy flat format
-        // (depOutputPaths, no deps adjacency): the leaf plan stage must fail
-        // loudly instead of computing an empty warm set.
-        let mut f = std::fs::File::create(dir.path().join("dep-closure.jsonl")).unwrap();
-        writeln!(
-            f,
-            r#"{{"job":"appB.x86_64-linux","drvPath":"/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-appB.drv","depOutputPaths":["/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-libA"],"caOutputs":[]}}"#
-        )
-        .unwrap();
-        let store = FakeStoreApi::default();
-        let err = run_plan(&leaf_spec(), dir.path(), &store, false)
-            .await
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("incompatible dep-closure format"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("dependency_closures"), "{err:#}");
     }
 }

@@ -42,20 +42,6 @@ impl Mode {
     }
 }
 
-/// Which eval set the campaign runs against.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(default)]
-pub struct EvalSetRef {
-    pub hydra_eval_id: u64,
-    /// Eval-set key digest as recorded in evalset.json (its 16-char short
-    /// form names the eval set's S3 prefix).
-    pub key_digest: String,
-    /// S3 bucket holding `parity/evals/...` (None = same bucket as `s3.bucket`).
-    pub s3_bucket: Option<String>,
-    /// Key prefix of the eval set, e.g. `parity/evals/1824219/8b919129046e0f60`.
-    pub s3_prefix: Option<String>,
-}
-
 /// Which replay archive the campaign runs against.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -143,27 +129,6 @@ pub struct Filters {
     pub limit: Option<usize>,
     /// Path to a newline-separated explicit job list (overrides include_globs).
     pub jobs_file: Option<PathBuf>,
-}
-
-/// Hydra-truth inputs: where narinfo presence is checked and how.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HydraBlock {
-    pub cache_url: String,
-    pub user_agent: String,
-    /// Optional path to a JSON map `{job: buildstatus}` for scoped campaigns
-    /// where exact Hydra buildstatus was collected at eval time.
-    pub buildstatus_file: Option<PathBuf>,
-}
-
-impl Default for HydraBlock {
-    fn default() -> Self {
-        Self {
-            cache_url: "https://cache.nixos.org".into(),
-            user_agent: crate::user_agent(None),
-            buildstatus_file: None,
-        }
-    }
 }
 
 /// Engine tuning knobs. The defaults are the locked starting values for
@@ -254,13 +219,12 @@ impl Default for Knobs {
 pub struct CampaignSpec {
     pub campaign_id: Option<String>,
     pub mode: Mode,
-    pub eval_set: EvalSetRef,
+    pub archive: ArchiveRef,
     pub s3: S3Target,
     pub cluster: ClusterEndpoints,
     pub tenants: TenantBlock,
     pub filters: Filters,
     pub knobs: Knobs,
-    pub hydra: HydraBlock,
     /// Deployed image versions verified by launch pre-flight (recorded verbatim).
     pub cluster_versions: Option<serde_json::Value>,
     /// Deadline (RFC3339); also settable via --deadline.
@@ -272,13 +236,12 @@ impl Default for CampaignSpec {
         Self {
             campaign_id: None,
             mode: Mode::Leaf,
-            eval_set: EvalSetRef::default(),
+            archive: ArchiveRef::default(),
             s3: S3Target::default(),
             cluster: ClusterEndpoints::default(),
             tenants: TenantBlock::default(),
             filters: Filters::default(),
             knobs: Knobs::default(),
-            hydra: HydraBlock::default(),
             cluster_versions: None,
             deadline: None,
         }
@@ -313,8 +276,6 @@ impl CampaignSpec {
             ),
             ("cluster.store_addr", self.cluster.store_addr.as_str()),
             ("tenants.build_tenant", self.tenants.build_tenant.as_str()),
-            ("eval_set.key_digest", self.eval_set.key_digest.as_str()),
-            ("hydra.cache_url", self.hydra.cache_url.as_str()),
         ];
         for (field, value) in non_empty {
             anyhow::ensure!(
@@ -322,6 +283,18 @@ impl CampaignSpec {
                 "campaign spec field {field} must not be empty"
             );
         }
+        // The archive id pins exactly which replay archive the campaign runs
+        // against (it is checked against the fetched manifest at bootstrap),
+        // so the spec must carry the full 64-hex form, never a prefix.
+        anyhow::ensure!(
+            self.archive.digest.len() == 64
+                && self
+                    .archive
+                    .digest
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+            "spec.archive.digest must be the 64-hex archive id"
+        );
         // The transport pins the gateway host key against this value on every
         // dial; a spec without one would silently disable SSH host-key
         // verification, so it is rejected here rather than at first dial.
@@ -332,10 +305,6 @@ impl CampaignSpec {
                 .is_some_and(|key| !key.trim().is_empty()),
             "campaign spec field cluster.gateway_host_key must be set; omitting it would disable \
              SSH host-key verification (the launcher populates it from the gateway host-key Secret)"
-        );
-        anyhow::ensure!(
-            self.eval_set.hydra_eval_id != 0,
-            "campaign spec field eval_set.hydra_eval_id must be a nonzero Hydra eval id"
         );
         let nonzero_knobs = [
             ("knobs.batch_max_jobs", self.knobs.batch_max_jobs),
@@ -436,7 +405,7 @@ pub struct PlanOutput {
 }
 
 /// The campaign.json artifact: identity, the spec as launched, the
-/// pinned eval set, the comparability block, and (once planned) the
+/// pinned replay archive, the comparability block, and (once planned) the
 /// plan-stage output.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -446,19 +415,9 @@ pub struct CampaignRecord {
     pub engine_version: String,
     pub signature_table_version: String,
     pub spec: CampaignSpec,
-    pub eval_set: EvalSetPin,
+    pub archive: ArchivePin,
     pub comparability: ComparabilityBlock,
     pub plan: Option<PlanOutput>,
-}
-
-/// The eval set a campaign ran against, pinned by id, key digest, and
-/// manifest checksum.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
-#[serde(rename_all = "camelCase", default)]
-pub struct EvalSetPin {
-    pub hydra_eval_id: u64,
-    pub key_digest: String,
-    pub manifest_sha256: String,
 }
 
 /// The replay archive a campaign ran against, pinned by the full archive id
@@ -480,11 +439,15 @@ impl CampaignRecord {
         campaign_id: String,
         created_at: String,
         spec: CampaignSpec,
-        pin: EvalSetPin,
+        pin: ArchivePin,
     ) -> Self {
+        // The comparability block keeps its historical `evalSet` /
+        // `manifestSha256` field names; their values now carry the archive
+        // identity (short id and full id respectively) until the wire
+        // vocabulary itself is renamed.
         let comparability = ComparabilityBlock {
-            eval_set: format!("{}/{}", pin.hydra_eval_id, pin.key_digest),
-            manifest_sha256: pin.manifest_sha256.clone(),
+            eval_set: pin.archive_id_short.clone(),
+            manifest_sha256: pin.archive_id.clone(),
             mode: spec.mode.as_str().to_string(),
             build_tenant: spec.tenants.build_tenant.clone(),
             filters: spec.filters.clone(),
@@ -498,7 +461,7 @@ impl CampaignRecord {
             engine_version: ENGINE_VERSION.to_string(),
             signature_table_version: SIGNATURE_TABLE_VERSION.to_string(),
             spec,
-            eval_set: pin,
+            archive: pin,
             comparability,
             plan: None,
         }
@@ -528,25 +491,61 @@ mod tests {
     fn spec_minimal_json_roundtrip() {
         // A minimal spec as xtask launch would write it; unknown fields tolerated,
         // missing fields defaulted.
-        let json = r#"{
+        let json = format!(
+            r#"{{
             "mode": "leaf",
-            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
-            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+            "archive": {{"digest": "{digest}", "s3_prefix": "parity/archives/0123456789abcdef"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
-                        "store_addr": "rio-store.rio-store.svc:9002"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
-                        "upstreams_verified": true}
-        }"#;
-        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+                        "store_addr": "rio-store.rio-store.svc:9002"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
         assert_eq!(spec.mode, Mode::Leaf);
-        assert_eq!(spec.eval_set.hydra_eval_id, 1824219);
+        assert_eq!(spec.archive.digest, "ab".repeat(32));
         assert_eq!(spec.knobs.batch_max_jobs, 50);
         assert_eq!(spec.tenants.build_tenant, "parity-leaf");
         assert_eq!(spec.mode.expected_build_tenant(), "parity-leaf");
         // Round-trips.
         let re: CampaignSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
-        assert_eq!(re.eval_set.key_digest, "ab12cd34");
+        assert_eq!(re.archive.digest, "ab".repeat(32));
+        assert_eq!(
+            re.archive.s3_prefix.as_deref(),
+            Some("parity/archives/0123456789abcdef")
+        );
+    }
+
+    #[test]
+    fn archive_digest_must_be_the_full_hex_id() {
+        // Otherwise-valid spec whose archive pin is empty / truncated /
+        // non-hex: validation names the field with the exact rule.
+        let valid = format!(
+            r#"{{
+            "mode": "leaf",
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let spec: CampaignSpec = serde_json::from_str(&valid).unwrap();
+        spec.validate().unwrap();
+        for bad in ["", "ab12cd34", &"AB".repeat(32), &"zz".repeat(32)] {
+            let mut spec = spec.clone();
+            spec.archive.digest = bad.to_string();
+            let err = spec.validate().unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "spec.archive.digest must be the 64-hex archive id",
+                "digest {bad:?}"
+            );
+        }
     }
 
     #[test]
@@ -557,16 +556,19 @@ mod tests {
         assert_eq!(k.probe_chunk, 2000);
         assert_eq!(k.probe_concurrency, 3);
         // Explicit zero overrides are rejected, naming the knob.
-        let json = r#"{
+        let json = format!(
+            r#"{{
             "mode": "leaf",
-            "eval_set": {"hydra_eval_id": 1, "key_digest": "ab12cd34"},
-            "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                         "scheduler_addr": "s:9001", "store_addr": "st:9002",
-                        "gateway_host_key": "SHA256:0000000000000000000000000000000000000000000"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"},
-            "knobs": {"connections": 0}
-        }"#;
-        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+                        "gateway_host_key": "SHA256:0000000000000000000000000000000000000000000"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}},
+            "knobs": {{"connections": 0}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
         assert!(
             spec.validate()
                 .unwrap_err()
@@ -596,14 +598,17 @@ mod tests {
 
         // An otherwise-valid spec without the pin is rejected naming the
         // field: omitting it would disable SSH host-key verification.
-        let json = r#"{
+        let json = format!(
+            r#"{{
             "mode": "leaf",
-            "eval_set": {"hydra_eval_id": 1, "key_digest": "ab12cd34"},
-            "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
-                        "scheduler_addr": "s:9001", "store_addr": "st:9002"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}
-        }"#;
-        let unpinned: CampaignSpec = serde_json::from_str(json).unwrap();
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
+                        "scheduler_addr": "s:9001", "store_addr": "st:9002"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let unpinned: CampaignSpec = serde_json::from_str(&json).unwrap();
         let err = unpinned.validate().unwrap_err();
         assert!(
             err.to_string().contains("cluster.gateway_host_key"),
@@ -653,18 +658,21 @@ mod tests {
         // Otherwise-valid spec with a zero batch timeout: validation must
         // name the offending knob instead of letting it become a 0-second
         // child deadline downstream.
-        let json = r#"{
+        let json = format!(
+            r#"{{
             "mode": "leaf",
-            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
-            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002",
-                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
-                        "upstreams_verified": true},
-            "knobs": {"batch_timeout_hours": 0.0}
-        }"#;
-        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}},
+            "knobs": {{"batch_timeout_hours": 0.0}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
         let err = spec.validate().unwrap_err();
         assert!(err.to_string().contains("batch_timeout_hours"), "{err:#}");
     }
@@ -673,20 +681,23 @@ mod tests {
     fn spec_tolerates_unknown_fields() {
         // Forward compatibility: a spec written by a newer launch tool (or
         // carrying operator annotations) still parses and validates.
-        let json = r#"{
+        let json = format!(
+            r#"{{
             "mode": "leaf",
-            "eval_set": {"hydra_eval_id": 1824219, "key_digest": "ab12cd34"},
-            "cluster": {"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002",
-                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
-                        "upstreams_verified": true},
-            "bogus_future_field": {"nested": [1, 2, 3]}
-        }"#;
-        let spec: CampaignSpec = serde_json::from_str(json).unwrap();
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}},
+            "bogus_future_field": {{"nested": [1, 2, 3]}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
         spec.validate().unwrap();
-        assert_eq!(spec.eval_set.hydra_eval_id, 1824219);
+        assert_eq!(spec.archive.digest, "ab".repeat(32));
     }
 
     #[test]
@@ -748,14 +759,17 @@ mod tests {
             "c1".into(),
             "2026-05-26T00:00:00Z".into(),
             spec,
-            EvalSetPin {
-                hydra_eval_id: 1,
-                key_digest: "k".into(),
-                manifest_sha256: "m".into(),
+            ArchivePin {
+                archive_id: "ab".repeat(32),
+                archive_id_short: "ab".repeat(8),
             },
         );
         assert_eq!(rec.comparability.mode, "self-hosted");
-        assert_eq!(rec.comparability.eval_set, "1/k");
+        // The historical comparability field names carry the archive
+        // identity: short id under `evalSet`, full id under `manifestSha256`.
+        assert_eq!(rec.comparability.eval_set, "ab".repeat(8));
+        assert_eq!(rec.comparability.manifest_sha256, "ab".repeat(32));
+        assert_eq!(rec.archive.archive_id, "ab".repeat(32));
         assert_eq!(rec.comparability.engine_version, ENGINE_VERSION);
     }
 }

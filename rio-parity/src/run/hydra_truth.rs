@@ -8,16 +8,18 @@
 //! shapes. Truth is baked in when the archive is recorded, so this path
 //! performs no outbound queries.
 //!
-//! [`run_hydra_truth`] is the campaign-time narinfo sweep: for every target
-//! output path and warm-set path it is given, it fetches the upstream
-//! narinfo (presence, `NarHash`, `NarSize`, `Deriver`) with bounded
-//! concurrency and per-path retries, appending each result to `hydra.jsonl`
-//! so an interrupted or resumed campaign never re-fetches a path it already
-//! has. Warm-set paths that are absent upstream are pre-classified
-//! `not-found-upstream` in `warm.jsonl`: the warm stage must never submit
-//! them, because substituting a path that upstream does not serve cannot
-//! succeed, and building it locally would mask exactly the work the
-//! campaign is trying to measure.
+//! [`run_hydra_truth`] is the campaign-time narinfo sweep that backs the
+//! warm stage's absent-upstream pre-classification: the engine invokes it
+//! with an empty target-path list and the warm-set paths only (target truth
+//! comes from the archive, never from outbound queries). For every path it
+//! is given it fetches the upstream narinfo (presence, `NarHash`,
+//! `NarSize`, `Deriver`) with bounded concurrency and per-path retries,
+//! appending each result to `hydra.jsonl` so an interrupted or resumed
+//! campaign never re-fetches a path it already has. Warm-set paths that are
+//! absent upstream are pre-classified `not-found-upstream` in `warm.jsonl`:
+//! the warm stage must never submit them, because substituting a path that
+//! upstream does not serve cannot succeed, and building it locally would
+//! mask exactly the work the campaign is trying to measure.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::time::Duration;
@@ -111,7 +113,7 @@ async fn fetch_one(
     path: &str,
     max_attempts: u32,
 ) -> Result<HydraEntry> {
-    // Validate up front: a malformed store path is an eval-set bug, not a
+    // Validate up front: a malformed store path is an archive bug, not a
     // transient fetch error — fail immediately instead of retrying it.
     let _ = rio_nix::store_path::StorePath::parse(path)
         .map_err(|e| anyhow::anyhow!("bad store path {path}: {e}"))?;
@@ -249,37 +251,6 @@ pub async fn run_hydra_truth(
     Ok(stats)
 }
 
-/// Hydra-side outcome for one job, derived from its declared outputs and the
-/// swept narinfo cache: a job is hydra-built when every declared output has
-/// an upstream narinfo; anything less is unknown (absence of a narinfo is
-/// absence of evidence, not proof of failure). An exact `buildstatus` (scoped
-/// campaigns that recorded it at eval time) overrides the narinfo heuristic
-/// and is the only way to produce [`HydraOutcome::Failed`].
-pub fn hydra_outcome_for_job(
-    outputs: &BTreeMap<String, String>,
-    by_path: &HashMap<String, HydraEntry>,
-    buildstatus: Option<i64>,
-) -> HydraOutcome {
-    if let Some(status) = buildstatus {
-        return if status == 0 {
-            HydraOutcome::Built
-        } else {
-            HydraOutcome::Failed
-        };
-    }
-    if outputs.is_empty() {
-        return HydraOutcome::Unknown;
-    }
-    if outputs
-        .values()
-        .all(|p| by_path.get(p).is_some_and(|e| e.found))
-    {
-        HydraOutcome::Built
-    } else {
-        HydraOutcome::Unknown
-    }
-}
-
 /// Expected truth for one campaign unit, loaded from the replay archive:
 /// the engine-side outcome plus the Hydra-side record fragment (expected
 /// per-output NAR identity) the classifier and the report consume.
@@ -401,7 +372,7 @@ pub fn expected_outcomes_for_units(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::evalset_input::test_fixtures::fake_hash;
+    use crate::run::archive_input::fake_hash;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -570,7 +541,7 @@ mod tests {
     }
 
     #[test]
-    fn narinfo_parse_to_entry_and_job_outcome() {
+    fn narinfo_parse_to_entry() {
         let p = store_path("x");
         let entry = entry_from_narinfo(&p, Some(&narinfo_text(&p)));
         assert!(entry.found);
@@ -583,36 +554,6 @@ mod tests {
         let malformed = entry_from_narinfo(&p, Some("definitely not a narinfo"));
         assert!(malformed.found);
         assert!(malformed.nar_hash.is_none());
-
-        let mut by_path = HashMap::new();
-        by_path.insert(p.clone(), entry);
-        let mut outputs = BTreeMap::new();
-        outputs.insert("out".to_string(), p.clone());
-        assert_eq!(
-            hydra_outcome_for_job(&outputs, &by_path, None),
-            HydraOutcome::Built
-        );
-        // A second output with no narinfo → unknown, not failed: absence of a
-        // narinfo is absence of evidence.
-        outputs.insert("dev".to_string(), store_path("y"));
-        assert_eq!(
-            hydra_outcome_for_job(&outputs, &by_path, None),
-            HydraOutcome::Unknown
-        );
-        // No declared outputs → unknown.
-        assert_eq!(
-            hydra_outcome_for_job(&BTreeMap::new(), &by_path, None),
-            HydraOutcome::Unknown
-        );
-        // Explicit buildstatus wins (scoped campaigns).
-        assert_eq!(
-            hydra_outcome_for_job(&outputs, &by_path, Some(0)),
-            HydraOutcome::Built
-        );
-        assert_eq!(
-            hydra_outcome_for_job(&outputs, &by_path, Some(1)),
-            HydraOutcome::Failed
-        );
     }
 
     #[test]

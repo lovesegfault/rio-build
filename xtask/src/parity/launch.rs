@@ -25,9 +25,8 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
-use rio_parity::run::evalset_input::EvalSetMeta;
 use rio_parity::run::spec::{
-    CampaignSpec, ClusterEndpoints, EvalSetRef, Filters, S3Target, TenantBlock,
+    ArchiveRef, CampaignSpec, ClusterEndpoints, Filters, S3Target, TenantBlock,
 };
 
 use super::jobs::{self, EngineJobCommon};
@@ -40,13 +39,13 @@ use crate::{git, ssh, tofu, ui};
 
 #[derive(Args)]
 pub struct LaunchArgs {
-    /// Hydra evaluation id whose eval set the campaign consumes
-    /// (must have been produced by `parity eval` first).
+    /// Hydra evaluation id whose recorded replay archive the campaign
+    /// consumes (must have been produced by `parity eval` first).
     #[arg(long)]
     pub eval: u64,
-    /// Eval-set key digest (or unambiguous prefix) to pin when more than
-    /// one eval set exists for --eval. Discover them with
-    /// `aws s3 ls s3://<chunk-bucket>/parity/evals/<eval>/`.
+    /// Recipe digest (or unambiguous prefix) to pin when more than one
+    /// archive exists for --eval. Discover them with
+    /// `aws s3 ls s3://<chunk-bucket>/parity/archives/`.
     #[arg(long)]
     pub eval_digest: Option<String>,
     /// Dependency mode: leaf = dependencies substituted from
@@ -173,8 +172,8 @@ pub fn engine_args(a: &LaunchArgs) -> Vec<String> {
     args
 }
 
-/// Correlation annotations for the campaign Job: which Hydra eval / eval
-/// set it consumes and which dependency mode it runs, so a Job seen in
+/// Correlation annotations for the campaign Job: which Hydra eval / replay
+/// archive it consumes and which dependency mode it runs, so a Job seen in
 /// `kubectl` can be tied back to its inputs without reading the spec
 /// ConfigMap.
 pub fn campaign_annotations(eval: u64, short_digest: &str, mode: Mode) -> BTreeMap<String, String> {
@@ -207,15 +206,20 @@ fn gateway_store_url(tenant: &str) -> String {
     )
 }
 
-/// The eval set a campaign will run against, as resolved from S3.
-pub struct EvalSetLocation {
-    /// Full key digest as recorded in evalset.json.
-    pub key_digest: String,
-    /// 16-char short digest — the S3 prefix segment.
-    pub short_digest: String,
-    /// Eval-set key prefix in the chunk bucket (no trailing slash),
-    /// e.g. `parity/evals/1824219/8b919129046e0f60`.
+/// The replay archive a campaign will run against, as resolved from S3.
+pub struct ArchiveLocation {
+    /// Full 64-hex archive id (SHA-256 of the archive's manifest.json).
+    pub archive_id: String,
+    /// 16-char short id — the S3 prefix segment.
+    pub archive_id_short: String,
+    /// Archive key prefix in the chunk bucket (no trailing slash),
+    /// e.g. `parity/archives/8b919129046e0f60`.
     pub s3_prefix: String,
+    /// Recipe digest from the archive's provenance (the eval recipe the
+    /// recorder ran), used for --eval-digest narrowing and operator audit.
+    pub recipe_digest: String,
+    /// Hydra eval id from the archive's provenance.
+    pub hydra_eval_id: u64,
 }
 
 /// What the pre-flight verified, recorded into the campaign spec: the
@@ -236,7 +240,7 @@ pub struct PreflightOutcome {
 fn build_campaign_spec(
     a: &LaunchArgs,
     campaign_id: &str,
-    eval_set: &EvalSetLocation,
+    archive: &ArchiveLocation,
     bucket: &str,
     hmac_present: bool,
     gateway_host_key: &str,
@@ -249,12 +253,10 @@ fn build_campaign_spec(
         // campaign.
         campaign_id: Some(campaign_id.to_owned()),
         mode,
-        eval_set: EvalSetRef {
-            hydra_eval_id: a.eval,
-            key_digest: eval_set.key_digest.clone(),
-            // Same bucket as the campaign artifacts (s3.bucket below).
-            s3_bucket: None,
-            s3_prefix: Some(eval_set.s3_prefix.clone()),
+        archive: ArchiveRef {
+            s3_bucket: Some(bucket.to_owned()),
+            s3_prefix: Some(archive.s3_prefix.clone()),
+            digest: archive.archive_id.clone(),
         },
         s3: S3Target {
             bucket: Some(bucket.to_owned()),
@@ -288,8 +290,8 @@ fn build_campaign_spec(
         cluster_versions: preflight
             .and_then(|p| serde_json::to_value(&p.deployed_tags).ok())
             .filter(|v| v.as_object().is_some_and(|m| !m.is_empty())),
-        // Knobs / hydra / deadline stay at the engine defaults; operators
-        // override per campaign via --engine-arg or a hand-edited spec.
+        // Knobs / deadline stay at the engine defaults; operators override
+        // per campaign via --engine-arg or a hand-edited spec.
         ..CampaignSpec::default()
     }
 }
@@ -316,11 +318,11 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     })
     .await?;
 
-    // Resolve the eval set first: a typo'd --eval (or an eval Job that
-    // hasn't finished uploading) should fail in seconds, before any
+    // Resolve the replay archive first: a typo'd --eval (or an eval Job
+    // that hasn't finished uploading) should fail in seconds, before any
     // cluster mutation.
-    let eval_set = ui::step("resolve eval set in S3", || {
-        resolve_eval_set(&region, &bucket, a.eval, a.eval_digest.as_deref())
+    let archive = ui::step("resolve replay archive in S3", || {
+        resolve_archive(&region, &bucket, a.eval, a.eval_digest.as_deref())
     })
     .await?;
 
@@ -389,7 +391,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     let spec = build_campaign_spec(
         &a,
         &campaign_id,
-        &eval_set,
+        &archive,
         &bucket,
         hmac_present,
         &gateway_host_key,
@@ -445,7 +447,11 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     job.metadata
         .annotations
         .get_or_insert_with(Default::default)
-        .extend(campaign_annotations(a.eval, &eval_set.short_digest, a.mode));
+        .extend(campaign_annotations(
+            a.eval,
+            &archive.archive_id_short,
+            a.mode,
+        ));
     ui::step(&format!("apply campaign Job {campaign_id}"), || {
         jobs::create_job(&client, &job)
     })
@@ -453,106 +459,138 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
 
     tracing::info!(
         "campaign launched: {campaign_id}\n  \
-         eval set:  {}/{} (mode {})\n  \
+         archive:   {} (hydra eval {}, recipe {}…, mode {})\n  \
          progress:  cargo xtask parity status {campaign_id} --watch\n  \
          report:    cargo xtask parity report {campaign_id}\n  \
          logs:      kubectl -n {NS_PARITY} logs -f job/{campaign_id}\n  \
          artifacts: s3://{bucket}/{}",
-        a.eval,
-        eval_set.short_digest,
+        archive.archive_id_short,
+        archive.hydra_eval_id,
+        &archive.recipe_digest[..archive.recipe_digest.len().min(16)],
         a.mode.as_str(),
         s3::campaign_key(&campaign_id, "")
     );
     Ok(())
 }
 
-/// Find the eval set for `eval` under `parity/evals/<eval>/` in the chunk
-/// bucket and read its evalset.json (the upload-completeness marker) for
-/// the full key digest the spec records. More than one eval set for the
-/// same Hydra eval requires `--eval-digest` to disambiguate.
-async fn resolve_eval_set(
+/// One archive prefix found under `parity/archives/`, with the provenance
+/// fields candidate filtering reads from its manifest.json.
+struct ArchiveCandidate {
+    archive_id_short: String,
+    s3_prefix: String,
+    archive_id: String,
+    recipe_digest: String,
+    hydra_eval_id: u64,
+}
+
+/// Find the replay archive recorded for `eval` under `parity/archives/` in
+/// the chunk bucket: list the per-archive prefixes, read each candidate's
+/// `manifest.json` provenance, keep the ones recorded from `eval` (and
+/// matching `--eval-digest` as a recipe-digest prefix when given), and
+/// require exactly one. The chosen prefix must carry `complete.json` —
+/// the recorder uploads it last, so its absence means the upload has not
+/// finished.
+// TODO: add the by-recipe fast path (GET parity/archives/by-recipe/<full
+// 64-hex recipe digest>.json straight to the archive prefix) so a fully
+// pinned --eval-digest avoids listing and reading every candidate
+// manifest, and factor the candidate filtering into a pure function for
+// finer-grained ambiguity tests.
+async fn resolve_archive(
     region: &str,
     bucket: &str,
     eval: u64,
     requested_digest: Option<&str>,
-) -> Result<EvalSetLocation> {
-    let prefix = s3::evals_prefix(eval);
-    let digests = s3::list_subprefixes(region, bucket, &prefix).await?;
-    if digests.is_empty() {
-        bail!(
-            "no eval set found under s3://{bucket}/{prefix} — run `cargo xtask parity eval \
-             --eval {eval} …` first and wait for its Job to complete"
-        );
+) -> Result<ArchiveLocation> {
+    let archives_prefix = format!("{}/archives/", super::S3_PREFIX);
+    let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
+    let mut candidates: Vec<ArchiveCandidate> = Vec::new();
+    for short in shorts {
+        // The recorder-owned idempotency pointers live under by-recipe/;
+        // they are not archive prefixes.
+        if short == "by-recipe" {
+            continue;
+        }
+        let prefix = format!("{archives_prefix}{short}");
+        let manifest_key = format!("{prefix}/manifest.json");
+        let Some(text) = s3::get_text(region, bucket, &manifest_key).await? else {
+            // No standalone manifest yet: an upload in flight (or a foreign
+            // prefix); never a candidate.
+            continue;
+        };
+        let manifest: serde_json::Value = serde_json::from_str(&text)
+            .with_context(|| format!("parse s3://{bucket}/{manifest_key}"))?;
+        let provenance = &manifest["provenance"];
+        candidates.push(ArchiveCandidate {
+            archive_id_short: short,
+            s3_prefix: prefix,
+            archive_id: sha256_hex(text.as_bytes()),
+            recipe_digest: provenance["recipe_digest"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string(),
+            hydra_eval_id: provenance["source"]["hydra_eval_id"].as_u64().unwrap_or(0),
+        });
     }
-    let chosen = choose_digest(&digests, requested_digest)
-        .with_context(|| format!("choose an eval set under s3://{bucket}/{prefix}"))?;
-    let set_prefix = format!("{prefix}{chosen}");
-    let meta_key = format!("{set_prefix}/evalset.json");
-    let text = s3::get_text(region, bucket, &meta_key)
-        .await?
-        .with_context(|| {
-            format!(
-                "s3://{bucket}/{meta_key} not found — evalset.json is uploaded last, so the eval \
-             Job is still running or failed mid-upload (check `kubectl -n {NS_PARITY} get jobs`)"
-            )
-        })?;
-    let meta: EvalSetMeta =
-        serde_json::from_str(&text).with_context(|| format!("parse s3://{bucket}/{meta_key}"))?;
+    let mut matches: Vec<ArchiveCandidate> = candidates
+        .into_iter()
+        .filter(|c| c.hydra_eval_id == eval)
+        .filter(|c| match requested_digest {
+            Some(want) => c.recipe_digest.starts_with(want),
+            None => true,
+        })
+        .collect();
+    match matches.len() {
+        0 => bail!(
+            "no replay archive recorded from hydra eval {eval}{} under \
+             s3://{bucket}/{archives_prefix} — run `cargo xtask parity eval --eval {eval} …` \
+             first and wait for its Job to complete",
+            requested_digest
+                .map(|d| format!(" with recipe digest {d}…"))
+                .unwrap_or_default()
+        ),
+        1 => {}
+        n => {
+            let listing: Vec<String> = matches
+                .iter()
+                .map(|c| {
+                    format!(
+                        "{} (recipe {}…)",
+                        c.archive_id_short,
+                        &c.recipe_digest[..c.recipe_digest.len().min(16)]
+                    )
+                })
+                .collect();
+            bail!(
+                "{n} replay archives were recorded from hydra eval {eval} ({}) — pass \
+                 --eval-digest <recipe digest prefix> to pick one",
+                listing.join(", ")
+            );
+        }
+    }
+    let chosen = matches.remove(0);
+    // complete.json is uploaded last: without it the prefix is a partial
+    // upload and the engine would refuse it anyway.
+    let complete_key = format!("{}/complete.json", chosen.s3_prefix);
     ensure!(
-        meta.hydra_eval_id == eval,
-        "evalset.json at s3://{bucket}/{meta_key} records hydra_eval_id {} (expected {eval})",
-        meta.hydra_eval_id
+        s3::get_text(region, bucket, &complete_key).await?.is_some(),
+        "s3://{bucket}/{} has no complete.json — the recorder Job has not finished \
+         (complete.json is uploaded last)",
+        chosen.s3_prefix
     );
-    ensure!(
-        !meta.key_digest.is_empty(),
-        "evalset.json at s3://{bucket}/{meta_key} has an empty key_digest"
-    );
-    Ok(EvalSetLocation {
-        key_digest: meta.key_digest,
-        short_digest: chosen.to_owned(),
-        s3_prefix: set_prefix,
+    Ok(ArchiveLocation {
+        archive_id: chosen.archive_id,
+        archive_id_short: chosen.archive_id_short,
+        s3_prefix: chosen.s3_prefix,
+        recipe_digest: chosen.recipe_digest,
+        hydra_eval_id: chosen.hydra_eval_id,
     })
 }
 
-/// Pick which eval-set `<key-digest>/` prefix to use out of the ones
-/// found in S3. `requested` may be the full key digest recorded in
-/// evalset.json or any prefix of the short (16-char) digest segment; it
-/// must match exactly one candidate — an ambiguous prefix is an error,
-/// never a silent first-match. Without `requested`, a single candidate
-/// is picked automatically and several candidates ask the operator to
-/// disambiguate with `--eval-digest`.
-fn choose_digest<'a>(candidates: &'a [String], requested: Option<&str>) -> Result<&'a str> {
-    match requested {
-        Some(want) => {
-            let matches: Vec<&str> = candidates
-                .iter()
-                .map(String::as_str)
-                .filter(|d| d.starts_with(want) || want.starts_with(d))
-                .collect();
-            match matches.as_slice() {
-                [one] => Ok(*one),
-                [] => bail!(
-                    "--eval-digest {want} matches none of the eval sets (found: {})",
-                    candidates.join(", ")
-                ),
-                more => bail!(
-                    "--eval-digest {want} is ambiguous — it matches {} eval sets ({}); pass more \
-                     of the digest",
-                    more.len(),
-                    more.join(", ")
-                ),
-            }
-        }
-        None => match candidates {
-            [one] => Ok(one.as_str()),
-            [] => bail!("no eval sets found"),
-            more => bail!(
-                "{} eval sets exist ({}) — pass --eval-digest to pick one",
-                more.len(),
-                more.join(", ")
-            ),
-        },
-    }
+/// Lowercase-hex SHA-256 of a byte slice — the archive id is this hash over
+/// the standalone manifest.json bytes.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::Digest as _;
+    hex::encode(sha2::Sha256::digest(bytes))
 }
 
 /// Refuse to (re)write the `<campaign-id>-spec` ConfigMap when the
@@ -933,16 +971,18 @@ mod tests {
         }
     }
 
-    fn eval_loc() -> EvalSetLocation {
-        // Obviously-fake digests (the engine only requires a non-empty
-        // key_digest); the short form is the leading 16 chars, mirroring
-        // how the real S3 prefix segment is derived from the full digest.
-        let key_digest = "deadbeef".repeat(8);
-        let short_digest = key_digest[..16].to_string();
-        EvalSetLocation {
-            s3_prefix: format!("parity/evals/1824219/{short_digest}"),
-            key_digest,
-            short_digest,
+    fn archive_loc() -> ArchiveLocation {
+        // Obviously-fake ids (the engine only requires a 64-hex digest);
+        // the short form is the leading 16 chars, mirroring how the real S3
+        // prefix segment is derived from the full archive id.
+        let archive_id = "deadbeef".repeat(8);
+        let archive_id_short = archive_id[..16].to_string();
+        ArchiveLocation {
+            s3_prefix: format!("parity/archives/{archive_id_short}"),
+            archive_id,
+            archive_id_short,
+            recipe_digest: "feedc0de".repeat(8),
+            hydra_eval_id: 1824219,
         }
     }
 
@@ -1069,7 +1109,7 @@ mod tests {
         let spec = build_campaign_spec(
             &args(Mode::Leaf),
             "parity-leaf-20260601-ab12",
-            &eval_loc(),
+            &archive_loc(),
             "rio-build-chunks-deadbeef",
             true,
             HOST_KEY_PIN,
@@ -1085,13 +1125,15 @@ mod tests {
             Some("parity-leaf-20260601-ab12")
         );
         assert_eq!(parsed.mode, EngineMode::Leaf);
-        assert_eq!(parsed.eval_set.hydra_eval_id, 1824219);
-        assert_eq!(parsed.eval_set.key_digest, eval_loc().key_digest);
+        assert_eq!(parsed.archive.digest, archive_loc().archive_id);
         assert_eq!(
-            parsed.eval_set.s3_prefix.as_deref(),
-            Some("parity/evals/1824219/deadbeefdeadbeef")
+            parsed.archive.s3_prefix.as_deref(),
+            Some("parity/archives/deadbeefdeadbeef")
         );
-        assert_eq!(parsed.eval_set.s3_bucket, None);
+        assert_eq!(
+            parsed.archive.s3_bucket.as_deref(),
+            Some("rio-build-chunks-deadbeef")
+        );
         assert_eq!(
             parsed.s3.bucket.as_deref(),
             Some("rio-build-chunks-deadbeef")
@@ -1136,10 +1178,9 @@ mod tests {
             parsed.cluster_versions,
             Some(json!({"rio-gateway": "abc123", "rio-scheduler": "abc123"}))
         );
-        // Engine knob/hydra defaults are left untouched.
+        // Engine knob defaults are left untouched.
         assert_eq!(parsed.knobs.batch_max_jobs, 50);
         assert_eq!(parsed.knobs.batch_max_nodes, 4500);
-        assert_eq!(parsed.hydra.cache_url, "https://cache.nixos.org");
         assert_eq!(parsed.deadline, None);
     }
 
@@ -1152,7 +1193,7 @@ mod tests {
         let spec = build_campaign_spec(
             &args(Mode::SelfHosted),
             "parity-selfhosted-20260601-0001",
-            &eval_loc(),
+            &archive_loc(),
             "rio-build-chunks-deadbeef",
             false,
             HOST_KEY_PIN,
@@ -1200,57 +1241,6 @@ mod tests {
                 .unwrap(),
             "self-hosted"
         );
-    }
-
-    #[test]
-    fn choose_digest_unrequested_needs_exactly_one_candidate() {
-        let one = vec!["8b919129046e0f60".to_string()];
-        assert_eq!(choose_digest(&one, None).unwrap(), "8b919129046e0f60");
-
-        let two = vec![
-            "8b919129046e0f60".to_string(),
-            "9c02aabbccddeeff".to_string(),
-        ];
-        let err = choose_digest(&two, None).unwrap_err().to_string();
-        assert!(err.contains("--eval-digest"), "{err}");
-        assert!(err.contains("8b919129046e0f60"), "{err}");
-
-        assert!(choose_digest(&[], None).is_err());
-    }
-
-    #[test]
-    fn choose_digest_prefix_full_digest_and_ambiguity() {
-        let candidates = vec![
-            "8b919129046e0f60".to_string(),
-            "8b02aabbccddeeff".to_string(),
-        ];
-        // Unambiguous short prefix.
-        assert_eq!(
-            choose_digest(&candidates, Some("8b91")).unwrap(),
-            "8b919129046e0f60"
-        );
-        // Full 64-char key digest matches the candidate that is its
-        // 16-char prefix.
-        let full = format!("8b919129046e0f60{}", "ab".repeat(24));
-        assert_eq!(
-            choose_digest(&candidates, Some(&full)).unwrap(),
-            "8b919129046e0f60"
-        );
-        // Ambiguous prefix → error naming every match, never first-match.
-        let err = choose_digest(&candidates, Some("8b"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("ambiguous"), "{err}");
-        assert!(
-            err.contains("8b919129046e0f60") && err.contains("8b02aabbccddeeff"),
-            "{err}"
-        );
-        // No match → error listing what exists.
-        let err = choose_digest(&candidates, Some("ffff"))
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("matches none"), "{err}");
-        assert!(err.contains("8b02aabbccddeeff"), "{err}");
     }
 
     #[test]
