@@ -1060,7 +1060,7 @@ async fn cluster_status_actor_dead_returns_unavailable() -> anyhow::Result<()> {
 // ClearPoison happy path
 // ---------------------------------------------------------------------------
 
-// r[verify sched.admin.clear-poison]
+// r[verify sched.admin.clear-poison+2]
 /// Poison a derivation via PermanentFailure, then ClearPoison it.
 /// Verifies cleared=true, in-mem status reset, PG poisoned_at cleared.
 #[tokio::test]

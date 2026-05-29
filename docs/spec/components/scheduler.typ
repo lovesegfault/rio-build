@@ -744,11 +744,15 @@ registration, draining, degraded, or connecting state left to report.
   path since the controller polls it every reconcile tick.
 ]
 
-#r("sched.admin.clear-poison")[
+#r("sched.admin.clear-poison+2")[
   `AdminService.ClearPoison` resets both PostgreSQL (`db.clear_poison()`:
-  status, `poisoned_at`, `retry_count`, `failed_builders`, joined by the
-  `poison_cleared` ledger reset row) and in-memory state (the node is removed
-  from the DAG so the next submit re-inserts it fresh). Returns `cleared=true`
+  status and `poisoned_at`, joined by the `poison_cleared` ledger reset row
+  --- migration 075 dropped the retry-mirror columns, so the attempt ledger
+  is the only failure history) and in-memory state (the node is removed
+  from the DAG so the next submit re-inserts it fresh); removing the Poisoned
+  (by definition un-produced) child MUST stamp the `closure_hole` breadcrumb
+  on each surviving parent, in memory and best-effort in PG
+  (#rref("sched.evidence.closure-hole")). Returns `cleared=true`
   only if both succeed. PG is cleared FIRST: if the PG clear fails, the
   in-memory state is left untouched (still Poisoned) and `false` is returned,
   so the operator's retry finds the derivation still poisoned and can proceed
@@ -1638,6 +1642,11 @@ Queue-level preemption is fully supported:
 #r("sched.state.poisoned-ttl")[
   The `poisoned → created` transition is gated by a 24h TTL.
 ]
+The poison-TTL sweep that performs the expiry removes the expired node from
+the DAG the same way the admin clear does, and is therefore one of the
+closure-hole stamping sites: the surviving parents are breadcrumbed in memory
+and best-effort in PG (#rref("sched.evidence.closure-hole")), exactly as for
+#rref("sched.admin.clear-poison").
 
 #r("sched.merge.poisoned-resubmit-bounded+4")[
   When a build merges and finds a pre-existing `poisoned` node in the global

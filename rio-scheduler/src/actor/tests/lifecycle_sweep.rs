@@ -316,7 +316,7 @@ async fn test_upsert_skips_no_tenant() -> TestResult {
 
 // r[verify sched.build.keep-going]
 // r[verify sched.poison.ttl-persist]
-// r[verify sched.admin.clear-poison]
+// r[verify sched.admin.clear-poison+2]
 /// keep_going=true build with 2 independent derivations. D1 poisoned,
 /// D2 keeps running. D1 is removed from the DAG (via TTL-expiry tick OR
 /// admin ClearPoison). D2 completes → build must reach terminal.

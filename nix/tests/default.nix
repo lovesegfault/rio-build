@@ -1093,7 +1093,7 @@ in
   # r[verify sched.admin.list-tenants]
   # r[verify sched.admin.list-executors+2]
   # r[verify sched.admin.list-builds]
-  # r[verify sched.admin.clear-poison]
+  # r[verify sched.admin.clear-poison+2]
   # r[verify cli.cmd.sla]
   # rio-cli had 0% coverage — never invoked by any test. This runs
   # status + create-tenant + list-tenants against the live scheduler's
