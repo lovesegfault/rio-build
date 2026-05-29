@@ -1984,7 +1984,11 @@ This makes persistence follow the in-memory first-writer-wins truth: the SQL
 upsert stays last-write-wins, but the only writers are creations, so an
 in-flight node's recovery row can no longer be overwritten --- or its
 authoritative inline content cleared --- by a submission that did not create
-it.
+it. The substitution-planning marks (`topdown_pruned`, `closure_hole`) are
+not part of that creation-time snapshot: they have their own dedicated
+writers (the joined-node stamp inside the merge transaction, the
+closure-hole setters, and the produced/vouched clear passes), so persisting
+them for a node a submission merely joined does not violate this rule.
 
 #r("sched.persist.recreate-refresh+2")[
   A submission that (re)creates a derivation's in-memory node MUST refresh

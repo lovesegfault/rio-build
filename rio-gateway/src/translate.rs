@@ -3,7 +3,7 @@
 //! Translates the per-session derivation cache into `SubmitBuildRequest`
 //! messages for the scheduler, walking `inputDrvs` recursively to build
 //! the full derivation graph.
-// r[impl gw.dag.reconstruct+3]
+// r[impl gw.dag.reconstruct+4]
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -349,7 +349,7 @@ fn populate_needs_resolve(
 /// Only the scheduler's cache-hit / substitutability classification
 /// reads this; `output_names` / `expected_output_paths` keep the full
 /// declared set (assignment-token allowlist, GC pins, client report).
-// r[impl gw.dag.reconstruct+3]
+// r[impl gw.dag.reconstruct+4]
 fn populate_wanted_outputs(
     nodes: &mut [types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -3591,7 +3591,7 @@ mod tests {
         Derivation::parse(&aterm).expect("test ATerm should parse")
     }
 
-    // r[verify gw.dag.reconstruct+3]
+    // r[verify gw.dag.reconstruct+4]
     /// A node consumed by one parent that names only `{out}` of its three
     /// declared outputs gets `wanted_output_names == ["out"]`. The `^*`
     /// root keeps the empty (= all declared outputs wanted) sentinel.

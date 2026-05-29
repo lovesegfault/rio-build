@@ -958,7 +958,7 @@ the handshake before the client will send any opcodes.
 
 = DAG Reconstruction
 
-#r("gw.dag.reconstruct+3")[
+#r("gw.dag.reconstruct+4")[
   When the gateway receives `wopBuildDerivation`, `wopBuildPaths`, or
   `wopBuildPathsWithResults`, it reconstructs the full derivation DAG to send
   to the scheduler via `SubmitBuild`. `wopBuildDerivation` (build-hook path)
@@ -1912,7 +1912,7 @@ untrusted handshake):*
   the realized inputs *and the `.drv` closure* (`wopAddToStoreNar` /
   `wopAddMultipleToStore`), then drives `wopBuildPathsWithResults`. The
   gateway runs the normal full-DAG reconstruction
-  (#rref("gw.dag.reconstruct+3")) and every submission gate, including the
+  (#rref("gw.dag.reconstruct+4")) and every submission gate, including the
   output-path binding (#rref("gw.reject.output-path-mismatch")).
 - *Content-bound derivations (any client):* the inline `wopBuildDerivation`
   single-node fallback still applies when the full `.drv` is unavailable ---
