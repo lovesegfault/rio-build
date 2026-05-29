@@ -4,8 +4,10 @@
 //!
 //! Canonicalisation makes the on-disk form of an output independent of
 //! *how* the build produced it (umask, build order, tooling quirks):
-//! deterministic mtimes, deterministic permission bits, no xattrs, no
-//! foreign owners, no special files. Everything the NAR serialization
+//! deterministic mtimes, deterministic permission bits, no build-written
+//! xattrs (kernel-owned ACL labels are left alone, matching CppNix's
+//! `ignored-acls` default), no foreign owners, no special files.
+//! Everything the NAR serialization
 //! cannot represent is either normalized away (timestamps, write bits,
 //! xattrs) or rejected (FIFOs, sockets, device nodes) — otherwise two
 //! builds of identical content could upload different NARs, or worse,
@@ -55,6 +57,12 @@ pub(crate) enum CanonicaliseError {
     Io {
         op: &'static str,
         path: String,
+        errno: nix::errno::Errno,
+    },
+    #[error("failed to remove extended attribute `{attr}` from {path}: {errno}")]
+    Xattr {
+        path: String,
+        attr: String,
         errno: nix::errno::Errno,
     },
 }
@@ -279,8 +287,30 @@ fn canonicalise_entry(
     Ok(())
 }
 
+/// Kernel- or filesystem-owned attributes that cannot be removed (often
+/// not even by root) and are therefore skipped rather than stripped.
+///
+/// This mirrors CppNix's `ignored-acls` setting, whose default is
+/// `security.csm security.selinux system.nfs4_acl`: SELinux relabels every
+/// fresh inode and rejects label removal (`EACCES`) regardless of
+/// privilege, and `system.nfs4_acl` is the filesystem's own ACL
+/// representation, not data a build wrote. Treating them as fatal would
+/// fail every build on a labeling host while stripping them is impossible
+/// by design. Skipping them is safe for store semantics: they are not part
+/// of NAR serialization, so they can never affect the uploaded bytes or
+/// the content address — and the store, not the worker, remains the
+/// authority on what gets registered.
+fn is_ignored_xattr(name: &[u8]) -> bool {
+    matches!(
+        name,
+        b"security.selinux" | b"system.nfs4_acl" | b"security.csm"
+    )
+}
+
 /// Remove every extended attribute on `path` (without following
-/// symlinks — callers only invoke this for non-symlinks anyway).
+/// symlinks — callers only invoke this for non-symlinks anyway), except
+/// the kernel-owned ACL labels in [`is_ignored_xattr`], which are left in
+/// place exactly as CppNix's `canonicalisePathMetaData_` does.
 ///
 /// `ENOTSUP` (filesystem without xattr support) and `ENODATA` (attribute
 /// vanished between list and remove) are not errors. Uses raw libc:
@@ -323,6 +353,9 @@ fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
 
     // The buffer is a sequence of NUL-terminated attribute names.
     for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+        if is_ignored_xattr(name) {
+            continue;
+        }
         let c_name = match CString::new(name) {
             Ok(c) => c,
             Err(_) => continue, // embedded NUL is impossible by construction
@@ -333,7 +366,13 @@ fn strip_xattrs(path: &Path) -> Result<(), CanonicaliseError> {
             let errno = nix::errno::Errno::last();
             match errno {
                 nix::errno::Errno::ENOTSUP | nix::errno::Errno::ENODATA => {}
-                e => return Err(CanonicaliseError::io("lremovexattr", path, e)),
+                e => {
+                    return Err(CanonicaliseError::Xattr {
+                        path: path.display().to_string(),
+                        attr: name.escape_ascii().to_string(),
+                        errno: e,
+                    });
+                }
             }
         }
     }
@@ -631,9 +670,56 @@ mod tests {
         canonicalise_output(&root, my_uid(), &mut HashSet::new()).unwrap();
 
         if set_rc == 0 {
-            // SAFETY: same as above; querying size only.
+            // The attribute we set must be gone. Asserting an empty list
+            // would be wrong on hosts whose kernel labels every inode
+            // (SELinux) or exposes ACLs as xattrs — those are ignored, not
+            // stripped, and legitimately remain.
+            // SAFETY: valid NUL-terminated strings; querying size only.
+            let got = unsafe {
+                libc::lgetxattr(
+                    c_path.as_ptr(),
+                    c"user.rio_test".as_ptr(),
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(got, -1, "user.rio_test must have been removed");
+            assert_eq!(nix::errno::Errno::last(), nix::errno::Errno::ENODATA);
+
+            // Anything still listed must be a kernel-owned ignored attr.
+            // SAFETY: same as above; size query then a sized read.
             let len = unsafe { libc::llistxattr(c_path.as_ptr(), std::ptr::null_mut(), 0) };
-            assert_eq!(len, 0, "xattr must have been removed");
+            assert!(len >= 0);
+            if len > 0 {
+                let mut names = vec![0u8; len as usize];
+                let len = unsafe {
+                    libc::llistxattr(c_path.as_ptr(), names.as_mut_ptr().cast(), names.len())
+                };
+                assert!(len >= 0);
+                names.truncate(len as usize);
+                for name in names.split(|&b| b == 0).filter(|n| !n.is_empty()) {
+                    assert!(
+                        is_ignored_xattr(name),
+                        "non-ignored xattr survived canonicalisation: {}",
+                        name.escape_ascii()
+                    );
+                }
+            }
         }
+    }
+
+    /// The ignored set is exactly CppNix's `ignored-acls` default; build-
+    /// or user-written attributes are never ignored.
+    #[test]
+    fn ignored_xattr_set_matches_cppnix_default() {
+        assert!(is_ignored_xattr(b"security.selinux"));
+        assert!(is_ignored_xattr(b"system.nfs4_acl"));
+        assert!(is_ignored_xattr(b"security.csm"));
+
+        assert!(!is_ignored_xattr(b"user.rio_test"));
+        assert!(!is_ignored_xattr(b"user.foo"));
+        assert!(!is_ignored_xattr(b"trusted.overlay.opaque"));
+        assert!(!is_ignored_xattr(b"security.capability"));
+        assert!(!is_ignored_xattr(b"security.selinux.extra"));
     }
 }
