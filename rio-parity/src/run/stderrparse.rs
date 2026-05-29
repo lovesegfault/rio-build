@@ -1,7 +1,8 @@
-//! Parsing of the `nix build -L` child's stderr: the gateway's
-//! `rio: build <uuid>` line and the relayed per-derivation failure
-//! lines, plus the classification of relayed scheduler reasons
-//! (infra vs. target vs. dependency) and the deterministic failure
+//! Parsing of the gateway's relayed stderr lines — the `rio: build <uuid>`
+//! announcement and the per-derivation failure lines — captured as evidence
+//! by the client-ops build observer (and by the warm-stage `nix build -L`
+//! child's stderr reader), plus the classification of relayed scheduler
+//! reasons (infra vs. target vs. dependency) and the deterministic failure
 //! signatures used to group identical failures.
 
 use std::collections::BTreeMap;

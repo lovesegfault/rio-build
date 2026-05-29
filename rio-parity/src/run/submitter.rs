@@ -1,36 +1,39 @@
-//! Batch submission to the rio gateway over ssh-ng.
+//! Batch submission to the rio gateway.
 //!
 //! [`Submitter`] is the trait the submit and warm stages drive, so both
 //! stages stay unit-testable against a scripted in-memory fake.
-//! [`NixSubmitter`] is the real implementation: per batch it imports the
-//! batch's derivation closures from the eval set's drv archive into the
-//! local store, then runs one stock `nix build` against the gateway's
-//! ssh-ng store URL, streaming the child's stderr through the
-//! gateway-line parser so the rio build id and the relayed
-//! per-derivation failure reasons are captured live.
+//! [`ClientOpsSubmitter`] is the build-path implementation: it drives the
+//! gateway's nix-daemon worker protocol in-process over the SSH channel
+//! pool — per batch it imports the batch's drv closure from the eval-set
+//! drv archive, then issues one `BuildPathsWithResults` call whose per-root
+//! results become the batch outcome; relayed stderr lines are captured as
+//! evidence only (build id, failure reasons, tail). [`WarmNixSubmitter`] is
+//! the `nix` shell-out submitter, now scoped to the leaf-mode warm-stage
+//! prefetch until the supply planner absorbs that stage.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
+use rio_nix::protocol::client::{KeyedBuildResult, StoreEntry};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 
 use super::batch::Batch;
-use super::model::PathOutcome;
+use super::drv_import::DrvArchive;
+use super::model::{PathOutcome, build_status_name};
 use super::stderrparse::{ParsedStderr, parse_line};
+use super::transport::{DaemonChannel, GatewayPool, TransportError};
 
-/// Result of one batch submission attempt (one `nix build` child process).
+/// Result of one batch submission attempt.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct BatchOutcome {
     /// Build id parsed from the gateway's `rio: build <uuid>` line.
     pub build_id: Option<String>,
-    /// Child exit code (`None` = killed by a signal, including the engine's
-    /// own batch timeout).
-    pub exit_code: Option<i32>,
     /// In-band per-root results (one entry per requested root); empty for
     /// submitters that have none.
     pub results: Vec<PathOutcome>,
@@ -39,24 +42,22 @@ pub struct BatchOutcome {
     /// Last ~200 stderr lines, kept verbatim as raw evidence for
     /// batches.jsonl.
     pub stderr_tail: String,
-    /// True when the engine killed the child (batch timeout, abort, or a
-    /// stderr read failure) rather than the child exiting on its own.
-    ///
-    /// Authoritative over `exit_code` when the two disagree: in the narrow
-    /// race where the child exits exactly as the engine's deadline fires,
-    /// `exit_code` can still be `Some(_)` — the outcome must be treated as
-    /// cancelled (the stderr stream was abandoned early, so the captured
-    /// evidence may be incomplete).
+    /// True when the engine itself cancelled the submission (batch deadline,
+    /// abort, or an evidence-stream failure that cut the capture short)
+    /// rather than the submission settling on its own. A cancelled outcome's
+    /// captured evidence may be incomplete and its `results` are empty —
+    /// collect re-offers the members instead of charging them.
     pub engine_cancelled: bool,
 }
 
 /// One batch-submission backend. The submit and warm stages only ever talk
 /// to this trait; unit tests script it with an in-memory fake while a real
-/// campaign uses [`NixSubmitter`].
+/// campaign uses [`ClientOpsSubmitter`] (build path) or [`WarmNixSubmitter`]
+/// (warm-stage prefetch).
 #[async_trait]
 pub trait Submitter: Send + Sync {
-    /// Submit one batch under the given store URL and wait for the child to
-    /// exit (or for `timeout` to kill it).
+    /// Submit one batch under the given store URL and wait for it to settle
+    /// (or for `timeout` to cancel it).
     async fn submit_batch(
         &self,
         store_url: &str,
@@ -90,6 +91,48 @@ pub const NIX_SSHOPTS: &str = "-o StrictHostKeyChecking=no -o UserKnownHostsFile
 /// How many trailing stderr lines to keep as raw evidence.
 const STDERR_TAIL_LINES: usize = 200;
 
+/// Append one line to the capped evidence tail, dropping the oldest line
+/// once [`STDERR_TAIL_LINES`] is reached.
+fn push_tail(tail: &mut VecDeque<String>, line: String) {
+    if tail.len() == STDERR_TAIL_LINES {
+        tail.pop_front();
+    }
+    tail.push_back(line);
+}
+
+/// Feed one observed stderr line through the gateway-line parser (build id,
+/// relayed per-derivation failure reasons) and append it to the capped
+/// evidence tail. Shared by the client-ops build observer and the warm
+/// shell-out's stderr reader so both capture identical evidence.
+fn observe_line(parsed: &mut ParsedStderr, tail: &mut VecDeque<String>, line: &str) {
+    parse_line(parsed, line);
+    push_tail(tail, line.to_string());
+}
+
+/// Map the daemon's per-root keyed results onto the batch's roots
+/// positionally: the daemon answers in submission order, so entry *i*
+/// belongs to `root_drvs[i]`. The recorded `drv_path` is always the bare
+/// root drv path (what collect indexes by), never the echoed `DerivedPath`
+/// string, which carries the output selector (`…!*`). A short result vector
+/// (fewer entries than roots) maps what it can — the uncovered roots are
+/// handled by collect's missing-result rule — and extra entries are ignored.
+fn path_outcomes_from_keyed(
+    root_drvs: &[String],
+    results: &[KeyedBuildResult],
+) -> Vec<PathOutcome> {
+    root_drvs
+        .iter()
+        .zip(results)
+        .map(|(drv, keyed)| PathOutcome {
+            drv_path: drv.clone(),
+            status: build_status_name(keyed.result.status).to_string(),
+            error_msg: keyed.result.error_msg.clone(),
+            start_time: keyed.result.start_time,
+            stop_time: keyed.result.stop_time,
+        })
+        .collect()
+}
+
 /// Decode one captured stderr line for evidence capture and the
 /// gateway-line regexes. Lossy on purpose: nix relays builder output
 /// verbatim, so a non-UTF-8 byte sequence must never abort the stream and
@@ -107,8 +150,27 @@ fn lossy_stderr_line(buf: &[u8]) -> String {
 /// even very large closures finish orders of magnitude faster than this.
 const IMPORT_TIMEOUT: Duration = Duration::from_secs(1800);
 
-/// [`Submitter`] that shells out to a stock `nix` binary.
-pub struct NixSubmitter {
+/// What one `nix` child run produced: the assembled outcome plus the child's
+/// exit code, which never leaves this module — the import gate needs it, but
+/// [`BatchOutcome`] is transport-agnostic and does not carry one.
+///
+/// `outcome.engine_cancelled` is authoritative over `exit_code` when the two
+/// disagree: in the narrow race where the child exits exactly as the
+/// engine's deadline fires, `exit_code` can still be `Some(_)` — the run
+/// must be treated as cancelled (the stderr stream was abandoned early, so
+/// the captured evidence may be incomplete).
+struct ChildCapture {
+    outcome: BatchOutcome,
+    /// Child exit code (`None` = killed by a signal, including the engine's
+    /// own deadline kill).
+    exit_code: Option<i32>,
+}
+
+/// [`Submitter`] that shells out to a stock `nix` binary. Serves ONLY the
+/// leaf-mode warm-stage prefetch (dependency warming via the warm tenant);
+/// it is removed once the supply planner takes over that stage. Build-path
+/// batches go through [`ClientOpsSubmitter`] instead.
+pub struct WarmNixSubmitter {
     /// Untarred eval-set drv archive (an uncompressed `file://` binary-cache
     /// layout) used to import each batch's drv closures into the local store
     /// before submission.
@@ -122,7 +184,7 @@ pub struct NixSubmitter {
     pub extra_env: BTreeMap<String, String>,
 }
 
-impl NixSubmitter {
+impl WarmNixSubmitter {
     pub fn new(drv_archive_dir: PathBuf) -> Self {
         Self {
             drv_archive_dir,
@@ -195,7 +257,7 @@ impl NixSubmitter {
     /// error likewise keeps the partial capture: the child is killed (so
     /// the `wait` below cannot block forever on a full pipe nobody drains)
     /// and the outcome is returned with `engine_cancelled` set.
-    async fn run_child(&self, args: &[String], timeout: Duration) -> Result<BatchOutcome> {
+    async fn run_child(&self, args: &[String], timeout: Duration) -> Result<ChildCapture> {
         let mut child = self.command(args).spawn().with_context(|| {
             format!(
                 "spawn {} {}",
@@ -209,12 +271,6 @@ impl NixSubmitter {
         let mut buf: Vec<u8> = Vec::new();
         let mut parsed = ParsedStderr::default();
         let mut tail: VecDeque<String> = VecDeque::new();
-        let push_tail = |tail: &mut VecDeque<String>, line: String| {
-            if tail.len() == STDERR_TAIL_LINES {
-                tail.pop_front();
-            }
-            tail.push_back(line);
-        };
 
         let deadline = tokio::time::Instant::now() + timeout;
         let mut engine_cancelled = false;
@@ -226,8 +282,7 @@ impl NixSubmitter {
                         Ok(_) => {
                             let line = lossy_stderr_line(&buf);
                             let line = line.trim_end_matches(['\r', '\n']);
-                            parse_line(&mut parsed, line);
-                            push_tail(&mut tail, line.to_string());
+                            observe_line(&mut parsed, &mut tail, line);
                             buf.clear();
                         }
                         Err(e) => {
@@ -266,21 +321,23 @@ impl NixSubmitter {
             push_tail(&mut tail, lossy_stderr_line(&buf));
         }
         let status = child.wait().await.context("wait for nix child")?;
-        Ok(BatchOutcome {
-            build_id: parsed.build_id,
+        Ok(ChildCapture {
+            outcome: BatchOutcome {
+                build_id: parsed.build_id,
+                // The nix-CLI child reports nothing in-band; per-root results
+                // stay empty for this submitter.
+                results: Vec::new(),
+                reasons: parsed.reasons,
+                stderr_tail: Vec::from(tail).join("\n"),
+                engine_cancelled,
+            },
             exit_code: status.code(),
-            // The nix-CLI child reports nothing in-band; per-root results
-            // stay empty for this submitter.
-            results: Vec::new(),
-            reasons: parsed.reasons,
-            stderr_tail: Vec::from(tail).join("\n"),
-            engine_cancelled,
         })
     }
 }
 
 #[async_trait]
-impl Submitter for NixSubmitter {
+impl Submitter for WarmNixSubmitter {
     async fn submit_batch(
         &self,
         store_url: &str,
@@ -295,12 +352,12 @@ impl Submitter for NixSubmitter {
         let import = self
             .run_child(&self.import_args(batch), IMPORT_TIMEOUT)
             .await?;
-        if import.exit_code != Some(0) || import.engine_cancelled {
+        if import.exit_code != Some(0) || import.outcome.engine_cancelled {
             // The import child's stderr is not persisted anywhere else, so
             // carry a clipped tail of it in the error.
-            let last_lines: Vec<&str> = import.stderr_tail.lines().rev().take(5).collect();
+            let last_lines: Vec<&str> = import.outcome.stderr_tail.lines().rev().take(5).collect();
             let last_lines: Vec<&str> = last_lines.into_iter().rev().collect();
-            let cancelled_note = if import.engine_cancelled {
+            let cancelled_note = if import.outcome.engine_cancelled {
                 " (killed at the engine's import deadline)"
             } else {
                 ""
@@ -313,8 +370,225 @@ impl Submitter for NixSubmitter {
                 crate::body_snippet(&last_lines.join(" | "))
             );
         }
-        self.run_child(&Self::build_args(store_url, batch), timeout)
+        let build = self
+            .run_child(&Self::build_args(store_url, batch), timeout)
+            .await?;
+        Ok(build.outcome)
+    }
+}
+
+/// `AddMultipleToStore` entries per upload call during the drv-text import.
+/// Each entry's NAR payload is materialized in memory
+/// ([`DrvArchive::entry`] returns `NarPayload::Bytes`), so this cap also
+/// bounds the upload's resident memory; derivation texts are tiny, so 500
+/// of them stay well under a megabyte. Aligned with the supply planner's
+/// batch-entry cap; becomes a knob when the planner lands.
+const DRV_UPLOAD_CHUNK: usize = 500;
+
+/// Effective-throughput floor used to scale upload deadlines with payload
+/// size, so a large `AddMultipleToStore` chunk is never cut off by a
+/// deadline tuned for metadata-sized ops. Deliberately conservative
+/// (1 MiB/s); drv-text chunks add nothing measurable on top of the base
+/// deadline.
+const UPLOAD_FLOOR_BYTES_PER_SEC: u64 = 1024 * 1024;
+
+/// Deadline for one upload call: the configured per-op deadline plus
+/// payload-proportional headroom at [`UPLOAD_FLOOR_BYTES_PER_SEC`].
+fn upload_deadline(base: Duration, payload_bytes: u64) -> Duration {
+    base + Duration::from_secs(payload_bytes / UPLOAD_FLOOR_BYTES_PER_SEC)
+}
+
+/// Submitter that drives the gateway's worker protocol directly: per batch
+/// it imports the batch's drv closure from the eval-set drv archive
+/// (a `QueryValidPaths` probe + `AddMultipleToStore` of the missing texts in
+/// reference order), then issues one `BuildPathsWithResults` call whose
+/// per-root results become the batch outcome. Relayed stderr lines are
+/// captured as evidence only (build id, failure reasons, tail).
+pub struct ClientOpsSubmitter {
+    /// SSH channel pool to the gateway; one channel is held per in-flight
+    /// submission.
+    pub pool: Arc<GatewayPool>,
+    /// Untarred eval-set drv archive the drv closure is imported from.
+    pub archive: Arc<DrvArchive>,
+    /// Per-op deadline for the probe and upload calls
+    /// (`knobs.op_timeout_secs`); the build call uses the batch timeout.
+    pub op_timeout: Duration,
+    /// Store paths per `QueryValidPaths` probe call (`knobs.probe_chunk`).
+    pub probe_chunk: usize,
+}
+
+impl ClientOpsSubmitter {
+    /// Bounded engine-side error for an import-phase transport failure,
+    /// naming the op and the pool connection it ran on. The submit loop
+    /// records the message on the batch record and re-offers the jobs.
+    fn import_error(op: &str, connection: usize, err: &TransportError) -> anyhow::Error {
+        anyhow!(
+            "drv import failed during {op} on gateway connection {connection}: {}",
+            crate::body_snippet(&err.to_string())
+        )
+    }
+
+    /// Materialize one slice of archive paths as upload entries plus their
+    /// total NAR payload size (which scales the upload deadline).
+    fn materialize_entries(&self, paths: &[String]) -> Result<(Vec<StoreEntry>, u64)> {
+        let entries = paths
+            .iter()
+            .map(|path| self.archive.entry(path))
+            .collect::<Result<Vec<_>>>()?;
+        let payload_bytes = entries.iter().map(|entry| entry.info.nar_size).sum();
+        Ok((entries, payload_bytes))
+    }
+
+    /// Upload one slice of missing drv texts on `chan`, returning the channel
+    /// to keep using afterwards.
+    ///
+    /// A clean daemon refusal is retried exactly once on a fresh channel: an
+    /// upload refusal can be a quota/policy answer, but it can also be the
+    /// refusal racing session teardown (the wire error surfaces as `Refused`
+    /// for upload ops), and either way the refused channel's wire position is
+    /// unknown, so it is dropped. A second failure — or any timeout/transport
+    /// error — is an engine-side submission failure (infrastructure, never
+    /// charged to the workload): the jobs are re-offered by the submit loop.
+    async fn upload_chunk(
+        &self,
+        mut chan: DaemonChannel,
+        paths: &[String],
+    ) -> Result<DaemonChannel> {
+        let (entries, payload_bytes) = self.materialize_entries(paths)?;
+        let op = format!("AddMultipleToStore ({} drv texts)", paths.len());
+        let deadline = upload_deadline(self.op_timeout, payload_bytes);
+        match chan.add_multiple_to_store(entries, deadline).await {
+            Ok(()) => Ok(chan),
+            Err(TransportError::Refused(msg)) => {
+                tracing::warn!(
+                    connection = chan.connection_index(),
+                    error = %msg,
+                    "drv upload refused; retrying once on a fresh gateway channel"
+                );
+                drop(chan);
+                let mut fresh = self
+                    .pool
+                    .open_channel()
+                    .await
+                    .context("open a fresh gateway channel after a refused drv upload")?;
+                let (entries, _) = self.materialize_entries(paths)?;
+                match fresh.add_multiple_to_store(entries, deadline).await {
+                    Ok(()) => Ok(fresh),
+                    Err(err) => Err(Self::import_error(
+                        &format!("{op} (retry on a fresh channel)"),
+                        fresh.connection_index(),
+                        &err,
+                    )),
+                }
+            }
+            Err(err) => Err(Self::import_error(&op, chan.connection_index(), &err)),
+        }
+    }
+}
+
+#[async_trait]
+impl Submitter for ClientOpsSubmitter {
+    async fn submit_batch(
+        &self,
+        _store_url: &str,
+        batch: &Batch,
+        timeout: Duration,
+    ) -> Result<BatchOutcome> {
+        // One submission = one daemon channel: the protocol is sequential per
+        // channel, and any error that desyncs the wire means switching to a
+        // fresh channel, so the import and the build share this one until an
+        // error forces a replacement. A failed channel open is an engine-side
+        // submission failure (the submit loop records it and re-offers the
+        // jobs), exactly like a failed ssh handshake before the cutover.
+        let mut chan = self
+            .pool
+            .open_channel()
             .await
+            .context("open a gateway daemon channel for the batch submission")?;
+
+        // ── Import: the batch's drv closure from the eval-set archive ──────
+        let closure = self.archive.closure(&batch.root_drvs)?;
+        let mut valid: BTreeSet<String> = BTreeSet::new();
+        for chunk in closure.chunks(self.probe_chunk.max(1)) {
+            match chan.query_valid_paths(chunk, self.op_timeout).await {
+                Ok(present) => valid.extend(present),
+                Err(err) => {
+                    return Err(Self::import_error(
+                        &format!("QueryValidPaths ({} paths)", chunk.len()),
+                        chan.connection_index(),
+                        &err,
+                    ));
+                }
+            }
+        }
+        // The probe filter and the upload slicing both preserve the closure's
+        // reference order — the archive's only ordering guarantee — so every
+        // reference is registered before its referrers.
+        let missing: Vec<String> = closure
+            .iter()
+            .filter(|path| !valid.contains(*path))
+            .cloned()
+            .collect();
+        for chunk in missing.chunks(DRV_UPLOAD_CHUNK) {
+            chan = self.upload_chunk(chan, chunk).await?;
+        }
+
+        // ── Build: one BuildPathsWithResults call over every root ──────────
+        let derived: Vec<String> = batch.root_drvs.iter().map(|d| format!("{d}!*")).collect();
+        let mut parsed = ParsedStderr::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+        let build_result = {
+            let mut observer = |line: &str| observe_line(&mut parsed, &mut tail, line);
+            chan.build_paths_with_results_observed(&derived, timeout, &mut observer)
+                .await
+        };
+        let (results, engine_cancelled) = match build_result {
+            Ok(keyed) => {
+                if keyed.len() != batch.root_drvs.len() {
+                    tracing::warn!(
+                        connection = chan.connection_index(),
+                        requested = batch.root_drvs.len(),
+                        returned = keyed.len(),
+                        "BuildPathsWithResults returned a different result count than requested \
+                         roots; uncovered roots are handled by collect's missing-result rule"
+                    );
+                }
+                (path_outcomes_from_keyed(&batch.root_drvs, &keyed), false)
+            }
+            Err(TransportError::Timeout { .. }) => {
+                // The batch deadline fired mid-build. Abandoning the channel
+                // IS the cancellation mechanism (the gateway cancels the
+                // session's builds when the channel closes); the evidence
+                // captured so far is kept and collect re-offers the members
+                // via the engine-cancelled rule.
+                tracing::warn!(
+                    connection = chan.connection_index(),
+                    roots = batch.root_drvs.len(),
+                    timeout_secs = timeout.as_secs(),
+                    "batch build deadline reached; abandoning the gateway channel"
+                );
+                chan.abandon();
+                (Vec::new(), true)
+            }
+            Err(err @ (TransportError::Refused(_) | TransportError::Other(_))) => {
+                // Daemon refusal (e.g. quota) or a transport/protocol failure:
+                // an engine-side submission failure, recorded on the batch
+                // record and re-offered — never charged to the workload.
+                return Err(anyhow!(
+                    "BuildPathsWithResults failed on gateway connection {}: {}",
+                    chan.connection_index(),
+                    crate::body_snippet(&err.to_string())
+                ));
+            }
+        };
+
+        Ok(BatchOutcome {
+            build_id: parsed.build_id,
+            results,
+            reasons: parsed.reasons,
+            stderr_tail: Vec::from(tail).join("\n"),
+            engine_cancelled,
+        })
     }
 }
 
@@ -383,6 +657,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rio_nix::protocol::build::{BuildResult, BuildStatus};
 
     fn batch() -> Batch {
         Batch {
@@ -396,8 +671,8 @@ mod tests {
     }
 
     #[test]
-    fn import_and_build_command_shapes() {
-        let sub = NixSubmitter::new(PathBuf::from("/scratch/drv-archive"));
+    fn warm_nix_submitter_keeps_import_and_build_command_shapes() {
+        let sub = WarmNixSubmitter::new(PathBuf::from("/scratch/drv-archive"));
         let import = sub.import_args(&batch());
         assert_eq!(
             import,
@@ -416,7 +691,7 @@ mod tests {
             .map(String::from)
             .collect::<Vec<_>>()
         );
-        let build = NixSubmitter::build_args(
+        let build = WarmNixSubmitter::build_args(
             "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/parity-leaf",
             &batch(),
         );
@@ -465,7 +740,7 @@ mod tests {
     /// covered without a nix binary or a cluster.
     #[tokio::test]
     async fn run_child_streams_and_parses_stderr() {
-        let mut sub = NixSubmitter::new(PathBuf::from("/nonexistent"));
+        let mut sub = WarmNixSubmitter::new(PathBuf::from("/nonexistent"));
         sub.nix_bin = "sh".to_string();
         let script = concat!(
             "i=0\n",
@@ -473,14 +748,15 @@ mod tests {
             "echo \"rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a (trace 4bf92f3577b34da6a3ce929d0e0e4736)\" >&2\n",
             "echo \"derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv' failed: poison threshold reached after 3 distinct-worker failures\" >&2\n",
         );
-        let out = sub
+        let capture = sub
             .run_child(
                 &["-c".to_string(), script.to_string()],
                 Duration::from_secs(60),
             )
             .await
             .unwrap();
-        assert_eq!(out.exit_code, Some(0));
+        let out = capture.outcome;
+        assert_eq!(capture.exit_code, Some(0));
         assert!(!out.engine_cancelled);
         assert_eq!(
             out.build_id.as_deref(),
@@ -544,21 +820,22 @@ mod tests {
     /// continues on the following lines.
     #[tokio::test]
     async fn run_child_keeps_evidence_across_invalid_utf8() {
-        let mut sub = NixSubmitter::new(PathBuf::from("/nonexistent"));
+        let mut sub = WarmNixSubmitter::new(PathBuf::from("/nonexistent"));
         sub.nix_bin = "sh".to_string();
         let script = concat!(
             "printf 'garbage \\377\\376 bytes\\n' >&2\n",
             "echo \"rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a\" >&2\n",
             "echo \"derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv' failed: builder failed with exit code 2\" >&2\n",
         );
-        let out = sub
+        let capture = sub
             .run_child(
                 &["-c".to_string(), script.to_string()],
                 Duration::from_secs(60),
             )
             .await
             .unwrap();
-        assert_eq!(out.exit_code, Some(0));
+        let out = capture.outcome;
+        assert_eq!(capture.exit_code, Some(0));
         assert!(!out.engine_cancelled);
         assert_eq!(
             out.build_id.as_deref(),
@@ -574,16 +851,125 @@ mod tests {
     /// kill as `engine_cancelled` with no exit code.
     #[tokio::test]
     async fn run_child_kills_the_child_at_the_timeout() {
-        let mut sub = NixSubmitter::new(PathBuf::from("/nonexistent"));
+        let mut sub = WarmNixSubmitter::new(PathBuf::from("/nonexistent"));
         sub.nix_bin = "sh".to_string();
-        let out = sub
+        let capture = sub
             .run_child(
                 &["-c".to_string(), "sleep 30".to_string()],
                 Duration::from_millis(250),
             )
             .await
             .unwrap();
-        assert!(out.engine_cancelled);
-        assert_eq!(out.exit_code, None);
+        assert!(capture.outcome.engine_cancelled);
+        assert_eq!(capture.exit_code, None);
+    }
+
+    /// The positional mapping from the daemon's keyed results to in-band
+    /// per-root outcomes: keyed by the bare ROOT drv path in submission
+    /// order (never the echoed `DerivedPath` string, which carries the
+    /// output selector), statuses written via `build_status_name`, error
+    /// message and timestamps carried over, and a short result vector maps
+    /// what it can without erroring.
+    #[test]
+    fn client_ops_outcome_maps_keyed_results_positionally() {
+        let roots = batch().root_drvs;
+        let keyed = vec![
+            KeyedBuildResult {
+                derived_path: format!("{}!*", roots[0]),
+                result: BuildResult {
+                    status: BuildStatus::Built,
+                    start_time: 100,
+                    stop_time: 200,
+                    ..BuildResult::default()
+                },
+            },
+            KeyedBuildResult {
+                derived_path: format!("{}!*", roots[1]),
+                result: BuildResult {
+                    status: BuildStatus::PermanentFailure,
+                    error_msg: "builder failed with exit code 2".into(),
+                    start_time: 300,
+                    stop_time: 400,
+                    ..BuildResult::default()
+                },
+            },
+        ];
+        let outcomes = path_outcomes_from_keyed(&roots, &keyed);
+        assert_eq!(outcomes.len(), 2);
+        // The recorded drv path is the plain root drv path collect indexes
+        // by — no `!*` / `^*` output-selector suffix from the echoed key.
+        assert_eq!(outcomes[0].drv_path, roots[0]);
+        assert_eq!(outcomes[1].drv_path, roots[1]);
+        assert!(
+            outcomes.iter().all(|o| o.drv_path.ends_with(".drv")),
+            "{outcomes:?}"
+        );
+        assert_eq!(outcomes[0].status, build_status_name(BuildStatus::Built));
+        assert_eq!(outcomes[0].error_msg, "");
+        assert_eq!((outcomes[0].start_time, outcomes[0].stop_time), (100, 200));
+        assert_eq!(
+            outcomes[1].status,
+            build_status_name(BuildStatus::PermanentFailure)
+        );
+        assert_eq!(outcomes[1].error_msg, "builder failed with exit code 2");
+        assert_eq!((outcomes[1].start_time, outcomes[1].stop_time), (300, 400));
+
+        // A short result vector (one entry for two roots) is not an error:
+        // the uncovered root simply has no outcome.
+        let short = path_outcomes_from_keyed(&roots, &keyed[..1]);
+        assert_eq!(short.len(), 1);
+        assert_eq!(short[0].drv_path, roots[0]);
+    }
+
+    /// The client-ops stderr observer captures the same evidence the warm
+    /// shell-out's stderr reader does: the gateway's build id, the relayed
+    /// per-derivation failure reasons, and a tail capped at
+    /// `STDERR_TAIL_LINES`.
+    #[test]
+    fn client_ops_observer_captures_build_id_reasons_and_tail() {
+        let mut parsed = ParsedStderr::default();
+        let mut tail: VecDeque<String> = VecDeque::new();
+        for i in 0..250 {
+            observe_line(&mut parsed, &mut tail, &format!("noise line {i}"));
+        }
+        observe_line(
+            &mut parsed,
+            &mut tail,
+            "rio: build 0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a (trace 4bf92f3577b34da6a3ce929d0e0e4736)",
+        );
+        observe_line(
+            &mut parsed,
+            &mut tail,
+            "derivation '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv' failed: poison threshold reached after 3 distinct-worker failures",
+        );
+        assert_eq!(
+            parsed.build_id.as_deref(),
+            Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
+        );
+        assert_eq!(parsed.reasons.len(), 1);
+        assert_eq!(
+            parsed.reasons["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"],
+            "poison threshold reached after 3 distinct-worker failures"
+        );
+        // Same cap as the warm shell-out's evidence tail: 252 lines fed, the
+        // first 52 noise lines dropped.
+        assert_eq!(tail.len(), STDERR_TAIL_LINES);
+        assert_eq!(tail.front().unwrap(), "noise line 52");
+        assert!(tail.back().unwrap().starts_with("derivation '"));
+    }
+
+    /// Upload deadlines scale with the chunk's payload size on top of the
+    /// configured per-op deadline, at the conservative 1 MiB/s floor.
+    #[test]
+    fn upload_deadline_scales_with_payload() {
+        let base = Duration::from_secs(120);
+        assert_eq!(upload_deadline(base, 0), base);
+        // A drv-text-sized chunk adds nothing measurable.
+        assert_eq!(upload_deadline(base, 512 * 1024), base);
+        // A 100 MiB payload adds 100 seconds of headroom.
+        assert_eq!(
+            upload_deadline(base, 100 * 1024 * 1024),
+            base + Duration::from_secs(100)
+        );
     }
 }

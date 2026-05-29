@@ -66,10 +66,10 @@ pub const COMPONENT_DISPATCH: &str = "dispatch";
 /// Engine-side phase of one campaign job, as fed by the run loop.
 ///
 /// `Active` means "member of an in-flight batch"; everything else is
-/// `Queued`. Per-drv assigned/running/substituting refinement needs
-/// mid-batch build-scoped reads (the batched per-drv status reader) and is
-/// deferred — the per-batch child timeout remains the hard backstop either
-/// way.
+/// `Queued`. Per-drv assigned/running/substituting refinement is deferred —
+/// in-band per-root results arrive only when a batch settles, so there is
+/// no mid-batch per-drv view — and the per-batch timeout remains the hard
+/// backstop either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobPhase {
     Queued,
@@ -370,9 +370,10 @@ impl Watchdog {
                 }
             }
         }
-        // TODO: refine `Active` to per-drv assigned/running/substituting once
-        // a batched per-drv status read allows mid-batch build-scoped reads;
-        // today Active means "member of an in-flight batch".
+        // TODO: refine `Active` to per-drv assigned/running/substituting if a
+        // mid-batch per-drv view ever becomes available — in-band per-root
+        // results only arrive when a batch settles; today Active means
+        // "member of an in-flight batch".
         TickOutcome {
             suspended,
             components,

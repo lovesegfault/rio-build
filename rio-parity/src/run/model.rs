@@ -431,6 +431,10 @@ pub fn build_status_from_name(name: &str) -> Option<BuildStatus> {
 
 /// One line of batches.jsonl — engine-internal bookkeeping for resume and
 /// build_id recovery (not part of the per-job results schema).
+///
+/// Records written before the client-ops cutover may carry an `exitCode`
+/// key (the nix child's exit status); there is no child process any more,
+/// so the field is gone and serde simply ignores it on read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BatchRecord {
@@ -445,7 +449,6 @@ pub struct BatchRecord {
     pub build_id: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
-    pub exit_code: Option<i32>,
     /// In-band per-root results from the submission; empty for submitters
     /// that have none and on records written before this field existed.
     #[serde(default)]
@@ -660,7 +663,6 @@ mod tests {
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
             started_at: "2026-05-26T00:00:00Z".into(),
             finished_at: Some("2026-05-26T00:05:00Z".into()),
-            exit_code: Some(0),
             results: vec![PathOutcome {
                 drv_path: drv.into(),
                 status: build_status_name(BuildStatus::Built).into(),
@@ -680,12 +682,14 @@ mod tests {
         assert!(json.contains(r#""stopTime":2"#), "{json}");
         assert!(!json.contains("drv_path"), "{json}");
 
-        // A batches.jsonl line written before the field existed (no
-        // `results` key) still deserializes; the array defaults to empty.
+        // A batches.jsonl line written before the client-ops cutover (no
+        // `results` key, a stale `exitCode` key) still deserializes: the
+        // array defaults to empty and the unknown key is ignored.
         let old = r#"{"batchId":3,"kind":"submit","jobs":["x.x86_64-linux"],"rootDrvs":["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv"],"estNodes":1,"buildId":null,"startedAt":"2026-05-26T00:00:00Z","finishedAt":null,"exitCode":1,"reasons":{},"stderrTail":"tail","engineCancelled":false}"#;
         let parsed: BatchRecord = serde_json::from_str(old).unwrap();
         assert!(parsed.results.is_empty());
-        assert_eq!(parsed.exit_code, Some(1));
+        assert_eq!(parsed.batch_id, 3);
+        assert_eq!(parsed.stderr_tail.as_deref(), Some("tail"));
     }
 
     #[test]

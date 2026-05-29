@@ -404,7 +404,6 @@ mod tests {
         let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(build_id.into()),
-            exit_code: Some(0),
             ..BatchOutcome::default()
         }));
         let reader = Arc::new(FakeReader::default());
@@ -500,7 +499,6 @@ mod tests {
             .push(Err(anyhow::anyhow!("ssh handshake failed")));
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(build_id.into()),
-            exit_code: Some(0),
             ..BatchOutcome::default()
         }));
         let reader = Arc::new(FakeReader::default());

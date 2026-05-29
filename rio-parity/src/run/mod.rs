@@ -62,7 +62,7 @@ use self::reader::{GetBuildGraphReader, ResultReader};
 use self::spec::{CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, generate_campaign_id};
 use self::state::{StateDir, StateFile, latest_per_job};
 use self::submit::{SubmitTracker, run_submit_loop};
-use self::submitter::{NixSubmitter, Submitter};
+use self::submitter::{ClientOpsSubmitter, Submitter, WarmNixSubmitter};
 use self::watchdog::{JobPhase, PollTick, StallKind, StallVerdict, Watchdog};
 
 /// CLI arguments for `rio-parity run`.
@@ -131,7 +131,14 @@ pub struct Backends {
     /// from the build graph. The build-path collect loop reads in-band
     /// per-root results from batches.jsonl instead and never touches this.
     pub reader: Arc<dyn ResultReader>,
+    /// Build-path submitter (the worker-protocol client-ops transport in
+    /// production).
     pub submitter: Arc<dyn Submitter>,
+    /// Warm-stage prefetch submitter (the `nix` shell-out in leaf mode, kept
+    /// until the supply planner absorbs the warm stage). `None` in
+    /// self-hosted mode and in tests that don't exercise warm — the warm
+    /// stage then falls back to `submitter`.
+    pub warm_submitter: Option<Arc<dyn Submitter>>,
     pub narinfo: Arc<dyn NarinfoSource>,
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
@@ -160,10 +167,12 @@ pub struct Backends {
 ///   it would kill the pod mid-drain instead of letting the partial report
 ///   render. A supplied deadline that does not parse as RFC3339 is a
 ///   startup error.
-/// - **Image requirements:** GNU `tar` + `zstd` (drv-archive unpack),
-///   `nix` and an `ssh` client (the submitter shells out to `nix build`
-///   against the gateway's ssh-ng URL), and the per-tenant SSH keys /
-///   service HMAC key mounted at the paths named in the spec.
+/// - **Image requirements:** the per-tenant SSH key files and the service
+///   HMAC key mounted at the paths named in the spec (the build path drives
+///   the gateway's worker protocol in-process), GNU `tar` + `zstd` for the
+///   drv-archive unpack, and `nix` plus an `ssh` client only for the
+///   leaf-mode warm-stage prefetch shell-out (until the supply planner
+///   absorbs that stage).
 /// - **Resume:** re-running with the same state dir skips completed stages
 ///   and already-terminal jobs. Resuming on a *fresh* pod volume
 ///   additionally requires `spec.campaign_id` to be pinned (it names the
@@ -189,7 +198,8 @@ pub async fn run(args: RunArgs) -> Result<()> {
         _ => artifacts.clone(),
     };
     // The eval set + drv archive must be on local disk before the backends
-    // are built (NixSubmitter needs the archive directory).
+    // are built (the client-ops submitter imports drv closures from it; the
+    // warm-stage shell-out's `nix copy` reads the same layout).
     let (eval_dir, archive_dir) = ensure_eval_set(
         &state,
         args.eval_set_dir.clone(),
@@ -201,6 +211,31 @@ pub async fn run(args: RunArgs) -> Result<()> {
         spec.cluster.scheduler_addr.clone(),
         spec.cluster.service_hmac_key_path.as_deref(),
     )?);
+    // Gateway worker-protocol transport for build-path submissions. The
+    // host-key pin is required by spec validation and re-required here: an
+    // absent pin is an explicit error at this call site, never an empty
+    // value passed downstream. Channel budget: a burst of channel-open
+    // refusals against this configuration is a configuration error (the
+    // gateway's per-connection cap changed, or the connections knob is
+    // wrong), not per-unit infra noise.
+    let endpoint = transport::GatewayEndpoint::parse(&spec.cluster.gateway_store_url)?;
+    let host_key = spec
+        .cluster
+        .gateway_host_key
+        .clone()
+        .filter(|key| !key.trim().is_empty())
+        .context("cluster.gateway_host_key must be set for the client-ops transport")?;
+    let policy = transport::HostKeyPolicy::Pinned(host_key);
+    let connections = spec
+        .knobs
+        .connections
+        .unwrap_or_else(|| transport::default_connections(spec.knobs.submit_concurrency));
+    let pool = Arc::new(transport::GatewayPool::new(endpoint, policy, connections)?);
+    tracing::info!(
+        connections,
+        channels_per_connection = transport::CHANNELS_PER_CONNECTION,
+        "gateway transport configured"
+    );
     let backends = Backends {
         store: Arc::new(GrpcStoreApi::new(
             spec.cluster.store_addr.clone(),
@@ -212,7 +247,17 @@ pub async fn run(args: RunArgs) -> Result<()> {
             spec.cluster.scheduler_addr.clone(),
             spec.cluster.service_hmac_key_path.as_deref(),
         )?)),
-        submitter: Arc::new(NixSubmitter::new(archive_dir)),
+        submitter: Arc::new(ClientOpsSubmitter {
+            pool,
+            archive: Arc::new(drv_import::DrvArchive::open(&archive_dir)?),
+            op_timeout: Duration::from_secs(spec.knobs.op_timeout_secs),
+            probe_chunk: spec.knobs.probe_chunk,
+        }),
+        // The warm-stage prefetch keeps the nix shell-out (and the drv
+        // archive on disk) until the supply planner absorbs it; self-hosted
+        // mode has no warm stage and carries no warm submitter.
+        warm_submitter: (spec.mode == Mode::Leaf)
+            .then(|| Arc::new(WarmNixSubmitter::new(archive_dir.clone())) as Arc<dyn Submitter>),
         narinfo: Arc::new(crate::nixcache::NixCacheClient::new(
             &spec.hydra.cache_url,
             &spec.hydra.user_agent,
@@ -293,8 +338,8 @@ pub async fn ensure_eval_set(
                 .with_context(|| format!("write {}", marker.display()))?;
         } else {
             // Local development and tests run without the archive (the
-            // FakeSubmitter never imports anything); a real NixSubmitter run
-            // against an empty archive fails loudly at the first import.
+            // FakeSubmitter never imports anything); a real campaign against
+            // an empty archive fails loudly at the first import.
             std::fs::create_dir_all(&archive_dir)
                 .with_context(|| format!("create {}", archive_dir.display()))?;
         }
@@ -777,9 +822,16 @@ pub async fn run_with_backends(
             .clone()
             .context("leaf mode requires cluster.warm_store_url")?;
         let plan_valid: HashSet<String> = plan_output.cached_prior_paths.iter().cloned().collect();
+        // The warm stage submits through its own shell-out submitter; the
+        // fallback to the build-path submitter keeps fake-backend tests that
+        // only set `submitter` working.
+        let warm_submitter = backends
+            .warm_submitter
+            .clone()
+            .unwrap_or_else(|| backends.submitter.clone());
         warm::run_warm(
             state.clone(),
-            backends.submitter.clone(),
+            warm_submitter,
             backends.reader.clone(),
             &warm_url,
             &plan_output.warm_set,
@@ -1594,7 +1646,6 @@ mod tests {
         let submit_build = "0193e4a2-7c1b-7d20-9b3a-00000000bbbb";
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(submit_build.into()),
-            exit_code: Some(0),
             results: vec![PathOutcome {
                 drv_path: app.drv_path.clone(),
                 status: build_status_name(BuildStatus::Built).into(),
@@ -1606,7 +1657,6 @@ mod tests {
         }));
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some(warm_build.into()),
-            exit_code: Some(0),
             ..BatchOutcome::default()
         }));
         let reader = Arc::new(FakeReader::default());
@@ -1624,12 +1674,15 @@ mod tests {
         // info and records the outputs without hashes (not-comparable),
         // which does not affect the bucket.
         let state_dir = tempfile::tempdir().unwrap();
+        // The same FakeSubmitter serves both the build path and the warm
+        // stage so the scripted warm outcome still applies.
         let backends = || Backends {
             store: Arc::new(FakeStoreApi::default()),
             admin: Arc::new(NoLogsAdmin),
             cluster: Arc::new(HealthyCluster),
             reader: reader.clone(),
             submitter: submitter.clone(),
+            warm_submitter: Some(submitter.clone()),
             narinfo: Arc::new(MapNarinfo(narinfos.clone())),
             artifacts: None,
         };

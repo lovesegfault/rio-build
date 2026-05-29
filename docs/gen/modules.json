@@ -953,7 +953,7 @@
     {
       "path": "run/stderrparse.rs",
       "depth": 1,
-      "doc": "Parsing of the `nix build -L` child's stderr: the gateway's"
+      "doc": "Parsing of the gateway's relayed stderr lines — the `rio: build <uuid>`"
     },
     {
       "path": "run/submit.rs",
@@ -963,7 +963,7 @@
     {
       "path": "run/submitter.rs",
       "depth": 1,
-      "doc": "Batch submission to the rio gateway over ssh-ng."
+      "doc": "Batch submission to the rio gateway."
     },
     {
       "path": "run/transport.rs",

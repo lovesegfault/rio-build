@@ -165,7 +165,6 @@ pub async fn submit_one_batch(
         build_id: None,
         started_at,
         finished_at: Some(now_rfc3339()),
-        exit_code: None,
         results: Vec::new(),
         reasons: BTreeMap::new(),
         stderr_tail: None,
@@ -174,7 +173,6 @@ pub async fn submit_one_batch(
     match outcome {
         Ok(o) => {
             record.build_id = o.build_id;
-            record.exit_code = o.exit_code;
             record.results = o.results;
             record.reasons = o.reasons;
             record.stderr_tail = Some(o.stderr_tail);
@@ -184,7 +182,7 @@ pub async fn submit_one_batch(
                 kind,
                 jobs = record.jobs.len(),
                 build_id = record.build_id.as_deref().unwrap_or(""),
-                exit_code = record.exit_code,
+                results = record.results.len(),
                 engine_cancelled = record.engine_cancelled,
                 reasons = record.reasons.len(),
                 "batch settled"
@@ -403,7 +401,6 @@ mod tests {
         };
         submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
-            exit_code: Some(1),
             results: vec![scripted_result.clone()],
             reasons: BTreeMap::from([(
                 "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x.drv".to_string(),
@@ -440,7 +437,6 @@ mod tests {
             rec.build_id.as_deref(),
             Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a")
         );
-        assert_eq!(rec.exit_code, Some(1));
         // The submitter's in-band per-root results ride the batch record.
         assert_eq!(rec.results, vec![scripted_result.clone()]);
         assert!(!tracker.in_flight.lock().await.contains("x.x86_64-linux"));
@@ -492,7 +488,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(rec.build_id, None);
-        assert_eq!(rec.exit_code, None);
+        assert!(rec.results.is_empty());
         assert!(
             rec.stderr_tail
                 .as_deref()
@@ -520,7 +516,6 @@ mod tests {
         for _ in 0..4 {
             submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
                 build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
-                exit_code: Some(0),
                 ..BatchOutcome::default()
             }));
         }
@@ -699,10 +694,11 @@ mod tests {
         );
         // Unpause and let the single batch run.
         pause.set_manual(false);
-        submitter.outcomes.lock().unwrap().push(Ok(BatchOutcome {
-            exit_code: Some(0),
-            ..BatchOutcome::default()
-        }));
+        submitter
+            .outcomes
+            .lock()
+            .unwrap()
+            .push(Ok(BatchOutcome::default()));
         // Once submitted, the loop still sees the job as non-terminal (the
         // terminal set above is constantly empty), so it would resubmit
         // forever; abort the task once the first submission is observed.
