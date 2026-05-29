@@ -9,11 +9,9 @@
 
 use std::io::{self, Read, Write};
 
-use crate::protocol::wire::{ZERO_PAD, padding_len};
-
+use super::frame;
 use super::sync_wire::{
     consume_padding, expect_str, read_name_bytes, read_string, read_target_bytes, read_u64,
-    write_str, write_u64,
 };
 use super::{
     MAX_DIRECTORY_ENTRIES, MAX_NAR_DEPTH, NAR_MAGIC, NarError, Result, validate_entry_name,
@@ -96,9 +94,71 @@ pub fn dump_path(path: &std::path::Path) -> Result<Vec<u8>> {
 /// so in practice this only catches filesystem bugs or a misconfigured
 /// worker that mounts a still-mutating path.
 pub fn dump_path_streaming(path: &std::path::Path, w: &mut impl Write) -> Result<u64> {
+    dump_path_observed(path, w, &mut ())
+}
+
+/// Tree-structure callbacks for [`dump_path_observed`].
+///
+/// The observer sees the walk's *structure* (entry names, kinds, file
+/// content bytes) while the `Write` sink sees the resulting NAR *byte
+/// stream* (framing + contents interleaved). ADR-022 §6.1's fused
+/// output walk hangs FastCDC chunking, per-file BLAKE3, and castore
+/// `Directory` construction off these hooks so each output byte is
+/// read from disk exactly once.
+///
+/// All methods default to no-ops; `()` implements the trait so
+/// [`dump_path_streaming`] stays observer-free. An `Err` from any hook
+/// aborts the walk.
+///
+/// `name` is the entry's basename as raw bytes (empty for the NAR
+/// root, which has no name). Calls arrive in canonical NAR walk order:
+/// a directory's `enter_dir` precedes its children (byte-lex sorted by
+/// name), and `leave_dir` follows the last child.
+pub trait WalkObserver {
+    /// A directory node begins. Its children follow, then [`Self::leave_dir`].
+    fn enter_dir(&mut self, name: &[u8]) -> io::Result<()> {
+        let _ = name;
+        Ok(())
+    }
+    /// The most recently entered directory has no more children.
+    fn leave_dir(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+    /// A symlink node.
+    fn symlink(&mut self, name: &[u8], target: &[u8]) -> io::Result<()> {
+        let _ = (name, target);
+        Ok(())
+    }
+    /// A regular file node begins. Exactly `size` bytes of content
+    /// follow via [`Self::file_data`], then [`Self::file_end`].
+    fn file_begin(&mut self, name: &[u8], executable: bool, size: u64) -> io::Result<()> {
+        let _ = (name, executable, size);
+        Ok(())
+    }
+    /// One read's worth of the current file's content bytes (≤ 256 KiB).
+    fn file_data(&mut self, data: &[u8]) -> io::Result<()> {
+        let _ = data;
+        Ok(())
+    }
+    /// The current file's content is complete.
+    fn file_end(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// No-op observer: [`dump_path_streaming`] without the structure hooks.
+impl WalkObserver for () {}
+
+/// [`dump_path_streaming`] with a [`WalkObserver`] receiving the tree
+/// structure and file contents alongside the NAR byte stream.
+pub fn dump_path_observed(
+    path: &std::path::Path,
+    w: &mut impl Write,
+    obs: &mut impl WalkObserver,
+) -> Result<u64> {
     let mut counter = CountingWriter::new(w);
-    write_str(&mut counter, NAR_MAGIC)?;
-    stream_node(&mut counter, path, 0)?;
+    frame::magic(&mut counter)?;
+    stream_node(&mut counter, path, 0, b"", obs)?;
     Ok(counter.written)
 }
 
@@ -136,13 +196,26 @@ impl<W: Write> Write for CountingWriter<W> {
 /// emit only what the consumer accepts, and untrusted derivation output
 /// must not be able to hang the worker (e.g. `mkfifo $out/pipe` would
 /// otherwise block in `open(O_RDONLY)` forever).
-fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Result<()> {
+// TODO: the whole-archive caps the ingest boundary enforces
+// (`MAX_NAR_ENTRIES`, `MAX_NAR_INDEX_BYTES` — `r[store.ingest.tree-bounds]`)
+// are not enforced here, only the per-axis ones above. Adding them means
+// threading an entry counter and a joined-path byte budget (plus the
+// prefix length) through this recursion; the store rejects an over-cap
+// upload at PutPath* anyway, so today the asymmetry only costs a builder
+// the wasted upload before the rejection. Add the two counters if failing
+// before bytes hit the wire becomes worth the extra plumbing.
+fn stream_node(
+    w: &mut impl Write,
+    path: &std::path::Path,
+    depth: usize,
+    name: &[u8],
+    obs: &mut impl WalkObserver,
+) -> Result<()> {
     if depth > MAX_NAR_DEPTH {
         return Err(NarError::NestingTooDeep(depth));
     }
     let metadata = std::fs::symlink_metadata(path)?;
-    write_str(w, "(")?;
-    write_str(w, "type")?;
+    frame::node_open(w)?;
 
     if metadata.is_symlink() {
         let target = std::fs::read_link(path)?;
@@ -151,11 +224,11 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
                 "symlink target is not valid UTF-8: {os_str:?}"
             )))
         })?;
-        write_str(w, "symlink")?;
-        write_str(w, "target")?;
-        write_str(w, &target)?;
+        frame::symlink(w, target.as_bytes())?;
+        obs.symlink(name, target.as_bytes())?;
     } else if metadata.is_dir() {
-        write_str(w, "directory")?;
+        frame::directory_open(w)?;
+        obs.enter_dir(name)?;
         // Collect + sort entries for deterministic output (same as
         // node_from_path — NAR requires sorted entries).
         let mut entries: Vec<_> = std::fs::read_dir(path)?.collect::<io::Result<Vec<_>>>()?;
@@ -169,29 +242,21 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
                     "directory entry name is not valid UTF-8: {os_str:?}"
                 )))
             })?;
-            write_str(w, "entry")?;
-            write_str(w, "(")?;
-            write_str(w, "name")?;
-            write_str(w, &name)?;
-            write_str(w, "node")?;
-            stream_node(w, &entry.path(), depth + 1)?;
-            write_str(w, ")")?;
+            frame::entry_open(w, name.as_bytes())?;
+            stream_node(w, &entry.path(), depth + 1, name.as_bytes(), obs)?;
+            frame::entry_close(w)?;
         }
+        obs.leave_dir()?;
     } else if metadata.file_type().is_file() {
         use std::os::unix::fs::PermissionsExt;
         let executable = metadata.permissions().mode() & 0o111 != 0;
         let len = metadata.len();
 
-        write_str(w, "regular")?;
-        if executable {
-            write_str(w, "executable")?;
-            write_str(w, "")?;
-        }
-        write_str(w, "contents")?;
-
-        // THE POINT: length prefix first, then stream contents in chunks.
-        // `write_bytes` would need the whole thing in a slice; we unfold it.
-        write_u64(w, len)?;
+        // THE POINT: the header ends with the length prefix, then contents
+        // stream in chunks. `write_bytes` would need the whole thing in a
+        // slice; we unfold it.
+        frame::regular_header(w, executable, len)?;
+        obs.file_begin(name, executable, len)?;
         let mut f = std::fs::File::open(path)?;
         let mut buf = vec![0u8; STREAM_CHUNK];
         let mut remaining = len;
@@ -212,13 +277,12 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
                 ))));
             }
             w.write_all(&buf[..n])?;
+            obs.file_data(&buf[..n])?;
             remaining -= n as u64;
         }
         // NAR padding to 8-byte boundary (same as write_bytes).
-        let pad = padding_len(len as usize);
-        if pad > 0 {
-            w.write_all(&ZERO_PAD[..pad])?;
-        }
+        frame::contents_padding(w, len)?;
+        obs.file_end()?;
     } else {
         // FIFO/socket/device. A FIFO would hang File::open(O_RDONLY)
         // forever; Nix throws "unsupported type" here. Builders are
@@ -226,7 +290,7 @@ fn stream_node(w: &mut impl Write, path: &std::path::Path, depth: usize) -> Resu
         return Err(NarError::UnsupportedFileType(path.to_path_buf()));
     }
 
-    write_str(w, ")")?;
+    frame::node_close(w)?;
     Ok(())
 }
 
