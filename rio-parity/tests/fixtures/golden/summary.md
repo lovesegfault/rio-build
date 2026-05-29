@@ -15,14 +15,14 @@ Generated: 2026-05-26T12:00:00Z
 | limit | none |
 | engine version | 0.1.0 |
 | signature table | m1-raw-evidence |
-| in scope / attemptable / attempted | 10 / 8 / 8 |
+| in scope / attemptable / attempted | 12 / 10 / 10 |
 | completeness | 100.00% |
 
 ## Headline
 - Build-outcome parity: **50.00%** (2 / 4)
 - NAR-hash agreement (secondary, non-gating): 50.00% (1 / 2 compared jobs)
-- Infra-failure rate (excluded from headline): 25.00%
-- Hydra-unknown rate: 12.50%
+- Infra-failure rate (excluded from headline): 20.00%
+- Hydra-unknown rate: 10.00%
 
 ## Buckets
 | bucket | count | of which cascaded |
@@ -35,6 +35,8 @@ Generated: 2026-05-26T12:00:00Z
 | not-attemptable | 1 |  |
 | hydra-unknown | 1 |  |
 | hydra-only-failure | 1 |  |
+| interruption-replayed | 1 |  |
+| interruption-not-reproduced | 1 |  |
 
 ## Top failure signatures
 Signatures group byte-identical raw evidence (60-character message slugs); the same failure mode worded differently appears as separate rows, so these are NOT failure-mode counts.
@@ -51,6 +53,9 @@ Signatures group byte-identical raw evidence (60-character message slugs); the s
 
 ## Suspension windows
 (none)
+
+## Supply
+(not recorded)
 
 ## Artifacts
 - results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file

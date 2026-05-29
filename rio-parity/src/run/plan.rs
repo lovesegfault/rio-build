@@ -14,8 +14,9 @@ use super::grpc::StoreApi;
 use super::model::now_rfc3339;
 use super::spec::{
     ArchivePin, CampaignSpec, Filters, Mode, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
-    PlanOutput, WARM_TENANT,
+    PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK, PlanOutput, WARM_TENANT,
 };
+use super::supply::exec::{current_rss_mib, peak_rss_mib};
 
 /// Why a job was excluded at plan time (the values of [`ScopeResult::skipped`]).
 pub const SKIP_SYSTEM: &str = "system-filtered";
@@ -286,6 +287,11 @@ pub async fn run_plan(
     let low_confidence = check_tenants(spec, allow_unverified_tenants)?;
 
     let manifest = super::archive_input::load_units(archive)?;
+    // Plan-time closure-graph memory measurement: resident-set size before
+    // the adjacency graph is loaded and the process peak after the
+    // warm-set/overlap computation over it. Recorded in the plan counts so
+    // the report can surface the memory cost of planning this archive.
+    let rss_before_mib = current_rss_mib();
     let dep_closure = super::archive_input::load_closures(archive, &manifest)?;
 
     let jobs_file_contents = match &spec.filters.jobs_file {
@@ -328,9 +334,24 @@ pub async fn run_plan(
     } else {
         WarmComputation::default()
     };
+    let rss_peak_mib = peak_rss_mib();
     let (valid_paths, cached_jobs) = validity_snapshot(store, &manifest, &scope.in_scope).await?;
 
     let mut counts = BTreeMap::new();
+    // The RSS measurements are best-effort (absent off-Linux or when
+    // /proc is unreadable); the keys are simply omitted then.
+    if let Some(mib) = rss_before_mib {
+        counts.insert(
+            PLAN_COUNT_RSS_BEFORE.to_string(),
+            usize::try_from(mib).unwrap_or(usize::MAX),
+        );
+    }
+    if let Some(mib) = rss_peak_mib {
+        counts.insert(
+            PLAN_COUNT_RSS_PEAK.to_string(),
+            usize::try_from(mib).unwrap_or(usize::MAX),
+        );
+    }
     counts.insert(PLAN_COUNT_IN_SCOPE.to_string(), scope.in_scope.len());
     counts.insert("skipped".to_string(), scope.skipped.len());
     counts.insert("notAttemptable".to_string(), warm.not_attemptable.len());
@@ -590,6 +611,10 @@ mod tests {
         assert!(result.output.cached_prior_paths.contains(&app_a_out));
         assert_eq!(result.output.cached_prior_jobs, vec!["appA.x86_64-linux"]);
         assert!(result.low_confidence.is_empty());
+        // The plan-time closure-graph memory measurement is recorded in the
+        // counts (always available on Linux).
+        assert!(result.output.counts.contains_key(PLAN_COUNT_RSS_BEFORE));
+        assert!(result.output.counts[PLAN_COUNT_RSS_PEAK] > 0);
         // The validity snapshot is one batched StoreApi query, not one per job.
         assert_eq!(*store.calls.lock().unwrap(), 1);
     }

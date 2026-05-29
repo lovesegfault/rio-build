@@ -624,6 +624,17 @@ pub const PLAN_COUNT_IN_SCOPE: &str = "inScope";
 /// (in scope minus not-attemptable). See [`PLAN_COUNT_IN_SCOPE`].
 pub const PLAN_COUNT_ATTEMPTABLE: &str = "attemptable";
 
+/// Key of [`PlanOutput::counts`] holding the engine's resident-set size in
+/// MiB just before the plan stage loads the closure graph. Paired with
+/// [`PLAN_COUNT_RSS_PEAK`] to measure the plan-time closure-graph memory
+/// cost; absent when the measurement was unavailable.
+pub const PLAN_COUNT_RSS_BEFORE: &str = "planRssMibBefore";
+
+/// Key of [`PlanOutput::counts`] holding the engine's peak resident-set
+/// size in MiB after the closure/overlap computation. See
+/// [`PLAN_COUNT_RSS_BEFORE`].
+pub const PLAN_COUNT_RSS_PEAK: &str = "planRssPeakMib";
+
 /// Plan-stage output persisted inside campaign.json: warm and
 /// not-attemptable membership plus the plan-time validity snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

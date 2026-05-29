@@ -43,7 +43,7 @@ fn golden_bucket_counts() {
     let (_campaign, records) = fixtures();
     let agg = aggregate(&records);
     let expect = |b: &str| agg.bucket_counts.get(b).copied().unwrap_or(0);
-    assert_eq!(records.len(), 10);
+    assert_eq!(records.len(), 12);
     assert_eq!(expect("match-built"), 2);
     assert_eq!(expect("rio-only-failure"), 1);
     assert_eq!(expect("rio-dependency-failure"), 1);
@@ -59,6 +59,10 @@ fn golden_bucket_counts() {
     assert_eq!(expect("cached-prior"), 1);
     assert_eq!(expect("not-attemptable"), 1);
     assert_eq!(expect("hydra-unknown"), 1);
+    // The timed-only interruption verdicts are counted like any other
+    // bucket and stay out of the headline.
+    assert_eq!(expect("interruption-replayed"), 1);
+    assert_eq!(expect("interruption-not-reproduced"), 1);
     // Headline: 2 match-built / (2 + 1 + 1) = 50%.
     let head = rio_parity::run::classify::headline(
         &agg.bucket_counts,
@@ -85,6 +89,11 @@ fn golden_summary_matches_and_rerenders_identically() {
         generated_at: "2026-05-26T12:00:00Z".to_string(),
         partial: false,
         top_n: 20,
+        supply: None,
+        timed: None,
+        abort_recommended: false,
+        plan_rss_mib: None,
+        plan_rss_peak_mib: None,
     };
     let rendered = render_summary(&input);
     let rendered_again = render_summary(&input);

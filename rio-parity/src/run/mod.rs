@@ -62,19 +62,22 @@ use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::hydra_truth::NarinfoSource;
 use self::model::{
     BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Bucket, FailureKind, HydraEntry, JobRecord, PauseState,
-    RioOutcome, now_rfc3339, rfc3339_to_unix,
+    RioOutcome, SupplyEntry, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
-    CampaignRecord, CampaignSpec, Knobs, Mode, PlanOutput, ScheduleMode, SupplyDependencies,
-    generate_campaign_id,
+    CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
+    PlanOutput, ScheduleMode, SupplyDependencies, generate_campaign_id,
 };
 use self::state::{StateDir, StateFile, latest_per_job};
 use self::submit::{SubmitTracker, run_submit_loop};
 use self::submitter::{ClientOpsSubmitter, Submitter};
-use self::supply::exec::{PoolSupplyTransport, SupplyInputs, SupplyTransport, run_supply_stage};
+use self::supply::exec::{
+    PoolSupplyTransport, SupplyInputs, SupplyStageReport, SupplyTransport, refresh_outcome_counts,
+    run_supply_stage,
+};
 use self::timeline::{
     RecordedRequest, RecordedTarget, RecordedTiming, ScheduledRequest, SharedTimingLookup,
-    TimelineConfig, build_schedule, run_timed_dispatch,
+    TimedRunStats, TimelineConfig, build_schedule, run_timed_dispatch,
 };
 use self::watchdog::{
     COMPONENT_DISPATCH, COMPONENT_PAUSE, JobPhase, PollTick, StallKind, StallVerdict, Watchdog,
@@ -1209,6 +1212,10 @@ pub async fn run_with_backends(
         state.write_json_atomic("supply-report.json", &supply_report)?;
         state.set_marker("supply")?;
     }
+    // Supply summary for progress.json while the campaign executes (the
+    // final report re-reads it after the journal stops growing). On resume
+    // the persisted report from the run that completed the stage is used.
+    let supply_summary = load_supply_summary(&state)?;
 
     // ── Main loop: submit ∥ collect ∥ watchdog ∥ sync ───────────────────────
     let job_closures = plan::job_closures(&dep_closure);
@@ -1328,6 +1335,7 @@ pub async fn run_with_backends(
         let schedule_mode = spec.scheduling.mode;
         let abort_recommended = abort_recommended.clone();
         let timing_degraded = timing_degraded.clone();
+        let supply_for_progress = supply_summary.clone();
         let store_url = spec.cluster.gateway_store_url.clone();
         let mut stop_rx = stop_rx.clone();
         tokio::spawn(async move {
@@ -1482,7 +1490,8 @@ pub async fn run_with_backends(
                     );
                 }
                 // progress.json (atomic rewrite — the status loop polls it)
-                // + periodic S3 sync.
+                // + periodic S3 sync. The timed summary only exists once the
+                // dispatcher has drained, so mid-run progress carries none.
                 let progress = {
                     let res = results.lock().await;
                     let wd = watchdog.lock().await;
@@ -1493,6 +1502,9 @@ pub async fn run_with_backends(
                         "submit+collect",
                         now_rfc3339(),
                         None,
+                        supply_for_progress.as_ref(),
+                        None,
+                        abort_recommended.load(Ordering::SeqCst),
                     )
                 };
                 if let Err(e) = state.write_json_atomic("progress.json", &progress) {
@@ -1778,6 +1790,31 @@ pub async fn run_with_backends(
     }
     let final_records: BTreeMap<String, JobRecord> = results.lock().await.clone();
     let suspension = watchdog.lock().await.suspension_summary();
+    // Re-read the supply and timed summaries for the final report: the
+    // per-batch top-up can append supply.jsonl entries during execution and
+    // the timed dispatcher persists its statistics only once it drains.
+    let supply_summary = load_supply_summary(&state)?;
+    let timed_summary: Option<TimedRunStats> = state.read_json("timed-stats.json")?;
+    let final_abort_recommended = abort_recommended.load(Ordering::SeqCst);
+    // A prefetch shortfall below the pause threshold did not stop the
+    // campaign, but it changed what the headline measured: flag it
+    // low-confidence. (Above the threshold the campaign paused before
+    // execution and the operator explicitly resumed it.)
+    if let Some(supply) = &supply_summary
+        && let Some(pct) = supply.shortfall_pct
+        && pct > 0.0
+        && pct <= spec.knobs.prefetch_shortfall_pause_pct
+        && !campaign
+            .comparability
+            .low_confidence
+            .iter()
+            .any(|flag| flag == "prefetch-shortfall")
+    {
+        campaign
+            .comparability
+            .low_confidence
+            .push("prefetch-shortfall".to_string());
+    }
     // Refresh the comparability block in campaign.json with final counts.
     let agg = report::aggregate(&final_records);
     let empty_counts = BTreeMap::new();
@@ -1789,6 +1826,11 @@ pub async fn run_with_backends(
     campaign.comparability =
         report::comparability_with_counts(&campaign.comparability, &agg, plan_counts);
     state.write_json_atomic("campaign.json", &campaign)?;
+    let plan_count_u64 = |key: &str| {
+        plan_counts
+            .get(key)
+            .map(|v| u64::try_from(*v).unwrap_or(u64::MAX))
+    };
     let input = report::ReportInput {
         campaign: &campaign,
         records: &final_records,
@@ -1796,6 +1838,11 @@ pub async fn run_with_backends(
         generated_at: now_rfc3339(),
         partial,
         top_n: spec.knobs.report_top_n,
+        supply: supply_summary.as_ref(),
+        timed: timed_summary.as_ref(),
+        abort_recommended: final_abort_recommended,
+        plan_rss_mib: plan_count_u64(PLAN_COUNT_RSS_BEFORE),
+        plan_rss_peak_mib: plan_count_u64(PLAN_COUNT_RSS_PEAK),
     };
     report::write_report(&state, &input)?;
     let progress = report::build_progress(
@@ -1805,6 +1852,9 @@ pub async fn run_with_backends(
         "done",
         now_rfc3339(),
         None,
+        supply_summary.as_ref(),
+        timed_summary.as_ref(),
+        final_abort_recommended,
     );
     state.write_json_atomic("progress.json", &progress)?;
     state.set_marker("report")?;
@@ -1821,6 +1871,20 @@ pub async fn run_with_backends(
     }
     tracing::info!(campaign_id, partial, "campaign run complete");
     Ok(())
+}
+
+/// Read the persisted supply-stage report back and re-derive its per-path
+/// outcome counts from the supply journal (latest record per path wins, so
+/// a path recorded by both the coverage probe and the supply stage — or
+/// re-supplied by a later arm — is counted once, under its settled
+/// disposition). `None` when the campaign state has no supply report.
+fn load_supply_summary(state: &StateDir) -> Result<Option<SupplyStageReport>> {
+    let Some(mut report) = state.read_json::<SupplyStageReport>("supply-report.json")? else {
+        return Ok(None);
+    };
+    let entries: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply)?;
+    refresh_outcome_counts(&mut report, &entries);
+    Ok(Some(report))
 }
 
 /// Collect-loop backend bundle (subset of [`Backends`], clonable into the
@@ -2815,13 +2879,35 @@ mod tests {
         assert_eq!(stats.requests_total, 2);
         assert_eq!(stats.dispatched, 2);
         assert_eq!(stats.interruptions_replayed, 1);
+        assert_eq!(stats.submission_failures, 0);
         assert!(!stats.timing_degraded);
+        // The final progress document carries the supply and timed summary
+        // blocks (with the upload-throughput field present even when the
+        // fake transport uploaded nothing) and the abort recommendation.
         let progress: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
                 .unwrap();
         assert_eq!(progress["stage"], "done");
+        assert!(progress["supply"].is_object(), "{progress}");
+        assert!(
+            progress["supply"].get("uploadMibPerS").is_some(),
+            "{progress}"
+        );
+        assert_eq!(progress["timed"]["dispatched"], 2);
+        assert_eq!(progress["timed"]["interruptionsReplayed"], 1);
+        assert_eq!(progress["abortRecommended"], false);
+        // The plan-time closure-graph memory measurement is in the persisted
+        // plan counts.
+        let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
+        let plan_counts = &campaign.plan.as_ref().unwrap().counts;
+        assert!(
+            plan_counts.contains_key(PLAN_COUNT_RSS_PEAK),
+            "{plan_counts:?}"
+        );
         let summary = std::fs::read_to_string(state.path("report/summary.md")).unwrap();
         assert!(summary.contains("Build-outcome parity"));
+        assert!(summary.contains("## Supply"), "{summary}");
+        assert!(summary.contains("## Timed dispatch"), "{summary}");
     }
 
     /// Transport-error path end to end: the first submission fails

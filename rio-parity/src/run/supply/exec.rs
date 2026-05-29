@@ -2073,6 +2073,33 @@ pub async fn run_supply_stage(
     Ok(report)
 }
 
+/// Re-derive the per-path outcome counts of a [`SupplyStageReport`] from the
+/// supply journal, keeping only the latest record per path.
+///
+/// The journal legitimately carries more than one row for a path — the
+/// upstream-coverage probe records `unavailable` before the supply stage
+/// runs, and a path one arm could not provide can be delivered by a later
+/// arm or a top-up — so counting raw rows would double-count. The last row
+/// per path is its settled disposition. Throughput, prefetch-shortfall, and
+/// probe-error figures are not per-path counts and stay as the stage
+/// reported them. An empty journal leaves the report untouched.
+pub fn refresh_outcome_counts(report: &mut SupplyStageReport, entries: &[SupplyEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    let mut latest: BTreeMap<&str, &str> = BTreeMap::new();
+    for entry in entries {
+        latest.insert(entry.path.as_str(), entry.outcome.as_str());
+    }
+    let count = |outcome: &str| latest.values().filter(|got| **got == outcome).count();
+    report.delivered = count(SUPPLY_OUTCOME_DELIVERED);
+    report.delegated = count(SUPPLY_OUTCOME_DELEGATED);
+    report.already_present = count(SUPPLY_OUTCOME_ALREADY_PRESENT);
+    report.refused = count(SUPPLY_OUTCOME_REFUSED);
+    report.unavailable = count(SUPPLY_OUTCOME_UNAVAILABLE);
+    report.failed = count(SUPPLY_OUTCOME_FAILED);
+}
+
 /// Resident-set size of this process in MiB, read from `/proc/self/status`
 /// (`VmRSS`); `None` when the file or the field is unavailable.
 pub fn current_rss_mib() -> Option<u64> {
@@ -2548,6 +2575,50 @@ mod tests {
         // the engine targets); both fields parse to a non-zero MiB value.
         assert!(current_rss_mib().unwrap() > 0);
         assert!(peak_rss_mib().unwrap() > 0);
+    }
+
+    #[test]
+    fn journal_outcome_counts_dedupe_latest_per_path() {
+        let entry = |path: &str, outcome: &str| SupplyEntry {
+            path: path.into(),
+            source: SUPPLY_SOURCE_TARGET_SUBSTITUTER.into(),
+            mechanism: SUPPLY_MECHANISM_NONE.into(),
+            outcome: outcome.into(),
+            detail: None,
+            batch_id: None,
+            bytes: None,
+            observed_at: now_rfc3339(),
+        };
+        const PATH_C: &str = "/nix/store/cccccccccccccccccccccccccccccccc-supply-c";
+        let entries = vec![
+            // The coverage probe found no upstream narinfo, then the supply
+            // stage re-recorded the same path: one unavailable path, not two.
+            entry(PATH_A, SUPPLY_OUTCOME_UNAVAILABLE),
+            entry(PATH_A, SUPPLY_OUTCOME_UNAVAILABLE),
+            // Failed by one arm, later delivered: only the settled
+            // disposition counts.
+            entry(PATH_B, SUPPLY_OUTCOME_FAILED),
+            entry(PATH_B, SUPPLY_OUTCOME_DELIVERED),
+            entry(PATH_C, SUPPLY_OUTCOME_DELEGATED),
+        ];
+        let mut report = SupplyStageReport {
+            unavailable: 9,
+            failed: 9,
+            ..SupplyStageReport::default()
+        };
+        refresh_outcome_counts(&mut report, &entries);
+        assert_eq!(report.unavailable, 1);
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.failed, 0);
+        assert_eq!(report.delegated, 1);
+
+        // An empty journal leaves the stage's own tallies untouched.
+        let mut untouched = SupplyStageReport {
+            delivered: 3,
+            ..SupplyStageReport::default()
+        };
+        refresh_outcome_counts(&mut untouched, &[]);
+        assert_eq!(untouched.delivered, 3);
     }
 
     #[test]

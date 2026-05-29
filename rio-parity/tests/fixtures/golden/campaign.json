@@ -26,6 +26,6 @@
     "plannedAt": "2026-05-26T00:10:00Z",
     "inScope": [], "skipped": {}, "notAttemptable": [], "warmSet": [],
     "cachedPriorPaths": [], "cachedPriorJobs": [],
-    "counts": { "inScope": 10, "attemptable": 8, "skipped": 1, "notAttemptable": 1, "warmSet": 4, "cachedPriorJobs": 1 }
+    "counts": { "inScope": 12, "attemptable": 10, "skipped": 1, "notAttemptable": 1, "warmSet": 4, "cachedPriorJobs": 1 }
   }
 }

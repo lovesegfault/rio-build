@@ -23,6 +23,8 @@ use super::spec::{
     CampaignRecord, ComparabilityBlock, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
 };
 use super::state::StateDir;
+use super::supply::exec::SupplyStageReport;
+use super::timeline::TimedRunStats;
 use super::watchdog::SuspensionSummary;
 
 /// Aggregates derived from the latest-per-job records.
@@ -110,6 +112,21 @@ pub struct ReportInput<'a> {
     pub generated_at: String,
     pub partial: bool,
     pub top_n: usize,
+    /// Supply-stage summary read back from `supply-report.json`; `None` for
+    /// campaign states that never ran the supply stage.
+    pub supply: Option<&'a SupplyStageReport>,
+    /// Timed-dispatch summary read back from `timed-stats.json`; `None` for
+    /// timeless campaigns.
+    pub timed: Option<&'a TimedRunStats>,
+    /// Latched abort recommendation (timed mode only: the infra-failure rate
+    /// crossed the pause threshold but pausing would distort the recorded
+    /// cadence, so the operator is asked to decide instead).
+    pub abort_recommended: bool,
+    /// Plan-stage resident-set size before the closure-graph load, in MiB.
+    pub plan_rss_mib: Option<u64>,
+    /// Process peak resident-set size after the closure/overlap computation,
+    /// in MiB.
+    pub plan_rss_peak_mib: Option<u64>,
 }
 
 fn fmt_pct(v: Option<f64>) -> String {
@@ -156,6 +173,11 @@ pub fn comparability_with_counts(
         Bucket::TargetSubstituted,
         Bucket::HydraUnknown,
         Bucket::EvalDivergence,
+        // The timed-only interruption verdicts are excluded-but-reported:
+        // they never enter the headline numerator or denominator, so they
+        // are accounted here like every other excluded bucket.
+        Bucket::InterruptionReplayed,
+        Bucket::InterruptionNotReproduced,
     ] {
         if let Some(n) = agg.bucket_counts.get(b.as_str()) {
             excluded.insert(b.as_str().to_string(), *n);
@@ -177,6 +199,34 @@ pub fn comparability_with_counts(
         0.0
     };
     block
+}
+
+/// The supply summary as reported: a copy of the stage report with the
+/// upload throughput derived from bytes / seconds when the stage did not
+/// record it itself (the formula is the same one the stage uses).
+fn supply_block(report: &SupplyStageReport) -> SupplyStageReport {
+    let mut block = report.clone();
+    if block.upload_mib_per_s.is_none() && block.upload_secs > 0.0 && block.uploaded_bytes > 0 {
+        block.upload_mib_per_s =
+            Some(block.uploaded_bytes as f64 / (1024.0 * 1024.0) / block.upload_secs);
+    }
+    block
+}
+
+/// The timed summary as reported: the dispatcher's run statistics with the
+/// interruption counts re-derived from the classified bucket counts.
+/// results.jsonl is the source of truth for what each armed unit ultimately
+/// classified as (e.g. an armed request abandoned by the build deadline
+/// rather than the disconnect deadline still classifies
+/// `interruption-replayed`), so the report never disagrees with the buckets
+/// it prints next to.
+fn timed_block(stats: &TimedRunStats, bucket_counts: &BTreeMap<String, usize>) -> TimedRunStats {
+    let count = |bucket: Bucket| bucket_counts.get(bucket.as_str()).copied().unwrap_or(0);
+    TimedRunStats {
+        interruptions_replayed: count(Bucket::InterruptionReplayed),
+        interruptions_not_reproduced: count(Bucket::InterruptionNotReproduced),
+        ..stats.clone()
+    }
 }
 
 /// Render summary.md. Deterministic for identical inputs.
@@ -346,6 +396,88 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
         }
         let _ = writeln!(out, "- windows: {}", input.suspension.windows.len());
     }
+    // Supply summary: always rendered (every campaign runs the supply
+    // stage); the placeholder covers states written before the stage existed
+    // or whose report was lost.
+    let _ = writeln!(out, "\n## Supply");
+    match input.supply {
+        Some(report) => {
+            let supply = supply_block(report);
+            let _ = writeln!(
+                out,
+                "- delivered: {} | delegated: {} | already-present: {} | refused: {} | \
+                 unavailable: {} | failed: {}",
+                supply.delivered,
+                supply.delegated,
+                supply.already_present,
+                supply.refused,
+                supply.unavailable,
+                supply.failed
+            );
+            let _ = writeln!(
+                out,
+                "- uploaded: {:.1} MiB at {}",
+                supply.uploaded_bytes as f64 / (1024.0 * 1024.0),
+                supply
+                    .upload_mib_per_s
+                    .map(|rate| format!("{rate:.2} MiB/s"))
+                    .unwrap_or_else(|| "n/a".to_string())
+            );
+            let _ = writeln!(
+                out,
+                "- prefetch shortfall: {} (planned {}, missing {})",
+                fmt_pct(supply.shortfall_pct),
+                supply.planned_prefetch,
+                supply.prefetch_missing
+            );
+        }
+        None => {
+            let _ = writeln!(out, "(not recorded)");
+        }
+    }
+    if input.plan_rss_mib.is_some() || input.plan_rss_peak_mib.is_some() {
+        let fmt_mib = |v: Option<u64>| {
+            v.map(|mib| format!("{mib} MiB"))
+                .unwrap_or_else(|| "n/a".to_string())
+        };
+        let _ = writeln!(
+            out,
+            "- plan-stage RSS: {} before, {} peak",
+            fmt_mib(input.plan_rss_mib),
+            fmt_mib(input.plan_rss_peak_mib)
+        );
+    }
+    // Timed dispatch summary: only timed campaigns have one.
+    if let Some(stats) = input.timed {
+        let timed = timed_block(stats, &agg.bucket_counts);
+        let _ = writeln!(out, "\n## Timed dispatch");
+        let _ = writeln!(
+            out,
+            "- requests: {} dispatched of {} scheduled",
+            timed.dispatched, timed.requests_total
+        );
+        let _ = writeln!(
+            out,
+            "- dispatch lateness: max {} ms, p50 {} ms, p95 {} ms",
+            timed.max_dispatch_lateness_ms, timed.lateness_p50_ms, timed.lateness_p95_ms
+        );
+        let _ = writeln!(
+            out,
+            "- interruptions: {} replayed, {} not reproduced",
+            timed.interruptions_replayed, timed.interruptions_not_reproduced
+        );
+        let _ = writeln!(
+            out,
+            "- engine-side submission failures: {}",
+            timed.submission_failures
+        );
+        let _ = writeln!(
+            out,
+            "- resumes: {} | timing degraded: {}",
+            timed.resume_count, timed.timing_degraded
+        );
+        let _ = writeln!(out, "- abort recommended: {}", input.abort_recommended);
+    }
     let _ = writeln!(out, "\n## Artifacts");
     let _ = writeln!(
         out,
@@ -370,9 +502,24 @@ pub struct Progress {
     pub eta_hours: Option<f64>,
     pub suspension: SuspensionSummary,
     pub comparability: ComparabilityBlock,
+    /// Supply-stage summary (delivered/delegated/… counts, upload
+    /// throughput, prefetch shortfall); absent until the supply stage has
+    /// run.
+    #[serde(default)]
+    pub supply: Option<SupplyStageReport>,
+    /// Timed-dispatch summary (lateness distribution, interruption counts,
+    /// resume/degradation flags); absent for timeless campaigns.
+    #[serde(default)]
+    pub timed: Option<TimedRunStats>,
+    /// True when the infra-failure rate crossed the pause threshold in timed
+    /// mode, where pausing would distort the recorded cadence — the operator
+    /// is asked to abort instead of the engine pausing itself.
+    #[serde(default)]
+    pub abort_recommended: bool,
 }
 
 /// Build the progress.json document from the current records and stage.
+#[allow(clippy::too_many_arguments)]
 pub fn build_progress(
     campaign: &CampaignRecord,
     records: &BTreeMap<String, JobRecord>,
@@ -380,6 +527,9 @@ pub fn build_progress(
     stage: &str,
     updated_at: String,
     jobs_per_hour: Option<f64>,
+    supply: Option<&SupplyStageReport>,
+    timed: Option<&TimedRunStats>,
+    abort_recommended: bool,
 ) -> Progress {
     let agg = aggregate(records);
     let empty_counts = BTreeMap::new();
@@ -407,6 +557,9 @@ pub fn build_progress(
             .map(|jph| remaining as f64 / jph),
         suspension: suspension.clone(),
         comparability: block,
+        supply: supply.map(supply_block),
+        timed: timed.map(|stats| timed_block(stats, &agg.bucket_counts)),
+        abort_recommended,
     }
 }
 
@@ -541,6 +694,11 @@ mod tests {
             generated_at: "2026-05-26T12:00:00Z".into(),
             partial: true,
             top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
         };
         let one = render_summary(&input);
         let two = render_summary(&input);
@@ -579,6 +737,9 @@ mod tests {
             "submit+collect",
             "2026-05-26T01:00:00Z".into(),
             Some(2.0),
+            None,
+            None,
+            false,
         );
         assert_eq!(p.stage, "submit+collect");
         assert_eq!(p.comparability.in_scope, 10);
@@ -607,6 +768,9 @@ mod tests {
             "submit+collect",
             "2026-05-26T01:00:00Z".into(),
             Some(2.0),
+            None,
+            None,
+            false,
         );
         assert_eq!(p.comparability.in_scope, 0);
         assert_eq!(p.eta_hours, None);
@@ -651,6 +815,11 @@ mod tests {
             generated_at: "2026-05-26T12:00:00Z".into(),
             partial: false,
             top_n: 2,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
         };
         let out = render_summary(&input);
         assert!(
@@ -668,6 +837,194 @@ mod tests {
         };
         let out = render_summary(&input);
         assert!(!out.contains("Showing the"), "{out}");
+    }
+
+    #[test]
+    fn progress_carries_supply_and_timed_blocks() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-test".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert(
+            "b".into(),
+            rec("b", Bucket::InterruptionReplayed, 1, None, false),
+        );
+        // The stage did not compute the throughput figure itself; the
+        // progress builder derives it from bytes / seconds.
+        let supply = SupplyStageReport {
+            delivered: 3,
+            uploaded_bytes: 64 * 1024 * 1024,
+            upload_secs: 2.0,
+            upload_mib_per_s: None,
+            shortfall_pct: Some(5.0),
+            ..SupplyStageReport::default()
+        };
+        // Dispatcher tallies deliberately disagree with the classified
+        // buckets to prove the buckets win in the rendered block.
+        let timed = TimedRunStats {
+            requests_total: 4,
+            dispatched: 4,
+            interruptions_replayed: 0,
+            interruptions_not_reproduced: 5,
+            ..TimedRunStats::default()
+        };
+        let p = build_progress(
+            &campaign,
+            &records,
+            &SuspensionSummary::default(),
+            "done",
+            "2026-05-26T01:00:00Z".into(),
+            None,
+            Some(&supply),
+            Some(&timed),
+            true,
+        );
+        assert!(p.abort_recommended);
+        let supply_block = p.supply.as_ref().expect("supply block present");
+        assert!(
+            (supply_block.upload_mib_per_s.unwrap() - 32.0).abs() < 1e-9,
+            "{supply_block:?}"
+        );
+        let timed_block = p.timed.as_ref().expect("timed block present");
+        // Interruption counts derive from the classified buckets (the source
+        // of truth), not from the dispatcher's own tally.
+        assert_eq!(timed_block.interruptions_replayed, 1);
+        assert_eq!(timed_block.interruptions_not_reproduced, 0);
+        // The interruption buckets are excluded from the headline, so the
+        // comparability block reports them under the excluded counts.
+        assert_eq!(
+            p.comparability.excluded.get("interruption-replayed"),
+            Some(&1)
+        );
+        // Wire keys are camelCase under the prescribed block names.
+        let json = serde_json::to_value(&p).unwrap();
+        assert_eq!(json["supply"]["uploadMibPerS"], serde_json::json!(32.0));
+        assert!(json["timed"]["latenessP95Ms"].is_number());
+        assert_eq!(json["abortRecommended"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn summary_renders_supply_and_timed_sections() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let campaign = CampaignRecord::new(
+            "c-test".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert(
+            "b".into(),
+            rec("b", Bucket::InterruptionReplayed, 1, None, false),
+        );
+        let supply = SupplyStageReport {
+            planned_prefetch: 40,
+            prefetch_missing: 3,
+            delivered: 2,
+            delegated: 1,
+            already_present: 4,
+            refused: 1,
+            unavailable: 3,
+            failed: 1,
+            uploaded_bytes: 10 * 1024 * 1024,
+            upload_secs: 5.0,
+            upload_mib_per_s: Some(2.0),
+            shortfall_pct: Some(7.5),
+            ..SupplyStageReport::default()
+        };
+        let timed = TimedRunStats {
+            requests_total: 6,
+            dispatched: 5,
+            max_dispatch_lateness_ms: 1200,
+            lateness_p50_ms: 40,
+            lateness_p95_ms: 900,
+            // Deliberately wrong: the rendered counts come from the buckets.
+            interruptions_replayed: 9,
+            interruptions_not_reproduced: 9,
+            submission_failures: 1,
+            resume_count: 1,
+            timing_degraded: true,
+        };
+        let suspension = SuspensionSummary::default();
+        let input = ReportInput {
+            campaign: &campaign,
+            records: &records,
+            suspension: &suspension,
+            generated_at: "2026-05-26T12:00:00Z".into(),
+            partial: false,
+            top_n: 5,
+            supply: Some(&supply),
+            timed: Some(&timed),
+            abort_recommended: true,
+            plan_rss_mib: Some(512),
+            plan_rss_peak_mib: Some(2048),
+        };
+        let out = render_summary(&input);
+        assert!(out.contains("## Supply"), "{out}");
+        assert!(
+            out.contains(
+                "delivered: 2 | delegated: 1 | already-present: 4 | refused: 1 | unavailable: 3 \
+                 | failed: 1"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("uploaded: 10.0 MiB at 2.00 MiB/s"), "{out}");
+        assert!(
+            out.contains("prefetch shortfall: 7.50% (planned 40, missing 3)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("plan-stage RSS: 512 MiB before, 2048 MiB peak"),
+            "{out}"
+        );
+        assert!(out.contains("## Timed dispatch"), "{out}");
+        assert!(
+            out.contains("requests: 5 dispatched of 6 scheduled"),
+            "{out}"
+        );
+        assert!(
+            out.contains("dispatch lateness: max 1200 ms, p50 40 ms, p95 900 ms"),
+            "{out}"
+        );
+        // Bucket-derived, not the dispatcher tally of 9/9.
+        assert!(
+            out.contains("interruptions: 1 replayed, 0 not reproduced"),
+            "{out}"
+        );
+        assert!(out.contains("engine-side submission failures: 1"), "{out}");
+        assert!(out.contains("resumes: 1 | timing degraded: true"), "{out}");
+        assert!(out.contains("abort recommended: true"), "{out}");
+
+        // A timeless campaign (no timed stats) keeps the Supply section but
+        // omits the Timed dispatch section entirely.
+        let timeless = ReportInput {
+            timed: None,
+            ..input.clone()
+        };
+        let out = render_summary(&timeless);
+        assert!(out.contains("## Supply"), "{out}");
+        assert!(!out.contains("## Timed dispatch"), "{out}");
+
+        // No supply report at all (e.g. a campaign state predating the
+        // supply stage): the section renders a placeholder, never vanishes.
+        let bare = ReportInput {
+            supply: None,
+            timed: None,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
+            ..input.clone()
+        };
+        let out = render_summary(&bare);
+        assert!(out.contains("## Supply"), "{out}");
+        assert!(out.contains("(not recorded)"), "{out}");
     }
 
     #[test]
@@ -694,6 +1051,11 @@ mod tests {
             generated_at: "2026-05-26T12:00:00Z".into(),
             partial: true,
             top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
         };
         write_report(&state, &input).unwrap();
         assert!(state.path("buckets/not-attempted.jsonl").exists());
@@ -710,6 +1072,11 @@ mod tests {
             generated_at: "2026-05-26T13:00:00Z".into(),
             partial: false,
             top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
         };
         write_report(&state, &input).unwrap();
         assert!(state.path("buckets/match-built.jsonl").exists());

@@ -363,6 +363,13 @@ pub struct TimedRunStats {
     /// Armed units that completed successfully before the recorded
     /// interruption offset.
     pub interruptions_not_reproduced: usize,
+    /// Timed submissions that settled with neither in-band results nor an
+    /// observed build id and were not engine cancellations — engine-side
+    /// submission failures. Their members get no terminal record from
+    /// collect and the dispatcher does not re-offer them, so they are
+    /// accounted here and fall to the end-of-run not-attempted backfill.
+    #[serde(default)]
+    pub submission_failures: usize,
     /// Requests skipped because every target was already terminal from a
     /// prior run that had dispatched them.
     pub resume_count: usize,
@@ -405,6 +412,19 @@ struct RequestOutcome {
     replayed: usize,
     /// Armed units that completed before the interruption offset.
     not_reproduced: usize,
+    /// Submissions of this request (initial or confirmation retry) that
+    /// failed engine-side — see [`engine_side_submission_failure`].
+    submission_failures: usize,
+}
+
+/// True when a settled timed submission produced neither in-band results
+/// nor an observed build id and was not an engine cancellation: the shape
+/// of an engine-side submission failure (channel open, drv import, the
+/// build op erroring before any result arrived). Collect writes no terminal
+/// record for such a batch's members and the timed dispatcher never
+/// re-offers them, so the run statistics account for them explicitly.
+fn engine_side_submission_failure(record: &BatchRecord) -> bool {
+    record.results.is_empty() && record.build_id.is_none() && !record.engine_cancelled
 }
 
 /// Dispatch a built timed schedule: fire each pending request at its due
@@ -523,6 +543,7 @@ pub async fn run_timed_dispatch(
     let mut dispatched = 0usize;
     let mut interruptions_replayed = 0usize;
     let mut interruptions_not_reproduced = 0usize;
+    let mut submission_failures = 0usize;
     while let Some(joined) = join_set.join_next().await {
         let outcome =
             joined.map_err(|e| anyhow::anyhow!("timed dispatch task panicked: {e}"))??;
@@ -534,6 +555,7 @@ pub async fn run_timed_dispatch(
         }
         interruptions_replayed += outcome.replayed;
         interruptions_not_reproduced += outcome.not_reproduced;
+        submission_failures += outcome.submission_failures;
     }
     let (max_dispatch_lateness_ms, lateness_p50_ms, lateness_p95_ms) =
         lateness_summary(&lateness_samples);
@@ -542,6 +564,7 @@ pub async fn run_timed_dispatch(
         max_dispatch_lateness_ms,
         interruptions_replayed,
         interruptions_not_reproduced,
+        submission_failures,
         "timed dispatch drained"
     );
     Ok(TimedRunStats {
@@ -552,6 +575,7 @@ pub async fn run_timed_dispatch(
         lateness_p95_ms,
         interruptions_replayed,
         interruptions_not_reproduced,
+        submission_failures,
         resume_count,
         timing_degraded: resumed,
     })
@@ -683,6 +707,7 @@ async fn dispatch_one_request(
     .await?;
     let mut batch_ids = vec![batch_id];
     let mut attempts = 1u32;
+    let mut submission_failures = usize::from(engine_side_submission_failure(&record));
 
     // Interruption accounting per armed unit, mirroring how collect buckets
     // them: an engine cancellation reproduces the recorded interruption; a
@@ -779,6 +804,7 @@ async fn dispatch_one_request(
             .await?;
             attempts += 1;
             batch_ids.push(retry_id);
+            submission_failures += usize::from(engine_side_submission_failure(&retry_record));
             for result in &retry_record.results {
                 last_status.insert(result.drv_path.clone(), result.status.clone());
             }
@@ -806,6 +832,7 @@ async fn dispatch_one_request(
         lateness_ms: Some(lateness_ms),
         replayed,
         not_reproduced,
+        submission_failures,
     })
 }
 
@@ -862,6 +889,7 @@ fn record_deadline_skip(
         lateness_ms: None,
         replayed: 0,
         not_reproduced: 0,
+        submission_failures: 0,
     })
 }
 
@@ -1507,6 +1535,57 @@ mod tests {
         );
         assert_eq!(stats.resume_count, 0);
         assert!(!stats.timing_degraded);
+    }
+
+    /// A timed submission that fails engine-side (no in-band results, no
+    /// build id, not an engine cancellation) is counted in the run
+    /// statistics and is never confirmation-retried — there is no in-band
+    /// failure to re-confirm, so its members are simply left to the
+    /// end-of-run not-attempted backfill.
+    #[tokio::test(start_paused = true)]
+    async fn engine_side_submission_failure_is_counted_and_not_retried() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let requests = vec![request(1, 0.0, DRV_A)];
+        // The recorded expectation is a successful build, so a reproduced
+        // in-band failure WOULD trigger confirmation retries; an engine-side
+        // submission failure must not.
+        let mut map = HashMap::new();
+        map.insert(
+            (1i64, DRV_A.to_string()),
+            RecordedTiming {
+                duration_s: Some(10.0),
+                stop_offset_s: None,
+                interrupted: false,
+                expected_built: true,
+            },
+        );
+        let schedule = build_schedule(&requests, &timing_in(&map), 1.0, None, true);
+        let fake = FakeSubmitter::default();
+        fake.outcomes
+            .lock()
+            .unwrap()
+            .push(Err(anyhow::anyhow!("channel open refused")));
+        let submitter = Arc::new(InstrumentedSubmitter::new(fake, Duration::ZERO));
+        let stats = drive_dispatch(
+            &state,
+            submitter.clone(),
+            schedule,
+            BTreeMap::from([(DRV_A.to_string(), "a".to_string())]),
+            timing_arc(map),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            HashSet::new(),
+        )
+        .await;
+
+        assert_eq!(stats.dispatched, 1);
+        assert_eq!(stats.submission_failures, 1);
+        // Exactly one submission: the engine-side failure is not retried.
+        assert_eq!(submitter.calls.lock().unwrap().len(), 1);
+        let entries: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].attempts, 1);
+        assert_eq!(entries[0].batch_ids.len(), 1);
     }
 
     /// A request whose only target was recorded as interrupted is submitted
