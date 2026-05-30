@@ -13,11 +13,10 @@ use rio_nix::protocol::client::{
 };
 use rio_nix::protocol::stderr::ResultField;
 use rio_nix::protocol::wire;
-use rio_proto::types::{ExecutorMessage, executor_message};
 
 use tracing::instrument;
 
-use crate::executor::ExecutorError;
+use crate::executor::{BuildTaskMessage, ExecutorError};
 use crate::log_stream::{AddLineResult, BATCH_TIMEOUT, LogBatcher};
 
 use super::DAEMON_SETUP_TIMEOUT;
@@ -57,7 +56,7 @@ pub(in crate::executor) async fn run_daemon_build(
     basic_drv: &rio_nix::derivation::BasicDerivation,
     opts: DaemonBuildOpts,
     batcher: LogBatcher,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &mpsc::Sender<BuildTaskMessage>,
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> (Result<BuildResult, ExecutorError>, u64) {
     // Returned alongside the result on every path so the caller can set
@@ -168,11 +167,12 @@ type LoopOutcome = Result<Option<BuildResult>, wire::WireError>;
 /// the actual work lives next to the state it mutates.
 struct StderrLoop<'a> {
     batcher: LogBatcher,
-    /// Control-plane channel to the scheduler. Carries `BuildPhase`
-    /// state edges only — log batches go to `upload_tx`. Closure means
-    /// the scheduler stream is gone (the build's completion can't be
-    /// reported either), so phase-send failure still aborts the loop.
-    log_tx: &'a mpsc::Sender<ExecutorMessage>,
+    /// The build-task sink (the runtime's process-lifetime channel).
+    /// Carries `BuildPhase` state edges only — log batches go to
+    /// `upload_tx`. Closure means the runtime that would forward the
+    /// build's completion is gone (it can't be reported either), so
+    /// phase-send failure still aborts the loop.
+    log_tx: &'a mpsc::Sender<BuildTaskMessage>,
     /// Data-plane channel to the per-build [`crate::log_upload::LogUploader`]
     /// (which streams to rio-store's `AppendLog`). Bounded (256) as
     /// ordinary queue slack between the loop and the uploader task. Store
@@ -202,7 +202,7 @@ struct StderrLoop<'a> {
 impl<'a> StderrLoop<'a> {
     fn new(
         batcher: LogBatcher,
-        log_tx: &'a mpsc::Sender<ExecutorMessage>,
+        log_tx: &'a mpsc::Sender<BuildTaskMessage>,
         upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
         silence: Duration,
     ) -> Self {
@@ -270,33 +270,30 @@ impl<'a> StderrLoop<'a> {
     }
 
     // r[impl builder.stderr.forward-set-phase]
-    /// `STDERR_RESULT{104 SetPhase}`: forward as `BuildPhase` so the
-    /// gateway can emit `resSetPhase` against the per-drv activity → nom
-    /// shows "buildPhase"/"installPhase". NOT batched (state edge, not
-    /// spew); does NOT reset the silence deadline (a build that only
-    /// emits phase markers but no actual output is still "silent" by
-    /// the maxSilentTime contract — same rule as Progress chatter).
+    /// `STDERR_RESULT{104 SetPhase}`: forward as `BuildPhase` into the
+    /// build-task sink. NOT batched (state edge, not spew); does NOT
+    /// reset the silence deadline (a build that only emits phase
+    /// markers but no actual output is still "silent" by the
+    /// maxSilentTime contract — same rule as Progress chatter).
     ///
     /// Flushes any buffered log lines first: a phase marker is the
     /// human-readable boundary between log sections, so the ≤63 lines
     /// awaiting `flush_tick` should reach the store before the phase
-    /// edge reaches the scheduler. (The two now travel on different
-    /// channels to different services, so this is best-effort ordering
-    /// for a human tailing the log, not a protocol invariant.)
+    /// edge leaves the loop. (The two travel on different channels to
+    /// different consumers, so this is best-effort ordering for a
+    /// human tailing the log, not a protocol invariant.)
     async fn forward_phase(&mut self, phase: &str) -> std::ops::ControlFlow<LoopOutcome> {
         if self.batcher.has_pending() {
             let batch = self.batcher.flush();
             self.send_log_batch(batch).await;
         }
-        let msg = ExecutorMessage {
-            msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
-                derivation_path: self.batcher.drv_path().to_owned(),
-                phase: phase.to_owned(),
-            })),
-        };
+        let msg = BuildTaskMessage::Phase(rio_proto::types::BuildPhase {
+            derivation_path: self.batcher.drv_path().to_owned(),
+            phase: phase.to_owned(),
+        });
         if self.log_tx.send(msg).await.is_err() {
             std::ops::ControlFlow::Break(Ok(Some(misc_fail(
-                "log channel closed during build (scheduler stream gone)",
+                "build-task sink closed during build (runtime gone)",
             ))))
         } else {
             std::ops::ControlFlow::Continue(())
@@ -431,18 +428,18 @@ fn misc_fail(m: &str) -> BuildResult {
 /// task means the read future is never cancelled; only the `recv()` side
 /// of the channel is — and `mpsc::Receiver::recv()` is cancel-safe.
 ///
-/// If the scheduler control channel (`log_tx`, which now carries only
-/// `BuildPhase` edges) closes during the build, returns `MiscFailure` —
-/// the scheduler stream is gone, so there's no way to report completion
-/// anyway. The log-batch channel (`upload_tx`) closing does NOT fail the
-/// build; see [`StderrLoop::send_log_batch`].
+/// If the build-task sink (`log_tx`, which carries only `BuildPhase`
+/// edges from this loop) closes during the build, returns `MiscFailure`
+/// — the runtime that would forward the completion is gone, so there's
+/// no way to report it anyway. The log-batch channel (`upload_tx`)
+/// closing does NOT fail the build; see [`StderrLoop::send_log_batch`].
 async fn read_build_stderr_loop<R>(
     reader: R,
     max_silent_time: u64,
     build_timeout: Duration,
     negotiated_version: u64,
     batcher: LogBatcher,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &mpsc::Sender<BuildTaskMessage>,
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> (Result<BuildResult, wire::WireError>, u64)
 where
@@ -651,12 +648,12 @@ mod tests {
 
     /// Run read_build_stderr_loop against a Cursor of `input` bytes with a
     /// fresh batcher. Returns (result, control messages received on the
-    /// scheduler channel, log batches received on the upload channel).
+    /// build-task sink, log batches received on the upload channel).
     async fn run_loop(
         input: Vec<u8>,
     ) -> (
         Result<BuildResult, wire::WireError>,
-        Vec<ExecutorMessage>,
+        Vec<BuildTaskMessage>,
         Vec<rio_proto::types::BuildLogBatch>,
     ) {
         run_loop_with_limits(input, crate::log_stream::LogLimits::UNLIMITED).await
@@ -846,7 +843,7 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (log_tx, _log_rx) = mpsc::channel::<BuildTaskMessage>(8);
         let (upload_tx, mut log_rx) = mpsc::channel(8);
 
         // Spawn the loop. It will read from read_half (which we write to).
@@ -935,7 +932,7 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (log_tx, _log_rx) = mpsc::channel::<BuildTaskMessage>(8);
         let (upload_tx, mut log_rx) = mpsc::channel(8);
 
         let loop_handle = tokio::spawn(async move {
@@ -1238,7 +1235,7 @@ mod tests {
         limits: crate::log_stream::LogLimits,
     ) -> (
         Result<BuildResult, wire::WireError>,
-        Vec<ExecutorMessage>,
+        Vec<BuildTaskMessage>,
         Vec<rio_proto::types::BuildLogBatch>,
     ) {
         let batcher = LogBatcher::new(
@@ -1483,7 +1480,7 @@ mod tests {
 
     // r[verify builder.stderr.forward-set-phase]
     /// STDERR_RESULT{104 SetPhase} is forwarded as a `BuildPhase`
-    /// `ExecutorMessage` (not batched, not a log line).
+    /// `BuildTaskMessage` (not batched, not a log line).
     #[tokio::test]
     async fn test_stderr_loop_forwards_set_phase() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::{ResultField, ResultType};
@@ -1508,12 +1505,12 @@ mod tests {
 
         let (result, msgs, batches) = run_loop(buf).await;
         result.expect("should succeed");
-        // Phase arrives as its own ExecutorMessage::Phase, separate from
+        // Phase arrives as its own BuildTaskMessage::Phase, separate from
         // the LogBatch containing "compiling".
         let phases: Vec<_> = msgs
             .iter()
-            .filter_map(|m| match &m.msg {
-                Some(executor_message::Msg::Phase(p)) => Some(p),
+            .filter_map(|m| match m {
+                BuildTaskMessage::Phase(p) => Some(p),
                 _ => None,
             })
             .collect();
@@ -1624,7 +1621,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     fn mk_stderr_loop<'a>(
-        tx: &'a mpsc::Sender<ExecutorMessage>,
+        tx: &'a mpsc::Sender<BuildTaskMessage>,
         upload_tx: &'a mpsc::Sender<rio_proto::types::BuildLogBatch>,
     ) -> StderrLoop<'a> {
         let batcher = LogBatcher::new(
@@ -1735,7 +1732,7 @@ mod tests {
             crate::log_stream::LogLimits::UNLIMITED,
             0,
         );
-        let (log_tx, _log_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (log_tx, _log_rx) = mpsc::channel::<BuildTaskMessage>(8);
         let (upload_tx, mut log_rx) = mpsc::channel(8);
         let loop_handle = tokio::spawn(async move {
             let _keep = _log_rx;
@@ -1798,12 +1795,11 @@ mod tests {
     // r[verify builder.stderr.forward-set-phase]
     /// A `SetPhase` arriving immediately after a buffered log line MUST
     /// flush that line to the upload channel before the phase edge is
-    /// forwarded to the scheduler. The two now travel on different
-    /// channels (log batches → the per-build uploader → rio-store;
-    /// phase edges → the scheduler stream), so the observable property
-    /// is "the buffered line is not held until final_flush" — the
-    /// pre-phase flush produces a dedicated batch — rather than a
-    /// single-channel index ordering.
+    /// forwarded. The two travel on different channels (log batches →
+    /// the per-build uploader → rio-store; phase edges → the build-task
+    /// sink), so the observable property is "the buffered line is not
+    /// held until final_flush" — the pre-phase flush produces a
+    /// dedicated batch — rather than a single-channel index ordering.
     #[tokio::test]
     async fn test_stderr_loop_phase_after_buffered_line_preserves_order() -> anyhow::Result<()> {
         use rio_nix::protocol::stderr::{ResultField, ResultType};
@@ -1831,8 +1827,8 @@ mod tests {
         assert_eq!(msgs.len(), 1, "exactly one Phase control message: {msgs:?}");
         assert!(
             matches!(
-                &msgs[0].msg,
-                Some(executor_message::Msg::Phase(p)) if p.phase == "buildPhase"
+                &msgs[0],
+                BuildTaskMessage::Phase(p) if p.phase == "buildPhase"
             ),
             "the control channel carries the phase marker, got: {:?}",
             msgs[0]

@@ -7,11 +7,10 @@
 use tokio::sync::mpsc;
 
 use rio_proto::types::{
-    BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport, ExecutorMessage,
-    ResourceUsage, executor_message,
+    BuildResult as ProtoBuildResult, BuildResultStatus, CompletionReport, ResourceUsage,
 };
 
-use crate::executor::{ExecutionResult, ExecutorError};
+use crate::executor::{BuildTaskMessage, ExecutionResult, ExecutorError};
 
 /// Per-worker fields stamped onto every `CompletionReport` regardless of
 /// outcome. Bundled so [`ok_completion`] / [`err_completion`] /
@@ -228,14 +227,12 @@ pub(super) fn outcome_label(completion: &CompletionReport) -> &'static str {
 /// other delivery signal (`r[builder.pull.exit-codes]`).
 // r[impl builder.completion.exactly-once-or-death+2]
 pub(super) async fn send_completion(
-    stream_tx: &mpsc::Sender<ExecutorMessage>,
+    stream_tx: &mpsc::Sender<BuildTaskMessage>,
     completion: CompletionReport,
 ) {
     metrics::counter!("rio_builder_builds_total", "outcome" => outcome_label(&completion))
         .increment(1);
-    let msg = ExecutorMessage {
-        msg: Some(executor_message::Msg::Completion(completion)),
-    };
+    let msg = BuildTaskMessage::Completion(Box::new(completion));
     if let Err(e) = stream_tx.send(msg).await {
         tracing::error!(error = %e, "failed to send completion report");
     }
@@ -341,10 +338,7 @@ mod tests {
         );
         // Message actually landed in the sink.
         let msg = rx.recv().await.unwrap();
-        assert!(matches!(
-            msg.msg,
-            Some(executor_message::Msg::Completion(_))
-        ));
+        assert!(matches!(msg, BuildTaskMessage::Completion(_)));
     }
 
     /// The cancel flag — not the executor error variant — decides the

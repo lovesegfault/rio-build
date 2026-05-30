@@ -41,11 +41,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use rio_proto::types::{
-    CompletionReport, ExecutorMessage, PullAssignmentRequest, PullAssignmentResponse,
-    ReportOutcomeRequest, WorkAssignment, executor_message, pull_assignment_response,
+    CompletionReport, PullAssignmentRequest, PullAssignmentResponse, ReportOutcomeRequest,
+    WorkAssignment, pull_assignment_response,
 };
 
 use super::{BuilderRuntime, run_teardown, spawn_build_task, try_cancel_build};
+use crate::executor::BuildTaskMessage;
 
 /// Default re-pull delay when `NotYetReady.retry_after_seconds` is 0
 /// (defensive — the scheduler always suggests one; decision P4 = 5 s).
@@ -348,11 +349,11 @@ pub(super) async fn report_until_acked<T: PullTransport>(
 /// edges) has no consumer here and is discarded; draining it also
 /// keeps the build task from ever blocking on a full channel.
 async fn wait_for_completion(
-    sink_rx: &mut mpsc::Receiver<ExecutorMessage>,
+    sink_rx: &mut mpsc::Receiver<BuildTaskMessage>,
 ) -> Option<CompletionReport> {
     while let Some(msg) = sink_rx.recv().await {
-        if let Some(executor_message::Msg::Completion(report)) = msg.msg {
-            return Some(report);
+        if let BuildTaskMessage::Completion(report) = msg {
+            return Some(*report);
         }
     }
     None
@@ -372,7 +373,7 @@ async fn wait_for_completion(
 async fn build_phase_with_abort(
     slot: &std::sync::Arc<super::BuildSlot>,
     drv_path: &str,
-    sink_rx: &mut mpsc::Receiver<ExecutorMessage>,
+    sink_rx: &mut mpsc::Receiver<BuildTaskMessage>,
     shutdown: &rio_common::signal::Token,
 ) -> Option<CompletionReport> {
     tokio::select! {
@@ -919,17 +920,15 @@ mod abort_tests {
     fn completion_with_status(
         drv_path: &str,
         status: rio_proto::types::BuildResultStatus,
-    ) -> ExecutorMessage {
-        ExecutorMessage {
-            msg: Some(executor_message::Msg::Completion(CompletionReport {
-                drv_path: drv_path.into(),
-                result: Some(rio_proto::types::BuildResult {
-                    status: status.into(),
-                    ..Default::default()
-                }),
+    ) -> BuildTaskMessage {
+        BuildTaskMessage::Completion(Box::new(CompletionReport {
+            drv_path: drv_path.into(),
+            result: Some(rio_proto::types::BuildResult {
+                status: status.into(),
                 ..Default::default()
-            })),
-        }
+            }),
+            ..Default::default()
+        }))
     }
 
     // r[verify builder.cancel.cgroup-kill+2]
@@ -945,7 +944,7 @@ mod abort_tests {
         let slot = Arc::new(super::super::BuildSlot::default());
         let guard = slot.try_claim(drv).expect("fresh slot claims");
         let cancel_flag = guard.cancelled();
-        let (sink_tx, mut sink_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<BuildTaskMessage>(8);
         let shutdown = rio_common::signal::Token::new();
 
         let slot_for_task = Arc::clone(&slot);
@@ -998,7 +997,7 @@ mod abort_tests {
         let slot = Arc::new(super::super::BuildSlot::default());
         let guard = slot.try_claim(drv).expect("fresh slot claims");
         let cancel_flag = guard.cancelled();
-        let (sink_tx, mut sink_rx) = mpsc::channel::<ExecutorMessage>(8);
+        let (sink_tx, mut sink_rx) = mpsc::channel::<BuildTaskMessage>(8);
         let shutdown = rio_common::signal::Token::new();
 
         sink_tx

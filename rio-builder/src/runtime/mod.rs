@@ -39,8 +39,9 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{Instrument, info, instrument};
 
-use rio_proto::types::{ExecutorMessage, WorkAssignment};
+use rio_proto::types::WorkAssignment;
 
+use crate::executor::BuildTaskMessage;
 use crate::{executor, log_stream};
 
 /// How long the build-completion path waits for the log uploader to
@@ -83,7 +84,7 @@ pub struct BuildSpawnContext {
     /// sends its `CompletionReport` (and phase edges) here; the pull
     /// loop consumes it and forwards the report through
     /// `ReportOutcome`.
-    pub stream_tx: mpsc::Sender<ExecutorMessage>,
+    pub stream_tx: mpsc::Sender<BuildTaskMessage>,
     /// Single-build occupancy. The pull loop `try_claim`s before
     /// calling [`spawn_build_task`].
     pub slot: Arc<BuildSlot>,
@@ -741,7 +742,7 @@ pub struct BuilderRuntime {
     /// The receive half of the build-task sink
     /// (`build_ctx.stream_tx`'s counterpart). `Option` only so the
     /// pull loop can take ownership when its build phase starts.
-    pull_sink_rx: Option<mpsc::Receiver<ExecutorMessage>>,
+    pull_sink_rx: Option<mpsc::Receiver<BuildTaskMessage>>,
     /// Probe-loop guards for both balanced channels. Held for process
     /// lifetime (dropping a `BalancedChannel` stops its probe loop).
     _balance_guard: BalanceGuards,

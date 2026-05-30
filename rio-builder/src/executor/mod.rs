@@ -5,9 +5,10 @@
 //! 2. Generate synthetic SQLite DB with input closure metadata
 //! 3. Spawn `nix-daemon --stdio` in overlay
 //! 4. Client handshake + wopSetOptions + wopBuildDerivation
-//! 5. Stream logs via LogBatcher -> BuildLogBatch -> scheduler stream
+//! 5. Stream logs via LogBatcher -> BuildLogBatch -> rio-store AppendLog
 //! 6. On completion: upload outputs to store via PutPath
-//! 7. Send CompletionReport on scheduler stream
+//! 7. Send CompletionReport into the build-task sink (the pull loop
+//!    forwards it through ReportOutcome)
 //! 8. Tear down overlay
 //!
 //! FOD handling: detect fixed-output derivations via `is_fixed_output`
@@ -31,7 +32,9 @@ use tracing::instrument;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
-use rio_proto::types::{BuildResult as ProtoBuildResult, ExecutorMessage, WorkAssignment};
+use rio_proto::types::{
+    BuildPhase, BuildResult as ProtoBuildResult, CompletionReport, WorkAssignment,
+};
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::log_stream::{LogBatcher, LogLimits};
@@ -280,6 +283,31 @@ pub const DAEMON_RETRY_BACKOFF: rio_common::backoff::Backoff = rio_common::backo
     jitter: rio_common::backoff::Jitter::None,
 };
 
+/// The builder's internal build-task → runtime envelope.
+///
+/// The spawned build task sends its [`CompletionReport`] (and phase
+/// edges) through the process-lifetime build-task sink typed with this
+/// enum; the pull loop consumes the sink and forwards the report via
+/// `ReportOutcome`. Never serialized — the envelope is builder-local
+/// (re-homed from the proto `ExecutorMessage`, which build_types.proto
+/// retains until a future proto change removes it). The payloads stay
+/// proto types: [`CompletionReport`] is what `ReportOutcome` sends
+/// upstream, and [`BuildPhase`] is `BuildEvent.phase`'s payload type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum BuildTaskMessage {
+    /// Build result. The pull loop forwards it through `ReportOutcome`
+    /// until the scheduler acknowledges it. Boxed because
+    /// `CompletionReport` (~328 B) dwarfs the `Phase` arm — the same
+    /// size asymmetry the proto envelope handled by boxing its oneof
+    /// (see rio-proto/build.rs).
+    Completion(Box<CompletionReport>),
+    /// Build phase change (forwarded resSetPhase). Sent unbatched per
+    /// `builder.stderr.forward-set-phase`; the pull loop drains and
+    /// discards it (no scheduler-side consumer since the BuildExecution
+    /// stream's removal).
+    Phase(BuildPhase),
+}
+
 /// Result of executing a single build.
 #[derive(Debug)]
 pub struct ExecutionResult {
@@ -430,7 +458,7 @@ pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &mpsc::Sender<BuildTaskMessage>,
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
     first_line: u64,
 ) -> ExecuteOutcome {
@@ -994,7 +1022,7 @@ async fn run_daemon_lifecycle(
     drv_path: &str,
     basic_drv: &rio_nix::derivation::BasicDerivation,
     opts: BuildOpts,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &mpsc::Sender<BuildTaskMessage>,
     upload_tx: &mpsc::Sender<rio_proto::types::BuildLogBatch>,
 ) -> Result<DaemonOutcome, ExecutorError> {
     tracing::info!(drv_path = %drv_path, "spawning nix-daemon in mount namespace");

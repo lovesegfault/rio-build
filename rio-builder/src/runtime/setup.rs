@@ -10,11 +10,12 @@ use std::sync::atomic::AtomicBool;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use rio_proto::types::{ExecutorKind, ExecutorMessage};
+use rio_proto::types::ExecutorKind;
 
 use super::slot::BuildSlot;
 use super::{BuildSpawnContext, BuilderRuntime};
 use crate::config::{Config, detect_system};
+use crate::executor::BuildTaskMessage;
 use crate::fuse::StoreClients;
 
 pub(super) type WorkerClient = rio_proto::ExecutorServiceClient<tonic::transport::Channel>;
@@ -192,7 +193,7 @@ pub async fn setup(
     // never closes while the build runs, so the build task's sends
     // cannot fail regardless of scheduler availability — delivery
     // retries live entirely in the pull loop's report phase.
-    let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
+    let (sink_tx, sink_rx) = mpsc::channel::<BuildTaskMessage>(256);
 
     // P0537: one build per pod. The slot tracks both occupancy and
     // the running drv_path. `try_claim` is non-blocking — see
