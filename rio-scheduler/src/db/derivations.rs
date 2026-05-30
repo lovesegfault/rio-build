@@ -2,7 +2,9 @@
 
 use sqlx::PgConnection;
 
-use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
+use super::{
+    AssignmentStatus, FencedWrite, PoisonedDerivationRow, SchedulerDb, terminal_status_sql,
+};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -84,17 +86,30 @@ impl SchedulerDb {
     /// same transaction** so a crash between can't leave a permanent
     /// un-GC-able row (terminal derivation + pending assignment).
     ///
+    /// Claims-floor fenced (`sched.evidence.durability`): a
+    /// `serving_generation` below the durable floor rolls back having
+    /// written nothing and returns [`FencedWrite::Fenced`].
+    ///
     /// Owns its transaction; appending sites that already hold one use
-    /// `update_derivation_status_in_tx` instead.
+    /// `update_derivation_status_in_tx` instead (their fence lives at
+    /// the transaction owner).
+    // r[impl sched.evidence.durability]
     pub async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
         status: DerivationStatus,
         assigned_executor: Option<&ExecutorId>,
-    ) -> Result<(), sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
         Self::update_derivation_status_in_tx(&mut tx, drv_hash, status, assigned_executor).await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(0))
     }
 
     /// Transaction-joining body of
@@ -152,23 +167,35 @@ impl SchedulerDb {
     /// If a future caller needs per-row worker IDs, add a UNNEST
     /// variant — don't make this one variadic.
     ///
+    /// Claims-floor fenced (`sched.evidence.durability`): a
+    /// `serving_generation` below the durable floor rolls back having
+    /// written nothing and returns [`FencedWrite::Fenced`].
+    ///
     /// Owns its transaction; appending sites that already hold one use
-    /// `update_derivation_status_batch_in_tx` instead.
+    /// `update_derivation_status_batch_in_tx` instead (their fence
+    /// lives at the transaction owner).
     ///
     /// [`update_derivation_status`]: Self::update_derivation_status
+    // r[impl sched.evidence.durability]
     pub async fn update_derivation_status_batch(
         &self,
         drv_hashes: &[&str],
         status: DerivationStatus,
-    ) -> Result<u64, sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         if drv_hashes.is_empty() {
-            return Ok(0);
+            return Ok(FencedWrite::Applied(0));
         }
         let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
         let updated =
             Self::update_derivation_status_batch_in_tx(&mut tx, drv_hashes, status).await?;
         tx.commit().await?;
-        Ok(updated)
+        Ok(FencedWrite::Applied(updated))
     }
 
     // r[impl sched.sla.reactive-floor+3]
@@ -245,12 +272,28 @@ impl SchedulerDb {
     /// `assigned_builder_id` is NULLed: a poisoned derivation has no
     /// assignment. Matches the in-mem semantics the caller should enforce.
     ///
+    /// Claims-floor fenced (`sched.evidence.durability`): a
+    /// `serving_generation` below the durable floor rolls back having
+    /// written nothing and returns [`FencedWrite::Fenced`].
+    ///
     /// Owns its transaction; appending sites that already hold one use
-    /// `persist_poisoned_in_tx` instead.
-    pub async fn persist_poisoned(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    /// `persist_poisoned_in_tx` instead (their fence lives at the
+    /// transaction owner).
+    // r[impl sched.evidence.durability]
+    pub async fn persist_poisoned(
+        &self,
+        drv_hash: &DrvHash,
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
         Self::persist_poisoned_in_tx(&mut tx, drv_hash).await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(0))
     }
 
     // r[impl sched.db.assignment-stale-sweep]
@@ -311,12 +354,28 @@ impl SchedulerDb {
     /// ledger row appended in the same transaction, which starts a fresh
     /// fold suffix.
     ///
+    /// Claims-floor fenced (`sched.evidence.durability`): a
+    /// `serving_generation` below the durable floor rolls back having
+    /// written nothing and returns [`FencedWrite::Fenced`].
+    ///
     /// Owns its connection; reset sites that already hold a transaction
-    /// use `clear_poison_in_tx` instead.
-    pub async fn clear_poison(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
+    /// use `clear_poison_in_tx` instead (their fence lives at the
+    /// transaction owner).
+    // r[impl sched.evidence.durability]
+    pub async fn clear_poison(
+        &self,
+        drv_hash: &DrvHash,
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
         Self::clear_poison_in_tx(&mut tx, drv_hash).await?;
-        tx.commit().await
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(0))
     }
 
     // r[impl sched.db.clear-poison-batch+3]
@@ -339,16 +398,30 @@ impl SchedulerDb {
     /// because the batch form is the hot-path vehicle and the scalar
     /// form owns its own connection.
     ///
+    /// Claims-floor fenced (`sched.evidence.durability`): a
+    /// `serving_generation` below the durable floor rolls back having
+    /// written nothing and returns [`FencedWrite::Fenced`].
+    ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
-    pub async fn clear_poison_batch(&self, drv_hashes: &[DrvHash]) -> Result<u64, sqlx::Error> {
+    // r[impl sched.evidence.durability]
+    pub async fn clear_poison_batch(
+        &self,
+        drv_hashes: &[DrvHash],
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         if drv_hashes.is_empty() {
-            return Ok(0);
+            return Ok(FencedWrite::Applied(0));
         }
         let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
         let cleared = Self::clear_poison_batch_in_tx(&mut tx, drv_hashes).await?;
         tx.commit().await?;
-        Ok(cleared)
+        Ok(FencedWrite::Applied(cleared))
     }
 
     /// Transaction-joining body of [`Self::clear_poison_batch`] — the

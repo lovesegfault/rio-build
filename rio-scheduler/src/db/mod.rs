@@ -465,9 +465,14 @@ pub(super) use list_builds_select;
 /// LeaderLost wipe. Callers log it at `warn!` with the floor and
 /// generation, increment `rio_scheduler_evidence_write_fenced_total`,
 /// and continue.
+///
+/// `pub` (not `pub(crate)`) only because the fenced status/poison
+/// writers (`update_derivation_status`, `persist_poisoned`, …) are
+/// `pub` and the private-interfaces lint denies the mismatch; nothing
+/// outside the crate consumes it.
 // r[impl sched.evidence.durability]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum FencedWrite {
+pub enum FencedWrite {
     /// The write committed; the payload is `rows_affected()` for
     /// statements that report it (0 for fixed-shape single-row writes
     /// whose callers don't consume a count).

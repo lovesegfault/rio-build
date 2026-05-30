@@ -4,7 +4,7 @@ use rio_test_support::TestDb;
 use uuid::Uuid;
 
 use super::{TERMINAL_STATUSES, insert_test_derivation};
-use crate::db::SchedulerDb;
+use crate::db::{FencedWrite, SchedulerDb};
 use crate::state::DrvHash;
 
 // r[verify sched.poison.ttl-persist]
@@ -23,7 +23,9 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
 
     // Single atomic call: sets status='poisoned' AND poisoned_at=now()
     // AND assigned_builder_id=NULL. No separate status update needed.
-    db.persist_poisoned(&drv_hash).await?;
+    // (No claims rows in this test -> any serving generation passes the
+    // claims-floor fence; same for every write below.)
+    db.persist_poisoned(&drv_hash, 1).await?;
 
     // Verify all three columns updated in one statement.
     let (status, has_ts, worker): (String, bool, Option<String>) = sqlx::query_as(
@@ -48,7 +50,7 @@ async fn test_poison_persistence_roundtrip() -> anyhow::Result<()> {
     );
 
     // clear_poison → no longer loadable; status reset to 'created'.
-    db.clear_poison(&drv_hash).await?;
+    db.clear_poison(&drv_hash, 1).await?;
     let rows = db.load_poisoned_derivations().await?;
     assert!(
         rows.is_empty(),
@@ -86,15 +88,19 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
         .collect();
     for h in &hashes {
         insert_test_derivation(&db, h.as_str()).await?;
-        db.persist_poisoned(h).await?;
+        db.persist_poisoned(h, 1).await?;
     }
     assert_eq!(db.load_poisoned_derivations().await?.len(), 100);
 
     // One call → 100 rows affected. The single-round-trip property is
     // structural (one `execute()`), so the assertion is on
     // `rows_affected`, not a query-count mock.
-    let affected = db.clear_poison_batch(&hashes).await?;
-    assert_eq!(affected, 100, "one ANY($1) UPDATE should touch all 100");
+    let affected = db.clear_poison_batch(&hashes, 1).await?;
+    assert_eq!(
+        affected,
+        FencedWrite::Applied(100),
+        "one ANY($1) UPDATE should touch all 100"
+    );
 
     // Poison lifecycle state cleared: status='created', poisoned_at
     // NULL. Nothing else on the derivations row carries retry state any
@@ -113,7 +119,10 @@ async fn test_clear_poison_batch() -> anyhow::Result<()> {
     assert_eq!(n_clean, 100);
 
     // Empty input: no-op, no PG round-trip.
-    assert_eq!(db.clear_poison_batch(&[]).await?, 0);
+    assert_eq!(
+        db.clear_poison_batch(&[], 1).await?,
+        FencedWrite::Applied(0)
+    );
     Ok(())
 }
 
@@ -343,5 +352,165 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
     );
     // Idempotent.
     assert_eq!(db.sweep_stale_assignments().await?, 0);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Claims-floor fence for the status/poison pool-variant writers
+// (`sched.evidence.durability`): a deposed tenure's late status or
+// poison write must be rolled back having written nothing; the current
+// tenure's writes must apply.
+// -----------------------------------------------------------------------
+
+/// A17 / `sched.evidence.durability`: every status/poison pool-variant
+/// writer is claims-floor fenced. The durable floor is 2 (a successor
+/// claimed); a deposed tenure-1 replica's late writes — a terminal
+/// status persist, a poison stamp, a poison clear (single and batch),
+/// and a batch status persist — must ALL be fenced: rolled back having
+/// written nothing, so the successor's view of those rows survives.
+///
+/// Pre-fence these writes applied unconditionally — the A17
+/// stale-override window for status/poison evidence (red transcript in
+/// the introducing commit).
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Two rows owned by the successor's view: one non-terminal (the
+    // status-write target), one poisoned (the clear target).
+    let plain: DrvHash = "fence-status".into();
+    let poisoned: DrvHash = "fence-poisoned".into();
+    insert_test_derivation(&db, plain.as_str()).await?;
+    insert_test_derivation(&db, poisoned.as_str()).await?;
+    sqlx::query(
+        "UPDATE derivations SET status = 'poisoned', poisoned_at = now() WHERE drv_hash = $1",
+    )
+    .bind(poisoned.as_str())
+    .execute(&test_db.pool)
+    .await?;
+
+    // The successor has claimed generation 2.
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (2, 'successor')",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    // --- The deposed tenure-1 replica's late writes: all must be fenced ---
+    // Terminal status persist (would also close assignment rows).
+    assert_eq!(
+        db.update_derivation_status(&plain, DerivationStatus::Cancelled, None, 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the status persist must be fenced below the floor"
+    );
+    // Batch status persist.
+    assert_eq!(
+        db.update_derivation_status_batch(&[plain.as_str()], DerivationStatus::DependencyFailed, 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the batch status persist must be fenced below the floor"
+    );
+    // Poison stamp on the plain row.
+    assert_eq!(
+        db.persist_poisoned(&plain, 1).await?,
+        FencedWrite::Fenced,
+        "the poison stamp must be fenced below the floor"
+    );
+    // Poison clear (single + batch) on the successor's poisoned row.
+    assert_eq!(
+        db.clear_poison(&poisoned, 1).await?,
+        FencedWrite::Fenced,
+        "the poison clear must be fenced below the floor"
+    );
+    assert_eq!(
+        db.clear_poison_batch(std::slice::from_ref(&poisoned), 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the batch poison clear must be fenced below the floor"
+    );
+
+    // The successor's view survives every stale write.
+    let (plain_status, plain_poisoned_at): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations \
+         WHERE drv_hash = $1",
+    )
+    .bind(plain.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(
+        plain_status, "created",
+        "a deposed tenure's status persist must be fenced (status overwritten)"
+    );
+    assert!(
+        plain_poisoned_at.is_none(),
+        "a deposed tenure's poison stamp must be fenced (poisoned_at written)"
+    );
+    let (poisoned_status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations \
+         WHERE drv_hash = $1",
+    )
+    .bind(poisoned.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(
+        poisoned_status, "poisoned",
+        "a deposed tenure's poison clear must be fenced (the successor's poison erased)"
+    );
+    assert!(
+        poisoned_at.is_some(),
+        "a deposed tenure's poison clear must be fenced (poisoned_at erased)"
+    );
+    Ok(())
+}
+
+/// The status/poison fence is not over-eager: the current tenure (at
+/// the floor) and a fresh cluster (empty floor) apply normally.
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
+    use crate::state::DerivationStatus;
+
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    let h: DrvHash = "fence-cur-status".into();
+    insert_test_derivation(&db, h.as_str()).await?;
+
+    // Fresh cluster (no claims): everything applies.
+    assert_eq!(db.persist_poisoned(&h, 1).await?, FencedWrite::Applied(0));
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = $1")
+        .bind(h.as_str())
+        .fetch_one(&test_db.pool)
+        .await?;
+    assert_eq!(status, "poisoned", "fresh-cluster poison stamp must apply");
+
+    // Current tenure at its own claim (floor == serving generation).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (3, 'tenure-cur')",
+    )
+    .execute(&test_db.pool)
+    .await?;
+    assert_eq!(db.clear_poison(&h, 3).await?, FencedWrite::Applied(0));
+    assert_eq!(
+        db.update_derivation_status(&h, DerivationStatus::Ready, None, 3)
+            .await?,
+        FencedWrite::Applied(0)
+    );
+    let (status, poisoned_at): (String, Option<f64>) = sqlx::query_as(
+        "SELECT status, EXTRACT(EPOCH FROM poisoned_at)::float8 FROM derivations \
+         WHERE drv_hash = $1",
+    )
+    .bind(h.as_str())
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(status, "ready", "the current tenure's writes must apply");
+    assert!(
+        poisoned_at.is_none(),
+        "the current tenure's clear must apply"
+    );
     Ok(())
 }

@@ -297,9 +297,15 @@ impl DagActor {
                 info!(drv_hash = %row.drv_hash, elapsed_secs = row.elapsed_secs,
                       "poison already past TTL at recovery — clearing");
                 let hash: crate::state::DrvHash = row.drv_hash.into();
-                if let Err(e) = self.db.clear_poison(&hash).await {
-                    warn!(drv_hash = %hash, error = %e,
-                          "clear_poison for expired-at-load failed; next recovery will retry");
+                match self.db.clear_poison(&hash, self.serving_generation()).await {
+                    Ok(crate::db::FencedWrite::Fenced) => {
+                        self.note_fenced_evidence_write("expired-at-load poison clear");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(drv_hash = %hash, error = %e,
+                              "clear_poison for expired-at-load failed; next recovery will retry");
+                    }
                 }
                 continue;
             }

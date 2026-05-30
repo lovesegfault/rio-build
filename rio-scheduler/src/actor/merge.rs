@@ -905,13 +905,24 @@ impl DagActor {
                     .node_mut(&ready_hash)
                     .is_some_and(|s| s.transition(DerivationStatus::Ready).is_ok())
             {
-                if let Err(e) = self
+                match self
                     .db
-                    .update_derivation_status(&ready_hash, DerivationStatus::Ready, None)
+                    .update_derivation_status(
+                        &ready_hash,
+                        DerivationStatus::Ready,
+                        None,
+                        self.serving_generation(),
+                    )
                     .await
                 {
-                    warn!(drv_hash = %ready_hash, error = %e,
-                          "failed to persist re-probe-unlocked Ready status");
+                    Ok(crate::db::FencedWrite::Fenced) => {
+                        self.note_fenced_evidence_write("re-probe-unlocked Ready persist");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(drv_hash = %ready_hash, error = %e,
+                              "failed to persist re-probe-unlocked Ready status");
+                    }
                 }
                 self.push_ready(ready_hash);
             }
@@ -1204,24 +1215,45 @@ impl DagActor {
                           "failed to clear poison in PG after deferred re-probe reset");
                 }
             }
-            if let Err(e) = self
+            match self
                 .db
-                .update_derivation_status(h, DerivationStatus::Queued, None)
+                .update_derivation_status(
+                    h,
+                    DerivationStatus::Queued,
+                    None,
+                    self.serving_generation(),
+                )
                 .await
             {
-                warn!(drv_hash = %h, error = %e,
-                      "failed to persist deferred re-probe Queued reset");
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("deferred re-probe Queued reset persist");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(drv_hash = %h, error = %e,
+                          "failed to persist deferred re-probe Queued reset");
+                }
             }
         }
         if !completed_batch.is_empty() {
             let hashes: Vec<&str> = completed_batch.iter().map(DrvHash::as_str).collect();
-            if let Err(e) = self
+            match self
                 .db
-                .update_derivation_status_batch(&hashes, DerivationStatus::Completed)
+                .update_derivation_status_batch(
+                    &hashes,
+                    DerivationStatus::Completed,
+                    self.serving_generation(),
+                )
                 .await
             {
-                warn!(count = hashes.len(), error = %e,
-                      "failed to persist cache-hit Completed status batch");
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("cache-hit Completed batch persist");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(count = hashes.len(), error = %e,
+                          "failed to persist cache-hit Completed status batch");
+                }
             }
             self.upsert_path_tenants_for_batch(&completed_batch).await;
         }
@@ -1433,16 +1465,22 @@ impl DagActor {
             if hashes.is_empty() {
                 continue;
             }
-            if let Err(e) = self
+            match self
                 .db
-                .update_derivation_status_batch(&hashes, status)
+                .update_derivation_status_batch(&hashes, status, self.serving_generation())
                 .await
             {
-                error!(
-                    status = ?status, count = hashes.len(), error = %e,
-                    "failed to persist initial-state status batch \
-                     (build is Active; continuing)"
-                );
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("initial-state status batch persist");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(
+                        status = ?status, count = hashes.len(), error = %e,
+                        "failed to persist initial-state status batch \
+                         (build is Active; continuing)"
+                    );
+                }
             }
         }
         first_dep_failed
@@ -1754,14 +1792,20 @@ impl DagActor {
             );
             metrics::counter!("rio_scheduler_stale_completed_reset_total").increment(1);
 
-            if let Err(e) = self
+            match self
                 .db
-                .update_derivation_status(&drv_hash_k, target, None)
+                .update_derivation_status(&drv_hash_k, target, None, self.serving_generation())
                 .await
             {
-                error!(drv_hash = %drv_hash, error = %e, ?target,
-                       "failed to persist stale-completed reset \
-                        (build is Active; continuing)");
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("stale-completed reset persist");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(drv_hash = %drv_hash, error = %e, ?target,
+                           "failed to persist stale-completed reset \
+                            (build is Active; continuing)");
+                }
             }
             if !deps_ok {
                 // Queued: no push_ready, no spawn — find_newly_ready
@@ -1826,13 +1870,24 @@ impl DagActor {
             }
             warn!(drv_hash = %p,
                   "stale-completed verify: demoting Ready parent of reset dep → Queued");
-            if let Err(e) = self
+            match self
                 .db
-                .update_derivation_status(&p, DerivationStatus::Queued, None)
+                .update_derivation_status(
+                    &p,
+                    DerivationStatus::Queued,
+                    None,
+                    self.serving_generation(),
+                )
                 .await
             {
-                error!(drv_hash = %p, error = %e,
-                       "failed to persist Ready-parent demotion (continuing)");
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("Ready-parent demotion persist");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    error!(drv_hash = %p, error = %e,
+                           "failed to persist Ready-parent demotion (continuing)");
+                }
             }
         }
 
