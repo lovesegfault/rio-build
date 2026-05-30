@@ -4,8 +4,10 @@ One file per fix family of the controller-formal calibration corpus
 (G-A/G-B/G-G over `spawnCoherence.qnt`, M1/M2/M3-M4/FFD-cover over
 `nodeclaimLifecycle.qnt`; the families whose every member is NOT-ENCODED
 have no file), one file per fix family of the refcount corpus
-(`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), and —
-the executor-lifecycle campaign — the single re-encoded pull-era
+(`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), one
+file per fix family of the gateway connection-lifecycle corpus
+(`gw-f*.qnt` over `gwConnLifecycle.qnt`), and — the executor-lifecycle
+campaign — the single re-encoded pull-era
 override (`executor-f4-pull-establish-early.qnt`, over the re-targeted
 live `executorSession.qnt` rather than a frozen as-built encoding). The
 executor corpus's as-built representatives
@@ -21,6 +23,17 @@ violation latches inside the pre-fix action keep the instantiated
 model's oracle: the behavior vals are reverted, the violation vals are
 not, so a falsification means that model's invariant set re-finds that
 bug class.
+
+The gateway files follow the same pattern with one addition forced by
+the model's scale: the full-alphabet `step` of `gwConnLifecycle.qnt`
+does not exhaust inside the per-check budget (the Stage-B B-measure), so
+each `gw-f*.qnt` override restricts its `calibStep` to the owning
+family's letters (the same single-rich-dimension principle as the wired
+`gwConnLifecycleFam*` checks) and the as-built baseline is an explicit
+`baselineStep` in the same file — the same alphabet and constants with
+the as-built action(s) restored — rather than the imported full `step`.
+T-direction (permissiveness) overrides additionally re-introduce the
+over-tight pre-fix guard and are run against the named P-property.
 
 Run an override (serially — the bundled Apalache server port is shared):
 
