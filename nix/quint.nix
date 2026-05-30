@@ -3460,12 +3460,26 @@ in
     # after the successor's recovery (the D14 leg): the late apply
     # leaves a stamped row and an activated build the new leader's
     # memory does not know about.
-    quint-closure-evidence-probe-stale-evidence-write = mkQuintWitnessCheck {
-      name = "closure-evidence-probe-stale-evidence-write";
-      spec = "closureEvidence";
-      main = "closureEvidenceStaleTenure";
-      witness = "leaderClassEvidenceWrites";
-    };
+    #
+    # NOT wired as a TLC check (Phase 0d housekeeping finding): the 0c
+    # wiring at design-scale closureEvidenceStaleTenure never completed
+    # a build (40+ min of TLC reaching only BFS depth 3), and the
+    # duo-scale re-point (closureEvidenceStaleDuo) hits a
+    # quint->TLC-backend discrepancy — the rust simulator produces the
+    # 5-state counterexample (merge intent pending -> leader lost ->
+    # successor recovery -> stale apply) in under a second at both
+    # scopes, but TLC explores past that depth (BFS depth 7, 220 K+
+    # distinct states) without flagging it. Until the backend issue is
+    # resolved this probe is a documented manual target:
+    #
+    #   quint run --main=closureEvidenceStaleDuo \
+    #     --invariant=leaderClassEvidenceWrites \
+    #     --max-samples=200000 --max-steps=15 \
+    #     docs/spec/models/closureEvidence.qnt
+    #
+    # The invariant map's Phase 0d stage record carries the discrepancy
+    # record and the run evidence; the D14/§9.1 fencing evidence stands
+    # on that rust-simulator record.
 
     # C3: with no failover, no store GC and no upstream withdrawal, no
     # build is wrongfully terminally failed — FAILS as-built (the Phase
@@ -3503,10 +3517,15 @@ in
     # nothing pins the walked outputs between the walk's finish and the
     # completion's consumption). The weak form (present at some instant
     # before consumption) holds and stays in asBuiltHoldInvariants.
+    # Phase 0d budget re-point: the design-scale
+    # closureEvidenceAdversarialStore wiring never completed a build in
+    # 0c/0d (the GC-after-vouch trace sits past an hour of TLC at that
+    # scope); the reduced closureEvidenceAdversarialStoreEx scope
+    # exhibits the same window at BFS depth 7 in under a minute of TLC.
     quint-closure-evidence-probe-vouched-closure-gone = mkQuintWitnessCheck {
       name = "closure-evidence-probe-vouched-closure-gone";
       spec = "closureEvidence";
-      main = "closureEvidenceAdversarialStore";
+      main = "closureEvidenceAdversarialStoreEx";
       witness = "substituteOkClosureStillPresentAtConsume";
     };
 
@@ -3540,11 +3559,13 @@ in
     # exhaustive checks constrain is reachable in the named regime. The
     # single-tenure witnesses run at the exhaustive-base scope (so they
     # guard exactly the wired conjunction against going vacuous); the
-    # cross-build, recovery and stale-tenure witnesses run at the
-    # smallest scope that contains their trigger (duo / failover-Ex /
-    # design-scale stale-tenure). Reachability at the design-scale
-    # regimes was additionally established by simulation and is recorded
-    # in the invariant map. No tracey markers on witnesses.
+    # cross-build and recovery witnesses run at the smallest scope that
+    # contains their trigger (duo / failover-Ex). The two stale-tenure
+    # witnesses are documented manual targets (rust-simulator backend)
+    # rather than wired TLC checks — see the record at the end of this
+    # section. Reachability at the design-scale regimes was additionally
+    # established by simulation and is recorded in the invariant map.
+    # No tracey markers on witnesses.
 
     # A pruned merge stamps a kept root whose submitted closure was
     # dropped.
@@ -3658,21 +3679,115 @@ in
       main = "closureEvidenceFailoverEx";
       witness = "canReachRecoveryClear";
     };
-    # A deposed tenure's evidence intent applies after the successor's
-    # recovery (the stale-apply window the A17/A18 probes quantify).
-    quint-closure-evidence-witness-stale-intent-apply = mkQuintWitnessCheck {
-      name = "closure-evidence-witness-stale-intent-apply";
-      spec = "closureEvidence";
-      main = "closureEvidenceStaleTenure";
-      witness = "canReachStaleIntentApply";
+    # The two stale-tenure witnesses (a deposed tenure's evidence intent
+    # applying after the successor's recovery — canReachStaleIntentApply
+    # — and a walk spawned by an older tenure consumed by a newer one —
+    # canReachCrossTenureWalkConsume) are NOT wired as TLC checks
+    # (Phase 0d housekeeping finding): the 0c design-scale
+    # closureEvidenceStaleTenure wirings never completed a build, and
+    # the duo-scale re-point hits the same quint->TLC-backend
+    # discrepancy as the A18 probe above (rust simulator reaches both
+    # in seconds at closureEvidenceStaleDuo; TLC explores past their
+    # depth without flagging). Documented manual targets until the
+    # backend issue is resolved:
+    #
+    #   quint run --main=closureEvidenceStaleDuo \
+    #     --invariant=canReachStaleIntentApply \
+    #     --max-samples=200000 --max-steps=15 \
+    #     docs/spec/models/closureEvidence.qnt
+    #   quint run --main=closureEvidenceStaleDuo \
+    #     --invariant=canReachCrossTenureWalkConsume \
+    #     --max-samples=200000 --max-steps=15 \
+    #     docs/spec/models/closureEvidence.qnt
+    #
+    # The stale-tenure regime's reachability evidence (these two
+    # witnesses plus the A18 probe) stands on the rust-simulator record
+    # in the invariant map's Phase 0d stage record.
+
+    # ---- Closure-evidence Stage-C calibration witnesses ----------------
+    # Phase 0d family-representative calibration overrides
+    # (docs/spec/models/calibration/closure-*.qnt; verdict table and the
+    # full per-family record in closure-evidence-invariant-map.md, Phase
+    # 0d stage record). Each check instantiates the closure-evidence
+    # model at the named override module's constants, swaps ONE action
+    # for its PRE-FIX behavior (the override's `calibStep`) and passes
+    # only while the checker still falsifies the property the historical
+    # fix protects — the machine-checked record that the model's
+    # invariant set re-finds that bug class. The remaining override
+    # modules under docs/spec/models/calibration/ are evidence modules
+    # (not wired), re-runnable with the command in each file's header.
+    # No tracey markers on calibration checks (house convention).
+
+    # F1 soundness (CE-2, 29f0a8afa): no stale-Produced verify — a
+    # resubmission's parent ends Ready above a Produced child whose
+    # live-wanted outputs are absent.
+    quint-closure-calib-f1-stale-produced = mkQuintWitnessCheck {
+      name = "closure-calib-f1-stale-produced";
+      spec = "calibration/closure-f1-stale-produced";
+      main = "closureCalibF1StaleProduced";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "staleProducedNeverUnlocksDependents";
     };
-    # A walk spawned by an older tenure is consumed by a newer one
-    # (completions carry no tenure token).
-    quint-closure-evidence-witness-cross-tenure-walk = mkQuintWitnessCheck {
-      name = "closure-evidence-witness-cross-tenure-walk";
-      spec = "closureEvidence";
-      main = "closureEvidenceStaleTenure";
-      witness = "canReachCrossTenureWalkConsume";
+
+    # F2 (CE-9, 808d82579): the walk ingests only the seed, not its
+    # reference closure — a parent completes by substitution while its
+    # child's outputs were never present.
+    quint-closure-calib-f2-seed-only-walk = mkQuintWitnessCheck {
+      name = "closure-calib-f2-seed-only-walk";
+      spec = "calibration/closure-f2-seed-only-walk";
+      main = "closureCalibF2SeedOnlyWalk";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "substituteOkImpliesClosureIngested";
+    };
+
+    # F4 demand-set completeness (CE-66, 85213119d): the prune's demand
+    # set is the structural roots only — an explicitly requested
+    # non-root is silently dropped.
+    quint-closure-calib-f4-demand-drop = mkQuintWitnessCheck {
+      name = "closure-calib-f4-demand-drop";
+      spec = "calibration/closure-f4-demand-drop";
+      main = "closureCalibF4DemandDrop";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "demandSetSurvivesPrune";
+    };
+
+    # F7 (CE-30/CE-28, c2decee6c/4e581f359): the merge clear pass keys
+    # on "has children" instead of Vouched evidence — the mark is
+    # dropped while the closure is not in the store.
+    quint-closure-calib-f7-clear-unbuilt = mkQuintWitnessCheck {
+      name = "closure-calib-f7-clear-unbuilt";
+      spec = "calibration/closure-f7-clear-unbuilt-children";
+      main = "closureCalibF7ClearUnbuiltChildren";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "clearSoundness";
+    };
+
+    # F8 (CE-33, 7e1092575 — THE anchor): the from-source admission does
+    # not consult the closure evidence — a recovered marked childless
+    # root is delivered from source.
+    quint-closure-calib-f8-dispatch-no-evidence = mkQuintWitnessCheck {
+      name = "closure-calib-f8-dispatch-no-evidence";
+      spec = "calibration/closure-f8-dispatch-no-evidence";
+      main = "closureCalibF8DispatchNoEvidence";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "noDoomedFromSourceDispatch";
+    };
+
+    # F9 (CE-41, 9097b71cc): the poison-clear removal does not stamp the
+    # closure-hole breadcrumb on surviving parents — the truncated child
+    # set looks intact one completion later.
+    quint-closure-calib-f9-poison-clear-no-stamp = mkQuintWitnessCheck {
+      name = "closure-calib-f9-poison-clear-no-stamp";
+      spec = "calibration/closure-f9-poison-clear-no-stamp";
+      main = "closureCalibF9PoisonClearNoStamp";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "holeCompleteness";
     };
   };
 }

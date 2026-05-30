@@ -2500,3 +2500,34 @@ module closureEvidenceFailoverDuo {
     STORE_PER_OUTPUT = true
   ).*
 }
+
+/// Adversarial-store probe regime at the reduced exhaustive scope
+/// (Phase 0d): single tenure, no failover, store GC / row GC / purge on,
+/// over the two-node, one-build universe — sized so the bounded checker
+/// reaches the GC-after-vouch window (the B2-strong probe: an ok walk's
+/// ingested closure is GC'd between the walk's finish and its
+/// consumption) within a wired check's budget. The design-scale
+/// closureEvidenceAdversarialStore module keeps the full §2b alphabet
+/// for the held-back exhaustive target and the deferred hunts.
+module closureEvidenceAdversarialStoreEx {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 2,
+    ROW_GC_BUDGET = 1,
+    PURGE_BUDGET = 1,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 2,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
+  ).*
+}
