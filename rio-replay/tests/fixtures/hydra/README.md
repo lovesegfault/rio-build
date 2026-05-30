@@ -2,8 +2,8 @@
 
 Responses recorded from hydra.nixos.org on 2026-05-26 for evaluation
 1824219 (jobset `nixos/unstable`), captured during the design spike that
-preceded the rio-parity implementation. The unit tests in
-`rio-parity/src/hydra.rs` (and the eval-recipe tests built on top of
+preceded the rio-replay implementation. The unit tests in
+`rio-replay/src/hydra.rs` (and the eval-recipe tests built on top of
 them) parse these files and assert against the recorded values.
 
 | File | Endpoint |
@@ -38,7 +38,7 @@ hydra.nixos.org is a shared, load-sensitive service — stay polite:
   second apart. The full set is 13 requests; stay under ~15 total.
 - Send `Accept: application/json` and a descriptive User-Agent that
   includes contact information, e.g.
-  `rio-parity-fixture-rerecord/0.1 (+https://github.com/lovesegfault/rio-build; contact: <email>)`.
+  `rio-replay-fixture-rerecord/0.1 (+https://github.com/lovesegfault/rio-build; contact: <email>)`.
 - URLs: `https://hydra.nixos.org/eval/1824219`,
   `https://hydra.nixos.org/jobset/nixos/unstable`, and
   `https://hydra.nixos.org/eval/1824219/job/<job>` for each

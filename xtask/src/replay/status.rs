@@ -1,8 +1,8 @@
-//! `cargo xtask parity status` — render campaign progress and Job state.
+//! `cargo xtask replay status` — render campaign progress and Job state.
 //!
 //! Progress comes from the campaign's progress.json in S3: the engine
 //! rewrites it on every watchdog tick and its poller syncs it (with the
-//! rest of the state dir) to `parity/campaigns/<id>/progress.json`, so
+//! rest of the state dir) to `replay/campaigns/<id>/progress.json`, so
 //! the document is at most a few minutes stale. The campaign Job's
 //! active/succeeded/failed counts come from the cluster, and `--watch`
 //! re-reads both every 30s, stamping each block with the local poll
@@ -10,7 +10,7 @@
 //! as transient — they are printed and polling continues, so a single
 //! 503 cannot kill an hours-long watch. Whether a finished campaign
 //! drained completely or stopped at its deadline is the `partial` flag
-//! in summary.md — `cargo xtask parity report` renders that; the
+//! in summary.md — `cargo xtask replay report` renders that; the
 //! engine's exit code does not distinguish the two.
 
 use anyhow::Result;
@@ -18,12 +18,12 @@ use clap::Args;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
 
-use super::NS_PARITY;
+use super::NS_REPLAY;
 use crate::k8s::client as kclient;
 
 #[derive(Args)]
 pub struct StatusArgs {
-    /// Campaign id (the Job name printed by `parity launch`).
+    /// Campaign id (the Job name printed by `replay launch`).
     pub campaign: String,
     /// Poll every 30s until interrupted.
     #[arg(long)]
@@ -95,7 +95,7 @@ fn poll_stamp(now: &jiff::Zoned) -> String {
 pub async fn run(a: StatusArgs) -> Result<()> {
     let store = super::s3::CampaignStore::discover()?;
     let client = kclient::client().await?;
-    let jobs_api: Api<Job> = Api::namespaced(client, NS_PARITY);
+    let jobs_api: Api<Job> = Api::namespaced(client, NS_REPLAY);
 
     // Fail fast until one poll has succeeded (a bad kubeconfig or AWS
     // credential chain should abort immediately); after that, --watch
@@ -136,7 +136,7 @@ async fn poll_once(
         Some(job) => {
             let st = job.status.unwrap_or_default();
             println!(
-                "job {NS_PARITY}/{}: active={} succeeded={} failed={}",
+                "job {NS_REPLAY}/{}: active={} succeeded={} failed={}",
                 a.campaign,
                 st.active.unwrap_or(0),
                 st.succeeded.unwrap_or(0),
@@ -144,7 +144,7 @@ async fn poll_once(
             );
         }
         None => println!(
-            "job {NS_PARITY}/{}: not found (deleted or never launched)",
+            "job {NS_REPLAY}/{}: not found (deleted or never launched)",
             a.campaign
         ),
     }
@@ -177,7 +177,7 @@ mod tests {
         // rename on the engine side fails this test instead of silently
         // degrading status output to the raw-JSON fallback.
         let progress = Progress {
-            campaign_id: "parity-leaf-20260601-ab12".into(),
+            campaign_id: "replay-leaf-20260601-ab12".into(),
             stage: "submit+collect".into(),
             updated_at: "2026-06-02T03:04:05Z".into(),
             verdict_counts: BTreeMap::from([("match-built".to_string(), 12)]),

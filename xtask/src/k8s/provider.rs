@@ -39,11 +39,11 @@ pub struct DeployOpts {
     /// immutable, so changing empty↔non-empty RECREATES the load
     /// balancer (new DNS name). EKS-only; k3s ignores it.
     pub public_cidrs: Vec<String>,
-    /// Render the chart with `parity.enabled=true` (nixpkgs-parity
+    /// Render the chart with `replay.enabled=true` (build-replay
     /// campaign enablement: engine CNP admissions + gateway build-policy
     /// defaults). Off by default; pass on every deploy that precedes a
     /// campaign window. EKS-only effect; k3s deploy ignores it.
-    pub parity: bool,
+    pub replay: bool,
 }
 
 /// Output of the nix-build portion of push. Held separately so `up`

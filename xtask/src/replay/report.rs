@@ -1,4 +1,4 @@
-//! `cargo xtask parity report` — download the rendered campaign report
+//! `cargo xtask replay report` — download the rendered campaign report
 //! (summary.md + progress.json) and print it.
 //!
 //! No campaign logic lives here: the engine renders summary.md (and
@@ -20,8 +20,8 @@ pub struct ReportArgs {
     /// Campaign id.
     pub campaign: String,
     /// Directory the artifacts are written into
-    /// (<out>/<campaign>/report/summary.md, …).
-    #[arg(long, default_value = ".parity-reports")]
+    /// (`<out>/<campaign>/report/summary.md`, …).
+    #[arg(long, default_value = ".replay-reports")]
     pub out: PathBuf,
 }
 
@@ -54,7 +54,7 @@ pub async fn run(a: ReportArgs) -> Result<()> {
             }
             None if rel == "report/summary.md" => anyhow::bail!(
                 "{} not found — the campaign has not rendered a report yet \
-                 (check `cargo xtask parity status {}`)",
+                 (check `cargo xtask replay status {}`)",
                 store.uri(&a.campaign, rel),
                 a.campaign
             ),
@@ -78,8 +78,8 @@ mod tests {
     #[test]
     fn local_path_nests_campaign_and_relpath() {
         assert_eq!(
-            local_path(Path::new(".parity-reports"), "c1", "report/summary.md"),
-            PathBuf::from(".parity-reports/c1/report/summary.md")
+            local_path(Path::new(".replay-reports"), "c1", "report/summary.md"),
+            PathBuf::from(".replay-reports/c1/report/summary.md")
         );
     }
 }

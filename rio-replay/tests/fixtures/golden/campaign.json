@@ -7,7 +7,7 @@
     "campaign_id": "c-golden-0001",
     "mode": "leaf",
     "archive": { "digest": "8b919129046e0f608b919129046e0f608b919129046e0f608b919129046e0f60" },
-    "tenants": { "build_tenant": "parity-leaf", "warm_tenant": "parity-warm", "upstreams_verified": true },
+    "tenants": { "build_tenant": "replay-leaf", "warm_tenant": "replay-warm", "upstreams_verified": true },
     "filters": { "systems": ["x86_64-linux"], "exclude_features": ["kvm"] }
   },
   "archive": { "archiveId": "8b919129046e0f608b919129046e0f608b919129046e0f608b919129046e0f60", "archiveIdShort": "8b919129046e0f60" },
@@ -15,7 +15,7 @@
     "evalSet": "8b919129046e0f60",
     "manifestSha256": "8b919129046e0f608b919129046e0f608b919129046e0f608b919129046e0f60",
     "mode": "leaf",
-    "buildTenant": "parity-leaf",
+    "buildTenant": "replay-leaf",
     "filters": { "systems": ["x86_64-linux"], "exclude_features": ["kvm"] },
     "engineVersion": "0.1.0",
     "signatureTableVersion": "m1-raw-evidence",

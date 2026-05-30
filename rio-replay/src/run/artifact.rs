@@ -1,7 +1,7 @@
 //! Campaign artifact storage (S3 or a local directory) plus state sync.
 //!
 //! Campaign artifacts live under `<prefix>/<campaign-id>/…` (default
-//! prefix `parity/campaigns`), one object per state file with the same
+//! prefix `replay/campaigns`), one object per state file with the same
 //! relative names the local state directory uses. The local-directory
 //! backend serves tests and `--no-s3` development runs; the S3 backend is
 //! a thin adapter over the shared `aws_sdk_s3` client. The sync uploads
@@ -333,30 +333,30 @@ mod tests {
         let store = LocalDirArtifactStore::new(dir.path());
         assert!(
             !store
-                .exists("parity/campaigns/c1/campaign.json")
+                .exists("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
         );
         assert!(
             store
-                .get_bytes("parity/campaigns/c1/campaign.json")
+                .get_bytes("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
                 .is_none()
         );
         store
-            .put_bytes("parity/campaigns/c1/campaign.json", b"{}".to_vec())
+            .put_bytes("replay/campaigns/c1/campaign.json", b"{}".to_vec())
             .await
             .unwrap();
         assert!(
             store
-                .exists("parity/campaigns/c1/campaign.json")
+                .exists("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
         );
         assert_eq!(
             store
-                .get_bytes("parity/campaigns/c1/campaign.json")
+                .get_bytes("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -381,32 +381,32 @@ mod tests {
         state
             .write_bytes("logs/a.x86_64-linux.log.zst", b"zstd-bytes")
             .unwrap();
-        let n1 = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
+        let n1 = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
         assert_eq!(n1, 3, "campaign.json + results.jsonl + log tail");
         assert!(
             store
-                .exists("parity/campaigns/c1/logs/a.x86_64-linux.log.zst")
+                .exists("replay/campaigns/c1/logs/a.x86_64-linux.log.zst")
                 .await
                 .unwrap()
         );
 
         // No change → nothing uploaded.
-        let n2 = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
+        let n2 = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
         assert_eq!(n2, 0);
 
         // Append → only results.jsonl re-uploaded.
         state.append_jsonl(StateFile::Results, &rec("b")).unwrap();
-        let n3 = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
+        let n3 = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
         assert_eq!(n3, 1);
         assert!(
             store
-                .exists("parity/campaigns/c1/results.jsonl")
+                .exists("replay/campaigns/c1/results.jsonl")
                 .await
                 .unwrap()
         );
@@ -455,7 +455,7 @@ mod tests {
         state.set_marker("plan").unwrap();
         state.set_marker("supply").unwrap();
 
-        let n = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
+        let n = sync_state(&state, &store, "replay/campaigns", "c1", &mut tracker)
             .await
             .unwrap();
         assert_eq!(n, 5, "campaign.json + results + bucket + two markers");
@@ -485,13 +485,13 @@ mod tests {
         use aws_smithy_mocks::{RuleMode, mock, mock_client};
 
         let get_miss = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(|req| req.key() == Some("parity/campaigns/c1/campaign.json"))
+            .match_requests(|req| req.key() == Some("replay/campaigns/c1/campaign.json"))
             .then_error(|| GetObjectError::NoSuchKey(NoSuchKey::builder().build()));
         let head_miss = mock!(aws_sdk_s3::Client::head_object)
-            .match_requests(|req| req.key() == Some("parity/campaigns/c1/campaign.json"))
+            .match_requests(|req| req.key() == Some("replay/campaigns/c1/campaign.json"))
             .then_error(|| HeadObjectError::NotFound(NotFound::builder().build()));
         let get_hit = mock!(aws_sdk_s3::Client::get_object)
-            .match_requests(|req| req.key() == Some("parity/campaigns/c1/results.jsonl"))
+            .match_requests(|req| req.key() == Some("replay/campaigns/c1/results.jsonl"))
             .then_output(|| {
                 GetObjectOutput::builder()
                     .body(ByteStream::from_static(b"{\"job\":\"a\"}\n"))
@@ -507,21 +507,21 @@ mod tests {
         // A missing object is a miss (None / false), not an error.
         assert!(
             store
-                .get_bytes("parity/campaigns/c1/campaign.json")
+                .get_bytes("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
                 .is_none()
         );
         assert!(
             !store
-                .exists("parity/campaigns/c1/campaign.json")
+                .exists("replay/campaigns/c1/campaign.json")
                 .await
                 .unwrap()
         );
         // A present object round-trips its bytes.
         assert_eq!(
             store
-                .get_bytes("parity/campaigns/c1/results.jsonl")
+                .get_bytes("replay/campaigns/c1/results.jsonl")
                 .await
                 .unwrap()
                 .unwrap(),
@@ -535,19 +535,19 @@ mod tests {
         let store = LocalDirArtifactStore::new(adir.path());
         store
             .put_bytes(
-                "parity/campaigns/c1/campaign.json",
+                "replay/campaigns/c1/campaign.json",
                 b"{\"campaignId\":\"c1\"}".to_vec(),
             )
             .await
             .unwrap();
         store
-            .put_bytes("parity/campaigns/c1/results.jsonl", b"".to_vec())
+            .put_bytes("replay/campaigns/c1/results.jsonl", b"".to_vec())
             .await
             .unwrap();
 
         let sdir = tempfile::tempdir().unwrap();
         let state = StateDir::new(sdir.path()).unwrap();
-        let restored = download_state_if_missing(&state, &store, "parity/campaigns", "c1")
+        let restored = download_state_if_missing(&state, &store, "replay/campaigns", "c1")
             .await
             .unwrap();
         assert!(restored);
@@ -555,7 +555,7 @@ mod tests {
         assert!(state.path("results.jsonl").exists());
 
         // Second call is a no-op (campaign.json now present locally).
-        let again = download_state_if_missing(&state, &store, "parity/campaigns", "c1")
+        let again = download_state_if_missing(&state, &store, "replay/campaigns", "c1")
             .await
             .unwrap();
         assert!(!again);

@@ -1,15 +1,15 @@
-//! rio-parity namespace/SA bootstrap and the campaign / eval Job builders.
+//! rio-replay namespace/SA bootstrap and the campaign / eval Job builders.
 //!
 //! Jobs are built here as typed `batch/v1 Job` objects and created with
 //! `Api::create` (NOT helm): a campaign or eval run is per-invocation
 //! operational state (operator-chosen args, one Job per campaign id /
 //! eval request), while the helm chart owns only the long-lived
 //! enablement — the scheduler/store CiliumNetworkPolicy admissions and
-//! the campaign tenants' build-policy defaults behind `parity.enabled`
+//! the campaign tenants' build-policy defaults behind `replay.enabled`
 //! (infra/helm/rio-build/values.yaml). Those CNP entries admit the
-//! engine by namespace + the `app.kubernetes.io/name: rio-parity` pod
+//! engine by namespace + the `app.kubernetes.io/name: rio-replay` pod
 //! label, so every pod template built here carries that label and runs
-//! in [`NS_PARITY`]; drop either and the engine's scheduler/store
+//! in [`NS_REPLAY`]; drop either and the engine's scheduler/store
 //! traffic is silently denied.
 //!
 //! Both Job shapes give the engine a `/work` emptyDir and point
@@ -19,7 +19,7 @@
 //! campaign-specific (cluster endpoints, tenants, deadline, knobs)
 //! reaches the engine through its argv and the mounted campaign-spec
 //! ConfigMap, not through env vars: the engine reads no `RIO_*` env
-//! beyond the eval CLI's `RIO_PARITY_S3_BUCKET` default.
+//! beyond the eval CLI's `RIO_REPLAY_S3_BUCKET` default.
 
 use std::collections::BTreeMap;
 
@@ -30,19 +30,19 @@ use k8s_openapi::api::core::v1::ServiceAccount;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::json;
 
-use super::{NS_PARITY, SA_PARITY};
+use super::{NS_REPLAY, SA_REPLAY};
 use crate::k8s::client as kube;
 
 /// Secret holding the per-tenant SSH private keys (created/merged by
-/// `parity launch`, one key per campaign tenant).
-pub const SSH_SECRET_NAME: &str = "rio-parity-ssh";
+/// `replay launch`, one key per campaign tenant).
+pub const SSH_SECRET_NAME: &str = "rio-replay-ssh";
 
 /// Where the campaign Job mounts [`SSH_SECRET_NAME`]. The launch-written
 /// campaign spec records this directory as `cluster.ssh_key_dir` (the engine
 /// derives per-tenant key paths from it) and points the build tenant's
 /// ssh-ng store URL at `<dir>/<tenant>` via the `ssh-key=` query parameter
 /// (see [`ssh_key_path`]).
-pub const SSH_KEY_MOUNT_DIR: &str = "/etc/rio/parity-ssh";
+pub const SSH_KEY_MOUNT_DIR: &str = "/etc/rio/replay-ssh";
 
 /// Per-tenant SSH private-key path inside the campaign pod: the
 /// [`SSH_SECRET_NAME`] data key for `tenant`, mounted under
@@ -53,8 +53,8 @@ pub fn ssh_key_path(tenant: &str) -> String {
     format!("{SSH_KEY_MOUNT_DIR}/{tenant}")
 }
 
-/// Service-HMAC Secret in the parity namespace (copied from the
-/// rio-system Secret of the same name by `parity launch`).
+/// Service-HMAC Secret in the replay namespace (copied from the
+/// rio-system Secret of the same name by `replay launch`).
 pub const HMAC_SECRET_NAME: &str = "rio-service-hmac";
 
 // The HMAC mount dir and key filename are spelled as macros so
@@ -77,7 +77,7 @@ pub const HMAC_MOUNT_DIR: &str = hmac_mount_dir!();
 
 /// Data key of [`HMAC_SECRET_NAME`] (and therefore the file name under
 /// [`HMAC_MOUNT_DIR`]) — the same key the chart's serviceHmac mounts
-/// use; `parity launch` copies the rio-system Secret's value under this
+/// use; `replay launch` copies the rio-system Secret's value under this
 /// key.
 pub const HMAC_KEY_FILENAME: &str = hmac_key_filename!();
 
@@ -91,16 +91,16 @@ pub const HMAC_KEY_MOUNT_PATH: &str = concat!(hmac_mount_dir!(), "/", hmac_key_f
 pub const WORK_DIR: &str = "/work";
 
 /// Where the campaign Job mounts the campaign-spec ConfigMap.
-pub const SPEC_MOUNT_DIR: &str = "/etc/rio/parity";
+pub const SPEC_MOUNT_DIR: &str = "/etc/rio/replay";
 
 /// ConfigMap key (and therefore file name) of the campaign spec.
 pub const SPEC_FILENAME: &str = "spec.json";
 
-/// In-pod path of the campaign spec — what `parity launch` passes to the
+/// In-pod path of the campaign spec — what `replay launch` passes to the
 /// engine as `run --spec <path>`.
-pub const SPEC_MOUNT_PATH: &str = "/etc/rio/parity/spec.json";
+pub const SPEC_MOUNT_PATH: &str = "/etc/rio/replay/spec.json";
 
-/// ConfigMap holding `<campaign-id>`'s spec (created by `parity launch`
+/// ConfigMap holding `<campaign-id>`'s spec (created by `replay launch`
 /// before the Job, mounted at [`SPEC_MOUNT_DIR`]).
 pub fn spec_configmap_name(campaign_id: &str) -> String {
     format!("{campaign_id}-spec")
@@ -108,10 +108,10 @@ pub fn spec_configmap_name(campaign_id: &str) -> String {
 
 /// Values shared by both Job shapes.
 pub struct EngineJobCommon {
-    /// Full image ref `<ecr-registry>/rio-parity:<tag>`.
+    /// Full image ref `<ecr-registry>/rio-replay:<tag>`.
     pub image: String,
     /// Chunk bucket name (tofu output `chunk_bucket_name`). Exported as
-    /// `RIO_PARITY_S3_BUCKET` — the eval CLI's bucket default; the
+    /// `RIO_REPLAY_S3_BUCKET` — the eval CLI's bucket default; the
     /// campaign engine reads `s3.bucket` from its spec instead.
     pub s3_bucket: String,
     /// AWS region (tofu output `region`) for the engine's S3 client.
@@ -132,7 +132,7 @@ fn common_env(c: &EngineJobCommon) -> serde_json::Value {
         {"name": "AWS_USE_DUALSTACK_ENDPOINT", "value": "true"},
         // Default for the eval CLI's --s3-bucket; the run subcommand
         // takes the bucket from spec.s3.bucket instead (harmless there).
-        {"name": "RIO_PARITY_S3_BUCKET", "value": c.s3_bucket},
+        {"name": "RIO_REPLAY_S3_BUCKET", "value": c.s3_bucket},
         // Single-user nix, ssh, and tar children key off HOME /
         // XDG_CACHE_HOME / TMPDIR; point them at the /work emptyDir so
         // caches and temp files land on the sized scratch volume, not
@@ -146,13 +146,13 @@ fn common_env(c: &EngineJobCommon) -> serde_json::Value {
 }
 
 /// Labels for the Jobs, their pod templates, and the campaign-spec
-/// ConfigMap `parity launch` applies next to the campaign Job. The
-/// pod-level `app.kubernetes.io/name: rio-parity` is what the chart's
+/// ConfigMap `replay launch` applies next to the campaign Job. The
+/// pod-level `app.kubernetes.io/name: rio-replay` is what the chart's
 /// CiliumNetworkPolicies match (see the module doc).
 pub fn labels(component: &str) -> BTreeMap<String, String> {
     BTreeMap::from(
         [
-            ("app.kubernetes.io/name", "rio-parity"),
+            ("app.kubernetes.io/name", "rio-replay"),
             ("app.kubernetes.io/component", component),
             ("app.kubernetes.io/part-of", "rio-build"),
             ("app.kubernetes.io/managed-by", "xtask"),
@@ -187,7 +187,7 @@ fn container_security() -> serde_json::Value {
 ///
 /// Shape decisions, tied to the engine's operational contract:
 ///
-/// - `args` are caller-provided (`run --spec /etc/rio/parity/spec.json
+/// - `args` are caller-provided (`run --spec /etc/rio/replay/spec.json
 ///   …`); the spec ConfigMap ([`spec_configmap_name`]) is mounted at
 ///   [`SPEC_MOUNT_DIR`], and the spec inside it must pin its
 ///   `campaign_id` field to `campaign_id` (the Job name) so a
@@ -209,8 +209,8 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
         "kind": "Job",
         "metadata": {
             "name": campaign_id,
-            "namespace": NS_PARITY,
-            "labels": labels("parity-campaign"),
+            "namespace": NS_REPLAY,
+            "labels": labels("replay-campaign"),
         },
         "spec": {
             // Container restarts resume in place (same emptyDir); pod
@@ -219,13 +219,13 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
             "backoffLimit": 6,
             "template": {
                 "metadata": {
-                    "labels": labels("parity-campaign"),
+                    "labels": labels("replay-campaign"),
                     // Karpenter must not consolidate the node under a
                     // multi-day campaign pod.
                     "annotations": {"karpenter.sh/do-not-disrupt": "true"},
                 },
                 "spec": {
-                    "serviceAccountName": SA_PARITY,
+                    "serviceAccountName": SA_REPLAY,
                     "restartPolicy": "OnFailure",
                     "nodeSelector": {"rio.build/node-role": "general"},
                     "securityContext": pod_security(),
@@ -233,14 +233,14 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
                         "name": "engine",
                         "image": c.image,
                         "args": args,
-                        // Relative engine defaults (./parity-state) land
+                        // Relative engine defaults (./replay-state) land
                         // on the scratch volume, not the container layer.
                         "workingDir": WORK_DIR,
                         "env": common_env(c),
                         "volumeMounts": [
                             {"name": "work", "mountPath": WORK_DIR},
                             {"name": "campaign-spec", "mountPath": SPEC_MOUNT_DIR, "readOnly": true},
-                            {"name": "parity-ssh", "mountPath": SSH_KEY_MOUNT_DIR, "readOnly": true},
+                            {"name": "replay-ssh", "mountPath": SSH_KEY_MOUNT_DIR, "readOnly": true},
                             {"name": "service-hmac", "mountPath": HMAC_MOUNT_DIR, "readOnly": true},
                         ],
                         "resources": {
@@ -259,7 +259,7 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
                         // check only applies to keys owned by the calling
                         // uid (Secret files are root-owned), and 0400 keeps
                         // "other" off entirely.
-                        {"name": "parity-ssh", "secret": {"secretName": SSH_SECRET_NAME, "defaultMode": 256}},
+                        {"name": "replay-ssh", "secret": {"secretName": SSH_SECRET_NAME, "defaultMode": 256}},
                         {"name": "service-hmac", "secret": {"secretName": HMAC_SECRET_NAME, "defaultMode": 256}},
                     ],
                 },
@@ -298,8 +298,8 @@ pub fn eval_job(
         "kind": "Job",
         "metadata": {
             "name": job_name,
-            "namespace": NS_PARITY,
-            "labels": labels("parity-eval"),
+            "namespace": NS_REPLAY,
+            "labels": labels("replay-eval"),
         },
         "spec": {
             // Eval is expensive and has no resume — retry once, then let
@@ -309,13 +309,13 @@ pub fn eval_job(
             "ttlSecondsAfterFinished": 86400,
             "template": {
                 "metadata": {
-                    "labels": labels("parity-eval"),
+                    "labels": labels("replay-eval"),
                     // A full-scope eval holds a large node for 1-2h;
                     // don't let Karpenter consolidate it mid-run.
                     "annotations": {"karpenter.sh/do-not-disrupt": "true"},
                 },
                 "spec": {
-                    "serviceAccountName": SA_PARITY,
+                    "serviceAccountName": SA_REPLAY,
                     "restartPolicy": "OnFailure",
                     "nodeSelector": {"rio.build/node-role": "general"},
                     "securityContext": pod_security(),
@@ -340,22 +340,22 @@ pub fn eval_job(
     Ok(job)
 }
 
-/// The IRSA-annotated [`SA_PARITY`] ServiceAccount both Job shapes run
+/// The IRSA-annotated [`SA_REPLAY`] ServiceAccount both Job shapes run
 /// as. Pure builder (no I/O) so the IRSA binding and the token-automount
 /// posture stay unit-testable; [`ensure_base`] applies it.
-fn parity_service_account(role_arn: &str) -> ServiceAccount {
+fn replay_service_account(role_arn: &str) -> ServiceAccount {
     ServiceAccount {
         metadata: ObjectMeta {
-            name: Some(SA_PARITY.into()),
-            namespace: Some(NS_PARITY.into()),
+            name: Some(SA_REPLAY.into()),
+            namespace: Some(NS_REPLAY.into()),
             labels: Some(BTreeMap::from([
                 ("app.kubernetes.io/part-of".into(), "rio-build".into()),
                 ("app.kubernetes.io/managed-by".into(), "xtask".into()),
             ])),
             // IRSA: the EKS pod-identity webhook injects the projected
             // web-identity token off this annotation; the role's trust
-            // policy is bound to rio-parity:rio-parity
-            // (infra/eks/parity.tf).
+            // policy is bound to rio-replay:rio-replay
+            // (infra/eks/replay.tf).
             annotations: Some(BTreeMap::from([(
                 "eks.amazonaws.com/role-arn".into(),
                 role_arn.to_owned(),
@@ -371,33 +371,33 @@ fn parity_service_account(role_arn: &str) -> ServiceAccount {
 }
 
 /// Ensure namespace + IRSA-annotated ServiceAccount exist (idempotent,
-/// SSA). Both `parity eval` and `parity launch` call this first.
+/// SSA). Both `replay record` and `replay launch` call this first.
 pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
-    kube::ensure_namespace(client, NS_PARITY, false).await?;
-    let sa = parity_service_account(role_arn);
-    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), NS_PARITY);
+    kube::ensure_namespace(client, NS_REPLAY, false).await?;
+    let sa = replay_service_account(role_arn);
+    let api: Api<ServiceAccount> = Api::namespaced(client.clone(), NS_REPLAY);
     let ssapply = PatchParams::apply("xtask").force();
-    api.patch(SA_PARITY, &ssapply, &Patch::Apply(&sa)).await?;
+    api.patch(SA_REPLAY, &ssapply, &Patch::Apply(&sa)).await?;
     Ok(())
 }
 
-/// Create the Job in [`NS_PARITY`] — the only namespace campaign/eval
+/// Create the Job in [`NS_REPLAY`] — the only namespace campaign/eval
 /// Jobs run in (the `job` built by [`campaign_job`]/[`eval_job`] already
 /// pins its metadata there). A 409 (already exists) is turned into
 /// actionable guidance instead of an SSA overwrite (Job templates are
 /// immutable).
 pub async fn create_job(client: &kube::Client, job: &Job) -> Result<()> {
     let name = job.metadata.name.clone().unwrap_or_default();
-    let api: Api<Job> = Api::namespaced(client.clone(), NS_PARITY);
+    let api: Api<Job> = Api::namespaced(client.clone(), NS_REPLAY);
     match api.create(&PostParams::default(), job).await {
         Ok(_) => {
-            tracing::info!("created Job {NS_PARITY}/{name}");
+            tracing::info!("created Job {NS_REPLAY}/{name}");
             Ok(())
         }
         Err(::kube::Error::Api(ae)) if ae.code == 409 => bail!(
-            "Job {NS_PARITY}/{name} already exists (Job templates are immutable). \
-             Inspect it with `kubectl -n {NS_PARITY} get job {name}`, then delete it with \
-             `kubectl -n {NS_PARITY} delete job {name}` before re-running."
+            "Job {NS_REPLAY}/{name} already exists (Job templates are immutable). \
+             Inspect it with `kubectl -n {NS_REPLAY} get job {name}`, then delete it with \
+             `kubectl -n {NS_REPLAY} delete job {name}` before re-running."
         ),
         Err(e) => Err(e.into()),
     }
@@ -409,7 +409,7 @@ mod tests {
 
     fn common() -> EngineJobCommon {
         EngineJobCommon {
-            image: "123.dkr.ecr.us-east-2.amazonaws.com/rio-parity:abc123".into(),
+            image: "123.dkr.ecr.us-east-2.amazonaws.com/rio-replay:abc123".into(),
             s3_bucket: "rio-build-chunks-deadbeef".into(),
             region: "us-east-2".into(),
             log_level: "info,rio_replay=debug".into(),
@@ -437,10 +437,10 @@ mod tests {
 
     #[test]
     fn campaign_job_pins_node_role_and_disruption_and_scratch() {
-        let id = "parity-leaf-20260601-ab12";
+        let id = "replay-leaf-20260601-ab12";
         let j = campaign_job(&common(), id, &["run".into()]).unwrap();
         assert_eq!(j.metadata.name.as_deref(), Some(id));
-        assert_eq!(j.metadata.namespace.as_deref(), Some(NS_PARITY));
+        assert_eq!(j.metadata.namespace.as_deref(), Some(NS_REPLAY));
 
         let spec = j.spec.clone().unwrap();
         // The engine owns the deadline (partial report at deadline, exit
@@ -456,7 +456,7 @@ mod tests {
         );
 
         let pod = pod_spec(&j);
-        assert_eq!(pod.service_account_name.as_deref(), Some(SA_PARITY));
+        assert_eq!(pod.service_account_name.as_deref(), Some(SA_REPLAY));
         assert_eq!(pod.restart_policy.as_deref(), Some("OnFailure"));
         assert_eq!(
             pod.node_selector
@@ -469,7 +469,7 @@ mod tests {
         let c = &pod.containers[0];
         assert_eq!(c.image.as_deref(), Some(common().image.as_str()));
         assert_eq!(c.args.as_deref(), Some(&["run".to_string()][..]));
-        // Relative engine defaults (e.g. --state-dir ./parity-state) must
+        // Relative engine defaults (e.g. --state-dir ./replay-state) must
         // land on the scratch volume, not the container layer.
         assert_eq!(c.working_dir.as_deref(), Some(WORK_DIR));
         let req = c.resources.clone().unwrap().requests.unwrap();
@@ -490,7 +490,7 @@ mod tests {
                     .is_some_and(|cm| cm.name == spec_configmap_name(id))
         }));
         assert!(vols.iter().any(|v| {
-            v.name == "parity-ssh"
+            v.name == "replay-ssh"
                 && v.secret
                     .as_ref()
                     .is_some_and(|s| s.secret_name.as_deref() == Some(SSH_SECRET_NAME))
@@ -503,7 +503,7 @@ mod tests {
         }));
         // Secret files are 0400: fsGroup re-modes them owner+group read
         // for uid 65532, and "other" stays off entirely.
-        for name in ["parity-ssh", "service-hmac"] {
+        for name in ["replay-ssh", "service-hmac"] {
             let v = vols.iter().find(|v| v.name == name).unwrap();
             assert_eq!(
                 v.secret.as_ref().unwrap().default_mode,
@@ -529,7 +529,7 @@ mod tests {
             "RUST_LOG",
             "AWS_REGION",
             "AWS_USE_DUALSTACK_ENDPOINT",
-            "RIO_PARITY_S3_BUCKET",
+            "RIO_REPLAY_S3_BUCKET",
             "HOME",
             "XDG_CACHE_HOME",
             "TMPDIR",
@@ -540,7 +540,7 @@ mod tests {
 
     #[test]
     fn eval_job_scoped_vs_full_scale_resources() {
-        let name = "parity-eval-1824219-ab12cd34";
+        let name = "replay-eval-1824219-ab12cd34";
         let scoped = eval_job(&common(), name, &["eval".into()], false).unwrap();
         let full = eval_job(&common(), name, &["eval".into()], true).unwrap();
 
@@ -583,7 +583,7 @@ mod tests {
         );
 
         // Eval Jobs mount no campaign secrets and upload via the
-        // RIO_PARITY_S3_BUCKET env the eval CLI reads.
+        // RIO_REPLAY_S3_BUCKET env the eval CLI reads.
         assert!(
             pod_spec(&scoped)
                 .volumes
@@ -594,23 +594,23 @@ mod tests {
         assert!(
             env_names(&pod_spec(&scoped))
                 .iter()
-                .any(|e| e == "RIO_PARITY_S3_BUCKET")
+                .any(|e| e == "RIO_REPLAY_S3_BUCKET")
         );
     }
 
     #[test]
     fn both_job_shapes_run_nonroot_with_the_cnp_label() {
         let campaign =
-            campaign_job(&common(), "parity-leaf-20260601-ab12", &["run".into()]).unwrap();
+            campaign_job(&common(), "replay-leaf-20260601-ab12", &["run".into()]).unwrap();
         let eval = eval_job(
             &common(),
-            "parity-eval-1824219-ab12cd34",
+            "replay-eval-1824219-ab12cd34",
             &["eval".into()],
             false,
         )
         .unwrap();
         for j in [&campaign, &eval] {
-            assert_eq!(j.metadata.namespace.as_deref(), Some(NS_PARITY));
+            assert_eq!(j.metadata.namespace.as_deref(), Some(NS_REPLAY));
             // The chart's CNPs admit the engine by namespace + this pod
             // label; without it scheduler/store traffic is dropped.
             let tmpl_labels = j
@@ -626,11 +626,11 @@ mod tests {
                 tmpl_labels
                     .get("app.kubernetes.io/name")
                     .map(String::as_str),
-                Some("rio-parity")
+                Some("rio-replay")
             );
 
             let pod = pod_spec(j);
-            assert_eq!(pod.service_account_name.as_deref(), Some(SA_PARITY));
+            assert_eq!(pod.service_account_name.as_deref(), Some(SA_REPLAY));
             let psc = pod.security_context.clone().unwrap();
             assert_eq!(psc.run_as_non_root, Some(true));
             assert_eq!(psc.run_as_user, Some(65532));
@@ -651,10 +651,10 @@ mod tests {
 
     #[test]
     fn service_account_pins_irsa_role_and_disables_token_automount() {
-        let arn = "arn:aws:iam::123456789012:role/rio-parity";
-        let sa = parity_service_account(arn);
-        assert_eq!(sa.metadata.name.as_deref(), Some(SA_PARITY));
-        assert_eq!(sa.metadata.namespace.as_deref(), Some(NS_PARITY));
+        let arn = "arn:aws:iam::123456789012:role/rio-replay";
+        let sa = replay_service_account(arn);
+        assert_eq!(sa.metadata.name.as_deref(), Some(SA_REPLAY));
+        assert_eq!(sa.metadata.namespace.as_deref(), Some(NS_REPLAY));
         // IRSA: the pod-identity webhook keys off this exact annotation.
         assert_eq!(
             sa.metadata
@@ -674,11 +674,11 @@ mod tests {
     fn labels_carry_the_full_app_kubernetes_io_set() {
         // launch reuses this exact set on the campaign-spec ConfigMap, so
         // the engine's k8s objects all answer the same label selectors.
-        let l = labels("parity-campaign");
-        assert_eq!(l.get("app.kubernetes.io/name").unwrap(), "rio-parity");
+        let l = labels("replay-campaign");
+        assert_eq!(l.get("app.kubernetes.io/name").unwrap(), "rio-replay");
         assert_eq!(
             l.get("app.kubernetes.io/component").unwrap(),
-            "parity-campaign"
+            "replay-campaign"
         );
         assert_eq!(l.get("app.kubernetes.io/part-of").unwrap(), "rio-build");
         assert_eq!(l.get("app.kubernetes.io/managed-by").unwrap(), "xtask");
@@ -693,12 +693,12 @@ mod tests {
             format!("{HMAC_MOUNT_DIR}/{HMAC_KEY_FILENAME}")
         );
         assert_eq!(
-            ssh_key_path("parity-leaf"),
-            "/etc/rio/parity-ssh/parity-leaf"
+            ssh_key_path("replay-leaf"),
+            "/etc/rio/replay-ssh/replay-leaf"
         );
         assert_eq!(
-            spec_configmap_name("parity-leaf-20260601-ab12"),
-            "parity-leaf-20260601-ab12-spec"
+            spec_configmap_name("replay-leaf-20260601-ab12"),
+            "replay-leaf-20260601-ab12-spec"
         );
     }
 }

@@ -86,11 +86,11 @@ use self::watchdog::{
 /// CLI arguments for `rio-replay run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
-    /// Path to the campaign spec JSON (written by `xtask parity launch`).
+    /// Path to the campaign spec JSON (written by `xtask replay launch`).
     #[arg(long)]
     pub spec: PathBuf,
     /// Local state directory (pod emptyDir). Created if missing.
-    #[arg(long, default_value = "./parity-state")]
+    #[arg(long, default_value = "./replay-state")]
     pub state_dir: PathBuf,
     /// Local replay archive (a .dwarfs image or a directory-form archive);
     /// skips the S3 fetch.
@@ -214,7 +214,7 @@ pub struct Backends {
 /// - **S3 layout:** the replay archive is read from
 ///   `<archive.s3_bucket or s3.bucket>/<archive.s3_prefix>/…`; campaign
 ///   artifacts are synced to `<s3.bucket>/<s3.prefix>/<campaign-id>/…`
-///   (default prefix `parity/campaigns`).
+///   (default prefix `replay/campaigns`).
 pub async fn run(args: RunArgs) -> Result<()> {
     let spec = CampaignSpec::load(&args.spec)?;
     let state = StateDir::new(&args.state_dir)?;
@@ -2144,10 +2144,10 @@ mod tests {
               "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                           "ssh_key_dir": "/keys",
                           "scheduler_addr": "s:9001", "store_addr": "st:9002"}},
-              "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+              "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                           "upstreams_verified": true}},
               "filters": {{"systems": ["x86_64-linux"], "exclude_features": ["kvm"]}},
-              "s3": {{"prefix": "parity/campaigns"}}
+              "s3": {{"prefix": "replay/campaigns"}}
             }}"#
         ))
         .unwrap();

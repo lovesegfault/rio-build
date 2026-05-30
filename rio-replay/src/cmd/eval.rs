@@ -114,11 +114,11 @@ pub struct EvalArgs {
     pub work_dir: Option<PathBuf>,
 
     /// Upload to this S3 bucket when set (otherwise local-only).
-    #[arg(long, env = "RIO_PARITY_S3_BUCKET")]
+    #[arg(long, env = "RIO_REPLAY_S3_BUCKET")]
     pub s3_bucket: Option<String>,
 
     /// S3 key prefix.
-    #[arg(long, default_value = "parity")]
+    #[arg(long, default_value = "replay")]
     pub s3_prefix: String,
 
     /// Stop after the fidelity gate: no closure pass, no truth sweep, no
@@ -150,7 +150,7 @@ pub struct EvalArgs {
     pub narinfo_concurrency: usize,
 
     /// Contact string appended to the User-Agent (politeness).
-    #[arg(long, env = "RIO_PARITY_CONTACT")]
+    #[arg(long, env = "RIO_REPLAY_CONTACT")]
     pub contact: Option<String>,
 
     /// Hard cap on hydra.nixos.org requests (auto-raised to scope size + 20
@@ -925,7 +925,7 @@ mod tests {
             "/tmp/out",
         ]);
         assert_eq!(t.eval.hydra_eval, 1824219);
-        assert_eq!(t.eval.s3_prefix, "parity");
+        assert_eq!(t.eval.s3_prefix, "replay");
         assert_eq!(t.eval.eval_workers, 4);
         assert_eq!(t.eval.narinfo_concurrency, 64);
         assert_eq!(

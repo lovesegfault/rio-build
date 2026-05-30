@@ -1,13 +1,13 @@
 //! S3 layout + small read helpers for campaign artifacts.
 //!
-//! Everything lives in the existing chunk bucket under the `parity/`
-//! prefix (own IRSA policy, infra/eks/parity.tf):
+//! Everything lives in the existing chunk bucket under the `replay/`
+//! prefix (own IRSA policy, infra/eks/replay.tf):
 //!
 //! ```text
-//! parity/archives/<archive-id-short>/{archive.dwarfs,manifest.json,
+//! replay/archives/<archive-id-short>/{archive.dwarfs,manifest.json,
 //!   complete.json}                                         (replay archives)
-//! parity/archives/by-recipe/<recipe-digest>.json           (recorder pointers)
-//! parity/campaigns/<campaign-id>/{campaign.json,progress.json,
+//! replay/archives/by-recipe/<recipe-digest>.json           (recorder pointers)
+//! replay/campaigns/<campaign-id>/{campaign.json,progress.json,
 //!   results.jsonl,buckets/,logs/,report/summary.md,…}      (campaigns)
 //! ```
 
@@ -22,28 +22,28 @@ use crate::tofu;
 /// Key of a campaign-scoped artifact, e.g. `progress.json` or
 /// `report/summary.md`. Matches the engine's campaign sync layout
 /// (`<prefix>/<campaign-id>/<rel>` with the engine's default prefix
-/// `parity/campaigns`).
+/// `replay/campaigns`).
 pub fn campaign_key(campaign_id: &str, rel: &str) -> String {
     format!("{S3_PREFIX}/campaigns/{campaign_id}/{rel}")
 }
 
 /// Prefix every published replay archive lives under
-/// (`parity/archives/`): one [`archive_prefix`] per archive, plus the
+/// (`replay/archives/`): one [`archive_prefix`] per archive, plus the
 /// recorder-owned [`by_recipe_prefix`] pointer tree. Matches the
-/// recorder's `ArchiveS3` layout with the engine's default `parity` root.
+/// recorder's `ArchiveS3` layout with the engine's default `replay` root.
 pub fn archives_prefix() -> String {
     format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/")
 }
 
 /// Key prefix of one published archive (no trailing slash):
-/// `parity/archives/<archive-id-short>` — holds `archive.dwarfs`,
+/// `replay/archives/<archive-id-short>` — holds `archive.dwarfs`,
 /// `manifest.json` and the `complete.json` upload marker.
 pub fn archive_prefix(archive_id_short: &str) -> String {
     format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/{archive_id_short}")
 }
 
 /// Prefix of the recorder-owned by-recipe idempotency pointers
-/// (`parity/archives/by-recipe/`): one `<recipe-digest>.json` per recorded
+/// (`replay/archives/by-recipe/`): one `<recipe-digest>.json` per recorded
 /// recipe, written after the archive's `complete.json`.
 pub fn by_recipe_prefix() -> String {
     format!("{S3_PREFIX}/{ARCHIVES_PREFIX_SEGMENT}/{BY_RECIPE_SEGMENT}/")
@@ -52,7 +52,7 @@ pub fn by_recipe_prefix() -> String {
 /// List the immediate "subdirectory" segment names under `prefix` (which
 /// must end with `/`): one ListObjectsV2 delimiter walk, returning each
 /// CommonPrefix with the leading `prefix` and trailing `/` stripped.
-/// `parity launch` uses it to discover the per-archive
+/// `replay launch` uses it to discover the per-archive
 /// `<archive-id-short>/` prefixes under [`archives_prefix`].
 pub async fn list_subprefixes(region: &str, bucket: &str, prefix: &str) -> Result<Vec<String>> {
     let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
@@ -142,25 +142,25 @@ mod tests {
     #[test]
     fn campaign_key_layout_matches_design() {
         assert_eq!(
-            campaign_key("parity-leaf-20260601-ab12", "progress.json"),
-            "parity/campaigns/parity-leaf-20260601-ab12/progress.json"
+            campaign_key("replay-leaf-20260601-ab12", "progress.json"),
+            "replay/campaigns/replay-leaf-20260601-ab12/progress.json"
         );
         assert_eq!(
             campaign_key("c1", "report/summary.md"),
-            "parity/campaigns/c1/report/summary.md"
+            "replay/campaigns/c1/report/summary.md"
         );
     }
 
     #[test]
     fn archive_prefix_layout_matches_design() {
-        assert_eq!(archives_prefix(), "parity/archives/");
+        assert_eq!(archives_prefix(), "replay/archives/");
         assert_eq!(
             archive_prefix("0123456789abcdef"),
-            "parity/archives/0123456789abcdef"
+            "replay/archives/0123456789abcdef"
         );
-        assert_eq!(by_recipe_prefix(), "parity/archives/by-recipe/");
+        assert_eq!(by_recipe_prefix(), "replay/archives/by-recipe/");
         // The pointer key launch GETs must be exactly the key the recorder
-        // writes (rio_replay::s3::by_recipe_key under the same `parity`
+        // writes (rio_replay::s3::by_recipe_key under the same `replay`
         // root) — a drift here makes every by-recipe lookup miss.
         let digest = "ab".repeat(32);
         assert_eq!(

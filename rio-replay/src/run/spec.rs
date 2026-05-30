@@ -1,6 +1,6 @@
 //! Campaign spec (operator input), engine knobs, and the campaign.json record.
 //!
-//! [`CampaignSpec`] is what `xtask parity launch` writes (or a developer
+//! [`CampaignSpec`] is what `xtask replay launch` writes (or a developer
 //! writes by hand for local runs); [`CampaignRecord`] is the engine-owned
 //! campaign.json artifact carrying the spec plus the plan-stage output and
 //! the comparability block every report leads with.
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 /// Conventional warm-stage tenant name (leaf mode): the tenant whose
 /// upstreams point at the public binary cache so dependency warming
 /// substitutes instead of rebuilding.
-pub const WARM_TENANT: &str = "parity-warm";
+pub const WARM_TENANT: &str = "replay-warm";
 
 /// How the campaign builds: against upstream caches (leaf) or entirely
 /// from source inside the cluster (self-hosted).
@@ -36,8 +36,8 @@ impl Mode {
     /// The build tenant conventionally paired with each mode.
     pub fn expected_build_tenant(&self) -> &'static str {
         match self {
-            Mode::Leaf => "parity-leaf",
-            Mode::SelfHosted => "parity-selfhosted",
+            Mode::Leaf => "replay-leaf",
+            Mode::SelfHosted => "replay-selfhosted",
         }
     }
 }
@@ -46,9 +46,9 @@ impl Mode {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ArchiveRef {
-    /// S3 bucket holding `parity/archives/...` (None = same bucket as `s3.bucket`).
+    /// S3 bucket holding `replay/archives/...` (None = same bucket as `s3.bucket`).
     pub s3_bucket: Option<String>,
-    /// Full key prefix of the archive, e.g. `parity/archives/<archive_id_short>`.
+    /// Full key prefix of the archive, e.g. `replay/archives/<archive_id_short>`.
     pub s3_prefix: Option<String>,
     /// The full 64-hex archive id (lowercase hex SHA-256 of the archive's
     /// `manifest.json` bytes).
@@ -61,7 +61,7 @@ pub struct ArchiveRef {
 pub struct S3Target {
     /// Campaign artifact bucket (the existing chunk bucket). None = S3 sync disabled.
     pub bucket: Option<String>,
-    /// Key prefix for campaign artifacts, default `parity/campaigns`.
+    /// Key prefix for campaign artifacts, default `replay/campaigns`.
     pub prefix: String,
 }
 
@@ -69,7 +69,7 @@ impl Default for S3Target {
     fn default() -> Self {
         Self {
             bucket: None,
-            prefix: "parity/campaigns".into(),
+            prefix: "replay/campaigns".into(),
         }
     }
 }
@@ -78,8 +78,8 @@ impl Default for S3Target {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ClusterEndpoints {
-    /// ssh-ng URL for the build tenant (parity-leaf / parity-selfhosted),
-    /// e.g. `ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/parity-leaf`.
+    /// ssh-ng URL for the build tenant (replay-leaf / replay-selfhosted),
+    /// e.g. `ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/replay-leaf`.
     pub gateway_store_url: String,
     /// Directory holding one passphrase-less SSH private key per campaign
     /// tenant, file name = tenant name; the prefetch arm dials the gateway
@@ -106,14 +106,14 @@ pub struct ClusterEndpoints {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct TenantBlock {
-    /// `parity-leaf` or `parity-selfhosted`.
+    /// `replay-leaf` or `replay-selfhosted`.
     pub build_tenant: String,
-    /// `parity-warm` (unused in self-hosted mode).
+    /// `replay-warm` (unused in self-hosted mode).
     pub warm_tenant: String,
-    /// Set by `xtask parity launch` after it asserted the parity tenants'
+    /// Set by `xtask replay launch` after it asserted the campaign tenants'
     /// upstream sets via rio-cli. The engine cannot perform that assertion
     /// itself: the ListTenants/ListUpstreams admin RPCs are allowlisted to
-    /// operator CLIs and exclude `rio-parity`.
+    /// operator CLIs and exclude `rio-replay`.
     pub upstreams_verified: bool,
     pub upstreams_verified_at: Option<String>,
     /// Snapshot recorded by launch: tenant name → upstream URLs.
@@ -904,7 +904,7 @@ mod tests {
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                         "upstreams_verified": true}},
             "bogus_future_field": {{"nested": [1, 2, 3]}}
         }}"#,
@@ -936,11 +936,11 @@ mod tests {
         let json = format!(
             r#"{{
             "mode": "leaf",
-            "archive": {{"digest": "{digest}", "s3_prefix": "parity/archives/0123456789abcdef"}},
+            "archive": {{"digest": "{digest}", "s3_prefix": "replay/archives/0123456789abcdef"}},
             "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                         "upstreams_verified": true}}
         }}"#,
             digest = "ab".repeat(32)
@@ -949,15 +949,15 @@ mod tests {
         assert_eq!(spec.mode, Mode::Leaf);
         assert_eq!(spec.archive.digest, "ab".repeat(32));
         assert_eq!(spec.knobs.batch_max_jobs, 50);
-        assert_eq!(spec.tenants.build_tenant, "parity-leaf");
-        assert_eq!(spec.mode.expected_build_tenant(), "parity-leaf");
+        assert_eq!(spec.tenants.build_tenant, "replay-leaf");
+        assert_eq!(spec.mode.expected_build_tenant(), "replay-leaf");
         // Round-trips.
         let re: CampaignSpec =
             serde_json::from_str(&serde_json::to_string(&spec).unwrap()).unwrap();
         assert_eq!(re.archive.digest, "ab".repeat(32));
         assert_eq!(
             re.archive.s3_prefix.as_deref(),
-            Some("parity/archives/0123456789abcdef")
+            Some("replay/archives/0123456789abcdef")
         );
     }
 
@@ -972,7 +972,7 @@ mod tests {
             "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                         "scheduler_addr": "s:9001", "store_addr": "st:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}}
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm"}}
         }}"#,
             digest = "ab".repeat(32)
         );
@@ -1005,7 +1005,7 @@ mod tests {
             "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                         "scheduler_addr": "s:9001", "store_addr": "st:9002",
                         "gateway_host_key": "SHA256:0000000000000000000000000000000000000000000"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}},
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm"}},
             "knobs": {{"connections": 0}}
         }}"#,
             digest = "ab".repeat(32)
@@ -1046,7 +1046,7 @@ mod tests {
             "archive": {{"digest": "{digest}"}},
             "cluster": {{"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                         "scheduler_addr": "s:9001", "store_addr": "st:9002"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm"}}
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm"}}
         }}"#,
             digest = "ab".repeat(32)
         );
@@ -1108,7 +1108,7 @@ mod tests {
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+            "tenants": {{"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                         "upstreams_verified": true}},
             "knobs": {{"batch_timeout_hours": 0.0}}
         }}"#,
@@ -1175,7 +1175,7 @@ mod tests {
     fn archive_ref_round_trips_and_validates() {
         let json = serde_json::json!({
             "s3_bucket": "rio-chunks",
-            "s3_prefix": "parity/archives/0123456789abcdef",
+            "s3_prefix": "replay/archives/0123456789abcdef",
             "digest": "ab".repeat(32),
         });
         let r: ArchiveRef = serde_json::from_value(json).unwrap();
@@ -1187,7 +1187,7 @@ mod tests {
         assert_eq!(re.s3_bucket.as_deref(), Some("rio-chunks"));
         assert_eq!(
             re.s3_prefix.as_deref(),
-            Some("parity/archives/0123456789abcdef")
+            Some("replay/archives/0123456789abcdef")
         );
     }
 
@@ -1268,7 +1268,7 @@ mod tests {
                         "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
                         "store_addr": "rio-store.rio-store.svc:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
-            "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+            "tenants": {"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                         "upstreams_verified": true}"#;
         // Non-positive speedup rejected outright.
         let spec: CampaignSpec =
@@ -1317,7 +1317,7 @@ mod tests {
             "cluster": {"gateway_store_url": "ssh-ng://rio@gw:22?ssh-key=/k",
                         "scheduler_addr": "s:9001", "store_addr": "st:9002",
                         "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"},
-            "tenants": {"build_tenant": "parity-selfhosted", "upstreams_verified": true},
+            "tenants": {"build_tenant": "replay-selfhosted", "upstreams_verified": true},
             "supply": {"dependencies": "substituters"}}"#;
         let spec: CampaignSpec = serde_json::from_str(json).unwrap();
         assert!(
@@ -1331,7 +1331,7 @@ mod tests {
     #[test]
     fn campaign_record_comparability_seeded() {
         let spec: CampaignSpec = serde_json::from_str(
-            r#"{"mode":"self-hosted","tenants":{"build_tenant":"parity-selfhosted"}}"#,
+            r#"{"mode":"self-hosted","tenants":{"build_tenant":"replay-selfhosted"}}"#,
         )
         .unwrap();
         let rec = CampaignRecord::new(
@@ -1374,7 +1374,7 @@ mod tests {
             "evalSet": "0123456789abcdef",
             "manifestSha256": "0123",
             "mode": "leaf",
-            "buildTenant": "parity-leaf",
+            "buildTenant": "replay-leaf",
             "inScope": 10, "attemptable": 8, "attempted": 8,
             "excluded": {}, "completenessPct": 100.0, "lowConfidence": []
         }"#;

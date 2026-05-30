@@ -1208,7 +1208,7 @@ mod tests {
     #[test]
     fn gateway_endpoint_parse_extracts_host_port_user_and_key() {
         let parsed = GatewayEndpoint::parse(
-            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-leaf",
+            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/replay-ssh/replay-leaf",
         )
         .expect("spec-shaped store URL parses");
         assert_eq!(parsed.host, "rio-gateway.rio-system.svc");
@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(parsed.user, "rio");
         assert_eq!(
             parsed.ssh_key_path,
-            PathBuf::from("/etc/rio/parity-ssh/parity-leaf")
+            PathBuf::from("/etc/rio/replay-ssh/replay-leaf")
         );
 
         // Missing user and port fall back to the documented defaults.
@@ -1307,7 +1307,7 @@ mod tests {
 
     #[test]
     fn pool_construction_requires_a_nonempty_host_key_pin() {
-        let endpoint = endpoint_with_key("/does/not/exist/parity-leaf");
+        let endpoint = endpoint_with_key("/does/not/exist/replay-leaf");
 
         // An empty (or whitespace-only) pin is a hard construction error
         // pointing at the spec field, not a silently unverified transport.

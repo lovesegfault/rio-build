@@ -297,13 +297,13 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
             .set("monitoring.enabled", "true")
-            // nixpkgs-parity campaign enablement: CNP admissions for the
+            // build-replay campaign enablement: CNP admissions for the
             // campaign engine + gateway build-policy defaults for the
             // campaign tenants. Helm gets a full fresh value set on every
             // upgrade, so omitting the flag reverts to the chart default
-            // (false) — `xtask parity launch` pre-flight refuses to start
+            // (false) — `xtask replay launch` pre-flight refuses to start
             // in that state.
-            .set("parity.enabled", if opts.parity { "true" } else { "false" })
+            .set("replay.enabled", if opts.replay { "true" } else { "false" })
             .wait(Duration::from_secs(600))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working

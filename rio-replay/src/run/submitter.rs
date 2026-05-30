@@ -400,7 +400,7 @@ mod tests {
     #[test]
     fn repro_command_strips_ssh_key() {
         let r = repro_command(
-            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/parity-leaf",
+            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/replay-leaf",
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv",
         );
         assert!(!r.contains("ssh-key"), "{r}");

@@ -1720,7 +1720,7 @@ mod tests {
             &state,
             &admin,
             &store,
-            Some((&artifacts, "parity/campaigns/c1".to_string())),
+            Some((&artifacts, "replay/campaigns/c1".to_string())),
             &contexts,
             &[
                 "ok.x86_64-linux".into(),
@@ -1774,7 +1774,7 @@ mod tests {
         assert!(
             artifacts_dir
                 .path()
-                .join("parity/campaigns/c1/logs/bad.x86_64-linux.log.zst")
+                .join("replay/campaigns/c1/logs/bad.x86_64-linux.log.zst")
                 .exists()
         );
         // Neither in-band results nor a build id → engine-side submission
@@ -2077,7 +2077,7 @@ mod tests {
             &state,
             &LogAdmin::default(),
             &FakeStoreApi::default(),
-            Some((&FailingArtifacts, "parity/campaigns/c1".to_string())),
+            Some((&FailingArtifacts, "replay/campaigns/c1".to_string())),
             &contexts,
             &["bad.x86_64-linux".into()],
             &batch,
@@ -2093,7 +2093,7 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].log_key.as_deref(),
-            Some("parity/campaigns/c1/logs/bad.x86_64-linux.log.zst")
+            Some("replay/campaigns/c1/logs/bad.x86_64-linux.log.zst")
         );
         assert!(
             state.path("logs/bad.x86_64-linux.log.zst").exists(),

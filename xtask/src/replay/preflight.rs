@@ -1,4 +1,4 @@
-//! Launch pre-flight checks for the nixpkgs-parity campaign.
+//! Launch pre-flight checks for the build-replay campaign.
 //!
 //! Verifies the deployed rio-gateway/rio-scheduler image tags, the
 //! gateway build-policy entries for the campaign tenants, and the
@@ -16,8 +16,8 @@ use kube::api::Api;
 use crate::k8s::client as kclient;
 
 /// Upstream URL every substituting campaign tenant must have — and the
-/// only one (parity-leaf / parity-warm substitute from exactly
-/// cache.nixos.org; parity-selfhosted substitutes from nothing).
+/// only one (replay-leaf / replay-warm substitute from exactly
+/// cache.nixos.org; replay-selfhosted substitutes from nothing).
 pub const CACHE_NIXOS_ORG: &str = crate::k8s::eks::smoke::UPSTREAM_URL;
 
 /// Tag suffix of an image ref, ignoring a registry port
@@ -54,7 +54,7 @@ pub async fn deployed_image_tags(client: &kclient::Client) -> Result<BTreeMap<St
 /// upstream objects) → the set of upstream URLs. Refuses output whose
 /// top level is not an array or whose entries carry no `url` string: a
 /// pre-flight parser must never silently degrade to an empty set (that
-/// would pass the parity-selfhosted "no upstreams" check on garbage).
+/// would pass the replay-selfhosted "no upstreams" check on garbage).
 pub fn upstream_urls(json_out: &str) -> Result<BTreeSet<String>> {
     let v: serde_json::Value =
         serde_json::from_str(json_out.trim()).context("parse `upstream list --json` output")?;
@@ -100,7 +100,7 @@ pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bo
         .with_context(|| {
             format!(
                 "deployed gateway.toml has no [build_policy.\"{tenant}\"] entry — \
-                 redeploy with parity.enabled=true (`cargo xtask k8s -p eks up --deploy --deploy-parity`)"
+                 redeploy with replay.enabled=true (`cargo xtask k8s -p eks up --deploy --deploy-replay`)"
             )
         })?;
     let kg = entry.get("keep_going").and_then(toml::Value::as_bool);
@@ -112,14 +112,14 @@ pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bo
             "deployed build-policy for '{tenant}' is {entry} — expected \
              keep_going = true, force_build_roots = {force_build_roots}; \
              remove (or fix) any conflicting gateway.buildPolicy values override and \
-             redeploy with `cargo xtask k8s -p eks up --deploy --deploy-parity`"
+             redeploy with `cargo xtask k8s -p eks up --deploy --deploy-replay`"
         );
     }
     Ok(())
 }
 
 /// Assert one deployed component's image tag matches `want` (the tag
-/// xtask computes for the current tree — the same tag the rio-parity
+/// xtask computes for the current tree — the same tag the rio-replay
 /// engine image is pushed and pulled as). Pure so the message stays
 /// unit-tested; the launch pre-flight calls it for rio-gateway and
 /// rio-scheduler.
@@ -129,7 +129,7 @@ pub fn check_image_tag(component: &str, got: &str, want: &str) -> Result<()> {
     }
     bail!(
         "deployed {component} image tag is '{got}' but the current tree builds '{want}' — \
-         push + redeploy this tree (`cargo xtask k8s -p eks up --push --deploy --deploy-parity`) \
+         push + redeploy this tree (`cargo xtask k8s -p eks up --push --deploy --deploy-replay`) \
          or check out the deployed revision before launching, so the campaign records the \
          component versions it actually ran against"
     )
@@ -137,7 +137,7 @@ pub fn check_image_tag(component: &str, got: &str, want: &str) -> Result<()> {
 
 /// Read the deployed gateway.toml from the rio-gateway-config ConfigMap
 /// (rendered by the chart's `rio.gatewayToml` named template; present
-/// whenever parity.enabled=true or any explicit gateway.buildPolicy
+/// whenever replay.enabled=true or any explicit gateway.buildPolicy
 /// entry is set). `None` ⇒ the chart was deployed without any of it.
 pub async fn read_build_policy(client: &kclient::Client) -> Result<Option<String>> {
     kclient::get_configmap_key(client, crate::k8s::NS, "rio-gateway-config", "gateway.toml").await
@@ -162,12 +162,12 @@ mod tests {
     fn upstream_urls_and_set_check() {
         let json = r#"[{"url":"https://cache.nixos.org","priority":50,"sig_mode":"keep","trusted_keys":["cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="]}]"#;
         let got = upstream_urls(json).unwrap();
-        check_upstreams("parity-leaf", &got, &["https://cache.nixos.org"]).unwrap();
-        check_upstreams("parity-selfhosted", &got, &[]).unwrap_err();
+        check_upstreams("replay-leaf", &got, &["https://cache.nixos.org"]).unwrap();
+        check_upstreams("replay-selfhosted", &got, &[]).unwrap_err();
         let none = upstream_urls("[]").unwrap();
-        check_upstreams("parity-selfhosted", &none, &[]).unwrap();
-        let err = check_upstreams("parity-warm", &none, &["https://cache.nixos.org"]).unwrap_err();
-        assert!(err.to_string().contains("parity-warm"), "{err}");
+        check_upstreams("replay-selfhosted", &none, &[]).unwrap();
+        let err = check_upstreams("replay-warm", &none, &["https://cache.nixos.org"]).unwrap_err();
+        assert!(err.to_string().contains("replay-warm"), "{err}");
     }
 
     #[test]
@@ -176,7 +176,7 @@ mod tests {
         // set: a non-array top level (e.g. a future envelope object) and
         // an entry without a `url` string both refuse instead of
         // vanishing — an empty set would wrongly pass the
-        // parity-selfhosted "no upstreams" check.
+        // replay-selfhosted "no upstreams" check.
         let err = upstream_urls(r#"{"upstreams":[]}"#).unwrap_err();
         assert!(format!("{err:#}").contains("not an array"), "{err:#}");
         let err = upstream_urls(r#"[{"priority":50}]"#).unwrap_err();
@@ -188,37 +188,37 @@ mod tests {
     fn build_policy_check_matches_helm_defaults() {
         // Exactly what the rio.gatewayToml named template
         // (infra/helm/rio-build/templates/gateway.yaml) renders with
-        // parity.enabled=true and no operator overrides.
+        // replay.enabled=true and no operator overrides.
         let policy = r#"
-[build_policy."parity-leaf"]
+[build_policy."replay-leaf"]
 keep_going = true
 force_build_roots = true
 
-[build_policy."parity-selfhosted"]
+[build_policy."replay-selfhosted"]
 keep_going = true
 force_build_roots = false
 
-[build_policy."parity-warm"]
+[build_policy."replay-warm"]
 keep_going = true
 force_build_roots = false
 "#;
         // Expectations come from the shared tenant matrix — the same table
-        // `parity launch` provisions from and pre-flights against — so the
+        // `replay launch` provisions from and pre-flights against — so the
         // chart fixture above and the launch path cannot drift apart
         // silently.
         for (tenant, _, force_build_roots) in super::super::TENANT_MATRIX {
             check_build_policy(policy, tenant, force_build_roots).unwrap();
         }
         // Wrong flag and missing tenant both refuse, and both name the
-        // fix (values override / redeploy with --deploy-parity).
-        let err = check_build_policy(policy, "parity-leaf", false).unwrap_err();
-        for needle in ["gateway.buildPolicy", "--deploy-parity"] {
+        // fix (values override / redeploy with --deploy-replay).
+        let err = check_build_policy(policy, "replay-leaf", false).unwrap_err();
+        for needle in ["gateway.buildPolicy", "--deploy-replay"] {
             assert!(err.to_string().contains(needle), "{err}");
         }
-        let err = check_build_policy("", "parity-leaf", true).unwrap_err();
-        assert!(err.to_string().contains("--deploy-parity"), "{err}");
+        let err = check_build_policy("", "replay-leaf", true).unwrap_err();
+        assert!(err.to_string().contains("--deploy-replay"), "{err}");
         // A parse failure names where the TOML came from.
-        let err = check_build_policy("not = [valid", "parity-leaf", true).unwrap_err();
+        let err = check_build_policy("not = [valid", "replay-leaf", true).unwrap_err();
         assert!(format!("{err:#}").contains("rio-gateway-config"), "{err:#}");
     }
 
@@ -228,7 +228,7 @@ force_build_roots = false
         let err = check_image_tag("rio-scheduler", "abc123", "def456")
             .unwrap_err()
             .to_string();
-        for needle in ["rio-scheduler", "abc123", "def456", "--deploy-parity"] {
+        for needle in ["rio-scheduler", "abc123", "def456", "--deploy-replay"] {
             assert!(err.contains(needle), "{err}");
         }
     }

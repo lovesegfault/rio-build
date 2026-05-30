@@ -409,7 +409,7 @@ fn image_identity(info: &ImageInfo, ami_tag: &str, attr: &str) -> (String, Strin
 /// and a separate create-tags left an AMI invisible to `find_existing`
 /// AND `gc` while blocking re-register via `InvalidAMIName.Duplicate`.
 ///
-/// rio.build/ami=<tag> is what the EC2NodeClass amiSelectorTerms
+/// `rio.build/ami=<tag>` is what the EC2NodeClass amiSelectorTerms
 /// match — content-addressed (I-182), pin to a value for reproducible
 /// rollback. rio.build/git-sha is traceability only (changes every
 /// commit; the content tag does not). rio.build/boot disambiguates the

@@ -217,7 +217,7 @@ pub async fn validity_snapshot(
 /// Mode ↔ tenant-name consistency plus the launch-time upstream-set
 /// assertion: the engine cannot list tenant upstreams itself (the
 /// ListTenants/ListUpstreams admin RPCs are allowlisted to operator CLIs),
-/// so `xtask parity launch` performs that assertion and records it in the
+/// so `xtask replay launch` performs that assertion and records it in the
 /// spec. Returns the low-confidence flags to carry into the report.
 pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<String>> {
     let mut low_confidence = Vec::new();
@@ -242,7 +242,7 @@ pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<
     if !spec.tenants.upstreams_verified {
         if !allow_unverified {
             bail!(
-                "spec.tenants.upstreams_verified is false — xtask parity launch must assert the \
+                "spec.tenants.upstreams_verified is false — xtask replay launch must assert the \
                  tenant upstream sets (the engine cannot: ListUpstreams is operator-CLI-only). \
                  Pass --allow-unverified-tenants to run anyway (flagged low-confidence)."
             );
@@ -422,7 +422,7 @@ mod tests {
               "mode": "leaf",
               "cluster": {"gateway_store_url": "ssh-ng://x", "ssh_key_dir": "/keys",
                           "scheduler_addr": "s:9001", "store_addr": "st:9002"},
-              "tenants": {"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+              "tenants": {"build_tenant": "replay-leaf", "warm_tenant": "replay-warm",
                           "upstreams_verified": true}
             }"#,
         )
@@ -626,7 +626,7 @@ mod tests {
 
         // Wrong tenant for the mode.
         let mut spec = leaf_spec();
-        spec.tenants.build_tenant = "parity-selfhosted".into();
+        spec.tenants.build_tenant = "replay-selfhosted".into();
         let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
         assert!(err.to_string().contains("requires build tenant"), "{err}");
 

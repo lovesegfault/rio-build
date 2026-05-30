@@ -133,12 +133,12 @@ pub struct UpOpts {
     /// working nodes that don't exist yet.
     #[arg(long = "deploy-no-hooks")]
     deploy_no_hooks: bool,
-    /// Deploy with parity.enabled=true (nixpkgs-parity campaign
+    /// Deploy with replay.enabled=true (build-replay campaign
     /// enablement — engine CNP admissions + gateway build-policy).
-    /// EKS-only; omitting it on a later deploy reverts parity to
+    /// EKS-only; omitting it on a later deploy reverts replay to
     /// disabled and rolls the gateway via the config checksum.
-    #[arg(long = "deploy-parity")]
-    deploy_parity: bool,
+    #[arg(long = "deploy-replay")]
+    deploy_replay: bool,
     /// After deploy, block until Karpenter has replaced all Drifted
     /// NodeClaims (AMI rollout complete). Without this, builds started
     /// immediately after `up` may be disrupted by node drift eviction.
@@ -228,7 +228,7 @@ impl UpOpts {
             Phase::Deploy
         );
         req!(self.deploy_no_hooks, "--deploy-no-hooks", Phase::Deploy);
-        req!(self.deploy_parity, "--deploy-parity", Phase::Deploy);
+        req!(self.deploy_replay, "--deploy-replay", Phase::Deploy);
         req!(self.wait_drift, "--wait-drift", Phase::Deploy);
         req!(!self.public_cidr.is_empty(), "--public-cidr", Phase::Deploy);
         req!(
@@ -686,7 +686,7 @@ pub(super) async fn run_up(
             tenant: o.deploy_tenant.clone(),
             skip_preflight: o.deploy_skip_preflight,
             no_hooks: o.deploy_no_hooks,
-            parity: o.deploy_parity,
+            replay: o.deploy_replay,
             wait_drift: o.wait_drift,
             // CLI > env: any --public-cidr flag wins; otherwise fall
             // back to RIO_PUBLIC_CIDRS so a bare `up --deploy` keeps
@@ -886,12 +886,12 @@ mod tests {
     }
 
     #[test]
-    fn deploy_parity_requires_deploy_phase_when_explicit() {
+    fn deploy_replay_requires_deploy_phase_when_explicit() {
         let mut o = opts();
         o.push = true;
-        o.deploy_parity = true;
+        o.deploy_replay = true;
         let e = o.validate_phase_opts(&o.phases()).unwrap_err().to_string();
-        assert!(e.contains("--deploy-parity requires --deploy"), "{e}");
+        assert!(e.contains("--deploy-replay requires --deploy"), "{e}");
         o.deploy = true;
         assert!(o.validate_phase_opts(&o.phases()).is_ok());
     }

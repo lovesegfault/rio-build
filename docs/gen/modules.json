@@ -2111,46 +2111,6 @@
       "doc": "Run cargo-mutants with the scoped config and print a summary."
     },
     {
-      "path": "parity/",
-      "depth": 0,
-      "doc": "`cargo xtask parity` — operator surface for the nixpkgs-parity campaign."
-    },
-    {
-      "path": "parity/eval.rs",
-      "depth": 1,
-      "doc": "`cargo xtask parity eval` — apply the recorder Job for one Hydra evaluation."
-    },
-    {
-      "path": "parity/jobs.rs",
-      "depth": 1,
-      "doc": "rio-parity namespace/SA bootstrap and the campaign / eval Job builders."
-    },
-    {
-      "path": "parity/launch.rs",
-      "depth": 1,
-      "doc": "`cargo xtask parity launch` — provision the campaign tenants, keys and"
-    },
-    {
-      "path": "parity/preflight.rs",
-      "depth": 1,
-      "doc": "Launch pre-flight checks for the nixpkgs-parity campaign."
-    },
-    {
-      "path": "parity/report.rs",
-      "depth": 1,
-      "doc": "`cargo xtask parity report` — download the rendered campaign report"
-    },
-    {
-      "path": "parity/s3.rs",
-      "depth": 1,
-      "doc": "S3 layout + small read helpers for campaign artifacts."
-    },
-    {
-      "path": "parity/status.rs",
-      "depth": 1,
-      "doc": "`cargo xtask parity status` — render campaign progress and Job state."
-    },
-    {
       "path": "regen/",
       "depth": 0,
       "doc": "Regenerate derived/checked-in files."
@@ -2194,6 +2154,46 @@
       "path": "regen/tfvars.rs",
       "depth": 1,
       "doc": "Regenerate infra/eks/generated.auto.tfvars.json from nix/pins.toml."
+    },
+    {
+      "path": "replay/",
+      "depth": 0,
+      "doc": "`cargo xtask replay` — operator surface for build-replay campaigns."
+    },
+    {
+      "path": "replay/eval.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay record` — apply the recorder Job for one Hydra evaluation."
+    },
+    {
+      "path": "replay/jobs.rs",
+      "depth": 1,
+      "doc": "rio-replay namespace/SA bootstrap and the campaign / eval Job builders."
+    },
+    {
+      "path": "replay/launch.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay launch` — provision the campaign tenants, keys and"
+    },
+    {
+      "path": "replay/preflight.rs",
+      "depth": 1,
+      "doc": "Launch pre-flight checks for the build-replay campaign."
+    },
+    {
+      "path": "replay/report.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay report` — download the rendered campaign report"
+    },
+    {
+      "path": "replay/s3.rs",
+      "depth": 1,
+      "doc": "S3 layout + small read helpers for campaign artifacts."
+    },
+    {
+      "path": "replay/status.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay status` — render campaign progress and Job state."
     },
     {
       "path": "sh.rs",

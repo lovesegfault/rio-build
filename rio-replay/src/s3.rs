@@ -78,7 +78,7 @@ impl ByRecipePointer {
 }
 
 /// Recorder-facing S3 destination (bucket + deployment root prefix, e.g.
-/// `parity`) for published replay archives.
+/// `replay`) for published replay archives.
 ///
 /// The upload/probe mechanics — write-once prefixes, upload order, the
 /// completion marker — are [`ArchiveStore`]'s; this type adapts them to the
@@ -254,21 +254,21 @@ mod tests {
 
     #[test]
     fn archive_keys_follow_the_layout() {
-        let layout = ArchiveS3::new("rio-chunks", "parity");
+        let layout = ArchiveS3::new("rio-chunks", "replay");
         assert_eq!(
             layout.object_key("0123456789abcdef", ARCHIVE_COMPLETE_OBJECT),
-            "parity/archives/0123456789abcdef/complete.json"
+            "replay/archives/0123456789abcdef/complete.json"
         );
         let digest = "ab".repeat(32);
         assert_eq!(
-            by_recipe_key("parity", &digest),
-            format!("parity/archives/by-recipe/{digest}.json")
+            by_recipe_key("replay", &digest),
+            format!("replay/archives/by-recipe/{digest}.json")
         );
         // Prefix slashes are normalized.
-        let layout = ArchiveS3::new("rio-chunks", "/parity/");
+        let layout = ArchiveS3::new("rio-chunks", "/replay/");
         assert_eq!(
             layout.object_key("0123456789abcdef", ARCHIVE_IMAGE_OBJECT),
-            "parity/archives/0123456789abcdef/archive.dwarfs"
+            "replay/archives/0123456789abcdef/archive.dwarfs"
         );
         // An empty prefix roots the archives tree at the bucket root without
         // a leading slash, for the pointer keys exactly like for the archive
@@ -298,7 +298,7 @@ mod tests {
             .then_output(|| HeadObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&head]);
 
-        let layout = ArchiveS3::new("rio-chunks", "parity");
+        let layout = ArchiveS3::new("rio-chunks", "replay");
         let err = layout
             .upload_archive(
                 &client,
@@ -319,7 +319,7 @@ mod tests {
     #[tokio::test]
     async fn by_recipe_pointer_round_trips() {
         let digest = "cd".repeat(32);
-        let key = format!("parity/archives/by-recipe/{digest}.json");
+        let key = format!("replay/archives/by-recipe/{digest}.json");
         let pointer = ByRecipePointer {
             archive_id: "ab".repeat(32),
             archive_id_short: "abababababababab".to_string(),
@@ -353,7 +353,7 @@ mod tests {
             });
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, &[&put, &get]);
 
-        let layout = ArchiveS3::new("rio-chunks", "parity");
+        let layout = ArchiveS3::new("rio-chunks", "replay");
         layout
             .write_by_recipe_pointer(&client, &digest, &pointer)
             .await
@@ -397,7 +397,7 @@ mod tests {
         });
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get]);
 
-        let layout = ArchiveS3::new("rio-chunks", "parity");
+        let layout = ArchiveS3::new("rio-chunks", "replay");
         let pointer = layout
             .read_by_recipe_pointer(&client, &digest)
             .await

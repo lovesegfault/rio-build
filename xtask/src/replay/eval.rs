@@ -1,10 +1,10 @@
-//! `cargo xtask parity eval` — apply the recorder Job for one Hydra evaluation.
+//! `cargo xtask replay record` — apply the recorder Job for one Hydra evaluation.
 //!
-//! The in-cluster engine (`rio-parity eval`) does the actual work and
+//! The in-cluster engine (`rio-replay eval`) does the actual work and
 //! publishes a v1 replay archive under
-//! `s3://<chunk-bucket>/parity/archives/<archive-id-short>/` (plus the
+//! `s3://<chunk-bucket>/replay/archives/<archive-id-short>/` (plus the
 //! recorder's by-recipe idempotency pointer under
-//! `parity/archives/by-recipe/`); xtask only verifies prerequisites
+//! `replay/archives/by-recipe/`); xtask only verifies prerequisites
 //! (image pushed, namespace + IRSA ServiceAccount) and applies the
 //! one-shot Job built by [`super::jobs::eval_job`].
 
@@ -22,7 +22,7 @@ use crate::{git, tofu, ui};
 /// Job's `/work` scratch emptyDir ([`jobs::WORK_DIR`]). The engine
 /// appends `<hydra-eval-id>/<recipe-short-digest>/` itself and publishes
 /// the packed archive to the bucket named by the Job's
-/// `RIO_PARITY_S3_BUCKET` env.
+/// `RIO_REPLAY_S3_BUCKET` env.
 const ENGINE_OUT_DIR: &str = "/work/evalsets";
 
 #[derive(Args)]
@@ -64,10 +64,10 @@ pub struct EvalArgs {
 }
 
 /// Engine argv for the eval Job. Flag names live only here and in the
-/// engine's clap definition (`rio-parity/src/cmd/eval.rs`): the engine
+/// engine's clap definition (`rio-replay/src/cmd/eval.rs`): the engine
 /// takes `--hydra-eval` / `--systems` / a mandatory `--scope` /
 /// `--out-dir`; the S3 bucket comes from the Job's
-/// `RIO_PARITY_S3_BUCKET` env, not the argv.
+/// `RIO_REPLAY_S3_BUCKET` env, not the argv.
 pub fn engine_args(a: &EvalArgs) -> Vec<String> {
     let mut args = vec!["eval".into(), "--hydra-eval".into(), a.eval.to_string()];
     for s in &a.systems {
@@ -86,7 +86,7 @@ pub fn engine_args(a: &EvalArgs) -> Vec<String> {
     args
 }
 
-/// Job name: `parity-eval-<eval>-<8 hex of the request digest>`. The
+/// Job name: `replay-eval-<eval>-<8 hex of the request digest>`. The
 /// digest covers what the operator asked for (systems/scope/jobset) plus
 /// the image tag, so "same request" re-runs collide on the existing Job
 /// (409 → guidance) instead of silently double-evaluating, while a new
@@ -110,7 +110,7 @@ pub fn job_name(a: &EvalArgs, image_tag: &str) -> String {
     h.update("\0");
     h.update(image_tag);
     let digest = hex::encode(&h.finalize()[..4]);
-    format!("parity-eval-{}-{digest}", a.eval)
+    format!("replay-eval-{}-{digest}", a.eval)
 }
 
 pub async fn run(a: EvalArgs) -> Result<()> {
@@ -118,24 +118,24 @@ pub async fn run(a: EvalArgs) -> Result<()> {
     let region = tf.get("region")?;
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
-    let role_arn = tf.get("parity_iam_role_arn")?;
+    let role_arn = tf.get("replay_iam_role_arn")?;
 
-    // The Job pulls <ecr>/rio-parity:<tag> for the CURRENT tree; refuse
+    // The Job pulls <ecr>/rio-replay:<tag> for the CURRENT tree; refuse
     // before creating anything if that tag was never pushed.
     let tag = git::image_tag(&git::open()?)?;
-    ui::step("rio-parity image in ECR", || {
-        push::assert_in_ecr("rio-parity", &tag, &region)
+    ui::step("rio-replay image in ECR", || {
+        push::assert_in_ecr("rio-replay", &tag, &region)
     })
     .await?;
 
     let client = kclient::client().await?;
-    ui::step("rio-parity namespace + ServiceAccount", || {
+    ui::step("rio-replay namespace + ServiceAccount", || {
         jobs::ensure_base(&client, &role_arn)
     })
     .await?;
 
     let common = EngineJobCommon {
-        image: format!("{ecr}/rio-parity:{tag}"),
+        image: format!("{ecr}/rio-replay:{tag}"),
         s3_bucket: bucket.clone(),
         region,
         log_level: a.log_level.clone(),
@@ -147,7 +147,7 @@ pub async fn run(a: EvalArgs) -> Result<()> {
     })
     .await?;
 
-    let ns = super::NS_PARITY;
+    let ns = super::NS_REPLAY;
     let prefix = super::s3::archives_prefix();
     tracing::info!(
         "eval Job applied.\n  \
@@ -155,7 +155,7 @@ pub async fn run(a: EvalArgs) -> Result<()> {
          wait for it:     kubectl -n {ns} wait --for=condition=complete job/{name} --timeout=3h\n  \
          archives land under s3://{bucket}/{prefix}\n  \
          find it: aws s3 ls s3://{bucket}/{prefix} — a prefix is complete once complete.json \
-         exists; `parity launch --eval {}` discovers it from the archive's provenance (use \
+         exists; `replay launch --eval {}` discovers it from the archive's provenance (use \
          --eval-digest <recipe digest> to disambiguate)\n  \
          full-scope evals need ~1-2h on an r8a.48xlarge-class node (~$15-31), and with \
          --full-scale the pod sits Pending for a few minutes while Karpenter provisions that \
@@ -222,7 +222,7 @@ mod tests {
         let n1 = job_name(&a, "abc123");
         let n2 = job_name(&a, "abc123");
         assert_eq!(n1, n2);
-        assert!(n1.starts_with("parity-eval-1824219-"), "{n1}");
+        assert!(n1.starts_with("replay-eval-1824219-"), "{n1}");
         assert!(n1.len() <= 63, "{n1}");
         // Different scope or different image tag ⇒ different Job name.
         let mut b = args();

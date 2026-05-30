@@ -1,12 +1,12 @@
-//! `cargo xtask parity launch` — provision the campaign tenants, keys and
+//! `cargo xtask replay launch` — provision the campaign tenants, keys and
 //! Secrets, run the launch pre-flight, and apply the campaign Job.
 //!
-//! The in-cluster engine (`rio-parity run`) is driven entirely by a
+//! The in-cluster engine (`rio-replay run`) is driven entirely by a
 //! campaign spec file: launch builds that spec with the engine's own
 //! [`CampaignSpec`] types, validates it locally, ships it as the
 //! `<campaign-id>-spec` ConfigMap (key [`jobs::SPEC_FILENAME`], mounted at
 //! [`jobs::SPEC_MOUNT_DIR`]), and points the Job argv at the mounted copy
-//! (`run --spec /etc/rio/parity/spec.json`). The spec pins `campaign_id`
+//! (`run --spec /etc/rio/replay/spec.json`). The spec pins `campaign_id`
 //! to the Job name so a rescheduled pod resumes from the campaign's S3
 //! prefix, and records the deployed component versions the pre-flight
 //! verified (`cluster_versions`) plus the tenant-upstream snapshot.
@@ -16,7 +16,7 @@
 //! only, and an authorized-keys merge whose key comments equal the tenant
 //! names (the gateway routes builds by that comment). Never `k8s grant` —
 //! it unconditionally adds cache.nixos.org, which would corrupt
-//! parity-selfhosted's deliberately empty upstream set.
+//! replay-selfhosted's deliberately empty upstream set.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -30,7 +30,7 @@ use rio_replay::run::spec::{
 };
 
 use super::jobs::{self, EngineJobCommon};
-use super::{NS_PARITY, TENANT_MATRIX, TENANT_RETENTION_HOURS, TENANT_WARM, preflight, s3};
+use super::{NS_REPLAY, TENANT_MATRIX, TENANT_RETENTION_HOURS, TENANT_WARM, preflight, s3};
 use crate::k8s::client as kclient;
 use crate::k8s::eks::smoke::{CliCtx, step_restart_gateway, step_upstream};
 use crate::k8s::eks::{TF_DIR, push};
@@ -40,14 +40,14 @@ use crate::{git, ssh, tofu, ui};
 #[derive(Args)]
 pub struct LaunchArgs {
     /// Hydra evaluation id whose recorded replay archive the campaign
-    /// consumes (must have been produced by `parity eval` first).
+    /// consumes (must have been produced by `replay record` first).
     #[arg(long)]
     pub eval: u64,
     /// Recipe digest (or unambiguous prefix) to pin when more than one
     /// archive exists for --eval. A full 64-hex digest is resolved
     /// directly via the recorder's by-recipe pointer; a shorter value
-    /// narrows the listing under `parity/archives/`. Discover candidates
-    /// with `aws s3 ls s3://<chunk-bucket>/parity/archives/`.
+    /// narrows the listing under `replay/archives/`. Discover candidates
+    /// with `aws s3 ls s3://<chunk-bucket>/replay/archives/`.
     #[arg(long)]
     pub eval_digest: Option<String>,
     /// Dependency mode: leaf = dependencies substituted from
@@ -56,7 +56,7 @@ pub struct LaunchArgs {
     #[arg(long, value_enum, default_value_t = Mode::Leaf)]
     pub mode: Mode,
     /// Campaign id (Job name + S3 prefix). Default:
-    /// `parity-<mode>-<YYYYMMDD>-<4 hex>`.
+    /// `replay-<mode>-<YYYYMMDD>-<4 hex>`.
     #[arg(long)]
     pub campaign_id: Option<String>,
     /// Cap on attempted jobs (smoke runs: 10-50). Recorded in the
@@ -65,7 +65,7 @@ pub struct LaunchArgs {
     pub limit: Option<usize>,
     /// Extra args appended verbatim to the engine `run` invocation
     /// (escape hatch while the engine CLI stabilises; must be valid
-    /// `rio-parity run` flags, e.g. `--deadline <rfc3339>`).
+    /// `rio-replay run` flags, e.g. `--deadline <rfc3339>`).
     #[arg(long = "engine-arg", allow_hyphen_values = true)]
     pub engine_args: Vec<String>,
     /// Proceed when the deployed gateway/scheduler tags don't match this
@@ -120,11 +120,11 @@ impl std::fmt::Display for Mode {
     }
 }
 
-/// Default campaign id: `parity-<mode>-<YYYYMMDD>-<4 hex>`. Lowercase
+/// Default campaign id: `replay-<mode>-<YYYYMMDD>-<4 hex>`. Lowercase
 /// RFC-1123 so it is a valid Job name.
 pub fn default_campaign_id(mode: Mode, now: jiff::Zoned, nonce: u16) -> String {
     format!(
-        "parity-{}-{}-{:04x}",
+        "replay-{}-{}-{:04x}",
         match mode {
             Mode::Leaf => "leaf",
             Mode::SelfHosted => "selfhosted",
@@ -223,7 +223,7 @@ pub struct ArchiveLocation {
     /// 16-char short id — the S3 prefix segment.
     pub archive_id_short: String,
     /// Archive key prefix in the chunk bucket (no trailing slash),
-    /// e.g. `parity/archives/8b919129046e0f60`.
+    /// e.g. `replay/archives/8b919129046e0f60`.
     pub s3_prefix: String,
     /// Recipe digest from the archive's provenance (the eval recipe the
     /// recorder ran), used for --eval-digest narrowing and operator audit.
@@ -270,7 +270,7 @@ fn build_campaign_spec(
         },
         s3: S3Target {
             bucket: Some(bucket.to_owned()),
-            // Default prefix (`parity/campaigns`) — also what
+            // Default prefix (`replay/campaigns`) — also what
             // `super::s3::campaign_key` renders for status/report.
             ..S3Target::default()
         },
@@ -318,13 +318,13 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     let region = tf.get("region")?;
     let ecr = tf.get("ecr_registry")?;
     let bucket = tf.get("chunk_bucket_name")?;
-    let role_arn = tf.get("parity_iam_role_arn")?;
+    let role_arn = tf.get("replay_iam_role_arn")?;
 
-    // The campaign Job pulls <ecr>/rio-parity:<tag> for the CURRENT tree;
+    // The campaign Job pulls <ecr>/rio-replay:<tag> for the CURRENT tree;
     // refuse before creating anything if that tag was never pushed.
     let tag = git::image_tag(&git::open()?)?;
-    ui::step("rio-parity image in ECR", || {
-        push::assert_in_ecr("rio-parity", &tag, &region)
+    ui::step("rio-replay image in ECR", || {
+        push::assert_in_ecr("rio-replay", &tag, &region)
     })
     .await?;
 
@@ -337,7 +337,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     .await?;
 
     let client = kclient::client().await?;
-    ui::step("rio-parity namespace + ServiceAccount", || {
+    ui::step("rio-replay namespace + ServiceAccount", || {
         jobs::ensure_base(&client, &role_arn)
     })
     .await?;
@@ -355,7 +355,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         ensure_tenant_keys(&client, a.restart_gateway)
     })
     .await?;
-    let hmac_present = ui::step("copy service-HMAC Secret into rio-parity", || {
+    let hmac_present = ui::step("copy service-HMAC Secret into rio-replay", || {
         copy_hmac_secret(&client)
     })
     .await?;
@@ -369,7 +369,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
                 "the deployed rio-gateway runs on an auto-generated (emptyDir) SSH host key, so \
                  there is nothing to pin and the campaign engine refuses to run without a pinned \
                  host key. Redeploy with a persistent host key — `cargo xtask k8s -p eks up \
-                 --deploy --deploy-parity` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
+                 --deploy --deploy-replay` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
                  (Secret data key `host_key`) — then re-run launch."
             ),
         }
@@ -419,10 +419,10 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     ui::step(
         &format!("campaign id {campaign_id} not already in use"),
         || async {
-            let jobs_api: Api<Job> = Api::namespaced(client.clone(), NS_PARITY);
+            let jobs_api: Api<Job> = Api::namespaced(client.clone(), NS_REPLAY);
             let job_exists = jobs_api.get_opt(&campaign_id).await?.is_some();
             let existing_spec =
-                kclient::get_configmap_key(&client, NS_PARITY, &cm_name, jobs::SPEC_FILENAME)
+                kclient::get_configmap_key(&client, NS_REPLAY, &cm_name, jobs::SPEC_FILENAME)
                     .await?;
             guard_existing_campaign(
                 &campaign_id,
@@ -438,17 +438,17 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     ui::step(&format!("apply spec ConfigMap {cm_name}"), || {
         kclient::apply_configmap(
             &client,
-            NS_PARITY,
+            NS_REPLAY,
             &cm_name,
             spec_data,
-            jobs::labels("parity-campaign"),
+            jobs::labels("replay-campaign"),
         )
     })
     .await?;
 
     // Campaign Job.
     let common = EngineJobCommon {
-        image: format!("{ecr}/rio-parity:{tag}"),
+        image: format!("{ecr}/rio-replay:{tag}"),
         s3_bucket: bucket.clone(),
         region: region.clone(),
         log_level: a.log_level.clone(),
@@ -470,9 +470,9 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     tracing::info!(
         "campaign launched: {campaign_id}\n  \
          archive:   {} (hydra eval {}, recipe {}…, mode {})\n  \
-         progress:  cargo xtask parity status {campaign_id} --watch\n  \
-         report:    cargo xtask parity report {campaign_id}\n  \
-         logs:      kubectl -n {NS_PARITY} logs -f job/{campaign_id}\n  \
+         progress:  cargo xtask replay status {campaign_id} --watch\n  \
+         report:    cargo xtask replay report {campaign_id}\n  \
+         logs:      kubectl -n {NS_REPLAY} logs -f job/{campaign_id}\n  \
          artifacts: s3://{bucket}/{}",
         archive.archive_id_short,
         archive.hydra_eval_id,
@@ -483,7 +483,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     Ok(())
 }
 
-/// One archive prefix found under `parity/archives/`, with the provenance
+/// One archive prefix found under `replay/archives/`, with the provenance
 /// fields candidate filtering reads from its manifest.json.
 #[derive(Debug)]
 struct ArchiveCandidate {
@@ -505,7 +505,7 @@ fn is_full_recipe_digest(digest: &str) -> bool {
             .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Find the replay archive recorded for `eval` under `parity/archives/`
+/// Find the replay archive recorded for `eval` under `replay/archives/`
 /// in the chunk bucket. A full 64-hex `--eval-digest` takes the by-recipe
 /// fast path (one GET of the recorder's idempotency pointer names the
 /// archive prefix directly); otherwise the per-archive prefixes are
@@ -584,7 +584,7 @@ async fn read_candidate(
     }))
 }
 
-/// Listing path: every per-archive prefix under `parity/archives/` whose
+/// Listing path: every per-archive prefix under `replay/archives/` whose
 /// standalone manifest is already uploaded becomes a candidate.
 async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCandidate>> {
     let archives_prefix = s3::archives_prefix();
@@ -604,7 +604,7 @@ async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCand
 }
 
 /// By-recipe fast path: a full recipe digest names the recorder's
-/// idempotency pointer (`parity/archives/by-recipe/<digest>.json`)
+/// idempotency pointer (`replay/archives/by-recipe/<digest>.json`)
 /// directly, so resolution costs one GET for the pointer plus one for the
 /// archive's manifest instead of listing and reading every candidate.
 async fn by_recipe_candidates(
@@ -617,7 +617,7 @@ async fn by_recipe_candidates(
     let Some(text) = s3::get_text(region, bucket, &pointer_key).await? else {
         bail!(
             "recipe {recipe_digest} has not been recorded: s3://{bucket}/{pointer_key} does not \
-             exist — run `cargo xtask parity eval --eval {eval} …` first and wait for its Job to \
+             exist — run `cargo xtask replay record --eval {eval} …` first and wait for its Job to \
              complete (the recorder writes the by-recipe pointer after publishing the archive)"
         );
     };
@@ -629,7 +629,7 @@ async fn by_recipe_candidates(
     ensure!(
         !short.is_empty(),
         "s3://{bucket}/{pointer_key} does not name an archive — re-record with \
-         `cargo xtask parity eval --eval {eval} … --force`, or pass --eval-digest as a shorter \
+         `cargo xtask replay record --eval {eval} … --force`, or pass --eval-digest as a shorter \
          prefix to resolve by listing instead"
     );
     let candidate = read_candidate(region, bucket, short)
@@ -638,7 +638,7 @@ async fn by_recipe_candidates(
             format!(
                 "the by-recipe pointer s3://{bucket}/{pointer_key} names archive {short}, but \
                  s3://{bucket}/{}/manifest.json does not exist — re-record with \
-                 `cargo xtask parity eval --eval {eval} … --force`",
+                 `cargo xtask replay record --eval {eval} … --force`",
                 s3::archive_prefix(short)
             )
         })?;
@@ -664,7 +664,7 @@ fn pick_candidate<'a>(
     match matches.len() {
         0 => bail!(
             "no replay archive recorded from hydra eval {eval}{} under {} — run \
-             `cargo xtask parity eval --eval {eval} …` first and wait for its Job to complete",
+             `cargo xtask replay record --eval {eval} …` first and wait for its Job to complete",
             eval_digest
                 .map(|d| format!(" with recipe digest {d}…"))
                 .unwrap_or_default(),
@@ -714,19 +714,19 @@ fn guard_existing_campaign(
     let cm = jobs::spec_configmap_name(campaign_id);
     if job_exists {
         bail!(
-            "campaign Job {NS_PARITY}/{campaign_id} already exists — re-using its campaign id \
-             would overwrite ConfigMap {NS_PARITY}/{cm}, the spec that campaign mounts. Pick a \
+            "campaign Job {NS_REPLAY}/{campaign_id} already exists — re-using its campaign id \
+             would overwrite ConfigMap {NS_REPLAY}/{cm}, the spec that campaign mounts. Pick a \
              different --campaign-id, or — only if you mean to relaunch/resume THIS campaign — \
-             delete the Job first (`kubectl -n {NS_PARITY} delete job {campaign_id}`) and re-run \
+             delete the Job first (`kubectl -n {NS_REPLAY} delete job {campaign_id}`) and re-run \
              launch."
         );
     }
     if existing_spec.is_some_and(|old| old != new_spec) {
         bail!(
-            "ConfigMap {NS_PARITY}/{cm} already exists with a different campaign spec (campaign \
+            "ConfigMap {NS_REPLAY}/{cm} already exists with a different campaign spec (campaign \
              id {campaign_id} was launched before). Refusing to overwrite it: pick a fresh \
              --campaign-id, or — if you are deliberately relaunching this campaign after deleting \
-             its Job — delete the stale ConfigMap too (`kubectl -n {NS_PARITY} delete configmap \
+             its Job — delete the stale ConfigMap too (`kubectl -n {NS_REPLAY} delete configmap \
              {cm}`) and re-run; resume state lives under the campaign's S3 prefix, not in the old \
              ConfigMap."
         );
@@ -772,7 +772,7 @@ async fn create_tenant(cli: &CliCtx, tenant: &str) -> Result<()> {
 }
 
 /// One ed25519 keypair per campaign tenant. Private halves live in the
-/// rio-parity-ssh Secret (data key = tenant name, the file name
+/// rio-replay-ssh Secret (data key = tenant name, the file name
 /// [`jobs::ssh_key_path`] points the spec's `ssh-key=` parameters at);
 /// public halves are merged into rio-gateway-ssh with comment = tenant
 /// (the gateway maps the key comment to `SubmitBuild.tenant_name`).
@@ -782,7 +782,7 @@ async fn create_tenant(cli: &CliCtx, tenant: &str) -> Result<()> {
 async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> Result<()> {
     use k8s_openapi::api::core::v1::Secret;
 
-    let api: Api<Secret> = Api::namespaced(client.clone(), NS_PARITY);
+    let api: Api<Secret> = Api::namespaced(client.clone(), NS_REPLAY);
     let existing: BTreeMap<String, String> = api
         .get_opt(jobs::SSH_SECRET_NAME)
         .await?
@@ -808,7 +808,7 @@ async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> 
             if reused {
                 format!(
                     "parse the existing private key for tenant {tenant} (data key {tenant:?} of \
-                     Secret {NS_PARITY}/{}) — delete that key from the Secret to have launch mint \
+                     Secret {NS_REPLAY}/{}) — delete that key from the Secret to have launch mint \
                      a fresh one",
                     jobs::SSH_SECRET_NAME
                 )
@@ -821,7 +821,7 @@ async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> 
         pub_lines.push(public.to_openssh()? + "\n");
         secret_data.insert(tenant.to_string(), private);
     }
-    kclient::apply_secret(client, NS_PARITY, jobs::SSH_SECRET_NAME, secret_data).await?;
+    kclient::apply_secret(client, NS_REPLAY, jobs::SSH_SECRET_NAME, secret_data).await?;
 
     let refs: Vec<&str> = pub_lines.iter().map(String::as_str).collect();
     shared::merge_authorized_keys_batch(client, &refs).await?;
@@ -859,7 +859,7 @@ async fn copy_hmac_secret(client: &kclient::Client) -> Result<bool> {
             BTreeMap::new()
         }
     };
-    kclient::apply_secret_bytes(client, NS_PARITY, jobs::HMAC_SECRET_NAME, data).await?;
+    kclient::apply_secret_bytes(client, NS_REPLAY, jobs::HMAC_SECRET_NAME, data).await?;
     Ok(present)
 }
 
@@ -1002,8 +1002,8 @@ async fn preflight_checks(
         }
         Ok(None) => failures.push(
             "ConfigMap rio-system/rio-gateway-config (key gateway.toml) not found — the chart was \
-             deployed without the gateway build-policy; redeploy with parity.enabled=true \
-             (`cargo xtask k8s -p eks up --deploy --deploy-parity`)"
+             deployed without the gateway build-policy; redeploy with replay.enabled=true \
+             (`cargo xtask k8s -p eks up --deploy --deploy-replay`)"
                 .to_string(),
         ),
         Err(e) => failures.push(format!("read deployed gateway build-policy: {e:#}")),
@@ -1118,12 +1118,12 @@ mod tests {
             ]),
             upstream_snapshot: BTreeMap::from([
                 (
-                    "parity-leaf".to_string(),
+                    "replay-leaf".to_string(),
                     vec!["https://cache.nixos.org".to_string()],
                 ),
-                ("parity-selfhosted".to_string(), vec![]),
+                ("replay-selfhosted".to_string(), vec![]),
                 (
-                    "parity-warm".to_string(),
+                    "replay-warm".to_string(),
                     vec!["https://cache.nixos.org".to_string()],
                 ),
             ]),
@@ -1136,12 +1136,12 @@ mod tests {
         let m = TENANT_MATRIX;
         assert_eq!(
             m[0],
-            ("parity-leaf", &["https://cache.nixos.org"][..], true)
+            ("replay-leaf", &["https://cache.nixos.org"][..], true)
         );
-        assert_eq!(m[1], ("parity-selfhosted", &[][..], false));
+        assert_eq!(m[1], ("replay-selfhosted", &[][..], false));
         assert_eq!(
             m[2],
-            ("parity-warm", &["https://cache.nixos.org"][..], false)
+            ("replay-warm", &["https://cache.nixos.org"][..], false)
         );
     }
 
@@ -1152,7 +1152,7 @@ mod tests {
             .to_zoned(jiff::tz::TimeZone::UTC)
             .unwrap();
         let id = default_campaign_id(Mode::Leaf, now.clone(), 0xab12);
-        assert_eq!(id, "parity-leaf-20260601-ab12");
+        assert_eq!(id, "replay-leaf-20260601-ab12");
         validate_campaign_id(&id).unwrap();
         assert!(id.len() <= 63);
         assert!(
@@ -1162,7 +1162,7 @@ mod tests {
         // The self-hosted segment stays hyphen-free so the id remains easy
         // to eyeball-split on '-'.
         let id = default_campaign_id(Mode::SelfHosted, now, 0x1);
-        assert_eq!(id, "parity-selfhosted-20260601-0001");
+        assert_eq!(id, "replay-selfhosted-20260601-0001");
         validate_campaign_id(&id).unwrap();
     }
 
@@ -1184,7 +1184,7 @@ mod tests {
                 "{bad:?} should be rejected"
             );
         }
-        validate_campaign_id("parity-leaf-20260601-ab12").unwrap();
+        validate_campaign_id("replay-leaf-20260601-ab12").unwrap();
         validate_campaign_id(&"a".repeat(58)).unwrap();
     }
 
@@ -1193,7 +1193,7 @@ mod tests {
         let a = args(Mode::Leaf);
         assert_eq!(
             engine_args(&a),
-            vec!["run", "--spec", "/etc/rio/parity/spec.json"]
+            vec!["run", "--spec", "/etc/rio/replay/spec.json"]
         );
         // Skipping the pre-flight produces an unverified-tenants spec; the
         // engine must be told that is intentional.
@@ -1205,7 +1205,7 @@ mod tests {
             vec![
                 "run",
                 "--spec",
-                "/etc/rio/parity/spec.json",
+                "/etc/rio/replay/spec.json",
                 "--allow-unverified-tenants",
                 "--deadline",
                 "2026-06-08T00:00:00Z",
@@ -1232,7 +1232,7 @@ mod tests {
     fn campaign_spec_round_trips_through_the_engine_types() {
         let spec = build_campaign_spec(
             &args(Mode::Leaf),
-            "parity-leaf-20260601-ab12",
+            "replay-leaf-20260601-ab12",
             &archive_loc(),
             "rio-build-chunks-deadbeef",
             true,
@@ -1246,13 +1246,13 @@ mod tests {
 
         assert_eq!(
             parsed.campaign_id.as_deref(),
-            Some("parity-leaf-20260601-ab12")
+            Some("replay-leaf-20260601-ab12")
         );
         assert_eq!(parsed.mode, EngineMode::Leaf);
         assert_eq!(parsed.archive.digest, archive_loc().archive_id);
         assert_eq!(
             parsed.archive.s3_prefix.as_deref(),
-            Some("parity/archives/deadbeefdeadbeef")
+            Some("replay/archives/deadbeefdeadbeef")
         );
         assert_eq!(
             parsed.archive.s3_bucket.as_deref(),
@@ -1262,14 +1262,14 @@ mod tests {
             parsed.s3.bucket.as_deref(),
             Some("rio-build-chunks-deadbeef")
         );
-        assert_eq!(parsed.s3.prefix, "parity/campaigns");
+        assert_eq!(parsed.s3.prefix, "replay/campaigns");
         assert_eq!(
             parsed.cluster.gateway_store_url,
-            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/parity-ssh/parity-leaf"
+            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/etc/rio/replay-ssh/replay-leaf"
         );
         assert_eq!(
             parsed.cluster.ssh_key_dir.as_deref(),
-            Some(std::path::Path::new("/etc/rio/parity-ssh"))
+            Some(std::path::Path::new("/etc/rio/replay-ssh"))
         );
         assert_eq!(
             parsed.cluster.scheduler_addr,
@@ -1284,15 +1284,15 @@ mod tests {
             parsed.cluster.gateway_host_key.as_deref(),
             Some(HOST_KEY_PIN)
         );
-        assert_eq!(parsed.tenants.build_tenant, "parity-leaf");
-        assert_eq!(parsed.tenants.warm_tenant, "parity-warm");
+        assert_eq!(parsed.tenants.build_tenant, "replay-leaf");
+        assert_eq!(parsed.tenants.warm_tenant, "replay-warm");
         assert!(parsed.tenants.upstreams_verified);
         assert_eq!(
             parsed.tenants.upstreams_verified_at.as_deref(),
             Some("2026-06-01T12:00:00Z")
         );
         assert_eq!(
-            parsed.tenants.upstream_snapshot.get("parity-selfhosted"),
+            parsed.tenants.upstream_snapshot.get("replay-selfhosted"),
             Some(&vec![])
         );
         assert_eq!(parsed.filters.limit, Some(50));
@@ -1315,7 +1315,7 @@ mod tests {
         // cluster_versions claim.
         let spec = build_campaign_spec(
             &args(Mode::SelfHosted),
-            "parity-selfhosted-20260601-0001",
+            "replay-selfhosted-20260601-0001",
             &archive_loc(),
             "rio-build-chunks-deadbeef",
             false,
@@ -1325,14 +1325,14 @@ mod tests {
         spec.validate().unwrap();
         assert_eq!(spec.cluster.gateway_host_key.as_deref(), Some(HOST_KEY_PIN));
         assert_eq!(spec.mode, EngineMode::SelfHosted);
-        assert_eq!(spec.tenants.build_tenant, "parity-selfhosted");
+        assert_eq!(spec.tenants.build_tenant, "replay-selfhosted");
         assert_eq!(
             spec.cluster.gateway_store_url,
-            gateway_store_url("parity-selfhosted")
+            gateway_store_url("replay-selfhosted")
         );
         assert_eq!(
             spec.cluster.ssh_key_dir.as_deref(),
-            Some(std::path::Path::new("/etc/rio/parity-ssh"))
+            Some(std::path::Path::new("/etc/rio/replay-ssh"))
         );
         assert!(spec.cluster.service_hmac_key_path.is_none());
         assert!(!spec.tenants.upstreams_verified);
@@ -1425,8 +1425,11 @@ mod tests {
             err.contains("no replay archive recorded from hydra eval 4242"),
             "{err}"
         );
-        assert!(err.contains("parity/archives/"), "{err}");
-        assert!(err.contains("cargo xtask parity eval --eval 4242"), "{err}");
+        assert!(err.contains("replay/archives/"), "{err}");
+        assert!(
+            err.contains("cargo xtask replay record --eval 4242"),
+            "{err}"
+        );
         // Zero matches because the digest narrowed everything away: the
         // requested digest is named so the typo is visible.
         let err = format!(
@@ -1457,8 +1460,8 @@ mod tests {
 
     #[test]
     fn guard_refuses_existing_job_or_differing_spec() {
-        let id = "parity-leaf-20260601-ab12";
-        let spec = r#"{"campaignId":"parity-leaf-20260601-ab12"}"#;
+        let id = "replay-leaf-20260601-ab12";
+        let spec = r#"{"campaignId":"replay-leaf-20260601-ab12"}"#;
 
         // Existing Job: refuse regardless of ConfigMap state, with the
         // delete-Job escape hatch spelled out.
@@ -1467,7 +1470,7 @@ mod tests {
             .to_string();
         assert!(err.contains("already exists"), "{err}");
         assert!(
-            err.contains("delete job parity-leaf-20260601-ab12"),
+            err.contains("delete job replay-leaf-20260601-ab12"),
             "{err}"
         );
 
@@ -1478,7 +1481,7 @@ mod tests {
             .to_string();
         assert!(err.contains("different campaign spec"), "{err}");
         assert!(
-            err.contains("delete configmap parity-leaf-20260601-ab12-spec"),
+            err.contains("delete configmap replay-leaf-20260601-ab12-spec"),
             "{err}"
         );
 

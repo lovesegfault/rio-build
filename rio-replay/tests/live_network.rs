@@ -16,7 +16,7 @@ const EVAL_ID: u64 = 1824219;
 #[tokio::test]
 #[ignore = "live network: hydra.nixos.org + cache.nixos.org (manual smoke, never in CI)"]
 async fn live_hydra_eval_jobset_and_constituents_shape() {
-    let ua = rio_replay::user_agent(std::env::var("RIO_PARITY_CONTACT").ok().as_deref());
+    let ua = rio_replay::user_agent(std::env::var("RIO_REPLAY_CONTACT").ok().as_deref());
     let c = HydraClient::new(
         "https://hydra.nixos.org",
         &ua,

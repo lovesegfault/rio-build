@@ -173,7 +173,7 @@ pub async fn apply_secret_bytes(
 
 /// Create/update a ConfigMap with string data and labels (SSA,
 /// idempotent) — the `apply_secret` sibling for non-secret payloads such
-/// as the parity campaign-spec ConfigMap. An empty `labels` map applies
+/// as the replay campaign-spec ConfigMap. An empty `labels` map applies
 /// no labels.
 pub async fn apply_configmap(
     client: &Client,

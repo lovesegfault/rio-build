@@ -8,7 +8,7 @@ Generated: 2026-05-26T12:00:00Z
 | eval set | 8b919129046e0f60 |
 | manifest sha256 | 8b919129046e0f608b919129046e0f608b919129046e0f608b919129046e0f60 |
 | mode | leaf |
-| build tenant | parity-leaf |
+| build tenant | replay-leaf |
 | systems | x86_64-linux |
 | exclude features | kvm |
 | include globs |  |

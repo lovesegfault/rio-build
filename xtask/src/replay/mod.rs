@@ -1,6 +1,6 @@
-//! `cargo xtask parity` — operator surface for the nixpkgs-parity campaign.
+//! `cargo xtask replay` — operator surface for build-replay campaigns.
 //!
-//! The campaign engine itself is the in-cluster `rio-parity` Job; xtask
+//! The campaign engine itself is the in-cluster `rio-replay` Job; xtask
 //! only verifies prerequisites, provisions the campaign tenants/Secrets,
 //! applies the Jobs, and renders the S3 artifacts. The repro/abort/cleanup
 //! subcommands are stubs for a later milestone (M2) so `--help` documents
@@ -8,8 +8,8 @@
 //!
 //! Operator note: chart-side enablement (the engine's CiliumNetworkPolicy
 //! admissions + the campaign tenants' gateway build-policy defaults) comes
-//! from deploying with `cargo xtask k8s up --deploy-parity`; see
-//! `cargo xtask parity launch --help` for the redeploy warning that applies
+//! from deploying with `cargo xtask k8s up --deploy-replay`; see
+//! `cargo xtask replay launch --help` for the redeploy warning that applies
 //! while a campaign is running.
 
 use anyhow::{Result, bail};
@@ -23,16 +23,16 @@ pub mod report;
 pub mod s3;
 pub mod status;
 
-/// Campaign tenants (created by `parity launch` directly via rio-cli —
+/// Campaign tenants (created by `replay launch` directly via rio-cli —
 /// never via `k8s grant`, which unconditionally adds cache.nixos.org).
 /// The same three names are seeded as gateway build-policy defaults by the
-/// helm chart when `parity.enabled=true`
+/// helm chart when `replay.enabled=true`
 /// (infra/helm/rio-build/templates/gateway.yaml); the launch pre-flight
 /// cross-checks the deployed gateway config against these constants so a
 /// rename on either side fails loudly before anything is submitted.
-pub const TENANT_LEAF: &str = "parity-leaf";
-pub const TENANT_SELFHOSTED: &str = "parity-selfhosted";
-pub const TENANT_WARM: &str = "parity-warm";
+pub const TENANT_LEAF: &str = "replay-leaf";
+pub const TENANT_SELFHOSTED: &str = "replay-selfhosted";
+pub const TENANT_WARM: &str = "replay-warm";
 
 /// Campaign-tenant matrix: (tenant, exact upstream URL set it must have,
 /// expected `force_build_roots` in the deployed gateway build-policy).
@@ -48,43 +48,45 @@ pub const TENANT_MATRIX: [(&str, &[&str], bool); 3] = [
 
 /// Namespace + ServiceAccount the campaign Jobs run under (created by
 /// xtask, not the chart). Must stay in sync with the chart's
-/// `parity.namespace` value and the `app.kubernetes.io/name: rio-parity`
+/// `replay.namespace` value and the `app.kubernetes.io/name: rio-replay`
 /// pod label — the chart's CiliumNetworkPolicies admit the engine only
-/// from that namespace+label pair — and with the parity IRSA trust
-/// binding to `rio-parity:rio-parity` (infra/eks/parity.tf).
-pub const NS_PARITY: &str = "rio-parity";
-pub const SA_PARITY: &str = "rio-parity";
+/// from that namespace+label pair — and with the replay IRSA trust
+/// binding to `rio-replay:rio-replay` (infra/eks/replay.tf).
+pub const NS_REPLAY: &str = "rio-replay";
+pub const SA_REPLAY: &str = "rio-replay";
 
-/// S3 prefix inside the chunk bucket; must match the parity IRSA policy
-/// (infra/eks/parity.tf, object actions scoped to `parity/*`) and the
+/// S3 prefix inside the chunk bucket; must match the replay IRSA policy
+/// (infra/eks/replay.tf, object actions scoped to `replay/*`) and the
 /// engine's layout — the eval CLI's default `--s3-prefix` and the
-/// campaign spec's default `parity/campaigns` artifact prefix both live
+/// campaign spec's default `replay/campaigns` artifact prefix both live
 /// under it.
-pub const S3_PREFIX: &str = "parity";
+pub const S3_PREFIX: &str = "replay";
 
 /// GC retention (hours) for the campaign tenants — 30 days, passed to
-/// `rio-cli create-tenant --gc-retention-hours` by `parity launch`.
+/// `rio-cli create-tenant --gc-retention-hours` by `replay launch`.
 pub const TENANT_RETENTION_HOURS: u32 = 720;
 
 #[derive(Args)]
-pub struct ParityArgs {
+pub struct ReplayArgs {
     #[command(subcommand)]
-    cmd: ParityCmd,
+    cmd: ReplayCmd,
 }
 
 #[derive(Subcommand)]
-enum ParityCmd {
-    /// Record (or reuse) a replay archive: apply the parity-eval Job for
-    /// one Hydra evaluation (publishes under `parity/archives/…` in S3).
-    Eval(eval::EvalArgs),
+enum ReplayCmd {
+    /// Create the evaluation-recorder Job (alias: eval): record (or
+    /// reuse) a replay archive for one Hydra evaluation (publishes under
+    /// `replay/archives/…` in S3).
+    #[command(alias = "eval")]
+    Record(eval::EvalArgs),
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
     /// and apply the campaign Job.
     ///
     /// Requires the chart to have been deployed with `cargo xtask k8s up
-    /// --deploy-parity`, and that requirement does not end at launch: any
+    /// --deploy-replay`, and that requirement does not end at launch: any
     /// redeploy while the campaign is running must also pass
-    /// --deploy-parity, because helm gets a full fresh value set on every
-    /// upgrade and omitting the flag reverts parity.enabled to false
+    /// --deploy-replay, because helm gets a full fresh value set on every
+    /// upgrade and omitting the flag reverts replay.enabled to false
     /// (dropping the engine's network admissions and the campaign
     /// tenants' build-policy defaults) and rolls the gateway. The
     /// launch-time pre-flight cannot protect against a redeploy that
@@ -118,15 +120,15 @@ enum ParityCmd {
     },
 }
 
-pub async fn run(args: ParityArgs) -> Result<()> {
+pub async fn run(args: ReplayArgs) -> Result<()> {
     match args.cmd {
-        ParityCmd::Eval(a) => eval::run(a).await,
-        ParityCmd::Launch(a) => launch::run(a).await,
-        ParityCmd::Status(a) => status::run(a).await,
-        ParityCmd::Report(a) => report::run(a).await,
-        ParityCmd::Repro { .. } => not_yet("repro"),
-        ParityCmd::Abort { .. } => not_yet("abort"),
-        ParityCmd::Cleanup { .. } => not_yet("cleanup"),
+        ReplayCmd::Record(a) => eval::run(a).await,
+        ReplayCmd::Launch(a) => launch::run(a).await,
+        ReplayCmd::Status(a) => status::run(a).await,
+        ReplayCmd::Report(a) => report::run(a).await,
+        ReplayCmd::Repro { .. } => not_yet("repro"),
+        ReplayCmd::Abort { .. } => not_yet("abort"),
+        ReplayCmd::Cleanup { .. } => not_yet("cleanup"),
     }
 }
 
@@ -134,7 +136,7 @@ pub async fn run(args: ParityArgs) -> Result<()> {
 /// surface documents the full campaign lifecycle from the start, but
 /// they fail loudly instead of pretending to work.
 fn not_yet(what: &str) -> Result<()> {
-    bail!("`cargo xtask parity {what}` is not yet implemented (planned for M2)")
+    bail!("`cargo xtask replay {what}` is not yet implemented (planned for M2)")
 }
 
 #[cfg(test)]
@@ -161,7 +163,7 @@ mod tests {
             ]
         );
         for t in &all {
-            assert!(t.starts_with("parity-"), "{t}");
+            assert!(t.starts_with("replay-"), "{t}");
         }
         assert_eq!(
             all.iter().collect::<std::collections::BTreeSet<_>>().len(),

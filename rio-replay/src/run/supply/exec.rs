@@ -2714,8 +2714,8 @@ mod tests {
         // component; traversal sequences, separators, and empty names must
         // never reach that join.
         assert_eq!(
-            tenant_key_path(std::path::Path::new("/etc/rio/parity-ssh"), "parity-warm").unwrap(),
-            std::path::PathBuf::from("/etc/rio/parity-ssh/parity-warm")
+            tenant_key_path(std::path::Path::new("/etc/rio/replay-ssh"), "replay-warm").unwrap(),
+            std::path::PathBuf::from("/etc/rio/replay-ssh/replay-warm")
         );
         for bad in ["../evil", "a/b", "", "warm tenant"] {
             let err = tenant_key_path(std::path::Path::new("/keys"), bad)

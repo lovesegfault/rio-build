@@ -60,7 +60,7 @@ pub struct FetchedArchive {
     pub marker: CompleteMarker,
 }
 
-/// S3 destination (bucket + deployment root prefix, e.g. "parity") for
+/// S3 destination (bucket + deployment root prefix, e.g. "replay") for
 /// replay archives.
 #[derive(Debug, Clone)]
 pub struct ArchiveStore {
@@ -69,7 +69,7 @@ pub struct ArchiveStore {
 }
 
 impl ArchiveStore {
-    /// Bucket + deployment root prefix (e.g. `parity`). Surrounding slashes
+    /// Bucket + deployment root prefix (e.g. `replay`). Surrounding slashes
     /// on the root are trimmed; an empty root puts the `archives/` tree at
     /// the bucket root.
     pub fn new(bucket: &str, root: &str) -> Self {
@@ -634,14 +634,14 @@ mod tests {
 
     #[test]
     fn keys_follow_the_archive_layout() {
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         assert_eq!(
             store.prefix("0123456789abcdef"),
-            "parity/archives/0123456789abcdef/"
+            "replay/archives/0123456789abcdef/"
         );
         assert_eq!(
             store.object_key("0123456789abcdef", ARCHIVE_COMPLETE_OBJECT),
-            "parity/archives/0123456789abcdef/complete.json"
+            "replay/archives/0123456789abcdef/complete.json"
         );
 
         // An empty root puts the archives tree at the bucket root without a
@@ -653,10 +653,10 @@ mod tests {
         );
 
         // Surrounding slashes on the root are normalized away.
-        let store = ArchiveStore::new("rio-chunks", "parity/");
+        let store = ArchiveStore::new("rio-chunks", "replay/");
         assert_eq!(
             store.prefix("0123456789abcdef"),
-            "parity/archives/0123456789abcdef/"
+            "replay/archives/0123456789abcdef/"
         );
     }
 
@@ -680,7 +680,7 @@ mod tests {
         ]
         .iter()
         .map(|&(object, ctype, conditional)| {
-            let key = format!("parity/archives/{short}/{object}");
+            let key = format!("replay/archives/{short}/{object}");
             mock!(aws_sdk_s3::Client::put_object)
                 .match_requests(move |req| {
                     let conditional_ok = if conditional {
@@ -699,7 +699,7 @@ mod tests {
         rules.extend(puts.iter());
         let client = mock_client!(aws_sdk_s3, RuleMode::Sequential, rules);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let marker = store
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
@@ -750,7 +750,7 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&head_200, &put]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
@@ -788,7 +788,7 @@ mod tests {
             &[&head_404, &put_data, &put_complete_412]
         );
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
@@ -819,7 +819,7 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&head, &put]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store
             .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
@@ -846,7 +846,7 @@ mod tests {
             .then_output(|| PutObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&head, &put]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store
             .publish(&client, &v0_image, &manifest_bytes, "rio-replay/test")
             .await
@@ -892,9 +892,9 @@ mod tests {
         };
         let marker_bytes = serde_json::to_vec(&marker).unwrap();
 
-        let complete_key = format!("parity/archives/{short}/complete.json");
-        let image_key = format!("parity/archives/{short}/archive.dwarfs");
-        let manifest_key = format!("parity/archives/{short}/manifest.json");
+        let complete_key = format!("replay/archives/{short}/complete.json");
+        let image_key = format!("replay/archives/{short}/archive.dwarfs");
+        let manifest_key = format!("replay/archives/{short}/manifest.json");
 
         let get_complete = get_rule(complete_key.clone(), marker_bytes.clone());
         let get_image = get_rule(image_key.clone(), image_bytes.clone());
@@ -905,7 +905,7 @@ mod tests {
             &[&get_complete, &get_image, &get_manifest]
         );
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let dest = dir.path().join("fetched");
         let fetched = store.fetch(&client, &short, &dest).await.unwrap();
         assert_eq!(fetched.image_path, dest.join(ARCHIVE_IMAGE_OBJECT));
@@ -975,7 +975,7 @@ mod tests {
             uploader: "rio-replay/test".to_string(),
         };
         let get_complete = get_rule(
-            format!("parity/archives/{short}/complete.json"),
+            format!("replay/archives/{short}/complete.json"),
             serde_json::to_vec(&marker).unwrap(),
         );
         // Catch-all for any other GET; the guard must keep it at zero calls.
@@ -983,7 +983,7 @@ mod tests {
             .then_output(|| GetObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_complete, &get_other]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let dir = tempfile::TempDir::new().unwrap();
         let err = store
             .fetch(&client, short, &dir.path().join("fetched"))
@@ -1011,14 +1011,14 @@ mod tests {
             uploader: "rio-replay/test".to_string(),
         };
         let get_complete = get_rule(
-            format!("parity/archives/{short}/complete.json"),
+            format!("replay/archives/{short}/complete.json"),
             serde_json::to_vec(&marker).unwrap(),
         );
         let get_other = mock!(aws_sdk_s3::Client::get_object)
             .then_output(|| GetObjectOutput::builder().build());
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&get_complete, &get_other]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let dir = tempfile::TempDir::new().unwrap();
         let err = store
             .fetch(&client, short, &dir.path().join("fetched"))
@@ -1053,40 +1053,40 @@ mod tests {
         // plus their data objects, and one incomplete prefix that has an
         // image but no complete.json yet.
         let list_page = mock!(aws_sdk_s3::Client::list_objects_v2)
-            .match_requests(|req| req.prefix() == Some("parity/archives/"))
+            .match_requests(|req| req.prefix() == Some("replay/archives/"))
             .then_output(move || {
                 ListObjectsV2Output::builder()
                     .contents(
                         Object::builder()
-                            .key(format!("parity/archives/{short_b}/complete.json"))
+                            .key(format!("replay/archives/{short_b}/complete.json"))
                             .build(),
                     )
                     .contents(
                         Object::builder()
-                            .key(format!("parity/archives/{short_b}/archive.dwarfs"))
+                            .key(format!("replay/archives/{short_b}/archive.dwarfs"))
                             .build(),
                     )
                     .contents(
                         Object::builder()
-                            .key(format!("parity/archives/{short_a}/complete.json"))
+                            .key(format!("replay/archives/{short_a}/complete.json"))
                             .build(),
                     )
                     .contents(
                         Object::builder()
-                            .key("parity/archives/cccccccccccccccc/archive.dwarfs")
+                            .key("replay/archives/cccccccccccccccc/archive.dwarfs")
                             .build(),
                     )
                     .build()
             });
-        let get_a = get_rule(format!("parity/archives/{short_a}/complete.json"), marker_a);
-        let get_b = get_rule(format!("parity/archives/{short_b}/complete.json"), marker_b);
+        let get_a = get_rule(format!("replay/archives/{short_a}/complete.json"), marker_a);
+        let get_b = get_rule(format!("replay/archives/{short_b}/complete.json"), marker_b);
         let client = mock_client!(
             aws_sdk_s3,
             RuleMode::MatchAny,
             &[&list_page, &get_a, &get_b]
         );
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let archives = store.list(&client).await.unwrap();
         assert_eq!(archives.len(), 2, "the incomplete prefix is invisible");
         assert_eq!(archives[0].0, short_a);
@@ -1111,23 +1111,23 @@ mod tests {
             uploader: "rio-replay/test".to_string(),
         };
         let list_page = mock!(aws_sdk_s3::Client::list_objects_v2)
-            .match_requests(|req| req.prefix() == Some("parity/archives/"))
+            .match_requests(|req| req.prefix() == Some("replay/archives/"))
             .then_output(move || {
                 ListObjectsV2Output::builder()
                     .contents(
                         Object::builder()
-                            .key(format!("parity/archives/{short}/complete.json"))
+                            .key(format!("replay/archives/{short}/complete.json"))
                             .build(),
                     )
                     .build()
             });
         let get_marker = get_rule(
-            format!("parity/archives/{short}/complete.json"),
+            format!("replay/archives/{short}/complete.json"),
             serde_json::to_vec(&marker).unwrap(),
         );
         let client = mock_client!(aws_sdk_s3, RuleMode::MatchAny, &[&list_page, &get_marker]);
 
-        let store = ArchiveStore::new("rio-chunks", "parity");
+        let store = ArchiveStore::new("rio-chunks", "replay");
         let err = store.list(&client).await.unwrap_err();
         assert!(format!("{err:#}").contains("lives under"), "got: {err:#}");
     }
