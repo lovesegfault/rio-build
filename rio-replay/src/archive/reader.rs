@@ -466,6 +466,26 @@ impl ReplayArchive {
         self.archive_id.as_deref().map(identity::short_id)
     }
 
+    /// The raw bytes of the archive's `manifest.json` member, exactly as
+    /// stored — re-read from the backend, never re-serialized from the
+    /// parsed [`Manifest`] (the archive id is defined over the stored
+    /// bytes, and a re-serialization would not be byte-identical).
+    /// Publishing an archive uploads exactly these bytes as the standalone
+    /// S3 manifest object next to the image.
+    ///
+    /// Errors for v0 archives: their manifest predates the v1 identity
+    /// contract, so they have no canonical manifest bytes to publish.
+    pub fn manifest_bytes(&self) -> Result<Vec<u8>> {
+        ensure!(
+            self.format == ArchiveFormat::V1,
+            "v0 archives have no content-addressed identity, so there are no canonical \
+             manifest bytes to expose; only v1 archives can be published"
+        );
+        self.backend.read_file(MANIFEST_MEMBER)?.ok_or_else(|| {
+            anyhow!("{MANIFEST_MEMBER} is no longer readable from an archive that was opened")
+        })
+    }
+
     /// Recorded requests, sorted by `offset_s` ascending, negative offsets
     /// clamped to 0, output lists normalized so `[]` becomes `["*"]`.
     pub fn requests(&self) -> &[RequestRecord] {
@@ -1202,6 +1222,10 @@ mod tests {
         assert_eq!(archive.format(), ArchiveFormat::V0);
         assert!(archive.archive_id().is_none());
         assert!(archive.archive_id_short().is_none());
+        // No identity ⇒ no canonical manifest bytes either: v0 archives
+        // cannot be published, and the refusal says so.
+        let err = format!("{:#}", archive.manifest_bytes().unwrap_err());
+        assert!(err.contains("v0"), "got: {err}");
 
         let manifest = archive.manifest();
         assert_eq!(

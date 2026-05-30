@@ -500,4 +500,21 @@ fn committed_fixture_round_trips_through_a_dwarfs_image() {
     assert_eq!(from_dir.outcomes().len(), from_image.outcomes().len());
     assert_eq!(from_dir.units().len(), from_image.units().len());
     assert_eq!(from_dir.closures().len(), from_image.closures().len());
+
+    // The raw manifest bytes exposed by the reader are the identity bytes:
+    // hashing them yields the archive id, in BOTH container forms. This is
+    // what publishing relies on — the standalone manifest.json uploaded next
+    // to the image must be byte-identical to the manifest member inside it.
+    assert_eq!(
+        identity::sha256_hex(&from_dir.manifest_bytes().unwrap()),
+        from_dir.archive_id().unwrap()
+    );
+    assert_eq!(
+        identity::sha256_hex(&from_image.manifest_bytes().unwrap()),
+        from_image.archive_id().unwrap()
+    );
+    assert_eq!(
+        from_dir.manifest_bytes().unwrap(),
+        from_image.manifest_bytes().unwrap()
+    );
 }
