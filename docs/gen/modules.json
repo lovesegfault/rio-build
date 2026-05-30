@@ -2186,6 +2186,11 @@
       "doc": "`cargo xtask replay report` — download the rendered campaign report"
     },
     {
+      "path": "replay/repro.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay repro` — engine-native single-unit re-run."
+    },
+    {
       "path": "replay/s3.rs",
       "depth": 1,
       "doc": "S3 layout + small read helpers for campaign artifacts."

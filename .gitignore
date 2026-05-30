@@ -71,5 +71,5 @@ mutants.out*/
 .stress-test/
 docs/dist/
 
-# `cargo xtask parity report` downloads campaign summaries here by default
-.parity-reports/
+# `cargo xtask replay report` downloads campaign summaries here by default
+.replay-reports/

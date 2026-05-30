@@ -12,6 +12,7 @@ use super::archive_input::{DepClosureEntry, ManifestEntry};
 use super::glob::glob_match;
 use super::grpc::StoreApi;
 use super::model::now_rfc3339;
+use super::report::FLAG_TENANT_UPSTREAMS_UNVERIFIED;
 use super::spec::{
     ArchivePin, CampaignSpec, Filters, Mode, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
     PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK, PlanOutput, WARM_TENANT,
@@ -247,7 +248,7 @@ pub fn check_tenants(spec: &CampaignSpec, allow_unverified: bool) -> Result<Vec<
                  Pass --allow-unverified-tenants to run anyway (flagged low-confidence)."
             );
         }
-        low_confidence.push("tenant-upstreams-unverified".to_string());
+        low_confidence.push(FLAG_TENANT_UPSTREAMS_UNVERIFIED.to_string());
     }
     Ok(low_confidence)
 }
@@ -636,7 +637,7 @@ mod tests {
         let err = run_plan(&spec, &archive, &store, false).await.unwrap_err();
         assert!(err.to_string().contains("upstreams_verified"), "{err}");
         let ok = run_plan(&spec, &archive, &store, true).await.unwrap();
-        assert_eq!(ok.low_confidence, vec!["tenant-upstreams-unverified"]);
+        assert_eq!(ok.low_confidence, vec![FLAG_TENANT_UPSTREAMS_UNVERIFIED]);
 
         // A spec pinning a different archive digest than the one opened is
         // refused; pinning the right digest (or none) plans normally.

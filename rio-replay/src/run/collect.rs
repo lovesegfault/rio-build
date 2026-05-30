@@ -356,6 +356,10 @@ pub fn failure_cause_for(rio: &RioOutcome) -> Option<String> {
 
 /// Assemble the final [`JobRecord`] for a terminal collect decision.
 ///
+/// `campaign_id` feeds the record's `repro` field — the engine-native
+/// single-unit re-run command ([`repro_command`]) is keyed by campaign id
+/// and drv path.
+///
 /// `log_tail` is the captured failure-log text (when any was fetched); it
 /// only feeds the failure-signature fallback, so failures whose Signal-1
 /// text was lost can still be grouped by their log evidence. The signature
@@ -372,7 +376,7 @@ pub fn build_record(
     poisoned: &HashMap<String, Vec<String>>,
     rio_paths: &HashMap<String, Option<(String, u64)>>,
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
     attempts: u32,
     log_key: Option<String>,
     first_active_at: Option<String>,
@@ -497,7 +501,7 @@ pub fn build_record(
             _ => signature_for(signal1.as_deref(), log_tail),
         },
         log_key,
-        repro: repro_command(store_url, &ctx.drv_path),
+        repro: repro_command(campaign_id, &ctx.drv_path),
         evidence,
         updated_at: now_rfc3339(),
     }
@@ -534,7 +538,7 @@ pub async fn process_settled_batch(
     prior_requeues: &HashMap<String, u32>,
     knobs: &Knobs,
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
     first_active: &HashMap<String, String>,
 ) -> Result<Vec<String>> {
     let mut requeue = Vec::new();
@@ -662,7 +666,7 @@ pub async fn process_settled_batch(
                             &poisoned,
                             &HashMap::new(),
                             mode,
-                            store_url,
+                            campaign_id,
                             prior + 1,
                             None,
                             first_active.get(job).cloned(),
@@ -757,7 +761,7 @@ pub async fn process_settled_batch(
                     &poisoned,
                     &rio_paths,
                     mode,
-                    store_url,
+                    campaign_id,
                     prior + 1,
                     log_key,
                     first_active.get(job).cloned(),
@@ -1449,19 +1453,8 @@ mod tests {
         let no_paths: HashMap<String, Option<(String, u64)>> = HashMap::new();
         let record = |batch: &BatchView, rio: &RioOutcome, target: Option<&PathOutcome>| {
             build_record(
-                &job_ctx,
-                rio,
-                None,
-                target,
-                batch,
-                &no_poison,
-                &no_paths,
-                "leaf",
-                "ssh-ng://x",
-                1,
-                None,
-                None,
-                None,
+                &job_ctx, rio, None, target, batch, &no_poison, &no_paths, "leaf", "c1", 1, None,
+                None, None,
             )
         };
 
@@ -1584,7 +1577,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1616,7 +1609,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1731,7 +1724,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://rio@gw:22?ssh-key=/k",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1756,7 +1749,7 @@ mod tests {
             ok.rio.outputs["out"].nar_hash.as_deref(),
             Some("ab".repeat(32).as_str())
         );
-        assert!(!ok.repro.contains("ssh-key"));
+        assert_eq!(ok.repro, format!("cargo xtask replay repro c1 {T}"));
         let bad = records
             .iter()
             .find(|r| r.job == "bad.x86_64-linux")
@@ -1790,7 +1783,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1826,7 +1819,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1881,7 +1874,7 @@ mod tests {
             &prior,
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1931,7 +1924,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -1975,7 +1968,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -2033,7 +2026,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await
@@ -2084,7 +2077,7 @@ mod tests {
             &HashMap::new(),
             &Knobs::default(),
             "leaf",
-            "ssh-ng://x",
+            "c1",
             &HashMap::new(),
         )
         .await

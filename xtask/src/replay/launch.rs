@@ -26,7 +26,8 @@ use clap::Args;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
 use rio_replay::run::spec::{
-    ArchiveRef, CampaignSpec, ClusterEndpoints, Filters, S3Target, TenantBlock,
+    ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, ReportBlock, ReportPolicy,
+    S3Target, TenantBlock,
 };
 
 use super::jobs::{self, EngineJobCommon};
@@ -82,6 +83,18 @@ pub struct LaunchArgs {
     /// engine is started with --allow-unverified-tenants).
     #[arg(long)]
     pub skip_preflight: bool,
+    /// Report policy applied at report time (repeatable; default: parity
+    /// alone). The regression-gate policy makes the engine write
+    /// report/gate.json, which `replay report --check` maps to its exit
+    /// code.
+    #[arg(long = "report-policy", value_enum, default_values_t = [ReportPolicyArg::Parity])]
+    pub report_policy: Vec<ReportPolicyArg>,
+    /// Regression-gate trip condition recorded in the spec. Requires
+    /// --report-policy regression-gate (the engine's spec validation
+    /// enforces it); never an engine exit-code knob — the gate is consumed
+    /// by `replay report --check`.
+    #[arg(long, value_enum, default_value_t = FailOnArg::None)]
+    pub fail_on: FailOnArg,
     /// RUST_LOG for the campaign pod.
     #[arg(long, default_value = "info,rio_replay=debug")]
     pub log_level: String,
@@ -120,6 +133,65 @@ impl std::fmt::Display for Mode {
     }
 }
 
+/// Report policy (CLI surface). Mirrors the engine's spec-level
+/// [`ReportPolicy`]; [`ReportPolicyArg::engine`] converts.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportPolicyArg {
+    Parity,
+    RegressionGate,
+}
+
+impl ReportPolicyArg {
+    /// The engine-side report policy this CLI value maps to.
+    pub fn engine(self) -> ReportPolicy {
+        match self {
+            ReportPolicyArg::Parity => ReportPolicy::Parity,
+            ReportPolicyArg::RegressionGate => ReportPolicy::RegressionGate,
+        }
+    }
+}
+
+impl std::fmt::Display for ReportPolicyArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Matches the clap ValueEnum rendering (`--report-policy parity`),
+        // which is also what clap prints for the default value in --help.
+        clap::ValueEnum::to_possible_value(self)
+            .expect("no skipped variants")
+            .get_name()
+            .fmt(f)
+    }
+}
+
+/// Regression-gate trip condition (CLI surface). Mirrors the engine's
+/// [`FailOn`]; [`FailOnArg::engine`] converts.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailOnArg {
+    None,
+    Regression,
+    Divergence,
+}
+
+impl FailOnArg {
+    /// The engine-side fail-on value this CLI value maps to.
+    pub fn engine(self) -> FailOn {
+        match self {
+            FailOnArg::None => FailOn::None,
+            FailOnArg::Regression => FailOn::Regression,
+            FailOnArg::Divergence => FailOn::Divergence,
+        }
+    }
+}
+
+impl std::fmt::Display for FailOnArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Matches the clap ValueEnum rendering (`--fail-on regression`).
+        clap::ValueEnum::to_possible_value(self)
+            .expect("no skipped variants")
+            .get_name()
+            .fmt(f)
+    }
+}
+
 /// Default campaign id: `replay-<mode>-<YYYYMMDD>-<4 hex>`. Lowercase
 /// RFC-1123 so it is a valid Job name.
 pub fn default_campaign_id(mode: Mode, now: jiff::Zoned, nonce: u16) -> String {
@@ -140,7 +212,8 @@ pub fn default_campaign_id(mode: Mode, now: jiff::Zoned, nonce: u16) -> String {
 /// (`<id>-spec`), and the S3 prefix segment — they must be lowercase
 /// RFC-1123 labels. The cap leaves room for the `-spec` suffix inside
 /// the same 63-char budget so every derived name stays label-safe.
-fn validate_campaign_id(id: &str) -> Result<()> {
+/// Shared with `replay repro`, whose derived ids face the same limits.
+pub(super) fn validate_campaign_id(id: &str) -> Result<()> {
     let max = 63 - jobs::spec_configmap_name("").len();
     let charset_ok = id
         .chars()
@@ -294,6 +367,13 @@ fn build_campaign_spec(
         filters: Filters {
             limit: a.limit,
             ..Filters::default()
+        },
+        // Report policies chosen at launch; the engine's spec validation
+        // (run below) rejects a fail-on condition without the
+        // regression-gate policy.
+        report: ReportBlock {
+            policies: a.report_policy.iter().map(|p| p.engine()).collect(),
+            fail_on: a.fail_on.engine(),
         },
         // Deployed image versions verified by the pre-flight, recorded
         // verbatim; None when --skip-preflight left them unverified.
@@ -704,8 +784,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 /// (its pod mounts the ConfigMap and re-reads it on container restart),
 /// or a leftover spec ConfigMap holds a different spec than this launch
 /// would apply. Pure so the refusal logic is unit-testable; the caller
-/// supplies the cluster facts.
-fn guard_existing_campaign(
+/// supplies the cluster facts. Shared with `replay repro`, which applies
+/// the same ConfigMap+Job pair.
+pub(super) fn guard_existing_campaign(
     campaign_id: &str,
     job_exists: bool,
     existing_spec: Option<&str>,
@@ -1073,6 +1154,8 @@ mod tests {
             allow_version_skew: false,
             restart_gateway: false,
             skip_preflight: false,
+            report_policy: vec![ReportPolicyArg::Parity],
+            fail_on: FailOnArg::None,
             log_level: "info".into(),
         }
     }
@@ -1304,6 +1387,91 @@ mod tests {
         assert_eq!(parsed.knobs.batch_max_jobs, 50);
         assert_eq!(parsed.knobs.batch_max_nodes, 4500);
         assert_eq!(parsed.deadline, None);
+        // Default report block: the parity policy alone, observational gate.
+        assert_eq!(parsed.report.policies, vec![ReportPolicy::Parity]);
+        assert_eq!(parsed.report.fail_on, FailOn::None);
+    }
+
+    #[test]
+    fn report_policy_flags_populate_the_spec_report_block() {
+        // --report-policy regression-gate --fail-on regression lands in
+        // spec.report with the engine's kebab-case wire strings, and the
+        // engine validation launch always runs accepts it.
+        let mut a = args(Mode::Leaf);
+        a.report_policy = vec![ReportPolicyArg::RegressionGate];
+        a.fail_on = FailOnArg::Regression;
+        let spec = build_campaign_spec(
+            &a,
+            "replay-leaf-20260601-ab12",
+            &archive_loc(),
+            "rio-build-chunks-deadbeef",
+            true,
+            HOST_KEY_PIN,
+            Some(&outcome()),
+        );
+        spec.validate().unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(v["report"]["policies"], json!(["regression-gate"]));
+        assert_eq!(v["report"]["fail_on"], json!("regression"));
+
+        // Both policies may be requested for one campaign (repeatable flag).
+        let mut a = args(Mode::Leaf);
+        a.report_policy = vec![ReportPolicyArg::Parity, ReportPolicyArg::RegressionGate];
+        a.fail_on = FailOnArg::Divergence;
+        let spec = build_campaign_spec(
+            &a,
+            "replay-leaf-20260601-ab12",
+            &archive_loc(),
+            "rio-build-chunks-deadbeef",
+            true,
+            HOST_KEY_PIN,
+            Some(&outcome()),
+        );
+        spec.validate().unwrap();
+        let v = serde_json::to_value(&spec).unwrap();
+        assert_eq!(
+            v["report"]["policies"],
+            json!(["parity", "regression-gate"])
+        );
+        assert_eq!(v["report"]["fail_on"], json!("divergence"));
+
+        // A fail-on condition without the regression-gate policy is refused
+        // by the engine's own spec validation, which launch runs before
+        // touching the cluster — no launch-side duplicate of that rule.
+        let mut a = args(Mode::Leaf);
+        a.fail_on = FailOnArg::Regression;
+        let spec = build_campaign_spec(
+            &a,
+            "replay-leaf-20260601-ab12",
+            &archive_loc(),
+            "rio-build-chunks-deadbeef",
+            true,
+            HOST_KEY_PIN,
+            Some(&outcome()),
+        );
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("regression-gate"), "{err}");
+
+        // The clap value names are the engine wire strings, so --help and
+        // the spec JSON can never disagree on the vocabulary.
+        for (arg, engine) in [
+            (ReportPolicyArg::Parity, ReportPolicy::Parity),
+            (
+                ReportPolicyArg::RegressionGate,
+                ReportPolicy::RegressionGate,
+            ),
+        ] {
+            assert_eq!(arg.to_string(), engine.as_str());
+            assert_eq!(arg.engine(), engine);
+        }
+        for (arg, engine) in [
+            (FailOnArg::None, FailOn::None),
+            (FailOnArg::Regression, FailOn::Regression),
+            (FailOnArg::Divergence, FailOn::Divergence),
+        ] {
+            assert_eq!(arg.to_string(), engine.as_str());
+            assert_eq!(arg.engine(), engine);
+        }
     }
 
     #[test]

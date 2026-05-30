@@ -800,6 +800,19 @@ mod tests {
     }
 
     #[test]
+    fn exclusions_recorded_is_none_for_an_exclusions_free_archive() {
+        // The timed mini archive stages no exclusions member at all: the
+        // recorder made no claim about exclusions, so the count is None (no
+        // completeness penalty applies) — distinct from Some(0), which would
+        // be a positive "nothing was excluded" claim.
+        let tmp = tempfile::tempdir().unwrap();
+        write_mini_timed_archive(tmp.path(), false);
+        let archive = ReplayArchive::open(tmp.path()).unwrap();
+        assert_eq!(exclusions_recorded(&archive), None);
+        assert!(exclusion_counts(&archive).is_empty());
+    }
+
+    #[test]
     fn identity_divergent_units_are_reported() {
         let tmp = tempfile::tempdir().unwrap();
         write_mini_archive(tmp.path());

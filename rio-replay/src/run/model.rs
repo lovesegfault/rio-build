@@ -485,6 +485,9 @@ pub struct JobRecord {
     pub flaky: bool,
     pub signature: Option<String>,
     pub log_key: Option<String>,
+    /// The engine-native single-unit re-run for this record
+    /// (`cargo xtask replay repro <campaign-id> <drv>`); empty for records
+    /// written before any attempt (plan-time exclusions, backfills).
     pub repro: String,
     /// Evidence quality flag, e.g. "log-tail-only".
     #[serde(default)]
@@ -1003,7 +1006,9 @@ mod tests {
             flaky: false,
             signature: None,
             log_key: None,
-            repro: "nix build ...".into(),
+            repro: "cargo xtask replay repro c1 \
+                    /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-hello-2.12.drv"
+                .into(),
             evidence: None,
             updated_at: "2026-05-26T00:00:00Z".into(),
         };

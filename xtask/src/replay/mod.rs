@@ -2,7 +2,7 @@
 //!
 //! The campaign engine itself is the in-cluster `rio-replay` Job; xtask
 //! only verifies prerequisites, provisions the campaign tenants/Secrets,
-//! applies the Jobs, and renders the S3 artifacts. The repro/abort/cleanup
+//! applies the Jobs, and renders the S3 artifacts. The abort/cleanup
 //! subcommands are stubs for a later milestone (M2) so `--help` documents
 //! the full campaign lifecycle.
 //!
@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod launch;
 pub mod preflight;
 pub mod report;
+pub mod repro;
 pub mod s3;
 pub mod status;
 
@@ -94,16 +95,14 @@ enum ReplayCmd {
     Launch(launch::LaunchArgs),
     /// Show campaign progress (progress.json from S3 + Job state).
     Status(status::StatusArgs),
-    /// Download the campaign report (summary.md, plus progress.json for
-    /// context) into a local directory and print the summary.
+    /// Download the campaign report (summary.md, plus progress.json and
+    /// gate.json for context) into a local directory and print the summary;
+    /// --check exits non-zero when the recorded regression gate tripped.
     Report(report::ReportArgs),
-    /// Print (or run) the recorded repro command for one job. M2.
-    Repro {
-        /// Campaign id.
-        campaign: String,
-        /// Job name (manifest `job` field).
-        job: String,
-    },
+    /// Re-run exactly one derivation of a finished campaign as a fresh
+    /// single-unit campaign — the engine-native invocation referenced by
+    /// the `repro` field of results.jsonl records.
+    Repro(repro::ReproArgs),
     /// Abort a running campaign (delete the Job, keep S3 state). M2.
     Abort {
         /// Campaign id.
@@ -126,15 +125,15 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         ReplayCmd::Launch(a) => launch::run(a).await,
         ReplayCmd::Status(a) => status::run(a).await,
         ReplayCmd::Report(a) => report::run(a).await,
-        ReplayCmd::Repro { .. } => not_yet("repro"),
+        ReplayCmd::Repro(a) => repro::run(a).await,
         ReplayCmd::Abort { .. } => not_yet("abort"),
         ReplayCmd::Cleanup { .. } => not_yet("cleanup"),
     }
 }
 
-/// The M2 subcommands (repro/abort/cleanup) ship as stubs so the CLI
-/// surface documents the full campaign lifecycle from the start, but
-/// they fail loudly instead of pretending to work.
+/// The M2 subcommands (abort/cleanup) ship as stubs so the CLI surface
+/// documents the full campaign lifecycle from the start, but they fail
+/// loudly instead of pretending to work.
 fn not_yet(what: &str) -> Result<()> {
     bail!("`cargo xtask replay {what}` is not yet implemented (planned for M2)")
 }
@@ -143,7 +142,7 @@ fn not_yet(what: &str) -> Result<()> {
 mod tests {
     #[test]
     fn m2_stubs_bail_with_milestone_hint() {
-        for cmd in ["repro", "abort", "cleanup"] {
+        for cmd in ["abort", "cleanup"] {
             let err = super::not_yet(cmd).unwrap_err().to_string();
             assert!(err.contains(cmd) && err.contains("M2"), "{err}");
         }

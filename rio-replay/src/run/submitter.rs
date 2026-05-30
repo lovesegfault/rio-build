@@ -319,26 +319,15 @@ impl Submitter for ClientOpsSubmitter {
     }
 }
 
-/// The per-job repro command recorded alongside each job result, so a human
-/// can re-drive exactly one derivation through the same gateway. The
-/// `ssh-key` query parameter is stripped from the store URL — secrets never
-/// land in campaign artifacts.
-pub fn repro_command(store_url: &str, drv_path: &str) -> String {
-    let sanitized: String = match store_url.split_once('?') {
-        Some((base, query)) => {
-            let kept: Vec<&str> = query
-                .split('&')
-                .filter(|kv| !kv.starts_with("ssh-key="))
-                .collect();
-            if kept.is_empty() {
-                base.to_string()
-            } else {
-                format!("{base}?{}", kept.join("&"))
-            }
-        }
-        None => store_url.to_string(),
-    };
-    format!("nix build -L --no-link --store '{sanitized}' '{drv_path}^*'")
+/// The per-job repro command recorded alongside each job result: the
+/// engine-native single-unit re-run (`cargo xtask replay repro`), which
+/// resolves the campaign's pinned archive and replays exactly the named
+/// derivation over the same transport and supply policy the campaign used.
+/// It needs no local archive copy, no local Nix store, and embeds no store
+/// URL — so no secret (such as an `ssh-key=` query parameter) can ever land
+/// in campaign artifacts through this field.
+pub fn repro_command(campaign_id: &str, drv_path: &str) -> String {
+    format!("cargo xtask replay repro {campaign_id} {drv_path}")
 }
 
 #[cfg(test)]
@@ -398,17 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn repro_command_strips_ssh_key() {
+    fn repro_command_is_the_engine_native_invocation() {
+        // The recorded repro is the operator-CLI single-unit re-run, keyed by
+        // campaign id + drv path; it never embeds the store URL, so secrets
+        // (ssh-key query parameters) cannot leak into campaign artifacts.
         let r = repro_command(
-            "ssh-ng://rio@rio-gateway.rio-system.svc:22?compress=true&ssh-key=/secrets/replay-leaf",
+            "replay-leaf-20260601-ab12",
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv",
         );
+        assert_eq!(
+            r,
+            "cargo xtask replay repro replay-leaf-20260601-ab12 \
+             /nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-libfoo-1.0.drv"
+        );
         assert!(!r.contains("ssh-key"), "{r}");
-        assert!(r.contains("compress=true"), "{r}");
-        assert!(r.ends_with("-libfoo-1.0.drv^*'"), "{r}");
-        // No query at all stays untouched.
-        let r2 = repro_command("ssh-ng://rio@host:22", "/nix/store/x.drv");
-        assert!(r2.contains("'ssh-ng://rio@host:22'"));
+        assert!(!r.contains("ssh-ng://"), "{r}");
     }
 
     /// Pin the [`test_support::FakeSubmitter`] scripting contract that the

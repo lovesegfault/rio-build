@@ -715,7 +715,7 @@ fn stall_record(
     ctx: &JobContext,
     signature: &str,
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
     attempts: u32,
 ) -> JobRecord {
     let rio_outcome = RioOutcome::TargetFailed {
@@ -749,7 +749,7 @@ fn stall_record(
         flaky: false,
         signature: Some(signature.to_string()),
         log_key: None,
-        repro: submitter::repro_command(store_url, &ctx.drv_path),
+        repro: submitter::repro_command(campaign_id, &ctx.drv_path),
         evidence: None,
         updated_at: now_rfc3339(),
     }
@@ -776,7 +776,7 @@ async fn apply_stall_actions(
     stall_retries: &mut HashMap<String, u32>,
     stalled: &[StallVerdict],
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
 ) -> Result<()> {
     for stall in stalled {
         match stall.kind {
@@ -814,7 +814,7 @@ async fn apply_stall_actions(
                         &stall.job,
                         "stalled-active",
                         mode,
-                        store_url,
+                        campaign_id,
                     )
                     .await?;
                     tracing::warn!(
@@ -834,7 +834,7 @@ async fn apply_stall_actions(
                     &stall.job,
                     "stalled-queued",
                     mode,
-                    store_url,
+                    campaign_id,
                 )
                 .await?;
                 tracing::warn!(
@@ -861,7 +861,7 @@ async fn write_terminal_stall(
     job: &str,
     signature: &str,
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
 ) -> Result<()> {
     let Some(ctx) = contexts.get(job) else {
         tracing::warn!(
@@ -872,7 +872,7 @@ async fn write_terminal_stall(
         return Ok(());
     };
     let attempts = tracker.resubmission_count(job).await;
-    let record = stall_record(ctx, signature, mode, store_url, attempts);
+    let record = stall_record(ctx, signature, mode, campaign_id, attempts);
     state.append_jsonl(StateFile::Results, &record)?;
     results.lock().await.insert(job.to_string(), record);
     watchdog.lock().await.remove_job(job);
@@ -1004,7 +1004,7 @@ pub async fn run_with_backends(
             })
         {
             replay_interruptions = false;
-            scheduling_low_confidence.push("replay-interruptions-disabled".to_string());
+            scheduling_low_confidence.push(report::FLAG_REPLAY_INTERRUPTIONS_DISABLED.to_string());
             tracing::warn!(
                 "the archive records no cancellations or client disconnects; interruption \
                  replay is disabled for this campaign and the report is flagged low-confidence"
@@ -1383,7 +1383,6 @@ pub async fn run_with_backends(
         let abort_recommended = abort_recommended.clone();
         let timing_degraded = timing_degraded.clone();
         let supply_for_progress = supply_summary.clone();
-        let store_url = spec.cluster.gateway_store_url.clone();
         let mut stop_rx = stop_rx.clone();
         tokio::spawn(async move {
             let mut sync_tracker = SyncTracker::default();
@@ -1529,7 +1528,7 @@ pub async fn run_with_backends(
                         &mut stall_retries,
                         &outcome.stalled,
                         &mode,
-                        &store_url,
+                        &campaign_id,
                     )
                     .await
                 {
@@ -1594,7 +1593,7 @@ pub async fn run_with_backends(
         let processed = processed.clone();
         let knobs = spec.knobs.clone();
         let mode = spec.mode.as_str().to_string();
-        let store_url = spec.cluster.gateway_store_url.clone();
+        let campaign_id = campaign_id.clone();
         let prefix = artifact_prefix.clone();
         let backends_collect = CollectBackends {
             admin: backends.admin.clone(),
@@ -1615,7 +1614,7 @@ pub async fn run_with_backends(
                         &mut processed_guard,
                         &knobs,
                         &mode,
-                        &store_url,
+                        &campaign_id,
                         Some(&prefix),
                     )
                     .await
@@ -1789,7 +1788,7 @@ pub async fn run_with_backends(
                     &mut processed_guard,
                     &spec.knobs,
                     spec.mode.as_str(),
-                    &spec.cluster.gateway_store_url,
+                    &campaign_id,
                     Some(&artifact_prefix),
                 )
                 .await?
@@ -1951,7 +1950,7 @@ async fn collect_pass_with(
     processed: &mut HashSet<u64>,
     knobs: &Knobs,
     mode: &str,
-    store_url: &str,
+    campaign_id: &str,
     artifact_prefix: Option<&str>,
 ) -> Result<usize> {
     let batches: Vec<model::BatchRecord> = state.load_jsonl(StateFile::Batches)?;
@@ -2008,7 +2007,7 @@ async fn collect_pass_with(
             &prior_requeues,
             knobs,
             mode,
-            store_url,
+            campaign_id,
             &first_active,
         )
         .await?;
@@ -2317,10 +2316,21 @@ mod tests {
             narinfo: Arc::new(MapNarinfo(narinfos.clone())),
             artifacts: None,
         };
+        // The campaign also requests the regression-gate report policy so
+        // this end-to-end run exercises gate.json: written to disk by the
+        // report stage and mirrored in progress.json.
+        let gated_spec = || {
+            let mut spec = leaf_spec(&archive_id);
+            spec.report
+                .policies
+                .push(spec::ReportPolicy::RegressionGate);
+            spec.report.fail_on = spec::FailOn::Regression;
+            spec
+        };
         let state = StateDir::new(state_dir.path()).unwrap();
         run_with_backends(
             run_args(state_dir.path()),
-            leaf_spec(&archive_id),
+            gated_spec(),
             state,
             archive.clone(),
             backends(),
@@ -2386,6 +2396,23 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
                 .unwrap();
         assert_eq!(progress["stage"], "done");
+        // Regression gate: persisted on disk as report/gate.json with the
+        // design's snake_case wire keys, and mirrored verbatim under
+        // progress.json's "gate" key. Nothing in this campaign belongs to
+        // the regression trip set, so the gate is untripped with no
+        // contributing counts.
+        let gate: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(state.path("report/gate.json")).unwrap())
+                .unwrap();
+        assert_eq!(gate["policy"], "regression-gate");
+        assert_eq!(gate["fail_on"], "regression");
+        assert_eq!(gate["tripped"], false);
+        assert_eq!(gate["counts"], serde_json::json!({}));
+        assert!(
+            gate.get("failOn").is_none(),
+            "gate.json keys are snake_case, never camelCase: {gate}"
+        );
+        assert_eq!(progress["gate"], gate);
         // campaign.json pins the archive and carries both exclusion
         // sources: the recorder-side exclusion counts from the archive and
         // the engine-side counts the comparability refresh re-derives from
@@ -2428,7 +2455,7 @@ mod tests {
         let state2 = StateDir::new(state_dir.path()).unwrap();
         run_with_backends(
             run_args(state_dir.path()),
-            leaf_spec(&archive_id),
+            gated_spec(),
             state2,
             archive.clone(),
             backends(),
@@ -2594,7 +2621,7 @@ mod tests {
             &mut processed,
             &Knobs::default(),
             "leaf",
-            "ssh-ng://test",
+            "c-timed",
             None,
         )
         .await
@@ -2837,7 +2864,7 @@ mod tests {
                 .comparability
                 .low_confidence
                 .iter()
-                .any(|flag| flag == "replay-interruptions-disabled"),
+                .any(|flag| flag == report::FLAG_REPLAY_INTERRUPTIONS_DISABLED),
             "{:?}",
             campaign.comparability.low_confidence
         );
@@ -3258,7 +3285,7 @@ mod tests {
             &mut stall_retries,
             &first.stalled,
             "leaf",
-            "ssh-ng://gw",
+            "c-stall",
         )
         .await
         .unwrap();
@@ -3300,7 +3327,7 @@ mod tests {
             &mut stall_retries,
             &second.stalled,
             "leaf",
-            "ssh-ng://gw",
+            "c-stall",
         )
         .await
         .unwrap();
@@ -3336,7 +3363,7 @@ mod tests {
             &mut stall_retries,
             &escalate,
             "leaf",
-            "ssh-ng://gw",
+            "c-stall",
         )
         .await
         .unwrap();

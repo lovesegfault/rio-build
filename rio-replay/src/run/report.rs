@@ -185,6 +185,15 @@ pub const FLAG_PREFETCH_SHORTFALL: &str = "prefetch-shortfall";
 /// Low-confidence flag: a timed run's recorded cadence was not honored
 /// (resume re-anchoring or a suspension window during timed execution).
 pub const FLAG_TIMING_DEGRADED: &str = "timing-degraded";
+/// Low-confidence flag (set at plan time): the campaign tenants' upstream
+/// sets were not verified by launch (`--skip-preflight` /
+/// `--allow-unverified-tenants`), so what the headline measured against is
+/// unconfirmed.
+pub const FLAG_TENANT_UPSTREAMS_UNVERIFIED: &str = "tenant-upstreams-unverified";
+/// Low-confidence flag (set at bootstrap): interruption replay was requested
+/// but the archive records no cancellations or client disconnects, so the
+/// knob was forced off for this campaign.
+pub const FLAG_REPLAY_INTERRUPTIONS_DISABLED: &str = "replay-interruptions-disabled";
 
 /// Derive the report-time low-confidence flags, in their fixed order:
 /// infra-indeterminate rate, no-truth rate, prefetch shortfall, timing
@@ -1383,7 +1392,7 @@ mod tests {
         );
         // A flag recorded at plan time must survive the refresh, after the
         // report-time derivations.
-        campaign.comparability.low_confidence = vec!["tenant-upstreams-unverified".to_string()];
+        campaign.comparability.low_confidence = vec![FLAG_TENANT_UPSTREAMS_UNVERIFIED.to_string()];
         // Three attempted records, one infra-indeterminate → 33% infra rate,
         // far above the 5% default threshold; the no-truth rate stays zero.
         let mut records = BTreeMap::new();
@@ -1405,7 +1414,10 @@ mod tests {
         );
         assert_eq!(
             block.low_confidence,
-            vec![FLAG_INFRA_INDETERMINATE_RATE, "tenant-upstreams-unverified"]
+            vec![
+                FLAG_INFRA_INDETERMINATE_RATE,
+                FLAG_TENANT_UPSTREAMS_UNVERIFIED
+            ]
         );
         // The supply report's shortfall and the timed stats' degradation are
         // copied into the block and flagged, keeping the fixed order.
@@ -1433,7 +1445,7 @@ mod tests {
                 FLAG_INFRA_INDETERMINATE_RATE,
                 FLAG_PREFETCH_SHORTFALL,
                 FLAG_TIMING_DEGRADED,
-                "tenant-upstreams-unverified",
+                FLAG_TENANT_UPSTREAMS_UNVERIFIED,
             ]
         );
         // Refreshing an already-refreshed block is idempotent: no duplicate
