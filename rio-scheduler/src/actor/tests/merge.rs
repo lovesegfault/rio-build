@@ -7660,3 +7660,88 @@ enum GcState {
     /// FindMissingPaths itself fails → fail-open, stays Completed.
     StoreUnreachable,
 }
+
+// ===========================================================================
+// Claims-floor fence on the merge transaction (sched.evidence.durability)
+// ===========================================================================
+
+/// The merge transaction (derivation upserts + build links + edges +
+/// Pending→Active activation, including the `topdown_pruned` stamps) is
+/// claims-floor fenced: a replica whose serving generation sits below
+/// the durable floor — a successor has claimed — must NOT commit it.
+/// The merge fails with `StaleGeneration` (mapped to gRPC
+/// FAILED_PRECONDITION so the client retries against the live leader)
+/// and leaves nothing behind: no derivation rows, no build links, no
+/// Active build.
+///
+/// This is the deposed-believer MergeDag window the as-built posture
+/// documented: leadership is checked at SubmitBuild enqueue time only,
+/// so a replica deposed after the enqueue still executes its merge
+/// transaction — racing the new leader's recovery — unless the
+/// transaction itself is fenced.
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn merge_from_deposed_generation_is_fenced() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // A successor has claimed generation 2. This actor's tenure stamp
+    // is 1 (the always-leader construction-time lease read).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (2, 'successor')",
+    )
+    .execute(&db.pool)
+    .await?;
+
+    // The deposed believer's merge must be fenced.
+    let build_id = Uuid::new_v4();
+    let reply =
+        merge_single_node(&handle, build_id, "fenced-merge", PriorityClass::Scheduled).await;
+    assert!(
+        matches!(
+            reply.as_ref().err().and_then(|e| e.downcast_ref()),
+            Some(ActorError::StaleGeneration {
+                serving: 1,
+                floor: 2
+            })
+        ),
+        "a merge from a deposed generation must fail with StaleGeneration, got {reply:?}"
+    );
+
+    // Nothing was committed: no derivation row, no build link, no
+    // Active build (the rejected merge's cleanup removes the Pending
+    // builds row it created before the transaction).
+    let drv_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM derivations WHERE drv_hash = 'fenced-merge'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        drv_count, 0,
+        "the fenced merge must leave zero derivation rows"
+    );
+    let link_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM build_derivations WHERE build_id = $1")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        link_count, 0,
+        "the fenced merge must leave zero build links"
+    );
+    let active_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM builds WHERE build_id = $1 AND status = 'active'")
+            .bind(build_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        active_count, 0,
+        "the fenced merge must not activate the build"
+    );
+
+    // The in-memory rollback also ran: the build is unknown to the actor.
+    let status_result = try_query_status(&handle, build_id).await?;
+    assert!(
+        matches!(status_result, Err(ActorError::BuildNotFound(_))),
+        "the fenced merge's build must be rolled back in memory, got {status_result:?}"
+    );
+    Ok(())
+}

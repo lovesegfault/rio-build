@@ -25,7 +25,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::MissingDbId { .. }
         | ActorError::StoreUnavailable
         | ActorError::PermissionDenied { .. }
-        | ActorError::NotLeader => {}
+        | ActorError::NotLeader
+        | ActorError::StaleGeneration { .. } => {}
     }
 }
 
@@ -75,6 +76,15 @@ fn test_actor_error_to_status_all_arms() {
             "permission denied",
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
+        (
+            // r[verify sched.evidence.durability]
+            ActorError::StaleGeneration {
+                serving: 1,
+                floor: 2,
+            },
+            Code::FailedPrecondition,
+            "below the durable claims floor",
+        ),
     ];
     // Count derived from the enum (strum::EnumCount), not a hardcoded
     // literal. The `_actor_error_exhaustive` pin only catches a missing

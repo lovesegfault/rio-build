@@ -968,6 +968,13 @@
     },
     {
       "enum": "ActorError",
+      "name": "StaleGeneration",
+      "crate": "rio-scheduler",
+      "msg": "merge fenced: serving generation {serving} is below the durable claims floor {floor} (a newer leader has claimed); retry against the current leader",
+      "doc": "The merge transaction's claims-floor fence rejected the write: this replica's serving generation sits below the durable floor (a successor has claimed), so committing the merge would let a deposed believer write evidence over the new tenure's. Maps to gRPC FAILED_PRECONDITION — the client retries against the live leader (whose own merge will succeed)."
+    },
+    {
+      "enum": "ActorError",
       "name": "StoreUnavailable",
       "crate": "rio-scheduler",
       "msg": "store service unavailable (cache-check circuit breaker open)",

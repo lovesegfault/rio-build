@@ -2008,6 +2008,28 @@ impl DagActor {
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
+        // r[impl sched.evidence.durability]
+        // Claims-floor fence for the whole merge transaction (stamps,
+        // links, edges, activation). Checked twice: once here at
+        // begin() — a cheap early abort so a large merge from a deposed
+        // believer never runs its multi-batch body — and once
+        // immediately before commit (the authoritative check; see the
+        // comment there). This is the deposed-believer MergeDag window:
+        // leadership is checked at SubmitBuild enqueue time only, so a
+        // replica deposed after the enqueue (or across this handler's
+        // awaits) still executes its merge transaction unless the
+        // transaction itself refuses to commit below the floor.
+        let serving_generation = self.serving_generation();
+        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
+        if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            self.note_fenced_evidence_write("merge transaction (begin-time check)");
+            return Err(ActorError::StaleGeneration {
+                serving: serving_generation,
+                floor: floor.unwrap_or(0),
+            });
+        }
+
         // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
@@ -2078,6 +2100,26 @@ impl DagActor {
                      in-mem mutation leaked into tx scope"
                 );
             }
+        }
+
+        // r[impl sched.evidence.durability]
+        // The AUTHORITATIVE claims-floor re-read, as the last statement
+        // before commit. Under READ COMMITTED a successor's claim
+        // INSERT can commit while the multi-batch tx body above runs
+        // (hundreds of ms to seconds on large merges), and the
+        // begin-time check would not see it — a begin-time-only fence
+        // leaves a window equal to the whole tx duration. Re-reading
+        // here narrows the residual to one floor-read-to-commit round
+        // trip; this is a window-narrowing fence, not a serializability
+        // proof.
+        let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
+        if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            self.note_fenced_evidence_write("merge transaction (commit-time check)");
+            return Err(ActorError::StaleGeneration {
+                serving: serving_generation,
+                floor: floor.unwrap_or(0),
+            });
         }
 
         tx.commit().await?;

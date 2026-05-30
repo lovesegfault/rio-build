@@ -722,6 +722,19 @@ pub enum ActorError {
     /// so BalancedChannel clients retry against the new leader.
     #[error("not leader (standby replica)")]
     NotLeader,
+
+    // r[impl sched.evidence.durability]
+    /// The merge transaction's claims-floor fence rejected the write:
+    /// this replica's serving generation sits below the durable floor
+    /// (a successor has claimed), so committing the merge would let a
+    /// deposed believer write evidence over the new tenure's. Maps to
+    /// gRPC FAILED_PRECONDITION — the client retries against the live
+    /// leader (whose own merge will succeed).
+    #[error(
+        "merge fenced: serving generation {serving} is below the durable claims floor {floor} \
+         (a newer leader has claimed); retry against the current leader"
+    )]
+    StaleGeneration { serving: i64, floor: i64 },
 }
 
 /// Read-only view of the actor's backpressure state.
