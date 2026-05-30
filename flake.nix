@@ -701,21 +701,25 @@
               # second eval of nix/quint.nix. checks.* still receives the
               # exact same attrset (same drvs), so the local gate is
               # unchanged.
-              quintChecks =
-                (import ./nix/quint.nix {
-                  inherit pkgs unfilteredRoot;
-                  inherit (pkgs) lib;
-                  # nextest reuse-build helpers plus the prebuilt rio-lease
-                  # and rio-store test binaries, for the mbt-rio-lease and
-                  # mbt-rio-logservice conformance checks (they run the
-                  # #[ignore]d mbt_* tests against the committed Quint
-                  # models with quint on PATH — same test binaries the
-                  # per-member nextest checks run, different filter and
-                  # environment).
-                  inherit (crateChecks) mkNextestRun mkNextestMeta;
-                  rioLeaseTestBin = crateChecks.testBins.rio-lease;
-                  rioStoreTestBin = crateChecks.testBins.rio-store;
-                }).checks;
+              # The full quint.nix import: `.checks` is merged into checks.*
+              # and the formal lane below; `.longChecks` names the [LONG]
+              # (Tier-2) checks the GHA formal matrix excludes — see the
+              # ciMatrix.formal comment.
+              quintImport = import ./nix/quint.nix {
+                inherit pkgs unfilteredRoot;
+                inherit (pkgs) lib;
+                # nextest reuse-build helpers plus the prebuilt rio-lease
+                # and rio-store test binaries, for the mbt-rio-lease and
+                # mbt-rio-logservice conformance checks (they run the
+                # #[ignore]d mbt_* tests against the committed Quint
+                # models with quint on PATH — same test binaries the
+                # per-member nextest checks run, different filter and
+                # environment).
+                inherit (crateChecks) mkNextestRun mkNextestMeta;
+                rioLeaseTestBin = crateChecks.testBins.rio-lease;
+                rioStoreTestBin = crateChecks.testBins.rio-store;
+              };
+              quintChecks = quintImport.checks;
 
               # --------------------------------------------------------------
               # Non-rustc check derivations (shared by checks.* and ci aggregate)
@@ -996,7 +1000,21 @@
                 # build IS the verification run, so the kind is fanned out
                 # into balanced shards by gen_matrix.py instead of being
                 # one cluster. See formalChecks above.
-                formal = formalChecks;
+                #
+                # [LONG] exclusion (closure-evidence Phase 1, owner
+                # decision 3 / adjudication OQ6): checks named in
+                # nix/quint.nix's `longChecks` are wired into checks.* —
+                # the LOCAL merge gate carries them under the raised
+                # 15–30-minute budget — but excluded from this matrix
+                # kind, because a 15–30-min-at-60-workers TLC check needs
+                # hours of pod wall-clock on the 4–16 vCPU rio-ci spot
+                # runners (over the 45-min job timeout even as a
+                # singleton shard). This is the cov-smoke runner-class
+                # precedent applied to the formal lane. They are absent
+                # from ciMatrix.checks too, because that kind subtracts
+                # formalChecks — the FULL intersection, [LONG] entries
+                # included.
+                formal = builtins.removeAttrs formalChecks quintImport.longChecks;
                 # 2min fuzz runs, one matrix entry per target. Keys are
                 # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
                 # entry rebuilds the shared fuzz-build derivation, but

@@ -236,6 +236,14 @@ let
       # calibration corpus exposed its pre-fix `calibStep`). null means
       # quint's default (`step`).
       step ? null,
+      # Pin the TLC worker count to the value the wiring measurement used
+      # (closure-evidence Phase-1 review finding MCI-6): an exhaustive
+      # check wired from a measured budget must run at the measurement's
+      # worker count or the budget is meaningless — TLC wall-clock does
+      # not scale linearly in workers, so "converges in N min at 60
+      # workers" says nothing about other widths. null (the default)
+      # keeps the pre-Phase-1 behavior: derive from NIX_BUILD_CORES.
+      workers ? null,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -271,7 +279,11 @@ let
         # hatch; everything else lives in the .qnt.
         workers="''${NIX_BUILD_CORES:-1}"
         [ "$workers" = "0" ] && workers='"auto"'
-        printf '{"workers": %s}\n' "$workers" > tlc-config.json
+        ${
+          lib.optionalString (workers != null) ''
+            workers=${toString workers}
+          ''
+        }printf '{"workers": %s}\n' "$workers" > tlc-config.json
 
         ${apalacheServerPrelude}
 
@@ -346,6 +358,8 @@ let
       # override modules (whose conversion request OOMs a 4 GiB server)
       # need more — see apalacheServerPreludeWithHeap.
       serverHeapMb ? 4096,
+      # Same semantics as mkQuintCheck's workers (MCI-6 pinning).
+      workers ? null,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -368,7 +382,11 @@ let
         # Same worker bound as mkQuintCheck (see its comment).
         workers="''${NIX_BUILD_CORES:-1}"
         [ "$workers" = "0" ] && workers='"auto"'
-        printf '{"workers": %s}\n' "$workers" > tlc-config.json
+        ${
+          lib.optionalString (workers != null) ''
+            workers=${toString workers}
+          ''
+        }printf '{"workers": %s}\n' "$workers" > tlc-config.json
 
         ${apalacheServerPreludeWithHeap serverHeapMb}
 
@@ -643,6 +661,33 @@ in
     mkQuintSimHoldsCheck
     mkQuintRunCheck
     ;
+
+  # [LONG] checks (Tier 2 of the closure-evidence Phase-1 three-tier
+  # wiring; owner decision 3 / adjudication OQ6): check names that are
+  # wired into checks.* — the LOCAL merge gate (`/nixbuild --checks`)
+  # carries them under the raised 15–30-minute budget — but are EXCLUDED
+  # from the GHA formal matrix (flake.nix removes them from
+  # ciMatrix.formal): a 15–30-min-at-60-workers TLC check needs hours of
+  # pod wall-clock on the 4–16 vCPU rio-ci spot runners, over the 45-min
+  # job timeout even as a singleton shard — the same runner-class
+  # rationale that keeps cov-smoke out of the GHA matrices. Every entry
+  # here MUST (a) exist in `checks` below, (b) pin `workers` to its
+  # qualifying measurement's count, and (c) name its Tier-1 GHA companion
+  # (the holdsInSim+pin pair covering the same property) in its comment.
+  #
+  # Track E knobs (FORMAL_SHARD_SIZE, --max-jobs, timeout-minutes, runner
+  # labels) are FROZEN for this campaign: per-check pod wall-clock is a
+  # constraint no shard knob fixes (sharding divides checks among jobs,
+  # it never shortens one check). Pressure to change them is
+  # stop-and-report, never a unilateral CI edit.
+  #
+  # Currently EMPTY: the Phase-1 Wave-4 measurement campaign (invariant
+  # map, Wave-4 stage record) found no exhaustive conjunction that
+  # converges within the 5–30-minute Tier-2 window at 60 workers — every
+  # candidate is either Tier 1 (none qualified) or a Tier-3 documented
+  # manual target. The mechanism is wired so a Phase-2 conjunction that
+  # does converge can be added here without touching flake.nix again.
+  longChecks = [ ];
 
   # Per-model checks. Imported by flake.nix as the quintChecks binding,
   # which merges them into checks.* and hands the same attrset to the
