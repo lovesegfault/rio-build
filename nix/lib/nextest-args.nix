@@ -140,6 +140,27 @@ in
       fileset = fs;
     }
   ) memberFilesets;
+  # Cross-member runtime fixtures: committed fixtures one member's
+  # tests read from ANOTHER member's tree at runtime, keyed by the
+  # consuming member → workspace-relative path → store path.
+  # mkNextestRun copies each into the consuming member's sandbox
+  # after its own overlay, mode-preserving (the archive fixture's
+  # run.sh carries an exec bit — same rule as memberRuntimeSrcs).
+  # Kept out of nextestRunSrc on purpose: editing a fixture here
+  # rebuilds only the consuming member's nextest run, not the SHARED
+  # cargoMetadataJson drv and every other member's run.
+  #
+  #   xtask — the dev dry-run test (xtask/src/replay/dev.rs) opens
+  #     rio-replay's committed archive fixture via
+  #     CARGO_MANIFEST_DIR/../rio-replay/tests/fixtures/archive/v1-basic.
+  crossMemberRuntimeSrcs = {
+    xtask = {
+      "rio-replay/tests/fixtures/archive" = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot + "/rio-replay/tests/fixtures/archive";
+        fileset = unfilteredRoot + "/rio-replay/tests/fixtures/archive";
+      };
+    };
+  };
   # Pass through the empty-target-file stub script so checks.nix's
   # cargoMetadataJson can pair it with nextestRunSrc. Defined in
   # nix/lib/filesets.nix alongside manifestsFileset (both are

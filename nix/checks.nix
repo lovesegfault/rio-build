@@ -75,6 +75,13 @@
   # content. Only the TARGET member's src is overlaid — other members
   # stay manifests-only.
   memberRuntimeSrcs ? { },
+  # Cross-member runtime fixtures (consuming member → workspace-
+  # relative path → store path): committed fixtures a member's tests
+  # read from ANOTHER member's tree at runtime, e.g. xtask's dev
+  # dry-run test opening rio-replay's archive fixture. Overlaid after
+  # the member's own source, mode-preserving for the same exec-bit
+  # reason (see nix/lib/nextest-args.nix).
+  crossMemberRuntimeSrcs ? { },
   # Drop workspace-hack from the per-member maps. flake.nix defines
   # the filter once and threads it here so checks.nix and the lcov
   # extract-pattern derivation share one definition.
@@ -791,12 +798,31 @@ let
             # target member's full src/. Other members stay manifests-
             # only so editing rio-cli/src/ doesn't invalidate
             # nextest-rio-scheduler.
+            #
+            # Cross-member fixtures this member's tests read at runtime
+            # (crossMemberRuntimeSrcs) are overlaid after the member's
+            # own source at their workspace-relative paths, also
+            # mode-preserving. The overlay is glued to the previous
+            # interpolation (no literal whitespace between them) so
+            # members WITHOUT cross-member fixtures keep a byte-identical
+            # buildCommand — and therefore a still-cached drv hash.
+            let
+              crossOverlays = lib.concatStrings (
+                lib.mapAttrsToList (relPath: src: ''
+                  mkdir -p "$(dirname "$ws/${relPath}")"
+                  rm -rf "$ws/${relPath}"
+                  cp -r ${src} "$ws/${relPath}"
+                '') (crossMemberRuntimeSrcs.${member} or { })
+              );
+            in
             ''
               cp -r --no-preserve=mode ${nextestRunSrc} $ws
-              ${lib.optionalString (memberRuntimeSrcs ? ${member}) ''
-                rm -rf $ws/${member}
-                cp -r ${memberRuntimeSrcs.${member}} $ws/${member}
-              ''}
+              ${
+                lib.optionalString (memberRuntimeSrcs ? ${member}) ''
+                  rm -rf $ws/${member}
+                  cp -r ${memberRuntimeSrcs.${member}} $ws/${member}
+                ''
+              }${crossOverlays}
             ''
         }
         # Store-path copies arrive read-only; nextest and the tests
