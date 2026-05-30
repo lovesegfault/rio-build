@@ -1,13 +1,12 @@
-//! Shared campaign data model: per-job records (results.jsonl),
-//! hydra-truth cache entries, warm dispositions, per-path supply
-//! outcomes (supply.jsonl), timed dispatch records (dispatch.jsonl),
+//! Shared campaign data model: per-job records (results.jsonl), per-path
+//! supply outcomes (supply.jsonl), timed dispatch records (dispatch.jsonl),
 //! batch records, and the engine's pause state. Wire field names are
 //! camelCase, matching the rest of the campaign artifacts.
 //!
 //! Convention: the stringly-typed `verdict`/`disposition`/`outcome` fields
 //! in the JSONL record structs stay `String` on the wire, but they MUST be
 //! written via the corresponding enums ([`Verdict::as_str`] /
-//! [`Disposition::as_str`], [`HydraOutcome`] / [`RioOutcome`] serde forms)
+//! [`Disposition::as_str`], [`ExpectedOutcome`] / [`RioOutcome`] serde forms)
 //! — never hand-typed literals — so the record values can never drift from
 //! the enum vocabulary.
 
@@ -27,27 +26,11 @@ pub fn rfc3339_to_unix(ts: &str) -> Option<i64> {
     ts.parse::<jiff::Timestamp>().ok().map(|t| t.as_second())
 }
 
-/// Hydra-side outcome for one job (derived from cache.nixos.org narinfo
-/// presence, plus exact buildstatus for scoped campaigns).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum HydraOutcome {
-    Built,
-    Failed,
-    Unknown,
-}
-
-impl HydraOutcome {
-    /// The [`HydraSide::outcome`] wire string — the same kebab-case name
-    /// this enum's serde form uses, so record writers never hand-type it.
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            HydraOutcome::Built => "built",
-            HydraOutcome::Failed => "failed",
-            HydraOutcome::Unknown => "unknown",
-        }
-    }
-}
+/// Expected outcome of one workload unit, as recorded in the replay
+/// archive's neutral vocabulary (re-exported from the archive schema so the
+/// classifier, the truth loader, and the record writers all share one type).
+/// [`ExpectedSide::outcome`] carries its `as_str`/serde wire form.
+pub use crate::archive::schema::ExpectedOutcome;
 
 /// Rio-side outcome for one job after collect (input to the bucket
 /// classifier).
@@ -440,23 +423,26 @@ pub struct RioSide {
     pub outputs: BTreeMap<String, RioOutput>,
 }
 
-/// One Hydra-published output path with its NAR identity.
+/// Expected NAR identity of one output, taken from the archive's recorded
+/// truth. `narinfo_present` is false when the recorder captured no hash for
+/// the output — the output is then merely not comparable.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct HydraOutput {
+pub struct ExpectedOutput {
     pub narinfo_present: bool,
     pub nar_hash: Option<String>,
     pub nar_size: Option<u64>,
 }
 
-/// Everything observed on the Hydra side for one job.
+/// The expected (recorded-truth) side of one job record: the unit's
+/// expected outcome plus the expected per-output NAR identities.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
-pub struct HydraSide {
-    /// "built" | "failed" | "unknown"
+pub struct ExpectedSide {
+    /// The [`ExpectedOutcome`] wire string (kebab-case, written via
+    /// `as_str` — never hand-typed).
     pub outcome: String,
-    pub buildstatus: Option<i64>,
-    pub outputs: BTreeMap<String, HydraOutput>,
+    pub outputs: BTreeMap<String, ExpectedOutput>,
 }
 
 /// One line of results.jsonl. Append-only: the LAST record per job wins
@@ -471,7 +457,7 @@ pub struct JobRecord {
     pub attempts: u32,
     pub build_ids: Vec<String>,
     pub rio: RioSide,
-    pub hydra: HydraSide,
+    pub expected: ExpectedSide,
     /// Per-output NAR comparison verdict: "equal" | "differs" | "not-comparable".
     pub nar_compare: BTreeMap<String, String>,
     /// Final comparison verdict for an attempted-and-compared unit, written
@@ -536,18 +522,6 @@ pub fn is_terminal_class(verdict: &Option<String>, disposition: &Option<String>)
     disposition
         .as_deref()
         .is_some_and(|d| d != Disposition::NotAttempted.as_str())
-}
-
-/// One line of hydra.jsonl — raw narinfo fetch cache keyed by output path.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct HydraEntry {
-    pub path: String,
-    pub found: bool,
-    pub nar_hash: Option<String>,
-    pub nar_size: Option<u64>,
-    pub deriver: Option<String>,
-    pub fetched_at: String,
 }
 
 /// [`SupplyEntry::source`] value for an output of a workload unit — never
@@ -793,17 +767,6 @@ mod tests {
 
     #[test]
     fn outcome_strings_match_their_serde_forms() {
-        for hydra in [
-            HydraOutcome::Built,
-            HydraOutcome::Failed,
-            HydraOutcome::Unknown,
-        ] {
-            assert_eq!(
-                serde_json::to_string(&hydra).unwrap(),
-                format!("\"{}\"", hydra.as_str()),
-                "{hydra:?}"
-            );
-        }
         for (rio, expected) in [
             (RioOutcome::NotAttempted, "not-attempted"),
             (RioOutcome::Built { executed: true }, "built"),
@@ -1028,9 +991,9 @@ mod tests {
                 outcome: "built".into(),
                 ..RioSide::default()
             },
-            hydra: HydraSide {
+            expected: ExpectedSide {
                 outcome: "built".into(),
-                ..HydraSide::default()
+                ..ExpectedSide::default()
             },
             nar_compare: BTreeMap::new(),
             verdict: Some(Verdict::MatchBuilt.as_str().into()),
@@ -1051,6 +1014,13 @@ mod tests {
         assert!(json.contains("\"verdict\":\"match-built\""), "{json}");
         assert!(!json.contains("\"bucket\""), "{json}");
         assert!(!json.contains("\"drv_path\""), "{json}");
+        // The recorded-truth side is keyed `expected` (the legacy `hydra`
+        // key is gone with the truth-source-neutral rename).
+        assert!(
+            json.contains("\"expected\":{\"outcome\":\"built\""),
+            "{json}"
+        );
+        assert!(!json.contains("\"hydra\""), "{json}");
         // Exactly one of verdict/disposition is set, so the unset side (and
         // the absent failure cause) never appear on the wire.
         assert!(!json.contains("\"disposition\""), "{json}");

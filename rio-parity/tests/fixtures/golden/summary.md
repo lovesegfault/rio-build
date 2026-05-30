@@ -64,4 +64,4 @@ Signatures group byte-identical raw evidence (60-character message slugs); the s
 (not recorded)
 
 ## Artifacts
-- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<verdict-or-disposition>.jsonl, report/gate.json (when a regression gate was requested), logs/<job>.log.zst next to this file
+- results.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<verdict-or-disposition>.jsonl, report/gate.json (when a regression gate was requested), logs/<job>.log.zst next to this file

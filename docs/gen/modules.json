@@ -888,7 +888,7 @@
     {
       "path": "run/classify.rs",
       "depth": 1,
-      "doc": "The classifier: ONE pure function over (Hydra outcome × rio outcome ×"
+      "doc": "The classifier: ONE pure function over (expected outcome × rio outcome ×"
     },
     {
       "path": "run/collect.rs",
@@ -911,14 +911,9 @@
       "doc": "Thin trait facades over the rio gRPC surfaces the engine reads, so every"
     },
     {
-      "path": "run/hydra_truth.rs",
-      "depth": 1,
-      "doc": "Per-unit expected-outcome truth for the campaign, plus the upstream"
-    },
-    {
       "path": "run/model.rs",
       "depth": 1,
-      "doc": "Shared campaign data model: per-job records (results.jsonl),"
+      "doc": "Shared campaign data model: per-job records (results.jsonl), per-path"
     },
     {
       "path": "run/plan.rs",
@@ -979,6 +974,11 @@
       "path": "run/transport.rs",
       "depth": 1,
       "doc": "In-process SSH transport for the gateway's nix-daemon worker protocol."
+    },
+    {
+      "path": "run/truth.rs",
+      "depth": 1,
+      "doc": "Per-unit expected-outcome truth for the campaign, plus the upstream"
     },
     {
       "path": "run/watchdog.rs",

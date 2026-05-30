@@ -155,7 +155,6 @@ const SYNCED_FILES: &[&str] = &[
     "campaign.json",
     "progress.json",
     "results.jsonl",
-    "hydra.jsonl",
     "supply.jsonl",
     "dispatch.jsonl",
     "batches.jsonl",
@@ -163,7 +162,6 @@ const SYNCED_FILES: &[&str] = &[
     "timed-stats.json",
     "report/summary.md",
     "markers/plan.done",
-    "markers/hydra-truth.done",
     "markers/supply.done",
     "markers/report.done",
 ];
@@ -302,7 +300,7 @@ pub fn file_name_of(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{Disposition, HydraSide, JobRecord, RioSide};
+    use crate::run::model::{Disposition, ExpectedSide, JobRecord, RioSide};
 
     fn rec(job: &str) -> JobRecord {
         JobRecord {
@@ -313,7 +311,7 @@ mod tests {
             attempts: 0,
             build_ids: vec![],
             rio: RioSide::default(),
-            hydra: HydraSide::default(),
+            expected: ExpectedSide::default(),
             nar_compare: Default::default(),
             verdict: None,
             disposition: Some(Disposition::NotAttempted.as_str().into()),
@@ -454,7 +452,7 @@ mod tests {
             .write_bytes("buckets/match-built.jsonl", b"{}\n")
             .unwrap();
         state.set_marker("plan").unwrap();
-        state.set_marker("hydra-truth").unwrap();
+        state.set_marker("supply").unwrap();
 
         let n = sync_state(&state, &store, "parity/campaigns", "c1", &mut tracker)
             .await

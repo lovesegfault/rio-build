@@ -525,7 +525,7 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let _ = writeln!(out, "\n## Artifacts");
     let _ = writeln!(
         out,
-        "- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, \
+        "- results.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, \
          buckets/<verdict-or-disposition>.jsonl, report/gate.json (when a regression gate was \
          requested), logs/<job>.log.zst next to this file"
     );
@@ -665,7 +665,7 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{HydraSide, RioSide, UnifiedClass};
+    use crate::run::model::{ExpectedSide, RioSide, UnifiedClass};
 
     fn v(verdict: Verdict) -> UnifiedClass {
         UnifiedClass::Verdict(verdict)
@@ -689,7 +689,7 @@ mod tests {
             attempts,
             build_ids: vec![],
             rio: RioSide::default(),
-            hydra: HydraSide::default(),
+            expected: ExpectedSide::default(),
             nar_compare: BTreeMap::new(),
             verdict: class.verdict().map(|v| v.as_str().into()),
             disposition: class.disposition().map(|d| d.as_str().into()),
@@ -705,7 +705,7 @@ mod tests {
     }
 
     #[test]
-    fn aggregate_counts_buckets_signatures_and_rates() {
+    fn aggregate_counts_classes_signatures_and_rates() {
         let mut records = BTreeMap::new();
         for (i, class) in [
             v(Verdict::MatchBuilt),

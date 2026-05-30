@@ -30,8 +30,8 @@ use super::classify::{
 };
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
-    BATCH_KIND_TIMED, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome, RioOutcome,
-    RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
+    BATCH_KIND_TIMED, ExpectedOutcome, ExpectedSide, FailureKind, JobRecord, PathOutcome,
+    RioOutcome, RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
 };
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
@@ -50,9 +50,8 @@ pub struct JobContext {
     /// Dependency drv closure (from the archive's closure records) — used for the
     /// fail-fast re-attribution rule.
     pub dep_drvs: HashSet<String>,
-    pub hydra_outcome: HydraOutcome,
-    pub hydra_outputs: BTreeMap<String, super::model::HydraOutput>,
-    pub hydra_buildstatus: Option<i64>,
+    pub expected_outcome: ExpectedOutcome,
+    pub expected_outputs: BTreeMap<String, super::model::ExpectedOutput>,
     pub plan_not_attemptable: bool,
     pub plan_snapshot_valid: bool,
 }
@@ -130,9 +129,9 @@ pub fn resolve_failure_kind(
             Some([]) => (FailureKind::Infra, None),
             Some(_) => (FailureKind::Genuine, None),
             // Signal 1 lost AND Signal 2 decayed (the failure outlived the
-            // scheduler's poison-evidence TTL, mirrored by
-            // `knobs.evidence_ttl_hours`): only the log tail is left, so the
-            // record carries the "log-tail-only" evidence-quality flag.
+            // scheduler's poison-evidence TTL): only the log tail is left,
+            // so the record carries the "log-tail-only" evidence-quality
+            // flag.
             None => (FailureKind::Genuine, Some("log-tail-only".to_string())),
         },
     }
@@ -393,7 +392,7 @@ pub fn build_record(
         resolve_unknown_divergent: None,
         timed_interruption: timed_interruption_for(batch, &ctx.drv_path, in_band_success),
     };
-    let classification = classify(&ctx.hydra_outcome, rio_outcome, &aux);
+    let classification = classify(&ctx.expected_outcome, rio_outcome, &aux);
     let reason = batch.reasons.get(&ctx.drv_path).cloned();
     let signal1 = target
         .map(|t| t.error_msg.clone())
@@ -413,12 +412,15 @@ pub fn build_record(
             },
         );
         if classification.class == UnifiedClass::Verdict(Verdict::MatchBuilt) {
-            let hydra_hash = ctx.hydra_outputs.get(name).and_then(|h| h.nar_hash.clone());
+            let expected_hash = ctx
+                .expected_outputs
+                .get(name)
+                .and_then(|h| h.nar_hash.clone());
             nar_compare.insert(
                 name.clone(),
                 compare_output(&OutputHashes {
                     rio_hex: rio_info.as_ref().map(|(h, _)| h.clone()),
-                    hydra_narhash: hydra_hash,
+                    expected_narhash: expected_hash,
                 })
                 .to_string(),
             );
@@ -454,10 +456,9 @@ pub fn build_record(
             Some(Verdict::MatchBuilt | Verdict::OutputDivergence)
         );
 
-    let hydra_side = HydraSide {
-        outcome: ctx.hydra_outcome.as_str().to_string(),
-        buildstatus: ctx.hydra_buildstatus,
-        outputs: ctx.hydra_outputs.clone(),
+    let expected_side = ExpectedSide {
+        outcome: ctx.expected_outcome.as_str().to_string(),
+        outputs: ctx.expected_outputs.clone(),
     };
     let rio_side = RioSide {
         outcome: rio_outcome.outcome_str().to_string(),
@@ -484,7 +485,7 @@ pub fn build_record(
         attempts,
         build_ids: batch.build_id.clone().into_iter().collect(),
         rio: rio_side,
-        hydra: hydra_side,
+        expected: expected_side,
         nar_compare,
         verdict: verdict.map(|v| v.as_str().to_string()),
         disposition: disposition.map(|d| d.as_str().to_string()),
@@ -607,9 +608,9 @@ pub async fn process_settled_batch(
         // Evidence-age gate: when a failed root carries neither an in-band
         // error message nor a relayed reason (Signal 1) and has no
         // ListPoisoned entry (Signal 2 — the scheduler's poison rows decay
-        // with its evidence TTL, mirrored by `knobs.evidence_ttl_hours`),
-        // fetch the log tail as the third signal; the record then carries
-        // the "log-tail-only" evidence flag from [`resolve_failure_kind`].
+        // with its evidence TTL), fetch the log tail as the third signal;
+        // the record then carries the "log-tail-only" evidence flag from
+        // [`resolve_failure_kind`].
         let target_status = target.and_then(|t| build_status_from_name(&t.status));
         let target_is_failure = target.is_some() && !target_status.is_some_and(|s| s.is_success());
         let needs_log_signal = target_is_failure
@@ -778,7 +779,7 @@ mod tests {
     use crate::run::model::{BATCH_KIND_SUBMIT, Disposition, build_status_name};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    fn ctx(job: &str, drv: &str, deps: &[&str], hydra: HydraOutcome) -> JobContext {
+    fn ctx(job: &str, drv: &str, deps: &[&str], expected: ExpectedOutcome) -> JobContext {
         JobContext {
             job: job.to_string(),
             system: "x86_64-linux".into(),
@@ -788,9 +789,8 @@ mod tests {
                 format!("{}-out", drv.trim_end_matches(".drv")),
             )]),
             dep_drvs: deps.iter().map(|s| s.to_string()).collect(),
-            hydra_outcome: hydra,
-            hydra_outputs: BTreeMap::new(),
-            hydra_buildstatus: None,
+            expected_outcome: expected,
+            expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
         }
@@ -960,7 +960,7 @@ mod tests {
     #[test]
     fn decide_covers_in_band_status_matrix() {
         let knobs = Knobs::default();
-        let c = ctx("app.x86_64-linux", T, &[DEP], HydraOutcome::Built);
+        let c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
         let batch = BatchView::default();
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
 
@@ -1165,7 +1165,7 @@ mod tests {
     #[test]
     fn signal1_prefers_error_msg_then_relayed_reason() {
         let knobs = Knobs::default();
-        let c = ctx("app.x86_64-linux", T, &[], HydraOutcome::Built);
+        let c = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
         let poisoned: HashMap<String, Vec<String>> = HashMap::from([(T.to_string(), vec![])]);
         let batch = BatchView {
             reasons: BTreeMap::from([(
@@ -1218,7 +1218,7 @@ mod tests {
     #[test]
     fn dependency_failed_reattribution_via_closure_membership() {
         let knobs = Knobs::default();
-        let c = ctx("app.x86_64-linux", T, &[DEP], HydraOutcome::Built);
+        let c = ctx("app.x86_64-linux", T, &[DEP], ExpectedOutcome::Built);
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
 
         // Trigger in the closure (named by the in-band error message), with
@@ -1370,9 +1370,9 @@ mod tests {
     #[test]
     fn mixed_multi_root_batch_classifies_each_root_independently() {
         let knobs = Knobs::default();
-        let job1 = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
-        let job2 = ctx("infra.x86_64-linux", DEP, &[], HydraOutcome::Built);
-        let job3 = ctx("missing.x86_64-linux", OTHER, &[], HydraOutcome::Built);
+        let job1 = ctx("ok.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        let job2 = ctx("infra.x86_64-linux", DEP, &[], ExpectedOutcome::Built);
+        let job3 = ctx("missing.x86_64-linux", OTHER, &[], ExpectedOutcome::Built);
         let batch = BatchView {
             build_id: Some("0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a".into()),
             results: vec![
@@ -1444,7 +1444,7 @@ mod tests {
     /// drives the verdict through the AuxFlags built in [`build_record`].
     #[test]
     fn timed_interruption_flag_derivation() {
-        let job_ctx = ctx("app.x86_64-linux", T, &[], HydraOutcome::Built);
+        let job_ctx = ctx("app.x86_64-linux", T, &[], ExpectedOutcome::Built);
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
         let no_paths: HashMap<String, Option<(String, u64)>> = HashMap::new();
         let record = |batch: &BatchView, rio: &RioOutcome, target: Option<&PathOutcome>| {
@@ -1557,11 +1557,11 @@ mod tests {
         let contexts: HashMap<String, JobContext> = [
             (
                 "armed.x86_64-linux".to_string(),
-                ctx("armed.x86_64-linux", T, &[], HydraOutcome::Built),
+                ctx("armed.x86_64-linux", T, &[], ExpectedOutcome::Built),
             ),
             (
                 "mate.x86_64-linux".to_string(),
-                ctx("mate.x86_64-linux", DEP, &[], HydraOutcome::Built),
+                ctx("mate.x86_64-linux", DEP, &[], ExpectedOutcome::Built),
             ),
         ]
         .into();
@@ -1639,8 +1639,8 @@ mod tests {
         };
         let no_poison: HashMap<String, Vec<String>> = HashMap::new();
         for (job, prior_requeues) in [
-            (ctx("a.x86_64-linux", T, &[], HydraOutcome::Built), 0),
-            (ctx("b.x86_64-linux", DEP, &[], HydraOutcome::Built), 5),
+            (ctx("a.x86_64-linux", T, &[], ExpectedOutcome::Built), 0),
+            (ctx("b.x86_64-linux", DEP, &[], ExpectedOutcome::Built), 5),
         ] {
             assert_eq!(
                 decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None),
@@ -1661,9 +1661,9 @@ mod tests {
         let state = StateDir::new(dir.path()).unwrap();
         let build_id = "0193e4a2-7c1b-7d20-9b3a-1f2e3d4c5b6a";
 
-        let ok_job = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
-        let bad_job = ctx("bad.x86_64-linux", DEP, &[], HydraOutcome::Built);
-        let mate_job = ctx("mate.x86_64-linux", OTHER, &[], HydraOutcome::Built);
+        let ok_job = ctx("ok.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        let bad_job = ctx("bad.x86_64-linux", DEP, &[], ExpectedOutcome::Built);
+        let mate_job = ctx("mate.x86_64-linux", OTHER, &[], ExpectedOutcome::Built);
 
         let mut store = FakeStoreApi::default();
         store
@@ -1807,7 +1807,7 @@ mod tests {
         let admin = LogAdmin::default();
         let contexts: HashMap<String, JobContext> = [(
             "ok.x86_64-linux".to_string(),
-            ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built),
+            ctx("ok.x86_64-linux", T, &[], ExpectedOutcome::Built),
         )]
         .into();
         let batch = BatchView {
@@ -1855,7 +1855,7 @@ mod tests {
         };
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
-            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+            ctx("bad.x86_64-linux", T, &[], ExpectedOutcome::Built),
         )]
         .into();
         let batch = BatchView {
@@ -1904,10 +1904,10 @@ mod tests {
         let state = StateDir::new(dir.path()).unwrap();
         let store = FakeStoreApi::default();
         store.fail_with("BatchQueryPathInfo: store unavailable");
-        let mut ok_job = ctx("ok.x86_64-linux", T, &[], HydraOutcome::Built);
-        ok_job.hydra_outputs.insert(
+        let mut ok_job = ctx("ok.x86_64-linux", T, &[], ExpectedOutcome::Built);
+        ok_job.expected_outputs.insert(
             "out".to_string(),
-            super::super::model::HydraOutput {
+            super::super::model::ExpectedOutput {
                 narinfo_present: true,
                 nar_hash: Some(format!("sha256:{}", "0".repeat(52))),
                 nar_size: Some(1),
@@ -1956,7 +1956,7 @@ mod tests {
         let admin = LogAdmin::default();
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
-            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+            ctx("bad.x86_64-linux", T, &[], ExpectedOutcome::Built),
         )]
         .into();
         let batch = BatchView {
@@ -2014,7 +2014,7 @@ mod tests {
         };
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
-            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+            ctx("bad.x86_64-linux", T, &[], ExpectedOutcome::Built),
         )]
         .into();
         let batch = BatchView {
@@ -2057,7 +2057,7 @@ mod tests {
         let state = StateDir::new(dir.path()).unwrap();
         let contexts: HashMap<String, JobContext> = [(
             "bad.x86_64-linux".to_string(),
-            ctx("bad.x86_64-linux", T, &[], HydraOutcome::Built),
+            ctx("bad.x86_64-linux", T, &[], ExpectedOutcome::Built),
         )]
         .into();
         let batch = BatchView {

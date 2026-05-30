@@ -267,9 +267,9 @@ pub struct SupplyInputs {
     pub prefetch_paths: BTreeMap<String, Option<String>>,
     /// Paths already valid in the target store at the plan snapshot.
     pub prior_valid: BTreeSet<String>,
-    /// Upstream coverage already known per path (the coverage probe's
-    /// hydra.jsonl `found` entries); the supply stage's own narinfo probes
-    /// extend it for the upload ladder.
+    /// Upstream coverage already known per path (the warm-set
+    /// upstream-coverage probe's found paths); the supply stage's own
+    /// narinfo probes extend it for the upload ladder.
     pub target_coverage: BTreeSet<String>,
     /// The open replay archive (production always passes it; `None` degrades
     /// the stage to the prefetch arm only and exists for unit tests).

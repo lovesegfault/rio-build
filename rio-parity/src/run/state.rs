@@ -32,7 +32,6 @@ use crate::run::model::JobRecord;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateFile {
     Results,
-    Hydra,
     Batches,
     Supply,
     Dispatch,
@@ -42,16 +41,14 @@ impl StateFile {
     pub fn file_name(&self) -> &'static str {
         match self {
             StateFile::Results => "results.jsonl",
-            StateFile::Hydra => "hydra.jsonl",
             StateFile::Batches => "batches.jsonl",
             StateFile::Supply => "supply.jsonl",
             StateFile::Dispatch => "dispatch.jsonl",
         }
     }
 
-    pub const ALL: [StateFile; 5] = [
+    pub const ALL: [StateFile; 4] = [
         StateFile::Results,
-        StateFile::Hydra,
         StateFile::Batches,
         StateFile::Supply,
         StateFile::Dispatch,
@@ -204,7 +201,7 @@ pub fn latest_per_job(records: Vec<JobRecord>) -> BTreeMap<String, JobRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{Disposition, HydraSide, RioSide, UnifiedClass, Verdict};
+    use crate::run::model::{Disposition, ExpectedSide, RioSide, UnifiedClass, Verdict};
 
     fn rec(job: &str, class: UnifiedClass, attempts: u32) -> JobRecord {
         JobRecord {
@@ -215,7 +212,7 @@ mod tests {
             attempts,
             build_ids: vec![],
             rio: RioSide::default(),
-            hydra: HydraSide::default(),
+            expected: ExpectedSide::default(),
             nar_compare: Default::default(),
             verdict: class.verdict().map(|v| v.as_str().into()),
             disposition: class.disposition().map(|d| d.as_str().into()),
@@ -293,7 +290,7 @@ mod tests {
     fn supply_and_dispatch_state_files_named() {
         assert_eq!(StateFile::Supply.file_name(), "supply.jsonl");
         assert_eq!(StateFile::Dispatch.file_name(), "dispatch.jsonl");
-        assert_eq!(StateFile::ALL.len(), 5);
+        assert_eq!(StateFile::ALL.len(), 4);
     }
 
     #[test]

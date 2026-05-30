@@ -1,4 +1,4 @@
-//! The classifier: ONE pure function over (Hydra outcome × rio outcome ×
+//! The classifier: ONE pure function over (expected outcome × rio outcome ×
 //! auxiliary flags) that assigns each unit a verdict or a disposition,
 //! plus the per-output NAR comparison verdict and the headline arithmetic.
 //! No I/O, no clocks — everything here is deterministic and exhaustively
@@ -11,15 +11,15 @@
 //! evaluation failures are dispositive on their own, so they are honored
 //! before any build evidence is consulted; infrastructure failures and
 //! upstream source rot say nothing about outcome agreement (the build never
-//! got a fair attempt), so they are pulled out before the Hydra-keyed cross
-//! product that actually scores agreement.
+//! got a fair attempt), so they are pulled out before the cross product
+//! keyed by the expected outcome that actually scores agreement.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    Disposition, FailureKind, HydraOutcome, RioOutcome, RootCauseKind, UnifiedClass, Verdict,
+    Disposition, ExpectedOutcome, FailureKind, RioOutcome, RootCauseKind, UnifiedClass, Verdict,
 };
 
 /// How a recorded interruption (cancellation or client disconnect) played
@@ -51,10 +51,11 @@ pub struct AuxFlags {
     /// Every declared output was already valid in rio-store at the
     /// plan-time validity snapshot.
     pub plan_snapshot_valid: bool,
-    /// Verdict from the optional resolve-unknown pass over Hydra-unknown
-    /// jobs: Some(true) = Hydra built a different drv for this job (eval
-    /// divergence), Some(false) = resolved and the drv matches. None when
-    /// resolution has not run (the default).
+    /// Verdict from the optional resolve-unknown pass over units whose
+    /// expected outcome is `unknown`: Some(true) = the recording evaluated a
+    /// different drv for this job (identity divergence), Some(false) =
+    /// resolved and the drv matches. None when resolution has not run (the
+    /// default).
     pub resolve_unknown_divergent: Option<bool>,
     /// How the timed dispatcher's interruption replay played out for this
     /// unit. None outside timed mode (and for timed units with no recorded
@@ -77,8 +78,8 @@ pub struct Classification {
 /// filtered → eval-error → not-attemptable → not-attempted →
 /// completed-without-execution (cached-prior / target-substituted) → infra
 /// and upstream-source-rot failures including their cascaded dependents →
-/// the remaining cross product, keyed by the Hydra outcome first.
-pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Classification {
+/// the remaining cross product, keyed by the expected outcome first.
+pub fn classify(expected: &ExpectedOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Classification {
     let verdict = |v: Verdict| Classification {
         class: UnifiedClass::Verdict(v),
         cascaded: false,
@@ -155,18 +156,29 @@ pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Cla
         }
         _ => {}
     }
-    // 8. Cross product, Hydra keyed first.
-    match hydra {
-        HydraOutcome::Unknown => match flags.resolve_unknown_divergent {
+    // 8. Cross product, keyed by the expected outcome first.
+    match expected {
+        ExpectedOutcome::Unknown => match flags.resolve_unknown_divergent {
             Some(true) => disposition(Disposition::IdentityDivergent),
             _ => verdict(Verdict::NoTruth),
         },
-        HydraOutcome::Failed => match rio {
+        // An interrupted or infrastructure-dependent recording carries no
+        // deterministic expectation to compare against; in timeless
+        // classification the unit is reported as truth-indeterminate
+        // whatever the replay did. (Timed runs reproduce recorded
+        // interruptions instead — the timed-interruption flag above.)
+        ExpectedOutcome::Cancelled
+        | ExpectedOutcome::Disconnected
+        | ExpectedOutcome::Indeterminate => verdict(Verdict::TruthIndeterminate),
+        // A source-side resource exhaustion is a failure-class expectation:
+        // it compares exactly like a recorded deterministic failure, and the
+        // expected value stays on the record so reports can break it out.
+        ExpectedOutcome::Failed | ExpectedOutcome::ResourceExhausted => match rio {
             RioOutcome::Built { .. } => verdict(Verdict::UnexpectedSuccess),
             // Any rio failure shape agrees with the recorded failure.
             _ => verdict(Verdict::MatchFailed),
         },
-        HydraOutcome::Built => match rio {
+        ExpectedOutcome::Built => match rio {
             RioOutcome::Built { .. } => verdict(Verdict::MatchBuilt),
             RioOutcome::DependencyFailed {
                 root: RootCauseKind::Genuine,
@@ -185,8 +197,9 @@ pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Cla
 pub struct OutputHashes {
     /// rio nar_hash as lowercase hex (raw SHA-256), when the path is valid.
     pub rio_hex: Option<String>,
-    /// cache.nixos.org NarHash field (e.g. `sha256:<nixbase32>`), when present.
-    pub hydra_narhash: Option<String>,
+    /// Expected NarHash from the archive's recorded truth (e.g.
+    /// `sha256:<nixbase32>`), when present.
+    pub expected_narhash: Option<String>,
 }
 
 /// Per-output NAR comparison verdict strings (the `narCompare` values in
@@ -196,15 +209,15 @@ pub const NAR_DIFFERS: &str = "differs";
 pub const NAR_NOT_COMPARABLE: &str = "not-comparable";
 
 /// Compare one output: comparable iff both sides have a hash; equality is on
-/// the raw SHA-256 digest (cache.nixos.org NarHash is nixbase32, rio's is hex).
-/// Anything that cannot be compared meaningfully — an upstream hash that is
+/// the raw SHA-256 digest (the recorded NarHash is nixbase32, rio's is hex).
+/// Anything that cannot be compared meaningfully — an expected hash that is
 /// not SHA-256, or a rio value that is not 64 lowercase hex characters — is
 /// `not-comparable` rather than a false `differs`.
 pub fn compare_output(h: &OutputHashes) -> &'static str {
-    let (Some(rio_hex), Some(hydra)) = (&h.rio_hex, &h.hydra_narhash) else {
+    let (Some(rio_hex), Some(expected)) = (&h.rio_hex, &h.expected_narhash) else {
         return NAR_NOT_COMPARABLE;
     };
-    let Ok(parsed) = rio_nix::hash::NixHash::parse(hydra) else {
+    let Ok(parsed) = rio_nix::hash::NixHash::parse(expected) else {
         return NAR_NOT_COMPARABLE;
     };
     if parsed.algo() != rio_nix::hash::HashAlgo::SHA256 {
@@ -324,137 +337,166 @@ mod tests {
 
     /// Spot rows straight out of the classification table + precedence list.
     #[rstest]
-    // timed-interruption flags outrank every other rule: any (hydra, rio)
+    // timed-interruption flags outrank every other rule: any (expected, rio)
     // pair classifies into the interruption verdict, including over the
     // filtered flag (the previous precedence head).
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: true },
            AuxFlags { timed_interruption: Some(TimedInterruption::Replayed), ..flags() },
            v(Verdict::InterruptionReplayed), false)]
-    #[case(HydraOutcome::Failed, failed(FailureKind::Genuine),
+    #[case(ExpectedOutcome::Failed, failed(FailureKind::Genuine),
            AuxFlags { timed_interruption: Some(TimedInterruption::NotReproduced), ..flags() },
            v(Verdict::InterruptionNotReproduced), false)]
-    #[case(HydraOutcome::Built, RioOutcome::NotAttempted,
+    #[case(ExpectedOutcome::Built, RioOutcome::NotAttempted,
            AuxFlags { timed_interruption: Some(TimedInterruption::Replayed),
                       skipped: Some("system".into()), ..flags() },
            v(Verdict::InterruptionReplayed), false)]
     // precedence head: filtered/eval-error/not-attemptable/not-attempted
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: true },
            AuxFlags { skipped: Some("system".into()), ..flags() }, d(Disposition::Filtered), false)]
-    #[case(HydraOutcome::Built, failed(FailureKind::Genuine),
+    #[case(ExpectedOutcome::Built, failed(FailureKind::Genuine),
            AuxFlags { eval_error: true, ..flags() }, d(Disposition::EvalError), false)]
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: false },
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: false },
            AuxFlags { plan_not_attemptable: true, ..flags() }, d(Disposition::NotAttemptable), false)]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         RioOutcome::NotAttempted,
         flags(),
         d(Disposition::NotAttempted),
         false
     )]
     // completed-without-execution discriminator
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: false },
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: false },
            AuxFlags { plan_snapshot_valid: true, ..flags() }, d(Disposition::CachedPrior), false)]
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: false }, flags(), d(Disposition::TargetSubstituted), false)]
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: false }, flags(), d(Disposition::TargetSubstituted), false)]
     // infra / source rot (and their cascades)
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         failed(FailureKind::Infra),
         flags(),
         v(Verdict::InfraIndeterminate),
         false
     )]
     #[case(
-        HydraOutcome::Failed,
+        ExpectedOutcome::Failed,
         failed(FailureKind::Infra),
         flags(),
         v(Verdict::InfraIndeterminate),
         false
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         failed(FailureKind::SourceRot),
         flags(),
         v(Verdict::SourceUnavailable),
         false
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         dep(RootCauseKind::Infra),
         flags(),
         v(Verdict::InfraIndeterminate),
         true
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         dep(RootCauseKind::SourceRot),
         flags(),
         v(Verdict::SourceUnavailable),
         true
     )]
-    // cross product, Hydra keyed first
-    #[case(HydraOutcome::Unknown, RioOutcome::Built { executed: true }, flags(), v(Verdict::NoTruth), false)]
-    #[case(HydraOutcome::Unknown, failed(FailureKind::Genuine),
+    // cross product, keyed by the expected outcome first
+    #[case(ExpectedOutcome::Unknown, RioOutcome::Built { executed: true }, flags(), v(Verdict::NoTruth), false)]
+    #[case(ExpectedOutcome::Unknown, failed(FailureKind::Genuine),
            AuxFlags { resolve_unknown_divergent: Some(true), ..flags() }, d(Disposition::IdentityDivergent), false)]
-    #[case(HydraOutcome::Failed, RioOutcome::Built { executed: true }, flags(), v(Verdict::UnexpectedSuccess), false)]
+    #[case(ExpectedOutcome::Failed, RioOutcome::Built { executed: true }, flags(), v(Verdict::UnexpectedSuccess), false)]
     #[case(
-        HydraOutcome::Failed,
+        ExpectedOutcome::Failed,
         failed(FailureKind::Genuine),
         flags(),
         v(Verdict::MatchFailed),
         false
     )]
     #[case(
-        HydraOutcome::Failed,
+        ExpectedOutcome::Failed,
         failed(FailureKind::Timeout),
         flags(),
         v(Verdict::MatchFailed),
         false
     )]
     #[case(
-        HydraOutcome::Failed,
+        ExpectedOutcome::Failed,
         dep(RootCauseKind::Genuine),
         flags(),
         v(Verdict::MatchFailed),
         false
     )]
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true }, flags(), v(Verdict::MatchBuilt), false)]
+    // resource-exhausted is a failure-class expectation: same rows as failed
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::ResourceExhausted,
+        failed(FailureKind::Genuine),
+        flags(),
+        v(Verdict::MatchFailed),
+        false
+    )]
+    #[case(ExpectedOutcome::ResourceExhausted, RioOutcome::Built { executed: true }, flags(), v(Verdict::UnexpectedSuccess), false)]
+    // interrupted / infrastructure-dependent recordings carry no
+    // deterministic expectation: truth-indeterminate whatever the replay did
+    #[case(ExpectedOutcome::Cancelled, RioOutcome::Built { executed: true }, flags(), v(Verdict::TruthIndeterminate), false)]
+    #[case(
+        ExpectedOutcome::Disconnected,
+        failed(FailureKind::Genuine),
+        flags(),
+        v(Verdict::TruthIndeterminate),
+        false
+    )]
+    #[case(
+        ExpectedOutcome::Indeterminate,
+        dep(RootCauseKind::Genuine),
+        flags(),
+        v(Verdict::TruthIndeterminate),
+        false
+    )]
+    #[case(ExpectedOutcome::Built, RioOutcome::Built { executed: true }, flags(), v(Verdict::MatchBuilt), false)]
+    #[case(
+        ExpectedOutcome::Built,
         failed(FailureKind::Genuine),
         flags(),
         v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         failed(FailureKind::Timeout),
         flags(),
         v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         failed(FailureKind::ResourceCeiling),
         flags(),
         v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
-        HydraOutcome::Built,
+        ExpectedOutcome::Built,
         dep(RootCauseKind::Genuine),
         flags(),
         v(Verdict::UnexpectedDependencyFailure),
         false
     )]
     fn design_rows(
-        #[case] hydra: HydraOutcome,
+        #[case] expected_outcome: ExpectedOutcome,
         #[case] rio: RioOutcome,
         #[case] aux: AuxFlags,
         #[case] expected: UnifiedClass,
         #[case] cascaded: bool,
     ) {
-        let c = classify(&hydra, &rio, &aux);
-        assert_eq!(c.class, expected, "hydra={hydra:?} rio={rio:?} aux={aux:?}");
+        let c = classify(&expected_outcome, &rio, &aux);
+        assert_eq!(
+            c.class, expected,
+            "expected={expected_outcome:?} rio={rio:?} aux={aux:?}"
+        );
         assert_eq!(c.cascaded, cascaded);
     }
 
@@ -480,29 +522,41 @@ mod tests {
     #[test]
     fn infra_poisoned_shared_dependency_cascade() {
         // Dependent of the infra-poisoned dep: excluded, counted as cascaded.
-        let c = classify(&HydraOutcome::Built, &dep(RootCauseKind::Infra), &flags());
+        let c = classify(
+            &ExpectedOutcome::Built,
+            &dep(RootCauseKind::Infra),
+            &flags(),
+        );
         assert_eq!(
             (c.class, c.cascaded),
             (v(Verdict::InfraIndeterminate), true)
         );
         // Dependent of a genuine target failure: stays in the denominator.
-        let c = classify(&HydraOutcome::Built, &dep(RootCauseKind::Genuine), &flags());
+        let c = classify(
+            &ExpectedOutcome::Built,
+            &dep(RootCauseKind::Genuine),
+            &flags(),
+        );
         assert_eq!(
             (c.class, c.cascaded),
             (v(Verdict::UnexpectedDependencyFailure), false)
         );
     }
 
-    /// Exhaustive grid: every (hydra, rio, flag-combination) maps to exactly
-    /// one verdict or disposition, the precedence holds (e.g. the filtered
-    /// flag beats everything below the timed flag), and excluded-by-plan
-    /// flags never leak into the match-built verdict.
+    /// Exhaustive grid: every (expected, rio, flag-combination) maps to
+    /// exactly one verdict or disposition, the precedence holds (e.g. the
+    /// filtered flag beats everything below the timed flag), and
+    /// excluded-by-plan flags never leak into the match-built verdict.
     #[test]
     fn exhaustive_grid_is_total_and_respects_precedence() {
-        let hydras = [
-            HydraOutcome::Built,
-            HydraOutcome::Failed,
-            HydraOutcome::Unknown,
+        let expecteds = [
+            ExpectedOutcome::Built,
+            ExpectedOutcome::Failed,
+            ExpectedOutcome::ResourceExhausted,
+            ExpectedOutcome::Cancelled,
+            ExpectedOutcome::Disconnected,
+            ExpectedOutcome::Indeterminate,
+            ExpectedOutcome::Unknown,
         ];
         let rios = [
             RioOutcome::NotAttempted,
@@ -525,7 +579,7 @@ mod tests {
             Some(TimedInterruption::NotReproduced),
         ];
         let mut grid = 0usize;
-        for hydra in &hydras {
+        for expected_outcome in &expecteds {
             for rio in &rios {
                 for skipped in &bools {
                     for eval_error in &bools {
@@ -542,9 +596,10 @@ mod tests {
                                             timed_interruption: *ti,
                                         };
                                         grid += 1;
-                                        let c = classify(hydra, rio, &aux);
-                                        let ctx =
-                                            format!("hydra={hydra:?} rio={rio:?} aux={aux:?}");
+                                        let c = classify(expected_outcome, rio, &aux);
+                                        let ctx = format!(
+                                            "expected={expected_outcome:?} rio={rio:?} aux={aux:?}"
+                                        );
                                         // Total: every combination yields exactly one class —
                                         // a verdict or a disposition, never both, never neither.
                                         assert!(
@@ -615,39 +670,39 @@ mod tests {
         }
         assert_eq!(
             grid,
-            3 * 11 * 2 * 2 * 2 * 2 * 3 * 3,
+            7 * 11 * 2 * 2 * 2 * 2 * 3 * 3,
             "grid covered every combination"
         );
     }
 
     #[test]
     fn nar_comparison_and_verdicts() {
-        // cache.nixos.org publishes nixbase32; rio stores raw bytes (hex here).
+        // The recorded NarHash is nixbase32; rio stores raw bytes (hex here).
         // Build a matching pair via rio-nix to avoid hand-encoding base32.
         let digest = [7u8; 32];
         let nix_hash =
             rio_nix::hash::NixHash::new(rio_nix::hash::HashAlgo::SHA256, digest.to_vec()).unwrap();
         let equal = compare_output(&OutputHashes {
             rio_hex: Some(hex::encode(digest)),
-            hydra_narhash: Some(nix_hash.to_colon()),
+            expected_narhash: Some(nix_hash.to_colon()),
         });
         assert_eq!(equal, NAR_EQUAL);
         let differs = compare_output(&OutputHashes {
             rio_hex: Some(hex::encode([8u8; 32])),
-            hydra_narhash: Some(nix_hash.to_colon()),
+            expected_narhash: Some(nix_hash.to_colon()),
         });
         assert_eq!(differs, NAR_DIFFERS);
         assert_eq!(
             compare_output(&OutputHashes {
                 rio_hex: None,
-                hydra_narhash: Some(nix_hash.to_colon())
+                expected_narhash: Some(nix_hash.to_colon())
             }),
             NAR_NOT_COMPARABLE
         );
         // SRI form is also accepted (NixHash::parse handles both).
         let sri = compare_output(&OutputHashes {
             rio_hex: Some(hex::encode(digest)),
-            hydra_narhash: Some(nix_hash.to_sri()),
+            expected_narhash: Some(nix_hash.to_sri()),
         });
         assert_eq!(sri, NAR_EQUAL);
 
@@ -682,7 +737,7 @@ mod tests {
         assert_eq!(
             compare_output(&OutputHashes {
                 rio_hex: Some(rio_hex.clone()),
-                hydra_narhash: Some(sha512.to_colon()),
+                expected_narhash: Some(sha512.to_colon()),
             }),
             NAR_NOT_COMPARABLE
         );
@@ -699,7 +754,7 @@ mod tests {
             assert_eq!(
                 compare_output(&OutputHashes {
                     rio_hex: Some(bad.clone()),
-                    hydra_narhash: Some(sha256.clone()),
+                    expected_narhash: Some(sha256.clone()),
                 }),
                 NAR_NOT_COMPARABLE,
                 "rio_hex={bad}"
@@ -709,7 +764,7 @@ mod tests {
         assert_eq!(
             compare_output(&OutputHashes {
                 rio_hex: Some(rio_hex),
-                hydra_narhash: Some(sha256),
+                expected_narhash: Some(sha256),
             }),
             NAR_EQUAL
         );
@@ -718,7 +773,7 @@ mod tests {
     /// The headline numerator/denominator are an explicit verdict list, so
     /// the timed-only interruption verdicts never enter either side.
     #[test]
-    fn headline_ignores_interruption_buckets() {
+    fn headline_ignores_interruption_verdicts() {
         let mut counts = BTreeMap::new();
         counts.insert(Verdict::MatchBuilt.as_str().to_string(), 90);
         counts.insert(Verdict::UnexpectedFailure.as_str().to_string(), 7);

@@ -1102,7 +1102,7 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{AdminApi, GraphSnapshot, PoisonedView};
     use crate::run::model::{
-        HydraOutcome, HydraSide, JobRecord, PathOutcome, RioSide, Verdict, build_status_name,
+        ExpectedOutcome, ExpectedSide, JobRecord, PathOutcome, RioSide, Verdict, build_status_name,
     };
     use crate::run::state::latest_per_job;
     use crate::run::submitter::BatchOutcome;
@@ -1527,9 +1527,8 @@ mod tests {
                 format!("{}-out", drv.trim_end_matches(".drv")),
             )]),
             dep_drvs: HashSet::new(),
-            hydra_outcome: HydraOutcome::Built,
-            hydra_outputs: BTreeMap::new(),
-            hydra_buildstatus: None,
+            expected_outcome: ExpectedOutcome::Built,
+            expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
         }
@@ -1545,7 +1544,7 @@ mod tests {
             attempts: 1,
             build_ids: Vec::new(),
             rio: RioSide::default(),
-            hydra: HydraSide::default(),
+            expected: ExpectedSide::default(),
             nar_compare: BTreeMap::new(),
             verdict: Some(Verdict::MatchBuilt.as_str().into()),
             disposition: None,

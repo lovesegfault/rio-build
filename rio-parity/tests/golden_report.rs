@@ -42,7 +42,7 @@ fn fixtures() -> (CampaignRecord, BTreeMap<String, JobRecord>) {
 }
 
 #[test]
-fn golden_bucket_counts() {
+fn golden_class_counts() {
     let (_campaign, records) = fixtures();
     let agg = aggregate(&records);
     let verdict = |v: &str| agg.verdict_counts.get(v).copied().unwrap_or(0);

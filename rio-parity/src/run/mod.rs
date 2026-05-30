@@ -15,7 +15,7 @@
 //! proper, taking every external surface behind the [`Backends`] traits so
 //! a whole campaign can execute against in-memory fakes (see the
 //! end-to-end test in this module). Stages are gated by done-markers in
-//! the state directory: plan → hydra-truth/truth-load → supply →
+//! the state directory: plan → truth load → supply →
 //! execute ∥ collect ∥ watchdog ∥ sync → report.
 
 pub mod archive_input;
@@ -26,7 +26,6 @@ pub mod collect;
 pub mod drv_import;
 pub mod glob;
 pub mod grpc;
-pub mod hydra_truth;
 pub mod model;
 pub mod plan;
 pub mod report;
@@ -38,6 +37,7 @@ pub mod submitter;
 pub mod supply;
 pub mod timeline;
 pub mod transport;
+pub mod truth;
 pub mod watchdog;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -59,10 +59,9 @@ use self::artifact::{
 };
 use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
-use self::hydra_truth::NarinfoSource;
 use self::model::{
-    BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Disposition, FailureKind, HydraEntry, JobRecord,
-    PauseState, RioOutcome, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
+    BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Disposition, FailureKind, JobRecord, PauseState,
+    RioOutcome, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
@@ -79,6 +78,7 @@ use self::timeline::{
     RecordedRequest, RecordedTarget, RecordedTiming, ScheduledRequest, SharedTimingLookup,
     TimedRunStats, TimelineConfig, build_schedule, run_timed_dispatch,
 };
+use self::truth::NarinfoSource;
 use self::watchdog::{
     COMPONENT_DISPATCH, COMPONENT_PAUSE, JobPhase, PollTick, StallKind, StallVerdict, Watchdog,
 };
@@ -119,8 +119,8 @@ pub struct RunArgs {
 /// wedged connection well inside the collect poll cadence.
 const STORE_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Per-path attempt budget for the hydra-truth narinfo sweep (transient
-/// cache.nixos.org/Fastly errors only — 404s are recorded, not retried).
+/// Per-path attempt budget for the warm-set upstream-coverage probe
+/// (transient upstream/CDN errors only — 404s are recorded, not retried).
 const NARINFO_SWEEP_ATTEMPTS: u32 = 5;
 
 /// Rolling window (most recent terminal records) over which the poller
@@ -560,8 +560,8 @@ fn write_plan_time_records(
                     outcome: disposition.as_str().to_string(),
                     ..Default::default()
                 },
-                hydra: model::HydraSide {
-                    outcome: model::HydraOutcome::Unknown.as_str().to_string(),
+                expected: model::ExpectedSide {
+                    outcome: model::ExpectedOutcome::Unknown.as_str().to_string(),
                     ..Default::default()
                 },
                 nar_compare: BTreeMap::new(),
@@ -628,8 +628,8 @@ fn write_not_attempted_records(
                     outcome: RioOutcome::NotAttempted.outcome_str().to_string(),
                     ..Default::default()
                 },
-                hydra: model::HydraSide {
-                    outcome: model::HydraOutcome::Unknown.as_str().to_string(),
+                expected: model::ExpectedSide {
+                    outcome: model::ExpectedOutcome::Unknown.as_str().to_string(),
                     ..Default::default()
                 },
                 nar_compare: BTreeMap::new(),
@@ -734,10 +734,9 @@ fn stall_record(
             },
             ..Default::default()
         },
-        hydra: model::HydraSide {
-            outcome: ctx.hydra_outcome.as_str().to_string(),
-            buildstatus: ctx.hydra_buildstatus,
-            outputs: ctx.hydra_outputs.clone(),
+        expected: model::ExpectedSide {
+            outcome: ctx.expected_outcome.as_str().to_string(),
+            outputs: ctx.expected_outputs.clone(),
         },
         nar_compare: BTreeMap::new(),
         verdict: Some(Verdict::InfraIndeterminate.as_str().to_string()),
@@ -962,7 +961,7 @@ fn recorded_timing_from(record: &OutcomeRecord) -> RecordedTiming {
     }
 }
 
-/// The orchestrator: plan → hydra-truth/truth-load → supply → (execute ∥
+/// The orchestrator: plan → truth load → supply → (execute ∥
 /// collect ∥ watchdog ∥ sync) → report, with stage done-markers and resume.
 /// The execute stage is the timeless submit loop or the timed dispatcher,
 /// chosen by `spec.scheduling.mode`.
@@ -1123,26 +1122,11 @@ pub async fn run_with_backends(
     // recompute it.
     let warm_comp = plan::compute_warm_sets(&manifest, &dep_closure, &plan_output.in_scope);
 
-    // ── Stage: hydra-truth ──────────────────────────────────────────────────
+    // ── Stage: truth load ───────────────────────────────────────────────────
     // Per-unit expected outcomes come from the archive's recorded truth (no
-    // outbound queries). The marker-gated sweep below only probes the
-    // prefetch-set paths' upstream coverage so the supply stage never asks
-    // the target to substitute a path its substituter cannot serve.
-    let truth = hydra_truth::expected_outcomes_for_units(&archive, &manifest)?;
-    if !state.marker_done("hydra-truth") {
-        if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
-            hydra_truth::run_hydra_truth(
-                &state,
-                backends.narinfo.as_ref(),
-                &[],
-                &plan_output.warm_set,
-                spec.knobs.narinfo_concurrency,
-                NARINFO_SWEEP_ATTEMPTS,
-            )
-            .await?;
-        }
-        state.set_marker("hydra-truth")?;
-    }
+    // outbound queries), so the load is pure, cheap, and re-derived on every
+    // start — it needs no done-marker.
+    let truth = truth::expected_outcomes_for_units(&archive, &manifest)?;
 
     // ── Stage: supply ───────────────────────────────────────────────────────
     let batch_seq = Arc::new(AtomicU64::new(
@@ -1191,13 +1175,28 @@ pub async fn run_with_backends(
             } else {
                 BTreeMap::new()
             };
-        // Upstream coverage already probed by the hydra-truth sweep.
-        let target_coverage: BTreeSet<String> = state
-            .load_jsonl::<HydraEntry>(StateFile::Hydra)?
-            .into_iter()
-            .filter(|entry| entry.found)
-            .map(|entry| entry.path)
-            .collect();
+        // Upstream coverage for the prefetch set: probe the archive's
+        // declared substituter for every warm path so the supply stage never
+        // asks the target to substitute a path its substituter cannot serve.
+        // Absent paths are pre-classified `unavailable` in supply.jsonl by
+        // the probe; found paths seed the ladder's coverage set. Running
+        // under the supply gate means a resumed campaign that has not
+        // finished its supply stage re-probes — resume costs re-probing,
+        // never correctness.
+        let target_coverage: BTreeSet<String> =
+            if spec.mode == Mode::Leaf && !plan_output.warm_set.is_empty() {
+                truth::probe_warm_upstream_coverage(
+                    &state,
+                    backends.narinfo.as_ref(),
+                    &plan_output.warm_set,
+                    spec.knobs.narinfo_concurrency,
+                    NARINFO_SWEEP_ATTEMPTS,
+                )
+                .await?
+                .found
+            } else {
+                BTreeSet::new()
+            };
         let transport = match &backends.supply_transport {
             Some(transport) => transport.clone(),
             None => build_supply_transport(&spec)?,
@@ -1282,10 +1281,10 @@ pub async fn run_with_backends(
         let unit_truth = truth
             .get(&m.job)
             .cloned()
-            .unwrap_or_else(|| hydra_truth::UnitTruth {
-                outcome: model::HydraOutcome::Unknown,
-                side: model::HydraSide {
-                    outcome: model::HydraOutcome::Unknown.as_str().to_string(),
+            .unwrap_or_else(|| truth::UnitTruth {
+                outcome: model::ExpectedOutcome::Unknown,
+                side: model::ExpectedSide {
+                    outcome: model::ExpectedOutcome::Unknown.as_str().to_string(),
                     ..Default::default()
                 },
             });
@@ -1301,11 +1300,8 @@ pub async fn run_with_backends(
                 drv_path: m.drv_path.clone(),
                 outputs: m.outputs.clone(),
                 dep_drvs: dep_drvs.clone(),
-                hydra_outcome: unit_truth.outcome,
-                hydra_outputs: unit_truth.side.outputs.clone(),
-                // Native source status codes stay in the archive's detail
-                // strings; they are never engine input.
-                hydra_buildstatus: None,
+                expected_outcome: unit_truth.outcome,
+                expected_outputs: unit_truth.side.outputs.clone(),
                 plan_not_attemptable: not_attemptable.contains(m.job.as_str()),
                 plan_snapshot_valid: cached_prior_jobs.contains(m.job.as_str()),
             },
@@ -2045,7 +2041,7 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
-        DispatchEntry, HydraOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
+        DispatchEntry, ExpectedOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
         SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry,
         build_status_name,
     };
@@ -2194,7 +2190,7 @@ mod tests {
             attempts: 1,
             build_ids: vec![],
             rio: model::RioSide::default(),
-            hydra: model::HydraSide::default(),
+            expected: model::ExpectedSide::default(),
             nar_compare: BTreeMap::new(),
             verdict: Some(Verdict::MatchBuilt.as_str().into()),
             disposition: None,
@@ -2334,7 +2330,7 @@ mod tests {
 
         // Final state assertions.
         let state = StateDir::new(state_dir.path()).unwrap();
-        for marker in ["plan", "hydra-truth", "supply", "report"] {
+        for marker in ["plan", "supply", "report"] {
             assert!(state.marker_done(marker), "marker {marker} set");
         }
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
@@ -2555,9 +2551,8 @@ mod tests {
                     format!("{}-out", drv.trim_end_matches(".drv")),
                 )]),
                 dep_drvs: HashSet::new(),
-                hydra_outcome: HydraOutcome::Built,
-                hydra_outputs: BTreeMap::new(),
-                hydra_buildstatus: None,
+                expected_outcome: ExpectedOutcome::Built,
+                expected_outputs: BTreeMap::new(),
                 plan_not_attemptable: false,
                 plan_snapshot_valid: false,
             },
@@ -2730,7 +2725,7 @@ mod tests {
         let msg = format!("{err:#}");
         assert!(msg.contains("timed") && msg.contains("capability"), "{msg}");
         let state = StateDir::new(state_dir.path()).unwrap();
-        for marker in ["plan", "hydra-truth", "supply", "report"] {
+        for marker in ["plan", "supply", "report"] {
             assert!(
                 !state.marker_done(marker),
                 "marker {marker} must not be set"
@@ -3178,9 +3173,8 @@ mod tests {
             drv_path: drv.to_string(),
             outputs: BTreeMap::new(),
             dep_drvs: HashSet::new(),
-            hydra_outcome: HydraOutcome::Built,
-            hydra_outputs: BTreeMap::new(),
-            hydra_buildstatus: None,
+            expected_outcome: ExpectedOutcome::Built,
+            expected_outputs: BTreeMap::new(),
             plan_not_attemptable: false,
             plan_snapshot_valid: false,
         };
@@ -3369,8 +3363,8 @@ mod tests {
                         outcome: Disposition::NotAttemptable.as_str().into(),
                         ..Default::default()
                     },
-                    hydra: model::HydraSide {
-                        outcome: HydraOutcome::Unknown.as_str().into(),
+                    expected: model::ExpectedSide {
+                        outcome: ExpectedOutcome::Unknown.as_str().into(),
                         ..Default::default()
                     },
                     nar_compare: BTreeMap::new(),

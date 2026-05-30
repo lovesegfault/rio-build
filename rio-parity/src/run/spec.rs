@@ -155,7 +155,6 @@ pub struct Knobs {
     pub max_queued_requeues: u32,
     pub max_auto_retries: u32,
     pub failfast_singleton_after: u32,
-    pub evidence_ttl_hours: f64,
     pub batch_timeout_hours: f64,
     pub log_tail_bytes: usize,
     pub idle_polls_for_suspend: u32,
@@ -164,8 +163,12 @@ pub struct Knobs {
     pub dispatch_gap_polls: u32,
     pub pause_queue_depth: Option<u32>,
     pub infra_pause_pct: f64,
+    /// Low-confidence threshold (percent) on the infra-indeterminate rate:
+    /// above it the report flags the campaign's headline as low-confidence.
     pub infra_low_confidence_pct: f64,
-    pub hydra_unknown_threshold_pct: f64,
+    /// Low-confidence threshold (percent) on the no-truth rate: above it
+    /// the report flags the campaign's truth coverage as low-confidence.
+    pub no_truth_threshold_pct: f64,
     pub report_top_n: usize,
     /// SSH connections the gateway transport pool dials. `None` derives the
     /// count from the in-flight channel budget as
@@ -233,7 +236,6 @@ impl Default for Knobs {
             max_queued_requeues: 2,
             max_auto_retries: 1,
             failfast_singleton_after: 3,
-            evidence_ttl_hours: 24.0,
             batch_timeout_hours: 24.0,
             log_tail_bytes: 65536,
             idle_polls_for_suspend: 3,
@@ -243,7 +245,7 @@ impl Default for Knobs {
             pause_queue_depth: None,
             infra_pause_pct: 25.0,
             infra_low_confidence_pct: 5.0,
-            hydra_unknown_threshold_pct: 5.0,
+            no_truth_threshold_pct: 5.0,
             report_top_n: 20,
             connections: None,
             op_timeout_secs: 120,
@@ -726,7 +728,8 @@ mod tests {
         assert_eq!(k.max_queued_requeues, 2);
         assert_eq!(k.max_auto_retries, 1);
         assert_eq!(k.active_stall_hours, 6.0);
-        assert_eq!(k.evidence_ttl_hours, 24.0);
+        assert_eq!(k.infra_low_confidence_pct, 5.0);
+        assert_eq!(k.no_truth_threshold_pct, 5.0);
         assert_eq!(k.idle_polls_for_suspend, 3);
         assert_eq!(k.ice_masked_cells_threshold, 3);
         assert_eq!(k.dispatch_gap_threshold, 50);
