@@ -35,7 +35,11 @@ const PATH_MISSING: &str = "/nix/store/11111111111111111111111111111111-conforma
 
 /// Input-addressed test derivation for the build-op tests. The output is a
 /// full, valid store path so the enriched builtOutputs can be asserted
-/// byte-for-byte on the client side.
+/// byte-for-byte on the client side. Because it IS parseable, the gateway's
+/// post-build store verification (gw.opcode.build-results-honest) asks the
+/// store about it — tests that expect this root to come back Built must seed
+/// [`CONF_DRV_OUT`] into the mock store, mirroring the worker upload that a
+/// real Completed derivation implies.
 const CONF_DRV_PATH: &str = "/nix/store/00000000000000000000000000000000-conformance.drv";
 const CONF_DRV_OUT: &str = "/nix/store/cccccccccccccccccccccccccccccccc-conformance-out";
 
@@ -248,6 +252,11 @@ async fn conformance_build_paths_with_results() -> anyhow::Result<()> {
         .set_submit_outcome(SubmitOutcome::completed());
     sess.store
         .seed_with_content(CONF_DRV_PATH, conf_drv_aterm().as_bytes());
+    // The output the completed build implies: the gateway verifies it
+    // against the store before reporting Built, so the mock store must
+    // hold it (a real worker would have uploaded it before Completed).
+    sess.store
+        .seed_with_content(CONF_DRV_OUT, b"conformance out");
     let (mut rd, mut wr, version) = handshake_session(&mut sess).await?;
 
     let derived_path = format!("{CONF_DRV_PATH}!out");
@@ -311,6 +320,11 @@ async fn conformance_build_paths_with_results_multi_root_per_root_status() -> an
         .seed_with_content(CONF_DRV_PATH, conf_drv_aterm().as_bytes());
     sess.store
         .seed_with_content(CONF_DRV_FAIL_PATH, conf_fail_drv_aterm().as_bytes());
+    // Only the COMPLETED root's output is in the store. The failing root's
+    // output is deliberately absent: the store verification must leave that
+    // root's own failure standing (no promotion without positive evidence).
+    sess.store
+        .seed_with_content(CONF_DRV_OUT, b"conformance out");
     let fail_msg = "builder failed with exit code 2";
     sess.scheduler
         .set_submit_outcome(SubmitOutcome::scripted(vec![
