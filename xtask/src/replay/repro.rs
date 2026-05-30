@@ -223,7 +223,20 @@ pub async fn run(a: ReproArgs) -> Result<()> {
         region: region.clone(),
         log_level: a.log_level.clone(),
     };
-    let job = jobs::campaign_job(&common, &repro_id, &engine_args(&spec))?;
+    let mut job = jobs::campaign_job(&common, &repro_id, &engine_args(&spec))?;
+    // Same correlation annotations launch stamps on campaign Jobs: the
+    // archive short id (from the original campaign's stored pin) and the
+    // mode, so a repro Job seen in `kubectl` ties back to its inputs. The
+    // stored record carries no recorder eval id, so that annotation is
+    // absent here.
+    job.metadata
+        .annotations
+        .get_or_insert_with(Default::default)
+        .extend(launch::campaign_annotations(
+            None,
+            &original.archive.archive_id_short,
+            spec.mode,
+        ));
     ui::step(&format!("apply repro Job {repro_id}"), || {
         jobs::create_job(&client, &job)
     })
@@ -359,6 +372,26 @@ mod tests {
             err.contains("c1") && err.contains("/nix/store/cccc-missing.drv"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn repro_jobs_carry_archive_correlation_annotations() {
+        // The repro Job is annotated from the stored campaign record's
+        // archive pin: same eval-set/mode keys launch writes, no
+        // hydra-eval-id (the record does not carry the recorder eval id).
+        let original = record_fixture();
+        let spec = derive_repro_spec(
+            &original,
+            "app.x86_64-linux",
+            "replay-leaf-20260601-ab12-repro-0123abcd",
+        );
+        let ann = launch::campaign_annotations(None, &original.archive.archive_id_short, spec.mode);
+        assert_eq!(
+            ann.get("rio.build/eval-set").unwrap(),
+            &original.archive.archive_id_short
+        );
+        assert_eq!(ann.get("rio.build/mode").unwrap(), "leaf");
+        assert!(!ann.contains_key("rio.build/hydra-eval-id"));
     }
 
     #[test]

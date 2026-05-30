@@ -58,8 +58,9 @@ enum Cmd {
     K8s(k8s::K8sArgs),
     /// build-replay campaigns: record archives, launch campaigns, watch
     /// status, fetch reports (--check gates CI on the recorded regression
-    /// gate), re-run single units (repro); abort/cleanup are stubs for a
-    /// later milestone (M2).
+    /// gate), re-run single units (repro), run the engine locally against
+    /// a local archive (dev); abort/cleanup are stubs for a later
+    /// milestone (M2).
     Replay(replay::ReplayArgs),
     /// Workspace-level invariant checks ("lints that can't be lints").
     /// With no subcommand, runs every lint.

@@ -2,9 +2,11 @@
 //!
 //! The campaign engine itself is the in-cluster `rio-replay` Job; xtask
 //! only verifies prerequisites, provisions the campaign tenants/Secrets,
-//! applies the Jobs, and renders the S3 artifacts. The abort/cleanup
-//! subcommands are stubs for a later milestone (M2) so `--help` documents
-//! the full campaign lifecycle.
+//! applies the Jobs, and renders the S3 artifacts. The one exception is
+//! `replay dev`, which runs the engine in-process on the operator machine
+//! against a local archive — explicitly a development affordance, never a
+//! measurement surface. The abort/cleanup subcommands are stubs for a
+//! later milestone (M2) so `--help` documents the full campaign lifecycle.
 //!
 //! Operator note: chart-side enablement (the engine's CiliumNetworkPolicy
 //! admissions + the campaign tenants' gateway build-policy defaults) comes
@@ -15,6 +17,7 @@
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
 
+pub mod dev;
 pub mod eval;
 pub mod jobs;
 pub mod launch;
@@ -103,6 +106,10 @@ enum ReplayCmd {
     /// single-unit campaign — the engine-native invocation referenced by
     /// the `repro` field of results.jsonl records.
     Repro(repro::ReproArgs),
+    /// Run the engine locally against a local archive (dev/k3s only);
+    /// --dry-run plans fully offline without a cluster. Not a measurement
+    /// surface.
+    Dev(dev::DevArgs),
     /// Abort a running campaign (delete the Job, keep S3 state). M2.
     Abort {
         /// Campaign id.
@@ -126,6 +133,7 @@ pub async fn run(args: ReplayArgs) -> Result<()> {
         ReplayCmd::Status(a) => status::run(a).await,
         ReplayCmd::Report(a) => report::run(a).await,
         ReplayCmd::Repro(a) => repro::run(a).await,
+        ReplayCmd::Dev(a) => dev::run(a).await,
         ReplayCmd::Abort { .. } => not_yet("abort"),
         ReplayCmd::Cleanup { .. } => not_yet("cleanup"),
     }

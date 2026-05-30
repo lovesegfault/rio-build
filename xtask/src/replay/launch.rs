@@ -32,8 +32,8 @@ use rio_replay::archive::s3::{
 use rio_replay::archive::schema::{Capabilities, Manifest};
 use rio_replay::archive::writer::pack_with_mkdwarfs;
 use rio_replay::run::spec::{
-    ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, Knobs, ReportBlock, ReportPolicy,
-    S3Target, ScheduleMode, SchedulingBlock, TenantBlock,
+    ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, Knobs, Mode as EngineMode,
+    ReportBlock, ReportPolicy, S3Target, ScheduleMode, SchedulingBlock, TenantBlock,
 };
 
 use super::jobs::{self, EngineJobCommon};
@@ -311,11 +311,13 @@ pub fn engine_args(a: &LaunchArgs) -> Vec<String> {
 /// eval it was recorded from, so a Job seen in `kubectl` can be tied back
 /// to its inputs without reading the spec ConfigMap. The
 /// `rio.build/eval-set` annotation key keeps its historical name; its
-/// value is the archive id short form.
+/// value is the archive id short form. Takes the engine-side mode so both
+/// Job creators (launch from its CLI flags, repro from a stored campaign
+/// spec) annotate from the same type.
 pub fn campaign_annotations(
     eval: Option<u64>,
     archive_id_short: &str,
-    mode: Mode,
+    mode: EngineMode,
 ) -> BTreeMap<String, String> {
     let mut annotations = BTreeMap::from([
         (
@@ -754,7 +756,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         .extend(campaign_annotations(
             archive.hydra_eval_id,
             &archive.archive_id_short,
-            a.mode,
+            a.mode.engine(),
         ));
     ui::step(&format!("apply campaign Job {campaign_id}"), || {
         jobs::create_job(&client, &job)
@@ -1547,7 +1549,6 @@ async fn preflight_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_replay::run::spec::{Mode as EngineMode, ScheduleMode};
     use serde_json::json;
 
     /// Fixture gateway host-key pin (what `gateway_host_key_pin` derives
@@ -1940,19 +1941,19 @@ mod tests {
 
     #[test]
     fn campaign_annotations_carry_eval_set_and_mode() {
-        let ann = campaign_annotations(Some(1824219), "8b919129046e0f60", Mode::Leaf);
+        let ann = campaign_annotations(Some(1824219), "8b919129046e0f60", EngineMode::Leaf);
         assert_eq!(ann.get("rio.build/hydra-eval-id").unwrap(), "1824219");
         assert_eq!(ann.get("rio.build/eval-set").unwrap(), "8b919129046e0f60");
         assert_eq!(ann.get("rio.build/mode").unwrap(), "leaf");
         assert_eq!(
-            campaign_annotations(Some(1), "d", Mode::SelfHosted)
+            campaign_annotations(Some(1), "d", EngineMode::SelfHosted)
                 .get("rio.build/mode")
                 .unwrap(),
             "self-hosted"
         );
         // Archives named by --archive (not resolved through the recorder
         // path) have no Hydra eval id; the annotation is simply absent.
-        let ann = campaign_annotations(None, "8b919129046e0f60", Mode::Leaf);
+        let ann = campaign_annotations(None, "8b919129046e0f60", EngineMode::Leaf);
         assert!(!ann.contains_key("rio.build/hydra-eval-id"));
         assert_eq!(ann.get("rio.build/eval-set").unwrap(), "8b919129046e0f60");
     }

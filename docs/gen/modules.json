@@ -2161,6 +2161,11 @@
       "doc": "`cargo xtask replay` — operator surface for build-replay campaigns."
     },
     {
+      "path": "replay/dev.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay dev` — local engine run and the offline dry-run."
+    },
+    {
       "path": "replay/eval.rs",
       "depth": 1,
       "doc": "`cargo xtask replay record` — apply the recorder Job for one Hydra evaluation."

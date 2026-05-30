@@ -1,5 +1,5 @@
 //! `cargo xtask replay report` — download the rendered campaign report
-//! (summary.md + progress.json) and print it.
+//! (summary.md, plus progress.json and gate.json) and print it.
 //!
 //! No campaign logic lives here: the engine renders summary.md (and
 //! keeps progress.json fresh) under the campaign's S3 prefix, and this
