@@ -869,6 +869,38 @@ module closureEvidence {
     budget.poisons >= 0, budget.cancels >= 0
   }
 
+  /// The conjunction the wired exhaustive regime checks verify (Phase 0c):
+  /// allInvariants minus C3 (noWrongfulTerminalFailureSingleTenure). C3 is
+  /// excluded because the as-built consumption path genuinely violates it —
+  /// a stale ok=false walk verdict, produced before the outputs became
+  /// available, fail-fasts a resubmitted build whose wanted outputs are all
+  /// present at consumption time (the Phase 0c finding; trace and code walk
+  /// in the invariant map). Its falsification is pinned by the
+  /// expect-violation check in nix/quint.nix until the Phase-1 disposition;
+  /// putting it here would make every exhaustive regime check permanently
+  /// red for a known, recorded reason.
+  val asBuiltHoldInvariants = and {
+    noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
+    holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
+    brokenNeverVouches, failFastConsumesMarkKeepsHole,
+    failoverPreservation, pullRefusalNoMint, chainTermination,
+    stampAtomicWithActivation, terminalIsTerminal,
+    readyImpliesDeclaredDepsProduced, liveInterestRequiredForDispatch,
+    recoveryClearCompleteness, healCompleteness,
+    chainEndClearsForgiveness, condemnRequiresLiveCoOwnedFailure,
+    completedWithoutBuildImpliesWantedPresent,
+    substituteOkImpliesClosureIngested, unknownNeverDemotes,
+    noVacuousWantedVerdict, storedWantedMonotone,
+    rollbackRestoresWantedAndEvidence,
+    pruneNotMorePermissiveThanClassification,
+    dispatchImpliesProbedThisPass, staleProducedNeverUnlocksDependents,
+    demandSetSurvivesPrune, wrongfulFailFastBoundedPerArming,
+    noWrongfulFromSourceDemotion,
+    noBuildWhenWantedPresent, terminalBuildStopsPinning,
+    substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
+    boundsOK
+  }
+
   /// The default safety conjunction (everything except the
   /// pre-registered expected-fail probes A17/A18/B2-strong/C1-strict/L2).
   /// Phase 0c selects per-regime lists from the individual names; this

@@ -3380,5 +3380,299 @@ in
       step = "calibStep";
       witness = "s18ListenerSurvivesAcceptErrors";
     };
+
+    # ------------------------------------------------------------------
+    # Closure-evidence lifecycle (the `topdown_pruned` / `closure_hole`
+    # campaign, closure-evidence-formal Phase 0c). Model:
+    # docs/spec/models/closureEvidence.qnt — the pruned-merge stamp, the
+    # five clears, the four hole stamps, the merge heal, the recovery
+    # gates over the durable relation, the single classifier /
+    # must_substitute, the fail-fast and its caller arms, the prune's
+    # demand set, the pull-admission interlock, with the store / probe
+    # cache / detached walk / leader tenure / PG intent environment.
+    # Invariant ↔ rule map, regime scopes, the reduction-ladder record
+    # and the per-property verdict table:
+    # docs/spec/models/closure-evidence-invariant-map.md (Phase 0c stage
+    # record).
+    #
+    # Regime scope note: the reduced exhaustive-scope instantiations
+    # (…Ex modules — two-node universe, one build, per-derivation store
+    # letters, one outstanding walk per node — the §2b.1 reduction
+    # ladder) are the manual exhaustive targets described below; the
+    # design-scale modules (four nodes, two builds, §2b granularity)
+    # did not converge within a gate-compatible budget and are likewise
+    # held back, the executor-campaign precedent. The wired checks are
+    # the witness and expected-fail-probe set: they run against the
+    # exhaustive-scope, duo and design-scale modules so every scenario
+    # the held-back exhaustive runs constrain stays demonstrably
+    # reachable in CI.
+    # ------------------------------------------------------------------
+
+    # The exhaustive regime checks are NOT wired in this stage — even the
+    # reduced base scope (closureEvidenceBaseEx, two nodes / one build)
+    # runs to several million distinct states, which lands in the
+    # tens-of-minutes class on a CI builder and past the campaign's
+    # ≤5-minute per-check commitment (§2b.1). They are held as documented
+    # manual targets, the executor-campaign precedent:
+    #
+    #   quint verify --backend=tlc --main=closureEvidenceBaseEx \
+    #     --invariant=asBuiltHoldInvariants docs/spec/models/closureEvidence.qnt
+    #
+    # (asBuiltHoldInvariants = allInvariants minus C3, which is genuinely
+    # violated as built — the Phase 0c finding pinned by the
+    # probe-wrongful-terminal-failure check below.) The run records, the
+    # per-property verdicts and the held-back design-scale regimes are in
+    # docs/spec/models/closure-evidence-invariant-map.md; the witness and
+    # probe checks below keep every constrained scenario reachable in CI
+    # in the meantime.
+
+    # The fault-persist and failover exhaustive checks are NOT wired in
+    # this stage: their reduced-scope modules
+    # (closureEvidenceFaultPersistEx / closureEvidenceFailoverEx) and
+    # the shared asBuiltHoldInvariants conjunction exist, but neither
+    # regime has a completed budget measurement yet (the lost-write and
+    # failover/recovery alphabets multiply the base scope's state count
+    # past what this stage could measure within its time budget). The
+    # invariant map's regime-scope record carries the held-back status;
+    # wiring follows the base check's pattern once a measurement
+    # establishes the per-check budget. The recovery- and
+    # durability-direction witnesses below (hole-from-recovery,
+    # recovery-clear, stale-intent-apply) keep those regimes'
+    # reachability pinned in the meantime.
+
+    # ---- Closure-evidence expected-fail probes -----------------------
+    # The design's pre-registered expected falsifications (§3 / the §8 0c
+    # gate) plus the Phase 0c C3 finding. Each wired entry is an
+    # expect-violation check: it PASSES only while the checker still
+    # produces the counterexample, which is the machine-checked record
+    # of the as-built behavior the campaign documents (the §9.1 fencing
+    # evidence, the GC-after-vouch bound, the stale-evidence fail-fast).
+    # The probes that could not be produced within a wired check's
+    # budget (A17, L2/D16, C1-strict) are recorded inline below and in
+    # the invariant map rather than wired red. None of these predicates
+    # appear in the asBuiltHoldInvariants conjunction. Deliberately no
+    # tracey markers (these are as-built-behavior records, not
+    # verification of the spec rules).
+
+    # A18: only the current tenure's evidence intents reach PG — FAILS
+    # as-built (no SQL fence on evidence writes; entry-time gates only).
+    # The counterexample is a deposed tenure's merge transaction landing
+    # after the successor's recovery (the D14 leg): the late apply
+    # leaves a stamped row and an activated build the new leader's
+    # memory does not know about.
+    quint-closure-evidence-probe-stale-evidence-write = mkQuintWitnessCheck {
+      name = "closure-evidence-probe-stale-evidence-write";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleTenure";
+      witness = "leaderClassEvidenceWrites";
+    };
+
+    # C3: with no failover, no store GC and no upstream withdrawal, no
+    # build is wrongfully terminally failed — FAILS as-built (the Phase
+    # 0c finding, pre-registered as the 0b C3 observation): a stale
+    # ok=false walk verdict produced before the outputs became available
+    # is consumed after a directed resubmit re-pruned and stamped the
+    # root and a poison clear holed it, and the fail-fast terminally
+    # fails the resubmitted build although every output it wants is
+    # present. Pinned here as an expect-violation check until the
+    # Phase-1 disposition (fix or accepted-with-rationale); the
+    # asBuiltHoldInvariants conjunction (the manual exhaustive target's
+    # invariant) excludes C3 for exactly this reason.
+    quint-closure-evidence-probe-wrongful-terminal-failure = mkQuintWitnessCheck {
+      name = "closure-evidence-probe-wrongful-terminal-failure";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "noWrongfulTerminalFailureSingleTenure";
+    };
+
+    # A17 (a clear/heal intent created under tenure g never erases a bit
+    # a newer tenure stamped — the dangerous direction of the unfenced
+    # evidence writes) is NOT wired yet: the override interleaving needs
+    # a clear-class statement emitted and left pending under one tenure,
+    # the same bit durably cleared and re-stamped by the successor, and
+    # only then the stale statement landing — ≥14 steps even at duo
+    # scope, which neither the bounded simulation nor the BFS hunts
+    # reached within a wired check's budget in Phase 0c. The stale-apply
+    # window itself is exhibited by the A18 probe above; the erasure
+    # statements (W2/W3/W5) and the §9.1 evidence summary are in the
+    # invariant map, and closureEvidenceStaleDuo remains the documented
+    # probe scope for the deferred hunt.
+
+    # B2-strong: a consumed ok walk's closure is still present at
+    # consumption time — FAILS under adversarial-store (GC-after-vouch:
+    # nothing pins the walked outputs between the walk's finish and the
+    # completion's consumption). The weak form (present at some instant
+    # before consumption) holds and stays in asBuiltHoldInvariants.
+    quint-closure-evidence-probe-vouched-closure-gone = mkQuintWitnessCheck {
+      name = "closure-evidence-probe-vouched-closure-gone";
+      spec = "closureEvidence";
+      main = "closureEvidenceAdversarialStore";
+      witness = "substituteOkClosureStillPresentAtConsume";
+    };
+
+    # C1-strict (at most one wrongful fail-fast per (node, stamp), no
+    # recovery re-arming) is deliberately NOT wired: the AW2 re-arming
+    # loop it was expected to exhibit needs the same output to change
+    # availability twice (once so the first fail-fast is wrongful, once
+    # so a second walk failure can re-arm substitute_tried after the
+    # recovery wiped it), which the §2b ceiling of one upstream change
+    # per output excludes — within the modeled ceilings the strict bound
+    # holds instead of falsifying, so an expect-violation check would be
+    # permanently red. The analysis and the owner-facing follow-up are
+    # in the invariant map's Phase 0c stage record; the per-arming bound
+    # C1 stays in the asBuiltHoldInvariants conjunction.
+
+    # L2 / D16 (the present-but-tried limbo cell, the §9.2 settlement
+    # deliverable) is NOT wired yet: the cell needs the mark, the hole,
+    # substitute_tried and full presence to assemble on one node without
+    # any of the in-between steps settling it — ≥16 steps at duo scope —
+    # and neither the bounded simulation (200 000 × 45-step traces) nor
+    # the BFS hunts reached it within a wired check's budget in Phase
+    # 0c. The hand-derived reachability path, the hunt record and the
+    # deferred-probe plan are in the invariant map; closureEvidenceDuo
+    # remains the documented probe scope. sched.evidence.settlement
+    # stays intentionally uncovered either way until the §9.2 owner
+    # decision.
+
+    # ---- Closure-evidence non-vacuity witnesses ----------------------
+    # Each check passes only when the checker violates its canReach*
+    # predicate — machine-checked evidence that the scenario the
+    # exhaustive checks constrain is reachable in the named regime. The
+    # single-tenure witnesses run at the exhaustive-base scope (so they
+    # guard exactly the wired conjunction against going vacuous); the
+    # cross-build, recovery and stale-tenure witnesses run at the
+    # smallest scope that contains their trigger (duo / failover-Ex /
+    # design-scale stale-tenure). Reachability at the design-scale
+    # regimes was additionally established by simulation and is recorded
+    # in the invariant map. No tracey markers on witnesses.
+
+    # A pruned merge stamps a kept root whose submitted closure was
+    # dropped.
+    quint-closure-evidence-witness-stamp = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-stamp";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachStamp";
+    };
+    # The prune actually fires (demand set kept, rest dropped).
+    quint-closure-evidence-witness-prune = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-prune";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachPrune";
+    };
+    # A merge rollback happens (so rollback inertness is not vacuous).
+    quint-closure-evidence-witness-rollback = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-rollback";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachRollback";
+    };
+    # The topdown fail-fast fires.
+    quint-closure-evidence-witness-fail-fast = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-fail-fast";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachFailFast";
+    };
+    # Admin ClearPoison stamps a closure hole on a surviving parent (H2).
+    quint-closure-evidence-witness-hole-admin-clear = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-hole-admin-clear";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachHoleFromAdminClear";
+    };
+    # The poison-TTL sweep stamps a closure hole (H3).
+    quint-closure-evidence-witness-hole-ttl-sweep = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-hole-ttl-sweep";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachHoleFromTtlSweep";
+    };
+    # An ok substitution walk is consumed into Produced.
+    quint-closure-evidence-witness-walk-ok = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-walk-ok";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachWalkOkConsumed";
+    };
+    # A failed substitution walk is consumed.
+    quint-closure-evidence-witness-walk-fail = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-walk-fail";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachWalkFailConsumed";
+    };
+    # An ok walk with a non-empty forgiven set is consumed (the CE-23
+    # accepted forgiveness residual is reachable, not forbidden).
+    quint-closure-evidence-witness-forgiven-residual = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-forgiven-residual";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachForgivenResidual";
+    };
+    # A substitute_tried one-shot demotion is taken while the missing
+    # output is available upstream (C2's exemption is exercised).
+    quint-closure-evidence-witness-tried-demotion = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-tried-demotion";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachTriedDemotionUpstreamHas";
+    };
+    # A forgiven-now-wanted downgrade re-spawns the walk (A12/A21's
+    # chain-growth subject is exercised).
+    quint-closure-evidence-witness-downgrade-respawn = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-downgrade-respawn";
+      spec = "closureEvidence";
+      main = "closureEvidenceBaseEx";
+      witness = "canReachDowngradeRespawn";
+    };
+    # The terminal-build reap stamps a closure hole on a surviving
+    # shared parent (H1) — needs the second build, hence duo scope.
+    quint-closure-evidence-witness-hole-reap = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-hole-reap";
+      spec = "closureEvidence";
+      main = "closureEvidenceDuo";
+      witness = "canReachHoleFromReap";
+    };
+    # The wrongful-fail-fast trigger witness (canReachWrongfulFfTrigger)
+    # is not wired: like the D16 cell it needs the deep marked+Broken+
+    # available assembly the bounded hunts did not reach in budget (the
+    # 0b record had already flagged both as needing checker support).
+    # The C-group's non-vacuity is carried by the C3 falsification probe
+    # above (a wrongful fail-fast is exhibited there) and by the
+    # tried-demotion witness; the deferred-hunt record is in the
+    # invariant map.
+    # Recovery stamps a closure hole from the durable relation (H4).
+    quint-closure-evidence-witness-hole-recovery = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-hole-recovery";
+      spec = "closureEvidence";
+      main = "closureEvidenceFailoverEx";
+      witness = "canReachHoleFromRecovery";
+    };
+    # The recovery clear gate clears a restored mark via the strict
+    # durable criterion (C3 in the clear inventory).
+    quint-closure-evidence-witness-recovery-clear = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-recovery-clear";
+      spec = "closureEvidence";
+      main = "closureEvidenceFailoverEx";
+      witness = "canReachRecoveryClear";
+    };
+    # A deposed tenure's evidence intent applies after the successor's
+    # recovery (the stale-apply window the A17/A18 probes quantify).
+    quint-closure-evidence-witness-stale-intent-apply = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-stale-intent-apply";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleTenure";
+      witness = "canReachStaleIntentApply";
+    };
+    # A walk spawned by an older tenure is consumed by a newer one
+    # (completions carry no tenure token).
+    quint-closure-evidence-witness-cross-tenure-walk = mkQuintWitnessCheck {
+      name = "closure-evidence-witness-cross-tenure-walk";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleTenure";
+      witness = "canReachCrossTenureWalkConsume";
+    };
   };
 }
