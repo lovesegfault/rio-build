@@ -6,8 +6,12 @@ One file per fix family of the controller-formal calibration corpus
 have no file), one file per fix family of the refcount corpus
 (`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), one
 file per fix family of the gateway connection-lifecycle corpus
-(`gw-f*.qnt` over `gwConnLifecycle.qnt`), and — the executor-lifecycle
-campaign — the single re-encoded pull-era
+(`gw-f*.qnt` over `gwConnLifecycle.qnt`), one file per fix family of
+the closure-evidence corpus (`closure-*.qnt` over `closureEvidence.qnt`,
+the F1–F14 representatives of the closure-evidence-formal Phase 0d
+gate; the families whose members are NOT-ENCODED — F15/F16/F17 — have
+no file), and — the executor-lifecycle campaign — the single
+re-encoded pull-era
 override (`executor-f4-pull-establish-early.qnt`, over the re-targeted
 live `executorSession.qnt` rather than a frozen as-built encoding). The
 executor corpus's as-built representatives
@@ -54,8 +58,9 @@ The verdict table — every corpus commit, its classification, override
 module, predicted vs. actual verdict, depth/state counts, and
 disposition — lives next to the owning campaign's invariant map
 (`controller-invariant-map.md`, `refcount-invariant-map.md`,
-`executor-invariant-map.md`, each in its Stage-C calibration section).
+`executor-invariant-map.md`, `closure-evidence-invariant-map.md`, each
+in its Stage-C / Phase-0d calibration section).
 A subset of the overrides is wired into `nix/quint.nix` as permanent
 expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
-`quint-executor-calib-*`); the rest are evidence modules, re-runnable on
-demand with the command above.
+`quint-executor-calib-*`, `quint-closure-calib-*`); the rest are
+evidence modules, re-runnable on demand with the command above.
