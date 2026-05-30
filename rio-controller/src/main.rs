@@ -21,7 +21,6 @@ use kube::Client;
 use tracing::{info, warn};
 
 use rio_controller::config::{CliArgs, Config};
-use rio_controller::reconcilers::node_informer::NodeLabelCache;
 use rio_controller::reconcilers::nodeclaim_pool::{self, ControllerLeaseHooks};
 use rio_controller::reconcilers::{AdminClient, Ctx, componentscaler, node_informer, pool};
 use rio_controller::spawn_controller;
@@ -224,39 +223,38 @@ async fn main() -> anyhow::Result<()> {
     );
 
     // ---- Node informer ----
-    // Caches Node labels → hw_class string for completion-ingest
-    // join (ADR-023). Builders report spec.nodeName (downward API);
-    // controller joins server-side because builders are air-gapped
-    // from apiserver. `hw_class` is the operator's `[sla.hw_classes.$h]`
-    // key matched against Node labels (NOT a hardcoded reconstruction;
-    // bug_061). Reuses `hw_config` loaded above the `Ctx` block.
-    // TODO: clone node_cache into the completion-ingest consumer
-    // once that lands; until then this populates but nobody reads.
-    let node_cache = NodeLabelCache::with_config(hw_config.clone());
+    // λ[h] spot-exposure flush (60s Node LIST) + 300s HwClassConfig
+    // refresh (ADR-023). Node labels are NOT cached: the per-need
+    // consumers below GET the node when they actually need a label
+    // join (§4(a)2 — the NodeLabelCache deletion). `hw_class` is the
+    // operator's `[sla.hw_classes.$h]` key matched against Node
+    // labels (NOT a hardcoded reconstruction; bug_061). Reuses
+    // `hw_config` loaded above the `Ctx` block.
     rio_common::task::spawn_monitored(
         "node-informer",
         node_informer::run(
             client.clone(),
-            node_cache.clone(),
+            hw_config.clone(),
             admin.clone(),
             shutdown.clone(),
         ),
     );
     // ADR-023 phase-10: stamp `rio.build/hw-class` on each builder
-    // pod once `spec.nodeName` resolves. Builder reads it via
-    // downward-API to key its `hw_perf_samples` microbench insert.
+    // pod once `spec.nodeName` resolves (per-need Node GET). Builder
+    // reads it via downward-API to key its `hw_perf_samples`
+    // microbench insert.
     rio_common::task::spawn_monitored(
         "hw-class-annotator",
-        node_informer::run_pod_annotator(client.clone(), node_cache.clone(), shutdown.clone()),
+        node_informer::run_pod_annotator(client.clone(), hw_config.clone(), shutdown.clone()),
     );
     // ADR-023 phase-13: SpotInterrupted Event → interrupt_samples
-    // (λ\[h\] numerator). Node-DELETE in the informer above writes the
-    // exposure denominator.
+    // (λ\[h\] numerator). The informer's periodic flush above writes
+    // the exposure denominator.
     rio_common::task::spawn_monitored(
         "spot-interrupt-watcher",
         node_informer::run_spot_interrupt_watcher(
             client.clone(),
-            node_cache,
+            hw_config.clone(),
             admin.clone(),
             shutdown.clone(),
         ),

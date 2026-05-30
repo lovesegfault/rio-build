@@ -1,32 +1,33 @@
-//! Node-label cache for `hw_class` join at completion-ingest.
+//! Node-label → `hw_class` resolution and spot-exposure (λ\[h\])
+//! accounting.
 //!
 //! ADR-023 §Hardware heterogeneity: builders are air-gapped from the
 //! apiserver, so they report `spec.nodeName` (downward API) and the
-//! controller joins to Node labels server-side when ingesting build
-//! completion samples. `hw_class` is the operator's
-//! `[sla.hw_classes.$h]` key whose label conjunction matches the
-//! Node — fetched via [`HwClassConfig::load`] (`GetHwClassConfig`
-//! RPC) so the controller stamps the SAME `$h` string the scheduler's
-//! `solve_intent_for` keys on, not a hardcoded 4-label reconstruction
-//! that breaks the moment an operator's label schema differs (bug_061).
+//! controller joins to Node labels server-side. `hw_class` is the
+//! operator's `[sla.hw_classes.$h]` key whose label conjunction
+//! matches the Node — fetched via [`HwClassConfig::load`]
+//! (`GetHwClassConfig` RPC) so the controller stamps the SAME `$h`
+//! string the scheduler's `solve_intent_for` keys on, not a hardcoded
+//! 4-label reconstruction that breaks the moment an operator's label
+//! schema differs (bug_061).
 //!
-//! Node-gone-at-ingest → [`NodeLabelCache::hw_class_of`] returns
-//! `None` and the sample's `hw_class` stays NULL. This is expected
-//! for builds that finish after their node has been reaped (rare —
-//! ephemeral builders typically outlive their single build).
+//! # No labels cache (campaign §4(a)2)
 //!
-//! # Why a watcher, not per-ingest `Api::get`
+//! Node labels are NOT cached in-process. The two consumers read them
+//! straight from the apiserver:
 //!
-//! Completion-ingest is on the hot path (one per build). A cached
-//! lookup is O(1) in-process; a per-ingest `GET /api/v1/nodes/{name}`
-//! is an apiserver round-trip per build. The watch is one long-lived
-//! connection that incrementally updates the cache.
+//! - **Per-flush LIST** ([`run`]): the λ exposure flush LISTs Nodes
+//!   once per [`EXPOSURE_FLUSH_SECS`] and joins labels at that point.
+//! - **Per-need GET** ([`run_pod_annotator`],
+//!   [`run_spot_interrupt_watcher`]): one `GET /api/v1/nodes/{name}`
+//!   per pod that needs an `rio.build/hw-class` stamp (≈ one per
+//!   builder pod) and per `SpotInterrupted` event (rare). Node gone
+//!   at lookup → `None`, the consumer skips (degraded, not broken).
 //!
-//! # Why not `reflector::store()`
-//!
-//! The reflector store caches full `Node` objects (status, conditions,
-//! images list — kilobytes each). We need the labels map only. A
-//! hand-rolled `HashMap<String, NodeMeta>` is the lightweight version.
+//! What survives is the per-spot-node **exposure cursor** (`name →
+//! last-banked epoch`, M11): an accounting position ("exposure banked
+//! up to T"), not a mirror of any apiserver state — it cannot be
+//! recomputed from a LIST and is owned by [`run`]'s flush loop.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -34,7 +35,7 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use k8s_openapi::api::core::v1::{Event, Node, Pod};
-use kube::api::{Patch, PatchParams};
+use kube::api::{ListParams, Patch, PatchParams};
 use kube::runtime::{WatchStreamExt, watcher};
 use kube::{Api, Client};
 use parking_lot::RwLock;
@@ -48,18 +49,19 @@ use crate::reconcilers::{AdminClient, admin_call};
 /// `hw_perf_samples` insert.
 pub const ANNOT_HW_CLASS: &str = "rio.build/hw-class";
 
-/// `karpenter.sh/capacity-type` — `spot` or `on-demand`. Read from the
-/// cached labels so the spot-interrupt watcher can skip on-demand nodes
-/// without re-fetching.
+/// `karpenter.sh/capacity-type` — `spot` or `on-demand`. The exposure
+/// flush reads it off each LISTed Node so on-demand nodes contribute
+/// nothing to λ.
 const LABEL_CAPACITY_TYPE: &str = "karpenter.sh/capacity-type";
 
 /// Operator-configured hw-class definitions, fetched once via
-/// `GetHwClassConfig`. Shared (`Arc`) between [`NodeLabelCache`] and
-/// the [`load`](Self::load) task. The match is lazy
-/// ([`NodeLabelCache::hw_class_of`] etc. call [`Self::match_node`] on
-/// each lookup) so config arriving AFTER nodes are cached still
-/// resolves correctly; before load completes `hw_class = None`
-/// everywhere — annotator skips, λ-samples skip.
+/// `GetHwClassConfig`. Shared (`Arc`) between every consumer task
+/// (exposure flush, annotator, spot-interrupt watcher, the
+/// nodeclaim_pool reconciler) and the [`load`](Self::load) refresh.
+/// The match is lazy ([`Self::match_node`] runs per lookup against
+/// freshly-read Node labels) so config arriving late still resolves
+/// correctly; before load completes `hw_class = None` everywhere —
+/// annotator skips, λ-samples skip.
 ///
 /// Stored as a sorted `Vec` so [`Self::match_node`] is deterministic
 /// when a Node satisfies two overlapping conjunctions (lexicographic
@@ -424,221 +426,120 @@ impl HwClassConfig {
     }
 }
 
-/// Per-node cache value: full label map (matched lazily against
-/// [`HwClassConfig`]) + the spot-exposure cursor.
-#[derive(Debug, Clone)]
-struct NodeMeta {
-    /// All Node labels. [`HwClassConfig::match_node`] reads these on
-    /// each lookup — config arriving after the node was cached still
-    /// resolves. `capacity_type` is `labels.get(LABEL_CAPACITY_TYPE)`.
-    labels: BTreeMap<String, String>,
-    /// Epoch of the last exposure flush for this node (initialised to
-    /// `metadata.creationTimestamp` on first sight). [`NodeLabelCache::spot_exposure`]
-    /// and [`NodeLabelCache::drain_live_spot_exposure`] return the
-    /// delta `now - last_exposure_at`, so live nodes contribute to the
-    /// λ denominator every flush instead of only on Delete.
-    last_exposure_at: Option<f64>,
-}
-
-impl NodeMeta {
-    fn is_spot(&self) -> bool {
-        self.labels.get(LABEL_CAPACITY_TYPE).map(String::as_str) == Some("spot")
-    }
-}
-
-/// Node-name → labels cache + the [`HwClassConfig`] those labels are
-/// matched against. Cheap to clone (`Arc` × 2); share one instance
-/// between the informer task and consumers.
-#[derive(Clone, Default)]
-pub struct NodeLabelCache {
-    nodes: Arc<RwLock<HashMap<String, NodeMeta>>>,
-    config: HwClassConfig,
-}
-
-impl NodeLabelCache {
-    /// Construct with a pre-populated [`HwClassConfig`]. `main.rs`
-    /// loads the config once (retry-backoff) before spawning the
-    /// informer/annotator tasks so the first watch relist already
-    /// resolves correctly; lazy match means a late-loading config
-    /// would also work, but loading-first avoids a window of
-    /// `hw_class = None` λ-samples on cold start.
-    pub fn with_config(config: HwClassConfig) -> Self {
-        Self {
-            nodes: Default::default(),
-            config,
-        }
-    }
-
-    /// Operator's `[sla.hw_classes.$h]` key matching `node_name`'s
-    /// labels, or `None` if the node is not (or no longer) cached, no
-    /// `$h` matches, or config is not yet loaded.
-    pub fn hw_class_of(&self, node_name: &str) -> Option<String> {
-        let g = self.nodes.read();
-        self.config.match_node(&g.get(node_name)?.labels)
-    }
-
-    /// `Some((hw_class, node_seconds_since_last_flush))` for
-    /// `node_name` IF it's a spot node with a creation timestamp AND
-    /// matches a configured `$h`. Feeds the exposure half of λ\[h\] —
-    /// on-demand nodes contribute neither numerator nor denominator
-    /// (their λ is 0 by definition); unmatched nodes (non-builder
-    /// NodePool) have no `$h` to key on.
-    ///
-    /// Returns the slice since the last
-    /// [`Self::drain_live_spot_exposure`] (or since creation if never
-    /// drained) so the Delete arm reports only the final residual,
-    /// not the full lifetime — the periodic flush has already banked
-    /// the rest.
-    pub fn spot_exposure(&self, node_name: &str, now_epoch: f64) -> Option<(String, f64)> {
-        let g = self.nodes.read();
-        let m = g.get(node_name)?;
-        if !m.is_spot() {
-            return None;
-        }
-        let hw = self.config.match_node(&m.labels)?;
-        let secs = (now_epoch - m.last_exposure_at?).max(0.0);
-        Some((hw, secs))
-    }
-
-    /// For every live spot node, sum `now - last_exposure_at` per
-    /// `hw_class` and advance `last_exposure_at = now`. Called from
-    /// [`run`]'s periodic flush so the λ denominator includes
-    /// still-running (right-censored) nodes — without this, a single
-    /// early interrupt in a fresh N-node burst inflates λ ≈N× until
-    /// the survivors are eventually deleted.
-    ///
-    /// Controller restart re-seeds `last_exposure_at = created_at`
-    /// (in-process state), so the first post-restart flush re-reports
-    /// the pre-restart slice once. Accepted: restarts are rare and
-    /// the 24h EMA halflife dampens the duplicate; the alternative
-    /// (seed `= now`) would *under*-count on cold start, which is the
-    /// bias direction this fix exists to eliminate.
-    pub fn drain_live_spot_exposure(&self, now_epoch: f64) -> Vec<(String, f64)> {
-        let mut by_hw: HashMap<String, f64> = HashMap::new();
-        let mut g = self.nodes.write();
-        for m in g.values_mut() {
-            if !m.is_spot() {
-                continue;
-            }
-            let Some(last) = m.last_exposure_at else {
-                continue;
-            };
-            let secs = (now_epoch - last).max(0.0);
-            m.last_exposure_at = Some(now_epoch);
-            if secs > 0.0
-                && let Some(hw) = self.config.match_node(&m.labels)
-            {
-                *by_hw.entry(hw).or_default() += secs;
-            }
-        }
-        by_hw.into_iter().collect()
-    }
-
-    /// Evict every cached entry whose name is NOT in `seen`, returning
-    /// each evicted spot entry's final exposure slice. Called on
-    /// `InitDone` after a watch-gap relist: the raw `watcher` does NOT
-    /// synthesize `Delete` for nodes gone during the gap, so without
-    /// this they linger and feed [`Self::drain_live_spot_exposure`]
-    /// ~60 phantom node-seconds/min forever — biasing λ\[h\] low and
-    /// `solve_full` toward spot. Mirrors the `Delete` arm's residual
-    /// flush so the evicted node's last slice still lands in the
-    /// denominator.
-    pub fn prune_absent(&self, seen: &HashSet<String>, now_epoch: f64) -> Vec<(String, f64)> {
-        // Aggregate by hw_class (mirrors `drain_live_spot_exposure`):
-        // the caller awaits one `report_exposure` RPC per returned
-        // entry inside a single `select!` arm, so per-NODE tuples turn
-        // a 100-node spot-storm relist into 100 sequential awaits ×
-        // ADMIN_RPC_TIMEOUT against a degraded scheduler — ~500s of
-        // watch-loop starvation. The RPC payload carries no per-node
-        // identity (only hw_class/kind/value, event_uid: None) and
-        // exposure sums into λ's denominator, so aggregation is
-        // lossless (bug_057).
-        let mut by_hw: HashMap<String, f64> = HashMap::new();
-        let config = &self.config;
-        self.nodes.write().retain(|name, m| {
-            if seen.contains(name) {
-                return true;
-            }
-            if m.is_spot()
-                && let Some(last) = m.last_exposure_at
-                && let Some(hw) = config.match_node(&m.labels)
-            {
-                *by_hw.entry(hw).or_default() += (now_epoch - last).max(0.0);
-            }
-            false
-        });
-        by_hw.into_iter().collect()
-    }
-
-    /// Current cache size. For the `rio_controller_node_cache_size`
-    /// gauge and tests.
-    pub fn len(&self) -> usize {
-        self.nodes.read().len()
-    }
-
-    /// `len() == 0`. Clippy `len_without_is_empty`.
-    pub fn is_empty(&self) -> bool {
-        self.nodes.read().is_empty()
-    }
-
-    fn apply(&self, node: &Node) {
-        let Some(name) = node.metadata.name.clone() else {
-            return;
+/// One λ exposure flush over a fresh Node LIST: for every spot node
+/// matching a configured `$h`, bank `now − cursor` node-seconds
+/// against that `hw_class` and advance the cursor; drop cursors for
+/// nodes absent from the LIST. Pure — [`run`] feeds it the LIST.
+///
+/// Cursor (M11) discipline — what makes a 60s LIST a safe replacement
+/// for the deleted Node watch + labels cache:
+///
+/// - **Seed**: a node first seen here starts its cursor at
+///   `metadata.creationTimestamp`, so its pre-first-flush lifetime is
+///   banked exactly once. Controller restart re-seeds the same way →
+///   the first post-restart flush re-reports the pre-restart slice
+///   once (accepted bias, unchanged from the watch-cache behavior;
+///   the 24h EMA halflife dampens it).
+/// - **No double-count**: the cursor advances to `now` on every flush
+///   that sees the node, whether or not a `$h` matched, so
+///   consecutive flushes bank disjoint slices and a late config load
+///   does NOT retro-bank the unmatched window.
+/// - **Absent node** (deleted between flushes): its cursor is dropped
+///   WITHOUT banking the final partial slice (≤ one flush period).
+///   This replaces the watch's Delete-arm residual flush — an
+///   accepted under-count; λ reads marginally high, the
+///   cost-conservative direction (the solver under-prefers spot;
+///   never the phantom-exposure over-count that biased it toward
+///   spot, bug `b81da271f`).
+/// - **Aggregated per hw_class** (one RPC per class per flush, not
+///   per node): a 100-node spot fleet stays one `report_exposure`
+///   await per class, preserving the bug_057 loop-starvation bound.
+fn flush_spot_exposure(
+    cursors: &mut HashMap<String, f64>,
+    nodes: &[Node],
+    config: &HwClassConfig,
+    now_epoch: f64,
+) -> Vec<(String, f64)> {
+    let mut by_hw: HashMap<String, f64> = HashMap::new();
+    let mut seen: HashSet<&str> = HashSet::with_capacity(nodes.len());
+    for node in nodes {
+        let Some(name) = node.metadata.name.as_deref() else {
+            continue;
         };
-        let created_at = node
+        seen.insert(name);
+        let Some(labels) = node.metadata.labels.as_ref() else {
+            continue;
+        };
+        // On-demand nodes contribute neither numerator nor denominator
+        // (their λ is 0 by definition) and get no cursor.
+        if labels.get(LABEL_CAPACITY_TYPE).map(String::as_str) != Some("spot") {
+            continue;
+        }
+        let created = node
             .metadata
             .creation_timestamp
             .as_ref()
             .map(|t| t.0.as_second() as f64);
-        let mut g = self.nodes.write();
-        // Preserve last_exposure_at across re-apply (watch relist,
-        // label-change Modify) so the periodic flush doesn't re-count
-        // the already-banked slice. New entry → seed from created_at.
-        let last_exposure_at = g.get(&name).and_then(|m| m.last_exposure_at).or(created_at);
-        g.insert(
-            name,
-            NodeMeta {
-                labels: node.metadata.labels.clone().unwrap_or_default(),
-                last_exposure_at,
-            },
-        );
+        // Cursor, else seed from creationTimestamp, else (no creation
+        // timestamp — synthetic objects only) start banking from now.
+        let last = cursors.get(name).copied().or(created).unwrap_or(now_epoch);
+        let secs = (now_epoch - last).max(0.0);
+        cursors.insert(name.to_string(), now_epoch);
+        if secs > 0.0
+            && let Some(hw) = config.match_node(labels)
+        {
+            *by_hw.entry(hw).or_default() += secs;
+        }
     }
+    cursors.retain(|name, _| seen.contains(name.as_str()));
+    by_hw.into_iter().collect()
+}
 
-    fn delete(&self, node: &Node) -> Option<NodeMeta> {
-        node.metadata
-            .name
-            .as_ref()
-            .and_then(|n| self.nodes.write().remove(n))
+/// Per-need Node GET + `[sla.hw_classes.$h]` match — the §4(a)2
+/// replacement for the deleted labels-cache lookup. `None` if the
+/// node is gone (404), the GET failed (logged), no `$h` matches, or
+/// config is not yet loaded; callers skip (degraded, not broken).
+async fn node_hw_class(nodes: &Api<Node>, config: &HwClassConfig, name: &str) -> Option<String> {
+    match nodes.get_opt(name).await {
+        Ok(Some(node)) => config.match_node(node.metadata.labels.as_ref()?),
+        Ok(None) => {
+            debug!(node = %name, "node gone; no hw_class");
+            None
+        }
+        Err(e) => {
+            warn!(node = %name, error = %e, "node GET failed; no hw_class");
+            None
+        }
     }
 }
 
-/// Run the Node informer. Returns on `shutdown.cancelled()` or if
-/// the watch stream ends (shouldn't — `default_backoff()` retries
-/// indefinitely).
+/// Run the spot-exposure flush loop + the periodic [`HwClassConfig`]
+/// refresh. Returns on `shutdown.cancelled()`.
+///
+/// §4(a)2: replaces the Node watch + labels cache. λ's denominator
+/// must include censored (still-running) observations — every
+/// [`EXPOSURE_FLUSH_SECS`] this LISTs all Nodes and banks each spot
+/// node's slice since its cursor (see [`flush_spot_exposure`]),
+/// bounding the right-censoring bias to ≤60 node-seconds per node.
 ///
 /// `spawn_monitored("node-informer", run(...))` from main.rs. Panics
-/// are logged; the controller keeps reconciling. Consumers see an
-/// empty/stale cache → `hw_class_of` returns `None` → samples ingest
-/// with NULL `hw_class` (degraded, not broken).
+/// are logged; the controller keeps reconciling. A failed LIST skips
+/// that flush — cursors are untouched, so the next successful flush
+/// banks the full delta since the last successful one (nothing lost,
+/// nothing double-counted; λ samples arrive late, not wrong).
 pub async fn run(
     client: Client,
-    cache: NodeLabelCache,
+    config: HwClassConfig,
     mut admin: AdminClient,
     shutdown: rio_common::signal::Token,
 ) {
     let nodes: Api<Node> = Api::all(client);
 
-    // Raw event stream (not `.applied_objects()`): we need Delete to
-    // evict cache entries. `default_backoff()`: exponential retry on
-    // watch connection loss (apiserver restart, network blip) — same
-    // as disruption.rs.
-    let mut stream = watcher(nodes, watcher::Config::default())
-        .default_backoff()
-        .boxed();
+    // M11: per-spot-node exposure cursor (`name → last-banked epoch`).
+    // An accounting position, not a cache — survives the §4(a)2
+    // labels-cache deletion and is private to this loop.
+    let mut cursors: HashMap<String, f64> = HashMap::new();
 
-    // Live-exposure flush cadence. λ's denominator must include
-    // censored (still-running) observations; flushing every minute
-    // bounds the right-censoring bias to ≤60 node-seconds per node.
     let mut flush = tokio::time::interval(Duration::from_secs(EXPOSURE_FLUSH_SECS));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -653,91 +554,38 @@ pub async fn run(
     let mut hw_refresh = tokio::time::interval(Duration::from_secs(HW_CONFIG_REFRESH_SECS));
     hw_refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-    // Names seen between Init and InitDone. `Some` only during a
-    // relist; `None` during steady-state Apply/Delete.
-    let mut relist_seen: Option<HashSet<String>> = None;
-
-    info!("Node informer started");
+    info!("Node informer started (per-flush LIST, no watch)");
 
     loop {
-        let event = tokio::select! {
+        tokio::select! {
             biased;
             _ = shutdown.cancelled() => {
                 debug!("Node informer: shutdown");
                 return;
             }
             _ = flush.tick() => {
-                for (hw, secs) in cache.drain_live_spot_exposure(now_epoch()) {
-                    report_exposure(&mut admin, hw, secs).await;
-                }
-                continue;
-            }
-            _ = hw_refresh.tick() => {
-                cache.config.load(&mut admin).await;
-                continue;
-            }
-            next = stream.next() => match next {
-                Some(Ok(ev)) => ev,
-                Some(Err(e)) => {
-                    warn!(error = %e, "Node informer: stream error");
-                    continue;
-                }
-                None => {
-                    warn!("Node informer: stream ended (unexpected)");
-                    return;
-                }
-            },
-        };
-
-        // Apply/InitApply → upsert; Delete → remove. Init/InitDone
-        // bracket a relist: Init opens a seen-set, InitApply both
-        // upserts AND records the name, InitDone prunes any cached
-        // entry NOT re-seen. The raw watcher synthesizes no Delete
-        // for nodes gone during a watch gap; before the periodic
-        // drain_live_spot_exposure flush this was a harmless stale-
-        // entry leak (passive lookup), but now a leaked spot entry
-        // would feed phantom node-seconds into λ's denominator until
-        // controller restart.
-        match event {
-            watcher::Event::Apply(node) => {
-                cache.apply(&node);
-            }
-            watcher::Event::InitApply(node) => {
-                if let Some(seen) = relist_seen.as_mut()
-                    && let Some(name) = &node.metadata.name
-                {
-                    seen.insert(name.clone());
-                }
-                cache.apply(&node);
-            }
-            watcher::Event::Delete(node) => {
-                // ADR-023 phase-13: final exposure slice → λ
-                // denominator. Compute BEFORE delete (cache still has
-                // last_exposure_at). Periodic flush above has already
-                // banked the bulk of this node's lifetime.
-                if let Some(name) = &node.metadata.name
-                    && let Some((hw, secs)) = cache.spot_exposure(name, now_epoch())
-                {
-                    report_exposure(&mut admin, hw, secs).await;
-                }
-                cache.delete(&node);
-            }
-            watcher::Event::Init => {
-                relist_seen = Some(HashSet::new());
-            }
-            watcher::Event::InitDone => {
-                if let Some(seen) = relist_seen.take() {
-                    for (hw, secs) in cache.prune_absent(&seen, now_epoch()) {
-                        report_exposure(&mut admin, hw, secs).await;
+                match nodes.list(&ListParams::default()).await {
+                    Ok(list) => {
+                        for (hw, secs) in
+                            flush_spot_exposure(&mut cursors, &list.items, &config, now_epoch())
+                        {
+                            report_exposure(&mut admin, hw, secs).await;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "node LIST failed; exposure flush skipped this round");
                     }
                 }
+            }
+            _ = hw_refresh.tick() => {
+                config.load(&mut admin).await;
             }
         }
     }
 }
 
 /// Live spot-node exposure flush cadence (seconds). See
-/// [`NodeLabelCache::drain_live_spot_exposure`].
+/// [`flush_spot_exposure`].
 const EXPOSURE_FLUSH_SECS: u64 = 60;
 
 /// `HwClassConfig::load` re-fetch cadence. Covers the scheduler-
@@ -766,6 +614,12 @@ const POOL_LABEL: &str = "rio.build/pool";
 /// annotation already exists) — pod annotations are sticky and the
 /// hw_class can't change for a scheduled pod.
 ///
+/// §4(a)2: the node's labels come from a per-need GET
+/// ([`node_hw_class`]), not a cache. The GET happens only AFTER the
+/// pure [`annotation_target`] pre-check passes, so the apiserver cost
+/// is one GET per pod that actually needs a stamp (≈ one per builder
+/// pod lifetime), not one per watch event.
+///
 /// `spawn_monitored("hw-class-annotator", run_pod_annotator(...))`
 /// from main.rs. Same degraded-not-broken contract as [`run`]: if the
 /// watcher dies, builders' downward-API volume stays empty,
@@ -786,10 +640,11 @@ const POOL_LABEL: &str = "rio.build/pool";
 /// (controller already holds that channel).
 pub async fn run_pod_annotator(
     client: Client,
-    cache: NodeLabelCache,
+    config: HwClassConfig,
     shutdown: rio_common::signal::Token,
 ) {
     let pods: Api<Pod> = Api::all(client.clone());
+    let nodes: Api<Node> = Api::all(client.clone());
     let cfg = watcher::Config::default().labels(POOL_LABEL);
     let mut stream = watcher(pods, cfg)
         .default_backoff()
@@ -811,7 +666,14 @@ pub async fn run_pod_annotator(
                 None => { warn!("hw-class annotator: stream ended (unexpected)"); return; }
             },
         };
-        let Some((name, ns, hw)) = hw_class_patch_target(&pod, &cache) else {
+        // Pure pre-check first: no apiserver round-trip for pods that
+        // are already stamped or not yet scheduled.
+        let Some((name, ns, node_name)) = annotation_target(&pod) else {
+            continue;
+        };
+        // Per-need GET; node gone / unmatched / config unloaded → skip
+        // (don't stamp a bogus value).
+        let Some(hw) = node_hw_class(&nodes, &config, &node_name).await else {
             continue;
         };
         let pods_ns: Api<Pod> = Api::namespaced(client.clone(), &ns);
@@ -830,15 +692,16 @@ pub async fn run_pod_annotator(
 /// ADR-023 phase-13 λ\[h\] self-calibration: watch `core/v1.Event` for
 /// `reason=SpotInterrupted` (Karpenter emits this on BOTH the NodeClaim
 /// and the Node when AWS sends the 2-minute spot interruption notice;
-/// we watch the Node event because [`NodeLabelCache`] is keyed by Node
-/// name), resolve the referenced node's hw_class, and append
+/// we watch the Node event so `involvedObject.name` is the Node
+/// `metadata.name`), resolve the referenced node's hw_class via a
+/// per-need GET ([`node_hw_class`], §4(a)2 — interrupts are rare, so
+/// one GET per event is negligible), and append
 /// `interrupt_samples(hw_class, kind='interrupt', value=1)` via
 /// `AdminService.AppendInterruptSample`.
 ///
 /// The exposure half (`kind='exposure', value=node_seconds`) is
 /// emitted from [`run`]: a periodic flush banks live node-seconds
-/// every `EXPOSURE_FLUSH_SECS`, and the Node-DELETE arm appends
-/// the final residual slice. Live nodes MUST contribute — counting
+/// every `EXPOSURE_FLUSH_SECS`. Live nodes MUST contribute — counting
 /// only completed lifetimes is the right-censoring bias that spikes
 /// λ at burst onset.
 ///
@@ -846,17 +709,17 @@ pub async fn run_pod_annotator(
 /// on the cluster's full event firehose. Karpenter's interruption
 /// controller emits the `SpotInterrupted` event on BOTH the NodeClaim
 /// and the Node; we watch the **Node** event so `involvedObject.name`
-/// is the Node `metadata.name` — the same key [`NodeLabelCache`] is
-/// indexed by. The NodeClaim event's `involvedObject.name` is the
-/// NodeClaim name (`{nodepool}-{hash}` on EKS), which would always
-/// miss the IP-derived-Node-name-keyed cache.
+/// is the Node `metadata.name` — the name the GET resolves. The
+/// NodeClaim event's `involvedObject.name` is the NodeClaim name
+/// (`{nodepool}-{hash}` on EKS), which is not a Node name.
 pub async fn run_spot_interrupt_watcher(
     client: Client,
-    cache: NodeLabelCache,
+    config: HwClassConfig,
     mut admin: AdminClient,
     shutdown: rio_common::signal::Token,
 ) {
-    let events: Api<Event> = Api::all(client);
+    let events: Api<Event> = Api::all(client.clone());
+    let nodes: Api<Node> = Api::all(client);
     let cfg = watcher::Config::default().fields("reason=SpotInterrupted,involvedObject.kind=Node");
     let mut stream = watcher(events, cfg)
         .default_backoff()
@@ -876,12 +739,12 @@ pub async fn run_spot_interrupt_watcher(
             },
         };
         // involvedObject.kind=Node ⇒ involvedObject.name IS the Node
-        // metadata.name — the cache key.
+        // metadata.name.
         let Some(node) = ev.involved_object.name else {
             continue;
         };
-        let Some(hw_class) = cache.hw_class_of(&node) else {
-            debug!(%node, "spot-interrupt: node not in cache; skipping");
+        let Some(hw_class) = node_hw_class(&nodes, &config, &node).await else {
+            debug!(%node, "spot-interrupt: node unresolvable; skipping");
             continue;
         };
         // `event_uid` makes the INSERT idempotent: `.applied_objects()`
@@ -909,7 +772,7 @@ pub async fn run_spot_interrupt_watcher(
 /// Best-effort: a failed/timed-out RPC drops one denominator sample
 /// (λ reads slightly high until the next flush lands). Bounded by
 /// [`admin_call`]'s timeout so a hung scheduler can't wedge the Node-
-/// informer's watch loop (every caller is inside that loop).
+/// informer's flush loop (every caller is inside that loop).
 async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
     if let Err(e) = admin_call(admin.append_interrupt_sample(
         rio_proto::types::AppendInterruptSampleRequest {
@@ -927,10 +790,12 @@ async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
     }
 }
 
-/// `Some((pod_name, namespace, hw_class))` if `pod` should be stamped:
-/// it has a `spec.nodeName`, that node is in `cache`, and the
-/// annotation isn't already set. Pure for unit-testability.
-fn hw_class_patch_target(pod: &Pod, cache: &NodeLabelCache) -> Option<(String, String, String)> {
+/// `Some((pod_name, namespace, node_name))` if `pod` is a candidate
+/// for the `rio.build/hw-class` stamp: scheduled (`spec.nodeName`
+/// set) and not already annotated. Pure pre-check — the per-need
+/// node GET ([`node_hw_class`]) runs only after this passes, so
+/// already-stamped and Pending pods cost no apiserver round-trip.
+fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
     let already = pod
         .metadata
         .annotations
@@ -939,11 +804,10 @@ fn hw_class_patch_target(pod: &Pod, cache: &NodeLabelCache) -> Option<(String, S
     if already {
         return None;
     }
-    let node = pod.spec.as_ref()?.node_name.as_deref()?;
-    let hw = cache.hw_class_of(node)?;
+    let node = pod.spec.as_ref()?.node_name.clone()?;
     let name = pod.metadata.name.clone()?;
     let ns = pod.metadata.namespace.clone()?;
-    Some((name, ns, hw))
+    Some((name, ns, node))
 }
 
 #[cfg(test)]
@@ -972,8 +836,8 @@ mod tests {
         ])
     }
 
-    fn band_cache() -> NodeLabelCache {
-        NodeLabelCache::with_config(band_config())
+    fn labels_of(node: &Node) -> BTreeMap<String, String> {
+        node.metadata.labels.clone().unwrap_or_default()
     }
 
     #[test]
@@ -1015,15 +879,22 @@ mod tests {
         assert_eq!(HwClassConfig::default().labels_for("intel-7"), None);
     }
 
+    /// The label match every per-need GET and per-flush LIST runs: a
+    /// node's labels resolve to the operator's `$h` key; an unmatched
+    /// label set resolves to `None`. Successor of the deleted cache's
+    /// `hw_class_of_matches_operator_config` — the lookup-by-name half
+    /// is gone with the cache (the GET reads the apiserver directly).
     #[test]
-    fn hw_class_of_matches_operator_config() {
-        let cache = band_cache();
-        cache.apply(&node(
-            "ip-10-0-1-5",
-            &[("rio.build/hw-band", "7"), ("unrelated", "x")],
-        ));
-        assert_eq!(cache.hw_class_of("ip-10-0-1-5"), Some("intel-7".into()));
-        assert_eq!(cache.hw_class_of("missing"), None);
+    fn match_node_matches_operator_config() {
+        let cfg = band_config();
+        assert_eq!(
+            cfg.match_node(&labels_of(&node(
+                "ip-10-0-1-5",
+                &[("rio.build/hw-band", "7"), ("unrelated", "x")],
+            ))),
+            Some("intel-7".into())
+        );
+        assert_eq!(cfg.match_node(&BTreeMap::new()), None);
     }
 
     /// bug_061 contract: the matched value IS the operator's `$h` key,
@@ -1040,34 +911,40 @@ mod tests {
                 ("rio.build/storage", "nvme"),
             ],
         )]);
-        let cache = NodeLabelCache::with_config(cfg);
-        cache.apply(&node(
-            "full",
-            &[
-                ("karpenter.k8s.aws/instance-cpu-manufacturer", "amd"),
-                ("rio.build/storage", "nvme"),
-                ("karpenter.k8s.aws/instance-generation", "6"),
-            ],
-        ));
-        assert_eq!(cache.hw_class_of("full"), Some("amd-nvme-mid".into()));
+        assert_eq!(
+            cfg.match_node(&labels_of(&node(
+                "full",
+                &[
+                    ("karpenter.k8s.aws/instance-cpu-manufacturer", "amd"),
+                    ("rio.build/storage", "nvme"),
+                    ("karpenter.k8s.aws/instance-generation", "6"),
+                ],
+            ))),
+            Some("amd-nvme-mid".into())
+        );
         // Partial match (one label of the conjunction missing) → None.
-        cache.apply(&node(
-            "partial",
-            &[("karpenter.k8s.aws/instance-cpu-manufacturer", "amd")],
-        ));
-        assert_eq!(cache.hw_class_of("partial"), None);
+        assert_eq!(
+            cfg.match_node(&labels_of(&node(
+                "partial",
+                &[("karpenter.k8s.aws/instance-cpu-manufacturer", "amd")],
+            ))),
+            None
+        );
     }
 
-    /// Unloaded config → `hw_class_of` returns `None` (annotator
-    /// skips, λ-samples skip — degraded, not broken). Late config load
-    /// resolves already-cached nodes (lazy match).
+    /// Unloaded config → `match_node` returns `None` (annotator skips,
+    /// λ-samples skip — degraded, not broken). Once config loads, the
+    /// SAME labels resolve — and because every per-need GET / per-flush
+    /// LIST re-matches against current config, there is no stale-cache
+    /// window to invalidate (successor of the deleted cache's
+    /// lazy-match test).
     #[test]
-    fn hw_class_none_until_config_loaded_then_lazy_match() {
-        let cache = NodeLabelCache::default();
-        cache.apply(&node("n", &[("rio.build/hw-band", "7")]));
-        assert_eq!(cache.hw_class_of("n"), None, "config empty → no match");
-        // Config arrives: already-cached node now resolves.
-        cache.config.set(
+    fn match_none_until_config_loaded() {
+        let cfg = HwClassConfig::default();
+        let labels = labels_of(&node("n", &[("rio.build/hw-band", "7")]));
+        assert_eq!(cfg.match_node(&labels), None, "config empty → no match");
+        // Config arrives: the same labels now resolve.
+        cfg.set(
             [(
                 "intel-7".into(),
                 rio_proto::types::HwClassLabels {
@@ -1084,8 +961,8 @@ mod tests {
             .into(),
             (192, 1536 << 30),
         );
-        assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
-        assert_eq!(cache.config.ceilings_for("intel-7"), Some((64, 256 << 30)));
+        assert_eq!(cfg.match_node(&labels), Some("intel-7".into()));
+        assert_eq!(cfg.ceilings_for("intel-7"), Some((64, 256 << 30)));
     }
 
     /// `ceilings_for`: per-class capacity ceilings; `None` for unknown
@@ -1148,51 +1025,6 @@ mod tests {
         assert_eq!(cfg.match_node(&labels), Some("aa".into()));
     }
 
-    #[test]
-    fn delete_evicts_entry() {
-        let cache = band_cache();
-        let n = node("ip-10-0-1-5", &[("rio.build/hw-band", "7")]);
-        cache.apply(&n);
-        assert_eq!(cache.len(), 1);
-        cache.delete(&n);
-        assert_eq!(cache.hw_class_of("ip-10-0-1-5"), None);
-        assert!(cache.is_empty());
-    }
-
-    #[test]
-    fn spot_exposure_gates_on_capacity_type() {
-        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
-        use k8s_openapi::jiff::Timestamp;
-        let cache = band_cache();
-        let mut spot = node(
-            "spot-n",
-            &[(LABEL_CAPACITY_TYPE, "spot"), ("rio.build/hw-band", "7")],
-        );
-        spot.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
-        cache.apply(&spot);
-        let mut od = node(
-            "od-n",
-            &[
-                (LABEL_CAPACITY_TYPE, "on-demand"),
-                ("rio.build/hw-band", "7"),
-            ],
-        );
-        od.metadata.creation_timestamp = Some(Time(Timestamp::from_second(1000).unwrap()));
-        cache.apply(&od);
-        // Spot node → exposure with hw_class + uptime.
-        let (hw, secs) = cache.spot_exposure("spot-n", 1100.0).unwrap();
-        assert_eq!(hw, "intel-7");
-        assert!((secs - 100.0).abs() < 1e-6);
-        // On-demand → no exposure (λ=0 by definition).
-        assert!(cache.spot_exposure("od-n", 1100.0).is_none());
-        // Unknown node → None.
-        assert!(cache.spot_exposure("missing", 1100.0).is_none());
-        // Spot but no matching $h (config empty) → None (no key for λ).
-        let bare = NodeLabelCache::default();
-        bare.apply(&spot);
-        assert!(bare.spot_exposure("spot-n", 1100.0).is_none());
-    }
-
     fn spot_node(name: &str, band: &str, created: i64) -> Node {
         use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
         use k8s_openapi::jiff::Timestamp;
@@ -1204,85 +1036,141 @@ mod tests {
         n
     }
 
-    /// Right-censoring fix: live spot nodes contribute exposure on
-    /// every periodic drain, not only on Delete. Drain returns the
-    /// per-hw_class delta since last drain and advances the cursor;
-    /// Delete-arm `spot_exposure` then sees only the residual.
-    #[test]
-    fn drain_live_spot_exposure_banks_incremental_deltas() {
-        let cache = band_cache();
-        cache.apply(&spot_node("a", "7", 1000));
-        cache.apply(&spot_node("b", "7", 1000));
-        cache.apply(&spot_node("c", "6", 1020));
-        // On-demand node: must NOT appear in drain output.
-        let mut od = node("od", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
-        od.metadata.creation_timestamp = spot_node("x", "7", 1000).metadata.creation_timestamp;
-        cache.apply(&od);
-
-        // First drain at t=1060: a+b → 2×60=120s for intel-7, c → 40s.
-        let mut d = cache.drain_live_spot_exposure(1060.0);
-        d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(d, vec![("intel-6".into(), 40.0), ("intel-7".into(), 120.0)]);
-
-        // Second drain at t=1120: deltas only (60s each), not
-        // cumulative-from-created.
-        let mut d = cache.drain_live_spot_exposure(1120.0);
-        d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 120.0)]);
-
-        // Re-apply (watch relist / label Modify) MUST preserve
-        // last_exposure_at — no double-count of the banked slice.
-        cache.apply(&spot_node("a", "7", 1000));
-        let (_, secs) = cache.spot_exposure("a", 1150.0).unwrap();
-        assert!((secs - 30.0).abs() < 1e-6, "residual since last drain");
-
-        // Delete-arm sees only the residual since last drain, not
-        // full lifetime (periodic flush already banked 1000..1120).
-        let (_, secs) = cache.spot_exposure("c", 1150.0).unwrap();
-        assert!((secs - 30.0).abs() < 1e-6);
+    fn od_node(name: &str, created: i64) -> Node {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::Time;
+        use k8s_openapi::jiff::Timestamp;
+        let mut n = node(
+            name,
+            &[
+                (LABEL_CAPACITY_TYPE, "on-demand"),
+                ("rio.build/hw-band", "7"),
+            ],
+        );
+        n.metadata.creation_timestamp = Some(Time(Timestamp::from_second(created).unwrap()));
+        n
     }
 
-    /// Watch-gap relist: a spot node deleted during the gap gets no
-    /// Delete event. `prune_absent` (called on InitDone) must evict it
-    /// — returning its final exposure slice — so it stops feeding
-    /// `drain_live_spot_exposure` phantom node-seconds.
+    fn sorted(mut v: Vec<(String, f64)>) -> Vec<(String, f64)> {
+        v.sort_by(|a, b| a.0.cmp(&b.0));
+        v
+    }
+
+    /// §4(a)2 gate (M11 no-double-count): right-censoring fix carried
+    /// over from the watch cache — live spot nodes contribute exposure
+    /// on every flush, each flush banks only the delta since the
+    /// previous one (cursor advance), and on-demand nodes contribute
+    /// nothing. Port of the deleted cache's
+    /// `drain_live_spot_exposure_banks_incremental_deltas`.
     #[test]
-    fn prune_absent_evicts_nodes_missing_from_relist() {
-        let cache = band_cache();
-        cache.apply(&spot_node("a", "7", 1000));
-        cache.apply(&spot_node("b", "7", 1000));
-        cache.apply(&spot_node("b2", "7", 1000));
-        cache.apply(&spot_node("c", "6", 1020));
-        // On-demand: evicted but contributes no exposure slice.
-        let mut od = node("od", &[(LABEL_CAPACITY_TYPE, "on-demand")]);
-        od.metadata.creation_timestamp = spot_node("x", "7", 1000).metadata.creation_timestamp;
-        cache.apply(&od);
+    fn flush_banks_incremental_deltas() {
+        let cfg = band_config();
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let nodes = vec![
+            spot_node("a", "7", 1000),
+            spot_node("b", "7", 1000),
+            spot_node("c", "6", 1020),
+            // On-demand node: must NOT appear in flush output.
+            od_node("od", 1000),
+        ];
 
-        // Periodic flush at t=1060 advances all cursors to 1060.
-        let _ = cache.drain_live_spot_exposure(1060.0);
+        // First flush at t=1060: cursors seed from creationTimestamp →
+        // a+b → 2×60=120s for intel-7, c → 40s.
+        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 1060.0));
+        assert_eq!(d, vec![("intel-6".into(), 40.0), ("intel-7".into(), 120.0)]);
 
-        // Relist at t=1090 saw only {a, c}. b, b2, od deleted during
-        // the gap → prune. b+b2 residuals (1060..1090 each) are
-        // returned AGGREGATED by hw_class (bug_057: per-node tuples
-        // would emit 2 entries × 30.0, defeating the watch-loop
-        // bound); od is not spot → no exposure slice.
-        let seen: HashSet<String> = ["a", "c"].into_iter().map(String::from).collect();
-        let evicted = cache.prune_absent(&seen, 1090.0);
+        // Second flush at t=1120 over the SAME LIST: deltas only (60s
+        // each), not cumulative-from-created — the cursor advanced.
+        let d = sorted(flush_spot_exposure(&mut cursors, &nodes, &cfg, 1120.0));
+        assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 120.0)]);
+
+        // On-demand node never grew a cursor.
+        assert!(!cursors.contains_key("od"));
+    }
+
+    /// §4(a)2 gate (capacity-type / match gating): spot nodes whose
+    /// labels match no configured `$h` advance their cursor WITHOUT
+    /// banking — a late config load does not retro-bank the unmatched
+    /// window (same semantics as the deleted cache). Port of
+    /// `spot_exposure_gates_on_capacity_type`'s config-empty half.
+    #[test]
+    fn flush_unmatched_window_is_dropped_not_retro_banked() {
+        let unloaded = HwClassConfig::default();
+        let loaded = band_config();
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let nodes = vec![spot_node("a", "7", 1000)];
+
+        // Flush at t=1060 with config not yet loaded: nothing banked,
+        // but the cursor still advances to 1060.
+        let d = flush_spot_exposure(&mut cursors, &nodes, &unloaded, 1060.0);
+        assert!(d.is_empty(), "unmatched spot node banks nothing");
+        assert_eq!(cursors.get("a").copied(), Some(1060.0));
+
+        // Config loads; flush at t=1120 banks ONLY 1060..1120 — the
+        // unmatched 1000..1060 window is dropped, not retro-banked.
+        let d = flush_spot_exposure(&mut cursors, &nodes, &loaded, 1120.0);
+        assert_eq!(d, vec![("intel-7".into(), 60.0)]);
+    }
+
+    /// §4(a)2 gate (the recorded accepted under-count): a node absent
+    /// from the LIST has its cursor dropped WITHOUT banking the final
+    /// partial slice. This is the deleted watch cache's Delete-arm /
+    /// `prune_absent` residual flush, deliberately forfeited (≤ one
+    /// flush period per node, λ reads marginally high — the
+    /// cost-conservative direction). Successor of
+    /// `prune_absent_evicts_nodes_missing_from_relist`, with the
+    /// assertion inverted to match the recorded semantics change.
+    #[test]
+    fn flush_drops_absent_node_cursors_without_banking() {
+        let cfg = band_config();
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let all = vec![
+            spot_node("a", "7", 1000),
+            spot_node("b", "7", 1000),
+            spot_node("b2", "7", 1000),
+            spot_node("c", "6", 1020),
+            od_node("od", 1000),
+        ];
+
+        // Flush at t=1060 sees everything; all cursors advance.
+        let _ = flush_spot_exposure(&mut cursors, &all, &cfg, 1060.0);
+        assert_eq!(cursors.len(), 4, "four spot nodes tracked");
+
+        // b, b2, od deleted between flushes → the t=1090 LIST has only
+        // {a, c}. Their 1060..1090 residuals are forfeited (NOT in the
+        // output) and their cursors are dropped.
+        let survivors = vec![spot_node("a", "7", 1000), spot_node("c", "6", 1020)];
+        let d = sorted(flush_spot_exposure(&mut cursors, &survivors, &cfg, 1090.0));
         assert_eq!(
-            evicted,
-            vec![("intel-7".into(), 60.0)],
-            "two same-hw_class spot nodes → ONE aggregated entry (Σsecs)"
+            d,
+            vec![("intel-6".into(), 30.0), ("intel-7".into(), 30.0)],
+            "only survivors bank; absent nodes' residuals are forfeited"
         );
-        assert_eq!(cache.len(), 2);
-        assert!(cache.hw_class_of("b").is_none());
-        assert!(cache.hw_class_of("b2").is_none());
-        assert!(cache.hw_class_of("od").is_none());
+        assert_eq!(cursors.len(), 2);
+        assert!(!cursors.contains_key("b"));
+        assert!(!cursors.contains_key("b2"));
 
-        // Next periodic drain at t=1120: only survivors contribute —
-        // no phantom 60s from b/b2.
-        let mut d = cache.drain_live_spot_exposure(1120.0);
-        d.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(d, vec![("intel-6".into(), 60.0), ("intel-7".into(), 60.0)]);
+        // Next flush at t=1120: still only the survivors — no phantom
+        // node-seconds from the departed nodes (the b81da271f hazard
+        // the watch needed `prune_absent` for cannot exist here).
+        let d = sorted(flush_spot_exposure(&mut cursors, &survivors, &cfg, 1120.0));
+        assert_eq!(d, vec![("intel-6".into(), 30.0), ("intel-7".into(), 30.0)]);
+    }
+
+    /// A re-listed node (same LIST contents, later flush) must NOT
+    /// re-seed its cursor from creationTimestamp — the cursor map is
+    /// the no-double-count authority (M11). Port of the re-apply half
+    /// of the deleted cache's incremental-deltas test.
+    #[test]
+    fn flush_preserves_cursor_across_relists() {
+        let cfg = band_config();
+        let mut cursors: HashMap<String, f64> = HashMap::new();
+        let nodes = vec![spot_node("a", "7", 1000)];
+        let d = flush_spot_exposure(&mut cursors, &nodes, &cfg, 1060.0);
+        assert_eq!(d, vec![("intel-7".into(), 60.0)]);
+        // Same node, fresh LIST objects (a relist): banks 30s, not 110s.
+        let relisted = vec![spot_node("a", "7", 1000)];
+        let d = flush_spot_exposure(&mut cursors, &relisted, &cfg, 1090.0);
+        assert_eq!(d, vec![("intel-7".into(), 30.0)]);
     }
 
     fn pod(name: &str, ns: &str, node: Option<&str>, annots: &[(&str, &str)]) -> Pod {
@@ -1306,46 +1194,30 @@ mod tests {
         p
     }
 
+    /// The pure pre-check that gates the per-need GET: stamp candidates
+    /// are scheduled, not-yet-annotated pods. The "node missing" and
+    /// "no `$h` matches" skip arms moved into [`node_hw_class`] (the
+    /// GET half) — their match logic is covered by the `match_node`
+    /// tests above. Successor of the deleted `patch_target_stamps_once`.
     #[test]
-    fn patch_target_stamps_once() {
-        let cache = band_cache();
-        cache.apply(&node("ip-10-0-1-5", &[("rio.build/hw-band", "7")]));
-        // Scheduled, not yet annotated → stamp.
+    fn annotation_target_stamps_once() {
+        // Scheduled, not yet annotated → candidate (carries node name
+        // for the GET).
         let p = pod("rb-abc", "rio", Some("ip-10-0-1-5"), &[]);
         assert_eq!(
-            hw_class_patch_target(&p, &cache),
-            Some(("rb-abc".into(), "rio".into(), "intel-7".into()))
+            annotation_target(&p),
+            Some(("rb-abc".into(), "rio".into(), "ip-10-0-1-5".into()))
         );
-        // Already annotated → skip (sticky).
+        // Already annotated → skip (sticky), costing no GET.
         let p = pod(
             "rb-abc",
             "rio",
             Some("ip-10-0-1-5"),
             &[(ANNOT_HW_CLASS, "intel-7")],
         );
-        assert_eq!(hw_class_patch_target(&p, &cache), None);
-        // Pending (no nodeName yet) → skip.
+        assert_eq!(annotation_target(&p), None);
+        // Pending (no nodeName yet) → skip, costing no GET.
         let p = pod("rb-pending", "rio", None, &[]);
-        assert_eq!(hw_class_patch_target(&p, &cache), None);
-        // Node not in cache (informer race / non-Karpenter) → skip.
-        let p = pod("rb-unk", "rio", Some("ip-10-0-9-9"), &[]);
-        assert_eq!(hw_class_patch_target(&p, &cache), None);
-        // Cached node but no $h matches (e.g. non-builder NodePool, or
-        // config not yet loaded) → skip — don't stamp a bogus value.
-        cache.apply(&node("nomatch", &[("rio.build/hw-band", "9")]));
-        let p = pod("rb-nm", "rio", Some("nomatch"), &[]);
-        assert_eq!(hw_class_patch_target(&p, &cache), None);
-    }
-
-    #[test]
-    fn apply_upserts_on_label_change() {
-        let cache = band_cache();
-        cache.apply(&node("n", &[("rio.build/hw-band", "6")]));
-        assert_eq!(cache.hw_class_of("n"), Some("intel-6".into()));
-        // Relabel (e.g., operator manually patched) → Modify event →
-        // apply() again → cache reflects new value.
-        cache.apply(&node("n", &[("rio.build/hw-band", "7")]));
-        assert_eq!(cache.hw_class_of("n"), Some("intel-7".into()));
-        assert_eq!(cache.len(), 1, "upsert, not duplicate");
+        assert_eq!(annotation_target(&p), None);
     }
 }
