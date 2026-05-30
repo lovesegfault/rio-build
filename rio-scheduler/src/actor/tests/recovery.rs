@@ -2308,6 +2308,241 @@ async fn test_recovery_substituting_with_poisoned_dep_goes_dependency_failed() -
     Ok(())
 }
 
+/// Shared staging for the cross-build recovery-condemnation tests below
+/// (the bug_009 shape with a within-TTL poison instead of a cancel):
+///
+///  - build A full-merges `xrc-parent`→`xrc-child` (A owns both rows and
+///    declares the edge);
+///  - build B merges `xrc-parent` alone (B co-owns the parent but never
+///    the child — the pruning-build shape: interested in its kept root,
+///    never in the root's closure);
+///  - PG is then backdated to the post-crash shape: child poisoned
+///    within TTL (poisoned under A's ownership), parent substituting
+///    (its detached fetch died with the old leader), build A failed
+///    (the natural consequence of its own child's poison), build B
+///    still active.
+///
+/// The child's `poisoned_at` is future-dated by one hour so the
+/// within-TTL load is deterministic regardless of host speed: the
+/// cfg(test) `POISON_TTL` is 100ms, and a real `now()` timestamp could
+/// expire between the backdate and `load_poisoned_derivations` on a
+/// loaded CI host (`from_poisoned_row` clamps the negative elapsed to 0
+/// — a fresh full TTL at recovery time).
+async fn seed_cross_build_poisoned_dep(
+    handle: ActorHandle,
+    pool: sqlx::PgPool,
+    build_a: Uuid,
+    build_b: Uuid,
+) -> anyhow::Result<()> {
+    let _rxa = merge_dag(
+        &handle,
+        build_a,
+        vec![make_node("xrc-parent"), make_node("xrc-child")],
+        vec![make_test_edge("xrc-parent", "xrc-child")],
+        false,
+    )
+    .await?;
+    let _rxb = merge_dag(
+        &handle,
+        build_b,
+        vec![make_node("xrc-parent")],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    drop(handle);
+    sqlx::query(
+        "UPDATE derivations SET status = 'poisoned', poisoned_at = now() + interval '1 hour' \
+         WHERE drv_hash = 'xrc-child'",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'xrc-parent'")
+        .execute(&pool)
+        .await?;
+    sqlx::query("UPDATE builds SET status = 'failed' WHERE build_id = $1")
+        .bind(build_a)
+        .execute(&pool)
+        .await?;
+    Ok(())
+}
+
+// r[verify sched.recovery.failed-dep-cascade+2]
+/// The recovery condemnation MUST be scoped by build co-ownership (the
+/// `sched.recovery.failed-dep-cascade+2` MUST NOT clause): a recovered
+/// parent above a within-TTL poisoned child is condemned only when a
+/// LIVE build co-owns that child with it. A parent whose only
+/// failed-child evidence belongs to a dead build (or to a live build
+/// that never owned the parent) recovers normally — Queued above the
+/// still-loaded poisoned child — and its owning build stays Active.
+///
+/// Both recovery condemnation mechanisms must honor the scoping: the
+/// cascade pre-pass (`load_parents_with_failed_deps` — already scoped,
+/// bug_341/bug_009) and the in-DAG recompute (`compute_initial_states` /
+/// `any_co_owned_dep_terminally_failed` — the Wave-2 residual finding).
+/// The within-TTL poisoned child IS loaded with its edge
+/// (`sched.recovery.poisoned-failed-count`), so only the in-DAG
+/// recompute sees it; pre-fix that recompute used the UNSCOPED
+/// `any_dep_terminally_failed`, condemned the parent to DependencyFailed
+/// (persisted at recovery) and `finalize_recovered_builds` terminally
+/// failed build B — a wrongful C3-class failure on cross-build evidence,
+/// even though B's own work could still succeed once the poison clears.
+#[tokio::test]
+async fn test_recovery_cross_build_poisoned_dep_spares_non_co_owning_parent() -> TestResult {
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        seed_cross_build_poisoned_dep(handle, pool, build_a, build_b).await
+    })
+    .await?;
+
+    // Precondition: the within-TTL poisoned child is loaded into the DAG
+    // (with its edge) for TTL tracking. If this fails the test is
+    // exercising the dropped-edge path, not the residual scenario.
+    let child = expect_drv(&f.handle, "xrc-child").await;
+    assert_eq!(
+        child.status,
+        DerivationStatus::Poisoned,
+        "fixture premise: within-TTL poisoned child is loaded at recovery"
+    );
+
+    // The parent must NOT be condemned: its only failed-child evidence
+    // belongs to dead build A. It recovers Queued above the still-loaded
+    // poisoned child, waiting for the poison to clear.
+    let parent = expect_drv(&f.handle, "xrc-parent").await;
+    assert_eq!(
+        parent.status,
+        DerivationStatus::Queued,
+        "a recovered parent above a non-co-owned poisoned child must NOT be \
+         condemned (sched.recovery.failed-dep-cascade+2 MUST NOT clause), \
+         got {:?}",
+        parent.status
+    );
+
+    // Build B (the parent's only live owner) must stay Active — failing
+    // it here is exactly the wrongful terminal failure the scoping
+    // prevents.
+    let status = query_status(&f.handle, build_b).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build B must stay Active (its parent was spared by co-ownership \
+         scoping); error_summary: {:?}",
+        status.error_summary
+    );
+
+    // The wrongful condemnation must not be persisted either (pre-fix it
+    // was, via the recovery DependencyFailed persist).
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'xrc-parent'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_ne!(
+        pg_status, "dependency_failed",
+        "the spared parent's PG row must not carry the wrongful dependency_failed"
+    );
+
+    Ok(())
+}
+
+// r[verify sched.poison.clear-survivor-reevaluation]
+// r[verify sched.recovery.failed-dep-cascade+2]
+/// What un-blocks the parent spared by the co-ownership scoping (test
+/// above): the poison-clear removal. When the non-co-owned child's
+/// poison is cleared — admin `ClearPoison` or the poison-TTL sweep —
+/// the surviving parent must be re-evaluated: it is now childless, all
+/// dependencies vacuously satisfied, so it MUST be promoted to Ready
+/// and pushed for dispatch, and its PG row updated.
+///
+/// Without the re-evaluation the spared parent sits Queued forever (no
+/// completion event will ever fire for the removed child — the exact
+/// hang shape the unscoped condemnation was preventing) and build B
+/// never makes progress. Scoping and survivor re-evaluation are two
+/// halves of one fix; this test pins the second half on both removal
+/// paths.
+#[rstest::rstest]
+#[case::admin_clear(false)]
+#[case::ttl_expiry(true)]
+#[tokio::test]
+async fn test_poison_clear_reevaluates_spared_recovered_parent(
+    #[case] via_ttl: bool,
+) -> TestResult {
+    let build_a = Uuid::new_v4();
+    let build_b = Uuid::new_v4();
+    let f = RecoveryFixture::run(async |handle, pool| {
+        seed_cross_build_poisoned_dep(handle, pool, build_a, build_b).await
+    })
+    .await?;
+
+    // Recovery left the spared parent Queued above the loaded poisoned
+    // child (the half-1 test pins this in detail).
+    assert_eq!(
+        expect_drv(&f.handle, "xrc-parent").await.status,
+        DerivationStatus::Queued,
+        "fixture premise: the spared parent recovered Queued"
+    );
+
+    // Clear the child's poison: admin ClearPoison, or the cfg(test)
+    // 100ms TTL + a Tick. (The recovered in-memory `poisoned_at` is
+    // recovery-time — `from_poisoned_row` clamps the future-dated row's
+    // negative elapsed to 0 — so the TTL sweep fires after a real
+    // ~100ms sleep.)
+    if via_ttl {
+        tokio::time::sleep(crate::state::POISON_TTL + std::time::Duration::from_millis(250)).await;
+        tick(&f.handle).await?;
+    } else {
+        let (tx, rx) = oneshot::channel();
+        f.handle
+            .send_unchecked(ActorCommand::ClearPoison {
+                drv_hash: "xrc-child".into(),
+                reply: tx,
+            })
+            .await?;
+        assert!(rx.await?, "ClearPoison → cleared=true");
+    }
+    assert!(
+        f.handle
+            .debug_query_derivation("xrc-child")
+            .await?
+            .is_none(),
+        "the poisoned child must be removed from the DAG"
+    );
+
+    // The surviving parent must be promoted: Queued + childless →
+    // all deps vacuously satisfied → Ready (and pushed for dispatch).
+    let parent = expect_drv(&f.handle, "xrc-parent").await;
+    assert_eq!(
+        parent.status,
+        DerivationStatus::Ready,
+        "the poison-clear removal must re-evaluate the surviving parent: \
+         Queued + now-childless → Ready (sched.poison.clear-survivor-reevaluation), \
+         got {:?}",
+        parent.status
+    );
+
+    // The promotion is persisted (so a second failover doesn't reload a
+    // stale 'substituting'/'queued' row).
+    let (pg_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'xrc-parent'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(
+        pg_status, "ready",
+        "the survivor promotion must be persisted to PG"
+    );
+
+    // Build B is still Active and now has dispatchable work.
+    let status = query_status(&f.handle, build_b).await?;
+    assert_eq!(
+        status.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build B must still be Active with its parent now dispatchable"
+    );
+
+    Ok(())
+}
+
 // r[verify sched.timeout.per-build]
 /// `build_timeout` is "wall-clock since SUBMISSION" — recovery must
 /// seed `submitted_at` from PG, not reset to `Instant::now()`. Otherwise

@@ -404,6 +404,20 @@ impl DagActor {
                       "failed to persist closure_hole after poison-TTL sweep (continuing)");
             }
         }
+        // r[impl sched.poison.clear-survivor-reevaluation]
+        // Wake the surviving parents (the TTL-sweep twin of the admin
+        // ClearPoison hook): settle marked-Broken survivors, promote
+        // Queued ones whose deps are now (vacuously) satisfied. A parent
+        // the recovery condemnation spared on co-ownership grounds waits
+        // Queued above its non-co-owned poisoned child until exactly this
+        // sweep fires — without the re-evaluation it would sit there
+        // forever (`find_newly_ready` fires only on completions) and its
+        // build would hang. Leader-only: `handle_tick` no-ops on standby.
+        self.reevaluate_removal_survivors(
+            &holed_parents,
+            "poisoned dep expired while the closure was never produced",
+        )
+        .await;
     }
 
     /// DAG-state sweep for `dispatched_cells`. The arm-on-ack write

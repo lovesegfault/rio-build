@@ -1278,6 +1278,96 @@ impl DagActor {
         BrokenSettlement::VerificationSpawned
     }
 
+    // r[impl sched.poison.clear-survivor-reevaluation]
+    // r[impl sched.merge.substitute-topdown+12]
+    /// Per-survivor verdicts after children were removed from the DAG.
+    /// Shared by every leader-side removal path that leaves surviving
+    /// parents behind: the terminal-build reap
+    /// (`handle_cleanup_terminal_build`), admin `ClearPoison`
+    /// (`handle_clear_poison`) and the poison-TTL sweep
+    /// (`tick_process_expired_poisons`).
+    ///
+    /// Two stranded shapes are closed, mirroring the reap-survivor hook
+    /// this loop was extracted from:
+    ///
+    ///  - A topdown-pruned survivor with Broken closure evidence
+    ///    (childless, or closure-holed by the removal): nothing
+    ///    children-keyed can ever settle it (`find_newly_ready` only
+    ///    fires on completions), so settle it NOW via
+    ///    [`Self::settle_broken_marked_root`]
+    ///    (r[sched.evidence.settlement]). Skipped while the survivor is
+    ///    `Substituting`/`Assigned`/`Running` — an in-flight walk or
+    ///    attempt keeps its chance and its own completion settles it —
+    ///    and while `Queued` (the promotion arm below + the next
+    ///    dispatch sweep's settlement-aware partition own that shape).
+    ///
+    ///  - A `Queued` survivor whose last un-produced children were
+    ///    removed: it is now vacuously all-deps-completed, but no
+    ///    completion event will ever promote it. Promote it to Ready,
+    ///    push it and persist, so the next dispatch pass picks it up.
+    ///    This is what un-blocks a parent the recovery condemnation
+    ///    spared on co-ownership grounds
+    ///    (`sched.recovery.failed-dep-cascade+2`'s MUST NOT clause): it
+    ///    recovered Queued above a non-co-owned within-TTL poisoned
+    ///    child, and the poison-clear removal of that child is its only
+    ///    wake-up edge — without this arm it would sit Queued forever
+    ///    and its build would hang (the L3 strand).
+    ///
+    /// Skipped: vanished nodes, terminal nodes (already settled), and
+    /// nodes with no interested builds (no build left to hang).
+    ///
+    /// Leader-only: every caller is leader-gated — the reap hook runs
+    /// inside its `is_leader()` block, `handle_clear_poison`'s only
+    /// production caller is the leader-guarded admin RPC, and
+    /// `handle_tick` no-ops on standby
+    /// (`r[sched.lease.standby-tick-noop]`).
+    pub(super) async fn reevaluate_removal_survivors(
+        &mut self,
+        survivors: &[DrvHash],
+        settle_cause: &str,
+    ) {
+        for parent in survivors {
+            let Some(node) = self.dag.node(parent) else {
+                continue;
+            };
+            if node.status().is_terminal() || node.interested_builds.is_empty() {
+                continue;
+            }
+            let status = node.status();
+            // `must_substitute` = marked AND closure evidence Broken
+            // (childless OR closure-holed): a closure hole means the
+            // surviving children are a removal-truncated view of the
+            // pruned closure, so they must not vouch for a from-source
+            // dispatch any more than an empty set would.
+            if self.must_substitute(parent)
+                && status != DerivationStatus::Substituting
+                && status != DerivationStatus::Assigned
+                && status != DerivationStatus::Running
+                && status != DerivationStatus::Queued
+            {
+                // r[impl sched.evidence.settlement]
+                // Same settlement as the SubstituteComplete Broken arm:
+                // before terminally failing the survivor's builds,
+                // re-probe — the outputs may be present (the co-build
+                // dedup shape) or substitutable. The settlement itself
+                // branches on the one-shot (untried -> verification
+                // walk; tried -> fail-fast).
+                self.settle_broken_marked_root(parent, settle_cause).await;
+            } else if status == DerivationStatus::Queued
+                && self.dag.all_deps_completed(parent)
+                && let Some(s) = self.dag.node_mut(parent)
+                && s.transition(DerivationStatus::Ready).is_ok()
+            {
+                // Promotion arm. A promoted marked-Broken survivor is
+                // settled by the next dispatch sweep's settlement-aware
+                // partition; an unmarked one dispatches normally.
+                self.push_ready(parent.clone());
+                self.persist_status(parent, DerivationStatus::Ready, None)
+                    .await;
+            }
+        }
+    }
+
     // r[impl gw.activity.subst-progress]
     /// Relay byte-progress from a detached substitute fetch to every
     /// interested build via [`Event::SubstituteProgress`]. Display-only

@@ -942,11 +942,15 @@ impl DerivationDag {
 
     /// Check whether any dependency is in a terminal failure state.
     ///
-    /// Used during merge: when a newly inserted node depends on an
-    /// already-`Poisoned`/`DependencyFailed` existing node, the new node can
-    /// never complete. Without this check it would go to `Queued` and stay
-    /// there forever (never Ready since dep != Completed, never cascaded
-    /// since cascade only runs on *transition to* Poisoned).
+    /// This is the UNSCOPED form: any in-DAG terminal-failed child counts,
+    /// regardless of which build owns it. Reserved for first-party
+    /// judgments — [`Self::revert_target_for`], where the node being
+    /// reverted just had its OWN walk/dispatch fail and its children's
+    /// states are read only to pick the revert target. Decision points
+    /// that CONDEMN a node on its children's failures
+    /// ([`Self::compute_initial_states`]) go through the co-ownership-
+    /// scoped [`Self::any_co_owned_dep_terminally_failed`] instead — see
+    /// its doc for the evidence rule.
     pub fn any_dep_terminally_failed(&self, drv_hash: &str) -> bool {
         let Some(children) = self.children.get(drv_hash) else {
             return false;
@@ -963,12 +967,74 @@ impl DerivationDag {
         })
     }
 
+    /// True when at least one build is interested in BOTH nodes (their
+    /// `interested_builds` sets intersect). `interested_builds` only ever
+    /// contains live (pending/active) builds — merge inserts the
+    /// submitting build, terminal-build cleanup removes it, and recovery
+    /// rebuilds the sets from `build_derivations` links of non-terminal
+    /// builds only — so a non-empty intersection is exactly "a live build
+    /// co-owns both".
+    pub fn builds_co_own(&self, a: &str, b: &str) -> bool {
+        match (self.nodes.get(a), self.nodes.get(b)) {
+            (Some(na), Some(nb)) => !na.interested_builds.is_disjoint(&nb.interested_builds),
+            _ => false,
+        }
+    }
+
+    // r[impl sched.recovery.failed-dep-cascade+2]
+    /// Check whether any dependency is in a terminal failure state AND is
+    /// co-owned with `drv_hash` by a live build.
+    ///
+    /// The co-ownership scoping is the recovery condemnation evidence rule
+    /// (the `sched.recovery.failed-dep-cascade+2` MUST NOT clause, the
+    /// in-memory mirror of `load_parents_with_failed_deps`'s SQL): a
+    /// terminal-failed child counts against a parent only when a live
+    /// build demanded BOTH — another build's poisoned/cancelled child must
+    /// not condemn a parent that build never owned (bug_009's cross-build
+    /// shape). The spared parent recovers normally — Queued above a
+    /// still-loaded within-TTL poisoned child — and is re-evaluated when
+    /// that child's poison clears
+    /// (`sched.poison.clear-survivor-reevaluation`) or, for dropped-edge
+    /// children, re-discovered at dispatch time.
+    ///
+    /// Used by [`Self::compute_initial_states`] (the merge-time seed and
+    /// the recovery recompute). At merge time the scoping is a no-op in
+    /// production flows: a submission carries its full (possibly pruned)
+    /// closure, so the merging build co-owns every child its newly
+    /// inserted parents reference. At recovery it is load-bearing: within-
+    /// TTL poisoned children are loaded with their edges
+    /// (`sched.recovery.poisoned-failed-count`) but belong to whichever
+    /// builds' links PG holds — possibly none of the parent's.
+    pub fn any_co_owned_dep_terminally_failed(&self, drv_hash: &str) -> bool {
+        let Some(parent) = self.nodes.get(drv_hash) else {
+            return false;
+        };
+        let Some(children) = self.children.get(drv_hash) else {
+            return false;
+        };
+        children.iter().any(|child_hash| {
+            self.nodes.get(child_hash).is_some_and(|n| {
+                matches!(
+                    n.status(),
+                    DerivationStatus::Poisoned
+                        | DerivationStatus::DependencyFailed
+                        | DerivationStatus::Cancelled
+                ) && !parent.interested_builds.is_disjoint(&n.interested_builds)
+            })
+        })
+    }
+
     // r[impl sched.state.transitions]
     /// Canonical 3-way revert/reset target for a node whose own status is
-    /// being recomputed from its dependencies' CURRENT states. Mirrors
-    /// [`Self::compute_initial_states`]: terminally-failed dep →
-    /// `DependencyFailed`; all deps satisfied → `Ready`; otherwise
-    /// `Queued`.
+    /// being recomputed from its dependencies' CURRENT states. Same
+    /// 3-way shape as [`Self::compute_initial_states`]'s walk
+    /// (terminally-failed dep → `DependencyFailed`; all deps satisfied →
+    /// `Ready`; otherwise `Queued`), but deliberately UNSCOPED where that
+    /// walk is co-ownership-scoped: the callers here (post-walk-failure
+    /// reverts, dispatch-time demotions) are re-deriving the status of a
+    /// node whose OWN walk or dispatch just failed — first-party
+    /// evidence — not condemning it on another build's failure, so the
+    /// condemnation evidence rule does not apply.
     ///
     /// Exists so callers can't repeat the 2-way `Ready|Queued` mistake
     /// that drops the `any_dep_terminally_failed` check — a node reverted
@@ -1267,10 +1333,13 @@ impl DerivationDag {
     /// `path_for_hash` would not resolve afterwards) plus the deduped
     /// surviving parents that just lost children to the reap, so the caller
     /// can re-evaluate them. The survivor collection lives here — NOT in
-    /// [`Self::remove_node`] — because `remove_node` is shared with the
-    /// poison-TTL sweep and admin ClearPoison, where the removal exists to
-    /// reset the node for a fresh re-merge and must not trigger parent
-    /// re-evaluation.
+    /// [`Self::remove_node`] — because `remove_node` is a low-level
+    /// primitive shared with the poison-removal paths (poison-TTL sweep,
+    /// admin ClearPoison), which capture their own survivor sets at their
+    /// own call sites BEFORE removing the node and run the same actor-level
+    /// re-evaluation afterwards (`reevaluate_removal_survivors`,
+    /// `sched.poison.clear-survivor-reevaluation`); putting collection in
+    /// `remove_node` would double-collect for them.
     ///
     /// Survivors that lost at least one UN-PRODUCED child (status not
     /// Completed/Skipped at reap time) additionally get the in-memory
@@ -1395,10 +1464,17 @@ impl DerivationDag {
     /// immediately to Ready. Others stay in Created until they become Queued
     /// (when their dependencies complete).
     /// Derivations whose dependency is already Poisoned/DependencyFailed go
-    /// directly to DependencyFailed (pre-poisoned detection).
+    /// directly to DependencyFailed (pre-poisoned detection) — but only
+    /// when a live build co-owns that dependency with them
+    /// ([`Self::any_co_owned_dep_terminally_failed`]): condemnation is an
+    /// evidence-scoped verdict, and another build's failed child is not
+    /// evidence against a parent that build never owned
+    /// (`sched.recovery.failed-dep-cascade+2`'s MUST NOT clause; the
+    /// recovery recompute is where the cross-build case actually arises).
     ///
     /// Returns lists of (drv_hash, new_status) transitions.
     // r[impl sched.merge.dep-failed-transitive]
+    // r[impl sched.recovery.failed-dep-cascade+2]
     pub fn compute_initial_states(
         &self,
         newly_inserted: &HashSet<DrvHash>,
@@ -1415,24 +1491,36 @@ impl DerivationDag {
         let mut will_fail: HashSet<DrvHash> = HashSet::new();
 
         for drv_hash in self.kahn_topo(newly_inserted) {
-            let dep_failed_in_this_call = self
-                .children
-                .get(&drv_hash)
-                .is_some_and(|cs| cs.iter().any(|c| will_fail.contains(c)));
+            // The will_fail propagation carries the same co-ownership
+            // scoping as the direct check: a child condemned in this call
+            // condemns its parent only if a live build co-owns the pair.
+            // (Transitive same-build chains stay condemned — every link
+            // shares the submitting/owning build; a cross-build link
+            // breaks the cascade exactly like the direct case.)
+            let dep_failed_in_this_call = self.children.get(&drv_hash).is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| will_fail.contains(c) && self.builds_co_own(&drv_hash, c))
+            });
             if self.all_deps_completed(&drv_hash) {
                 // No deps or all deps already completed -> directly to ready
                 // We go created -> queued -> ready
                 transitions.push((drv_hash, DerivationStatus::Ready));
-            } else if self.any_dep_terminally_failed(&drv_hash) || dep_failed_in_this_call {
-                // A dep is already poisoned/failed (or just decided
-                // DependencyFailed in THIS call). This node cannot
+            } else if self.any_co_owned_dep_terminally_failed(&drv_hash) || dep_failed_in_this_call
+            {
+                // A co-owned dep is already poisoned/failed (or just
+                // decided DependencyFailed in THIS call). This node cannot
                 // complete. Mark DependencyFailed so the build
                 // terminates instead of hanging forever with this node
                 // stuck in Queued.
                 will_fail.insert(drv_hash.clone());
                 transitions.push((drv_hash, DerivationStatus::DependencyFailed));
             } else {
-                // Has incomplete deps -> queued (waiting for deps)
+                // Has incomplete deps -> queued (waiting for deps).
+                // Includes the spared cross-build case: a parent above a
+                // NON-co-owned terminal-failed child waits Queued; the
+                // poison-clear survivor re-evaluation
+                // (`sched.poison.clear-survivor-reevaluation`) or the
+                // dispatch-time re-discovery unblocks it.
                 transitions.push((drv_hash, DerivationStatus::Queued));
             }
         }

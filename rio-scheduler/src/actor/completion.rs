@@ -2511,6 +2511,10 @@ impl DagActor {
     /// it fresh with full proto fields and runs it through
     /// `compute_initial_states`. PG: `db.clear_poison()` sets
     /// status='created', NULLs `poisoned_at`/`retry_count`/`failed_builders`.
+    /// Surviving parents are closure-hole stamped and then re-evaluated
+    /// (`reevaluate_removal_survivors` — settlement / promotion), so a
+    /// parent that was waiting Queued above this child makes progress
+    /// (`sched.poison.clear-survivor-reevaluation`).
     ///
     /// PG first, in-mem second — if PG fails the operator's retry
     /// finds in-mem still Poisoned and can proceed. The previous
@@ -2589,6 +2593,20 @@ impl DagActor {
                       "failed to persist closure_hole after admin poison clear (continuing)");
             }
         }
+        // r[impl sched.poison.clear-survivor-reevaluation]
+        // Wake the surviving parents: settle marked-Broken survivors,
+        // promote Queued ones whose deps are now (vacuously) satisfied.
+        // Without this, a parent the recovery condemnation spared on
+        // co-ownership grounds (it recovered Queued above this
+        // non-co-owned poisoned child) waits forever — this removal is
+        // its only wake-up edge, since `find_newly_ready` fires only on
+        // completions. Leader-only by the same construction as the PG
+        // writes above.
+        self.reevaluate_removal_survivors(
+            &holed_parents,
+            "poisoned dep cleared while the closure was never produced",
+        )
+        .await;
         info!(drv_hash = %drv_hash, "poison cleared by admin; node removed from DAG");
         true
     }

@@ -700,6 +700,30 @@ parents whose cascade was interrupted by a crash. All three exist because a
 keep-going build with a poisoned leaf otherwise hangs Active forever ---
 `completed + failed` never reaches `total`.
 
+#r("sched.poison.clear-survivor-reevaluation")[
+  Both poison-removal paths --- admin `ClearPoison` and the poison-TTL
+  sweep --- MUST re-evaluate every surviving parent of the removed child
+  after the removal and the closure-hole stamp: a `Queued` survivor whose
+  remaining dependencies are all satisfied (vacuously so when the removed
+  child was its last incomplete dependency) MUST be promoted to `Ready`,
+  pushed for dispatch and persisted; a topdown-pruned survivor whose
+  closure evidence is Broken and that has no walk or attempt in flight and
+  is not `Queued` MUST be routed through the broken-marked-root settlement
+  (#rref("sched.evidence.settlement")). Vanished, terminal, and
+  interest-free survivors are skipped.
+]
+The re-evaluation is what makes the recovery condemnation's co-ownership
+scoping (#rref("sched.recovery.failed-dep-cascade")) sound as a pair: a
+recovered parent spared by that scoping waits `Queued` above a non-co-owned
+within-TTL poisoned child, and the removal of that child --- by the
+operator's clear or by TTL expiry --- is its only wake-up edge
+(`find_newly_ready` fires on completions, never on removals). Scoping
+without re-evaluation reintroduces the build hang the unscoped condemnation
+was preventing; re-evaluation without scoping is dead code (the condemnation
+leaves no non-terminal survivors). The terminal-build reap's survivor hook
+(#rref("sched.merge.substitute-topdown")) runs the same loop at its own call
+site.
+
 #r("sched.admin.list-executors-leader-age+3")[
   `ListExecutorsResponse.leader_for_secs` is the seconds since this replica
   acquired leadership (`LeaderState::leader_for()`). Consumers MUST treat the
@@ -1377,8 +1401,8 @@ interested builds of the node (the verdict is per-node, not per-build).
   stale-Completed reset, reprobe-Poisoned→Substituting) MUST complete before
   any dependent-verdict computation (reprobe-unlocked Queued→Ready,
   `seed_initial_states`). A pending-substitute reprobe node MUST transition
-  →Substituting before `seed_initial_states` reads `any_dep_terminally_failed`
-  for its dependents.
+  →Substituting before `seed_initial_states` reads
+  `any_co_owned_dep_terminally_failed` for its dependents.
 ]
 
 #r("sched.admin.snapshot-substituting")[

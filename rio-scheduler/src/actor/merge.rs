@@ -782,9 +782,9 @@ impl DagActor {
         // r[sched.merge.reconcile-order]: split pending_substitute by
         // lane. Reprobe-substitutable (pre-existing Poisoned/Failed/
         // DependencyFailed) MUST transition →Substituting BEFORE
-        // seed_initial_states reads `any_dep_terminally_failed` (6d);
-        // newly-inserted substitutable nodes need seed to put them at
-        // Created/Queued/Ready first (6g). Partition keys on
+        // seed_initial_states reads `any_co_owned_dep_terminally_failed`
+        // (6d); newly-inserted substitutable nodes need seed to put them
+        // at Created/Queued/Ready first (6g). Partition keys on
         // existing_reprobe (the only set whose members can BE Poisoned
         // here — newly_inserted nodes are at Created).
         let (reprobe_sub, new_sub): (Vec<_>, Vec<_>) = pending_substitute
@@ -843,11 +843,12 @@ impl DagActor {
         // Reprobe-substitutable lane FIRST: a hard-Poisoned node whose
         // output is now upstream-substitutable transitions Poisoned →
         // Substituting BEFORE seed_initial_states reads
-        // `any_dep_terminally_failed` for its dependents. Otherwise a
-        // newly-inserted dependent A of a reprobe-Poisoned B is marked
-        // DependencyFailed against B's stale Poisoned status,
-        // first_dep_failed=Some(A), and !keep_going builds fail-fast
-        // while B's fetch is mid-flight.
+        // `any_co_owned_dep_terminally_failed` for its dependents (the
+        // merging build co-owns its whole submission, so the scoped check
+        // fires for these). Otherwise a newly-inserted dependent A of a
+        // reprobe-Poisoned B is marked DependencyFailed against B's stale
+        // Poisoned status, first_dep_failed=Some(A), and !keep_going
+        // builds fail-fast while B's fetch is mid-flight.
         if !reprobe_sub.is_empty() {
             self.spawn_substitute_fetches(reprobe_sub, sub_auth.clone())
                 .await;

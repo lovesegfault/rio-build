@@ -775,6 +775,90 @@ fn test_initial_states_with_prepoisoned_dep() -> anyhow::Result<()> {
     Ok(())
 }
 
+// r[verify sched.recovery.failed-dep-cascade+2]
+/// The condemnation evidence rule at the DAG level: a terminal-failed
+/// child condemns a parent through `compute_initial_states` /
+/// `any_co_owned_dep_terminally_failed` only when a live build is
+/// interested in BOTH nodes. The test above
+/// (`test_initial_states_with_prepoisoned_dep`) pins the co-owned case
+/// (build 2's merge includes the poisoned leaf, so it co-owns it); this
+/// one pins the cross-build case the recovery recompute hits: the
+/// parent's interest and the poisoned child's interest are disjoint —
+/// the recovered shape after `load_build_derivations` rebuilds interest
+/// from live builds' links only (the actor-level staging is
+/// `test_recovery_cross_build_poisoned_dep_spares_non_co_owning_parent`).
+#[test]
+fn test_initial_states_cross_build_poisoned_dep_not_co_owned() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+
+    // Build A merges parent→child (full merge: owns both, declares the edge).
+    let build_a = Uuid::new_v4();
+    let nodes = vec![
+        make_node("xbParent", "x86_64-linux"),
+        make_node("xbChild", "x86_64-linux"),
+    ];
+    let edges = vec![make_edge("xbParent", "xbChild")];
+    dag.merge(build_a, &nodes, &edges, "")?;
+
+    // The child is poisoned (at the resubmit limit so nothing resets it).
+    {
+        let child = dag.nodes.get_mut("xbChild").expect("xbChild");
+        child.set_status_for_test(DerivationStatus::Poisoned);
+        child.retry.resubmit_cycles = crate::state::POISON_RESUBMIT_RETRY_LIMIT;
+    }
+
+    // Reproduce the recovered interest shape: build A is dead, build B
+    // owns ONLY the parent (the bug_009 pruning-build shape). Interest
+    // sets become parent={B}, child={} — disjoint.
+    let build_b = Uuid::new_v4();
+    {
+        let parent = dag.nodes.get_mut("xbParent").expect("xbParent");
+        parent.set_status_for_test(DerivationStatus::Queued);
+        parent.interested_builds.clear();
+        parent.interested_builds.insert(build_b);
+        let child = dag.nodes.get_mut("xbChild").expect("xbChild");
+        child.interested_builds.clear();
+    }
+
+    // The unscoped check still sees the terminal child (revert_target_for's
+    // first-party form)…
+    assert!(dag.any_dep_terminally_failed("xbParent"));
+    // …but the scoped check does not: no live build co-owns the pair.
+    assert!(
+        !dag.any_co_owned_dep_terminally_failed("xbParent"),
+        "a non-co-owned terminal child must not count as condemnation evidence"
+    );
+    assert!(!dag.builds_co_own("xbParent", "xbChild"));
+
+    // compute_initial_states spares the parent: Queued (waiting on the
+    // still-loaded poisoned child), NOT DependencyFailed.
+    let recompute: HashSet<DrvHash> = HashSet::from(["xbParent".into()]);
+    let states = dag.compute_initial_states(&recompute);
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].0, "xbParent");
+    assert_eq!(
+        states[0].1,
+        DerivationStatus::Queued,
+        "a parent above a NON-co-owned poisoned child must be spared \
+         (sched.recovery.failed-dep-cascade+2 MUST NOT clause), not condemned"
+    );
+
+    // Control: give the child a co-owning live build again → condemned.
+    dag.nodes
+        .get_mut("xbChild")
+        .expect("xbChild")
+        .interested_builds
+        .insert(build_b);
+    assert!(dag.any_co_owned_dep_terminally_failed("xbParent"));
+    let states = dag.compute_initial_states(&recompute);
+    assert_eq!(
+        states[0].1,
+        DerivationStatus::DependencyFailed,
+        "the same shape WITH co-ownership is condemned (the legitimate case)"
+    );
+    Ok(())
+}
+
 #[test]
 fn test_find_newly_ready() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();

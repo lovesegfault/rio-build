@@ -713,7 +713,15 @@ impl DagActor {
         //
         // compute_initial_states does the same dep-state walk MergeDag
         // uses for fresh nodes: all_deps_completed() → Ready,
-        // any_dep_terminally_failed() → DependencyFailed, else Queued.
+        // any_co_owned_dep_terminally_failed() → DependencyFailed, else
+        // Queued. The condemnation arm is co-ownership-scoped
+        // (r[sched.recovery.failed-dep-cascade+2] MUST NOT clause): a
+        // loaded within-TTL poisoned child condemns a recovered parent
+        // only when a live build co-owns the pair — the in-memory mirror
+        // of the cascade pre-pass's SQL evidence rule below. A parent
+        // spared by the scoping recovers Queued above the still-poisoned
+        // child and is woken by the poison-clear survivor re-evaluation
+        // (`sched.poison.clear-survivor-reevaluation`).
         // Only Created/Queued are recomputed — Ready was already
         // correct, Assigned/Running are reconcile-assignments' job.
         //
