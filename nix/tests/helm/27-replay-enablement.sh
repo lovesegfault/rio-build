@@ -2,7 +2,7 @@
 # admissions must render when enabled, the three campaign tenants must get
 # default [build_policy."…"] entries in the gateway.toml ConfigMap (the
 # gateway build-policy vehicle: rio-gateway-config, subPath-mounted at
-# /etc/rio/gateway.toml — see 25-gateway-buildpolicy-toml.sh), and NONE of
+# /etc/rio/gateway.toml — see 26-gateway-buildpolicy-toml.sh), and NONE of
 # the replay bits may leak into the default render.
 
 on=$TMPDIR/replay-on.yaml
@@ -68,7 +68,7 @@ done
 # The widened gate (`or .Values.replay.enabled $g.buildPolicy`): with
 # replay.enabled=true and gateway.buildPolicy nulled out entirely (nulling
 # the key is the only way to drop the default qa-* entries — see
-# 25-gateway-buildpolicy-toml.sh), the rio-gateway-config ConfigMap must
+# 26-gateway-buildpolicy-toml.sh), the rio-gateway-config ConfigMap must
 # still render with the three replay tables, and the gateway Deployment
 # must still carry the /etc/rio/gateway.toml subPath mount and the
 # gateway-config volume. The narrow `if $g.buildPolicy` gate would render

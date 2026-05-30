@@ -103,7 +103,7 @@ spec:
       annotations:
         # Gateway reads /etc/rio/gateway.toml once at boot; subPath mounts
         # don't live-update. Hash the rendered body so any buildPolicy edit
-        # rolls the pod. helm/25-gateway-buildpolicy-toml.sh enforces.
+        # rolls the pod. helm/26-gateway-buildpolicy-toml.sh enforces.
         checksum/gateway-toml: {{ include "rio.gatewayToml" . | sha256sum }}
     spec:
       serviceAccountName: rio-gateway
