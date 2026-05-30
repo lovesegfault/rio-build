@@ -3671,36 +3671,48 @@ in
     # checks DO carry markers — they are the model-level verification of
     # the fixed rules.
 
-    # A18: only the current tenure's evidence intents reach PG — FAILS
-    # as-built (no SQL fence on evidence writes; entry-time gates only).
-    # The counterexample is a deposed tenure's merge transaction landing
-    # after the successor's recovery (the D14 leg): the late apply
-    # leaves a stamped row and an activated build the new leader's
-    # memory does not know about.
+    # A18 (only the current tenure's evidence intents reach PG) and A17
+    # (a stale clear/heal never erases a newer tenure's bit): FLIPPED in
+    # Phase 1 (Wave 4). Through Phase 0c-0d A18 was an expect-violation
+    # probe here (quint-closure-evidence-probe-stale-evidence-write: the
+    # deposed tenure's merge transaction landing after the successor's
+    # recovery — the D14 leg) and A17 was a deferred probe (its deeper
+    # clear-then-restamp interleaving was never produced in any hunted
+    # budget). The Wave-3 production fix (the uniform claims-floor fence
+    # on every evidence write, sched.evidence.durability+2) and its
+    # Wave-4 model encoding (pgApplyAny discards stale evidence intents)
+    # close both: A17 and A18 now HOLD and sit in asBuiltHoldInvariants /
+    # allInvariants.
     #
-    # Wired through the rust-simulator constructor, NOT TLC — BUDGET, not
-    # backend correctness (the post-0d triage re-diagnosis of what the 0d
-    # record called a "TLC-backend discrepancy"): TLC's BFS at the
-    # stale-tenure scopes is correct and does find this violation, but
-    # the per-level state growth (~10x per BFS level at
-    # closureEvidenceStaleDuo) puts the 5-state counterexample's level
-    # past every gate-compatible budget; the 0d "TLC explores past the
-    # violation depth" reading rested on TLC's Progress(N) diameter
-    # metric, which reports dequeued-state depth, not completed BFS
-    # levels, and so overstates progress. The triage's link-bisection
-    # (each prefix of the violation path pinned by its own throwaway
-    # witness) showed every link is taken by TLC at its true depth; the
-    # full run record is in the invariant map's post-0d triage section.
-    # The simulator finds the 5-state counterexample in under a second,
-    # which restores this probe to the wired CI surface (it had been
-    # demoted to a manual target by the 0d housekeeping); the
-    # D14/§9.1 fencing evidence is thereby pinned by CI again.
-    quint-closure-evidence-probe-stale-evidence-write = mkQuintSimWitnessCheck {
-      name = "closure-evidence-probe-stale-evidence-write";
+    # The falsifiability direction is preserved by the calibration pin
+    # quint-closure-calib-a17-unfenced below (frozen pre-fence apply,
+    # expect-violation); the post-fix HOLDS direction is wired by
+    # quint-closure-evidence-stale-fence-holds; the stale-write window's
+    # reachability (deposed intents still survive into a successor's
+    # tenure — what the old probe really exhibited) is the
+    # witness-fenced-discard entry in the witness section.
+
+    # A17 + A18 HOLDS (decision 4 / Phase-1 flip): the claims-floor
+    # fence's model-level verification. Bounded-simulation evidence at
+    # the closureEvidenceStaleDuo scope — the same scope whose pre-fence
+    # model produced the A18 violation in under a second (the retired
+    # probe and today's calibration pin), so "no violation in 2M
+    # samples" is a meaningful holds verdict, not vacuity. Paired
+    # falsifiability pin: quint-closure-calib-a17-unfenced. The
+    # exhaustive TLC counterpart (StaleDuo x A17+A18) is a Wave-4
+    # measured manual target; figures in the invariant map's Wave-4
+    # stage record.
+    # r[verify sched.evidence.durability+2]
+    quint-closure-evidence-stale-fence-holds = mkQuintSimHoldsCheck {
+      name = "closure-evidence-stale-fence-holds";
       spec = "closureEvidence";
       main = "closureEvidenceStaleDuo";
-      witness = "leaderClassEvidenceWrites";
-      maxSamples = 500000;
+      invariants = [
+        "leaderClassEvidenceWrites"
+        "noStaleTenureClearOverride"
+      ];
+      maxSamples = 2000000;
+      maxSteps = 15;
     };
 
     # C3 (no wrongful terminal failure in the single-tenure envelope):
@@ -3727,19 +3739,6 @@ in
     #   quint verify --backend=tlc --main=closureEvidenceC3Duo \
     #     --invariant=asBuiltHoldInvariants \
     #     docs/spec/models/closureEvidence.qnt
-
-    # A17 (a clear/heal intent created under tenure g never erases a bit
-    # a newer tenure stamped — the dangerous direction of the unfenced
-    # evidence writes) is NOT wired yet: the override interleaving needs
-    # a clear-class statement emitted and left pending under one tenure,
-    # the same bit durably cleared and re-stamped by the successor, and
-    # only then the stale statement landing — ≥14 steps even at duo
-    # scope, which neither the bounded simulation nor the BFS hunts
-    # reached within a wired check's budget in Phase 0c. The stale-apply
-    # window itself is exhibited by the A18 probe above; the erasure
-    # statements (W2/W3/W5) and the §9.1 evidence summary are in the
-    # invariant map, and closureEvidenceStaleDuo remains the documented
-    # probe scope for the deferred hunt.
 
     # B2-strong: a consumed ok walk's closure is still present at
     # consumption time — FAILS under adversarial-store (GC-after-vouch:
@@ -3995,27 +3994,35 @@ in
       main = "closureEvidenceFailoverEx";
       witness = "canReachRecoveryClear";
     };
-    # The two stale-tenure witnesses (a deposed tenure's evidence intent
-    # applying after the successor's recovery — canReachStaleIntentApply
-    # — and a walk spawned by an older tenure consumed by a newer one —
-    # canReachCrossTenureWalkConsume) are wired through the
-    # rust-simulator constructor for the same budget reason as the A18
-    # probe above: the 0c design-scale closureEvidenceStaleTenure TLC
-    # wirings never completed a build, and the duo-scale re-point's BFS
-    # levels sit past a gate-compatible TLC budget (the post-0d triage
-    # re-diagnosis — TLC's BFS is correct but the per-level cost at the
-    # stale-tenure scopes puts even these shallow witnesses in the
-    # tens-of-minutes-to-hours class). The simulator reaches both in
-    # seconds; wiring them restores the stale-tenure regime's
-    # reachability pins to the CI surface (demoted to manual targets by
-    # the 0d housekeeping).
-    quint-closure-evidence-witness-stale-intent-apply = mkQuintSimWitnessCheck {
-      name = "closure-evidence-witness-stale-intent-apply";
+    # The two stale-tenure witnesses are wired through the rust-simulator
+    # constructor for budget reasons (the 0c design-scale TLC wirings
+    # never completed a build, and the duo-scale BFS levels sit past a
+    # gate-compatible TLC budget — the post-0d triage re-diagnosis).
+    #
+    # Phase-1 re-point: canReachStaleIntentApply (a deposed tenure's
+    # evidence intent APPLYING after the successor's recovery) became
+    # unreachable when the claims-floor fence was encoded — stale
+    # evidence intents are now discarded at the apply site — so its
+    # check is replaced by canReachFencedDiscard: the same window (a
+    # deposed intent surviving into the successor's tenure and reaching
+    # the apply site), observed at the fence's discard instead of at the
+    # apply. This is the fence's non-vacuity proof: A17/A18 hold because
+    # the fence fires, not because the contention disappeared. The
+    # pre-fix apply-side reachability remains demonstrable through the
+    # closure-a17-unfenced calibration pin (whose frozen pre-fence apply
+    # still sets the staleIntentApplied flag).
+    quint-closure-evidence-witness-fenced-discard = mkQuintSimWitnessCheck {
+      name = "closure-evidence-witness-fenced-discard";
       spec = "closureEvidence";
       main = "closureEvidenceStaleDuo";
-      witness = "canReachStaleIntentApply";
+      witness = "canReachFencedDiscard";
       maxSamples = 500000;
+      maxSteps = 15;
     };
+    # A walk spawned by an older tenure consumed by a newer one — NOT
+    # affected by the fence (walk consumption is not a PG write; the
+    # same-epoch in-flight work the durability rule's residuals carve
+    # out). Re-validated still-reachable after the fence encoding.
     quint-closure-evidence-witness-cross-tenure-walk = mkQuintSimWitnessCheck {
       name = "closure-evidence-witness-cross-tenure-walk";
       spec = "closureEvidence";
@@ -4036,9 +4043,9 @@ in
     # falsifies the property the fix protects — the machine-checked
     # record that the model's invariant set re-finds that bug class. The
     # 0d overrides freeze one historical-fix guard each; the Phase-1
-    # pins (closure-c3-no-reprobe) freeze the Phase-1 fixes' pre-fix
-    # behavior and are the falsifiability halves of the Phase-1 holds
-    # checks above. The remaining override modules
+    # pins (closure-c3-no-reprobe, closure-a17-unfenced) freeze the
+    # Phase-1 fixes' pre-fix behavior and are the falsifiability halves
+    # of the Phase-1 holds checks above. The remaining override modules
     # under docs/spec/models/calibration/ are evidence modules (not
     # wired), re-runnable with the command in each file's header.
     # No tracey markers on calibration checks (house convention).
@@ -4137,6 +4144,31 @@ in
       witness = "noWrongfulTerminalFailureSingleTenure";
       maxSamples = 5000000;
       maxSteps = 14;
+    };
+
+    # A17/A18 claims-floor fence regression pin (Phase 1, Wave 4): the
+    # frozen pre-fence intent apply (stale evidence intents applied
+    # instead of discarded) must keep falsifying A18
+    # (leaderClassEvidenceWrites) — the stale-write class the Wave-3
+    # production fence and the Wave-4 model encoding removed. The A18
+    # falsification is the wired oracle for the shared unfenced-apply
+    # mechanism (A17's deeper clear-then-restamp interleaving was never
+    # produced in any hunted budget — the 0c deferred-probe record — and
+    # the same statement-level fence closes both). If this pin ever
+    # stops falsifying, the model has drifted away from the stale-write
+    # class it documents and the stale-fence-holds check above is no
+    # longer evidence of anything. Rust-simulator backend at the
+    # StaleDuo constants (the post-0d A18 probe's scope and hit-rate
+    # class).
+    quint-closure-calib-a17-unfenced = mkQuintSimWitnessCheck {
+      name = "closure-calib-a17-unfenced";
+      spec = "calibration/closure-a17-unfenced";
+      main = "closureCalibA17Unfenced";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "leaderClassEvidenceWrites";
+      maxSamples = 500000;
+      maxSteps = 15;
     };
   };
 }

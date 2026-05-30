@@ -298,7 +298,13 @@ module closureEvidence {
     // WALK_CONSUME_CEIL headroom witness — the settlement spawns one
     // verification walk per arming on top of the original, so its
     // completion needs a ceiling of at least 2 (review finding FC-5).
-    secondWalkConsumed: bool
+    secondWalkConsumed: bool,
+    // Phase 1 (the fence): a stale (deposed-tenure) evidence intent
+    // reached the apply site and was DISCARDED by the claims-floor
+    // fence. Feeds the fence's non-vacuity witness — proof that the
+    // stale-apply window still arises and the fence (not chance) is
+    // what keeps A17/A18 holding.
+    fencedDiscard: bool
   }
 
   // --- 2. constants (const = overridable per regime) ----------------------
@@ -392,7 +398,8 @@ module closureEvidence {
     walkOkWithForgiven: false, staleIntentApplied: false,
     triedDemotionUpstreamHas: false, pruneFired: false,
     rollbackSeen: false, crossTenureWalkConsumed: false,
-    downgradeRespawned: false, secondWalkConsumed: false
+    downgradeRespawned: false, secondWalkConsumed: false,
+    fencedDiscard: false
   }
 
   pure val noopIntent: IntentRec = { op: INop, tenure: 0 }
@@ -806,13 +813,21 @@ module closureEvidence {
   /// A16: probe/dispatch/attempt actions fire only with live interest.
   val liveInterestRequiredForDispatch = not(viol.dispatchNoInterest)
 
-  /// A17 (expected-fail probe, stale-tenure): a clear/heal intent from an
-  /// older tenure never erases a bit a newer tenure set. NOT in any
-  /// exported conjunction.
+  /// A17: a clear/heal intent from an older tenure never erases a bit a
+  /// newer tenure set. Phase-1 flip (Wave 4): pre-fence this was an
+  /// expected-fail probe (the stale-tenure regimes exhibited the
+  /// unfenced-apply window); the claims-floor fence — pgApplyAny
+  /// discards stale evidence intents instead of applying them, the
+  /// model mirror of the Wave-3 production fence
+  /// (sched.evidence.durability+2) — closes it, and the val now holds
+  /// in every regime and sits in allInvariants/asBuiltHoldInvariants.
+  /// Falsifiability is preserved by the closure-a17-unfenced
+  /// calibration pin (frozen pre-fence apply).
   val noStaleTenureClearOverride = not(viol.staleClearOverride)
 
-  /// A18 (expected-fail probe, stale-tenure): only the current tenure's
-  /// evidence intents reach PG. NOT in any exported conjunction.
+  /// A18: only the current tenure's evidence intents reach PG. Phase-1
+  /// flip: same as A17 — the same fence closes both (the latches sit on
+  /// the apply path, and fenced intents never reach it).
   val leaderClassEvidenceWrites = not(viol.staleEvidenceApply)
 
   /// A19: recovery clears every restored mark whose strict PG criterion
@@ -980,11 +995,12 @@ module closureEvidence {
   /// the reap-survivor settlement, mirroring the Wave-1 production fix at
   /// the same three sites) removes the wrongful fail-fast class, C3 holds
   /// as-built, and this conjunction is again the FULL invariant set —
-  /// identical to allInvariants (C3 and the L2 armed form included). The
-  /// name is kept because the 0c/0d/Phase-1 records and the manual-target
-  /// commands in nix/quint.nix reference it; the C3 falsifiability record
-  /// is preserved by the closure-c3-no-reprobe calibration pin (pre-fix
-  /// actions, expect-violation).
+  /// identical to allInvariants (C3, the L2 armed form, and the
+  /// fence-flipped A17/A18 included). The name is kept because the
+  /// 0c/0d/Phase-1 records and the manual-target commands in
+  /// nix/quint.nix reference it; the falsifiability records are
+  /// preserved by the closure-c3-no-reprobe and closure-a17-unfenced
+  /// calibration pins (pre-fix actions, expect-violation).
   val asBuiltHoldInvariants = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -1005,6 +1021,38 @@ module closureEvidence {
     noBuildWhenWantedPresent, terminalBuildStopsPinning,
     substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
     markedBrokenSettlementArmed,
+    noStaleTenureClearOverride, leaderClassEvidenceWrites,
+    boundsOK
+  }
+
+  /// The adversarial-store-scope hold conjunction: asBuiltHoldInvariants
+  /// minus B9 (staleProducedNeverUnlocksDependents) — the documented
+  /// pre-registered as-built trip under store GC (GC-after-produce, the
+  /// design §5 accepted bound; the 0b/0c records and the per-property
+  /// table's B9 row). Every other conjunct must hold under the
+  /// adversarial-store alphabet; this is the AdversarialStoreEx
+  /// exhaustive measurement / manual-target invariant.
+  val asBuiltHoldInvariantsAdversarialStore = and {
+    noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
+    holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
+    brokenNeverVouches, failFastConsumesMarkKeepsHole,
+    failoverPreservation, pullRefusalNoMint, chainTermination,
+    stampAtomicWithActivation, terminalIsTerminal,
+    readyImpliesDeclaredDepsProduced, liveInterestRequiredForDispatch,
+    recoveryClearCompleteness, healCompleteness,
+    chainEndClearsForgiveness, condemnRequiresLiveCoOwnedFailure,
+    completedWithoutBuildImpliesWantedPresent,
+    substituteOkImpliesClosureIngested, unknownNeverDemotes,
+    noVacuousWantedVerdict, storedWantedMonotone,
+    rollbackRestoresWantedAndEvidence,
+    pruneNotMorePermissiveThanClassification,
+    dispatchImpliesProbedThisPass,
+    demandSetSurvivesPrune, wrongfulFailFastBoundedPerArming,
+    noWrongfulFromSourceDemotion, noWrongfulTerminalFailureSingleTenure,
+    noBuildWhenWantedPresent, terminalBuildStopsPinning,
+    substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
+    markedBrokenSettlementArmed,
+    noStaleTenureClearOverride, leaderClassEvidenceWrites,
     boundsOK
   }
 
@@ -1058,18 +1106,22 @@ module closureEvidence {
 
   /// The default safety conjunction (everything except the
   /// pre-registered expected-fail probes that remain expected-fail —
-  /// A17/A18/B2-strong/C1-strict). Phase 0c selects per-regime lists from
+  /// B2-strong/C1-strict). Phase 0c selects per-regime lists from
   /// the individual names; this conjunction is the base-regime check's
   /// invariant.
   ///
-  /// Phase-1 (Wave 4) membership flip: L2 (markedBrokenSettlementArmed,
-  /// restated in the armed/settlement form) joined when the settlement
-  /// was encoded — pre-fix it was the expected-fail D16 probe. C3 was
-  /// already a member (its violation was the documented as-built defect
-  /// that kept asBuiltHoldInvariants separate); with the settlement
-  /// encoded it holds. The flip's pre-fix falsifiability is preserved by
-  /// the closure-c3-no-reprobe expect-violation calibration pin so the
-  /// falsification direction stays permanently checkable.
+  /// Phase-1 (Wave 4) membership flips, each preserved as falsifiable by
+  /// an expect-violation calibration pin:
+  ///  - L2 (markedBrokenSettlementArmed, restated in the armed form)
+  ///    joined when the settlement was encoded — pre-fix it was the
+  ///    expected-fail D16 probe. C3 was already a member (its violation
+  ///    was the documented as-built defect that kept
+  ///    asBuiltHoldInvariants separate); with the settlement encoded it
+  ///    holds. Pin: closure-c3-no-reprobe.
+  ///  - A17/A18 (noStaleTenureClearOverride / leaderClassEvidenceWrites)
+  ///    joined when the claims-floor fence was encoded — pre-fence they
+  ///    were the expected-fail stale-tenure probes. Pin:
+  ///    closure-a17-unfenced.
   val allInvariants = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -1090,6 +1142,7 @@ module closureEvidence {
     noBuildWhenWantedPresent, terminalBuildStopsPinning,
     substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
     markedBrokenSettlementArmed,
+    noStaleTenureClearOverride, leaderClassEvidenceWrites,
     boundsOK
   }
 
@@ -1119,7 +1172,23 @@ module closureEvidence {
   /// accepted forgiveness residual is reachable).
   val canReachForgivenResidual = not(reach.walkOkWithForgiven)
   /// A stale-tenure intent applied after a newer tenure recovered.
+  /// UNREACHABLE in the production model as of Phase 1: the claims-floor
+  /// fence discards stale evidence intents before the apply, so this
+  /// flag can no longer be set here. Kept (not deleted) because the
+  /// closure-a17-unfenced calibration override's frozen pre-fence apply
+  /// still sets it — the predicate remains the override's reachability
+  /// oracle. The production-model replacement is canReachFencedDiscard
+  /// below (the same window, observed at the fence instead of at the
+  /// apply).
   val canReachStaleIntentApply = not(reach.staleIntentApplied)
+  /// A stale (deposed-tenure) evidence intent reached the apply site and
+  /// was DISCARDED by the claims-floor fence (Phase 1). The fence's
+  /// non-vacuity witness: proof that the stale-apply window the pre-fix
+  /// model exhibited (the A18 trace) still arises — deposed intents
+  /// still survive into a successor's tenure in the stale-apply regimes
+  /// — and that the fence, not unreachability, is what keeps A17/A18
+  /// holding. Replaces canReachStaleIntentApply on the wired surface.
+  val canReachFencedDiscard = not(reach.fencedDiscard)
   /// The D16 limbo cell is reachable. Pre-fix (Phase 0c): never produced
   /// within any hunted budget — the >=16-step assembly (deferred-probe
   /// record). Post-fix (Phase 1): reachable at shallow depth via the
@@ -1204,15 +1273,38 @@ module closureEvidence {
   /// Apply one pending intent to the durable state. Best-effort
   /// statements may have been emitted by a now-deposed tenure; outside
   /// the stale-apply regimes those were discarded at recovery.
+  ///
+  /// Phase 1 — the claims-floor fence (the Wave-3 production fix,
+  /// sched.evidence.durability+2, encoded Wave 4): a STALE evidence
+  /// intent — one whose tenure sits below the current leader generation
+  /// — is DISCARDED at the apply site instead of applied: it leaves the
+  /// queue with no PG effect, the model form of "a below-floor write
+  /// rolls back having written nothing". At this abstraction lead.gen
+  /// IS the durable claims floor, because recoverAsLeader atomically
+  /// claims the new generation together with the recovery's own writes;
+  /// the code earns the same equivalence by claiming BEFORE its
+  /// recovery writes run (the Wave-3 T-3.1 LeaderAcquired reorder — the
+  /// model cannot represent the unfixed claim-after-recovery ordering,
+  /// which is exactly why that reorder is a production prerequisite of
+  /// the fence, review findings CF-2/FC-2). The A17/A18 violation
+  /// latches sit on the apply path, so a fenced discard can never set
+  /// them; their reachability evidence moves to the fencedDiscard flag
+  /// (the canReachFencedDiscard witness) and to the frozen pre-fence
+  /// apply in the closure-a17-unfenced calibration override. Zero new
+  /// state variables (review finding MCI-4): the fence is a branch in
+  /// this action, not a tracked floor.
   action pgApplyAny: bool = {
     nondet pick = intents.union(Set(noopIntent)).oneOf()
     val stale = pick.tenure < lead.gen
     val isEvidence = pick.op != INop
+    // The fence: a stale evidence intent is discarded, never applied.
+    val fenced = stale and isEvidence
     all {
       intents.contains(pick),
       intents' = intents.exclude(Set(pick)),
-      reach' = { ...reach, staleIntentApplied: reach.staleIntentApplied or stale },
-      viol' = {
+      reach' = if (fenced) { ...reach, fencedDiscard: true }
+        else { ...reach, staleIntentApplied: reach.staleIntentApplied or stale },
+      viol' = if (fenced) viol else {
         ...viol,
         staleEvidenceApply: viol.staleEvidenceApply or (stale and isEvidence),
         // A17: a stale clear/heal erasing a bit set by a newer tenure
@@ -1228,7 +1320,7 @@ module closureEvidence {
         pgBitLowered: viol.pgBitLowered,
         wantedShrunk: viol.wantedShrunk
       },
-      drv' = match pick.op {
+      drv' = if (fenced) drv else match pick.op {
         | IClearBoth(d) =>
             if (drv.get(d).rowExists)
               drv.set(d, { ...drv.get(d), pgTp: false, pgCh: false })
@@ -1254,13 +1346,13 @@ module closureEvidence {
             })
         | INop => drv
       },
-      pgEdges' = match pick.op {
+      pgEdges' = if (fenced) pgEdges else match pick.op {
         | IMerge(m) =>
             if (m.pruned) pgEdges
             else pgEdges.union(REFS.filter(e => m.rows.contains(e._1) and m.rows.contains(e._2)))
         | _ => pgEdges
       },
-      blds' = match pick.op {
+      blds' = if (fenced) blds else match pick.op {
         // build_derivations links are per build id; the directed resubmit
         // re-uses the slot, so its links REPLACE the failed submission's
         // (a fresh build id in production)
@@ -2890,9 +2982,16 @@ module closureEvidenceDuo {
 
 /// Stale-tenure probe regime at duo scope: the deposed-believer late-apply
 /// alphabet (STALE_APPLY / cross-tenure walk consumption) over the
-/// two-node, two-build universe, sized so the bounded checker can reach
-/// the A17 dangerous-direction interleaving (an old tenure's clear/heal
-/// erasing a bit a newer tenure stamped) within a wired check's budget.
+/// two-node, two-build universe. Phase-1 roles: the constants the
+/// closure-a17-unfenced calibration override imports (the frozen
+/// pre-fence apply falsifies A18 here in five states — the wired
+/// regression pin), the scope of the post-fence holds check
+/// (quint-closure-evidence-stale-fence-holds: A17+A18 hold under the
+/// claims-floor fence), and the scope of the fenced-discard and
+/// cross-tenure-walk witnesses. Through 0c-0d this was the A17/A18
+/// expected-fail probe scope; the A17 dangerous-direction interleaving
+/// (clear-then-restamp-then-stale-apply) was never produced within any
+/// hunted budget and is closed by the same fence that closes A18.
 module closureEvidenceStaleDuo {
   import closureEvidence(
     DRVS = Set("d1", "d2"),
