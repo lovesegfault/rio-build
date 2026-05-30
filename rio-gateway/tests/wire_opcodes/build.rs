@@ -3130,7 +3130,7 @@ async fn test_build_paths_policy_sets_keep_going() -> anyhow::Result<()> {
         keep_going: true,
         force_build_roots: false,
     };
-    let mut h = GatewaySession::new_with_tenant_and_policy("parity-leaf", policy).await?;
+    let mut h = GatewaySession::new_with_tenant_and_policy("replay-leaf", policy).await?;
     do_handshake(&mut h.stream).await?;
     send_set_options(&mut h.stream).await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
@@ -3155,7 +3155,7 @@ async fn test_build_paths_policy_sets_keep_going() -> anyhow::Result<()> {
         submits[0].keep_going,
         "policy keep_going must be on the wire"
     );
-    assert_eq!(submits[0].tenant_name, "parity-leaf");
+    assert_eq!(submits[0].tenant_name, "replay-leaf");
 
     h.finish().await;
     Ok(())
@@ -3173,7 +3173,7 @@ async fn test_build_paths_policy_sets_force_build_roots() -> anyhow::Result<()> 
         keep_going: true,
         force_build_roots: true,
     };
-    let mut h = GatewaySession::new_with_tenant_and_policy("parity-leaf", policy).await?;
+    let mut h = GatewaySession::new_with_tenant_and_policy("replay-leaf", policy).await?;
     do_handshake(&mut h.stream).await?;
     send_set_options(&mut h.stream).await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
@@ -3202,7 +3202,7 @@ async fn test_build_paths_policy_sets_force_build_roots() -> anyhow::Result<()> 
         submits[0].keep_going,
         "policy keep_going must be on the wire"
     );
-    assert_eq!(submits[0].tenant_name, "parity-leaf");
+    assert_eq!(submits[0].tenant_name, "replay-leaf");
 
     h.finish().await;
     Ok(())

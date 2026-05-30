@@ -349,7 +349,7 @@ mod tests {
         per_minute = 42
         burst = 7
 
-        [build_policy."parity-leaf"]
+        [build_policy."replay-leaf"]
         keep_going = true
         force_build_roots = true
         "#,
@@ -376,9 +376,9 @@ mod tests {
             assert_eq!(rl.burst.get(), 7);
             let pol = cfg
                 .build_policy
-                .get("parity-leaf")
+                .get("replay-leaf")
                 .copied()
-                .expect("[build_policy.\"parity-leaf\"] table must deserialize");
+                .expect("[build_policy.\"replay-leaf\"] table must deserialize");
             assert!(pol.keep_going, "keep_going=true must round-trip");
             assert!(
                 pol.force_build_roots,

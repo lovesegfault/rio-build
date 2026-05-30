@@ -971,7 +971,7 @@ mod tests {
     #[test]
     fn test_build_submit_request_applies_build_policy() {
         use crate::config::BuildPolicy;
-        let name = NormalizedName::new("parity-leaf").unwrap();
+        let name = NormalizedName::new("replay-leaf").unwrap();
         let req = build_submit_request(
             vec![],
             vec![],
