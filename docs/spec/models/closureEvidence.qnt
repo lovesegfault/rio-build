@@ -309,6 +309,20 @@ module closureEvidence {
   const WALK_CONSUME_CEIL: int   // walk completions consumed per node
   const ATTEMPT_CYCLE_CEIL: int  // attempt open/close cycles per node
   const INTENT_CEIL: int         // pending unapplied intents at any instant
+  /// Reduction-ladder step (4) (design §2b.1; invariant-map Phase 0c stage
+  /// record): outstanding walk instances per node. 2 in the regimes that
+  /// exercise the dual-walk rows (stale-tenure / adversarial-store:
+  /// an undelivered older-tenure walk next to a fresh spawn); 1 elsewhere.
+  const WALKS_PER_NODE: int
+  /// Reduction-ladder step (2) (design §2b.1): per-output vs per-derivation
+  /// store/upstream granularity for the ENVIRONMENT letters. When false,
+  /// storeIngestAt / upstreamChangeAt act on every output of the touched
+  /// node together (per-derivation store presence); per-output divergence
+  /// still arises where the families need it — walk-ok ingests skip the
+  /// forgiven outputs and attempt success ingests only the built node.
+  /// True in the regimes whose families read individual output paths
+  /// (stale-tenure / adversarial-store, the GC-after-vouch direction).
+  const STORE_PER_OUTPUT: bool
 
   // --- 3. pure defs -------------------------------------------------------
 
@@ -362,6 +376,7 @@ module closureEvidence {
   }
 
   pure val noopIntent: IntentRec = { op: INop, tenure: 0 }
+
 
   /// Is a status un-produced terminal (the truncation producers)?
   pure def isUnprodTerminal(s: MSt): bool =
@@ -928,22 +943,34 @@ module closureEvidence {
   // --- 7a. store / upstream environment ------------------------------------
 
   /// A non-walk ingest makes an output present (another tenant's build,
-  /// a PutPath, an out-of-band substitution).
-  action storeIngestAt(o: (str, int)): bool = all {
-    not(store.get(o).present),
-    not(store.get(o).ingested),
-    store' = store.set(o, { ...store.get(o), present: true, everPresent: true, ingested: true }),
-    drv' = drv, blds' = blds, memEdges' = memEdges, pgEdges' = pgEdges,
-    intents' = intents, lead' = lead, budget' = budget, viol' = viol, reach' = reach
+  /// a PutPath, an out-of-band substitution). Under per-derivation store
+  /// granularity (reduction-ladder step (2), STORE_PER_OUTPUT = false) the
+  /// ingest covers every still-absent output of the touched node.
+  action storeIngestAt(o: (str, int)): bool = {
+    val outs = if (STORE_PER_OUTPUT) Set(o) else OUTIDX.map(i => (o._1, i))
+    val targets = outs.filter(oo => not(store.get(oo).present) and not(store.get(oo).ingested))
+    all {
+      targets != Set(),
+      store' = targets.fold(store, (acc, oo) =>
+        acc.set(oo, { ...acc.get(oo), present: true, everPresent: true, ingested: true })),
+      drv' = drv, blds' = blds, memEdges' = memEdges, pgEdges' = pgEdges,
+      intents' = intents, lead' = lead, budget' = budget, viol' = viol, reach' = reach
+    }
   }
 
   /// Upstream availability flips (publication or deletion). The probe
   /// cache is deliberately NOT updated — that is the staleness window.
-  action upstreamChangeAt(o: (str, int)): bool = all {
-    not(store.get(o).upFlipped),
-    store' = store.set(o, { ...store.get(o), upHas: not(store.get(o).upHas), upFlipped: true }),
-    drv' = drv, blds' = blds, memEdges' = memEdges, pgEdges' = pgEdges,
-    intents' = intents, lead' = lead, budget' = budget, viol' = viol, reach' = reach
+  /// Under per-derivation granularity the flip covers the whole node
+  /// (its outputs' upstream availability never diverges in those regimes).
+  action upstreamChangeAt(o: (str, int)): bool = {
+    val outs = if (STORE_PER_OUTPUT) Set(o) else OUTIDX.map(i => (o._1, i))
+    all {
+      outs.forall(oo => not(store.get(oo).upFlipped)),
+      store' = outs.fold(store, (acc, oo) =>
+        acc.set(oo, { ...acc.get(oo), upHas: not(acc.get(oo).upHas), upFlipped: true })),
+      drv' = drv, blds' = blds, memEdges' = memEdges, pgEdges' = pgEdges,
+      intents' = intents, lead' = lead, budget' = budget, viol' = viol, reach' = reach
+    }
   }
 
   /// Store GC removes an unpinned present output (including after a
@@ -1282,10 +1309,14 @@ module closureEvidence {
       pEffWanted(drv, bldsNew, BUILDS, d).forall(i => store.get((d, i)).present))
     val confirmableMissing = classifiable.filter(d =>
       pEffWanted(drv, bldsNew, BUILDS, d).exists(i => pMissAnswerable(store, (d, i))))
+    // Pending-substitute lane (the I-094 / existing_reprobe analogue): a
+    // classifiable node is never Substituting, so any walk records it
+    // still carries are stale (their late results are dropped on
+    // arrival); the re-probe spawns a fresh fetch regardless of them,
+    // exactly as production's reprobe-substitutable lane does.
     val pendingSub = classifiable.filter(d => and {
       not(cacheHits.contains(d)),
-      not(pessimistic and confirmableMissing.contains(d)),
-      dm3.get(d).walks.length() < 2
+      not(pessimistic and confirmableMissing.contains(d))
     })
     val normalQueued = classifiable.filter(d =>
       not(cacheHits.contains(d)) and pessimistic and confirmableMissing.contains(d))
@@ -1298,7 +1329,10 @@ module closureEvidence {
       else if (pendingSub.contains(d))
         { ...r, mSt: MSubstituting, probed: true,
           probedKind: if (effWd.forall(i => store.get((d, i)).present or pSubAnswerable(store, (d, i)))) PKSubst else PKIndet,
-          walks: r.walks.append({ forgivable: OUTIDXSET.exclude(effWd).exclude(r.nf), tenure: lead.gen, res: WPending }) }
+          // fresh spawn replaces stale (never-Substituting) records — the
+          // walk-instance ceiling stays respected without blocking the
+          // re-probe arming the node
+          walks: [{ forgivable: OUTIDXSET.exclude(effWd).exclude(r.nf), tenure: lead.gen, res: WPending }] }
       else if (normalQueued.contains(d))
         { ...r, probed: true, probedKind: PKMissing }
       else r
@@ -1547,7 +1581,7 @@ module closureEvidence {
       liveInterest(d),
       not(drvOf(d).tried),
       missing != Set(),
-      drvOf(d).walks.length() < 2,
+      drvOf(d).walks.length() < WALKS_PER_NODE,
       drv' = drv.set(d, { ...drvOf(d),
         mSt: MSubstituting, probed: true, probedKind: verdict,
         walks: drvOf(d).walks.append({ forgivable: OUTIDXSET.exclude(effWanted(d)).exclude(drvOf(d).nf), tenure: lead.gen, res: WPending }) }),
@@ -1655,9 +1689,12 @@ module closureEvidence {
   action walkFinishes(d: str): bool = {
     nondet idx = Set(0, 1).oneOf()
     nondet okPick = Set(true, false).oneOf()
-    nondet forgivenPick = OUTIDXSET.powerset().oneOf()
     val w = pWalkAt(drvOf(d).walks, idx)
-    val forgiven = forgivenPick.intersect(w.forgivable)
+    // the forgiven set ranges over subsets of the spawn-time forgivable
+    // snapshot directly (the previous OUTIDX-powerset pick intersected
+    // with it produced the same successor set with more enumeration).
+    nondet forgivenPick = w.forgivable.powerset().oneOf()
+    val forgiven = forgivenPick
     val descendants = pClosure(REFS, pKids(REFS, d))
     val ingestOuts = OUTIDX.exclude(forgiven).map(i => (d, i))
       .union(tuples(descendants, OUTIDX))
@@ -1907,20 +1944,25 @@ module closureEvidence {
   /// its in-DAG ancestors to DependencyFailed, and — the
   /// terminal_failure_epilogue's completion check, run in the same
   /// handler — every live build holding a now-terminal member fails.
-  /// Bits untouched.
+  /// Bits untouched. The cascade reaches only ancestors that have not
+  /// started yet (Queued/Ready) — production cascade_dependency_failure
+  /// skips Substituting/Assigned/Running/Failed parents, whose in-flight
+  /// walk or attempt keeps its chance and settles them via its own
+  /// completion (Phase 0c encoding fix; see the invariant map).
   action poisonArrival(d: str): bool = all {
     leaderActive,
     budget.poisons > 0,
     drvOf(d).mSt == MReady or drvOf(d).mSt == MOpen or drvOf(d).mSt == MFailed or drvOf(d).mSt == MQueued,
     val ancestors = 0.to(4).fold(Set(d), (acc, _i) => acc.union(acc.fold(Set(), (a2, x) => a2.union(pParents(memEdges, x))))).exclude(Set(d))
-    val hitSet = Set(d).union(ancestors.filter(x => not(isTerminal(drv.get(x).mSt)) and drv.get(x).mSt != MAbsent))
+    val cascaded = ancestors.filter(x => drv.get(x).mSt == MQueued or drv.get(x).mSt == MReady)
+    val hitSet = Set(d).union(cascaded)
     val pinOuts = tuples(memKids(d), OUTIDX)
     all {
       drv' = DRVS.mapBy(x => {
         val r = drv.get(x)
         if (x == d)
           { ...r, mSt: MPoisoned, pgSt: if (r.rowExists) MPoisoned else r.pgSt, attemptOpen: false }
-        else if (ancestors.contains(x) and not(isTerminal(r.mSt)) and r.mSt != MAbsent)
+        else if (cascaded.contains(x))
           { ...r, mSt: MDepFailed, pgSt: if (r.rowExists) MDepFailed else r.pgSt }
         else r
       }),
@@ -1997,15 +2039,24 @@ module closureEvidence {
   }
 
   // --- 8. init ------------------------------------------------------------
+  // Reduction-ladder step CE-L1 (invariant-map Phase 0c stage record): the
+  // initial store/upstream assignment is drawn PER DERIVATION (both outputs
+  // of a node start with the same presence and the same upstream
+  // availability) instead of per output. Every per-output-asymmetric
+  // configuration stays reachable through the per-output environment
+  // letters (storeIngestAt / upstreamChangeAt / storeGcAt / walk ingest /
+  // attemptCloseSuccess), so no design-§4 falsification or witness depends
+  // on an asymmetry only the initial assignment could provide; the cut is
+  // 2^(2|D||O|) -> 2^(2|D|) initial states.
 
   action init = {
-    nondet presentPick = tuples(DRVS, OUTIDX).powerset().oneOf()
-    nondet upstreamPick = tuples(DRVS, OUTIDX).powerset().oneOf()
+    nondet presentPick = DRVS.powerset().oneOf()
+    nondet upstreamPick = DRVS.powerset().oneOf()
     all {
       drv' = DRVS.mapBy(d => freshDrv),
       store' = tuples(DRVS, OUTIDX).mapBy(o => {
-        present: presentPick.contains(o), everPresent: presentPick.contains(o),
-        pinned: false, upHas: upstreamPick.contains(o), upFlipped: false,
+        present: presentPick.contains(o._1), everPresent: presentPick.contains(o._1),
+        pinned: false, upHas: upstreamPick.contains(o._1), upFlipped: false,
         ingested: false, cache: CNone }),
       blds' = BUILDS.mapBy(b => freshBuild(DRVS)),
       memEdges' = Set(),
@@ -2021,53 +2072,72 @@ module closureEvidence {
   }
 
   // --- 9. step --------------------------------------------------------------
+  // The transition relation is grouped by which nondeterministic argument
+  // each action consumes, so the checker enumerates each argument domain
+  // only for the actions that read it instead of taking the full
+  // node x build x output cross product for every action. The successor
+  // relation is identical to the flat form (each disjunct reads only its
+  // own bound variable); only the successor-generation cost changes.
+  // Recorded in the invariant map's Phase 0c stage record.
 
-  action step = {
-    nondet d = DRVS.oneOf()
-    nondet b = BUILDS.oneOf()
+  /// Per-output environment letters.
+  action stepStore = {
     nondet o = tuples(DRVS, OUTIDX).oneOf()
     any {
-      // store / upstream environment
       storeIngestAt(o),
       upstreamChangeAt(o),
-      storeGcAt(o),
-      // PG intent plumbing
-      pgApplyAny,
-      pgDropAny,
-      // lease
-      leaderLost,
-      recoverAsLeader,
-      // merge
+      storeGcAt(o)
+    }
+  }
+
+  /// Per-build letters (merge, lifecycle, reap, purge).
+  action stepBuild = {
+    nondet b = BUILDS.oneOf()
+    any {
       mergeCommit(b),
       mergeRollback(b),
-      // build lifecycle
       cancelBuild(b),
       buildCompletes(b),
       buildFails(b),
       reapTerminalBuild(b),
-      // dispatch probe partition
+      buildsRowPurge(b)
+    }
+  }
+
+  /// Per-derivation letters (dispatch probe partition, walks, attempts,
+  /// poison machinery, row GC).
+  action stepDrv = {
+    nondet d = DRVS.oneOf()
+    any {
       probeInline(d),
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
       probeMissingUnmarked(d),
-      // walks
       walkFinishes(d),
       consumeWalk(d),
       dropStaleWalkResult(d),
-      // attempts
       attemptOpen(d),
       attemptCloseSuccess(d),
       attemptCloseFail(d),
       reassignOpen(d),
       requeueFailed(d),
-      // poison machinery
       poisonArrival(d),
       poisonClear(d),
-      // durable-state GC
-      orphanRowGc(d),
-      buildsRowPurge(b)
+      orphanRowGc(d)
     }
+  }
+
+  action step = any {
+    stepStore,
+    stepBuild,
+    stepDrv,
+    // PG intent plumbing
+    pgApplyAny,
+    pgDropAny,
+    // lease
+    leaderLost,
+    recoverAsLeader
   }
 }
 
@@ -2096,7 +2166,9 @@ module closureEvidenceSlice {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 3
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
   ).*
 }
 
@@ -2119,7 +2191,9 @@ module closureEvidenceBase {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 3
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
   ).*
 }
 
@@ -2141,7 +2215,9 @@ module closureEvidenceFaultPersist {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 3
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
   ).*
 }
 
@@ -2163,7 +2239,9 @@ module closureEvidenceFailover {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 3
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
   ).*
 }
 
@@ -2187,7 +2265,9 @@ module closureEvidenceStaleTenure {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 5
+    INTENT_CEIL = 5,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
   ).*
 }
 
@@ -2212,6 +2292,179 @@ module closureEvidenceAdversarialStore {
     CANCEL_BUDGET = 1,
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 2,
-    INTENT_CEIL = 5
+    INTENT_CEIL = 5,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
+  ).*
+}
+
+// ===========================================================================
+// Exhaustive-scope instantiations (Phase 0c reduction ladder; invariant-map
+// 0c stage record). The design-scale modules above keep the §2b granularity
+// and carry the witness / expected-fail-probe checks (reach tracking on,
+// dual walks, per-output store letters); these reduced instantiations are
+// the regimes the exhaustive invariant-conjunction checks run over —
+// reductions: 2-node universe, one build slot, two submissions,
+// per-derivation store letters, one outstanding walk, no reach tracking.
+// Witness reachability at this scope is NOT claimed; the canReach* checks
+// run against the design-scale modules.
+// ===========================================================================
+
+/// Exhaustive base regime: single tenure, no faults, no GC.
+module closureEvidenceBaseEx {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 2,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
+  ).*
+}
+
+/// Exhaustive fault-persist regime: best-effort PG writes may be lost.
+module closureEvidenceFaultPersistEx {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 2,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 2,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
+  ).*
+}
+
+/// Exhaustive failover regime: lost writes plus one failover/recovery.
+module closureEvidenceFailoverEx {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 1,
+    PGDROP_BUDGET = 1,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 2,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = false
+  ).*
+}
+
+/// Two-build investigation/probe regime ("duo"): the smallest universe in
+/// which the cross-build evidence shapes exist (a wider-wanted co-build
+/// next to a narrow one, reap-survivor verdicts, the present-but-tried
+/// limbo cell). No faults. Used by expect-violation probes and the Phase
+/// 0c pre-registered-observation investigations, never by an exhaustive
+/// invariant check (the C3 single-tenure permissiveness claim is
+/// genuinely violated by the as-built fail-fast at this scope — see the
+/// invariant map's 0c stage record).
+module closureEvidenceDuo {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
+  ).*
+}
+
+/// Stale-tenure probe regime at duo scope: the deposed-believer late-apply
+/// alphabet (STALE_APPLY / cross-tenure walk consumption) over the
+/// two-node, two-build universe, sized so the bounded checker can reach
+/// the A17 dangerous-direction interleaving (an old tenure's clear/heal
+/// erasing a bit a newer tenure stamped) within a wired check's budget.
+module closureEvidenceStaleDuo {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 2,
+    PGDROP_BUDGET = 1,
+    STALE_APPLY = true,
+    CROSS_TENURE_WALKS = true,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 5,
+    WALKS_PER_NODE = 2,
+    STORE_PER_OUTPUT = true
+  ).*
+}
+
+/// Failover probe regime at duo scope: lost best-effort writes plus two
+/// failovers over the two-node, two-build universe, sized so the bounded
+/// checker can reach the C1-strict re-arming loop (lost mark-clear ->
+/// failover restore -> second wrongful fail-fast) within a wired check's
+/// budget.
+module closureEvidenceFailoverDuo {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 3,
+    FAILOVERS = 2,
+    PGDROP_BUDGET = 2,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 1,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 2,
+    ATTEMPT_CYCLE_CEIL = 1,
+    INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
   ).*
 }
