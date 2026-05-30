@@ -71,6 +71,7 @@ async fn test_load_parents_with_all_children_produced_requires_live_build_link()
         None,
         PriorityClass::Scheduled,
         false,
+        false,
         &BuildOptions::default(),
         None,
     )
@@ -88,6 +89,7 @@ async fn test_load_parents_with_all_children_produced_requires_live_build_link()
         None,
         PriorityClass::Scheduled,
         false,
+        false,
         &BuildOptions::default(),
         None,
     )
@@ -100,6 +102,7 @@ async fn test_load_parents_with_all_children_produced_requires_live_build_link()
         rerequest_build,
         None,
         PriorityClass::Scheduled,
+        false,
         false,
         &BuildOptions::default(),
         None,
@@ -116,6 +119,7 @@ async fn test_load_parents_with_all_children_produced_requires_live_build_link()
         noncoowner_build,
         None,
         PriorityClass::Scheduled,
+        false,
         false,
         &BuildOptions::default(),
         None,
@@ -192,6 +196,7 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
         None,
         PriorityClass::Scheduled,
         false,
+        false,
         &BuildOptions::default(),
         None,
     )
@@ -209,6 +214,7 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
         None,
         PriorityClass::Scheduled,
         false,
+        false,
         &BuildOptions::default(),
         None,
     )
@@ -222,6 +228,7 @@ async fn test_load_parents_with_failed_deps_requires_live_co_owning_voucher() ->
         p2_rerequest,
         None,
         PriorityClass::Scheduled,
+        false,
         false,
         &BuildOptions::default(),
         None,
