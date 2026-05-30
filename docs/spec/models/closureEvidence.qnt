@@ -508,6 +508,26 @@ module closureEvidence {
         bm.get(b).phase == BpActive and bm.get(b).pgRow and
         bm.get(b).pgLinks.contains(d) and bm.get(b).pgLinks.contains(c)))
 
+  /// The in-DAG recompute's condemnation criterion (compute_initial_states
+  /// → any_co_owned_dep_terminally_failed) as of the Phase-1 Wave-2b
+  /// co-ownership fix: some LOADED un-produced-terminal child co-owned
+  /// with d by a live build. Production scopes by intersection of the
+  /// nodes' in-memory `interested_builds`; at recovery those sets ARE the
+  /// durable links of live builds (the bd_rows rebuild), so the
+  /// durable-link form here is the same predicate. Over the loaded
+  /// relation this is subsumed by pCondemnCriterion (a loaded
+  /// terminal-state child is a within-TTL poisoned row: rowExists, pgSt
+  /// poisoned, its loaded edge ⊆ pgEdges) — kept as its own named
+  /// criterion so the two production mechanisms stay separately visible
+  /// and separately falsifiable by calibration overrides.
+  pure def pInDagCondemnCriterion(dm: str -> DrvRec, bm: str -> BuildRec, bs: Set[str],
+                                  memE: Set[(str, str)], d: str): bool =
+    pKids(memE, d).exists(c =>
+      isUnprodTerminal(dm.get(c).mSt) and
+      bs.exists(b =>
+        bm.get(b).phase == BpActive and bm.get(b).pgRow and
+        bm.get(b).pgLinks.contains(d) and bm.get(b).pgLinks.contains(c)))
+
   /// Promote-and-clear cascade after a set of nodes became Produced:
   /// for every in-memory parent of a newly produced node, promote a
   /// vacuously-satisfied Queued parent to Ready and (the C2 clear) drop
@@ -771,10 +791,13 @@ module closureEvidence {
   /// load_parents_with_failed_deps short-circuit) condemns only on a
   /// live co-owned persisted failure. The compute_initial_states
   /// in-DAG recompute that runs after it is a separate production
-  /// mechanism with NO co-ownership scoping (mirrored by recoverAsLeader's
-  /// condemnation arm (b)); it is intentionally outside this property —
-  /// the spec-vs-code divergence is the Phase-1 model-corrections record's
-  /// subject, routed to the owner.
+  /// mechanism, ALSO co-ownership-scoped as of the Phase-1 Wave-2b fix
+  /// (any_co_owned_dep_terminally_failed; recoverAsLeader's condemnation
+  /// arm (b) / pInDagCondemnCriterion). The latch stays keyed on the
+  /// cascade arm — the mechanism the spec rule names — and the in-DAG
+  /// arm's scoping is pinned operationally: the Wave-2b L3 re-hunt's red
+  /// half (scoping without the poisonClear survivor promotion) re-opens
+  /// the strand, and the wired battery holds with both halves in.
   val condemnRequiresLiveCoOwnedFailure = not(viol.condemnUnscoped)
 
   // Group B — the missing families (design §3b).
@@ -925,18 +948,23 @@ module closureEvidence {
   /// the traced strand depended on recovery leaving the parent Queued
   /// above its still-poisoned child, which the model permitted only
   /// through the missing compute_initial_states condemnation arm
-  /// (recoverAsLeader's arm (b), above). With the corrected encoding the
-  /// parent is condemned at recovery — exactly what production does
-  /// (rio-scheduler compute_initial_states / any_dep_terminally_failed,
-  /// pinned by test_initial_states_with_prepoisoned_dep) — and the L3
-  /// re-hunt found no violation at FailoverEx or Duo under either
-  /// backend. asBuiltHoldInvariants (WITH L3) is therefore the
-  /// expected-hold conjunction at the failover scopes too; this variant
-  /// is retained for comparison against the 0d record and as the
-  /// pre-correction manual-target form. Refutation evidence, re-hunt
-  /// figures and the residual spec-vs-code divergence: invariant map,
-  /// Phase-1 Wave-2 stage record. The single-tenure scopes' 0c BaseEx
-  /// record is unaffected.
+  /// (recoverAsLeader's arm (b), above). Wave 2b then fixed production's
+  /// unscoped form of that arm red-first (the residual finding): the
+  /// condemnation is now co-ownership-scoped (pInDagCondemnCriterion) AND
+  /// the poison-clear removal promotes the surviving parents
+  /// (poisonClear's promotion arm) — the spared parent waits Queued
+  /// (progress-armed: its poisoned child is non-produced) and is promoted
+  /// at the clear, so the strand stays closed by the
+  /// scoping+promotion pair where the unscoped condemnation used to close
+  /// it alone. The Wave-2b L3 re-hunt at FailoverEx and Duo (both
+  /// backends) finds no violation with both halves in, and the red half
+  /// (scoping without promotion) re-finds the strand — the calibration
+  /// that the pairing, not luck, closes it. asBuiltHoldInvariants (WITH
+  /// L3) remains the expected-hold conjunction at the failover scopes;
+  /// this variant is retained for comparison against the 0d record.
+  /// Refutation evidence, re-hunt figures and the Wave-2b fix record:
+  /// invariant map, Phase-1 Wave-2/2b stage records. The single-tenure
+  /// scopes' 0c BaseEx record is unaffected.
   val asBuiltHoldInvariantsFailoverEx = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -1182,8 +1210,9 @@ module closureEvidence {
   /// Leader recovery: one atomic action over the durable state at this
   /// instant — row load (terminal rows excluded), poisoned-row TTL
   /// split, edge truncation to loaded endpoints, failed-dep
-  /// condemnation (the co-owned R2 cascade pre-pass AND the unscoped
-  /// compute_initial_states in-DAG dep check — see the dm2 comment),
+  /// condemnation (the co-owned R2 cascade pre-pass AND the
+  /// equally-co-owned compute_initial_states in-DAG dep check — see the
+  /// dm2 comment; both scoped as of Phase-1 Wave 2b),
   /// the strict-criterion clear gate (C3), the recovery hole stamp
   /// (H4), the in-memory-only Substituting reset, interest rebuild
   /// from durable links without per-build contributions.
@@ -1232,24 +1261,31 @@ module closureEvidence {
       else {
         val kidsLoaded = pKids(newMemEdges, d)
         // Failed-dep condemnation is the disjunction of production's TWO
-        // recovery mechanisms:
+        // recovery mechanisms — BOTH co-ownership-scoped as of the Phase-1
+        // Wave-2b fix:
         //  (a) the R2 cascade pre-pass (load_parents_with_failed_deps →
         //      cascade_failed in seed_ready_queue) — co-ownership-scoped
         //      over the DURABLE relation (pCondemnCriterion; the bug_009
         //      evidence rule and the spec's condemnation rule);
         //  (b) the compute_initial_states recompute over the LOADED child
-        //      set (any_dep_terminally_failed): a node above an in-DAG
-        //      un-produced-terminal child is condemned REGARDLESS of build
-        //      co-ownership. Within-TTL poisoned children are loaded with
-        //      their edges, so this is the arm that condemns a recovered
-        //      parent above a still-poisoned child another build owns.
-        // Arm (b) is strictly more condemning than the spec's R2 rule; the
-        // spec-vs-code divergence is recorded in the invariant map (Phase-1
-        // model corrections record) and routed to the owner. The A22 latch
-        // (condemnUnscoped) stays keyed on arm (a) only — it guards the
-        // cascade mechanism the spec rule constrains, not arm (b).
+        //      set (any_co_owned_dep_terminally_failed): a node above an
+        //      in-DAG un-produced-terminal child is condemned only when a
+        //      live build co-owns the pair (pInDagCondemnCriterion). The
+        //      pre-fix unscoped form — any loaded terminal child condemns,
+        //      regardless of ownership — was the Wave-2 residual finding
+        //      (spec-vs-code divergence from
+        //      sched.recovery.failed-dep-cascade+2's MUST NOT clause),
+        //      fixed red-first in Wave 2b.
+        // A parent spared by the scoping recovers MQueued above the loaded
+        // poisoned child; the poisonClear survivor promotion (the
+        // production reevaluate_removal_survivors hook, mirrored in
+        // poisonClear below) is its wake-up edge — the pairing that keeps
+        // L3 (liveBuildTerminalOrProgressArmed) holding under the
+        // narrowed condemnation. The A22 latch (condemnUnscoped) stays
+        // keyed on arm (a) only — it guards the cascade mechanism the
+        // spec rule names explicitly.
         val condemned = pCondemnCriterion(dm1, blds, BUILDS, pgEdges, d)
-          or kidsLoaded.exists(c => isUnprodTerminal(dm1.get(c).mSt))
+          or pInDagCondemnCriterion(dm1, blds, BUILDS, newMemEdges, d)
         val clearGate = r.mTp and not(r.mCh) and pStrictPgCriterion(dm1, blds, BUILDS, pgEdges, d)
         val holeStamp = pRecoveryHoleCriterion(dm1, pgEdges, d)
         val depsSatisfied = kidsLoaded.forall(c => dm1.get(c).mSt == MProduced)
@@ -2173,8 +2209,23 @@ module closureEvidence {
   }
 
   /// Poison resolution (admin ClearPoison or the TTL sweep): the node is
-  /// removed from the DAG, its row reset, and every surviving parent
-  /// gets the closure-hole breadcrumb (H2/H3).
+  /// removed from the DAG, its row reset, every surviving parent gets
+  /// the closure-hole breadcrumb (H2/H3), and the survivors are
+  /// re-evaluated (the production reevaluate_removal_survivors hook —
+  /// Phase-1 Wave 2b, sched.poison.clear-survivor-reevaluation): a
+  /// MQueued survivor whose remaining loaded kids are all produced
+  /// (vacuously, when the cleared child was its last one) is promoted to
+  /// MReady — the same promotion arm reapTerminalBuild applies to its
+  /// survivors. This is the wake-up edge for a parent the recovery
+  /// condemnation spared on co-ownership grounds (it recovered MQueued
+  /// above this non-co-owned poisoned child); without it that parent is
+  /// stranded Queued/childless/un-armed and L3
+  /// (liveBuildTerminalOrProgressArmed) is violated — the refuted 0d
+  /// strand made real by the scoping. The settlement arm for
+  /// marked-Broken survivors needs no separate encoding here: a promoted
+  /// (or already-) MReady marked survivor is exactly what the
+  /// dispatch-partition letters (probeWalk / probeFailFast*) fire on,
+  /// and an MFailed survivor re-arms via requeueFailed.
   action poisonClear(d: str): bool = {
     nondet viaAdmin = Set(true, false).oneOf()
     all {
@@ -2182,15 +2233,26 @@ module closureEvidence {
       drvOf(d).mSt == MPoisoned,
       val parents = memParentsOf(d).filter(p => drvOf(p).mSt != MAbsent)
       val newIntents = parents.map(p => { op: ISetHole(p), tenure: lead.gen })
+      // The post-removal edge relation: the cleared child's edges are gone,
+      // so the survivor promotion judges the remaining kids only.
+      val memEdges1 = memEdges.filter(e => e._1 != d and e._2 != d)
       all {
         intents.size() + newIntents.size() <= INTENT_CEIL,
         drv' = DRVS.mapBy(x => {
           val r = drv.get(x)
           if (x == d) { ...r, mSt: MAbsent, pgSt: if (r.rowExists) MQueued else r.pgSt, walks: [], nf: Set() }
-          else if (parents.contains(x)) { ...r, mCh: true }
+          else if (parents.contains(x)) {
+            // Hole stamp + the survivor promotion arm (mirrors
+            // reapTerminalBuild's dmFinal pass; mSt-only like that pass —
+            // recovery re-derives dispatchability from the dep walk, so
+            // the durable status is immaterial here).
+            val promoted = r.mSt == MQueued and
+              pKids(memEdges1, x).forall(c => drv.get(c).mSt == MProduced)
+            { ...r, mCh: true, mSt: if (promoted) MReady else r.mSt }
+          }
           else r
         }),
-        memEdges' = memEdges.filter(e => e._1 != d and e._2 != d),
+        memEdges' = memEdges1,
         intents' = intents.union(newIntents),
         store' = store, blds' = blds, pgEdges' = pgEdges, lead' = lead, budget' = budget,
         viol' = { ...viol, holeUnsound: viol.holeUnsound or parents.exists(p => drvOf(d).mSt == MProduced) },

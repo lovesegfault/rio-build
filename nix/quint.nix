@@ -3535,25 +3535,30 @@ in
     # as-built finding (the strand trace). The Phase-1 Wave-2 model
     # correction REFUTED that classification: the traced strand existed
     # only through the model's missing recovery-condemnation arm
-    # (recoverAsLeader arm (b) — production's compute_initial_states /
-    # any_dep_terminally_failed condemns the recovered parent above its
-    # still-poisoned child, so the strand state never forms in
-    # production). Under the corrected encoding the L3 re-hunt found no
-    # violation at FailoverEx or Duo under either backend, so the manual
-    # exhaustive target for this scope is the FULL conjunction:
+    # (recoverAsLeader arm (b) — production's compute_initial_states
+    # condemned the recovered parent above its still-poisoned child, so
+    # the strand state never formed in production). Wave 2b then fixed
+    # production's unscoped form of that arm red-first (the spec-vs-code
+    # divergence the Wave-2 record routed to the owner): the condemnation
+    # is now co-ownership-scoped AND both poison-removal paths re-evaluate
+    # surviving parents (sched.poison.clear-survivor-reevaluation). The
+    # model mirrors both halves (pInDagCondemnCriterion in recoverAsLeader;
+    # the promotion arm in poisonClear), and the Wave-2b L3 re-hunt keeps
+    # the strand closed: the red half (scoping without the promotion)
+    # re-finds the 9-state strand under TLC at FailoverEx, and the full
+    # pair finds no violation under either backend — figures in the
+    # invariant map's Wave-2b stage record. The manual exhaustive target
+    # for this scope stays the FULL conjunction:
     #
     #   quint verify --backend=tlc --main=closureEvidenceFailoverEx \
     #     --invariant=asBuiltHoldInvariants \
     #     docs/spec/models/closureEvidence.qnt
     #
     # (asBuiltHoldInvariantsFailoverEx — the L3-free variant — is retained
-    # in the model for comparison against the 0d record.) The refutation
-    # evidence, the re-hunt figures and the residual spec-vs-code
-    # divergence routed to the owner (production's unscoped recovery
-    # condemnation) are in the invariant map's Phase-1 Wave-2 stage
-    # record. The recovery- and durability-direction witnesses below
-    # (hole-from-recovery, recovery-clear, stale-intent-apply) keep those
-    # regimes' reachability pinned in the meantime.
+    # in the model for comparison against the 0d record.) The recovery-
+    # and durability-direction witnesses below (hole-from-recovery,
+    # recovery-clear, stale-intent-apply) keep those regimes'
+    # reachability pinned in the meantime.
 
     # ---- Closure-evidence expected-fail probes -----------------------
     # The design's pre-registered expected falsifications (§3 / the §8 0c

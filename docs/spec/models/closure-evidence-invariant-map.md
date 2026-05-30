@@ -32,10 +32,15 @@ downgraded. Phase 1 in progress: Wave 1 (the C3+D16 settlement, red-first)
 is landed — `sched.evidence.settlement` is covered and the C3 wrongful
 fail-fast class is closed at all three call sites; Wave 2 corrected the
 model's recovery-condemnation encoding (review finding RT-2) and REFUTED
-the post-0d L3 finding as a model artifact — no L3 fix is needed; the
-residual spec-vs-code divergence (production's unscoped recovery
-condemnation) is routed to the owner. See the Phase-1 Wave-2 stage record
-(the last section).**
+the post-0d L3 finding as a model artifact — no L3 fix is needed; Wave 2b
+(owner decision 2026-05-30, disposition (b)) fixed the residual
+spec-vs-code divergence red-first: production's recovery condemnation is
+now co-ownership-scoped AND both poison-removal paths re-evaluate
+surviving parents (`sched.poison.clear-survivor-reevaluation`), the model
+mirrors both halves, and the L3 re-hunt under the corrected pair keeps the
+strand closed (the red half — scoping without the promotion — re-finds it,
+the calibration that the pairing is load-bearing). See the Phase-1
+Wave-2/2b stage records (the last sections).**
 
 ## Phase 0a spec-audit record
 
@@ -86,7 +91,7 @@ executor-campaign convention.
 | A19 | `recoveryClearCompleteness` | Recovery clears every restored mark whose strict durable criterion holds. | sched.merge.substitute-topdown+11 | HOLDS at the reduced base scope (vacuous there — its trigger lives in the deferred fault-persist/failover runs); trigger reachability pinned by the recovery/durability witnesses |
 | A20 | `healCompleteness` | A full merge heals every re-declared parent with a persisted hole, not keyed on the in-memory bit. | sched.evidence.closure-hole | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | A21 | `chainEndClearsForgiveness` | The chain-scoped forgiveness latch never outlives its chain (state form; dead latches on terminal/absent nodes allowed, see ENC-0b-14). | sched.substitute.detached+5 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
-| A22 | `condemnRequiresLiveCoOwnedFailure` | The recovery failed-dep cascade condemns only on a persisted failure a live build co-owns with the parent. | sched.merge.substitute-topdown+11 | HOLDS at the reduced base scope (vacuous there — its trigger lives in the deferred fault-persist/failover runs); trigger reachability pinned by the recovery/durability witnesses |
+| A22 | `condemnRequiresLiveCoOwnedFailure` | The recovery failed-dep cascade condemns only on a persisted failure a live build co-owns with the parent. | sched.merge.substitute-topdown+11, sched.recovery.failed-dep-cascade+2 | HOLDS at the reduced base scope (vacuous there — its trigger lives in the deferred fault-persist/failover runs); trigger reachability pinned by the recovery/durability witnesses. As of Wave 2b the in-DAG recompute — the second recovery condemnation mechanism, previously unscoped (the Wave-2 residual finding) — carries the same co-ownership scoping in production (`any_co_owned_dep_terminally_failed`) and in the model (`pInDagCondemnCriterion`); the latch stays keyed on the cascade arm |
 
 ### Group B — missing families (B1–B10)
 
@@ -121,7 +126,7 @@ executor-campaign convention.
 |---|---|---|---|---|
 | L1 | `substitutingAlwaysArmed` | A Substituting node always has a walk instance in flight. | sched.substitute.detached+5 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | L2 | `markedBrokenSettlementArmed` | No reachable D16 limbo cell (marked, Broken, tried, Ready, live interest, all live-wanted outputs present, no walk). **Pre-registered expected-fail probe** (base); its violation trace is the D16 deliverable. | sched.evidence.settlement (intentionally uncovered) | expected-fail probe — NOT yet produced (the D16 cell is ≥16 steps deep at duo scope; deferred-probe record in the 0c stage record) |
-| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (0c run record); the post-0d triage's failover-scope violation is **REFUTED as a production defect — model artifact of the recovery-condemnation gap (Phase 1 Wave 2)**: the traced strand needed recovery to leave the parent Queued above its still-poisoned child, which production never does (`compute_initial_states` / `any_dep_terminally_failed` condemns it; the model was missing that arm — review finding RT-2). Corrected encoding + re-hunt (FailoverEx + Duo, both backends) + code walk: Wave-2 stage record. NOT a Phase-1 fix candidate. The residual spec-vs-code divergence (production's unscoped recovery condemnation) is a separate owner item — Wave-2 stage record, residual finding |
+| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11, sched.poison.clear-survivor-reevaluation | No violation found at the reduced base scope (0c run record); the post-0d triage's failover-scope violation is **REFUTED as a production defect — model artifact of the recovery-condemnation gap (Phase 1 Wave 2)**: the traced strand needed recovery to leave the parent Queued above its still-poisoned child, which pre-Wave-2b production never did (the unscoped `compute_initial_states` condemnation closed it). **Wave 2b narrowed that mechanism** (the residual-finding fix: co-ownership scoping) **and added its replacement closure**: the poison-clear survivor re-evaluation promotes the spared parent when the child is removed. Re-hunt under the scoped pair (FailoverEx + Duo, both backends): no violation; the red half (scoping without promotion) re-finds the 9-state strand under TLC — the pairing, not the unscoped condemnation, now closes the strand. Wave-2/2b stage records |
 
 ### Non-vacuity witnesses (encoded in 0b, wired as expect-violation checks in 0c)
 
@@ -1609,6 +1614,178 @@ Disposition options for the owner (this stage takes no action):
    flip (settlement encoding + calibration pin re-point) is Wave 4 (T-4.1).
 7. The 0c carry-overs — unchanged, except the FailoverEx manual target is now the full
    conjunction (consequence 2 of the gate above).
+
+### Phase 1 Wave 2b — the residual-finding fix: co-ownership scoping + poison-clear survivor re-evaluation (this stage)
+
+**Headline: the Wave-2 residual finding (production's unscoped recovery condemnation) is FIXED
+red-first, both halves together, per the owner's 2026-05-30 decision (disposition (b)).** The
+recovery in-DAG recompute now condemns a recovered parent only for a terminal child a live
+build co-owns with it, and both poison-removal paths re-evaluate surviving parents so the
+spared parent makes progress when the poison clears. The model mirrors both halves; the L3
+re-hunt under the corrected encoding finds no violation at any hunted scope under either
+backend, while the red half (scoping without the promotion) re-finds the 9-state strand under
+TLC in under six minutes — the calibration evidence that the scoping+promotion PAIR, not
+either half alone, closes the strand. All 25 wired checks rebuilt green; the production test
+battery needed zero updates.
+
+**1. The owner decision and the fix shape.**
+
+The Wave-2 record routed the residual finding to the owner with two dispositions: (a) accepted
+bound + spec amendment, or (b) spec-conformance fix. The owner chose (b) on 2026-05-30, with
+the explicit requirement that both halves land together — the Wave-2 record's analysis that
+"the scoping alone re-introduces the L3 hang; the re-evaluation alone is dead code" is
+confirmed empirically by this stage's red-half TLC run (section 6).
+
+**2. Red-first execution (production) — rio-scheduler commit `7750a4d45`.**
+
+- RED: `test_recovery_cross_build_poisoned_dep_spares_non_co_owning_parent`
+  (actor/tests/recovery.rs) stages the exact residual scenario — build A full-merges
+  parent→child and is dead at recovery with the child poisoned within TTL; build B owns only
+  the parent (the bug_009 pruning-build shape; the child's `poisoned_at` is future-dated so
+  the within-TTL load is deterministic under the 100ms cfg(test) TTL). Pre-fix failure
+  verified: `assertion failed: ... got DependencyFailed, expected Queued` — the wrongful
+  condemnation, exactly the finding's characterization. The companion
+  `test_poison_clear_reevaluates_spared_recovered_parent` (admin-clear + ttl-expiry rstest
+  cases) pins the second half and was red for the same reason (its fixture premise is the
+  spared recovery).
+- FIX half 1 (co-ownership scoping): `compute_initial_states`'s condemnation arm now goes
+  through the new `DerivationDag::any_co_owned_dep_terminally_failed` — a terminal child
+  counts only when `interested_builds` of parent and child intersect (the in-memory mirror of
+  `load_parents_with_failed_deps`'s SQL evidence rule; at recovery the in-memory sets ARE the
+  durable links of live builds). The `will_fail` transitive propagation carries the same
+  scoping. `any_dep_terminally_failed` keeps its unscoped form for `revert_target_for`
+  (first-party walk-failure judgments — mechanism (iii) of the Wave-2 code walk, deliberately
+  untouched).
+- FIX half 2 (survivor re-evaluation): the Wave-1 reap-survivor loop is extracted into
+  `reevaluate_removal_survivors` (dispatch.rs) — settlement for marked-Broken survivors,
+  promotion (Ready + push + persist) for Queued survivors whose remaining deps are satisfied —
+  and is now called from all three removal sites: the terminal-build reap (unchanged
+  behavior), admin `ClearPoison` (`handle_clear_poison`) and the poison-TTL sweep
+  (`tick_process_expired_poisons`). The two poison sites previously stamped closure holes and
+  deliberately did NOT re-evaluate ("must not trigger parent verdicts" — a rationale that
+  Wave 2b's scoping invalidates: the spared parent's only wake-up edge is exactly this
+  removal).
+- GREEN: both new tests pass post-fix; clippy (stable, CI parity), treefmt, tracey validate
+  and the full rio-scheduler nextest suite are green at the commit boundary.
+
+**3. The existing-test battery — zero updates needed (under the predicted bound of 2+2).**
+
+1094/1094 tests pass unmodified. The Wave-2 record predicted the two condemnation-pinning
+tests would regress; they do not, and the reason is informative:
+
+| Test | Why it stays green |
+|---|---|
+| `test_initial_states_with_prepoisoned_dep` (dag/tests.rs) | Build 2's merge node list INCLUDES the poisoned leaf, so build 2 co-owns it (`dag.merge` adds the merging build's interest to existing nodes); the scoped condemnation still fires. The test pins the legitimate co-owned case, not the unscoped-ness. |
+| `test_recovery_substituting_with_poisoned_dep_goes_dependency_failed` (actor/tests/recovery.rs) | One build owns both nodes, so the parent is condemned by the cascade pre-pass (`load_parents_with_failed_deps` → `cascade_failed`), which was always co-ownership-scoped; the in-DAG recompute never even sees it. |
+
+Every other condemnation-adjacent test (bug_341, bug_051, the transitive-persist test, the
+keep_going merge tests, the poison-clear closure-hole tests, the keep_going poison-removal
+tests) likewise stages co-owned scenarios or in-flight survivors that the new survivor loop
+deliberately skips. The cross-build non-co-owned case had NO pre-existing test — which is
+exactly why it survived as a residual finding until the Wave-2 model review surfaced it.
+
+**4. Spec changes.**
+
+- `sched.recovery.failed-dep-cascade+2`: text UNCHANGED, no bump — the rule already mandated
+  the scoped outcome (its MUST NOT clause); production now conforms. New impl markers on
+  `any_co_owned_dep_terminally_failed` / `compute_initial_states`, new verify marker on the
+  red test. (The Wave-2 record's planned "divergence note" amendment is moot under
+  disposition (b): there is no divergence left to document.)
+- NEW rule `sched.poison.clear-survivor-reevaluation` (scheduler.typ, after the
+  cascade-dependents rule): both poison-removal paths MUST re-evaluate surviving parents
+  (promotion / settlement / skip rules as implemented), with the rationale prose explaining
+  the pairing with the failed-dep-cascade scoping. Impl markers at the shared loop and both
+  poison call sites; verify markers on the new rstest pair. tracey validate green; the rule
+  is neither uncovered nor untested.
+
+**5. The model update (closureEvidence.qnt) — both halves mirrored.**
+
+- `recoverAsLeader` pass-2 condemnation arm (b) flips from the unscoped
+  `kidsLoaded.exists(c => isUnprodTerminal(...))` to the scoped `pInDagCondemnCriterion`
+  (new pure def): a loaded un-produced-terminal child condemns only when a live build's
+  durable links contain both parent and child — the model form of production's
+  interested-builds intersection (identical at recovery, where interest IS the durable-link
+  relation). Over the loaded relation the scoped arm (b) is subsumed by arm (a)
+  (pCondemnCriterion); it is kept as a separately named criterion so the two production
+  mechanisms stay separately visible and separately falsifiable.
+- `poisonClear` gains the survivor promotion arm: a MQueued surviving parent whose remaining
+  loaded kids are all MProduced (vacuously, when the cleared child was the last) is promoted
+  to MReady — the same mSt-only promotion `reapTerminalBuild`'s dmFinal pass applies. The
+  settlement arm needs no separate encoding (a promoted/existing MReady marked survivor is
+  what the dispatch-partition letters fire on; an MFailed survivor re-arms via requeueFailed).
+- The A22 latch (`condemnUnscoped`) stays keyed on the cascade arm (a) — unchanged semantics,
+  updated comment. `asBuiltHoldInvariantsFailoverEx` is retained for 0d comparison with an
+  updated header.
+
+Encoding decisions recorded: the model promotion is single-step and mSt-only (recovery
+re-derives dispatchability from the dep walk, so the durable status is immaterial — the
+existing reap-promotion encoding decision, reused); production's settlement arm for
+marked-Broken non-Queued survivors maps onto the existing dispatch-partition letters rather
+than a new poisonClear branch (same observable: the survivor is ARMED, which is all L3 reads).
+
+**6. The L3 re-hunt — the strand stays closed by the scoping+promotion pair.**
+
+Backend 1 — rust simulator (the wired sim checks' budget shape), 2 000 000 samples × 14 steps,
+`liveBuildTerminalOrProgressArmed`:
+
+| Scope | Model | Result |
+|---|---|---|
+| closureEvidenceFailoverEx | Wave-2b (scoping + promotion) | [ok] no violation (67.4 s, 29 684 traces/s) |
+| closureEvidenceDuo | Wave-2b (scoping + promotion) | [ok] no violation (70.8 s, 28 233 traces/s) |
+| closureEvidenceFailoverEx | red half (scoping, NO promotion) | [ok] no violation (68.0 s) — the simulator cannot find this strand class (consistent with the Wave-2 calibration note: it also missed the pre-correction violation), so the sims corroborate but are not decisive; TLC below is |
+| closureEvidenceDuo | red half | [ok] no violation (70.9 s) — same reading |
+
+Supplementary `allInvariants` sweeps (40 000 samples × 14 steps, the Wave-2 re-validation
+battery shape): Base / FaultPersist / Failover / StaleTenure / Duo / FailoverDuo / C3Duo all
+[ok]; AdversarialStore reports the documented pre-registered B9 trip
+(`staleProducedUnlocked`, GC-after-produce) — NOT a Wave-2b break: the violation reproduces
+with the same seed (`0x58b7a35c717a4f85`) against the Wave-2 baseline model (HEAD~1) in
+143 ms, and B9-under-adversarial-store is the standing pre-registered as-built observation
+(0b/0c records, Wave-2 record).
+
+Backend 2 — TLC exhaustive BFS, 60 workers, same host / same day / same quint 0.32.0 +
+Apalache 0.56.1 distribution for all runs:
+
+| Run | Model | Invariant | Result |
+|---|---|---|---|
+| Red half (the calibration) | scoping WITHOUT the poisonClear promotion | liveBuildTerminalOrProgressArmed | **[violation]** at 1 884 601 distinct / 7 697 354 generated, 5 min 46 s — a 9-state trace: mergeCommit → pgApply → poisonArrival → mergeCommit (the resubmit whose IMerge REPLACES the build's links, making the poisoned child non-co-owned) → leaderLost → pgApply → recoverAsLeader (the SCOPED condemnation now spares d1 → recovers MQueued above MPoisoned d2) → poisonClear (d2 removed, NO promotion) → final state: b1 BpActive interest={d1}, d1 MQueued childless un-armed, d2 MAbsent. This is the 0d strand made real by the scoping — proof that (i) this exact TLC setup finds the violation when it exists, and (ii) half 2 is load-bearing |
+| Re-hunt (the fix) | Wave-2b (scoping + promotion) | liveBuildTerminalOrProgressArmed | NO violation through 21 384 877 distinct / 96 719 329 generated / Progress(14) at the 35-minute cap (unconverged) — 11.3× the distinct and 12.6× the generated states of the red-half violation coordinates, with the violation's own depth class (a 9-state trace) fully enumerated well inside that prefix |
+| Re-hunt (breaks nothing else) | Wave-2b (scoping + promotion) | asBuiltHoldInvariants (the FULL conjunction, L3 included — the FailoverEx manual-target form) | NO violation of ANY conjunct through 23 695 257 distinct / 107 664 812 generated / Progress(14) at the 35-minute cap (unconverged) — 12.6× the distinct and 14× the generated states of the red-half violation coordinates |
+
+Reading: the red-half violation sits at the same coordinate class as the Wave-2 baseline
+violation (2.02 M distinct / 8.27 M generated / 8 min 11 s on the pre-correction model) — the
+strand's depth did not move, only its closing mechanism did. The re-hunt runs explore well
+past those coordinates without a violation, so the verdict criterion is the same
+baseline-found vs re-hunt-not-found comparison over a strictly larger prefix that the Wave-2
+record used.
+
+**7. The 25 wired checks — all green against the Wave-2b model.**
+
+`nix build` of all 25 `quint-closure-*` checks (the .qnt fileset is their eval input, so every
+one rebuilt against the modified model): exit 0, 25/25. This includes every
+recovery/poison-dependent check — the FailoverEx TLC witnesses (hole-recovery,
+recovery-clear), the BaseEx hole-admin-clear / hole-ttl-sweep witnesses (poisonClear
+reachability, now exercised against the promotion-bearing action), the three StaleDuo sim
+checks, the C3 probe at Duo, the downgrade-respawn witness at C3Duo, and calib-f8 / calib-f9
+(whose calibSteps consume the production recoverAsLeader / poisonClear respectively). No
+witness became unreachable; no calibration stopped falsifying.
+
+**8. Updated owner sign-off items (supersedes the Wave-2 list; renumbered).**
+
+1. The C5 / CE-7 deferral — unchanged (Wave-2 item 1).
+2. The F6 falsifications resting on the rust simulator — unchanged (Wave-2 item 2).
+3. The CE-45 (F10) evidence-module-only falsification — unchanged (Wave-2 item 3).
+4. The mkQuintWitnessCheck rust-backend extension funding question — unchanged (Wave-2
+   item 4).
+5. ~~The residual finding (unscoped recovery condemnation)~~ — **FIXED by this stage**
+   (disposition (b), red-first, both halves; commit `7750a4d45` + the model/map commit). The
+   wrongful-failure window (failover × within-TTL poisoned child × non-co-owning
+   parent-owner build) is closed; the spared parent's progress is owned by
+   `sched.poison.clear-survivor-reevaluation`.
+6. C3 — RESOLVED by Phase 1 Wave 1 (unchanged; the model-side C3 flip is Wave 4 / T-4.1).
+7. The 0c carry-overs — unchanged: the held-back exhaustive conjunctions (the FailoverEx
+   manual target remains the full `asBuiltHoldInvariants`, now also exercised by this
+   stage's capped TLC run) and the deferred A17 / L2 / C1-strict probes.
 
 Later phases append here (Wave 3: fencing; Wave 4: model + CI updates; Wave 5 / close-out:
 acceptance table over the full corpus, deployment-checklist deltas and counter-signatures).
