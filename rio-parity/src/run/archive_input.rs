@@ -173,6 +173,19 @@ pub fn exclusion_counts(archive: &ReplayArchive) -> BTreeMap<String, usize> {
     counts
 }
 
+/// Total recorder-side exclusion records, or `None` when the archive
+/// carries no exclusions member at all. The distinction matters for the
+/// comparability accounting: an absent member means the recorder declared
+/// nothing about exclusions (no completeness penalty applies), while a
+/// present-but-empty member is a positive "nothing was excluded" claim.
+pub fn exclusions_recorded(archive: &ReplayArchive) -> Option<usize> {
+    archive
+        .manifest()
+        .files
+        .contains_key(crate::archive::EXCLUSIONS_MEMBER)
+        .then(|| archive.exclusions().len())
+}
+
 /// Job names (label, or the drv-basename fallback) of every unit the
 /// recorder marked identity divergent, sorted.
 pub fn identity_divergent_units(archive: &ReplayArchive) -> Result<Vec<String>> {
@@ -780,6 +793,10 @@ mod tests {
 
         let excl = exclusion_counts(&archive);
         assert_eq!(excl.get("eval-error"), Some(&1));
+        // The mini archive stages an exclusions member with one record, so
+        // the recorder-side exclusion count is present (not the absent-member
+        // `None`).
+        assert_eq!(exclusions_recorded(&archive), Some(1));
     }
 
     #[test]

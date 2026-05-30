@@ -1090,6 +1090,14 @@ pub async fn run_with_backends(
             // workload units, so they enter the comparability accounting here
             // and are merged — never overwritten — by the report-time refresh.
             record.comparability.excluded = archive_input::exclusion_counts(&archive);
+            record.comparability.exclusions_recorded = archive_input::exclusions_recorded(&archive);
+            // Archive provenance: when the archive was recorded and how old
+            // it was when this campaign started, both part of what makes two
+            // reports comparable.
+            let campaign_created_at = record.created_at.clone();
+            record
+                .comparability
+                .record_archive_provenance(archive.manifest().created_at, &campaign_created_at);
             record.plan = Some(result.output.clone());
             state.write_json_atomic("campaign.json", &record)?;
             record
@@ -1840,26 +1848,9 @@ pub async fn run_with_backends(
     let supply_summary = load_supply_summary(&state)?;
     let timed_summary: Option<TimedRunStats> = state.read_json("timed-stats.json")?;
     let final_abort_recommended = abort_recommended.load(Ordering::SeqCst);
-    // A prefetch shortfall below the pause threshold did not stop the
-    // campaign, but it changed what the headline measured: flag it
-    // low-confidence. (Above the threshold the campaign paused before
-    // execution and the operator explicitly resumed it.)
-    if let Some(supply) = &supply_summary
-        && let Some(pct) = supply.shortfall_pct
-        && pct > 0.0
-        && pct <= spec.knobs.prefetch_shortfall_pause_pct
-        && !campaign
-            .comparability
-            .low_confidence
-            .iter()
-            .any(|flag| flag == "prefetch-shortfall")
-    {
-        campaign
-            .comparability
-            .low_confidence
-            .push("prefetch-shortfall".to_string());
-    }
-    // Refresh the comparability block in campaign.json with final counts.
+    // Refresh the comparability block in campaign.json with final counts,
+    // the supply/timing context (prefetch shortfall, timed degradation), and
+    // the re-derived low-confidence flags.
     let agg = report::aggregate(&final_records);
     let empty_counts = BTreeMap::new();
     let plan_counts = campaign
@@ -1867,8 +1858,14 @@ pub async fn run_with_backends(
         .as_ref()
         .map(|p| &p.counts)
         .unwrap_or(&empty_counts);
-    campaign.comparability =
-        report::comparability_with_counts(&campaign.comparability, &agg, plan_counts);
+    campaign.comparability = report::comparability_with_counts(
+        &campaign.comparability,
+        &agg,
+        plan_counts,
+        &spec.knobs,
+        supply_summary.as_ref(),
+        timed_summary.as_ref(),
+    );
     state.write_json_atomic("campaign.json", &campaign)?;
     let plan_count_u64 = |key: &str| {
         plan_counts
@@ -2402,6 +2399,28 @@ mod tests {
         );
         assert_eq!(campaign.comparability.excluded.get("eval-error"), Some(&1));
         assert_eq!(campaign.comparability.excluded.get("filtered"), Some(&2));
+        // Archive provenance and campaign identity recorded at bootstrap:
+        // the mini archive's manifest timestamp, its (positive) age relative
+        // to the campaign, the recorder's one exclusion record, and the
+        // scheduling/supply identity of a leaf timeless campaign.
+        assert_eq!(
+            campaign.comparability.archive_created_at.as_deref(),
+            Some("2026-05-28T00:00:00Z")
+        );
+        assert!(
+            campaign.comparability.archive_age_days.unwrap() > 0.0,
+            "{:?}",
+            campaign.comparability.archive_age_days
+        );
+        assert_eq!(campaign.comparability.exclusions_recorded, Some(1));
+        assert_eq!(
+            campaign.comparability.scheduling_mode.as_deref(),
+            Some("timeless")
+        );
+        assert_eq!(
+            campaign.comparability.supply_policy.as_deref(),
+            Some("substituters")
+        );
 
         // Resume: same state dir, no scripted submitter outcomes left → must
         // not submit anything new and must finish with identical buckets.

@@ -17,6 +17,7 @@ Generated: 2026-05-26T12:00:00Z
 | signature table | m1-raw-evidence |
 | in scope / attemptable / attempted | 12 / 10 / 10 |
 | completeness | 100.00% |
+| **low confidence** | infra-indeterminate-rate, no-truth-rate |
 
 ## Headline
 - Build-outcome parity: **50.00%** (2 / 4)

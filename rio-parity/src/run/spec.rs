@@ -281,6 +281,17 @@ pub enum ScheduleMode {
     Timed,
 }
 
+impl ScheduleMode {
+    /// The wire string (matches the serde kebab-case form); used wherever
+    /// the mode is recorded as data, e.g. the comparability block.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ScheduleMode::Timeless => "timeless",
+            ScheduleMode::Timed => "timed",
+        }
+    }
+}
+
 /// Scheduling block of the campaign spec; part of the campaign's identity
 /// and recorded in the comparability block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -305,6 +316,18 @@ pub enum SupplyDependencies {
     /// mechanism; only derivation texts and embedded input sources are
     /// uploaded, and the target builds the entire closure itself.
     None,
+}
+
+impl SupplyDependencies {
+    /// The wire string (matches the serde kebab-case form); used wherever
+    /// the policy is recorded as data, e.g. the comparability block.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SupplyDependencies::Substituters => "substituters",
+            SupplyDependencies::EmbeddedOnly => "embedded-only",
+            SupplyDependencies::None => "none",
+        }
+    }
 }
 
 /// When planned supply is delivered relative to execution.
@@ -679,6 +702,9 @@ pub fn generate_campaign_id(now_rfc3339: &str) -> String {
 /// Comparability block: every report leads with it so two campaign
 /// reports can only be compared when their eval set, mode, tenant,
 /// filters, and engine/signature versions actually line up.
+///
+/// Every field added after the block first shipped is serde-defaulted, so
+/// campaign.json artifacts written by older engines keep parsing.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ComparabilityBlock {
@@ -695,6 +721,60 @@ pub struct ComparabilityBlock {
     pub excluded: BTreeMap<String, usize>,
     pub completeness_pct: f64,
     pub low_confidence: Vec<String>,
+    /// When the replay archive was recorded (the archive manifest's creation
+    /// timestamp, RFC3339); `None` for campaign records written before this
+    /// field existed.
+    pub archive_created_at: Option<String>,
+    /// Age of the archive, in days, at campaign creation time (campaign
+    /// `created_at` minus archive `created_at`). Campaigns replaying the
+    /// same archive at very different ages measure different upstream
+    /// worlds (sources drift, caches garbage-collect), so the age is part
+    /// of the comparability story.
+    pub archive_age_days: Option<f64>,
+    /// Count of recorder-side exclusion records carried by the archive.
+    /// `None` means the archive has no exclusions member at all, so no
+    /// completeness penalty applies; `Some(0)` means the recorder declared
+    /// an empty exclusion set.
+    pub exclusions_recorded: Option<usize>,
+    /// The supply stage's planned-but-missing prefetch percentage, recorded
+    /// even when it stayed below the pause threshold (any nonzero shortfall
+    /// changes what the headline measured).
+    pub prefetch_shortfall_pct: Option<f64>,
+    /// True when a timed run's recorded cadence was not honored (resume
+    /// re-anchoring, or a pause/dispatch suspension window during timed
+    /// execution); mirrors the timed dispatcher's degradation flag.
+    pub timing_degraded: bool,
+    /// The campaign's scheduling mode ([`ScheduleMode`] wire string), copied
+    /// from the spec because it is part of the campaign's identity.
+    pub scheduling_mode: Option<String>,
+    /// The campaign's effective dependency-supply policy
+    /// ([`SupplyDependencies`] wire string, resolved against the campaign
+    /// mode when the spec leaves it unset), copied from the spec because it
+    /// is part of the campaign's identity.
+    pub supply_policy: Option<String>,
+}
+
+impl ComparabilityBlock {
+    /// Record when the replay archive was created and how old it was (in
+    /// days) when the campaign started.
+    ///
+    /// An unparsable campaign timestamp leaves the age unset rather than
+    /// failing campaign bootstrap; the archive timestamp is still recorded.
+    pub fn record_archive_provenance(
+        &mut self,
+        archive_created_at: jiff::Timestamp,
+        campaign_created_at: &str,
+    ) {
+        self.archive_created_at = Some(archive_created_at.to_string());
+        self.archive_age_days =
+            campaign_created_at
+                .parse::<jiff::Timestamp>()
+                .ok()
+                .map(|campaign_created| {
+                    (campaign_created.as_second() - archive_created_at.as_second()) as f64
+                        / 86_400.0
+                });
+    }
 }
 
 /// Key of [`PlanOutput::counts`] holding the number of in-scope jobs.
@@ -782,6 +862,15 @@ impl CampaignRecord {
             filters: spec.filters.clone(),
             engine_version: ENGINE_VERSION.to_string(),
             signature_table_version: SIGNATURE_TABLE_VERSION.to_string(),
+            // Scheduling mode and the effective supply policy are campaign
+            // identity: two reports are only comparable when both match.
+            scheduling_mode: Some(spec.scheduling.mode.as_str().to_string()),
+            supply_policy: Some(
+                spec.supply
+                    .effective_dependencies(spec.mode)
+                    .as_str()
+                    .to_string(),
+            ),
             ..ComparabilityBlock::default()
         };
         Self {
@@ -1261,5 +1350,107 @@ mod tests {
         assert_eq!(rec.comparability.manifest_sha256, "ab".repeat(32));
         assert_eq!(rec.archive.archive_id, "ab".repeat(32));
         assert_eq!(rec.comparability.engine_version, ENGINE_VERSION);
+        // Campaign identity copied from the spec: the scheduling mode and
+        // the effective supply policy (self-hosted mode derives "none" when
+        // the spec leaves the dependency policy unset).
+        assert_eq!(
+            rec.comparability.scheduling_mode.as_deref(),
+            Some("timeless")
+        );
+        assert_eq!(rec.comparability.supply_policy.as_deref(), Some("none"));
+        // Archive provenance is recorded at bootstrap (once the archive
+        // manifest is open), not here.
+        assert_eq!(rec.comparability.archive_created_at, None);
+        assert_eq!(rec.comparability.archive_age_days, None);
+        assert_eq!(rec.comparability.exclusions_recorded, None);
+    }
+
+    #[test]
+    fn comparability_block_context_fields_default_and_use_camel_case() {
+        // A comparability block written before the archive/scheduling/supply
+        // context fields existed still parses, with every new field at its
+        // absent default.
+        let pre_existing = r#"{
+            "evalSet": "0123456789abcdef",
+            "manifestSha256": "0123",
+            "mode": "leaf",
+            "buildTenant": "parity-leaf",
+            "inScope": 10, "attemptable": 8, "attempted": 8,
+            "excluded": {}, "completenessPct": 100.0, "lowConfidence": []
+        }"#;
+        let block: ComparabilityBlock = serde_json::from_str(pre_existing).unwrap();
+        assert_eq!(block.archive_created_at, None);
+        assert_eq!(block.archive_age_days, None);
+        assert_eq!(block.exclusions_recorded, None);
+        assert_eq!(block.prefetch_shortfall_pct, None);
+        assert!(!block.timing_degraded);
+        assert_eq!(block.scheduling_mode, None);
+        assert_eq!(block.supply_policy, None);
+        // The new fields use the block's camelCase wire form and round-trip.
+        let mut block = block;
+        block.archive_created_at = Some("2026-05-01T00:00:00Z".into());
+        block.archive_age_days = Some(25.0);
+        block.exclusions_recorded = Some(2);
+        block.prefetch_shortfall_pct = Some(1.5);
+        block.timing_degraded = true;
+        block.scheduling_mode = Some("timed".into());
+        block.supply_policy = Some("substituters".into());
+        let v = serde_json::to_value(&block).unwrap();
+        for key in [
+            "archiveCreatedAt",
+            "archiveAgeDays",
+            "exclusionsRecorded",
+            "prefetchShortfallPct",
+            "timingDegraded",
+            "schedulingMode",
+            "supplyPolicy",
+        ] {
+            assert!(v.get(key).is_some(), "missing wire key {key}: {v}");
+        }
+        let re: ComparabilityBlock = serde_json::from_value(v).unwrap();
+        assert_eq!(re, block);
+    }
+
+    #[test]
+    fn archive_provenance_records_age_in_days() {
+        let mut block = ComparabilityBlock::default();
+        block.record_archive_provenance(
+            "2026-05-01T00:00:00Z".parse().unwrap(),
+            "2026-05-31T12:00:00Z",
+        );
+        assert_eq!(
+            block.archive_created_at.as_deref(),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert!((block.archive_age_days.unwrap() - 30.5).abs() < 1e-9);
+        // An unparsable campaign timestamp leaves the age unset (never fails
+        // bootstrap); the archive timestamp is still recorded.
+        let mut block = ComparabilityBlock::default();
+        block.record_archive_provenance("2026-05-01T00:00:00Z".parse().unwrap(), "not-a-time");
+        assert_eq!(
+            block.archive_created_at.as_deref(),
+            Some("2026-05-01T00:00:00Z")
+        );
+        assert_eq!(block.archive_age_days, None);
+    }
+
+    #[test]
+    fn schedule_mode_and_supply_dependency_strings_match_serde_forms() {
+        for mode in [ScheduleMode::Timeless, ScheduleMode::Timed] {
+            assert_eq!(
+                serde_json::to_value(mode).unwrap(),
+                serde_json::json!(mode.as_str())
+            );
+        }
+        for deps in [
+            SupplyDependencies::Substituters,
+            SupplyDependencies::EmbeddedOnly,
+            SupplyDependencies::None,
+        ] {
+            assert_eq!(
+                serde_json::to_value(deps).unwrap(),
+                serde_json::json!(deps.as_str())
+            );
+        }
     }
 }

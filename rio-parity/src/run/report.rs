@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
 use super::model::{Disposition, JobRecord, Verdict};
 use super::spec::{
-    CampaignRecord, ComparabilityBlock, FailOn, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+    CampaignRecord, ComparabilityBlock, FailOn, Knobs, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
     ReportPolicy,
 };
 use super::state::StateDir;
@@ -172,11 +172,61 @@ fn terminal_job_count(
             .sum::<usize>()
 }
 
-/// Refresh the comparability block with final counts.
+/// Low-confidence flag: the infra-indeterminate rate exceeded
+/// `knobs.infra_low_confidence_pct`.
+pub const FLAG_INFRA_INDETERMINATE_RATE: &str = "infra-indeterminate-rate";
+/// Low-confidence flag: the no-truth rate exceeded
+/// `knobs.no_truth_threshold_pct`.
+pub const FLAG_NO_TRUTH_RATE: &str = "no-truth-rate";
+/// Low-confidence flag: the supply stage recorded a nonzero prefetch
+/// shortfall (planned-but-missing prefetch paths), so the headline measured
+/// something other than what was planned.
+pub const FLAG_PREFETCH_SHORTFALL: &str = "prefetch-shortfall";
+/// Low-confidence flag: a timed run's recorded cadence was not honored
+/// (resume re-anchoring or a suspension window during timed execution).
+pub const FLAG_TIMING_DEGRADED: &str = "timing-degraded";
+
+/// Derive the report-time low-confidence flags, in their fixed order:
+/// infra-indeterminate rate, no-truth rate, prefetch shortfall, timing
+/// degradation. Flags set at plan/bootstrap time (tenant verification,
+/// scheduling degradations) are not re-derived here — they arrive through
+/// the base block and are merged by [`comparability_with_counts`].
+pub fn low_confidence_flags(
+    agg: &Aggregates,
+    knobs: &Knobs,
+    block: &ComparabilityBlock,
+) -> Vec<String> {
+    let mut flags = Vec::new();
+    if agg
+        .infra_rate_pct
+        .is_some_and(|pct| pct > knobs.infra_low_confidence_pct)
+    {
+        flags.push(FLAG_INFRA_INDETERMINATE_RATE.to_string());
+    }
+    if agg
+        .no_truth_rate_pct
+        .is_some_and(|pct| pct > knobs.no_truth_threshold_pct)
+    {
+        flags.push(FLAG_NO_TRUTH_RATE.to_string());
+    }
+    if block.prefetch_shortfall_pct.is_some_and(|pct| pct > 0.0) {
+        flags.push(FLAG_PREFETCH_SHORTFALL.to_string());
+    }
+    if block.timing_degraded {
+        flags.push(FLAG_TIMING_DEGRADED.to_string());
+    }
+    flags
+}
+
+/// Refresh the comparability block with final counts, the supply/timing
+/// context, and the re-derived low-confidence flags.
 pub fn comparability_with_counts(
     base: &ComparabilityBlock,
     agg: &Aggregates,
     plan_counts: &BTreeMap<String, usize>,
+    knobs: &Knobs,
+    supply: Option<&SupplyStageReport>,
+    timed: Option<&TimedRunStats>,
 ) -> ComparabilityBlock {
     let mut block = base.clone();
     block.in_scope = plan_counts.get(PLAN_COUNT_IN_SCOPE).copied().unwrap_or(0);
@@ -221,6 +271,28 @@ pub fn comparability_with_counts(
     } else {
         0.0
     };
+    // Supply/timing context: copied into the block so the low-confidence
+    // derivation below (and anyone reading campaign.json or progress.json)
+    // sees them without chasing the per-stage reports. A missing stage
+    // report keeps whatever the base block already recorded.
+    if let Some(pct) = supply.and_then(|report| report.shortfall_pct) {
+        block.prefetch_shortfall_pct = Some(pct);
+    }
+    if timed.is_some_and(|stats| stats.timing_degraded) {
+        block.timing_degraded = true;
+    }
+    // Low-confidence flags: the report-time derivations first (in their
+    // fixed order), then any flag already recorded at plan/bootstrap time
+    // (tenant verification, scheduling degradations) that the derivation
+    // did not re-emit. Merging instead of overwriting keeps the refresh
+    // idempotent across resume cycles: a flag can be added, never lost.
+    let mut low_confidence = low_confidence_flags(agg, knobs, &block);
+    for flag in &base.low_confidence {
+        if !low_confidence.contains(flag) {
+            low_confidence.push(flag.clone());
+        }
+    }
+    block.low_confidence = low_confidence;
     block
 }
 
@@ -263,7 +335,14 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
         .as_ref()
         .map(|p| &p.counts)
         .unwrap_or(&empty_counts);
-    let block = comparability_with_counts(&input.campaign.comparability, &agg, plan_counts);
+    let block = comparability_with_counts(
+        &input.campaign.comparability,
+        &agg,
+        plan_counts,
+        &input.campaign.spec.knobs,
+        input.supply,
+        input.timed,
+    );
     let mut out = String::new();
     let _ = writeln!(
         out,
@@ -316,6 +395,34 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
         block.in_scope, block.attemptable, block.attempted
     );
     let _ = writeln!(out, "| completeness | {:.2}% |", block.completeness_pct);
+    // Archive provenance, campaign identity, and confidence context: each
+    // row renders only when recorded, so reports over older campaign states
+    // (and smoke runs) stay compact.
+    if let Some(created_at) = &block.archive_created_at {
+        let _ = writeln!(out, "| archive created_at | {created_at} |");
+    }
+    if let Some(age_days) = block.archive_age_days {
+        let _ = writeln!(out, "| archive age (days) | {age_days:.1} |");
+    }
+    if let Some(mode) = &block.scheduling_mode {
+        let _ = writeln!(out, "| scheduling mode | {mode} |");
+    }
+    if let Some(policy) = &block.supply_policy {
+        let _ = writeln!(out, "| supply policy | {policy} |");
+    }
+    if block.prefetch_shortfall_pct.is_some() {
+        let _ = writeln!(
+            out,
+            "| prefetch shortfall | {} |",
+            fmt_pct(block.prefetch_shortfall_pct)
+        );
+    }
+    if block.timing_degraded {
+        let _ = writeln!(out, "| timing degraded | true |");
+    }
+    if let Some(count) = block.exclusions_recorded {
+        let _ = writeln!(out, "| exclusions recorded | {count} |");
+    }
     if !block.low_confidence.is_empty() {
         let _ = writeln!(
             out,
@@ -679,7 +786,14 @@ pub fn build_progress(
         .as_ref()
         .map(|p| &p.counts)
         .unwrap_or(&empty_counts);
-    let block = comparability_with_counts(&campaign.comparability, &agg, plan_counts);
+    let block = comparability_with_counts(
+        &campaign.comparability,
+        &agg,
+        plan_counts,
+        &campaign.spec.knobs,
+        supply,
+        timed,
+    );
     let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
     let remaining = block.in_scope.saturating_sub(terminal);
     Progress {
@@ -1225,6 +1339,191 @@ mod tests {
         let counts = BTreeMap::new();
         assert!(evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped);
         assert!(!evaluate_gate(FailOn::None, &counts, &dispositions).tripped);
+    }
+
+    #[test]
+    fn low_confidence_flags_derive_in_fixed_order() {
+        let knobs = Knobs::default();
+        let mut agg = Aggregates::default();
+        let mut block = ComparabilityBlock::default();
+        // Nothing over threshold, nothing recorded → no flags.
+        assert!(low_confidence_flags(&agg, &knobs, &block).is_empty());
+        // Every condition holds → all four flags, in the fixed order.
+        agg.infra_rate_pct = Some(knobs.infra_low_confidence_pct + 0.1);
+        agg.no_truth_rate_pct = Some(knobs.no_truth_threshold_pct + 0.1);
+        block.prefetch_shortfall_pct = Some(0.5);
+        block.timing_degraded = true;
+        assert_eq!(
+            low_confidence_flags(&agg, &knobs, &block),
+            vec![
+                FLAG_INFRA_INDETERMINATE_RATE,
+                FLAG_NO_TRUTH_RATE,
+                FLAG_PREFETCH_SHORTFALL,
+                FLAG_TIMING_DEGRADED,
+            ]
+        );
+        // Boundaries: rates exactly at their threshold and a zero shortfall
+        // do not flag (the rules are strictly-greater-than).
+        agg.infra_rate_pct = Some(knobs.infra_low_confidence_pct);
+        agg.no_truth_rate_pct = Some(knobs.no_truth_threshold_pct);
+        block.prefetch_shortfall_pct = Some(0.0);
+        block.timing_degraded = false;
+        assert!(low_confidence_flags(&agg, &knobs, &block).is_empty());
+    }
+
+    #[test]
+    fn comparability_flags_low_confidence_and_merges_plan_time_flags() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let mut campaign = CampaignRecord::new(
+            "c-flags".into(),
+            "2026-05-26T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        // A flag recorded at plan time must survive the refresh, after the
+        // report-time derivations.
+        campaign.comparability.low_confidence = vec!["tenant-upstreams-unverified".to_string()];
+        // Three attempted records, one infra-indeterminate → 33% infra rate,
+        // far above the 5% default threshold; the no-truth rate stays zero.
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
+        records.insert("b".into(), rec("b", v(Verdict::MatchBuilt), 1, None, false));
+        records.insert(
+            "c".into(),
+            rec("c", v(Verdict::InfraIndeterminate), 1, None, false),
+        );
+        let agg = aggregate(&records);
+        let plan_counts = BTreeMap::new();
+        let block = comparability_with_counts(
+            &campaign.comparability,
+            &agg,
+            &plan_counts,
+            &campaign.spec.knobs,
+            None,
+            None,
+        );
+        assert_eq!(
+            block.low_confidence,
+            vec![FLAG_INFRA_INDETERMINATE_RATE, "tenant-upstreams-unverified"]
+        );
+        // The supply report's shortfall and the timed stats' degradation are
+        // copied into the block and flagged, keeping the fixed order.
+        let supply = SupplyStageReport {
+            shortfall_pct: Some(2.5),
+            ..SupplyStageReport::default()
+        };
+        let timed = TimedRunStats {
+            timing_degraded: true,
+            ..TimedRunStats::default()
+        };
+        let block = comparability_with_counts(
+            &campaign.comparability,
+            &agg,
+            &plan_counts,
+            &campaign.spec.knobs,
+            Some(&supply),
+            Some(&timed),
+        );
+        assert_eq!(block.prefetch_shortfall_pct, Some(2.5));
+        assert!(block.timing_degraded);
+        assert_eq!(
+            block.low_confidence,
+            vec![
+                FLAG_INFRA_INDETERMINATE_RATE,
+                FLAG_PREFETCH_SHORTFALL,
+                FLAG_TIMING_DEGRADED,
+                "tenant-upstreams-unverified",
+            ]
+        );
+        // Refreshing an already-refreshed block is idempotent: no duplicate
+        // flags accumulate across resume cycles, and a context value persists
+        // even when its stage report is no longer supplied.
+        let again =
+            comparability_with_counts(&block, &agg, &plan_counts, &campaign.spec.knobs, None, None);
+        assert_eq!(again.low_confidence, block.low_confidence);
+        assert_eq!(again.prefetch_shortfall_pct, Some(2.5));
+        assert!(again.timing_degraded);
+    }
+
+    #[test]
+    fn summary_renders_comparability_context_rows_only_when_present() {
+        let spec: crate::run::spec::CampaignSpec =
+            serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        let mut campaign = CampaignRecord::new(
+            "c-ctx".into(),
+            "2026-06-01T00:00:00Z".into(),
+            spec,
+            crate::run::spec::ArchivePin::default(),
+        );
+        let mut records = BTreeMap::new();
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
+        let suspension = SuspensionSummary::default();
+        let input = ReportInput {
+            campaign: &campaign,
+            records: &records,
+            suspension: &suspension,
+            generated_at: "2026-06-01T12:00:00Z".into(),
+            partial: false,
+            top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
+        };
+        let out = render_summary(&input);
+        // Campaign identity (scheduling mode, supply policy) is seeded by
+        // CampaignRecord::new and always renders; the optional archive and
+        // confidence context rows stay absent until recorded.
+        assert!(out.contains("| scheduling mode | timeless |"), "{out}");
+        assert!(out.contains("| supply policy | substituters |"), "{out}");
+        assert!(!out.contains("| archive created_at |"), "{out}");
+        assert!(!out.contains("| archive age (days) |"), "{out}");
+        assert!(!out.contains("| prefetch shortfall |"), "{out}");
+        assert!(!out.contains("| timing degraded |"), "{out}");
+        assert!(!out.contains("| exclusions recorded |"), "{out}");
+        assert!(!out.contains("low confidence"), "{out}");
+
+        // Populate the archive provenance and confidence context: every row
+        // renders, and the block-recorded shortfall/degradation also flag
+        // the report low-confidence.
+        drop(input);
+        campaign.comparability.record_archive_provenance(
+            "2026-05-01T00:00:00Z".parse().unwrap(),
+            "2026-06-01T00:00:00Z",
+        );
+        campaign.comparability.exclusions_recorded = Some(3);
+        campaign.comparability.prefetch_shortfall_pct = Some(2.5);
+        campaign.comparability.timing_degraded = true;
+        let input = ReportInput {
+            campaign: &campaign,
+            records: &records,
+            suspension: &suspension,
+            generated_at: "2026-06-01T12:00:00Z".into(),
+            partial: false,
+            top_n: 5,
+            supply: None,
+            timed: None,
+            abort_recommended: false,
+            plan_rss_mib: None,
+            plan_rss_peak_mib: None,
+        };
+        let out = render_summary(&input);
+        assert!(
+            out.contains("| archive created_at | 2026-05-01T00:00:00Z |"),
+            "{out}"
+        );
+        assert!(out.contains("| archive age (days) | 31.0 |"), "{out}");
+        assert!(out.contains("| scheduling mode | timeless |"), "{out}");
+        assert!(out.contains("| supply policy | substituters |"), "{out}");
+        assert!(out.contains("| prefetch shortfall | 2.50% |"), "{out}");
+        assert!(out.contains("| timing degraded | true |"), "{out}");
+        assert!(out.contains("| exclusions recorded | 3 |"), "{out}");
+        assert!(
+            out.contains("| **low confidence** | prefetch-shortfall, timing-degraded |"),
+            "{out}"
+        );
     }
 
     #[test]
