@@ -204,9 +204,9 @@ pub fn latest_per_job(records: Vec<JobRecord>) -> BTreeMap<String, JobRecord> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{Bucket, HydraSide, RioSide};
+    use crate::run::model::{Disposition, HydraSide, RioSide, UnifiedClass, Verdict};
 
-    fn rec(job: &str, bucket: Bucket, attempts: u32) -> JobRecord {
+    fn rec(job: &str, class: UnifiedClass, attempts: u32) -> JobRecord {
         JobRecord {
             job: job.into(),
             system: "x86_64-linux".into(),
@@ -217,8 +217,11 @@ mod tests {
             rio: RioSide::default(),
             hydra: HydraSide::default(),
             nar_compare: Default::default(),
-            bucket: bucket.as_str().into(),
+            verdict: class.verdict().map(|v| v.as_str().into()),
+            disposition: class.disposition().map(|d| d.as_str().into()),
             cascaded: false,
+            failure_cause: None,
+            flaky: false,
             signature: None,
             log_key: None,
             repro: String::new(),
@@ -232,19 +235,28 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         state
-            .append_jsonl(StateFile::Results, &rec("a", Bucket::NotAttempted, 0))
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Disposition(Disposition::NotAttempted), 0),
+            )
             .unwrap();
         state
-            .append_jsonl(StateFile::Results, &rec("b", Bucket::MatchBuilt, 1))
+            .append_jsonl(
+                StateFile::Results,
+                &rec("b", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
             .unwrap();
         state
-            .append_jsonl(StateFile::Results, &rec("a", Bucket::MatchBuilt, 1))
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
             .unwrap();
         let loaded: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(loaded.len(), 3);
         let latest = latest_per_job(loaded);
         assert_eq!(latest.len(), 2);
-        assert_eq!(latest["a"].bucket, "match-built");
+        assert_eq!(latest["a"].verdict.as_deref(), Some("match-built"));
         assert_eq!(latest["a"].attempts, 1);
     }
 
@@ -253,7 +265,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state = StateDir::new(dir.path()).unwrap();
         state
-            .append_jsonl(StateFile::Results, &rec("a", Bucket::MatchBuilt, 1))
+            .append_jsonl(
+                StateFile::Results,
+                &rec("a", UnifiedClass::Verdict(Verdict::MatchBuilt), 1),
+            )
             .unwrap();
         // Simulate a crash mid-append: torn trailing line.
         let path = state.path("results.jsonl");
@@ -266,7 +281,8 @@ mod tests {
         // Mid-file corruption must be loud.
         std::fs::write(&path, "{\"not\":\"a job record\"}\n").unwrap();
         let mut f = OpenOptions::new().append(true).open(&path).unwrap();
-        let good = serde_json::to_string(&rec("b", Bucket::MatchBuilt, 1)).unwrap();
+        let good = serde_json::to_string(&rec("b", UnifiedClass::Verdict(Verdict::MatchBuilt), 1))
+            .unwrap();
         f.write_all(format!("{good}\n").as_bytes()).unwrap();
         drop(f);
         let res: Result<Vec<JobRecord>> = state.load_jsonl(StateFile::Results);

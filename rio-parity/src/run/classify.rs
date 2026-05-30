@@ -1,23 +1,27 @@
-//! The bucket classifier: ONE pure function over (Hydra outcome × rio
-//! outcome × auxiliary flags), plus the per-output NAR comparison verdict
-//! and the headline arithmetic. No I/O, no clocks — everything here is
-//! deterministic and exhaustively testable.
+//! The classifier: ONE pure function over (Hydra outcome × rio outcome ×
+//! auxiliary flags) that assigns each unit a verdict or a disposition,
+//! plus the per-output NAR comparison verdict and the headline arithmetic.
+//! No I/O, no clocks — everything here is deterministic and exhaustively
+//! testable.
 //!
 //! Precedence rationale: a replayed (or out-raced) recorded interruption is
 //! its own final observation — the unit's recorded outcome was an
 //! interruption, so no other comparison is meaningful and the timed flag is
-//! honored before everything else. After that, operator skips and
+//! honored before everything else. After that, operator filters and
 //! evaluation failures are dispositive on their own, so they are honored
 //! before any build evidence is consulted; infrastructure failures and
-//! upstream source rot say nothing about parity (the build never got a fair
-//! attempt), so they are pulled out before the Hydra-keyed cross product
-//! that actually scores agreement.
+//! upstream source rot say nothing about outcome agreement (the build never
+//! got a fair attempt), so they are pulled out before the Hydra-keyed cross
+//! product that actually scores agreement.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::model::{Bucket, FailureKind, HydraOutcome, RioOutcome, RootCauseKind};
+use super::model::{
+    Bucket, Disposition, FailureKind, HydraOutcome, RioOutcome, RootCauseKind, UnifiedClass,
+    Verdict,
+};
 
 /// How a recorded interruption (cancellation or client disconnect) played
 /// out when the timed dispatcher replayed it for a unit. Only ever set for
@@ -60,24 +64,28 @@ pub struct AuxFlags {
     pub timed_interruption: Option<TimedInterruption>,
 }
 
-/// Classification result: the bucket plus whether the job is a cascaded
-/// dependent counted under an excluded root cause (its failing dependency
-/// was infra / source-rot, so the job is excluded from the headline rather
-/// than charged as its own failure).
+/// Classification result: the unified class (a verdict or a disposition)
+/// plus whether the job is a cascaded dependent counted under an excluded
+/// root cause (its failing dependency was infra / source-rot, so the job is
+/// excluded from the headline rather than charged as its own failure).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Classification {
-    pub bucket: Bucket,
+    pub class: UnifiedClass,
     pub cascaded: bool,
 }
 
 /// THE classifier. Precedence (highest first): timed-interruption flag →
-/// skipped → eval-error → not-attemptable → not-attempted →
+/// filtered → eval-error → not-attemptable → not-attempted →
 /// completed-without-execution (cached-prior / target-substituted) → infra
 /// and upstream-source-rot failures including their cascaded dependents →
 /// the remaining cross product, keyed by the Hydra outcome first.
 pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Classification {
-    let plain = |bucket| Classification {
-        bucket,
+    let verdict = |v: Verdict| Classification {
+        class: UnifiedClass::Verdict(v),
+        cascaded: false,
+    };
+    let disposition = |d: Disposition| Classification {
+        class: UnifiedClass::Disposition(d),
         cascaded: false,
     };
 
@@ -85,54 +93,55 @@ pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Cla
     // interruption, so the replay (or the build out-racing it) is the final
     // observation — no other rule applies.
     match flags.timed_interruption {
-        Some(TimedInterruption::Replayed) => return plain(Bucket::InterruptionReplayed),
+        Some(TimedInterruption::Replayed) => return verdict(Verdict::InterruptionReplayed),
         Some(TimedInterruption::NotReproduced) => {
-            return plain(Bucket::InterruptionNotReproduced);
+            return verdict(Verdict::InterruptionNotReproduced);
         }
         None => {}
     }
-    // 1. skipped
+    // 1. filtered (operator scope filters; the skip reason is retained on
+    // the record by the caller)
     if flags.skipped.is_some() {
-        return plain(Bucket::Skipped);
+        return disposition(Disposition::Filtered);
     }
     // 2. eval-error
     if flags.eval_error {
-        return plain(Bucket::EvalError);
+        return disposition(Disposition::EvalError);
     }
     // 3. not-attemptable (plan-time set)
     if flags.plan_not_attemptable {
-        return plain(Bucket::NotAttemptable);
+        return disposition(Disposition::NotAttemptable);
     }
     // 4. not-attempted
     if matches!(rio, RioOutcome::NotAttempted) {
-        return plain(Bucket::NotAttempted);
+        return disposition(Disposition::NotAttempted);
     }
     // 5/6. completed-without-execution discriminator: plan-snapshot valid ⇒
     // cached-prior; (not-attemptable already handled); else
     // target-substituted.
     if let RioOutcome::Built { executed: false } = rio {
         return if flags.plan_snapshot_valid {
-            plain(Bucket::CachedPrior)
+            disposition(Disposition::CachedPrior)
         } else {
-            plain(Bucket::TargetSubstituted)
+            disposition(Disposition::TargetSubstituted)
         };
     }
     // 7. infra / source-rot (incl. cascaded dependents per the cascade rule).
     match rio {
         RioOutcome::TargetFailed {
             kind: FailureKind::Infra,
-        } => return plain(Bucket::RioInfraFailure),
+        } => return verdict(Verdict::InfraIndeterminate),
         RioOutcome::TargetFailed {
             kind: FailureKind::SourceRot,
         } => {
-            return plain(Bucket::UpstreamSourceUnavailable);
+            return verdict(Verdict::SourceUnavailable);
         }
         RioOutcome::DependencyFailed {
             root: RootCauseKind::Infra,
             ..
         } => {
             return Classification {
-                bucket: Bucket::RioInfraFailure,
+                class: UnifiedClass::Verdict(Verdict::InfraIndeterminate),
                 cascaded: true,
             };
         }
@@ -141,7 +150,7 @@ pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Cla
             ..
         } => {
             return Classification {
-                bucket: Bucket::UpstreamSourceUnavailable,
+                class: UnifiedClass::Verdict(Verdict::SourceUnavailable),
                 cascaded: true,
             };
         }
@@ -150,24 +159,24 @@ pub fn classify(hydra: &HydraOutcome, rio: &RioOutcome, flags: &AuxFlags) -> Cla
     // 8. Cross product, Hydra keyed first.
     match hydra {
         HydraOutcome::Unknown => match flags.resolve_unknown_divergent {
-            Some(true) => plain(Bucket::EvalDivergence),
-            _ => plain(Bucket::HydraUnknown),
+            Some(true) => disposition(Disposition::IdentityDivergent),
+            _ => verdict(Verdict::NoTruth),
         },
         HydraOutcome::Failed => match rio {
-            RioOutcome::Built { .. } => plain(Bucket::HydraOnlyFailure),
-            // Any rio failure shape agrees with Hydra's failure.
-            _ => plain(Bucket::BothFailed),
+            RioOutcome::Built { .. } => verdict(Verdict::UnexpectedSuccess),
+            // Any rio failure shape agrees with the recorded failure.
+            _ => verdict(Verdict::MatchFailed),
         },
         HydraOutcome::Built => match rio {
-            RioOutcome::Built { .. } => plain(Bucket::MatchBuilt),
+            RioOutcome::Built { .. } => verdict(Verdict::MatchBuilt),
             RioOutcome::DependencyFailed {
                 root: RootCauseKind::Genuine,
                 ..
-            } => plain(Bucket::RioDependencyFailure),
-            RioOutcome::TargetFailed { .. } => plain(Bucket::RioOnlyFailure),
+            } => verdict(Verdict::UnexpectedDependencyFailure),
+            RioOutcome::TargetFailed { .. } => verdict(Verdict::UnexpectedFailure),
             // Exhaustiveness: NotAttempted and Built{executed:false} were
             // handled above; DependencyFailed infra/source-rot handled above.
-            _ => plain(Bucket::RioOnlyFailure),
+            _ => verdict(Verdict::UnexpectedFailure),
         },
     }
 }
@@ -233,6 +242,19 @@ pub fn job_nar_verdict<S: AsRef<str>>(outputs: &BTreeMap<String, S>) -> &'static
     }
 }
 
+/// The verdict-level projection of "any recorded output hash differs":
+/// `match-built` with a `differs` job-level NAR verdict becomes
+/// `output-divergence`; every other verdict (and a non-differing
+/// `match-built`) passes through unchanged. Callers compute `nar_verdict`
+/// with [`job_nar_verdict`].
+pub fn project_output_divergence(verdict: Verdict, nar_verdict: &str) -> Verdict {
+    if verdict == Verdict::MatchBuilt && nar_verdict == NAR_DIFFERS {
+        Verdict::OutputDivergence
+    } else {
+        verdict
+    }
+}
+
 /// Headline + secondary metrics from bucket counts. The headline ratio is
 /// match-built over (match-built + rio-only-failure + rio-dependency-failure);
 /// every other bucket is excluded from the denominator. NAR agreement is the
@@ -286,144 +308,163 @@ mod tests {
     fn failed(kind: FailureKind) -> RioOutcome {
         RioOutcome::TargetFailed { kind }
     }
+    fn v(verdict: Verdict) -> UnifiedClass {
+        UnifiedClass::Verdict(verdict)
+    }
+    fn d(disposition: Disposition) -> UnifiedClass {
+        UnifiedClass::Disposition(disposition)
+    }
 
     /// Spot rows straight out of the classification table + precedence list.
     #[rstest]
     // timed-interruption flags outrank every other rule: any (hydra, rio)
-    // pair classifies into the interruption bucket, including over `skipped`
-    // (the previous precedence head).
+    // pair classifies into the interruption verdict, including over the
+    // filtered flag (the previous precedence head).
     #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
            AuxFlags { timed_interruption: Some(TimedInterruption::Replayed), ..flags() },
-           Bucket::InterruptionReplayed, false)]
+           v(Verdict::InterruptionReplayed), false)]
     #[case(HydraOutcome::Failed, failed(FailureKind::Genuine),
            AuxFlags { timed_interruption: Some(TimedInterruption::NotReproduced), ..flags() },
-           Bucket::InterruptionNotReproduced, false)]
+           v(Verdict::InterruptionNotReproduced), false)]
     #[case(HydraOutcome::Built, RioOutcome::NotAttempted,
            AuxFlags { timed_interruption: Some(TimedInterruption::Replayed),
                       skipped: Some("system".into()), ..flags() },
-           Bucket::InterruptionReplayed, false)]
-    // precedence head: skipped/eval-error/not-attemptable/not-attempted
+           v(Verdict::InterruptionReplayed), false)]
+    // precedence head: filtered/eval-error/not-attemptable/not-attempted
     #[case(HydraOutcome::Built, RioOutcome::Built { executed: true },
-           AuxFlags { skipped: Some("system".into()), ..flags() }, Bucket::Skipped, false)]
+           AuxFlags { skipped: Some("system".into()), ..flags() }, d(Disposition::Filtered), false)]
     #[case(HydraOutcome::Built, failed(FailureKind::Genuine),
-           AuxFlags { eval_error: true, ..flags() }, Bucket::EvalError, false)]
+           AuxFlags { eval_error: true, ..flags() }, d(Disposition::EvalError), false)]
     #[case(HydraOutcome::Built, RioOutcome::Built { executed: false },
-           AuxFlags { plan_not_attemptable: true, ..flags() }, Bucket::NotAttemptable, false)]
+           AuxFlags { plan_not_attemptable: true, ..flags() }, d(Disposition::NotAttemptable), false)]
     #[case(
         HydraOutcome::Built,
         RioOutcome::NotAttempted,
         flags(),
-        Bucket::NotAttempted,
+        d(Disposition::NotAttempted),
         false
     )]
     // completed-without-execution discriminator
     #[case(HydraOutcome::Built, RioOutcome::Built { executed: false },
-           AuxFlags { plan_snapshot_valid: true, ..flags() }, Bucket::CachedPrior, false)]
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: false }, flags(), Bucket::TargetSubstituted, false)]
+           AuxFlags { plan_snapshot_valid: true, ..flags() }, d(Disposition::CachedPrior), false)]
+    #[case(HydraOutcome::Built, RioOutcome::Built { executed: false }, flags(), d(Disposition::TargetSubstituted), false)]
     // infra / source rot (and their cascades)
     #[case(
         HydraOutcome::Built,
         failed(FailureKind::Infra),
         flags(),
-        Bucket::RioInfraFailure,
+        v(Verdict::InfraIndeterminate),
         false
     )]
     #[case(
         HydraOutcome::Failed,
         failed(FailureKind::Infra),
         flags(),
-        Bucket::RioInfraFailure,
+        v(Verdict::InfraIndeterminate),
         false
     )]
     #[case(
         HydraOutcome::Built,
         failed(FailureKind::SourceRot),
         flags(),
-        Bucket::UpstreamSourceUnavailable,
+        v(Verdict::SourceUnavailable),
         false
     )]
     #[case(
         HydraOutcome::Built,
         dep(RootCauseKind::Infra),
         flags(),
-        Bucket::RioInfraFailure,
+        v(Verdict::InfraIndeterminate),
         true
     )]
     #[case(
         HydraOutcome::Built,
         dep(RootCauseKind::SourceRot),
         flags(),
-        Bucket::UpstreamSourceUnavailable,
+        v(Verdict::SourceUnavailable),
         true
     )]
     // cross product, Hydra keyed first
-    #[case(HydraOutcome::Unknown, RioOutcome::Built { executed: true }, flags(), Bucket::HydraUnknown, false)]
+    #[case(HydraOutcome::Unknown, RioOutcome::Built { executed: true }, flags(), v(Verdict::NoTruth), false)]
     #[case(HydraOutcome::Unknown, failed(FailureKind::Genuine),
-           AuxFlags { resolve_unknown_divergent: Some(true), ..flags() }, Bucket::EvalDivergence, false)]
-    #[case(HydraOutcome::Failed, RioOutcome::Built { executed: true }, flags(), Bucket::HydraOnlyFailure, false)]
+           AuxFlags { resolve_unknown_divergent: Some(true), ..flags() }, d(Disposition::IdentityDivergent), false)]
+    #[case(HydraOutcome::Failed, RioOutcome::Built { executed: true }, flags(), v(Verdict::UnexpectedSuccess), false)]
     #[case(
         HydraOutcome::Failed,
         failed(FailureKind::Genuine),
         flags(),
-        Bucket::BothFailed,
+        v(Verdict::MatchFailed),
         false
     )]
     #[case(
         HydraOutcome::Failed,
         failed(FailureKind::Timeout),
         flags(),
-        Bucket::BothFailed,
+        v(Verdict::MatchFailed),
         false
     )]
     #[case(
         HydraOutcome::Failed,
         dep(RootCauseKind::Genuine),
         flags(),
-        Bucket::BothFailed,
+        v(Verdict::MatchFailed),
         false
     )]
-    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true }, flags(), Bucket::MatchBuilt, false)]
+    #[case(HydraOutcome::Built, RioOutcome::Built { executed: true }, flags(), v(Verdict::MatchBuilt), false)]
     #[case(
         HydraOutcome::Built,
         failed(FailureKind::Genuine),
         flags(),
-        Bucket::RioOnlyFailure,
+        v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
         HydraOutcome::Built,
         failed(FailureKind::Timeout),
         flags(),
-        Bucket::RioOnlyFailure,
+        v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
         HydraOutcome::Built,
         failed(FailureKind::ResourceCeiling),
         flags(),
-        Bucket::RioOnlyFailure,
+        v(Verdict::UnexpectedFailure),
         false
     )]
     #[case(
         HydraOutcome::Built,
         dep(RootCauseKind::Genuine),
         flags(),
-        Bucket::RioDependencyFailure,
+        v(Verdict::UnexpectedDependencyFailure),
         false
     )]
     fn design_rows(
         #[case] hydra: HydraOutcome,
         #[case] rio: RioOutcome,
         #[case] aux: AuxFlags,
-        #[case] expected: Bucket,
+        #[case] expected: UnifiedClass,
         #[case] cascaded: bool,
     ) {
         let c = classify(&hydra, &rio, &aux);
-        assert_eq!(
-            c.bucket, expected,
-            "hydra={hydra:?} rio={rio:?} aux={aux:?}"
-        );
+        assert_eq!(c.class, expected, "hydra={hydra:?} rio={rio:?} aux={aux:?}");
         assert_eq!(c.cascaded, cascaded);
+    }
+
+    /// The verdict-level projection of the per-output NAR comparison: only a
+    /// differing match-built becomes output-divergence; every other verdict
+    /// (and a non-differing match-built) passes through unchanged.
+    #[rstest]
+    #[case(Verdict::MatchBuilt, NAR_DIFFERS, Verdict::OutputDivergence)]
+    #[case(Verdict::MatchFailed, NAR_DIFFERS, Verdict::MatchFailed)]
+    #[case(Verdict::MatchBuilt, NAR_EQUAL, Verdict::MatchBuilt)]
+    #[case(Verdict::MatchBuilt, NAR_NOT_COMPARABLE, Verdict::MatchBuilt)]
+    fn output_divergence_projection(
+        #[case] verdict: Verdict,
+        #[case] nar_verdict: &str,
+        #[case] expected: Verdict,
+    ) {
+        assert_eq!(project_output_divergence(verdict, nar_verdict), expected);
     }
 
     /// The infra-poisoned shared dependency scenario: the dependency itself
@@ -433,18 +474,22 @@ mod tests {
     fn infra_poisoned_shared_dependency_cascade() {
         // Dependent of the infra-poisoned dep: excluded, counted as cascaded.
         let c = classify(&HydraOutcome::Built, &dep(RootCauseKind::Infra), &flags());
-        assert_eq!((c.bucket, c.cascaded), (Bucket::RioInfraFailure, true));
+        assert_eq!(
+            (c.class, c.cascaded),
+            (v(Verdict::InfraIndeterminate), true)
+        );
         // Dependent of a genuine target failure: stays in the denominator.
         let c = classify(&HydraOutcome::Built, &dep(RootCauseKind::Genuine), &flags());
         assert_eq!(
-            (c.bucket, c.cascaded),
-            (Bucket::RioDependencyFailure, false)
+            (c.class, c.cascaded),
+            (v(Verdict::UnexpectedDependencyFailure), false)
         );
     }
 
     /// Exhaustive grid: every (hydra, rio, flag-combination) maps to exactly
-    /// one bucket, the precedence holds (e.g. skipped beats everything), and
-    /// excluded-by-plan flags never leak into headline buckets.
+    /// one verdict or disposition, the precedence holds (e.g. the filtered
+    /// flag beats everything below the timed flag), and excluded-by-plan
+    /// flags never leak into the match-built verdict.
     #[test]
     fn exhaustive_grid_is_total_and_respects_precedence() {
         let hydras = [
@@ -493,33 +538,46 @@ mod tests {
                                         let c = classify(hydra, rio, &aux);
                                         let ctx =
                                             format!("hydra={hydra:?} rio={rio:?} aux={aux:?}");
-                                        // Total: as_str never panics, bucket is one of ALL.
-                                        assert!(Bucket::ALL.contains(&c.bucket), "{ctx}");
+                                        // Total: every combination yields exactly one class —
+                                        // a verdict or a disposition, never both, never neither.
+                                        assert!(
+                                            c.class.verdict().is_some()
+                                                != c.class.disposition().is_some(),
+                                            "{ctx}"
+                                        );
                                         // Precedence assertions: the timed-interruption flag
                                         // wins over everything else, then the plan-time flags.
                                         if let Some(ti) = aux.timed_interruption {
                                             let expected = match ti {
                                                 TimedInterruption::Replayed => {
-                                                    Bucket::InterruptionReplayed
+                                                    Verdict::InterruptionReplayed
                                                 }
                                                 TimedInterruption::NotReproduced => {
-                                                    Bucket::InterruptionNotReproduced
+                                                    Verdict::InterruptionNotReproduced
                                                 }
                                             };
-                                            assert_eq!(c.bucket, expected, "{ctx}");
+                                            assert_eq!(c.class, v(expected), "{ctx}");
                                             assert!(!c.cascaded, "{ctx}");
                                         } else if aux.skipped.is_some() {
-                                            assert_eq!(c.bucket, Bucket::Skipped, "{ctx}");
+                                            assert_eq!(c.class, d(Disposition::Filtered), "{ctx}");
                                         } else if aux.eval_error {
-                                            assert_eq!(c.bucket, Bucket::EvalError, "{ctx}");
+                                            assert_eq!(c.class, d(Disposition::EvalError), "{ctx}");
                                         } else if aux.plan_not_attemptable {
-                                            assert_eq!(c.bucket, Bucket::NotAttemptable, "{ctx}");
+                                            assert_eq!(
+                                                c.class,
+                                                d(Disposition::NotAttemptable),
+                                                "{ctx}"
+                                            );
                                         } else if matches!(rio, RioOutcome::NotAttempted) {
-                                            assert_eq!(c.bucket, Bucket::NotAttempted, "{ctx}");
+                                            assert_eq!(
+                                                c.class,
+                                                d(Disposition::NotAttempted),
+                                                "{ctx}"
+                                            );
                                         }
-                                        // Headline buckets only ever come from executed builds
-                                        // or genuine failures.
-                                        if c.bucket == Bucket::MatchBuilt {
+                                        // The match-built verdict only ever comes from builds
+                                        // this campaign actually executed.
+                                        if c.class == v(Verdict::MatchBuilt) {
                                             assert!(
                                                 matches!(rio, RioOutcome::Built { executed: true }),
                                                 "{ctx}"

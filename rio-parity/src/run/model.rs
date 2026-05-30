@@ -4,11 +4,12 @@
 //! batch records, and the engine's pause state. Wire field names are
 //! camelCase, matching the rest of the campaign artifacts.
 //!
-//! Convention: the stringly-typed `bucket`/`outcome` fields in the JSONL
-//! record structs stay `String` on the wire, but they MUST be written via
-//! the corresponding enums ([`Bucket::as_str`], [`HydraOutcome`] /
-//! [`RioOutcome`] serde forms) — never hand-typed literals — so the
-//! record values can never drift from the enum vocabulary.
+//! Convention: the stringly-typed `verdict`/`disposition`/`outcome` fields
+//! in the JSONL record structs stay `String` on the wire, but they MUST be
+//! written via the corresponding enums ([`Verdict::as_str`] /
+//! [`Disposition::as_str`], [`HydraOutcome`] / [`RioOutcome`] serde forms)
+//! — never hand-typed literals — so the record values can never drift from
+//! the enum vocabulary.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -492,9 +493,10 @@ pub struct RioOutput {
 #[serde(rename_all = "camelCase", default)]
 pub struct RioSide {
     /// Kebab-case mirror of the [`RioOutcome`] variant ("built",
-    /// "not-attempted", "target-failed", "dependency-failed") or a
-    /// plan-time exclusion value ("skipped", "not-attemptable",
-    /// "cached-prior", "eval-error").
+    /// "not-attempted", "target-failed", "dependency-failed") or, for
+    /// plan-time exclusion records, the unit's [`Disposition`] string
+    /// ("filtered", "not-attemptable", "cached-prior",
+    /// "identity-divergent").
     pub outcome: String,
     /// Terminal status recorded for the target drv, when observed: the
     /// worker-protocol BuildStatus name from the in-band per-root result
@@ -548,11 +550,29 @@ pub struct JobRecord {
     pub hydra: HydraSide,
     /// Per-output NAR comparison verdict: "equal" | "differs" | "not-comparable".
     pub nar_compare: BTreeMap<String, String>,
-    pub bucket: String,
+    /// Final comparison verdict for an attempted-and-compared unit, written
+    /// via [`Verdict::as_str`] (never hand-typed). Exactly one of
+    /// `verdict`/`disposition` is `Some` on a classified record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
+    /// Why the unit was never compared, written via [`Disposition::as_str`]
+    /// (never hand-typed). Exactly one of `verdict`/`disposition` is `Some`
+    /// on a classified record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disposition: Option<String>,
     /// True when this job is a cascaded dependent counted under an
     /// infra/source-rot root cause rather than charged as its own failure.
     #[serde(default)]
     pub cascaded: bool,
+    /// The surviving failure cause for failure-class verdicts: the
+    /// kebab-case serde form of the target's [`FailureKind`] (or the
+    /// blocking dependency's [`RootCauseKind`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_cause: Option<String>,
+    /// More than one attempt was needed before the final verdict settled on
+    /// a match (`match-built` / `output-divergence`).
+    #[serde(default)]
+    pub flaky: bool,
     pub signature: Option<String>,
     pub log_key: Option<String>,
     pub repro: String,
@@ -562,11 +582,36 @@ pub struct JobRecord {
     pub updated_at: String,
 }
 
-/// Whether a record is terminal: every classified bucket except
-/// `not-attempted` is terminal (an empty bucket means the record has not
-/// been classified yet).
-pub fn is_terminal_bucket(bucket: &str) -> bool {
-    bucket != Bucket::NotAttempted.as_str() && !bucket.is_empty()
+impl JobRecord {
+    /// The unified class this record carries: its verdict when set, else
+    /// its disposition, parsed back through the enums' serde forms. `None`
+    /// when neither field is set (an unclassified record) or the stored
+    /// string is outside the vocabulary.
+    pub fn class(&self) -> Option<UnifiedClass> {
+        if let Some(verdict) = &self.verdict {
+            return serde_json::from_value(serde_json::Value::String(verdict.clone()))
+                .ok()
+                .map(UnifiedClass::Verdict);
+        }
+        if let Some(disposition) = &self.disposition {
+            return serde_json::from_value(serde_json::Value::String(disposition.clone()))
+                .ok()
+                .map(UnifiedClass::Disposition);
+        }
+        None
+    }
+}
+
+/// Whether a record is terminal: any verdict is terminal, and so is any
+/// disposition other than `not-attempted`; a record with neither field set
+/// has not been classified yet and is not terminal.
+pub fn is_terminal_class(verdict: &Option<String>, disposition: &Option<String>) -> bool {
+    if verdict.is_some() {
+        return true;
+    }
+    disposition
+        .as_deref()
+        .is_some_and(|d| d != Disposition::NotAttempted.as_str())
 }
 
 /// One line of hydra.jsonl — raw narinfo fetch cache keyed by output path.
@@ -860,8 +905,15 @@ mod tests {
             assert_eq!(back, bucket);
         }
         // A replayed interruption is a final observation for its job.
-        assert!(is_terminal_bucket("interruption-replayed"));
-        assert!(is_terminal_bucket("interruption-not-reproduced"));
+        for verdict in [
+            Verdict::InterruptionReplayed,
+            Verdict::InterruptionNotReproduced,
+        ] {
+            assert!(is_terminal_class(
+                &Some(verdict.as_str().to_string()),
+                &None
+            ));
+        }
     }
 
     #[test]
@@ -1116,8 +1168,11 @@ mod tests {
                 ..HydraSide::default()
             },
             nar_compare: BTreeMap::new(),
-            bucket: Bucket::MatchBuilt.as_str().into(),
+            verdict: Some(Verdict::MatchBuilt.as_str().into()),
+            disposition: None,
             cascaded: false,
+            failure_cause: None,
+            flaky: false,
             signature: None,
             log_key: None,
             repro: "nix build ...".into(),
@@ -1128,7 +1183,43 @@ mod tests {
         assert!(json.contains("\"drvPath\""), "{json}");
         assert!(json.contains("\"buildIds\""), "{json}");
         assert!(json.contains("\"narCompare\""), "{json}");
+        assert!(json.contains("\"verdict\":\"match-built\""), "{json}");
+        assert!(!json.contains("\"bucket\""), "{json}");
         assert!(!json.contains("\"drv_path\""), "{json}");
+        // Exactly one of verdict/disposition is set, so the unset side (and
+        // the absent failure cause) never appear on the wire.
+        assert!(!json.contains("\"disposition\""), "{json}");
+        assert!(!json.contains("\"failureCause\""), "{json}");
+        assert_eq!(
+            rec.class(),
+            Some(UnifiedClass::Verdict(Verdict::MatchBuilt))
+        );
+
+        // A failure-class record carries its cause under the camelCase key
+        // and parses back to its verdict.
+        let mut failed = rec.clone();
+        failed.verdict = Some(Verdict::UnexpectedFailure.as_str().into());
+        failed.failure_cause = Some("genuine".into());
+        failed.flaky = false;
+        let json = serde_json::to_string(&failed).unwrap();
+        assert!(json.contains("\"failureCause\":\"genuine\""), "{json}");
+        assert!(!json.contains("\"failure_cause\""), "{json}");
+        assert_eq!(
+            failed.class(),
+            Some(UnifiedClass::Verdict(Verdict::UnexpectedFailure))
+        );
+
+        // A disposition-only record reads back as its disposition.
+        let mut excluded = rec.clone();
+        excluded.verdict = None;
+        excluded.disposition = Some(Disposition::Filtered.as_str().into());
+        let json = serde_json::to_string(&excluded).unwrap();
+        assert!(json.contains("\"disposition\":\"filtered\""), "{json}");
+        assert!(!json.contains("\"verdict\""), "{json}");
+        assert_eq!(
+            excluded.class(),
+            Some(UnifiedClass::Disposition(Disposition::Filtered))
+        );
     }
 
     #[test]
@@ -1143,11 +1234,19 @@ mod tests {
     }
 
     #[test]
-    fn terminal_bucket_predicate() {
-        assert!(is_terminal_bucket("match-built"));
-        assert!(is_terminal_bucket("rio-infra-failure"));
-        assert!(!is_terminal_bucket("not-attempted"));
-        assert!(!is_terminal_bucket(""));
+    fn terminal_class_predicate() {
+        // Any verdict is terminal.
+        let verdict = Some(Verdict::MatchBuilt.as_str().to_string());
+        assert!(is_terminal_class(&verdict, &None));
+        let verdict = Some(Verdict::InfraIndeterminate.as_str().to_string());
+        assert!(is_terminal_class(&verdict, &None));
+        // Any disposition except not-attempted is terminal.
+        let disposition = Some(Disposition::CachedPrior.as_str().to_string());
+        assert!(is_terminal_class(&None, &disposition));
+        let disposition = Some(Disposition::NotAttempted.as_str().to_string());
+        assert!(!is_terminal_class(&None, &disposition));
+        // A record with neither field has not been classified yet.
+        assert!(!is_terminal_class(&None, &None));
     }
 
     #[test]

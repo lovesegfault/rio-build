@@ -302,7 +302,7 @@ pub fn file_name_of(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{Bucket, HydraSide, JobRecord, RioSide};
+    use crate::run::model::{Disposition, HydraSide, JobRecord, RioSide};
 
     fn rec(job: &str) -> JobRecord {
         JobRecord {
@@ -315,8 +315,11 @@ mod tests {
             rio: RioSide::default(),
             hydra: HydraSide::default(),
             nar_compare: Default::default(),
-            bucket: Bucket::NotAttempted.as_str().into(),
+            verdict: None,
+            disposition: Some(Disposition::NotAttempted.as_str().into()),
             cascaded: false,
+            failure_cause: None,
+            flaky: false,
             signature: None,
             log_key: None,
             repro: String::new(),

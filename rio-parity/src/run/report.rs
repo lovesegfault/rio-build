@@ -18,7 +18,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
-use super::model::{Bucket, JobRecord, is_terminal_bucket};
+use super::model::{Bucket, JobRecord};
 use super::spec::{
     CampaignRecord, ComparabilityBlock, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
 };
@@ -50,14 +50,21 @@ pub struct Aggregates {
 pub fn aggregate(records: &BTreeMap<String, JobRecord>) -> Aggregates {
     let mut agg = Aggregates::default();
     for rec in records.values() {
-        *agg.bucket_counts.entry(rec.bucket.clone()).or_default() += 1;
+        // The per-record class string: the verdict when set, else the
+        // disposition (records carry exactly one of the two).
+        let class = rec
+            .verdict
+            .clone()
+            .or_else(|| rec.disposition.clone())
+            .unwrap_or_default();
+        *agg.bucket_counts.entry(class.clone()).or_default() += 1;
         if rec.cascaded {
-            *agg.cascaded_counts.entry(rec.bucket.clone()).or_default() += 1;
+            *agg.cascaded_counts.entry(class.clone()).or_default() += 1;
         }
         if let Some(sig) = &rec.signature {
             *agg.signature_counts.entry(sig.clone()).or_default() += 1;
         }
-        if rec.bucket == Bucket::MatchBuilt.as_str() {
+        if class == Bucket::MatchBuilt.as_str() {
             if rec.attempts <= 1 {
                 agg.first_attempt_successes += 1;
             } else {
@@ -136,14 +143,15 @@ fn fmt_pct(v: Option<f64>) -> String {
     }
 }
 
-/// Number of jobs whose latest record sits in a terminal bucket — the one
+/// Number of jobs whose latest record carries a terminal class — the one
 /// "terminal" definition the report path uses (completeness, progress
-/// remaining-work). Delegates to [`is_terminal_bucket`] so it can never
-/// drift from the run loop's notion of terminal.
+/// remaining-work): every verdict and every disposition except
+/// `not-attempted` is terminal; an empty key (a record with neither field)
+/// is not.
 fn terminal_job_count(bucket_counts: &BTreeMap<String, usize>) -> usize {
     bucket_counts
         .iter()
-        .filter(|(bucket, _)| is_terminal_bucket(bucket))
+        .filter(|(class, _)| !class.is_empty() && class.as_str() != Bucket::NotAttempted.as_str())
         .map(|(_, count)| *count)
         .sum()
 }
@@ -587,7 +595,12 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
     }
     let mut by_bucket: BTreeMap<String, Vec<&JobRecord>> = BTreeMap::new();
     for rec in input.records.values() {
-        by_bucket.entry(rec.bucket.clone()).or_default().push(rec);
+        let class = rec
+            .verdict
+            .clone()
+            .or_else(|| rec.disposition.clone())
+            .unwrap_or_default();
+        by_bucket.entry(class).or_default().push(rec);
     }
     for (bucket, recs) in by_bucket {
         let path = state.path(&format!("buckets/{bucket}.jsonl"));
@@ -611,7 +624,7 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{HydraSide, RioSide};
+    use crate::run::model::{HydraSide, RioSide, unified_from_legacy_bucket};
 
     fn rec(
         job: &str,
@@ -620,6 +633,11 @@ mod tests {
         signature: Option<&str>,
         cascaded: bool,
     ) -> JobRecord {
+        // Test fixtures are still written in the legacy bucket vocabulary;
+        // route them through the frozen legacy mapping so the records carry
+        // the verdict/disposition pair the engine now writes.
+        let class = unified_from_legacy_bucket(bucket.as_str(), false)
+            .expect("legacy test bucket maps to the unified vocabulary");
         JobRecord {
             job: job.into(),
             system: "x86_64-linux".into(),
@@ -630,8 +648,11 @@ mod tests {
             rio: RioSide::default(),
             hydra: HydraSide::default(),
             nar_compare: BTreeMap::new(),
-            bucket: bucket.as_str().into(),
+            verdict: class.verdict().map(|v| v.as_str().into()),
+            disposition: class.disposition().map(|d| d.as_str().into()),
             cascaded,
+            failure_cause: None,
+            flaky: false,
             signature: signature.map(String::from),
             log_key: None,
             repro: String::new(),

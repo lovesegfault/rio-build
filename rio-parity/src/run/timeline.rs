@@ -1102,7 +1102,7 @@ mod tests {
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{AdminApi, GraphSnapshot, PoisonedView};
     use crate::run::model::{
-        Bucket, HydraOutcome, HydraSide, JobRecord, PathOutcome, RioSide, build_status_name,
+        HydraOutcome, HydraSide, JobRecord, PathOutcome, RioSide, Verdict, build_status_name,
     };
     use crate::run::state::latest_per_job;
     use crate::run::submitter::BatchOutcome;
@@ -1547,8 +1547,11 @@ mod tests {
             rio: RioSide::default(),
             hydra: HydraSide::default(),
             nar_compare: BTreeMap::new(),
-            bucket: Bucket::MatchBuilt.as_str().into(),
+            verdict: Some(Verdict::MatchBuilt.as_str().into()),
+            disposition: None,
             cascaded: false,
+            failure_cause: None,
+            flaky: false,
             signature: None,
             log_key: None,
             repro: String::new(),
@@ -1930,11 +1933,14 @@ mod tests {
         assert_eq!(stats.interruptions_not_reproduced, 0);
 
         // The production collect path over that batch yields the
-        // interruption-replayed bucket for the unit.
+        // interruption-replayed verdict for the unit.
         let contexts = HashMap::from([("a".to_string(), job_ctx("a", DRV_A))]);
         collect_settled_batch(&state, &batches[0], &contexts).await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records["a"].bucket, Bucket::InterruptionReplayed.as_str());
+        assert_eq!(
+            records["a"].verdict.as_deref(),
+            Some(Verdict::InterruptionReplayed.as_str())
+        );
     }
 
     /// The same armed request whose build settles in band before the
@@ -1992,8 +1998,8 @@ mod tests {
         collect_settled_batch(&state, &batches[0], &contexts).await;
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         assert_eq!(
-            records["a"].bucket,
-            Bucket::InterruptionNotReproduced.as_str()
+            records["a"].verdict.as_deref(),
+            Some(Verdict::InterruptionNotReproduced.as_str())
         );
     }
 

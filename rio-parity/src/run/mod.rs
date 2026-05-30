@@ -61,8 +61,8 @@ use self::collect::{BatchView, JobContext, process_settled_batch};
 use self::grpc::{AdminApi, ClusterApi, GrpcAdminApi, GrpcStoreApi, StoreApi};
 use self::hydra_truth::NarinfoSource;
 use self::model::{
-    BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Bucket, FailureKind, HydraEntry, JobRecord, PauseState,
-    RioOutcome, SupplyEntry, now_rfc3339, rfc3339_to_unix,
+    BATCH_KIND_SUBMIT, BATCH_KIND_TIMED, Disposition, FailureKind, HydraEntry, JobRecord,
+    PauseState, RioOutcome, SupplyEntry, Verdict, now_rfc3339, rfc3339_to_unix,
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
@@ -524,12 +524,12 @@ pub async fn ensure_archive(
 
 /// Plan-time excluded jobs carry their exclusion as `rio.outcome` with no
 /// build/exec fields: write their terminal records right after planning.
-/// The exclusion vocabulary equals the bucket names, so both fields are
-/// written via [`Bucket::as_str`] (never hand-typed literals).
+/// The exclusion vocabulary equals the disposition names, so both fields
+/// are written via [`Disposition::as_str`] (never hand-typed literals).
 /// `divergent_in_scope` lists the in-scope jobs the recorder marked
 /// identity-divergent: their evaluation here cannot be compared against the
-/// recorded truth, so they are retired up front under the eval-divergence
-/// bucket instead of being submitted.
+/// recorded truth, so they are retired up front under the
+/// identity-divergent disposition instead of being submitted.
 fn write_plan_time_records(
     state: &StateDir,
     manifest: &[archive_input::ManifestEntry],
@@ -540,7 +540,7 @@ fn write_plan_time_records(
 ) -> Result<()> {
     let by_job: HashMap<&str, &archive_input::ManifestEntry> =
         manifest.iter().map(|m| (m.job.as_str(), m)).collect();
-    let emit = |job: &str, bucket: Bucket| -> Result<()> {
+    let emit = |job: &str, disposition: Disposition| -> Result<()> {
         if existing.contains_key(job) {
             return Ok(());
         }
@@ -557,7 +557,7 @@ fn write_plan_time_records(
                 attempts: 0,
                 build_ids: vec![],
                 rio: model::RioSide {
-                    outcome: bucket.as_str().to_string(),
+                    outcome: disposition.as_str().to_string(),
                     ..Default::default()
                 },
                 hydra: model::HydraSide {
@@ -565,8 +565,11 @@ fn write_plan_time_records(
                     ..Default::default()
                 },
                 nar_compare: BTreeMap::new(),
-                bucket: bucket.as_str().to_string(),
+                verdict: None,
+                disposition: Some(disposition.as_str().to_string()),
                 cascaded: false,
+                failure_cause: None,
+                flaky: false,
                 signature: None,
                 log_key: None,
                 repro: String::new(),
@@ -576,24 +579,25 @@ fn write_plan_time_records(
         )
     };
     for job in plan.skipped.keys() {
-        emit(job, Bucket::Skipped)?;
+        emit(job, Disposition::Filtered)?;
     }
     for job in &plan.not_attemptable {
-        emit(job, Bucket::NotAttemptable)?;
+        emit(job, Disposition::NotAttemptable)?;
     }
     for job in &plan.cached_prior_jobs {
-        emit(job, Bucket::CachedPrior)?;
+        emit(job, Disposition::CachedPrior)?;
     }
     for job in divergent_in_scope {
-        emit(job, Bucket::EvalDivergence)?;
+        emit(job, Disposition::IdentityDivergent)?;
     }
     Ok(())
 }
 
 /// Partial report (deadline/abort): every in-scope job that never reached a
 /// record gets an explicit not-attempted [`JobRecord`] (rio outcome and
-/// bucket "not-attempted", no build/exec fields), so the report's bucket
-/// counts sum to the in-scope total. Returns how many were written.
+/// disposition "not-attempted", no build/exec fields), so the report's
+/// per-class counts sum to the in-scope total. Returns how many were
+/// written.
 fn write_not_attempted_records(
     state: &StateDir,
     manifest: &[archive_input::ManifestEntry],
@@ -629,8 +633,11 @@ fn write_not_attempted_records(
                     ..Default::default()
                 },
                 nar_compare: BTreeMap::new(),
-                bucket: Bucket::NotAttempted.as_str().to_string(),
+                verdict: None,
+                disposition: Some(Disposition::NotAttempted.as_str().to_string()),
                 cascaded: false,
+                failure_cause: None,
+                flaky: false,
                 signature: None,
                 log_key: None,
                 repro: String::new(),
@@ -643,11 +650,12 @@ fn write_not_attempted_records(
     Ok(written)
 }
 
-/// Jobs whose latest record sits in a terminal bucket.
+/// Jobs whose latest record carries a terminal class (any verdict, or any
+/// disposition other than not-attempted).
 fn terminal_set(records: &BTreeMap<String, JobRecord>) -> HashSet<String> {
     records
         .iter()
-        .filter(|(_, r)| model::is_terminal_bucket(&r.bucket))
+        .filter(|(_, r)| model::is_terminal_class(&r.verdict, &r.disposition))
         .map(|(job, _)| job.clone())
         .collect()
 }
@@ -698,8 +706,8 @@ fn parse_deadline(deadline: Option<&str>) -> Result<Option<i64>> {
 }
 
 /// Build the terminal stall record for one job (watchdog escalation →
-/// rio-infra-failure with the "stalled-active" / "stalled-queued"
-/// signature).
+/// the infra-indeterminate verdict with the "stalled-active" /
+/// "stalled-queued" signature).
 fn stall_record(
     ctx: &JobContext,
     signature: &str,
@@ -732,8 +740,11 @@ fn stall_record(
             outputs: ctx.hydra_outputs.clone(),
         },
         nar_compare: BTreeMap::new(),
-        bucket: Bucket::RioInfraFailure.as_str().to_string(),
+        verdict: Some(Verdict::InfraIndeterminate.as_str().to_string()),
+        disposition: None,
         cascaded: false,
+        failure_cause: collect::failure_cause_for(&rio_outcome),
+        flaky: false,
         signature: Some(signature.to_string()),
         log_key: None,
         repro: submitter::repro_command(store_url, &ctx.drv_path),
@@ -1436,7 +1447,9 @@ pub async fn run_with_backends(
                     let infra_rate_pct = if window.len() >= INFRA_RATE_MIN_SAMPLE {
                         let infra = window
                             .iter()
-                            .filter(|r| r.bucket == Bucket::RioInfraFailure.as_str())
+                            .filter(|r| {
+                                r.verdict.as_deref() == Some(Verdict::InfraIndeterminate.as_str())
+                            })
                             .count();
                         Some((infra as f64 / window.len() as f64) * 100.0)
                     } else {
@@ -1446,7 +1459,7 @@ pub async fn run_with_backends(
                         .iter()
                         .filter(|(job, r)| {
                             in_scope_jobs.contains(job.as_str())
-                                && model::is_terminal_bucket(&r.bucket)
+                                && model::is_terminal_class(&r.verdict, &r.disposition)
                         })
                         .count();
                     (terminal_in_scope, infra_rate_pct)
@@ -2171,7 +2184,7 @@ mod tests {
     }
 
     /// Minimal terminal (match-built) record for tests that only need a
-    /// terminal bucket, not full evidence.
+    /// terminal class, not full evidence.
     fn terminal_record(job: &str) -> JobRecord {
         JobRecord {
             job: job.into(),
@@ -2183,8 +2196,11 @@ mod tests {
             rio: model::RioSide::default(),
             hydra: model::HydraSide::default(),
             nar_compare: BTreeMap::new(),
-            bucket: Bucket::MatchBuilt.as_str().into(),
+            verdict: Some(Verdict::MatchBuilt.as_str().into()),
+            disposition: None,
             cascaded: false,
+            failure_cause: None,
+            flaky: false,
             signature: None,
             log_key: None,
             repro: String::new(),
@@ -2322,11 +2338,26 @@ mod tests {
             assert!(state.marker_done(marker), "marker {marker} set");
         }
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
-        assert_eq!(records["appB.x86_64-linux"].bucket, "match-built");
-        assert_eq!(records["divergentC.x86_64-linux"].bucket, "eval-divergence");
-        assert_eq!(records["kvmTest.x86_64-linux"].bucket, "skipped");
-        assert_eq!(records["libA.aarch64-linux"].bucket, "skipped");
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["divergentC.x86_64-linux"].disposition.as_deref(),
+            Some("identity-divergent")
+        );
+        assert_eq!(
+            records["kvmTest.x86_64-linux"].disposition.as_deref(),
+            Some("filtered")
+        );
+        assert_eq!(
+            records["libA.aarch64-linux"].disposition.as_deref(),
+            Some("filtered")
+        );
         // Supply outcomes replace the old warm dispositions: the covered
         // libA output is delegated to the target cluster (prefetch
         // substitution), the uncovered stdenv output is recorded
@@ -2360,7 +2391,10 @@ mod tests {
                 .unwrap();
         assert_eq!(progress["stage"], "done");
         // campaign.json pins the archive and carries the recorder-side
-        // exclusion counts alongside the engine's own plan-time exclusions.
+        // exclusion counts; the engine's own plan-time exclusions are
+        // asserted on their per-job records above (the comparability
+        // excluded map re-derives engine-side counts from the report's
+        // class vocabulary).
         let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
         assert_eq!(campaign.archive.archive_id, archive_id);
         assert_eq!(
@@ -2368,7 +2402,6 @@ mod tests {
             campaign.archive.archive_id_short
         );
         assert_eq!(campaign.comparability.excluded.get("eval-error"), Some(&1));
-        assert_eq!(campaign.comparability.excluded.get("skipped"), Some(&2));
 
         // Resume: same state dir, no scripted submitter outcomes left → must
         // not submit anything new and must finish with identical buckets.
@@ -2394,7 +2427,10 @@ mod tests {
                 .load_jsonl(StateFile::Results)
                 .unwrap(),
         );
-        assert_eq!(records2["appB.x86_64-linux"].bucket, "match-built");
+        assert_eq!(
+            records2["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
 
         // A different archive may not resume this campaign: the stored pin
         // refuses it before any stage runs. A one-unit archive is enough —
@@ -2551,7 +2587,10 @@ mod tests {
             "the timed batch is marked processed"
         );
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records[job].bucket, Bucket::InterruptionReplayed.as_str());
+        assert_eq!(
+            records[job].verdict.as_deref(),
+            Some(Verdict::InterruptionReplayed.as_str())
+        );
     }
 
     /// The poller's pause decision across scheduling modes: in timeless mode
@@ -2791,8 +2830,14 @@ mod tests {
             "no interruption is armed when the archive records none"
         );
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
-        assert_eq!(records["appB.x86_64-linux"].bucket, "match-built");
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
     }
 
     /// Timed campaign end to end over a mini timed archive: the supply stage
@@ -2932,19 +2977,22 @@ mod tests {
         // Exactly one unit matched its recorded build and one reproduced its
         // recorded interruption.
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        let bucket_count = |bucket: &str| {
+        let verdict_count = |verdict: &str| {
             records
                 .values()
-                .filter(|record| record.bucket == bucket)
+                .filter(|record| record.verdict.as_deref() == Some(verdict))
                 .count()
         };
-        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
         assert_eq!(
-            records["appB.x86_64-linux"].bucket,
-            Bucket::InterruptionReplayed.as_str()
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
         );
-        assert_eq!(bucket_count("match-built"), 1);
-        assert_eq!(bucket_count(Bucket::InterruptionReplayed.as_str()), 1);
+        assert_eq!(
+            records["appB.x86_64-linux"].verdict.as_deref(),
+            Some(Verdict::InterruptionReplayed.as_str())
+        );
+        assert_eq!(verdict_count("match-built"), 1);
+        assert_eq!(verdict_count(Verdict::InterruptionReplayed.as_str()), 1);
         // The dispatcher's run statistics are persisted for the report.
         let stats: timeline::TimedRunStats = state
             .read_json("timed-stats.json")
@@ -3057,9 +3105,12 @@ mod tests {
                 .unwrap(),
         );
         let app_record = &records["appB.x86_64-linux"];
-        assert_eq!(app_record.bucket, "match-built");
+        assert_eq!(app_record.verdict.as_deref(), Some("match-built"));
         assert!(app_record.attempts >= 1, "{app_record:?}");
-        assert_eq!(records["appA.x86_64-linux"].bucket, "match-built");
+        assert_eq!(
+            records["appA.x86_64-linux"].verdict.as_deref(),
+            Some("match-built")
+        );
 
         // Two build-path submissions were recorded (the supply stage's
         // prefetch and uploads never touch batches.jsonl): the first carries
@@ -3237,7 +3288,11 @@ mod tests {
         .await
         .unwrap();
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records[active_job].bucket, "rio-infra-failure");
+        assert_eq!(
+            records[active_job].verdict.as_deref(),
+            Some("infra-indeterminate")
+        );
+        assert_eq!(records[active_job].failure_cause.as_deref(), Some("infra"));
         assert_eq!(
             records[active_job].signature.as_deref(),
             Some("stalled-active")
@@ -3269,7 +3324,10 @@ mod tests {
         .await
         .unwrap();
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
-        assert_eq!(records[queued_job].bucket, "rio-infra-failure");
+        assert_eq!(
+            records[queued_job].verdict.as_deref(),
+            Some("infra-indeterminate")
+        );
         assert_eq!(
             records[queued_job].signature.as_deref(),
             Some("stalled-queued")
@@ -3307,7 +3365,7 @@ mod tests {
                     attempts: 0,
                     build_ids: vec![],
                     rio: model::RioSide {
-                        outcome: Bucket::NotAttemptable.as_str().into(),
+                        outcome: Disposition::NotAttemptable.as_str().into(),
                         ..Default::default()
                     },
                     hydra: model::HydraSide {
@@ -3315,8 +3373,11 @@ mod tests {
                         ..Default::default()
                     },
                     nar_compare: BTreeMap::new(),
-                    bucket: Bucket::NotAttemptable.as_str().into(),
+                    verdict: None,
+                    disposition: Some(Disposition::NotAttemptable.as_str().into()),
                     cascaded: false,
+                    failure_cause: None,
+                    flaky: false,
                     signature: None,
                     log_key: None,
                     repro: String::new(),
@@ -3336,11 +3397,12 @@ mod tests {
 
         let records = latest_per_job(state.load_jsonl(StateFile::Results).unwrap());
         let app = &records["appB.x86_64-linux"];
-        assert_eq!(app.bucket, "not-attempted");
+        assert_eq!(app.disposition.as_deref(), Some("not-attempted"));
+        assert_eq!(app.verdict, None);
         assert_eq!(app.rio.outcome, "not-attempted");
         assert!(app.build_ids.is_empty() && app.rio.exec_id.is_none());
-        // Bucket counts sum to in-scope: the partial report is complete over
-        // the scope.
+        // Per-class counts sum to in-scope: the partial report is complete
+        // over the scope.
         let agg = report::aggregate(&records);
         assert_eq!(
             agg.bucket_counts.values().sum::<usize>(),

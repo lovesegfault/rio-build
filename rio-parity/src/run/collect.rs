@@ -2,9 +2,9 @@
 //! reasons, and scheduler poison evidence into terminal per-job records.
 //!
 //! For every settled batch the stage reads the per-root [`PathOutcome`]s the
-//! submission returned in band, decides one [`Verdict`] per member job
-//! (terminal or re-queue), captures evidence — NAR hashes via the store for
-//! successes, a compressed log tail for failures — and appends terminal
+//! submission returned in band, decides one [`CollectDecision`] per member
+//! job (terminal or re-queue), captures evidence — NAR hashes via the store
+//! for successes, a compressed log tail for failures — and appends terminal
 //! [`JobRecord`]s to results.jsonl.
 //!
 //! Failure attribution combines two independent signals: the failing root's
@@ -24,11 +24,14 @@ use anyhow::Result;
 use rio_nix::protocol::build::BuildStatus;
 
 use super::artifact::ArtifactStore;
-use super::classify::{AuxFlags, OutputHashes, TimedInterruption, classify, compare_output};
+use super::classify::{
+    AuxFlags, OutputHashes, TimedInterruption, classify, compare_output, job_nar_verdict,
+    project_output_divergence,
+};
 use super::grpc::{AdminApi, StoreApi};
 use super::model::{
-    BATCH_KIND_TIMED, Bucket, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome,
-    RioOutcome, RioSide, RootCauseKind, build_status_from_name, now_rfc3339,
+    BATCH_KIND_TIMED, FailureKind, HydraOutcome, HydraSide, JobRecord, PathOutcome, RioOutcome,
+    RioSide, RootCauseKind, UnifiedClass, Verdict, build_status_from_name, now_rfc3339,
 };
 use super::spec::Knobs;
 use super::state::{StateDir, StateFile};
@@ -58,10 +61,10 @@ pub struct JobContext {
 ///
 /// In-band per-root results are terminal by construction (the build call
 /// does not return until every requested root has an outcome), so there is
-/// no still-running verdict: every member of a settled batch is either
+/// no still-running decision: every member of a settled batch is either
 /// terminal or re-offered.
 #[derive(Debug, Clone, PartialEq)]
-pub enum Verdict {
+pub enum CollectDecision {
     /// Terminal outcome — write the results.jsonl record.
     Terminal {
         rio: RioOutcome,
@@ -183,8 +186,8 @@ pub fn timed_interruption_for(
     None
 }
 
-/// Decide the verdict for one job given its in-band per-root result and the
-/// batch-wide poison snapshot.
+/// Decide what collect does with one job given its in-band per-root result
+/// and the batch-wide poison snapshot.
 ///
 /// `target` is this root's [`PathOutcome`] (None = the submission returned
 /// no result for it). `poisoned` is the batch's `ListPoisoned` snapshot
@@ -213,7 +216,7 @@ pub fn decide(
     prior_requeues: u32,
     knobs: &Knobs,
     log_tail: Option<&str>,
-) -> Verdict {
+) -> CollectDecision {
     let relayed = batch.reasons.get(&ctx.drv_path).map(String::as_str);
     let Some(target) = target else {
         // No in-band result for this root. An engine-cancelled batch
@@ -221,16 +224,16 @@ pub fn decide(
         // is always re-offered; otherwise a missing result is a transport
         // defect — one auto-retry, then an infra failure.
         if batch.engine_cancelled {
-            return Verdict::Requeue {
+            return CollectDecision::Requeue {
                 why: "engine-cancelled",
             };
         }
         if prior_requeues < knobs.max_auto_retries {
-            return Verdict::Requeue {
+            return CollectDecision::Requeue {
                 why: "no-inband-result",
             };
         }
-        return Verdict::Terminal {
+        return CollectDecision::Terminal {
             rio: RioOutcome::TargetFailed {
                 kind: FailureKind::Infra,
             },
@@ -251,13 +254,13 @@ pub fn decide(
             None,
             log_tail,
         );
-        return Verdict::Terminal {
+        return CollectDecision::Terminal {
             rio: RioOutcome::TargetFailed { kind },
             evidence: Some(format!("unrecognized in-band status: {}", target.status)),
         };
     };
     if status == BuildStatus::Built {
-        return Verdict::Terminal {
+        return CollectDecision::Terminal {
             rio: RioOutcome::Built { executed: true },
             evidence: None,
         };
@@ -267,7 +270,7 @@ pub fn decide(
         // without execution; the completed-without-execution discriminator
         // (cached-prior vs target-substituted) is the classifier's job,
         // driven by the plan-snapshot flag.
-        return Verdict::Terminal {
+        return CollectDecision::Terminal {
             rio: RioOutcome::Built { executed: false },
             evidence: None,
         };
@@ -281,7 +284,7 @@ pub fn decide(
         });
         let Some(trigger) = trigger else {
             // No identifiable trigger: treat as a fail-fast batch-mate.
-            return Verdict::Requeue {
+            return CollectDecision::Requeue {
                 why: "dependency-failed-no-trigger",
             };
         };
@@ -290,7 +293,7 @@ pub fn decide(
             // trigger is not in this job's own closure, so the job never got
             // a fair attempt and is re-queued instead of being charged with
             // a dependency failure.
-            return Verdict::Requeue {
+            return CollectDecision::Requeue {
                 why: "failfast-batch-mate",
             };
         }
@@ -309,7 +312,7 @@ pub fn decide(
             FailureKind::SourceRot => RootCauseKind::SourceRot,
             _ => RootCauseKind::Genuine,
         };
-        return Verdict::Terminal {
+        return CollectDecision::Terminal {
             rio: RioOutcome::DependencyFailed {
                 root,
                 failing_drv: trigger,
@@ -329,17 +332,30 @@ pub fn decide(
         log_tail,
     );
     if kind == FailureKind::Infra && prior_requeues < knobs.max_auto_retries {
-        return Verdict::Requeue {
+        return CollectDecision::Requeue {
             why: "infra-auto-retry",
         };
     }
-    Verdict::Terminal {
+    CollectDecision::Terminal {
         rio: RioOutcome::TargetFailed { kind },
         evidence,
     }
 }
 
-/// Assemble the final [`JobRecord`] for a terminal verdict.
+/// The kebab-case failure-cause string for a failure-shaped rio outcome:
+/// the target's own [`FailureKind`] serde form, or the blocking
+/// dependency's [`RootCauseKind`] serde form. `None` for non-failure
+/// outcomes.
+pub fn failure_cause_for(rio: &RioOutcome) -> Option<String> {
+    let value = match rio {
+        RioOutcome::TargetFailed { kind } => serde_json::to_value(kind).ok()?,
+        RioOutcome::DependencyFailed { root, .. } => serde_json::to_value(root).ok()?,
+        RioOutcome::NotAttempted | RioOutcome::Built { .. } => return None,
+    };
+    value.as_str().map(str::to_string)
+}
+
+/// Assemble the final [`JobRecord`] for a terminal collect decision.
 ///
 /// `log_tail` is the captured failure-log text (when any was fetched); it
 /// only feeds the failure-signature fallback, so failures whose Signal-1
@@ -396,7 +412,7 @@ pub fn build_record(
                 nar_size: rio_info.as_ref().map(|(_, s)| *s),
             },
         );
-        if classification.bucket == Bucket::MatchBuilt {
+        if classification.class == UnifiedClass::Verdict(Verdict::MatchBuilt) {
             let hydra_hash = ctx.hydra_outputs.get(name).and_then(|h| h.nar_hash.clone());
             nar_compare.insert(
                 name.clone(),
@@ -408,6 +424,35 @@ pub fn build_record(
             );
         }
     }
+
+    // Final per-unit class: a match-built verdict whose recorded output
+    // hashes disagree is projected to output-divergence; dispositions pass
+    // through untouched. Exactly one of verdict/disposition is set.
+    let (verdict, disposition) = match classification.class {
+        UnifiedClass::Verdict(v) => (
+            Some(project_output_divergence(v, job_nar_verdict(&nar_compare))),
+            None,
+        ),
+        UnifiedClass::Disposition(d) => (None, Some(d)),
+    };
+    // The surviving failure cause is recorded only for failure-class
+    // verdicts (the cause of a requeued or excluded unit is not a final
+    // observation).
+    let failure_cause = match verdict {
+        Some(
+            Verdict::UnexpectedFailure
+            | Verdict::UnexpectedDependencyFailure
+            | Verdict::MatchFailed
+            | Verdict::InfraIndeterminate
+            | Verdict::SourceUnavailable,
+        ) => failure_cause_for(rio_outcome),
+        _ => None,
+    };
+    let flaky = attempts > 1
+        && matches!(
+            verdict,
+            Some(Verdict::MatchBuilt | Verdict::OutputDivergence)
+        );
 
     let hydra_side = HydraSide {
         outcome: ctx.hydra_outcome.as_str().to_string(),
@@ -441,8 +486,11 @@ pub fn build_record(
         rio: rio_side,
         hydra: hydra_side,
         nar_compare,
-        bucket: classification.bucket.as_str().to_string(),
+        verdict: verdict.map(|v| v.as_str().to_string()),
+        disposition: disposition.map(|d| d.as_str().to_string()),
         cascaded: classification.cascaded,
+        failure_cause,
+        flaky,
         signature: match rio_outcome {
             RioOutcome::Built { .. } => None,
             _ => signature_for(signal1.as_deref(), log_tail),
@@ -593,7 +641,7 @@ pub async fn process_settled_batch(
             knobs,
             log_signal_text.as_deref(),
         ) {
-            Verdict::Requeue { why } => {
+            CollectDecision::Requeue { why } => {
                 if timed {
                     // Never re-offered (the timed dispatcher owns retries).
                     // An armed interruption the engine did cancel is the
@@ -628,7 +676,7 @@ pub async fn process_settled_batch(
                     requeue.push(job.clone());
                 }
             }
-            Verdict::Terminal { rio, evidence } => {
+            CollectDecision::Terminal { rio, evidence } => {
                 // Evidence capture: NAR hashes for successes, log tail for
                 // failures.
                 let mut log_key = None;
@@ -727,7 +775,7 @@ mod tests {
     use crate::run::artifact::LocalDirArtifactStore;
     use crate::run::grpc::test_support::FakeStoreApi;
     use crate::run::grpc::{GraphSnapshot, PoisonedView};
-    use crate::run::model::{BATCH_KIND_SUBMIT, build_status_name};
+    use crate::run::model::{BATCH_KIND_SUBMIT, Disposition, build_status_name};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn ctx(job: &str, drv: &str, deps: &[&str], hydra: HydraOutcome) -> JobContext {
@@ -927,7 +975,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::Built { executed: true },
                 evidence: None
             }
@@ -950,7 +998,7 @@ mod tests {
                     &knobs,
                     None
                 ),
-                Verdict::Terminal {
+                CollectDecision::Terminal {
                     rio: RioOutcome::Built { executed: false },
                     evidence: None
                 },
@@ -978,7 +1026,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "infra-auto-retry"
             }
         );
@@ -992,7 +1040,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Infra
                 },
@@ -1013,7 +1061,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Genuine
                 },
@@ -1036,7 +1084,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Genuine
                 },
@@ -1059,7 +1107,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Timeout
                 },
@@ -1074,7 +1122,7 @@ mod tests {
             ..PathOutcome::default()
         };
         match decide(&c, Some(&bogus), &batch, &no_poison, 0, &knobs, None) {
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed { .. },
                 evidence,
             } => assert!(evidence.unwrap().contains("bogus-status")),
@@ -1089,18 +1137,18 @@ mod tests {
         };
         assert_eq!(
             decide(&c, None, &cancelled_batch, &no_poison, 5, &knobs, None),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "engine-cancelled"
             }
         );
         assert_eq!(
             decide(&c, None, &batch, &no_poison, 0, &knobs, None),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "no-inband-result"
             }
         );
         match decide(&c, None, &batch, &no_poison, 1, &knobs, None) {
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio:
                     RioOutcome::TargetFailed {
                         kind: FailureKind::Infra,
@@ -1142,7 +1190,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Genuine
                 },
@@ -1161,7 +1209,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "infra-auto-retry"
             }
         );
@@ -1201,7 +1249,7 @@ mod tests {
             &knobs,
             None,
         ) {
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::DependencyFailed { root, failing_drv },
                 ..
             } => {
@@ -1240,7 +1288,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::DependencyFailed {
                     root: RootCauseKind::Infra,
                     ..
@@ -1268,7 +1316,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::DependencyFailed { .. },
                 ..
             }
@@ -1290,7 +1338,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "failfast-batch-mate"
             }
         );
@@ -1308,7 +1356,7 @@ mod tests {
                 &knobs,
                 None
             ),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "dependency-failed-no-trigger"
             }
         );
@@ -1347,20 +1395,20 @@ mod tests {
         // missing result requeued.
         assert_eq!(
             decide(&job1, target_for(T), &batch, &poisoned, 0, &knobs, None),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::Built { executed: true },
                 evidence: None
             }
         );
         assert_eq!(
             decide(&job2, target_for(DEP), &batch, &poisoned, 0, &knobs, None),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "infra-auto-retry"
             }
         );
         assert_eq!(
             decide(&job3, target_for(OTHER), &batch, &poisoned, 0, &knobs, None),
-            Verdict::Requeue {
+            CollectDecision::Requeue {
                 why: "no-inband-result"
             }
         );
@@ -1370,7 +1418,7 @@ mod tests {
         // evidence.
         assert!(matches!(
             decide(&job2, target_for(DEP), &batch, &poisoned, 1, &knobs, None),
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio: RioOutcome::TargetFailed {
                     kind: FailureKind::Infra
                 },
@@ -1378,7 +1426,7 @@ mod tests {
             }
         ));
         match decide(&job3, target_for(OTHER), &batch, &poisoned, 1, &knobs, None) {
-            Verdict::Terminal {
+            CollectDecision::Terminal {
                 rio:
                     RioOutcome::TargetFailed {
                         kind: FailureKind::Infra,
@@ -1393,7 +1441,7 @@ mod tests {
     /// engine-cancelled carries Replayed, armed + in-band success carries
     /// NotReproduced, armed + failure without a cancellation carries no flag,
     /// and the flag is never derived outside timed batches. The derived flag
-    /// drives the bucket through the AuxFlags built in [`build_record`].
+    /// drives the verdict through the AuxFlags built in [`build_record`].
     #[test]
     fn timed_interruption_flag_derivation() {
         let job_ctx = ctx("app.x86_64-linux", T, &[], HydraOutcome::Built);
@@ -1430,7 +1478,11 @@ mod tests {
             Some(TimedInterruption::Replayed)
         );
         let rec = record(&cancelled, &RioOutcome::NotAttempted, None);
-        assert_eq!(rec.bucket, Bucket::InterruptionReplayed.as_str());
+        assert_eq!(
+            rec.verdict.as_deref(),
+            Some(Verdict::InterruptionReplayed.as_str())
+        );
+        assert_eq!(rec.disposition, None);
 
         // Armed + in-band success (the build out-raced the recorded
         // interruption): NotReproduced.
@@ -1449,7 +1501,10 @@ mod tests {
             &RioOutcome::Built { executed: true },
             Some(&built.results[0]),
         );
-        assert_eq!(rec.bucket, Bucket::InterruptionNotReproduced.as_str());
+        assert_eq!(
+            rec.verdict.as_deref(),
+            Some(Verdict::InterruptionNotReproduced.as_str())
+        );
 
         // Armed + failure without a cancellation: no flag — the failure
         // classifies on its own evidence.
@@ -1471,7 +1526,11 @@ mod tests {
             },
             Some(&failed.results[0]),
         );
-        assert_eq!(rec.bucket, Bucket::RioOnlyFailure.as_str());
+        assert_eq!(
+            rec.verdict.as_deref(),
+            Some(Verdict::UnexpectedFailure.as_str())
+        );
+        assert_eq!(rec.failure_cause.as_deref(), Some("genuine"));
 
         // An unarmed root of the same cancelled batch carries no flag, and a
         // non-timed batch never carries one.
@@ -1534,7 +1593,10 @@ mod tests {
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].job, "armed.x86_64-linux");
-        assert_eq!(records[0].bucket, Bucket::InterruptionReplayed.as_str());
+        assert_eq!(
+            records[0].verdict.as_deref(),
+            Some(Verdict::InterruptionReplayed.as_str())
+        );
         assert_eq!(records[0].rio.outcome, "not-attempted");
 
         // An engine-side submission failure (no results, no build id, not
@@ -1582,7 +1644,7 @@ mod tests {
         ] {
             assert_eq!(
                 decide(&job, None, &batch, &no_poison, prior_requeues, &knobs, None),
-                Verdict::Requeue {
+                CollectDecision::Requeue {
                     why: "engine-cancelled"
                 },
                 "prior_requeues = {prior_requeues}"
@@ -1682,7 +1744,9 @@ mod tests {
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 2);
         let ok = records.iter().find(|r| r.job == "ok.x86_64-linux").unwrap();
-        assert_eq!(ok.bucket, "match-built");
+        assert_eq!(ok.verdict.as_deref(), Some("match-built"));
+        assert_eq!(ok.disposition, None);
+        assert!(!ok.flaky, "first-attempt success is not flaky");
         assert_eq!(ok.rio.status.as_deref(), Some("Built"));
         assert_eq!(
             ok.rio.exec_id, None,
@@ -1697,7 +1761,8 @@ mod tests {
             .iter()
             .find(|r| r.job == "bad.x86_64-linux")
             .unwrap();
-        assert_eq!(bad.bucket, "rio-only-failure");
+        assert_eq!(bad.verdict.as_deref(), Some("unexpected-failure"));
+        assert_eq!(bad.failure_cause.as_deref(), Some("genuine"));
         assert_eq!(bad.signature.as_deref(), Some("failed-every-worker"));
         assert_eq!(bad.rio.failed_builders, vec!["b1".to_string()]);
         assert!(
@@ -1770,7 +1835,11 @@ mod tests {
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 0);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].bucket, "target-substituted");
+        assert_eq!(
+            records[0].disposition.as_deref(),
+            Some(Disposition::TargetSubstituted.as_str())
+        );
+        assert_eq!(records[0].verdict, None);
         assert_eq!(records[0].rio.status.as_deref(), Some("Substituted"));
     }
 
@@ -1821,7 +1890,8 @@ mod tests {
         assert_eq!(admin.poisoned_calls.load(Ordering::SeqCst), 1);
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].bucket, "rio-infra-failure");
+        assert_eq!(records[0].verdict.as_deref(), Some("infra-indeterminate"));
+        assert_eq!(records[0].failure_cause.as_deref(), Some("infra"));
         assert!(records[0].rio.failed_builders.is_empty());
     }
 
@@ -1869,7 +1939,7 @@ mod tests {
         assert!(requeue.is_empty());
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].bucket, "match-built");
+        assert_eq!(records[0].verdict.as_deref(), Some("match-built"));
         assert_eq!(records[0].rio.outputs["out"].nar_hash, None);
         assert_eq!(records[0].nar_compare["out"], "not-comparable");
     }
@@ -1914,7 +1984,7 @@ mod tests {
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         let rec = &records[0];
-        assert_eq!(rec.bucket, "rio-only-failure");
+        assert_eq!(rec.verdict.as_deref(), Some("unexpected-failure"));
         assert_eq!(rec.evidence.as_deref(), Some("log-tail-only"));
         // No reason from either Signal-1 source: the signature falls back to
         // the captured tail.
@@ -1971,7 +2041,7 @@ mod tests {
         let records: Vec<JobRecord> = state.load_jsonl(StateFile::Results).unwrap();
         assert_eq!(records.len(), 1);
         let rec = &records[0];
-        assert_eq!(rec.bucket, "rio-only-failure");
+        assert_eq!(rec.verdict.as_deref(), Some("unexpected-failure"));
         assert_eq!(rec.evidence.as_deref(), Some("log-tail-only"));
         assert_eq!(rec.signature, None, "empty tail must not become `log:`");
         assert_eq!(rec.log_key, None);
