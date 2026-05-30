@@ -1501,7 +1501,7 @@
                   # Promoted from packages.kani-toolchain.kani-checks once
                   # the harness landed — a vacuous 0-harness check would
                   # have diluted the gate. The formal protocol model
-                  # (quint-leader-election, in miscChecks) verifies the
+                  # (quint-leader-election, in quintChecks) verifies the
                   # protocol-level safety property; this verifies the
                   # per-decision logic that complements it (richer case
                   # structure than the model's action partition — not a
@@ -1512,7 +1512,7 @@
                   # decision kernels (rio-store/src/logs/kernel.rs) — the
                   # chunk-interval arithmetic, the read-path overlap
                   # dedup, the accept verdict, and the completeness fold.
-                  # The formal model (quint-log-service-*, in miscChecks)
+                  # The formal model (quint-log-service-*, in quintChecks)
                   # verifies the protocol over a bounded line domain;
                   # these harnesses verify the per-decision arithmetic
                   # over the full u64 domain.
@@ -1525,9 +1525,17 @@
                   # representation's set-semantics harness. Gated once the
                   # cfg(kani) IdSet/BoundedIdSet representation swap
                   # brought the harnesses inside the gate budget; the
-                  # formal model (quint-retry-policy-*, in miscChecks)
+                  # formal model (quint-retry-policy-*, in quintChecks)
                   # checks the protocol, these harnesses the decision
                   # arithmetic over bounded arbitrary inputs.
+                  #
+                  # This inherit is also what routes a kani proof into the
+                  # CI `formal` matrix lane: ciMatrix.formal intersects
+                  # (quintChecks // kaniChecks) with config.checks, so a
+                  # NEW kani-* check needs its one-line promotion here to
+                  # be sharded into that lane (quint checks need no extra
+                  # step — the whole quintChecks set is merged into
+                  # checks.* above, so they flow through automatically).
                   inherit (kaniChecks) kani-rio-lease kani-rio-store kani-rio-retry-kernel;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.

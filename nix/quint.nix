@@ -84,8 +84,8 @@
   lib,
   unfilteredRoot,
   # nix/checks.nix's nextest reuse-build helpers and the prebuilt
-  # rio-lease / rio-store test binaries, threaded through
-  # misc-checks.nix. Only the mbt-rio-lease and mbt-rio-logservice
+  # rio-lease / rio-store test binaries, threaded through flake.nix's
+  # quintChecks binding. Only the mbt-rio-lease and mbt-rio-logservice
   # conformance checks below consume them — the model checks need
   # nothing from the Rust build.
   mkNextestRun,
@@ -440,7 +440,9 @@ in
   # attrs below.
   inherit mkQuintCheck mkQuintWitnessCheck mkQuintRunCheck;
 
-  # Per-model checks. Spliced into checks.* via misc-checks.nix.
+  # Per-model checks. Imported by flake.nix as the quintChecks binding,
+  # which merges them into checks.* and hands the same attrset to the
+  # CI matrix's `formal` kind.
   checks = {
     # rio-lease's leader-election protocol over a Kubernetes Lease
     # object: per-node clocks (bounded skew), the observed-record
