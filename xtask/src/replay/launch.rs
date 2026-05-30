@@ -19,15 +19,21 @@
 //! replay-selfhosted's deliberately empty upstream set.
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
+use rio_replay::archive::reader::ReplayArchive;
+use rio_replay::archive::s3::{
+    ARCHIVE_COMPLETE_OBJECT, ARCHIVE_MANIFEST_OBJECT, ArchiveStore, CompleteMarker,
+};
+use rio_replay::archive::schema::{Capabilities, Manifest};
+use rio_replay::archive::writer::pack_with_mkdwarfs;
 use rio_replay::run::spec::{
-    ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, ReportBlock, ReportPolicy,
-    S3Target, TenantBlock,
+    ArchiveRef, CampaignSpec, ClusterEndpoints, FailOn, Filters, Knobs, ReportBlock, ReportPolicy,
+    S3Target, ScheduleMode, SchedulingBlock, TenantBlock,
 };
 
 use super::jobs::{self, EngineJobCommon};
@@ -41,9 +47,11 @@ use crate::{git, ssh, tofu, ui};
 #[derive(Args)]
 pub struct LaunchArgs {
     /// Hydra evaluation id whose recorded replay archive the campaign
-    /// consumes (must have been produced by `replay record` first).
+    /// consumes (must have been produced by `replay record` first). This
+    /// is the recorder-convenience alias for Hydra-derived archives;
+    /// exactly one of --eval / --archive names the campaign input.
     #[arg(long)]
-    pub eval: u64,
+    pub eval: Option<u64>,
     /// Recipe digest (or unambiguous prefix) to pin when more than one
     /// archive exists for --eval. A full 64-hex digest is resolved
     /// directly via the recorder's by-recipe pointer; a shorter value
@@ -51,6 +59,15 @@ pub struct LaunchArgs {
     /// with `aws s3 ls s3://<chunk-bucket>/replay/archives/`.
     #[arg(long)]
     pub eval_digest: Option<String>,
+    /// Campaign input archive named by location instead of by recorder
+    /// address: a local packed `.dwarfs` image, a local directory-form
+    /// archive (packed with mkdwarfs first), or the `s3://bucket/prefix`
+    /// of an already-published archive. Local archives are published
+    /// write-once under `replay/archives/` before launch; the upload is
+    /// skipped when the content-addressed digest is already published.
+    /// Mutually exclusive with --eval / --eval-digest.
+    #[arg(long)]
+    pub archive: Option<String>,
     /// Dependency mode: leaf = dependencies substituted from
     /// cache.nixos.org and roots force-built; self-hosted = full closure
     /// built by rio.
@@ -95,6 +112,18 @@ pub struct LaunchArgs {
     /// by `replay report --check`.
     #[arg(long, value_enum, default_value_t = FailOnArg::None)]
     pub fail_on: FailOnArg,
+    /// When submissions happen: timeless = queue-driven dispatch ignoring
+    /// recorded timing; timed = recorded request offsets divided by
+    /// --speedup. Timed scheduling requires an archive recorded with the
+    /// `timed` capability (launch refuses early; the engine re-validates).
+    #[arg(long, value_enum, default_value_t = Schedule::Timeless)]
+    pub schedule: Schedule,
+    /// Divisor applied to recorded request offsets when building the timed
+    /// schedule (recorded into the spec's knobs). Only meaningful with
+    /// --schedule timed — the engine's spec validation refuses a
+    /// non-default value in timeless mode.
+    #[arg(long, default_value_t = 1.0)]
+    pub speedup: f64,
     /// RUST_LOG for the campaign pod.
     #[arg(long, default_value = "info,rio_replay=debug")]
     pub log_level: String,
@@ -126,6 +155,35 @@ impl Mode {
 impl std::fmt::Display for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Matches the clap ValueEnum rendering (`--mode self-hosted`).
+        clap::ValueEnum::to_possible_value(self)
+            .expect("no skipped variants")
+            .get_name()
+            .fmt(f)
+    }
+}
+
+/// Campaign scheduling mode (CLI surface). Mirrors the engine's spec-level
+/// [`ScheduleMode`]; [`Schedule::engine`] converts.
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Schedule {
+    Timeless,
+    Timed,
+}
+
+impl Schedule {
+    /// The engine-side scheduling mode this CLI value maps to.
+    pub fn engine(self) -> ScheduleMode {
+        match self {
+            Schedule::Timeless => ScheduleMode::Timeless,
+            Schedule::Timed => ScheduleMode::Timed,
+        }
+    }
+}
+
+impl std::fmt::Display for Schedule {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Matches the clap ValueEnum rendering (`--schedule timeless`),
+        // which is also what clap prints for the default value in --help.
         clap::ValueEnum::to_possible_value(self)
             .expect("no skipped variants")
             .get_name()
@@ -247,24 +305,31 @@ pub fn engine_args(a: &LaunchArgs) -> Vec<String> {
     args
 }
 
-/// Correlation annotations for the campaign Job: which Hydra eval / replay
-/// archive (by its 16-char short id) it consumes and which dependency mode
-/// it runs, so a Job seen in `kubectl` can be tied back to its inputs
-/// without reading the spec ConfigMap. The `rio.build/eval-set` annotation
-/// key keeps its historical name; its value is the archive id short form.
+/// Correlation annotations for the campaign Job: which replay archive (by
+/// its 16-char short id) it consumes, which dependency mode it runs, and —
+/// when the archive was resolved through the recorder path — which Hydra
+/// eval it was recorded from, so a Job seen in `kubectl` can be tied back
+/// to its inputs without reading the spec ConfigMap. The
+/// `rio.build/eval-set` annotation key keeps its historical name; its
+/// value is the archive id short form.
 pub fn campaign_annotations(
-    eval: u64,
+    eval: Option<u64>,
     archive_id_short: &str,
     mode: Mode,
 ) -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("rio.build/hydra-eval-id".to_string(), eval.to_string()),
+    let mut annotations = BTreeMap::from([
         (
             "rio.build/eval-set".to_string(),
             archive_id_short.to_string(),
         ),
         ("rio.build/mode".to_string(), mode.as_str().to_string()),
-    ])
+    ]);
+    // Archives named by --archive carry no Hydra eval id (non-recorder
+    // archives have none); the annotation is written only when known.
+    if let Some(eval) = eval {
+        annotations.insert("rio.build/hydra-eval-id".to_string(), eval.to_string());
+    }
+    annotations
 }
 
 /// In-cluster scheduler AdminService address recorded in the campaign
@@ -289,20 +354,129 @@ fn gateway_store_url(tenant: &str) -> String {
     )
 }
 
-/// The replay archive a campaign will run against, as resolved from S3.
+/// The replay archive a campaign will run against, as resolved (and, for
+/// local `--archive` inputs, published) from the launch flags.
 pub struct ArchiveLocation {
     /// Full 64-hex archive id (SHA-256 of the archive's manifest.json).
     pub archive_id: String,
     /// 16-char short id — the S3 prefix segment.
     pub archive_id_short: String,
-    /// Archive key prefix in the chunk bucket (no trailing slash),
+    /// Archive key prefix (no trailing slash),
     /// e.g. `replay/archives/8b919129046e0f60`.
     pub s3_prefix: String,
+    /// Bucket holding the archive prefix. `None` = the campaign chunk
+    /// bucket (recorder-resolved and locally-published archives);
+    /// `Some` only for `--archive s3://…` references to another bucket.
+    pub s3_bucket: Option<String>,
     /// Recipe digest from the archive's provenance (the eval recipe the
     /// recorder ran), used for --eval-digest narrowing and operator audit.
-    pub recipe_digest: String,
-    /// Hydra eval id from the archive's provenance.
-    pub hydra_eval_id: u64,
+    /// `None` for archives not resolved through the recorder path.
+    pub recipe_digest: Option<String>,
+    /// Hydra eval id from the archive's provenance. `None` for archives
+    /// not resolved through the recorder path.
+    pub hydra_eval_id: Option<u64>,
+}
+
+/// How the operator named the campaign's input archive — the classified
+/// `--eval` / `--eval-digest` / `--archive` flag combination.
+#[derive(Debug)]
+pub enum ArchiveInput {
+    /// `--eval` (plus optional `--eval-digest`): the recorder-convenience
+    /// alias, resolved through the recorder's S3 layout (by-recipe pointer
+    /// or listing).
+    Recorded {
+        eval: u64,
+        eval_digest: Option<String>,
+    },
+    /// `--archive s3://<bucket>/<prefix>`: an already-published archive,
+    /// verified against its completion marker.
+    S3 { bucket: String, prefix: String },
+    /// `--archive <path to a .dwarfs file>`: a local packed image,
+    /// published write-once before launch.
+    LocalImage(PathBuf),
+    /// `--archive <path to a directory>`: a local directory-form archive,
+    /// packed with mkdwarfs and then published write-once before launch.
+    LocalDir(PathBuf),
+}
+
+/// Classify the `--eval` / `--eval-digest` / `--archive` flags into an
+/// [`ArchiveInput`]. Exactly one of `--eval` / `--archive` must name the
+/// campaign input; every refusal names the accepted forms. The clap fields
+/// stay plain `Option`s so this helper owns all input validation and stays
+/// unit-testable (its only I/O is the local-path existence/file-type
+/// probe).
+fn archive_input(
+    eval: Option<u64>,
+    eval_digest: Option<&str>,
+    archive: Option<&str>,
+) -> Result<ArchiveInput> {
+    match (eval, archive) {
+        (None, None) => bail!(
+            "the campaign input archive must be named: pass --eval <hydra eval id> (a \
+             recorder-produced archive) or --archive <local path | s3://bucket/prefix>"
+        ),
+        (Some(_), Some(_)) => bail!(
+            "--eval and --archive are mutually exclusive ways to name the campaign input \
+             archive — pass exactly one"
+        ),
+        (None, Some(_)) if eval_digest.is_some() => {
+            bail!("--eval-digest narrows --eval and is mutually exclusive with --archive")
+        }
+        (Some(eval), None) => Ok(ArchiveInput::Recorded {
+            eval,
+            eval_digest: eval_digest.map(str::to_string),
+        }),
+        (None, Some(archive)) => {
+            if let Some(rest) = archive.strip_prefix("s3://") {
+                let (bucket, prefix) = rest
+                    .split_once('/')
+                    .map(|(bucket, prefix)| (bucket, prefix.trim_end_matches('/')))
+                    .filter(|(bucket, prefix)| !bucket.is_empty() && !prefix.is_empty())
+                    .with_context(|| {
+                        format!(
+                            "--archive {archive:?} must name a published archive prefix as \
+                             s3://<bucket>/<prefix> (e.g. \
+                             s3://<chunk-bucket>/replay/archives/<archive-id-short>)"
+                        )
+                    })?;
+                return Ok(ArchiveInput::S3 {
+                    bucket: bucket.to_string(),
+                    prefix: prefix.to_string(),
+                });
+            }
+            // Any other URL scheme cannot be fetched: archives are either
+            // already in S3 or local files.
+            ensure!(
+                !archive.contains("://"),
+                "--archive {archive:?} is not an accepted archive form — pass the s3:// prefix \
+                 of a published archive, a local .dwarfs image, or a local archive directory"
+            );
+            let path = Path::new(archive);
+            ensure!(
+                path.exists(),
+                "--archive {archive:?} does not exist — pass the s3:// prefix of a published \
+                 archive, a local .dwarfs image, or a local archive directory"
+            );
+            if path.is_dir() {
+                Ok(ArchiveInput::LocalDir(path.to_path_buf()))
+            } else {
+                Ok(ArchiveInput::LocalImage(path.to_path_buf()))
+            }
+        }
+    }
+}
+
+/// Refuse `--schedule timed` against an archive that was not recorded with
+/// the `timed` capability (per-request offsets). Launch only fails fast
+/// here — the engine re-validates the same gate at bootstrap.
+fn ensure_timed_capability(schedule: Schedule, caps: &Capabilities) -> Result<()> {
+    ensure!(
+        schedule != Schedule::Timed || caps.timed,
+        "--schedule timed requires an archive recorded with the `timed` capability \
+         (per-request offsets), and this archive's manifest does not declare it — launch with \
+         --schedule timeless, or record a timed archive"
+    );
+    Ok(())
 }
 
 /// What the pre-flight verified, recorded into the campaign spec: the
@@ -337,7 +511,15 @@ fn build_campaign_spec(
         campaign_id: Some(campaign_id.to_owned()),
         mode,
         archive: ArchiveRef {
-            s3_bucket: Some(bucket.to_owned()),
+            // The archive may live in a different bucket than the campaign
+            // artifacts (an --archive s3://… reference); recorder-resolved
+            // and locally-published archives live in the chunk bucket.
+            s3_bucket: Some(
+                archive
+                    .s3_bucket
+                    .clone()
+                    .unwrap_or_else(|| bucket.to_owned()),
+            ),
             s3_prefix: Some(archive.s3_prefix.clone()),
             digest: archive.archive_id.clone(),
         },
@@ -368,6 +550,17 @@ fn build_campaign_spec(
             limit: a.limit,
             ..Filters::default()
         },
+        // Scheduling mode and the speedup knob from the launch flags;
+        // every other knob stays at the engine default (operators override
+        // via --engine-arg or a hand-edited spec). The engine's spec
+        // validation rejects a non-default speedup in timeless mode.
+        scheduling: SchedulingBlock {
+            mode: a.schedule.engine(),
+        },
+        knobs: Knobs {
+            speedup: a.speedup,
+            ..Knobs::default()
+        },
         // Report policies chosen at launch; the engine's spec validation
         // (run below) rejects a fail-on condition without the
         // regression-gate policy.
@@ -380,8 +573,8 @@ fn build_campaign_spec(
         cluster_versions: preflight
             .and_then(|p| serde_json::to_value(&p.deployed_tags).ok())
             .filter(|v| v.as_object().is_some_and(|m| !m.is_empty())),
-        // Knobs / deadline stay at the engine defaults; operators override
-        // per campaign via --engine-arg or a hand-edited spec.
+        // The deadline stays at the engine default; operators override per
+        // campaign via --engine-arg or a hand-edited spec.
         ..CampaignSpec::default()
     }
 }
@@ -393,6 +586,10 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     if let Some(id) = &a.campaign_id {
         validate_campaign_id(id)?;
     }
+    // Classify the --eval/--archive flags before anything else: a missing
+    // or contradictory input combination needs no AWS or cluster traffic
+    // to be refused.
+    let input = archive_input(a.eval, a.eval_digest.as_deref(), a.archive.as_deref())?;
 
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
@@ -408,13 +605,30 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     })
     .await?;
 
-    // Resolve the replay archive first: a typo'd --eval (or an eval Job
-    // that hasn't finished uploading) should fail in seconds, before any
-    // cluster mutation.
-    let archive = ui::step("resolve replay archive in S3", || {
-        resolve_archive(&region, &bucket, a.eval, a.eval_digest.as_deref())
+    // Resolve (and for local inputs publish) the replay archive first: a
+    // typo'd --eval, an eval Job that hasn't finished uploading, or a bad
+    // --archive should fail in seconds, before any cluster mutation.
+    let (archive, local_capabilities) = ui::step("resolve replay archive", || {
+        resolve_archive_input(&region, &bucket, &input)
     })
     .await?;
+
+    // Timed scheduling needs the archive's `timed` capability; check it
+    // before any cluster mutation. Local inputs were opened above; for S3
+    // and recorder-resolved archives the published standalone manifest is
+    // fetched. The engine re-validates the same gate at bootstrap.
+    if a.schedule == Schedule::Timed {
+        let capabilities = match local_capabilities {
+            Some(capabilities) => capabilities,
+            None => {
+                ui::step("fetch archive capabilities", || {
+                    archive_capabilities_from_s3(&region, &bucket, &archive)
+                })
+                .await?
+            }
+        };
+        ensure_timed_capability(a.schedule, &capabilities)?;
+    }
 
     let client = kclient::client().await?;
     ui::step("rio-replay namespace + ServiceAccount", || {
@@ -538,7 +752,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         .annotations
         .get_or_insert_with(Default::default)
         .extend(campaign_annotations(
-            a.eval,
+            archive.hydra_eval_id,
             &archive.archive_id_short,
             a.mode,
         ));
@@ -547,20 +761,215 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     })
     .await?;
 
+    // Recorder provenance (Hydra eval + recipe) is shown only when the
+    // archive was resolved through the recorder path; --archive inputs
+    // have neither.
+    let provenance = match (archive.hydra_eval_id, &archive.recipe_digest) {
+        (Some(eval), Some(digest)) => {
+            format!(
+                ", hydra eval {eval}, recipe {}…",
+                &digest[..digest.len().min(16)]
+            )
+        }
+        _ => String::new(),
+    };
     tracing::info!(
         "campaign launched: {campaign_id}\n  \
-         archive:   {} (hydra eval {}, recipe {}…, mode {})\n  \
+         archive:   {} (mode {}{provenance})\n  \
          progress:  cargo xtask replay status {campaign_id} --watch\n  \
          report:    cargo xtask replay report {campaign_id}\n  \
          logs:      kubectl -n {NS_REPLAY} logs -f job/{campaign_id}\n  \
          artifacts: s3://{bucket}/{}",
         archive.archive_id_short,
-        archive.hydra_eval_id,
-        &archive.recipe_digest[..archive.recipe_digest.len().min(16)],
         a.mode.as_str(),
         s3::campaign_key(&campaign_id, "")
     );
     Ok(())
+}
+
+/// Resolve whichever [`ArchiveInput`] the operator named into the campaign
+/// archive's location:
+///
+/// - `Recorded` goes through the recorder's S3 layout (by-recipe pointer or
+///   listing) exactly as before;
+/// - `S3` references must already carry the completion marker;
+/// - local images/directories are published write-once under
+///   `replay/archives/` first (the upload is skipped when the
+///   content-addressed digest is already published).
+///
+/// For local inputs the archive's capability flags are returned alongside
+/// (the archive was opened locally anyway), so the timed-capability gate
+/// needs no extra S3 round trip.
+async fn resolve_archive_input(
+    region: &str,
+    bucket: &str,
+    input: &ArchiveInput,
+) -> Result<(ArchiveLocation, Option<Capabilities>)> {
+    match input {
+        ArchiveInput::Recorded { eval, eval_digest } => {
+            let location = resolve_archive(region, bucket, *eval, eval_digest.as_deref()).await?;
+            Ok((location, None))
+        }
+        ArchiveInput::S3 {
+            bucket: archive_bucket,
+            prefix,
+        } => {
+            let location = resolve_published_archive(region, archive_bucket, prefix).await?;
+            Ok((location, None))
+        }
+        ArchiveInput::LocalImage(path) => {
+            let (location, capabilities) =
+                publish_local_archive(region, bucket, path, false).await?;
+            Ok((location, Some(capabilities)))
+        }
+        ArchiveInput::LocalDir(path) => {
+            let (location, capabilities) =
+                publish_local_archive(region, bucket, path, true).await?;
+            Ok((location, Some(capabilities)))
+        }
+    }
+}
+
+/// Resolve an `--archive s3://…` reference: the prefix must carry the
+/// completion marker (`complete.json` is uploaded last, so its absence
+/// means the archive is not — or not yet — published), and the marker
+/// names the archive id the spec pins.
+async fn resolve_published_archive(
+    region: &str,
+    bucket: &str,
+    prefix: &str,
+) -> Result<ArchiveLocation> {
+    let complete_key = format!("{prefix}/{ARCHIVE_COMPLETE_OBJECT}");
+    let Some(text) = s3::get_text(region, bucket, &complete_key).await? else {
+        bail!(
+            "s3://{bucket}/{prefix} has no {ARCHIVE_COMPLETE_OBJECT} — the completion marker is \
+             uploaded last, so this archive is not (yet) published; wait for its publisher to \
+             finish, or check the prefix for a typo"
+        );
+    };
+    let marker: CompleteMarker = serde_json::from_str(&text)
+        .with_context(|| format!("parse s3://{bucket}/{complete_key}"))?;
+    Ok(ArchiveLocation {
+        archive_id: marker.archive_id,
+        archive_id_short: marker.archive_id_short,
+        s3_prefix: prefix.to_string(),
+        s3_bucket: Some(bucket.to_string()),
+        // Referenced archives are not resolved through the recorder path;
+        // whatever provenance they carry stays in their manifest.
+        recipe_digest: None,
+        hydra_eval_id: None,
+    })
+}
+
+/// Publish a local archive (a packed `.dwarfs` image, or a directory-form
+/// archive packed here first) into the write-once `replay/archives/`
+/// layout of the chunk bucket, returning where it landed plus its
+/// capability flags. Content-addressed: when the archive id is already
+/// published the upload is skipped entirely, so re-launching from the same
+/// local archive is idempotent and cheap.
+async fn publish_local_archive(
+    region: &str,
+    bucket: &str,
+    path: &Path,
+    is_dir: bool,
+) -> Result<(ArchiveLocation, Capabilities)> {
+    // Open (and validate) the local archive off the async executor —
+    // DwarFS open is blocking work. Only v1 archives can be published:
+    // v0 archives have no content-addressed identity to key the S3
+    // layout by.
+    let open_path = path.to_path_buf();
+    let archive = tokio::task::spawn_blocking(move || ReplayArchive::open(&open_path))
+        .await
+        .context("archive open task panicked or was cancelled")?
+        .with_context(|| format!("open replay archive {}", path.display()))?;
+    let Some(archive_id) = archive.archive_id().map(str::to_string) else {
+        bail!(
+            "{} is a v0 archive, which has no content-addressed identity and cannot be \
+             published to the write-once S3 layout — re-record it as a v1 archive",
+            path.display()
+        );
+    };
+    let archive_id_short = archive
+        .archive_id_short()
+        .expect("v1 archives always have a short id");
+    let capabilities = *archive.capabilities();
+    // The exact stored manifest bytes are the published standalone
+    // manifest.json (the identity bytes) — never a re-serialization.
+    let manifest_bytes = archive.manifest_bytes()?;
+
+    // The published at-rest form is always the DwarFS image: directories
+    // (the recorder/dev staging form) are packed into a temporary image
+    // first. The TempDir guard must outlive the upload below.
+    let _packed_image_dir;
+    let image_path = if is_dir {
+        let tempdir = tempfile::TempDir::new().context("create a staging dir for mkdwarfs")?;
+        let image = tempdir.path().join("archive.dwarfs");
+        _packed_image_dir = tempdir;
+        let staging = path.to_path_buf();
+        let packed = image.clone();
+        // mkdwarfs is a long-running external process driven synchronously
+        // by the packer; run it off the async executor.
+        tokio::task::spawn_blocking(move || pack_with_mkdwarfs(&staging, &packed))
+            .await
+            .context("mkdwarfs packing task panicked or was cancelled")??;
+        image
+    } else {
+        path.to_path_buf()
+    };
+
+    // Write-once publish, skipped when the content-addressed digest is
+    // already there (`complete.json` is the authoritative marker).
+    let client = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
+    let store = ArchiveStore::new(bucket, super::S3_PREFIX);
+    if store.is_complete(&client, &archive_id_short).await? {
+        tracing::info!(
+            "archive {archive_id_short} is already published — skipping the upload \
+             (content-addressed)"
+        );
+    } else {
+        store
+            .publish(&client, &image_path, &manifest_bytes, "xtask-replay-launch")
+            .await
+            .with_context(|| format!("publish {} to s3://{bucket}", path.display()))?;
+    }
+
+    Ok((
+        ArchiveLocation {
+            archive_id,
+            s3_prefix: s3::archive_prefix(&archive_id_short),
+            archive_id_short,
+            // Local archives are published into the campaign chunk bucket.
+            s3_bucket: None,
+            // Publishing is not the recorder path; provenance stays in the
+            // archive manifest.
+            recipe_digest: None,
+            hydra_eval_id: None,
+        },
+        capabilities,
+    ))
+}
+
+/// Fetch a published archive's standalone `manifest.json` and return its
+/// capability flags — the timed-capability gate for archives that were not
+/// opened locally (recorder-resolved and `--archive s3://…` inputs).
+async fn archive_capabilities_from_s3(
+    region: &str,
+    chunk_bucket: &str,
+    location: &ArchiveLocation,
+) -> Result<Capabilities> {
+    let bucket = location.s3_bucket.as_deref().unwrap_or(chunk_bucket);
+    let manifest_key = format!("{}/{ARCHIVE_MANIFEST_OBJECT}", location.s3_prefix);
+    let text = s3::get_text(region, bucket, &manifest_key)
+        .await?
+        .with_context(|| {
+            format!(
+                "s3://{bucket}/{manifest_key} does not exist — the archive prefix carries a \
+                 completion marker but no standalone manifest"
+            )
+        })?;
+    let manifest: Manifest = serde_json::from_str(&text)
+        .with_context(|| format!("parse s3://{bucket}/{manifest_key}"))?;
+    Ok(manifest.capabilities)
 }
 
 /// One archive prefix found under `replay/archives/`, with the provenance
@@ -624,8 +1033,10 @@ async fn resolve_archive(
         archive_id: chosen.archive_id.clone(),
         archive_id_short: chosen.archive_id_short.clone(),
         s3_prefix: chosen.s3_prefix.clone(),
-        recipe_digest: chosen.recipe_digest.clone(),
-        hydra_eval_id: chosen.hydra_eval_id,
+        // Recorder archives live in the campaign chunk bucket.
+        s3_bucket: None,
+        recipe_digest: Some(chosen.recipe_digest.clone()),
+        hydra_eval_id: Some(chosen.hydra_eval_id),
     })
 }
 
@@ -1136,7 +1547,7 @@ async fn preflight_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_replay::run::spec::Mode as EngineMode;
+    use rio_replay::run::spec::{Mode as EngineMode, ScheduleMode};
     use serde_json::json;
 
     /// Fixture gateway host-key pin (what `gateway_host_key_pin` derives
@@ -1145,8 +1556,9 @@ mod tests {
 
     fn args(mode: Mode) -> LaunchArgs {
         LaunchArgs {
-            eval: 1824219,
+            eval: Some(1824219),
             eval_digest: None,
+            archive: None,
             mode,
             campaign_id: None,
             limit: Some(50),
@@ -1156,6 +1568,8 @@ mod tests {
             skip_preflight: false,
             report_policy: vec![ReportPolicyArg::Parity],
             fail_on: FailOnArg::None,
+            schedule: Schedule::Timeless,
+            speedup: 1.0,
             log_level: "info".into(),
         }
     }
@@ -1170,8 +1584,9 @@ mod tests {
             s3_prefix: s3::archive_prefix(&archive_id_short),
             archive_id,
             archive_id_short,
-            recipe_digest: "feedc0de".repeat(8),
-            hydra_eval_id: 1824219,
+            s3_bucket: None,
+            recipe_digest: Some("feedc0de".repeat(8)),
+            hydra_eval_id: Some(1824219),
         }
     }
 
@@ -1525,16 +1940,21 @@ mod tests {
 
     #[test]
     fn campaign_annotations_carry_eval_set_and_mode() {
-        let ann = campaign_annotations(1824219, "8b919129046e0f60", Mode::Leaf);
+        let ann = campaign_annotations(Some(1824219), "8b919129046e0f60", Mode::Leaf);
         assert_eq!(ann.get("rio.build/hydra-eval-id").unwrap(), "1824219");
         assert_eq!(ann.get("rio.build/eval-set").unwrap(), "8b919129046e0f60");
         assert_eq!(ann.get("rio.build/mode").unwrap(), "leaf");
         assert_eq!(
-            campaign_annotations(1, "d", Mode::SelfHosted)
+            campaign_annotations(Some(1), "d", Mode::SelfHosted)
                 .get("rio.build/mode")
                 .unwrap(),
             "self-hosted"
         );
+        // Archives named by --archive (not resolved through the recorder
+        // path) have no Hydra eval id; the annotation is simply absent.
+        let ann = campaign_annotations(None, "8b919129046e0f60", Mode::Leaf);
+        assert!(!ann.contains_key("rio.build/hydra-eval-id"));
+        assert_eq!(ann.get("rio.build/eval-set").unwrap(), "8b919129046e0f60");
     }
 
     #[test]
@@ -1624,6 +2044,132 @@ mod tests {
         );
         assert!(err.contains("--eval-digest"), "{err}");
         assert!(!err.contains("cccccccccccccccc"), "{err}");
+    }
+
+    #[test]
+    fn archive_input_classification_and_exclusivity() {
+        // Exactly one of --eval / --archive names the campaign input.
+        let err = archive_input(None, None, None).unwrap_err().to_string();
+        assert!(err.contains("--eval") && err.contains("--archive"), "{err}");
+        let err = archive_input(
+            Some(1824219),
+            None,
+            Some("s3://b/replay/archives/0123456789abcdef"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("mutually exclusive"), "{err}");
+        // Recorder-convenience alias path is untouched.
+        match archive_input(Some(1824219), Some("ab".repeat(32).as_str()), None).unwrap() {
+            ArchiveInput::Recorded { eval, eval_digest } => {
+                assert_eq!(eval, 1824219);
+                assert_eq!(eval_digest.as_deref(), Some("ab".repeat(32).as_str()));
+            }
+            other => panic!("expected Recorded, got {other:?}"),
+        }
+        // s3:// URIs split into bucket + prefix; trailing slash tolerated.
+        match archive_input(
+            None,
+            None,
+            Some("s3://rio-chunks/replay/archives/0123456789abcdef/"),
+        )
+        .unwrap()
+        {
+            ArchiveInput::S3 { bucket, prefix } => {
+                assert_eq!(bucket, "rio-chunks");
+                assert_eq!(prefix, "replay/archives/0123456789abcdef");
+            }
+            other => panic!("expected S3, got {other:?}"),
+        }
+        // Local paths classify by form: .dwarfs image vs directory archive.
+        let dir = tempfile::tempdir().unwrap();
+        match archive_input(None, None, Some(dir.path().to_str().unwrap())).unwrap() {
+            ArchiveInput::LocalDir(p) => assert_eq!(p, dir.path()),
+            other => panic!("expected LocalDir, got {other:?}"),
+        }
+        let image = dir.path().join("a.dwarfs");
+        std::fs::write(&image, b"placeholder").unwrap();
+        match archive_input(None, None, Some(image.to_str().unwrap())).unwrap() {
+            ArchiveInput::LocalImage(p) => assert_eq!(p, image),
+            other => panic!("expected LocalImage, got {other:?}"),
+        }
+        // Anything else is rejected naming the accepted forms.
+        let err = archive_input(None, None, Some("https://example.org/a"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("s3://") && err.contains(".dwarfs"), "{err}");
+        let err = archive_input(None, None, Some("/no/such/path"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("does not exist"), "{err}");
+    }
+
+    #[test]
+    fn scheduling_flags_populate_the_spec_and_validate() {
+        // Defaults stay timeless / 1.0 so existing launches are byte-identical.
+        let spec = build_campaign_spec(
+            &args(Mode::Leaf),
+            "c1",
+            &archive_loc(),
+            "rio-chunks",
+            true,
+            HOST_KEY_PIN,
+            None,
+        );
+        assert_eq!(spec.scheduling.mode, ScheduleMode::Timeless);
+        assert_eq!(spec.knobs.speedup, 1.0);
+        spec.validate().unwrap();
+        // --schedule timed --speedup 50 lands in scheduling.mode + knobs.speedup.
+        let mut a = args(Mode::Leaf);
+        a.schedule = Schedule::Timed;
+        a.speedup = 50.0;
+        let spec = build_campaign_spec(
+            &a,
+            "c1",
+            &archive_loc(),
+            "rio-chunks",
+            true,
+            HOST_KEY_PIN,
+            None,
+        );
+        assert_eq!(spec.scheduling.mode, ScheduleMode::Timed);
+        assert_eq!(spec.knobs.speedup, 50.0);
+        spec.validate().unwrap();
+        // A non-default speedup without timed scheduling is refused by the
+        // engine's own spec validation, which launch already runs before
+        // applying anything.
+        let mut a = args(Mode::Leaf);
+        a.speedup = 50.0;
+        let spec = build_campaign_spec(
+            &a,
+            "c1",
+            &archive_loc(),
+            "rio-chunks",
+            true,
+            HOST_KEY_PIN,
+            None,
+        );
+        let err = spec.validate().unwrap_err().to_string();
+        assert!(err.contains("speedup") && err.contains("timed"), "{err}");
+    }
+
+    #[test]
+    fn timed_schedule_requires_the_archive_timed_capability() {
+        use rio_replay::archive::schema::Capabilities;
+        let caps = Capabilities {
+            timed: false,
+            ..Capabilities::default()
+        };
+        let err = ensure_timed_capability(Schedule::Timed, &caps)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timed"), "{err}");
+        ensure_timed_capability(Schedule::Timeless, &caps).unwrap();
+        let caps = Capabilities {
+            timed: true,
+            ..Capabilities::default()
+        };
+        ensure_timed_capability(Schedule::Timed, &caps).unwrap();
     }
 
     #[test]
