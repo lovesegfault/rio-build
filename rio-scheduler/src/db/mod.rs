@@ -470,7 +470,7 @@ pub(super) use list_builds_select;
 /// writers (`update_derivation_status`, `persist_poisoned`, …) are
 /// `pub` and the private-interfaces lint denies the mismatch; nothing
 /// outside the crate consumes it.
-// r[impl sched.evidence.durability]
+// r[impl sched.evidence.durability+2]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FencedWrite {
     /// The write committed; the payload is `rows_affected()` for
@@ -493,7 +493,7 @@ impl SchedulerDb {
         &self.pool
     }
 
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     /// The durable claims floor: `GREATEST` over
     /// `assignments.generation` and `leader_generation_claims.generation`
     /// — the same two arms as [`Self::max_known_generation`], read on
@@ -512,7 +512,7 @@ impl SchedulerDb {
         Ok(row.0)
     }
 
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     /// The fence comparison: a write applies iff its serving generation
     /// is at or above the claims floor. The comparison is `>=` (equal
     /// passes) and this is load-bearing — a write carrying a generation

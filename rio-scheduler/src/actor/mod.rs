@@ -430,7 +430,7 @@ pub struct DagActor {
     /// cast `u64 as i64` at THAT single boundary instead of at every
     /// proto-encode site.
     leader: LeaderState,
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     /// The lease generation of the tenure that built the CURRENT
     /// in-memory DAG state — what every claims-floor-fenced evidence
     /// write carries as its serving generation. Written in exactly two
@@ -790,7 +790,7 @@ impl DagActor {
         self.snapshot_tx.subscribe()
     }
 
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     /// The serving generation every claims-floor-fenced evidence write
     /// of this tenure carries — the tenure-tracking field, never a
     /// fresh `self.leader.generation()` read (see the field doc for why
@@ -799,7 +799,7 @@ impl DagActor {
         self.serving_generation
     }
 
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     /// Shared posture for a [`crate::db::FencedWrite::Fenced`] outcome
     /// on a best-effort evidence write: warn (with the serving-tenure
     /// context an operator needs), count it, and continue. A fenced

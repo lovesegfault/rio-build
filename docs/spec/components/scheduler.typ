@@ -1244,7 +1244,7 @@ truncated edges and carries the breadcrumb with them), and the heal is total
 relative to a reaped-and-reinserted or recovered-as-stub in-memory node whose
 field sits at its `false` default.
 
-#r("sched.evidence.durability")[
+#r("sched.evidence.durability+2")[
   The `topdown_pruned` stamp MUST be written inside the same transaction that
   persists the pruned merge --- the row upsert, the edge and
   `build_derivations` inserts, and the Pending→Active build activation as the
@@ -1252,9 +1252,12 @@ field sits at its `false` default.
   committed merge cannot lose it; the in-memory stamp MUST be applied only
   after that transaction commits. Every other durable evidence write --- the
   Vouched-keyed both-bits clear, the mark-only clear, the closure-hole stamp,
-  and the heal --- is best-effort: a single pool-level statement outside any
-  transaction, issued after the corresponding in-memory mutation, whose
-  failure is logged and MUST NOT fail the surrounding operation. The merge
+  and the heal --- is best-effort: a generation-fenced single-statement
+  transaction (claims-floor read + the write, rolled back having written
+  nothing when the serving generation is below the floor), issued after the
+  corresponding in-memory mutation, whose ERROR failure is logged and MUST
+  NOT fail the surrounding operation --- a Fenced outcome is the fence
+  working on a deposed replica, not an error. The merge
   upsert MUST be monotone for both evidence columns (OR-on-conflict): no
   merge --- pruned or not --- may clear `topdown_pruned` or `closure_hole`
   through the upsert, and the persisted wanted-output union MUST only grow
@@ -1265,6 +1268,25 @@ field sits at its `false` default.
   with the state it describes (the stamp) or be re-derivable at the next
   recovery (the closure-hole stamp, re-derived from the un-produced child's
   persisted row and edges).
+
+  Every durable evidence write --- the merge transaction (stamp, links,
+  edges, activation), the Vouched-keyed both-bits clear, the mark-only
+  clear, the closure-hole stamp, the heal, and every derivation-status /
+  poison persistence (the pool-variant writers and every transaction that
+  carries their `_in_tx` bodies) --- MUST carry the serving generation of
+  the tenure that built the in-memory state issuing the write (claimed by
+  #rref("sched.lease.generation-claim") before that tenure's evidence writes
+  run) and MUST be applied only if that generation is at or above the
+  durable claims floor (`GREATEST` over `assignments.generation` and
+  `leader_generation_claims.generation`), read on the same connection inside
+  the same transaction as the write; a below-floor write MUST roll back
+  having written nothing. For the multi-statement merge transaction the
+  floor is re-read immediately before commit; the residual window for every
+  fenced write is one floor-read-to-commit round trip (a window-narrowing
+  fence, not a serializability proof). The comparison is at-or-above
+  (`>=`): a write carrying a generation equal to the floor is the
+  same-epoch re-acquire keep that #rref("sched.lease.generation-claim")
+  requires, and MUST apply.
 ]
 A lost clear is absorbed by the next recovery's produced-children gate or
 costs at most one bounded resubmit-directing fail-fast after a failover ---
@@ -1276,26 +1298,34 @@ the resubmit-directing error), stale-false evidence would make it permissive
 (dispatch a node whose closure was never merged), so only the former is
 tolerated outside the merge transaction.
 
-Fencing posture for evidence writes, as built: every evidence write above is
-guarded by entry-time leader checks only --- the reap hook's leader-gated
-block, the substitute-complete and Tick handlers' entry gates, recovery
-running only on the just-acquired leader, and the admin paths' gRPC leader
-guard --- and none of it carries a SQL generation fence; the only
-generation-fenced statements in the scheduler are the three attempt-ledger
-transactions (the pull mint, the establishment charge, and the
-synthesized/uncharged close, #rref("sched.lease.generation-fence")). The
-MergeDag handler itself has no leader check at all: leadership is checked
-once at SubmitBuild enqueue time, so a replica deposed after the enqueue (or
-across the merge handler's awaits) still executes its merge transaction ---
-stamp and build activation included --- plus the post-merge heal and clear
-pass, racing the new leader's recovery gate and recovery hole stamp. A
-deposed believer can therefore keep issuing evidence writes for up to the
-lease self-fence interval plus whatever handler work was already in flight
-(#rref("sched.lease.self-fence")). Whether evidence writes should be
-tenure-fenced --- and if so which statements --- is an owner decision
-deliberately deferred until the closure-evidence campaign's stale-tenure
-model evidence is in (`docs/spec/models/closure-evidence-invariant-map.md`);
-this paragraph records the as-built posture and is not a requirement.
+Fencing posture for evidence writes: the uniform claims-floor fence above is
+normative as of Phase 1 of the closure-evidence campaign (the 2026-05-30
+owner decision, "fence everything" / design option D15(b)), replacing the
+original entry-time-leader-checks-only posture. The deciding evidence was
+the campaign's stale-tenure model results (the A17 stale-override and A18
+deposed-writer probes,
+`docs/spec/models/closure-evidence-invariant-map.md`): entry-time gates
+cannot close the deposed-believer window --- a replica deposed after a
+handler's entry check (or after the SubmitBuild enqueue check, for the
+otherwise-ungated MergeDag handler) keeps issuing evidence writes for up to
+the lease self-fence interval plus in-flight handler work
+(#rref("sched.lease.self-fence")), racing the successor's recovery gate and
+recovery hole stamp. What the fence guarantees: a deposed tenure's evidence
+write never lands once a successor's claim is durable (narrowed to the one
+floor-read-to-commit round trip stated in the rule). What it does not
+guarantee: serializability across the residual window, and it does not
+cover work that is not a PG evidence write at all --- same-epoch in-flight
+work (required to survive, per the `>=` comparison), walk-completion
+consumption (in-memory; covered by the model's walk-identity abstraction,
+whose cross-tenure witness stays reachable), and the documented
+Lease-deletion-plus-PG-fault conjunction
+(#rref("sched.lease.generation-claim") residuals). The serving-generation
+capture is tenure-tracking, not per-command: the value is stamped at the
+generation claim that precedes the tenure's recovery writes and is never
+re-read from the lease atomic mid-tenure, so a new leader's own recovery
+writes always pass (the claim made them the floor) while commands queued
+under a deposed tenure keep carrying the deposed generation and are
+refused.
 
 Accepted residuals of the evidence lifecycle, recorded so operators have the
 recovery answer (in every shape it is: resubmit the build --- the

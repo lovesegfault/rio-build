@@ -141,7 +141,7 @@ impl DagActor {
     /// (`sched.evidence.durability`): a deposed replica's transaction
     /// rolls back having written nothing — no attempt row, no poison —
     /// and pushes no in-memory mirror.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn record_attempt_with_poison(
         &mut self,
         drv_hash: &DrvHash,
@@ -298,7 +298,7 @@ impl DagActor {
     /// [`crate::db::FencedWrite::Fenced`] — callers treat it like the
     /// PG-failure arm of their existing contract (nothing was cleared),
     /// minus the error log.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn record_reset_with_clear_poison(
         &mut self,
         drv_hash: &DrvHash,
@@ -335,7 +335,7 @@ impl DagActor {
     /// Claims-floor fenced at the transaction start
     /// (`sched.evidence.durability`): a deposed replica's reset rolls
     /// back having written nothing and pushes no in-memory mirror.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn record_resubmit_resets(
         &mut self,
         reset_on_resubmit: &[DrvHash],
@@ -380,7 +380,7 @@ impl DagActor {
     /// PG is recovery-only). Claims-floor fenced
     /// (`sched.evidence.durability`): a Fenced outcome is the fence
     /// refusing a deposed replica's write — warn + count + continue.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn persist_status(
         &self,
         drv_hash: &DrvHash,
@@ -411,7 +411,7 @@ impl DagActor {
     /// Single SQL UPDATE — no crash window between the two columns.
     /// Logs error!, never returns it (same semantics as `persist_status`).
     /// Claims-floor fenced (`sched.evidence.durability`), same posture.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn persist_poisoned(&self, drv_hash: &DrvHash) {
         match self
             .db
@@ -450,7 +450,7 @@ impl DagActor {
     /// [`persist_status`].
     ///
     /// [`persist_status`]: Self::persist_status
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(super) async fn persist_status_batch(&self, drv_hashes: &[&str], status: DerivationStatus) {
         match self
             .db
@@ -2624,7 +2624,7 @@ impl DagActor {
             .await
         {
             Ok(crate::db::FencedWrite::Applied(_)) => {}
-            // r[impl sched.evidence.durability]
+            // r[impl sched.evidence.durability+2]
             // Fenced: this replica is deposed (a successor's claim is
             // the floor). The PG clear did NOT happen, so the admin
             // contract is the same as the PG-failure arm: report
@@ -2771,7 +2771,7 @@ impl DagActor {
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Claims-floor fence at the appending-transaction start:
                 // a deposed replica records nothing and persists nothing.
                 let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
@@ -3085,7 +3085,7 @@ impl DagActor {
         let (decision, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Claims-floor fence at the appending-transaction start.
                 let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
                 if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
@@ -3283,7 +3283,7 @@ impl DagActor {
             // commit or leave the derivation untouched.
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Claims-floor fence at the appending-transaction start.
                 let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
                 if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
@@ -3447,7 +3447,7 @@ impl DagActor {
         let (verdict, recorded_row) = if let Some(row) = attempt_row {
             let result: Result<Option<crate::retry_policy::Decision>, sqlx::Error> = async {
                 let mut tx = self.db.pool().begin().await?;
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Claims-floor fence at the appending-transaction start.
                 let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
                 if !crate::db::SchedulerDb::at_or_above_floor(floor, self.serving_generation()) {
@@ -3676,7 +3676,7 @@ impl DagActor {
         let batch: Vec<AttemptRow> = rows.iter().map(|(_, r)| r.clone()).collect();
         let result: Result<bool, sqlx::Error> = async {
             let mut tx = self.db.pool().begin().await?;
-            // r[impl sched.evidence.durability]
+            // r[impl sched.evidence.durability+2]
             // Claims-floor fence at the appending-transaction start: a
             // deposed replica's cascade persists nothing (the successor's
             // recovery recomputes the cascade from the poisoned row).

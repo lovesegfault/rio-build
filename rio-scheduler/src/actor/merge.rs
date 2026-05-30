@@ -581,7 +581,7 @@ impl DagActor {
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         // r[impl sched.merge.substitute-topdown+12]
-        // r[impl sched.evidence.durability]
+        // r[impl sched.evidence.durability+2]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
         // The stamp is a cross-build-visible mutation of possibly
@@ -1977,7 +1977,7 @@ impl DagActor {
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
@@ -2063,7 +2063,7 @@ impl DagActor {
         // Transaction: 3 batched roundtrips instead of 2N+E serial.
         let mut tx = self.db.pool().begin().await?;
 
-        // r[impl sched.evidence.durability]
+        // r[impl sched.evidence.durability+2]
         // Claims-floor fence for the whole merge transaction (stamps,
         // links, edges, activation). Checked twice: once here at
         // begin() — a cheap early abort so a large merge from a deposed
@@ -2157,7 +2157,7 @@ impl DagActor {
             }
         }
 
-        // r[impl sched.evidence.durability]
+        // r[impl sched.evidence.durability+2]
         // The AUTHORITATIVE claims-floor re-read, as the last statement
         // before commit. Under READ COMMITTED a successor's claim
         // INSERT can commit while the multi-batch tx body above runs

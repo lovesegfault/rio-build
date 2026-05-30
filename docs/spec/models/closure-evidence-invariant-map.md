@@ -144,7 +144,7 @@ cross-tenure/downgrade reachability probes the regimes need.
 
 | Item | Record | Disposition |
 |---|---|---|
-| Fencing posture for evidence writes (D14/D15) | Entry-time leader gates only; no SQL fence on any evidence write; the only fenced statements are the three attempt-ledger transactions; the MergeDag handler is ungated past the SubmitBuild enqueue guard. Recorded as rationale prose after `sched.evidence.durability`. | Owner decision deferred to Phase 0c evidence (the A17/A18 stale-tenure probes); no fencing requirement is pre-committed. |
+| Fencing posture for evidence writes (D14/D15) | Entry-time leader gates only; no SQL fence on any evidence write; the only fenced statements are the three attempt-ledger transactions; the MergeDag handler is ungated past the SubmitBuild enqueue guard. Recorded as rationale prose after `sched.evidence.durability`. | **RESOLVED — normative fence implemented Phase 1 Wave 3 (owner decision 2026-05-30, FENCE EVERYTHING / D15 option (b))**: every evidence write carries the tenure's serving generation and is applied only at-or-above the durable claims floor; `sched.evidence.durability+2` makes it normative. See the Wave-3 stage record for the statement inventory and residuals. |
 | D16 present-but-tried limbo cell | `sched.evidence.settlement` added (owner adopted the obligation); the as-built dispatch probe violates it, so the rule is intentionally uncovered (`tracey query uncovered`) until the Phase-1 fix lands red-first. | Settling arm chosen by the model (L2); fix in Phase 1. |
 
 ## Verify-marker status (Phase 0a)
@@ -1787,5 +1787,127 @@ witness became unreachable; no calibration stopped falsifying.
    manual target remains the full `asBuiltHoldInvariants`, now also exercised by this
    stage's capped TLC run) and the deferred A17 / L2 / C1-strict probes.
 
-Later phases append here (Wave 3: fencing; Wave 4: model + CI updates; Wave 5 / close-out:
-acceptance table over the full corpus, deployment-checklist deltas and counter-signatures).
+### Phase 1 Wave 3 — uniform claims-floor fencing of every evidence write (this stage)
+
+**Headline: the owner's FENCE EVERYTHING decision (2026-05-30, design §5 D15 option (b)) is
+implemented.** Every evidence write the scheduler issues — the merge transaction, the four
+batched mark/hole helpers, the five status/poison pool-variant writers, and every owning
+transaction that carries their `_in_tx` bodies — now reads the durable claims floor
+(`GREATEST` over `assignments.generation` ∪ `leader_generation_claims.generation`) on its own
+connection inside its own transaction and rolls back having written nothing when the issuing
+tenure's serving generation sits below it. `sched.evidence.durability` is bumped to `+2` with
+the fence as a normative MUST. No migration: the floor reads the two existing tables
+(the pull-mint pattern, `mint_pull_attempt_fenced`).
+
+**1. The six commits (red-first working-tree ritual; transcripts in commit bodies).**
+
+| Commit | Task | Content |
+|---|---|---|
+| `498db7410` | T-3.1 | Tenure-tracking `serving_generation` + the LeaderAcquired claim-before-recovery reorder + the saturated-floor tripwire test |
+| `889a575e6` | T-3.2/T-3.3 | `FencedWrite`/`claims_floor`/`at_or_above_floor` primitives; the four batch.rs evidence helpers fenced; red test `stale_tenure_clear_does_not_erase_newer_evidence` + positive companions |
+| `55a1fa6cb` | T-3.4 | The merge transaction fenced (begin-time + commit-adjacent authoritative re-read); `ActorError::StaleGeneration` → gRPC FAILED_PRECONDITION |
+| `865b85dbe` | T-3.5 | The five status/poison pool writers + eight owning transactions fenced; red test `stale_tenure_status_and_poison_writes_are_fenced` |
+| `26ad50144` | T-3.6 | Actor-level end-to-end deposed-actor test (`fencing.rs`); the ClearPoison/TTL-sweep `Ok(Fenced)` caller-contract fixes it forced |
+| (this commit) | T-3.7 | `sched.evidence.durability+2` normative text; marker re-pointing; this record |
+
+**2. The fenced-statement inventory (final, post-Wave-3 file:line).**
+
+The capture: every statement carries `DagActor::serving_generation` — the tenure-tracking
+field (mod.rs:750 init, recovery.rs:1691 claim stamp; **no per-command read of the lease
+atomic anywhere**) — through `serving_generation()` at the call site.
+
+Statements (the owner's "~10"):
+
+| # | Statement | Where | Fence form |
+|---|---|---|---|
+| 1 | merge tx: `batch_upsert_derivations` + `batch_insert_build_derivations` + `batch_insert_edges` + `activate_build_tx` | actor/merge.rs `persist_merge_to_db` (early check ~:2067, authoritative commit-adjacent re-read ~:2161) | two floor checks; below-floor → `ActorError::StaleGeneration` → gRPC FAILED_PRECONDITION |
+| 2 | W2 `clear_topdown_pruned_by_hashes` | db/batch.rs:355 | tx-wrapped helper, `FencedWrite` return |
+| 3 | W3 `clear_topdown_pruned_by_hash` | db/batch.rs:413 | tx-wrapped helper |
+| 4 | W4 `set_closure_hole_by_hashes` | db/batch.rs:466 | tx-wrapped helper |
+| 5 | W5 `clear_closure_hole_by_hashes` | db/batch.rs:512 | tx-wrapped helper |
+| 6 | `update_derivation_status` | db/derivations.rs:97 | fence inside the existing owned tx |
+| 7 | `update_derivation_status_batch` | db/derivations.rs:180 | same |
+| 8 | `persist_poisoned` | db/derivations.rs:283 | same |
+| 9 | `clear_poison` | db/derivations.rs:365 | same |
+| 10 | `clear_poison_batch` | db/derivations.rs:408 | same |
+
+Owning transactions (one floor check after `begin()`; the `_in_tx` variants themselves stay
+unfenced by design — their fence lives at the owner):
+
+| # | Transaction | Where | Plan status |
+|---|---|---|---|
+| 11 | `record_attempt_with_poison` | actor/completion.rs:145 | enumerated |
+| 12 | `record_reset_with_clear_poison` | actor/completion.rs:302 | enumerated |
+| 13 | `record_resubmit_resets` | actor/completion.rs:339 | enumerated |
+| 14 | `handle_transient_failure` | actor/completion.rs:2735 | **enumeration correction** |
+| 15 | `handle_infrastructure_failure` | actor/completion.rs:2988 | **enumeration correction** |
+| 16 | `handle_permanent_failure` | actor/completion.rs:3247 | **enumeration correction** |
+| 17 | `handle_timeout_failure` | actor/completion.rs:3401 | **enumeration correction** |
+| 18 | `record_cascade_attempts_and_status` | actor/completion.rs:3662 | **enumeration correction** |
+
+**Enumeration correction (the Wave-1 precedent applied).** The plan's table counted "~10
+statements + 4 owning transactions"; rows 14–18 are five additional owning transactions the
+enumeration missed — the Phase-1b failure-classification handlers, which persist status/poison
+evidence through the same `_in_tx` bodies inside their own appending transactions. They
+pre-existed the plan (they are not Wave-1/2b additions); all five take the identical fence
+pattern (floor check after `begin()`, below-floor → rollback + `FailureHandling::Handled`,
+i.e. drop-the-report — re-delivery would re-hit the fence; the successor re-derives the
+failure from the open attempt row via its establishment sweep). Waves 1/2b added new CALL
+SITES of already-enumerated statements (the settlement helper's fail-fast/lazy clears, the
+survivor re-evaluation's status persists), not new statements; those call sites were swept up
+by the parameter threading.
+
+Already fenced before this wave (no change, different rule —
+`sched.lease.generation-fence+3`): the pull-mint transaction (db/open_attempts.rs) and the
+establishment-charge transaction (actor/housekeeping.rs, which also carries a poison persist).
+The establishment charge keeps its per-sweep lease-atomic capture: it implements the
+attempt-ledger fence rule, not the evidence rule; its FC-2-style residual is bounded by the
+Tick handler's `is_leader` gate and by the fence it already carries.
+
+**3. The capture redesign (CF-2/FC-2/OQ7) and its verification.**
+
+`handle_leader_acquired` now runs floor-read → claim → `serving_generation` stamp →
+`recover_from_pg` (the reorder), so a new leader's recovery evidence writes carry the claimed
+generation and pass the fence *because the claim made them the floor*. The lease-atomic seed
+(`seed_generation_from`) stays at the post-TOCTOU-gate tail (moving it would false-positive
+the gate); the fence reads the field, not the atomic.
+
+- **FC-2 verification** — `saturated_floor_recovery_evidence_writes_land`
+  (actor/tests/recovery.rs): a fresh leader (lease generation 1) over a foreign claim row at
+  200 claims 201 and lands BOTH recovery evidence-write classes (the W4 closure-hole stamp and
+  the poisoned-dep DependencyFailed status persist). Green at every Wave-3 commit boundary —
+  the tripwire never fired.
+- **Permissiveness** — `live_leader_evidence_writes_are_never_fenced` (actor/tests/fencing.rs)
+  + `current_tenure_*_apply` db pairs + the full single-tenure batteries: the fence never
+  rejects a live single leader (the `evidence_writes_fenced` test counter stays 0 across the
+  entire suite except the two deposed-actor tests).
+- **Same-epoch keep (OQ4)** — `same_generation_write_at_floor_applies` pins `>=`; the
+  comparison can never be tightened to `>` without a red test.
+- **End-to-end** — `deposed_actor_evidence_writes_are_fenced`: a real actor + a successor
+  claim + admin ClearPoison ⇒ cleared=false, poison survives in PG, fenced-counter increments.
+  This test caught a real wiring gap (callers matching the fenced reset with `if let Err`
+  treated `Ok(Fenced)` as success); the gap is fixed in the same commit.
+
+**4. Residuals (stated normatively in `sched.evidence.durability+2`).**
+
+- The fence is window-narrowing, not serializability: every fenced write retains a residual of
+  one floor-read-to-commit round trip; for the multi-statement merge transaction the
+  commit-adjacent re-read is what brings its window down from the whole tx body (FC-4).
+- Not covered (not PG evidence writes): same-epoch in-flight work (required to survive),
+  walk-completion consumption (model-covered, `canReachCrossTenureWalkConsume` stays
+  reachable), the documented Lease-deletion + PG-fault conjunction.
+- The status/poison fence has NO model coverage (those writes are not modeled as intents —
+  ENC-0b-2): its verification is the T-3.5 db test pairs + the T-3.6 actor-level test (OQ3
+  correction).
+
+**5. Battery status.**
+
+Full rio-scheduler suite green at every commit boundary (1096 → 1104 tests, +8 from this
+wave); the recovery/floor battery (`test(recovery)`, 66 tests) green with **zero assertion
+changes** (the OQ7 acceptance gate); merge battery (97) green; clippy (stable), tracey
+validate, treefmt green at every boundary. Model-side flips (A17/A18 → holds, the fence
+encoding) are Wave 4 (T-4.3); the A17/A18 rows in the per-property table above stay
+"expected-fail probe" until then.
+
+Later phases append here (Wave 4: model + CI updates; Wave 5 / close-out: acceptance table
+over the full corpus, deployment-checklist deltas and counter-signatures).

@@ -492,7 +492,7 @@ impl DagActor {
                 // Best-effort persisted clear so later failovers don't
                 // re-evaluate the same rows; the in-memory clear above
                 // is what this tenure's correctness relies on.
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Ordering tripwire: this recovery evidence write must
                 // run AFTER handle_leader_acquired's generation claim
                 // stamped serving_generation (the claims-floor fence
@@ -569,7 +569,7 @@ impl DagActor {
             // the next failover re-derives the hole from the same
             // persisted children — or misses it if those rows are GC'd
             // first, the already-accepted best-effort window.
-            // r[impl sched.evidence.durability]
+            // r[impl sched.evidence.durability+2]
             // Ordering tripwire: same claim-before-recovery-writes
             // invariant as the mark clear above.
             debug_assert!(
@@ -1672,7 +1672,7 @@ impl DagActor {
         // reads a floor that covers our claim and exceeds it.
         let rounds_at_claim = self.leader.renew_rounds_started();
 
-        // r[impl sched.evidence.durability]
+        // r[impl sched.evidence.durability+2]
         // The claim above is durable (or, on the unclaimed degradation
         // paths, was at least offered to the ledger): every evidence
         // write this tenure issues from here on — starting with

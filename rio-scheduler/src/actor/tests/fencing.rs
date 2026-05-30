@@ -33,7 +33,7 @@ use super::*;
 ///    `grep -rEn "self\.serving_generation = |serving_generation: i64::try_from" rio-scheduler/src/actor/`
 ///    returns exactly DagActor::new's struct-literal init and
 ///    handle_leader_acquired's claim stamp.
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn deposed_actor_evidence_writes_are_fenced() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -125,7 +125,7 @@ async fn deposed_actor_evidence_writes_are_fenced() -> TestResult {
 /// companion to the deposed-actor test above (the same property the
 /// recovery batteries pin at scale — stop-and-report condition 2 if it
 /// ever regresses).
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn live_leader_evidence_writes_are_never_fenced() -> TestResult {
     let (db, handle, _task) = setup().await;

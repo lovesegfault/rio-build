@@ -664,7 +664,7 @@ async fn stage_evidence_at_floor(
 /// Pre-fence this was exactly the A17 stale-override window: the
 /// pool-level clear had no idea it was stale and erased the evidence
 /// (red transcript in the introducing commit).
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn stale_tenure_clear_does_not_erase_newer_evidence() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -714,7 +714,7 @@ async fn stale_tenure_clear_does_not_erase_newer_evidence() -> anyhow::Result<()
 /// The fence is not over-eager: the CURRENT tenure's writes (serving at
 /// the floor — its own claim) apply normally, and a fresh cluster (no
 /// claims, no assignments — empty floor) applies everything.
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn current_tenure_evidence_writes_apply() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
@@ -766,7 +766,7 @@ async fn current_tenure_evidence_writes_apply() -> anyhow::Result<()> {
 /// no newer tenure's evidence exists, so this is the same-epoch
 /// re-acquire keep, not a hazard. The fence comparison is `>=` and must
 /// never be tightened to `>`: this test pins that.
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;

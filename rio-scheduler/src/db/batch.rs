@@ -114,7 +114,7 @@ impl SchedulerDb {
         // effective set (`effective_wanted`, in-memory per-build
         // contributions) and only falls back to this column.
         //
-        // r[impl sched.evidence.durability]
+        // r[impl sched.evidence.durability+2]
         // topdown_pruned is OR-combined on conflict for the same reason:
         // an unrelated, non-pruned merge of the same drv elsewhere must
         // never clear a prior pruned merge's marker through the upsert.
@@ -351,7 +351,7 @@ impl SchedulerDb {
     /// warns and continues — the in-memory clear already happened and
     /// the merge outcome must not depend on this write.
     // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(crate) async fn clear_topdown_pruned_by_hashes(
         &self,
         drv_hashes: &[String],
@@ -409,7 +409,7 @@ impl SchedulerDb {
     /// generation below the claims floor) likewise rolls back having
     /// written nothing (`sched.evidence.durability`).
     // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(crate) async fn clear_topdown_pruned_by_hash(
         &self,
         drv_hash: &str,
@@ -462,7 +462,7 @@ impl SchedulerDb {
     /// breadcrumb across a failover (the already-accepted best-effort
     /// window), never this tenure's correctness.
     // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(crate) async fn set_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],
@@ -508,7 +508,7 @@ impl SchedulerDb {
     /// stale persisted hole errs toward the bounded fail-fast after a
     /// later failover, never the doomed from-source dispatch.
     // r[impl sched.evidence.closure-hole]
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub(crate) async fn clear_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],

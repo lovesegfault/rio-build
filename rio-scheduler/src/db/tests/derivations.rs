@@ -372,7 +372,7 @@ async fn test_sweep_stale_assignments_repairs_torn_terminal() -> anyhow::Result<
 /// Pre-fence these writes applied unconditionally — the A17
 /// stale-override window for status/poison evidence (red transcript in
 /// the introducing commit).
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;
@@ -470,7 +470,7 @@ async fn stale_tenure_status_and_poison_writes_are_fenced() -> anyhow::Result<()
 
 /// The status/poison fence is not over-eager: the current tenure (at
 /// the floor) and a fresh cluster (empty floor) apply normally.
-// r[verify sched.evidence.durability]
+// r[verify sched.evidence.durability+2]
 #[tokio::test]
 async fn current_tenure_status_and_poison_writes_apply() -> anyhow::Result<()> {
     use crate::state::DerivationStatus;

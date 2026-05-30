@@ -93,7 +93,7 @@ impl SchedulerDb {
     /// Owns its transaction; appending sites that already hold one use
     /// `update_derivation_status_in_tx` instead (their fence lives at
     /// the transaction owner).
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub async fn update_derivation_status(
         &self,
         drv_hash: &DrvHash,
@@ -176,7 +176,7 @@ impl SchedulerDb {
     /// lives at the transaction owner).
     ///
     /// [`update_derivation_status`]: Self::update_derivation_status
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub async fn update_derivation_status_batch(
         &self,
         drv_hashes: &[&str],
@@ -279,7 +279,7 @@ impl SchedulerDb {
     /// Owns its transaction; appending sites that already hold one use
     /// `persist_poisoned_in_tx` instead (their fence lives at the
     /// transaction owner).
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub async fn persist_poisoned(
         &self,
         drv_hash: &DrvHash,
@@ -361,7 +361,7 @@ impl SchedulerDb {
     /// Owns its connection; reset sites that already hold a transaction
     /// use `clear_poison_in_tx` instead (their fence lives at the
     /// transaction owner).
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub async fn clear_poison(
         &self,
         drv_hash: &DrvHash,
@@ -404,7 +404,7 @@ impl SchedulerDb {
     ///
     /// [`clear_poison`]: Self::clear_poison
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
-    // r[impl sched.evidence.durability]
+    // r[impl sched.evidence.durability+2]
     pub async fn clear_poison_batch(
         &self,
         drv_hashes: &[DrvHash],

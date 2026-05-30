@@ -363,7 +363,7 @@ impl DagActor {
                 .await
             {
                 Ok(crate::db::FencedWrite::Applied(_)) => {}
-                // r[impl sched.evidence.durability]
+                // r[impl sched.evidence.durability+2]
                 // Fenced: deposed replica. The PG clear did not happen,
                 // so the PG-first contract skips the in-memory removal
                 // exactly like the PG-failure arm — the successor owns
