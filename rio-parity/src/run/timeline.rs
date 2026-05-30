@@ -573,6 +573,13 @@ struct DispatchShared {
     job_of_drv: Arc<BTreeMap<String, String>>,
     timing: SharedTimingLookup,
     deadline_reached: Arc<dyn Fn() -> bool + Send + Sync>,
+    /// Pre-submission supply hook (the campaign's [`LadderTopup`] when the
+    /// supply stage ran under a policy with something to top up): called with
+    /// each request's root drvs after admission, before submission. `None`
+    /// disables the top-up (self-hosted / dependencies-none campaigns,
+    /// resumed campaigns whose supply stage ran in an earlier process).
+    ///
+    /// [`LadderTopup`]: crate::run::supply::exec::LadderTopup
     topup: Option<Arc<dyn PreSubmitSupply>>,
     semaphore: Arc<Semaphore>,
     store_url: String,
@@ -616,6 +623,13 @@ fn engine_side_submission_failure(record: &BatchRecord) -> bool {
 /// time under FIFO admission, replay recorded interruptions via the
 /// disconnect deadline, re-confirm unexpected failures, and append one
 /// [`DispatchEntry`] per request.
+///
+/// When `topup` is present (production passes the supply stage's
+/// [`LadderTopup`](crate::run::supply::exec::LadderTopup) on prewarm-policy
+/// leaf campaigns), each admitted request gets a pre-submission supply
+/// top-up for its root drvs — the inline fallback for paths the prewarm pass
+/// missed. Top-up failures degrade to a warning; the request is submitted
+/// regardless.
 ///
 /// Resume semantics: requests whose every target is already terminal (per
 /// `terminal_jobs`, keyed by job) are skipped — counted into `resume_count`
@@ -1720,6 +1734,82 @@ mod tests {
         );
         assert_eq!(stats.resume_count, 0);
         assert!(!stats.timing_degraded);
+    }
+
+    /// Scripted pre-submission supply hook: records the roots of every call
+    /// together with how many submissions the instrumented submitter had
+    /// already made at that moment, then fails — proving both the
+    /// before-submission ordering and that a top-up failure never blocks the
+    /// dispatch.
+    struct RecordingTopup {
+        submitter: Arc<InstrumentedSubmitter>,
+        /// `(roots, submissions already made)` per call, in call order.
+        calls: std::sync::Mutex<Vec<(Vec<String>, usize)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl PreSubmitSupply for RecordingTopup {
+        async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+            let submitted = self.submitter.calls.lock().unwrap().len();
+            self.calls.lock().unwrap().push((roots.to_vec(), submitted));
+            anyhow::bail!("scripted top-up failure")
+        }
+    }
+
+    /// The pre-submission top-up runs once per request with that request's
+    /// root drvs, before the request's own submission; a failing top-up
+    /// degrades to a warning and the request is submitted anyway.
+    #[tokio::test(start_paused = true)]
+    async fn topup_runs_before_each_submission_and_failures_never_block_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = Arc::new(StateDir::new(dir.path()).unwrap());
+        let requests = vec![request(1, 0.0, DRV_A), request(2, 5.0, DRV_B)];
+        let schedule = build_schedule(&requests, &no_timing, 1.0, None, true);
+        let fake = FakeSubmitter::default();
+        for _ in 0..2 {
+            fake.outcomes
+                .lock()
+                .unwrap()
+                .push(Ok(BatchOutcome::default()));
+        }
+        let submitter = Arc::new(InstrumentedSubmitter::new(fake, Duration::ZERO));
+        let topup = Arc::new(RecordingTopup {
+            submitter: submitter.clone(),
+            calls: std::sync::Mutex::new(Vec::new()),
+        });
+
+        let stats = run_timed_dispatch(
+            state.clone(),
+            submitter.clone(),
+            Arc::new(SubmitTracker::default()),
+            schedule,
+            Arc::new(BTreeMap::from([
+                (DRV_A.to_string(), "a".to_string()),
+                (DRV_B.to_string(), "b".to_string()),
+            ])),
+            timing_arc(HashMap::new()),
+            "ssh-ng://test".into(),
+            TimelineConfig::from_knobs(&Knobs::default()),
+            Knobs::default(),
+            Arc::new(AtomicU64::new(1)),
+            || false,
+            Some(topup.clone() as Arc<dyn PreSubmitSupply>),
+            Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+        )
+        .await
+        .unwrap();
+
+        // One top-up call per request, carrying that request's roots, and
+        // each happened before the request's own submission: the first saw
+        // zero prior submissions, the second exactly one.
+        let calls = topup.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls,
+            vec![(vec![DRV_A.to_string()], 0), (vec![DRV_B.to_string()], 1),]
+        );
+        // Both requests were submitted despite the scripted top-up failures.
+        assert_eq!(submitter.calls.lock().unwrap().len(), 2);
+        assert_eq!(stats.dispatched, 2);
     }
 
     /// A timed submission that fails engine-side (no in-band results, no

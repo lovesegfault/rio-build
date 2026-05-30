@@ -66,14 +66,14 @@ use self::model::{
 };
 use self::spec::{
     CampaignRecord, CampaignSpec, Knobs, Mode, PLAN_COUNT_RSS_BEFORE, PLAN_COUNT_RSS_PEAK,
-    PlanOutput, ScheduleMode, SupplyDependencies, generate_campaign_id,
+    PlanOutput, ScheduleMode, SupplyDelivery, SupplyDependencies, generate_campaign_id,
 };
 use self::state::{StateDir, StateFile, latest_per_job};
 use self::submit::{SubmitTracker, run_submit_loop};
 use self::submitter::{ClientOpsSubmitter, Submitter};
 use self::supply::exec::{
-    PoolSupplyTransport, SupplyInputs, SupplyStageReport, SupplyTransport, refresh_outcome_counts,
-    run_supply_stage,
+    LadderTopup, PoolSupplyTransport, PreSubmitSupply, SupplyInputs, SupplyStageReport,
+    SupplyTransport, refresh_outcome_counts, run_supply_stage,
 };
 use self::timeline::{
     RecordedRequest, RecordedTarget, RecordedTiming, ScheduledRequest, SharedTimingLookup,
@@ -158,7 +158,9 @@ pub struct Backends {
     /// Supply-stage transport (validity probes, client uploads, prefetch
     /// builds). `None` = construct the production [`PoolSupplyTransport`]
     /// from the campaign spec when the supply stage runs; tests inject a
-    /// scripted fake instead.
+    /// scripted fake instead. On timed prewarm campaigns the same transport
+    /// is kept alive past the supply stage for the dispatcher's
+    /// pre-submission top-up ([`LadderTopup`]).
     pub supply_transport: Option<Arc<dyn SupplyTransport>>,
     pub narinfo: Arc<dyn NarinfoSource>,
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
@@ -1140,6 +1142,10 @@ pub async fn run_with_backends(
             .max()
             .unwrap_or(1),
     ));
+    // Pre-submission supply hook for the timed dispatcher: built below only
+    // when the supply stage runs in this process under a policy that has
+    // something to top up; `None` keeps the dispatcher running without one.
+    let mut supply_topup: Option<Arc<dyn PreSubmitSupply>> = None;
     if !state.marker_done("supply") {
         let effective_dependencies = spec.supply.effective_dependencies(spec.mode);
         // Outputs (and drvs) of the units that remain attemptable: those
@@ -1200,17 +1206,40 @@ pub async fn run_with_backends(
         // Production blocks on the prefetch-shortfall pause (the operator
         // resumes by removing the PAUSE file); the report is persisted so
         // the final report and resumed runs can re-read it.
-        let supply_report = run_supply_stage(
+        let supply_output = run_supply_stage(
             state.clone(),
-            transport,
+            transport.clone(),
             inputs,
             &spec.knobs,
             batch_seq.clone(),
             true,
         )
         .await?;
-        state.write_json_atomic("supply-report.json", &supply_report)?;
+        state.write_json_atomic("supply-report.json", &supply_output.report)?;
         state.set_marker("supply")?;
+        // Timed campaigns keep the stage's transport and ladder context alive
+        // past the supply stage: the dispatcher calls the inline top-up for
+        // each request's roots right before submission, so a path the prewarm
+        // pass missed (refused, failed, or skipped) gets one more delivery
+        // attempt without re-admitting substituters or re-probing what is
+        // already known valid. Self-hosted / dependencies-none campaigns have
+        // nothing to top up, and a resumed campaign whose supply marker is
+        // already set ran the stage in an earlier process — no context exists,
+        // so the dispatcher runs without the hook exactly as before.
+        if spec.scheduling.mode == ScheduleMode::Timed
+            && spec.supply.delivery == SupplyDelivery::Prewarm
+            && effective_dependencies != SupplyDependencies::None
+            && let Some(ladder) = supply_output.ladder
+        {
+            let topup: Arc<dyn PreSubmitSupply> = Arc::new(LadderTopup::new(
+                transport,
+                archive.clone(),
+                ladder,
+                spec.knobs.clone(),
+                state.clone(),
+            ));
+            supply_topup = Some(topup);
+        }
     }
     // Supply summary for progress.json while the campaign executes (the
     // final report re-reads it after the journal stops growing). On resume
@@ -1695,7 +1724,10 @@ pub async fn run_with_backends(
                 Some(inputs) => {
                     // Requests whose every target is already terminal (a
                     // resumed run) are skipped from this snapshot; the
-                    // dispatcher never consults the pause state.
+                    // dispatcher never consults the pause state. The supply
+                    // stage's top-up hook (when one was built above) gives
+                    // every request a pre-submission gap top-up — the inline
+                    // fallback for prewarm misses.
                     let terminal = terminal_set(&*results.lock().await);
                     let mut stats = run_timed_dispatch(
                         state.clone(),
@@ -1709,7 +1741,7 @@ pub async fn run_with_backends(
                         spec.knobs.clone(),
                         batch_seq.clone(),
                         deadline_reached,
-                        None,
+                        supply_topup.clone(),
                         Arc::new(tokio::sync::Mutex::new(terminal)),
                     )
                     .await?;
@@ -2001,7 +2033,8 @@ mod tests {
     use crate::run::grpc::{ClusterCounts, GraphSnapshot, IceSnapshot, PoisonedView};
     use crate::run::model::{
         DispatchEntry, HydraOutcome, PathOutcome, SUPPLY_OUTCOME_DELEGATED,
-        SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry, build_status_name,
+        SUPPLY_OUTCOME_DELIVERED, SUPPLY_OUTCOME_REFUSED, SUPPLY_OUTCOME_UNAVAILABLE, SupplyEntry,
+        build_status_name,
     };
     use crate::run::submitter::BatchOutcome;
     use crate::run::submitter::test_support::FakeSubmitter;
@@ -2811,6 +2844,18 @@ mod tests {
             },
         );
 
+        // The supply transport is shared between the supply stage and the
+        // dispatcher's pre-submission top-up. Two scripted refusals make the
+        // prewarm pass miss appA's derivation text (refusal + retry both
+        // refused), so the top-up has a genuine prewarm miss to deliver at
+        // dispatch time.
+        let supply_transport = Arc::new(FakeSupplyTransport::default());
+        supply_transport
+            .refusals
+            .lock()
+            .unwrap()
+            .insert(app_a.drv_path.clone(), 2);
+
         let state_dir = tempfile::tempdir().unwrap();
         let mut spec = leaf_spec(&built.archive_id);
         spec.scheduling.mode = ScheduleMode::Timed;
@@ -2820,7 +2865,7 @@ mod tests {
             admin: Arc::new(NoLogsAdmin),
             cluster: Arc::new(HealthyCluster),
             submitter: submitter.clone(),
-            supply_transport: Some(Arc::new(FakeSupplyTransport::default())),
+            supply_transport: Some(supply_transport.clone()),
             narinfo: Arc::new(MapNarinfo(narinfos)),
             artifacts: None,
         };
@@ -2836,6 +2881,35 @@ mod tests {
 
         let state = StateDir::new(state_dir.path()).unwrap();
         assert!(state.marker_done("supply"), "supply stage marker set");
+        // The prewarm pass missed appA's derivation text (scripted refusal),
+        // and the dispatcher's pre-submission top-up delivered it before the
+        // request was submitted: the supply journal carries both settlements
+        // and the target ended up with every workload derivation text.
+        let supply_entries: Vec<SupplyEntry> = state.load_jsonl(StateFile::Supply).unwrap();
+        let outcomes_for = |path: &str| -> Vec<&str> {
+            supply_entries
+                .iter()
+                .filter(|entry| entry.path == path)
+                .map(|entry| entry.outcome.as_str())
+                .collect()
+        };
+        assert!(
+            outcomes_for(&app_a.drv_path).contains(&SUPPLY_OUTCOME_REFUSED),
+            "{supply_entries:?}"
+        );
+        assert!(
+            outcomes_for(&app_a.drv_path).contains(&SUPPLY_OUTCOME_DELIVERED),
+            "{supply_entries:?}"
+        );
+        {
+            let valid = supply_transport.valid.lock().unwrap();
+            for drv in [&app_a.drv_path, &app_b.drv_path] {
+                assert!(
+                    valid.contains(drv.as_str()),
+                    "the top-up delivered {drv} after the prewarm miss"
+                );
+            }
+        }
         // One dispatch entry per recorded request; the appB request carries
         // the armed-and-fired interruption.
         let dispatch: Vec<DispatchEntry> = state.load_jsonl(StateFile::Dispatch).unwrap();

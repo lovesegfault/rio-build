@@ -24,7 +24,9 @@
 //!   target cluster itself via prefetch builds over the prefetch tenant.
 //! - [`topup_for_roots`] is the per-submission gap top-up (the prewarm-miss
 //!   fallback and the inline-delivery path): probe, plan, and upload only
-//!   what the given roots' closure still misses.
+//!   what the given roots' closure still misses. [`LadderTopup`] packages it
+//!   with the stage's ladder context as the [`PreSubmitSupply`] hook the
+//!   timed dispatcher calls before each request's submission.
 //!
 //! Every per-path outcome is appended to `supply.jsonl` as a
 //! [`SupplyEntry`] using the shared vocabulary constants. Per-path and
@@ -127,12 +129,80 @@ pub trait SupplyTransport: Send + Sync {
 
 /// Pre-submission supply hook: deliver whatever the given roots' closures
 /// still miss before the request is submitted (the prewarm-miss fallback and
-/// the inline-delivery path). The production implementation wraps
-/// [`topup_for_roots`] over the campaign's supply context.
+/// the inline-delivery path). The production implementation is
+/// [`LadderTopup`], which wraps [`topup_for_roots`] over the supply stage's
+/// ladder context.
 #[async_trait]
 pub trait PreSubmitSupply: Send + Sync {
     /// Top up the target store for the given root derivations.
     async fn topup(&self, roots: &[String]) -> anyhow::Result<()>;
+}
+
+/// Production [`PreSubmitSupply`]: the supply stage's ladder context and
+/// transport packaged for the timed dispatcher, so every request gets a
+/// [`topup_for_roots`] pass over its root derivations immediately before
+/// submission — the inline top-up that backstops a prewarm miss (a path the
+/// prewarm pass refused, failed, or never planned).
+///
+/// Cheap when there is nothing to do: the held [`SupplyContext`] is the one
+/// the supply stage probed and uploaded with, so paths already delivered (by
+/// the prewarm pass or an earlier top-up) or already probed valid are never
+/// re-sent — a fully supplied request costs one validity probe of its
+/// closure remainder and uploads nothing. Concurrent requests needing the
+/// same path coordinate through the held [`UploadClaims`]. Reusing the
+/// stage's context also means the substituter guard is never re-run here:
+/// only URLs the stage already admitted can be fetched from.
+pub struct LadderTopup {
+    /// The supply stage's transport (build-tenant probes and uploads).
+    transport: Arc<dyn SupplyTransport>,
+    /// The open replay archive (payload source for embedded paths).
+    archive: Arc<ReplayArchive>,
+    /// The supply stage's ladder context: admitted relay substituters,
+    /// probed coverage, and the evolving target-validity set.
+    ctx: SupplyContext,
+    /// Campaign knobs (batch caps, timeouts, claim wait).
+    knobs: Knobs,
+    /// Campaign state dir for supply.jsonl appends.
+    state: Arc<StateDir>,
+    /// Cross-request upload claims shared by every top-up call.
+    claims: UploadClaims,
+}
+
+impl LadderTopup {
+    /// Package the supply stage's transport and ladder context for
+    /// per-request top-up calls.
+    pub fn new(
+        transport: Arc<dyn SupplyTransport>,
+        archive: Arc<ReplayArchive>,
+        ctx: SupplyContext,
+        knobs: Knobs,
+        state: Arc<StateDir>,
+    ) -> Self {
+        Self {
+            transport,
+            archive,
+            ctx,
+            knobs,
+            state,
+            claims: UploadClaims::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl PreSubmitSupply for LadderTopup {
+    async fn topup(&self, roots: &[String]) -> anyhow::Result<()> {
+        topup_for_roots(
+            self.transport.as_ref(),
+            &self.archive,
+            &self.ctx,
+            roots,
+            &self.knobs,
+            &self.state,
+            &self.claims,
+        )
+        .await
+    }
 }
 
 /// What the supply stage did, for progress.json and the final report.
@@ -1696,7 +1766,10 @@ async fn probe_substituter_narinfos(
 /// closure, extend target coverage with live substituter probes, resolve
 /// every needed path through the source ladder, and deliver the resulting
 /// upload plan (prewarm uploads, or an explicit deferral record under
-/// inline delivery). Folds its outcomes into `report`.
+/// inline delivery). Folds its outcomes into `report` and returns the ladder
+/// context it built (admitted relay substituters, probed coverage, the
+/// validity set as of the last delivery) so the caller can keep it for
+/// per-request top-ups; `None` when the workload has no drvs to plan over.
 async fn run_upload_ladder(
     state: &StateDir,
     transport: &dyn SupplyTransport,
@@ -1704,10 +1777,10 @@ async fn run_upload_ladder(
     inputs: &SupplyInputs,
     knobs: &Knobs,
     report: &mut SupplyStageReport,
-) -> Result<()> {
+) -> Result<Option<SupplyContext>> {
     let roots: Vec<String> = inputs.workload_drvs.iter().cloned().collect();
     if roots.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
     // The closure walk reads and parses derivation texts (or adjacency
     // records) — keep the synchronous work off the async runtime.
@@ -1919,7 +1992,20 @@ async fn run_upload_ladder(
             }
         }
     }
-    Ok(())
+    Ok(Some(ctx))
+}
+
+/// What [`run_supply_stage`] hands back to the campaign orchestrator: the
+/// stage report plus the ladder context the upload ladder built, kept alive
+/// so the timed dispatcher's pre-submission top-up ([`LadderTopup`]) can
+/// reuse the already-admitted substituters and probe results instead of
+/// re-admitting or re-probing them.
+pub struct SupplyStageOutput {
+    /// Aggregated stage accounting (persisted as `supply-report.json`).
+    pub report: SupplyStageReport,
+    /// The upload ladder's context; `None` when the stage ran without an
+    /// archive or the workload had no drvs to plan over.
+    pub ladder: Option<SupplyContext>,
 }
 
 /// Run the whole supply stage: classify the prefetch set, delegate covered
@@ -1944,7 +2030,7 @@ pub async fn run_supply_stage(
     knobs: &Knobs,
     batch_seq: Arc<AtomicU64>,
     wait_for_resume: bool,
-) -> Result<SupplyStageReport> {
+) -> Result<SupplyStageOutput> {
     let mut report = SupplyStageReport::default();
 
     // ── Prefetch classification ─────────────────────────────────────────
@@ -2032,8 +2118,9 @@ pub async fn run_supply_stage(
     report.failed += stats.failed;
 
     // ── Upload ladder over the workload union closure ───────────────────
+    let mut ladder = None;
     if let Some(archive) = inputs.archive.clone() {
-        run_upload_ladder(
+        ladder = run_upload_ladder(
             &state,
             transport.as_ref(),
             &archive,
@@ -2070,7 +2157,7 @@ pub async fn run_supply_stage(
         }
     }
 
-    Ok(report)
+    Ok(SupplyStageOutput { report, ladder })
 }
 
 /// Re-derive the per-path outcome counts of a [`SupplyStageReport`] from the
@@ -2716,7 +2803,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
 
         assert_eq!(report.planned_prefetch, 10);
         assert_eq!(report.prefetch_missing, 2);
@@ -2751,7 +2839,8 @@ mod tests {
             false,
         )
         .await
-        .unwrap();
+        .unwrap()
+        .report;
         assert_eq!(report.prefetch_missing, 0);
         assert_eq!(report.shortfall_pct, Some(0.0));
         assert!(
@@ -2797,7 +2886,7 @@ mod tests {
             delivery: crate::run::spec::SupplyDelivery::Prewarm,
         };
 
-        let report = run_supply_stage(
+        let output = run_supply_stage(
             state.clone(),
             fake.clone(),
             inputs,
@@ -2807,6 +2896,11 @@ mod tests {
         )
         .await
         .unwrap();
+        let report = output.report;
+        assert!(
+            output.ladder.is_some(),
+            "the upload ladder ran, so its context is handed back for top-ups"
+        );
 
         // The closure's three derivation texts (appB → libA → stdenv) were
         // uploaded; appB's own outputs are never supplied and never recorded.
@@ -2847,5 +2941,114 @@ mod tests {
         assert_eq!(report.planned_prefetch, 0);
         assert_eq!(report.shortfall_pct, None);
         assert!(!state.path("PAUSE").exists());
+    }
+
+    /// Open the mini archive and return it together with the appB workload
+    /// unit (the unit whose closure carries the libA and stdenv derivations).
+    fn mini_archive_app_b() -> (
+        tempfile::TempDir,
+        Arc<crate::archive::reader::ReplayArchive>,
+        crate::run::archive_input::ManifestEntry,
+    ) {
+        let archive_dir = tempfile::tempdir().unwrap();
+        crate::run::archive_input::write_mini_archive(archive_dir.path());
+        let archive =
+            Arc::new(crate::archive::reader::ReplayArchive::open(archive_dir.path()).unwrap());
+        let app_b = crate::run::archive_input::load_units(&archive)
+            .unwrap()
+            .into_iter()
+            .find(|unit| unit.job == "appB.x86_64-linux")
+            .unwrap();
+        (archive_dir, archive, app_b)
+    }
+
+    /// The production pre-submission hook delivers what the prewarm pass
+    /// missed, records it, and never re-uploads what an earlier call already
+    /// delivered.
+    #[tokio::test]
+    async fn ladder_topup_delivers_prewarm_missed_paths_only_once() {
+        let (_archive_dir, archive, app_b) = mini_archive_app_b();
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        let mut ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        ctx.workload_outputs = app_b.outputs.values().cloned().collect();
+        let topup = LadderTopup::new(
+            fake.clone(),
+            archive.clone(),
+            ctx,
+            Knobs::default(),
+            state.clone(),
+        );
+        let roots = vec![app_b.drv_path.clone()];
+
+        // Nothing is valid on the target (the prewarm pass missed the whole
+        // closure): the top-up delivers the three derivation texts
+        // (appB → libA → stdenv) and records each as a supply entry.
+        topup.topup(&roots).await.unwrap();
+        let uploaded: BTreeSet<String> = fake
+            .uploaded_batches
+            .lock()
+            .unwrap()
+            .iter()
+            .flatten()
+            .cloned()
+            .collect();
+        assert_eq!(uploaded.len(), 3, "{uploaded:?}");
+        assert!(uploaded.contains(&app_b.drv_path));
+        let journal = entries(&state);
+        for path in &uploaded {
+            assert_eq!(
+                entry_for(&journal, path).outcome,
+                SUPPLY_OUTCOME_DELIVERED,
+                "{journal:?}"
+            );
+        }
+        let upload_calls = fake.upload_calls.load(Ordering::SeqCst);
+        assert!(upload_calls > 0);
+
+        // Everything the first call delivered is remembered by the shared
+        // ladder context, so a second top-up for the same roots makes no
+        // further upload calls and appends nothing.
+        topup.topup(&roots).await.unwrap();
+        assert_eq!(fake.upload_calls.load(Ordering::SeqCst), upload_calls);
+        assert_eq!(entries(&state).len(), journal.len());
+    }
+
+    /// A top-up over a target that already has the whole closure makes no
+    /// upload calls at all (the validity probe is the only traffic).
+    #[tokio::test]
+    async fn ladder_topup_makes_no_upload_calls_when_nothing_is_missing() {
+        let (_archive_dir, archive, app_b) = mini_archive_app_b();
+        let (_dir, state) = state();
+        let state = Arc::new(state);
+        let fake = Arc::new(FakeSupplyTransport::default());
+        // The target already holds every closure member (delivered by the
+        // prewarm pass, or valid all along).
+        let closure = walk_closure(&archive, std::slice::from_ref(&app_b.drv_path)).unwrap();
+        fake.valid
+            .lock()
+            .unwrap()
+            .extend(closure.all_paths.iter().cloned());
+        let mut ctx = SupplyContext::new(SupplyDependencies::Substituters);
+        ctx.workload_outputs = app_b.outputs.values().cloned().collect();
+        let topup = LadderTopup::new(
+            fake.clone(),
+            archive.clone(),
+            ctx,
+            Knobs::default(),
+            state.clone(),
+        );
+
+        topup
+            .topup(std::slice::from_ref(&app_b.drv_path))
+            .await
+            .unwrap();
+
+        assert_eq!(fake.upload_calls.load(Ordering::SeqCst), 0);
+        assert!(
+            entries(&state).is_empty(),
+            "nothing was missing, so nothing is recorded"
+        );
     }
 }
