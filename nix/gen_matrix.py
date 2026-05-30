@@ -35,10 +35,18 @@
 #   checks-nowait   Same shape; clusters with NO overlap with the
 #                   warm set. They start as soon as gen-matrix
 #                   finishes (treefmt feedback does not wait for the
-#                   rust trunk). Only `checks` gets this split: every
-#                   fuzz/vm/coverage entry always needs its kind's
-#                   trunk, so a nowait partition there would always
-#                   be empty.
+#                   rust trunk). Only `checks` and `formal` get this
+#                   split: every fuzz/vm/coverage entry always needs
+#                   its kind's trunk, so a nowait partition there
+#                   would always be empty.
+#   formal          Formal-verification checks (quint/TLC model
+#                   checks, MBT conformance, kani proofs): kani-*
+#                   singletons plus round-robin shards of the rest,
+#                   gated on the warm matrix. Same object shape.
+#   formal-nowait   The non-gated formal clusters (in practice the
+#                   quint shards -- their only inputs are the .qnt
+#                   models and the quint toolchain from the public
+#                   cache, so they never wait for the rust trunk).
 #   fuzz            singleton clusters, same object shape
 #   vm-test         singleton clusters, same object shape
 #   coverage        one "unit" cluster + vm-* singletons
@@ -97,7 +105,20 @@ DEFAULT_WORKERS = 8
 CHECK_KIND_RE = re.compile(r"^(clippy-test|clippy|doc|nextest)-(.+)$")
 
 # All matrix kinds, in stable emission order.
-MATRIX_KINDS = ("checks", "fuzz", "vm-test", "coverage")
+MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "coverage")
+
+# Kinds whose clusters are partitioned into a warm-gated matrix and a
+# nowait matrix (`<kind>` / `<kind>-nowait`) by trunk overlap. fuzz /
+# vm-test / coverage entries always need their kind's trunk, so a
+# nowait partition there would always be empty.
+SPLIT_KINDS = ("checks", "formal")
+
+# Target shard width for the `formal` kind (see cluster_formal).
+# Override with FORMAL_SHARD_SIZE. Sized so a shard stays well inside
+# its job timeout even when round-robin deals it two or three of the
+# minutes-class exhaustive regime checks, while keeping the worst-case
+# matrix (every formal check uncached) under ~20 jobs.
+DEFAULT_FORMAL_SHARD_SIZE = 12
 
 # Upper bound on warm matrix width. The trunk usually decomposes into
 # 2-4 independent components (the normal tree + images, the
@@ -369,6 +390,46 @@ def cluster_coverage(names):
     return clusters
 
 
+def cluster_formal(names, shard_size=None):
+    """Shard the formal-verification checks (quint-*/mbt-*/kani-*).
+
+    These derivations' build IS the verification run -- a TLC or CBMC
+    process per check, JVM heaps in the gigabytes -- and the full set
+    is ~160 entries growing by tens per campaign. One runner cannot
+    absorb them: when they shared the catch-all `misc` cluster, that
+    job starved its runner of memory long before the timeout.
+
+    kani-* entries stay singletons: each drags a per-member
+    kani-compiler closure whose build cost has nothing to do with the
+    quint shards, the job name gives exact attribution, and the warm
+    stage already dedups the closure they share. Everything else is
+    dealt round-robin into shards of at most shard_size entries over
+    the sorted name list -- round-robin because the expensive
+    exhaustive regime checks sort adjacently (quint-<model>-base /
+    -contend / -corrupt / ...), and contiguous chunking would stack
+    several of them into one shard while its siblings get only cheap
+    witness checks.
+    """
+    if shard_size is None:
+        shard_size = int(
+            os.environ.get("FORMAL_SHARD_SIZE", DEFAULT_FORMAL_SHARD_SIZE)
+        )
+    kani = sorted(n for n in names if n.startswith("kani-"))
+    rest = sorted(n for n in names if not n.startswith("kani-"))
+    clusters = [{"name": n, "targets": n} for n in kani]
+    if rest:
+        count = -(-len(rest) // shard_size)  # ceil division
+        width = len(str(count))
+        clusters.extend(
+            {
+                "name": f"quint-{i + 1:0{width}d}of{count}",
+                "targets": " ".join(rest[i::count]),
+            }
+            for i in range(count)
+        )
+    return clusters
+
+
 def singletons(names):
     """One cluster per name. Used for fuzz and vm-test, where the
     leaf work (a fixed-wall-time fuzz run, a VM boot) dominates the
@@ -396,12 +457,13 @@ def build_outputs(results):
 
     Per kind: cluster the uncached entry names, attach drv paths,
     compute the cross-cluster shared set (the warm job's work list),
-    and -- for checks only -- split the clusters into gated/nowait by
-    whether they overlap the warm set.
+    and -- for checks and formal -- split the clusters into
+    gated/nowait by whether they overlap the warm set.
     """
     pend = pending(results)
     clusterers = {
         "checks": cluster_checks,
+        "formal": cluster_formal,
         "fuzz": singletons,
         "vm-test": singletons,
         "coverage": cluster_coverage,
@@ -421,10 +483,10 @@ def build_outputs(results):
     for kind in MATRIX_KINDS:
         meta = pend.get(kind, {})
         clusters = kind_clusters[kind]
-        if kind == "checks":
+        if kind in SPLIT_KINDS:
             gated, nowait = partition_gated(clusters, meta, trunk)
-            matrices["checks"] = attach_drvs(gated, meta)
-            matrices["checks-nowait"] = attach_drvs(nowait, meta)
+            matrices[kind] = attach_drvs(gated, meta)
+            matrices[f"{kind}-nowait"] = attach_drvs(nowait, meta)
         else:
             matrices[kind] = attach_drvs(clusters, meta)
     outputs = {}
@@ -601,7 +663,15 @@ def main():
     for shard in json.loads(outputs["warm"]):
         n = len(shard["drvs"].split())
         print(f"::notice::warm {shard['name']}: {n} shared drvs")
-    for key in ("checks", "checks-nowait", "fuzz", "vm-test", "coverage"):
+    for key in (
+        "checks",
+        "checks-nowait",
+        "formal",
+        "formal-nowait",
+        "fuzz",
+        "vm-test",
+        "coverage",
+    ):
         print(f"::notice::{key}: {outputs[key]}")
 
     with open(output_path, "a") as fh:
@@ -988,6 +1058,112 @@ class ClusterTests(unittest.TestCase):
             [
                 {"name": "fuzz-nar_parsing", "targets": "fuzz-nar_parsing"},
                 {"name": "fuzz-refscan", "targets": "fuzz-refscan"},
+            ],
+        )
+
+
+class FormalClusterTests(unittest.TestCase):
+    def test_kani_singletons_rest_sharded(self):
+        names = [f"quint-w{i}" for i in range(5)] + [
+            "kani-rio-lease",
+            "mbt-rio-lease",
+        ]
+        got = cluster_formal(names, shard_size=3)
+        self.assertEqual(
+            got[0], {"name": "kani-rio-lease", "targets": "kani-rio-lease"}
+        )
+        shards = got[1:]
+        self.assertEqual([s["name"] for s in shards], ["quint-1of2", "quint-2of2"])
+        # Every non-kani name lands in exactly one shard, none lost.
+        members = " ".join(s["targets"] for s in shards).split()
+        self.assertEqual(
+            sorted(members),
+            sorted(["mbt-rio-lease"] + [f"quint-w{i}" for i in range(5)]),
+        )
+        # Balanced within one entry of each other.
+        sizes = [len(s["targets"].split()) for s in shards]
+        self.assertLessEqual(max(sizes) - min(sizes), 1)
+
+    def test_round_robin_spreads_adjacent_heavy_names(self):
+        # Exhaustive regime checks sort adjacently (-base, -contend,
+        # -corrupt, -crash). Round-robin must deal them to different
+        # shards instead of stacking them into the first one.
+        names = [
+            "quint-m-base",
+            "quint-m-contend",
+            "quint-m-corrupt",
+            "quint-m-crash",
+            "quint-m-witness-a",
+            "quint-m-witness-b",
+        ]
+        got = cluster_formal(names, shard_size=3)
+        self.assertEqual(len(got), 2)
+        first = got[0]["targets"].split()
+        second = got[1]["targets"].split()
+        self.assertIn("quint-m-base", first)
+        self.assertIn("quint-m-contend", second)
+
+    def test_shard_cap_and_count(self):
+        names = [f"quint-{i:03d}" for i in range(25)]
+        got = cluster_formal(names, shard_size=12)
+        self.assertEqual(len(got), 3)
+        self.assertTrue(
+            all(len(c["targets"].split()) <= 12 for c in got)
+        )
+
+    def test_zero_padding_keeps_ui_sort_order(self):
+        names = [f"quint-{i:03d}" for i in range(60)]
+        got = cluster_formal(names, shard_size=6)
+        self.assertEqual(got[0]["name"], "quint-01of10")
+        self.assertEqual(got[-1]["name"], "quint-10of10")
+
+    def test_empty_input_empty_output(self):
+        self.assertEqual(cluster_formal([]), [])
+
+    def test_formal_partition_quint_nowait_kani_gated(self):
+        # Two kani singletons share the kani-compiler member closure
+        # -> it is in the trunk -> they gate on warm. The quint shard
+        # needs nothing beyond its own drv -> it starts immediately.
+        kani_dep = "/d/kani-member.drv"
+        results = [
+            _entry(
+                "formal.kani-rio-lease",
+                "notBuilt",
+                drv="/d/kani-rio-lease.drv",
+                needed=[kani_dep, "/d/kani-rio-lease.drv"],
+            ),
+            _entry(
+                "formal.kani-rio-store",
+                "notBuilt",
+                drv="/d/kani-rio-store.drv",
+                needed=[kani_dep, "/d/kani-rio-store.drv"],
+            ),
+            _entry(
+                "formal.quint-leader-election",
+                "notBuilt",
+                drv="/d/quint-le.drv",
+                needed=["/d/quint-le.drv"],
+            ),
+        ]
+        out = build_outputs(results)
+        self.assertEqual(
+            json.loads(out["warm"]),
+            [{"name": "formal", "drvs": kani_dep}],
+        )
+        gated = json.loads(out["formal"])
+        nowait = json.loads(out["formal-nowait"])
+        self.assertEqual(
+            sorted(c["name"] for c in gated),
+            ["kani-rio-lease", "kani-rio-store"],
+        )
+        self.assertEqual(
+            nowait,
+            [
+                {
+                    "name": "quint-1of1",
+                    "targets": "quint-leader-election",
+                    "drvs": "/d/quint-le.drv",
+                }
             ],
         )
 

@@ -46,6 +46,8 @@ jobs:
       warm: ${{ steps.gen.outputs.warm }}
       checks: ${{ steps.gen.outputs.checks }}
       checks-nowait: ${{ steps.gen.outputs.checks-nowait }}
+      formal: ${{ steps.gen.outputs.formal }}
+      formal-nowait: ${{ steps.gen.outputs.formal-nowait }}
       fuzz: ${{ steps.gen.outputs.fuzz }}
       vm-test: ${{ steps.gen.outputs.vm-test }}
       coverage: ${{ steps.gen.outputs.coverage }}
@@ -222,6 +224,81 @@ jobs:
               || echo "::error title=check failed::${targets[$i]}"
           done
           exit "$status"
+  # Formal-verification lane: quint/TLC model checks, MBT conformance
+  # runs, and kani/CBMC proofs, fanned out as kani-* singletons plus
+  # round-robin quint shards (gen_matrix.py cluster_formal). Each
+  # check's build IS a model-checking / proof run — a JVM (apalache
+  # server + TLC) or CBMC per derivation — so the lane caps nix
+  # parallelism at 3 concurrent builds: with the default max-jobs
+  # (auto = host cores on a CFS-quota'd ARC pod) a shard launches
+  # dozens of multi-GB JVMs at once and starves the runner agent,
+  # which is exactly how the old all-in-one `misc` cluster died. The
+  # shard width (FORMAL_SHARD_SIZE, default 12) and this cap together
+  # bound a shard to ~4 build waves; a typical shard finishes in
+  # 5-15min, the 45min timeout leaves headroom for an unlucky deal of
+  # the minutes-class exhaustive regime checks.
+  formal:
+    name: formal / ${{ matrix.name }}
+    needs: [gen-matrix, warm]
+    if: |
+      !cancelled()
+      && needs.gen-matrix.result == 'success'
+      && needs.warm.result != 'failure'
+      && needs.gen-matrix.outputs.formal != '[]'
+    runs-on: rio-ci
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.formal) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
+      - name: Build ${{ matrix.targets }}
+        run: |
+          read -ra targets <<< "${{ matrix.targets }}"
+          read -ra drvs <<< "${{ matrix.drvs }}"
+          status=0
+          nix build --keep-going --max-jobs 3 --print-build-logs "${drvs[@]/%/^*}" || status=$?
+          for i in "${!targets[@]}"; do
+            nix path-info "${drvs[$i]}^*" >/dev/null 2>&1 \
+              || echo "::error title=formal check failed::${targets[$i]}"
+          done
+          exit "$status"
+  # Formal clusters with no overlap with the warm set — in practice
+  # the quint shards, whose only inputs are the committed .qnt models
+  # and the quint toolchain from the public cache. They start as soon
+  # as gen-matrix finishes instead of idling behind the rust trunk;
+  # the kani singletons (which need the kani-compiler member closure)
+  # stay in the gated job above. Identical step otherwise.
+  formal-nowait:
+    name: formal / ${{ matrix.name }}
+    needs: gen-matrix
+    if: needs.gen-matrix.outputs.formal-nowait != '[]'
+    runs-on: rio-ci
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.gen-matrix.outputs.formal-nowait) }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: ./.github/actions/setup-nix
+        with:
+          drv-cache: 'true'
+      - name: Build ${{ matrix.targets }}
+        run: |
+          read -ra targets <<< "${{ matrix.targets }}"
+          read -ra drvs <<< "${{ matrix.drvs }}"
+          status=0
+          nix build --keep-going --max-jobs 3 --print-build-logs "${drvs[@]/%/^*}" || status=$?
+          for i in "${!targets[@]}"; do
+            nix path-info "${drvs[$i]}^*" >/dev/null 2>&1 \
+              || echo "::error title=formal check failed::${targets[$i]}"
+          done
+          exit "$status"
   fuzz:
     name: fuzz / ${{ matrix.name }}
     needs: [gen-matrix, warm]
@@ -352,6 +429,8 @@ jobs:
       - warm
       - checks
       - check-nowait
+      - formal
+      - formal-nowait
       - fuzz
       - vm-test
       - coverage
@@ -371,4 +450,4 @@ jobs:
           # warm stage failed (in which case warm is the red one).
           # gen-matrix and coverage-upload are NOT listed: both must
           # always run — if either skips, something is wrong.
-          allowed-skips: warm, checks, check-nowait, fuzz, vm-test, coverage
+          allowed-skips: warm, checks, check-nowait, formal, formal-nowait, fuzz, vm-test, coverage
