@@ -58,9 +58,11 @@ The verdict table — every corpus commit, its classification, override
 module, predicted vs. actual verdict, depth/state counts, and
 disposition — lives next to the owning campaign's invariant map
 (`controller-invariant-map.md`, `refcount-invariant-map.md`,
-`executor-invariant-map.md`, `closure-evidence-invariant-map.md`, each
-in its Stage-C / Phase-0d calibration section).
+`executor-invariant-map.md`, `closure-evidence-invariant-map.md`,
+`gw-session-invariant-map.md`, each in its Stage-C / Phase-0d
+calibration section).
 A subset of the overrides is wired into `nix/quint.nix` as permanent
 expect-violation checks (`quint-ctrl-calib-*`, `quint-refcount-calib-*`,
-`quint-executor-calib-*`, `quint-closure-calib-*`); the rest are
-evidence modules, re-runnable on demand with the command above.
+`quint-executor-calib-*`, `quint-closure-calib-*`, `quint-gw-calib-*`);
+the rest are evidence modules, re-runnable on demand with the command
+above.

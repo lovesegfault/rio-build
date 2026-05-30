@@ -16,18 +16,22 @@ instantiation modules, a fallback measurement module, and the eight
 Stage-C per-family restricted-alphabet modules the wired exhaustive
 checks run on).
 
-**Status: Stage A (spec audit) complete; Stage B (model + measurement
+**Status: Phase 0 complete — campaign CLOSED (verify-only; no Phase 1
+needed).** Stage A (spec audit) complete; Stage B (model + measurement
 milestone) complete — all 34 properties encoded, witnesses and
 pre-registered falsification probes confirmed reachable/falsifying, the
 B-measure recorded below with the regime-split recommendation; Stage C
 check-set selection + CI wiring + witnesses/probes + the §4 model-first
 evidence complete (31 permanent `nix/quint.nix` checks, verdicts in the
-Stage-C record below); Stage-C calibration complete (this change set —
-override modules under `calibration/gw-f*.qnt`, all 17 encodable
-candidates falsified in the violation direction, the three T halves
-falsified for GW-2/GW-13/GW-18, 9 permanent `quint-gw-calib-*` checks,
-verdicts in the calibration table below). Phase-0 acceptance verdict and
-go/no-go recommendation: see the calibration stage record.**
+Stage-C record below); Stage-C calibration complete (override modules
+under `calibration/gw-f*.qnt`, all 17 encodable candidates falsified in
+the violation direction, the three T halves falsified for
+GW-2/GW-13/GW-18, 9 permanent `quint-gw-calib-*` checks, verdicts in the
+calibration table below). Phase-0 acceptance verdict and go/no-go
+recommendation: the calibration stage record. The verify-only closure
+decision, the counter-signatures, the corrections they forced, the
+accepted residuals, and the deployment-checklist deltas: the campaign
+close-out at the end of this document.
 
 Stage A added three new rules (`gw.conn.force-close`,
 `gw.conn.send-deadline`, `gw.conn.accept-resilience`), amended and bumped
@@ -141,8 +145,8 @@ calibration table below.
 | GW-11 | 1cca275b4 (+9a18f756a) | L8, S3 | V |
 | GW-12 | a2fcb8aa0 (+8e7c6e724) | S1 | V |
 | GW-13 | 765671437 / d653222cf / a6a5a77b9 | S17, L4, P6 | V + T |
-| GW-14 | fac58554b | — (wire-position integrity, below the data-plane abstraction) | OOM: `wire_opcodes` + golden-conformance upload tests |
-| GW-15 | cb64e2913 (+d2e84cf31) | — (per-entry upload bounds) | OOM: store campaign (store half) + golden/integration multi-entry upload tests (gateway half) |
+| GW-14 | fac58554b | — (wire-position integrity, below the data-plane abstraction) | OOM: the `wire_opcodes` upload tests (`opcodes_write.rs`, incl. the fac58554b regression test) + `functional/nar_roundtrip.rs` (corrected at close-out: previously attributed to "golden-conformance upload tests" — that suite has no upload tests) |
+| GW-15 | cb64e2913 (+d2e84cf31) | — (per-entry upload bounds) | OOM: store campaign (store half) + the `wire_opcodes` multi-entry upload tests and `functional/nar_roundtrip.rs` (gateway half; corrected at close-out: previously attributed to "golden/integration multi-entry upload tests") |
 | GW-16 | 755f49744 (+0f5408e11, d617bf3e5) | L6 | V |
 | GW-17 | 09807689f (+a8b5c1974) | — (credential freshness; needs a clock) | OOM: `session_jwt_token_refreshes_per_access` + I-129 regression tests |
 | GW-18 | 9d80038cb | S2 + P1, P2, P3 | V + T |
@@ -216,7 +220,7 @@ these is NOT caught by any check this campaign adds.
 | **Scheduler orphan-watcher backstop**: a build whose gateway-side watcher is gone (skipped cancel on a handler panic, SIGKILL, or the non-wire removal heuristic guessing wrong) is auto-cancelled by the scheduler once it has no attached watcher (`r[sched.backstop.orphan-watcher]`, `rio-scheduler/src/actor/housekeeping.rs` 300 s sweep) | S10 (panic-regime weakening), S16 / the W10 disposition, the SIGKILL deployment-checklist line | Scheduler campaign; assumption named per property, never re-modeled here |
 | **WatchBuild reconnect residual**: the in-opcode build-event-wait state has no deadline by design; the model assumes the WatchBuild reconnect loop is finitely bounded (MAX_RECONNECT = 10, capped backoff ≈ 111 s). A regression re-introducing an unbounded reconnect loop (the 553359e59 family, excluded from this corpus per design §8 Q6) would not be caught by this campaign's checks | The build-event-wait sub-state of the compound session node (§2a); L6 is scoped to rpc-wait only because of this | `test_build_paths_reconnect_exhausted_returns_failure` (non-vacuous since b6dc68834) and `test_reconnect_sends_first_event_sequence_not_zero`, `rio-gateway/tests/wire_opcodes/build.rs` (both `r[verify gw.reconnect.*]`) |
 | **Scheduler stream silent forever with a live client**: a scheduler that accepts a build then keeps the BuildEvent stream open and silent indefinitely parks the session in build-event-wait until a terminal event, a transport-reap letter, or shutdown — an environment assumption, not a verified bound (the `process_build_events` select has no timeout arm, `rio-gateway/src/handler/build.rs`) | The §2a abstraction loss table; W5 occupancy bound | Recorded here; no test asserts the absence of a deadline (it is the design) |
-| **ForceClose earliest-deadline-wins arithmetic**: the numeric "earliest wins / never moves later" half of S11 has no observable negation in a tick-free model | S11 (the model checks armed-stickiness and post-expiry gating only) | `fetch_min` implementation + the arm assertions in the stalled-send / window-starved unit tests (`rio-gateway/src/server/connection.rs`); a dedicated monotonicity unit test is an optional Stage B line item |
+| **ForceClose earliest-deadline-wins arithmetic**: the numeric "earliest wins / never moves later" half of S11 has no observable negation in a tick-free model | S11 (the model checks armed-stickiness and post-expiry gating only) | `fetch_min` implementation (`ForceClose::arm_within`, `rio-gateway/src/server/mod.rs`) + the arm assertions in the stalled-send / window-starved unit tests (`rio-gateway/src/server/connection.rs`); a dedicated monotonicity unit test is an optional Stage B line item (citation corrected at close-out: the implementation lives in `mod.rs`, the tests in `connection.rs`) |
 
 ## Stage records
 
@@ -245,7 +249,8 @@ these is NOT caught by any check this campaign adds.
 ### Stage B — model + measurement milestone (this change set)
 
 **Artifact.** `docs/spec/models/gwConnLifecycle.qnt` — one core module
-(2.2k lines) + seven §2e regime instantiation modules (`Base`, `Cap`,
+(≈2.0k lines at the Stage-B commit; corrected at close-out from "2.2k")
++ seven §2e regime instantiation modules (`Base`, `Cap`,
 `FaultOccupancy`, `FaultTransport`, `FaultUpstream`, `FaultDrain`,
 `FaultDegraded`) + a `BaseSlim` measurement module for the §2e fallback
 (2). Five state variables (`conns`, `chans`, `srv`, `viol`, `reach`)
@@ -374,13 +379,28 @@ concern under the regime-split decision above.
 
 **Verification subject / churn pin.** The verification subject is this
 worktree's base — `formal-sprint` at cccb4d778 ("docs(rio-scheduler): drop
-stale references to the deleted dispatch helpers"), the same HEAD the
-inventory and calibration corpus were mined against. `git log cccb4d778..HEAD
--- rio-gateway/` contains only this campaign's own Stage-A commits
-(66901f86d, af9f7c482, 805c8ab4a, c088d7af2), and their rio-gateway diffs are
-comment-only (`r[impl]`/`r[verify]` markers and doc comments — 31 insertions,
-5 deletions, no executable line touched). rio-gateway has not changed since
-the corpus/inventory were mined.
+stale references to the deleted dispatch helpers"), the same HEAD the code
+inventory was mined against. The calibration corpus was mined earlier, from
+`origin/main` at dfe9a5569 (the corpus's own provenance line); between
+dfe9a5569 and cccb4d778 rio-gateway changed by 1,313 insertions /
+112 deletions across 14 files — the four round-1 LogService cutover commits
+(808db8976, f226a12f7, 1a1bcef29, 82060a2a2), which touched the modeled
+lifecycle files (handler/build.rs, main.rs, server/connection.rs,
+server/mod.rs, session.rs) and added handler/log_tail.rs. None of the four
+is a lifecycle FIX/HARDENING commit, so no corpus family, candidate, or
+acceptance verdict rests on the difference. *(Corrected at close-out: this
+paragraph originally claimed cccb4d778 was "the same HEAD the inventory and
+calibration corpus were mined against" and that "rio-gateway has not changed
+since the corpus/inventory were mined" — true for the inventory, wrong for
+the corpus; the impact is confined to this provenance statement.)*
+`git log cccb4d778..HEAD -- rio-gateway/` contains only this campaign's own
+Stage-A commits — recorded at wiring time under their pre-rebase hashes
+(66901f86d, af9f7c482, 805c8ab4a, c088d7af2); on the integrated branch the
+same four commits are fd92fb873, a9f3ee2bc, a99314b20, 56fc66ea4 (corrected
+at close-out: a reader replaying the recorded command sees the post-rebase
+hashes) — and their rio-gateway diffs are comment-only (`r[impl]`/`r[verify]`
+markers and doc comments — 31 insertions, 5 deletions, no executable line
+touched).
 
 **Check-set decision (the §2e fallback ladder, applied).** The Stage-B
 B-measure stands: the full-alphabet `base` regime is ≈59.7 M distinct states
@@ -830,7 +850,7 @@ exists, with the as-built baseline holding at the same scope.
 | F5 egress flow control / bounded queues | **calibrated** | GW-2 (V: S15, L2; T: P5), GW-8 (V: S13) |
 | F6 teardown obligations | **calibrated** | GW-9 (V: S16, S10), GW-10 (V: S10), GW-11 (V: L8, S3), GW-20 (V: S19) |
 | F7 drain/shutdown ordering | **calibrated** | GW-13 (V: L4, S17; T: P6) |
-| F8 upload bounding & wire-position integrity | **pre-registered out-of-model (test-only)** | GW-14: `wire_opcodes` + golden-conformance upload tests; GW-15: store-side half owned by the store campaign, gateway permissiveness half by the golden/integration multi-entry upload tests (owner decision §8 Q5) |
+| F8 upload bounding & wire-position integrity | **pre-registered out-of-model (test-only)** | GW-14: the `wire_opcodes` upload tests (`opcodes_write.rs` — `test_add_multiple_streaming_early_ok_preserves_wire_position` is the fac58554b regression test, plus the multi-entry batch/mixed permissiveness tests) and `functional/nar_roundtrip.rs`; GW-15: store-side half owned by the store campaign, gateway permissiveness half by the same `wire_opcodes` multi-entry tests + `functional/nar_roundtrip.rs` (owner decision §8 Q5). Corrected at close-out: both halves were previously attributed to "golden-conformance" / "golden/integration" upload tests (wording inherited from design §3.4) — the golden-conformance suite has no upload tests; the dispositions themselves are unchanged |
 | F9 anti-hang deadlines on upstream waits | **calibrated** | GW-16 (V: L6); the budget-sizing members stay non-candidates per the corpus |
 | F10 accept-path availability | **calibrated** | GW-19 (V: S18) |
 | F11 session credential freshness | **pre-registered out-of-model (test-only)** | GW-17: `session_jwt_token_refreshes_per_access` + the I-129 regression tests (no clock in the model; owner decision §8 Q5) |
@@ -871,7 +891,10 @@ environment-assumption rows above (scheduler orphan watcher, WatchBuild
 reconnect boundedness, the silent-stream assumption, fetch_min
 monotonicity) are imported, not verified; (d) the §4 dispositions still
 need the owner's sign-off — they are recommendations with model
-evidence, not decisions this campaign can make. **Recommendation: GO** —
+evidence, not decisions this campaign can make *(collected: the
+2026-05-30 Phase-0 checkpoint ratified the W2/W5/W7/W10 dispositions
+with their recorded bounds — see the campaign close-out below)*.
+**Recommendation: GO** —
 proceed to Phase 1 with the small scope §7 already names (the two W10
 pinning/assumption-validation tests; the optional W7 hardening and
 `errors_total{setsockopt}` label only if the owner asks; new finds
@@ -894,3 +917,283 @@ under `checks.x86_64-linux`; each wired check was built once via the
 harness before commit (seven on the remote builder at the default
 server heap, the two heavy ones locally at 8 GiB after the
 `serverHeapMb` fix) and reports its expected violation.
+
+## Campaign close-out — gateway connection/session lifecycle (verify-only)
+
+The gw-session-formal campaign (Track B, round 2) is complete and
+CLOSED at Phase 0, on the design's "stop after Phase 0" arm: a
+verify-only campaign with no Phase 1. This section is the
+campaign-level record, in the same shape as the round-1 close-outs
+(retry, executor, log); the per-stage evidence lives in the stage
+records above, the introducing commits, and the CI transcripts. The
+counter-signatures below are the round-2 close-out discipline's
+independent verification of this map's own claims; the corrections they
+forced have been applied in place above, each with a "(corrected at
+close-out: ...)" note.
+
+**The verdict.** The as-built gateway connection/channel/session/server
+lifecycle is correct at the model's resolution — **zero as-built
+defects, zero code changes needed**. Every §3 property (20 safety, 6
+permissiveness, 8 settlement) holds exhaustively over every wired
+per-family scope; the only reachable violations are the four
+pre-registered documented windows (W3/P4 admit race, W10 orphan bound,
+P12 panic carve-out, W7 degraded tier), each falsifying exactly as
+predicted and each accepted with a recorded bound; no unlisted
+falsification surfaced in any exhaustive run, witness search, or
+calibration baseline; and the calibration record proves the invariant
+set re-finds all 17 encodable historical bug classes (plus the three
+permissiveness halves) when their fixes are reverted. Where round-1
+campaigns found and fixed as-built defects (retry's D1–D4, the
+executor's `1bbad1ee7`, closure-evidence's C3/L3), this campaign's
+Phase-0 product is a clean bill of health plus the permanent
+verification stack that keeps it honest: the Stage-A spec rules, the
+model, the 40 wired CI checks, this map, and the deployment-checklist
+deltas below.
+
+**Owner decisions closing the campaign.** The 2026-05-29 design
+checkpoint bound the campaign to seven Track-B decisions (B1 guard-held
+session accounting, B2 panics-in-envelope/SIGKILL-out, B3
+scheduler-side cancel as a named assumption, B4 conn-permit-at-accept
+as a fixed fact, B5 GW-14/15/17/21 test-only, B6 corpus exclusions
+ratified, B7 STDERR exit-path writes left unfixed); the owner-decision
+table near the top of this map carries the four that shape properties
+directly, and the other three are carried in the panic-regime
+properties, the environment-assumption rows, and the acceptance table's
+§8 Q5/Q6 citations. The 2026-05-30 Phase-0 checkpoint ratified the
+W2/W5/W7/W10 window dispositions with their recorded bounds (closing
+the go/no-go's clause-(d) sign-off above) and closed the campaign
+verify-only: the W10 decision rule did not trigger (`w10TriggerAbsent`
+holds over fam-upstream's 3.25 M states), the optional W7 hardening and
+`errors_total{setsockopt}` label were not commissioned, the 1–3
+small-fix budget for new finds went unspent, and the two W10
+pinning/assumption-validation tests that were parked on the Phase-1
+list land with no Phase 1 — i.e. they do not exist; W10's coverage is
+the wired falsification probe plus the scheduler orphan-watcher
+environment assumption, exactly as the residuals below record.
+
+### Final check inventory and CI cost
+
+40 permanent `nix/quint.nix` checks, all evaluating under
+`checks.x86_64-linux.*`, all in the merge gate:
+
+| Kind | Count | Checks | Verdict class |
+|---|---|---|---|
+| Per-family exhaustive (restricted alphabet, full §2e bounds) | 8 | `quint-gw-lifecycle-fam-{preauth,admission,cap,wedge,hostile,upstream,drain,degraded}` | HOLDS `allInvariants` (34 properties) exhaustively at scope |
+| Reachability witnesses (full regimes) | 17 | `quint-gw-lifecycle-witness-*` | expect-violation (reachable) |
+| Pre-registered falsification probes (full regimes) | 4 | `quint-gw-lifecycle-falsification-{l5-no-carve-out,s16-terminal-only,s10-panic,l1-no-inactivity}` | expect-violation (the documented W3/W10/P12/W7 windows) |
+| Named runs | 2 | `quint-gw-lifecycle-run-{compliant-peer,stall-wedge}` | pass (`quint test`) |
+| Calibration guards (one per falsifying corpus family) | 9 | `quint-gw-calib-f{1,2,3,4,5,6,7,9,10}-*` | expect-violation (pre-fix revert re-finds the bug class) |
+
+Measured aggregate cost at wiring time (32 TLC workers, shared builder,
+serial protocol; figures from the Stage-C tables above): ≈12 min for
+the 8 exhaustive checks (worst single check ≈4 min), ≈6–11 min for the
+17 witnesses, ≈2 min for the 4 probes, ≈5–7 min for the 9 calibration
+guards, seconds for the 2 runs — roughly 25–30 minutes of checker time
+across 40 derivations on a fully uncached gate run, parallelized by
+nix-fast-build and off the VM-test critical path; inside the design §5
+estimate. Every check is individually inside the §2e ≤15 min hard cap.
+Unwired manual targets (re-runnable with the command in each file's
+header): the 16 non-wired calibration override modules, the 12 as-built
+baseline modules, and any future full-regime exhaustive run.
+
+### Counter-signatures (close-out verification, workflow run wf_96638bed-4fb, 2026-05-30)
+
+Three independent verification slices were run over the integrated
+campaign records — this map, the model, the calibration modules, the
+`nix/quint.nix` wiring, the spec markers, and the
+corpus/inventory/decision-log context documents — per the round-2
+close-out discipline (orchestration stage B5). Each slice re-derived
+the record's claims from the artifacts (rebuilding checks, reading
+transcripts, reading every cited test and marker site) rather than
+trusting the record.
+
+| Slice | Scope | Rows checked | Verdict | Discrepancies |
+|---|---|---|---|---|
+| checks-vs-records | every wired check vs the Stage-C/calibration tables: inventory, module/invariant/step/heap parameters, verdicts, state counts, costs; spot force-rebuilds | 41 | **counter-signed** | 3 (2 minor, 1 cosmetic) — measurement-snapshot variance and a rounding overstatement; no false claims |
+| acceptance-vs-corpus | all 14 acceptance-table family rows + the owner-decision rows vs the corpus, all 9 override files, the named test coverage, and the decision log | 18 | **counter-signed-with-corrections** | 4 (1 material, 1 minor, 2 cosmetic) |
+| spec-markers-vs-reality | the 7 campaign tracey rules (≈40 marker sites read against the cited code/tests) + the 4 environment-assumption rows + wiring/validation claims | 11 | **counter-signed-with-corrections** | 3 (1 minor, 2 cosmetic) |
+
+Aggregate: 70 rows, 10 discrepancies — 1 material (corrected in place),
+4 minor (2 corrected in place; the 2 measurement-variance findings are
+noted below, combined into one note), 5 cosmetic (2 corrected in place,
+3 noted below). No discrepancy affects any verdict: every HOLD, every
+violation, every calibration falsification, and every acceptance
+disposition stands as recorded.
+
+Spot-rebuild evidence from the checks-vs-records slice: 10 of the 40
+checks force-rebuilt (`nix build --rebuild`) on a 192-core host,
+spanning all 5 kinds. The rebuilt exhaustive checks reproduce their
+recorded distinct-state counts EXACTLY (fam-preauth 1,183 / fam-hostile
+968,151 / fam-upstream 3,253,999 / fam-wedge 66,059 — exhaustive counts
+are deterministic); witnesses, falsification probes, and calibration
+guards violate as recorded; the runs pass. All 40 stored transcripts
+were read and agree with their recorded verdicts. The unwired
+`gwCalibF3AsBuilt` baseline was additionally re-run manually and HOLDS
+at exactly the recorded 1,183 distinct states, confirming the
+structural cross-check row (`gwCalibF3AsBuilt` ↔ famPreauth).
+
+### Corrections applied at this close-out
+
+The record text above was corrected in place; reality (code, model,
+checks) needed no changes anywhere.
+
+1. **Material — churn-pin provenance (Stage-C record).** The record
+   claimed the corpus and inventory were both mined at cccb4d778 and
+   that "rio-gateway has not changed since the corpus/inventory were
+   mined". True only for the inventory: the corpus was mined from
+   origin/main dfe9a5569, and the four round-1 LogService cutover
+   commits (1,313 insertions / 112 deletions across 14 rio-gateway
+   files) sit between the two HEADs. None of the four is a lifecycle
+   FIX/HARDENING commit, so no corpus family, candidate, or acceptance
+   verdict is affected — the error was confined to the provenance
+   sentence. Corrected in place.
+2. **Minor — F8 test attribution (crosswalk + acceptance tables).** The
+   GW-14/GW-15 out-of-model coverage was attributed to
+   "golden-conformance" / "golden/integration" upload tests (wording
+   inherited from design §3.4); the golden-conformance suite has no
+   upload tests. The real coverage — the `wire_opcodes` upload tests in
+   `opcodes_write.rs` (including the exact fac58554b regression test)
+   and `functional/nar_roundtrip.rs` — exists and is load-bearing.
+   Corrected in place; the test-only dispositions themselves are
+   unchanged.
+3. **Minor — pre-rebase commit hashes (churn-pin paragraph).** The four
+   Stage-A commit hashes were recorded pre-rebase; the integrated
+   branch carries them as fd92fb873 / a9f3ee2bc / a99314b20 /
+   56fc66ea4. Corrected in place (both hash sets recorded).
+4. **Cosmetic, corrected in place:** the Stage-B core-module line count
+   ("2.2k" → ≈2.0k at the Stage-B commit); the fetch_min implementation
+   citation (`ForceClose::arm_within` lives in `server/mod.rs`; the
+   arm-assertion tests live in `connection.rs`).
+
+Noted but not corrected (the record is accurate as a snapshot, or the
+inaccuracy lives outside this document):
+
+- **State-count / depth variance (minor).** Witness and falsification
+  states-at-first-violation, and 4 of the 13 measured
+  falsification/calibration depths (l5-no-carve-out, calib f2/f5/f9),
+  are TLC-worker-count and parallel-BFS-race dependent: re-runs find
+  equally valid counterexamples at 2–5× different state counts and
+  slightly different depths (one witness reached 344,631 distinct
+  states at 192 workers vs the recorded 87–130,940 range at 32
+  workers). The recorded figures are correct as wiring-time snapshots
+  under their stated conditions; violation/HOLD verdicts and exhaustive
+  distinct-state counts are run-invariant and reproduce exactly. Reruns
+  should compare verdicts and exhaustive counts, not first-violation
+  statistics.
+- **Owner-decision table is a subset (cosmetic).** It carries 4 of the
+  design checkpoint's 7 Track-B decisions; the other three (B2
+  panics-in-envelope, B3 scheduler-side cancel, B6 corpus exclusions)
+  are carried in other sections of this map. A correct subset, no
+  contradiction; the close-out paragraph above now lists all seven.
+- **GW-16 crosswalk constituents (cosmetic).** The crosswalk row
+  follows design §3.4's constituent swap (d617bf3e5 in, 5bc482e52 out)
+  rather than corpus §4; the crosswalk header cites the design, so the
+  row is internally consistent — representative, family, predicted
+  property (L6), and verdict are identical either way.
+- **Tracey impl-list overcount (cosmetic).** `tracey query rule
+  gw.conn.cancel-on-disconnect+3` lists a verb-less cross-reference
+  comment in `xtask/src/k8s/qa/scenarios/i183_pending_reaped.rs` as an
+  impl site (it pre-existed the campaign and was only version-bumped).
+  The rule's genuine enforcement sites (the session.rs cancel-loop
+  select, the handler/build.rs removal-policy guard) carry the real
+  impl markers; coverage is not overstated by this map.
+
+### Accepted residuals (the GO's residue, ratified 2026-05-30)
+
+What this campaign verified is bounded by the following — all
+deliberate, all recorded at the stage that introduced them, and all
+ratified at the Phase-0 checkpoint:
+
+- **The four windows, accepted with their recorded bounds:**
+  - **W2 — guard-vs-proto-task divergence** (owner decision B1,
+    guard-held accounting): the `channels_active` gauge under-counts
+    winding-down sessions for ≤ ~30 s per session; structurally bounded
+    (the diverged proto task can only occupy `cancelling`, whose exit
+    needs no peer, upstream, or timer cooperation). Pinned by
+    `quint-gw-lifecycle-witness-server-side-release`; deployment note
+    GW-D2 below.
+  - **W5 — half-open vanish occupancy:** a vanished peer pins one conn
+    permit (of 1000), one session permit (of 4096), the gauge slots,
+    ≈512 KiB of duplex buffers, possibly a NAR assembly buffer (≤4 GiB,
+    `MAX_NAR_SIZE`), and the in-flight scheduler/builder work for
+    ≈300–330 s until the designed transport reap fires. An occupancy
+    bound, not a violation. Pinned by
+    `quint-gw-lifecycle-witness-vanish-reclaimed`; deployment note
+    GW-D3 below.
+  - **W7 — degraded-tier reclamation:** with the TCP_USER_TIMEOUT
+    setsockopt failed, reclamation of a parked-write connection
+    degrades from the designed ~305 s to the ~1 h inactivity backstop;
+    the narrower in-process-unbounded sliver (arming after both russh
+    wakes are spent) is out of model. The gating premise — a kernel
+    setsockopt failure on the Linux/EKS target — is the deployment
+    observable GW-D1 below. Pinned by
+    `quint-gw-lifecycle-falsification-l1-no-inactivity`.
+  - **W10 — non-Wire removal orphan:** a non-Wire stream failure with a
+    dead or absent client orphans a running build for up to ~300 s
+    until the scheduler orphan watcher cancels it. The Phase-1
+    removal-predicate fix was NOT triggered (the trigger condition is
+    unreachable; `w10TriggerAbsent` holds exhaustively); the leak is
+    bounded by a named environment assumption, not by this campaign's
+    checks. Pinned by
+    `quint-gw-lifecycle-falsification-s16-terminal-only`.
+  - Plus the two pre-registered carve-outs that are windows by design:
+    the W3/P4 admit-vs-grace race (bounded by one grace cycle; pinned
+    by `l5-no-carve-out`) and the P12 handler-panic carve-out (pinned
+    by `s10-panic`; backstopped by the same orphan watcher).
+- **Deferred full-regime exhaustive coverage** (the Stage-C check-set
+  record's list): cross-family interleavings, conn-B concurrent full
+  session lifecycles, two concurrent egress/panic sessions on one
+  connection, and the base-regime "everything legitimate at once" proof
+  remain witness/named-run-pinned only. A future full-regime exhaustive
+  run stays available as a manual target; it is not in the merge gate.
+- **Out-of-model families on test-only coverage** (owner decisions
+  §8 Q5/Q6 = B5/B6, ratified): F8 (GW-14/GW-15 upload bounding — the
+  `wire_opcodes` upload tests + `functional/nar_roundtrip.rs`; store
+  half owned by the store campaign), F11 (GW-17 credential freshness —
+  the session_jwt refresh + I-129 regression tests), F14 (GW-21 ingress
+  memory budget — the drv_cache cap tests; named Phase-2 Kani candidate
+  if ever commissioned), F12/F13 (out of corpus: result-integrity vs
+  store, and the adjacent state machines — scheduler-watch reconnect,
+  STDERR framing, startup/readiness).
+- **Environment assumptions** (imported, not verified; a regression
+  behind one is NOT caught by any check this campaign added): the
+  scheduler orphan-watcher backstop; WatchBuild reconnect boundedness;
+  the silent-stream-with-live-client design; ForceClose fetch_min
+  monotonicity (unit-test-covered only). The environment-assumptions
+  table above names the owner and coverage of each.
+
+### Deployment-checklist deltas (the operator handoff)
+
+This campaign adds no deployment gates (round-2 no-deploy discipline);
+these are the operational consequences of the accepted residuals and
+the design-checkpoint decisions, finalized here as checklist items for
+whoever first deploys the gateway. Sources: design §4 dispositions as
+ratified, owner decisions B1/B2/B4.
+
+| # | Item | What to do at deployment time | Source |
+|---|---|---|---|
+| GW-D1 | **TCP_USER_TIMEOUT setsockopt-failure alert** | Alert on the `set TCP_USER_TIMEOUT failed` warn line (`rio-gateway/src/server/mod.rs:511`). The W7 acceptance rests on the premise that this setsockopt effectively cannot fail on the Linux/EKS target — the alert is the check on that load-bearing premise. There is no `errors_total` label for it (the optional Phase-1 label was not commissioned); the warn line is the only signal. If it fires: parked-write reclamation degrades to the ~1 h inactivity backstop, and the out-of-model sliver (slow-output + zero-window-ACKing peer) is unbounded in-process until restart. | §4 W7 |
+| GW-D2 | **`channels_active` autoscaling caveat** | `rio_gateway_channels_active` (the autoscaling signal) momentarily under-counts winding-down sessions during mass disconnects with an unresponsive scheduler — the W2 guard-held divergence, ≤ ~30 s per session (the cancel-loop bound). Do not tune autoscaler reactions tighter than that window; treat dips during mass-disconnect events as expected. | §4 W2 / owner decision B1 |
+| GW-D3 | **Memory headroom for NAR buffering** | Per-connection worst-case memory is NOT bounded by the lifecycle caps: a half-open vanish (W5) or a slow client can pin ≈512 KiB of duplex buffers plus a NAR assembly buffer (up to `MAX_NAR_SIZE` = 4 GiB) for the full ~300–330 s reap window, per occurrence. Size pod memory limits for expected concurrent uploads × realistic NAR sizes on top of the steady-state footprint (the W8 amplification has no in-process cap; the existing 4 GiB pod limit was sized for drv_cache, not concurrent NAR uploads). | §4 W5/W8 |
+| GW-D4 | **Conn-permit occupancy alert** | Alert on sustained `rio_gateway_errors_total{type="conn_cap"}` growth. Conn-permit-at-accept is a fixed fact (owner decision B4): probes and SYN-flood-with-completion can transiently hold conn permits with no auth-level signal, indistinguishable in-process from legitimate load. | Owner decision B4 |
+| GW-D5 | **SIGKILL / terminationGracePeriodSeconds** | SIGKILL is outside the verified envelope (owner decision B2). Set the gateway pod's `terminationGracePeriodSeconds` ≥ the drain budget (accept-stop + session-drain timeout + 5 s CANCEL_GRACE) so the verified three-stage drain is what actually runs on eviction; the scheduler orphan watcher and store backstops are the named assumptions behind anything a SIGKILL interrupts. | Owner decision B2 |
+
+### What the campaign does NOT claim
+
+No deployment, soak, or canary validation exists (no cluster was ever
+involved); every figure above is a model, test, or CI measurement. The
+exhaustive verdicts hold at the §2e bounds (2 connections, 2 channel
+slots on conn A, queue depth 2, window credits 2, residue ceiling 2,
+≤1 tracked build) under the restricted per-family alphabets; the
+full-alphabet regimes are witness/probe-pinned, not exhausted. Recorded
+wall-clocks and first-violation state counts are snapshots under their
+stated conditions (TLC worker count and builder contention move them;
+verdicts and exhaustive counts do not). Nothing is machine-proved at
+the code level (no Kani harness exists for any gateway path; F14's
+drv_cache budget is the named candidate if one is ever commissioned);
+the coupling between model and code is the calibration corpus plus the
+tracey marker discipline, not refinement. The four environment
+assumptions above are imported, not verified. SIGKILL, the data plane
+(upload framing, NAR streaming, STDERR), credential freshness, and the
+adjacent state machines are outside the verified envelope, on the
+test-only coverage the acceptance table names.
