@@ -190,7 +190,10 @@ pub struct Backends {
 ///   consumers must read the `partial` flag in progress.json / summary.md,
 ///   not the exit code. Non-zero means an error (invalid spec or archive,
 ///   unreachable backends, state-dir I/O failure, or a dead background
-///   task).
+///   task). A tripped regression gate does not change the exit code either:
+///   the gate result is data (`report/gate.json`, mirrored in
+///   progress.json) consumed by the operator CLI's `report --check`, never
+///   by the pod exit code.
 /// - **Deadline:** `--deadline` (or `spec.deadline`) stops *new*
 ///   submissions once reached; batches already in flight still drain,
 ///   which can take up to `knobs.batch_timeout_hours`. Do not set a

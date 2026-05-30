@@ -923,7 +923,7 @@
     {
       "path": "run/report.rs",
       "depth": 1,
-      "doc": "Report rendering: summary.md, per-class JSONL files, and progress.json."
+      "doc": "Report rendering: summary.md, gate.json, per-class JSONL files, progress.json."
     },
     {
       "path": "run/spec.rs",

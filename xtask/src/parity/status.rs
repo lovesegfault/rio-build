@@ -197,6 +197,7 @@ mod tests {
             supply: None,
             timed: None,
             abort_recommended: false,
+            gate: None,
         };
         let raw = serde_json::to_string(&progress).unwrap();
         let s = summarize_progress(&raw);

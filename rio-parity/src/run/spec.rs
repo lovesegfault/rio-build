@@ -346,6 +346,77 @@ impl SupplyBlock {
     }
 }
 
+/// Campaign-level aggregation policy applied at report time. Policies are
+/// chosen at launch and recorded in the spec; they are never baked into the
+/// replay archive, and both may be requested for one campaign.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ReportPolicy {
+    /// The headline build-outcome agreement report (the parity report):
+    /// the verdict-based numerator/denominator plus the comparability block.
+    Parity,
+    /// The regression gate: a tripped/not-tripped result over the `fail_on`
+    /// trip set, written to `report/gate.json` and mirrored in progress.json.
+    RegressionGate,
+}
+
+impl ReportPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ReportPolicy::Parity => "parity",
+            ReportPolicy::RegressionGate => "regression-gate",
+        }
+    }
+}
+
+/// What trips the regression gate. The gate result is data consumed by the
+/// operator CLI (`report --check`); it never changes the engine's exit code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FailOn {
+    /// Observational run: the gate never trips.
+    None,
+    /// Trip on anything charged to the target or to run confidence:
+    /// unexpected-failure, unexpected-dependency-failure, upload-rejected,
+    /// infra-indeterminate.
+    Regression,
+    /// Everything in `regression`, plus the informational divergence
+    /// classes: output-divergence, unexpected-success,
+    /// interruption-not-reproduced.
+    Divergence,
+}
+
+impl FailOn {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            FailOn::None => "none",
+            FailOn::Regression => "regression",
+            FailOn::Divergence => "divergence",
+        }
+    }
+}
+
+/// Report-policy block of the campaign spec: which aggregation policies the
+/// report stage applies and what trips the regression gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ReportBlock {
+    /// Policies applied at report time. Defaults to the parity report alone.
+    pub policies: Vec<ReportPolicy>,
+    /// Regression-gate trip condition; only meaningful when `policies`
+    /// includes the regression-gate policy (validation enforces that).
+    pub fail_on: FailOn,
+}
+
+impl Default for ReportBlock {
+    fn default() -> Self {
+        Self {
+            policies: vec![ReportPolicy::Parity],
+            fail_on: FailOn::None,
+        }
+    }
+}
+
 /// The operator-provided campaign spec (input to `rio-parity run --spec`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -359,6 +430,7 @@ pub struct CampaignSpec {
     pub filters: Filters,
     pub scheduling: SchedulingBlock,
     pub supply: SupplyBlock,
+    pub report: ReportBlock,
     pub knobs: Knobs,
     /// Deployed image versions verified by launch pre-flight (recorded verbatim).
     pub cluster_versions: Option<serde_json::Value>,
@@ -378,6 +450,7 @@ impl Default for CampaignSpec {
             filters: Filters::default(),
             scheduling: SchedulingBlock::default(),
             supply: SupplyBlock::default(),
+            report: ReportBlock::default(),
             knobs: Knobs::default(),
             cluster_versions: None,
             deadline: None,
@@ -571,6 +644,14 @@ impl CampaignSpec {
             ),
             _ => {}
         }
+        // A fail-on condition is only ever evaluated by the regression-gate
+        // policy; requesting one without the other would silently produce a
+        // campaign whose gate never exists, so it is refused up front.
+        anyhow::ensure!(
+            self.report.fail_on == FailOn::None
+                || self.report.policies.contains(&ReportPolicy::RegressionGate),
+            "report.fail_on requires the regression-gate policy to be requested"
+        );
         Ok(())
     }
 }
@@ -719,6 +800,29 @@ impl CampaignRecord {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An otherwise-valid spec, parsed from JSON that also carries an
+    /// unknown field. Tests that need `validate()` to reach a later rule
+    /// (instead of tripping on an empty cluster/tenant field first) start
+    /// from this fixture; `spec_tolerates_unknown_fields` shares it to prove
+    /// forward compatibility.
+    fn valid_spec() -> CampaignSpec {
+        let json = format!(
+            r#"{{
+            "mode": "leaf",
+            "archive": {{"digest": "{digest}"}},
+            "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
+                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
+                        "store_addr": "rio-store.rio-store.svc:9002",
+                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
+            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
+                        "upstreams_verified": true}},
+            "bogus_future_field": {{"nested": [1, 2, 3]}}
+        }}"#,
+            digest = "ab".repeat(32)
+        );
+        serde_json::from_str(&json).unwrap()
+    }
 
     #[test]
     fn knob_defaults_match_design() {
@@ -929,24 +1033,39 @@ mod tests {
     #[test]
     fn spec_tolerates_unknown_fields() {
         // Forward compatibility: a spec written by a newer launch tool (or
-        // carrying operator annotations) still parses and validates.
-        let json = format!(
-            r#"{{
-            "mode": "leaf",
-            "archive": {{"digest": "{digest}"}},
-            "cluster": {{"gateway_store_url": "ssh-ng://rio@rio-gateway.rio-system.svc:22?ssh-key=/k",
-                        "scheduler_addr": "rio-scheduler.rio-system.svc:9001",
-                        "store_addr": "rio-store.rio-store.svc:9002",
-                        "gateway_host_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPlaceholder gateway"}},
-            "tenants": {{"build_tenant": "parity-leaf", "warm_tenant": "parity-warm",
-                        "upstreams_verified": true}},
-            "bogus_future_field": {{"nested": [1, 2, 3]}}
-        }}"#,
-            digest = "ab".repeat(32)
-        );
-        let spec: CampaignSpec = serde_json::from_str(&json).unwrap();
+        // carrying operator annotations) still parses and validates. The
+        // shared fixture's JSON carries the unknown field.
+        let spec = valid_spec();
         spec.validate().unwrap();
         assert_eq!(spec.archive.digest, "ab".repeat(32));
+    }
+
+    #[test]
+    fn report_block_defaults_and_wire_strings() {
+        let spec: CampaignSpec = serde_json::from_str(r#"{"mode":"leaf"}"#).unwrap();
+        assert_eq!(spec.report.policies, vec![ReportPolicy::Parity]);
+        assert_eq!(spec.report.fail_on, FailOn::None);
+        assert_eq!(
+            serde_json::to_value(ReportPolicy::RegressionGate).unwrap(),
+            serde_json::json!("regression-gate")
+        );
+        assert_eq!(
+            serde_json::to_value(FailOn::Divergence).unwrap(),
+            serde_json::json!("divergence")
+        );
+        // fail_on != none requires the regression-gate policy to be requested.
+        // valid_spec() is an otherwise-valid fixture so validate() reaches the
+        // report rule instead of tripping on an empty cluster/tenant field
+        // first (validate checks those before anything else).
+        let mut bad = valid_spec();
+        bad.report = ReportBlock {
+            policies: vec![ReportPolicy::Parity],
+            fail_on: FailOn::Regression,
+        };
+        let err = bad.validate().unwrap_err().to_string();
+        assert!(err.contains("regression-gate"), "{err}");
+        bad.report.policies.push(ReportPolicy::RegressionGate);
+        bad.validate().unwrap();
     }
 
     #[test]

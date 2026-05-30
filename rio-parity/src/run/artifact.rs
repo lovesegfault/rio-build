@@ -161,6 +161,7 @@ const SYNCED_FILES: &[&str] = &[
     "supply-report.json",
     "timed-stats.json",
     "report/summary.md",
+    "report/gate.json",
     "markers/plan.done",
     "markers/supply.done",
     "markers/report.done",

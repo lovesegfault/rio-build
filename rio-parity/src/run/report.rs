@@ -1,4 +1,4 @@
-//! Report rendering: summary.md, per-class JSONL files, and progress.json.
+//! Report rendering: summary.md, gate.json, per-class JSONL files, progress.json.
 //!
 //! Each distinct verdict or disposition gets its own JSONL file under
 //! `buckets/`, named by the class's wire string.
@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
 use super::model::{Disposition, JobRecord, Verdict};
 use super::spec::{
-    CampaignRecord, ComparabilityBlock, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+    CampaignRecord, ComparabilityBlock, FailOn, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
+    ReportPolicy,
 };
 use super::state::StateDir;
 use super::supply::exec::SupplyStageReport;
@@ -532,6 +533,94 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     out
 }
 
+/// Regression-gate result, written to `report/gate.json` and mirrored in
+/// progress.json when the campaign requested the regression-gate report
+/// policy. The gate is data for the operator CLI (`report --check` maps it
+/// to an exit code); the engine's own exit code never depends on it. The
+/// field names are the wire keys verbatim (snake_case), so the JSON reads
+/// `{"policy":…,"fail_on":…,"tripped":…,"counts":{…}}`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct GateResult {
+    /// Always the regression-gate policy name.
+    pub policy: String,
+    /// The trip condition the gate was evaluated under ([`FailOn`] wire string).
+    pub fail_on: String,
+    /// Whether any contributing class had a nonzero count.
+    pub tripped: bool,
+    /// The contributing classes with nonzero counts (empty when nothing in
+    /// the trip set was observed).
+    pub counts: BTreeMap<String, usize>,
+}
+
+/// Evaluate the regression gate over the final per-class counts.
+/// `regression` trips on anything charged to the target or to run
+/// confidence (unexpected-failure, unexpected-dependency-failure,
+/// upload-rejected, infra-indeterminate); `divergence` adds the
+/// informational divergence classes on top (output-divergence,
+/// unexpected-success, interruption-not-reproduced); `none` never trips.
+pub fn evaluate_gate(
+    fail_on: FailOn,
+    verdict_counts: &BTreeMap<String, usize>,
+    disposition_counts: &BTreeMap<String, usize>,
+) -> GateResult {
+    let regression = [
+        Verdict::UnexpectedFailure.as_str(),
+        Verdict::UnexpectedDependencyFailure.as_str(),
+        Disposition::UploadRejected.as_str(),
+        Verdict::InfraIndeterminate.as_str(),
+    ];
+    let divergence_extra = [
+        Verdict::OutputDivergence.as_str(),
+        Verdict::UnexpectedSuccess.as_str(),
+        Verdict::InterruptionNotReproduced.as_str(),
+    ];
+    let contributing: Vec<&str> = match fail_on {
+        FailOn::None => Vec::new(),
+        FailOn::Regression => regression.to_vec(),
+        FailOn::Divergence => regression
+            .iter()
+            .chain(divergence_extra.iter())
+            .copied()
+            .collect(),
+    };
+    // The verdict and disposition vocabularies never overlap, so each class
+    // name resolves in exactly one of the two count maps.
+    let mut counts = BTreeMap::new();
+    for class in contributing {
+        let count = verdict_counts
+            .get(class)
+            .or_else(|| disposition_counts.get(class))
+            .copied()
+            .unwrap_or(0);
+        if count > 0 {
+            counts.insert(class.to_string(), count);
+        }
+    }
+    GateResult {
+        policy: ReportPolicy::RegressionGate.as_str().to_string(),
+        fail_on: fail_on.as_str().to_string(),
+        tripped: !counts.is_empty(),
+        counts,
+    }
+}
+
+/// The campaign's gate result when (and only when) the regression-gate
+/// report policy was requested in the spec; `None` otherwise.
+fn gate_for_spec(campaign: &CampaignRecord, agg: &Aggregates) -> Option<GateResult> {
+    campaign
+        .spec
+        .report
+        .policies
+        .contains(&ReportPolicy::RegressionGate)
+        .then(|| {
+            evaluate_gate(
+                campaign.spec.report.fail_on,
+                &agg.verdict_counts,
+                &agg.disposition_counts,
+            )
+        })
+}
+
 /// progress.json: stage, per-verdict/disposition counts, rates, suspension
 /// windows, ETA.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -563,6 +652,11 @@ pub struct Progress {
     /// is asked to abort instead of the engine pausing itself.
     #[serde(default)]
     pub abort_recommended: bool,
+    /// Regression-gate result over the counts above, mirroring
+    /// `report/gate.json`; absent when the campaign did not request the
+    /// regression-gate report policy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gate: Option<GateResult>,
 }
 
 /// Build the progress.json document from the current records and stage.
@@ -608,14 +702,23 @@ pub fn build_progress(
         supply: supply.map(supply_block),
         timed: timed.map(|stats| timed_block(stats, &agg.verdict_counts)),
         abort_recommended,
+        gate: gate_for_spec(campaign, &agg),
     }
 }
 
-/// Write summary.md + `buckets/<verdict-or-disposition>.jsonl` into the
-/// state dir and return the rendered summary text.
+/// Write summary.md + `report/gate.json` (when a regression gate was
+/// requested) + `buckets/<verdict-or-disposition>.jsonl` into the state dir
+/// and return the rendered summary text.
 pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String> {
     let summary = render_summary(input);
     state.write_bytes("report/summary.md", summary.as_bytes())?;
+    // Regression gate: persisted as data next to the summary, never encoded
+    // in the engine's exit code — the gate is consumed by the operator CLI's
+    // report --check, and a nonzero pod exit would make the Job controller
+    // retry the whole campaign.
+    if let Some(gate) = gate_for_spec(input.campaign, &aggregate(input.records)) {
+        state.write_json_atomic("report/gate.json", &gate)?;
+    }
     // Per-class JSONL (one file per distinct verdict or disposition). The
     // report stage owns buckets/: drop files from a previous render first,
     // so a job that since moved classes cannot linger in its old file.
@@ -1103,6 +1206,25 @@ mod tests {
         let out = render_summary(&bare);
         assert!(out.contains("## Supply"), "{out}");
         assert!(out.contains("(not recorded)"), "{out}");
+    }
+
+    #[test]
+    fn gate_trips_per_fail_on_policy() {
+        let mut counts = BTreeMap::new();
+        counts.insert(Verdict::MatchBuilt.as_str().to_string(), 10);
+        let dispositions = BTreeMap::new();
+        assert!(!evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped);
+        counts.insert(Verdict::OutputDivergence.as_str().to_string(), 1);
+        assert!(!evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped);
+        assert!(evaluate_gate(FailOn::Divergence, &counts, &dispositions).tripped);
+        counts.insert(Verdict::UnexpectedFailure.as_str().to_string(), 1);
+        let gate = evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped;
+        assert!(gate);
+        let mut dispositions = BTreeMap::new();
+        dispositions.insert(Disposition::UploadRejected.as_str().to_string(), 2);
+        let counts = BTreeMap::new();
+        assert!(evaluate_gate(FailOn::Regression, &counts, &dispositions).tripped);
+        assert!(!evaluate_gate(FailOn::None, &counts, &dispositions).tripped);
     }
 
     #[test]
