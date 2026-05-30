@@ -910,6 +910,41 @@ module closureEvidence {
     boundsOK
   }
 
+  /// The failover-scope variant of asBuiltHoldInvariants: additionally
+  /// excludes L3 (liveBuildTerminalOrProgressArmed), which is genuinely
+  /// violated as built at the failover scopes — the post-0d triage
+  /// finding: a failover kills a Substituting member's walk, recovery
+  /// restores it as Queued waiting on its persisted-Poisoned child (the
+  /// D17 in-memory-only Substituting reset never re-arms walks), and a
+  /// subsequent admin ClearPoison / TTL sweep removes that child WITHOUT
+  /// re-evaluating the surviving parent's readiness
+  /// (handle_clear_poison -> remove_node, "must not trigger parent
+  /// re-evaluation") — leaving the parent Queued, childless and unarmed
+  /// under a live build's interest. Trace, code walk and the Phase-1
+  /// disposition: invariant map, post-0d triage record. The single-tenure
+  /// scopes keep L3 (it holds there — the 0c BaseEx record).
+  val asBuiltHoldInvariantsFailoverEx = and {
+    noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
+    holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
+    brokenNeverVouches, failFastConsumesMarkKeepsHole,
+    failoverPreservation, pullRefusalNoMint, chainTermination,
+    stampAtomicWithActivation, terminalIsTerminal,
+    readyImpliesDeclaredDepsProduced, liveInterestRequiredForDispatch,
+    recoveryClearCompleteness, healCompleteness,
+    chainEndClearsForgiveness, condemnRequiresLiveCoOwnedFailure,
+    completedWithoutBuildImpliesWantedPresent,
+    substituteOkImpliesClosureIngested, unknownNeverDemotes,
+    noVacuousWantedVerdict, storedWantedMonotone,
+    rollbackRestoresWantedAndEvidence,
+    pruneNotMorePermissiveThanClassification,
+    dispatchImpliesProbedThisPass, staleProducedNeverUnlocksDependents,
+    demandSetSurvivesPrune, wrongfulFailFastBoundedPerArming,
+    noWrongfulFromSourceDemotion,
+    noBuildWhenWantedPresent, terminalBuildStopsPinning,
+    substitutingAlwaysArmed,
+    boundsOK
+  }
+
   /// The default safety conjunction (everything except the
   /// pre-registered expected-fail probes A17/A18/B2-strong/C1-strict/L2).
   /// Phase 0c selects per-regime lists from the individual names; this
@@ -2583,6 +2618,48 @@ module closureEvidenceFailoverDuo {
     WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 1,
     INTENT_CEIL = 3,
+    WALKS_PER_NODE = 1,
+    STORE_PER_OUTPUT = true
+  ).*
+}
+
+/// C3 probe regime (post-0d triage): the two-build universe restricted
+/// to exactly the alphabet the CONFIRMED C3 trace needs — duplicate
+/// submissions, the client cancel + terminal-build reap, per-output
+/// store letters and the substitution walk — with the poison, attempt,
+/// fault and GC alphabets off and one extra intent slot so the
+/// fail-fast's mark-clear emission fits without a pgApply step. This is
+/// the scope the wired expect-violation check
+/// quint-closure-evidence-probe-wrongful-terminal-failure runs against:
+/// the faithful two-live-builds wrongful-terminal-failure trace (narrow
+/// build prunes+stamps and cache-hits; wide co-build demotes the
+/// stale-Produced root and spawns the wide walk; the walk genuinely
+/// fails on the wide-only output at check time; the co-build is
+/// cancelled, its child reaped, the root holed; the stale verdict
+/// fail-fasts the narrow build whose own wanted output is present) is
+/// reachable here in seven actions, where the full closureEvidenceDuo
+/// scope needs multi-hour TLC for the same violation (the post-0d
+/// triage budget record). Following the closureEvidenceAdversarialStoreEx
+/// precedent: a probe scope is sized so its violation sits inside a
+/// wired check's budget, never so small that the violation disappears.
+module closureEvidenceC3Duo {
+  import closureEvidence(
+    DRVS = Set("d1", "d2"),
+    BUILDS = Set("b1", "b2"),
+    REFS = Set(("d1", "d2")),
+    SUBMISSION_BUDGET = 2,
+    FAILOVERS = 0,
+    PGDROP_BUDGET = 0,
+    STALE_APPLY = false,
+    CROSS_TENURE_WALKS = false,
+    STORE_GC_BUDGET = 0,
+    ROW_GC_BUDGET = 0,
+    PURGE_BUDGET = 0,
+    POISON_BUDGET = 0,
+    CANCEL_BUDGET = 1,
+    WALK_CONSUME_CEIL = 1,
+    ATTEMPT_CYCLE_CEIL = 0,
+    INTENT_CEIL = 4,
     WALKS_PER_NODE = 1,
     STORE_PER_OUTPUT = true
   ).*
