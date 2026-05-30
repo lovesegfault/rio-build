@@ -18,14 +18,18 @@ complete — verdict GO: every corpus family that the design marks
 encodable falsifies through a wired or evidence-module representative
 with a holding baseline, except the C5/CE-7 row (deferred to a
 documented manual target, owner sign-off requested) and with the F6 /
-F11 falsifications resting on the rust-simulator backend (a TLC-backend
-discrepancy is recorded as a tool issue). Six permanent
+F11 falsifications resting on the rust-simulator backend. Six permanent
 quint-closure-calib-* checks are wired and green; verdicts, re-routes,
-the acceptance table, the housekeeping record for the six 0c checks,
-and two new stop-and-report items (the TLC discrepancy; an unidentified
-as-built conjunction violation at the FailoverEx scope) are in the 0d
-stage record. Phase 1 (red-first fixes) is next, gated on the owner
-adjudications listed there.**
+the acceptance table, and the housekeeping record for the six 0c checks
+are in the 0d stage record. Post-0d triage complete (its stage record is
+the last section): the three C3-adjudication model corrections are
+applied and the C3 probe re-pointed to the faithful two-build scope; the
+0d FailoverEx stop-and-report item is triaged to an L3 violation — a
+REAL as-built finding, the second Phase-1 candidate; and the 0d
+"TLC-backend discrepancy" stop-and-report item is re-diagnosed as a
+budget/metric issue, not a tool bug — no exhaustive verdict is
+downgraded. Phase 1 (red-first fixes) is next, gated on the owner
+adjudications listed in the post-0d triage record.**
 
 ## Phase 0a spec-audit record
 
@@ -101,7 +105,7 @@ executor-campaign convention.
 | C1 | `wrongfulFailFastBoundedPerArming` | At most one wrongful fail-fast per (node, arming); re-arming is a new stamp or a recovery restoring the mark. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | C1-strict | `wrongfulFailFastBoundedPerStamp` | The per-(node, stamp) form with no recovery re-arming. **Pre-registered expected-fail probe** (failover/fault-persist); the AW2 deliverable. | — (AW2 disposition) | expected-fail probe — NOT producible within the §2b ceilings (the AW2 loop needs a second availability transition per output); recorded as a deviation, not wired |
 | C2 | `noWrongfulFromSourceDemotion` | Outside the genuine-walk-failure one-shot, the probe never routes a node from-source while every missing live-wanted output is available upstream. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
-| C3 | `noWrongfulTerminalFailureSingleTenure` | With no failover, no store GC and no upstream withdrawal, no build is wrongfully terminally failed. | sched.merge.substitute-topdown+11 | VIOLATED as-built at base scope — REAL defect candidate (11-state trace + code walk in the 0c stage record); excluded from the wired conjunction, pinned by the wrongful-terminal-failure expect-violation check; Phase-1 red-first candidate, owner adjudication |
+| C3 | `noWrongfulTerminalFailureSingleTenure` | With no failover, no store GC and no upstream withdrawal, no build is wrongfully terminally failed. | sched.merge.substitute-topdown+11 | VIOLATED as-built — CONFIRMED defect (C3 adjudication + post-0d triage): the violation needs TWO live builds (the faithful trace is in the post-0d triage record); after the adjudication's model corrections C3 HOLDS at the single-build BaseEx scope (the 0c 11-state trace is refuted). Excluded from the wired conjunctions, pinned by the wrongful-terminal-failure expect-violation check at the closureEvidenceC3Duo probe scope; Phase-1 red-first candidate |
 | C4 | `noBuildWhenWantedPresent` | A node whose live-wanted outputs are all present at merge is not queued for a from-source build. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | C5 | `terminalBuildStopsPinning` | Only live builds' wanted outputs drive resets, forgiveness refusal and re-pinning. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) (latch is a by-construction hook; falsifiability owned by the 0d calibration override) |
 
@@ -111,7 +115,7 @@ executor-campaign convention.
 |---|---|---|---|---|
 | L1 | `substitutingAlwaysArmed` | A Substituting node always has a walk instance in flight. | sched.substitute.detached+5 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | L2 | `markedBrokenSettlementArmed` | No reachable D16 limbo cell (marked, Broken, tried, Ready, live interest, all live-wanted outputs present, no walk). **Pre-registered expected-fail probe** (base); its violation trace is the D16 deliverable. | sched.evidence.settlement (intentionally uncovered) | expected-fail probe — NOT yet produced (the D16 cell is ≥16 steps deep at duo scope; deferred-probe record in the 0c stage record) |
-| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
+| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (0c run record); **VIOLATED as-built at the failover scope — REAL finding (post-0d triage)**: failover + recovery + ClearPoison strands a recovered parent Queued/childless/unarmed under a live build's interest (10-state trace + code walk in the post-0d triage record); excluded from the failover manual target's conjunction (`asBuiltHoldInvariantsFailoverEx`); Phase-1 candidate, owner adjudication |
 
 ### Non-vacuity witnesses (encoded in 0b, wired as expect-violation checks in 0c)
 
@@ -547,6 +551,7 @@ the owner rather than made silently here.
 | closureEvidenceBase / FaultPersist / Failover / StaleTenure / AdversarialStore | design §2b constants (4 drv / 2 builds, per-output store, dual walks) | witness + expected-fail-probe vehicles; exhaustive checks at this scale did not converge within a gate-compatible budget (the 0b slice measurement and the ladder table above carry the figures) and are held as unwired manual targets — the executor-campaign precedent; owner adjudication at close-out |
 | closureEvidenceBaseEx / FaultPersistEx / FailoverEx | 2 drv / 1 build / 2 submissions, ladder granularity | the manual exhaustive targets (`asBuiltHoldInvariants`); held back from CI on budget, run records below |
 | closureEvidenceDuo | 2 drv / 2 builds, no faults | cross-build probe/investigation scope: the L2/D16 probe, the H1 reap witness, the wrongful-FF-trigger witness, the C3 investigation |
+| closureEvidenceC3Duo (added post-0d) | 2 drv / 2 builds, cancel/reap + per-output store only (no poison/attempts/faults/GC), INTENT_CEIL 4 | the C3 probe scope: the confirmed two-build wrongful-terminal-failure trace inside a wired check's budget (post-0d triage record) |
 | closureEvidenceStaleDuo / FailoverDuo | 2 drv / 2 builds + failovers (+ stale apply / + lost writes) | probe scopes for A17 and C1-strict |
 
 What the reduced exhaustive scope gives up relative to the design
@@ -629,7 +634,7 @@ time given per check).**
 | (manual target, not wired) closureEvidenceBaseEx × `asBuiltHoldInvariants` | — | the exhaustive single-tenure verdicts of the per-property table; held back from CI on budget (the §2b.1 contingency) | the 0c run record below |
 | quint-closure-evidence-probe-stale-evidence-write | closureEvidenceStaleTenure, A18 | the unfenced-evidence-write window (D14 leg) | violation at depth 4–5; seconds |
 | quint-closure-evidence-probe-vouched-closure-gone | closureEvidenceAdversarialStore, B2-strong | the GC-after-vouch accepted bound | violation at depth 5–6; seconds |
-| quint-closure-evidence-probe-wrongful-terminal-failure | closureEvidenceBaseEx, C3 | the Phase 0c finding (stale walk-failure fail-fast) until its Phase-1 disposition | violation at depth 11; ≈3–5 min |
+| quint-closure-evidence-probe-wrongful-terminal-failure | closureEvidenceBaseEx, C3 *(re-pointed to closureEvidenceC3Duo by the post-0d triage — the BaseEx violation was the refuted single-build trace)* | the Phase 0c finding (stale walk-failure fail-fast) until its Phase-1 disposition | violation at depth 11; ≈3–5 min |
 | 11 single-tenure witnesses (stamp, prune, rollback, fail-fast, hole-admin-clear, hole-ttl-sweep, walk-ok, walk-fail, forgiven-residual, tried-demotion, downgrade-respawn) | closureEvidenceBaseEx | non-vacuity of the wired base conjunction | violations at depth ≤8; seconds |
 | witness-hole-reap | closureEvidenceDuo | H1 (reap of a shared parent's un-produced child) | shallow; seconds-to-minutes |
 | witness-hole-recovery, witness-recovery-clear | closureEvidenceFailoverEx | H4 and the strict-criterion recovery clear | shallow; seconds-to-minutes |
@@ -693,9 +698,16 @@ The re-point and the unwirings are recorded inline in nix/quint.nix at
 the affected entries, with the rust-simulator commands. Net wired-check
 delta for the 0c set: 6 wired → 4 wired (hole-reap, recovery-clear,
 re-pointed B2-strong, plus the C3 probe and the 11 BaseEx witnesses
-which were already green at the 0c report), 3 manual targets.
+which were already green at the 0c report), 3 manual targets. *[The 3
+manual-target demotions are reversed by the post-0d triage record (the
+last section): all three are re-wired through the rust-simulator
+expect-violation constructor that stage adds.]*
 
-**TLC-backend discrepancy (tool issue; stop-and-report).** Found while
+**TLC-backend discrepancy (tool issue; stop-and-report).** *[Since
+re-diagnosed by the post-0d triage record (the last section): not a
+tool issue — a budget + progress-metric misreading; TLC finds every
+affected violation at its true depth given the budget. The paragraph
+below is kept as the 0d-stage observation.]* Found while
 fixing the housekeeping wirings and reproducible at will: for the
 stale-tenure alphabet (STALE_APPLY / CROSS_TENURE_WALKS) at
 closureEvidenceStaleDuo scope, and for the consume-walk downgrade-revert
@@ -882,7 +894,11 @@ pattern); the C5 target above is the one override still to be written.
 No tracey markers on calibration checks (house convention).
 
 **The FailoverEx as-built conjunction violation (stop-and-report; the
-first measurement of a fault regime).** As part of establishing
+first measurement of a fault regime).** *[Since triaged by the post-0d
+triage record (the last section): the violated conjunct is L3, a REAL
+as-built finding — trace, code walk and Phase-1-candidate disposition
+there. The paragraph below is kept as the 0d-stage observation.]* As
+part of establishing
 baselines, this stage ran the held-back manual exhaustive target
 `closureEvidenceFailoverEx` × `asBuiltHoldInvariants` (the as-built
 step, no override) for the first time: **VIOLATED** at BFS depth 16
@@ -952,7 +968,9 @@ re-dispositioned; the two re-routes and the two structural deferrals
 above are within-family and recorded).
 
 **Go/no-go.** GO for Phase 1, with the following named owner-sign-off
-items carried out of the gate rather than papered over:
+items carried out of the gate rather than papered over. *[This list is
+superseded by the "Updated owner sign-off items" list at the end of the
+post-0d triage record, which resolves items 4–5 below.]*
 
 1. The C5 / CE-7 deferral — the only §4 ENC row with no falsification
    in hand; manual-target plan recorded above.
@@ -992,6 +1010,377 @@ evidence handling should re-run the corresponding family's evidence
 module even where it is not wired; any change to the model file
 re-runs all six wired calib checks plus the witness/probe set
 automatically (the .qnt fileset is the eval input).
+
+### Post-0d triage — C3-adjudication corrections, FailoverEx conjunction, TLC-backend discrepancy (this stage)
+
+This stage executes the two stop-and-report items the 0d record raised
+for orchestrator triage and applies the three model corrections the C3
+adjudication queued. Verification subject unchanged (`formal-sprint` @
+`cccb4d778`); all measurements in this section: 192-core builder, TLC
+via the warm shared apalache-server prelude, worker counts as noted.
+
+**1. The C3-adjudication model corrections (applied).**
+
+The adjudication confirmed the C3 mechanism (a stale ok=false walk
+verdict consumed at the topdown fail-fast with no presence re-check)
+but refuted the 0c single-build trace: its step 7+9 combination is
+unreachable as-built because the sole-interest cancel chain cancels the
+stale walk's node and the directed resubmit re-probes it. Three model
+corrections were queued (deliberately held until 0d finished) and are
+now applied:
+
+- CE-CORR-1 (`poisonArrival` cancel pass): when a poison verdict fails
+  builds, the model now runs the `cancel_build_derivations` pass over
+  the failing builds' exclusively-owned members — un-hit, non-terminal
+  members whose every interested active build is itself failing go
+  Cancelled, exactly as `handle_derivation_failure`'s keep_going=false
+  arm does (build.rs:cancel_build_derivations; mirrors the model's
+  existing cancelBuild / pFailFast cancel passes). A sole-interest
+  Substituting member therefore leaves Substituting when its build
+  fails, and its in-flight walk is orphaned into the not-Substituting
+  drop guard instead of staying consumable.
+- CE-CORR-2 (walk staleness re-grounded on walk duration): the walk
+  actions are re-documented and re-grounded as check-time vs send-time —
+  `walkFinishes` is the walk task's last presence check (the verdict and
+  the ok-ingest are fixed mid-flight), `consumeWalk` is the send plus
+  the actor's processing as ONE step. The window between them is the
+  tail of the walk's own duration; a SubstituteComplete can be stale
+  only because the world changed DURING the walk. The actor's FIFO
+  mailbox excludes the reordering the refuted trace relied on (a
+  resubmit issued in response to the build failure being processed
+  before the walk completion that was already enqueued). No transition-
+  relation change was needed for this correction — the two-action
+  structure already encodes exactly this window; what changes is the
+  stated grounding (the 0b/0c reading treated the window as mailbox
+  delay) and, with CE-CORR-1/3, which traces survive it.
+- CE-CORR-3 (Cancelled/Failed resubmit-reset re-probe): the merge's
+  reset of kept terminal/Failed nodes now also discards stale walk
+  records (`walks: []`), completing the fresh-state semantics of
+  production's remove+reinsert (dag/mod.rs:389-443
+  `is_retriable_on_resubmit`, merge.rs:486-507 `existing_reprobe`): a
+  reset node re-evaluates presence through THIS merge's classification
+  (cache-hit → Produced from store), never through a verdict formed
+  before it went terminal. Propagated to the five calibration modules
+  that carry frozen `mergeCommit` copies (closure-f1-stale-produced,
+  closure-f1-skip-store-recheck, closure-f4-demand-drop,
+  closure-f4-vacuous-prune, closure-f7-clear-unbuilt-children) so each
+  still differs from as-built by exactly its one intended guard.
+
+Validation after each correction: `quint typecheck` green (core model +
+all 15 calibration modules). Behavioral validation:
+
+- C3 at `closureEvidenceBaseEx` (the single-build scope): **no longer
+  violated.** Rust simulator: no violation in 30 K samples × 20 steps.
+  TLC: no violation through 10.34 M distinct states (43.95 M generated,
+  reported diameter 14, 40 workers, stopped at the 30-min cap) — 5.8×
+  the distinct-state count at which the 0c run found the old trace
+  (1.77 M). The refuted single-build trace is gone from the model, as
+  the adjudication requires.
+- C3 at two-build scopes: **violated via the faithful trace.** Rust
+  simulator at `closureEvidenceDuo`: violation in ≈2.3 s (≈200 K
+  traces); the captured 12-state trace is exactly the adjudication's
+  surviving variant — b1's narrow pruned merge stamps d1 and cache-hits
+  it (output 1 present); b2's wide duplicate submission demotes the
+  stale-Produced d1 (wide wanted set not all present) and spawns the
+  wide walk; the walk genuinely fails on the wide-only output 2 at
+  check time; b2 is cancelled, d2 reaped, d1 holed; the stale verdict's
+  delivery fail-fasts b1, whose own (narrow) wanted output is present.
+  Single tenure, no GC, no upstream change anywhere in the trace.
+- `asBuiltHoldInvariants` still holds under simulation at BaseEx, Duo
+  and FailoverEx after the corrections (20–40 K samples × 30 steps
+  each).
+
+Wiring consequence: the wired expect-violation check
+`quint-closure-evidence-probe-wrongful-terminal-failure` is re-pointed
+from `closureEvidenceBaseEx` under TLC (where it would now fail — no
+violation exists there) to `closureEvidenceDuo` under the NEW
+rust-simulator expect-violation constructor (`mkQuintSimWitnessCheck`,
+added to nix/quint.nix by this stage — see item 3's consequences). The
+TLC route was measured and rejected on budget at both two-build scopes:
+
+- `closureEvidenceDuo` × C3 under TLC: stopped unconverged at 540 K
+  distinct states / 15 min (60 workers) with the violation still ≥2
+  BFS levels away — the same per-level cost story as item 3.
+- A dedicated reduced probe scope `closureEvidenceC3Duo` was added (the
+  two-build universe restricted to exactly the confirmed trace's
+  alphabet: duplicate submissions, cancel + reap, per-output store
+  letters, walks; poison / attempt / fault / GC off; one extra intent
+  slot so the 7-action trace needs no pgApply step) and measured: TLC
+  stopped unconverged at 573 K distinct states / 4.0 M generated /
+  ≈15 min (60 workers) without reaching the depth-8 violation. The
+  module is kept as the documented TLC manual target for C3 (it is the
+  cheapest known TLC scope for this violation), but it is not
+  gate-compatible either.
+- The rust simulator at `closureEvidenceDuo` finds the violation
+  reliably (7/7 independent runs at 2 M samples; the violation sits at
+  a per-trace hit rate of ≈1/150 K, so the wired check's 5 M-sample
+  budget puts the miss probability at ≈e^-33). Per-run wall clock:
+  ≈20–30 s.
+
+**2. FailoverEx as-built conjunction violation: triaged — the violated
+conjunct is L3, a REAL as-built finding (the second Phase-1
+candidate).**
+
+Re-run after the Part-1 corrections (per the triage plan: if the
+violation had disappeared, the cause would have been the poisonArrival
+encoding gap): **still violated** — `closureEvidenceFailoverEx` ×
+`asBuiltHoldInvariants`, violated at 2.06 M distinct states (8.5 M
+generated, reported diameter 12) in 8 min 15 s at 60 workers, and this
+run emitted the trace (the 0d full-width run had not). The poisonArrival
+hypothesis is refuted; the violation is real and survives the
+corrections.
+
+Violated conjunct (identified from the trace — no per-property
+bisection was needed): **L3 `liveBuildTerminalOrProgressArmed`**. Every
+violation latch in the final state is false, so the violated conjunct
+is one of the state-form properties, and the final state is exactly
+L3's negation: a live build with non-empty interest whose only member
+has no progress arm.
+
+The 10-state trace (archived in the triage run transcript;
+`/tmp/rio-dev/ce-triage/runC-failoverex/run.log` during the session,
+reproducible with the manual-target command below):
+
+1. Environment: nothing present or upstream anywhere.
+2. `mergeCommit(b1)` — full merge of {d1→d2}; d1 → Substituting (walk
+   spawned), d2 → Ready (confirmed-missing classification).
+3. `pgApplyAny` — the merge transaction lands (rows, edges (d1,d2),
+   links {d1,d2}).
+4. `poisonArrival(d2)` — d2 → Poisoned (persisted); b1 fails; the
+   cascade skips Substituting d1; the (new) cancel pass cancels
+   sole-interest d1 → Cancelled.
+5. `mergeCommit(b1)` — the directed resubmit: prune keeps {d1} (demand
+   available via the substitutable answer), d2 dropped; d1 (Cancelled →
+   reset, stale walk discarded) re-classified pending-substitute →
+   Substituting with a FRESH walk; b1 Active again; the resubmit's
+   merge intent replaces b1's links with {d1}.
+6. `pgApplyAny` — the resubmit's transaction lands (b1's durable links
+   are now {d1}).
+7. `leaderLost`.
+8. (environment step)
+9. `recoverAsLeader` — recovery loads d1 (pgSt Queued — Substituting is
+   in-memory-only, D17) and d2 (pgSt Poisoned, within TTL); b1 Active
+   with interest {d1} (links ∩ loaded); d1 restored MQueued (its
+   durable child d2 is un-produced, so the dependency walk gates it);
+   d1's in-flight walk died with the old tenure (CROSS_TENURE_WALKS =
+   false), so NOTHING is armed on d1 — but L3 still holds here: d1 is
+   Queued above an un-produced child, which counts as armed (the
+   child's own settlement will cascade).
+10. `poisonClear(d2)` — admin ClearPoison / TTL sweep: d2 removed from
+    the DAG, the (d1,d2) edge scrubbed, d1's closure-hole stamped. d1
+    is now **Queued, childless, walk-less, attempt-less** — and b1 is
+    Active with interest {d1}. No progress arm exists: L3 violated.
+
+Code walk (formal-sprint @ cccb4d778), step by step: the resubmit's
+re-classification spawns a detached fetch whose task dies with the
+process at failover (no walk identity, no persistence — dispatch.rs
+spawn_substitute_fetches); recovery's `seed_ready_queue` re-derives
+dispatchability from the recovered child set and never re-arms
+substitution walks (the D17 in-memory-only Substituting reset —
+recovery.rs); `handle_clear_poison` (completion.rs:2520–2594) removes
+the node via `dag.remove_node` and stamps the surviving parents'
+closure_hole, and `remove_node`'s own contract (dag/mod.rs:1271–1273,
+1359–1390) is explicit that the removal "must not trigger parent
+re-evaluation" — the design intent being that the next merge re-inserts
+the child fresh; nothing else ever re-evaluates the parent: the
+promotion passes run only at merge time and at child-completion time,
+the dispatch probe partition only touches Ready nodes, and the parent
+is Queued. The recovered build b1 therefore hangs Active forever unless
+an external new submission happens to re-merge d1.
+
+Classification: **REAL as-built finding** (not a model artifact): every
+step is as-built behavior, and the stranding is the composition of
+three individually-documented behaviors (walks die with the tenure;
+recovery's dependency gating; ClearPoison's no-re-evaluation removal).
+It is the failover-scope sibling of the D16 settlement gap: where D16
+is "marked+Broken+tried+present and the dispatch probe refuses to act",
+this is "Queued+childless+unarmed and nothing ever looks at it". Per
+the design §8 triage rule (a counterexample violating a property in a
+fault regime the §2b matrix marks in-scope is a defect candidate) this
+is a **Phase-1 candidate** — candidate fix shapes: ClearPoison /
+poison-TTL removal runs the same promote-newly-ready pass the
+completion path runs for surviving parents (the narrow fix), or
+recovery re-probes Queued nodes whose durable children are all
+terminal (the wider fix, also closing the recovery half of D16) — with
+accepted-with-rationale (operator runbook: directed resubmit after
+ClearPoison) as the alternative disposition; owner adjudication
+required. NOT fixed in this phase.
+
+Dispositions:
+
+- The model gains `asBuiltHoldInvariantsFailoverEx` (=
+  `asBuiltHoldInvariants` minus L3) so the FailoverEx manual exhaustive
+  target remains meaningful while the finding is open; the
+  single-tenure scopes keep L3 (it holds there — the 0c BaseEx record).
+- The L3 falsification at FailoverEx is a **documented manual target**,
+  not a wired probe (the violation sits at ≈2 M distinct states /
+  ≈8 min at 60 workers — past the wired-check budget; the C3 precedent
+  of wiring the falsification applies only when the violation fits the
+  budget):
+
+  ```
+  quint verify --backend=tlc --main=closureEvidenceFailoverEx \
+    --invariant=liveBuildTerminalOrProgressArmed \
+    docs/spec/models/closureEvidence.qnt
+  ```
+
+  The rust simulator does NOT reach this violation in bounded samples
+  (300 K × 14 steps found nothing — the trace needs two specific merge
+  payloads, a poison, a failover and a poison-clear in order), so the
+  TLC run above and the archived trace are the falsification evidence.
+- The 0c per-property table's L3 row is updated (violated as-built at
+  the failover scope); the 0c "no violation found at the reduced base
+  scope" reading for L3 stands — the violation needs the failover
+  alphabet.
+- Whether the 0d depth-16 violation was this same L3 shape cannot be
+  confirmed (that run never emitted a trace), but it is consistent: the
+  violation exists in the pre-correction model along the same path
+  (correction CE-CORR-1 appears in the trace at step 4 but is not
+  load-bearing — without it d1 stays Substituting through the resubmit
+  and the recovery strands it the same way).
+
+**3. TLC-backend discrepancy: resolved — not a tool bug; a budget +
+progress-metric misreading. No exhaustive verdict is downgraded.**
+
+Reproduction (same module, same property, both backends): rust
+simulator finds the A18 `leaderClassEvidenceWrites` violation at
+`closureEvidenceStaleDuo` in 0.7 s; TLC runs capped at 15–40 min do
+not (16-worker and 1-worker runs both timed out without flagging it,
+matching the 0d observation).
+
+Diagnosis by link bisection — each prefix of the 4-action violation
+path (mergeCommit → leaderLost → recoverAsLeader → stale pgApplyAny)
+pinned by a throwaway expect-violation witness, all run with the FULL
+step relation at StaleDuo:
+
+| Prefix pinned | TLC outcome |
+|---|---|
+| any intent exists (depth 1, mergeCommit fires) | violated in ≈2 s |
+| leader down (depth 2, leaderLost fires) | violated in seconds |
+| second tenure exists (depth 3, recoverAsLeader fires) | violated at the true depth-3 trace in ≈35 s (1.9 K distinct states) |
+| stale intent survives recovery (depth 4) | violated at the true depth-4 trace in ≈320 s (16 K distinct states) |
+| the A18 violation itself (depth 5) | found in 49 s / 7 K distinct states under a restricted step (merge+lease+pgApply only), proving the translation of every involved action is sound; **and found with the FULL step relation** in 14.8 min / 776 K distinct states (5.1 M generated) at 100 workers — the closing confirmation that TLC finds exactly the violation the 0d record said it "explores past" |
+
+So TLC's BFS is CORRECT — every link is taken at its true depth, and
+the full violation is found whenever the budget covers its level. The
+discrepancy's root causes are:
+
+- (ii) of the candidate list — a depth/throughput accounting issue:
+  the per-level distinct-state growth at the stale-tenure scope is
+  ≈10× per BFS level (1.9 K → 16 K → ≈160 K+ distinct states for
+  levels 3/4/5) with a high per-state successor cost (dual walks,
+  per-output store letters, two builds, the stale-apply alphabet), so
+  the depth-5 violation needs roughly an hour of TLC at moderate worker
+  counts — past every 0c/0d/triage cap.
+- TLC's `Progress(N)` diameter metric overstates completed BFS levels:
+  it reports the depth of recently dequeued states, and with the
+  multi-worker disk queue, deeper states are dequeued before shallower
+  levels complete. The 0d reading "TLC explores past the violation
+  depth (BFS depth 6–7) without flagging" was this metric, not a
+  completed level. (Independent corroboration: the 0c BaseEx C3
+  violation is an 11-state trace that TLC reported at diameter 16.)
+- The 0d record's "one run hard-errored at 93 ms" is consistent with
+  the documented cold-server conversion failure (the empty-details gRPC
+  INTERNAL error quint surfaces as a fast hard error), not with a TLC
+  evaluation error; no evaluation error was reproduced in any triage
+  run, including single-worker runs.
+
+Consequences and dispositions:
+
+- **No verdict downgrade.** Nothing in the map claimed exhaustive
+  verification through the affected scopes — the affected items were
+  already manual targets / rust-simulator evidence. The "exhaustive
+  verdicts stand" branch of the triage deliverable applies.
+- The F6 / F11 calibration rows keep their rust-simulator evidence,
+  but their classification changes from "tool issue (candidate
+  upstream filing)" to "budget" — there is **no upstream issue to
+  file**. nix/quint.nix's inline records are updated accordingly.
+- The A18 / D14 fencing evidence (§9.1) now rests on: the rust
+  simulator (0.7 s reproduction, now WIRED — below), TLC's
+  restricted-step confirmation (depth-5 violation, 49 s), TLC's
+  full-step confirmation (14.8 min, 776 K distinct states), and the
+  link-bisection table above. This is strictly stronger than the 0d
+  posture (unwired rust evidence only).
+- **Harness extension (done in this stage, not deferred):**
+  nix/quint.nix gains `mkQuintSimWitnessCheck`, a rust-simulator
+  expect-violation constructor for violations that are real and
+  confirmed but whose BFS level sits past a gate-compatible TLC budget.
+  Semantics note in the constructor's header: an expect-violation
+  check's claim is existential, so a bounded random search that finds
+  the violation is exactly as strong as TLC finding it; only the
+  "no violation found" outcome is weaker, and that outcome is a check
+  FAILURE either way. Flake discipline: maxSamples is sized from the
+  measured per-trace hit rate so the miss probability is ≤~1e-11.
+- With that constructor, the three 0d-unwired stale-tenure checks are
+  **restored to the wired CI surface**: the A18 probe
+  (quint-closure-evidence-probe-stale-evidence-write), the
+  stale-intent-apply witness and the cross-tenure-walk witness, all at
+  closureEvidenceStaleDuo (hit rates ≈1/2.5 K, ≈1/2 K and ≈1/100 K per
+  trace; budgets 500 K / 500 K / 2 M samples). The 0d net-wired-check
+  delta (6 wired → 4 wired, 3 manual) is thereby reversed to 4 wired →
+  7 wired, with the C3 probe also re-pointed onto this constructor.
+- The F6 (A21-at-Duo) calibration row's diagnosis is extrapolated, not
+  re-run: the same scope-cost structure applies (the Duo C3 budget
+  record under item 1 independently demonstrates the Duo cost story).
+  Re-running F6 under a long-budget TLC, and/or wiring it through the
+  sim constructor, is a recorded optional follow-up, not a gate item.
+
+**Wired-check delta of this stage.**
+
+| Check | Before | After |
+|---|---|---|
+| quint-closure-evidence-probe-wrongful-terminal-failure | closureEvidenceBaseEx, TLC backend (violation = the refuted single-build trace) | closureEvidenceDuo, rust-simulator backend via mkQuintSimWitnessCheck (violation = the confirmed two-build trace); TLC manual target at closureEvidenceC3Duo |
+| quint-closure-evidence-witness-downgrade-respawn | closureEvidenceBaseEx, TLC (its reachability rested on the refuted single-build behavior — unreachable post-corrections: rust 500 K × 20-step samples find nothing at BaseEx) | closureEvidenceC3Duo, rust-simulator backend (the faithful two-build trace: narrow pruned merge + wide pruned co-merge + ok-walk with a forgiven output + consume → mustSub respawn; four actions deep, rust ≈3.4 s; the TLC form costs ≈10 min at 60 workers — multi-worker queue-ordering delay — and is the recorded manual target) |
+| quint-closure-evidence-probe-stale-evidence-write (A18) | unwired (0d housekeeping demotion to manual target) | WIRED, closureEvidenceStaleDuo, rust-simulator backend |
+| quint-closure-evidence-witness-stale-intent-apply | unwired (0d) | WIRED, closureEvidenceStaleDuo, rust-simulator backend |
+| quint-closure-evidence-witness-cross-tenure-walk | unwired (0d) | WIRED, closureEvidenceStaleDuo, rust-simulator backend |
+| (harness) | mkQuintCheck / mkQuintWitnessCheck / mkQuintRunCheck | + mkQuintSimWitnessCheck (rust-simulator expect-violation constructor) |
+| (model) | — | new probe module `closureEvidenceC3Duo` (the C3 TLC manual-target scope + the wired downgrade-respawn scope); new conjunction `asBuiltHoldInvariantsFailoverEx` |
+| manual targets | FailoverEx × asBuiltHoldInvariants ("not yet measured" → 0d: violated, conjunct unknown) | FailoverEx × asBuiltHoldInvariantsFailoverEx (the open-finding-free target) + the L3 falsification target (the finding's pin) + C3 × closureEvidenceC3Duo (TLC form of the wired sim pin) |
+
+Net wired closure-evidence checks: 22 (0d) → 25. All other wired
+closure-evidence checks (the remaining 10 BaseEx witnesses, the
+duo/failover witnesses, the B2-strong probe, the six calib checks) are
+unchanged in wiring; they re-run automatically against the corrected
+model because the .qnt fileset is their eval input. Re-validation of
+the unchanged checks against the corrected model (this stage's harness
+runs): every one that completed its build is green — the ten remaining
+BaseEx witnesses, hole-admin-clear and hole-ttl-sweep included (the two
+poison-path witnesses whose traces the cancel-pass correction
+touches), the B2-strong probe at AdversarialStoreEx, hole-recovery at
+FailoverEx, and five of the six calib checks (f2/f4/f7/f8/f9; f9 is
+the poisonClear copy most exposed to the correction). The stragglers
+still building at the report cut (hole-reap, recovery-clear, calib-f1
+— the three slowest TLC checks of the set) have unchanged reachability
+arguments; their completion is part of the next full gate run.
+
+**Updated owner sign-off items for the Phase-0 checkpoint** (supersedes
+the 0d go/no-go list; items renumbered):
+
+1. The C5 / CE-7 deferral — unchanged from 0d (the only §4 ENC row with
+   no falsification in hand; manual-target plan in the 0d record).
+2. The F6 permissiveness-direction argument and the F6 safety
+   falsification resting on the rust simulator — unchanged from 0d,
+   with the discrepancy re-diagnosis (budget, not tool bug) attached.
+3. The CE-45 (F10) falsification being evidence-module-only — unchanged
+   from 0d.
+4. ~~The TLC-backend discrepancy~~ — RESOLVED by this triage (budget +
+   metric misreading; no tool issue, no downgrades). The residual
+   sign-off question is only whether to fund the mkQuintWitnessCheck
+   rust-backend extension so the affected manual targets can become
+   wired checks.
+5. The FailoverEx conjunction violation — TRIAGED to the L3 as-built
+   finding. New owner adjudication: Phase-1 fix (ClearPoison promotes
+   surviving parents / recovery re-probe) vs accepted-with-rationale
+   (operator runbook). This is the second confirmed as-built finding of
+   the campaign, alongside C3.
+6. C3 — CONFIRMED (adjudication + this stage's faithful-trace
+   reproduction); Phase-1 red-first fix candidate; fix authorization
+   requested. The model corrections and probe re-point of this stage do
+   not change the production-code question.
+7. The 0c carry-overs unchanged: the held-back exhaustive conjunctions
+   (now with the FailoverEx target split per item 5) and the deferred
+   A17 / L2 / C1-strict probes.
 
 Later phases append here (1: red-first fixes; 2: acceptance table over
 the full corpus incl. the trailing evidence modules; close-out:
