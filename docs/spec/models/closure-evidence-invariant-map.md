@@ -10,10 +10,22 @@ run wf_b88941b2-973 incorporated). Verification subject and fix target:
 
 **Status: Phase 0a (spec audit) complete; Phase 0b (model construction)
 complete; Phase 0c (exhaustive checking, witnesses, CI wiring) complete —
-with the C3 as-built finding raised for owner adjudication, the
-exhaustive conjunctions held as manual targets on budget, and the
-A17 / L2 / C1-strict probes deferred (records in the 0c stage record).
-Phase 0d (calibration) is next.**
+with the C3 as-built finding raised for owner adjudication (since
+adjudicated CONFIRMED — 0d stage record), the exhaustive conjunctions
+held as manual targets on budget, and the A17 / L2 / C1-strict probes
+deferred (records in the 0c stage record). Phase 0d (calibration)
+complete — verdict GO: every corpus family that the design marks
+encodable falsifies through a wired or evidence-module representative
+with a holding baseline, except the C5/CE-7 row (deferred to a
+documented manual target, owner sign-off requested) and with the F6 /
+F11 falsifications resting on the rust-simulator backend (a TLC-backend
+discrepancy is recorded as a tool issue). Six permanent
+quint-closure-calib-* checks are wired and green; verdicts, re-routes,
+the acceptance table, the housekeeping record for the six 0c checks,
+and two new stop-and-report items (the TLC discrepancy; an unidentified
+as-built conjunction violation at the FailoverEx scope) are in the 0d
+stage record. Phase 1 (red-first fixes) is next, gated on the owner
+adjudications listed there.**
 
 ## Phase 0a spec-audit record
 
@@ -663,6 +675,324 @@ the Phase-1 disposition), and the deferred-probe records (the A17 / L2
 hunts and the C1-strict ceiling question), which 0d may fold into its
 own runs if the owner re-scopes them.
 
-Later phases append here (0d: calibration verdict table; 1:
-red-first fixes; 2: acceptance table; close-out: deployment-checklist
-deltas and counter-signatures).
+### Phase 0d — calibration (this stage)
+
+**Housekeeping: the six 0c checks that were still building at the 0c
+report.** Final status (with the wiring-level fixes this stage made):
+
+| Check | 0c wiring | 0d outcome |
+|---|---|---|
+| witness-hole-reap | closureEvidenceDuo | builds GREEN as wired |
+| witness-recovery-clear | closureEvidenceFailoverEx | builds GREEN as wired |
+| probe-vouched-closure-gone (B2-strong) | closureEvidenceAdversarialStore (design scale) | design-scale TLC never completes (the 0c "violation at depth 5–6; seconds" projection was wrong — 40+ min reaching BFS depth 2–3 under the parallel gate); **re-pointed** to the new reduced `closureEvidenceAdversarialStoreEx` scope (this stage adds the module), where TLC produces the GC-after-vouch violation at depth 7 in ~40 s; builds GREEN re-pointed |
+| probe-stale-evidence-write (A18) | closureEvidenceStaleTenure (design scale) | design-scale TLC never completes (one JVM SIGSEGV + retries reaching only depth 3 in 40+ min); the duo-scale re-point hits the TLC-backend discrepancy below; **unwired** — documented manual target (rust simulator: violation in <1 s at closureEvidenceStaleDuo) |
+| witness-stale-intent-apply | closureEvidenceStaleTenure | same as A18: design scale never completes, StaleDuo hits the TLC discrepancy; **unwired** — documented manual target (rust: <1 s) |
+| witness-cross-tenure-walk | closureEvidenceStaleTenure | same; **unwired** — documented manual target (rust: ~2 s) |
+
+The re-point and the unwirings are recorded inline in nix/quint.nix at
+the affected entries, with the rust-simulator commands. Net wired-check
+delta for the 0c set: 6 wired → 4 wired (hole-reap, recovery-clear,
+re-pointed B2-strong, plus the C3 probe and the 11 BaseEx witnesses
+which were already green at the 0c report), 3 manual targets.
+
+**TLC-backend discrepancy (tool issue; stop-and-report).** Found while
+fixing the housekeeping wirings and reproducible at will: for the
+stale-tenure alphabet (STALE_APPLY / CROSS_TENURE_WALKS) at
+closureEvidenceStaleDuo scope, and for the consume-walk downgrade-revert
+arm at closureEvidenceDuo scope, the rust simulator (`quint run`)
+produces shallow counterexamples (depth 4–5, milliseconds-to-seconds)
+that the TLC backend (`quint verify --backend=tlc`) does NOT find — TLC
+explores past the violation depth (BFS depth 6–7, 200 K+ distinct
+states) and keeps going, the swallowed-evaluation-exception signature;
+one run hard-errored at 93 ms instead. The same predicates and branches
+ARE TLC-findable at closureEvidenceBaseEx scope (the 0c
+downgrade-respawn witness is TLC-green), so the issue is
+scope-conditional, not a general encoding error. Affected items and
+their dispositions: the three stale-tenure housekeeping checks
+(unwired, above), and the F6 calibration falsification (rust-backend
+evidence module, below). Everything wired in CI is TLC-validated
+end-to-end. Owner follow-up options: file the quint/TLC issue with the
+two-module reproducer; or extend mkQuintWitnessCheck with a
+rust-simulator backend for expect-violation checks (the bounded
+semantics is sufficient for witnesses); or re-encode the affected
+corners until TLC finds them. Not resolved in this stage.
+
+**Override modules (docs/spec/models/calibration/closure-*.qnt).** One
+module per wired family representative, each importing
+`closureEvidence` at the named scope's constants, replacing ONE action
+with its pre-fix variant (the behavior the named historical fix
+removed) and exposing it through `calibStep`; the violation latches
+keep the production oracle, exactly the round-1 convention
+(calibration/README.md). Scopes are the post-ladder 0c scopes: the
+reduced exhaustive-base constants ("BaseEx"), the reduced failover
+constants ("FailoverEx"), and the duo probe constants ("Duo").
+
+| Module | Family / corpus rep | Pre-fix behavior (one guard) | Property | Scope |
+|---|---|---|---|---|
+| closure-f1-stale-produced | F1 soundness / CE-2 | merge has no stale-Produced verify | B9 | BaseEx |
+| closure-f1-skip-store-recheck | F1 permissiveness / CE-1 | merge classification has no local store re-check | C4 | BaseEx |
+| closure-f2-seed-only-walk | F2 / CE-9 | walk checks/ingests the seed only, not the closure | B2 | BaseEx |
+| closure-f3-indet-failfast | F3 soundness / CE-61 | fail-fast arm fires without a confirmed-miss answer | B3 | FailoverEx |
+| closure-f3-substitutable-demoted | F3 permissiveness / CE-60+CE-3 shape | probe routing demotes on any missing output | C2 | FailoverEx |
+| closure-f4-vacuous-prune | F4 / CE-13 | empty wanted selection satisfies the prune availability ∀ | B4 | BaseEx |
+| closure-f4-demand-drop | F4 / CE-66 | prune demand set = structural roots only | B10 | BaseEx |
+| closure-f5-wanted-overwrite | F5 / CE-16 (re-routed, see below) | merge apply overwrites the stored wanted union | B5 | BaseEx |
+| closure-f6-latch-outlives-chain | F6 / CE-20+CE-21 shape | downgrade revert keeps the never-forgive latch | A21 | Duo |
+| closure-f7-clear-unbuilt-children | F7 (+F12) / CE-30+CE-28 | merge clear pass keys on "has children", not Vouched | A3 | Duo |
+| closure-f8-dispatch-no-evidence | F8 / CE-33 | from-source admission consults no evidence | A1 | FailoverEx |
+| closure-f9-poison-clear-no-stamp | F9 / CE-41 (re-routed, see below) | poison clear stamps no surviving parent | A5 | BaseEx |
+| closure-f10-recovery-vouch-unscoped | F10 / CE-45 | recovery clear gate drops live co-ownership scoping | A3 | FailoverEx |
+| closure-f13-unprobed-dispatch | F13 / CE-58 | from-source admission needs no probe verdict this pass | B8 | FailoverEx |
+| closure-f14-recovery-keeps-substituting | F14+F10 / CE-48(i) shape | recovery trusts the persisted Substituting status | L1 | FailoverEx |
+
+**Calibration verdict table.** Every override must FALSIFY its
+predicted property under `calibStep` while the as-built baseline HOLDS
+it at the same constants. Falsification runs: TLC backend (`quint
+verify --backend=tlc`), 192/60/40/8 workers on the 0d builder; trace
+lengths are TLC trace states (initial state included; where the
+full-width run did not emit the trace the length is from an 8-worker
+re-capture of the same falsification). The F6 row is the rust-simulator
+exception (the TLC discrepancy above). Baselines, three layers: (i)
+for latch-backed properties the as-built baseline holds **by
+construction** — the latch site requires exactly the condition the
+override removes (the 0c "by-construction + latch" convention); (ii)
+the BaseEx-constants properties are conjuncts of the 0c
+property-identification + closing runs (2.87 M / 16.4 M distinct
+states, depth 21, no violation except C3); (iii) bounded as-built runs
+made this stage at the non-BaseEx scopes: `closureEvidenceFailoverEx` ×
+{A1, B3, B8, C2, L1, A3} HOLDS-BOUNDED to BFS depth 12 / 2.23 M
+distinct states (9-min cap, 60 workers); `closureEvidenceDuo` × {A21,
+A3} HOLDS-BOUNDED to BFS depth 7 / 280 K distinct states (9-min cap),
+plus A21 at Duo under the rust simulator: no violation in 100 K
+× 12-step samples.
+
+| Family (direction) | Representative → property | Falsification (calibStep) | Baseline (as-built step) |
+|---|---|---|---|
+| F1 (soundness) | CE-2 → B9 | VIOLATED — 7-state TLC trace (756 K distinct explored): narrow merge, walk-ok, poison, wider resubmit leaves the parent Ready above the stale-Produced child | HOLDS (0c BaseEx record + by construction) |
+| F1 (permissiveness) | CE-1 → C4 | VIOLATED — 5-state TLC trace (3.6 K distinct): a locally-present node is classified missing and queued from source | HOLDS (0c BaseEx record + by construction) |
+| F2 | CE-9 → B2 | VIOLATED — 4-state TLC trace (5.5 K distinct): seed-only walk ok, consumption completes the parent with the child closure never present | HOLDS (0c BaseEx record + by construction) |
+| F3 (soundness) | CE-61 → B3 | VIOLATED — 6-state TLC trace (62 K distinct): recovered marked root fail-fasted on a substitutable-only answer | HOLDS-BOUNDED (FailoverEx depth 12) + by construction |
+| F3 (permissiveness) | CE-60/CE-3 → C2 | VIOLATED — 6-state TLC trace (4.5 K distinct): recovered Ready node with upstream-available outputs routed from source | HOLDS-BOUNDED (FailoverEx depth 12) + by construction |
+| F4 | CE-13 → B4 | VIOLATED — 3-state TLC trace (4.4 K distinct): empty wanted selection, prune fires vacuously | HOLDS (0c BaseEx record + by construction) |
+| F4 (demand set) | CE-66 → B10 | VIOLATED — 5-state TLC trace (6.6 K distinct): explicitly-requested non-root dropped by the roots-only prune | HOLDS (0c BaseEx record + by construction) |
+| F5 | CE-16 → B5 | VIOLATED — TLC violation at search depth 12 (29.8 K distinct; full-width run did not emit the trace): a narrow resubmit's apply overwrites the wide stored union | HOLDS (0c BaseEx record + by construction) |
+| F6 | CE-20/CE-21 → A21 | VIOLATED — 5-state RUST-SIMULATOR trace (167 ms; narrow merge → failed walk forgiving the unwanted output → wide co-build merge → downgrade-revert keeps nf on a Ready node); TLC does not find it (the backend discrepancy above) | HOLDS — rust 100 K × 12-step samples find no violation; TLC bounded to depth 7 |
+| F7 (+F12) | CE-30/CE-28 → A3 | VIOLATED — 3-state TLC trace (18 K distinct): pruned-merge stamp, then a full re-merge clears the mark over an unbuilt child | HOLDS-BOUNDED (Duo depth 7) + by construction |
+| F8 | CE-33 → A1 | VIOLATED — 6-state TLC trace (78.7 K distinct): recovered marked childless root delivered from source by the evidence-blind admission | HOLDS-BOUNDED (FailoverEx depth 12) + by construction |
+| F9 | CE-41 → A5 | VIOLATED — 4-state TLC trace (4.4–13.7 K distinct): merge, poison, poison-clear with no surviving-parent stamp | HOLDS (0c BaseEx record + by construction) |
+| F10 (vouch scoping) | CE-45 → A3 | VIOLATED — TLC violation at depth 17 (5.15 M distinct, ≈8.4 min full-width; trace not emitted): the unscoped recovery gate clears on a child co-owned only by a superseded submission. Too deep/slow for a wired check — evidence module only | HOLDS-BOUNDED (FailoverEx depth 12) + by construction (the as-built clear gate IS the strict criterion, so the A3 latch at the recovery site is structurally unreachable without the override) |
+| F10 (stranded recovery) | CE-48(i) → L1 | VIOLATED — 5-state TLC trace (2 K distinct): merge, intent apply, failover, recovery re-enters the persisted Substituting row with no walk anywhere | HOLDS-BOUNDED (FailoverEx depth 12; L1 is a state-form property — the bounded run is the baseline) |
+| F11 | CE-50 → A18 (regime comparison, no calibStep) | VIOLATED as-built in the stale-apply alphabet — rust simulator at closureEvidenceStaleDuo (<1 s) and the 0c design-scale simulation; the wired TLC probe could not be kept (the housekeeping record above) | HOLDS by construction in the no-stale-alphabet regimes (base / fault-persist / failover discard deposed intents at recovery), so the regime split itself is the baseline |
+| F13 | CE-58 → B8 | VIOLATED — 6-state TLC trace (6.8 K distinct): recovered, never-re-probed Ready node opened from source | HOLDS-BOUNDED (FailoverEx depth 12) + by construction |
+| F14 | CE-48(i)/CE-52 → L1 | same run as the F10 stranded-recovery row above (one module carries both rows) | HOLDS-BOUNDED (FailoverEx depth 12) |
+
+**Permissiveness directions (the §4 both-directions clause).** F1
+calibrates in both directions (B9 + C4 above). F3 calibrates in both
+directions (B3 + C2 above). The C-group's C4 and C2 are thereby
+falsifiable non-vacuously; C5's override is deferred (below). For F6
+the safety direction (A21) calibrates above; the permissiveness
+consequence the corpus describes for F6 (the inherited veto demotes
+substitutable work, CE-20's harm) is **not separately producible at
+this model's abstraction**: the model's wrongful-demotion latch (C2,
+ENC-0b-9) requires every missing wanted output to be available
+upstream while the demotion site additionally requires a
+confirmed-miss answer, and with the negative-cache polarity excluded
+by ENC-0b-8 those two cannot hold together except through the F3
+override's weakened verdict mapping. The F6 permissiveness direction
+is therefore carried by (a) the A21 falsification (the stale latch
+demonstrably outlives its chain — the precondition of the inherited
+veto) plus (b) the C2 falsification through the F3 representative,
+with this structural argument recorded in place of a second F6-specific
+override. Re-dispositioning this as a full ENC row would need the
+negative-cache polarity added to the model (an ENC-0b-8 revisit), which
+is left to the owner.
+
+**Re-routes and dispositions inside families (no silent drops).**
+
+- F5: the design's named representative CE-18 (rollback replay, a
+  structural override) is inert at this model's granularity — the
+  all-or-nothing merge intent makes the as-built `mergeRollback` a
+  no-op, so a replay-shaped override would falsify B6 only by
+  re-introducing behavior the abstraction already excludes. The family
+  falsification is re-routed to CE-16 → B5 (the overwrite-vs-union
+  guard, the same family's wanted-lifecycle invariant); CE-18/CE-19/
+  CE-68/CE-75 stay listed as trailing structural evidence targets for
+  the Phase 2 acceptance table.
+- F9: re-routed from CE-40/CE-43 to CE-41 (the poison-clear setter) —
+  the minimal single-action delta at the post-ladder scope; CE-40
+  (recovery edge-drop stamp) and CE-43 (fail-fast keeps the breadcrumb)
+  need recovery/consume-walk structural copies whose falsifications sit
+  deeper, and stay trailing evidence targets for Phase 2.
+- F14: re-routed from CE-52 to the CE-48(i) stranded-Substituting
+  shape. CE-52's exact lane (Poisoned-at-limit re-probe rejected by the
+  transition table) is absorbed by the model's merge-time resetNodes
+  lane — the re-probe lane cannot strand a node here, so there is no
+  state invariant for it to falsify; the family's stuck-state invariant
+  (L1) is falsified through the recovery-trusts-Substituting variant
+  instead.
+- F10: the family falsifies through two representatives (CE-45 and
+  CE-48(i)); the CE-45 falsification is evidence-module-only (≈8 min,
+  past the wired-check budget).
+- F11: no calibStep override — the leader-gate guard is a regime
+  constant in this model (STALE_APPLY / CROSS_TENURE_WALKS), not an
+  action guard, so the family is calibrated by regime comparison (the
+  A18 falsification in the stale-apply alphabet vs the by-construction
+  hold without it). With the TLC discrepancy, the falsification side
+  of that comparison is rust-simulator evidence.
+- F12: covered by the F7 representative (CE-69 → ENC-A CE-30 in the
+  design crosswalk; the clear-before-reconciliation weakening is the
+  F12 ordering shape).
+- C5 / CE-7 (terminal build's stored union drives resets): **NOT
+  falsified in 0d — deferred to a documented manual target.** The
+  trigger needs a Produced node with a divergent stored-vs-live wanted
+  view (stored {1,2}, live {1}, output 2 absent) plus a third
+  submission slot to re-run the verify after the wide build went
+  terminal; at the duo scope the third slot does not exist (a cancelled
+  build's slot cannot resubmit), so the hunt plan is the design's
+  non-regime-constants pattern: BUILDS = {b1,b2,b3},
+  SUBMISSION_BUDGET = 3, override = the stale-Produced verify keyed on
+  `pgWanted` instead of the live effective wanted set, predicted
+  falsification C5 (`unionDrivenDecision`), baseline = the same
+  constants without `--step`. Until that override exists C5's
+  falsifiability remains owned by this deferred target (the 0c
+  per-property note stands); owner sign-off required to accept the
+  deferral, per the §8 0d gate language.
+- CE-25 (stamp-before-commit, the F7 structural rep) stays a trailing
+  Phase-2 structural evidence target for the same reason as CE-18 (the
+  all-or-nothing intent encoding).
+- CE-31 (recovery clear gate keyed on the in-memory child view → A19)
+  is covered for the family by the CE-45/CE-48(i) falsifications; its
+  own override (an A19-completeness-direction recovery copy) is a
+  trailing Phase-2 evidence target.
+
+**Wired permanent calibration checks (nix/quint.nix,
+`quint-closure-calib-*`).** Six of the falsifications run in the
+minutes class end-to-end under the TLC backend and are wired as
+permanent expect-violation checks, one per major property group and
+scope — all six built green in this stage's harness run:
+quint-closure-calib-f1-stale-produced (B9, BaseEx),
+quint-closure-calib-f2-seed-only-walk (B2, BaseEx),
+quint-closure-calib-f4-demand-drop (B10, BaseEx),
+quint-closure-calib-f7-clear-unbuilt (A3, Duo),
+quint-closure-calib-f8-dispatch-no-evidence (A1, FailoverEx),
+quint-closure-calib-f9-poison-clear-no-stamp (A5, BaseEx). The
+remaining override modules are committed evidence modules, re-runnable
+with the command in each file's header (calibration/README.md
+pattern); the C5 target above is the one override still to be written.
+No tracey markers on calibration checks (house convention).
+
+**The FailoverEx as-built conjunction violation (stop-and-report; the
+first measurement of a fault regime).** As part of establishing
+baselines, this stage ran the held-back manual exhaustive target
+`closureEvidenceFailoverEx` × `asBuiltHoldInvariants` (the as-built
+step, no override) for the first time: **VIOLATED** at BFS depth 16
+after 2.63 M distinct states (≈4.4 min at full builder width); the
+full-width run did not emit the trace (the recurring TLC
+trace-emission issue at high worker counts). The violated conjunct is
+NOT identified yet; what is known: the six calibration-relevant
+properties (A1, B3, B8, C2, L1, A3) hold bounded to depth 12 at this
+scope in a separate run, and every latch-backed property's as-built
+guard argument still applies, so the suspect set is the state-form /
+counter properties or a model-encoding issue the failover alphabet
+exposes (the CE-FIX-1/2 precedent — both 0c encoding fixes were found
+exactly this way). The 0c record's per-property table is NOT
+invalidated (it covers the reduced base scope only; the failover scope
+was explicitly "not yet measured"). Triage owner: the orchestrator —
+either a third encoding fix (model artifact) or a real as-built
+finding at the failover scope; the triage needs a trace, which needs
+either a low-worker-count re-run (slower but emits traces) or
+per-property bisection of the conjunction. Until then the FailoverEx
+exhaustive target stays a held-back manual target, now with a recorded
+partial result instead of "not yet measured".
+
+**C3 adjudication update (carried in from the concurrent
+investigation).** The C3 finding (wrongful terminal failure, the 0c
+stop-and-report item 1) was adversarially adjudicated during this
+stage: **CONFIRMED** via a two-live-builds variant of the trace; the
+original single-build 11-state trace is refuted (its step 7+9
+combination is unreachable as-built because the sole-interest cancel
+chain would have cancelled the stale walk's node), but the two-build
+variant reproduces the same wrongful fail-fast with both builds live.
+C3 is therefore a confirmed Phase-1 red-first fix candidate, no longer
+"pending adjudication". The model corrections that follow from the
+refuted single-build leg are queued AFTER this stage's commits (not
+applied here, to keep the calibration evidence and the correction
+disjoint); the wired C3 expect-violation probe
+(quint-closure-evidence-probe-wrongful-terminal-failure) stays green
+against the current model and gets re-validated when those corrections
+land.
+
+**Acceptance verdict (the design §4 calibration acceptance protocol /
+§8 0d gate), per corpus family.**
+
+| Family | Verdict | Evidence / disposition |
+|---|---|---|
+| F1 | MET (both directions) | CE-2 → B9 falsified (wired); CE-1 → C4 falsified (evidence module) |
+| F2 | MET | CE-9 → B2 falsified (wired) |
+| F3 | MET (both directions) | CE-61 → B3 and CE-60/CE-3 → C2 falsified (evidence modules) |
+| F4 | MET | CE-13 → B4 falsified; CE-66 → B10 falsified (wired) |
+| F5 | MET (re-routed rep) | CE-16 → B5 falsified; CE-18 structural override deferred to Phase 2 |
+| F6 | MET for the safety direction (rust-backend evidence); permissiveness direction by recorded argument | CE-20/CE-21 → A21 falsified (rust simulator; TLC discrepancy recorded); C2 carried by the F3 representative + the structural argument above (owner sign-off requested) |
+| F7 | MET | CE-30/CE-28 → A3 falsified (wired); CE-25 structural deferred to Phase 2 |
+| F8 | MET | CE-33 → A1 falsified (wired) |
+| F9 | MET (re-routed rep) | CE-41 → A5 falsified (wired); CE-40/CE-43 deferred to Phase 2 |
+| F10 | MET | CE-45 → A3 falsified (evidence module); CE-48(i) → L1 falsified |
+| F11 | MET by regime comparison | A18 falsified in the stale-apply alphabet (rust simulator — the TLC discrepancy keeps it un-wired); no-stale-alphabet regimes are the baseline |
+| F12 | MET via ENC-A | covered by the F7/CE-30 representative per the design crosswalk |
+| F13 | MET | CE-58 → B8 falsified |
+| F14 | MET (re-routed shape) | CE-48(i) → L1 falsified; CE-52 absorption argument recorded |
+| F15 | NOT-ENC (pre-registered, unchanged) | store-side; rio-store unit/VM tests |
+| F16 | NOT-ENC (pre-registered, unchanged) | motivates the detached-walk asynchrony only |
+| F17 | NOT-ENC (pre-registered, unchanged) | build accounting; existing unit tests |
+| C-group | C2/C4 MET (above); C1 covered by the 0c hold + the deferred C1-strict probe; C3 is the confirmed as-built finding (cannot serve as a calibration baseline; Phase-1 fix candidate); **C5 NOT MET — deferred manual target (owner sign-off requested)** | see the dispositions above |
+| §4 UNCLEAR rump (6 commits) | unchanged | no re-disposition was needed |
+
+The NOT-ENC list is unchanged from the design (no row was silently
+re-dispositioned; the two re-routes and the two structural deferrals
+above are within-family and recorded).
+
+**Go/no-go.** GO for Phase 1, with the following named owner-sign-off
+items carried out of the gate rather than papered over:
+
+1. The C5 / CE-7 deferral — the only §4 ENC row with no falsification
+   in hand; manual-target plan recorded above.
+2. The F6 permissiveness-direction argument standing in for a second
+   F6 override, and the F6 safety falsification resting on the
+   rust-simulator backend (the TLC discrepancy).
+3. The CE-45 (F10) falsification being evidence-module-only (the
+   family is met; that row is slower than the wired budget).
+4. The TLC-backend discrepancy itself — three 0c stale-tenure checks
+   unwired to manual targets, and one calibration row on rust
+   evidence; the fencing-evidence chain (A18/D14, §9.1) now rests on
+   simulation rather than a wired check.
+5. The FailoverEx as-built conjunction violation — unidentified
+   conjunct, needs orchestrator triage (encoding fix vs finding).
+6. The 0c carry-overs unchanged by this stage: C3 (now CONFIRMED, a
+   Phase-1 red-first fix candidate), the held-back exhaustive
+   conjunctions, and the deferred A17 / L2 / C1-strict probes.
+
+Items 1–3 are 0d-scope calls the owner can accept or reverse without
+re-opening the model; items 4–5 are new stop-and-report findings of
+this stage; item 6 is the existing 0c set. Every §4 encodable family
+falsifies through a representative with a holding baseline at the same
+constants — under the TLC backend for 13 of 15 representatives, under
+the rust simulator for F6 and the F11 regime comparison — which
+satisfies the §8 0d gate with the listed caveats made explicit rather
+than absorbed.
+
+**0d → Phase 1 handoff.** The calibration evidence base for the
+red-first fixes: the C3 expect-violation probe and its trace (now a
+confirmed defect), the re-pointed B2-strong probe (the GC-after-vouch
+disposition), the A18 rust-simulator record (the fencing disposition),
+the six wired calib checks (regression guards for the guard classes
+Phase-1 edits are most likely to touch), and the deferred-target list
+above (C5, CE-18/CE-25 structural, CE-40/CE-43, CE-31, the A17/L2
+hunts). Any Phase-1 change to merge.rs/dispatch.rs/recovery.rs
+evidence handling should re-run the corresponding family's evidence
+module even where it is not wired; any change to the model file
+re-runs all six wired calib checks plus the witness/probe set
+automatically (the .qnt fileset is the eval input).
+
+Later phases append here (1: red-first fixes; 2: acceptance table over
+the full corpus incl. the trailing evidence modules; close-out:
+deployment-checklist deltas and counter-signatures).
