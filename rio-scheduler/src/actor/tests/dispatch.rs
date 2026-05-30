@@ -479,6 +479,80 @@ async fn batch_probe_completes_on_missing_unwanted_output() -> TestResult {
     Ok(())
 }
 
+/// D16 / sched.evidence.settlement: a marked node with Broken closure
+/// evidence (childless), a spent substitute_tried one-shot, live build
+/// interest, and all live-wanted outputs PRESENT in the store must be
+/// settled by the dispatch sweep (completed with its closure
+/// re-verified, or fail-fasted) — not left Ready forever while
+/// admit_pull refuses to mint for it.
+///
+/// As built this is the probe partition's no-action cell
+/// (locally_present requires !substitute_tried; nothing else fires for
+/// a present node), so the node sits Ready and the build hangs Active:
+/// the limbo the settlement rule forbids.
+// r[verify sched.evidence.settlement]
+#[tokio::test]
+async fn marked_broken_tried_present_node_settles() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let out = test_store_path("d16-out");
+    // Nothing present/substitutable at merge time: the single-node
+    // submission stays Ready for from-source dispatch, unmarked.
+    let mut d1 = make_node("d16-d1");
+    d1.expected_output_paths = vec![out.clone()];
+    d1.wanted_output_names = vec!["out".into()];
+    let build = Uuid::new_v4();
+    // Hold the event receiver: the cfg(test) orphan-watcher grace is
+    // ZERO, so a dropped receiver + >=2 Ticks auto-cancels the build
+    // (housekeeping.rs ORPHAN_BUILD_GRACE caution).
+    let _ev = merge_dag(&handle, build, vec![d1], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "d16-d1").await.status,
+        DerivationStatus::Ready,
+        "precondition: nothing available -> Ready"
+    );
+
+    // Assemble the D16 cell directly (the production assembly path is
+    // >= 16 steps; the debug forcers pin the cell, production
+    // reachability is owned by the model's canReachD16Cell witness):
+    //   marked (childless => evidence Broken => must_substitute)
+    //   + substitute_tried + Ready + live interest.
+    assert!(handle.debug_set_topdown_pruned("d16-d1", true).await?);
+    assert!(handle.debug_set_substitute_tried("d16-d1", true).await?);
+
+    // Late ingest: the wanted output is now PRESENT.
+    store.seed_with_content(&out, b"d16-out-content");
+
+    // Drive the dispatch sweep. Pre-fix: the probe's all-present cell
+    // skips tried nodes; nothing else touches it.
+    tick(&handle).await?;
+    tick(&handle).await?;
+    settle_substituting(&handle, &["d16-d1"]).await; // post-fix: the
+    // settlement spawns a verification walk; wait for it to land.
+    tick(&handle).await?;
+
+    let info = handle
+        .debug_query_derivation("d16-d1")
+        .await?
+        .expect("exists");
+    assert_ne!(
+        info.status,
+        DerivationStatus::Ready,
+        "D16 limbo: marked+Broken+tried+present node was left Ready by the \
+         dispatch sweep (and admit_pull refuses it) — the settlement rule is violated"
+    );
+    // The full settlement: present closure verified -> Completed, build done.
+    assert_eq!(info.status, DerivationStatus::Completed);
+    let st = query_status(&handle, build).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the interested build must complete once the node settles"
+    );
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

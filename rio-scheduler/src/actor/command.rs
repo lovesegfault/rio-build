@@ -473,6 +473,14 @@ pub enum DebugCmd {
         value: bool,
         reply: oneshot::Sender<bool>,
     },
+    /// Set the `substitute_tried` one-shot directly (in-memory). For
+    /// settlement tests that need the tried bit without driving a full
+    /// walk-failure cycle.
+    SetSubstituteTried {
+        drv_hash: String,
+        value: bool,
+        reply: oneshot::Sender<bool>,
+    },
     /// Clear a derivation's `drv_content`. Simulates the post-recovery
     /// state for the `sched.ca.resolve` recovery-fetch test.
     ClearDrvContent {

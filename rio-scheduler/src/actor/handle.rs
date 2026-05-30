@@ -324,6 +324,22 @@ impl ActorHandle {
         .await
     }
 
+    /// Set a derivation's `substitute_tried` one-shot. Returns `false`
+    /// if not found.
+    pub async fn debug_set_substitute_tried(
+        &self,
+        drv_hash: &str,
+        value: bool,
+    ) -> Result<bool, ActorError> {
+        let drv_hash = drv_hash.to_string();
+        self.debug(|reply| DebugCmd::SetSubstituteTried {
+            drv_hash,
+            value,
+            reply,
+        })
+        .await
+    }
+
     /// Force a derivation into `status`, bypassing the transition
     /// table. Returns `false` if not found.
     pub async fn debug_force_status(

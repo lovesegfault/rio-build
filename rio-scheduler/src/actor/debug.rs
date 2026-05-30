@@ -93,6 +93,17 @@ impl DagActor {
                 });
                 let _ = reply.send(ok);
             }
+            DebugCmd::SetSubstituteTried {
+                drv_hash,
+                value,
+                reply,
+            } => {
+                let ok = self.dag.node_mut(&drv_hash).is_some_and(|s| {
+                    s.substitute_tried = value;
+                    true
+                });
+                let _ = reply.send(ok);
+            }
             DebugCmd::ClearDrvContent { drv_hash, reply } => {
                 let _ = reply.send(self.handle_debug_clear_drv_content(&drv_hash));
             }

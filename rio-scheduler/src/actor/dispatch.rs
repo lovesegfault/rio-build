@@ -229,15 +229,31 @@ impl DagActor {
                 })
                 .unwrap_or_else(|| paths.clone());
             if wanted.iter().all(|p| !missing.contains(p)) {
+                if !substitute_tried {
+                    locally_present.push(drv_hash);
+                } else if self.must_substitute(&drv_hash) {
+                    // r[impl sched.evidence.settlement]
+                    // D16: present + tried + must-substitute. As built this cell
+                    // took no action while admit_pull kept refusing the node —
+                    // the limbo the settlement rule forbids. Settle by spawning
+                    // the verification walk: FMP presence does not imply closure
+                    // completeness for a tried node (the walk may have ingested
+                    // the seed then failed on a ref), so completion must go
+                    // through the walk's re-verification; an all-local closure
+                    // makes that walk QPI-only. Its genuine failure lands at the
+                    // Broken-arm settlement with the one-shot spent and takes the
+                    // fail-fast there — no livelock: the node leaves Ready
+                    // (Substituting) the moment the walk spawns.
+                    to_spawn.push((drv_hash, paths));
+                }
+                // present + tried + NOT must-substitute keeps the as-built
+                // fall-through to from-source dispatch (deps are in the DAG):
                 // `substitute_tried` ⇒ the closure walk ingested the
                 // seed (output) then failed on a ref — output-present
                 // in PG does NOT imply closure-complete. FMP probes
                 // output paths only, so "present" here can hide a
                 // hole. Fall through to dispatch (build re-derives the
                 // full closure) instead of marking Completed.
-                if !substitute_tried {
-                    locally_present.push(drv_hash);
-                }
             } else if !substitute_tried
                 && wanted.iter().all(|p| {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
@@ -249,19 +265,31 @@ impl DagActor {
                 // through to build via `substitute_tried`.
                 to_spawn.push((drv_hash, paths));
             } else if self.must_substitute(&drv_hash) {
-                // r[impl sched.merge.substitute-topdown+11]
-                // Truly missing (a wanted output is missing upstream and
-                // not substitutable): every other node is left Ready and
-                // dispatches from source. A topdown-pruned root whose
-                // closure evidence is Broken (childless or closure-holed)
-                // must not — its dep closure was never merged, so a
-                // from-source dispatch is doomed (worker ENOENTs on
-                // inputDrvs). This is the post-failover shape: the
-                // recovered wanted union ('{}' = all declared) is wider
-                // than the prune-time criterion, so an output the prune
-                // never vouched for can be definitively missing here.
-                // Fail fast with the resubmit-directing error instead.
-                to_fail_fast.push(drv_hash);
+                if wanted.iter().all(|p| {
+                    !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+                }) {
+                    // r[impl sched.evidence.settlement]
+                    // tried + substitutable + must-substitute: the upstream may
+                    // have gained the output since the failed walk; same
+                    // verification re-spawn as the present cell (as built this
+                    // fell through to the fail-fast although the probe just said
+                    // the outputs are obtainable).
+                    to_spawn.push((drv_hash, paths));
+                } else {
+                    // r[impl sched.merge.substitute-topdown+11]
+                    // Confirmed-missing (a wanted output is missing upstream and
+                    // not substitutable): every other node is left Ready and
+                    // dispatches from source. A topdown-pruned root whose
+                    // closure evidence is Broken (childless or closure-holed)
+                    // must not — its dep closure was never merged, so a
+                    // from-source dispatch is doomed (worker ENOENTs on
+                    // inputDrvs). This is the post-failover shape: the
+                    // recovered wanted union ('{}' = all declared) is wider
+                    // than the prune-time criterion, so an output the prune
+                    // never vouched for can be definitively missing here.
+                    // Fail fast with the resubmit-directing error instead.
+                    to_fail_fast.push(drv_hash);
+                }
             }
         }
         self.complete_ready_from_store_batch(&locally_present).await;
