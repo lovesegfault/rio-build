@@ -1078,7 +1078,7 @@ rather than making end-user JWTs mandatory.
 | `builder.fs.fd-handoff-ordering` | decisions/022 §2.5 | castore_fuse/session.rs (P0560§A) | vm-castore-e2e (P0560§B) |
 | `builder.fs.digest-fuse-open` | decisions/022 §2.6 | castore_fuse/open.rs (P0559) | vm-castore-e2e `cold-build` (P0560§B) + unit (P0559) |
 | `builder.fs.passthrough-on-hit` | decisions/022 §2.6 | castore_fuse/open.rs (P0559) | vm-castore-e2e `passthrough-small`+`warm-read` (P0560§B) |
-| `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | composefs-spike-priv `passthrough-under-overlay` (P0578) |
+| `builder.fs.passthrough-stack-depth` | decisions/022 §2.9 | castore_fuse/mod.rs init (P0559) | vm-castore-xfstests overlay-consumer + warm-read legs (re-homed from the retired composefs-spike-priv `passthrough-under-overlay`, P0578) |
 | `builder.fs.file-digest-integrity` | decisions/022 §2.7 | castore_fuse/open.rs (P0559) | vm-castore-e2e `integrity-fail` (P0560§B) |
 | `builder.fs.fetch-circuit` | components/builder.md | castore_fuse/circuit.rs (P0559) | vm-castore-e2e `eio-on-fetch-fail` (P0560§B) |
 | `builder.fs.node-digest-cache` | components/builder.md | castore_fuse/sweep.rs (P0571) | sweep.rs `evicts_oldest_first_and_stops_at_target` (P0571); vm-castore-e2e `cross-build-dedup` (P0560§B) |

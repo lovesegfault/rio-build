@@ -888,6 +888,13 @@
                     # not a coverage axis. Excluding keeps after_n_builds
                     # stable.
                     "vm-standby-burst-k3s"
+                    # xfstests ports: exercises the same castore_fuse
+                    # callbacks vm-castore-fuse already covers (lookup/
+                    # readdir/open/read/release), just with more POSIX
+                    # assertions on the kernel side — no new instrumented
+                    # lines, so including it would bump after_n_builds for
+                    # zero coverage signal.
+                    "vm-castore-xfstests"
                   ];
 
               # --------------------------------------------------------------

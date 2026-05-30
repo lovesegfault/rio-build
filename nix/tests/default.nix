@@ -74,6 +74,10 @@ let
   # doubles as the FUSE/mountd machine, so the node config and the
   # testScript that depends on it live in the same file.
   castore-fuse = import ./scenarios/castore-fuse.nix { inherit pkgs common; };
+  # xfstests ports against the castore-FUSE — reuses castore-fuse's
+  # fuseClientModule (the client doubles as the FUSE/mountd machine).
+  # Selection + tiering: rio-builder/tests/xfstests_port/PLAN.md.
+  castore-fuse-xfstests = import ./scenarios/castore-fuse-xfstests.nix { inherit pkgs common; };
   castore-e2e = import ./scenarios/castore-e2e.nix;
   drvs = import ./lib/derivations.nix { inherit pkgs; };
 
@@ -542,6 +546,31 @@ in
       defaultTenant = "vmtest";
       # psql() on control for the scenario's own tenant + path_tenants
       # setup.
+      extraPackages = [ pkgs.postgresql_18 ];
+      extraClientModules = [ castore-fuse.fuseClientModule ];
+    };
+  };
+
+  # ── xfstests ports against the castore-FUSE ─────────────────────────
+  # POSIX-conformance checks (readdir resume, byte-exact names, ELOOP,
+  # exec/access semantics, write protection, errno contracts, read
+  # integrity) re-expressed from xfstests tests/generic/ as Rust syscall
+  # probes (the xfstests_runner binary) against a serve-castore mount of
+  # a purpose-built fixture tree, plus one dispatched build for the
+  # overlay-lowerdir leg. The testScript is a thin harness; every
+  # filesystem assertion lives in the runner. Same fixture shape as
+  # vm-castore-fuse (the wiring rationale above applies unchanged);
+  # ranked selection: rio-builder/tests/xfstests_port/PLAN.md.
+  #
+  # Passthrough stacking: the consumer build dispatched to the worker
+  # reads the dep through the production overlay-over-castore mount
+  # (overlay on FUSE = depth 2, only mountable with max_stack_depth=1
+  # negotiated), and the runner's warm-read checks exercise
+  # BACKING_OPEN passthrough against the depth-0 ext4 backing.
+  # r[verify builder.fs.passthrough-stack-depth]
+  vm-castore-xfstests = castore-fuse-xfstests.mkTest {
+    fixture = standalone {
+      defaultTenant = "vmtest";
       extraPackages = [ pkgs.postgresql_18 ];
       extraClientModules = [ castore-fuse.fuseClientModule ];
     };
