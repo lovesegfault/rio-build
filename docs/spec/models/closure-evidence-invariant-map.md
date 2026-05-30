@@ -28,8 +28,14 @@ applied and the C3 probe re-pointed to the faithful two-build scope; the
 REAL as-built finding, the second Phase-1 candidate; and the 0d
 "TLC-backend discrepancy" stop-and-report item is re-diagnosed as a
 budget/metric issue, not a tool bug — no exhaustive verdict is
-downgraded. Phase 1 (red-first fixes) is next, gated on the owner
-adjudications listed in the post-0d triage record.**
+downgraded. Phase 1 in progress: Wave 1 (the C3+D16 settlement, red-first)
+is landed — `sched.evidence.settlement` is covered and the C3 wrongful
+fail-fast class is closed at all three call sites; Wave 2 corrected the
+model's recovery-condemnation encoding (review finding RT-2) and REFUTED
+the post-0d L3 finding as a model artifact — no L3 fix is needed; the
+residual spec-vs-code divergence (production's unscoped recovery
+condemnation) is routed to the owner. See the Phase-1 Wave-2 stage record
+(the last section).**
 
 ## Phase 0a spec-audit record
 
@@ -115,7 +121,7 @@ executor-campaign convention.
 |---|---|---|---|---|
 | L1 | `substitutingAlwaysArmed` | A Substituting node always has a walk instance in flight. | sched.substitute.detached+5 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | L2 | `markedBrokenSettlementArmed` | No reachable D16 limbo cell (marked, Broken, tried, Ready, live interest, all live-wanted outputs present, no walk). **Pre-registered expected-fail probe** (base); its violation trace is the D16 deliverable. | sched.evidence.settlement (intentionally uncovered) | expected-fail probe — NOT yet produced (the D16 cell is ≥16 steps deep at duo scope; deferred-probe record in the 0c stage record) |
-| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (0c run record); **VIOLATED as-built at the failover scope — REAL finding (post-0d triage)**: failover + recovery + ClearPoison strands a recovered parent Queued/childless/unarmed under a live build's interest (10-state trace + code walk in the post-0d triage record); excluded from the failover manual target's conjunction (`asBuiltHoldInvariantsFailoverEx`); Phase-1 candidate, owner adjudication |
+| L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (0c run record); the post-0d triage's failover-scope violation is **REFUTED as a production defect — model artifact of the recovery-condemnation gap (Phase 1 Wave 2)**: the traced strand needed recovery to leave the parent Queued above its still-poisoned child, which production never does (`compute_initial_states` / `any_dep_terminally_failed` condemns it; the model was missing that arm — review finding RT-2). Corrected encoding + re-hunt (FailoverEx + Duo, both backends) + code walk: Wave-2 stage record. NOT a Phase-1 fix candidate. The residual spec-vs-code divergence (production's unscoped recovery condemnation) is a separate owner item — Wave-2 stage record, residual finding |
 
 ### Non-vacuity witnesses (encoded in 0b, wired as expect-violation checks in 0c)
 
@@ -1392,6 +1398,217 @@ the 0d go/no-go list; items renumbered):
    (now with the FailoverEx target split per item 5) and the deferred
    A17 / L2 / C1-strict probes.
 
-Later phases append here (1: red-first fixes; 2: acceptance table over
-the full corpus incl. the trailing evidence modules; close-out:
-deployment-checklist deltas and counter-signatures).
+### Phase 1 Wave 2 — recovery-condemnation correction, L3 re-hunt, decision gate (this stage)
+
+**Headline: the post-0d triage's L3 finding is REFUTED as a production defect.** The recorded
+FailoverEx violation of `liveBuildTerminalOrProgressArmed` was a model artifact of a
+recovery-encoding faithfulness gap (the plan's adversarial-review finding RT-2), not an
+as-built defect. The model is corrected, the full wired battery stays green, and the re-hunt
+under the corrected encoding finds no L3 violation at any hunted scope under either backend —
+while the same setup re-finds the violation on the pre-correction model in eight minutes. No
+fix is implemented (owner decision 1's L3 half is moot as premised); the genuine residual the
+review surfaced — production's unscoped recovery condemnation, a C3-class behavior at a fourth
+decision point — is characterized below and routed to the owner. The plan's conditional Wave-2
+tasks (T-2.2..T-2.4) did not execute.
+
+**1. The faithfulness gap and the correction (closureEvidence.qnt, recoverAsLeader pass 2).**
+
+Production has TWO recovery condemnation mechanisms; the 0b model encoded only the first:
+
+| Mechanism | Production | Model pre-correction | Model post-correction |
+|---|---|---|---|
+| R2 cascade pre-pass | `load_parents_with_failed_deps` -> `cascade_failed` short-circuit in `seed_ready_queue` (recovery.rs) — co-ownership-scoped (the bug_009 evidence rule; the `sched.recovery.failed-dep-cascade+2` MUST) | `pCondemnCriterion` (faithful) | unchanged |
+| In-DAG recompute | `compute_initial_states` (dag/mod.rs) -> `any_dep_terminally_failed` over the LOADED child set — NO co-ownership scoping; within-TTL poisoned children are loaded with their edges, so a recovered parent above another build's still-poisoned child IS condemned | **missing** | `kidsLoaded.exists(c => isUnprodTerminal(dm1.get(c).mSt))`, disjoined with the cascade arm |
+
+Faithfulness evidence for the second mechanism: `any_dep_terminally_failed` (dag/mod.rs:950–964,
+Poisoned|DependencyFailed|Cancelled over in-DAG children, no liveness filter);
+`compute_initial_states` (dag/mod.rs:1402–1441, the :1426 condemnation branch, persisted at
+recovery.rs:841–849); pinned by the pre-existing production tests
+`test_initial_states_with_prepoisoned_dep` (dag/tests.rs:736 — the cross-build case: build1's
+poisoned leaf condemns build2's parent with no co-ownership) and
+`test_recovery_substituting_with_poisoned_dep_goes_dependency_failed`
+(actor/tests/recovery.rs:2271).
+
+Encoding decisions recorded:
+
+- The A22 latch (`condemnUnscoped`) stays keyed on the cascade arm only. A22's spec subject
+  (`sched.recovery.failed-dep-cascade+2`) constrains the cascade pre-pass, which production
+  does scope by co-ownership; the in-DAG recompute is the divergent mechanism and is the
+  residual finding's subject (below), not an A22 violation. A22 therefore keeps holding
+  as-built, and the calibration hook for cascade-mis-scoping overrides keeps its meaning.
+- The model's new arm is single-level (checks pass-1 statuses) where production's `will_fail`
+  set propagates transitively in topo order. Immaterial for verdicts: an intermediate condemned
+  child is itself MDepFailed in dm2 (terminal => progressArmed), and a build whose recovered
+  interest contains it is failed by the recovery tail (`memberFailed`), exactly like
+  production's `finalize_recovered_builds`.
+- The model's new arm has no I-059 orphan gate and no Created/Queued/Substituting status
+  filter (production's `to_recompute` has both). Immaterial for every checked property: an
+  L3-relevant node has live interest by definition, and the over-condemnation of true orphans
+  is unobservable by the wired invariant/witness set (verified empirically by the full battery
+  below).
+
+**2. Re-validation battery under the corrected encoding — green; no baseline breaks.**
+
+- `quint typecheck`: clean (quint 0.32.0).
+- Sim sweeps, `allInvariants`, 40 000 samples, rust backend, per design-scale regime + Duo:
+  Base [ok] 8.9 s; FaultPersist [ok] 9.5 s; Failover [ok] 9.4 s; StaleTenure [ok] 9.3 s;
+  Duo [ok] 7.9 s; AdversarialStore **[violation] = B9 `staleProducedUnlocked`** — NOT a
+  baseline break: B9-under-adversarial-store is the documented pre-registered as-built trip
+  (this map's B9 row; the 0b "B1 and B9 are expected to trip under adversarial-store" record;
+  the 0c pre-registered observation (b)). Attribution to pre-existing behavior is airtight:
+  the violating trace never fires `recoverAsLeader` (lead.gen = 1 and budget.failovers
+  undecremented in every state — the correction only changes recoverAsLeader), and a same-seed
+  re-run (`--seed=0x5d893ce5c423e2f1`) against the PRE-correction model reproduces the same B9
+  violation in 149 ms. The trace consumes the storeGc budget (the GC-after-produce shape).
+- All 25 wired `quint-closure-*` checks rebuilt green against the corrected model
+  (`nix build`, exit 0 — run twice: once against the semantic correction, once against the
+  final committed text), including every recovery-dependent check: the FailoverEx TLC
+  witnesses (hole-recovery, recovery-clear), the three StaleDuo sim checks (A18 probe,
+  stale-intent-apply, cross-tenure-walk), and calib-f8 (FAILOVERS=1, production
+  recoverAsLeader in its calibStep). No wired witness became unreachable (stop-and-report
+  condition 4 not triggered); no calibration stopped falsifying (condition 3 not triggered).
+
+**3. The L3 re-hunt (corrected encoding) — no violation under either backend.**
+
+Backend 1 — rust simulator (existential search; the wired sim checks' budget shape):
+
+| Scope | Invariant | Budget | Result |
+|---|---|---|---|
+| closureEvidenceFailoverEx | liveBuildTerminalOrProgressArmed | 2 000 000 samples x 14 steps | [ok] no violation (36.4 s) |
+| closureEvidenceDuo | liveBuildTerminalOrProgressArmed | 2 000 000 samples x 14 steps | [ok] no violation (38.7 s) |
+
+(Calibration of this signal: the simulator also could not find the PRE-correction violation —
+the post-0d triage's 300 K x 14 record — so the sims corroborate but are not decisive.)
+
+Backend 2 — TLC exhaustive BFS, 60 workers, 35-minute cap per run (the plan's Wave-2 budget),
+all three runs on the same host on the same day with the same quint 0.32.0 / Apalache 0.56.1
+distribution:
+
+| Run | Model | Invariant | Result |
+|---|---|---|---|
+| Baseline (red half) | PRE-correction (Wave-1 tip) | liveBuildTerminalOrProgressArmed | **[violation]** at 2 024 464 distinct / 8 271 444 generated / Progress(12), 8 min 11 s — a 9-state trace ending in the strand (parent MQueued+marked+holed, child removed, build live). Re-confirms the 0d finding (2.06 M / 8.5 M / diameter 12 / 8 min 15 s) and proves this exact setup finds the violation when it exists |
+| Re-hunt | POST-correction | asBuiltHoldInvariantsFailoverEx (the L3-free conjunction — "the correction breaks nothing else") | NO violation through 18 928 539 distinct / 85 343 972 generated / Progress(14) at the cap (unconverged) |
+| Re-hunt | POST-correction | liveBuildTerminalOrProgressArmed (the L3-bearing form — the re-hunt proper) | NO violation through 19 114 520 distinct / 86 073 903 generated / Progress(14) at the cap (unconverged) |
+
+Reading the unconverged re-hunt runs: both explored ~9.4x the distinct states and ~10.4x the
+generated states of the coordinates where the pre-correction violation lives, two BFS progress
+levels deeper, without a violation — and the violation's own depth class (a 9–10-state trace)
+is fully enumerated well inside that prefix. Full convergence of the FailoverEx scope remains
+a Wave-4 (T-4.5) measurement item — the same "convergence borderline" the plan's design table
+predicted; the cap-hit here does not weaken the refutation, whose decisive comparison is
+baseline-found vs re-hunt-not-found over a strictly larger prefix.
+
+**4. The decision gate: outcome B — L3 as authorized does not exist.**
+
+The defect the owner authorized a fix for (decision 1's L3 half: "failover + ClearPoison
+strands a parent Queued/childless/un-armed under a live build forever") is refuted as a
+production defect on three independent grounds:
+
+1. **The corrected model cannot reach it** (the re-hunt above).
+2. **The code walk** (the plan's design analysis §B, re-verified against this tree): three
+   production mechanisms each independently prevent the strand state from forming —
+   (i) `cascade_dependency_failure` (completion.rs:3425) condemns every un-started
+   (Queued/Ready/Created) in-DAG ancestor when the poison lands, transitively, with no
+   ownership scoping; (ii) `compute_initial_states`/`any_dep_terminally_failed`
+   (dag/mod.rs:1402–1441/:950–964) condemns a recovered Created/Queued/Substituting parent
+   above a loaded terminally-failed child (within-TTL poisoned children are loaded with their
+   edges); (iii) `revert_target_for` (dag/mod.rs:979–987) sends a Substituting parent whose
+   walk fails above a terminally-failed child to DependencyFailed, not Queued. The traced
+   strand requires a parent Queued above a still-poisoned child at ClearPoison time; every
+   production path to that configuration is closed by (i)–(iii).
+3. **The trace's load-bearing step is the model artifact**: step 9 of the 0d trace (recovery
+   restores d1 Queued above within-TTL-poisoned d2) is exactly the missing-arm state;
+   production condemns d1 there (mechanism ii), the build fails with an actionable
+   DependencyFailed error, and the ClearPoison step finds no live build to strand.
+
+Consequences:
+
+- The L3 row in the per-property table is flipped to REFUTED (model artifact); the header
+  status block is updated.
+- `asBuiltHoldInvariantsFailoverEx` (the L3-free conjunction) is retained in the model for
+  comparison with the 0d record; the FailoverEx manual exhaustive target becomes the FULL
+  `asBuiltHoldInvariants` (with L3) — nix/quint.nix's manual-target comment is updated
+  accordingly.
+- The plan's conditional Wave-2 tasks (T-2.2 strand red test, T-2.3 survivor re-evaluation,
+  T-2.4 clear-poison spec amendment) DO NOT EXECUTE: there is no production defect to fix, and
+  the T-2.3 hardening alone would be dead code in production (production never strands the
+  parent, because it condemns it — the residual below).
+- Wave-4 L3-conditional items (T-4.2 model L3 fix + calibration pin; the FailoverEx L3 row
+  flip in T-4.5/T-4.6) are likewise moot in their outcome-A form; T-4.5's measurement of
+  FailoverEx convergence proceeds with the full conjunction.
+
+**5. The residual finding routed to the owner: production's unscoped recovery condemnation
+(a C3-class behavior at a fourth decision point; spec-vs-code divergence).**
+
+What it is: at recovery, `compute_initial_states`'s `any_dep_terminally_failed` branch
+condemns a Created/Queued/Substituting parent (with live interest) above ANY in-DAG
+terminally-failed child — regardless of build co-ownership. The spec rule
+`sched.recovery.failed-dep-cascade+2` (scheduler.typ) mandates the opposite outcome for
+non-co-owned failures: "A parent whose only failed-child evidence belongs to dead builds or to
+builds that never owned it MUST NOT be condemned by the cascade --- it recovers normally
+(childless if the edge was dropped) and any genuine problem is re-discovered at dispatch
+time."
+
+Code walk: the rule's "recovers normally (childless if the edge was dropped)" premise holds
+for `dependency_failed`/`cancelled`/expired-poisoned children — those rows are not loaded,
+their edges are dropped, the parent recovers childless and Ready, and the dispatch sweep
+(post-Wave-1: the settlement re-probe) re-discovers any genuine problem. It does NOT hold for
+a within-TTL POISONED child: that row IS loaded (required by
+`sched.recovery.poisoned-failed-count` for TTL tracking) and keeps its edge, so
+`compute_initial_states` sees it and condemns the parent to DependencyFailed (persisted), even
+when no live build co-owns the child and even when the parent's own wanted outputs are present
+or substitutable. The owning build then fails at the recovery tail
+(`finalize_recovered_builds` -> `check_build_completion`). The wrongful-failure window is:
+failover x within-TTL poisoned child x parent-owning build that does not co-own that child.
+The two production tests named in section 1 PIN this behavior (one is exactly the cross-build
+case), so it is deliberate hang-prevention, not an accident.
+
+Wave-1 coverage: NONE. The settlement helper (`settle_broken_marked_root`) is reached from
+exactly three sites — the dispatch-probe partition, the `handle_substitute_complete` Broken
+arm, and the reap-survivor hook. The recovery condemnation transitions the node to terminal
+DependencyFailed before any dispatch sweep runs; no settlement site ever sees it.
+
+Why production is shaped this way (the trade-off the owner must adjudicate): the unconditional
+condemnation is precisely what prevents the L3 hang in production. If recovery honored the
+spec's scoping for the loaded-poisoned-child case, the parent would recover Queued above the
+poisoned child, and when ClearPoison/TTL-sweep later removes that child, nothing re-evaluates
+the parent (production's removal paths do not re-evaluate survivors) — the build hangs
+forever, which is the refuted L3 trace's shape made real. Production traded a bounded wrongful
+failure (terminal, actionable, resubmittable) for hang-freedom.
+
+Disposition options for the owner (this stage takes no action):
+
+- **(a) Accepted bound + spec amendment**: amend `sched.recovery.failed-dep-cascade+2` to
+  carve out the loaded-poisoned-child case (production behavior becomes spec-sanctioned),
+  record the bound in this map and the deployment checklist. Rationale: the harm is one
+  wrongful build failure per (failover x within-TTL-poisoned non-co-owned child) conjunction;
+  the failed build is recoverable by directed resubmit, and post-Wave-1 the resubmitted
+  build's settlement handles the re-merged node correctly. The hang-freedom this buys is
+  exactly what L3 checks.
+- **(b) Spec-conformance fix** (NOT authorized by current decisions; needs a new red-first
+  plan): scope the in-DAG condemnation by co-ownership (mirror the cascade's evidence rule)
+  AND add the survivor re-evaluation on poison-clear removals (the conditional T-2.2..T-2.4
+  shape). Both halves are required together: the scoping alone re-introduces the L3 hang; the
+  re-evaluation alone is dead code. This option converts the recovery decision point to the
+  same settle-don't-condemn shape Wave 1 gave the dispatch/reap decision points, at the cost
+  of touching `compute_initial_states` (shared with the merge path) and the recovery sequence.
+
+**6. Updated owner sign-off items (supersedes the post-0d triage list; renumbered).**
+
+1. The C5 / CE-7 deferral — unchanged (post-0d item 1).
+2. The F6 falsifications resting on the rust simulator — unchanged (post-0d item 2).
+3. The CE-45 (F10) evidence-module-only falsification — unchanged (post-0d item 3).
+4. The mkQuintWitnessCheck rust-backend extension funding question — unchanged (post-0d
+   item 4 residual).
+5. ~~The FailoverEx conjunction violation / L3 as-built finding~~ — **REFUTED by this stage**
+   (the recovery-condemnation correction + re-hunt + code walk above). Owner decision 1's L3
+   fix authorization is moot as premised. NEW adjudication request in its place: the residual
+   finding (section 5 above) — disposition (a) accepted bound + spec amendment vs (b)
+   spec-conformance fix.
+6. C3 — RESOLVED by Phase 1 Wave 1 (the settlement fix; red-first, landed). The model-side C3
+   flip (settlement encoding + calibration pin re-point) is Wave 4 (T-4.1).
+7. The 0c carry-overs — unchanged, except the FailoverEx manual target is now the full
+   conjunction (consequence 2 of the gate above).
+
+Later phases append here (Wave 3: fencing; Wave 4: model + CI updates; Wave 5 / close-out:
+acceptance table over the full corpus, deployment-checklist deltas and counter-signatures).

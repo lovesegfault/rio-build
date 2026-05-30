@@ -3527,32 +3527,33 @@ in
     # The fault-persist and failover exhaustive checks are NOT wired in
     # this stage: their reduced-scope modules
     # (closureEvidenceFaultPersistEx / closureEvidenceFailoverEx) exist,
-    # but neither regime converges within a gate-compatible budget. The
-    # FailoverEx target's invariant is asBuiltHoldInvariantsFailoverEx
-    # (asBuiltHoldInvariants minus L3): the post-0d triage identified the
+    # but neither regime converges within a gate-compatible budget.
+    #
+    # L3 verdict history at FailoverEx: the post-0d triage identified the
     # FailoverEx as-built conjunction violation as L3
-    # (liveBuildTerminalOrProgressArmed), a REAL as-built finding — a
-    # failover kills a Substituting member's walk, recovery restores it
-    # Queued waiting on its persisted-Poisoned child, and a subsequent
-    # ClearPoison removes that child without re-evaluating the parent's
-    # readiness, stranding it Queued/childless/unarmed under a live
-    # build's interest. Like C3, the finding is recorded in the invariant
-    # map (post-0d triage record: trace + code walk + Phase-1 candidate
-    # disposition); unlike C3 its falsification is a documented manual
-    # target rather than a wired probe (the violation sits at ~2 M
-    # distinct states / minutes-to-tens-of-minutes of TLC, past the
-    # wired-check budget):
+    # (liveBuildTerminalOrProgressArmed) and classified it as a real
+    # as-built finding (the strand trace). The Phase-1 Wave-2 model
+    # correction REFUTED that classification: the traced strand existed
+    # only through the model's missing recovery-condemnation arm
+    # (recoverAsLeader arm (b) — production's compute_initial_states /
+    # any_dep_terminally_failed condemns the recovered parent above its
+    # still-poisoned child, so the strand state never forms in
+    # production). Under the corrected encoding the L3 re-hunt found no
+    # violation at FailoverEx or Duo under either backend, so the manual
+    # exhaustive target for this scope is the FULL conjunction:
     #
     #   quint verify --backend=tlc --main=closureEvidenceFailoverEx \
-    #     --invariant=liveBuildTerminalOrProgressArmed \
+    #     --invariant=asBuiltHoldInvariants \
     #     docs/spec/models/closureEvidence.qnt
     #
-    # The invariant map's regime-scope record carries the held-back
-    # status; wiring follows the base check's pattern once a measurement
-    # establishes the per-check budget. The recovery- and
-    # durability-direction witnesses below (hole-from-recovery,
-    # recovery-clear, stale-intent-apply) keep those regimes'
-    # reachability pinned in the meantime.
+    # (asBuiltHoldInvariantsFailoverEx — the L3-free variant — is retained
+    # in the model for comparison against the 0d record.) The refutation
+    # evidence, the re-hunt figures and the residual spec-vs-code
+    # divergence routed to the owner (production's unscoped recovery
+    # condemnation) are in the invariant map's Phase-1 Wave-2 stage
+    # record. The recovery- and durability-direction witnesses below
+    # (hole-from-recovery, recovery-clear, stale-intent-apply) keep those
+    # regimes' reachability pinned in the meantime.
 
     # ---- Closure-evidence expected-fail probes -----------------------
     # The design's pre-registered expected falsifications (§3 / the §8 0c

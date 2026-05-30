@@ -767,8 +767,14 @@ module closureEvidence {
       drvOf(d).mSt == MAbsent
     })
 
-  /// A22: the recovery failed-dep cascade condemns only on a live
-  /// co-owned persisted failure.
+  /// A22: the recovery failed-dep CASCADE PRE-PASS (the
+  /// load_parents_with_failed_deps short-circuit) condemns only on a
+  /// live co-owned persisted failure. The compute_initial_states
+  /// in-DAG recompute that runs after it is a separate production
+  /// mechanism with NO co-ownership scoping (mirrored by recoverAsLeader's
+  /// condemnation arm (b)); it is intentionally outside this property —
+  /// the spec-vs-code divergence is the Phase-1 model-corrections record's
+  /// subject, routed to the owner.
   val condemnRequiresLiveCoOwnedFailure = not(viol.condemnUnscoped)
 
   // Group B — the missing families (design §3b).
@@ -911,18 +917,26 @@ module closureEvidence {
   }
 
   /// The failover-scope variant of asBuiltHoldInvariants: additionally
-  /// excludes L3 (liveBuildTerminalOrProgressArmed), which is genuinely
-  /// violated as built at the failover scopes — the post-0d triage
-  /// finding: a failover kills a Substituting member's walk, recovery
-  /// restores it as Queued waiting on its persisted-Poisoned child (the
-  /// D17 in-memory-only Substituting reset never re-arms walks), and a
-  /// subsequent admin ClearPoison / TTL sweep removes that child WITHOUT
-  /// re-evaluating the surviving parent's readiness
-  /// (handle_clear_poison -> remove_node, "must not trigger parent
-  /// re-evaluation") — leaving the parent Queued, childless and unarmed
-  /// under a live build's interest. Trace, code walk and the Phase-1
-  /// disposition: invariant map, post-0d triage record. The single-tenure
-  /// scopes keep L3 (it holds there — the 0c BaseEx record).
+  /// excludes L3 (liveBuildTerminalOrProgressArmed). HISTORICAL: the
+  /// post-0d triage classified an L3 violation at FailoverEx as a real
+  /// as-built finding (failover + recovery + ClearPoison strands a
+  /// recovered parent Queued/childless/unarmed under a live build).
+  /// **REFUTED by the Phase-1 Wave-2 recovery-condemnation correction**:
+  /// the traced strand depended on recovery leaving the parent Queued
+  /// above its still-poisoned child, which the model permitted only
+  /// through the missing compute_initial_states condemnation arm
+  /// (recoverAsLeader's arm (b), above). With the corrected encoding the
+  /// parent is condemned at recovery — exactly what production does
+  /// (rio-scheduler compute_initial_states / any_dep_terminally_failed,
+  /// pinned by test_initial_states_with_prepoisoned_dep) — and the L3
+  /// re-hunt found no violation at FailoverEx or Duo under either
+  /// backend. asBuiltHoldInvariants (WITH L3) is therefore the
+  /// expected-hold conjunction at the failover scopes too; this variant
+  /// is retained for comparison against the 0d record and as the
+  /// pre-correction manual-target form. Refutation evidence, re-hunt
+  /// figures and the residual spec-vs-code divergence: invariant map,
+  /// Phase-1 Wave-2 stage record. The single-tenure scopes' 0c BaseEx
+  /// record is unaffected.
   val asBuiltHoldInvariantsFailoverEx = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -1168,9 +1182,11 @@ module closureEvidence {
   /// Leader recovery: one atomic action over the durable state at this
   /// instant — row load (terminal rows excluded), poisoned-row TTL
   /// split, edge truncation to loaded endpoints, failed-dep
-  /// condemnation, the strict-criterion clear gate (C3), the recovery
-  /// hole stamp (H4), the in-memory-only Substituting reset, interest
-  /// rebuild from durable links without per-build contributions.
+  /// condemnation (the co-owned R2 cascade pre-pass AND the unscoped
+  /// compute_initial_states in-DAG dep check — see the dm2 comment),
+  /// the strict-criterion clear gate (C3), the recovery hole stamp
+  /// (H4), the in-memory-only Substituting reset, interest rebuild
+  /// from durable links without per-build contributions.
   action recoverAsLeader: bool = {
     nondet expired = DRVS.powerset().oneOf()
     val newGen = lead.gen + 1
@@ -1207,16 +1223,35 @@ module closureEvidence {
           // a restored mark re-arms the per-arming wrongful-fail-fast budget
           wrongFF: if (r.pgTp) 0 else r.wrongFF, wrongFFStrict: r.wrongFFStrict }
     })
-    // pass 2: failed-dep condemnation (R2), clear gate (C3), hole stamp (H4),
-    // Substituting reset, ready seeding — over the durable relation
+    // pass 2: failed-dep condemnation (R2 + the in-DAG recompute), clear gate
+    // (C3), hole stamp (H4), Substituting reset, ready seeding — over the
+    // durable relation
     val dm2 = DRVS.mapBy(d => {
       val r = dm1.get(d)
       if (r.mSt == MAbsent or r.mSt == MPoisoned) r
       else {
+        val kidsLoaded = pKids(newMemEdges, d)
+        // Failed-dep condemnation is the disjunction of production's TWO
+        // recovery mechanisms:
+        //  (a) the R2 cascade pre-pass (load_parents_with_failed_deps →
+        //      cascade_failed in seed_ready_queue) — co-ownership-scoped
+        //      over the DURABLE relation (pCondemnCriterion; the bug_009
+        //      evidence rule and the spec's condemnation rule);
+        //  (b) the compute_initial_states recompute over the LOADED child
+        //      set (any_dep_terminally_failed): a node above an in-DAG
+        //      un-produced-terminal child is condemned REGARDLESS of build
+        //      co-ownership. Within-TTL poisoned children are loaded with
+        //      their edges, so this is the arm that condemns a recovered
+        //      parent above a still-poisoned child another build owns.
+        // Arm (b) is strictly more condemning than the spec's R2 rule; the
+        // spec-vs-code divergence is recorded in the invariant map (Phase-1
+        // model corrections record) and routed to the owner. The A22 latch
+        // (condemnUnscoped) stays keyed on arm (a) only — it guards the
+        // cascade mechanism the spec rule constrains, not arm (b).
         val condemned = pCondemnCriterion(dm1, blds, BUILDS, pgEdges, d)
+          or kidsLoaded.exists(c => isUnprodTerminal(dm1.get(c).mSt))
         val clearGate = r.mTp and not(r.mCh) and pStrictPgCriterion(dm1, blds, BUILDS, pgEdges, d)
         val holeStamp = pRecoveryHoleCriterion(dm1, pgEdges, d)
-        val kidsLoaded = pKids(newMemEdges, d)
         val depsSatisfied = kidsLoaded.forall(c => dm1.get(c).mSt == MProduced)
         // seed_ready_queue re-derives dispatchability from the dependency
         // walk: a persisted 'ready'/'substituting' status is never trusted
@@ -1238,6 +1273,10 @@ module closureEvidence {
       dm1.get(d).mTp and not(dm1.get(d).mCh) and pStrictPgCriterion(dm1, blds, BUILDS, pgEdges, d))
     val holedSet = DRVS.filter(d => dm2.get(d).mSt != MAbsent and dm2.get(d).mSt != MPoisoned and
       not(clearedSet.contains(d)) and pRecoveryHoleCriterion(dm1, pgEdges, d) and not(dm1.get(d).mCh))
+    // The CASCADE-arm condemned set only (arm (a) above): feeds the A22
+    // latch hook, which guards the co-ownership scoping of the R2 cascade
+    // pre-pass. Nodes condemned solely by the in-DAG recompute arm (b) are
+    // deliberately not in this set — see the dm2 comment.
     val condemnedSet = DRVS.filter(d => dm1.get(d).mSt != MAbsent and dm1.get(d).mSt != MPoisoned and
       pCondemnCriterion(dm1, blds, BUILDS, pgEdges, d))
     val newIntents =
