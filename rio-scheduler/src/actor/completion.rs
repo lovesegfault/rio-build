@@ -515,9 +515,19 @@ impl DagActor {
             cleared = cleared.len(),
             "cleared topdown_pruned for parents whose children became produced at completion"
         );
-        if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
-            warn!(count = cleared.len(), error = %e,
-                  "failed to clear persisted topdown_pruned after child completion (continuing)");
+        match self
+            .db
+            .clear_topdown_pruned_by_hashes(&cleared, self.serving_generation())
+            .await
+        {
+            Ok(crate::db::FencedWrite::Fenced) => {
+                self.note_fenced_evidence_write("completion-time topdown_pruned clear");
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(count = cleared.len(), error = %e,
+                      "failed to clear persisted topdown_pruned after child completion (continuing)");
+            }
         }
     }
 
@@ -2588,9 +2598,19 @@ impl DagActor {
             // relies on — so no redundant gate here. A lost write costs
             // only the breadcrumb's durability across a failover; the
             // in-memory stamp covers this tenure.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
-                warn!(drv_hash = %drv_hash, count = holed.len(), error = %e,
-                      "failed to persist closure_hole after admin poison clear (continuing)");
+            match self
+                .db
+                .set_closure_hole_by_hashes(&holed, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("admin poison-clear closure_hole stamp");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(drv_hash = %drv_hash, count = holed.len(), error = %e,
+                          "failed to persist closure_hole after admin poison clear (continuing)");
+                }
             }
         }
         // r[impl sched.poison.clear-survivor-reevaluation]

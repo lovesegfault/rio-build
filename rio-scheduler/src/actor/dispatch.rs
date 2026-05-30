@@ -786,9 +786,19 @@ impl DagActor {
             // later walk failure would wrongly fail-fast. Same
             // error posture as the fail-fast's clear: warn and
             // continue, never fail the handler.
-            if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
-                warn!(%drv_hash, error = %e,
-                      "failed to clear persisted topdown_pruned after lazy clear (continuing)");
+            match self
+                .db
+                .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("lazy walk-failure topdown_pruned clear");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(%drv_hash, error = %e,
+                          "failed to clear persisted topdown_pruned after lazy clear (continuing)");
+                }
             }
         } else if topdown_pruned && evidence == ClosureEvidence::Pending {
             debug!(%drv_hash,
@@ -1121,9 +1131,19 @@ impl DagActor {
             // A failure costs at most one more wrongful fail-fast cycle
             // after a later failover — never fail the actor command
             // over it.
-            if let Err(e) = self.db.clear_topdown_pruned_by_hash(drv_hash).await {
-                warn!(%drv_hash, error = %e,
-                      "failed to clear persisted topdown_pruned after fail-fast (continuing)");
+            match self
+                .db
+                .clear_topdown_pruned_by_hash(drv_hash, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("fail-fast topdown_pruned clear");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(%drv_hash, error = %e,
+                          "failed to clear persisted topdown_pruned after fail-fast (continuing)");
+                }
             }
         }
         for build_id in self.get_interested_builds(drv_hash) {

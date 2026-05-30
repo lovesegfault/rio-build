@@ -96,6 +96,7 @@
     "rio_scheduler_derivations_queued",
     "rio_scheduler_derivations_running",
     "rio_scheduler_event_persist_dropped_total",
+    "rio_scheduler_evidence_write_fenced_total",
     "rio_scheduler_features_stripped_total",
     "rio_scheduler_generation_claim_failed_total",
     "rio_scheduler_generation_floor_read_failed_total",
@@ -693,6 +694,11 @@
         "name": "rio_scheduler_event_persist_dropped_total",
         "kind": "counter",
         "help": "BuildEvents dropped from PG persister (channel backpressure). Broadcast still live; only mid-backlog reconnect loses it. Alert if rate > 0 sustained."
+      },
+      {
+        "name": "rio_scheduler_evidence_write_fenced_total",
+        "kind": "counter",
+        "help": "Evidence writes (topdown_pruned/closure_hole stamps and clears, derivation status/poison persists, merge transactions) refused by the claims-floor generation fence: the writing replica's serving generation sat below the durable floor (GREATEST over assignments.generation and leader_generation_claims.generation). On a replica that just lost the lease this is the fence working — the successor owns the evidence now; on the current leader it should be ZERO (a nonzero rate there means a capture bug or a PG floor regression and needs investigation)."
       },
       {
         "name": "rio_scheduler_features_stripped_total",

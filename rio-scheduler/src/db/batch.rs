@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use super::{DerivationRow, SchedulerDb, encode_pg_text_array};
+use super::{DerivationRow, FencedWrite, SchedulerDb, encode_pg_text_array};
 
 impl SchedulerDb {
     /// Link a build to a derivation. Test-only singular form; production
@@ -327,7 +327,7 @@ impl SchedulerDb {
     }
 
     /// Best-effort batched `topdown_pruned` clear keyed by `drv_hash`,
-    /// on the pool (outside any transaction). Callers: the
+    /// as a generation-fenced single-statement transaction. Callers: the
     /// post-reconciliation clear pass in `handle_merge_dag` (unique
     /// parents whose children are all produced — and verified — after
     /// `reconcile_merged_state`),
@@ -342,17 +342,29 @@ impl SchedulerDb {
     /// and the widened WHERE additionally mops up a markless leftover
     /// hole (a heal whose best-effort PG write was lost after the mark
     /// itself had already been cleared).
-    /// Returns the number of rows actually touched.
-    /// Same error posture as `clear_topdown_pruned_by_hash`: the caller
+    /// Returns [`FencedWrite::Applied`] with the number of rows actually
+    /// touched, or [`FencedWrite::Fenced`] (rolled back, nothing
+    /// written) when `serving_generation` sits below the durable claims
+    /// floor — a deposed tenure's late clear must not erase evidence a
+    /// newer tenure has since written (`sched.evidence.durability`).
+    /// Same ERROR posture as `clear_topdown_pruned_by_hash`: the caller
     /// warns and continues — the in-memory clear already happened and
     /// the merge outcome must not depend on this write.
     // r[impl sched.evidence.closure-hole]
+    // r[impl sched.evidence.durability]
     pub(crate) async fn clear_topdown_pruned_by_hashes(
         &self,
         drv_hashes: &[String],
-    ) -> Result<u64, sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         if drv_hashes.is_empty() {
-            return Ok(0);
+            return Ok(FencedWrite::Applied(0));
+        }
+        let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
         }
         let result = sqlx::query(
             r#"
@@ -362,13 +374,15 @@ impl SchedulerDb {
             "#,
         )
         .bind(drv_hashes)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(result.rows_affected()))
     }
 
     /// Best-effort single-row, mark-only `topdown_pruned` clear, keyed
-    /// by `drv_hash`, outside any transaction. Never touches the
+    /// by `drv_hash`, as a generation-fenced single-statement
+    /// transaction. Never touches the
     /// `closure_hole` breadcrumb (unlike `clear_topdown_pruned_by_hashes`,
     /// whose callers are all keyed on produced/vouched children). Two
     /// callers, and mark-only is correct at both:
@@ -391,13 +405,23 @@ impl SchedulerDb {
     ///
     /// Callers treat an error as warn-and-continue — the in-memory
     /// clear already happened and the build verdict must not depend on
-    /// this write.
+    /// this write. A [`FencedWrite::Fenced`] outcome (serving
+    /// generation below the claims floor) likewise rolls back having
+    /// written nothing (`sched.evidence.durability`).
     // r[impl sched.evidence.closure-hole]
+    // r[impl sched.evidence.durability]
     pub(crate) async fn clear_topdown_pruned_by_hash(
         &self,
         drv_hash: &str,
-    ) -> Result<(), sqlx::Error> {
-        sqlx::query(
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
+        }
+        let result = sqlx::query(
             r#"
             UPDATE derivations
             SET topdown_pruned = false, updated_at = now()
@@ -405,13 +429,15 @@ impl SchedulerDb {
             "#,
         )
         .bind(drv_hash)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(())
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(result.rows_affected()))
     }
 
-    /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, on
-    /// the pool (outside any transaction). Four callers, one per
+    /// Best-effort batched `closure_hole` stamp keyed by `drv_hash`, as
+    /// a generation-fenced single-statement transaction. Four callers,
+    /// one per
     /// production removal of an un-produced child out from under a
     /// surviving parent: the leader-gated survivor hook in
     /// `handle_cleanup_terminal_build`, for the parents the
@@ -428,17 +454,28 @@ impl SchedulerDb {
     /// `r[sched.lease.standby-drops-writes]`) and the in-memory
     /// breadcrumb is stamped at the removal site itself, independently
     /// of this write.
-    /// Returns the number of rows actually stamped. The caller warns and
-    /// continues on error — losing the write costs durability of the
+    /// Returns [`FencedWrite::Applied`] with the number of rows actually
+    /// stamped, or [`FencedWrite::Fenced`] (rolled back, nothing
+    /// written) when `serving_generation` sits below the durable claims
+    /// floor (`sched.evidence.durability`). The caller warns and
+    /// continues on ERROR — losing the write costs durability of the
     /// breadcrumb across a failover (the already-accepted best-effort
     /// window), never this tenure's correctness.
     // r[impl sched.evidence.closure-hole]
+    // r[impl sched.evidence.durability]
     pub(crate) async fn set_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],
-    ) -> Result<u64, sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         if drv_hashes.is_empty() {
-            return Ok(0);
+            return Ok(FencedWrite::Applied(0));
+        }
+        let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
         }
         let result = sqlx::query(
             r#"
@@ -447,30 +484,44 @@ impl SchedulerDb {
             "#,
         )
         .bind(drv_hashes)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(result.rows_affected()))
     }
 
-    /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, on
-    /// the pool (outside any transaction). Sole caller: the merge-time
+    /// Best-effort batched `closure_hole` clear keyed by `drv_hash`, as
+    /// a generation-fenced single-statement transaction. Sole caller:
+    /// the merge-time
     /// heal in `handle_merge_dag`, for EVERY edge parent of a full
     /// merge (the heal clears the hole even when the `topdown_pruned`
     /// mark stays, so it cannot ride the mark-clear helpers above; it
     /// is total — not keyed on the in-memory bit — because the
     /// persisted copy can be stale when the in-memory one was cleared
     /// elsewhere or lost, and the `AND closure_hole` WHERE keeps the
-    /// statement a no-op for clean rows). Returns the number of rows
-    /// actually cleared. The caller warns and continues on error — a
+    /// statement a no-op for clean rows). Returns
+    /// [`FencedWrite::Applied`] with the number of rows
+    /// actually cleared, or [`FencedWrite::Fenced`] (rolled back,
+    /// nothing written) when `serving_generation` sits below the
+    /// durable claims floor (`sched.evidence.durability`). The caller
+    /// warns and continues on ERROR — a
     /// stale persisted hole errs toward the bounded fail-fast after a
     /// later failover, never the doomed from-source dispatch.
     // r[impl sched.evidence.closure-hole]
+    // r[impl sched.evidence.durability]
     pub(crate) async fn clear_closure_hole_by_hashes(
         &self,
         drv_hashes: &[String],
-    ) -> Result<u64, sqlx::Error> {
+        serving_generation: i64,
+    ) -> Result<FencedWrite, sqlx::Error> {
         if drv_hashes.is_empty() {
-            return Ok(0);
+            return Ok(FencedWrite::Applied(0));
+        }
+        let mut tx = self.pool.begin().await?;
+        let floor = Self::claims_floor(&mut tx).await?;
+        if !Self::at_or_above_floor(floor, serving_generation) {
+            tx.rollback().await?;
+            return Ok(FencedWrite::Fenced);
         }
         let result = sqlx::query(
             r#"
@@ -479,8 +530,9 @@ impl SchedulerDb {
             "#,
         )
         .bind(drv_hashes)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
-        Ok(result.rows_affected())
+        tx.commit().await?;
+        Ok(FencedWrite::Applied(result.rows_affected()))
     }
 }

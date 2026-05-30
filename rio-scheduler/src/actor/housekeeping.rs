@@ -399,9 +399,19 @@ impl DagActor {
             // redundant gate here. A lost write costs only the
             // breadcrumb's durability across a failover; the in-memory
             // stamp covers this tenure.
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
-                warn!(count = holed.len(), error = %e,
-                      "failed to persist closure_hole after poison-TTL sweep (continuing)");
+            match self
+                .db
+                .set_closure_hole_by_hashes(&holed, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("poison-TTL sweep closure_hole stamp");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(count = holed.len(), error = %e,
+                          "failed to persist closure_hole after poison-TTL sweep (continuing)");
+                }
             }
         }
         // r[impl sched.poison.clear-survivor-reevaluation]

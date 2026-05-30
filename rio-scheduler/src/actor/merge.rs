@@ -191,11 +191,21 @@ impl DagActor {
             .iter()
             .map(|h| h.to_string())
             .collect();
-        if !heal_parents.is_empty()
-            && let Err(e) = self.db.clear_closure_hole_by_hashes(&heal_parents).await
-        {
-            warn!(build_id = %build_id, count = heal_parents.len(), error = %e,
-                  "failed to clear persisted closure_hole after merge heal (continuing)");
+        if !heal_parents.is_empty() {
+            match self
+                .db
+                .clear_closure_hole_by_hashes(&heal_parents, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("merge-heal closure_hole clear");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(build_id = %build_id, count = heal_parents.len(), error = %e,
+                          "failed to clear persisted closure_hole after merge heal (continuing)");
+                }
+            }
         }
         let mut clear_candidates: HashSet<DrvHash> =
             ingest.edge_parent_hashes.iter().cloned().collect();
@@ -218,9 +228,19 @@ impl DagActor {
                 cleared = cleared.len(),
                 "cleared topdown_pruned for parents whose children are all produced after reconciliation"
             );
-            if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
-                warn!(build_id = %build_id, error = %e,
-                      "failed to clear persisted topdown_pruned after merge reconciliation (continuing)");
+            match self
+                .db
+                .clear_topdown_pruned_by_hashes(&cleared, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("merge-reconciliation topdown_pruned clear");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(build_id = %build_id, error = %e,
+                          "failed to clear persisted topdown_pruned after merge reconciliation (continuing)");
+                }
             }
         }
 

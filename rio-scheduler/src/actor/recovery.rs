@@ -498,10 +498,20 @@ impl DagActor {
                      claim-before-recovery-writes ordering is broken",
                     self.serving_generation
                 );
-                if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
-                    warn!(count = cleared.len(), error = %e,
-                          "failed to clear persisted topdown_pruned at recovery (best-effort; \
-                           next failover re-evaluates)");
+                match self
+                    .db
+                    .clear_topdown_pruned_by_hashes(&cleared, self.serving_generation())
+                    .await
+                {
+                    Ok(crate::db::FencedWrite::Fenced) => {
+                        self.note_fenced_evidence_write("recovery-gate topdown_pruned clear");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(count = cleared.len(), error = %e,
+                              "failed to clear persisted topdown_pruned at recovery (best-effort; \
+                               next failover re-evaluates)");
+                    }
                 }
             }
         }
@@ -563,10 +573,20 @@ impl DagActor {
                  claim-before-recovery-writes ordering is broken",
                 self.serving_generation
             );
-            if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
-                warn!(count = holed.len(), error = %e,
-                      "failed to persist closure holes at recovery (best-effort; \
-                       in-memory breadcrumb covers this tenure)");
+            match self
+                .db
+                .set_closure_hole_by_hashes(&holed, self.serving_generation())
+                .await
+            {
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("recovery closure_hole stamp");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    warn!(count = holed.len(), error = %e,
+                          "failed to persist closure holes at recovery (best-effort; \
+                           in-memory breadcrumb covers this tenure)");
+                }
             }
         }
 

@@ -635,6 +635,12 @@ pub(crate) struct TestCounters {
     /// and a TOCTOU at the same `inputs_gen` if `spot_price_poller`
     /// writes mid-pass).
     pub solve_inputs_calls: std::sync::atomic::AtomicU64,
+    /// Incremented on every `note_fenced_evidence_write` call — the
+    /// test-readable mirror of `rio_scheduler_evidence_write_fenced_total`
+    /// (`sched.evidence.durability`). The deposed-actor fencing test
+    /// asserts it moved; the single-leader batteries assert it stayed 0
+    /// (the fence must never reject a live leader's writes).
+    pub evidence_writes_fenced: std::sync::atomic::AtomicU64,
 }
 
 #[cfg(test)]
@@ -644,6 +650,7 @@ impl TestCounters {
         TestCountersSnapshot {
             persist_status_calls: self.persist_status_calls.load(SeqCst),
             solve_inputs_calls: self.solve_inputs_calls.load(SeqCst),
+            evidence_writes_fenced: self.evidence_writes_fenced.load(SeqCst),
             // Filled by the `DebugCmd::Counters` handler — `substitute_sem`
             // lives on `DagActor`, not here.
             substitute_sem_permits: 0,
@@ -660,6 +667,9 @@ impl TestCounters {
 pub struct TestCountersSnapshot {
     pub persist_status_calls: u64,
     pub solve_inputs_calls: u64,
+    /// Mirror of `rio_scheduler_evidence_write_fenced_total` — see
+    /// [`TestCounters::evidence_writes_fenced`].
+    pub evidence_writes_fenced: u64,
     /// `DagActor.substitute_sem.available_permits()` at snapshot time.
     /// Filled by the [`DebugCmd::Counters`] handler (not
     /// [`TestCounters::snapshot`] — the semaphore lives on the actor).
@@ -778,6 +788,36 @@ impl DagActor {
     /// (`watch::Sender::subscribe` is cheap, single-slot).
     pub fn snapshot_receiver(&self) -> watch::Receiver<Arc<ClusterSnapshot>> {
         self.snapshot_tx.subscribe()
+    }
+
+    // r[impl sched.evidence.durability]
+    /// The serving generation every claims-floor-fenced evidence write
+    /// of this tenure carries — the tenure-tracking field, never a
+    /// fresh `self.leader.generation()` read (see the field doc for why
+    /// the distinction is load-bearing).
+    pub(super) fn serving_generation(&self) -> i64 {
+        self.serving_generation
+    }
+
+    // r[impl sched.evidence.durability]
+    /// Shared posture for a [`crate::db::FencedWrite::Fenced`] outcome
+    /// on a best-effort evidence write: warn (with the serving-tenure
+    /// context an operator needs), count it, and continue. A fenced
+    /// write is NOT an error — it is the claims-floor fence refusing a
+    /// deposed replica's stale write; the in-memory state that produced
+    /// the write is garbage the queued LeaderLost wipe discards.
+    pub(super) fn note_fenced_evidence_write(&self, write: &'static str) {
+        warn!(
+            serving_generation = self.serving_generation,
+            write,
+            "evidence write fenced: serving generation below the durable claims floor \
+             (deposed replica; a newer tenure owns the evidence now)"
+        );
+        metrics::counter!("rio_scheduler_evidence_write_fenced_total").increment(1);
+        #[cfg(test)]
+        self.test_counters
+            .evidence_writes_fenced
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// Reset DAG + per-build maps to empty. Called on leader-acquire,

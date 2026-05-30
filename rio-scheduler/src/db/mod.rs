@@ -13,7 +13,7 @@
 //! for partial-index proof; the splice macro keeps those queries
 //! `&'static str` so they still satisfy sqlx 0.9's `SqlSafeStr` bound.
 
-use sqlx::PgPool;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::state::DerivationStatus;
@@ -453,6 +453,30 @@ macro_rules! list_builds_select {
 }
 pub(super) use list_builds_select;
 
+/// Outcome of a claims-floor-fenced evidence write
+/// (`sched.evidence.durability`): either the write applied (with the
+/// number of rows it touched, where the statement reports one) or the
+/// fence rolled the transaction back having written nothing because
+/// the caller's serving generation sits below the durable claims
+/// floor.
+///
+/// `Fenced` is NOT an error: it is the fence working on a deposed
+/// replica whose in-memory state is garbage awaiting the queued
+/// LeaderLost wipe. Callers log it at `warn!` with the floor and
+/// generation, increment `rio_scheduler_evidence_write_fenced_total`,
+/// and continue.
+// r[impl sched.evidence.durability]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FencedWrite {
+    /// The write committed; the payload is `rows_affected()` for
+    /// statements that report it (0 for fixed-shape single-row writes
+    /// whose callers don't consume a count).
+    Applied(u64),
+    /// The serving generation is below the claims floor: the
+    /// transaction rolled back having written nothing.
+    Fenced,
+}
+
 impl SchedulerDb {
     /// Create a new database handle from a connection pool.
     pub fn new(pool: PgPool) -> Self {
@@ -462,5 +486,42 @@ impl SchedulerDb {
     /// Get a reference to the underlying connection pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    // r[impl sched.evidence.durability]
+    /// The durable claims floor: `GREATEST` over
+    /// `assignments.generation` and `leader_generation_claims.generation`
+    /// — the same two arms as [`Self::max_known_generation`], read on
+    /// the CALLER's connection so the comparison happens inside the
+    /// same transaction as the write it fences (the pull-mint pattern,
+    /// `mint_pull_attempt_fenced`). `None` = fresh cluster (no
+    /// assignments, no claims): nothing to fence against.
+    pub(crate) async fn claims_floor(conn: &mut PgConnection) -> Result<Option<i64>, sqlx::Error> {
+        let row: (Option<i64>,) = sqlx::query_as(
+            "SELECT GREATEST( \
+                 (SELECT MAX(generation) FROM assignments), \
+                 (SELECT MAX(generation) FROM leader_generation_claims))",
+        )
+        .fetch_one(&mut *conn)
+        .await?;
+        Ok(row.0)
+    }
+
+    // r[impl sched.evidence.durability]
+    /// The fence comparison: a write applies iff its serving generation
+    /// is at or above the claims floor. The comparison is `>=` (equal
+    /// passes) and this is load-bearing — a write carrying a generation
+    /// EQUAL to the floor is the same-epoch re-acquire keep that
+    /// `sched.lease.generation-claim` requires (same generation ⇔ no
+    /// holder change ⇔ no newer tenure's evidence exists), so it MUST
+    /// apply; tightening to `>` would fence a leader's own writes after
+    /// every same-epoch re-acquire. A negative floor row (hand-edited
+    /// anomaly) demands nothing, same trust posture as
+    /// `max_known_generation`'s callers.
+    pub(crate) fn at_or_above_floor(floor: Option<i64>, serving_generation: i64) -> bool {
+        match floor {
+            Some(f) => serving_generation >= f,
+            None => true,
+        }
     }
 }

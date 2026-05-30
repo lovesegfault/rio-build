@@ -714,9 +714,19 @@ impl DagActor {
             // still guards this tenure), never the cleanup itself.
             if !reap.holed_parents.is_empty() {
                 let holed: Vec<String> = reap.holed_parents.iter().map(|h| h.to_string()).collect();
-                if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
-                    warn!(build_id = %build_id, count = holed.len(), error = %e,
-                          "failed to persist closure_hole for reap survivors (continuing)");
+                match self
+                    .db
+                    .set_closure_hole_by_hashes(&holed, self.serving_generation())
+                    .await
+                {
+                    Ok(crate::db::FencedWrite::Fenced) => {
+                        self.note_fenced_evidence_write("terminal-build reap closure_hole stamp");
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        warn!(build_id = %build_id, count = holed.len(), error = %e,
+                              "failed to persist closure_hole for reap survivors (continuing)");
+                    }
                 }
             }
             self.reevaluate_removal_survivors(

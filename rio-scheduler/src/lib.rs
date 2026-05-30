@@ -348,6 +348,17 @@ pub fn describe_metrics() {
          from the leader_generation_claims ledger and may sit below the durable floor. \
          Sustained nonzero means PG is flapping exactly at failover time."
     );
+    describe_counter!(
+        "rio_scheduler_evidence_write_fenced_total",
+        "Evidence writes (topdown_pruned/closure_hole stamps and clears, derivation \
+         status/poison persists, merge transactions) refused by the claims-floor \
+         generation fence: the writing replica's serving generation sat below the \
+         durable floor (GREATEST over assignments.generation and \
+         leader_generation_claims.generation). On a replica that just lost the lease \
+         this is the fence working — the successor owns the evidence now; on the \
+         current leader it should be ZERO (a nonzero rate there means a capture bug \
+         or a PG floor regression and needs investigation)."
+    );
     describe_histogram!(
         "rio_scheduler_recovery_duration_seconds",
         "Time to reconstruct actor state from PG on LeaderAcquired \

@@ -4,7 +4,7 @@ use rio_test_support::TestDb;
 use uuid::Uuid;
 
 use super::insert_test_derivation;
-use crate::db::{DerivationRow, SchedulerDb, encode_pg_text_array};
+use crate::db::{DerivationRow, FencedWrite, SchedulerDb, encode_pg_text_array};
 use crate::state::DerivationStatus;
 
 #[test]
@@ -483,10 +483,12 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     );
 
     // 2. The stamp helper (shared by the reap hook, the recovery-time
-    //    stamp, and the poison-clear paths) sets it.
+    //    stamp, and the poison-clear paths) sets it. No claims rows in
+    //    this test -> the floor is empty and any serving generation
+    //    passes the fence.
     assert_eq!(
-        db.set_closure_hole_by_hashes(&hashes).await?,
-        1,
+        db.set_closure_hole_by_hashes(&hashes, 1).await?,
+        FencedWrite::Applied(1),
         "stamp helper must report the row it stamped"
     );
     assert_eq!(read().await?, (true, true));
@@ -513,7 +515,10 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     );
 
     // 5. The merge-heal helper clears the breadcrumb but not the mark.
-    assert_eq!(db.clear_closure_hole_by_hashes(&hashes).await?, 1);
+    assert_eq!(
+        db.clear_closure_hole_by_hashes(&hashes, 1).await?,
+        FencedWrite::Applied(1)
+    );
     assert_eq!(
         read().await?,
         (true, false),
@@ -521,8 +526,11 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     );
 
     // 6. The extended batched mark clear drops both bits.
-    db.set_closure_hole_by_hashes(&hashes).await?;
-    assert_eq!(db.clear_topdown_pruned_by_hashes(&hashes).await?, 1);
+    db.set_closure_hole_by_hashes(&hashes, 1).await?;
+    assert_eq!(
+        db.clear_topdown_pruned_by_hashes(&hashes, 1).await?,
+        FencedWrite::Applied(1)
+    );
     assert_eq!(
         read().await?,
         (false, false),
@@ -536,15 +544,15 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
     //    hole either (lost-heal residue waits for the next full-merge
     //    heal).
     upsert(mk(true)).await?;
-    db.set_closure_hole_by_hashes(&hashes).await?;
+    db.set_closure_hole_by_hashes(&hashes, 1).await?;
     assert_eq!(read().await?, (true, true));
-    db.clear_topdown_pruned_by_hash(drv_hash).await?;
+    db.clear_topdown_pruned_by_hash(drv_hash, 1).await?;
     assert_eq!(
         read().await?,
         (false, true),
         "the single-row clear must consume the mark and retain the breadcrumb"
     );
-    db.clear_topdown_pruned_by_hash(drv_hash).await?;
+    db.clear_topdown_pruned_by_hash(drv_hash, 1).await?;
     assert_eq!(
         read().await?,
         (false, true),
@@ -604,5 +612,191 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
         .await?;
     // ≤ edges.len() because of ON CONFLICT dedup, but > old limit.
     assert!(count > 32_768);
+    Ok(())
+}
+
+// -----------------------------------------------------------------------
+// Claims-floor fence for the evidence write helpers
+// (`sched.evidence.durability`): a deposed tenure's late evidence write
+// must be rolled back having written nothing; the current tenure's (and
+// a same-generation tenure's) writes must apply.
+// -----------------------------------------------------------------------
+
+/// Stage one derivation carrying evidence (mark + hole) written by the
+/// CURRENT tenure (serving at `floor_generation`, which is also the
+/// durable claims floor).
+async fn stage_evidence_at_floor(
+    db: &SchedulerDb,
+    pool: &sqlx::PgPool,
+    drv_hash: &str,
+    floor_generation: i64,
+) -> anyhow::Result<()> {
+    insert_test_derivation(db, drv_hash).await?;
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES ($1, 'tenure-current')",
+    )
+    .bind(floor_generation)
+    .execute(pool)
+    .await?;
+    // The current tenure's evidence: mark + hole both set, written AT
+    // the floor (its own claim) — the fence must let these through.
+    sqlx::query("UPDATE derivations SET topdown_pruned = true WHERE drv_hash = $1")
+        .bind(drv_hash)
+        .execute(pool)
+        .await?;
+    let stamped = db
+        .set_closure_hole_by_hashes(&[drv_hash.to_string()], floor_generation)
+        .await?;
+    anyhow::ensure!(
+        stamped == FencedWrite::Applied(1),
+        "staging premise: the current tenure's stamp at the floor must apply, got {stamped:?}"
+    );
+    Ok(())
+}
+
+/// A17 / `sched.evidence.durability`: a deposed tenure's late evidence
+/// clear must NOT erase evidence the newer tenure relies on. The
+/// durable claims floor is 2 (the successor claimed); the deposed
+/// tenure's in-flight batched clear (serving generation 1) arrives
+/// afterwards and must be fenced — rolled back having written nothing —
+/// so the successor's mark and closure-hole breadcrumb survive.
+///
+/// Pre-fence this was exactly the A17 stale-override window: the
+/// pool-level clear had no idea it was stale and erased the evidence
+/// (red transcript in the introducing commit).
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn stale_tenure_clear_does_not_erase_newer_evidence() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+    stage_evidence_at_floor(&db, &test_db.pool, "fence-a", 2).await?;
+
+    // The deposed tenure's late clear (it served at generation 1; the
+    // floor is 2): every fenced helper must refuse it.
+    assert_eq!(
+        db.clear_topdown_pruned_by_hashes(&["fence-a".to_string()], 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the batched both-bits clear must be fenced below the floor"
+    );
+    assert_eq!(
+        db.clear_topdown_pruned_by_hash("fence-a", 1).await?,
+        FencedWrite::Fenced,
+        "the single-row mark clear must be fenced below the floor"
+    );
+    assert_eq!(
+        db.clear_closure_hole_by_hashes(&["fence-a".to_string()], 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the heal must be fenced below the floor"
+    );
+    assert_eq!(
+        db.set_closure_hole_by_hashes(&["fence-b".to_string()], 1)
+            .await?,
+        FencedWrite::Fenced,
+        "the stamp must be fenced below the floor (even for rows it would not touch)"
+    );
+
+    // The newer tenure's evidence must survive every stale write.
+    let (pruned, hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'fence-a'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert!(
+        pruned && hole,
+        "a deposed tenure's late batched clear must be fenced by the claims floor, \
+         not erase the newer tenure's evidence (topdown_pruned={pruned}, closure_hole={hole})"
+    );
+    Ok(())
+}
+
+/// The fence is not over-eager: the CURRENT tenure's writes (serving at
+/// the floor — its own claim) apply normally, and a fresh cluster (no
+/// claims, no assignments — empty floor) applies everything.
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn current_tenure_evidence_writes_apply() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    // Fresh cluster: no claims rows at all — the floor is empty and any
+    // generation passes (stage_evidence_at_floor's own ensure! covers
+    // the at-the-floor stamp once the claim row exists).
+    insert_test_derivation(&db, "fence-fresh").await?;
+    sqlx::query("UPDATE derivations SET topdown_pruned = true WHERE drv_hash = 'fence-fresh'")
+        .execute(&test_db.pool)
+        .await?;
+    assert_eq!(
+        db.set_closure_hole_by_hashes(&["fence-fresh".to_string()], 1)
+            .await?,
+        FencedWrite::Applied(1),
+        "a fresh cluster (empty floor) must apply evidence writes"
+    );
+
+    // Current tenure at the floor: stamp, heal, and clear all apply.
+    stage_evidence_at_floor(&db, &test_db.pool, "fence-cur", 7).await?;
+    assert_eq!(
+        db.clear_closure_hole_by_hashes(&["fence-cur".to_string()], 7)
+            .await?,
+        FencedWrite::Applied(1),
+        "the current tenure's heal must apply"
+    );
+    assert_eq!(
+        db.clear_topdown_pruned_by_hashes(&["fence-cur".to_string()], 7)
+            .await?,
+        FencedWrite::Applied(1),
+        "the current tenure's both-bits clear must apply"
+    );
+    // A LATER tenure (above the floor) also applies — the fence is a
+    // floor, not an exact-match check.
+    sqlx::query("UPDATE derivations SET topdown_pruned = true WHERE drv_hash = 'fence-cur'")
+        .execute(&test_db.pool)
+        .await?;
+    assert_eq!(
+        db.clear_topdown_pruned_by_hash("fence-cur", 8).await?,
+        FencedWrite::Applied(1),
+        "an above-floor serving generation must apply"
+    );
+    Ok(())
+}
+
+/// OQ4 / `sched.lease.generation-claim`: a write carrying a generation
+/// EQUAL to the floor MUST apply — same generation ⇔ no holder change ⇔
+/// no newer tenure's evidence exists, so this is the same-epoch
+/// re-acquire keep, not a hazard. The fence comparison is `>=` and must
+/// never be tightened to `>`: this test pins that.
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn same_generation_write_at_floor_applies() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    insert_test_derivation(&db, "fence-same").await?;
+    // The floor is exactly 5 (this tenure's own claim, re-read after a
+    // same-epoch re-acquire).
+    sqlx::query(
+        "INSERT INTO leader_generation_claims (generation, holder_id) VALUES (5, 'tenure-same')",
+    )
+    .execute(&test_db.pool)
+    .await?;
+
+    // A write carrying EXACTLY the floor generation applies and changes
+    // the row.
+    assert_eq!(
+        db.set_closure_hole_by_hashes(&["fence-same".to_string()], 5)
+            .await?,
+        FencedWrite::Applied(1),
+        "a write at exactly the floor (same-epoch re-acquire) MUST apply — \
+         the >= comparison is load-bearing"
+    );
+    let (hole,): (bool,) =
+        sqlx::query_as("SELECT closure_hole FROM derivations WHERE drv_hash = 'fence-same'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert!(
+        hole,
+        "the at-floor write must have actually changed the row"
+    );
     Ok(())
 }
