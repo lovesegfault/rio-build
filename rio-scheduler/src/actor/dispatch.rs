@@ -1013,11 +1013,13 @@ impl DagActor {
     /// children (`Pending`) suppress the fail-fast but no longer shed
     /// the mark; only a `Vouched` child set — all produced, no hole —
     /// clears it):
-    ///  - [`Self::settle_broken_marked_root`] — the settlement the
-    ///    `handle_substitute_complete` Broken arm routes through
-    ///    (r[sched.evidence.settlement]): the fail-fast fires only when
-    ///    the verification one-shot is already spent or the re-probe
-    ///    confirms a wanted output missing-and-unsubstitutable;
+    ///  - [`Self::settle_broken_marked_root`] — the settlement that BOTH
+    ///    the `handle_substitute_complete` Broken arm and the reap-time
+    ///    survivor re-evaluation in `handle_cleanup_terminal_build`
+    ///    (leader-gated) route through (r[sched.evidence.settlement]):
+    ///    the fail-fast fires only when the verification one-shot is
+    ///    already spent or the re-probe confirms a wanted output
+    ///    missing-and-unsubstitutable;
     ///  - the dispatch-time probe (`batch_probe_cached_ready`) when a
     ///    marked node with Broken evidence can neither complete inline
     ///    nor be routed to substitution (its confirmed-missing cell) —
@@ -1025,15 +1027,7 @@ impl DagActor {
     ///    (wider) wanted union contains an output that is genuinely
     ///    missing upstream. Pre-fix that outcome left the node Ready
     ///    and dispatched it from source — the doomed dispatch this arm
-    ///    exists to prevent;
-    ///  - the reap-time survivor re-evaluation in
-    ///    `handle_cleanup_terminal_build` (leader-gated), which
-    ///    additionally requires `substitute_tried` (the node's own walk
-    ///    already failed) and a non-`Substituting` status (a walk in
-    ///    flight keeps its chance) for a survivor the reap left
-    ///    childless or closure-holed — nothing children-keyed would
-    ///    ever re-evaluate it otherwise (`find_newly_ready` only fires
-    ///    on completions).
+    ///    exists to prevent.
     pub(super) async fn fail_fast_topdown_pruned_root(&mut self, drv_hash: &DrvHash, cause: &str) {
         // A prior iteration of the same dispatch pass may already have
         // settled this node: `batch_probe_cached_ready` collects the

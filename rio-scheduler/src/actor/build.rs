@@ -680,25 +680,17 @@ impl DagActor {
         // the node for a fresh re-merge and must not trigger parent
         // verdicts. Two stranded shapes are closed:
         //
-        //  - A topdown-pruned root whose own walk already failed
-        //    (`substitute_tried`) while another build's unbuilt children
-        //    were attached: the walk-failure handler suppressed the
-        //    fail-fast (children present) and parked it Queued; with those
-        //    children now reaped — all of them (childless) or just an
-        //    un-produced subset (the reap stamped `closure_hole` on the
-        //    survivor) — the remaining child set no longer represents the
-        //    pruned input closure, so nothing children-keyed may settle
-        //    it: `find_newly_ready` only fires on completions, and the
-        //    promote arm below would lift a holed survivor Ready over the
-        //    vacuously-produced remainder. Take the resubmit-directing
-        //    fail-fast now. Two restrictions:
-        //    `substitute_tried` keeps never-walked nodes out (the next
-        //    dispatch pass re-probes those with its own hole-aware
-        //    carve-out and fail-fast arms — they judge the same
-        //    `must_substitute` predicate as this arm, so a marked
-        //    survivor with broken closure evidence is deferred or
-        //    fail-fasted there, never dispatched from source), and the
-        //    arm is skipped while the survivor is
+        //  - A topdown-pruned root with Broken closure evidence after the
+        //    reap — all children gone (childless) or an un-produced subset
+        //    gone (the reap stamped `closure_hole` on the survivor): the
+        //    remaining child set no longer represents the pruned input
+        //    closure, so nothing children-keyed may settle it
+        //    (`find_newly_ready` only fires on completions). Settle it NOW
+        //    via `settle_broken_marked_root` (r[sched.evidence.settlement]):
+        //    re-probe the live wanted set and route an obtainable survivor
+        //    to a closure-re-verifying walk (untried) or take the
+        //    resubmit-directing fail-fast (one-shot spent /
+        //    confirmed-missing). The arm is skipped while the survivor is
         //    `Substituting` — a walk in flight keeps its chance, and
         //    STATUS is the only reliable signal for that: the one-shot
         //    `substitute_tried` bit is sticky (never cleared on a live
@@ -706,14 +698,20 @@ impl DagActor {
         //    re-spawns a walk for an existing Queued node without
         //    resetting it. That in-flight walk's own SubstituteComplete
         //    settles the now-childless (or holed) root (ok=false → the
-        //    established fail-fast there, ok=true → completion); parking
+        //    Broken-arm settlement there, ok=true → completion); parking
         //    it here would terminally fail its builds prematurely and the
         //    late verdict would then be dropped by the not-Substituting
-        //    guard.
+        //    guard. Equally skipped while Assigned/Running (an open
+        //    attempt's verdict arrives via the worker report, the
+        //    controller-synthesized verdict, or the establishment sweep)
+        //    and while Queued — a Queued survivor takes the promotion arm
+        //    below and the next dispatch sweep's settlement-aware
+        //    partition settles it (one settlement path, not two).
         //  - A Queued parent whose last unbuilt children were reaped: it is
         //    now vacuously all-deps-completed, but no completion will ever
         //    promote it. Promote it to Ready here so the next dispatch pass
-        //    picks it up.
+        //    picks it up (and, for a marked-Broken survivor, settles it —
+        //    the partition handles every cell of that shape).
         //
         // Skipped: vanished nodes, terminal nodes (already settled), and
         // nodes with no interested builds (no build left to hang — and
@@ -762,7 +760,6 @@ impl DagActor {
                     continue;
                 }
                 let status = node.status();
-                let substitute_tried = node.substitute_tried;
                 // `must_substitute` = marked AND closure evidence
                 // Broken (childless OR closure-holed): a closure hole
                 // means the surviving children are a reap-truncated
@@ -772,25 +769,37 @@ impl DagActor {
                 //
                 // Skipped while the survivor is Substituting (a walk in
                 // flight keeps its chance — its own SubstituteComplete
-                // settles it) AND while it is Assigned/Running (an open
+                // settles it), while it is Assigned/Running (an open
                 // attempt in flight keeps its chance the same way: its
                 // verdict arrives via the worker report, the
                 // controller-synthesized verdict, or the establishment
-                // sweep). Failing it here would cancel an in-flight
-                // node out from under its open attempt; the
+                // sweep), and while it is Queued (the promotion arm
+                // below + the next sweep's settlement-aware partition
+                // own that shape). Settling an in-flight node here
+                // would cancel it out from under its open attempt; the
                 // pull-admission guard (`admit_pull` refuses to mint
                 // for `must_substitute` nodes) keeps new from-source
                 // attempts from opening on it.
                 if self.must_substitute(&parent)
-                    && substitute_tried
                     && status != DerivationStatus::Substituting
                     && status != DerivationStatus::Assigned
                     && status != DerivationStatus::Running
+                    && status != DerivationStatus::Queued
                 {
-                    self.fail_fast_topdown_pruned_root(
+                    // r[impl sched.evidence.settlement]
+                    // Same settlement as the SubstituteComplete Broken
+                    // arm: the reap just truncated this survivor's child
+                    // set; before terminally failing its builds,
+                    // re-probe — the outputs may be present (the
+                    // co-build dedup shape) or substitutable. The old
+                    // substitute_tried precondition is gone: the
+                    // settlement itself branches on it (untried ->
+                    // verification walk; tried -> fail-fast), which is
+                    // the doc'd intent of the old guard with the
+                    // wrongful case removed.
+                    self.settle_broken_marked_root(
                         &parent,
-                        "deps reaped after a failed substitute fetch while the closure \
-                         was never produced",
+                        "deps reaped while the closure was never produced",
                     )
                     .await;
                 } else if status == DerivationStatus::Queued
@@ -798,6 +807,9 @@ impl DagActor {
                     && let Some(s) = self.dag.node_mut(&parent)
                     && s.transition(DerivationStatus::Ready).is_ok()
                 {
+                    // (unchanged promotion arm; a promoted marked-Broken
+                    // survivor is settled by the next dispatch sweep's
+                    // settlement-aware partition.)
                     self.push_ready(parent.clone());
                     self.persist_status(&parent, DerivationStatus::Ready, None)
                         .await;

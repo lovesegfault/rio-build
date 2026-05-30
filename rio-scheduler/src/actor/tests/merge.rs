@@ -1594,6 +1594,7 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The reap hazard with the ORDERING REVERSED: the walk verdict arrives
 /// while another build's unbuilt children are still attached, and only
 /// then are those children reaped. B1's prune stamps childless R and
@@ -1603,11 +1604,15 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
 /// and parks R Queued with the one-shot `substitute_tried` set; B2 is
 /// then cancelled and its sole-interest nodes reaped, scrubbing dep out
 /// of `children[R]`. R is now a childless, marked, already-walked root
-/// that nothing will ever re-evaluate — `find_newly_ready` only fires on
-/// completions and R has no children left to complete — so B1 would hang
-/// Active forever. The terminal-build reap must re-evaluate the
-/// surviving parent and take the same resubmit-directing fail-fast the
-/// verdict-after-reap ordering (test above) gets.
+/// that nothing children-keyed will ever re-evaluate — `find_newly_ready`
+/// only fires on completions and R has no children left to complete — so
+/// B1 would hang Active forever. The terminal-build reap must keep a
+/// settling step armed for the survivor (r[sched.evidence.settlement]):
+/// the Queued survivor is promoted to Ready at reap time, and the next
+/// dispatch sweep's settlement-aware partition routes it (tried +
+/// substitutable + must-substitute) to a closure-re-verifying walk that
+/// completes it — never a silent hang, and never (pre-settlement's pin)
+/// the unconditional reap-time fail-fast for an obtainable output.
 #[tokio::test]
 async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_walk() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1710,6 +1715,14 @@ async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_wa
         "fixture premise: the failed walk set the one-shot flag"
     );
 
+    // Disarm the QPI gate so the post-promotion settlement's
+    // verification walk (below) can complete against the substitutable
+    // upstream; the original parked walk stays parked.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
     // Cancel B2 and reap its sole-interest nodes (dep, app). R is shared
     // with B1, so it survives — childless again, mark intact, walk spent.
     let (ctx, crx) = oneshot::channel();
@@ -1735,33 +1748,46 @@ async fn test_topdown_pruned_root_fail_fast_when_children_reaped_after_failed_wa
         "B2's sole-interest app must be reaped"
     );
 
-    // Designed outcome: the reap re-evaluates the surviving parent and
-    // takes the resubmit-directing fail-fast — not a silent hang.
+    // Designed outcome (r[sched.evidence.settlement]): the reap promotes
+    // the stranded Queued survivor to Ready (vacuously all-deps-completed)
+    // and the next dispatch sweep settles it — never a silent hang.
+    // (Pre-settlement this pinned the unconditional reap-time fail-fast:
+    // B1 Failed + resubmit-directing error.)
+    let promoted = expect_drv(&handle, "tdvr-r").await;
+    assert_eq!(
+        promoted.status,
+        DerivationStatus::Ready,
+        "the reap must promote the stranded Queued survivor to Ready"
+    );
+    assert!(
+        promoted.topdown_pruned && promoted.substitute_tried,
+        "the promotion consumes neither the mark nor the one-shot"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 stays Active until the sweep settles the promoted survivor"
+    );
+
+    // The next dispatch sweep settles the promoted survivor: marked +
+    // Broken + tried + substitutable upstream -> the partition routes it
+    // to the verification walk -> Completed -> B1 Succeeded.
+    tick(&handle).await?;
+    settle_substituting(&handle, &["tdvr-r"]).await;
+    let r = expect_drv(&handle, "tdvr-r").await;
+    assert_eq!(
+        r.status,
+        DerivationStatus::Completed,
+        "the sweep's settlement must complete the promoted survivor from the \
+         substitutable upstream (never a from-source dispatch of a closure-less \
+         root, never a hang)"
+    );
     let s1 = query_status(&handle, b1).await?;
     assert_eq!(
         s1.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast when the reap \
-         strands its already-walked pruned root (was: left Active forever)"
-    );
-    assert!(
-        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
-        "error summary should direct resubmit; got {:?}",
-        s1.error_summary
-    );
-    let r = expect_drv(&handle, "tdvr-r").await;
-    assert!(
-        !matches!(
-            r.status,
-            DerivationStatus::Assigned | DerivationStatus::Running
-        ),
-        "childless topdown-pruned R with a spent walk must not be dispatched \
-         from source; got {:?}",
-        r.status
-    );
-    assert!(
-        !r.topdown_pruned,
-        "the fail-fast consumes (clears) the mark it acted on"
+        rio_proto::types::BuildState::Succeeded as i32,
+        "B1 must succeed once the settlement completes R (was pre-settlement: \
+         Failed via the reap-time fail-fast)"
     );
     Ok(())
 }
@@ -2340,6 +2366,7 @@ async fn test_topdown_pruned_root_not_failed_at_reap_while_respawned_walk_in_fli
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The MIXED-children reap shape, ordering A (verdict before the reap):
 /// B1's prune stamps R and parks its detached fetch; BC produces a
 /// second child dep2 (cache-hit at merge) and its interest keeps dep2
@@ -2349,11 +2376,15 @@ async fn test_topdown_pruned_root_not_failed_at_reap_while_respawned_walk_in_fli
 /// sole-interest nodes reaped. dep1 — never produced — is reaped out
 /// from under R while the produced dep2 survives via BC's interest, so
 /// R's remaining child set no longer represents its pruned input
-/// closure (a closure hole). The reap-time re-evaluation must take the
-/// same resubmit-directing fail-fast as the childless shape — NOT
-/// promote R Ready over the vacuously-produced survivor and hand it to
-/// a worker from source (the doomed ENOENT dispatch this machinery
-/// exists to prevent).
+/// closure (a closure hole). The reap-time re-evaluation promotes the
+/// Queued survivor to Ready (the spec-amended settlement behavior) and
+/// the next dispatch sweep settles it: the carried hole keeps the
+/// truncated child set Broken, so the partition routes R (tried +
+/// substitutable + must-substitute) to a closure-re-verifying walk that
+/// completes it — NEVER a from-source dispatch of R over the
+/// vacuously-produced survivor (the doomed ENOENT dispatch this
+/// machinery exists to prevent), and never (pre-settlement's pin) the
+/// unconditional reap-time fail-fast for an obtainable output.
 #[tokio::test]
 async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_produced_child_survives()
 -> TestResult {
@@ -2477,6 +2508,14 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         "fixture premise: mark kept and one-shot flag set by the failed walk"
     );
 
+    // Disarm the QPI gate so the post-promotion settlement's
+    // verification walk (below) can complete against the substitutable
+    // upstream; the original parked walk stays parked.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
     // Cancel B2 and reap its sole-interest nodes: dep1 (never produced)
     // and app go; dep2 survives via BC's interest; R survives via B1's.
     let (ctx, crx) = oneshot::channel();
@@ -2506,35 +2545,49 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         "dep2 must survive the reap (BC still holds interest in it)"
     );
 
-    // Designed outcome: the reap-truncated child set ({dep2}, produced)
-    // must not be trusted — the surviving-parent re-evaluation takes the
-    // resubmit-directing fail-fast instead of promoting R Ready for a
-    // doomed from-source dispatch.
+    // Designed outcome (r[sched.evidence.settlement]): the reap promotes
+    // the Queued survivor to Ready — the promotion IS the spec-amended
+    // behavior; the reap-truncated child set ({dep2}, produced) is still
+    // not trusted, because the carried closure hole keeps R's evidence
+    // Broken and the next sweep's settlement (not a from-source
+    // dispatch) is what acts on it. The mark, the one-shot, and the hole
+    // all survive the promotion.
+    let promoted = expect_drv(&handle, "tdmx-r").await;
+    assert_eq!(
+        promoted.status,
+        DerivationStatus::Ready,
+        "the reap must promote the Queued survivor over its produced child set"
+    );
+    assert!(
+        promoted.topdown_pruned && promoted.substitute_tried && promoted.closure_hole,
+        "the promotion consumes neither the mark, the one-shot, nor the hole"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "B1 stays Active until the sweep settles the promoted survivor"
+    );
+
+    // The next dispatch sweep settles the promoted survivor: the hole
+    // keeps the evidence Broken (the produced survivor must not vouch),
+    // so the partition routes R to the verification walk -> Completed ->
+    // B1 Succeeded. Never a from-source dispatch (the doomed ENOENT).
+    tick(&handle).await?;
+    settle_substituting(&handle, &["tdmx-r"]).await;
+    let r = expect_drv(&handle, "tdmx-r").await;
+    assert_eq!(
+        r.status,
+        DerivationStatus::Completed,
+        "the sweep's settlement must complete the promoted survivor from the \
+         substitutable upstream — never dispatch it from source over the \
+         reap-truncated child set"
+    );
     let s1 = query_status(&handle, b1).await?;
     assert_eq!(
         s1.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast when an un-produced \
-         child is reaped out from under its pruned root (was: R promoted Ready \
-         over the surviving produced child and B1 left Active)"
-    );
-    assert!(
-        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
-        "error summary should direct resubmit; got {:?}",
-        s1.error_summary
-    );
-    let r = expect_drv(&handle, "tdmx-r").await;
-    assert!(
-        !matches!(
-            r.status,
-            DerivationStatus::Ready | DerivationStatus::Assigned | DerivationStatus::Running
-        ),
-        "R must not be dispatchable from source after the closure hole; got {:?}",
-        r.status
-    );
-    assert!(
-        !r.topdown_pruned,
-        "the fail-fast consumes (clears) the mark it acted on"
+        rio_proto::types::BuildState::Succeeded as i32,
+        "B1 must succeed once the settlement completes R (was pre-settlement: \
+         Failed via the reap-time fail-fast)"
     );
     Ok(())
 }

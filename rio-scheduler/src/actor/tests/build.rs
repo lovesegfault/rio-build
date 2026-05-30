@@ -544,6 +544,181 @@ async fn cleanup_reap_skips_marked_holed_survivor_with_open_attempt() -> TestRes
     Ok(())
 }
 
+/// Reap-survivor settlement (third C3/D16 site): when a terminal
+/// build's reap leaves a marked survivor holed but the survivor's
+/// live-wanted outputs ARE obtainable, the reap hook itself must
+/// settle the node (spawn the verification walk / fail-fast) at reap
+/// time — not leave it for a later sweep that may never see it in
+/// this shape.
+///
+/// Two cases:
+///  - untried: RED pre-fix (the hook requires substitute_tried and
+///    skips the survivor entirely; it sits Ready until the next
+///    sweep). Post-fix the hook settles it: verification walk spawned
+///    at reap time -> Completed -> build Succeeded.
+///  - tried: a regression PIN, not a red case (the fail-fast outcome
+///    is unchanged pre/post fix); it pins the one-shot bound.
+// r[verify sched.evidence.settlement]
+// r[verify sched.merge.substitute-topdown+11]
+#[rstest::rstest]
+#[case::untried(false)]
+#[case::tried(true)]
+#[tokio::test]
+async fn reap_survivor_settles_at_reap_time(#[case] tried: bool) -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park any detached fetch so build B's prune-merge walk never
+    // completes on its own; the survivor is forced out of Substituting
+    // below so the reap hook (not a walk verdict) is what settles it.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // d1's narrow output: substitutable at merge time (so B's prune
+    // fires), PRESENT later (the reap-time re-probe must see it
+    // obtainable). The wide output is never available.
+    let out = test_store_path("reap-d1-out");
+    let wide = test_store_path("reap-d1-wide");
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let mk_d1 = |wanted: Vec<String>| {
+        let mut n = make_node("reap-d1");
+        n.output_names = vec!["out".into(), "wide".into()];
+        n.expected_output_paths = vec![out.clone(), wide.clone()];
+        n.wanted_output_names = wanted;
+        n
+    };
+    let mk_d2 = || {
+        let mut n = make_node("reap-d2");
+        n.expected_output_paths = vec![test_store_path("reap-d2-out")];
+        n
+    };
+
+    // Build B (narrow): pruned merge keeps {d1} (stamped, childless),
+    // drops d2, parks d1's walk on the QPI gate. B stays interested.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(
+        &handle,
+        build_b,
+        vec![mk_d1(vec!["out".into()]), mk_d2()],
+        vec![make_test_edge("reap-d1", "reap-d2")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        expect_drv(&handle, "reap-d1").await.topdown_pruned,
+        "precondition: B's pruned merge stamps d1"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.total_derivations,
+        1,
+        "precondition: B took the roots-only prune path"
+    );
+
+    // Build A (wide): the duplicate submission {d1 -> d2}; the wide
+    // want blocks the prune -> full merge -> d2 enters the DAG under d1.
+    let build_a = Uuid::new_v4();
+    let _ev_a = merge_dag(
+        &handle,
+        build_a,
+        vec![mk_d1(vec!["out".into(), "wide".into()]), mk_d2()],
+        vec![make_test_edge("reap-d1", "reap-d2")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("reap-d2").await?.is_some(),
+        "precondition: A's full merge brings d2 into the DAG"
+    );
+
+    // Stage the survivor shape the reap hook must settle: d1 out of
+    // Substituting (its walk verdict was "consumed elsewhere" — forced
+    // Ready), the one-shot per case, the wanted output now PRESENT,
+    // and the QPI gate disarmed so a (post-fix) verification walk can
+    // run; the original parked walk stays parked.
+    assert!(handle.debug_set_substitute_tried("reap-d1", tried).await?);
+    assert!(
+        handle
+            .debug_force_status("reap-d1", DerivationStatus::Ready)
+            .await?
+    );
+    store.seed_with_content(&out, b"present");
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // Cancel A and reap its sole-interest nodes: d2 is removed, d1
+    // survives — marked, closure-holed (Broken), Ready, with B's live
+    // interest and a PRESENT wanted output.
+    cancel_build(&handle, build_a).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build_a })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("reap-d2").await?.is_none(),
+        "precondition: A's sole-interest d2 must be reaped"
+    );
+
+    // THE RED ASSERTION: the hook must have acted at reap time (before
+    // any tick/sweep runs).
+    let status_after_reap = expect_drv(&handle, "reap-d1").await.status;
+    assert_ne!(
+        status_after_reap,
+        DerivationStatus::Ready,
+        "reap hook took no action on the marked+Broken survivor (pre-fix: untried \
+         survivors are skipped entirely; the settlement obligation is violated at \
+         this decision point)"
+    );
+
+    if tried {
+        // One-shot spent => settlement-by-fail-fast. Pin the bound.
+        let st = query_status(&handle, build_b).await?;
+        assert_eq!(
+            st.state,
+            rio_proto::types::BuildState::Failed as i32,
+            "tried survivor: the reap-time settlement takes the fail-fast"
+        );
+        assert!(
+            st.error_summary.contains("resubmit"),
+            "the fail-fast must direct resubmit; got {:?}",
+            st.error_summary
+        );
+    } else {
+        // Untried + present => verification walk spawned at reap time.
+        // The walk runs against the locally-present MockStore output, so
+        // it can land before this query runs — accept in-flight OR
+        // already-completed (both prove the settlement acted at reap
+        // time; the terminal assertions below pin the outcome).
+        assert!(
+            matches!(
+                status_after_reap,
+                DerivationStatus::Substituting | DerivationStatus::Completed
+            ),
+            "untried survivor with obtainable outputs: the reap-time settlement \
+             spawns the verification walk; got {status_after_reap:?}"
+        );
+        settle_substituting(&handle, &["reap-d1"]).await;
+        tick(&handle).await?;
+        assert_eq!(
+            expect_drv(&handle, "reap-d1").await.status,
+            DerivationStatus::Completed,
+            "the verification walk completes the survivor from the store"
+        );
+        let st = query_status(&handle, build_b).await?;
+        assert_eq!(
+            st.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "the surviving build succeeds once the survivor settles"
+        );
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // Build not-found paths
 // ---------------------------------------------------------------------------
