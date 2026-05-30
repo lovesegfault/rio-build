@@ -547,8 +547,8 @@ rec {
   # drv-text import drive the gateway worker protocol in-process),
   # `nix-eval-jobs` (recorder evaluation), and the OpenSSH client
   # (`nix … --store ssh-ng://` spawns `ssh`). dwarfs provides
-  # `mkdwarfs`, which the recorder (`rio-replay record`) shells out to
-  # when packing its staged replay archive into the published .dwarfs
+  # `mkdwarfs`, which the recorder (`cargo xtask replay record`) shells
+  # out to when packing its staged replay archive into the published .dwarfs
   # image; the campaign engine opens that image in place and needs no
   # unpack tools. GNU tar + gzip cover the `tar -xzf` unpack of the
   # nixpkgs source tarball during recorder evaluation; zstd is kept for
