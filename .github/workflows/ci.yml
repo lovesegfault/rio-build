@@ -227,16 +227,30 @@ jobs:
   # Formal-verification lane: quint/TLC model checks, MBT conformance
   # runs, and kani/CBMC proofs, fanned out as kani-* singletons plus
   # round-robin quint shards (gen_matrix.py cluster_formal). Each
-  # check's build IS a model-checking / proof run — a JVM (apalache
-  # server + TLC) or CBMC per derivation — so the lane caps nix
-  # parallelism at 3 concurrent builds: with the default max-jobs
-  # (auto = host cores on a CFS-quota'd ARC pod) a shard launches
-  # dozens of multi-GB JVMs at once and starves the runner agent,
-  # which is exactly how the old all-in-one `misc` cluster died. The
-  # shard width (FORMAL_SHARD_SIZE, default 12) and this cap together
-  # bound a shard to ~4 build waves; a typical shard finishes in
-  # 5-15min, the 45min timeout leaves headroom for an unlucky deal of
-  # the minutes-class exhaustive regime checks.
+  # check's build IS a model-checking / proof run — an apalache server
+  # JVM (-Xmx4096m, nix/quint.nix) plus a TLC JVM, or CBMC harnesses
+  # for the kani singletons — so the lane caps nix parallelism instead
+  # of inheriting the default max-jobs (auto = host cores on a
+  # CFS-quota'd ARC pod), which launches dozens of multi-GB JVMs at
+  # once and starves the runner agent — exactly how the old
+  # all-in-one `misc` cluster died with "runner lost communication".
+  #
+  # Memory budget behind --max-jobs 2: the rio-ci pod limits live in
+  # rio-infra (arc.tf), not in this repo, so they cannot be verified
+  # here; the in-repo evidence points small (actionlint.yaml: spot,
+  # 4-16 vCPU; gen_matrix.py sizes its eval workers for a 4-8 GiB
+  # pod). Two concurrent builds bound the worst case to roughly
+  # 2 × (4 GiB apalache -Xmx + TLC heap + node) ≈ 8-10 GiB plus the
+  # nix daemon and runner agent — assumed to fit a ≥16 GiB pod with
+  # headroom, and judged against the first real runs (an OOM here
+  # looks like the very "runner lost communication" failure this lane
+  # exists to fix; check the pod's memory limit and OOM-kill events
+  # before blaming a shard). Only raise --max-jobs after confirming
+  # the real limit in rio-infra: ~5-6 GiB per in-flight check means
+  # 3 jobs wants ≥20 GiB. The shard width (FORMAL_SHARD_SIZE, default
+  # 12) and this cap bound a shard to ~6 build waves; a typical shard
+  # finishes in 10-20min, the 45min timeout leaves headroom for an
+  # unlucky deal of the minutes-class exhaustive regime checks.
   formal:
     name: formal / ${{ matrix.name }}
     needs: [gen-matrix, warm]
@@ -261,7 +275,7 @@ jobs:
           read -ra targets <<< "${{ matrix.targets }}"
           read -ra drvs <<< "${{ matrix.drvs }}"
           status=0
-          nix build --keep-going --max-jobs 3 --print-build-logs "${drvs[@]/%/^*}" || status=$?
+          nix build --keep-going --max-jobs 2 --print-build-logs "${drvs[@]/%/^*}" || status=$?
           for i in "${!targets[@]}"; do
             nix path-info "${drvs[$i]}^*" >/dev/null 2>&1 \
               || echo "::error title=formal check failed::${targets[$i]}"
@@ -272,9 +286,13 @@ jobs:
   # and the quint toolchain from the public cache. They start as soon
   # as gen-matrix finishes instead of idling behind the rust trunk;
   # the kani singletons (which need the kani-compiler member closure)
-  # stay in the gated job above. Identical step otherwise.
+  # stay in the gated job above. Identical step (and --max-jobs 2
+  # memory budget) otherwise. The "(nowait)" suffix keeps the display
+  # name distinct from the gated job's: a shard whose members are
+  # split across both jobs (some need the trunk, some don't) would
+  # otherwise show up as two identically-named GHA jobs.
   formal-nowait:
-    name: formal / ${{ matrix.name }}
+    name: formal / ${{ matrix.name }} (nowait)
     needs: gen-matrix
     if: needs.gen-matrix.outputs.formal-nowait != '[]'
     runs-on: rio-ci
@@ -293,7 +311,7 @@ jobs:
           read -ra targets <<< "${{ matrix.targets }}"
           read -ra drvs <<< "${{ matrix.drvs }}"
           status=0
-          nix build --keep-going --max-jobs 3 --print-build-logs "${drvs[@]/%/^*}" || status=$?
+          nix build --keep-going --max-jobs 2 --print-build-logs "${drvs[@]/%/^*}" || status=$?
           for i in "${!targets[@]}"; do
             nix path-info "${drvs[$i]}^*" >/dev/null 2>&1 \
               || echo "::error title=formal check failed::${targets[$i]}"

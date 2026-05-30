@@ -114,10 +114,15 @@ MATRIX_KINDS = ("checks", "formal", "fuzz", "vm-test", "coverage")
 SPLIT_KINDS = ("checks", "formal")
 
 # Target shard width for the `formal` kind (see cluster_formal).
-# Override with FORMAL_SHARD_SIZE. Sized so a shard stays well inside
-# its job timeout even when round-robin deals it two or three of the
-# minutes-class exhaustive regime checks, while keeping the worst-case
-# matrix (every formal check uncached) under ~20 jobs.
+# Override with FORMAL_SHARD_SIZE (validated by formal_shard_size --
+# anything that is not an integer >= 1 is a hard gen-matrix failure).
+# Sized so a shard stays well inside its job timeout even when
+# round-robin deals it two or three of the minutes-class exhaustive
+# regime checks, while keeping the worst-case matrix (every formal
+# check uncached) under ~20 jobs. ci.yml's formal jobs build a shard
+# with `nix build --max-jobs 2` (memory budget -- see the formal job
+# comment there), so 12 entries is ~6 build waves; widen the shards
+# only together with that budget.
 DEFAULT_FORMAL_SHARD_SIZE = 12
 
 # Upper bound on warm matrix width. The trunk usually decomposes into
@@ -390,6 +395,30 @@ def cluster_coverage(names):
     return clusters
 
 
+def formal_shard_size():
+    """FORMAL_SHARD_SIZE from the environment, validated.
+
+    The knob feeds cluster_formal's ceil-division and slicing: a value
+    < 1 would silently emit an EMPTY shard list -- every non-kani
+    formal check dropped from the matrix while ci-gate stays green --
+    and a non-integer would die with a raw traceback. Both become a
+    one-line hard failure naming the knob and the offending value
+    instead; gen-matrix must never quietly emit a thinner formal lane.
+    """
+    raw = os.environ.get("FORMAL_SHARD_SIZE")
+    if raw is None:
+        return DEFAULT_FORMAL_SHARD_SIZE
+    try:
+        value = int(raw)
+    except ValueError:
+        value = None
+    if value is None or value < 1:
+        sys.exit(
+            f"FORMAL_SHARD_SIZE must be an integer >= 1, got {raw!r}"
+        )
+    return value
+
+
 def cluster_formal(names, shard_size=None):
     """Shard the formal-verification checks (quint-*/mbt-*/kani-*).
 
@@ -411,9 +440,7 @@ def cluster_formal(names, shard_size=None):
     witness checks.
     """
     if shard_size is None:
-        shard_size = int(
-            os.environ.get("FORMAL_SHARD_SIZE", DEFAULT_FORMAL_SHARD_SIZE)
-        )
+        shard_size = formal_shard_size()
     kani = sorted(n for n in names if n.startswith("kani-"))
     rest = sorted(n for n in names if not n.startswith("kani-"))
     clusters = [{"name": n, "targets": n} for n in kani]
@@ -634,6 +661,10 @@ def main():
     output_path = os.environ.get("GITHUB_OUTPUT")
     if not output_path:
         sys.exit("GITHUB_OUTPUT must be set")
+    # Validate the FORMAL_SHARD_SIZE knob up front so a bad value is a
+    # sub-second failure, not one surfacing after the multi-minute
+    # nix-eval-jobs pass (cluster_formal re-reads it later either way).
+    formal_shard_size()
     workers = int(os.environ.get("NEJ_WORKERS", DEFAULT_WORKERS))
     results = run_nix_eval_jobs(workers)
 
@@ -1063,6 +1094,16 @@ class ClusterTests(unittest.TestCase):
 
 
 class FormalClusterTests(unittest.TestCase):
+    def setUp(self):
+        # Keep the env-knob tests hermetic: stash any ambient
+        # FORMAL_SHARD_SIZE and restore it afterwards.
+        self._saved_shard_size = os.environ.pop("FORMAL_SHARD_SIZE", None)
+
+    def tearDown(self):
+        os.environ.pop("FORMAL_SHARD_SIZE", None)
+        if self._saved_shard_size is not None:
+            os.environ["FORMAL_SHARD_SIZE"] = self._saved_shard_size
+
     def test_kani_singletons_rest_sharded(self):
         names = [f"quint-w{i}" for i in range(5)] + [
             "kani-rio-lease",
@@ -1119,6 +1160,36 @@ class FormalClusterTests(unittest.TestCase):
 
     def test_empty_input_empty_output(self):
         self.assertEqual(cluster_formal([]), [])
+
+    def test_shard_size_env_negative_fails_loudly(self):
+        # A negative size would flow into the ceil-division as-is and
+        # silently drop every non-kani entry from the matrix (the
+        # shard count goes <= 0, so the range() emitting shards is
+        # empty) while ci-gate stays green. It must instead be a hard
+        # gen-matrix failure naming the knob and the value.
+        os.environ["FORMAL_SHARD_SIZE"] = "-3"
+        with self.assertRaises(SystemExit) as ctx:
+            cluster_formal(["quint-a", "quint-b"])
+        self.assertIn("FORMAL_SHARD_SIZE", str(ctx.exception))
+        self.assertIn("-3", str(ctx.exception))
+
+    def test_shard_size_env_non_integer_fails_loudly(self):
+        # A non-integer would be a raw int() traceback and 0 a
+        # ZeroDivisionError; both get the same one-line failure.
+        for bad in ("twelve", "0", ""):
+            with self.subTest(bad=bad):
+                os.environ["FORMAL_SHARD_SIZE"] = bad
+                with self.assertRaises(SystemExit) as ctx:
+                    cluster_formal(["quint-a", "quint-b"])
+                self.assertIn("FORMAL_SHARD_SIZE", str(ctx.exception))
+                self.assertIn(repr(bad), str(ctx.exception))
+
+    def test_shard_size_env_valid_override_is_used(self):
+        os.environ["FORMAL_SHARD_SIZE"] = "2"
+        got = cluster_formal([f"quint-{i}" for i in range(4)])
+        self.assertEqual(
+            [c["name"] for c in got], ["quint-1of2", "quint-2of2"]
+        )
 
     def test_formal_partition_quint_nowait_kani_gated(self):
         # Two kani singletons share the kani-compiler member closure
