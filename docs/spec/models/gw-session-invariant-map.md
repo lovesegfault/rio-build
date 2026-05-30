@@ -21,9 +21,13 @@ milestone) complete — all 34 properties encoded, witnesses and
 pre-registered falsification probes confirmed reachable/falsifying, the
 B-measure recorded below with the regime-split recommendation; Stage C
 check-set selection + CI wiring + witnesses/probes + the §4 model-first
-evidence complete (this change set — 31 permanent `nix/quint.nix` checks,
-verdicts in the Stage-C record below); Stage-C calibration (override
-modules, both directions for GW-2/GW-13/GW-18) pending.**
+evidence complete (31 permanent `nix/quint.nix` checks, verdicts in the
+Stage-C record below); Stage-C calibration complete (this change set —
+override modules under `calibration/gw-f*.qnt`, all 17 encodable
+candidates falsified in the violation direction, the three T halves
+falsified for GW-2/GW-13/GW-18, 9 permanent `quint-gw-calib-*` checks,
+verdicts in the calibration table below). Phase-0 acceptance verdict and
+go/no-go recommendation: see the calibration stage record.**
 
 Stage A added three new rules (`gw.conn.force-close`,
 `gw.conn.send-deadline`, `gw.conn.accept-resilience`), amended and bumped
@@ -55,8 +59,9 @@ never silently modeled around. Stage-C status for every row below:
 of `allInvariants`) by every wired per-family exhaustive check and holds in
 all of them; which family check carries each property's *content* (and which
 full-regime interleavings are therefore not exhaustively explored) is the
-Stage-C record's coverage table below. Calibration verdicts land with the
-override modules (next change set).
+Stage-C record's coverage table below. Calibration verdicts (which
+properties fall when each historical guard is reverted) are in the
+calibration table of the Stage-C calibration record.
 
 Model predicate names are the lowercased property ids (e.g.
 `s1ConnPermitConservation`, `l1ConnReclaimArmed`); all 34 are conjoined as
@@ -116,9 +121,10 @@ the property's content is actually exercised (it is asserted everywhere).
 
 Direction: V = violation-on-guard-removal calibration; T = trace-admission
 (permissiveness) calibration; OOM = out-of-model in Phase 0 with a
-pre-registered disposition. Stage C builds the override modules and records
-the falsified-property @ depth verdicts; this table is the Stage-B
-pre-registration of what each override must reproduce.
+pre-registered disposition. This table is the Stage-B pre-registration of
+what each override must reproduce; the override modules and the measured
+falsified-property @ depth verdicts are in the Stage-C calibration record's
+calibration table below.
 
 | Candidate | Repr. commit | Property(ies) targeted | Direction / disposition |
 |---|---|---|---|
@@ -554,11 +560,337 @@ harness (remote builder) before commit — exhaustive checks pass, witness
 and falsification checks report their expected violations, run checks
 pass.
 
-### Stage C (continued) — calibration (pending, next change set)
+### Stage C (continued) — calibration and the Phase-0 acceptance verdict (this change set)
 
-Will add: the calibration table (override module ↔ candidate ↔ falsified
-property @ depth, trace-walk record), both directions for GW-2 / GW-13 /
-GW-18, and the re-confirmed §4 window dispositions. The override modules
-land under `docs/spec/models/calibration/gw-*.qnt` and instantiate the
-full-alphabet regime modules (not the restricted family modules), per
-design §5.
+**Artifacts.** Nine override files under `docs/spec/models/calibration/`
+(`gw-f1-capacity.qnt`, `gw-f2-occupancy.qnt`, `gw-f3-force-close.qnt`,
+`gw-f4-channel-accounting.qnt`, `gw-f5-egress.qnt`, `gw-f6-teardown.qnt`,
+`gw-f7-drain.qnt`, `gw-f9-upstream-deadline.qnt`, `gw-f10-accept.qnt`),
+one per falsifying corpus family, carrying 25 override modules (the 17
+encodable candidates, with separate modules where a candidate's
+constituent commits revert distinct mechanisms, plus the three
+trace-admission halves) and 12 as-built baseline modules. Each override
+module instantiates the `gwConnLifecycle` core (the same
+import-and-override pattern as the round-1 calibration corpus), defines
+the PRE-FIX variant of one action (the behavior the named historical fix
+removed), and exposes it through `calibStep`; the as-built violation and
+reachability latches are never reverted, so a falsification means the
+as-built invariant set re-finds that bug class.
+
+**Scope and baselines (a documented deviation from the §5 letter).** §5
+planned the overrides on the full-alphabet regime modules; the Stage-B
+B-measure showed those do not exhaust inside the per-check budget, so the
+falsification direction would have been fine (TLC stops at the first
+violation) but the matching baseline ("with the guard restored the
+violation disappears at the same scope") would not have been provable.
+Each override's `calibStep` therefore restricts the alphabet to its
+family's letters — the same single-rich-dimension principle as the wired
+`gwConnLifecycleFam*` checks — and the as-built baseline is an explicit
+`baselineStep` in the same file (same constants, same alphabet shape, the
+as-built action(s) restored) run to exhaustion. No §2e structural or
+environment bound is reduced, and the §2e policy-cap table's
+pre-registered override values are used where required (GW-6/GW-7 at
+`MAX_CHANNELS_PER_CONN = 1`, GW-12 at `MAX_CONNECTIONS = 1`). Verdict
+format: property @ depth (states generated / distinct); wall-clocks are
+from the same serial `quint verify --backend=tlc` protocol as the Stage-C
+check measurements (24–32 workers on the shared builder, ≈20–30 s of
+JVM/conversion overhead included in every figure).
+
+**Calibration table — violation (V) direction.** Every encodable
+candidate falsifies a predicted property; every baseline holds.
+
+| Candidate | Override module (file) | Constants dialed | Predicted | Verdict |
+|---|---|---|---|---|
+| GW-1 | `gwCalibF1ServerSideKeepsGuard` (f1) | — | S2, S3, L2 | **FALSIFIES L2** @ 14 (757,893/24,405); S15 falls on the same trace; S2/S3 do not fall (note 1) |
+| GW-2 (release ordering) | `gwCalibF5ReleaseAfterCloseOut` (f5) | — | S15, L2 | **FALSIFIES S15** @ 9 (5,228/408) |
+| GW-2 (send budget) | `gwCalibF5NoSendBudget` (f5) | — | S15, L2 | **FALSIFIES L2** @ 10 (6,600/479) |
+| GW-3 (representative) | `gwCalibF2OpenDisarmsGrace` (f2) | — | L1, L3, S20 | **FALSIFIES S20** @ 6 (506/57) and **L1** @ 6 (465/51) |
+| GW-3 (a207ee15c constituent) | `gwCalibF2NoHandshakeDeadline` (f2) | — | L3 | **FALSIFIES L3** @ 8 (663/67) |
+| GW-4 | `gwCalibF3DecideWithoutArm` (f3) | — | S12, S11, L1 | **FALSIFIES S12** @ 5 (443/80); the 2f11bb8f5 S11/L1 constituent: note 2 |
+| GW-5 | `gwCalibF4ForgedCloseDecrements` (f4) | — | S7 | **FALSIFIES S7** @ 3 (97/27) |
+| GW-6 | `gwCalibF4BoundOnSessionsMap` (f4) | `MAX_CHANNELS_PER_CONN = 1` | S7 | **FALSIFIES S7** @ 6 (1,469/110) |
+| GW-7 | `gwCalibF4RefusePolitely` (f4) | `MAX_CHANNELS_PER_CONN = 1` | S14 | **FALSIFIES S14** @ 4 (733/68) |
+| GW-8 | `gwCalibF5UnwindowedSend` (f5) | — | S13 | **FALSIFIES S13** @ 7 (922/117) |
+| GW-9 (tracking cleared early) | `gwCalibF6WireErrorRemovesTracked` (f6) | — | S10, S16 | **FALSIFIES S16** @ 11 (6,966/403) |
+| GW-9 (exit edge skips cancel) | `gwCalibF6ExitEdgeSkipsCancel` (f6) | — | S10 | **FALSIFIES S10** @ 12 (14,698/723) |
+| GW-10 | `gwCalibF6AbortWinsOverCancel` (f6) | — | S10 | **FALSIFIES S10** @ 11 (4,599/277) |
+| GW-11 (task quiescence) | `gwCalibF6FinishSkipsPumpReap` (f6) | — | L8 | **FALSIFIES L8** @ 14 (77,880/3,536) |
+| GW-11 (gauge, 9a18f756a) | `gwCalibF6ConnDropLeaksGauge` (f6) | — | S3 | **FALSIFIES S3** @ 7 (965/100) |
+| GW-12 | `gwCalibF1AuthRejectSkipsGate` (f1) | `MAX_CONNECTIONS = 1` | S1 | **FALSIFIES S1** @ 4 (297/56) |
+| GW-13 (drain-expiry cancel) | `gwCalibF7DrainExpiryNoCancel` (f7) | — | S17, L4, P6 | **FALSIFIES L4** @ 14 (408,403/11,417) |
+| GW-13 (stage collapse) | `gwCalibF7SigtermSkipsStages` (f7) | — | S17 | **FALSIFIES S17** @ 7 (811/58) |
+| GW-16 | `gwCalibF9RpcWaitNoDeadline` (f9) | — | L6 | **FALSIFIES L6** @ 10 (1,592/81) |
+| GW-18 (global cap, V) | `gwCalibF1NoGlobalSessionCap` (f1) | — | S2 | **FALSIFIES S2** @ 13 (159,819/8,164) |
+| GW-19 | `gwCalibF10AcceptErrorFatal` (f10) | — | S18 | **FALSIFIES S18** @ 3 (82/24) (note 3) |
+| GW-20 | `gwCalibF6CloseOutSkipsExitStatus` (f6) | — | S19 | **FALSIFIES S19** @ 10 (3,467/222) |
+
+**Calibration table — trace-admission (T) direction** (the over-tight
+pre-fix guards re-introduced per §2d/§5; the named permissiveness
+property must fall).
+
+| Candidate | Override module | Predicted | Verdict |
+|---|---|---|---|
+| GW-2 | `gwCalibF5BudgetIgnoresPeerClass` (f5) | P5 | **FALSIFIES P5** @ 10 (32,253/1,567) |
+| GW-13 | `gwCalibF7AcceptStopKillsEstablished` (f7) | P6 | **FALSIFIES P6** @ 8 (1,327/85) |
+| GW-18 | `gwCalibF1PerConnCapRefusals` (f1) | P1, P2, P3 | **FALSIFIES P1** @ 8 (6,538/556), **P2** @ 7 (471/56), **P3** @ 7 (466/53) |
+
+**Baselines (as-built `baselineStep`, exhaustive, every one HOLDS
+`allInvariants` at its override's scope).**
+
+| Baseline module | Baselines | Distinct states | Wall |
+|---|---|---|---|
+| `gwCalibF1AsBuilt` | GW-1 | 12,107,117 | 480 s |
+| `gwCalibF1AsBuiltSpread` | GW-18 (V and T) | 199,002 | 34 s |
+| `gwCalibF1AsBuiltCap1` | GW-12 | 1,119 | 30 s |
+| `gwCalibF2AsBuilt` | GW-3 (both arms) | 1,350,115 | 99 s |
+| `gwCalibF3AsBuilt` | GW-4 | 1,183 | 38 s |
+| `gwCalibF4AsBuilt` | GW-5 | 52,870 | 44 s |
+| `gwCalibF4AsBuiltChanCap1` | GW-6, GW-7 | 18,445 | 45 s |
+| `gwCalibF5AsBuilt` | GW-2 (V and T), GW-8 | 66,059 | 44 s |
+| `gwCalibF6AsBuilt` | GW-9, GW-10, GW-11, GW-20 | 3,253,999 | 224 s |
+| `gwCalibF7AsBuilt` | GW-13 (V and T) | 3,337,595 | 228 s |
+| `gwCalibF9AsBuilt` | GW-16 | 1,204,287 | 120 s |
+| `gwCalibF10AsBuilt` | GW-19 | 49,315 | 44 s |
+
+The baseline state counts double as a structural cross-check: where a
+baseline's alphabet is reachability-equivalent to a wired family check's
+(`gwCalibF3AsBuilt` ↔ famPreauth at 1,183, `gwCalibF5AsBuilt` ↔ famWedge
+at 66,059, `gwCalibF6AsBuilt` ↔ famUpstream at 3,253,999) the distinct
+counts match exactly.
+
+**Trace walks and dispositions** (every falsifying trace was read
+step-by-step against the pre-fix code path before being recorded as a
+reproduction; the notes the tables reference).
+
+- GW-1: accept → auth → exec → handshake timeout (server-side ending) →
+  pre-fix pump exit keeps the guard → close-out completes → capacity
+  still held with no budget, no enforceable force-close and no pump exit
+  left — the 443670d43 exec-then-silent shape (permit/gauge keyed on the
+  sessions map, which only client action removes). S15 falls on the same
+  trace (the release-before-close-out ordering rule post-dates the
+  pre-fix world). **Note 1 — predicted S2/S3 do not fall:** the pre-fix
+  accounting is internally consistent (the gauge still counts the held
+  guard, the permit is still held by a live guard), so the conservation
+  forms cannot distinguish it; the defect is a settlement failure, which
+  is exactly the predicted-and-falsified L2. The S2/S3 half of the
+  prediction is carried within F1 by the representatives that do break
+  conservation (GW-12 → S1, GW-18 → S2). Not a crosswalk contradiction —
+  the mapped property set falls through L2.
+- GW-2 (release ordering): client EOF → proto exits → pre-fix pump exit
+  enters the close-out with the guard still held — S15 at the first
+  close-out state (51123b2be: release waited on the peer-parkable handle
+  queue). (budget): a withhold-window peer parks the send with no
+  HANDLE_SEND_TIMEOUT armed — L2 falls with capacity held toward a
+  transport-withholding peer and nothing armed (861888876's unbounded
+  handle.data() await). (T): a compliant peer's window simply runs out
+  and the budget — stripped of the §2d peer-class condition — fires the
+  wedge response against it; P5 falls via budgetFiredOnCompliant /
+  fcByBudget (the structural form of "budget too small for normal
+  congestion", the 5 s close-out budget 861888876 replaced).
+- GW-3 (representative): an authenticated connection opens a channel and
+  never execs; the pre-fix open disarms the empty grace, so the
+  connection sits with no stage deadline, no grace, no budget and no
+  designed reap enabled against a keepalive-answering peer — S20's
+  must-be-armed clause and L1's armed-path disjunction fall in the same
+  state (79912eda0). The 0101be9c6 constituent (grace armed only at
+  channel_close) is the same wrong-emptiness-signal mechanism at model
+  resolution, and aec2521a3 (no pre-banner bound) is the same L1
+  armed-path loss one stage earlier — both covered by this module's
+  falsification rather than separate overrides. (a207ee15c constituent):
+  an exec admitted with no handshake deadline armed — L3 falls at the
+  admission.
+- GW-4: reject-only auth attempts → the pre-auth deadline's phase-2
+  decision queues the polite disconnect WITHOUT arming the force-close —
+  S12 falls at the decision point (1c46d9781). **Note 2 — the 2f11bb8f5
+  constituent (enforcement restricted to the read path; TCP_USER_TIMEOUT
+  added as the kernel backstop):** at the model's armed-style resolution
+  this revert is the loss of the parked-write enforcement wake
+  (`parkWake`) plus the kernel reap letter, and its violating state is
+  exactly the one the wired
+  `quint-gw-lifecycle-falsification-l1-no-inactivity` probe already
+  exhibits (L1-strict falls in fault-degraded when both are absent and
+  only the inactivity backstop remains). Recorded as a
+  structural-argument disposition — the bug class is expressible and
+  permanently pinned by that probe — rather than duplicated as a third
+  F3 override. The 5a50b3f70 constituent's enforcement half is the same
+  decide-implies-arm mechanism this module reverts; its occupancy half
+  is GW-3's surface (famPreauth carries the as-built KEX-parked
+  reclamation witness).
+- GW-5: a forged/duplicate CHANNEL_CLOSE on a connection with no
+  accepted channel decrements `open_channels` below the accepted-set
+  size (9739aca65's unguarded decrement); the same module carries the
+  exec-on-never-accepted-channel arm of that fix.
+- GW-6: at the override's per-connection cap of 1, two opens both pass
+  the pre-fix bound check (it reads the exec'd-sessions map, which is
+  empty before any exec) — the accepted-open count exceeds the bound
+  (719f99809's burst-open-then-exec, caught at the open transition).
+- GW-7: two politely-refused opens leave residue 2 > f = 1 — the pre-fix
+  `Ok(false)` path retains russh channel-table state and the connection
+  survives (2cd23d940 / eef1fbd8d). The pre-auth position of the opens
+  in the shortest counterexample is the as-built attempt letter's own
+  enabling condition, not something the override loosened.
+- GW-8: the first response send goes through the pre-fix non-window path
+  (`Handle::data`) — russh-side pending occupancy above zero with no
+  credit consumed; S13 falls immediately (deea04bbc). L2 deliberately
+  does not fall here (pre-fix sends complete instantly into the
+  unbounded buffer), exactly as the §3.4 row predicts.
+- GW-9 (tracking): a tracked build's stream fails with a Wire-class
+  error and the pre-fix handler removes it from `active_build_ids`
+  anyway — S16 falls (bbf30cc7f: the disconnect cleanup loop later finds
+  an empty set). (exit edge): a non-panic exit edge skips the cancel
+  loop with a build still tracked — S10 falls (the 0f476d6f0 /
+  a207ee15c case-completeness shape).
+- GW-10: channel close hard-aborts the protocol task (the pre-fix
+  ChannelSession::Drop abort) — the cancel obligation is destroyed with
+  it; S10 falls. GW-9's exit-edge arm and GW-10 falsify the same
+  property through different reverted mechanisms (a missing call site
+  vs an abort racing the cancel loop); this is not the §1 simplification
+  trigger (which needs the same property at the same depth across all
+  regimes plus a revert that falsifies nothing).
+- GW-11 (quiescence): the close-out completes but the pre-fix finish
+  awaits the client pump instead of reaping it — L8 falls with the pump
+  still live after the finish (1cca275b4). (gauge): a connection drop
+  tears down a still-held SessionGuard but the pre-fix path never
+  decrements `channels_active` (the scattered explicit decrement sites
+  missed the abnormal exits) — S3 falls; S2 stays true on the same trace
+  (the permit release is correct), so the falsification is attributable
+  to the gauge alone (9a18f756a).
+- GW-12: a reject-only auth callback skips mark_real_connection /
+  ensure_permit — a live connection past the auth layer that is neither
+  counted nor being torn down (a2fcb8aa0). The found counterexample is
+  the uncounted half; the permit-less-not-torn-down half violates the
+  same invariant's other conjunct deeper in the same module (the §2e
+  cap-1 constants keep it reachable).
+- GW-13 (expiry cancel): SIGTERM → accept-stop → drain expiry with a
+  build parked in the build-event wait; the pre-fix token observation
+  (opcode-read points only) never reaches it and the CANCEL_GRACE hard
+  exit fires with the build still tracked and never cancelled — L4
+  falls at the exit (765671437). (stage collapse): SIGTERM with a live
+  session takes the process straight down — S17 falls via the
+  stage-order latch and the same state exits with live proto tasks
+  (d653222cf / a6a5a77b9). (T): accept-stop tears down an established
+  connection with a live session — P6 falls (the pre-drain rollout
+  behavior).
+- GW-16: an upstream RPC await issued without a deadline — L6 falls at
+  the first un-deadlined rpc-wait entry (755f49744).
+- GW-18 (V): with no global session semaphore, sessions spread across
+  both connections exceed `MAX_SESSIONS` — S2 falls at the third
+  concurrent guard (9d80038cb's safety half). (T): the
+  per-connection-cap world refuses a second exec below the global cap
+  (P1), refuses the channel open itself (P3), and disconnects the
+  connection the instant its session count touches zero (P2) — all
+  three permissiveness latches fall (9d80038cb's permissiveness half).
+- GW-19: a transient accept error treated as fatal — S18 falls via the
+  listener-death latch. **Note 3:** S18's content is latch-shaped (as
+  the witness table already records — the as-built letter is a no-op by
+  construction), so the override is necessarily a latch-setter; the
+  pinned counterexample exits the process with a live connection up, so
+  the structural consequence (the corpus's "all live sessions aborted",
+  the L4 form) is visible in the same trace (9b693441f).
+- GW-20: the close-out ladder starts at eof — S19's exit-status-first
+  ordering falls immediately (24bd41581). V-only per the §3.4 row (the
+  client-side hang is environment, not modeled).
+
+**Permanent CI artifacts (this change set).** Nine expect-violation
+calibration checks (`quint-gw-calib-*`, `nix/quint.nix`), one per
+falsifying corpus family — the round-1 proportion (the representative
+with the most plausible regression path and a cheap state space; every
+check stops at its first violation, so each is well under a minute of
+checker time at the falsification-table costs above):
+`f1-server-side-release` (GW-1 → L2), `f2-open-disarms-grace` (GW-3 →
+S20), `f3-decide-without-arm` (GW-4 → S12), `f4-forged-close-decrement`
+(GW-5 → S7), `f5-release-after-close-out` (GW-2 → S15),
+`f6-exit-edge-skips-cancel` (GW-9 → S10), `f7-drain-expiry-no-cancel`
+(GW-13 → L4), `f9-rpc-wait-no-deadline` (GW-16 → L6),
+`f10-accept-error-fatal` (GW-19 → S18). Aggregate addition to a fully
+uncached gate run ≈ 5–7 minutes of builder time, inside the §5 estimate.
+Each was built once via the harness before commit and reports its
+expected violation. Harness finding: the conversion request for the two
+largest override modules (`gwCalibF1ServerSideKeepsGuard`,
+`gwCalibF6ExitEdgeSkipsCancel` — a rich connection alphabet multiplied
+by the in-session machinery) OOMs the harness's default 4 GiB Apalache
+server, so `mkQuintWitnessCheck` gained a `serverHeapMb` parameter
+(default unchanged and hash-stable for every existing check; the two
+heavy checks pass 8 GiB, validated locally). The remaining override
+modules, the baseline modules and the three T-direction runs stay as
+documented manual targets, re-runnable with the command in each file's
+header.
+
+**Acceptance verdict (the §5 criterion, per corpus family).**
+"Calibrated" = the family falsifies its predicted property through at
+least one trace-walked representative, both directions where a T half
+exists, with the as-built baseline holding at the same scope.
+
+| Family | Verdict | Evidence |
+|---|---|---|
+| F1 capacity conservation | **calibrated** | GW-1 (V: L2), GW-12 (V: S1), GW-18 (V: S2; T: P1/P2/P3); GW-2's release-ordering member also lands in F1 via S15 |
+| F2 progress-bounded occupancy | **calibrated** | GW-3 (V: S20 + L1; constituent arm L3) |
+| F3 decision-to-enforcement | **calibrated** | GW-4 (V: S12); the 2f11bb8f5 constituent dispositioned by structural argument onto the wired l1-no-inactivity probe (note 2) |
+| F4 channel/session bookkeeping integrity | **calibrated** | GW-5 (V: S7), GW-6 (V: S7), GW-7 (V: S14) |
+| F5 egress flow control / bounded queues | **calibrated** | GW-2 (V: S15, L2; T: P5), GW-8 (V: S13) |
+| F6 teardown obligations | **calibrated** | GW-9 (V: S16, S10), GW-10 (V: S10), GW-11 (V: L8, S3), GW-20 (V: S19) |
+| F7 drain/shutdown ordering | **calibrated** | GW-13 (V: L4, S17; T: P6) |
+| F8 upload bounding & wire-position integrity | **pre-registered out-of-model (test-only)** | GW-14: `wire_opcodes` + golden-conformance upload tests; GW-15: store-side half owned by the store campaign, gateway permissiveness half by the golden/integration multi-entry upload tests (owner decision §8 Q5) |
+| F9 anti-hang deadlines on upstream waits | **calibrated** | GW-16 (V: L6); the budget-sizing members stay non-candidates per the corpus |
+| F10 accept-path availability | **calibrated** | GW-19 (V: S18) |
+| F11 session credential freshness | **pre-registered out-of-model (test-only)** | GW-17: `session_jwt_token_refreshes_per_access` + the I-129 regression tests (no clock in the model; owner decision §8 Q5) |
+| F12 result-integrity vs store | **out of corpus (pre-registered exclusion)** | not a lifecycle-machine family (corpus §3, design §1 out-of-scope table); coverage: the 85118ecdf / cb3f6bfbb output-verification paths and their build-result tests; a separate data-integrity model would own it if commissioned |
+| F13 adjacent state machines (scheduler-watch reconnect, STDERR framing, startup/readiness) | **out of corpus (pre-registered exclusion, §8 Q6)** | reconnect boundedness: `test_build_paths_reconnect_exhausted_returns_failure` + `test_reconnect_sends_first_event_sequence_not_zero` (the WatchBuild environment-assumption row above); STDERR framing: wire/golden conformance tests; startup/readiness: the vm-lifecycle scenarios |
+| F14 per-session ingress memory budget | **pre-registered out-of-model (test-only; named Phase-2 Kani candidate)** | GW-21: drv_cache cap unit tests (`MAX_TRANSITIVE_INPUTS`, `insert_drv_bounded`, the occupancy-aware gate tests) |
+
+No family is NOT MET: every encodable family (F1–F7, F9, F10) falsifies
+its predicted property through at least one trace-walked representative
+with the baseline holding at the same scope; the three T halves
+(GW-2/GW-13/GW-18) falsify their named permissiveness properties; the
+four OOM candidates (GW-14/15/17/21) carry their pre-registered
+dispositions. No falsification contradicted the §3.4 crosswalk (the one
+partial-prediction case, GW-1's S2/S3, falls through the predicted L2
+and is documented in note 1); no unlisted falsification of the as-built
+model surfaced (every baseline holds `allInvariants`); there is no
+stop-and-report item.
+
+**§4 window dispositions.** Unchanged by calibration: the W2 / W5 / W7 /
+W10 model-first evidence recorded in the Stage-C wiring record above
+stands (the calibration overrides revert pre-fix variants, they do not
+touch the as-built dispositions), and no calibration trace contradicted
+any of the four recommendations.
+
+**Phase-0 go/no-go (the §7 gate, stated honestly).** The Stage-A and
+Stage-B exit gates are met and recorded above; the Stage-C exit gate is
+met by this record (every encodable family falsifies through a
+trace-walked representative or carries its pre-registered disposition;
+the §4 verdicts re-confirmed). The calibration table shows the model
+expresses the bug classes of F1–F7, F9 and F10 — the §7 go condition.
+What Phase 0 does NOT establish, recorded as the explicit residue of a
+GO: (a) the deferred full-regime exhaustive coverage listed in the
+Stage-C check-set record (cross-family interleavings, conn-B concurrent
+full sessions, two concurrent egress/panic sessions, the base-regime
+"everything legitimate at once" proof) remains witness/named-run-pinned
+only; (b) the four OOM families stay on test-only coverage; (c) the
+environment-assumption rows above (scheduler orphan watcher, WatchBuild
+reconnect boundedness, the silent-stream assumption, fetch_min
+monotonicity) are imported, not verified; (d) the §4 dispositions still
+need the owner's sign-off — they are recommendations with model
+evidence, not decisions this campaign can make. **Recommendation: GO** —
+proceed to Phase 1 with the small scope §7 already names (the two W10
+pinning/assumption-validation tests; the optional W7 hardening and
+`errors_total{setsockopt}` label only if the owner asks; new finds
+budgeted at 1–3 small fixes), conditional on that owner sign-off. If the
+owner instead stops after Phase 0, the campaign is still independently
+valuable per the design: the spec rules, the model, the 31 + 9 permanent
+checks and this calibration record stand on their own.
+
+**Validation.** `quint typecheck` green on all nine override files;
+every falsification and baseline run above executed via the same
+`quint verify --backend=tlc` invocation the harness uses (the only
+non-serial exception — two F1 baseline attempts that ran concurrently
+against one Apalache server — produced tool errors, not verdicts, and
+was redone serially; concurrent conversions against one server are not
+trustworthy, which is also why the harness keeps one server per
+sandbox); `tracey query validate` clean (the calibration checks
+deliberately carry no markers, same policy as the witness checks);
+`treefmt` clean; `nix eval` lists the nine `quint-gw-calib-*` checks
+under `checks.x86_64-linux`; each wired check was built once via the
+harness before commit (seven on the remote builder at the default
+server heap, the two heavy ones locally at 8 GiB after the
+`serverHeapMb` fix) and reports its expected violation.
