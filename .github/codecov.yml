@@ -54,6 +54,10 @@ ignore:
   # coverage by construction. Including them in patch math just
   # deflates the signal on real production code.
   - "**/bin/spike_*.rs"
+  # xfstests runner: VM-test scaffolding (vm-castore-xfstests), same
+  # status as the spike harnesses — its syscall checks need a live
+  # castore-FUSE mount, which only exists inside the VM test.
+  - "**/bin/xfstests_runner/**"
 
 comment:
   # condensed_header drops the giant coverage-diff ASCII block;

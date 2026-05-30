@@ -26,6 +26,14 @@ path = "src/bin/rio-mountd.rs"
 name = "spike_mountd_client"
 path = "src/bin/spike_mountd_client.rs"
 
+# xfstests ports against a live castore-FUSE mount (vm-castore-xfstests
+# scenario). Every kernel-visible POSIX assertion lives here as Rust
+# syscall probes; the NixOS testScript only assembles the mount and
+# runs this binary. Selection: rio-builder/tests/xfstests_port/PLAN.md.
+[[bin]]
+name = "xfstests_runner"
+path = "src/bin/xfstests_runner/main.rs"
+
 [features]
 # RIO_BUILDER_SCRIPT fixture intercept (sla-sizing VM scenario): skips
 # the daemon lifecycle and reports scripted (wall, peak_mem, peak_cpu,
