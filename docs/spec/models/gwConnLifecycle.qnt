@@ -311,6 +311,13 @@ module gwConnLifecycle {
   /// Residue policy bound f (as-built terminate-on-refusal keeps residue ≤ 1).
   const RESIDUE_BOUND: int
 
+  /// Structural channel slots available to the legitimate connection cB
+  /// (conn cA always has both). 2 = the §2e default; 1 is the §2e
+  /// pre-registered state-space fallback (2) — "drop conn B's channel count
+  /// to 1 in that regime" — kept as a constant so a regime can apply the
+  /// fallback without touching the transition relation.
+  const B_CHANNEL_SLOTS: int
+
   /// Regime alphabet switches (§2e regime definitions).
   const LET_OCC: bool        // occupancy-withholding peer letters (silent, KEX-park, never-auth, no-exec, idle)
   const LET_WEDGE: bool      // stop-draining + withhold-window-adjust (the park-producing pair)
@@ -1108,6 +1115,7 @@ module gwConnLifecycle {
     conn(c).exists, conn(c).live, not(conn(c).kex), not(conn(c).herr), not(conn(c).expired), not(conn(c).discQ),
     conn(c).stage == CAuthed or conn(c).stage == CChanOpen,
     chanAt(c, i).ch == ChNone,
+    c == ADV or i < B_CHANNEL_SLOTS,
     conn(c).openCh < MAX_CHANNELS_PER_CONN,
     conns' = conns.set(c, { ...conn(c), stage: CChanOpen, openCh: conn(c).openCh + 1 }),
     chans' = chans.set((c, i), { ...chanAt(c, i), ch: ChAccepted, writeHalf: true }),
@@ -1998,6 +2006,77 @@ module gwConnLifecycle {
       srvExit
     }
   }
+
+  // --- 10. named runs ---------------------------------------------------------
+  // Deterministic reproductions of the design's pinned traces. Stage C wires
+  // them via mkQuintRunCheck; they also serve as executable documentation of
+  // the intended scenario for the corresponding witnesses.
+
+  /// The compliant peer's full lifecycle (design §3.2 P5 named run, base
+  /// regime): connect → auth → open → exec → handshake → build opcode →
+  /// terminal → close-out in order → channel close → peer close. No budget
+  /// fires, no force-close, no timer reap, and every resource is back to
+  /// zero at the end.
+  run compliantLifecycleRun =
+    init
+      .then(acceptConn("cB"))
+      .then(peerBanner("cB"))
+      .then(peerAuthOk("cB"))
+      .then(peerOpenChannel("cB", 0))
+      .then(execAdmit("cB", 0))
+      .then(peerHandshake("cB", 0))
+      .then(peerOpcode("cB", 0))
+      .then(opcodeToRpcWait("cB", 0))
+      .then(rpcCompletesBuildSubmit("cB", 0))
+      .then(buildTerminal("cB", 0))
+      .then(emitDone("cB", 0))
+      .then(peerClientEof("cB", 0))
+      .then(protoSeesClientEof("cB", 0))
+      .then(pumpExitEof("cB", 0))
+      .then(closeOutSendStatus("cB", 0))
+      .then(queueDrainDeliver("cB"))
+      .then(closeOutSendEof("cB", 0))
+      .then(queueDrainDeliver("cB"))
+      .then(closeOutSendClose("cB", 0))
+      .then(closeOutComplete("cB", 0))
+      .then(peerChannelClose("cB", 0))
+      .then(reapTransportEnd("cB", LPeerClose))
+      .expect(and {
+        not(conns.get("cB").fcArmed),
+        not(viol.budgetFiredOnCompliant),
+        not(viol.timerReapedCompliant),
+        reach.closeOutOrdered,
+        srv.sessPermits == 0,
+        srv.chansActive == 0,
+        srv.connsActive == 0,
+        srv.connPermits == 0,
+        allInvariants
+      })
+
+  /// The GW-2 / C14 wedge response (fault-peer-transport regime): a
+  /// window-starved send toward a stop-draining peer exhausts the send
+  /// budget — capacity is released first, the close-out starts under its
+  /// own budget, and the force-close is armed.
+  run stallArmsForceCloseRun =
+    init
+      .then(acceptConn("cA"))
+      .then(peerBanner("cA"))
+      .then(peerAuthOk("cA"))
+      .then(peerOpenChannel("cA", 0))
+      .then(execAdmit("cA", 0))
+      .then(pumpSendOk("cA", 0))
+      .then(pumpSendOk("cA", 0))
+      .then(pumpSendBlocks("cA", 0))
+      .then(peerStopDraining("cA"))
+      .then(fireSendBudget("cA", 0))
+      .expect(and {
+        reach.stallFcArmed,
+        conns.get("cA").fcArmed,
+        conns.get("cA").liveSess == 0,
+        srv.sessPermits == 0,
+        chans.get(("cA", 0)).sess.eg == EgCloseOut,
+        allInvariants
+      })
 }
 
 // ===========================================================================
@@ -2018,6 +2097,7 @@ module gwConnLifecycleBase {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = false,
     LET_HOSTILE = false,
@@ -2038,6 +2118,7 @@ module gwConnLifecycleCap {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = false,
     LET_HOSTILE = false,
@@ -2059,6 +2140,7 @@ module gwConnLifecycleFaultOccupancy {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = true,
     LET_WEDGE = false,
     LET_HOSTILE = false,
@@ -2080,6 +2162,7 @@ module gwConnLifecycleFaultTransport {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = true,
     LET_HOSTILE = true,
@@ -2100,6 +2183,7 @@ module gwConnLifecycleFaultUpstream {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = false,
     LET_HOSTILE = false,
@@ -2120,6 +2204,7 @@ module gwConnLifecycleFaultDrain {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = false,
     LET_HOSTILE = false,
@@ -2143,6 +2228,7 @@ module gwConnLifecycleFaultDegraded {
     MAX_CHANNELS_PER_CONN = 2,
     MAX_SESSIONS = 2,
     RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 2,
     LET_OCC = false,
     LET_WEDGE = true,
     LET_HOSTILE = false,
@@ -2151,5 +2237,28 @@ module gwConnLifecycleFaultDegraded {
     LET_PANIC = true,
     LET_SOCKOPT_FAIL = true,
     INACTIVITY_AVAILABLE = true
+  ).*
+}
+
+/// Base regime under the §2e pre-registered state-space fallback (2): the
+/// legitimate connection cB is limited to one channel slot (cA keeps both,
+/// so the mux/blast-radius content stays on the adversary side). This is
+/// the measurement variant for the Stage-B budget decision; Stage C decides
+/// per regime whether the wired check uses the full or the fallback bound.
+module gwConnLifecycleBaseSlim {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
   ).*
 }
