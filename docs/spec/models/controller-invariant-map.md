@@ -1394,3 +1394,202 @@ message and the checks' transcripts). The Stage-C delta-pass claim —
 no calibrated controller family's mechanism changed at 1d — is
 consistent with the per-family tables above. No Model J/N assumption
 is invalidated.
+
+## Phase 1 — the limited recomputable-cache cleanup (§4(a) items 1–2)
+
+Executed 2026-05-30 on the `ctrl-cache` worktree (Round-2 Track C,
+carried from round 1), per the Phase-1 input list above and the design
+§4(a) scope: *"the §4(a) recomputable-cache deletions (PodRequestedCache
+→ per-tick LIST with the named derivation rule and gate tests;
+NodeLabelCache labels → per-need GET / per-flush LIST with the M11
+cursor semantics named) were never model-gated and proceed on their own
+named test/VM evidence, after this Stage C, as the design schedules
+them."* No deletion is licensed by calibration; each item's license is
+its named test/VM gate, listed per item below.
+
+### Item 1 — `PodRequestedCache` (M12/M13) → per-tick Pod LIST. DONE
+
+Commit `d82f1214c` (`refactor(rio-controller): replace
+PodRequestedCache with a per-tick pod LIST`), net −6 lines
+(516+/522−; the additions are predominantly the ported test battery
+and derivation docs — the watch/relist machinery and its guard fixes
+are deleted outright).
+
+- **What changed.** `nodeclaim_pool/pods.rs::PodSnapshot::derive` is
+  the relocation target the design required: one label-selected
+  (`rio.build/pool`) Pod LIST per tick, derived in both tick bodies
+  (`reconcile_once` and `consolidate_only`), feeding
+  `LiveNode.requested` (via `list_live_nodeclaims`), FFD's bound
+  short-circuit, the OA2 wedge attribution fallback, and
+  `report_unfulfillable`'s `bound_intents` protos. The watch cache,
+  its three guard fixes (`mb_034` pod-name-guarded delete, `bug_023`
+  terminating-apply guard, `prune_absent`), and the
+  `run_pod_requested_cache` task are deleted from `node_informer.rs`
+  and `main.rs`. The N3 decision-site row above ("`requested` filled
+  from the pod-requested cache") now reads from this snapshot — the
+  Stage-A table is left as the Phase-0 record per the map's
+  delta-entry convention.
+- **Derivation rules** (the design's (a)/(b)/(c), carried verbatim
+  into the module doc): requested sums include terminating pods;
+  bindings exclude them; newest-creationTimestamp wins conflicts with
+  pod-name tie-break; an intent whose only pod is terminating is
+  unbound (fail-safe).
+- **Gates run (the license).**
+  (1) Ported guard tests, all green: `two_pods_one_intent_overlap_window`
+  (replaces `apply_terminating_preserves_newer_binding` +
+  `delete_preserves_newer_binding_for_same_intent`; also pins the
+  shipped `BoundIntent` set targeting the non-terminating pod's node)
+  and `absent_pods_contribute_nothing` (replaces
+  `prune_absent_evicts_stale_bound_intent_with_surviving_sibling`),
+  plus `snapshot_sums_requests_by_node`,
+  `snapshot_excludes_terminal_phases`, `snapshot_indexes_bound_intent`,
+  `intent_with_only_terminating_pod_is_unbound`,
+  `newest_pod_wins_binding_conflict`.
+  (2) Consequence-chain coverage: the design named the chain
+  `bound_intents` → `dead_nodes` → dead-node reap; since the executor
+  campaign's 1c'/1d deletions (entries above) the scheduler-side
+  hung-node detector and `dead_nodes` field are gone, so the live
+  chain is `bound_intents` → OA2 wedge attribution fallback →
+  Dead-equivalent mark → `health::reap_unhealthy`. Coverage: the
+  overlap-window test (the shipped set), `wedge.rs::
+  attribution_falls_back_to_bound_intents_and_skips_unknown`
+  (attribution), `health.rs::dead_nodes_reaped_with_cap` (capped reap)
+  — all pre-existing and green.
+  (3) `vm-sla-sizing-kwok` (the `rio-forecast-provisioning` scenario —
+  the one VM scenario exercising the L10 FFD/NodeClaim path) rebuilt
+  green against the change.
+  (4) Per-commit checks: `cargo clippy -p rio-controller` (deny
+  warnings), `cargo nextest run -p rio-controller` (316/316), treefmt,
+  `tracey query validate` — all green.
+- **Failure-polarity change (recorded).** A failed Pod LIST now aborts
+  the tick (fail-closed, same posture as a failed NodeClaim LIST);
+  the watch cache's failure mode was silent stale-data degradation
+  (mis-sized FFD). Strictly safer; no spec rule states the old
+  degradation, so no rule amendment is needed.
+- **Residual exposure (design gate (4), for the Phase-2 acceptance
+  table).** The dead_nodes-misattribution exposure the design recorded
+  is narrowed but not gone: a wrong binding can still misattribute a
+  wedge cluster to a healthy node. It is covered by gate tests (1)–(2)
+  plus `dead_reap_cap` (`health.rs`) and the wedge window/threshold —
+  not by any F1–F5 invariant. Unchanged in kind from the design's
+  record; the source of the binding is now a fresh LIST instead of a
+  watch cache, which removes the watch-gap ghost class entirely.
+
+### Item 2 — `NodeLabelCache.labels` (M10) → per-need GET / per-flush LIST; M11 cursor KEPT. DONE
+
+Commit `7f1f6135c` (`refactor(rio-controller): drop the node-labels
+cache for per-need GET / per-flush LIST`), net −130 lines (381+/511−).
+
+- **What changed.** `NodeLabelCache`, `NodeMeta`, and the Node watch
+  are deleted. `node_informer::run` is now a flush loop: one Node LIST
+  per 60s exposure flush (`flush_spot_exposure`, pure) + the existing
+  300s `HwClassConfig` refresh. The annotator and the spot-interrupt
+  watcher resolve `hw_class` via per-need GET (`node_hw_class`),
+  gated behind the pure `annotation_target` pre-check so
+  already-stamped/Pending pods cost no round-trip.
+- **Surviving λ-accounting semantics (the M11 cursor), as the gate
+  requires the deletion commit to name.** The per-spot-node cursor
+  (`name → last-banked epoch`) survives as flush-loop-local state — an
+  accounting position, not a cache. Pinned by tests:
+  `flush_banks_incremental_deltas` (no double-count across flushes),
+  `flush_preserves_cursor_across_relists` (no re-seed),
+  `flush_unmatched_window_is_dropped_not_retro_banked` (late config
+  load does not retro-bank). A failed LIST skips the flush with
+  cursors untouched — the next successful flush banks the full delta.
+- **Recorded accepted under-count (the gate's named loss).** The
+  watch's Delete-arm/`prune_absent` residual flush is retired: a node
+  deleted between flushes forfeits its final partial slice (≤ one
+  flush period ≈ 60 node-seconds). λ reads marginally high — the
+  cost-conservative direction (solver under-prefers spot), never the
+  phantom-exposure over-count (`b81da271f`) the prune machinery
+  existed to prevent (that hazard class is unrepresentable for a
+  LIST). Pinned by `flush_drops_absent_node_cursors_without_banking`,
+  whose doc comment records the inversion from its predecessor test.
+- **Ported / superseded tests** (the gate's third clause):
+  `drain_live_spot_exposure_banks_incremental_deltas` and
+  `prune_absent_evicts_nodes_missing_from_relist` → the four `flush_*`
+  tests; `hw_class_of_*` / lazy-match / label-change-upsert cache
+  tests → `match_node_matches_operator_config`,
+  `match_none_until_config_loaded`,
+  `hw_class_is_operator_key_not_reconstruction` (per-need reads make
+  the cache-staleness cases structurally impossible);
+  `patch_target_stamps_once` → `annotation_target_stamps_once`.
+- **Gates run:** clippy (deny warnings), nextest (315/315), treefmt,
+  `tracey query validate`, and the same `vm-sla-sizing-kwok` build
+  (the controller image in that scenario runs all node_informer
+  tasks). RBAC needs no change — `get`/`list` were already granted on
+  `nodes` and `pods` (the chart and `ctrl.*` RBAC table list
+  get/list/watch).
+
+### Items 3–5 — not licensed / not adopted; NO CHANGE
+
+- **`recorded_boot` (M3):** keep as-is, per design §4(a)3 ("the
+  weakest candidate"; the annotation-PATCH alternative is new protocol
+  surface, not a deletion). Untouched.
+- **`ScalerState.low_ticks` (M15):** design §4(a)4 defaults to *not
+  now* and conditions the move on the L2 owner adopting it; no
+  adoption has happened. Untouched.
+- **`HwClassConfig` (M14):** already a periodic re-fetch; no change
+  (design §4(a)5). The 300s refresh stays where it was, now in the
+  flush loop's select arm.
+
+### Discipline checklist (design §5 Phase-1 exit-gate row)
+
+- **Non-candidates untouched:** `prev_idle` (M1), `inflight_created`
+  (M2), the sketches reload latch + recency gate (M3/M4), the
+  placeable gate and its fail-closed consumer postures, the per-class
+  cover clamp, the M11 exposure cursor, every fail-open/fail-closed
+  gate, the foreground-delete discipline, and the level-triggered
+  shape of `pool/jobs.rs` — none modified. The wired
+  `quint-ctrl-calib-*` expect-violation checks that attach
+  machine-checked evidence to those non-candidates are untouched.
+- **Net-negative diff:** both commits net-negative (−6 and −130;
+  −136 total), with the production-code deletion substantially larger
+  than the headline (the additions are tests and derivation docs).
+- **No restored mechanism:** no test or VM gate failed during the
+  cleanup, so nothing was restored and no falsifying run needed
+  recording.
+- **Model impact: none, by construction.** Models J and N carry no
+  Pod objects and no node-label state (the M10–M13 rows are
+  NOT-ENCODED in the calibration table above; the design itself notes
+  "the F1/F4 model checks are necessary but not sufficient: they do
+  not read the code and cannot detect this regression"). The
+  `requested`/`bound` source swap and the labels-cache deletion sit
+  below the models' input abstraction, so the wired
+  `quint-spawn-coherence-*` / `quint-nodeclaim-*` /
+  `quint-ctrl-calib-*` checks are unaffected by construction; the
+  models stay byte-unchanged.
+- **Tick-body churn (re-pin protocol note).** This Phase-1 work
+  changes a modeled file's tick body (`nodeclaim_pool/mod.rs`: the
+  per-tick Pod LIST replaces the cache read; `pods.rs` is new). This
+  is the campaign's own scheduled Phase-1 work, not external churn;
+  the change preserves the modeled decision-site structure (N3's
+  read is still "one per-tick snapshot of per-node requested + bound
+  index", now sourced from a LIST). Any future Stage re-validation
+  should treat `d82f1214c` as the new anchor for the N3 row.
+- **Full CI gate:** the per-commit gates above ran on the `ctrl-cache`
+  worktree; the full `nix-fast-build .#checks` gate runs at Track-C
+  integration per the round-2 orchestration (this worktree does not
+  push or run the full gate by itself).
+
+### Known prose drift outside this track's path ownership (integration follow-ups)
+
+Four comment/prose-only references to the deleted structs survive in
+files this track may not modify. None is functional (no broken code
+reference, no tracey marker, no RBAC verb change needed); each is a
+one-line touch-up for whoever next edits the file:
+
+1. `docs/spec/components/controller.typ:572` — the RBAC table's
+   parenthetical: "node_informer `NodeLabelCache` (hw-band label
+   join)" → the permission is still needed and used by node_informer
+   (now per-flush LIST / per-need GET); only the struct name is stale.
+2. `infra/helm/rio-build/templates/rbac.yaml:109` — comment "Node
+   watch → NodeLabelCache (hw-band label join …)"; verbs unchanged.
+3. `rio-scheduler/src/actor/tests/sla_contract.rs:598` — comment
+   "(deleted pods disappear from the controller's
+   `PodRequestedCache`)" → semantics unchanged (pods absent from the
+   per-tick LIST contribute nothing); struct name stale.
+4. `docs/REVIEW.md:855` — the r25 bug_021 review rule names
+   `PodRequestedCache` as the kube-authoritative binding source → the
+   rule's substance is unchanged (the binding is kube-authoritative,
+   now from the per-tick LIST).
