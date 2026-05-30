@@ -427,6 +427,22 @@ impl DagActor {
         // non-force submission must not substitute it out from under
         // that build). Pruning deps would also guarantee a doomed
         // dispatch (inputs never merged).
+        //
+        // Deliberately keyed on structural roots, NOT the full demand
+        // set check_roots_topdown prunes to (roots ∪
+        // explicitly_requested): an explicitly-requested non-root that
+        // is another live build's force-build root does not block this
+        // submission's prune. It still cannot be substituted — the
+        // step-4 pending_substitute filter and the dispatch-time probes
+        // gate on is_force_build_root independently of any prune — and
+        // it completes via that build's from-source dispatch. If that
+        // build is cancelled first, its terminal reap leaves the kept
+        // node with Broken closure evidence (childless or
+        // closure-holed), so it either re-opens for substitution (the
+        // force gate dies with its build) or takes the standard topdown
+        // fail-fast; a doomed from-source dispatch cannot happen, so
+        // widening this gate would only trade the prune away for
+        // closure-pinning the other build already provides.
         let topdown_blocked =
             force_build_roots || submission_roots.iter().any(|h| self.is_force_build_root(h));
         let (nodes, edges, topdown_fired, pruned_closure_parents) = if topdown_blocked {
