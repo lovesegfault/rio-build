@@ -94,6 +94,7 @@ module closureCalibF3IndetFailFast {
       probeWalk(d),
       calibProbeFailFastIndet(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       walkFinishes(d),
       consumeWalk(d),

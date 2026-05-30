@@ -116,7 +116,7 @@ executor-campaign convention.
 | C1 | `wrongfulFailFastBoundedPerArming` | At most one wrongful fail-fast per (node, arming); re-arming is a new stamp or a recovery restoring the mark. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | C1-strict | `wrongfulFailFastBoundedPerStamp` | The per-(node, stamp) form with no recovery re-arming. **Pre-registered expected-fail probe** (failover/fault-persist); the AW2 deliverable. | — (AW2 disposition) | expected-fail probe — NOT producible within the §2b ceilings (the AW2 loop needs a second availability transition per output); recorded as a deviation, not wired |
 | C2 | `noWrongfulFromSourceDemotion` | Outside the genuine-walk-failure one-shot, the probe never routes a node from-source while every missing live-wanted output is available upstream. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
-| C3 | `noWrongfulTerminalFailureSingleTenure` | With no failover, no store GC and no upstream withdrawal, no build is wrongfully terminally failed. | sched.merge.substitute-topdown+11 | VIOLATED as-built — CONFIRMED defect (C3 adjudication + post-0d triage): the violation needs TWO live builds (the faithful trace is in the post-0d triage record); after the adjudication's model corrections C3 HOLDS at the single-build BaseEx scope (the 0c 11-state trace is refuted). Excluded from the wired conjunctions, pinned by the wrongful-terminal-failure expect-violation check at the closureEvidenceC3Duo probe scope; Phase-1 red-first candidate |
+| C3 | `noWrongfulTerminalFailureSingleTenure` | With no failover, no store GC and no upstream withdrawal, no build is wrongfully terminally failed. | sched.merge.substitute-topdown+12, sched.evidence.settlement | **FIXED Phase 1** (Wave 1: the settlement re-probe at the three production fail-fast sites; Wave 4: the model encoding — probeSettleTried, the consumeWalk Broken-arm settlement, the reap-survivor settlement with the MQueued exclusion). HOLDS at BaseEx and Duo under the settlement-encoded model (Wave-4 stage record); back in `asBuiltHoldInvariants`/`allInvariants`; wired holds check `quint-closure-evidence-settlement-holds`; falsifiability preserved by the `quint-closure-calib-c3-no-reprobe` regression pin (pre-fix actions still falsify). The reap-survivor path is the second C3 violation family (adjudication OQ2 / review finding MCI-2), closed by the same settlement |
 | C4 | `noBuildWhenWantedPresent` | A node whose live-wanted outputs are all present at merge is not queued for a from-source build. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
 | C5 | `terminalBuildStopsPinning` | Only live builds' wanted outputs drive resets, forgiveness refusal and re-pinning. | sched.merge.substitute-topdown+11 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) (latch is a by-construction hook; falsifiability owned by the 0d calibration override) |
 
@@ -125,27 +125,31 @@ executor-campaign convention.
 | # | Property | Statement (one line) | Rule(s) | Status |
 |---|---|---|---|---|
 | L1 | `substitutingAlwaysArmed` | A Substituting node always has a walk instance in flight. | sched.substitute.detached+5 | No violation found at the reduced base scope (the closing run was capped before convergence — 0c run record) |
-| L2 | `markedBrokenSettlementArmed` | No reachable D16 limbo cell (marked, Broken, tried, Ready, live interest, all live-wanted outputs present, no walk). **Pre-registered expected-fail probe** (base); its violation trace is the D16 deliverable. | sched.evidence.settlement (intentionally uncovered) | expected-fail probe — NOT yet produced (the D16 cell is ≥16 steps deep at duo scope; deferred-probe record in the 0c stage record) |
+| L2 | `markedBrokenSettlementArmed` | **ARMED/settlement form (Phase-1 restatement)**: every reachable D16 limbo cell is covered by the settlement partition (some settling action's availability arm holds for it). The 0b state form ("no reachable cell") is retired — post-fix the cell is a designed transient (reap/poison-clear promotion → next-sweep settlement), so state-unreachability can never hold; the armed form is what the fix guarantees (review findings RT-3/MCI-1/FC-3; orchestrator call within owner decision 4). | sched.evidence.settlement | **FIXED Phase 1 / WIRED (decision 4)**: HOLDS at Duo/C3Duo; in `allInvariants`/`asBuiltHoldInvariants`; wired via `quint-closure-evidence-settlement-holds`; the cell's reachability (the state form's real content) is the now-demonstrable `canReachD16Cell` witness — wired as `quint-closure-evidence-witness-d16-cell` (pre-fix it was unreachable in any hunted budget; post-fix the promotion transient assembles it at shallow depth, the settlement action's non-vacuity proof). The pre-fix partition form (`markedBrokenSettlementArmedPreFix`) lives in the closure-c3-no-reprobe override and falsifies under the production step — the pre/post distinguisher |
 | L3 | `liveBuildTerminalOrProgressArmed` | Every live build is terminal, all-produced, or has a progress step armed at some member. | sched.merge.substitute-topdown+11, sched.poison.clear-survivor-reevaluation | No violation found at the reduced base scope (0c run record); the post-0d triage's failover-scope violation is **REFUTED as a production defect — model artifact of the recovery-condemnation gap (Phase 1 Wave 2)**: the traced strand needed recovery to leave the parent Queued above its still-poisoned child, which pre-Wave-2b production never did (the unscoped `compute_initial_states` condemnation closed it). **Wave 2b narrowed that mechanism** (the residual-finding fix: co-ownership scoping) **and added its replacement closure**: the poison-clear survivor re-evaluation promotes the spared parent when the child is removed. Re-hunt under the scoped pair (FailoverEx + Duo, both backends): no violation; the red half (scoping without promotion) re-finds the 9-state strand under TLC — the pairing, not the unscoped condemnation, now closes the strand. Wave-2/2b stage records |
 
-### Non-vacuity witnesses (encoded in 0b, wired as expect-violation checks in 0c)
+### Non-vacuity witnesses (encoded in 0b, wired as expect-violation checks in 0c; Phase-1 additions marked)
 
 `canReachStamp`, `canReachHoleFromReap`, `canReachHoleFromAdminClear`,
 `canReachHoleFromTtlSweep`, `canReachHoleFromRecovery`, `canReachFailFast`,
 `canReachRecoveryClear`, `canReachWalkOkConsumed`, `canReachWalkFailConsumed`,
 `canReachForgivenResidual` (the CE-23 residual), `canReachStaleIntentApply`,
-`canReachD16Cell` (= the L2 predicate), `canReachWrongfulFfTrigger`,
+`canReachD16Cell` (its own predicate as of Phase 1 — no longer an alias of
+the L2 val, which is now the armed form; demonstrable post-fix and wired),
+`canReachVerificationWalkConsumed` (Phase 1: the WALK_CONSUME_CEIL headroom
+pin, review finding FC-5), `canReachWrongfulFfTrigger`,
 `canReachTriedDemotionUpstreamHas`, `canReachPrune`, `canReachRollback`,
-`canReachCrossTenureWalkConsume`, `canReachDowngradeRespawn` — 18 named
+`canReachCrossTenureWalkConsume`, `canReachDowngradeRespawn` — 19 named
 predicates covering the design §4 list of 14 plus the prune/rollback/
-cross-tenure/downgrade reachability probes the regimes need.
+cross-tenure/downgrade/ceiling-headroom reachability probes the regimes
+need.
 
 ## Contradiction / posture records
 
 | Item | Record | Disposition |
 |---|---|---|
 | Fencing posture for evidence writes (D14/D15) | Entry-time leader gates only; no SQL fence on any evidence write; the only fenced statements are the three attempt-ledger transactions; the MergeDag handler is ungated past the SubmitBuild enqueue guard. Recorded as rationale prose after `sched.evidence.durability`. | **RESOLVED — normative fence implemented Phase 1 Wave 3 (owner decision 2026-05-30, FENCE EVERYTHING / D15 option (b))**: every evidence write carries the tenure's serving generation and is applied only at-or-above the durable claims floor; `sched.evidence.durability+2` makes it normative. See the Wave-3 stage record for the statement inventory and residuals. |
-| D16 present-but-tried limbo cell | `sched.evidence.settlement` added (owner adopted the obligation); the as-built dispatch probe violates it, so the rule is intentionally uncovered (`tracey query uncovered`) until the Phase-1 fix lands red-first. | Settling arm chosen by the model (L2); fix in Phase 1. |
+| D16 present-but-tried limbo cell | `sched.evidence.settlement` added (owner adopted the obligation); the as-built dispatch probe violated it, so the rule was intentionally uncovered until the Phase-1 fix. | **RESOLVED — fixed Phase 1**: Wave 1 landed the production settlement red-first (rule covered, impl+verify markers); Wave 4 encoded it in the model (probeSettleTried + the consumeWalk/reap settlements), restated L2 in the armed form, and wired the holds check + the D16-cell witness + the c3-no-reprobe regression pin. See the Wave-4 stage record. |
 
 ## Verify-marker status (Phase 0a)
 

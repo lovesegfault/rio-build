@@ -82,7 +82,13 @@ module closureCalibF6LatchOutlivesChain {
   /// forgiven-now-wanted downgrade's REVERT arm keeps the grown
   /// never-forgive set instead of clearing it with the chain
   /// (pre-71e37da5f node-lifetime scoping). Every other branch and
-  /// every latch is the live model's.
+  /// every latch is the live model's AS OF THE FREEZE — this copy also
+  /// predates the Phase-1 Broken-arm settlement (its Broken arm is the
+  /// pre-settlement direct fail-fast), which is intentional: the copy
+  /// freezes the consumeWalk of the era whose A21 defect it documents,
+  /// and the A21 falsification (the nf latch on the REVERT arm) does not
+  /// touch the Broken arm. The step alphabet carries the production
+  /// probeSettleTried so the rest of the partition stays current.
   action calibConsumeWalkKeepNf(d: str): bool = {
     nondet idx = Set(0, 1).oneOf()
     val w = pWalkAt(drvOf(d).walks, idx)
@@ -183,6 +189,7 @@ module closureCalibF6LatchOutlivesChain {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       walkFinishes(d),
       calibConsumeWalkKeepNf(d),

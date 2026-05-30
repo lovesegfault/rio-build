@@ -99,6 +99,7 @@ module closureCalibF9PoisonClearNoStamp {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       walkFinishes(d),
       consumeWalk(d),

@@ -292,7 +292,13 @@ module closureEvidence {
     pruneFired: bool,
     rollbackSeen: bool,
     crossTenureWalkConsumed: bool,
-    downgradeRespawned: bool
+    downgradeRespawned: bool,
+    // Phase 1 (the settlement): a node's SECOND walk completion was
+    // consumed (walkConsumed >= 1 at consumption time). Feeds the
+    // WALK_CONSUME_CEIL headroom witness — the settlement spawns one
+    // verification walk per arming on top of the original, so its
+    // completion needs a ceiling of at least 2 (review finding FC-5).
+    secondWalkConsumed: bool
   }
 
   // --- 2. constants (const = overridable per regime) ----------------------
@@ -312,7 +318,15 @@ module closureEvidence {
   const PURGE_BUDGET: int        // external builds-row purges
   const POISON_BUDGET: int       // inbound poison verdicts
   const CANCEL_BUDGET: int       // build cancellations
-  const WALK_CONSUME_CEIL: int   // walk completions consumed per node
+  /// Walk completions consumed per node. Phase-1 sizing (review finding
+  /// FC-5): the settlement spawns one verification walk per arming ON TOP
+  /// of the original walk, so every regime used for a post-fix holds
+  /// verdict needs a ceiling of at least 2 (original + verification); the
+  /// reduced exhaustive / probe regimes use 3 to also admit one downgrade
+  /// re-spawn. A ceiling of 1 makes the settlement's completion
+  /// unreachable (holds checks go vacuous) -- the
+  /// canReachVerificationWalkConsumed witness pins the headroom.
+  const WALK_CONSUME_CEIL: int
   const ATTEMPT_CYCLE_CEIL: int  // attempt open/close cycles per node
   const INTENT_CEIL: int         // pending unapplied intents at any instant
   /// Reduction-ladder step (4) (design §2b.1; invariant-map Phase 0c stage
@@ -378,7 +392,7 @@ module closureEvidence {
     walkOkWithForgiven: false, staleIntentApplied: false,
     triedDemotionUpstreamHas: false, pruneFired: false,
     rollbackSeen: false, crossTenureWalkConsumed: false,
-    downgradeRespawned: false
+    downgradeRespawned: false, secondWalkConsumed: false
   }
 
   pure val noopIntent: IntentRec = { op: INop, tenure: 0 }
@@ -669,6 +683,39 @@ module closureEvidence {
     }
   }
 
+  /// Settlement-arm availability guards (Phase 1 — the C3+D16 settlement
+  /// fix). Shared by the settling actions (probeSettleTried, the
+  /// consumeWalk Broken-arm settlement, the reap-survivor settlement) AND
+  /// the L2 armed form below, so the invariant and the action guards
+  /// cannot silently diverge: an edit that re-narrows an action's
+  /// availability arm re-narrows the partition the invariant checks, and
+  /// the armed form goes red as soon as a checker reaches a cell inside
+  /// the re-opened hole.
+  ///
+  /// settleArmAvailable: every live effective wanted output is obtainable
+  /// — present locally or available upstream. The model form of the
+  /// code's present-or-substitutable-or-indeterminate FMP partition (an
+  /// indeterminate answer counts toward the settlement arm, never the
+  /// fail-fast arm — B3; at this model's store abstraction a missing
+  /// output with no upstream is always confirm-answerable, so the
+  /// indeterminate letter collapses into these two arms). The settling
+  /// action spawns the closure-re-verifying substitution walk.
+  def settleArmAvailable(d: str): bool = allWantedPresentOrUpstream(d)
+
+  /// failFastArmConfirmedMissing: some live effective wanted output is
+  /// confirmed unobtainable (missing locally AND absent upstream) — the
+  /// narrowed probeFailFastTried criterion, the genuine fail-fast arm.
+  def failFastArmConfirmedMissing(d: str): bool = not(allWantedPresentOrUpstream(d))
+
+  /// The settlement partition over a tried marked-Broken cell: at least
+  /// one settling arm covers it. Post-fix the two arms partition
+  /// availability totally; pre-fix the fail-fast arm alone existed and
+  /// was keyed on LOCAL presence only (not(allWantedPresent)), which
+  /// left the all-present cell covered by nothing — the D16 limbo. The
+  /// pre-fix coverage is frozen as settlementEnabledPreFix in the
+  /// closure-c3-no-reprobe calibration override.
+  def settlementEnabled(d: str): bool = settleArmAvailable(d) or failFastArmConfirmedMissing(d)
+
   /// Progress armed for a member of a live build (L3's disjunction).
   /// The D16 cell is deliberately counted as armed here: that cell is
   /// L2's subject and is carved out of L3 so the two probes stay
@@ -876,9 +923,27 @@ module closureEvidence {
   val substitutingAlwaysArmed = DRVS.forall(d =>
     (drvOf(d).mSt == MSubstituting) implies (drvOf(d).walks != []))
 
-  /// L2 (expected-fail probe, base): no reachable D16 limbo cell. NOT in
-  /// any exported conjunction; its violation trace is the D16 deliverable.
-  val markedBrokenSettlementArmed = not(DRVS.exists(d => d16Cell(d)))
+  /// L2 (ARMED/settlement form — the Phase-1 restatement; the FB-1
+  /// armed-invariant precedent and ENC-0b-6's carve-out discipline):
+  /// every D16 limbo cell is covered by the settlement partition — some
+  /// settling arm's availability guard holds for it, so the next
+  /// dispatch sweep settles the cell instead of skipping it. Pre-fix the
+  /// partition had a hole at exactly the cell (the tried fail-fast arm
+  /// was keyed on local presence only and nothing else fired for a
+  /// present cell), so the pre-fix form of this val
+  /// (markedBrokenSettlementArmedPreFix in the closure-c3-no-reprobe
+  /// calibration override) is violated wherever the cell is reachable;
+  /// post-fix probeSettleTried's arm covers it and this val holds.
+  ///
+  /// Why not the 0b state form (not(exists d16Cell))? That form can
+  /// never hold post-fix: the fixes make the cell a designed TRANSIENT —
+  /// the reap / poison-clear promotion arms turn a marked+tried Queued
+  /// survivor into the cell, and the next sweep's settlement consumes it
+  /// — so state-unreachability is the wrong claim (review findings
+  /// RT-3/MCI-1/FC-3). The armed form is the wireable claim; the cell's
+  /// reachability (non-vacuity of this implication) is the
+  /// canReachD16Cell witness, kept wired.
+  val markedBrokenSettlementArmed = DRVS.forall(d => d16Cell(d) implies settlementEnabled(d))
 
   /// L3: every live build has a progress step armed (or is all-produced /
   /// has a terminal member that arms its failure path).
@@ -904,19 +969,22 @@ module closureEvidence {
     budget.poisons >= 0, budget.cancels >= 0
   }
 
-  /// The conjunction the wired exhaustive regime checks verify (Phase 0c):
-  /// allInvariants minus C3 (noWrongfulTerminalFailureSingleTenure). C3 is
-  /// excluded because the as-built consumption path genuinely violates it —
-  /// a walk verdict fixed at check time, while a wanted output was
-  /// genuinely missing, fail-fasts a co-build whose own wanted outputs are
-  /// all present by the time the verdict is delivered (the Phase 0c
-  /// finding, CONFIRMED by the C3 adjudication in its two-live-builds
-  /// form: the single-build resubmit variant of the original trace is
-  /// refuted by the cancel chain — see the invariant map's correction
-  /// record). Its falsification is pinned by the expect-violation check in
-  /// nix/quint.nix (two-build probe scope) until the Phase-1 disposition;
-  /// putting it here would make every two-build regime check permanently
-  /// red for a known, recorded reason.
+  /// The conjunction the exhaustive regime targets verify. HISTORY: at
+  /// Phase 0c this was allInvariants minus C3
+  /// (noWrongfulTerminalFailureSingleTenure) — the as-built consumption
+  /// path genuinely violated C3 (a stale walk verdict fail-fasting a
+  /// build whose wanted outputs are present), so the conjunction had to
+  /// exclude it to be a usable HOLD target while the defect was open.
+  /// **As of Phase 1 (Wave 4) the exclusion is closed**: the settlement
+  /// re-probe (probeSettleTried / the consumeWalk Broken-arm settlement /
+  /// the reap-survivor settlement, mirroring the Wave-1 production fix at
+  /// the same three sites) removes the wrongful fail-fast class, C3 holds
+  /// as-built, and this conjunction is again the FULL invariant set —
+  /// identical to allInvariants (C3 and the L2 armed form included). The
+  /// name is kept because the 0c/0d/Phase-1 records and the manual-target
+  /// commands in nix/quint.nix reference it; the C3 falsifiability record
+  /// is preserved by the closure-c3-no-reprobe calibration pin (pre-fix
+  /// actions, expect-violation).
   val asBuiltHoldInvariants = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -933,9 +1001,10 @@ module closureEvidence {
     pruneNotMorePermissiveThanClassification,
     dispatchImpliesProbedThisPass, staleProducedNeverUnlocksDependents,
     demandSetSurvivesPrune, wrongfulFailFastBoundedPerArming,
-    noWrongfulFromSourceDemotion,
+    noWrongfulFromSourceDemotion, noWrongfulTerminalFailureSingleTenure,
     noBuildWhenWantedPresent, terminalBuildStopsPinning,
     substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
+    markedBrokenSettlementArmed,
     boundsOK
   }
 
@@ -988,9 +1057,19 @@ module closureEvidence {
   }
 
   /// The default safety conjunction (everything except the
-  /// pre-registered expected-fail probes A17/A18/B2-strong/C1-strict/L2).
-  /// Phase 0c selects per-regime lists from the individual names; this
-  /// conjunction is the base-regime check's invariant.
+  /// pre-registered expected-fail probes that remain expected-fail —
+  /// A17/A18/B2-strong/C1-strict). Phase 0c selects per-regime lists from
+  /// the individual names; this conjunction is the base-regime check's
+  /// invariant.
+  ///
+  /// Phase-1 (Wave 4) membership flip: L2 (markedBrokenSettlementArmed,
+  /// restated in the armed/settlement form) joined when the settlement
+  /// was encoded — pre-fix it was the expected-fail D16 probe. C3 was
+  /// already a member (its violation was the documented as-built defect
+  /// that kept asBuiltHoldInvariants separate); with the settlement
+  /// encoded it holds. The flip's pre-fix falsifiability is preserved by
+  /// the closure-c3-no-reprobe expect-violation calibration pin so the
+  /// falsification direction stays permanently checkable.
   val allInvariants = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
     holeSoundness, holeCompleteness, healSoundness, pgMonotoneUpsert,
@@ -1010,6 +1089,7 @@ module closureEvidence {
     noWrongfulFromSourceDemotion, noWrongfulTerminalFailureSingleTenure,
     noBuildWhenWantedPresent, terminalBuildStopsPinning,
     substitutingAlwaysArmed, liveBuildTerminalOrProgressArmed,
+    markedBrokenSettlementArmed,
     boundsOK
   }
 
@@ -1040,8 +1120,24 @@ module closureEvidence {
   val canReachForgivenResidual = not(reach.walkOkWithForgiven)
   /// A stale-tenure intent applied after a newer tenure recovered.
   val canReachStaleIntentApply = not(reach.staleIntentApplied)
-  /// The D16 limbo cell is reachable (same predicate as L2).
-  val canReachD16Cell = markedBrokenSettlementArmed
+  /// The D16 limbo cell is reachable. Pre-fix (Phase 0c): never produced
+  /// within any hunted budget — the >=16-step assembly (deferred-probe
+  /// record). Post-fix (Phase 1): reachable at shallow depth via the
+  /// reap / poison-clear promotion transient — a marked+tried Queued
+  /// survivor whose last child is removed is promoted to Ready and IS
+  /// the cell until the next sweep's probeSettleTried consumes it. This
+  /// witness is the proof that probeSettleTried is live code and that
+  /// the L2 armed form's implication is exercised non-vacuously.
+  val canReachD16Cell = not(DRVS.exists(d => d16Cell(d)))
+  /// A second walk completion was consumed on the same node. This is the
+  /// WALK_CONSUME_CEIL headroom pin (review finding FC-5): the Phase-1
+  /// settlement spawns one verification walk per arming ON TOP of the
+  /// original walk, so a regime used for a post-fix holds verdict needs
+  /// a consumption ceiling of at least 2 — if a future edit drops a
+  /// ceiling back to 1, the settlement's completion becomes unreachable
+  /// (the holds checks go vacuous) and this witness catches it as a
+  /// wired-check failure.
+  val canReachVerificationWalkConsumed = not(reach.secondWalkConsumed)
   /// A wrongful-fail-fast trigger state is reachable.
   val canReachWrongfulFfTrigger = not(DRVS.exists(d => wrongfulFfTrigger(d)))
   /// A substitute_tried one-shot demotion was taken while upstream had
@@ -1628,8 +1724,9 @@ module closureEvidence {
 
   /// Terminal-build cleanup: reap exclusively-owned members, stamp holes
   /// on surviving parents that lost an un-produced child (H1), then run
-  /// the survivor verdicts (fail-fast a stranded marked survivor, promote
-  /// a vacuously-ready Queued one).
+  /// the survivor verdicts (Phase 1: the SETTLEMENT for marked-Broken
+  /// non-Queued survivors — verification-respawn or genuine fail-fast —
+  /// and the promotion arm for vacuously-ready Queued ones).
   action reapTerminalBuild(b: str): bool = all {
     leaderActive,
     blds.get(b).cleanup,
@@ -1649,23 +1746,51 @@ module closureEvidence {
       else r
     })
     val bm1 = blds.set(b, { ...blds.get(b), interest: Set(), cleanup: false })
-    // survivor verdicts on the post-removal state
+    // Survivor verdicts on the post-removal state (Phase 1 — mirrors
+    // production reevaluate_removal_survivors + settle_broken_marked_root,
+    // Wave-1 T-1.6): every marked-Broken survivor that is not in flight
+    // (Substituting/Open), not terminal and NOT Queued routes through the
+    // settlement. The MQueued exclusion is the same one the code carries:
+    // Queued survivors take the promotion arm below (and the next sweep's
+    // settlement-aware partition picks the promoted node up); without the
+    // exclusion the model would wrongfully fail-fast a Queued+tried
+    // survivor that the code promotes-and-completes (review finding
+    // MCI-2), and the dropped pre-fix `tried` requirement means untried
+    // survivors are settled here too instead of being skipped.
     val survivors = DRVS.filter(p => not(removalSet.contains(p)) and dmRemoved.get(p).mSt != MAbsent and
       removalSet.exists(c => memEdges.contains((p, c))))
-    val ffTargets = survivors.filter(p => and {
+    val settleTargets = survivors.filter(p => and {
       pMustSub(dmRemoved, memEdges1, p),
-      dmRemoved.get(p).tried,
       not(isTerminal(dmRemoved.get(p).mSt)),
       dmRemoved.get(p).mSt != MSubstituting, dmRemoved.get(p).mSt != MOpen,
+      dmRemoved.get(p).mSt != MQueued,
       pLiveInterest(bm1, BUILDS, p)
     })
+    // The settlement's two arms (settle_broken_marked_root): an UNTRIED
+    // survivor whose live effective wanted outputs are all obtainable
+    // re-spawns the verification walk (one-shot spent at the spawn); a
+    // tried survivor (one-shot already spent) or one with a confirmed-
+    // unobtainable output takes the genuine fail-fast.
+    val respawnTargets = settleTargets.filter(p => and {
+      not(dmRemoved.get(p).tried),
+      pAllWantedPresentOrUpstream(dmRemoved, bm1, BUILDS, store, p)
+    })
+    val ffTargets = settleTargets.exclude(respawnTargets)
     val afterFf = ffTargets.fold({ dm: dmRemoved, bm: bm1, wrongful: false, fired: false }, (st, p) => {
       val one = pFailFast(st.dm, st.bm, BUILDS, memEdges1, store, p)
       { dm: one.dm, bm: one.bm, wrongful: st.wrongful or one.wrongful, fired: st.fired or one.fired }
     })
     val dmFinal = DRVS.mapBy(d => {
       val r = afterFf.dm.get(d)
-      if (survivors.contains(d) and not(ffTargets.contains(d)) and r.mSt == MQueued and
+      if (respawnTargets.contains(d))
+        // verification-walk respawn: one-shot spent, fresh walk armed (the
+        // survivor was not Substituting, so any walk records it carries are
+        // stale never-Substituting leftovers — the fresh spawn replaces
+        // them, the mergeCommit pendingSub re-probe precedent)
+        { ...r, tried: true, mSt: MSubstituting, probed: true,
+          probedKind: if (pAllWantedPresent(afterFf.dm, afterFf.bm, BUILDS, store, d)) PKPresent else PKSubst,
+          walks: [{ forgivable: OUTIDXSET.exclude(pEffWanted(afterFf.dm, afterFf.bm, BUILDS, d)).exclude(r.nf), tenure: lead.gen, res: WPending }] }
+      else if (survivors.contains(d) and not(ffTargets.contains(d)) and r.mSt == MQueued and
           pKids(memEdges1, d).forall(c => afterFf.dm.get(c).mSt == MProduced))
         { ...r, mSt: MReady }
       else r
@@ -1788,15 +1913,24 @@ module closureEvidence {
   }
 
   /// Probe a Ready marked-Broken node whose walk already failed
-  /// (substitute_tried) and whose wanted set is not fully present: the
-  /// tried-arm fail-fast (no fresh confirmed-missing verdict required).
+  /// (substitute_tried) and that has a CONFIRMED-UNOBTAINABLE wanted
+  /// output (missing locally AND absent upstream): the tried-arm
+  /// fail-fast, now genuine.
+  ///
+  /// Phase-1 narrowing (the D16/C3 settlement): pre-fix this arm fired
+  /// on not(allWantedPresent(d)) — any locally-missing output, even one
+  /// the upstream still offered — which was the wrongful half of the
+  /// tried cell's routing; the obtainable cells (present, substitutable)
+  /// now route to probeSettleTried instead. The two guards partition the
+  /// tried cell via the shared settlement-arm defs (settlementEnabled),
+  /// so this narrowing and the L2 armed form cannot drift apart.
   action probeFailFastTried(d: str): bool = all {
     leaderActive,
     drvOf(d).mSt == MReady,
     liveInterest(d),
     mustSub(d),
     drvOf(d).tried,
-    not(allWantedPresent(d)),
+    failFastArmConfirmedMissing(d),
     intents.size() + 1 <= INTENT_CEIL,
     val ff = pFailFast(drv, blds, BUILDS, memEdges, store, d)
     all {
@@ -1813,6 +1947,40 @@ module closureEvidence {
       },
       reach' = { ...reach, failFast: true }
     }
+  }
+
+  /// Probe a Ready marked-Broken node whose walk already failed
+  /// (substitute_tried) and whose live effective wanted outputs are ALL
+  /// obtainable (present locally or available upstream): the Phase-1
+  /// settlement arm — the model mirror of the production dispatch-probe
+  /// partition's settlement cells (batch_probe_cached_ready, Wave 1
+  /// T-1.2; the spec rule is sched.evidence.settlement). Pre-fix this cell
+  /// either got NO action (all present — the D16 limbo: probeInline is
+  /// gated on not-tried, the fail-fast arm on not-all-present, and
+  /// admit_pull refuses must-substitute nodes) or the wrongful fail-fast
+  /// (substitutable: the un-narrowed tried arm). Post-fix it re-enters
+  /// the substitution walk — the closure-re-verifying "verification
+  /// walk": its ok completion routes through consumeWalk's ok arm
+  /// (complete-from-store), its genuine failure lands at the Broken arm
+  /// with the one-shot spent and fail-fasts there. The model's
+  /// single-step MReady -> MSubstituting respawn abstracts the code's
+  /// spawn (Ready -> Substituting is a valid production transition at
+  /// this call site — no revert needed, unlike the Broken-arm respawn).
+  action probeSettleTried(d: str): bool = all {
+    leaderActive,
+    drvOf(d).mSt == MReady,
+    liveInterest(d),
+    mustSub(d),
+    drvOf(d).tried,
+    settleArmAvailable(d),
+    drvOf(d).walks.length() < WALKS_PER_NODE,
+    drv' = drv.set(d, { ...drvOf(d),
+      mSt: MSubstituting, probed: true,
+      probedKind: if (allWantedPresent(d)) PKPresent else PKSubst,
+      walks: drvOf(d).walks.append({ forgivable: OUTIDXSET.exclude(effWanted(d)).exclude(drvOf(d).nf), tenure: lead.gen, res: WPending }) }),
+    viol' = { ...viol, dispatchNoInterest: viol.dispatchNoInterest or not(liveInterest(d)) },
+    store' = store, blds' = blds, memEdges' = memEdges, pgEdges' = pgEdges,
+    intents' = intents, lead' = lead, budget' = budget, reach' = reach
   }
 
   /// Probe an unmarked Ready node and get a confirmed-missing verdict:
@@ -1925,9 +2093,14 @@ module closureEvidence {
   /// re-reads the CURRENT evidence and wanted set: forgiven-now-wanted
   /// downgrade (re-spawn or revert, growing never-forgive), ok
   /// completion, Vouched lazy clear, Pending suppression, Broken
-  /// fail-fast. The verdict it routes on was fixed at check time
+  /// SETTLEMENT (Phase 1: re-probe, then verification-respawn or genuine
+  /// fail-fast). The verdict it routes on was fixed at check time
   /// (walkFinishes), so the routing can act on evidence that is stale by
-  /// exactly the walk's own duration — the as-built C3 mechanism.
+  /// exactly the walk's own duration — the C3 mechanism whose terminal
+  /// consequence the settlement re-probe now removes: a stale ok=false
+  /// verdict for a node whose live-wanted outputs are obtainable at
+  /// consumption time spends the one-shot and spawns the verification
+  /// walk instead of terminally failing the interested builds.
   action consumeWalk(d: str): bool = {
     nondet idx = Set(0, 1).oneOf()
     val w = pWalkAt(drvOf(d).walks, idx)
@@ -1937,6 +2110,8 @@ module closureEvidence {
     val forgivenNowWanted = res.forgiven.intersect(effWanted(d))
     val revertTo = pRevertTarget(drv, memEdges, d)
     val ev = evidence(d)
+    // FC-5 ceiling-headroom tracking: is this the node's 2nd+ consumption?
+    val secondConsume = drvOf(d).walkConsumed >= 1
     // downgrade ingredients
     val grownNf = baseRec.nf.union(forgivenNowWanted)
     val respawn = revertTo == MDepFailed or mustSub(d)
@@ -1947,7 +2122,8 @@ module closureEvidence {
       pgSt: if (baseRec.rowExists) MProduced else baseRec.pgSt, nf: OUTIDX.exclude(OUTIDX) })
     val cascade = pPromoteAndClear(dmProduced, memEdges, DRVS, Set(d))
     val okIntents = cascade.cleared.map(p => { op: IClearBoth(p), tenure: lead.gen })
-    // broken fail-fast ingredients
+    // broken-arm ingredients: the settlement re-probe (Phase 1) and the
+    // genuine fail-fast it narrows to
     val withTried = drv.set(d, { ...baseRec, tried: true, triedGenuine: res.genuine, mSt: MReady, nf: OUTIDX.exclude(OUTIDX) })
     val ff = pFailFast(withTried, blds, BUILDS, memEdges, store, d)
     all {
@@ -1975,6 +2151,7 @@ module closureEvidence {
         reach' = { ...reach,
           walkFailConsumed: true,
           downgradeRespawned: reach.downgradeRespawned or respawn,
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
           crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
       } else if (res.ok) all {
         // ok: complete the node, end the chain, cascade C2 clears + promotes
@@ -1995,6 +2172,7 @@ module closureEvidence {
         reach' = { ...reach,
           walkOkConsumed: true,
           walkOkWithForgiven: reach.walkOkWithForgiven or res.forgiven != Set(),
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
           crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
       } else if (ev == EvVouched) all {
         // failed walk on Vouched evidence: the C4 lazy clear (mark only), revert
@@ -2005,6 +2183,7 @@ module closureEvidence {
         blds' = blds,
         viol' = { ...viol, clearUnsound: viol.clearUnsound or not(vouchedNow(d)) },
         reach' = { ...reach, walkFailConsumed: true,
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
           crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
       } else if (ev == EvPending or not(drvOf(d).mTp)) all {
         // failed walk, Pending evidence (keep the mark) or unmarked node:
@@ -2016,9 +2195,37 @@ module closureEvidence {
         blds' = blds,
         viol' = viol,
         reach' = { ...reach, walkFailConsumed: true,
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
+          crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
+      } else if (not(drvOf(d).tried) and settleArmAvailable(d)) all {
+        // failed walk on a marked Broken node, verification one-shot
+        // unspent, every live-wanted output obtainable at consumption
+        // time: the Phase-1 SETTLEMENT re-probe (sched.evidence.
+        // settlement / Wave-1 T-1.4's settle_broken_marked_root). The
+        // verdict in hand was fixed at the walk's own check time and can
+        // be stale by the walk's full duration (the C3 defect class);
+        // instead of consuming it as a terminal verdict, spend the
+        // one-shot and re-spawn the closure-re-verifying walk. The
+        // model's single-step respawn (stay MSubstituting, fresh pending
+        // walk) abstracts the code's revert-for-respawn — production has
+        // no Substituting->Substituting edge, so it transitions to
+        // revert_target_for(..) first and then spawns (review findings
+        // CF-1/FC-1); the post-spawn state is the same either way.
+        drv' = drv.set(d, { ...baseRec,
+          tried: true, triedGenuine: res.genuine, mSt: MSubstituting,
+          probed: true, probedKind: if (allWantedPresent(d)) PKPresent else PKSubst,
+          walks: baseRec.walks.append({ forgivable: OUTIDXSET.exclude(effWanted(d)).exclude(baseRec.nf), tenure: lead.gen, res: WPending }) }),
+        intents' = intents,
+        blds' = blds,
+        viol' = viol,
+        reach' = { ...reach, walkFailConsumed: true,
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
           crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
       } else all {
-        // failed walk on a marked Broken node: fail-fast
+        // failed walk on a marked Broken node, the GENUINE fail-fast arm:
+        // the verification one-shot is already spent (this IS the
+        // verification walk's own failure), or some live-wanted output
+        // is confirmed unobtainable at consumption time.
         intents.size() + 1 <= INTENT_CEIL,
         drv' = ff.dm,
         blds' = ff.bm,
@@ -2027,6 +2234,7 @@ module closureEvidence {
           wrongfulTerminalFailure: viol.wrongfulTerminalFailure or ff.wrongful,
           ffBadEffect: viol.ffBadEffect or (ff.fired and (ff.dm.get(d).mTp or (baseRec.mCh and not(ff.dm.get(d).mCh)))) },
         reach' = { ...reach, walkFailConsumed: true, failFast: reach.failFast or ff.fired,
+          secondWalkConsumed: reach.secondWalkConsumed or secondConsume,
           crossTenureWalkConsumed: reach.crossTenureWalkConsumed or crossTenure }
       },
       store' = store, memEdges' = memEdges, pgEdges' = pgEdges, lead' = lead, budget' = budget
@@ -2368,6 +2576,7 @@ module closureEvidence {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       walkFinishes(d),
       consumeWalk(d),
@@ -2581,7 +2790,9 @@ module closureEvidenceBaseEx {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 2,
     INTENT_CEIL = 3,
     WALKS_PER_NODE = 1,
@@ -2605,7 +2816,9 @@ module closureEvidenceFaultPersistEx {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 2,
     INTENT_CEIL = 3,
     WALKS_PER_NODE = 1,
@@ -2629,7 +2842,9 @@ module closureEvidenceFailoverEx {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 2,
     INTENT_CEIL = 3,
     WALKS_PER_NODE = 1,
@@ -2641,10 +2856,13 @@ module closureEvidenceFailoverEx {
 /// which the cross-build evidence shapes exist (a wider-wanted co-build
 /// next to a narrow one, reap-survivor verdicts, the present-but-tried
 /// limbo cell). No faults. Used by expect-violation probes and the Phase
-/// 0c pre-registered-observation investigations, never by an exhaustive
-/// invariant check (the C3 single-tenure permissiveness claim is
-/// genuinely violated by the as-built fail-fast at this scope — see the
-/// invariant map's 0c stage record).
+/// 0c pre-registered-observation investigations. HISTORY: through Phase
+/// 0c-0d this scope was excluded from exhaustive invariant checks because
+/// the as-built fail-fast genuinely violated C3 here (the confirmed
+/// two-build wrongful-terminal-failure trace); as of Phase 1 (Wave 4) the
+/// settlement encoding closes that violation and the full conjunction is
+/// expected to HOLD at this scope — the pre-fix falsification is
+/// preserved by the closure-c3-no-reprobe calibration pin.
 module closureEvidenceDuo {
   import closureEvidence(
     DRVS = Set("d1", "d2"),
@@ -2660,7 +2878,9 @@ module closureEvidenceDuo {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 1,
     INTENT_CEIL = 3,
     WALKS_PER_NODE = 1,
@@ -2688,7 +2908,9 @@ module closureEvidenceStaleDuo {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 1,
     INTENT_CEIL = 5,
     WALKS_PER_NODE = 2,
@@ -2724,25 +2946,32 @@ module closureEvidenceFailoverDuo {
   ).*
 }
 
-/// C3 probe regime (post-0d triage): the two-build universe restricted
-/// to exactly the alphabet the CONFIRMED C3 trace needs — duplicate
-/// submissions, the client cancel + terminal-build reap, per-output
-/// store letters and the substitution walk — with the poison, attempt,
-/// fault and GC alphabets off and one extra intent slot so the
-/// fail-fast's mark-clear emission fits without a pgApply step. This is
-/// the scope the wired expect-violation check
-/// quint-closure-evidence-probe-wrongful-terminal-failure runs against:
-/// the faithful two-live-builds wrongful-terminal-failure trace (narrow
-/// build prunes+stamps and cache-hits; wide co-build demotes the
-/// stale-Produced root and spawns the wide walk; the walk genuinely
-/// fails on the wide-only output at check time; the co-build is
-/// cancelled, its child reaped, the root holed; the stale verdict
-/// fail-fasts the narrow build whose own wanted output is present) is
-/// reachable here in seven actions, where the full closureEvidenceDuo
-/// scope needs multi-hour TLC for the same violation (the post-0d
-/// triage budget record). Following the closureEvidenceAdversarialStoreEx
-/// precedent: a probe scope is sized so its violation sits inside a
-/// wired check's budget, never so small that the violation disappears.
+/// C3/settlement probe regime (post-0d triage; re-purposed by Phase 1):
+/// the two-build universe restricted to exactly the alphabet the
+/// confirmed C3 trace family needs — duplicate submissions, the client
+/// cancel + terminal-build reap, per-output store letters and the
+/// substitution walk — with the poison, attempt, fault and GC alphabets
+/// off and one extra intent slot so the fail-fast's mark-clear emission
+/// fits without a pgApply step.
+///
+/// Roles after the Phase-1 settlement encoding (Wave 4):
+///  - the constants the closure-c3-no-reprobe calibration override
+///    imports (the pre-fix actions falsify C3 here via the second C3
+///    family: the reap of a marked+tried Queued survivor whose outputs
+///    are obtainable — review finding MCI-2's seven-action trace);
+///  - the scope of the post-fix HOLDS checks for C3 + the L2 armed form
+///    (quint-closure-evidence-settlement-holds) — the same alphabet that
+///    produced the violation pre-fix is what makes the holds verdict
+///    non-vacuous post-fix;
+///  - the scope of the canReachD16Cell witness (the cell assembles here
+///    through the reap-promotion transient: merge wide / walk fails /
+///    consume reverts Queued+tried / ingest / prune-merge stamps / cancel
+///    / reap holes+promotes — the cell, settled by the next sweep) and of
+///    the canReachVerificationWalkConsumed ceiling-headroom witness;
+///  - the wired downgrade-respawn witness scope (unchanged from post-0d).
+/// Following the closureEvidenceAdversarialStoreEx precedent: a probe
+/// scope is sized so its violation sits inside a wired check's budget,
+/// never so small that the violation disappears.
 module closureEvidenceC3Duo {
   import closureEvidence(
     DRVS = Set("d1", "d2"),
@@ -2758,7 +2987,10 @@ module closureEvidenceC3Duo {
     PURGE_BUDGET = 0,
     POISON_BUDGET = 0,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 1,
+    // Phase 1 (FC-5): 2 = original walk + the settlement's verification walk
+    // (the C3 trace consumes one stale verdict, the settlement re-spawn's
+    // completion is the second); canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 2,
     ATTEMPT_CYCLE_CEIL = 0,
     INTENT_CEIL = 4,
     WALKS_PER_NODE = 1,
@@ -2789,7 +3021,9 @@ module closureEvidenceAdversarialStoreEx {
     PURGE_BUDGET = 1,
     POISON_BUDGET = 1,
     CANCEL_BUDGET = 1,
-    WALK_CONSUME_CEIL = 2,
+    // Phase 1 (FC-5): admits original walk + the settlement's verification
+    // walk + one downgrade re-spawn; canReachVerificationWalkConsumed pins it.
+    WALK_CONSUME_CEIL = 3,
     ATTEMPT_CYCLE_CEIL = 2,
     INTENT_CEIL = 3,
     WALKS_PER_NODE = 1,

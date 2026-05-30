@@ -491,6 +491,97 @@ let
         fi
       '';
 
+  # Bounded-simulation HOLDS check: the dual of mkQuintSimWitnessCheck.
+  # `quint run` over maxSamples random traces must find NO violation of
+  # the named invariants. This is bounded evidence, not proof — where an
+  # exhaustive TLC conjunction exists (wired or manual target) it remains
+  # the proof obligation; this constructor's role is the GHA-wired
+  # deliverable for FIXED properties whose exhaustive conjunctions exceed
+  # every gate-compatible TLC budget (the closure-evidence Phase-1 flips:
+  # owner decision 4's A17/L2 wiring).
+  #
+  # Vacuity discipline: a holds check proves nothing if the model can no
+  # longer reach the states the property constrains. Every check built
+  # from this constructor MUST name its paired expect-violation
+  # calibration pin in its comment — the pin re-introduces the pre-fix
+  # behavior and must keep falsifying the same property, which is the
+  # machine-checked evidence that the property is still about something
+  # reachable. A holds check without a falsifying pair is not wired here.
+  #
+  # Multiple invariants are conjoined with "and" into one expression
+  # (`quint run --invariant` accepts an expression; the comma form is
+  # verify-only). A violation therefore does not name the failing
+  # conjunct — re-run per-invariant to identify it, same as TLC's q_inv.
+  mkQuintSimHoldsCheck =
+    {
+      name,
+      spec,
+      main ? spec,
+      # The invariant `val` names expected to HOLD.
+      invariants,
+      # Per-run sample / step bounds. Sizing: large enough that the paired
+      # pin's violation class would be re-found if it re-opened (use the
+      # pin's own measured budget as the floor); the introducing commit
+      # records the measurement.
+      maxSamples ? 2000000,
+      maxSteps ? 15,
+      # Same semantics as mkQuintCheck's extraSpecs / step.
+      extraSpecs ? [ ],
+      step ? null,
+    }:
+    pkgs.runCommand "quint-${name}"
+      {
+        nativeBuildInputs = [ pkgs.quint ];
+        # Same fileset narrowing as mkQuintCheck.
+        src = lib.fileset.toSource {
+          root = modelsDir;
+          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
+        };
+        env = {
+          MODEL = spec;
+          MAIN = main;
+          INVARIANTS = lib.concatStringsSep " and " invariants;
+        };
+      }
+      ''
+        set -euo pipefail
+        cd "$TMPDIR"
+
+        # A violation exits nonzero; capture the status so the verdict
+        # grep below (not the exit code) decides the outcome.
+        status=0
+        quint run \
+          --backend=rust \
+          --main=${main} \
+          ${lib.optionalString (step != null) "--step=${step}"} \
+          --invariant='${lib.concatStringsSep " and " invariants}' \
+          --max-samples=${toString maxSamples} \
+          --max-steps=${toString maxSteps} \
+          "$src/${spec}.qnt" 2>&1 | tee $out || status=$?
+
+        if grep -qF '[violation] Found an issue' $out; then
+          echo "" >&2
+          echo "${name}: a violation of (${lib.concatStringsSep " and " invariants}) was found in ${main}." >&2
+          echo "A Phase-1 fixed property regressed (or its model encoding drifted): capture the trace above" >&2
+          echo "and triage against the paired calibration pin before touching this check." >&2
+          exit 1
+        fi
+
+        # "Holds" requires the simulator's own verdict, not just exit 0:
+        # a crash that never ran any trace must not read as bounded
+        # evidence.
+        if [ "$status" -ne 0 ]; then
+          echo "" >&2
+          echo "${name}: quint run failed (status $status) without reporting a violation — tool error." >&2
+          exit 1
+        fi
+        if ! grep -qF '[ok] No violation found' $out; then
+          echo "" >&2
+          echo "${name}: quint run exited 0 but reported no verdict (tool error?)." >&2
+          exit 1
+        fi
+      '';
+
   # Deterministic named-run replay: `quint test` over a regime module's
   # `run` definitions. The runs are the model's executable scenario pins
   # (the documented-divergence reproducers and the happy-path narratives);
@@ -549,6 +640,7 @@ in
     mkQuintCheck
     mkQuintWitnessCheck
     mkQuintSimWitnessCheck
+    mkQuintSimHoldsCheck
     mkQuintRunCheck
     ;
 
@@ -3512,14 +3604,14 @@ in
     #   quint verify --backend=tlc --main=closureEvidenceBaseEx \
     #     --invariant=asBuiltHoldInvariants docs/spec/models/closureEvidence.qnt
     #
-    # (asBuiltHoldInvariants = allInvariants minus C3 — the Phase 0c
-    # finding pinned by the probe-wrongful-terminal-failure check below.
-    # Since the C3-adjudication model corrections, C3 itself HOLDS at the
-    # single-build BaseEx scope — the violation needs two live builds —
-    # so the exclusion there is cross-scope consistency of the
-    # conjunction, not a BaseEx-level necessity; the two-build scopes are
-    # where it is load-bearing.) The run records, the per-property
-    # verdicts and the held-back design-scale regimes are in
+    # (asBuiltHoldInvariants: through Phase 0c-0d this was allInvariants
+    # minus C3 — the open as-built finding; as of Phase 1 / Wave 4 the
+    # settlement encoding closes C3 and the conjunction is the FULL
+    # invariant set, identical to allInvariants with the L2 armed form
+    # included. The historical name is kept because every recorded
+    # measurement and manual-target command references it.) The run
+    # records, the per-property verdicts and the held-back design-scale
+    # regimes are in
     # docs/spec/models/closure-evidence-invariant-map.md; the witness and
     # probe checks below keep every constrained scenario reachable in CI
     # in the meantime.
@@ -3560,19 +3652,24 @@ in
     # recovery-clear, stale-intent-apply) keep those regimes'
     # reachability pinned in the meantime.
 
-    # ---- Closure-evidence expected-fail probes -----------------------
+    # ---- Closure-evidence probes: expected-fail + Phase-1 holds -------
     # The design's pre-registered expected falsifications (§3 / the §8 0c
-    # gate) plus the Phase 0c C3 finding. Each wired entry is an
-    # expect-violation check: it PASSES only while the checker still
-    # produces the counterexample, which is the machine-checked record
-    # of the as-built behavior the campaign documents (the §9.1 fencing
-    # evidence, the GC-after-vouch bound, the stale-evidence fail-fast).
-    # The probes that could not be produced within a wired check's
-    # budget (A17, L2/D16, C1-strict) are recorded inline below and in
-    # the invariant map rather than wired red. None of these predicates
-    # appear in the asBuiltHoldInvariants conjunction. Deliberately no
-    # tracey markers (these are as-built-behavior records, not
-    # verification of the spec rules).
+    # gate), the Phase 0c C3 finding, and — Phase 1 — the HOLDS checks
+    # that replace the probes whose defects were fixed. An expect-
+    # violation entry PASSES only while the checker still produces the
+    # counterexample (the machine-checked record of as-built behavior); a
+    # holds entry PASSES only while the checker finds none (bounded
+    # evidence the fix stays in). Every Phase-1 holds check names its
+    # paired expect-violation calibration pin — the falsifiability
+    # record that keeps it from going green by vacuity/drift.
+    # Probes that could not be produced within a wired check's budget
+    # (C1-strict) are recorded inline below and in the invariant map
+    # rather than wired red. The remaining expected-fail predicates
+    # (B2-strong, C1-strict) are not in the asBuiltHoldInvariants
+    # conjunction. No tracey markers on expect-violation entries
+    # (as-built-behavior records, not verification); the Phase-1 holds
+    # checks DO carry markers — they are the model-level verification of
+    # the fixed rules.
 
     # A18: only the current tenure's evidence intents reach PG — FAILS
     # as-built (no SQL fence on evidence writes; entry-time gates only).
@@ -3606,47 +3703,30 @@ in
       maxSamples = 500000;
     };
 
-    # C3: with no failover, no store GC and no upstream withdrawal, no
-    # build is wrongfully terminally failed — FAILS as-built (the Phase
-    # 0c finding, CONFIRMED by the C3 adjudication in its two-live-builds
-    # form): a narrow build's pruned merge stamps the root and cache-hits
-    # it; a wide co-build's duplicate submission demotes the
-    # stale-Produced root and spawns the wide walk; that walk genuinely
-    # fails on the wide-only output at check time; the co-build is
-    # cancelled, its child reaped and the root holed; the stale verdict's
-    # delivery then fail-fasts the narrow build although every output IT
-    # wants is present. Pinned here as an expect-violation check until
-    # the Phase-1 disposition (fix or accepted-with-rationale); the
-    # asBuiltHoldInvariants conjunction (the manual exhaustive targets'
-    # invariant) excludes C3 for exactly this reason.
+    # C3 (no wrongful terminal failure in the single-tenure envelope):
+    # FLIPPED in Phase 1 (Wave 4). Through Phase 0c-0d this was an
+    # expect-violation probe (quint-closure-evidence-probe-wrongful-
+    # terminal-failure at closureEvidenceDuo): the as-built consumption
+    # path fail-fasted a build whose wanted outputs were present by the
+    # time a stale walk verdict was delivered. The Wave-1 production fix
+    # (the settlement re-probe at the three fail-fast decision points)
+    # and its Wave-4 model encoding (probeSettleTried, the consumeWalk
+    # Broken-arm settlement, the reap-survivor settlement) close that
+    # class: C3 now HOLDS and is back in the asBuiltHoldInvariants /
+    # allInvariants conjunctions.
     #
-    # Scope and backend re-point (post-0d triage): the original wiring ran
-    # this probe at closureEvidenceBaseEx under TLC, where the violation
-    # rested on the REFUTED single-build trace (mailbox-reordering
-    # staleness + a resubmit cache-hitting a node the cancel chain would
-    # have cancelled). After the C3-adjudication model corrections that
-    # trace is gone — C3 HOLDS at BaseEx — and the faithful violation
-    # needs two live builds. At the two-build scopes the violation's BFS
-    # level is past a gate-compatible TLC budget (the post-0d triage
-    # budget record), so the wired pin uses the rust-simulator
-    # expect-violation constructor at closureEvidenceDuo, where the
-    # confirmed trace's many interleavings give a seconds-class hit
-    # (the per-trace hit rate and the maxSamples sizing are in the
-    # introducing commit's message). The TLC counterpart of this pin is
-    # the documented manual target at the dedicated
-    # closureEvidenceC3Duo probe scope:
+    # The falsifiability direction is preserved by the calibration pin
+    # quint-closure-calib-c3-no-reprobe below (pre-fix actions,
+    # expect-violation — the closure-evidence section's flip convention:
+    # a fixed defect's violation must stay permanently producible against
+    # the pre-fix model, or the holds checks could go green by drift).
+    # The post-fix HOLDS direction is wired by
+    # quint-closure-evidence-settlement-holds. The TLC manual target for
+    # the exhaustive post-fix verdict:
     #
     #   quint verify --backend=tlc --main=closureEvidenceC3Duo \
-    #     --invariant=noWrongfulTerminalFailureSingleTenure \
+    #     --invariant=asBuiltHoldInvariants \
     #     docs/spec/models/closureEvidence.qnt
-    quint-closure-evidence-probe-wrongful-terminal-failure = mkQuintSimWitnessCheck {
-      name = "closure-evidence-probe-wrongful-terminal-failure";
-      spec = "closureEvidence";
-      main = "closureEvidenceDuo";
-      witness = "noWrongfulTerminalFailureSingleTenure";
-      maxSamples = 5000000;
-      maxSteps = 14;
-    };
 
     # A17 (a clear/heal intent created under tenure g never erases a bit
     # a newer tenure stamped — the dangerous direction of the unfenced
@@ -3690,17 +3770,49 @@ in
     # in the invariant map's Phase 0c stage record; the per-arming bound
     # C1 stays in the asBuiltHoldInvariants conjunction.
 
-    # L2 / D16 (the present-but-tried limbo cell, the §9.2 settlement
-    # deliverable) is NOT wired yet: the cell needs the mark, the hole,
-    # substitute_tried and full presence to assemble on one node without
-    # any of the in-between steps settling it — ≥16 steps at duo scope —
-    # and neither the bounded simulation (200 000 × 45-step traces) nor
-    # the BFS hunts reached it within a wired check's budget in Phase
-    # 0c. The hand-derived reachability path, the hunt record and the
-    # deferred-probe plan are in the invariant map; closureEvidenceDuo
-    # remains the documented probe scope. sched.evidence.settlement
-    # stays intentionally uncovered either way until the §9.2 owner
-    # decision.
+    # L2 / D16 (the present-but-tried limbo cell): WIRED in Phase 1
+    # (Wave 4), in the ARMED/settlement form. The 0b state form ("no
+    # reachable D16 cell") could never be wired: pre-fix the cell sat
+    # >=16 steps deep (no checker reached it — the 0c deferred-probe
+    # record), and post-fix it can never HOLD because the fixes make the
+    # cell a designed transient (reap/poison-clear promotion -> next-
+    # sweep settlement). The armed restatement
+    # (markedBrokenSettlementArmed: every reachable cell is covered by a
+    # settling action's guard) is what the production fix actually
+    # guarantees, holds post-fix, and is wired through the
+    # settlement-holds check below together with C3. The cell's
+    # REACHABILITY — which the state form was really about — is the
+    # quint-closure-evidence-witness-d16-cell entry in the witness
+    # section: post-fix the promotion transient assembles the cell at
+    # shallow depth, so the witness that was undeliverable for two
+    # phases is now a routine wired check. sched.evidence.settlement is
+    # covered (Wave 1: production impl/tests; this check: the model
+    # verification).
+
+    # C3 + L2-armed HOLDS (decision 4 / Phase-1 flip): the settlement
+    # fix's model-level verification. Bounded-simulation evidence at the
+    # closureEvidenceDuo scope — the same scope and sample budget whose
+    # pre-fix model produced the C3 violation reliably (the retired
+    # expect-violation probe), so "no violation in 5M samples" is a
+    # meaningful holds verdict, not vacuity. Paired falsifiability pin:
+    # quint-closure-calib-c3-no-reprobe (pre-fix actions at the same
+    # constants MUST keep falsifying C3). The exhaustive TLC counterpart
+    # is the closureEvidenceC3Duo / closureEvidenceDuo manual target
+    # (asBuiltHoldInvariants) — measured unconverged at the Phase-1
+    # 30-minute budget; figures in the invariant map's Wave-4 record.
+    # r[verify sched.evidence.settlement]
+    # r[verify sched.merge.substitute-topdown+12]
+    quint-closure-evidence-settlement-holds = mkQuintSimHoldsCheck {
+      name = "closure-evidence-settlement-holds";
+      spec = "closureEvidence";
+      main = "closureEvidenceDuo";
+      invariants = [
+        "noWrongfulTerminalFailureSingleTenure"
+        "markedBrokenSettlementArmed"
+      ];
+      maxSamples = 5000000;
+      maxSteps = 14;
+    };
 
     # ---- Closure-evidence non-vacuity witnesses ----------------------
     # Each check passes only when the checker violates its canReach*
@@ -3816,6 +3928,42 @@ in
       maxSamples = 5000000;
       maxSteps = 8;
     };
+    # The D16 limbo cell (marked + Broken + tried + Ready + live interest
+    # + all wanted outputs present + no walk) is reachable — the
+    # non-vacuity proof for the L2 armed form and for probeSettleTried
+    # (Phase 1). Pre-fix this was the deferred L2 probe (the >=16-step
+    # assembly no checker reached in 0c/0d budgets); post-fix the
+    # reap/poison-clear promotion transient assembles the cell at shallow
+    # depth: a marked+tried Queued survivor whose last child is removed
+    # is promoted to Ready and IS the cell until the next sweep's
+    # settlement consumes it. If this witness stops being violated, the
+    # settlement-holds check above has gone vacuous (the cell it
+    # constrains is no longer reachable) — investigate the promotion
+    # arms, never just delete the witness. Sample sizing: see the
+    # introducing commit.
+    quint-closure-evidence-witness-d16-cell = mkQuintSimWitnessCheck {
+      name = "closure-evidence-witness-d16-cell";
+      spec = "closureEvidence";
+      main = "closureEvidenceC3Duo";
+      witness = "canReachD16Cell";
+      maxSamples = 5000000;
+      maxSteps = 14;
+    };
+    # A second walk completion is consumed on the same node — the
+    # WALK_CONSUME_CEIL headroom pin (Phase 1, review finding FC-5). The
+    # settlement spawns a verification walk ON TOP of the original walk's
+    # consumption, so every holds-verdict regime needs a consumption
+    # ceiling of at least 2; if a future state-space reduction drops a
+    # ceiling back to 1, the settlement can spawn but never complete, the
+    # holds checks go vacuous, and THIS check goes red.
+    quint-closure-evidence-witness-verification-walk = mkQuintSimWitnessCheck {
+      name = "closure-evidence-witness-verification-walk";
+      spec = "closureEvidence";
+      main = "closureEvidenceC3Duo";
+      witness = "canReachVerificationWalkConsumed";
+      maxSamples = 2000000;
+      maxSteps = 14;
+    };
     # The terminal-build reap stamps a closure hole on a surviving
     # shared parent (H1) — needs the second build, hence duo scope.
     quint-closure-evidence-witness-hole-reap = mkQuintWitnessCheck {
@@ -3877,17 +4025,22 @@ in
     };
 
     # ---- Closure-evidence Stage-C calibration witnesses ----------------
-    # Phase 0d family-representative calibration overrides
+    # Phase 0d family-representative calibration overrides plus the
+    # Phase-1 regression pins
     # (docs/spec/models/calibration/closure-*.qnt; verdict table and the
     # full per-family record in closure-evidence-invariant-map.md, Phase
-    # 0d stage record). Each check instantiates the closure-evidence
-    # model at the named override module's constants, swaps ONE action
-    # for its PRE-FIX behavior (the override's `calibStep`) and passes
-    # only while the checker still falsifies the property the historical
-    # fix protects — the machine-checked record that the model's
-    # invariant set re-finds that bug class. The remaining override
-    # modules under docs/spec/models/calibration/ are evidence modules
-    # (not wired), re-runnable with the command in each file's header.
+    # 0d / Phase-1 Wave-4 stage records). Each check instantiates the
+    # closure-evidence model at the named override module's constants,
+    # swaps the named action(s) for their PRE-FIX behavior (the
+    # override's `calibStep`) and passes only while the checker still
+    # falsifies the property the fix protects — the machine-checked
+    # record that the model's invariant set re-finds that bug class. The
+    # 0d overrides freeze one historical-fix guard each; the Phase-1
+    # pins (closure-c3-no-reprobe) freeze the Phase-1 fixes' pre-fix
+    # behavior and are the falsifiability halves of the Phase-1 holds
+    # checks above. The remaining override modules
+    # under docs/spec/models/calibration/ are evidence modules (not
+    # wired), re-runnable with the command in each file's header.
     # No tracey markers on calibration checks (house convention).
 
     # F1 soundness (CE-2, 29f0a8afa): no stale-Produced verify — a
@@ -3960,6 +4113,30 @@ in
       extraSpecs = [ "closureEvidence" ];
       step = "calibStep";
       witness = "holeCompleteness";
+    };
+
+    # C3/D16 settlement regression pin (Phase 1, Wave 4): the pre-fix
+    # consumeWalk / reapTerminalBuild / probe-partition trio (no
+    # settlement re-probe, no MQueued reap exclusion, un-narrowed tried
+    # fail-fast) must keep falsifying C3
+    # (noWrongfulTerminalFailureSingleTenure) — the wrongful-terminal-
+    # failure class the Wave-1 production fix and the Wave-4 model
+    # encoding removed. If this pin ever stops falsifying, the model has
+    # drifted away from the defect class it documents and the
+    # settlement-holds check above is no longer evidence of anything.
+    # Rust-simulator backend at the Duo constants (the scope where the
+    # retired expect-violation probe measured its hit rate); sample
+    # sizing and the falsification trace family: the introducing commit
+    # and the invariant map's Wave-4 stage record.
+    quint-closure-calib-c3-no-reprobe = mkQuintSimWitnessCheck {
+      name = "closure-calib-c3-no-reprobe";
+      spec = "calibration/closure-c3-no-reprobe";
+      main = "closureCalibC3NoReprobe";
+      extraSpecs = [ "closureEvidence" ];
+      step = "calibStep";
+      witness = "noWrongfulTerminalFailureSingleTenure";
+      maxSamples = 5000000;
+      maxSteps = 14;
     };
   };
 }

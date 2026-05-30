@@ -89,6 +89,7 @@ module closureCalibF2SeedOnlyWalk {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       calibWalkFinishesSeedOnly(d),
       consumeWalk(d),

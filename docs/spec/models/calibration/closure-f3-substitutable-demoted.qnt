@@ -88,6 +88,7 @@ module closureCalibF3SubstitutableDemoted {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       calibProbeMissingAnyAbsent(d),
       walkFinishes(d),
       consumeWalk(d),

@@ -95,6 +95,7 @@ module closureCalibF8DispatchNoEvidence {
       probeWalk(d),
       probeFailFastMissing(d),
       probeFailFastTried(d),
+      probeSettleTried(d),
       probeMissingUnmarked(d),
       walkFinishes(d),
       consumeWalk(d),
