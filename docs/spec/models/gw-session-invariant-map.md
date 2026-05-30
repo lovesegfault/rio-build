@@ -12,13 +12,18 @@ the one proven on rio-lease, the log subsystem, retry, the controller, and
 the executor session campaigns; the executable counterpart of this map is
 the Stage-B model `gwConnLifecycle.qnt` (one module carrying the russh
 transport-environment variables of design §2b inline, plus seven regime
-instantiation modules and a fallback measurement module).
+instantiation modules, a fallback measurement module, and the eight
+Stage-C per-family restricted-alphabet modules the wired exhaustive
+checks run on).
 
 **Status: Stage A (spec audit) complete; Stage B (model + measurement
 milestone) complete — all 34 properties encoded, witnesses and
 pre-registered falsification probes confirmed reachable/falsifying, the
 B-measure recorded below with the regime-split recommendation; Stage C
-(CI wiring + calibration) pending.**
+check-set selection + CI wiring + witnesses/probes + the §4 model-first
+evidence complete (this change set — 31 permanent `nix/quint.nix` checks,
+verdicts in the Stage-C record below); Stage-C calibration (override
+modules, both directions for GW-2/GW-13/GW-18) pending.**
 
 Stage A added three new rules (`gw.conn.force-close`,
 `gw.conn.send-deadline`, `gw.conn.accept-resilience`), amended and bumped
@@ -39,16 +44,19 @@ already present — no amendment needed there.
 | SIGKILL is **outside** the verified envelope | Deployment-checklist territory (terminationGracePeriodSeconds ≥ drain budget; scheduler/store backstops); not a modeled action. |
 | Exit-path STDERR writes (idle-timeout notice, version-too-old) stay **unfixed** | Below the model's abstraction; no spec rule was added that the code would violate. |
 
-## Property ↔ rule map (Stage B: encoded; Stage C wires the checks)
+## Property ↔ rule map (Stage B: encoded; Stage C: checks wired)
 
 Verdict legend: **COVERS** — the rule's normative sentence states the
 invariant (or its load-bearing piece). **PARTIAL** — a piece is stated; the
 missing piece is named. **GAP** — closed by a new `#r()` rule.
 **CONTRADICTION** — code does not do what the rule says; recorded below,
-never silently modeled around. Stage B status for every row below:
-**encoded — Stage C pending** (the model predicate exists in
-`gwConnLifecycle.qnt` and holds in the regimes named; the CI wiring, named
-runs and calibration verdicts land in Stage C).
+never silently modeled around. Stage-C status for every row below:
+**encoded — holds (Stage-C check set)** — the predicate is asserted (as part
+of `allInvariants`) by every wired per-family exhaustive check and holds in
+all of them; which family check carries each property's *content* (and which
+full-regime interleavings are therefore not exhaustively explored) is the
+Stage-C record's coverage table below. Calibration verdicts land with the
+override modules (next change set).
 
 Model predicate names are the lowercased property ids (e.g.
 `s1ConnPermitConservation`, `l1ConnReclaimArmed`); all 34 are conjoined as
@@ -59,50 +67,50 @@ the property's content is actually exercised (it is asserted everywhere).
 
 | # | Property | Rule(s) | Regime(s) | Witness / named run | Verdict |
 |---|---|---|---|---|---|
-| S1 | ConnPermitConservation | `gw.conn.cap`, `gw.conn.real-connection-marker` | all; over-cap clause exercised in cap | `canReachOverCapAuthTorn` (cap regime) | encoded — Stage C pending |
-| S2 | SessionPermitConservation | `gw.conn.session-cap+2` | all | `canReachSessionCapExecRejected` | encoded — Stage C pending |
-| S3 | GaugeAccuracy | `gw.conn.real-connection-marker`, `gw.conn.session-cap+2` | all | `canReachServerSideEndingReleasesEarly` | encoded — Stage C pending |
-| S4 | PerConnLiveCount | `gw.conn.exit-status+3` (grace/live-count pairing) | all; panic term exercised in fault-degraded | `canReachMuxTouchZeroThenExec` | encoded — Stage C pending |
-| S5 | NoSessionOutlivesConnection | `gw.conn.cancel-on-disconnect+3`, `gw.conn.lifecycle` | all | `canReachVanishReclaimedDesigned` (teardown cascade) | encoded — Stage C pending |
-| S6 | SingleExecPerChannel | `gw.conn.exec-request`, `gw.conn.per-channel-state` | all | `canReachMuxTouchZeroThenExec` (re-exec on a fresh channel) | encoded — Stage C pending |
-| S7 | ChannelAccounting | `gw.conn.channel-limit+4`, `gw.conn.per-channel-state` | all; bound exercised in fault-transport | `canReachBurstHitsBound`, `canReachForgedCloseIgnored` | encoded — Stage C pending |
-| S8 | RejectReleasesCapacity | `gw.conn.exec-request` | content falsifiable only in fault-degraded (panic splitter) | panic-letter run (Stage C) | encoded — Stage C pending |
-| S9 | SingleRelease | `gw.conn.session-cap+2`, `gw.conn.cap` | all | shares S2/S3 witnesses | encoded — Stage C pending |
-| S10 | CancelOnSessionEnd | `gw.conn.cancel-on-disconnect+3` | all; carve-out exercised in fault-degraded | `canReachDrainExpiryCancel`, `canReachVanishReclaimedDesigned` | encoded — Stage C pending |
-| S11 | ForceCloseArmedSticky | `gw.conn.force-close` | all (latches); fetch_min arithmetic stays with the unit tests | `canReachStallArmsForceClose` | encoded — Stage C pending |
-| S12 | DecideImpliesArmed | `gw.conn.force-close` | all | `canReachGraceFiresOnIdleConn` | encoded — Stage C pending |
-| S13 | WindowPacedEgress | `gw.conn.session-cap+2` (window-pacing clause) | all; contended in fault-transport | `canReachStallArmsForceClose` | encoded — Stage C pending |
-| S14 | RusshResidueBounded | `gw.conn.channel-limit+4`, `gw.conn.channel-types` | fault-transport | `canReachOverBoundOpenTerminates` | encoded — Stage C pending |
-| S15 | ReleaseBeforeCloseOut | `gw.conn.send-deadline`, `gw.conn.exit-status+3` | all | `canReachServerSideEndingReleasesEarly` | encoded — Stage C pending |
-| S16 | TrackedBuildPolicy | `gw.conn.cancel-on-disconnect+3` (tracking-policy clause) | fault-upstream | `canReachNonWireRemovesTracked`; strict probe `s16StrictTerminalOnly` | encoded — Stage C pending |
-| S17 | DrainStageOrder | `gw.drain.three-stage`, `gw.conn.session-drain` | fault-drain | `canReachDrainExpiryCancel` | encoded — Stage C pending |
-| S18 | ListenerSurvivesAcceptErrors | `gw.conn.accept-resilience` | fault-upstream (EMFILE letter) | latch-only (no dedicated reach flag; the letter is a no-op by construction) | encoded — Stage C pending |
-| S19 | CloseOutOrder | `gw.conn.exit-status+3` | all | `canReachCloseOutCompletesInOrder` | encoded — Stage C pending |
-| S20 | GraceArmedExactlyWhenEmpty | `gw.conn.exit-status+3` (grace clause) | all | `canReachGraceFiresOnIdleConn`, `canReachExecWithinGraceSurvives` | encoded — Stage C pending |
+| S1 | ConnPermitConservation | `gw.conn.cap`, `gw.conn.real-connection-marker` | all; over-cap clause exercised in cap | `canReachOverCapAuthTorn` (cap regime) | encoded — holds (Stage-C check set) |
+| S2 | SessionPermitConservation | `gw.conn.session-cap+2` | all | `canReachSessionCapExecRejected` | encoded — holds (Stage-C check set) |
+| S3 | GaugeAccuracy | `gw.conn.real-connection-marker`, `gw.conn.session-cap+2` | all | `canReachServerSideEndingReleasesEarly` | encoded — holds (Stage-C check set) |
+| S4 | PerConnLiveCount | `gw.conn.exit-status+3` (grace/live-count pairing) | all; panic term exercised in fault-degraded | `canReachMuxTouchZeroThenExec` | encoded — holds (Stage-C check set) |
+| S5 | NoSessionOutlivesConnection | `gw.conn.cancel-on-disconnect+3`, `gw.conn.lifecycle` | all | `canReachVanishReclaimedDesigned` (teardown cascade) | encoded — holds (Stage-C check set) |
+| S6 | SingleExecPerChannel | `gw.conn.exec-request`, `gw.conn.per-channel-state` | all | `canReachMuxTouchZeroThenExec` (re-exec on a fresh channel) | encoded — holds (Stage-C check set) |
+| S7 | ChannelAccounting | `gw.conn.channel-limit+4`, `gw.conn.per-channel-state` | all; bound exercised in fault-transport | `canReachBurstHitsBound`, `canReachForgedCloseIgnored` | encoded — holds (Stage-C check set) |
+| S8 | RejectReleasesCapacity | `gw.conn.exec-request` | content falsifiable only in fault-degraded (panic splitter) | panic-letter run (Stage C) | encoded — holds (Stage-C check set) |
+| S9 | SingleRelease | `gw.conn.session-cap+2`, `gw.conn.cap` | all | shares S2/S3 witnesses | encoded — holds (Stage-C check set) |
+| S10 | CancelOnSessionEnd | `gw.conn.cancel-on-disconnect+3` | all; carve-out exercised in fault-degraded | `canReachDrainExpiryCancel`, `canReachVanishReclaimedDesigned` | encoded — holds (Stage-C check set) |
+| S11 | ForceCloseArmedSticky | `gw.conn.force-close` | all (latches); fetch_min arithmetic stays with the unit tests | `canReachStallArmsForceClose` | encoded — holds (Stage-C check set) |
+| S12 | DecideImpliesArmed | `gw.conn.force-close` | all | `canReachGraceFiresOnIdleConn` | encoded — holds (Stage-C check set) |
+| S13 | WindowPacedEgress | `gw.conn.session-cap+2` (window-pacing clause) | all; contended in fault-transport | `canReachStallArmsForceClose` | encoded — holds (Stage-C check set) |
+| S14 | RusshResidueBounded | `gw.conn.channel-limit+4`, `gw.conn.channel-types` | fault-transport | `canReachOverBoundOpenTerminates` | encoded — holds (Stage-C check set) |
+| S15 | ReleaseBeforeCloseOut | `gw.conn.send-deadline`, `gw.conn.exit-status+3` | all | `canReachServerSideEndingReleasesEarly` | encoded — holds (Stage-C check set) |
+| S16 | TrackedBuildPolicy | `gw.conn.cancel-on-disconnect+3` (tracking-policy clause) | fault-upstream | `canReachNonWireRemovesTracked`; strict probe `s16StrictTerminalOnly` | encoded — holds (Stage-C check set) |
+| S17 | DrainStageOrder | `gw.drain.three-stage`, `gw.conn.session-drain` | fault-drain | `canReachDrainExpiryCancel` | encoded — holds (Stage-C check set) |
+| S18 | ListenerSurvivesAcceptErrors | `gw.conn.accept-resilience` | fault-upstream (EMFILE letter) | latch-only (no dedicated reach flag; the letter is a no-op by construction) | encoded — holds (Stage-C check set) |
+| S19 | CloseOutOrder | `gw.conn.exit-status+3` | all | `canReachCloseOutCompletesInOrder` | encoded — holds (Stage-C check set) |
+| S20 | GraceArmedExactlyWhenEmpty | `gw.conn.exit-status+3` (grace clause) | all | `canReachGraceFiresOnIdleConn`, `canReachExecWithinGraceSurvives` | encoded — holds (Stage-C check set) |
 
 ### Permissiveness (P1–P6, design §3.2)
 
 | # | Property | Rule(s) | Regime(s) | Witness / named run | Verdict |
 |---|---|---|---|---|---|
-| P1 | MuxFanOutAdmitted | `gw.conn.session-cap+2` (exec-only rejection) | all (latch) | `canReachMuxTouchZeroThenExec` | encoded — Stage C pending |
-| P2 | SurvivesSessionCountZero | `gw.conn.exit-status+3` (grace clause) | all (latch) | `canReachGraceFiresOnIdleConn` | encoded — Stage C pending |
-| P3 | CapRejectsExecOnly | `gw.conn.session-cap+2` | all (latch) | `canReachSessionCapExecRejected` | encoded — Stage C pending |
-| P4 | WithinGraceExecSurvives | `gw.conn.exit-status+3` (grace clause) | all (latch) | `canReachExecWithinGraceSurvives` | encoded — Stage C pending |
-| P5 | CompliantPeerNotForceClosed | `gw.conn.force-close`, `gw.conn.send-deadline`, `gw.conn.keepalive+2` | fault-peer-occupancy / fault-peer-transport (conn B is the compliant control) | base-regime compliant named run (Stage C); GW-2 T-override is the falsifier | encoded — Stage C pending |
-| P6 | EstablishedSurviveAcceptStop | `gw.drain.three-stage` | fault-drain (latch) | `canReachDrainExpiryCancel` | encoded — Stage C pending |
+| P1 | MuxFanOutAdmitted | `gw.conn.session-cap+2` (exec-only rejection) | all (latch) | `canReachMuxTouchZeroThenExec` | encoded — holds (Stage-C check set) |
+| P2 | SurvivesSessionCountZero | `gw.conn.exit-status+3` (grace clause) | all (latch) | `canReachGraceFiresOnIdleConn` | encoded — holds (Stage-C check set) |
+| P3 | CapRejectsExecOnly | `gw.conn.session-cap+2` | all (latch) | `canReachSessionCapExecRejected` | encoded — holds (Stage-C check set) |
+| P4 | WithinGraceExecSurvives | `gw.conn.exit-status+3` (grace clause) | all (latch) | `canReachExecWithinGraceSurvives` | encoded — holds (Stage-C check set) |
+| P5 | CompliantPeerNotForceClosed | `gw.conn.force-close`, `gw.conn.send-deadline`, `gw.conn.keepalive+2` | fault-peer-occupancy / fault-peer-transport (conn B is the compliant control) | base-regime compliant named run (Stage C); GW-2 T-override is the falsifier | encoded — holds (Stage-C check set) |
+| P6 | EstablishedSurviveAcceptStop | `gw.drain.three-stage` | fault-drain (latch) | `canReachDrainExpiryCancel` | encoded — holds (Stage-C check set) |
 
 ### Settlement (L1–L8, design §3.3 — armed-style state invariants)
 
 | # | Property | Rule(s) | Regime(s) | Witness / named run | Verdict |
 |---|---|---|---|---|---|
-| L1 | ConnReclaimArmed | `gw.conn.force-close`, `gw.conn.keepalive+2`, `gw.conn.exit-status+3` | all; degraded tier in fault-degraded | `canReachKexParkedReclaimed`, `canReachVanishReclaimedDesigned`, `canReachParkedReclaimedByInactivity`; strict probe `l1StrictNoInactivity` | encoded — Stage C pending |
-| L2 | SendSettleArmed | `gw.conn.send-deadline` | all; contended in fault-transport | `canReachStallArmsForceClose` | encoded — Stage C pending |
-| L3 | PreSessionOccupancyArmed | `gw.handshake.timeout`, `gw.conn.lifecycle` | all; firing exercised in fault-peer-occupancy | GW-3 calibration (Stage C); occupancy-regime reclamation runs | encoded — Stage C pending |
-| L4 | DrainObligationsArmed | `gw.drain.three-stage`, `gw.conn.session-drain` | fault-drain | `canReachDrainExpiryCancel`; full drain named run (Stage C) | encoded — Stage C pending |
-| L5 | GraceNeverKillsLiveSession | `gw.conn.exit-status+3` (grace clause) | all (latch) | strict probe `l5StrictNoCarveOut` shows the documented race is reachable | encoded — Stage C pending |
-| L6 | RpcWaitDeadlineArmed | `gw.conn.cancel-on-disconnect+3` (timeout-wrapped upstream calls), `gw.store.transient-retry` | all; deadline fire in fault-upstream | reachability via `canReachNonWireRemovesTracked` (passes through rpc-wait) | encoded — Stage C pending |
-| L7 | UpstreamStreamReleasedOnExit | `gw.conn.cancel-on-disconnect+3` | all | `canReachNonWireRemovesTracked` (stream held then released) | encoded — Stage C pending |
-| L8 | SessionTaskQuiescence | `gw.conn.lifecycle`, `gw.conn.per-channel-state` | all | `canReachMuxSiblingQuiescence` | encoded — Stage C pending |
+| L1 | ConnReclaimArmed | `gw.conn.force-close`, `gw.conn.keepalive+2`, `gw.conn.exit-status+3` | all; degraded tier in fault-degraded | `canReachKexParkedReclaimed`, `canReachVanishReclaimedDesigned`, `canReachParkedReclaimedByInactivity`; strict probe `l1StrictNoInactivity` | encoded — holds (Stage-C check set) |
+| L2 | SendSettleArmed | `gw.conn.send-deadline` | all; contended in fault-transport | `canReachStallArmsForceClose` | encoded — holds (Stage-C check set) |
+| L3 | PreSessionOccupancyArmed | `gw.handshake.timeout`, `gw.conn.lifecycle` | all; firing exercised in fault-peer-occupancy | GW-3 calibration (Stage C); occupancy-regime reclamation runs | encoded — holds (Stage-C check set) |
+| L4 | DrainObligationsArmed | `gw.drain.three-stage`, `gw.conn.session-drain` | fault-drain | `canReachDrainExpiryCancel`; full drain named run (Stage C) | encoded — holds (Stage-C check set) |
+| L5 | GraceNeverKillsLiveSession | `gw.conn.exit-status+3` (grace clause) | all (latch) | strict probe `l5StrictNoCarveOut` shows the documented race is reachable | encoded — holds (Stage-C check set) |
+| L6 | RpcWaitDeadlineArmed | `gw.conn.cancel-on-disconnect+3` (timeout-wrapped upstream calls), `gw.store.transient-retry` | all; deadline fire in fault-upstream | reachability via `canReachNonWireRemovesTracked` (passes through rpc-wait) | encoded — holds (Stage-C check set) |
+| L7 | UpstreamStreamReleasedOnExit | `gw.conn.cancel-on-disconnect+3` | all | `canReachNonWireRemovesTracked` (stream held then released) | encoded — holds (Stage-C check set) |
+| L8 | SessionTaskQuiescence | `gw.conn.lifecycle`, `gw.conn.per-channel-state` | all | `canReachMuxSiblingQuiescence` | encoded — holds (Stage-C check set) |
 
 ## Calibration-candidate crosswalk (design §3.4) and OOM dispositions
 
@@ -146,9 +154,13 @@ arm/disarm pairing.
 ## Witness pre-registration (design §5; encoded as `canReach*` predicates)
 
 Seventeen expect-violation witnesses are encoded in the model (§6b of the
-.qnt); Stage C wires each as a `mkQuintWitnessCheck` in the regime listed.
-A witness that stops violating means the regime's invariants have gone
-vacuous for that scenario.
+.qnt); Stage C wired each as a `mkQuintWitnessCheck`
+(`quint-gw-lifecycle-witness-*`, `nix/quint.nix`) against the FULL-alphabet
+regime module listed — witness checks stop at the first violation, so the
+unrestricted alphabets stay affordable there. All seventeen were measured
+violating (reachable) at wiring time; per-check times are in the Stage-C
+record. A witness that stops violating means the regime's invariants have
+gone vacuous for that scenario.
 
 | Witness predicate | Regime | Pins |
 |---|---|---|
@@ -172,9 +184,13 @@ vacuous for that scenario.
 
 ## Pre-registered expected as-built falsifications (design §3/§4/§6)
 
-Encoded as named predicates outside `allInvariants`; Stage C wires each as
-an expect-violation check. A probe that stops falsifying after a code or
-model change is a finding, not a pass.
+Encoded as named predicates outside `allInvariants`; Stage C wired each as
+an expect-violation check (`quint-gw-lifecycle-falsification-*`,
+`nix/quint.nix`) on the full regime listed. All four falsify exactly as
+predicted; the captured counterexample traces are summarized in the Stage-C
+record (they are the model-first evidence behind the §4 dispositions). A
+probe that stops falsifying after a code or model change is a finding, not
+a pass.
 
 | Probe | Regime | Expected falsifying trace | Why it is acceptable |
 |---|---|---|---|
@@ -348,8 +364,201 @@ materialize; every witness is reachable. The outstanding gate item is
 exhaustive per-regime runs inside the budget, which is a Stage-C wiring
 concern under the regime-split decision above.
 
-### Stage C — calibration (pending)
+### Stage C — check-set selection, CI wiring, witnesses and probes (this change set)
+
+**Verification subject / churn pin.** The verification subject is this
+worktree's base — `formal-sprint` at cccb4d778 ("docs(rio-scheduler): drop
+stale references to the deleted dispatch helpers"), the same HEAD the
+inventory and calibration corpus were mined against. `git log cccb4d778..HEAD
+-- rio-gateway/` contains only this campaign's own Stage-A commits
+(66901f86d, af9f7c482, 805c8ab4a, c088d7af2), and their rio-gateway diffs are
+comment-only (`r[impl]`/`r[verify]` markers and doc comments — 31 insertions,
+5 deletions, no executable line touched). rio-gateway has not changed since
+the corpus/inventory were mined.
+
+**Check-set decision (the §2e fallback ladder, applied).** The Stage-B
+B-measure stands: the full-alphabet `base` regime is ≈59.7 M distinct states
+at depth 24 and still growing at 629 s on a 192-worker host, and fallback (2)
+(`BaseSlim`) shrinks it only ≈2×. A Stage-C re-measurement confirmed the same
+holds for any restriction that keeps a rich connection-level alphabet
+multiplied by two concurrent full session lifecycles (first-cut per-family
+modules that kept conn B's session and both conn-A sessions were still
+heading past 20 M distinct at 8+ minutes). Per the §2e pre-committed order
+the wired exhaustive set is therefore **fallbacks (3)/(4): eight per-family
+restricted-alphabet modules** (`gwConnLifecycleFam*` in the model, wired as
+`quint-gw-lifecycle-fam-*`), each keeping every §2e structural/environment
+bound (2 conns, 2 channel slots on conn A, queue depth 2, window credits 2,
+residue ceiling 2, ≤1 tracked build) and its regime's policy-cap values,
+applying fallback (2) (`B_CHANNEL_SLOTS = 1`), and restricting only the
+alphabet: conn B plays the connection-level legitimate letters (accept,
+banner, auth, grace, reaps — so cross-connection permit/gauge arithmetic is
+asserted everywhere), conn A plays the family's letters, and famWedge /
+famDegraded additionally confine the egress/panic session to conn A channel
+0 (their corpus shapes are single-session). **No environment bound was
+reduced below the design's registered floors and nothing moved out of the
+merge gate** — the full-alphabet regimes carry the witness, falsification
+and named-run checks (TLC stops at the first violation there), and the
+calibration overrides (next change set) instantiate the full regimes as
+before. The witnesses and probes were *not* moved onto restricted modules.
+
+**What the restricted exhaustive set does NOT cover** (deferred full-regime
+exhaustive coverage; the named restricted check that carries each
+property's content instead is in the table below): cross-family
+interleavings (e.g. occupancy withholding × window stalls × builds in one
+trace); conn B running its own full session lifecycle concurrently with
+conn A's (B-side sessions appear only in famHostile's cap-rejection arm);
+two concurrent *egress/panic* sessions on one connection (famWedge /
+famDegraded are single-session; multi-session interleavings are exhausted
+in famAdmission / famUpstream / famDrain / famHostile, which carry the
+mux/sibling content); and the "everything legitimate at once" base-regime
+proof, which remains witness-and-named-run-pinned only. A future
+full-regime exhaustive run stays available as a manual `packages.*`-style
+target if the owner wants to spend builder-hours on it; it is not in the
+merge gate.
+
+**Wired checks, scopes, measured cost vs budget.** Budget per §2e: ≈5 min
+soft target, ≤15 min hard cap per check. Measurements below are wall-clock
+of the same `quint verify --backend=tlc` invocation the harness runs, at 32
+TLC workers on a shared 192-core builder (concurrent with 3–5 other TLC
+instances, i.e. conservative), including ≈20–30 s of conversion/JVM
+overhead; states = TLC distinct states at completion (exhaustive) or at
+first violation (witnesses/probes).
+
+| Check (`checks.x86_64-linux.*`) | Module / scope | Verdict | Distinct states | Wall |
+|---|---|---|---|---|
+| `quint-gw-lifecycle-fam-preauth` | FamPreauth (conn-level establishment/occupancy/grace/reaps) | HOLDS exhaustive @ scope | 1,183 | 31 s |
+| `quint-gw-lifecycle-fam-admission` | FamAdmission (admission vs grace, stage deadlines, conn-A sessions ×2) | HOLDS exhaustive @ scope | 136,103 | 34 s |
+| `quint-gw-lifecycle-fam-cap` | FamCap (MAX_CONNECTIONS=1, over-cap auth teardown) | HOLDS exhaustive @ scope | 260,061 | 39 s |
+| `quint-gw-lifecycle-fam-wedge` | FamWedge (egress pacing/budgets/parks/vanish, single egress session) | HOLDS exhaustive @ scope | 66,059 | 34 s |
+| `quint-gw-lifecycle-fam-hostile` | FamHostile (hostile opens/closes, channel accounting, P3 rejection) | HOLDS exhaustive @ scope | 968,151 | 69 s |
+| `quint-gw-lifecycle-fam-upstream` | FamUpstream (rpc-wait/build tracking/cancel/close-out; also asserts `w10TriggerAbsent`) | HOLDS exhaustive @ scope | 3,253,999 | 246 s |
+| `quint-gw-lifecycle-fam-drain` | FamDrain (three-stage drain, drain-expiry cancel, exit quiescence) | HOLDS exhaustive @ scope | 3,337,595 | 216 s |
+| `quint-gw-lifecycle-fam-degraded` | FamDegraded (panic splitter, sockopt-fail, parks, inactivity tier; single session) | HOLDS exhaustive @ scope | 225,953 | 26 s |
+| `quint-gw-lifecycle-witness-*` (17) | full regimes per the witness table above | all 17 violate (reachable) | 87–130,940 each | 21–38 s each |
+| `quint-gw-lifecycle-falsification-l5-no-carve-out` | base | expect-violation confirmed (depth 11) | 168 | 30 s |
+| `quint-gw-lifecycle-falsification-s16-terminal-only` | fault-upstream | expect-violation confirmed (depth 11) | 1,078 | 30 s |
+| `quint-gw-lifecycle-falsification-s10-panic` | fault-degraded | expect-violation confirmed (depth 11) | 3,732 | 24 s |
+| `quint-gw-lifecycle-falsification-l1-no-inactivity` | fault-degraded | expect-violation confirmed (depth 15) | 430,271 | 46 s |
+| `quint-gw-lifecycle-run-compliant-peer` | base, `compliantLifecycleRun` | run passes (`quint test`) | — | <1 s + harness overhead |
+| `quint-gw-lifecycle-run-stall-wedge` | fault-transport, `stallArmsForceCloseRun` | run passes (`quint test`) | — | <1 s + harness overhead |
+
+Every wired check is comfortably inside the ≤15 min hard cap with headroom
+(worst exhaustive check ≈4 min measured under contention); the seventeen
+witnesses and four probes are each well under a minute. The first-cut
+family modules that did NOT fit (a combined establishment family and a
+two-session wedge family, both >20 M states and still growing at 8–10 min)
+were replaced by the famPreauth/famAdmission split and the single-session
+famWedge/famDegraded pin before wiring — that re-shaping is an alphabet
+decision, not a bound change.
+
+**Per-property coverage in the restricted set** (which family check carries
+each property's content; every check asserts all 34 via `allInvariants`):
+S1 famPreauth + famCap (over-cap clause); S2/S3/S9 all (global arithmetic),
+content-deepest in famAdmission/famUpstream; S4 famAdmission (+ panic term
+famDegraded); S5 all teardown families (famWedge/famUpstream/famDrain);
+S6 famAdmission/famHostile; S7/S14 famHostile; S8 famDegraded;
+S10 famUpstream/famDrain (panic carve-out famDegraded); S11/S12 famPreauth
+(grace/pre-auth arms) + famWedge (stall arm) + famDegraded (park ordering);
+S13 famWedge; S15 famWedge/famUpstream; S16 famUpstream; S17 famDrain;
+S18 famUpstream; S19 famWedge/famUpstream; S20 famPreauth/famAdmission;
+P1/P2/P4 famAdmission; P3 famHostile; P5 famPreauth/famWedge (+ the
+compliant named run); P6 famDrain; L1 famPreauth (occupancy) + famWedge
+(transport) + famDegraded (inactivity tier); L2 famWedge; L3 famAdmission;
+L4 famDrain; L5 famAdmission; L6/L7 famUpstream; L8 famUpstream/famWedge.
+
+**Pre-registered falsification probes — trace summaries (the §4
+model-first evidence).**
+
+- `l5StrictNoCarveOut` (base, depth 11): accept → auth (grace arms) → open
+  → grace re-check passes → **exec admitted after the re-check** → grace
+  fires and disconnects with `live_sessions = 1`. The documented W3/P4
+  post-check admit race, bounded by one grace cycle; the carved L5 and P4
+  hold everywhere.
+- `s16StrictTerminalOnly` (fault-upstream, depth 11): exec → handshake →
+  opcode → rpc-wait → SubmitBuild accepted (tracked, BuildEvent stream
+  held) → **non-Wire stream error removes the build with no processed
+  terminal outcome** (the shipped policy; S16-as-shipped holds). The
+  W10 evidence paragraph below carries the decision-rule answer.
+- `s10StrictIncludingPanic` (fault-degraded, depth 11): same prefix to a
+  tracked build → **handler panic unwinds the proto task**: exit reason
+  panic, no CancelBuild attempt, stream dropped with the unwound frame.
+  The scheduler orphan-watcher backstop is the named environment
+  assumption; non-panic S10 holds everywhere.
+- `l1StrictNoInactivity` (fault-degraded, depth 15): auth → stop-draining
+  peer → TCP_USER_TIMEOUT setsockopt fails → exec → handshake timeout →
+  guard released, close-out queued → channel closed (close-out budget
+  disarmed) → **queue write parks with the force-close not yet armed**
+  (no enforcement wake) → grace fires (force-close armed only after the
+  park). Reachable reclamation paths in that state: none designed — only
+  the inactivity backstop (INACTIVITY_AVAILABLE) re-arms L1. That is the
+  W7 degraded tier (~1 h bound) exactly as pre-registered; full L1 holds
+  in fault-degraded, and in every designed regime L1 holds without the
+  inactivity disjunct.
+
+**W10 evidence (the §4 decision rule, answered).** The trigger condition —
+a build leaving the tracked set with no processed terminal outcome, no
+CancelBuild attempt, and the upstream-stream-held bit still set after
+session exit — does **not** appear in any reachable trace. Evidence:
+(a) the falsifying strict-S16 trace above shows the stream-held bit
+dropping in the same transition as the removal (the BuildEvent stream is a
+handler-local; the handler frame that removes the build is the frame that
+drops the stream), with the session still live; (b) the new
+`w10TriggerAbsent` invariant (the trigger stated as "never reachable") is
+asserted by the exhaustive `quint-gw-lifecycle-fam-upstream` check and
+holds over that family's full space (3.25 M states), alongside L7 holding
+in every check; (c) no witness or probe run produced a state matching the
+trigger. Per the design's decision rule the Phase-1 gateway-side
+removal-predicate change is therefore **not** triggered; what remains for
+the owner to sign off is the orphan-watcher-bounded leak itself (the
+strict-S16 trace: a non-Wire stream failure with a dead or absent client
+orphans a running build for up to ~300 s until
+`rio-scheduler/src/actor/housekeeping.rs`'s sweep cancels it) — the
+recommendation stays accepted-with-rationale, and the two W10
+pinning/assumption-validation tests stay on the Phase-1 list regardless.
+
+**W5 evidence (occupancy bound, confirmed).** The
+`canReachVanishReclaimedDesigned` witness violates in `fault-transport`
+(depth 8): a half-open vanish (no FIN/RST, keepalives unanswered) is
+reclaimed by a designed transport-reap letter — keepalive-exhaustion /
+TCP_USER_TIMEOUT — in a regime whose alphabet contains no inactivity
+letter, and L1/L2 (armed form) hold across that regime's witness searches
+and across famWedge exhaustively. The finding stays an occupancy bound,
+not a violation: until the ≈300–330 s designed reap fires, the vanished
+peer pins one conn permit (of 1000), one session permit (of 4096), the
+gauge slots, the per-connection duplex buffers (≈512 KiB) and possibly a
+NAR assembly buffer, plus the in-flight scheduler/builder work — per
+occurrence, exactly the §4 W5 figure. No code change; the W8 memory
+amplification stays a deployment-checklist headroom note.
+
+**W2 evidence (divergence visible and bounded).** The
+`canReachServerSideEndingReleasesEarly` witness violates in `base`
+(depth 11): a server-side session ending releases the permit/gauge/
+live-count (guard drop) while the channel is still open and the connection
+live — the guard-held accounting definition doing exactly what the owner
+decision says it should. The divergence window (proto task still in its
+cancel loop after the guard released) is structurally bounded: the only
+state a diverged proto task can occupy is `cancelling`, whose exit action
+(`cancelLoopDone`, the bounded-by-DEFAULT_GRPC_TIMEOUT cancel loop) is
+enabled unconditionally — no peer letter, no upstream reply and no timer
+is required for it to retire — and S5/L8 hold in every check, so the
+divergence cannot survive connection end or session-task quiescence. The
+~30 s worst-case figure remains the deployment-checklist note about
+`channels_active` momentarily under-counting during mass disconnects.
+
+**Validation.** `quint typecheck` green on the extended model;
+`tracey query validate` clean (the new `r[verify]` markers at the
+`nix/quint.nix` wiring points resolve against the Stage-A rules);
+`treefmt` clean; `nix eval` lists all 31 new checks under
+`checks.x86_64-linux`; the wired checks were each built once via the
+harness (remote builder) before commit — exhaustive checks pass, witness
+and falsification checks report their expected violations, run checks
+pass.
+
+### Stage C (continued) — calibration (pending, next change set)
 
 Will add: the calibration table (override module ↔ candidate ↔ falsified
 property @ depth, trace-walk record), both directions for GW-2 / GW-13 /
-GW-18, and the re-confirmed §4 window dispositions.
+GW-18, and the re-confirmed §4 window dispositions. The override modules
+land under `docs/spec/models/calibration/gw-*.qnt` and instantiate the
+full-alphabet regime modules (not the restricted family modules), per
+design §5.
