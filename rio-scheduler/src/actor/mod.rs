@@ -430,6 +430,39 @@ pub struct DagActor {
     /// cast `u64 as i64` at THAT single boundary instead of at every
     /// proto-encode site.
     leader: LeaderState,
+    // r[impl sched.evidence.durability]
+    /// The lease generation of the tenure that built the CURRENT
+    /// in-memory DAG state — what every claims-floor-fenced evidence
+    /// write carries as its serving generation. Written in exactly two
+    /// places: [`DagActor::new`] (initial lease read) and
+    /// `handle_leader_acquired` (re-stamped to the claim target
+    /// immediately after the generation claim succeeds, BEFORE any of
+    /// the new tenure's evidence writes run). NEVER re-read from
+    /// `self.leader.generation()` per command: the lease task can bump
+    /// that atomic mid-mailbox (a same-process cross-epoch re-acquire),
+    /// and a command queued under the old tenure must keep carrying the
+    /// old tenure's number so the claims-floor fence refuses its writes
+    /// instead of letting them ride the new tenure's authority while
+    /// operating on the old tenure's DAG. `handle_leader_lost`
+    /// deliberately leaves the field at the deposed tenure's value:
+    /// stale-by-construction, it sits below any successor's claimed
+    /// floor, which is exactly what makes the fence reject the deposed
+    /// replica's queued-command writes.
+    ///
+    /// i64 (not u64 like the lease atomic): this value exists solely to
+    /// be compared against PG BIGINT floors; converting once at the
+    /// stamp sites keeps every fence comparison cast-free.
+    serving_generation: i64,
+    /// Ordering tripwire for the claim-before-recovery-writes invariant
+    /// (`sched.evidence.durability`): false at `handle_leader_acquired`
+    /// entry, true once the generation claim has stamped
+    /// `serving_generation`. The recovery evidence-write sites
+    /// `debug_assert!` it so a future re-ordering of
+    /// `handle_leader_acquired` (claim moved back after
+    /// `recover_from_pg`) fails loudly in tests instead of silently
+    /// re-introducing self-fenced recovery writes in the saturated-floor
+    /// regime.
+    recovery_claim_stamped: bool,
     /// True only while `self.dag` reflects PG: set in
     /// `handle_leader_acquired`'s Ok arm (this tenure's
     /// `recover_from_pg` succeeded), cleared by every
@@ -700,6 +733,14 @@ impl DagActor {
             solve_cache: Arc::default(),
             tick_count: 0,
             backpressure_active: Arc::new(AtomicBool::new(false)),
+            // The initial tenure stamp (see the field doc): the lease
+            // read at construction time. K8s-mode actors re-stamp it at
+            // every LeaderAcquired's generation claim; always-leader
+            // actors keep this value for the process lifetime.
+            serving_generation: i64::try_from(plumbing.leader.generation()).unwrap_or(i64::MAX),
+            // No claim has run for this construction-time stamp; the
+            // first handle_leader_acquired sets it before recovery.
+            recovery_claim_stamped: false,
             leader: plumbing.leader,
             dag_authoritative,
             holder_id: plumbing.holder_id,
@@ -785,6 +826,14 @@ impl DagActor {
             tick_count: _,
             backpressure_active: _,
             leader: _,
+            // Retained: the tenure stamp of the state being wiped. A
+            // wipe does not change which tenure last claimed; LeaderLost
+            // deliberately keeps the deposed tenure's value (below any
+            // successor's floor — that IS the fence working), and the
+            // next LeaderAcquired re-stamps it at its own claim before
+            // any of its evidence writes run.
+            serving_generation: _,
+            recovery_claim_stamped: _,
             // Retained: static replica identity (the generation-claim
             // ledger's holder column), not per-term state.
             holder_id: _,

@@ -486,6 +486,18 @@ impl DagActor {
                 // Best-effort persisted clear so later failovers don't
                 // re-evaluate the same rows; the in-memory clear above
                 // is what this tenure's correctness relies on.
+                // r[impl sched.evidence.durability]
+                // Ordering tripwire: this recovery evidence write must
+                // run AFTER handle_leader_acquired's generation claim
+                // stamped serving_generation (the claims-floor fence
+                // prerequisite) — see the field doc on DagActor.
+                debug_assert!(
+                    self.recovery_claim_stamped,
+                    "recovery evidence write (topdown_pruned clear) ran before the \
+                     generation claim stamped serving_generation (currently {}) — the \
+                     claim-before-recovery-writes ordering is broken",
+                    self.serving_generation
+                );
                 if let Err(e) = self.db.clear_topdown_pruned_by_hashes(&cleared).await {
                     warn!(count = cleared.len(), error = %e,
                           "failed to clear persisted topdown_pruned at recovery (best-effort; \
@@ -541,6 +553,16 @@ impl DagActor {
             // the next failover re-derives the hole from the same
             // persisted children — or misses it if those rows are GC'd
             // first, the already-accepted best-effort window.
+            // r[impl sched.evidence.durability]
+            // Ordering tripwire: same claim-before-recovery-writes
+            // invariant as the mark clear above.
+            debug_assert!(
+                self.recovery_claim_stamped,
+                "recovery evidence write (closure-hole stamp) ran before the \
+                 generation claim stamped serving_generation (currently {}) — the \
+                 claim-before-recovery-writes ordering is broken",
+                self.serving_generation
+            );
             if let Err(e) = self.db.set_closure_hole_by_hashes(&holed).await {
                 warn!(count = holed.len(), error = %e,
                       "failed to persist closure holes at recovery (best-effort; \
@@ -1074,6 +1096,14 @@ impl DagActor {
         // dispatch permanently.
         self.leader.invalidate_recovery_completion();
         info!("leader lost: clearing persisted actor state");
+        // `serving_generation` is deliberately NOT touched here: it
+        // keeps the deposed tenure's value, which sits below any
+        // successor's claimed floor — so evidence writes from commands
+        // still queued behind this LeaderLost are refused by the
+        // claims-floor fence (that IS the fence working), and the next
+        // LeaderAcquired re-stamps the field at its own claim before
+        // any of the new tenure's writes run
+        // (`sched.evidence.durability`).
         self.clear_persisted_state();
         // (The stream-era workers_active gauge is gone; nothing
         // registration-shaped needs zeroing here.)
@@ -1087,8 +1117,12 @@ impl DagActor {
     }
 
     /// Handle `LeaderAcquired`: snapshot the flap-detection signals,
-    /// run state recovery from PG, then run the claim /
-    /// bump-confirmation loop and the recovery TOCTOU gate, recording
+    /// read the PG floor and durably claim the generation this term
+    /// will serve at, THEN run state recovery from PG — so every
+    /// recovery evidence write carries the just-claimed generation and
+    /// passes the claims-floor fence because the claim made it the
+    /// floor (`sched.evidence.durability`) — then run the
+    /// bump-confirmation and the recovery TOCTOU gate, recording
     /// the epoch-keyed completion (`set_recovery_complete` with the
     /// transition count snapshotted at recovery entry) only when the
     /// gate passes — completion is deliberately withheld on the
@@ -1110,6 +1144,13 @@ impl DagActor {
         // pre-LeaderAcquired gap is closed by the PREVIOUS tenure's
         // LeaderLost-time clear, not by anything in this fn.)
         self.dag_authoritative = false;
+        // This acquisition's generation claim has not stamped the
+        // serving generation yet — the stamp below (right after the
+        // claim loop) flips this back before recover_from_pg runs, and
+        // the recovery evidence-write sites debug_assert it
+        // (sched.evidence.durability's claim-before-recovery-writes
+        // ordering).
+        self.recovery_claim_stamped = false;
 
         // Nudge `interrupt_housekeeping` so its lease-acquire
         // edge-reload of `cost_table` (and the `cost_was_leader`
@@ -1231,21 +1272,23 @@ impl DagActor {
         let gen_at_entry = self.leader.generation();
         let transitions_at_entry = self.leader.acquired_transitions();
 
-        let start = Instant::now();
-        let result = self.recover_from_pg().await;
-
         // --- Fetch PG generation high-water mark (independent step) ---
-        // Read OUTSIDE recover_from_pg so a DAG-load failure cannot
-        // take the floor — and the claim/confirmation built on it —
-        // down with it; reading after the load preserves the previous
-        // freshness ordering (the claim loop's PK-conflict retry
-        // tolerates a stale read either way). NOT applied here: the
-        // fetch_max happens at the shared post-gate tail below, AFTER
-        // the TOCTOU gen-snapshot check — writing self.leader's
-        // generation here would false-positive that check. The floor
-        // spans assignments ∪ leader_generation_claims — see
-        // max_known_generation's doc for why neither arm alone is
-        // reliable.
+        // Read BEFORE recover_from_pg (together with the claim loop
+        // below) so the generation claim is durable — and
+        // `serving_generation` is stamped to it — before any of this
+        // tenure's recovery evidence writes run: the claim is what puts
+        // this tenure's generation at the claims floor those writes are
+        // fenced against (`sched.evidence.durability`). Reading
+        // independently of the load keeps the original property that a
+        // DAG-load failure cannot take the floor — and the
+        // claim/confirmation built on it — down with it (the claim
+        // loop's PK-conflict retry tolerates a stale read either way).
+        // NOT applied here: the fetch_max happens at the shared
+        // post-gate tail below, AFTER the TOCTOU gen-snapshot check —
+        // writing self.leader's generation here would false-positive
+        // that check. The floor spans assignments ∪
+        // leader_generation_claims — see max_known_generation's doc for
+        // why neither arm alone is reliable.
         // Test-only: deterministic floor-read failure (same `ActorError`
         // shape a sqlx error maps to) without touching the DB; scoped to
         // the floor read only — the DAG load above is unaffected.
@@ -1278,7 +1321,10 @@ impl DagActor {
         // await is caught at the TOCTOU gate below — like every other
         // PG round-trip in handle_leader_acquired it must run inside
         // the gen_at_entry window. The DELETE is DB-side
-        // terminal-status based, independent of `result`.
+        // terminal-status based, independent of the recovery load's
+        // outcome (and of its position relative to the load: it touches
+        // only rows for terminal derivations, which the load never
+        // reads).
         match self.db.sweep_stale_live_pins().await {
             Ok(n) if n > 0 => {
                 info!(
@@ -1296,8 +1342,9 @@ impl DagActor {
         // derivation terminal but assignment pending → permanently
         // un-GC-able (I-209 leak class). Best-effort backstop; the
         // tx-wrap chokepoint is the structural fix going forward.
-        // DB-side terminal-status based, independent of `result` —
-        // same TOCTOU-window placement as sweep_stale_live_pins above.
+        // DB-side terminal-status based, independent of the recovery
+        // load's outcome — same TOCTOU-window placement as
+        // sweep_stale_live_pins above.
         // r[impl sched.db.assignment-stale-sweep]
         match self.db.sweep_stale_assignments().await {
             Ok(n) if n > 0 => {
@@ -1337,11 +1384,15 @@ impl DagActor {
         // under a PG point-in-time restore (which regresses the claims
         // table and the assignment history together).
         //
-        // Placement: BEFORE the gen re-check below, like the
-        // sweep_stale_* calls above — these are the async PG
-        // round-trips of handle_leader_acquired and every one of them
-        // must sit inside the gen_at_entry window so a lease flap
-        // during any of these awaits is caught at the single TOCTOU
+        // Placement: BEFORE recover_from_pg() (sched.evidence.durability
+        // — the claim must be durable, and `serving_generation` stamped
+        // to it, before any of this tenure's recovery evidence writes
+        // run, so those writes pass the claims-floor fence because the
+        // claim just became the floor), and BEFORE the gen re-check
+        // below, like the sweep_stale_* calls above — these are the
+        // async PG round-trips of handle_leader_acquired and every one
+        // of them must sit inside the gen_at_entry window so a lease
+        // flap during any of these awaits is caught at the single TOCTOU
         // gate. The claim does not write self.leader's generation, so
         // it cannot false-positive that gate. (Only the
         // seed_generation_from ATOMIC WRITE must come after the gate —
@@ -1594,6 +1645,29 @@ impl DagActor {
         // is one) became durable, so any replica that acquires later
         // reads a floor that covers our claim and exceeds it.
         let rounds_at_claim = self.leader.renew_rounds_started();
+
+        // r[impl sched.evidence.durability]
+        // The claim above is durable (or, on the unclaimed degradation
+        // paths, was at least offered to the ledger): every evidence
+        // write this tenure issues from here on — starting with
+        // recover_from_pg's own recovery stamps and status persists —
+        // carries the claimed generation and passes the claims-floor
+        // fence BECAUSE the claim just became the floor. This stamp
+        // running before recover_from_pg is the fence's correctness
+        // prerequisite: stamping after (or reading the lease atomic
+        // per-write) would self-fence the new leader's recovery writes
+        // in the saturated-floor regime, where the lease-derived
+        // generation sits permanently below the inherited PG floor.
+        // The atomic-side seed (seed_generation_from) deliberately
+        // stays at the post-gate tail — writing the lease atomic here
+        // would false-positive the TOCTOU gate; the fence reads THIS
+        // field, not the atomic.
+        self.serving_generation = i64::try_from(claim_target).unwrap_or(i64::MAX);
+        self.recovery_claim_stamped = true;
+
+        // --- Recover the DAG from PG, under the claimed generation ---
+        let start = Instant::now();
+        let result = self.recover_from_pg().await;
 
         // Test-only interleave gate: lets a test bump `generation`
         // between the awaits above and the gen re-check below,

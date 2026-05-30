@@ -886,6 +886,181 @@ async fn test_recovery_seeds_generation_from_unpersisted_claim() -> TestResult {
     Ok(())
 }
 
+/// Saturated-floor regime (post-lease-deletion): a fresh leader whose
+/// lease-derived generation (1) sits far below the inherited PG floor
+/// (a foreign claim row at 200) must still land its OWN recovery
+/// evidence writes — the recovery exceeds the floor, claims 201,
+/// stamps `serving_generation` to it BEFORE `recover_from_pg` runs,
+/// and the recovery's evidence writes (the closure-hole stamp and the
+/// poisoned-dep DependencyFailed status persist exercised here) land
+/// under that claimed generation.
+///
+/// TRIPWIRE for the claims-floor fence work
+/// (`sched.evidence.durability`): this test must stay green through
+/// every fencing commit, with zero assertion changes. Under a
+/// per-dequeue / lease-derived capture design the recovery writes
+/// would carry generation 1, sit below the floor of 200, and be
+/// silently rolled back by the fence — re-introducing the
+/// stale-evidence loss class the fence exists to eliminate, and
+/// turning the PG assertions below red. If a fencing change makes this
+/// test fail, the capture design is wrong (stop-and-report condition
+/// 2); do NOT adjust this test.
+// r[verify sched.evidence.durability]
+#[tokio::test]
+async fn saturated_floor_recovery_evidence_writes_land() -> TestResult {
+    let out = test_store_path("satfloor-root-out");
+    let dbg = test_store_path("satfloor-root-debug");
+    let keep_out = test_store_path("satfloor-keep-out");
+
+    let b2 = Uuid::new_v4(); // full-merge owner of P, C1, C2 — cancelled at failover
+    let b_keep = Uuid::new_v4(); // live build keeping the surviving sibling C1 alive
+    let b1 = Uuid::new_v4(); // pruning build — owns only P
+    let b_poison = Uuid::new_v4(); // owner of the poisoned-dep pair D→E
+    let f = RecoveryFixture::run(async |handle, pool| {
+        // --- Shape 1: the recovery closure-hole stamp (W4) ---
+        // Same staging as
+        // test_failover_recovery_records_closure_hole_for_dropped_
+        // unproduced_terminal_child: a marked parent whose un-produced
+        // terminal child's edge the recovery load drops.
+        let mk_parent = || {
+            let mut n = make_node("satfloor-root");
+            n.output_names = vec!["out".into(), "debug".into()];
+            n.expected_output_paths = vec![out.clone(), dbg.clone()];
+            n.wanted_output_names = vec![];
+            n
+        };
+        let mk_keep = || {
+            let mut n = make_node("satfloor-keep");
+            n.expected_output_paths = vec![keep_out.clone()];
+            n
+        };
+        merge_dag(
+            &handle,
+            b2,
+            vec![mk_parent(), mk_keep(), make_node("satfloor-gone")],
+            vec![
+                make_test_edge("satfloor-root", "satfloor-keep"),
+                make_test_edge("satfloor-root", "satfloor-gone"),
+            ],
+            false,
+        )
+        .await?;
+        merge_dag(&handle, b_keep, vec![mk_keep()], vec![], false).await?;
+        merge_dag(&handle, b1, vec![mk_parent()], vec![], false).await?;
+
+        // --- Shape 2: the recovery DependencyFailed status persist ---
+        // Same staging as
+        // test_recovery_substituting_with_poisoned_dep_goes_dependency_
+        // failed: a Substituting parent over a within-TTL poisoned dep,
+        // both co-owned by one live build.
+        merge_dag(
+            &handle,
+            b_poison,
+            vec![make_node("satfloor-D"), make_node("satfloor-E")],
+            vec![make_test_edge("satfloor-D", "satfloor-E")],
+            true,
+        )
+        .await?;
+        barrier(&handle).await;
+        drop(handle);
+
+        // Backdate AFTER the merges (a later merge re-upserts the rows).
+        sqlx::query("UPDATE derivations SET status = 'cancelled' WHERE drv_hash = 'satfloor-gone'")
+            .execute(&pool)
+            .await?;
+        sqlx::query(
+            "UPDATE derivations SET status = 'substituting', topdown_pruned = true \
+             WHERE drv_hash = 'satfloor-root'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE builds SET status = 'cancelled' WHERE build_id = $1")
+            .bind(b2)
+            .execute(&pool)
+            .await?;
+        // Future-dated poisoned_at so the within-TTL load is
+        // deterministic under the 100ms cfg(test) POISON_TTL.
+        sqlx::query(
+            "UPDATE derivations \
+             SET status = 'poisoned', poisoned_at = now() + interval '1 hour' \
+             WHERE drv_hash = 'satfloor-E'",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query("UPDATE derivations SET status = 'substituting' WHERE drv_hash = 'satfloor-D'")
+            .execute(&pool)
+            .await?;
+
+        // --- The saturated floor itself ---
+        // The only trace of a foreign previous term: its claim row at
+        // generation 200, far above the fresh leader's lease-derived 1.
+        sqlx::query(
+            "INSERT INTO leader_generation_claims (generation, holder_id) \
+             VALUES (200, 'deposed-before-persist')",
+        )
+        .execute(&pool)
+        .await?;
+        Ok(())
+    })
+    .await?;
+
+    // 1. The recovery exceeded the saturated floor and durably claimed
+    //    past it (200 → 201) before its evidence writes ran.
+    let g = f.handle.leader_generation();
+    assert!(
+        g >= 201,
+        "generation must seed past the foreign claim at 200: expected >= 201, got {g}"
+    );
+    let claimed: Vec<(i64,)> =
+        sqlx::query_as("SELECT generation FROM leader_generation_claims ORDER BY generation")
+            .fetch_all(&f.db.pool)
+            .await?;
+    assert!(
+        claimed.iter().any(|(c,)| *c == g as i64),
+        "the generation recovery landed on ({g}) must be in the claims ledger, got {claimed:?}"
+    );
+
+    // 2. The W4 recovery evidence write LANDED: the closure-hole
+    //    breadcrumb for the parent whose un-produced terminal child's
+    //    edge the load dropped is TRUE in PG. (Post-fence, this write
+    //    goes through the claims-floor fence carrying the claimed
+    //    generation 201 ≥ floor 201 — it must apply, never be fenced.)
+    let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
+        "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'satfloor-root'",
+    )
+    .fetch_one(&f.db.pool)
+    .await?;
+    assert!(
+        pg_pruned,
+        "fixture premise: the persisted topdown_pruned mark survives recovery"
+    );
+    assert!(
+        pg_hole,
+        "the recovery-time closure-hole stamp must LAND in the saturated-floor \
+         regime — the new leader's own evidence writes must never be fenced"
+    );
+
+    // 3. The recovery DependencyFailed status persist LANDED in PG for
+    //    the Substituting-over-poisoned-dep node. (Post-fence, same
+    //    argument as the hole stamp.)
+    let d = expect_drv(&f.handle, "satfloor-D").await;
+    assert_eq!(
+        d.status,
+        DerivationStatus::DependencyFailed,
+        "Substituting with a co-owned poisoned dep must recompute to DependencyFailed"
+    );
+    let (pg_d_status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'satfloor-D'")
+            .fetch_one(&f.db.pool)
+            .await?;
+    assert_eq!(
+        pg_d_status, "dependency_failed",
+        "the recovery's DependencyFailed persist must LAND in the saturated-floor regime"
+    );
+
+    Ok(())
+}
+
 /// Same-epoch re-acquire is idempotent: a self-fence false alarm
 /// followed by a successful renew re-fires the acquire edge and re-runs
 /// recovery, and the PG floor now contains OUR OWN claim row from the
