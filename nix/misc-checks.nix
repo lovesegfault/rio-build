@@ -24,14 +24,6 @@
   nodeAmi,
   docsLib,
   xtaskBin,
-  # nix/checks.nix's nextest reuse-build helpers and the prebuilt
-  # rio-lease / rio-store test binaries. Only nix/quint.nix's
-  # mbt-rio-lease and mbt-rio-logservice conformance checks consume
-  # them.
-  mkNextestRun,
-  mkNextestMeta,
-  rioLeaseTestBin,
-  rioStoreTestBin,
 }:
 let
   # Regenerate-then-diff drift check. `generate` populates
@@ -956,17 +948,7 @@ in
         touch $out
       '';
 }
-# Quint checks for formal protocol models in docs/spec/models/: the
-# per-regime model checks plus the mbt-rio-lease and mbt-rio-logservice
-# implementation conformance checks. See nix/quint.nix.
-// (import ./quint.nix {
-  inherit
-    pkgs
-    unfilteredRoot
-    mkNextestRun
-    mkNextestMeta
-    rioLeaseTestBin
-    rioStoreTestBin
-    ;
-  inherit (pkgs) lib;
-}).checks
+# The quint/TLC protocol-model checks and the mbt-* conformance checks
+# used to be spliced in here; they are now imported directly by
+# flake.nix (the `quintChecks` binding) so the CI matrix can give them
+# their own `formal` kind. checks.* still contains them.

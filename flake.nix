@@ -139,7 +139,7 @@
         options.perSystem = flake-parts-lib.mkPerSystemOption {
           options.ciMatrix = nixpkgs.lib.mkOption {
             type = nixpkgs.lib.types.lazyAttrsOf nixpkgs.lib.types.raw;
-            description = "GHA matrix data: {checks, fuzz, vm-test, coverage} → name→drv attrsets";
+            description = "GHA matrix data: {checks, formal, fuzz, vm-test, coverage} → name→drv attrsets";
           };
         };
 
@@ -691,6 +691,33 @@
               };
 
               # --------------------------------------------------------------
+              # Formal protocol models (quint/TLC) + MBT conformance checks
+              # --------------------------------------------------------------
+              #
+              # Imported at the flake level (not spliced inside
+              # misc-checks.nix, where this set used to live) so ciMatrix
+              # below can hand the quint/mbt set — together with the kani
+              # members — its own GHA matrix kind (`formal`) without a
+              # second eval of nix/quint.nix. checks.* still receives the
+              # exact same attrset (same drvs), so the local gate is
+              # unchanged.
+              quintChecks =
+                (import ./nix/quint.nix {
+                  inherit pkgs unfilteredRoot;
+                  inherit (pkgs) lib;
+                  # nextest reuse-build helpers plus the prebuilt rio-lease
+                  # and rio-store test binaries, for the mbt-rio-lease and
+                  # mbt-rio-logservice conformance checks (they run the
+                  # #[ignore]d mbt_* tests against the committed Quint
+                  # models with quint on PATH — same test binaries the
+                  # per-member nextest checks run, different filter and
+                  # environment).
+                  inherit (crateChecks) mkNextestRun mkNextestMeta;
+                  rioLeaseTestBin = crateChecks.testBins.rio-lease;
+                  rioStoreTestBin = crateChecks.testBins.rio-store;
+                }).checks;
+
+              # --------------------------------------------------------------
               # Non-rustc check derivations (shared by checks.* and ci aggregate)
               # --------------------------------------------------------------
               miscChecks = import ./nix/misc-checks.nix {
@@ -712,16 +739,6 @@
                   docsLib
                   ;
                 xtaskBin = crateBuild.memberBins.xtask;
-                # The nextest reuse-build helpers plus the prebuilt
-                # rio-lease and rio-store test binaries, for the
-                # mbt-rio-lease and mbt-rio-logservice conformance
-                # checks in nix/quint.nix (they run the #[ignore]d mbt_*
-                # tests against the committed Quint models with quint on
-                # PATH — same test binaries the per-member nextest
-                # checks run, different filter and environment).
-                inherit (crateChecks) mkNextestRun mkNextestMeta;
-                rioLeaseTestBin = crateChecks.testBins.rio-lease;
-                rioStoreTestBin = crateChecks.testBins.rio-store;
               };
 
               # Container images (Linux-only — dockerTools uses Linux VM
@@ -931,6 +948,21 @@
               # everything else on `rio-ci` (spot). This keeps the flake
               # emitting simple name→drv maps without per-entry metadata.
               #
+              # The formal-verification lane: every checks.* entry wired
+              # through nix/quint.nix (exhaustive model checks, witnesses,
+              # run pins, calibration witnesses, mbt-* conformance) or
+              # nix/kani.nix (per-member CBMC proofs). intersectAttrs
+              # against config.checks keeps the lane a strict subset of
+              # the local gate — a quint/kani check only reaches CI's
+              # formal matrix once it is actually wired into checks.*, and
+              # the matrix values ARE the checks.* derivations. ~160
+              # entries today and growing by tens per campaign, each one a
+              # JVM+TLC or CBMC run: that is why it is its own matrix kind
+              # (sharded by gen_matrix.py) instead of part of the `checks`
+              # kind, whose catch-all `misc` cluster it used to starve to
+              # death on a single runner.
+              formalChecks = builtins.intersectAttrs (quintChecks // kaniChecks) config.checks;
+
               ciMatrix = {
                 # Rust + static checks. Derived from config.checks — same
                 # P0525 rationale as the old .#ci aggregate: a manual list
@@ -955,8 +987,16 @@
                 # ciMatrix.coverage, but its KEY is a literal, so no
                 # recursion.
                 checks = builtins.removeAttrs config.checks (
-                  builtins.attrNames fuzz.runs ++ builtins.attrNames vmTests ++ [ "cov-smoke" ]
+                  builtins.attrNames fuzz.runs
+                  ++ builtins.attrNames vmTests
+                  ++ builtins.attrNames formalChecks
+                  ++ [ "cov-smoke" ]
                 );
+                # Formal-verification checks (quint/TLC, MBT, kani). Their
+                # build IS the verification run, so the kind is fanned out
+                # into balanced shards by gen_matrix.py instead of being
+                # one cluster. See formalChecks above.
+                formal = formalChecks;
                 # 2min fuzz runs, one matrix entry per target. Keys are
                 # fuzz-<target> (from nix/fuzz.nix). On a cold cache each
                 # entry rebuilds the shared fuzz-build derivation, but
@@ -1323,7 +1363,7 @@
                 # ──────────────────────────────────────────────────────────
                 #
                 # Everything the GHA pipeline (.github/workflows/ci.yml)
-                # builds, as one local target: the union of the four
+                # builds, as one local target: the union of the five
                 # ciMatrix kinds. Built FROM ciMatrix — the same value
                 # gen-matrix evaluates — so it cannot drift from what CI
                 # runs (the drift that retired the old hand-curated .#ci,
@@ -1420,6 +1460,11 @@
                 # Workspace-level policy checks (deny, helm-lint,
                 # tracey-validate, crds-drift, tfvars-fresh, …).
                 // miscChecks
+                # Formal protocol-model checks: quint/TLC per-regime
+                # proofs, witness/run/calibration checks, and the mbt-*
+                # conformance runs (nix/quint.nix). Imported at the flake
+                # level so ciMatrix.formal can reuse the same attrset.
+                // quintChecks
                 # Design-book builds (`docs-pdf`, `docs-html` + smokes).
                 // docsLib.checks
                 # 2min fuzz runs (Linux-only). Compiled binaries shared
