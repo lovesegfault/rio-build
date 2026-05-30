@@ -131,7 +131,15 @@ let
   # own verdict line ("[ok] No violation found" / "[violation] Found an
   # issue") is present in the transcript — exit codes alone are not
   # trusted in either direction.
-  apalacheServerPrelude = ''
+  #
+  # The server heap is parameterized because the conversion request for
+  # the largest modules (the gateway-lifecycle calibration overrides that
+  # carry both a rich connection alphabet and the in-session machinery)
+  # exceeds the 4 GiB default — the server OOMs parsing the request and
+  # every later attempt against the wedged JVM fails too. Only the checks
+  # that need it pass a larger value: the default renders byte-identical
+  # script text, so existing checks do not rehash.
+  apalacheServerPreludeWithHeap = serverHeapMb: ''
     # Start the bundled Apalache server (the same distribution quint
     # would spawn) so it outlives individual quint invocations and stays
     # JIT-warm across retries. Its chatter goes to a side log, keeping
@@ -139,7 +147,7 @@ let
     # the sandbox's private network namespace keeps parallel checks from
     # colliding on it.
     apalache_jar=$(ls ${pkgs.quint}/share/quint/apalache-dist-*/apalache/lib/apalache.jar)
-    ${pkgs.jdk21_headless}/bin/java -Xmx4096m -XX:+UseG1GC -jar "$apalache_jar" server --port=8822 \
+    ${pkgs.jdk21_headless}/bin/java -Xmx${toString serverHeapMb}m -XX:+UseG1GC -jar "$apalache_jar" server --port=8822 \
       > apalache-server.log 2>&1 &
     apalache_pid=$!
     trap 'kill $apalache_pid 2>/dev/null || true' EXIT
@@ -193,6 +201,11 @@ let
       return 0
     }
   '';
+
+  # The default-heap prelude every existing check interpolates; renders
+  # the exact text the constructors carried before the heap was
+  # parameterized, so no existing derivation rehashes.
+  apalacheServerPrelude = apalacheServerPreludeWithHeap 4096;
 
   # One `quint verify` run per (model, main-module, invariant-set,
   # backend) tuple. `main` selects the module within the file — a model
@@ -328,6 +341,11 @@ let
       # for override modules that select a non-default transition
       # relation).
       step ? null,
+      # Apalache server heap (MiB) for the quint->TLA+ conversion. The
+      # default matches the historical hardcoded value; only the largest
+      # override modules (whose conversion request OOMs a 4 GiB server)
+      # need more — see apalacheServerPreludeWithHeap.
+      serverHeapMb ? 4096,
     }:
     pkgs.runCommand "quint-${name}"
       {
@@ -352,7 +370,7 @@ let
         [ "$workers" = "0" ] && workers='"auto"'
         printf '{"workers": %s}\n' "$workers" > tlc-config.json
 
-        ${apalacheServerPrelude}
+        ${apalacheServerPreludeWithHeap serverHeapMb}
 
         # The violation is the EXPECTED outcome, so the verify call's
         # nonzero exit must not abort the script -- the retry helper
@@ -3232,6 +3250,135 @@ in
       spec = "gwConnLifecycle";
       main = "gwConnLifecycleFaultTransport";
       match = "stallArmsForceCloseRun";
+    };
+
+    # ---- Gateway lifecycle Stage-C calibration witnesses ----------------
+    # The historical-fix corpus replayed against the as-built model (the
+    # gw-session-formal campaign's Phase-0 Stage C). Each check
+    # instantiates the gwConnLifecycle core at a family-restricted scope,
+    # swaps ONE action for its PRE-FIX behavior (the calibration module's
+    # `calibStep`) and passes only while the checker still falsifies the
+    # invariant the corresponding historical fix protects — machine-checked
+    # evidence that the model would re-find that bug class if it were
+    # reintroduced, and that the invariant is not vacuous for it. The full
+    # per-candidate calibration table (verdict @ depth, states, the
+    # trace-walk notes, and the evidence-only override modules and
+    # T-direction runs that are not wired here) lives in
+    # docs/spec/models/gw-session-invariant-map.md; the wired ones are the
+    # representative per-family regression guards (one per falsifying
+    # family, deepest consequence, cheap state space — every check stops at
+    # its first violation). Deliberately no tracey markers (same policy as
+    # the other models' witness/calibration checks).
+
+    # F1 (443670d43 / GW-1): the session permit/gauge release keyed on the
+    # sessions map (client action) again — a server-side ending leaves
+    # capacity held with nothing armed to release it.
+    quint-gw-calib-f1-server-side-release = mkQuintWitnessCheck {
+      name = "gw-calib-f1-server-side-release";
+      spec = "calibration/gw-f1-capacity";
+      main = "gwCalibF1ServerSideKeepsGuard";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "l2SendSettleArmed";
+      # This module's conversion request is one of the two that OOM the
+      # default 4 GiB Apalache server (occupancy letters x the full
+      # close-out ladder); validated at 8 GiB.
+      serverHeapMb = 8192;
+    };
+
+    # F2 (79912eda0 / GW-3): connection emptiness measured on open channels
+    # again — a channel open disarms the empty grace and the
+    # open-without-exec population sits with no deadline armed.
+    quint-gw-calib-f2-open-disarms-grace = mkQuintWitnessCheck {
+      name = "gw-calib-f2-open-disarms-grace";
+      spec = "calibration/gw-f2-occupancy";
+      main = "gwCalibF2OpenDisarmsGrace";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s20GraceArmedExactlyWhenEmpty";
+    };
+
+    # F3 (1c46d9781 / GW-4): a polite disconnect queued without arming the
+    # force-close at the same decision point.
+    quint-gw-calib-f3-decide-without-arm = mkQuintWitnessCheck {
+      name = "gw-calib-f3-decide-without-arm";
+      spec = "calibration/gw-f3-force-close";
+      main = "gwCalibF3DecideWithoutArm";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s12DecideImpliesArmed";
+    };
+
+    # F4 (9739aca65 / GW-5): channel_close decrements unconditionally again
+    # (forged/duplicate closes skew open_channels; exec honored on
+    # never-accepted channels).
+    quint-gw-calib-f4-forged-close-decrement = mkQuintWitnessCheck {
+      name = "gw-calib-f4-forged-close-decrement";
+      spec = "calibration/gw-f4-channel-accounting";
+      main = "gwCalibF4ForgedCloseDecrements";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s7ChannelAccounting";
+    };
+
+    # F5 (51123b2be / GW-2): the close-out sends ordered before the
+    # SessionGuard drop again — capacity release waits on the peer draining
+    # the handle queue.
+    quint-gw-calib-f5-release-after-close-out = mkQuintWitnessCheck {
+      name = "gw-calib-f5-release-after-close-out";
+      spec = "calibration/gw-f5-egress";
+      main = "gwCalibF5ReleaseAfterCloseOut";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s15ReleaseBeforeCloseOut";
+    };
+
+    # F6 (0f476d6f0/a207ee15c / GW-9): a session-exit edge skips
+    # cancel_active_builds again — the recurring case-completeness shape.
+    quint-gw-calib-f6-exit-edge-skips-cancel = mkQuintWitnessCheck {
+      name = "gw-calib-f6-exit-edge-skips-cancel";
+      spec = "calibration/gw-f6-teardown";
+      main = "gwCalibF6ExitEdgeSkipsCancel";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s10CancelOnSessionEnd";
+      # Same conversion-size OOM as f1-server-side-release (the build
+      # chain x the close-out ladder); validated at 8 GiB.
+      serverHeapMb = 8192;
+    };
+
+    # F7 (765671437 / GW-13): the shutdown token only observed at the
+    # opcode-read point again — drain expiry exits with an in-flight build
+    # never cancelled.
+    quint-gw-calib-f7-drain-expiry-no-cancel = mkQuintWitnessCheck {
+      name = "gw-calib-f7-drain-expiry-no-cancel";
+      spec = "calibration/gw-f7-drain";
+      main = "gwCalibF7DrainExpiryNoCancel";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "l4DrainObligationsArmed";
+    };
+
+    # F9 (755f49744 / GW-16): an upstream RPC await inside a session loses
+    # its deadline again — the session parks in rpc-wait unbounded.
+    quint-gw-calib-f9-rpc-wait-no-deadline = mkQuintWitnessCheck {
+      name = "gw-calib-f9-rpc-wait-no-deadline";
+      spec = "calibration/gw-f9-upstream-deadline";
+      main = "gwCalibF9RpcWaitNoDeadline";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "l6RpcWaitDeadlineArmed";
+    };
+
+    # F10 (9b693441f / GW-19): a transient accept error terminates the
+    # listener (and the process, with every live session) again.
+    quint-gw-calib-f10-accept-error-fatal = mkQuintWitnessCheck {
+      name = "gw-calib-f10-accept-error-fatal";
+      spec = "calibration/gw-f10-accept";
+      main = "gwCalibF10AcceptErrorFatal";
+      extraSpecs = [ "gwConnLifecycle" ];
+      step = "calibStep";
+      witness = "s18ListenerSurvivesAcceptErrors";
     };
   };
 }
