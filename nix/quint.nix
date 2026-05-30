@@ -2886,5 +2886,352 @@ in
       step = "pullStep";
       witness = "noAtCapTermination";
     };
+
+    # ------------------------------------------------------------------
+    # Gateway connection/session lifecycle campaign (gw-session-formal,
+    # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
+    # channel open → exec admission → protocol session → teardown
+    # lifecycle as built — capacity permits and gauges, deadlines and
+    # keepalives, force-close arming/enforcement, the cancel-on-disconnect
+    # obligations, egress pacing and the three-stage drain — modeled
+    # against an explicit russh transport environment
+    # (docs/spec/models/gwConnLifecycle.qnt). The invariant ↔ spec-rule
+    # map, the Stage-B B-measure, the Stage-C check-set decision and the
+    # per-check verdicts live in
+    # docs/spec/models/gw-session-invariant-map.md.
+    #
+    # Check-set shape (the §2e pre-registered fallback ladder, applied at
+    # the Stage-B measurement milestone): the full-alphabet regimes do not
+    # exhaust inside the per-check budget (the base regime alone is in the
+    # tens of millions of distinct states, and fallback (2) shrinks it
+    # only ≈2×), so the merge-gated EXHAUSTIVE checks are the per-family
+    # restricted-alphabet modules (§2e fallbacks (3)/(4): every structural
+    # and environment bound intact, conn B at connection level, one corpus
+    # family's letters per check, asserting the full 34-property
+    # `allInvariants` conjunction over that family's reachable space).
+    # The full-alphabet regime modules carry the witness, expect-violation
+    # and named-run checks below — those stop at the first violation, so
+    # they stay cheap on the unrestricted alphabets. Which cross-family
+    # interleavings are therefore NOT exhaustively explored is recorded
+    # per property in the invariant map's Stage-C record.
+    # ------------------------------------------------------------------
+
+    # Pre-auth establishment / occupancy family (corpus F2/F3 pre-auth
+    # half, GW-3/GW-4): the ConnStage machine, accept-time conn permits,
+    # the gauge latch on the first auth callback (accept and reject
+    # outcomes), silent / KEX-parked / never-auth peers, the two-phase
+    # pre-auth deadline, the empty grace on idle authenticated
+    # connections, decide-implies-arm at both polite-disconnect sites,
+    # force-close enforcement, and every designed reap letter — at the
+    # connection level (the admission interplay is the next check's).
+    # r[verify gw.conn.lifecycle]
+    # r[verify gw.conn.real-connection-marker]
+    # r[verify gw.conn.force-close]
+    # r[verify gw.conn.keepalive+2]
+    quint-gw-lifecycle-fam-preauth = mkQuintCheck {
+      name = "gw-lifecycle-fam-preauth";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamPreauth";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Admission family (corpus F2 post-auth half, the GW-18 admission
+    # surface): exec admission against the empty-connection grace (the
+    # arm/disarm/re-arm cycle, the documented W3/P4 admit-vs-fire race),
+    # the per-session handshake and opcode-idle deadlines against
+    # occupancy-withholding peers, re-admission after the session count
+    # touches zero, and channel opens not counting as activity — on conn
+    # A's two channels with the egress/finish machinery abstracted to
+    # channel-close release (famWedge / famUpstream own those paths).
+    # r[verify gw.conn.lifecycle]
+    # r[verify gw.conn.exit-status+3]
+    # r[verify gw.conn.exec-request]
+    # r[verify gw.handshake.timeout]
+    quint-gw-lifecycle-fam-admission = mkQuintCheck {
+      name = "gw-lifecycle-fam-admission";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamAdmission";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Connection-cap family (GW-12 surface): MAX_CONNECTIONS dialed to 1
+    # (the §2e cap-regime value) so the over-cap permit-None path — the
+    # connection that reaches its first auth callback permit-less, is
+    # counted there, and is torn down instead of authenticating — is
+    # exhaustively explored with two modeled connections.
+    # r[verify gw.conn.cap]
+    # r[verify gw.conn.real-connection-marker]
+    quint-gw-lifecycle-fam-cap = mkQuintCheck {
+      name = "gw-lifecycle-fam-cap";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamCap";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Egress-pacing / wedge family (corpus F5, GW-2/GW-8, the W5 vanish
+    # reap): window-credited sends, the send and close-out budgets firing
+    # only against transport-withholding peers, capacity release before
+    # close-out, the close-out ordering, queue parks against non-reading
+    # peers, stall → force-close arming, and the designed transport reaps
+    # (keepalive / TCP_USER_TIMEOUT) for vanished peers — exhaustive for
+    # one egress session on conn A (the wedge candidates are
+    # single-session shapes; the multi-session content lives in
+    # famUpstream/famHostile and the full-regime witnesses). Conn B is
+    # the compliant control for the P5 clauses.
+    # r[verify gw.conn.send-deadline]
+    # r[verify gw.conn.session-cap+2]
+    # r[verify gw.conn.force-close]
+    # r[verify gw.conn.exit-status+3]
+    quint-gw-lifecycle-fam-wedge = mkQuintCheck {
+      name = "gw-lifecycle-fam-wedge";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamWedge";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Channel-accounting / hostile-open family (corpus F7, GW-5/GW-6/GW-7):
+    # forged and duplicate closes are ignored, over-bound and non-session
+    # opens terminate the connection (russh residue stays bounded), burst
+    # opens hit the per-connection bound, the write half is consumed by at
+    # most one exec, the open/close bookkeeping never goes negative, and
+    # capacity exhaustion is signaled by exec rejection only (conn B opens
+    # its channel and takes the session-cap rejection — the P3 surface).
+    # r[verify gw.conn.channel-limit+4]
+    # r[verify gw.conn.channel-types]
+    # r[verify gw.conn.per-channel-state]
+    # r[verify gw.conn.exec-request]
+    # r[verify gw.conn.session-cap+2]
+    quint-gw-lifecycle-fam-hostile = mkQuintCheck {
+      name = "gw-lifecycle-fam-hostile";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamHostile";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Upstream / teardown-obligation family (corpus F6/F9, GW-9/GW-10/
+    # GW-16/GW-19; the W10/W2 surface): the rpc-wait deadline (and the
+    # deliberately deadline-free build-event-wait), terminal vs non-Wire
+    # build-stream outcomes against the shipped tracking policy, the
+    # cancel loop on every non-panic exit, the upstream-stream release at
+    # session exit, the close-out ladder, and transient accept errors.
+    # Also asserts w10TriggerAbsent — the §4 W10 decision-rule trigger (a
+    # build leaving the tracked set with no terminal outcome, no
+    # CancelBuild attempt and the upstream stream still held after session
+    # exit) is unreachable; the owner's W10 sign-off consumes this
+    # together with the s16-terminal-only falsification trace below.
+    # r[verify gw.conn.cancel-on-disconnect+3]
+    # r[verify gw.store.transient-retry]
+    # r[verify gw.conn.accept-resilience]
+    # r[verify gw.conn.exit-status+3]
+    quint-gw-lifecycle-fam-upstream = mkQuintCheck {
+      name = "gw-lifecycle-fam-upstream";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamUpstream";
+      step = "famStep";
+      invariants = [
+        "allInvariants"
+        "w10TriggerAbsent"
+      ];
+    };
+
+    # Drain family (corpus F10, GW-13): SIGTERM at any point, the
+    # NOT_SERVING → accept-stop → session-drain-expiry → exit staging,
+    # accept-stop terminating no established connection or session, the
+    # drain-expiry shutdown-token cancel of a tracked build, and exit only
+    # at full quiescence.
+    # r[verify gw.drain.three-stage]
+    # r[verify gw.conn.session-drain]
+    quint-gw-lifecycle-fam-drain = mkQuintCheck {
+      name = "gw-lifecycle-fam-drain";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamDrain";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Degraded-tier family (the §2e fault-degraded surface): the exec-gate
+    # panic splitter and proto-task panics (S4's leak term, S8's
+    # no-stranded-permit clause, S10's panic carve-out), the
+    # TCP_USER_TIMEOUT setsockopt failure, write parks ordered against
+    # force-close arming (the W7 ordering bit), and the inactivity reap
+    # backstop that exists only in this regime's alphabet.
+    # r[verify gw.conn.force-close]
+    # r[verify gw.conn.exec-request]
+    # r[verify gw.conn.keepalive+2]
+    quint-gw-lifecycle-fam-degraded = mkQuintCheck {
+      name = "gw-lifecycle-fam-degraded";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFamDegraded";
+      step = "famStep";
+      invariants = [ "allInvariants" ];
+    };
+
+    # Non-vacuity witnesses for the gateway lifecycle model, on the
+    # FULL-alphabet regime modules (they stop at the first violation, so
+    # the unrestricted alphabets stay affordable). Each check passes only
+    # when the checker still reaches the contended scenario; one that
+    # stops violating means the regime's invariants have gone vacuous for
+    # it. Deliberately no tracey markers here (same policy as the other
+    # models' witnesses).
+    quint-gw-lifecycle-witness-server-side-release = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-server-side-release";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachServerSideEndingReleasesEarly";
+    };
+    quint-gw-lifecycle-witness-grace-fires-idle = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-grace-fires-idle";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachGraceFiresOnIdleConn";
+    };
+    quint-gw-lifecycle-witness-exec-within-grace = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-exec-within-grace";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachExecWithinGraceSurvives";
+    };
+    quint-gw-lifecycle-witness-session-cap-rejected = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-session-cap-rejected";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachSessionCapExecRejected";
+    };
+    quint-gw-lifecycle-witness-mux-touch-zero-exec = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-mux-touch-zero-exec";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachMuxTouchZeroThenExec";
+    };
+    quint-gw-lifecycle-witness-mux-sibling-quiescence = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-mux-sibling-quiescence";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachMuxSiblingQuiescence";
+    };
+    quint-gw-lifecycle-witness-close-out-order = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-close-out-order";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "canReachCloseOutCompletesInOrder";
+    };
+    quint-gw-lifecycle-witness-over-cap-auth-torn = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-over-cap-auth-torn";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleCap";
+      witness = "canReachOverCapAuthTorn";
+    };
+    quint-gw-lifecycle-witness-kex-parked-reclaimed = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-kex-parked-reclaimed";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultOccupancy";
+      witness = "canReachKexParkedReclaimed";
+    };
+    quint-gw-lifecycle-witness-stall-arms-force-close = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-stall-arms-force-close";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      witness = "canReachStallArmsForceClose";
+    };
+    quint-gw-lifecycle-witness-forged-close-ignored = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-forged-close-ignored";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      witness = "canReachForgedCloseIgnored";
+    };
+    quint-gw-lifecycle-witness-over-bound-open = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-over-bound-open";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      witness = "canReachOverBoundOpenTerminates";
+    };
+    quint-gw-lifecycle-witness-burst-hits-bound = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-burst-hits-bound";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      witness = "canReachBurstHitsBound";
+    };
+    quint-gw-lifecycle-witness-vanish-reclaimed = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-vanish-reclaimed";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      witness = "canReachVanishReclaimedDesigned";
+    };
+    quint-gw-lifecycle-witness-nonwire-removes-tracked = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-nonwire-removes-tracked";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultUpstream";
+      witness = "canReachNonWireRemovesTracked";
+    };
+    quint-gw-lifecycle-witness-drain-expiry-cancel = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-drain-expiry-cancel";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultDrain";
+      witness = "canReachDrainExpiryCancel";
+    };
+    quint-gw-lifecycle-witness-parked-inactivity-reclaim = mkQuintWitnessCheck {
+      name = "gw-lifecycle-witness-parked-inactivity-reclaim";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultDegraded";
+      witness = "canReachParkedReclaimedByInactivity";
+    };
+
+    # Pre-registered expected as-built falsifications (design §3/§4/§6,
+    # the invariant map's probe table): each strict variant is EXPECTED to
+    # be violated by today's code, and the check passes only while the
+    # counterexample still materializes — a probe that stops falsifying
+    # after a code or model change is a finding (the documented trade-off
+    # moved), not a pass. The traces these capture are the model-first
+    # evidence behind the §4 W3/W7/W10/P12 dispositions. No tracey
+    # markers (the spec rules are verified by the HOLD checks above).
+    quint-gw-lifecycle-falsification-l5-no-carve-out = mkQuintWitnessCheck {
+      name = "gw-lifecycle-falsification-l5-no-carve-out";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      witness = "l5StrictNoCarveOut";
+    };
+    quint-gw-lifecycle-falsification-s16-terminal-only = mkQuintWitnessCheck {
+      name = "gw-lifecycle-falsification-s16-terminal-only";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultUpstream";
+      witness = "s16StrictTerminalOnly";
+    };
+    quint-gw-lifecycle-falsification-s10-panic = mkQuintWitnessCheck {
+      name = "gw-lifecycle-falsification-s10-panic";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultDegraded";
+      witness = "s10StrictIncludingPanic";
+    };
+    quint-gw-lifecycle-falsification-l1-no-inactivity = mkQuintWitnessCheck {
+      name = "gw-lifecycle-falsification-l1-no-inactivity";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultDegraded";
+      witness = "l1StrictNoInactivity";
+    };
+
+    # The two deterministic named runs: the compliant peer's full
+    # lifecycle (the P5 completion half — no budget, force-close or reap
+    # ever fires against it, and every resource returns to zero) and the
+    # GW-2/C14 stalled-send wedge response (release before close-out,
+    # close-out under its own budget, force-close armed). Replayed step by
+    # step with their expectations re-asserted; each is pinned to the
+    # regime whose alphabet it needs.
+    quint-gw-lifecycle-run-compliant-peer = mkQuintRunCheck {
+      name = "gw-lifecycle-run-compliant-peer";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleBase";
+      match = "compliantLifecycleRun";
+    };
+    quint-gw-lifecycle-run-stall-wedge = mkQuintRunCheck {
+      name = "gw-lifecycle-run-stall-wedge";
+      spec = "gwConnLifecycle";
+      main = "gwConnLifecycleFaultTransport";
+      match = "stallArmsForceCloseRun";
+    };
   };
 }
