@@ -211,7 +211,7 @@ impl HmacClaims for ExecutorClaims {
 ///
 /// Shared by every control-plane caller of a service-token-gated RPC:
 /// rio-controller (`caller="rio-controller"`), rio-cli
-/// (`caller="rio-cli"`), and rio-parity (`caller="rio-parity"`). The
+/// (`caller="rio-cli"`), and rio-replay (`caller="rio-replay"`). The
 /// verifier side checks `claims.caller` against a per-RPC allowlist.
 /// `signer = None` → no-op (dev-mode pass-through; the verifier is also
 /// `None` in that mode). See `r[sec.authz.service-token]`.

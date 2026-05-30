@@ -155,7 +155,7 @@ pub trait ClusterApi: Send + Sync {
 /// Caller string the engine signs ServiceClaims with. Must stay listed in
 /// the scheduler AdminService allowlists for the read RPCs the engine uses
 /// (GetBuildGraph, ListPoisoned, GetSpawnIntents).
-pub const ENGINE_CALLER: &str = "rio-parity";
+pub const ENGINE_CALLER: &str = "rio-replay";
 
 /// Retry policy for leader-gated AdminService reads answered with
 /// UNAVAILABLE by a standby or during a failover window. Failover usually

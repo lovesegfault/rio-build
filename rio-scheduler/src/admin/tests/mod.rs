@@ -767,19 +767,19 @@ async fn service_token_allowlist_enforced() {
         .unwrap_err();
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
 
-    // parity+cli+dashboard read allowlist
-    // (`["rio-parity","rio-cli","rio-dashboard"]`). GetBuildGraph reads
+    // replay+cli+dashboard read allowlist
+    // (`["rio-replay","rio-cli","rio-dashboard"]`). GetBuildGraph reads
     // PG directly: an unknown build_id under the (default-leader) test
-    // state yields an empty graph, so Ok proves the rio-parity caller
+    // state yields an empty graph, so Ok proves the rio-replay caller
     // got PAST the gate (cf. admin_cancel_build_gated_on_service_token's
     // reaches-the-actor pattern); a builder identity is still rejected
     // at the gate.
     let gb = GetBuildGraphRequest {
         build_id: Uuid::new_v4().to_string(),
     };
-    svc.get_build_graph(req_with_token(&signer, "rio-parity", gb.clone()))
+    svc.get_build_graph(req_with_token(&signer, "rio-replay", gb.clone()))
         .await
-        .expect("rio-parity allowed on GetBuildGraph");
+        .expect("rio-replay allowed on GetBuildGraph");
     let err = svc
         .get_build_graph(req_with_token(&signer, "rio-builder", gb))
         .await

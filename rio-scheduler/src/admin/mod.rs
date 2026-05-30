@@ -566,7 +566,7 @@ impl AdminService for AdminServiceImpl {
         // r[impl sched.sla.threat.read-path-auth]
         self.ensure_service_caller(
             request.metadata(),
-            &["rio-parity", "rio-cli", "rio-dashboard"],
+            &["rio-replay", "rio-cli", "rio-dashboard"],
         )?;
         self.ensure_leader()?;
         // DB is the source of truth for poisoned_at (the in-memory DAG
@@ -649,7 +649,7 @@ impl AdminService for AdminServiceImpl {
         // r[impl sched.sla.threat.read-path-auth]
         self.ensure_service_caller(
             request.metadata(),
-            &["rio-parity", "rio-cli", "rio-dashboard"],
+            &["rio-replay", "rio-cli", "rio-dashboard"],
         )?;
         self.ensure_leader()?;
         let req = request.into_inner();
@@ -675,7 +675,7 @@ impl AdminService for AdminServiceImpl {
         // dashboard/CLI hold plain data.
         self.ensure_service_caller(
             request.metadata(),
-            &["rio-controller", "rio-dashboard", "rio-cli", "rio-parity"],
+            &["rio-controller", "rio-dashboard", "rio-cli", "rio-replay"],
         )?;
         self.ensure_leader()?;
         self.check_actor_alive()?;
