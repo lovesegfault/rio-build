@@ -276,7 +276,7 @@ impl DagActor {
                     // the outputs are obtainable).
                     to_spawn.push((drv_hash, paths));
                 } else {
-                    // r[impl sched.merge.substitute-topdown+11]
+                    // r[impl sched.merge.substitute-topdown+12]
                     // Confirmed-missing (a wanted output is missing upstream and
                     // not substitutable): every other node is left Ready and
                     // dispatches from source. A topdown-pruned root whose
@@ -726,7 +726,7 @@ impl DagActor {
             self.sweep_ready_cached().await;
             return;
         }
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Topdown-pruned root: the dep subgraph was dropped from this
         // submission, so a build dispatch cannot succeed (worker
         // ENOENTs on inputDrvs). Fail every interested build with a
@@ -995,7 +995,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// Topdown-pruned fail-fast: the node's dep subgraph was dropped
     /// from its submission, so a from-source build dispatch cannot
     /// succeed (the worker ENOENTs on inputDrvs that were never
@@ -1146,7 +1146,7 @@ impl DagActor {
     }
 
     // r[impl sched.evidence.settlement]
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// Settlement for a topdown-pruned node whose closure evidence is
     /// Broken at a fail-fast decision point. Instead of trusting
     /// walk-failure evidence that may predate out-of-band ingestion (the

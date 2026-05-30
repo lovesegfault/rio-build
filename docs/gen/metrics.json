@@ -137,6 +137,7 @@
     "rio_scheduler_substitute_fetch_retries_total",
     "rio_scheduler_substitute_spawned_total",
     "rio_scheduler_topdown_prune_total",
+    "rio_scheduler_topdown_settlement_reprobe_total",
     "rio_scheduler_topdown_substitute_fail_total",
     "rio_scheduler_transition_rejected_total",
     "rio_scheduler_undeclared_built_output_total",
@@ -897,6 +898,11 @@
         "name": "rio_scheduler_topdown_prune_total",
         "kind": "counter",
         "help": "Submissions pruned to roots-only by the top-down substitution pre-check"
+      },
+      {
+        "name": "rio_scheduler_topdown_settlement_reprobe_total",
+        "kind": "counter",
+        "help": "Settlement re-probes at topdown fail-fast decision points (labels: outcome = verification_walk|fail_fast). verification_walk: a stale walk verdict was about to wrongfully fail builds whose live-wanted outputs are obtainable — the settlement spawned a closure-re-verifying walk instead. fail_fast: the re-probe confirmed a wanted output missing and unsubstitutable (the genuine fail-fast)."
       },
       {
         "name": "rio_scheduler_topdown_substitute_fail_total",

@@ -142,7 +142,17 @@ cross-tenure/downgrade reachability probes the regimes need.
   the inventoried sites; verify markers on the existing unit tests that
   already pin the behaviors (merge/recovery closure-hole battery, the
   PG-persistence and stamp-rollback tests).
-- `sched.evidence.settlement`: no impl, no verify (intentional — see above).
+- `sched.evidence.settlement`: no impl, no verify at Phase 0a (intentional —
+  see above). **Closed by Phase 1 Wave 1** (the C3+D16 settlement fix): impl
+  markers at the dispatch-probe partition's settlement cells, the
+  `settle_broken_marked_root` helper and its `handle_substitute_complete`
+  Broken-arm routing (`actor/dispatch.rs`), and the reap-survivor hook
+  (`actor/build.rs`); verify markers on the D16 limbo test
+  (`marked_broken_tried_present_node_settles`), the C3 two-build test
+  (`stale_walk_failure_does_not_fail_build_with_present_outputs`), the
+  reap-settlement test (`reap_survivor_settles_at_reap_time`), and the
+  updated topdown battery in `actor/tests/merge.rs`. The rule no longer
+  appears in `tracey query uncovered`.
 - §7.12 zero-verify adjacents — left unannotated, recorded here instead:
   `sched.merge.stale-substitutable` (no existing test exercises the
   stale-Completed-but-substitutable stays-completed path; the nearby tests

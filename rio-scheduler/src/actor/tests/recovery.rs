@@ -2373,7 +2373,7 @@ async fn test_recovery_restores_build_timeout_baseline() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// `topdown_pruned` must survive leader failover: a derivations row
 /// persisted with the flag set is restored with the flag set (not
 /// reset to false) so the new leader keeps honoring the "must complete
@@ -2418,7 +2418,7 @@ async fn test_recovery_restores_topdown_pruned_flag() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Failover regression (the doomed dispatch): a roots-only-pruned root
 /// persisted as `substituting` is recovered CHILDLESS by the new
 /// leader, comes back Ready (no deps in the DAG), and is re-probed
@@ -2522,7 +2522,7 @@ async fn test_failover_childless_pruned_root_fails_fast_not_dispatched_from_sour
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The fail-fast must CONSUME the `topdown_pruned` marker (clear it in
 /// memory and in PG) when it parks a node: the flag can be stale (a
 /// committed merge whose activation failed, a node stamped while its
@@ -2633,7 +2633,7 @@ async fn test_fail_fast_clears_topdown_pruned_and_resubmission_builds_from_sourc
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Failover counterpart of the children-became-produced clear: a
 /// restored `topdown_pruned` mark must be DROPPED at recovery when the
 /// node's persisted children are all produced (`completed`/`skipped`)
@@ -2754,7 +2754,7 @@ async fn test_failover_clears_topdown_pruned_when_children_all_produced() -> Tes
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Live-build scoping of the recovery-time gate: a restored
 /// `topdown_pruned` mark must be KEPT when the parent's produced
 /// children are vouched for only by TERMINAL builds.
@@ -2901,7 +2901,7 @@ async fn test_failover_keeps_topdown_pruned_when_produced_children_belong_to_ter
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The closure-hole breadcrumb is persisted (`migrations/064`) and must
 /// be restored by `from_recovery_row` — not reset to false the way the
 /// pre-064 code did. Restoring it is what lets the recovery-time gate
@@ -3011,7 +3011,7 @@ async fn test_recovery_restores_closure_hole_and_heal_clears_persisted_breadcrum
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// bug_006 regression (the recovery-time veto): a restored
 /// `topdown_pruned` mark whose row also carries the persisted
 /// `closure_hole` breadcrumb must be KEPT at recovery even when every
@@ -3321,7 +3321,7 @@ async fn test_failover_pruned_build_completes_via_substitution_despite_other_bui
 }
 
 // r[verify sched.recovery.failed-dep-cascade+2]
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// bug_009, verdict harm: when the recovered parent's wanted set is
 /// genuinely unsatisfiable by substitution, the verdict and error must
 /// come from the node's OWN bounded resubmit-directing fail-fast — not
@@ -3510,7 +3510,7 @@ async fn test_failover_unflagged_parent_with_other_builds_cancelled_child_dispat
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// bug_006 regression (the recovery-time stamp): when recovery drops the
 /// edge to an un-produced terminal child of a restored marked parent, it
 /// must record the closure hole — in memory and best-effort in PG —

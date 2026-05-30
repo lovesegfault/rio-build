@@ -574,7 +574,7 @@ async fn marked_broken_tried_present_node_settles() -> TestResult {
 /// output is present (a walk verdict is stale by the walk's own
 /// duration). The settlement must re-probe the live effective wanted
 /// set first and route the obtainable node to a verification walk.
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 // r[verify sched.evidence.settlement]
 #[tokio::test]
 async fn stale_walk_failure_does_not_fail_build_with_present_outputs() -> TestResult {
@@ -3293,7 +3293,7 @@ async fn substitute_downgrade_never_forgives_the_same_path_twice() -> TestResult
 }
 
 // r[verify sched.merge.wanted-outputs+2]
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 // r[verify sched.substitute.detached+5]
 /// Downgraded completion (a forgiven seed became wanted mid-fetch) on a
 /// topdown-pruned CHILDLESS root: the dependency closure was dropped
@@ -3414,7 +3414,7 @@ async fn substitute_downgrade_on_topdown_pruned_childless_root_does_not_dispatch
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Fail-open carve-out: when the dispatch-time store probe errors out
 /// (RPC failure / timeout), every other Ready node keeps the existing
 /// fail-open behaviour and dispatches — but a CHILDLESS topdown-pruned
@@ -3473,7 +3473,7 @@ async fn topdown_pruned_childless_node_not_dispatched_when_probe_fails_open() ->
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// Two childless topdown-pruned roots, both sole-interest of the SAME
 /// build, both with a wanted output definitively missing and not
 /// substitutable, land in `to_fail_fast` together in one dispatch pass

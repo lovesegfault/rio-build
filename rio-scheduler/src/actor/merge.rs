@@ -123,7 +123,7 @@ impl DagActor {
         // (total, completed, cached) to PG so list_builds is O(LIMIT).
         self.update_build_counts(build_id).await;
 
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Post-reconciliation `topdown_pruned` clear pass. A node may
         // only lose the mark once its children (in the post-merge DAG)
         // are all already produced — its closure is then in the store,
@@ -355,7 +355,7 @@ impl DagActor {
         }
 
         // === Step 0: Top-down demand-set substitution check =========
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // Before merging the full DAG, check if the DEMANDED
         // derivations' outputs are already available. The demand set is
         // the structural roots ∪ every node the gateway marked
@@ -384,7 +384,7 @@ impl DagActor {
         // unreachable, partial demand-set cache, CA demanded nodes).
         // The fetch itself is deferred
         // (`r[sched.substitute.detached+5]`); on fetch failure the
-        // build fails fast (`r[sched.merge.substitute-topdown+11]` —
+        // build fails fast (`r[sched.merge.substitute-topdown+12]` —
         // resubmit re-probes). The existing check_cached_outputs at
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
@@ -560,7 +560,7 @@ impl DagActor {
         phase!("5-persist-and-activate");
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
-        // r[impl sched.merge.substitute-topdown+11]
+        // r[impl sched.merge.substitute-topdown+12]
         // r[impl sched.evidence.durability]
         // Stamp topdown_pruned on the kept (demanded) nodes only now
         // that the merge is committed (steps 4–5 can no longer fail).
@@ -1867,7 +1867,7 @@ impl DagActor {
         self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
     /// closure evidence is [`ClosureEvidence::Broken`] (childless or
     /// closure-holed): its dependency closure was dropped from the
@@ -2568,7 +2568,7 @@ impl DagActor {
         Ok(Some(resp))
     }
 
-    // r[impl sched.merge.substitute-topdown+11]
+    // r[impl sched.merge.substitute-topdown+12]
     /// Top-down demand-set substitution pre-check (step 0 of
     /// `handle_merge_dag`).
     ///

@@ -399,7 +399,7 @@ async fn test_cleanup_terminal_build_gc_deletes_event_log() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 /// The reap-time survivor re-evaluation must NOT fail-fast a marked,
 /// holed, walk-spent survivor that is Assigned/Running — an open
 /// attempt in flight gets its verdict from the worker report, the
@@ -559,7 +559,7 @@ async fn cleanup_reap_skips_marked_holed_survivor_with_open_attempt() -> TestRes
 ///  - tried: a regression PIN, not a red case (the fail-fast outcome
 ///    is unchanged pre/post fix); it pins the one-shot bound.
 // r[verify sched.evidence.settlement]
-// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.merge.substitute-topdown+12]
 #[rstest::rstest]
 #[case::untried(false)]
 #[case::tried(true)]

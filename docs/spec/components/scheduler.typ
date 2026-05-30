@@ -1065,7 +1065,7 @@ submitted after the failover record contributions as usual).
   origin URL.
 ]
 
-#r("sched.merge.substitute-topdown+11")[
+#r("sched.merge.substitute-topdown+12")[
   Before merging a submission's full DAG, the scheduler MUST first check
   whether the submission's *demand set* --- its structural roots (nodes with
   no parent edge in the submission) ∪ every node the client explicitly
@@ -1104,10 +1104,19 @@ submitted after the failover record contributions as usual).
   with a closure hole because an un-produced child was removed out from
   under it (reaped by a terminal interested build's cleanup, removed by a
   poison clear, or dropped at recovery as a lost edge) --- MUST NOT be
-  dispatched as a from-source build: when its deferred fetch fails
-  (`SubstituteComplete{ok=false}`), when the reap itself strands it with an
-  already-spent walk, or when its wanted outputs can neither be completed
-  inline nor routed to substitution at dispatch time, the scheduler MUST
+  dispatched as a from-source build, and MUST NOT take the
+  resubmit-directing fail-fast while its live effective wanted outputs are
+  obtainable: every fail-fast decision point --- the substitute-completion
+  routing (`SubstituteComplete{ok=false}`), the dispatch-probe partition
+  (wanted outputs that can neither be completed inline nor routed to
+  substitution), and the terminal-build reap's survivor pass --- MUST first
+  re-probe the live effective wanted set and route an obtainable node
+  (every live-wanted output present, substitutable, or indeterminate) to a
+  closure-re-verifying substitution walk
+  (#rref("sched.evidence.settlement")), at most one such verification walk
+  per `substitute_tried` arming; only a
+  confirmed-missing-and-unsubstitutable answer, or a failed verification
+  walk (the spent one-shot), takes the fail-fast: the scheduler MUST then
   fail every interested build with a resubmit-directing error --- the
   dependency subgraph was dropped, so the worker cannot resolve `inputDrvs`
   --- and this MUST hold across leader failover. Pull admission MUST refuse
@@ -1115,11 +1124,13 @@ submitted after the failover record contributions as usual).
   `NotYetReady`, no attempt row, no status change, and deliberately not a
   fail-fast (the pull carries no store verdict) --- leaving settlement to the
   dispatch sweep's probe/walk/fail-fast arms; and the reap-time
-  re-evaluation of surviving parents MUST skip survivors whose walk has not
-  yet been tried and survivors that are `Substituting`/`Assigned`/`Running`
-  --- an in-flight walk or open attempt keeps its chance to settle the node,
-  and the pull-admission refusal is what keeps new from-source attempts from
-  opening on it meanwhile.
+  re-evaluation of surviving parents MUST skip survivors that are
+  `Substituting`/`Assigned`/`Running` --- an in-flight walk or open attempt
+  keeps its chance to settle the node, and the pull-admission refusal is
+  what keeps new from-source attempts from opening on it meanwhile --- and
+  MUST route `Queued` survivors through the promotion arm (vacuously
+  all-deps-completed after the reap) so the next dispatch sweep's
+  settlement covers them.
 ]
 The prune short-circuits the common case where a requested package is already
 cached upstream: instead of eager-fetching hundreds of dependency NARs (the
@@ -1299,20 +1310,31 @@ failure rather than the resubmit-directing error.
   re-verified) or fail-fasted with the resubmit-directing error.
 ]
 This is the settlement obligation adopted for the closure-evidence campaign
-(its D16 finding). As built, the dispatch probe's present-but-tried cell
-violates it: such a node takes the probe partition's all-present branch and
-gets no action --- not completed inline (already tried), not routed to a walk
-(already tried), not fail-fasted (that arm is the else of the missing branch)
---- while `admit_pull` keeps refusing it `NotYetReady`, and when its hole came
-from a poison-clear path there is no reap-hook survivor pass to re-evaluate
-it; it sits Ready until a new merge, completion, or failover changes its
-state. The settling arm is deliberately NOT chosen here: completing inline
-would trust an output-present view that `substitute_tried` exists to
-distrust, and an unconditional fail-fast could be wrongful after a transient
-walk failure --- which arm satisfies the campaign's wrongful-failure bounds
-is what the model adjudicates, and the fix lands with that evidence
-(`docs/spec/models/closure-evidence-invariant-map.md`). Until then this rule
-is intentionally unimplemented and appears in `tracey query uncovered`.
+(its D16 finding). Pre-settlement, the dispatch probe's present-but-tried
+cell violated it: such a node took the probe partition's all-present branch
+and got no action --- not completed inline (already tried), not routed to a
+walk (already tried), not fail-fasted (that arm is the else of the missing
+branch) --- while `admit_pull` kept refusing it `NotYetReady`, and when its
+hole came from a poison-clear path there was no reap-hook survivor pass to
+re-evaluate it; it sat Ready until a new merge, completion, or failover
+changed its state. The settling arm is the model-adjudicated one (the
+campaign's OQ1 adjudication, recorded in
+`docs/spec/models/closure-evidence-invariant-map.md`): an obtainable node is
+routed to a *closure-re-verifying substitution walk* --- never completed
+inline directly --- because FMP presence covers output paths only and a
+tried node's earlier walk may have ingested the seed then failed on a
+reference, so "present" can hide a closure hole that only the walk's own
+reference traversal re-verifies; the walk's `ok=true` completion is what
+satisfies "completed (with its closure re-verified)", and its genuine
+failure lands back at the Broken arm with the one-shot spent and takes the
+fail-fast there. Direct inline completion would re-open the closure-hole
+hazard, and an unconditional fail-fast is wrongful for outputs that became
+obtainable during the walk (the C3 defect class). The settlement bounds
+wrongful terminal failures to at most one per `substitute_tried` arming (the
+campaign's C1 bound) and eliminates them entirely only in the
+no-failover / no-store-fault / no-upstream-withdrawal envelope (C3's scope);
+a co-build with genuinely unobtainable wanted outputs still fails all
+interested builds of the node (the verdict is per-node, not per-build).
 
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
