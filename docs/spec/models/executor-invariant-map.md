@@ -4226,7 +4226,13 @@ no deviation to record under the §4.5 honesty rule.
 7. ExecutorMessage remains in the proto as the builder's internal
    build-task envelope (completion + phase arms); re-homing it onto a
    builder-local type is cosmetic and can ride any future
-   build_types.proto change.
+   build_types.proto change. **Done (builder half) — closed by the
+   Round-2 Track C envelope cleanup** (2026-05-30): the builder's
+   internal envelope is now the builder-local `BuildTaskMessage`
+   (rio-builder/src/executor/mod.rs); only the proto-side removal of
+   the now-unreferenced `ExecutorMessage` message still rides a future
+   build_types.proto change. Record in the post-close-out section
+   below.
 
 #### What G6 (the 1d landing gate) still needs from the owner
 
@@ -4913,7 +4919,7 @@ development tree; all of them gate the staged rollout.
 | Kani harness for the pull kernels | Whoever next touches `admit_pull`/`fold_report` | Only on the recorded reconsideration triggers (loops/collections/counter arithmetic in the kernels, an extraction, or a changed floor-comparison shape); the rio-retry-kernel bounded-representation pattern is the template |
 | MBT over the pull handlers | Same | Only if a pure protocol core worth driving emerges (the retry campaign's omission triggers transfer); the quint-connect machinery is in-tree |
 | OA4/OA5 dashboard follow-ups: the fleet-view repoint ask and any future BuildPhase carrier | Dashboard owner | Recorded asks from 1b/1d; the Executors page works against the re-pointed RPCs today; DrainButton removal was acknowledged as the recorded fallback at the 1d landing review |
-| `ExecutorMessage` proto envelope re-homing onto a builder-local type | Any future build_types.proto change | Cosmetic (1d record item 7) |
+| `ExecutorMessage` proto envelope re-homing onto a builder-local type | Any future build_types.proto change | Cosmetic (1d record item 7). **Done (builder half, 2026-05-30, Round-2 Track C):** the builder's internal envelope is the builder-local `BuildTaskMessage`; what still rides a future build_types.proto change is only the proto-side removal of the now-unreferenced `ExecutorMessage` message. Record in the build-task-envelope post-close-out section below |
 | `sched.backpressure.hysteresis+2`, reactive-floor residual, and the other 1d-recorded accepted residuals | Standing | Already re-stated/recorded at 1d; listed here only so the close-out's leftover list is the 1d record's, not a shorter one |
 
 ### What the campaign does NOT claim
@@ -5084,3 +5090,68 @@ the comment references in nix/quint.nix, `executorSession.qnt`,
 `executor-f4-pull-establish-early.qnt` and scheduler.typ's
 session-epoch retirement note were re-worded to past tense by the
 retiring commit.
+
+## Post-close-out — the build-task envelope re-homing (Round-2 Track C, 2026-05-30)
+
+The deferred item executed: 1d record item 7 / the close-out
+deferred-items table row "`ExecutorMessage` proto envelope re-homing
+onto a builder-local type" — the builder's internal build-task →
+runtime envelope was the proto `ExecutorMessage` (a prost oneof
+wrapper) even though nothing it carries has touched a wire since the
+1d builder collapse.
+
+What was done (the builder half — the only half that does not touch
+the proto):
+
+- `BuildTaskMessage` (rio-builder/src/executor/mod.rs, two arms:
+  `Completion(Box<CompletionReport>)` + `Phase(BuildPhase)`) is now
+  the type of the process-lifetime build-task sink. Producers
+  (`send_completion`, the stderr loop's `forward_phase`) and consumers
+  (the pull loop's `wait_for_completion` / `build_phase_with_abort`)
+  match on the two-arm enum instead of unwrapping the prost
+  `msg: Option<Msg>` shape. The `Completion` arm is boxed for the same
+  size asymmetry the proto envelope handled by boxing its oneof
+  (rio-proto/build.rs).
+- The payloads stay proto types deliberately: `CompletionReport` is
+  what `ReportOutcome` sends upstream; `BuildPhase` is
+  `BuildEvent.phase`'s payload type (the producer-less display arm the
+  OA4 record keeps for a possible future carrier).
+- No behavior change: same channel, same arms, same send/consume
+  sites, phase edges still produced (per
+  `builder.stderr.forward-set-phase`) and still drained-and-discarded
+  by the pull loop. The existing rio-builder test batteries pin the
+  semantics; no test's assertion target changed beyond the envelope
+  type itself.
+
+What this does NOT take (stays deferred under its original owner):
+
+- The proto-side removal of the now-unreferenced `ExecutorMessage`
+  message from build_types.proto (and its build.rs boxing config +
+  the rio-proto contract-test row). That is a protocol change; per the
+  original record it rides any future build_types.proto change. The
+  message body and its reserved arms are unchanged by this cleanup.
+
+Spec-prose staleness recorded (the C3/C4 treatment — amendment
+deferred to the rule's next substantive edit, no behavior question):
+
+- `builder.stderr.forward-set-phase` (builder.typ) names the carrier:
+  "forwards … as a `BuildPhase{derivation_path, phase}`
+  `ExecutorMessage`". The payload clause stays exactly true; the
+  carrier word is now the builder-local `BuildTaskMessage`. The rule's
+  normative substance (forward SetPhase as a BuildPhase, unbatched, no
+  silence-deadline reset) is implemented and verified unchanged — the
+  `r[impl]`/`r[verify]` markers are intact and tracey-validate is
+  green.
+
+Verification (the rio-builder gate, all green at the re-homing
+commit): `cargo clippy -p rio-builder --all-targets -- --deny
+warnings`; `cargo nextest run -p rio-builder` (298/298); `treefmt`
+(no drift); `tracey query validate` (0 errors);
+`checks.x86_64-linux.vm-protocol-warm-standalone` (the standalone
+fixture's full pull → build → report path against the production
+intent/token RPCs) rebuilt green on the re-homed envelope.
+
+Net delta: +108/−89 lines in rio-builder (the growth is the new
+enum's definition and documentation; every use site shrank). No
+shared-registry regeneration needed — no Cargo.toml, proto, or
+docs/gen surface changed.
