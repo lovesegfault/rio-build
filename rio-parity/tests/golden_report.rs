@@ -1,12 +1,15 @@
 //! Golden report test: a canned results.jsonl must aggregate to exact
-//! bucket counts and render to a stable summary.md, and re-rendering the
-//! same input must be byte-identical. Regenerate the golden summary with:
+//! verdict/disposition counts and render to a stable summary.md, and
+//! re-rendering the same input must be byte-identical. The frozen
+//! pre-cutover fixture (legacy-results.jsonl) additionally proves the
+//! legacy-bucket → verdict/disposition rename count-preserving.
+//! Regenerate the golden summary with:
 //!   BLESS=1 nix develop -c cargo nextest run -p rio-parity -E 'test(golden_summary_matches)'
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rio_parity::run::model::JobRecord;
+use rio_parity::run::model::{JobRecord, unified_from_legacy_bucket};
 use rio_parity::run::report::{ReportInput, aggregate, render_summary};
 use rio_parity::run::spec::CampaignRecord;
 use rio_parity::run::watchdog::SuspensionSummary;
@@ -42,40 +45,97 @@ fn fixtures() -> (CampaignRecord, BTreeMap<String, JobRecord>) {
 fn golden_bucket_counts() {
     let (_campaign, records) = fixtures();
     let agg = aggregate(&records);
-    let expect = |b: &str| agg.bucket_counts.get(b).copied().unwrap_or(0);
+    let verdict = |v: &str| agg.verdict_counts.get(v).copied().unwrap_or(0);
+    let disposition = |d: &str| agg.disposition_counts.get(d).copied().unwrap_or(0);
     assert_eq!(records.len(), 12);
-    assert_eq!(expect("match-built"), 2);
-    assert_eq!(expect("rio-only-failure"), 1);
-    assert_eq!(expect("rio-dependency-failure"), 1);
-    assert_eq!(expect("rio-infra-failure"), 2);
+    assert_eq!(verdict("match-built"), 1);
+    assert_eq!(verdict("output-divergence"), 1);
+    assert_eq!(verdict("unexpected-failure"), 1);
+    assert_eq!(verdict("unexpected-dependency-failure"), 1);
+    assert_eq!(verdict("infra-indeterminate"), 2);
     assert_eq!(
         agg.cascaded_counts
-            .get("rio-infra-failure")
+            .get("infra-indeterminate")
             .copied()
             .unwrap_or(0),
         1
     );
-    assert_eq!(expect("hydra-only-failure"), 1);
-    assert_eq!(expect("cached-prior"), 1);
-    assert_eq!(expect("not-attemptable"), 1);
-    assert_eq!(expect("hydra-unknown"), 1);
+    assert_eq!(verdict("unexpected-success"), 1);
+    assert_eq!(verdict("no-truth"), 1);
+    assert_eq!(disposition("cached-prior"), 1);
+    assert_eq!(disposition("not-attemptable"), 1);
     // The timed-only interruption verdicts are counted like any other
-    // bucket and stay out of the headline.
-    assert_eq!(expect("interruption-replayed"), 1);
-    assert_eq!(expect("interruption-not-reproduced"), 1);
-    // Headline: 2 match-built / (2 + 1 + 1) = 50%.
+    // verdict and stay out of the headline.
+    assert_eq!(verdict("interruption-replayed"), 1);
+    assert_eq!(verdict("interruption-not-reproduced"), 1);
+    // Headline: (1 match-built + 1 output-divergence) / (2 + 1 + 1) = 50%.
     let head = rio_parity::run::classify::headline(
-        &agg.bucket_counts,
+        &agg.verdict_counts,
         agg.nar_equal,
         agg.nar_compared_jobs,
     );
     assert_eq!(head.denominator, 4);
     assert_eq!(head.numerator, 2);
-    // NAR: one equal, one differs among compared match-built jobs.
+    // NAR: one equal, one differs among the compared match-class jobs.
     assert_eq!(
         (agg.nar_equal, agg.nar_differs, agg.nar_compared_jobs),
         (1, 1, 2)
     );
+}
+
+/// The frozen pre-cutover results file maps onto the unified vocabulary
+/// count-preservingly: every legacy record lands in exactly one verdict or
+/// disposition, totals are preserved, and each legacy bucket's count
+/// reappears under its mapped name (with the one data-dependent split:
+/// `match-built` records whose narCompare carries a `differs` entry become
+/// `output-divergence`). The legacy fixture stays byte-identical to the
+/// pre-cutover artifact forever, old tenant/prefix strings included.
+#[test]
+fn legacy_results_render_count_preserving() {
+    let path = manifest_dir().join("tests/fixtures/golden/legacy-results.jsonl");
+    let mut legacy_total = 0usize;
+    let mut legacy_by_bucket: BTreeMap<String, usize> = BTreeMap::new();
+    let mut unified: BTreeMap<String, usize> = BTreeMap::new();
+    for line in std::fs::read_to_string(&path).unwrap().lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        let bucket = value["bucket"]
+            .as_str()
+            .expect("legacy record has a bucket");
+        let nar_differs = value["narCompare"]
+            .as_object()
+            .is_some_and(|outputs| outputs.values().any(|v| v == "differs"));
+        let class = unified_from_legacy_bucket(bucket, nar_differs)
+            .expect("every legacy bucket maps onto the unified vocabulary");
+        legacy_total += 1;
+        *legacy_by_bucket.entry(bucket.to_string()).or_default() += 1;
+        *unified.entry(class.as_str().to_string()).or_default() += 1;
+    }
+    // Count preservation: nothing dropped, nothing double-counted.
+    assert_eq!(legacy_total, 12);
+    assert_eq!(unified.values().sum::<usize>(), legacy_total);
+    // Name-for-name: each legacy bucket's count reappears under its mapped
+    // name. The two match-built records split 1/1 because exactly one of
+    // them carries a differs narCompare entry.
+    assert_eq!(legacy_by_bucket["match-built"], 2);
+    let expected: BTreeMap<&str, usize> = BTreeMap::from([
+        ("match-built", 1),
+        ("output-divergence", 1),
+        ("unexpected-failure", 1),
+        ("unexpected-dependency-failure", 1),
+        ("infra-indeterminate", 2),
+        ("unexpected-success", 1),
+        ("no-truth", 1),
+        ("cached-prior", 1),
+        ("not-attemptable", 1),
+        ("interruption-replayed", 1),
+        ("interruption-not-reproduced", 1),
+    ]);
+    let unified_ref: BTreeMap<&str, usize> =
+        unified.iter().map(|(k, v)| (k.as_str(), *v)).collect();
+    assert_eq!(unified_ref, expected);
 }
 
 #[test]

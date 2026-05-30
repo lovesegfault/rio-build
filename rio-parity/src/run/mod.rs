@@ -2390,11 +2390,11 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(state.path("progress.json")).unwrap())
                 .unwrap();
         assert_eq!(progress["stage"], "done");
-        // campaign.json pins the archive and carries the recorder-side
-        // exclusion counts; the engine's own plan-time exclusions are
-        // asserted on their per-job records above (the comparability
-        // excluded map re-derives engine-side counts from the report's
-        // class vocabulary).
+        // campaign.json pins the archive and carries both exclusion
+        // sources: the recorder-side exclusion counts from the archive and
+        // the engine-side counts the comparability refresh re-derives from
+        // the per-class vocabulary (the two filtered jobs roll up under
+        // their disposition).
         let campaign: CampaignRecord = state.read_json("campaign.json").unwrap().unwrap();
         assert_eq!(campaign.archive.archive_id, archive_id);
         assert_eq!(
@@ -2402,6 +2402,7 @@ mod tests {
             campaign.archive.archive_id_short
         );
         assert_eq!(campaign.comparability.excluded.get("eval-error"), Some(&1));
+        assert_eq!(campaign.comparability.excluded.get("filtered"), Some(&2));
 
         // Resume: same state dir, no scripted submitter outcomes left → must
         // not submit anything new and must finish with identical buckets.
@@ -3405,7 +3406,8 @@ mod tests {
         // over the scope.
         let agg = report::aggregate(&records);
         assert_eq!(
-            agg.bucket_counts.values().sum::<usize>(),
+            agg.verdict_counts.values().sum::<usize>()
+                + agg.disposition_counts.values().sum::<usize>(),
             plan.in_scope.len()
         );
         // Idempotent: nothing more to write on a second call.

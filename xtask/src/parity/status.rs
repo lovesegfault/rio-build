@@ -33,9 +33,10 @@ pub struct StatusArgs {
 /// One human-readable line per interesting progress.json field; falls
 /// back to the raw document when the shape is unknown. The engine owns
 /// the schema (`rio_parity::run::report::Progress`, camelCase): stage,
-/// per-bucket counts, attempted (with its inScope/attemptable
-/// denominators from the comparability block), infra / hydra-unknown
-/// rates, throughput, ETA, suspension windows, completeness.
+/// per-verdict and per-disposition counts, attempted (with its
+/// inScope/attemptable denominators from the comparability block),
+/// infra-indeterminate / no-truth rates, throughput, ETA, suspension
+/// windows, completeness.
 pub fn summarize_progress(raw: &str) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
         return raw.to_owned();
@@ -48,9 +49,10 @@ pub fn summarize_progress(raw: &str) -> String {
     }
     for key in [
         "attempted",
-        "bucketCounts",
+        "verdictCounts",
+        "dispositionCounts",
         "infraRatePct",
-        "hydraUnknownRatePct",
+        "noTruthRatePct",
         "jobsPerHour",
         "etaHours",
     ] {
@@ -178,13 +180,11 @@ mod tests {
             campaign_id: "parity-leaf-20260601-ab12".into(),
             stage: "submit+collect".into(),
             updated_at: "2026-06-02T03:04:05Z".into(),
-            bucket_counts: BTreeMap::from([
-                ("match-built".to_string(), 12),
-                ("queued".to_string(), 38),
-            ]),
+            verdict_counts: BTreeMap::from([("match-built".to_string(), 12)]),
+            disposition_counts: BTreeMap::from([("not-attempted".to_string(), 38)]),
             attempted: 50,
             infra_rate_pct: Some(1.5),
-            hydra_unknown_rate_pct: None,
+            no_truth_rate_pct: None,
             jobs_per_hour: Some(120.0),
             eta_hours: Some(2.0),
             suspension: SuspensionSummary::default(),
@@ -203,6 +203,7 @@ mod tests {
         assert!(s.contains("stage: submit+collect"), "{s}");
         assert!(s.contains("updatedAt: 2026-06-02T03:04:05Z"), "{s}");
         assert!(s.contains("\"match-built\":12"), "{s}");
+        assert!(s.contains("\"not-attempted\":38"), "{s}");
         assert!(s.contains("attempted: 50"), "{s}");
         assert!(s.contains("infraRatePct: 1.5"), "{s}");
         assert!(s.contains("jobsPerHour: 120"), "{s}");
@@ -213,7 +214,7 @@ mod tests {
         assert!(s.contains("inScope/attemptable: 100 / 80"), "{s}");
         assert!(s.contains("completenessPct: 12.5"), "{s}");
         // Null fields are dropped, not rendered as "null".
-        assert!(!s.contains("hydraUnknownRatePct"), "{s}");
+        assert!(!s.contains("noTruthRatePct"), "{s}");
         assert!(!s.contains("null"), "{s}");
 
         // Unknown shape → pretty JSON; non-JSON → verbatim.

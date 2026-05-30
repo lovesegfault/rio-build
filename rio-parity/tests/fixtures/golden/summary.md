@@ -1,4 +1,4 @@
-# Parity campaign c-golden-0001 — summary
+# Replay campaign c-golden-0001 — summary
 
 Generated: 2026-05-26T12:00:00Z
 
@@ -20,23 +20,29 @@ Generated: 2026-05-26T12:00:00Z
 
 ## Headline
 - Build-outcome parity: **50.00%** (2 / 4)
+- Output divergence (within headline): 1 jobs
 - NAR-hash agreement (secondary, non-gating): 50.00% (1 / 2 compared jobs)
-- Infra-failure rate (excluded from headline): 20.00%
-- Hydra-unknown rate: 10.00%
+- Infra-indeterminate rate (excluded from headline): 20.00%
+- No-truth rate: 10.00%
 
-## Buckets
-| bucket | count | of which cascaded |
+## Verdicts
+| verdict | count | of which cascaded |
 |---|---:|---:|
-| match-built | 2 |  |
-| rio-only-failure | 1 |  |
-| rio-dependency-failure | 1 |  |
-| rio-infra-failure | 2 | 1 |
-| cached-prior | 1 |  |
-| not-attemptable | 1 |  |
-| hydra-unknown | 1 |  |
-| hydra-only-failure | 1 |  |
+| match-built | 1 |  |
+| output-divergence | 1 |  |
+| unexpected-failure | 1 |  |
+| unexpected-dependency-failure | 1 |  |
+| unexpected-success | 1 |  |
+| infra-indeterminate | 2 | 1 |
+| no-truth | 1 |  |
 | interruption-replayed | 1 |  |
 | interruption-not-reproduced | 1 |  |
+
+## Dispositions
+| disposition | count |
+|---|---:|
+| not-attemptable | 1 |
+| cached-prior | 1 |
 
 ## Top failure signatures
 Signatures group byte-identical raw evidence (60-character message slugs); the same failure mode worded differently appears as separate rows, so these are NOT failure-mode counts.
@@ -49,7 +55,7 @@ Signatures group byte-identical raw evidence (60-character message slugs); the s
 - differs.x86_64-linux
 
 ## Retries
-- match-built on first attempt: 1 | after retries: 1
+- match-built/output-divergence on first attempt: 1 | after retries: 1
 
 ## Suspension windows
 (none)
@@ -58,4 +64,4 @@ Signatures group byte-identical raw evidence (60-character message slugs); the s
 (not recorded)
 
 ## Artifacts
-- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file
+- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, buckets/<verdict-or-disposition>.jsonl, report/gate.json (when a regression gate was requested), logs/<job>.log.zst next to this file

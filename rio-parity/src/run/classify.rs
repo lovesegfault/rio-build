@@ -19,8 +19,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use super::model::{
-    Bucket, Disposition, FailureKind, HydraOutcome, RioOutcome, RootCauseKind, UnifiedClass,
-    Verdict,
+    Disposition, FailureKind, HydraOutcome, RioOutcome, RootCauseKind, UnifiedClass, Verdict,
 };
 
 /// How a recorded interruption (cancellation or client disconnect) played
@@ -255,10 +254,13 @@ pub fn project_output_divergence(verdict: Verdict, nar_verdict: &str) -> Verdict
     }
 }
 
-/// Headline + secondary metrics from bucket counts. The headline ratio is
-/// match-built over (match-built + rio-only-failure + rio-dependency-failure);
-/// every other bucket is excluded from the denominator. NAR agreement is the
-/// non-gating share of compared jobs whose NAR hashes match.
+/// Headline + secondary metrics from verdict counts. The build-outcome
+/// headline ratio is (match-built + output-divergence) over (match-built +
+/// output-divergence + unexpected-failure + unexpected-dependency-failure);
+/// every other verdict and every disposition is excluded from the
+/// denominator. NAR agreement is the non-gating share of the headline
+/// numerator that stayed `match-built` (i.e. no recorded output hash
+/// differed).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Headline {
     pub numerator: usize,
@@ -269,24 +271,29 @@ pub struct Headline {
     pub nar_agreement_pct: Option<f64>,
 }
 
-/// Compute the [`Headline`] metrics from final bucket counts (keyed by
-/// [`Bucket::as_str`]) plus the job-level NAR comparison tallies.
+/// Compute the [`Headline`] metrics from final verdict counts (keyed by
+/// [`Verdict::as_str`]) plus the job-level NAR comparison tallies. The NAR
+/// agreement percentage is derived from the verdict counts (match-built
+/// over match-built + output-divergence); the `nar_equal`/`nar_compared`
+/// tallies are carried through verbatim for the summary line.
 pub fn headline(
-    bucket_counts: &BTreeMap<String, usize>,
+    verdict_counts: &BTreeMap<String, usize>,
     nar_equal: usize,
     nar_compared: usize,
 ) -> Headline {
-    let get = |b: Bucket| bucket_counts.get(b.as_str()).copied().unwrap_or(0);
-    let numerator = get(Bucket::MatchBuilt);
-    let denominator = numerator + get(Bucket::RioOnlyFailure) + get(Bucket::RioDependencyFailure);
+    let get = |v: Verdict| verdict_counts.get(v.as_str()).copied().unwrap_or(0);
+    let match_built = get(Verdict::MatchBuilt);
+    let output_divergence = get(Verdict::OutputDivergence);
+    let numerator = match_built + output_divergence;
+    let denominator =
+        numerator + get(Verdict::UnexpectedFailure) + get(Verdict::UnexpectedDependencyFailure);
     Headline {
         numerator,
         denominator,
         headline_pct: (denominator > 0).then(|| 100.0 * numerator as f64 / denominator as f64),
         nar_equal,
         nar_compared,
-        nar_agreement_pct: (nar_compared > 0)
-            .then(|| 100.0 * nar_equal as f64 / nar_compared as f64),
+        nar_agreement_pct: (numerator > 0).then(|| 100.0 * match_built as f64 / numerator as f64),
     }
 }
 
@@ -708,17 +715,17 @@ mod tests {
         );
     }
 
-    /// The headline numerator/denominator are an explicit bucket list, so
-    /// the timed-only interruption buckets never enter either side.
+    /// The headline numerator/denominator are an explicit verdict list, so
+    /// the timed-only interruption verdicts never enter either side.
     #[test]
     fn headline_ignores_interruption_buckets() {
         let mut counts = BTreeMap::new();
-        counts.insert(Bucket::MatchBuilt.as_str().to_string(), 90);
-        counts.insert(Bucket::RioOnlyFailure.as_str().to_string(), 7);
-        counts.insert(Bucket::RioDependencyFailure.as_str().to_string(), 3);
+        counts.insert(Verdict::MatchBuilt.as_str().to_string(), 90);
+        counts.insert(Verdict::UnexpectedFailure.as_str().to_string(), 7);
+        counts.insert(Verdict::UnexpectedDependencyFailure.as_str().to_string(), 3);
         let without = headline(&counts, 80, 85);
-        counts.insert(Bucket::InterruptionReplayed.as_str().to_string(), 5);
-        counts.insert(Bucket::InterruptionNotReproduced.as_str().to_string(), 2);
+        counts.insert(Verdict::InterruptionReplayed.as_str().to_string(), 5);
+        counts.insert(Verdict::InterruptionNotReproduced.as_str().to_string(), 2);
         let with = headline(&counts, 80, 85);
         assert_eq!(with.numerator, without.numerator);
         assert_eq!(with.denominator, without.denominator);
@@ -728,17 +735,23 @@ mod tests {
     #[test]
     fn headline_math() {
         let mut counts = BTreeMap::new();
-        counts.insert(Bucket::MatchBuilt.as_str().to_string(), 90);
-        counts.insert(Bucket::RioOnlyFailure.as_str().to_string(), 7);
-        counts.insert(Bucket::RioDependencyFailure.as_str().to_string(), 3);
-        counts.insert(Bucket::RioInfraFailure.as_str().to_string(), 5); // excluded
-        counts.insert(Bucket::CachedPrior.as_str().to_string(), 11); // excluded
+        counts.insert(Verdict::MatchBuilt.as_str().to_string(), 90);
+        counts.insert(Verdict::OutputDivergence.as_str().to_string(), 4);
+        counts.insert(Verdict::UnexpectedFailure.as_str().to_string(), 7);
+        counts.insert(Verdict::UnexpectedDependencyFailure.as_str().to_string(), 3);
+        counts.insert(Verdict::InfraIndeterminate.as_str().to_string(), 5); // excluded
         let h = headline(&counts, 80, 85);
-        assert_eq!(h.denominator, 100);
-        assert_eq!(h.numerator, 90);
-        assert!((h.headline_pct.unwrap() - 90.0).abs() < f64::EPSILON);
-        assert!((h.nar_agreement_pct.unwrap() - (80.0 / 85.0 * 100.0)).abs() < 1e-9);
+        assert_eq!(h.numerator, 94);
+        assert_eq!(h.denominator, 104);
+        assert!((h.headline_pct.unwrap() - (94.0 / 104.0 * 100.0)).abs() < 1e-9);
+        // NAR agreement comes from the verdict counts: the share of the
+        // headline numerator that stayed match-built.
+        assert!((h.nar_agreement_pct.unwrap() - (90.0 / 94.0 * 100.0)).abs() < 1e-9);
+        // The raw comparison tallies are carried through for the summary
+        // line, not recomputed.
+        assert_eq!((h.nar_equal, h.nar_compared), (80, 85));
         let empty = headline(&BTreeMap::new(), 0, 0);
         assert_eq!(empty.headline_pct, None);
+        assert_eq!(empty.nar_agreement_pct, None);
     }
 }

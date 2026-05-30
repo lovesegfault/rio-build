@@ -928,7 +928,7 @@
     {
       "path": "run/report.rs",
       "depth": 1,
-      "doc": "Report rendering: summary.md, per-bucket JSONL, and progress.json."
+      "doc": "Report rendering: summary.md, per-class JSONL files, and progress.json."
     },
     {
       "path": "run/spec.rs",

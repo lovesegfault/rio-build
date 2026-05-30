@@ -1,4 +1,7 @@
-//! Report rendering: summary.md, per-bucket JSONL, and progress.json.
+//! Report rendering: summary.md, per-class JSONL files, and progress.json.
+//!
+//! Each distinct verdict or disposition gets its own JSONL file under
+//! `buckets/`, named by the class's wire string.
 //!
 //! Rendering is a pure function of its inputs (including the
 //! `generated_at` timestamp the caller supplies), so re-rendering
@@ -7,8 +10,9 @@
 //!
 //! The arithmetic is not re-derived here: [`headline`] and
 //! [`job_nar_verdict`] (from the classifier module) stay the single
-//! sources of the headline ratio and the per-job NAR verdict, and bucket
-//! names are only ever read via [`Bucket::as_str`].
+//! sources of the headline ratio and the per-job NAR verdict, and
+//! verdict/disposition names are only ever read via [`Verdict::as_str`] /
+//! [`Disposition::as_str`].
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -18,7 +22,7 @@ use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
 use super::classify::{Headline, NAR_DIFFERS, NAR_EQUAL, headline, job_nar_verdict};
-use super::model::{Bucket, JobRecord};
+use super::model::{Disposition, JobRecord, Verdict};
 use super::spec::{
     CampaignRecord, ComparabilityBlock, PLAN_COUNT_ATTEMPTABLE, PLAN_COUNT_IN_SCOPE,
 };
@@ -31,7 +35,10 @@ use super::watchdog::SuspensionSummary;
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Aggregates {
-    pub bucket_counts: BTreeMap<String, usize>,
+    pub verdict_counts: BTreeMap<String, usize>,
+    pub disposition_counts: BTreeMap<String, usize>,
+    /// Cascaded-dependent counts, keyed by the verdict string (only
+    /// verdict-carrying records can be cascaded).
     pub cascaded_counts: BTreeMap<String, usize>,
     pub signature_counts: BTreeMap<String, usize>,
     pub nar_equal: usize,
@@ -41,30 +48,33 @@ pub struct Aggregates {
     pub first_attempt_successes: usize,
     pub multi_attempt_successes: usize,
     pub infra_rate_pct: Option<f64>,
-    pub hydra_unknown_rate_pct: Option<f64>,
+    pub no_truth_rate_pct: Option<f64>,
     pub attempted: usize,
 }
 
-/// Tally bucket/cascade/signature counts, NAR agreement, retry splits, and
-/// the attempted-job rates from the latest record per job.
+/// Tally verdict/disposition/cascade/signature counts, NAR agreement,
+/// retry splits, and the attempted-job rates from the latest record per
+/// job.
 pub fn aggregate(records: &BTreeMap<String, JobRecord>) -> Aggregates {
     let mut agg = Aggregates::default();
     for rec in records.values() {
-        // The per-record class string: the verdict when set, else the
-        // disposition (records carry exactly one of the two).
-        let class = rec
-            .verdict
-            .clone()
-            .or_else(|| rec.disposition.clone())
-            .unwrap_or_default();
-        *agg.bucket_counts.entry(class.clone()).or_default() += 1;
-        if rec.cascaded {
-            *agg.cascaded_counts.entry(class.clone()).or_default() += 1;
+        // A classified record carries exactly one of verdict/disposition;
+        // an unclassified record (neither set) enters neither count map.
+        if let Some(verdict) = &rec.verdict {
+            *agg.verdict_counts.entry(verdict.clone()).or_default() += 1;
+            if rec.cascaded {
+                *agg.cascaded_counts.entry(verdict.clone()).or_default() += 1;
+            }
+        } else if let Some(disposition) = &rec.disposition {
+            *agg.disposition_counts
+                .entry(disposition.clone())
+                .or_default() += 1;
         }
         if let Some(sig) = &rec.signature {
             *agg.signature_counts.entry(sig.clone()).or_default() += 1;
         }
-        if class == Bucket::MatchBuilt.as_str() {
+        let verdict_is = |v: Verdict| rec.verdict.as_deref() == Some(v.as_str());
+        if verdict_is(Verdict::MatchBuilt) || verdict_is(Verdict::OutputDivergence) {
             if rec.attempts <= 1 {
                 agg.first_attempt_successes += 1;
             } else {
@@ -89,23 +99,24 @@ pub fn aggregate(records: &BTreeMap<String, JobRecord>) -> Aggregates {
         }
     }
     agg.nar_divergent_jobs.sort();
-    let get = |b: Bucket| agg.bucket_counts.get(b.as_str()).copied().unwrap_or(0);
-    // Attempted = jobs that produced a rio observation via submission
-    // (everything except plan-time exclusions and not-attempted).
-    let excluded_from_attempt = get(Bucket::Skipped)
-        + get(Bucket::EvalError)
-        + get(Bucket::NotAttemptable)
-        + get(Bucket::NotAttempted)
-        + get(Bucket::CachedPrior);
+    let verdict = |v: Verdict| agg.verdict_counts.get(v.as_str()).copied().unwrap_or(0);
+    let disposition = |d: Disposition| agg.disposition_counts.get(d.as_str()).copied().unwrap_or(0);
+    // Attempted = jobs that produced a rio observation via submission:
+    // everything except the dispositions that mean the unit was never
+    // submitted (plan-time exclusions, demotions, and deadline backfill).
+    let excluded_from_attempt = disposition(Disposition::Filtered)
+        + disposition(Disposition::EvalError)
+        + disposition(Disposition::NotAttemptable)
+        + disposition(Disposition::NotAttempted)
+        + disposition(Disposition::CachedPrior)
+        + disposition(Disposition::DemotedImpure)
+        + disposition(Disposition::IdentityDivergent);
     agg.attempted = records.len().saturating_sub(excluded_from_attempt);
     if agg.attempted > 0 {
         agg.infra_rate_pct =
-            Some(100.0 * get(Bucket::RioInfraFailure) as f64 / agg.attempted as f64);
-    }
-    let in_comparison = agg.attempted;
-    if in_comparison > 0 {
-        agg.hydra_unknown_rate_pct =
-            Some(100.0 * get(Bucket::HydraUnknown) as f64 / in_comparison as f64);
+            Some(100.0 * verdict(Verdict::InfraIndeterminate) as f64 / agg.attempted as f64);
+        agg.no_truth_rate_pct =
+            Some(100.0 * verdict(Verdict::NoTruth) as f64 / agg.attempted as f64);
     }
     agg
 }
@@ -146,14 +157,18 @@ fn fmt_pct(v: Option<f64>) -> String {
 /// Number of jobs whose latest record carries a terminal class — the one
 /// "terminal" definition the report path uses (completeness, progress
 /// remaining-work): every verdict and every disposition except
-/// `not-attempted` is terminal; an empty key (a record with neither field)
-/// is not.
-fn terminal_job_count(bucket_counts: &BTreeMap<String, usize>) -> usize {
-    bucket_counts
-        .iter()
-        .filter(|(class, _)| !class.is_empty() && class.as_str() != Bucket::NotAttempted.as_str())
-        .map(|(_, count)| *count)
-        .sum()
+/// `not-attempted` is terminal; a record with neither field set entered
+/// neither count map and so never counts.
+fn terminal_job_count(
+    verdict_counts: &BTreeMap<String, usize>,
+    disposition_counts: &BTreeMap<String, usize>,
+) -> usize {
+    verdict_counts.values().sum::<usize>()
+        + disposition_counts
+            .iter()
+            .filter(|(class, _)| class.as_str() != Disposition::NotAttempted.as_str())
+            .map(|(_, count)| *count)
+            .sum::<usize>()
 }
 
 /// Refresh the comparability block with final counts.
@@ -169,38 +184,37 @@ pub fn comparability_with_counts(
         .copied()
         .unwrap_or(0);
     block.attempted = agg.attempted;
+    // Excluded-but-reported: every verdict outside the headline denominator
+    // (everything except match-built, output-divergence, unexpected-failure,
+    // unexpected-dependency-failure) and every disposition, keyed by its
+    // wire string, with its nonzero count.
+    let headline_verdicts = [
+        Verdict::MatchBuilt.as_str(),
+        Verdict::OutputDivergence.as_str(),
+        Verdict::UnexpectedFailure.as_str(),
+        Verdict::UnexpectedDependencyFailure.as_str(),
+    ];
     let mut excluded = BTreeMap::new();
-    for b in [
-        Bucket::Skipped,
-        Bucket::EvalError,
-        Bucket::NotAttemptable,
-        Bucket::NotAttempted,
-        Bucket::CachedPrior,
-        Bucket::RioInfraFailure,
-        Bucket::UpstreamSourceUnavailable,
-        Bucket::TargetSubstituted,
-        Bucket::HydraUnknown,
-        Bucket::EvalDivergence,
-        // The timed-only interruption verdicts are excluded-but-reported:
-        // they never enter the headline numerator or denominator, so they
-        // are accounted here like every other excluded bucket.
-        Bucket::InterruptionReplayed,
-        Bucket::InterruptionNotReproduced,
-    ] {
-        if let Some(n) = agg.bucket_counts.get(b.as_str()) {
-            excluded.insert(b.as_str().to_string(), *n);
+    for (verdict, count) in &agg.verdict_counts {
+        if !headline_verdicts.contains(&verdict.as_str()) && *count > 0 {
+            excluded.insert(verdict.clone(), *count);
+        }
+    }
+    for (disposition, count) in &agg.disposition_counts {
+        if *count > 0 {
+            excluded.insert(disposition.clone(), *count);
         }
     }
     // Merge, never overwrite: the base block carries exclusion counts the
     // job records cannot reproduce (the archive's recorder-side eval errors
     // and aggregates never become workload units), so any reason already
-    // recorded there and not re-derived from bucket counts above survives
-    // the refresh.
+    // recorded there and not re-derived from the class counts above
+    // survives the refresh.
     for (reason, count) in &base.excluded {
         excluded.entry(reason.clone()).or_insert(*count);
     }
     block.excluded = excluded;
-    let terminal = terminal_job_count(&agg.bucket_counts);
+    let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
     block.completeness_pct = if block.in_scope > 0 {
         100.0 * terminal as f64 / block.in_scope as f64
     } else {
@@ -222,17 +236,17 @@ fn supply_block(report: &SupplyStageReport) -> SupplyStageReport {
 }
 
 /// The timed summary as reported: the dispatcher's run statistics with the
-/// interruption counts re-derived from the classified bucket counts.
+/// interruption counts re-derived from the classified verdict counts.
 /// results.jsonl is the source of truth for what each armed unit ultimately
 /// classified as (e.g. an armed request abandoned by the build deadline
 /// rather than the disconnect deadline still classifies
-/// `interruption-replayed`), so the report never disagrees with the buckets
-/// it prints next to.
-fn timed_block(stats: &TimedRunStats, bucket_counts: &BTreeMap<String, usize>) -> TimedRunStats {
-    let count = |bucket: Bucket| bucket_counts.get(bucket.as_str()).copied().unwrap_or(0);
+/// `interruption-replayed`), so the report never disagrees with the verdict
+/// counts it prints next to.
+fn timed_block(stats: &TimedRunStats, verdict_counts: &BTreeMap<String, usize>) -> TimedRunStats {
+    let count = |verdict: Verdict| verdict_counts.get(verdict.as_str()).copied().unwrap_or(0);
     TimedRunStats {
-        interruptions_replayed: count(Bucket::InterruptionReplayed),
-        interruptions_not_reproduced: count(Bucket::InterruptionNotReproduced),
+        interruptions_replayed: count(Verdict::InterruptionReplayed),
+        interruptions_not_reproduced: count(Verdict::InterruptionNotReproduced),
         ..stats.clone()
     }
 }
@@ -240,7 +254,7 @@ fn timed_block(stats: &TimedRunStats, bucket_counts: &BTreeMap<String, usize>) -
 /// Render summary.md. Deterministic for identical inputs.
 pub fn render_summary(input: &ReportInput<'_>) -> String {
     let agg = aggregate(input.records);
-    let head: Headline = headline(&agg.bucket_counts, agg.nar_equal, agg.nar_compared_jobs);
+    let head: Headline = headline(&agg.verdict_counts, agg.nar_equal, agg.nar_compared_jobs);
     let empty_counts = BTreeMap::new();
     let plan_counts = input
         .campaign
@@ -252,7 +266,7 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let mut out = String::new();
     let _ = writeln!(
         out,
-        "# Parity campaign {} — summary",
+        "# Replay campaign {} — summary",
         input.campaign.campaign_id
     );
     if input.partial {
@@ -318,6 +332,14 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     );
     let _ = writeln!(
         out,
+        "- Output divergence (within headline): {} jobs",
+        agg.verdict_counts
+            .get(Verdict::OutputDivergence.as_str())
+            .copied()
+            .unwrap_or(0)
+    );
+    let _ = writeln!(
+        out,
         "- NAR-hash agreement (secondary, non-gating): {} ({} / {} compared jobs)",
         fmt_pct(head.nar_agreement_pct),
         head.nar_equal,
@@ -325,25 +347,25 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     );
     let _ = writeln!(
         out,
-        "- Infra-failure rate (excluded from headline): {}",
+        "- Infra-indeterminate rate (excluded from headline): {}",
         fmt_pct(agg.infra_rate_pct)
     );
-    let _ = writeln!(
-        out,
-        "- Hydra-unknown rate: {}",
-        fmt_pct(agg.hydra_unknown_rate_pct)
-    );
-    let _ = writeln!(out, "\n## Buckets");
-    let _ = writeln!(out, "| bucket | count | of which cascaded |");
+    let _ = writeln!(out, "- No-truth rate: {}", fmt_pct(agg.no_truth_rate_pct));
+    let _ = writeln!(out, "\n## Verdicts");
+    let _ = writeln!(out, "| verdict | count | of which cascaded |");
     let _ = writeln!(out, "|---|---:|---:|");
-    for bucket in Bucket::ALL {
-        let count = agg.bucket_counts.get(bucket.as_str()).copied().unwrap_or(0);
+    for verdict in Verdict::ALL {
+        let count = agg
+            .verdict_counts
+            .get(verdict.as_str())
+            .copied()
+            .unwrap_or(0);
         if count == 0 {
             continue;
         }
         let cascaded = agg
             .cascaded_counts
-            .get(bucket.as_str())
+            .get(verdict.as_str())
             .copied()
             .unwrap_or(0);
         let cascaded = if cascaded > 0 {
@@ -351,7 +373,21 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
         } else {
             String::new()
         };
-        let _ = writeln!(out, "| {} | {} | {} |", bucket.as_str(), count, cascaded);
+        let _ = writeln!(out, "| {} | {} | {} |", verdict.as_str(), count, cascaded);
+    }
+    let _ = writeln!(out, "\n## Dispositions");
+    let _ = writeln!(out, "| disposition | count |");
+    let _ = writeln!(out, "|---|---:|");
+    for disposition in Disposition::ALL {
+        let count = agg
+            .disposition_counts
+            .get(disposition.as_str())
+            .copied()
+            .unwrap_or(0);
+        if count == 0 {
+            continue;
+        }
+        let _ = writeln!(out, "| {} | {} |", disposition.as_str(), count);
     }
     let _ = writeln!(out, "\n## Top failure signatures");
     let _ = writeln!(
@@ -392,7 +428,7 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let _ = writeln!(out, "\n## Retries");
     let _ = writeln!(
         out,
-        "- match-built on first attempt: {} | after retries: {}",
+        "- match-built/output-divergence on first attempt: {} | after retries: {}",
         agg.first_attempt_successes, agg.multi_attempt_successes
     );
     let _ = writeln!(out, "\n## Suspension windows");
@@ -457,7 +493,7 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     }
     // Timed dispatch summary: only timed campaigns have one.
     if let Some(stats) = input.timed {
-        let timed = timed_block(stats, &agg.bucket_counts);
+        let timed = timed_block(stats, &agg.verdict_counts);
         let _ = writeln!(out, "\n## Timed dispatch");
         let _ = writeln!(
             out,
@@ -490,22 +526,25 @@ pub fn render_summary(input: &ReportInput<'_>) -> String {
     let _ = writeln!(
         out,
         "- results.jsonl, hydra.jsonl, supply.jsonl, dispatch.jsonl, batches.jsonl, \
-         buckets/<bucket>.jsonl, logs/<job>.log.zst next to this file"
+         buckets/<verdict-or-disposition>.jsonl, report/gate.json (when a regression gate was \
+         requested), logs/<job>.log.zst next to this file"
     );
     out
 }
 
-/// progress.json: stage, per-bucket counts, rates, suspension windows, ETA.
+/// progress.json: stage, per-verdict/disposition counts, rates, suspension
+/// windows, ETA.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Progress {
     pub campaign_id: String,
     pub stage: String,
     pub updated_at: String,
-    pub bucket_counts: BTreeMap<String, usize>,
+    pub verdict_counts: BTreeMap<String, usize>,
+    pub disposition_counts: BTreeMap<String, usize>,
     pub attempted: usize,
     pub infra_rate_pct: Option<f64>,
-    pub hydra_unknown_rate_pct: Option<f64>,
+    pub no_truth_rate_pct: Option<f64>,
     pub jobs_per_hour: Option<f64>,
     pub eta_hours: Option<f64>,
     pub suspension: SuspensionSummary,
@@ -547,16 +586,17 @@ pub fn build_progress(
         .map(|p| &p.counts)
         .unwrap_or(&empty_counts);
     let block = comparability_with_counts(&campaign.comparability, &agg, plan_counts);
-    let terminal = terminal_job_count(&agg.bucket_counts);
+    let terminal = terminal_job_count(&agg.verdict_counts, &agg.disposition_counts);
     let remaining = block.in_scope.saturating_sub(terminal);
     Progress {
         campaign_id: campaign.campaign_id.clone(),
         stage: stage.to_string(),
         updated_at,
-        bucket_counts: agg.bucket_counts.clone(),
+        verdict_counts: agg.verdict_counts.clone(),
+        disposition_counts: agg.disposition_counts.clone(),
         attempted: agg.attempted,
         infra_rate_pct: agg.infra_rate_pct,
-        hydra_unknown_rate_pct: agg.hydra_unknown_rate_pct,
+        no_truth_rate_pct: agg.no_truth_rate_pct,
         jobs_per_hour,
         // ETA is undefined when the plan has no in-scope work at all — a
         // "0h remaining" figure for an empty campaign would be misleading.
@@ -566,19 +606,19 @@ pub fn build_progress(
         suspension: suspension.clone(),
         comparability: block,
         supply: supply.map(supply_block),
-        timed: timed.map(|stats| timed_block(stats, &agg.bucket_counts)),
+        timed: timed.map(|stats| timed_block(stats, &agg.verdict_counts)),
         abort_recommended,
     }
 }
 
-/// Write summary.md + `buckets/<bucket>.jsonl` into the state dir and
-/// return the rendered summary text.
+/// Write summary.md + `buckets/<verdict-or-disposition>.jsonl` into the
+/// state dir and return the rendered summary text.
 pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String> {
     let summary = render_summary(input);
     state.write_bytes("report/summary.md", summary.as_bytes())?;
-    // Per-bucket JSONL. The report stage owns buckets/: drop files from a
-    // previous render first, so a job that since moved buckets cannot
-    // linger in its old file.
+    // Per-class JSONL (one file per distinct verdict or disposition). The
+    // report stage owns buckets/: drop files from a previous render first,
+    // so a job that since moved classes cannot linger in its old file.
     let buckets_dir = state.path("buckets");
     if buckets_dir.exists() {
         for entry in std::fs::read_dir(&buckets_dir)
@@ -593,17 +633,18 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
             }
         }
     }
-    let mut by_bucket: BTreeMap<String, Vec<&JobRecord>> = BTreeMap::new();
+    let mut by_class: BTreeMap<String, Vec<&JobRecord>> = BTreeMap::new();
     for rec in input.records.values() {
-        let class = rec
-            .verdict
-            .clone()
-            .or_else(|| rec.disposition.clone())
-            .unwrap_or_default();
-        by_bucket.entry(class).or_default().push(rec);
+        // An unclassified record (neither verdict nor disposition) belongs
+        // to no per-class file; the engine never writes one, but a skip is
+        // safer than inventing an empty file name for it.
+        let Some(class) = rec.verdict.clone().or_else(|| rec.disposition.clone()) else {
+            continue;
+        };
+        by_class.entry(class).or_default().push(rec);
     }
-    for (bucket, recs) in by_bucket {
-        let path = state.path(&format!("buckets/{bucket}.jsonl"));
+    for (class, recs) in by_class {
+        let path = state.path(&format!("buckets/{class}.jsonl"));
         let file =
             std::fs::File::create(&path).with_context(|| format!("create {}", path.display()))?;
         let mut writer = std::io::BufWriter::new(file);
@@ -624,20 +665,22 @@ pub fn write_report(state: &StateDir, input: &ReportInput<'_>) -> Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::run::model::{HydraSide, RioSide, unified_from_legacy_bucket};
+    use crate::run::model::{HydraSide, RioSide, UnifiedClass};
+
+    fn v(verdict: Verdict) -> UnifiedClass {
+        UnifiedClass::Verdict(verdict)
+    }
+    fn d(disposition: Disposition) -> UnifiedClass {
+        UnifiedClass::Disposition(disposition)
+    }
 
     fn rec(
         job: &str,
-        bucket: Bucket,
+        class: UnifiedClass,
         attempts: u32,
         signature: Option<&str>,
         cascaded: bool,
     ) -> JobRecord {
-        // Test fixtures are still written in the legacy bucket vocabulary;
-        // route them through the frozen legacy mapping so the records carry
-        // the verdict/disposition pair the engine now writes.
-        let class = unified_from_legacy_bucket(bucket.as_str(), false)
-            .expect("legacy test bucket maps to the unified vocabulary");
         JobRecord {
             job: job.into(),
             system: "x86_64-linux".into(),
@@ -664,32 +707,46 @@ mod tests {
     #[test]
     fn aggregate_counts_buckets_signatures_and_rates() {
         let mut records = BTreeMap::new();
-        for (i, b) in [
-            Bucket::MatchBuilt,
-            Bucket::MatchBuilt,
-            Bucket::RioOnlyFailure,
-            Bucket::RioInfraFailure,
-            Bucket::CachedPrior,
-            Bucket::NotAttempted,
+        for (i, class) in [
+            v(Verdict::MatchBuilt),
+            v(Verdict::OutputDivergence),
+            v(Verdict::UnexpectedFailure),
+            v(Verdict::InfraIndeterminate),
+            d(Disposition::CachedPrior),
+            d(Disposition::NotAttempted),
         ]
         .into_iter()
         .enumerate()
         {
-            let sig = (b == Bucket::RioOnlyFailure).then_some("poison-threshold");
-            records.insert(format!("j{i}"), rec(&format!("j{i}"), b, 1, sig, false));
+            let sig = (class == v(Verdict::UnexpectedFailure)).then_some("poison-threshold");
+            // Attempts = 2 everywhere so the retry split exercises both
+            // match-class verdicts (match-built and output-divergence).
+            records.insert(format!("j{i}"), rec(&format!("j{i}"), class, 2, sig, false));
         }
         records.insert(
             "casc".into(),
-            rec("casc", Bucket::RioInfraFailure, 1, None, true),
+            rec("casc", v(Verdict::InfraIndeterminate), 1, None, true),
         );
         let agg = aggregate(&records);
-        assert_eq!(agg.bucket_counts["match-built"], 2);
-        assert_eq!(agg.bucket_counts["rio-infra-failure"], 2);
-        assert_eq!(agg.cascaded_counts["rio-infra-failure"], 1);
+        assert_eq!(agg.verdict_counts["match-built"], 1);
+        assert_eq!(agg.verdict_counts["output-divergence"], 1);
+        assert_eq!(agg.verdict_counts["infra-indeterminate"], 2);
+        assert_eq!(agg.disposition_counts["cached-prior"], 1);
+        assert_eq!(agg.disposition_counts["not-attempted"], 1);
+        assert_eq!(agg.cascaded_counts["infra-indeterminate"], 1);
         assert_eq!(agg.signature_counts["poison-threshold"], 1);
+        // Both match-class verdicts (match-built and output-divergence)
+        // count toward the retry split; both fixtures took two attempts.
+        assert_eq!(
+            (agg.first_attempt_successes, agg.multi_attempt_successes),
+            (0, 2)
+        );
         // attempted = total(7) - cached-prior(1) - not-attempted(1) = 5
         assert_eq!(agg.attempted, 5);
         assert!((agg.infra_rate_pct.unwrap() - 40.0).abs() < 1e-9);
+        // no-truth rate is reported (zero here), keyed off the no-truth
+        // verdict over the attempted denominator.
+        assert!((agg.no_truth_rate_pct.unwrap() - 0.0).abs() < 1e-9);
     }
 
     #[test]
@@ -706,7 +763,7 @@ mod tests {
             },
         );
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
         let suspension = SuspensionSummary::default();
         let input = ReportInput {
             campaign: &campaign,
@@ -750,7 +807,7 @@ mod tests {
             ..Default::default()
         });
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
         let p = build_progress(
             &campaign,
             &records,
@@ -815,7 +872,7 @@ mod tests {
                 format!("fail{i}"),
                 rec(
                     &format!("fail{i}"),
-                    Bucket::RioOnlyFailure,
+                    v(Verdict::UnexpectedFailure),
                     1,
                     Some(sig),
                     false,
@@ -823,7 +880,7 @@ mod tests {
             );
         }
         for i in 0..3 {
-            let mut r = rec(&format!("div{i}"), Bucket::MatchBuilt, 1, None, false);
+            let mut r = rec(&format!("div{i}"), v(Verdict::MatchBuilt), 1, None, false);
             r.nar_compare
                 .insert("out".to_string(), crate::run::classify::NAR_DIFFERS.into());
             records.insert(format!("div{i}"), r);
@@ -871,10 +928,10 @@ mod tests {
             crate::run::spec::ArchivePin::default(),
         );
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
         records.insert(
             "b".into(),
-            rec("b", Bucket::InterruptionReplayed, 1, None, false),
+            rec("b", v(Verdict::InterruptionReplayed), 1, None, false),
         );
         // The stage did not compute the throughput figure itself; the
         // progress builder derives it from bytes / seconds.
@@ -941,10 +998,10 @@ mod tests {
             crate::run::spec::ArchivePin::default(),
         );
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
         records.insert(
             "b".into(),
-            rec("b", Bucket::InterruptionReplayed, 1, None, false),
+            rec("b", v(Verdict::InterruptionReplayed), 1, None, false),
         );
         let supply = SupplyStageReport {
             planned_prefetch: 40,
@@ -1064,7 +1121,10 @@ mod tests {
 
         // First render: the job is still not-attempted.
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::NotAttempted, 0, None, false));
+        records.insert(
+            "a".into(),
+            rec("a", d(Disposition::NotAttempted), 0, None, false),
+        );
         let input = ReportInput {
             campaign: &campaign,
             records: &records,
@@ -1085,7 +1145,7 @@ mod tests {
         // Second render: the job moved to match-built — its old bucket file
         // must not linger.
         let mut records = BTreeMap::new();
-        records.insert("a".into(), rec("a", Bucket::MatchBuilt, 1, None, false));
+        records.insert("a".into(), rec("a", v(Verdict::MatchBuilt), 1, None, false));
         let input = ReportInput {
             campaign: &campaign,
             records: &records,
