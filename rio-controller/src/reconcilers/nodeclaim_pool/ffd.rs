@@ -97,7 +97,7 @@ pub struct LiveNode {
     /// `(cores, mem_bytes, disk_bytes)` already requested by pods on
     /// the backing Node. `From<NodeClaim>` sets this to `(0,0,0)`;
     /// `list_live_nodeclaims` post-fills it from the per-tick
-    /// [`PodSnapshot`](super::pods::PodSnapshot) Pod LIST.
+    /// `PodSnapshot` (see `super::pods`) Pod LIST.
     pub requested: (u32, u64, u64),
     /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
     /// on a just-`create()`d object before the apiserver round-trip.

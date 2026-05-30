@@ -17,7 +17,7 @@
 //! straight from the apiserver:
 //!
 //! - **Per-flush LIST** ([`run`]): the λ exposure flush LISTs Nodes
-//!   once per [`EXPOSURE_FLUSH_SECS`] and joins labels at that point.
+//!   once per `EXPOSURE_FLUSH_SECS` and joins labels at that point.
 //! - **Per-need GET** ([`run_pod_annotator`],
 //!   [`run_spot_interrupt_watcher`]): one `GET /api/v1/nodes/{name}`
 //!   per pod that needs an `rio.build/hw-class` stamp (≈ one per
@@ -518,8 +518,8 @@ async fn node_hw_class(nodes: &Api<Node>, config: &HwClassConfig, name: &str) ->
 ///
 /// §4(a)2: replaces the Node watch + labels cache. λ's denominator
 /// must include censored (still-running) observations — every
-/// [`EXPOSURE_FLUSH_SECS`] this LISTs all Nodes and banks each spot
-/// node's slice since its cursor (see [`flush_spot_exposure`]),
+/// `EXPOSURE_FLUSH_SECS` this LISTs all Nodes and banks each spot
+/// node's slice since its cursor (see `flush_spot_exposure`),
 /// bounding the right-censoring bias to ≤60 node-seconds per node.
 ///
 /// `spawn_monitored("node-informer", run(...))` from main.rs. Panics
@@ -585,7 +585,7 @@ pub async fn run(
 }
 
 /// Live spot-node exposure flush cadence (seconds). See
-/// [`flush_spot_exposure`].
+/// `flush_spot_exposure`.
 const EXPOSURE_FLUSH_SECS: u64 = 60;
 
 /// `HwClassConfig::load` re-fetch cadence. Covers the scheduler-
@@ -615,8 +615,8 @@ const POOL_LABEL: &str = "rio.build/pool";
 /// hw_class can't change for a scheduled pod.
 ///
 /// §4(a)2: the node's labels come from a per-need GET
-/// ([`node_hw_class`]), not a cache. The GET happens only AFTER the
-/// pure [`annotation_target`] pre-check passes, so the apiserver cost
+/// (`node_hw_class`), not a cache. The GET happens only AFTER the
+/// pure `annotation_target` pre-check passes, so the apiserver cost
 /// is one GET per pod that actually needs a stamp (≈ one per builder
 /// pod lifetime), not one per watch event.
 ///
@@ -694,7 +694,7 @@ pub async fn run_pod_annotator(
 /// and the Node when AWS sends the 2-minute spot interruption notice;
 /// we watch the Node event so `involvedObject.name` is the Node
 /// `metadata.name`), resolve the referenced node's hw_class via a
-/// per-need GET ([`node_hw_class`], §4(a)2 — interrupts are rare, so
+/// per-need GET (`node_hw_class`, §4(a)2 — interrupts are rare, so
 /// one GET per event is negligible), and append
 /// `interrupt_samples(hw_class, kind='interrupt', value=1)` via
 /// `AdminService.AppendInterruptSample`.
@@ -793,7 +793,7 @@ async fn report_exposure(admin: &mut AdminClient, hw_class: String, secs: f64) {
 /// `Some((pod_name, namespace, node_name))` if `pod` is a candidate
 /// for the `rio.build/hw-class` stamp: scheduled (`spec.nodeName`
 /// set) and not already annotated. Pure pre-check — the per-need
-/// node GET ([`node_hw_class`]) runs only after this passes, so
+/// node GET (`node_hw_class`) runs only after this passes, so
 /// already-stamped and Pending pods cost no apiserver round-trip.
 fn annotation_target(pod: &Pod) -> Option<(String, String, String)> {
     let already = pod
@@ -1196,7 +1196,7 @@ mod tests {
 
     /// The pure pre-check that gates the per-need GET: stamp candidates
     /// are scheduled, not-yet-annotated pods. The "node missing" and
-    /// "no `$h` matches" skip arms moved into [`node_hw_class`] (the
+    /// "no `$h` matches" skip arms moved into `node_hw_class` (the
     /// GET half) — their match logic is covered by the `match_node`
     /// tests above. Successor of the deleted `patch_target_stamps_once`.
     #[test]

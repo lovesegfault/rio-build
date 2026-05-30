@@ -416,7 +416,7 @@
     {
       "path": "reconcilers/node_informer.rs",
       "depth": 1,
-      "doc": "Node-label cache for `hw_class` join at completion-ingest."
+      "doc": "Node-label → `hw_class` resolution and spot-exposure (λ\\[h\\])"
     },
     {
       "path": "reconcilers/nodeclaim_pool/",
@@ -442,6 +442,11 @@
       "path": "reconcilers/nodeclaim_pool/health.rs",
       "depth": 2,
       "doc": "Unhealthy-node reaping + ICE detection."
+    },
+    {
+      "path": "reconcilers/nodeclaim_pool/pods.rs",
+      "depth": 2,
+      "doc": "Per-tick Pod snapshot: `requested` sums + bound-intent index from"
     },
     {
       "path": "reconcilers/nodeclaim_pool/sketch.rs",

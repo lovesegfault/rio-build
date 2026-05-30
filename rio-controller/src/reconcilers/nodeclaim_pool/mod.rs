@@ -10,7 +10,7 @@
 //!    `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` consecutive ⊥-ticks, switch to
 //!    consolidate-only (don't grow the fleet on stale data).
 //! 2. LIST the owned NodeClaims and the `rio.build/pool` pods (one
-//!    label-selected Pod LIST per tick → [`pods::PodSnapshot`]: per-node
+//!    label-selected Pod LIST per tick → `pods::PodSnapshot`: per-node
 //!    requested sums + the bound-intent index), then FFD-simulate
 //!    placing the intents onto live (Registered + in-flight) NodeClaims
 //!    with the same MostAllocated bin-select that
@@ -669,7 +669,7 @@ pub struct NodeClaimPoolReconciler {
     /// `spec.requirements`.
     hw_config: HwClassConfig,
     /// Label-selected (`rio.build/pool`) Pod API for the per-tick
-    /// [`pods::PodSnapshot`] LIST (§4(a)1 — replaces the watch-fed
+    /// `pods::PodSnapshot` LIST (§4(a)1 — replaces the watch-fed
     /// `PodRequestedCache`). [`Self::list_pool_pods`] derives the
     /// per-node `requested` sums and the bound-intent index from one
     /// LIST per tick; [`Self::list_live_nodeclaims`] post-fills
@@ -1635,7 +1635,7 @@ impl NodeClaimPoolReconciler {
     }
 
     /// One label-selected (`rio.build/pool`) Pod LIST → this tick's
-    /// [`pods::PodSnapshot`].
+    /// `pods::PodSnapshot`.
     ///
     /// §4(a)1: replaces the watch-fed `PodRequestedCache`. The LIST is
     /// scoped to the same selector the deleted watcher used, so the
