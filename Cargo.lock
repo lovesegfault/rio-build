@@ -6368,7 +6368,34 @@ dependencies = [
 ]
 
 [[package]]
-name = "rio-parity"
+name = "rio-proto"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures-util",
+ "opentelemetry",
+ "opentelemetry_sdk",
+ "prost",
+ "prost-types",
+ "rio-common",
+ "rio-nix",
+ "rstest",
+ "serde",
+ "thiserror",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tonic",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-prost-build",
+ "tracing",
+ "tracing-opentelemetry",
+ "workspace-hack",
+]
+
+[[package]]
+name = "rio-replay"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -6404,33 +6431,6 @@ dependencies = [
  "uuid",
  "workspace-hack",
  "zstd",
-]
-
-[[package]]
-name = "rio-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures-util",
- "opentelemetry",
- "opentelemetry_sdk",
- "prost",
- "prost-types",
- "rio-common",
- "rio-nix",
- "rstest",
- "serde",
- "thiserror",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tonic",
- "tonic-health",
- "tonic-prost",
- "tonic-prost-build",
- "tracing",
- "tracing-opentelemetry",
- "workspace-hack",
 ]
 
 [[package]]
@@ -9270,8 +9270,8 @@ dependencies = [
  "reqwest",
  "rio-common",
  "rio-crds",
- "rio-parity",
  "rio-proto",
+ "rio-replay",
  "rio-scheduler",
  "rio-test-support",
  "rustls",

@@ -1,4 +1,4 @@
-//! `rio-parity eval` — record a v1 replay archive from a Hydra
+//! `rio-replay eval` — record a v1 replay archive from a Hydra
 //! evaluation: reproduce the evaluation locally, gate it on drvPath
 //! fidelity, sweep upstream truth, and publish the packed archive.
 //!
@@ -557,7 +557,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
                             dry_run: bool|
      -> serde_json::Value {
         let mut provenance = serde_json::json!({
-            "recorder": "rio-parity-eval",
+            "recorder": "rio-replay-eval",
             "recorder_version": env!("CARGO_PKG_VERSION"),
             "recipe_digest": &recipe_digest,
             "recipe": &set_key,
@@ -778,7 +778,7 @@ pub async fn run(args: EvalArgs) -> anyhow::Result<()> {
                 }
             };
             if !already_recorded {
-                let uploader = format!("rio-parity-eval/{}", env!("CARGO_PKG_VERSION"));
+                let uploader = format!("rio-replay-eval/{}", env!("CARGO_PKG_VERSION"));
                 let uploaded = layout
                     .upload_archive(
                         &client,

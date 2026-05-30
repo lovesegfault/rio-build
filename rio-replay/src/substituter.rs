@@ -622,7 +622,7 @@ References:
     /// parses to `Some`, a 404 is a definitive miss (`None`), and a 403
     /// stays an error so an authorization problem can never masquerade as
     /// "not cached". The fake cache also rejects requests without the
-    /// rio-parity User-Agent, so a politeness regression fails this test.
+    /// rio-replay User-Agent, so a politeness regression fails this test.
     #[tokio::test]
     async fn http_probe_distinguishes_miss_from_denial() {
         use axum::response::IntoResponse;
@@ -635,11 +635,11 @@ References:
             let ua_ok = headers
                 .get(axum::http::header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|ua| ua.starts_with("rio-parity/"));
+                .is_some_and(|ua| ua.starts_with("rio-replay/"));
             if !ua_ok {
                 return (
                     axum::http::StatusCode::NOT_ACCEPTABLE,
-                    "missing rio-parity User-Agent",
+                    "missing rio-replay User-Agent",
                 )
                     .into_response();
             }

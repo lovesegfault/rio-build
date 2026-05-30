@@ -12,8 +12,8 @@
     "rio-lease": "rio-lease",
     "rio-migrations": "rio-migrations",
     "rio-nix": "rio-nix",
-    "rio-parity": "rio-parity",
     "rio-proto": "rio-proto",
+    "rio-replay": "rio-replay",
     "rio-scheduler": "rio-scheduler",
     "rio-store": "rio-store",
     "rio-test-support": "rio-test-support",
@@ -20206,13 +20206,122 @@
         "Rio Contributors"
       ]
     },
-    "rio-parity": {
-      "crateName": "rio-parity",
+    "rio-proto": {
+      "crateName": "rio-proto",
       "version": "0.1.0",
       "edition": "2024",
       "source": {
         "type": "local",
-        "path": "rio-parity"
+        "path": "rio-proto"
+      },
+      "dependencies": [
+        {
+          "name": "anyhow",
+          "packageId": "anyhow"
+        },
+        {
+          "name": "futures-util",
+          "packageId": "futures-util"
+        },
+        {
+          "name": "opentelemetry",
+          "packageId": "opentelemetry"
+        },
+        {
+          "name": "prost",
+          "packageId": "prost"
+        },
+        {
+          "name": "prost-types",
+          "packageId": "prost-types"
+        },
+        {
+          "name": "rio-common",
+          "packageId": "rio-common"
+        },
+        {
+          "name": "rio-nix",
+          "packageId": "rio-nix"
+        },
+        {
+          "name": "serde",
+          "packageId": "serde"
+        },
+        {
+          "name": "thiserror",
+          "packageId": "thiserror"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        },
+        {
+          "name": "tokio-stream",
+          "packageId": "tokio-stream"
+        },
+        {
+          "name": "tokio-util",
+          "packageId": "tokio-util"
+        },
+        {
+          "name": "tonic",
+          "packageId": "tonic"
+        },
+        {
+          "name": "tonic-health",
+          "packageId": "tonic-health"
+        },
+        {
+          "name": "tonic-prost",
+          "packageId": "tonic-prost"
+        },
+        {
+          "name": "tracing",
+          "packageId": "tracing"
+        },
+        {
+          "name": "tracing-opentelemetry",
+          "packageId": "tracing-opentelemetry"
+        },
+        {
+          "name": "workspace-hack",
+          "packageId": "workspace-hack"
+        }
+      ],
+      "buildDependencies": [
+        {
+          "name": "tonic-prost-build",
+          "packageId": "tonic-prost-build"
+        }
+      ],
+      "devDependencies": [
+        {
+          "name": "opentelemetry_sdk",
+          "packageId": "opentelemetry_sdk"
+        },
+        {
+          "name": "rstest",
+          "packageId": "rstest"
+        },
+        {
+          "name": "tokio",
+          "packageId": "tokio"
+        }
+      ],
+      "libCrateTypes": [
+        "lib"
+      ],
+      "authors": [
+        "Rio Contributors"
+      ]
+    },
+    "rio-replay": {
+      "crateName": "rio-replay",
+      "version": "0.1.0",
+      "edition": "2024",
+      "source": {
+        "type": "local",
+        "path": "rio-replay"
       },
       "dependencies": [
         {
@@ -20360,117 +20469,8 @@
       ],
       "crateBin": [
         {
-          "name": "rio-parity",
+          "name": "rio-replay",
           "path": "src/main.rs"
-        }
-      ],
-      "libCrateTypes": [
-        "lib"
-      ],
-      "authors": [
-        "Rio Contributors"
-      ]
-    },
-    "rio-proto": {
-      "crateName": "rio-proto",
-      "version": "0.1.0",
-      "edition": "2024",
-      "source": {
-        "type": "local",
-        "path": "rio-proto"
-      },
-      "dependencies": [
-        {
-          "name": "anyhow",
-          "packageId": "anyhow"
-        },
-        {
-          "name": "futures-util",
-          "packageId": "futures-util"
-        },
-        {
-          "name": "opentelemetry",
-          "packageId": "opentelemetry"
-        },
-        {
-          "name": "prost",
-          "packageId": "prost"
-        },
-        {
-          "name": "prost-types",
-          "packageId": "prost-types"
-        },
-        {
-          "name": "rio-common",
-          "packageId": "rio-common"
-        },
-        {
-          "name": "rio-nix",
-          "packageId": "rio-nix"
-        },
-        {
-          "name": "serde",
-          "packageId": "serde"
-        },
-        {
-          "name": "thiserror",
-          "packageId": "thiserror"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
-        },
-        {
-          "name": "tokio-stream",
-          "packageId": "tokio-stream"
-        },
-        {
-          "name": "tokio-util",
-          "packageId": "tokio-util"
-        },
-        {
-          "name": "tonic",
-          "packageId": "tonic"
-        },
-        {
-          "name": "tonic-health",
-          "packageId": "tonic-health"
-        },
-        {
-          "name": "tonic-prost",
-          "packageId": "tonic-prost"
-        },
-        {
-          "name": "tracing",
-          "packageId": "tracing"
-        },
-        {
-          "name": "tracing-opentelemetry",
-          "packageId": "tracing-opentelemetry"
-        },
-        {
-          "name": "workspace-hack",
-          "packageId": "workspace-hack"
-        }
-      ],
-      "buildDependencies": [
-        {
-          "name": "tonic-prost-build",
-          "packageId": "tonic-prost-build"
-        }
-      ],
-      "devDependencies": [
-        {
-          "name": "opentelemetry_sdk",
-          "packageId": "opentelemetry_sdk"
-        },
-        {
-          "name": "rstest",
-          "packageId": "rstest"
-        },
-        {
-          "name": "tokio",
-          "packageId": "tokio"
         }
       ],
       "libCrateTypes": [
@@ -30201,12 +30201,12 @@
           "packageId": "rio-crds"
         },
         {
-          "name": "rio-parity",
-          "packageId": "rio-parity"
-        },
-        {
           "name": "rio-proto",
           "packageId": "rio-proto"
+        },
+        {
+          "name": "rio-replay",
+          "packageId": "rio-replay"
         },
         {
           "name": "rio-scheduler",

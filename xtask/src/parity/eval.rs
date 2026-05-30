@@ -59,7 +59,7 @@ pub struct EvalArgs {
     #[arg(long)]
     pub force: bool,
     /// RUST_LOG for the eval pod.
-    #[arg(long, default_value = "info,rio_parity=debug")]
+    #[arg(long, default_value = "info,rio_replay=debug")]
     pub log_level: String,
 }
 

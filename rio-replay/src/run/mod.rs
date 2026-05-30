@@ -1,6 +1,6 @@
-//! `rio-parity run` — the parity campaign engine.
+//! `rio-replay run` — the build-replay campaign engine.
 //!
-//! Executes one parity campaign against one replay archive: plan the
+//! Executes one replay campaign against one replay archive: plan the
 //! in-scope jobs, load each job's expected outcome from the archive's
 //! recorded truth, supply dependencies to the target (scheduler-side
 //! prefetch and client uploads), submit the workload to the rio cluster —
@@ -83,7 +83,7 @@ use self::watchdog::{
     COMPONENT_DISPATCH, COMPONENT_PAUSE, JobPhase, PollTick, StallKind, StallVerdict, Watchdog,
 };
 
-/// CLI arguments for `rio-parity run`.
+/// CLI arguments for `rio-replay run`.
 #[derive(Debug, Args)]
 pub struct RunArgs {
     /// Path to the campaign spec JSON (written by `xtask parity launch`).
@@ -166,7 +166,7 @@ pub struct Backends {
     pub artifacts: Option<Arc<dyn ArtifactStore>>,
 }
 
-/// Entry point for `rio-parity run`: load and validate the spec,
+/// Entry point for `rio-replay run`: load and validate the spec,
 /// materialize and open the replay archive, build the production backends,
 /// and hand off to [`run_with_backends`].
 ///

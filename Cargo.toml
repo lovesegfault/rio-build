@@ -8,8 +8,8 @@ members = [
   "rio-lease",
   "rio-migrations",
   "rio-nix",
-  "rio-parity",
   "rio-proto",
+  "rio-replay",
   "rio-scheduler",
   "rio-store",
   "rio-test-support",
@@ -34,8 +34,8 @@ rio-auth = { path = "rio-auth" }
 rio-common = { path = "rio-common" }
 rio-migrations = { path = "rio-migrations" }
 rio-nix = { path = "rio-nix" }
-rio-parity = { path = "rio-parity" }
 rio-proto = { path = "rio-proto" }
+rio-replay = { path = "rio-replay" }
 rio-scheduler = { path = "rio-scheduler" }
 # default-features off so members can opt into the lean `schema` feature
 # (rio-scheduler) without the server dep cascade. Members that need the

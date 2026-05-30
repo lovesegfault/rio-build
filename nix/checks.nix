@@ -775,7 +775,7 @@ let
         # The copy is cheap (~5 MB of Cargo.toml + src/**.rs; no
         # target/ or deps). Member sources are copied WITH their mode
         # bits: committed test fixtures can carry executable bits that
-        # tests assert on (rio-parity's archive fixture run.sh), so
+        # tests assert on (rio-replay's archive fixture run.sh), so
         # writability comes from the explicit chmod below rather than
         # cp --no-preserve=mode, which would strip the exec bits.
         ws=$TMPDIR/ws

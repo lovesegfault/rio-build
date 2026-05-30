@@ -305,7 +305,7 @@ mod tests {
                 tmp.path(),
                 &"a".repeat(64),
                 "aaaaaaaaaaaaaaaa",
-                "rio-parity-eval/test",
+                "rio-replay-eval/test",
             )
             .await
             .unwrap_err();

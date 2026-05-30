@@ -5,9 +5,9 @@
 
 use std::path::PathBuf;
 
-use rio_parity::archive::reader::ReplayArchive;
-use rio_parity::run::spec::Knobs;
-use rio_parity::run::timeline::plan_timed_dry_run;
+use rio_replay::archive::reader::ReplayArchive;
+use rio_replay::run::spec::Knobs;
+use rio_replay::run::timeline::plan_timed_dry_run;
 
 /// Crate directory at *runtime* (not `env!()`): under nextest
 /// `--workspace-remap` the compile-time path is a per-crate build sandbox

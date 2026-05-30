@@ -552,7 +552,7 @@ mod tests {
         // deliberately independent of the other test inputs (the builder
         // never derives or cross-checks provenance content).
         let provenance = serde_json::json!({
-            "recorder": "rio-parity-eval",
+            "recorder": "rio-replay-eval",
             "recorder_version": "0.1.0",
             "recipe_digest": recipe_digest,
             "recipe": serde_json::to_value(&recipe).unwrap(),
@@ -640,7 +640,7 @@ mod tests {
         assert_eq!(m.counts.embedded_drvs, 3);
         assert_eq!(m.counts.embedded_store_paths, 0);
         // provenance audit fields survive verbatim
-        assert_eq!(m.provenance["recorder"], "rio-parity-eval");
+        assert_eq!(m.provenance["recorder"], "rio-replay-eval");
         assert_eq!(m.provenance["recipe_digest"], inputs.recipe_digest);
         assert_eq!(m.provenance["source"]["hydra_eval_id"], 1824219);
         assert_eq!(m.provenance["fidelity"]["divergent"], false);

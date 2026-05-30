@@ -349,11 +349,11 @@ mod tests {
         let ua_ok = headers
             .get(axum::http::header::USER_AGENT)
             .and_then(|v| v.to_str().ok())
-            .is_some_and(|ua| ua.starts_with("rio-parity/"));
+            .is_some_and(|ua| ua.starts_with("rio-replay/"));
         if !accept_ok || !ua_ok {
             return (
                 axum::http::StatusCode::NOT_ACCEPTABLE,
-                "missing Accept: application/json or rio-parity User-Agent",
+                "missing Accept: application/json or rio-replay User-Agent",
             )
                 .into_response();
         }

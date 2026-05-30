@@ -536,7 +536,7 @@ mod tests {
     fn manifest_round_trips_through_json() {
         let captured_at = jiff::Timestamp::from_second(0).unwrap();
         let mut provenance = serde_json::Map::new();
-        provenance.insert("recorder".to_string(), json!("rio-parity-eval"));
+        provenance.insert("recorder".to_string(), json!("rio-replay-eval"));
         let manifest = Manifest {
             format_version: crate::archive::FORMAT_VERSION.to_string(),
             created_at: captured_at,

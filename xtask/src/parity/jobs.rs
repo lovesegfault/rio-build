@@ -412,7 +412,7 @@ mod tests {
             image: "123.dkr.ecr.us-east-2.amazonaws.com/rio-parity:abc123".into(),
             s3_bucket: "rio-build-chunks-deadbeef".into(),
             region: "us-east-2".into(),
-            log_level: "info,rio_parity=debug".into(),
+            log_level: "info,rio_replay=debug".into(),
         }
     }
 

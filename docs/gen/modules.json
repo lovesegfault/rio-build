@@ -749,7 +749,49 @@
       "doc": "Nix store path types, parsing, and nixbase32 encoding."
     }
   ],
-  "rio-parity": [
+  "rio-proto": [
+    {
+      "path": "client/",
+      "depth": 0,
+      "doc": "gRPC client transport: channel construction, h2 tuning, and the"
+    },
+    {
+      "path": "client/balance.rs",
+      "depth": 1,
+      "doc": "Health-aware load-balanced gRPC channel."
+    },
+    {
+      "path": "client/retry.rs",
+      "depth": 1,
+      "doc": "Shutdown-aware connect retry with exponential backoff."
+    },
+    {
+      "path": "client/store.rs",
+      "depth": 1,
+      "doc": "`StoreService` NAR-streaming and high-level RPC helpers."
+    },
+    {
+      "path": "interceptor.rs",
+      "depth": 0,
+      "doc": "W3C trace-context propagation across gRPC boundaries."
+    },
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Protobuf/gRPC service definitions for the rio workspace."
+    },
+    {
+      "path": "status.rs",
+      "depth": 0,
+      "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus`"
+    },
+    {
+      "path": "validated.rs",
+      "depth": 0,
+      "doc": "Validated wrappers around generated proto types."
+    }
+  ],
+  "rio-replay": [
     {
       "path": "archive/",
       "depth": 0,
@@ -798,7 +840,7 @@
     {
       "path": "cmd/eval.rs",
       "depth": 1,
-      "doc": "`rio-parity eval` — record a v1 replay archive from a Hydra"
+      "doc": "`rio-replay eval` — record a v1 replay archive from a Hydra"
     },
     {
       "path": "evalset/",
@@ -853,12 +895,12 @@
     {
       "path": "lib.rs",
       "depth": 0,
-      "doc": "rio-parity — nixpkgs-parity campaign engine."
+      "doc": "rio-replay — build-replay campaign engine."
     },
     {
       "path": "main.rs",
       "depth": 0,
-      "doc": "rio-parity binary entry point."
+      "doc": "rio-replay binary entry point."
     },
     {
       "path": "nixcache.rs",
@@ -868,7 +910,7 @@
     {
       "path": "run/",
       "depth": 0,
-      "doc": "`rio-parity run` — the parity campaign engine."
+      "doc": "`rio-replay run` — the build-replay campaign engine."
     },
     {
       "path": "run/archive_input.rs",
@@ -994,48 +1036,6 @@
       "path": "substituter.rs",
       "depth": 0,
       "doc": "Binary-cache (substituter) client — narinfo probing and NAR fetching"
-    }
-  ],
-  "rio-proto": [
-    {
-      "path": "client/",
-      "depth": 0,
-      "doc": "gRPC client transport: channel construction, h2 tuning, and the"
-    },
-    {
-      "path": "client/balance.rs",
-      "depth": 1,
-      "doc": "Health-aware load-balanced gRPC channel."
-    },
-    {
-      "path": "client/retry.rs",
-      "depth": 1,
-      "doc": "Shutdown-aware connect retry with exponential backoff."
-    },
-    {
-      "path": "client/store.rs",
-      "depth": 1,
-      "doc": "`StoreService` NAR-streaming and high-level RPC helpers."
-    },
-    {
-      "path": "interceptor.rs",
-      "depth": 0,
-      "doc": "W3C trace-context propagation across gRPC boundaries."
-    },
-    {
-      "path": "lib.rs",
-      "depth": 0,
-      "doc": "Protobuf/gRPC service definitions for the rio workspace."
-    },
-    {
-      "path": "status.rs",
-      "depth": 0,
-      "doc": "Bidirectional mapping between the nix-daemon wire `BuildStatus`"
-    },
-    {
-      "path": "validated.rs",
-      "depth": 0,
-      "doc": "Validated wrappers around generated proto types."
     }
   ],
   "rio-scheduler": [

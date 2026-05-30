@@ -25,7 +25,7 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::Args;
 use k8s_openapi::api::batch::v1::Job;
 use kube::api::Api;
-use rio_parity::run::spec::{
+use rio_replay::run::spec::{
     ArchiveRef, CampaignSpec, ClusterEndpoints, Filters, S3Target, TenantBlock,
 };
 
@@ -83,7 +83,7 @@ pub struct LaunchArgs {
     #[arg(long)]
     pub skip_preflight: bool,
     /// RUST_LOG for the campaign pod.
-    #[arg(long, default_value = "info,rio_parity=debug")]
+    #[arg(long, default_value = "info,rio_replay=debug")]
     pub log_level: String,
 }
 
@@ -102,10 +102,10 @@ impl Mode {
     }
 
     /// The engine-side mode this CLI value maps to.
-    pub fn engine(self) -> rio_parity::run::spec::Mode {
+    pub fn engine(self) -> rio_replay::run::spec::Mode {
         match self {
-            Mode::Leaf => rio_parity::run::spec::Mode::Leaf,
-            Mode::SelfHosted => rio_parity::run::spec::Mode::SelfHosted,
+            Mode::Leaf => rio_replay::run::spec::Mode::Leaf,
+            Mode::SelfHosted => rio_replay::run::spec::Mode::SelfHosted,
         }
     }
 }
@@ -593,7 +593,7 @@ async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCand
     for short in shorts {
         // The recorder-owned idempotency pointers live under by-recipe/;
         // they are not archive prefixes.
-        if short == rio_parity::s3::BY_RECIPE_SEGMENT {
+        if short == rio_replay::s3::BY_RECIPE_SEGMENT {
             continue;
         }
         if let Some(candidate) = read_candidate(region, bucket, &short).await? {
@@ -1055,7 +1055,7 @@ async fn preflight_checks(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rio_parity::run::spec::Mode as EngineMode;
+    use rio_replay::run::spec::Mode as EngineMode;
     use serde_json::json;
 
     /// Fixture gateway host-key pin (what `gateway_host_key_pin` derives

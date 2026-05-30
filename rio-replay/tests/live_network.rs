@@ -3,20 +3,20 @@
 //! (one-time prep before the first real eval-set build, and to confirm
 //! the recorded fixtures still match what the live services serve):
 //!
-//!   nix develop -c cargo nextest run -p rio-parity --run-ignored all -E 'binary(live_network)'
+//!   nix develop -c cargo nextest run -p rio-replay --run-ignored all -E 'binary(live_network)'
 //!
 //! Politeness: this file issues 4 hydra.nixos.org requests and 1
 //! cache.nixos.org request total.
 
-use rio_parity::hydra::HydraClient;
-use rio_parity::nixcache::{NixCacheClient, narhash_to_hex};
+use rio_replay::hydra::HydraClient;
+use rio_replay::nixcache::{NixCacheClient, narhash_to_hex};
 
 const EVAL_ID: u64 = 1824219;
 
 #[tokio::test]
 #[ignore = "live network: hydra.nixos.org + cache.nixos.org (manual smoke, never in CI)"]
 async fn live_hydra_eval_jobset_and_constituents_shape() {
-    let ua = rio_parity::user_agent(std::env::var("RIO_PARITY_CONTACT").ok().as_deref());
+    let ua = rio_replay::user_agent(std::env::var("RIO_PARITY_CONTACT").ok().as_deref());
     let c = HydraClient::new(
         "https://hydra.nixos.org",
         &ua,
@@ -65,7 +65,7 @@ async fn live_hydra_eval_jobset_and_constituents_shape() {
 #[tokio::test]
 #[ignore = "live network: cache.nixos.org (manual smoke, never in CI)"]
 async fn live_cache_narinfo_for_a_known_hydra_output() {
-    let ua = rio_parity::user_agent(None);
+    let ua = rio_replay::user_agent(None);
     let c = NixCacheClient::new("https://cache.nixos.org", &ua).unwrap();
     // Output path of nixpkgs.hello.x86_64-linux from the recorded
     // job fixture (eval 1824219, build 324433458).

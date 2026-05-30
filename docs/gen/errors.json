@@ -876,20 +876,6 @@
       "doc": ""
     },
     {
-      "enum": "SupplyTransportError",
-      "name": "Other",
-      "crate": "rio-parity",
-      "msg": "(transparent — delegates to inner error)",
-      "doc": "Transport, timeout, or channel-open failure."
-    },
-    {
-      "enum": "SupplyTransportError",
-      "name": "Refused",
-      "crate": "rio-parity",
-      "msg": "daemon refused: {0}",
-      "doc": "The daemon refused the upload (or refused it in a way that raced session teardown)."
-    },
-    {
       "enum": "NarCollectError",
       "name": "Io",
       "crate": "rio-proto",
@@ -937,6 +923,20 @@
       "crate": "rio-proto",
       "msg": "invalid store_path {path:?}: {source}",
       "doc": ""
+    },
+    {
+      "enum": "SupplyTransportError",
+      "name": "Other",
+      "crate": "rio-replay",
+      "msg": "(transparent — delegates to inner error)",
+      "doc": "Transport, timeout, or channel-open failure."
+    },
+    {
+      "enum": "SupplyTransportError",
+      "name": "Refused",
+      "crate": "rio-replay",
+      "msg": "daemon refused: {0}",
+      "doc": "The daemon refused the upload (or refused it in a way that raced session teardown)."
     },
     {
       "enum": "ActorError",
@@ -1444,16 +1444,6 @@
       "doc": ""
     },
     {
-      "name": "SupplyTransportError",
-      "crate": "rio-parity",
-      "doc": "Errors the upload arms distinguish: a daemon refusal (retry once on a fresh channel, then mark refused) vs. everything else (failed)."
-    },
-    {
-      "name": "TransportError",
-      "crate": "rio-parity",
-      "doc": "Errors the campaign engine distinguishes when driving daemon operations. Hand-rolled `Display`/`Error` impls (the variants carry everything the submitter needs without another derive dependency)."
-    },
-    {
       "name": "NarCollectError",
       "crate": "rio-proto",
       "doc": "Error from [`collect_nar_stream`] / [`collect_nar_stream_to_writer`]."
@@ -1462,6 +1452,16 @@
       "name": "PathInfoValidationError",
       "crate": "rio-proto",
       "doc": ""
+    },
+    {
+      "name": "SupplyTransportError",
+      "crate": "rio-replay",
+      "doc": "Errors the upload arms distinguish: a daemon refusal (retry once on a fresh channel, then mark refused) vs. everything else (failed)."
+    },
+    {
+      "name": "TransportError",
+      "crate": "rio-replay",
+      "doc": "Errors the campaign engine distinguishes when driving daemon operations. Hand-rolled `Display`/`Error` impls (the variants carry everything the submitter needs without another derive dependency)."
     },
     {
       "name": "ActorError",

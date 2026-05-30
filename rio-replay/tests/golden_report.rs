@@ -4,15 +4,15 @@
 //! pre-cutover fixture (legacy-results.jsonl) additionally proves the
 //! legacy-bucket → verdict/disposition rename count-preserving.
 //! Regenerate the golden summary with:
-//!   BLESS=1 nix develop -c cargo nextest run -p rio-parity -E 'test(golden_summary_matches)'
+//!   BLESS=1 nix develop -c cargo nextest run -p rio-replay -E 'test(golden_summary_matches)'
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use rio_parity::run::model::{JobRecord, unified_from_legacy_bucket};
-use rio_parity::run::report::{ReportInput, aggregate, render_summary};
-use rio_parity::run::spec::CampaignRecord;
-use rio_parity::run::watchdog::SuspensionSummary;
+use rio_replay::run::model::{JobRecord, unified_from_legacy_bucket};
+use rio_replay::run::report::{ReportInput, aggregate, render_summary};
+use rio_replay::run::spec::CampaignRecord;
+use rio_replay::run::watchdog::SuspensionSummary;
 
 /// Crate directory at *runtime* (not `env!()`): under nextest
 /// `--workspace-remap` the compile-time path is a per-crate build sandbox
@@ -69,7 +69,7 @@ fn golden_class_counts() {
     assert_eq!(verdict("interruption-replayed"), 1);
     assert_eq!(verdict("interruption-not-reproduced"), 1);
     // Headline: (1 match-built + 1 output-divergence) / (2 + 1 + 1) = 50%.
-    let head = rio_parity::run::classify::headline(
+    let head = rio_replay::run::classify::headline(
         &agg.verdict_counts,
         agg.nar_equal,
         agg.nar_compared_jobs,

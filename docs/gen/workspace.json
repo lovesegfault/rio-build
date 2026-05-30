@@ -33,12 +33,12 @@
       "description": "Nix protocol types and wire format"
     },
     {
-      "name": "rio-parity",
-      "description": "nixpkgs-parity campaign engine — eval-set builder and (later) campaign runner"
-    },
-    {
       "name": "rio-proto",
       "description": "Protobuf/gRPC service definitions for rio-build"
+    },
+    {
+      "name": "rio-replay",
+      "description": "build-replay campaign engine — evaluation recorder and campaign runner"
     },
     {
       "name": "rio-scheduler",
@@ -156,20 +156,20 @@
       "optional": [],
       "dev": []
     },
-    "rio-parity": {
+    "rio-proto": {
+      "prod": [
+        "rio-common",
+        "rio-nix"
+      ],
+      "optional": [],
+      "dev": []
+    },
+    "rio-replay": {
       "prod": [
         "rio-auth",
         "rio-common",
         "rio-nix",
         "rio-proto"
-      ],
-      "optional": [],
-      "dev": []
-    },
-    "rio-proto": {
-      "prod": [
-        "rio-common",
-        "rio-nix"
       ],
       "optional": [],
       "dev": []
@@ -214,8 +214,8 @@
       "prod": [
         "rio-common",
         "rio-crds",
-        "rio-parity",
         "rio-proto",
+        "rio-replay",
         "rio-scheduler",
         "rio-test-support"
       ],

@@ -1,9 +1,9 @@
-//! rio-parity binary entry point.
+//! rio-replay binary entry point.
 
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "rio-parity", version, about = "nixpkgs-parity campaign engine")]
+#[command(name = "rio-replay", version, about = "build-replay campaign engine")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -17,9 +17,9 @@ struct Cli {
 enum Cmd {
     /// Record a v1 replay archive (workload units, expected outcomes,
     /// closures, derivations) from a Hydra evaluation.
-    Eval(rio_parity::cmd::eval::EvalArgs),
-    /// Run a parity campaign against a previously built eval set.
-    Run(rio_parity::run::RunArgs),
+    Eval(rio_replay::cmd::eval::EvalArgs),
+    /// Run a replay campaign against a recorded replay archive.
+    Run(rio_replay::run::RunArgs),
 }
 
 #[tokio::main]
@@ -29,10 +29,10 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     // JSON logs by default (RIO_LOG_FORMAT=pretty for humans), RUST_LOG
     // filtering, optional OTLP — same bootstrap every rio binary uses.
-    let _otel_guard = rio_common::observability::init_tracing("parity")?;
+    let _otel_guard = rio_common::observability::init_tracing("replay")?;
     match cli.cmd {
-        Cmd::Eval(args) => rio_parity::cmd::eval::run(args).await,
-        Cmd::Run(args) => rio_parity::run::run(args).await,
+        Cmd::Eval(args) => rio_replay::cmd::eval::run(args).await,
+        Cmd::Run(args) => rio_replay::run::run(args).await,
     }
 }
 

@@ -866,9 +866,9 @@
                   end-of-file-fixer = {
                     enable = true;
                     # Recorded hydra.nixos.org responses are committed as
-                    # byte-exact fixtures (rio-parity provenance contract);
+                    # byte-exact fixtures (rio-replay provenance contract);
                     # appending a trailing newline would break that.
-                    excludes = [ "^rio-parity/tests/fixtures/hydra/" ];
+                    excludes = [ "^rio-replay/tests/fixtures/hydra/" ];
                   };
                   trim-trailing-whitespace.enable = true;
                   deadnix.enable = true;

@@ -12,8 +12,8 @@
 //! ```
 
 use anyhow::{Context, Result};
-use rio_parity::archive::s3::ARCHIVES_PREFIX_SEGMENT;
-use rio_parity::s3::BY_RECIPE_SEGMENT;
+use rio_replay::archive::s3::ARCHIVES_PREFIX_SEGMENT;
+use rio_replay::s3::BY_RECIPE_SEGMENT;
 
 use super::S3_PREFIX;
 use crate::k8s::eks::TF_DIR;
@@ -160,12 +160,12 @@ mod tests {
         );
         assert_eq!(by_recipe_prefix(), "parity/archives/by-recipe/");
         // The pointer key launch GETs must be exactly the key the recorder
-        // writes (rio_parity::s3::by_recipe_key under the same `parity`
+        // writes (rio_replay::s3::by_recipe_key under the same `parity`
         // root) — a drift here makes every by-recipe lookup miss.
         let digest = "ab".repeat(32);
         assert_eq!(
             format!("{}{digest}.json", by_recipe_prefix()),
-            rio_parity::s3::by_recipe_key(super::S3_PREFIX, &digest)
+            rio_replay::s3::by_recipe_key(super::S3_PREFIX, &digest)
         );
     }
 }

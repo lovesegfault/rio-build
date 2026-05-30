@@ -666,7 +666,7 @@ pub(crate) mod test_support {
     //! closures, and one exclusion.
     //!
     //! The committed-fixture integration test
-    //! (`rio-parity/tests/archive_fixture.rs`) cannot see this `#[cfg(test)]`
+    //! (`rio-replay/tests/archive_fixture.rs`) cannot see this `#[cfg(test)]`
     //! module and deliberately keeps its own copy of these constants and
     //! builders.
 

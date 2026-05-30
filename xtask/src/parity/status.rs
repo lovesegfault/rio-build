@@ -32,7 +32,7 @@ pub struct StatusArgs {
 
 /// One human-readable line per interesting progress.json field; falls
 /// back to the raw document when the shape is unknown. The engine owns
-/// the schema (`rio_parity::run::report::Progress`, camelCase): stage,
+/// the schema (`rio_replay::run::report::Progress`, camelCase): stage,
 /// per-verdict and per-disposition counts, attempted (with its
 /// inScope/attemptable denominators from the comparability block),
 /// infra-indeterminate / no-truth rates, throughput, ETA, suspension
@@ -165,9 +165,9 @@ async fn poll_once(
 mod tests {
     use std::collections::BTreeMap;
 
-    use rio_parity::run::report::Progress;
-    use rio_parity::run::spec::ComparabilityBlock;
-    use rio_parity::run::watchdog::SuspensionSummary;
+    use rio_replay::run::report::Progress;
+    use rio_replay::run::spec::ComparabilityBlock;
+    use rio_replay::run::watchdog::SuspensionSummary;
 
     use super::*;
 

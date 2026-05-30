@@ -3,18 +3,18 @@
 //! the truth sweep), `nix`, `nix-eval-jobs`, and `mkdwarfs` on PATH,
 //! and imports the nixpkgs tree (~300-700 MB) into the local
 //! /nix/store. This is the one-time drvPath fidelity-gate run for a
-//! scoped recording — the same flow `rio-parity eval` runs for real
+//! scoped recording — the same flow `rio-replay eval` runs for real
 //! campaigns — pinned to the recorded eval 1824219 so its expected
 //! drvPaths are known in advance.
 //!
-//!   nix develop -c cargo nextest run -p rio-parity --run-ignored all -E 'binary(eval_e2e)'
+//!   nix develop -c cargo nextest run -p rio-replay --run-ignored all -E 'binary(eval_e2e)'
 //!
 //! Budget: ~5 hydra.nixos.org requests, one ~50 MB github tarball, a
 //! handful of cache.nixos.org narinfo fetches, a few minutes of
 //! evaluation, and one mkdwarfs pack of a small archive.
 
-use rio_parity::archive::reader::ReplayArchive;
-use rio_parity::cmd::eval::{EvalArgs, run};
+use rio_replay::archive::reader::ReplayArchive;
+use rio_replay::cmd::eval::{EvalArgs, run};
 
 const HELLO_DRV: &str = "/nix/store/7mdg60drrnh0wq1j8hmmbhll47czm107-hello-2.12.3.drv";
 const JQ_DRV: &str = "/nix/store/0vb08cn5pf24mzjbibpc7n37g62lacfj-jq-1.8.1.drv";
@@ -122,7 +122,7 @@ async fn eval_scoped_two_plain_jobs_end_to_end() {
 
     // Provenance carries the recorder identity, the recipe, and the
     // source coordinates.
-    assert_eq!(manifest.provenance["recorder"], "rio-parity-eval");
+    assert_eq!(manifest.provenance["recorder"], "rio-replay-eval");
     assert_eq!(manifest.provenance["source"]["hydra_eval_id"], 1824219);
     assert_eq!(
         manifest.provenance["recipe_digest"].as_str().unwrap().len(),
@@ -145,6 +145,6 @@ async fn eval_scoped_two_plain_jobs_end_to_end() {
     // The standalone manifest copy is identity-equivalent to the image:
     // it hashes to the archive id the reader derived from the image.
     let manifest_bytes = std::fs::read(&standalone_manifest).unwrap();
-    let derived = rio_parity::archive::identity::archive_id_from_manifest_bytes(&manifest_bytes);
+    let derived = rio_replay::archive::identity::archive_id_from_manifest_bytes(&manifest_bytes);
     assert_eq!(archive.archive_id(), Some(derived.as_str()));
 }

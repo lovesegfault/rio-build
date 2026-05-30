@@ -585,7 +585,7 @@ rec {
     in
     mkImage {
       name = "parity";
-      bins = [ rio-crates.rio-parity ];
+      bins = [ rio-crates.rio-replay ];
       user = nonrootUser;
       extraContents =
         nonrootEtc

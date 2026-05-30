@@ -79,8 +79,8 @@ impl NixCacheClient {
 
     /// Fetch a narinfo as raw text. 404 ⇒ `Ok(None)` (path not upstream);
     /// any other non-200 is an error carrying a body snippet. The campaign
-    /// engine's hydra-truth sweep uses this form so it can decide how to
-    /// record a body that fails to parse.
+    /// engine's upstream-coverage probe uses this form so it can decide how
+    /// to record a body that fails to parse.
     pub async fn fetch_narinfo_text(&self, store_path: &str) -> anyhow::Result<Option<String>> {
         let url = self.narinfo_url(store_path)?;
         tracing::debug!(%url, "cache GET");
@@ -536,7 +536,7 @@ mod tests {
     /// real upstream values are deliberately not asserted offline),
     /// one narinfo whose NarHash uses an unsupported algorithm (md5),
     /// one 200 body that is not a narinfo at all, one always-broken
-    /// path, and 404s everything else. Requests without the rio-parity
+    /// path, and 404s everything else. Requests without the rio-replay
     /// User-Agent get 406 so a politeness regression fails these tests.
     async fn spawn_fake_cache() -> (String, tokio::task::JoinHandle<()>) {
         use axum::response::IntoResponse;
@@ -548,11 +548,11 @@ mod tests {
             let ua_ok = headers
                 .get(axum::http::header::USER_AGENT)
                 .and_then(|v| v.to_str().ok())
-                .is_some_and(|ua| ua.starts_with("rio-parity/"));
+                .is_some_and(|ua| ua.starts_with("rio-replay/"));
             if !ua_ok {
                 return (
                     axum::http::StatusCode::NOT_ACCEPTABLE,
-                    "missing rio-parity User-Agent",
+                    "missing rio-replay User-Agent",
                 )
                     .into_response();
             }

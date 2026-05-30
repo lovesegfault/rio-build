@@ -3,22 +3,22 @@
 //! regenerated only by the #[ignore] generator below; the non-ignored
 //! tests pin its contents and identity.
 //!
-//! Everything here goes through the public `rio_parity::archive` API only,
+//! Everything here goes through the public `rio_replay::archive` API only,
 //! which doubles as proof that the API is sufficient for an external
 //! recorder to assemble a valid archive.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use rio_parity::archive::reader::ReplayArchive;
-use rio_parity::archive::schema::{
+use rio_replay::archive::reader::ReplayArchive;
+use rio_replay::archive::schema::{
     Capabilities, ClosureRecord, EXCLUSION_REASON_EVAL_ERROR, ExclusionRecord, ExpectedOutcome,
     OutcomeRecord, OutputHash, RequestRecord, RequestTarget, Substituters, UnitRecord,
 };
-use rio_parity::archive::writer::{
+use rio_replay::archive::writer::{
     ArchiveWriter, FinalizedArchive, ManifestSeed, pack_with_mkdwarfs,
 };
-use rio_parity::archive::{MANIFEST_MEMBER, NARINFO_DIR, identity};
+use rio_replay::archive::{MANIFEST_MEMBER, NARINFO_DIR, identity};
 
 /// The pinned identity of the committed fixture: the SHA-256 of its
 /// `manifest.json` bytes. Run-once-and-pin discipline (same as the
@@ -334,7 +334,7 @@ fn collect_tree(root: &Path) -> BTreeMap<String, EntryFingerprint> {
 /// manually when the archive format or the writer changes deliberately:
 ///
 /// ```text
-/// nix develop -c cargo nextest run -p rio-parity --run-ignored all \
+/// nix develop -c cargo nextest run -p rio-replay --run-ignored all \
 ///   --no-capture -E 'test(regenerate_v1_basic_fixture)'
 /// ```
 ///

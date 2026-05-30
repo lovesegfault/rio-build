@@ -1,15 +1,15 @@
 [package]
-name = "rio-parity"
+name = "rio-replay"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "nixpkgs-parity campaign engine — eval-set builder and (later) campaign runner"
+description = "build-replay campaign engine — evaluation recorder and campaign runner"
 
 [[bin]]
-name = "rio-parity"
+name = "rio-replay"
 path = "src/main.rs"
 
 [dependencies]

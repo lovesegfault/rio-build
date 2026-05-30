@@ -1,6 +1,6 @@
-//! rio-parity — nixpkgs-parity campaign engine.
+//! rio-replay — build-replay campaign engine.
 //!
-//! This crate hosts the eval-set builder and the campaign engine. The
+//! This crate hosts the evaluation recorder and the campaign engine. The
 //! binary entry point is `src/main.rs`; everything else is a library
 //! module so it can be unit-tested against recorded fixtures.
 
@@ -30,7 +30,7 @@ const REPOSITORY_URL: &str = "https://github.com/lovesegfault/rio-build";
 /// reach whoever is running a campaign.
 pub fn user_agent(contact: Option<&str>) -> String {
     let base = format!(
-        "rio-parity/{} (+{REPOSITORY_URL})",
+        "rio-replay/{} (+{REPOSITORY_URL})",
         env!("CARGO_PKG_VERSION"),
     );
     match contact {
@@ -114,7 +114,7 @@ mod tests {
     #[test]
     fn user_agent_names_engine_and_repo() {
         let ua = user_agent(None);
-        assert!(ua.starts_with("rio-parity/"), "got: {ua}");
+        assert!(ua.starts_with("rio-replay/"), "got: {ua}");
         assert!(
             ua.contains("github.com/lovesegfault/rio-build"),
             "got: {ua}"

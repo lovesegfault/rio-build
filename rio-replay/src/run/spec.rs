@@ -440,7 +440,7 @@ impl Default for ReportBlock {
     }
 }
 
-/// The operator-provided campaign spec (input to `rio-parity run --spec`).
+/// The operator-provided campaign spec (input to `rio-replay run --spec`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CampaignSpec {

@@ -701,7 +701,7 @@ mod tests {
 
         let store = ArchiveStore::new("rio-chunks", "parity");
         let marker = store
-            .publish(&client, &image, &manifest_bytes, "rio-parity/test")
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap();
 
@@ -733,7 +733,7 @@ mod tests {
             identity::sha256_hex(&std::fs::read(&image).unwrap()),
             "the marker's image digest matches the uploaded image bytes"
         );
-        assert_eq!(marker.uploader, "rio-parity/test");
+        assert_eq!(marker.uploader, "rio-replay/test");
         for rule in &puts {
             assert_eq!(rule.num_calls(), 1, "every object uploaded exactly once");
         }
@@ -752,7 +752,7 @@ mod tests {
 
         let store = ArchiveStore::new("rio-chunks", "parity");
         let err = store
-            .publish(&client, &image, &manifest_bytes, "rio-parity/test")
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap_err();
         assert!(
@@ -790,7 +790,7 @@ mod tests {
 
         let store = ArchiveStore::new("rio-chunks", "parity");
         let err = store
-            .publish(&client, &image, &manifest_bytes, "rio-parity/test")
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap_err();
         let message = format!("{err:#}");
@@ -821,7 +821,7 @@ mod tests {
 
         let store = ArchiveStore::new("rio-chunks", "parity");
         let err = store
-            .publish(&client, &image, &manifest_bytes, "rio-parity/test")
+            .publish(&client, &image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap_err();
         assert!(
@@ -848,7 +848,7 @@ mod tests {
 
         let store = ArchiveStore::new("rio-chunks", "parity");
         let err = store
-            .publish(&client, &v0_image, &manifest_bytes, "rio-parity/test")
+            .publish(&client, &v0_image, &manifest_bytes, "rio-replay/test")
             .await
             .unwrap_err();
         assert!(
@@ -888,7 +888,7 @@ mod tests {
                 ),
             ]),
             uploaded_at: test_stamp(),
-            uploader: "rio-parity/test".to_string(),
+            uploader: "rio-replay/test".to_string(),
         };
         let marker_bytes = serde_json::to_vec(&marker).unwrap();
 
@@ -972,7 +972,7 @@ mod tests {
                 },
             )]),
             uploaded_at: test_stamp(),
-            uploader: "rio-parity/test".to_string(),
+            uploader: "rio-replay/test".to_string(),
         };
         let get_complete = get_rule(
             format!("parity/archives/{short}/complete.json"),
@@ -1008,7 +1008,7 @@ mod tests {
             archive_id_short: "bbbbbbbbbbbbbbbb".to_string(),
             objects: BTreeMap::new(),
             uploaded_at: test_stamp(),
-            uploader: "rio-parity/test".to_string(),
+            uploader: "rio-replay/test".to_string(),
         };
         let get_complete = get_rule(
             format!("parity/archives/{short}/complete.json"),
@@ -1044,7 +1044,7 @@ mod tests {
             archive_id_short: short.to_string(),
             objects: BTreeMap::new(),
             uploaded_at: test_stamp(),
-            uploader: "rio-parity/test".to_string(),
+            uploader: "rio-replay/test".to_string(),
         };
         let marker_a = serde_json::to_vec(&marker_for(short_a, 'a')).unwrap();
         let marker_b = serde_json::to_vec(&marker_for(short_b, 'b')).unwrap();
@@ -1108,7 +1108,7 @@ mod tests {
             archive_id_short: "bbbbbbbbbbbbbbbb".to_string(),
             objects: BTreeMap::new(),
             uploaded_at: test_stamp(),
-            uploader: "rio-parity/test".to_string(),
+            uploader: "rio-replay/test".to_string(),
         };
         let list_page = mock!(aws_sdk_s3::Client::list_objects_v2)
             .match_requests(|req| req.prefix() == Some("parity/archives/"))
