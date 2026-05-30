@@ -595,7 +595,7 @@ async fn ack_bound_intents_populates_authoritative_binding() {
 
     // Wholesale-rebuild: second Ack omitting `def456` → that entry
     // dropped (the Ack IS the authoritative snapshot; deleted pods
-    // disappear from the controller's `PodRequestedCache`).
+    // disappear from the controller's per-tick pod snapshot).
     actor.handle_ack_spawned_intents(
         &[],
         &[],

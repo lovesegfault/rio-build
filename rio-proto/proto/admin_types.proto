@@ -586,8 +586,8 @@ message AckSpawnedIntentsRequest {
   // allocatable. Edge-detected per NodeClaim — not full-set every tick.
   repeated ObservedInstanceType observed_instance_types = 4;
   // r[sched.admin.hung-node-detector+3]: kube-authoritative
-  // `intent_id → spec.nodeName` from the controller's pod informer
-  // (`PodRequestedCache.bound_intent`). Scheduler stores as
+  // `intent_id → spec.nodeName` from the controller's per-tick pod
+  // LIST (`PodSnapshot`). Scheduler stores as
   // `authoritative_binding` and `detect_hung_nodes` groups by it instead
   // of any worker-supplied value (worker is NOT trusted; a forged
   // node_name would let 2 colluding tenants reap an arbitrary

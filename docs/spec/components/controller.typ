@@ -564,12 +564,15 @@ The controller requires a dedicated ServiceAccount with a ClusterRole granting
 
     [`""` (core)],
     [pods],
-    [get, list, watch, patch --- `patch` for node_informer's
-      `rio.build/hw-class` annotation stamp],
+    [get, list, watch, patch --- per-tick LIST inventory (`PodSnapshot`);
+      `watch` for the DisruptionTarget preemption watcher and the pod
+      annotator; `patch` for node_informer's `rio.build/hw-class`
+      annotation stamp],
 
     [`""` (core)],
     [nodes],
-    [get, list, watch --- node_informer `NodeLabelCache` (hw-band label join)],
+    [get, list --- node_informer per-need GET / per-flush LIST (hw-band
+      label join; the Node watch was retired with `NodeLabelCache`)],
 
     [`""` (core)],
     [events],

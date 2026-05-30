@@ -98,19 +98,23 @@ rules:
   - apiGroups: [apps]
     resources: [deployments/scale]
     verbs: [get, patch, update]
-  # Reconciler inventories live worker pods by label to compute Job
-  # deficit. `patch`: node_informer's run_pod_annotator stamps the
-  # rio.build/hw-class annotation (Patch::Merge) so the builder's
-  # downward-API → RIO_HW_CLASS feeds hw_perf_samples. Pod lifecycle
-  # itself stays the Job controller's.
+  # Reconciler inventories live worker pods via a per-tick LIST
+  # (PodSnapshot) to compute Job deficit. `watch`: the
+  # DisruptionTarget preemption watcher and node_informer's
+  # run_pod_annotator stream pod events. `patch`: run_pod_annotator
+  # stamps the rio.build/hw-class annotation (Patch::Merge) so the
+  # builder's downward-API → RIO_HW_CLASS feeds hw_perf_samples. Pod
+  # lifecycle itself stays the Job controller's.
   - apiGroups: [""]
     resources: [pods]
     verbs: [get, list, watch, patch]
-  # node_informer: Node watch → NodeLabelCache (hw-band label join for
-  # the per-(band,cap) cost solve). Cluster-scoped.
+  # node_informer: per-need Node GET (annotator, spot watcher) and a
+  # per-flush LIST (hw-band label join for the per-(band,cap) cost
+  # solve). The Node watch was retired with NodeLabelCache.
+  # Cluster-scoped.
   - apiGroups: [""]
     resources: [nodes]
-    verbs: [get, list, watch]
+    verbs: [get, list]
   # node_informer: core/v1 Event watch for reason=SpotInterrupted
   # (Karpenter posts on the NodeClaim) → λ[h] spot-rate self-
   # calibration. core "" — the watcher uses k8s_openapi::api::core::
