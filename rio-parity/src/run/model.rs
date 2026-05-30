@@ -220,6 +220,255 @@ impl Bucket {
     ];
 }
 
+/// Per-unit comparison verdict: how the replayed outcome of one workload
+/// unit compares to the expected outcome its archive recorded. The
+/// kebab-case string forms are the wire `verdict` value in results.jsonl
+/// and the `buckets/<verdict>.jsonl` file names.
+///
+/// A unit ends a campaign with exactly one verdict or one
+/// [`Disposition`], never both: dispositions cover units that were never
+/// compared, verdicts cover units whose replayed outcome was actually
+/// held against the expectation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Verdict {
+    /// Expected built, replay built it; recorded output hashes (when the
+    /// archive carries them) all agree.
+    MatchBuilt,
+    /// Both built, but at least one recorded output NAR hash differs from
+    /// the replayed hash.
+    OutputDivergence,
+    /// Expected a failure and the replay also failed.
+    MatchFailed,
+    /// Expected built but the unit itself failed in the replay.
+    UnexpectedFailure,
+    /// Expected built but the unit was blocked by a dependency that
+    /// failed in the replay.
+    UnexpectedDependencyFailure,
+    /// Expected a failure but the replay built the unit.
+    UnexpectedSuccess,
+    /// The unit (or a dependency) failed only because a fixed-output
+    /// input could not be fetched from its upstream origin.
+    SourceUnavailable,
+    /// The replayed outcome cannot be trusted: rio-side infrastructure
+    /// failure, transport failure after retries, or evidence loss.
+    InfraIndeterminate,
+    /// The recorded outcome was interrupted or infrastructure-dependent,
+    /// so there is no deterministic expectation to compare against.
+    TruthIndeterminate,
+    /// The archive carries no expected outcome for this unit.
+    NoTruth,
+    /// Timed mode only: the recorded interruption (cancellation or client
+    /// disconnect) was reproduced at its recorded offset and the unit did
+    /// not complete, exactly as recorded.
+    InterruptionReplayed,
+    /// Timed mode only: the replayed build completed before the recorded
+    /// interruption offset — informational timing divergence, not a
+    /// correctness defect.
+    InterruptionNotReproduced,
+}
+
+impl Verdict {
+    /// The wire string for this verdict — the same kebab-case name the
+    /// serde form uses, so record writers never hand-type it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Verdict::MatchBuilt => "match-built",
+            Verdict::OutputDivergence => "output-divergence",
+            Verdict::MatchFailed => "match-failed",
+            Verdict::UnexpectedFailure => "unexpected-failure",
+            Verdict::UnexpectedDependencyFailure => "unexpected-dependency-failure",
+            Verdict::UnexpectedSuccess => "unexpected-success",
+            Verdict::SourceUnavailable => "source-unavailable",
+            Verdict::InfraIndeterminate => "infra-indeterminate",
+            Verdict::TruthIndeterminate => "truth-indeterminate",
+            Verdict::NoTruth => "no-truth",
+            Verdict::InterruptionReplayed => "interruption-replayed",
+            Verdict::InterruptionNotReproduced => "interruption-not-reproduced",
+        }
+    }
+
+    /// Every verdict, in report/table order.
+    pub const ALL: [Verdict; 12] = [
+        Verdict::MatchBuilt,
+        Verdict::OutputDivergence,
+        Verdict::MatchFailed,
+        Verdict::UnexpectedFailure,
+        Verdict::UnexpectedDependencyFailure,
+        Verdict::UnexpectedSuccess,
+        Verdict::SourceUnavailable,
+        Verdict::InfraIndeterminate,
+        Verdict::TruthIndeterminate,
+        Verdict::NoTruth,
+        Verdict::InterruptionReplayed,
+        Verdict::InterruptionNotReproduced,
+    ];
+}
+
+/// Per-unit disposition: why a workload unit was never compared (not
+/// attempted, or attempted but not countable as an outcome comparison).
+/// The kebab-case string forms are the wire `disposition` value in
+/// results.jsonl and the `buckets/<disposition>.jsonl` file names.
+///
+/// A unit carries either a disposition or a [`Verdict`], never both;
+/// dispositions are assigned with precedence over verdicts (a unit that
+/// was filtered out is never compared).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Disposition {
+    /// Outside the campaign's scope filters (system, glob, feature
+    /// exclude, limit, jobs file).
+    Filtered,
+    /// The archive marks the unit as failing at evaluation/recording
+    /// time; there is nothing to build.
+    EvalError,
+    /// The recorder's fidelity gate found the unit's derivation identity
+    /// divergent from the source it recorded; comparing it would compare
+    /// different builds.
+    IdentityDivergent,
+    /// Under the leaf measurement policy the unit's outputs lie inside
+    /// another in-scope unit's dependency closure, so it cannot be
+    /// measured independently.
+    NotAttemptable,
+    /// The unit declares impure environment variables the engine does not
+    /// forward; its recorded outputs are supplied like dependency outputs
+    /// and it is not rebuilt.
+    DemotedImpure,
+    /// Already valid in the target store before the campaign started.
+    CachedPrior,
+    /// The target refused an upload required for this unit's closure, so
+    /// the unit was not attempted.
+    UploadRejected,
+    /// The engine could not obtain or deliver required supply for reasons
+    /// not attributable to the target.
+    SupplyFailed,
+    /// Completed without execution because the target substituted it from
+    /// its own upstream during the run.
+    TargetSubstituted,
+    /// The run ended (deadline, pause, abort) before the unit was
+    /// attempted.
+    NotAttempted,
+}
+
+impl Disposition {
+    /// The wire string for this disposition — the same kebab-case name
+    /// the serde form uses, so record writers never hand-type it.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Disposition::Filtered => "filtered",
+            Disposition::EvalError => "eval-error",
+            Disposition::IdentityDivergent => "identity-divergent",
+            Disposition::NotAttemptable => "not-attemptable",
+            Disposition::DemotedImpure => "demoted-impure",
+            Disposition::CachedPrior => "cached-prior",
+            Disposition::UploadRejected => "upload-rejected",
+            Disposition::SupplyFailed => "supply-failed",
+            Disposition::TargetSubstituted => "target-substituted",
+            Disposition::NotAttempted => "not-attempted",
+        }
+    }
+
+    /// Every disposition, in assignment-precedence order: when more than
+    /// one disposition could apply to a unit, the earliest entry wins.
+    pub const ALL: [Disposition; 10] = [
+        Disposition::Filtered,
+        Disposition::EvalError,
+        Disposition::IdentityDivergent,
+        Disposition::NotAttemptable,
+        Disposition::DemotedImpure,
+        Disposition::CachedPrior,
+        Disposition::UploadRejected,
+        Disposition::SupplyFailed,
+        Disposition::TargetSubstituted,
+        Disposition::NotAttempted,
+    ];
+}
+
+/// The single classification a workload unit ends a campaign with:
+/// exactly one [`Verdict`] or exactly one [`Disposition`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnifiedClass {
+    /// The unit was attempted and its replayed outcome compared.
+    Verdict(Verdict),
+    /// The unit was never compared.
+    Disposition(Disposition),
+}
+
+impl UnifiedClass {
+    /// The verdict, when this class is one.
+    pub fn verdict(&self) -> Option<Verdict> {
+        match self {
+            UnifiedClass::Verdict(v) => Some(*v),
+            UnifiedClass::Disposition(_) => None,
+        }
+    }
+
+    /// The disposition, when this class is one.
+    pub fn disposition(&self) -> Option<Disposition> {
+        match self {
+            UnifiedClass::Verdict(_) => None,
+            UnifiedClass::Disposition(d) => Some(*d),
+        }
+    }
+
+    /// The wire string of the inner verdict or disposition.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UnifiedClass::Verdict(v) => v.as_str(),
+            UnifiedClass::Disposition(d) => d.as_str(),
+        }
+    }
+
+    /// Whether this class is a final observation for its unit: every
+    /// verdict is terminal, and so is every disposition except
+    /// `not-attempted` (a unit never reached by this run may still be
+    /// attempted by a later resume).
+    pub fn is_terminal(&self) -> bool {
+        match self {
+            UnifiedClass::Verdict(_) => true,
+            UnifiedClass::Disposition(d) => *d != Disposition::NotAttempted,
+        }
+    }
+}
+
+/// Map one legacy results.jsonl `bucket` string — plus whether any of the
+/// record's per-output NAR comparisons reads `differs` — onto the unified
+/// verdict/disposition vocabulary, or `None` for a string that was never
+/// a legacy bucket.
+///
+/// This is the frozen mapping used to prove the vocabulary cutover
+/// count-preserving against campaign artifacts written before it: the
+/// function reads only legacy `bucket` strings and never new-schema
+/// records, so it matches on the historical literals rather than any live
+/// enum. The one data-dependent split is `match-built`, which becomes
+/// `output-divergence` when a recorded output hash differs; the two timed
+/// buckets (`interruption-replayed`, `interruption-not-reproduced`)
+/// already carry their final names and map to themselves.
+pub fn unified_from_legacy_bucket(bucket: &str, nar_differs: bool) -> Option<UnifiedClass> {
+    let class = match bucket {
+        "match-built" if nar_differs => UnifiedClass::Verdict(Verdict::OutputDivergence),
+        "match-built" => UnifiedClass::Verdict(Verdict::MatchBuilt),
+        "rio-only-failure" => UnifiedClass::Verdict(Verdict::UnexpectedFailure),
+        "rio-dependency-failure" => UnifiedClass::Verdict(Verdict::UnexpectedDependencyFailure),
+        "rio-infra-failure" => UnifiedClass::Verdict(Verdict::InfraIndeterminate),
+        "upstream-source-unavailable" => UnifiedClass::Verdict(Verdict::SourceUnavailable),
+        "hydra-only-failure" => UnifiedClass::Verdict(Verdict::UnexpectedSuccess),
+        "both-failed" => UnifiedClass::Verdict(Verdict::MatchFailed),
+        "hydra-unknown" => UnifiedClass::Verdict(Verdict::NoTruth),
+        "interruption-replayed" => UnifiedClass::Verdict(Verdict::InterruptionReplayed),
+        "interruption-not-reproduced" => UnifiedClass::Verdict(Verdict::InterruptionNotReproduced),
+        "eval-divergence" => UnifiedClass::Disposition(Disposition::IdentityDivergent),
+        "eval-error" => UnifiedClass::Disposition(Disposition::EvalError),
+        "skipped" => UnifiedClass::Disposition(Disposition::Filtered),
+        "not-attemptable" => UnifiedClass::Disposition(Disposition::NotAttemptable),
+        "not-attempted" => UnifiedClass::Disposition(Disposition::NotAttempted),
+        "cached-prior" => UnifiedClass::Disposition(Disposition::CachedPrior),
+        "target-substituted" => UnifiedClass::Disposition(Disposition::TargetSubstituted),
+        _ => return None,
+    };
+    Some(class)
+}
+
 /// Engine-observed lifecycle timestamps for one job.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -899,5 +1148,183 @@ mod tests {
         assert!(is_terminal_bucket("rio-infra-failure"));
         assert!(!is_terminal_bucket("not-attempted"));
         assert!(!is_terminal_bucket(""));
+    }
+
+    #[test]
+    fn verdict_and_disposition_wire_strings_are_frozen() {
+        let verdicts: Vec<&str> = Verdict::ALL.iter().map(|v| v.as_str()).collect();
+        assert_eq!(
+            verdicts,
+            [
+                "match-built",
+                "output-divergence",
+                "match-failed",
+                "unexpected-failure",
+                "unexpected-dependency-failure",
+                "unexpected-success",
+                "source-unavailable",
+                "infra-indeterminate",
+                "truth-indeterminate",
+                "no-truth",
+                "interruption-replayed",
+                "interruption-not-reproduced",
+            ]
+        );
+        let dispositions: Vec<&str> = Disposition::ALL.iter().map(|d| d.as_str()).collect();
+        assert_eq!(
+            dispositions,
+            [
+                "filtered",
+                "eval-error",
+                "identity-divergent",
+                "not-attemptable",
+                "demoted-impure",
+                "cached-prior",
+                "upload-rejected",
+                "supply-failed",
+                "target-substituted",
+                "not-attempted",
+            ]
+        );
+        // serde forms match as_str for every variant, both directions.
+        for v in Verdict::ALL {
+            let json = serde_json::to_string(&v).unwrap();
+            assert_eq!(json, format!("\"{}\"", v.as_str()), "{v:?}");
+            assert_eq!(serde_json::from_str::<Verdict>(&json).unwrap(), v);
+        }
+        for d in Disposition::ALL {
+            let json = serde_json::to_string(&d).unwrap();
+            assert_eq!(json, format!("\"{}\"", d.as_str()), "{d:?}");
+            assert_eq!(serde_json::from_str::<Disposition>(&json).unwrap(), d);
+        }
+        // Verdict and disposition vocabularies never overlap.
+        let overlap: Vec<&str> = verdicts
+            .iter()
+            .copied()
+            .filter(|v| dispositions.contains(v))
+            .collect();
+        assert!(overlap.is_empty(), "{overlap:?}");
+    }
+
+    #[test]
+    fn legacy_bucket_mapping_is_total_and_count_preserving_per_bucket() {
+        // Every legacy bucket string maps to exactly one unified class; the
+        // only data-dependent split is match-built with differing NAR hashes.
+        let cases: [(&str, bool, UnifiedClass); 18] = [
+            (
+                "match-built",
+                false,
+                UnifiedClass::Verdict(Verdict::MatchBuilt),
+            ),
+            (
+                "match-built",
+                true,
+                UnifiedClass::Verdict(Verdict::OutputDivergence),
+            ),
+            (
+                "rio-only-failure",
+                false,
+                UnifiedClass::Verdict(Verdict::UnexpectedFailure),
+            ),
+            (
+                "rio-dependency-failure",
+                false,
+                UnifiedClass::Verdict(Verdict::UnexpectedDependencyFailure),
+            ),
+            (
+                "rio-infra-failure",
+                false,
+                UnifiedClass::Verdict(Verdict::InfraIndeterminate),
+            ),
+            (
+                "upstream-source-unavailable",
+                false,
+                UnifiedClass::Verdict(Verdict::SourceUnavailable),
+            ),
+            (
+                "hydra-only-failure",
+                false,
+                UnifiedClass::Verdict(Verdict::UnexpectedSuccess),
+            ),
+            (
+                "both-failed",
+                false,
+                UnifiedClass::Verdict(Verdict::MatchFailed),
+            ),
+            (
+                "hydra-unknown",
+                false,
+                UnifiedClass::Verdict(Verdict::NoTruth),
+            ),
+            (
+                "interruption-replayed",
+                false,
+                UnifiedClass::Verdict(Verdict::InterruptionReplayed),
+            ),
+            (
+                "interruption-not-reproduced",
+                false,
+                UnifiedClass::Verdict(Verdict::InterruptionNotReproduced),
+            ),
+            (
+                "eval-divergence",
+                false,
+                UnifiedClass::Disposition(Disposition::IdentityDivergent),
+            ),
+            (
+                "eval-error",
+                false,
+                UnifiedClass::Disposition(Disposition::EvalError),
+            ),
+            (
+                "skipped",
+                false,
+                UnifiedClass::Disposition(Disposition::Filtered),
+            ),
+            (
+                "not-attemptable",
+                false,
+                UnifiedClass::Disposition(Disposition::NotAttemptable),
+            ),
+            (
+                "not-attempted",
+                false,
+                UnifiedClass::Disposition(Disposition::NotAttempted),
+            ),
+            (
+                "cached-prior",
+                false,
+                UnifiedClass::Disposition(Disposition::CachedPrior),
+            ),
+            (
+                "target-substituted",
+                false,
+                UnifiedClass::Disposition(Disposition::TargetSubstituted),
+            ),
+        ];
+        for (bucket, nar_differs, expected) in cases {
+            assert_eq!(
+                unified_from_legacy_bucket(bucket, nar_differs),
+                Some(expected),
+                "{bucket} nar_differs={nar_differs}"
+            );
+        }
+        assert_eq!(unified_from_legacy_bucket("no-such-bucket", false), None);
+    }
+
+    #[test]
+    fn unified_class_terminal_predicate() {
+        // Every verdict is terminal; every disposition except not-attempted is
+        // terminal.
+        for v in Verdict::ALL {
+            assert!(UnifiedClass::Verdict(v).is_terminal(), "{v:?}");
+        }
+        for d in Disposition::ALL {
+            assert_eq!(
+                UnifiedClass::Disposition(d).is_terminal(),
+                d != Disposition::NotAttempted,
+                "{d:?}"
+            );
+        }
     }
 }
