@@ -973,7 +973,7 @@
     {
       "path": "run/timeline.rs",
       "depth": 1,
-      "doc": "Timed-replay scheduling: schedule construction and the timed dispatcher."
+      "doc": "Timed-replay scheduling: the schedule, the timed dispatcher, and the offline dry-run planner."
     },
     {
       "path": "run/transport.rs",

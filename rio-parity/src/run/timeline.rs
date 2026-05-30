@@ -1,4 +1,4 @@
-//! Timed-replay scheduling: schedule construction and the timed dispatcher.
+//! Timed-replay scheduling: the schedule, the timed dispatcher, and the offline dry-run planner.
 //!
 //! [`build_schedule`] turns recorded client requests into a paced
 //! [`ScheduledRequest`] list — offset-sorted, speedup-scaled, optionally
@@ -24,9 +24,13 @@
 //! Schedule construction is pure over engine-owned input types
 //! ([`RecordedRequest`], [`RecordedTiming`]); loading those inputs from a
 //! replay archive and choosing the scheduling mode belong to the run
-//! orchestration, not here.
+//! orchestration, not here. The exception is [`plan_timed_dry_run`], the
+//! offline planning entry point: it reads a replay archive directly
+//! (through the orchestration's sanitizing conversions) and summarizes what
+//! a timed campaign would schedule and supply ([`TimedDryRunPlan`]) without
+//! touching a cluster or the network.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -36,15 +40,18 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+use crate::archive::reader::ReplayArchive;
+
 use super::batch::Batch;
 use super::model::{
     BATCH_KIND_TIMED, BatchRecord, DispatchEntry, build_status_from_name, now_rfc3339,
 };
-use super::spec::Knobs;
+use super::spec::{Knobs, SupplyDependencies};
 use super::state::{StateDir, StateFile};
 use super::submit::{SubmitTracker, submit_one_batch};
 use super::submitter::Submitter;
 use super::supply::exec::PreSubmitSupply;
+use super::supply::{PathSource, resolve_source, walk_closure, workload_set};
 
 /// Disconnect delay assumed when a recorded interruption carries no stop
 /// offset (scaled by the speedup like a recorded one).
@@ -286,6 +293,184 @@ pub fn re_anchor_pending(
         // of panicking.
         entry.due = now_offset + entry.due.saturating_sub(earliest_pending);
     }
+}
+
+/// What a timed campaign over one replay archive would schedule and supply,
+/// computed fully offline by [`plan_timed_dry_run`].
+///
+/// Counts are split the way an operator reads them: schedule shape
+/// (`requests`/`schedule_len`/`due_window_secs`/`interruption_candidates`),
+/// the workload split (`workload_units`/`demoted_impure`), and the offline
+/// supply resolution over the union closure of every scheduled target
+/// (`union_*`, `workload_outputs_never_supplied`, `embedded_uploadable`,
+/// `unresolved_offline`).
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TimedDryRunPlan {
+    /// Recorded client requests in the archive (before any limit).
+    pub requests: usize,
+    /// Requests actually scheduled (after the optional limit).
+    pub schedule_len: usize,
+    /// Due time of the last scheduled request, in seconds — the replayed
+    /// window length at the configured speedup.
+    pub due_window_secs: f64,
+    /// Scheduled requests with at least one interrupted target that the
+    /// target cluster will actually build (impure-demoted units are supplied
+    /// rather than rebuilt, so their recorded interruptions are not
+    /// candidates for replay).
+    pub interruption_candidates: usize,
+    /// Derivations with a recorded expected outcome the target must build
+    /// itself.
+    pub workload_units: usize,
+    /// Derivations demoted out of the workload because the archive lists
+    /// impure environment variables for them.
+    pub demoted_impure: usize,
+    /// Closure paths that are outputs of workload derivations: built by the
+    /// target, never supplied.
+    pub workload_outputs_never_supplied: usize,
+    /// Distinct store paths in the union closure of every scheduled target
+    /// (derivations, sources, and known outputs).
+    pub union_paths: usize,
+    /// Derivations in that union closure (each uploaded as drv text by a
+    /// live run).
+    pub union_drvs: usize,
+    /// Non-derivation closure paths embedded in the archive and uploadable
+    /// from it.
+    pub embedded_uploadable: usize,
+    /// Non-derivation closure paths nothing offline can place — a live run
+    /// probes the target and relay substituters for these.
+    pub unresolved_offline: usize,
+}
+
+/// Plan a timed replay of `archive` fully offline: build the schedule the
+/// timed dispatcher would run and resolve the supply ladder over the union
+/// closure of every scheduled target, without touching a cluster or the
+/// network.
+///
+/// The schedule uses the campaign knobs exactly as the timed wiring does
+/// (`speedup`, `replay_interruptions`, the optional request `limit`) and the
+/// same sanitizing conversions from archive records, so the dry-run numbers
+/// match what a live timed run would schedule. Source resolution runs with
+/// empty target-coverage and relay sets — without probes the ladder can only
+/// answer workload / embedded / unresolved, which is exactly the offline
+/// summary an operator needs before committing to a live run.
+pub fn plan_timed_dry_run(
+    archive: &ReplayArchive,
+    knobs: &Knobs,
+    limit: Option<usize>,
+) -> Result<TimedDryRunPlan> {
+    // Recorded requests and per-(session, drv) timing truth, through the
+    // same sanitizing conversions the timed wiring applies.
+    let requests: Vec<RecordedRequest> = archive
+        .requests()
+        .iter()
+        .map(super::recorded_request_from)
+        .collect();
+    let timing = |session: i64, drv: &str| {
+        archive
+            .expected_outcome(session, drv)
+            .map(super::recorded_timing_from)
+    };
+    let schedule = build_schedule(
+        &requests,
+        &timing,
+        knobs.speedup,
+        limit,
+        knobs.replay_interruptions,
+    );
+    let due_window_secs = schedule
+        .last()
+        .map(|entry| entry.due.as_secs_f64())
+        .unwrap_or_default();
+
+    // Workload split, and which scheduled requests carry an interruption the
+    // replay would actually reproduce (one over a unit the target builds).
+    let workload = workload_set(archive);
+    let interruption_candidates = schedule
+        .iter()
+        .filter(|entry| {
+            entry
+                .interruption_drvs
+                .iter()
+                .any(|drv| workload.drvs.contains(drv))
+        })
+        .count();
+
+    // Union closure of every scheduled target, in first-appearance order.
+    let mut roots: Vec<String> = Vec::new();
+    let mut seen_roots: BTreeSet<&str> = BTreeSet::new();
+    for entry in &schedule {
+        for target in &entry.request.targets {
+            if seen_roots.insert(target.drv.as_str()) {
+                roots.push(target.drv.clone());
+            }
+        }
+    }
+    let closure = walk_closure(archive, &roots)?;
+
+    // Outputs of workload drvs, taken from the closure nodes — a workload
+    // drv outside the closure cannot be requested, so these are sufficient.
+    let workload_outputs: BTreeSet<String> = closure
+        .topo
+        .iter()
+        .filter(|node| workload.drvs.contains(&node.drv_path))
+        .flat_map(|node| node.outputs.values().filter(|path| !path.is_empty()))
+        .cloned()
+        .collect();
+    let input_srcs: BTreeSet<String> = closure
+        .topo
+        .iter()
+        .flat_map(|node| node.input_srcs.iter().cloned())
+        .collect();
+    let closure_drvs: BTreeSet<&str> = closure
+        .topo
+        .iter()
+        .map(|node| node.drv_path.as_str())
+        .collect();
+
+    // Offline source resolution: empty coverage and relay maps under the
+    // full ladder, so each non-derivation closure path settles as a workload
+    // output, an archive-embedded upload, or unresolved-offline.
+    let target_coverage = BTreeSet::new();
+    let relay_narinfos = HashMap::new();
+    let mut workload_outputs_never_supplied = 0usize;
+    let mut embedded_uploadable = 0usize;
+    let mut unresolved_offline = 0usize;
+    for path in &closure.all_paths {
+        if closure_drvs.contains(path.as_str()) {
+            continue;
+        }
+        match resolve_source(
+            path,
+            &workload_outputs,
+            &target_coverage,
+            &input_srcs,
+            |candidate| archive.has_embedded(candidate),
+            &relay_narinfos,
+            SupplyDependencies::Substituters,
+        ) {
+            PathSource::NotSupplied { workload: true } => workload_outputs_never_supplied += 1,
+            PathSource::Archive => embedded_uploadable += 1,
+            PathSource::NotSupplied { workload: false } => unresolved_offline += 1,
+            // Unreachable offline: with no probe results there is nothing to
+            // point at a substituter.
+            PathSource::TargetSubstituter | PathSource::Relay { .. } => {}
+        }
+    }
+
+    Ok(TimedDryRunPlan {
+        requests: requests.len(),
+        schedule_len: schedule.len(),
+        due_window_secs,
+        interruption_candidates,
+        workload_units: workload.drvs.len(),
+        demoted_impure: workload.demoted_impure.len(),
+        workload_outputs_never_supplied,
+        union_paths: closure.all_paths.len(),
+        union_drvs: closure.topo.len(),
+        embedded_uploadable,
+        unresolved_offline,
+    })
 }
 
 /// Timed-dispatcher tuning derived from the campaign knobs once at the
