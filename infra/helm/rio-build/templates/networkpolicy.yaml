@@ -270,13 +270,13 @@ spec:
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
           matchExpressions:
             - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
-        {{- if .Values.parity.enabled }}
-        # nixpkgs-parity campaign engine (rio-parity namespace): direct
+        {{- if .Values.replay.enabled }}
+        # Build-replay campaign engine (rio-replay namespace): direct
         # AdminService reads (ListBuilds, GetBuildGraph, ClusterStatus,
         # GetSpawnIntents, …). Build submission goes via the gateway.
         - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ .Values.parity.namespace }}
-            k8s:app.kubernetes.io/name: rio-parity
+            k8s:io.kubernetes.pod.namespace: {{ .Values.replay.namespace }}
+            k8s:app.kubernetes.io/name: rio-replay
         {{- end }}
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
@@ -311,12 +311,12 @@ spec:
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
           matchExpressions:
             - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
-        {{- if .Values.parity.enabled }}
-        # nixpkgs-parity campaign engine: BatchQueryPathInfo /
+        {{- if .Values.replay.enabled }}
+        # Build-replay campaign engine: BatchQueryPathInfo /
         # BatchGetManifest comparison reads.
         - matchLabels:
-            k8s:io.kubernetes.pod.namespace: {{ .Values.parity.namespace }}
-            k8s:app.kubernetes.io/name: rio-parity
+            k8s:io.kubernetes.pod.namespace: {{ .Values.replay.namespace }}
+            k8s:app.kubernetes.io/name: rio-replay
         {{- end }}
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
     - fromEntities: [host, remote-node, cluster]

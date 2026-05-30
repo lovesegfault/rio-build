@@ -117,23 +117,23 @@ networkPolicy:
   storeS3Cidr: ""
 
 # ──────────────────────────────────────────────────────────────────────────
-# nixpkgs-parity validation campaign — cluster-side enablement only
+# Build-replay campaigns — cluster-side enablement only
 # ──────────────────────────────────────────────────────────────────────────
-# parity.enabled gates exactly the pieces that must ship with a deploy:
+# replay.enabled gates exactly the pieces that must ship with a deploy:
 # the scheduler-ingress / store-ingress CNP fromEndpoints entries that
 # admit the campaign engine, and the default gateway build-policy entries
 # for the three campaign tenants (merged into the rio.gatewayToml named
 # template in templates/gateway.yaml; explicit gateway.buildPolicy
 # entries win over the defaults).
-# The rio-parity namespace, ServiceAccount, Secrets, tenants and Jobs are
-# created by `cargo xtask parity launch|eval`, never by this chart.
-# EKS deploys flip this via `cargo xtask k8s -p eks up --deploy --deploy-parity`.
-parity:
+# The rio-replay namespace, ServiceAccount, Secrets, tenants and Jobs are
+# created by `cargo xtask replay launch|record`, never by this chart.
+# EKS deploys flip this via `cargo xtask k8s -p eks up --deploy --deploy-replay`.
+replay:
   enabled: false
   # Namespace the campaign-engine Jobs run in (created by xtask). The CNP
   # entries match on this namespace plus the pod label
-  # app.kubernetes.io/name=rio-parity.
-  namespace: rio-parity
+  # app.kubernetes.io/name=rio-replay.
+  namespace: rio-replay
 
 # nix.conf knobs for the rio-nix-conf ConfigMap (mounted into worker
 # pods at /etc/rio/nix-conf/nix.conf; see rio-builder/src/executor/

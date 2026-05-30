@@ -68,7 +68,7 @@ output "karpenter_node_role_name" {
   value       = module.karpenter.node_iam_role_name
 }
 
-output "parity_iam_role_arn" {
-  description = "IAM role ARN for the rio-parity campaign-engine IRSA (xtask parity launch/eval annotate the rio-parity ServiceAccount with it)"
-  value       = module.rio_parity_irsa.arn
+output "replay_iam_role_arn" {
+  description = "IAM role ARN for the rio-replay campaign-engine IRSA (xtask replay launch/record annotate the rio-replay ServiceAccount with it)"
+  value       = module.rio_replay_irsa.arn
 }

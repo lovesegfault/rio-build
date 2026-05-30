@@ -541,13 +541,13 @@ rec {
     extraCommands = builderExtraCommands;
   };
 
-  # ── nixpkgs-parity campaign engine ─────────────────────────────────────
+  # ── build-replay campaign engine ───────────────────────────────────────
   # Engine binary plus the external tools it shells out to: `nix`
   # (the leaf-mode warm-stage prefetch only — build-path submission and
   # drv-text import drive the gateway worker protocol in-process),
   # `nix-eval-jobs` (recorder evaluation), and the OpenSSH client
   # (`nix … --store ssh-ng://` spawns `ssh`). dwarfs provides
-  # `mkdwarfs`, which the recorder (`rio-parity eval`) shells out to
+  # `mkdwarfs`, which the recorder (`rio-replay record`) shells out to
   # when packing its staged replay archive into the published .dwarfs
   # image; the campaign engine opens that image in place and needs no
   # unpack tools. GNU tar + gzip cover the `tar -xzf` unpack of the
@@ -558,7 +558,7 @@ rec {
   # HTTPS); RIO_LOG_FORMAT=json + SSL_CERT_FILE from baseEnv. git is NOT
   # needed (the codeload tarball is NAR-identical to Hydra's git
   # export). Runs as nonroot (65532) like the other control-plane
-  # images; the parity Jobs provide a writable /work emptyDir and the
+  # images; the replay Jobs provide a writable /work emptyDir and the
   # single-user-store env (HOME/XDG/TMPDIR), so the image itself only
   # needs /tmp as a fallback scratch dir.
   #
@@ -567,11 +567,11 @@ rec {
   # inert outside the builder's overlayfs setup. (nix-eval-jobs links
   # the unpatched upstream nix component libraries, so its closure rides
   # along regardless — the dedup covers only the nix CLI itself.)
-  parity =
+  replay =
     let
       # Runtime tools the engine shells out to. Single list consumed by
       # BOTH extraContents and the image PATH so the two cannot drift.
-      parityTools = [
+      replayTools = [
         nixForBuilder
         pkgs.nix-eval-jobs
         pkgs.openssh
@@ -584,12 +584,12 @@ rec {
       ];
     in
     mkImage {
-      name = "parity";
+      name = "replay";
       bins = [ rio-crates.rio-replay ];
       user = nonrootUser;
       extraContents =
         nonrootEtc
-        ++ parityTools
+        ++ replayTools
         ++ [
           # New-style `nix` CLI needs the experimental flag; the engine and
           # operators exec `nix` inside this image, never nix-daemon.
@@ -597,7 +597,7 @@ rec {
             experimental-features = nix-command
           '')
         ];
-      extraEnv = [ "PATH=${lib.makeBinPath parityTools}" ];
+      extraEnv = [ "PATH=${lib.makeBinPath replayTools}" ];
       extraCommands = ''
         mkdir -p tmp
         chmod 1777 tmp

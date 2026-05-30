@@ -1,18 +1,18 @@
-# nixpkgs-parity enablement (parity.enabled): the campaign engine's CNP
+# Build-replay enablement (replay.enabled): the campaign engine's CNP
 # admissions must render when enabled, the three campaign tenants must get
 # default [build_policy."…"] entries in the gateway.toml ConfigMap (the
 # gateway build-policy vehicle: rio-gateway-config, subPath-mounted at
 # /etc/rio/gateway.toml — see 25-gateway-buildpolicy-toml.sh), and NONE of
-# the parity bits may leak into the default render.
+# the replay bits may leak into the default render.
 
-on=$TMPDIR/parity-on.yaml
+on=$TMPDIR/replay-on.yaml
 helm template rio . \
   --set global.image.tag=test \
-  --set parity.enabled=true \
+  --set replay.enabled=true \
   >"$on"
 
 # scheduler-ingress and store-ingress each admit the engine pods
-# (namespace rio-parity, app.kubernetes.io/name=rio-parity), and the
+# (namespace rio-replay, app.kubernetes.io/name=rio-replay), and the
 # admitting ingress rule must be the one scoped to the service's gRPC
 # port (9001 scheduler / 9002 store). Rules are selected by content, not
 # list position, so reordering the ingress list can't dodge the assert.
@@ -22,12 +22,12 @@ for spec in scheduler-ingress:9001 store-ingress:9002; do
   yq "select(.kind==\"CiliumNetworkPolicy\" and .metadata.name==\"$pol\")
       | .spec.ingress[]
       | select([.fromEndpoints[]?
-                | select(.matchLabels.\"k8s:app.kubernetes.io/name\" == \"rio-parity\"
-                         and .matchLabels.\"k8s:io.kubernetes.pod.namespace\" == \"rio-parity\")]
+                | select(.matchLabels.\"k8s:app.kubernetes.io/name\" == \"rio-replay\"
+                         and .matchLabels.\"k8s:io.kubernetes.pod.namespace\" == \"rio-replay\")]
                | length > 0)
       | .toPorts[].ports[].port" "$on" |
     grep -x "$port" >/dev/null || {
-    echo "FAIL: $pol missing a rio-parity fromEndpoints entry on a port-$port ingress rule" >&2
+    echo "FAIL: $pol missing a rio-replay fromEndpoints entry on a port-$port ingress rule" >&2
     exit 1
   }
 done
@@ -36,25 +36,25 @@ done
 # campaign default policy (snake_case TOML keys are what the gateway
 # config loader consumes).
 toml=$(yq 'select(.kind=="ConfigMap" and .metadata.name=="rio-gateway-config") | .data."gateway.toml"' "$on")
-test -n "$toml" || { echo "FAIL: rio-gateway-config ConfigMap missing with parity.enabled=true" >&2; exit 1; }
-for tenant in parity-leaf parity-selfhosted parity-warm; do
+test -n "$toml" || { echo "FAIL: rio-gateway-config ConfigMap missing with replay.enabled=true" >&2; exit 1; }
+for tenant in replay-leaf replay-selfhosted replay-warm; do
   echo "$toml" | grep -F "[build_policy.\"$tenant\"]" >/dev/null || {
     echo "FAIL: gateway.toml missing [build_policy.\"$tenant\"] default entry: $toml" >&2
     exit 1
   }
 done
-# All three tenants keep going; only parity-leaf forces roots. keep_going
+# All three tenants keep going; only replay-leaf forces roots. keep_going
 # and force_build_roots are the two lines immediately after each table
 # header.
-echo "$toml" | grep -A2 -F '[build_policy."parity-leaf"]' | grep 'keep_going = true' >/dev/null || {
-  echo "FAIL: parity-leaf default must have keep_going = true: $toml" >&2
+echo "$toml" | grep -A2 -F '[build_policy."replay-leaf"]' | grep 'keep_going = true' >/dev/null || {
+  echo "FAIL: replay-leaf default must have keep_going = true: $toml" >&2
   exit 1
 }
-echo "$toml" | grep -A2 -F '[build_policy."parity-leaf"]' | grep 'force_build_roots = true' >/dev/null || {
-  echo "FAIL: parity-leaf default must have force_build_roots = true: $toml" >&2
+echo "$toml" | grep -A2 -F '[build_policy."replay-leaf"]' | grep 'force_build_roots = true' >/dev/null || {
+  echo "FAIL: replay-leaf default must have force_build_roots = true: $toml" >&2
   exit 1
 }
-for tenant in parity-selfhosted parity-warm; do
+for tenant in replay-selfhosted replay-warm; do
   echo "$toml" | grep -A2 -F "[build_policy.\"$tenant\"]" | grep 'keep_going = true' >/dev/null || {
     echo "FAIL: $tenant default must have keep_going = true: $toml" >&2
     exit 1
@@ -65,22 +65,22 @@ for tenant in parity-selfhosted parity-warm; do
   }
 done
 
-# The widened gate (`or .Values.parity.enabled $g.buildPolicy`): with
-# parity.enabled=true and gateway.buildPolicy nulled out entirely (nulling
+# The widened gate (`or .Values.replay.enabled $g.buildPolicy`): with
+# replay.enabled=true and gateway.buildPolicy nulled out entirely (nulling
 # the key is the only way to drop the default qa-* entries — see
 # 25-gateway-buildpolicy-toml.sh), the rio-gateway-config ConfigMap must
-# still render with the three parity tables, and the gateway Deployment
+# still render with the three replay tables, and the gateway Deployment
 # must still carry the /etc/rio/gateway.toml subPath mount and the
 # gateway-config volume. The narrow `if $g.buildPolicy` gate would render
 # none of these.
-nobp=$TMPDIR/parity-nobp.yaml
+nobp=$TMPDIR/replay-nobp.yaml
 helm template rio . \
   --set global.image.tag=test \
-  --set parity.enabled=true \
+  --set replay.enabled=true \
   --set gateway.buildPolicy=null \
   >"$nobp"
 nobp_toml=$(yq 'select(.kind=="ConfigMap" and .metadata.name=="rio-gateway-config") | .data."gateway.toml"' "$nobp")
-for tenant in parity-leaf parity-selfhosted parity-warm; do
+for tenant in replay-leaf replay-selfhosted replay-warm; do
   echo "$nobp_toml" | grep -F "[build_policy.\"$tenant\"]" >/dev/null || {
     echo "FAIL: or-gate: gateway.toml missing [build_policy.\"$tenant\"] with gateway.buildPolicy=null: $nobp_toml" >&2
     exit 1
@@ -101,28 +101,28 @@ yq 'select(.kind=="Deployment" and .metadata.name=="rio-gateway")
   exit 1
 }
 
-# An operator-supplied entry must override the parity default (merge
+# An operator-supplied entry must override the replay default (merge
 # semantics: explicit values win).
-ovr=$TMPDIR/parity-override.yaml
+ovr=$TMPDIR/replay-override.yaml
 helm template rio . \
   --set global.image.tag=test \
-  --set parity.enabled=true \
-  --set gateway.buildPolicy.parity-leaf.keepGoing=false \
-  --set gateway.buildPolicy.parity-leaf.forceBuildRoots=true \
+  --set replay.enabled=true \
+  --set gateway.buildPolicy.replay-leaf.keepGoing=false \
+  --set gateway.buildPolicy.replay-leaf.forceBuildRoots=true \
   >"$ovr"
 yq 'select(.kind=="ConfigMap" and .metadata.name=="rio-gateway-config") | .data."gateway.toml"' "$ovr" |
-  grep -A2 -F '[build_policy."parity-leaf"]' | grep 'keep_going = false' >/dev/null || {
-  echo "FAIL: explicit gateway.buildPolicy entry did not override the parity default" >&2
+  grep -A2 -F '[build_policy."replay-leaf"]' | grep 'keep_going = false' >/dev/null || {
+  echo "FAIL: explicit gateway.buildPolicy entry did not override the replay default" >&2
   exit 1
 }
 
-# Negative: the default render carries no parity bits. (The gateway.toml
-# ConfigMap itself MAY exist by default for non-parity entries, e.g. the
-# qa-* ones — only the parity strings must be absent.)
-off=$TMPDIR/parity-off.yaml
+# Negative: the default render carries no replay bits. (The gateway.toml
+# ConfigMap itself MAY exist by default for non-replay entries, e.g. the
+# qa-* ones — only the replay strings must be absent.)
+off=$TMPDIR/replay-off.yaml
 helm template rio . --set global.image.tag=test >"$off"
-! grep -q 'rio-parity\|parity-leaf\|parity-selfhosted\|parity-warm' "$off" || {
-  echo "FAIL: parity enablement rendered with parity.enabled=false (default)" >&2
-  grep -n 'rio-parity\|parity-leaf\|parity-selfhosted\|parity-warm' "$off" >&2
+! grep -q 'rio-replay\|replay-' "$off" || {
+  echo "FAIL: replay enablement rendered with replay.enabled=false (default)" >&2
+  grep -n 'rio-replay\|replay-' "$off" >&2
   exit 1
 }

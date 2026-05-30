@@ -51,9 +51,9 @@ let
     # queue as drvs become known). Replaces the old `.#ci` aggregate.
     nix-fast-build
 
-    # Parallel evaluator used by `rio-parity eval` (nixpkgs-parity
-    # campaign) for local/scoped eval-set builds; the same pinned
-    # binary nix-fast-build and gen-matrix already use.
+    # Parallel evaluator used by `rio-replay record` (build-replay
+    # campaign recorder) for local/scoped archive recording; the same
+    # pinned binary nix-fast-build and gen-matrix already use.
     nix-eval-jobs
 
     # DwarFS image tools (mkdwarfs): pack replay-archive staging

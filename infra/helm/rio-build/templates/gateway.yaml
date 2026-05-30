@@ -1,17 +1,17 @@
 {{- /* Named template so the ConfigMap body and the checksum annotation
        hash the SAME rendered string (see controller.yaml / bug_022).
        `define` must be at top level (not inside `if`).
-       parity.enabled merges in default [build_policy] entries for the
-       three nixpkgs-parity campaign tenants (keep_going for all three,
-       force_build_roots for parity-leaf only); explicit
+       replay.enabled merges in default [build_policy] entries for the
+       three build-replay campaign tenants (keep_going for all three,
+       force_build_roots for replay-leaf only); explicit
        gateway.buildPolicy entries win over the defaults. */}}
 {{- define "rio.gatewayToml" -}}
 {{- $policy := dict -}}
-{{- if .Values.parity.enabled -}}
+{{- if .Values.replay.enabled -}}
 {{- $policy = dict
-      "parity-leaf"       (dict "keepGoing" true "forceBuildRoots" true)
-      "parity-selfhosted" (dict "keepGoing" true "forceBuildRoots" false)
-      "parity-warm"       (dict "keepGoing" true "forceBuildRoots" false)
+      "replay-leaf"       (dict "keepGoing" true "forceBuildRoots" true)
+      "replay-selfhosted" (dict "keepGoing" true "forceBuildRoots" false)
+      "replay-warm"       (dict "keepGoing" true "forceBuildRoots" false)
 -}}
 {{- end -}}
 {{- $policy = mustMergeOverwrite $policy (deepCopy (.Values.gateway.buildPolicy | default dict)) -}}
@@ -214,7 +214,7 @@ spec:
               readOnly: true
             {{- end }}
             {{- include "rio.mounts" (dict "root" . "form" "mount" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 12 }}
-            {{- if or .Values.parity.enabled $g.buildPolicy }}
+            {{- if or .Values.replay.enabled $g.buildPolicy }}
             # rio_common::config::load reads /etc/rio/gateway.toml. The
             # [build_policy."<tenant>"] tables are only settable via the
             # TOML file layer (the RIO_ env layer mangles map keys with
@@ -272,7 +272,7 @@ spec:
             secretName: {{ $g.ssh.authorizedKeysSecret }}
         {{- end }}
         {{- include "rio.mounts" (dict "root" . "form" "volume" "want" (list "cov" "jwtSign" "serviceHmac")) | nindent 8 }}
-        {{- if or .Values.parity.enabled $g.buildPolicy }}
+        {{- if or .Values.replay.enabled $g.buildPolicy }}
         - name: gateway-config
           configMap:
             name: rio-gateway-config
@@ -320,7 +320,7 @@ spec:
       {{- with $g.service.nodePort }}
       nodePort: {{ . }}
       {{- end }}
-{{- if or .Values.parity.enabled $g.buildPolicy }}
+{{- if or .Values.replay.enabled $g.buildPolicy }}
 ---
 # Mounted at /etc/rio/gateway.toml (subPath). The config loader merges
 # this UNDER env (RIO_* wins for scalars). The [build_policy."<tenant>"]
