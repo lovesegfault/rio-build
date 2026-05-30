@@ -553,6 +553,186 @@ async fn marked_broken_tried_present_node_settles() -> TestResult {
     Ok(())
 }
 
+/// C3 / sched.merge.substitute-topdown: a stale ok=false walk verdict
+/// consumed at the topdown fail-fast must not terminally fail a build
+/// whose own (live effective) wanted outputs are PRESENT in the store —
+/// the two-build dedup variant (the model's faithful C3 trace).
+///
+/// d1 declares two outputs: "out" (build B's narrow want; substitutable
+/// at merge time, PRESENT later) and "wide" (build A's extra want;
+/// never available). Build B's narrow pruned merge keeps {d1} (stamped,
+/// childless) and spawns d1's walk (parked on the QPI gate). Build A's
+/// wide full merge re-attaches d2 under d1 (its wide want blocks the
+/// prune). d1's narrow output then becomes PRESENT (late ingest). A is
+/// cancelled and reaped: d2 (sole-interest of A) is removed, d1 is
+/// closure-holed -> evidence Broken. The parked walk's stale ok=false
+/// verdict then arrives.
+///
+/// As built, handle_substitute_complete's Broken arm consumes the
+/// verdict with NO presence re-check and fail-fasts every interested
+/// build — wrongfully terminally failing build B although its wanted
+/// output is present (a walk verdict is stale by the walk's own
+/// duration). The settlement must re-probe the live effective wanted
+/// set first and route the obtainable node to a verification walk.
+// r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
+#[tokio::test]
+async fn stale_walk_failure_does_not_fail_build_with_present_outputs() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Park the detached fetch: QueryPathInfo waits on the gate, so d1
+    // stays Substituting through the staging sequence and the injected
+    // (stale) SubstituteComplete below is accepted.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    // d1's narrow output: substitutable upstream at merge time (so
+    // build B's prune fires and the walk spawns), PRESENT later.
+    // The wide output is never available anywhere.
+    let out = test_store_path("c3-d1-out");
+    let wide = test_store_path("c3-d1-wide");
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    let mk_d1 = |wanted: Vec<String>| {
+        let mut n = make_node("c3-d1");
+        n.output_names = vec!["out".into(), "wide".into()];
+        n.expected_output_paths = vec![out.clone(), wide.clone()];
+        n.wanted_output_names = wanted;
+        n
+    };
+    let mk_d2 = || {
+        let mut n = make_node("c3-d2");
+        n.expected_output_paths = vec![test_store_path("c3-d2-out")];
+        n
+    };
+
+    // Build B (narrow): {d1 -> d2} wanting only d1's "out", which is
+    // available upstream -> the topdown prune fires: keeps {d1}
+    // (stamped, childless), drops d2, classifies d1 pending-substitute
+    // -> the detached walk spawns and parks on the QPI gate.
+    let build_b = Uuid::new_v4();
+    let _ev_b = merge_dag(
+        &handle,
+        build_b,
+        vec![mk_d1(vec!["out".into()]), mk_d2()],
+        vec![make_test_edge("c3-d1", "c3-d2")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let d1 = expect_drv(&handle, "c3-d1").await;
+    assert!(
+        d1.topdown_pruned,
+        "precondition: B's pruned merge stamps d1"
+    );
+    assert_eq!(
+        d1.status,
+        DerivationStatus::Substituting,
+        "precondition: d1's detached fetch is parked on the QPI gate"
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.total_derivations,
+        1,
+        "precondition: B took the roots-only prune path"
+    );
+
+    // Build A (wide): the duplicate submission {d1 -> d2}, wanting both
+    // of d1's outputs. The wide want is missing and not substitutable,
+    // so the prune cannot fire -> full merge: d2 enters the DAG, the
+    // (d1, d2) edge is created, and the in-flight Substituting d1 is
+    // left alone. A registers interest in both.
+    let build_a = Uuid::new_v4();
+    let _ev_a = merge_dag(
+        &handle,
+        build_a,
+        vec![mk_d1(vec!["out".into(), "wide".into()]), mk_d2()],
+        vec![make_test_edge("c3-d1", "c3-d2")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("c3-d2").await?.is_some(),
+        "precondition: A's full merge brings d2 into the DAG"
+    );
+
+    // Late ingest: d1's narrow output becomes locally PRESENT (another
+    // build/tenant uploaded it during the walk).
+    store.seed_with_content(&out, b"c3-d1-out-content");
+
+    // Cancel A and reap its sole-interest nodes: d2 is removed, d1
+    // (shared with B) survives — childless and closure-holed.
+    cancel_build(&handle, build_a).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build_a })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle.debug_query_derivation("c3-d2").await?.is_none(),
+        "precondition: A's sole-interest d2 must be reaped"
+    );
+    let d1 = expect_drv(&handle, "c3-d1").await;
+    assert!(
+        d1.closure_hole,
+        "precondition: the reap stamps the closure hole on the survivor"
+    );
+    assert_eq!(
+        d1.status,
+        DerivationStatus::Substituting,
+        "precondition: the in-flight walk keeps d1 Substituting through the reap"
+    );
+
+    // Disarm the QPI gate so the (post-fix) settlement's verification
+    // walk can proceed; the original parked walk stays parked (its
+    // verdict is the injected one below).
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The stale verdict: ok=false, fixed at the walk's own check time —
+    // before "out" became present.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "c3-d1".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+
+    // THE RED ASSERTION (C3): build B's wanted output IS present; the
+    // stale verdict must not terminally fail it.
+    let st = query_status(&handle, build_b).await?;
+    assert_ne!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "C3 wrongful terminal failure: the stale ok=false walk verdict was \
+         consumed at the topdown fail-fast with no presence re-check — build \
+         B's wanted output is present in the store"
+    );
+
+    // Post-fix: the settlement re-probes the live effective wanted set,
+    // sees the output present, and spawns the verification walk; wait
+    // for it to land and assert the full settlement.
+    settle_substituting(&handle, &["c3-d1"]).await;
+    tick(&handle).await?;
+    assert_eq!(
+        expect_drv(&handle, "c3-d1").await.status,
+        DerivationStatus::Completed,
+        "settlement: present wanted output -> closure re-verified -> Completed"
+    );
+    let st = query_status(&handle, build_b).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build B must succeed once d1 settles"
+    );
+    Ok(())
+}
+
 /// I-163 Fix 3: `cluster_snapshot_cached()` reads the watch-channel
 /// value the actor publishes on `Tick` — no mailbox round-trip. The
 /// `fn` (not `async fn`) signature is the structural proof; this test

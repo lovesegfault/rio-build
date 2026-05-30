@@ -372,6 +372,23 @@ pub(crate) async fn try_query_status(
     Ok(rx.await?)
 }
 
+/// Cancel a build through the production `CancelBuild` command and
+/// await acceptance. Panics if the cancel is rejected (terminal build /
+/// not found) — that is a test-sequencing bug.
+pub(crate) async fn cancel_build(handle: &ActorHandle, build_id: Uuid) -> TestResult {
+    let (tx, rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::CancelBuild {
+            build_id,
+            caller_tenant: None,
+            reason: "test cancel".into(),
+            reply: tx,
+        })
+        .await?;
+    assert!(rx.await??, "CancelBuild must be accepted");
+    Ok(())
+}
+
 /// Send a successful completion (Built) with a single `out` output.
 /// Uses a placeholder output_hash; override via inline construction if
 /// the test asserts on hash contents.

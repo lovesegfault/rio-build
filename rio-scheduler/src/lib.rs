@@ -240,6 +240,14 @@ pub fn describe_metrics() {
         "Top-down-pruned roots that could not complete via substitution (deferred fetch failed, or a wanted output was definitively missing/unsubstitutable at dispatch time) — build failed fast; resubmit re-probes"
     );
     describe_counter!(
+        "rio_scheduler_topdown_settlement_reprobe_total",
+        "Settlement re-probes at topdown fail-fast decision points (labels: outcome = \
+         verification_walk|fail_fast). verification_walk: a stale walk verdict was about to \
+         wrongfully fail builds whose live-wanted outputs are obtainable — the settlement \
+         spawned a closure-re-verifying walk instead. fail_fast: the re-probe confirmed a \
+         wanted output missing and unsubstitutable (the genuine fail-fast)."
+    );
+    describe_counter!(
         "rio_scheduler_queue_backpressure",
         "Backpressure activations (queue reached 80% capacity)"
     );

@@ -1408,6 +1408,7 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The reap hazard, end to end: B1's prune stamps childless R and parks
 /// its detached fetch; B2 full-merges app→R→dep, which previously
 /// cleared the stamp even though dep was UNBUILT; B2 is cancelled and
@@ -1418,7 +1419,12 @@ async fn test_topdown_pruned_flag_ignored_after_full_merge_adds_deps() -> TestRe
 /// prevent). The clear must therefore use the same closure-evidence
 /// criterion as the stamp (`closure_vouched`): B2's unbuilt dep
 /// must NOT clear the mark, in memory or in PG, and after the reap the
-/// walk failure must take the designed resubmit-directing fail-fast.
+/// walk failure must take the designed settlement — the verdict in hand
+/// is stale by the walk's own duration, so the settlement re-probes the
+/// live wanted set, finds it still substitutable upstream, and routes R
+/// to a closure-re-verifying walk that completes it (never the doomed
+/// from-source dispatch; pre-settlement this pinned the unconditional
+/// resubmit-directing fail-fast).
 #[tokio::test]
 async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped() -> TestResult {
     let (db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -1535,7 +1541,17 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
         "R survives (B1's interest) with the mark intact after the reap"
     );
 
-    // R's parked walk now genuinely fails.
+    // Disarm the QPI gate so the settlement's verification walk (below)
+    // can complete against the substitutable upstream; the original
+    // parked walk stays parked — its verdict is the injected one.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // R's parked walk now reports failure — a verdict that is stale by
+    // the walk's own duration (R's wanted output is still substitutable
+    // upstream).
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdreap-r".into(),
@@ -1545,7 +1561,11 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
         .await?;
     barrier(&handle).await;
 
-    // Designed outcome: the fail-fast, not a from-source dispatch.
+    // Designed outcome (r[sched.evidence.settlement]): never a
+    // from-source dispatch — the settlement re-probes the live wanted
+    // set, finds it substitutable, and routes R to a verification walk
+    // that completes it from upstream. (Pre-settlement this pinned the
+    // unconditional fail-fast: B1 Failed + resubmit-directing error.)
     let r = expect_drv(&handle, "tdreap-r").await;
     assert!(
         !matches!(
@@ -1556,21 +1576,19 @@ async fn test_topdown_pruned_kept_when_merge_adds_unbuilt_children_then_reaped()
          dispatchable from source; got {:?}",
         r.status
     );
-    assert!(
-        !r.topdown_pruned,
-        "the fail-fast consumes (clears) the mark it acted on"
+    settle_substituting(&handle, &["tdreap-r"]).await;
+    assert_eq!(
+        expect_drv(&handle, "tdreap-r").await.status,
+        DerivationStatus::Completed,
+        "the settlement's verification walk must complete R from the \
+         substitutable upstream"
     );
     let s1 = query_status(&handle, b1).await?;
     assert_eq!(
         s1.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast (was: doomed \
-         from-source dispatch after the eager clear lost the mark)"
-    );
-    assert!(
-        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
-        "error summary should direct resubmit; got {:?}",
-        s1.error_summary
+        rio_proto::types::BuildState::Succeeded as i32,
+        "B1 must succeed once the settlement completes R (was pre-settlement: \
+         Failed via the unconditional fail-fast)"
     );
     Ok(())
 }
@@ -2522,6 +2540,7 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The mixed-children reap shape with the ORDERING REVERSED: B2's
 /// unbuilt dep1 is reaped while R's walk is still in flight (the reap
 /// hook rightly defers to the walk — that skip is pinned by the
@@ -2530,9 +2549,11 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
 /// so a children-keyed lazy clear would drop the mark and revert R to
 /// Ready — but that child set is a reap-truncated view of the pruned
 /// closure (dep1 was never produced). The verdict must take the
-/// resubmit-directing fail-fast instead. The fail-fast consumes the
-/// mark only; the hole survives for the directed resubmit — see
-/// bug_006/round-23.
+/// settlement instead: the stale ok=false is re-probed against the
+/// live wanted set, found substitutable, and routed to a
+/// closure-re-verifying walk that completes R — never the lazy clear +
+/// Ready revert, and never (pre-settlement's pin) the unconditional
+/// resubmit-directing fail-fast for an obtainable output.
 #[tokio::test]
 async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_produced_child_survives_reversed()
 -> TestResult {
@@ -2694,9 +2715,18 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
          un-produced child"
     );
 
-    // The walk now genuinely fails. R's surviving children ({dep2}) are
-    // all produced, but they are a reap-truncated view of the pruned
-    // closure — the verdict must take the resubmit-directing fail-fast,
+    // Disarm the QPI gate so the settlement's verification walk (below)
+    // can complete against the substitutable upstream; the original
+    // parked walk stays parked — its verdict is the injected one.
+    store
+        .faults
+        .query_path_info_gate_armed
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The walk now reports failure — a verdict stale by the walk's own
+    // duration. R's surviving children ({dep2}) are all produced, but
+    // they are a reap-truncated view of the pruned closure — the
+    // verdict must take the settlement (re-probe -> verification walk),
     // not the lazy clear + Ready revert.
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
@@ -2706,19 +2736,6 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         })
         .await?;
     barrier(&handle).await;
-    let s1 = query_status(&handle, b1).await?;
-    assert_eq!(
-        s1.state,
-        rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast when the walk fails \
-         after an un-produced child was reaped (was: lazy clear over the \
-         surviving produced child and a Ready revert)"
-    );
-    assert!(
-        s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
-        "error summary should direct resubmit; got {:?}",
-        s1.error_summary
-    );
     let r = expect_drv(&handle, "tdmr-r").await;
     assert!(
         !matches!(
@@ -2728,25 +2745,38 @@ async fn test_topdown_pruned_root_fail_fast_when_unproduced_child_reaped_but_pro
         "R must not be dispatchable from source after the closure hole; got {:?}",
         r.status
     );
-    assert!(
-        !r.topdown_pruned,
-        "the fail-fast consumes (clears) the mark it acted on"
+    // r[sched.evidence.settlement]: the re-probe finds R's wanted output
+    // still substitutable upstream and routes it to the verification
+    // walk; the walk completes R and B1 succeeds. (Pre-settlement this
+    // pinned the unconditional fail-fast: B1 Failed + mark consumed.)
+    settle_substituting(&handle, &["tdmr-r"]).await;
+    assert_eq!(
+        expect_drv(&handle, "tdmr-r").await.status,
+        DerivationStatus::Completed,
+        "the settlement's verification walk must complete R from the \
+         substitutable upstream"
     );
-    // The fail-fast's persisted clear drops the mark it consumed but
-    // retains the breadcrumb: the truncated child edges survive the
-    // park, so the hole stays the evidence that protects the directed
-    // resubmit (an unmarked node's hole has no consumer that can
-    // mis-fire).
+    let s1 = query_status(&handle, b1).await?;
+    assert_eq!(
+        s1.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "B1 must succeed once the settlement completes R (was pre-settlement: \
+         Failed via the unconditional fail-fast)"
+    );
+    // The settlement consumes neither the mark nor the breadcrumb (only
+    // a genuine fail-fast clears the mark): both survive in PG on the
+    // now-Completed node — the hole stays the evidence protecting any
+    // later resubmit (bug_006/round-23), and a terminal node's mark has
+    // no consumer that can mis-fire.
     let (pg_pruned, pg_hole): (bool, bool) = sqlx::query_as(
         "SELECT topdown_pruned, closure_hole FROM derivations WHERE drv_hash = 'tdmr-r'",
     )
     .fetch_one(&db.pool)
     .await?;
     assert!(
-        !pg_pruned && pg_hole,
-        "the fail-fast consumes the mark only; the hole survives for the directed \
-         resubmit — see bug_006/round-23 (topdown_pruned={pg_pruned}, \
-         closure_hole={pg_hole})"
+        pg_pruned && pg_hole,
+        "the settlement consumes neither the mark nor the closure-hole breadcrumb \
+         (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
     );
     Ok(())
 }
@@ -3756,6 +3786,7 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The closure-hole breadcrumb must survive the node's own Completed →
 /// stale-reset round-trip (bughunter round-21 bug_007). Staging: B1's
 /// prune stamps R and parks its detached fetch; BC produces dep2; B2
@@ -3769,13 +3800,17 @@ async fn test_topdown_pruned_kept_after_closure_hole_until_full_remerge_heals() 
 /// declared → no heal): the stale-Completed verify resets R and
 /// re-spawns the walk. When that walk fails, the surviving child set
 /// ({dep2}, produced) is a reap-truncated view of R's pruned closure,
-/// so the verdict must take the resubmit-directing fail-fast — NOT the
-/// Vouched lazy clear + Ready revert that hands R to a worker from
-/// source. Pre-fix the completion dropped the in-memory hole, the lazy
-/// clear judged the truncated set Vouched (laundering the persisted
-/// mark AND breadcrumb), and the next dispatch pass cut a doomed
-/// from-source assignment. The fail-fast consumes the mark only; the
-/// hole survives for the directed resubmit — see bug_006/round-23.
+/// so the verdict must take the bounded settlement — NOT the Vouched
+/// lazy clear + Ready revert that hands R to a worker from source: the
+/// first stale verdict is re-probed (output still substitutable
+/// upstream) and routed to ONE verification walk (spending the
+/// one-shot), and that walk's OWN failure takes the genuine
+/// resubmit-directing fail-fast. Pre-fix the completion dropped the
+/// in-memory hole, the lazy clear judged the truncated set Vouched
+/// (laundering the persisted mark AND breadcrumb), and the next
+/// dispatch pass cut a doomed from-source assignment. The fail-fast
+/// consumes the mark only; the hole survives for the directed resubmit
+/// — see bug_006/round-23.
 // r[verify sched.evidence.closure-hole]
 #[tokio::test]
 async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> TestResult {
@@ -3981,10 +4016,37 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     // has somewhere to go if the truncated child set is wrongly judged
     // Vouched after the walk failure.
 
-    // The re-spawned walk genuinely fails (upstream advertised the
-    // path but could not deliver). R's surviving children ({dep2}) are
-    // all produced but reap-truncated: the verdict must take the
-    // resubmit-directing fail-fast, not the Vouched lazy clear.
+    // The re-spawned walk reports failure. r[sched.evidence.settlement]:
+    // the verdict is stale by the walk's own duration and R's wanted
+    // output is still substitutable upstream, so the settlement re-probe
+    // routes R to ONE verification walk (spending the one-shot) instead
+    // of fail-fasting — the surviving hole is what keeps the truncated
+    // child set Broken and the settlement armed at all (not the Vouched
+    // lazy clear).
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdcr-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let settled = expect_drv(&handle, "tdcr-r").await;
+    assert_eq!(
+        settled.status,
+        DerivationStatus::Substituting,
+        "the settlement must spawn the verification walk (parked on the QPI gate) \
+         instead of fail-fasting the obtainable output"
+    );
+    assert!(
+        settled.substitute_tried,
+        "the settlement spends the verification one-shot when it spawns the walk"
+    );
+
+    // The verification walk's OWN failure (upstream advertised the path
+    // but could not deliver). The one-shot is spent, so this verdict
+    // takes the genuine bounded resubmit-directing fail-fast — never the
+    // Vouched lazy clear over the reap-truncated child set.
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdcr-r".into(),
@@ -3997,9 +4059,9 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
     assert_eq!(
         sc.state,
         rio_proto::types::BuildState::Failed as i32,
-        "C must fail via the resubmit-directing fail-fast when the re-spawned walk \
-         fails (was: the completion-time hole drop made the truncated child set \
-         Vouched → lazy clear → Ready revert, C left Active)"
+        "C must fail via the resubmit-directing fail-fast when the verification walk \
+         fails with the one-shot spent (was: the completion-time hole drop made the \
+         truncated child set Vouched → lazy clear → Ready revert, C left Active)"
     );
     assert!(
         sc.error_summary.contains("topdown") && sc.error_summary.contains("resubmit"),
@@ -4050,6 +4112,7 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The closure-hole breadcrumb must be carried across the merge-time
 /// resubmit-reset (bughunter round-22 bug_006). Staging: B1's prune
 /// stamps R and parks its detached fetch; BC produces dep2; B2
@@ -4064,8 +4127,11 @@ async fn test_closure_hole_survives_completion_and_stale_completed_reset() -> Te
 /// child set ({dep2}, produced) survives un-re-declared, so the
 /// truncation evidence must ride along: with the carried hole the stamp
 /// gates see Broken closure evidence and re-stamp `topdown_pruned`, and
-/// the later walk failure takes the bounded resubmit-directing
-/// fail-fast. Pre-fix the reset rebuilt R hole-less, the all-produced
+/// the later walk failures take the bounded settlement: the FIRST
+/// stale verdict is re-probed (output still substitutable upstream) and
+/// routed to one verification walk — spending the one-shot — and that
+/// walk's OWN failure takes the genuine resubmit-directing fail-fast.
+/// Pre-fix the reset rebuilt R hole-less, the all-produced
 /// survivor read as Vouched, both stamp gates skipped the mark, and the
 /// walk failure took the generic revert to Ready — handing R to a
 /// worker from source even though its pruned closure was never merged.
@@ -4290,10 +4356,36 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     // has somewhere to go if the laundered child set were wrongly
     // trusted after the walk failure.
 
-    // The re-spawned walk genuinely fails (upstream advertised the
-    // path but could not deliver). The re-stamped, still-holed R must
-    // take the bounded resubmit-directing fail-fast, not the generic
-    // revert to Ready.
+    // The re-spawned walk reports failure. r[sched.evidence.settlement]:
+    // the verdict is stale by the walk's own duration and R's wanted
+    // output is still substitutable upstream, so the settlement re-probe
+    // routes R to ONE verification walk (spending the one-shot) instead
+    // of fail-fasting — the re-stamped mark + carried hole are what arm
+    // that settlement at all.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdrr-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let settled = expect_drv(&handle, "tdrr-r").await;
+    assert_eq!(
+        settled.status,
+        DerivationStatus::Substituting,
+        "the settlement must spawn the verification walk (parked on the QPI gate) \
+         instead of fail-fasting the obtainable output"
+    );
+    assert!(
+        settled.substitute_tried,
+        "the settlement spends the verification one-shot when it spawns the walk"
+    );
+
+    // The verification walk's OWN failure (upstream advertised the path
+    // but could not deliver). The one-shot is spent, so this verdict
+    // takes the genuine bounded resubmit-directing fail-fast — never the
+    // generic revert to Ready.
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdrr-r".into(),
@@ -4306,9 +4398,9 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
     assert_eq!(
         s3.state,
         rio_proto::types::BuildState::Failed as i32,
-        "B3 must fail via the resubmit-directing fail-fast when the re-spawned walk \
-         fails (was: the unmarked R took the generic revert to Ready and stayed \
-         dispatchable from source)"
+        "B3 must fail via the resubmit-directing fail-fast when the verification walk \
+         fails with the one-shot spent (was: the unmarked R took the generic revert \
+         to Ready and stayed dispatchable from source)"
     );
     assert!(
         s3.error_summary.contains("topdown") && s3.error_summary.contains("resubmit"),
@@ -4354,22 +4446,27 @@ async fn test_resubmit_reset_carries_closure_hole_and_restamps_topdown_pruned() 
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// The topdown fail-fast must consume the MARK only and retain the
 /// closure-hole breadcrumb, so the directed resubmit it solicits stays
 /// protected (bughunter round-23 bug_006). Staging: B1's prune stamps R
 /// and parks its detached fetch; BC produces dep2; B2 full-merges
 /// app→R→{dep1 unbuilt, dep2 produced}; B2's cancel+cleanup reaps the
 /// un-produced dep1 out from under R (closure hole set in memory,
-/// persisted by the leader's reap hook). R's parked walk then FAILS:
-/// the fail-fast fires (B1 fails with the resubmit-directing error) and
-/// consumes the mark — but the breadcrumb must survive, because the
-/// truncated child edge R→{dep2} also survives the park. B3 then
-/// follows the error message and resubmits the same target through
-/// another pruned merge inside B1's cleanup window: the resubmit-reset
-/// carries the retained hole, the re-pruning merge's stamp gates see
-/// Broken closure evidence over the produced survivor and re-stamp R,
-/// and the second walk failure repeats the bounded resubmit-directing
-/// outcome. Pre-fix the fail-fast cleared the hole together with the
+/// persisted by the leader's reap hook). R's parked walk then FAILS —
+/// twice, through the settlement's bounded cycle: the first stale
+/// verdict is re-probed (output still substitutable upstream) and
+/// routed to ONE verification walk (spending the one-shot), and that
+/// walk's own failure takes the genuine fail-fast (B1 fails with the
+/// resubmit-directing error) and consumes the mark — but the breadcrumb
+/// must survive, because the truncated child edge R→{dep2} also
+/// survives the park. B3 then follows the error message and resubmits
+/// the same target through another pruned merge inside B1's cleanup
+/// window: the resubmit-reset carries the retained hole, the re-pruning
+/// merge's stamp gates see Broken closure evidence over the produced
+/// survivor and re-stamp R, and the resubmitted walk's failures repeat
+/// the same bounded settlement-then-fail-fast outcome. Pre-fix the
+/// fail-fast cleared the hole together with the
 /// mark (memory + PG), the resubmit-reset carried the laundered false,
 /// the produced survivor read as Vouched, the re-prune skipped the
 /// re-stamp, and the second walk failure took the generic revert to
@@ -4520,9 +4617,31 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     // A puller is available throughout — a from-source delivery of R
     // would have somewhere to land at every later step.
 
-    // R's parked walk genuinely FAILS: the closure evidence is Broken
-    // (hole over the produced survivor), so the verdict takes the
-    // resubmit-directing fail-fast and B1 fails.
+    // R's parked walk reports failure. r[sched.evidence.settlement]: the
+    // closure evidence is Broken (hole over the produced survivor) and
+    // the output is still substitutable upstream, so the first stale
+    // verdict is settled by ONE verification walk (one-shot spent) —
+    // and that walk's OWN failure then takes the genuine
+    // resubmit-directing fail-fast: B1 fails.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdfk-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let settled = expect_drv(&handle, "tdfk-r").await;
+    assert_eq!(
+        settled.status,
+        DerivationStatus::Substituting,
+        "the settlement must spawn the verification walk instead of fail-fasting \
+         the obtainable output"
+    );
+    assert!(
+        settled.substitute_tried,
+        "the settlement spends the verification one-shot when it spawns the walk"
+    );
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdfk-r".into(),
@@ -4535,7 +4654,8 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     assert_eq!(
         s1.state,
         rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast when the walk fails"
+        "B1 must fail via the resubmit-directing fail-fast when the verification \
+         walk fails with the one-shot spent"
     );
     assert!(
         s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),
@@ -4607,8 +4727,26 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
          pruned merge (topdown_pruned={pg_pruned}, closure_hole={pg_hole})"
     );
 
-    // The resubmitted walk fails again: the bounded resubmit-directing
-    // outcome must repeat — never the doomed from-source dispatch.
+    // The resubmitted walk fails again: the bounded outcome must repeat
+    // — the resubmit-reset re-armed the one-shot, so the settlement
+    // routes the first stale verdict to one verification walk and that
+    // walk's failure takes the fail-fast. Never the doomed from-source
+    // dispatch.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "tdfk-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let resettled = expect_drv(&handle, "tdfk-r").await;
+    assert_eq!(
+        resettled.status,
+        DerivationStatus::Substituting,
+        "the re-armed settlement must spawn the verification walk for the \
+         resubmitted (reset) R"
+    );
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "tdfk-r".into(),
@@ -4621,9 +4759,9 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
     assert_eq!(
         s3.state,
         rio_proto::types::BuildState::Failed as i32,
-        "B3 must fail via the resubmit-directing fail-fast when the resubmitted walk \
-         fails (was: the unmarked R took the generic revert to Ready and stayed \
-         dispatchable from source)"
+        "B3 must fail via the resubmit-directing fail-fast when the resubmitted \
+         verification walk fails (was: the unmarked R took the generic revert to \
+         Ready and stayed dispatchable from source)"
     );
     assert!(
         s3.error_summary.contains("topdown") && s3.error_summary.contains("resubmit"),
@@ -4653,6 +4791,7 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
 }
 
 // r[verify sched.merge.substitute-topdown+11]
+// r[verify sched.evidence.settlement]
 /// Both poison-removal paths — admin `ClearPoison` and the poison-TTL
 /// sweep — must stamp the closure-hole breadcrumb on surviving parents
 /// when they remove a Poisoned (by definition un-produced) child,
@@ -4668,9 +4807,12 @@ async fn test_fail_fast_keeps_closure_hole_so_directed_resubmit_restamps() -> Te
 /// `closure_hole` on R (asserted directly in memory via the debug
 /// surface and in PG, and exercised through the bounded outcome below,
 /// which `closure_evidence` keys on). R's parked walk then fails: the
-/// Broken (holed) evidence must take the bounded resubmit-directing
-/// fail-fast — B1 fails with the "topdown … resubmit" error, no
-/// from-source Assignment is ever cut for R, and R does not end up
+/// Broken (holed) evidence must take the bounded settlement — the first
+/// stale verdict is re-probed (output still substitutable upstream) and
+/// routed to ONE verification walk (spending the one-shot), and that
+/// walk's own failure takes the genuine resubmit-directing fail-fast —
+/// B1 fails with the "topdown … resubmit" error, no from-source
+/// Assignment is ever cut for R, and R does not end up
 /// Ready/Assigned/Running. Pre-fix neither poison path stamped the
 /// breadcrumb: PG `closure_hole` stayed false, the truncated {dep2}
 /// child set read as Vouched at the walk failure, the lazy clear
@@ -4879,11 +5021,33 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
         "the persisted mark must survive the poison-clear removal (topdown_pruned={pg_pruned})"
     );
 
-    // R's parked walk genuinely FAILS: with the breadcrumb the closure
-    // evidence is Broken (hole over the produced survivor), so the
-    // verdict must take the resubmit-directing fail-fast instead of the
-    // lazy Vouched clear + revert-to-Ready (the doomed from-source
-    // dispatch — dep1's output was never produced).
+    // R's parked walk reports failure. r[sched.evidence.settlement]:
+    // with the breadcrumb the closure evidence is Broken (hole over the
+    // produced survivor) and the output is still substitutable
+    // upstream, so the first stale verdict is settled by ONE
+    // verification walk (one-shot spent) — never the lazy Vouched clear
+    // + revert-to-Ready (the doomed from-source dispatch — dep1's
+    // output was never produced). That walk's OWN failure then takes
+    // the genuine resubmit-directing fail-fast.
+    handle
+        .send_unchecked(ActorCommand::SubstituteComplete {
+            drv_hash: "pcs-r".into(),
+            ok: false,
+            forgiven: vec![],
+        })
+        .await?;
+    barrier(&handle).await;
+    let settled = expect_drv(&handle, "pcs-r").await;
+    assert_eq!(
+        settled.status,
+        DerivationStatus::Substituting,
+        "the settlement must spawn the verification walk instead of fail-fasting \
+         the obtainable output"
+    );
+    assert!(
+        settled.substitute_tried,
+        "the settlement spends the verification one-shot when it spawns the walk"
+    );
     handle
         .send_unchecked(ActorCommand::SubstituteComplete {
             drv_hash: "pcs-r".into(),
@@ -4896,7 +5060,8 @@ async fn test_poison_clear_paths_stamp_closure_hole_on_surviving_parent(
     assert_eq!(
         s1.state,
         rio_proto::types::BuildState::Failed as i32,
-        "B1 must fail via the resubmit-directing fail-fast when the walk fails"
+        "B1 must fail via the resubmit-directing fail-fast when the verification \
+         walk fails with the one-shot spent"
     );
     assert!(
         s1.error_summary.contains("topdown") && s1.error_summary.contains("resubmit"),

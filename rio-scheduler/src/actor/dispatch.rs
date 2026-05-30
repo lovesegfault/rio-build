@@ -796,12 +796,27 @@ impl DagActor {
                     suppressing the fail-fast but keeping the mark \
                     (children can still be reaped unbuilt)");
         } else if topdown_pruned && !forgiven_now_wanted {
-            self.fail_fast_topdown_pruned_root(
-                drv_hash,
-                "upstream substitute fetch failed after deps were pruned",
-            )
-            .await;
-            return;
+            // r[impl sched.evidence.settlement]
+            // The walk verdict in hand was fixed at the walk's own check time
+            // and can be stale by the walk's full duration; the build(s) we
+            // are about to fail may want only outputs that have since become
+            // present (the C3 two-build dedup defect). Re-probe before the
+            // terminal verdict.
+            match self
+                .settle_broken_marked_root(
+                    drv_hash,
+                    "upstream substitute fetch failed after deps were pruned",
+                )
+                .await
+            {
+                BrokenSettlement::VerificationSpawned | BrokenSettlement::FailedFast => return,
+                BrokenSettlement::Deferred => {
+                    // No store answer / rejected revert: fall through to the
+                    // plain revert below (Ready/Queued, NO substitute_tried)
+                    // so the next sweep re-probes — never fail-fast on an
+                    // unanswerable probe.
+                }
+            }
         }
         // 3-way revert (NOT 2-way Ready|Queued): the I-094 reprobe lane
         // can transition a node whose dep is Poisoned directly →
@@ -919,7 +934,14 @@ impl DagActor {
         // one-shot flag. (The hazardous DependencyFailed /
         // topdown-must-substitute targets never reach here — they
         // re-spawned above.)
-        if !forgiven_now_wanted {
+        //
+        // ALSO excepted: a marked-Broken node whose settlement above
+        // returned Deferred (no store answer / rejected revert). Setting
+        // the one-shot here would burn the verification credit on a
+        // store outage; leave it unspent so the next dispatch sweep's
+        // settlement-aware partition re-probes (r[sched.evidence.settlement]).
+        let deferred_settlement = topdown_pruned && evidence == ClosureEvidence::Broken;
+        if !(forgiven_now_wanted || deferred_settlement) {
             state.substitute_tried = true;
         }
         // Chain-scope bookkeeping: the only way this chain continues
@@ -991,13 +1013,15 @@ impl DagActor {
     /// children (`Pending`) suppress the fail-fast but no longer shed
     /// the mark; only a `Vouched` child set — all produced, no hole —
     /// clears it):
-    ///  - `handle_substitute_complete` on a failed/downgraded detached
-    ///    fetch (`SubstituteComplete{ok=false}` after the
-    ///    closure-evidence gate), the original home of this block;
+    ///  - [`Self::settle_broken_marked_root`] — the settlement the
+    ///    `handle_substitute_complete` Broken arm routes through
+    ///    (r[sched.evidence.settlement]): the fail-fast fires only when
+    ///    the verification one-shot is already spent or the re-probe
+    ///    confirms a wanted output missing-and-unsubstitutable;
     ///  - the dispatch-time probe (`batch_probe_cached_ready`) when a
-    ///    marked node with Broken
-    ///    evidence can neither complete inline nor be routed to
-    ///    substitution — the post-failover shape, where the recovered
+    ///    marked node with Broken evidence can neither complete inline
+    ///    nor be routed to substitution (its confirmed-missing cell) —
+    ///    the post-failover shape, where the recovered
     ///    (wider) wanted union contains an output that is genuinely
     ///    missing upstream. Pre-fix that outcome left the node Ready
     ///    and dispatched it from source — the doomed dispatch this arm
@@ -1125,6 +1149,139 @@ impl DagActor {
                        "failed to persist build-failed after topdown fail-fast");
             }
         }
+    }
+
+    // r[impl sched.evidence.settlement]
+    // r[impl sched.merge.substitute-topdown+11]
+    /// Settlement for a topdown-pruned node whose closure evidence is
+    /// Broken at a fail-fast decision point. Instead of trusting
+    /// walk-failure evidence that may predate out-of-band ingestion (the
+    /// C3 defect), re-probe the LIVE effective wanted outputs and route:
+    ///
+    ///  - every live-wanted output present / substitutable / indeterminate
+    ///    AND the verification one-shot is unspent (!substitute_tried):
+    ///    spend the one-shot and (re-)spawn the walk. The walk re-verifies
+    ///    the closure (the settlement rule's "completed with its closure
+    ///    re-verified") and its ok=true completion routes through
+    ///    complete_ready_from_store_batch; a genuine failure lands back at
+    ///    the Broken arm with the one-shot spent and fail-fasts there.
+    ///  - otherwise: the established fail-fast (now genuine — either a
+    ///    wanted output is confirmed missing+unsubstitutable, or the
+    ///    verification walk itself already failed).
+    ///
+    /// Spawn mechanics: there is no Substituting->Substituting edge in the
+    /// transition table (state/derivation.rs validate_transition rejects
+    /// non-terminal self-transitions), and spawn_substitute_fetches
+    /// silently skips candidates whose transition is rejected. When the
+    /// caller's node is currently Substituting (the SubstituteComplete
+    /// Broken arm — its entry guard guarantees it), this helper first
+    /// reverts the node to dag.revert_target_for(..) — the same
+    /// revert-for-respawn the forgiven-now-wanted downgrade uses — and
+    /// only then spawns. Call sites whose node is Ready (dispatch probe)
+    /// or Created/Failed (reap survivors) need no revert; the helper keys
+    /// the revert on the node's CURRENT status, never unconditionally.
+    ///
+    /// Probe failure / missing store client / rejected revert defers (B3:
+    /// an indeterminate answer never fail-fasts on its own): the caller
+    /// falls through to its plain revert and the next dispatch sweep —
+    /// whose partition settles marked-Broken nodes in every cell — picks
+    /// it up.
+    pub(super) async fn settle_broken_marked_root(
+        &mut self,
+        drv_hash: &DrvHash,
+        cause: &str,
+    ) -> BrokenSettlement {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return BrokenSettlement::Deferred;
+        };
+        let tried = state.substitute_tried;
+        let expected_paths = state.expected_output_paths.clone();
+        let current_status = state.status();
+        // The wanted slice mirrors batch_probe_cached_ready: live
+        // effective wanted, falling back to the stored union, degraded to
+        // all expected paths when unresolvable.
+        let wanted: Vec<String> = {
+            let eff = effective_wanted(state, &self.builds);
+            verifiable_wanted_paths(
+                &state.output_names,
+                &state.expected_output_paths,
+                eff.as_deref().unwrap_or(&state.wanted_output_names),
+            )
+            .map(|w| w.into_iter().map(str::to_owned).collect())
+            .unwrap_or_else(|| expected_paths.clone())
+        };
+
+        if tried {
+            // The verification one-shot is spent: this IS the genuine arm.
+            self.fail_fast_topdown_pruned_root(drv_hash, cause).await;
+            return BrokenSettlement::FailedFast;
+        }
+
+        // One single-node FMP call, same shape and failure posture as the
+        // batched dispatch probe.
+        let Some(store) = &self.store_client else {
+            return BrokenSettlement::Deferred;
+        };
+        let auth = self.probe_substitute_auth(std::iter::once(drv_hash));
+        let probe = auth.mint();
+        let probe_meta: Vec<(&'static str, &str)> =
+            probe.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let mut req = tonic::Request::new(FindMissingPathsRequest {
+            store_paths: wanted.clone(),
+        });
+        Self::inject_probe_meta(req.metadata_mut(), &probe_meta);
+        let resp =
+            match tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
+                .await
+            {
+                Ok(Ok(r)) => r.into_inner(),
+                Ok(Err(_)) | Err(_) => return BrokenSettlement::Deferred,
+            };
+        let missing: HashSet<String> = resp.missing_paths.into_iter().collect();
+        let substitutable: HashSet<String> = resp.substitutable_paths.into_iter().collect();
+        let indeterminate: HashSet<String> = resp.indeterminate_paths.into_iter().collect();
+
+        let all_available = wanted.iter().all(|p| {
+            !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+        });
+        if !all_available {
+            metrics::counter!("rio_scheduler_topdown_settlement_reprobe_total",
+                "outcome" => "fail_fast")
+            .increment(1);
+            self.fail_fast_topdown_pruned_root(drv_hash, cause).await;
+            return BrokenSettlement::FailedFast;
+        }
+
+        // Revert-for-respawn (CF-1/FC-1): a Substituting node cannot
+        // re-enter Substituting; transition it to its revert target
+        // FIRST, exactly like the forgiven-now-wanted downgrade re-spawn
+        // in handle_substitute_complete. Only Substituting needs this;
+        // Ready/Created/Failed have valid edges into Substituting.
+        if current_status == DerivationStatus::Substituting {
+            let to = self.dag.revert_target_for(drv_hash);
+            let Some(s) = self.dag.node_mut(drv_hash) else {
+                return BrokenSettlement::Deferred;
+            };
+            if let Err(e) = s.transition(to) {
+                warn!(%drv_hash, %e, "settlement revert-for-respawn rejected; deferring");
+                return BrokenSettlement::Deferred;
+            }
+        }
+        // Spend the one-shot and spawn the verification walk. The spend
+        // happens only on a path where the spawn's own transition is
+        // valid, so a deferral never burns the credit.
+        if let Some(s) = self.dag.node_mut(drv_hash) {
+            s.substitute_tried = true;
+        }
+        metrics::counter!("rio_scheduler_topdown_settlement_reprobe_total",
+            "outcome" => "verification_walk")
+        .increment(1);
+        info!(%drv_hash, cause,
+              "broken marked root's live-wanted outputs are available at \
+               re-probe; spawning verification walk instead of fail-fast");
+        self.spawn_substitute_fetches(vec![(drv_hash.clone(), expected_paths)], auth)
+            .await;
+        BrokenSettlement::VerificationSpawned
     }
 
     // r[impl gw.activity.subst-progress]
@@ -1893,6 +2050,21 @@ impl DagActor {
         let prio = self.queue_priority(&drv_hash);
         self.ready_queue.push(drv_hash, prio);
     }
+}
+
+/// Outcome of [`DagActor::settle_broken_marked_root`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BrokenSettlement {
+    /// A verification walk was (re-)spawned; its completion settles
+    /// the node (ok => complete-from-store, fail => fail-fast).
+    VerificationSpawned,
+    /// The node was fail-fasted (confirmed-missing wanted output, or
+    /// the verification one-shot was already spent).
+    FailedFast,
+    /// The store could not answer (no client / RPC failure), or the
+    /// revert-for-respawn transition was rejected: nothing was
+    /// decided; the node was left for the next dispatch sweep.
+    Deferred,
 }
 
 // r[impl sched.substitute.detached+5]
