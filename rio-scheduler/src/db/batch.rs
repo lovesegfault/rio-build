@@ -251,7 +251,7 @@ impl SchedulerDb {
     ///
     /// Each row is `(derivation_id, is_root)` — `is_root = TRUE` marks
     /// the derivations that were submission roots of THIS build
-    /// (migration 062), so recovery can re-derive the per-node
+    /// (migration 065), so recovery can re-derive the per-node
     /// force-build set after failover.
     pub async fn batch_insert_build_derivations(
         tx: &mut PgConnection,

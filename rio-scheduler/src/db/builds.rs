@@ -153,7 +153,7 @@ impl SchedulerDb {
     /// wrapper handles the serde round-trip).
     ///
     /// `force_build_roots` is the per-build substitution policy from
-    /// `SubmitBuildRequest.force_build_roots` (migration 062) — stamped
+    /// `SubmitBuildRequest.force_build_roots` (migration 065) — stamped
     /// here so recovery can rebuild it after leader failover.
     #[allow(clippy::too_many_arguments)] // one INSERT with the full row — a struct param would just rename the args
     pub async fn insert_build(

@@ -9,7 +9,7 @@
 //! tenant `qa-force-build`, so the gateway must stamp
 //! `SubmitBuildRequest.force_build_roots = true` onto builds submitted
 //! with that tenant's key and the scheduler must persist it to
-//! `builds.force_build_roots` (migration 062). One standard busybox
+//! `builds.force_build_roots` (migration 065). One standard busybox
 //! smoke build is submitted; the verdict is decided by that PG column
 //! on the latest `qa-force-build` build row.
 //!
@@ -112,7 +112,7 @@ impl Scenario for ForceBuildRootsPolicy {
 
         // 4. PG: the latest build row attributed to qa-force-build must
         //    carry force_build_roots = TRUE (gateway policy → proto →
-        //    scheduler insert_build, migration 062). Stale rows from
+        //    scheduler insert_build, migration 065). Stale rows from
         //    prior runs don't match: cleanup deletes the tenant, which
         //    SET NULLs their tenant_id, and a re-created tenant gets a
         //    fresh UUID anyway.
