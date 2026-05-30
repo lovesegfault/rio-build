@@ -101,7 +101,7 @@ module closureCalibF1SkipStoreRecheck {
           nf: Set(), probed: false, probedKind: PKNone }
       else if (resetNodes.contains(d) and r.mSt != MProduced)
         { ...r, mSt: MQueued, mTp: false, tried: false, triedGenuine: false,
-          nf: Set(), probed: false, probedKind: PKNone,
+          nf: Set(), probed: false, probedKind: PKNone, walks: [],
           pgSt: if (r.rowExists) MQueued else r.pgSt }
       else r
     })

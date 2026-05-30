@@ -53,11 +53,17 @@
 //     always available for a missing path).
 //   - The substitution walk as an asynchronous verdict: spawned by the
 //     handler that sets Substituting (snapshotting the forgivable set),
-//     finishing as an environment action (ok=true ingests the walked
-//     REFS-closure), consumed later by the handler — the store may
-//     change in between. Completions carry no tenure/walk token; a
-//     later tenure of the same process may consume one (stale-tenure
-//     regimes only).
+//     its verdict fixed mid-flight by the walk task's own serial check
+//     loop (walkFinishes, the CHECK time; ok=true ingests the walked
+//     REFS-closure as it goes), then sent and processed as one step
+//     (consumeWalk, the SEND time). The store may change between the
+//     check and the send — that window is the walk's own duration, and
+//     it is the ONLY staleness source: the actor's FIFO mailbox excludes
+//     reorderings where an event caused by the walk's outcome (a
+//     resubmit after the failure it triggers) is processed before the
+//     completion itself (C3-adjudication correction; see section 7g).
+//     Completions carry no tenure/walk token; a later tenure of the
+//     same process may consume one (stale-tenure regimes only).
 //   - Leader tenure as a generation counter; LeaderLost / Recover;
 //     recovery as one atomic action over the durable state (row load,
 //     poisoned-row TTL split, edge truncation, failed-dep condemnation,
@@ -872,12 +878,15 @@ module closureEvidence {
   /// The conjunction the wired exhaustive regime checks verify (Phase 0c):
   /// allInvariants minus C3 (noWrongfulTerminalFailureSingleTenure). C3 is
   /// excluded because the as-built consumption path genuinely violates it —
-  /// a stale ok=false walk verdict, produced before the outputs became
-  /// available, fail-fasts a resubmitted build whose wanted outputs are all
-  /// present at consumption time (the Phase 0c finding; trace and code walk
-  /// in the invariant map). Its falsification is pinned by the
-  /// expect-violation check in nix/quint.nix until the Phase-1 disposition;
-  /// putting it here would make every exhaustive regime check permanently
+  /// a walk verdict fixed at check time, while a wanted output was
+  /// genuinely missing, fail-fasts a co-build whose own wanted outputs are
+  /// all present by the time the verdict is delivered (the Phase 0c
+  /// finding, CONFIRMED by the C3 adjudication in its two-live-builds
+  /// form: the single-build resubmit variant of the original trace is
+  /// refuted by the cancel chain — see the invariant map's correction
+  /// record). Its falsification is pinned by the expect-violation check in
+  /// nix/quint.nix (two-build probe scope) until the Phase-1 disposition;
+  /// putting it here would make every two-build regime check permanently
   /// red for a known, recorded reason.
   val asBuiltHoldInvariants = and {
     noDoomedFromSourceDispatch, stampSoundness, clearSoundness,
@@ -1308,7 +1317,19 @@ module closureEvidence {
     val resetNodes = kept.filter(d => isTerminal(drv.get(d).mSt) or drv.get(d).mSt == MFailed)
     val newEdges = if (pruneOk) Set() else REFS.filter(e => kept.contains(e._1) and kept.contains(e._2))
     val memEdges1 = memEdges.union(newEdges)
-    // pass 1: bring kept nodes into the DAG / reset terminal ones (hole carried, mark re-derived)
+    // pass 1: bring kept nodes into the DAG / reset terminal ones.
+    // The Cancelled/Failed resubmit-reset (dag/mod.rs:389-443
+    // is_retriable_on_resubmit remove+reinsert; merge.rs existing_reprobe
+    // for Poisoned/DependencyFailed): the node re-enters as FRESH state —
+    // hole carried, mark re-derived by THIS merge's own prune/stamp
+    // decision, and NO inherited probe or walk evidence: the reset node
+    // flows through the classification below (cache-hit / pending-
+    // substitute / confirmed-missing) against the store AS IT IS NOW,
+    // never against a verdict formed before it went terminal
+    // (C3-adjudication model correction). Stale walk records are
+    // discarded here: production re-inserts the node without any link to
+    // the old detached task, whose eventual completion meets the
+    // not-Substituting drop guard.
     val dm1 = DRVS.mapBy(d => {
       val r = drv.get(d)
       if (not(kept.contains(d))) r
@@ -1317,7 +1338,7 @@ module closureEvidence {
           nf: Set(), probed: false, probedKind: PKNone }
       else if (resetNodes.contains(d) and r.mSt != MProduced)
         { ...r, mSt: MQueued, mTp: false, tried: false, triedGenuine: false,
-          nf: Set(), probed: false, probedKind: PKNone,
+          nf: Set(), probed: false, probedKind: PKNone, walks: [],
           pgSt: if (r.rowExists) MQueued else r.pgSt }
       else r
     })
@@ -1711,13 +1732,39 @@ module closureEvidence {
   }
 
   // --- 7g. the substitution walk ---------------------------------------------
+  //
+  // Staleness grounding (C3-adjudication model correction): the walk is a
+  // detached serial loop whose verdict is determined by what it observed
+  // at CHECK time, while the actor learns it at SEND time —
+  //
+  //   walkFinishes  = the walk task's last presence/availability check:
+  //                   the verdict (and, for ok walks, the ingest) is fixed
+  //                   here, mid-flight. The task itself is still live.
+  //   consumeWalk   = the task sends SubstituteComplete AND the actor
+  //                   processes it, as one step.
+  //   dropStaleWalkResult = the same send, processed by the actor's
+  //                   not-Substituting drop guard.
+  //
+  // The window between walkFinishes and consumeWalk is therefore the TAIL
+  // OF THE WALK'S OWN DURATION (after its last check, before its send) —
+  // not an actor-mailbox delay. Anything that interleaves there happened
+  // while the walk was still running, so a SubstituteComplete can be
+  // stale only because the world changed DURING the walk. Modeling the
+  // send and the processing as separate steps would instead allow
+  // mailbox reorderings that the actor's FIFO mailbox excludes (a message
+  // enqueued after the completion — e.g. a directed resubmit issued in
+  // response to the build failure — can never be processed before it);
+  // the refuted single-build C3 trace of the 0c record relied on exactly
+  // such a reordering. See the invariant map's correction record.
 
-  /// A spawned walk finishes (environment): ok walks ingest the
-  /// non-forgiven seed outputs and the REFS-descendant closure (every
-  /// ingested output must be present already or available upstream);
-  /// failed walks require a genuinely missing-and-unavailable
-  /// non-forgivable output (transient-only failures are below this
-  /// model's resolution; encoding decision ENC-0b-5).
+  /// The walk task's serial check loop completes (environment): ok walks
+  /// ingest the non-forgiven seed outputs and the REFS-descendant closure
+  /// (every ingested output must be present already or available
+  /// upstream); failed walks require a genuinely
+  /// missing-and-unavailable non-forgivable output AT CHECK TIME
+  /// (transient-only failures are below this model's resolution; encoding
+  /// decision ENC-0b-5). The verdict recorded here is what the walk will
+  /// deliver when it sends — the world may keep changing until then.
   action walkFinishes(d: str): bool = {
     nondet idx = Set(0, 1).oneOf()
     nondet okPick = Set(true, false).oneOf()
@@ -1748,9 +1795,12 @@ module closureEvidence {
     }
   }
 
-  /// Drop a delivered or pending walk record for a node that is no
-  /// longer Substituting (the handler discards completions whose node
-  /// moved on; orphaned tasks die with their tenure).
+  /// A walk task's send lands on a node that is no longer Substituting:
+  /// the handler's drop guard discards the completion (and a still-pending
+  /// task orphaned the same way will meet this guard when it eventually
+  /// sends; orphaned tasks die with their tenure). This is the
+  /// neutralization arm the cancel passes rely on — a cancelled node's
+  /// in-flight walk ends here, never at consumeWalk.
   action dropStaleWalkResult(d: str): bool = all {
     drvOf(d).mSt != MSubstituting,
     drvOf(d).walks != [],
@@ -1759,11 +1809,15 @@ module closureEvidence {
     intents' = intents, lead' = lead, budget' = budget, viol' = viol, reach' = reach
   }
 
-  /// Consume a finished walk (handle_substitute_complete). The routing
+  /// The walk task sends SubstituteComplete and the actor processes it
+  /// (handle_substitute_complete), one step — the send-time end of the
+  /// staleness window (see the section comment above). The routing
   /// re-reads the CURRENT evidence and wanted set: forgiven-now-wanted
   /// downgrade (re-spawn or revert, growing never-forgive), ok
   /// completion, Vouched lazy clear, Pending suppression, Broken
-  /// fail-fast.
+  /// fail-fast. The verdict it routes on was fixed at check time
+  /// (walkFinishes), so the routing can act on evidence that is stale by
+  /// exactly the walk's own duration — the as-built C3 mechanism.
   action consumeWalk(d: str): bool = {
     nondet idx = Set(0, 1).oneOf()
     val w = pWalkAt(drvOf(d).walks, idx)
@@ -1981,6 +2035,19 @@ module closureEvidence {
   /// skips Substituting/Assigned/Running/Failed parents, whose in-flight
   /// walk or attempt keeps its chance and settles them via its own
   /// completion (Phase 0c encoding fix; see the invariant map).
+  ///
+  /// Each failed build then runs handle_derivation_failure's
+  /// keep_going=false arm, which is cancel_build_derivations: every
+  /// member owned EXCLUSIVELY by the failing builds (no still-active
+  /// build also holds interest) that is not itself in the hit set and
+  /// not yet terminal goes Cancelled — including Substituting members,
+  /// whose in-flight walk is thereby orphaned (its completion is later
+  /// dropped by the not-Substituting guard). This pass is the
+  /// C3-adjudication model correction: without it a sole-interest
+  /// Substituting node survived its build's failure with a live,
+  /// consumable stale walk, which is not as-built behavior (it mirrors
+  /// cancelBuild / pFailFast's cancel pass; production
+  /// build.rs:cancel_build_derivations).
   action poisonArrival(d: str): bool = all {
     leaderActive,
     budget.poisons > 0,
@@ -1989,6 +2056,24 @@ module closureEvidence {
     val cascaded = ancestors.filter(x => drv.get(x).mSt == MQueued or drv.get(x).mSt == MReady)
     val hitSet = Set(d).union(cascaded)
     val pinOuts = tuples(memKids(d), OUTIDX)
+    // the builds this verdict terminally fails (terminal_failure_epilogue)
+    val failedBuilds = BUILDS.filter(b =>
+      blds.get(b).phase == BpActive and blds.get(b).interest.intersect(hitSet) != Set())
+    // cancel_build_derivations pass over the failing builds' members:
+    // exclusively-owned (every active build holding the member is itself
+    // failing — production removes interest build-by-build, so a member
+    // shared only among failing builds ends up sole-interest for the last
+    // one), un-hit, non-terminal members go Cancelled.
+    val cancelled = DRVS.filter(m => and {
+      not(hitSet.contains(m)),
+      not(isTerminal(drv.get(m).mSt)),
+      drv.get(m).mSt != MAbsent,
+      failedBuilds.exists(b => blds.get(b).interest.contains(m)),
+      BUILDS.forall(b2 => or {
+        failedBuilds.contains(b2),
+        not(blds.get(b2).phase == BpActive and blds.get(b2).interest.contains(m))
+      })
+    })
     all {
       drv' = DRVS.mapBy(x => {
         val r = drv.get(x)
@@ -1996,6 +2081,8 @@ module closureEvidence {
           { ...r, mSt: MPoisoned, pgSt: if (r.rowExists) MPoisoned else r.pgSt, attemptOpen: false }
         else if (cascaded.contains(x))
           { ...r, mSt: MDepFailed, pgSt: if (r.rowExists) MDepFailed else r.pgSt }
+        else if (cancelled.contains(x))
+          { ...r, mSt: MCancelled, pgSt: if (r.rowExists) MCancelled else r.pgSt }
         else r
       }),
       store' = if (drvOf(d).attemptOpen) pinOuts.fold(store, (acc, o) => acc.set(o, { ...acc.get(o), pinned: false })) else store,
