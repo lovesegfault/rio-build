@@ -43,6 +43,46 @@
       "doc": "VM-test client for the production `rio-mountd` daemon (P0567)."
     },
     {
+      "path": "bin/xfstests_runner/",
+      "depth": 1,
+      "doc": ""
+    },
+    {
+      "path": "bin/xfstests_runner/checks/",
+      "depth": 2,
+      "doc": ""
+    },
+    {
+      "path": "bin/xfstests_runner/checks/errno_battery.rs",
+      "depth": 3,
+      "doc": "Error-path checks: permission enforcement for the unprivileged"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/meta.rs",
+      "depth": 3,
+      "doc": "Metadata checks: mount layout, readdir, inode identity, file kinds,"
+    },
+    {
+      "path": "bin/xfstests_runner/checks/read.rs",
+      "depth": 3,
+      "doc": "Read-path checks: byte integrity on the cold (streaming) and warm"
+    },
+    {
+      "path": "bin/xfstests_runner/checks.rs",
+      "depth": 2,
+      "doc": "The check registry and shared helpers."
+    },
+    {
+      "path": "bin/xfstests_runner/main.rs",
+      "depth": 2,
+      "doc": "xfstests-port runner for the castore-FUSE (`vm-castore-xfstests`)."
+    },
+    {
+      "path": "bin/xfstests_runner/manifest.rs",
+      "depth": 2,
+      "doc": "Expected-content manifest: the oracle for every xfstests check."
+    },
+    {
       "path": "castore_fuse/",
       "depth": 0,
       "doc": "Castore-FUSE lazy `/nix/store` (ADR-022 §2)."
