@@ -1029,6 +1029,21 @@ module gwConnLifecycle {
   /// post-check admit race, W3).
   val l5StrictNoCarveOut = not(reach.graceFiredWithLiveSession)
 
+  /// The §4 W10 decision-rule trigger, stated as an invariant ("the trigger
+  /// never fires"): no reachable state has a build that left the tracked
+  /// set with no processed terminal outcome, no CancelBuild attempt, and
+  /// the upstream-stream-held bit still set after session exit
+  /// (equivalently: an L7 falsification restricted to the BuildEvent
+  /// stream). Expected to HOLD — the stream is a handler-local, so every
+  /// removal-without-cancel path coincides with the stream dropping — and
+  /// the Stage-C upstream-family exhaustive check asserts it; the owner's
+  /// W10 sign-off consumes this plus the s16StrictTerminalOnly trace.
+  val w10TriggerAbsent =
+    CHKEYS.forall(k =>
+      (sessOf(k).everTracked and not(sessOf(k).tracked) and not(sessOf(k).terminal)
+        and not(sessOf(k).cancelSent) and sessOf(k).proto == PExited)
+      implies not(sessOf(k).streamHeld))
+
   // --- 7. actions ------------------------------------------------------------
 
   // --- 7a. accept and SSH establishment (legitimate alphabet) ----------------
@@ -2261,4 +2276,514 @@ module gwConnLifecycleBaseSlim {
     LET_SOCKOPT_FAIL = false,
     INACTIVITY_AVAILABLE = false
   ).*
+}
+
+
+// ===========================================================================
+// Per-family restricted-alphabet modules (§2e fallbacks (3)/(4), the wired
+// exhaustive set decided by the Stage-B measurement milestone).
+//
+// The Stage-B B-measure showed the full-alphabet regimes sit in the high
+// tens-of-millions of distinct states (base: ≈59.7 M distinct at depth 24,
+// incomplete at 629 s on a 192-worker host; fallback (2) alone shrinks the
+// space only ≈2×) — an order of magnitude past the §2e per-check budget —
+// and the Stage-C re-measurement showed the same is true of any restriction
+// that keeps a rich connection-level alphabet multiplied by two concurrent
+// full session lifecycles. Per the §2e pre-committed fallback order, the
+// merge-gated EXHAUSTIVE checks therefore run on these per-family modules.
+// Each keeps every §2e structural / environment bound (two connection
+// slots, two channel slots on conn A, handle-queue depth 2, window credits
+// 2, residue ceiling 2, ≤1 tracked build per session) and its regime's §2e
+// policy-cap values, applies fallback (2) (B_CHANNEL_SLOTS = 1), and
+// restricts the ALPHABET only (the calibration `calibStep` pattern: a
+// `famStep` composed from the core actions):
+//   - to one corpus family's letters plus the minimum supporting lifecycle
+//     letters (so each check multiplies at most one "rich" dimension —
+//     either the connection-level fault surface or the in-session
+//     machinery — never both), and
+//   - to the §2e role asymmetry taken one step further: conn B (the
+//     legitimate connection) plays the connection-level alphabet — accept,
+//     banner, auth, its grace, its reaps — so cross-connection
+//     permit/gauge/grace arithmetic stays exercised, while the
+//     channel/session-level letters are played by conn A (famHostile
+//     additionally lets conn B open its channel and take the session-cap
+//     exec rejection, the P3 surface).
+// No environment bound is reduced below the design's registered floors and
+// no §3.4 candidate's required structural slot is removed — the loss
+// relative to the full regimes is the cross-family / B-side-session /
+// (where noted) second-concurrent-session interleavings only, recorded per
+// property in gw-session-invariant-map.md (Stage-C record). The
+// full-alphabet regime modules above stay as the home of the witness /
+// expect-violation / named-run checks (which stop at first violation) and
+// of the Stage-C calibration overrides.
+// ===========================================================================
+
+/// Family: pre-auth establishment and occupancy withholding at the
+/// connection level (corpus F2/F3 pre-auth half, GW-3/GW-4): the ConnStage
+/// machine, accept-time permits, the gauge latch on the first auth callback
+/// (accept and reject outcomes), silent / KEX-parked / never-auth peers,
+/// the two-phase pre-auth deadline, the empty-connection grace on idle
+/// authenticated connections, decide-implies-arm, force-close enforcement
+/// and every designed reap letter. No channels or sessions — the admission
+/// interplay lives in famAdmission.
+module gwConnLifecycleFamPreauth {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = true,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthFail(c),
+      peerAuthOk(c),
+      peerSilent(c),
+      peerParkInKex(c),
+      peerCompletesKex(c),
+      peerWithholdsProgress(c),
+      firePreAuthPhase1(c),
+      firePreAuthPhase2(c),
+      graceCheckPass(c),
+      graceFire(c),
+      fireForceCloseEnforce(c),
+      reapTransportEnd(c, letter)
+    }
+  }
+}
+
+/// Family: exec admission against the empty-connection grace and the
+/// per-session stage deadlines (corpus F2 post-auth half plus the GW-18
+/// admission surface): the grace arm/disarm/re-arm cycle vs admission (the
+/// documented W3/P4 race window), the handshake and opcode-idle deadlines,
+/// occupancy-withholding in-session peers, and re-admission after the
+/// session count touches zero — on conn A's two channels with the session
+/// egress/finish machinery abstracted to channel-close release (famWedge /
+/// famUpstream own the pump and close-out paths). Conn B holds its
+/// permit/gauge slot and its own grace.
+module gwConnLifecycleFamAdmission {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = true,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet i = CHANS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      peerWithholdsProgress(c),
+      graceCheckPass(c),
+      graceFire(c),
+      reapTransportEnd(c, letter),
+      // admission and session-deadline letters, conn A only
+      peerOpenChannel(ADV, i),
+      execAdmit(ADV, i),
+      peerHandshake(ADV, i),
+      fireHandshakeTimeout(ADV, i),
+      fireOpcodeIdle(ADV, i),
+      peerClientEof(ADV, i),
+      protoSeesClientEof(ADV, i),
+      protoObservesConnGone(ADV, i),
+      peerChannelClose(ADV, i)
+    }
+  }
+}
+
+/// Cap family: MAX_CONNECTIONS dialed to 1 (the §2e cap-regime value) so
+/// the over-cap permit-None path — torn down at the first auth callback —
+/// is exhaustively explored with two modeled connections (S1's cap clause,
+/// the GW-12 surface). Whichever connection accepts second is the
+/// permit-less one; sessions stay on conn A; no fault letters.
+module gwConnLifecycleFamCap {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 1,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet i = CHANS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      graceCheckPass(c),
+      graceFire(c),
+      fireForceCloseEnforce(c),
+      reapTransportEnd(c, letter),
+      // session-level letters, conn A only
+      peerOpenChannel(ADV, i),
+      execAdmit(ADV, i),
+      peerClientEof(ADV, i),
+      protoSeesClientEof(ADV, i),
+      protoObservesConnGone(ADV, i),
+      pumpExitEof(ADV, i),
+      pumpExitSendFail(ADV, i),
+      clientPumpSelfExit(ADV, i),
+      peerChannelClose(ADV, i)
+    }
+  }
+}
+
+/// Family: egress pacing and the wedge response (corpus F5, GW-2/GW-8; the
+/// W5 vanish reap and the stalled-send → force-close arm). Window credits,
+/// send/close-out budgets, capacity release before close-out, the close-out
+/// ordering, queue parks against non-reading peers, and the designed
+/// transport reaps for vanished peers — exhaustive for one egress session
+/// on conn A (the wedge candidates are single-session shapes; concurrent
+/// multi-session content lives in famUpstream / famHostile and the
+/// full-regime witnesses). Conn B is the compliant control for P5.
+module gwConnLifecycleFamWedge {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = true,
+    LET_HOSTILE = true,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      queueDrainDeliver(c),
+      queueDrainParks(c),
+      fireForceCloseEnforce(c),
+      reapTransportEnd(c, letter),
+      // the transport-withholding letters (conn A by their own guards)
+      peerStopDraining(c),
+      peerWithholdWindow(c),
+      peerVanish(c),
+      // the single egress session, conn A channel 0
+      peerOpenChannel(ADV, 0),
+      execAdmit(ADV, 0),
+      pumpSendOk(ADV, 0),
+      pumpSendBlocks(ADV, 0),
+      peerWindowAdjust(ADV, 0),
+      fireSendBudget(ADV, 0),
+      peerClientEof(ADV, 0),
+      protoSeesClientEof(ADV, 0),
+      protoObservesConnGone(ADV, 0),
+      pumpExitEof(ADV, 0),
+      pumpExitSendFail(ADV, 0),
+      closeOutSendStatus(ADV, 0),
+      closeOutSendEof(ADV, 0),
+      closeOutSendClose(ADV, 0),
+      closeOutComplete(ADV, 0),
+      fireCloseOutBudget(ADV, 0),
+      closeOutDeadTransport(ADV, 0),
+      clientPumpSelfExit(ADV, 0),
+      peerChannelClose(ADV, 0)
+    }
+  }
+}
+
+/// Family: channel accounting under hostile opens and closes (corpus F7,
+/// GW-5/GW-6/GW-7): forged/duplicate closes, over-bound and non-session
+/// opens, wire garbage, and the bookkeeping/residue consequences on conn
+/// A's two channels; conn B opens its own channel and takes the
+/// session-cap exec rejection (the P3 exec-only-rejection surface).
+/// Egress pacing, the close-out ladder, occupancy letters and the
+/// in-opcode data plane are excluded.
+module gwConnLifecycleFamHostile {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = false,
+    LET_HOSTILE = true,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet i = CHANS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections; conn B may open its
+      // channel and have its exec rejected at the session cap (P3)
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      peerOpenChannel(c, i),
+      execRejectCap(c, i),
+      peerClientEof(c, i),
+      peerChannelClose(c, i),
+      reapTransportEnd(c, letter),
+      // the hostile letters (conn A by their own guards)
+      peerOpenOverBound(c),
+      peerOpenNonSession(c),
+      peerForgedClose(c),
+      // session letters, conn A only
+      execAdmit(ADV, i),
+      peerHandshake(ADV, i),
+      peerWireGarbage(ADV, i),
+      protoSeesClientEof(ADV, i),
+      protoObservesConnGone(ADV, i),
+      pumpExitEof(ADV, i),
+      pumpExitSendFail(ADV, i),
+      clientPumpSelfExit(ADV, i)
+    }
+  }
+}
+
+/// Family: in-opcode occupancy, upstream deadlines, build tracking and the
+/// teardown obligations (corpus F6/F9, GW-9/GW-10/GW-16/GW-19; the W10/W2
+/// surface): rpc-wait vs build-event-wait, the rpc deadline, terminal /
+/// non-Wire stream outcomes, the cancel loop, the close-out ladder and the
+/// transient-accept-error letter, on conn A's two channels. The egress
+/// window machinery and the occupancy/wedge/grace letters are excluded.
+module gwConnLifecycleFamUpstream {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = true,
+    LET_DRAIN = false,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet i = CHANS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      queueDrainDeliver(c),
+      reapTransportEnd(c, letter),
+      acceptErrorTransient,
+      // session / opcode / build / close-out letters, conn A only
+      peerOpenChannel(ADV, i),
+      execAdmit(ADV, i),
+      peerHandshake(ADV, i),
+      peerOpcode(ADV, i),
+      opcodeToRpcWait(ADV, i),
+      opcodeToEmit(ADV, i),
+      rpcCompletesStore(ADV, i),
+      rpcCompletesBuildSubmit(ADV, i),
+      fireRpcDeadline(ADV, i),
+      buildTerminal(ADV, i),
+      buildStreamErrorNonWire(ADV, i),
+      emitDone(ADV, i),
+      peerClientEof(ADV, i),
+      protoSeesClientEof(ADV, i),
+      protoHandlerError(ADV, i),
+      protoObservesConnGone(ADV, i),
+      cancelLoopDone(ADV, i),
+      pumpExitEof(ADV, i),
+      pumpExitSendFail(ADV, i),
+      closeOutSendStatus(ADV, i),
+      closeOutSendEof(ADV, i),
+      closeOutSendClose(ADV, i),
+      closeOutComplete(ADV, i),
+      closeOutDeadTransport(ADV, i),
+      clientPumpSelfExit(ADV, i),
+      peerChannelClose(ADV, i)
+    }
+  }
+}
+
+/// Family: the three-stage drain (corpus F10, GW-13): SIGTERM at any
+/// point, accept-stop permissiveness, the session-drain expiry token, the
+/// drain-expiry cancel of a tracked build, and exit quiescence. The build
+/// path is included so a tracked build can be live at every drain stage;
+/// the non-build opcode branch, the close-out ladder, egress windows and
+/// the fault letters are excluded.
+module gwConnLifecycleFamDrain {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = false,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = true,
+    LET_PANIC = false,
+    LET_SOCKOPT_FAIL = false,
+    INACTIVITY_AVAILABLE = false
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet i = CHANS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      reapTransportEnd(c, letter),
+      // the drain stages
+      opSigterm,
+      srvAcceptStop,
+      srvSessionDrainTimeout,
+      srvExit,
+      // session / build letters, conn A only
+      peerOpenChannel(ADV, i),
+      execAdmit(ADV, i),
+      peerHandshake(ADV, i),
+      peerOpcode(ADV, i),
+      opcodeToRpcWait(ADV, i),
+      rpcCompletesBuildSubmit(ADV, i),
+      buildTerminal(ADV, i),
+      emitDone(ADV, i),
+      peerClientEof(ADV, i),
+      protoSeesClientEof(ADV, i),
+      protoObservesShutdown(ADV, i),
+      protoObservesConnGone(ADV, i),
+      cancelLoopDone(ADV, i),
+      pumpExitEof(ADV, i),
+      pumpExitSendFail(ADV, i),
+      clientPumpSelfExit(ADV, i),
+      peerChannelClose(ADV, i)
+    }
+  }
+}
+
+/// Family: the degraded tier (design §2e fault-degraded): the exec-gate
+/// panic splitter and proto-task panics (P12), the TCP_USER_TIMEOUT
+/// setsockopt failure, write parks ordered against force-close arming (the
+/// W7 ordering bit), and the inactivity reap backstop that exists only in
+/// this regime's alphabet — exhaustive for one session on conn A carrying
+/// the build-tracking chain (so the panic-leaks-a-tracked-build shape is
+/// in scope). The grace machinery, hostile opens and the non-build opcode
+/// branch are excluded (famPreauth / famAdmission / famHostile /
+/// famUpstream own them).
+module gwConnLifecycleFamDegraded {
+  import gwConnLifecycle(
+    MAX_CONNECTIONS = 2,
+    MAX_CHANNELS_PER_CONN = 2,
+    MAX_SESSIONS = 2,
+    RESIDUE_BOUND = 1,
+    B_CHANNEL_SLOTS = 1,
+    LET_OCC = false,
+    LET_WEDGE = true,
+    LET_HOSTILE = false,
+    LET_UPSTREAM = false,
+    LET_DRAIN = false,
+    LET_PANIC = true,
+    LET_SOCKOPT_FAIL = true,
+    INACTIVITY_AVAILABLE = true
+  ).*
+
+  action famStep = {
+    nondet c = CONNS.oneOf()
+    nondet letter = REAP_LETTERS.oneOf()
+    any {
+      // connection-level letters, both connections
+      acceptConn(c),
+      peerBanner(c),
+      peerAuthOk(c),
+      queueDrainDeliver(c),
+      queueDrainParks(c),
+      fireForceCloseEnforce(c),
+      reapTransportEnd(c, letter),
+      // the degraded-tier and wedge letters (conn A by their own guards)
+      sockoptFails(c),
+      peerStopDraining(c),
+      peerWithholdWindow(c),
+      // the single session, conn A channel 0: admission, the build chain,
+      // panics, egress sends and the close-out ladder
+      peerOpenChannel(ADV, 0),
+      execAdmit(ADV, 0),
+      execGatePanic(ADV, 0),
+      peerHandshake(ADV, 0),
+      peerOpcode(ADV, 0),
+      opcodeToRpcWait(ADV, 0),
+      rpcCompletesBuildSubmit(ADV, 0),
+      protoPanic(ADV, 0),
+      pumpSendOk(ADV, 0),
+      pumpSendBlocks(ADV, 0),
+      fireSendBudget(ADV, 0),
+      peerClientEof(ADV, 0),
+      protoSeesClientEof(ADV, 0),
+      protoHandlerError(ADV, 0),
+      protoObservesConnGone(ADV, 0),
+      cancelLoopDone(ADV, 0),
+      pumpExitEof(ADV, 0),
+      pumpExitSendFail(ADV, 0),
+      closeOutSendStatus(ADV, 0),
+      closeOutSendEof(ADV, 0),
+      closeOutSendClose(ADV, 0),
+      closeOutComplete(ADV, 0),
+      fireCloseOutBudget(ADV, 0),
+      closeOutDeadTransport(ADV, 0),
+      clientPumpSelfExit(ADV, 0),
+      peerChannelClose(ADV, 0)
+    }
+  }
 }
