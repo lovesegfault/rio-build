@@ -81,14 +81,28 @@ resource "helm_release" "external_secrets" {
     # hostNetwork: EKS managed API server can't route to overlay pod IPs
     # (Cilium cluster-pool fd42::) for admission webhook calls →
     # "Address is not allowed". hostNetwork puts the webhook on a node
-    # VPC IP. Port 10260 avoids kubelet's 10250.
+    # VPC IP — and turns every listener (webhook, metrics, readyz) into
+    # a host-port claim. The previous 10260/8080/8081 collided with
+    # prom-operator (10260) and aws-lbc metrics (8080), so the webhook
+    # sat Pending whenever no node had all three free. 9445-9447 sit in
+    # the admission-webhook block next to aws-lbc (9443) and KEDA
+    # (9444), inside the 9443-10260 control-plane→node SG rule. Full
+    # allocation table: main.tf webhooks_from_control_plane.
     {
       name  = "webhook.hostNetwork"
       value = "true"
     },
     {
       name  = "webhook.port"
-      value = "10260"
+      value = "9445"
+    },
+    {
+      name  = "webhook.metrics.listen.port"
+      value = "9446"
+    },
+    {
+      name  = "webhook.readinessProbe.port"
+      value = "9447"
     },
   ]
 

@@ -61,10 +61,10 @@ resource "helm_release" "keda" {
     # metrics listener (prometheus.metricServer.port — declared as a
     # containerPort, so the scheduler reserves it even with scraping
     # disabled). Its 8080 default is taken on the system nodes by the
-    # external-secrets and aws-lbc metrics endpoints, so move it into
-    # the 1027x block holding KEDA's auxiliary listeners (just above
-    # kubelet's 10250 and external-secrets/prometheus-operator's
-    # 10260). Sitting outside the 9443-10260 control-plane→node rule is
+    # aws-lbc metrics endpoint, so move it into the 1027x block holding
+    # KEDA's auxiliary listeners (just above kubelet's 10250 and
+    # prometheus-operator's 10260).
+    # Sitting outside the 9443-10260 control-plane→node rule is
     # fine here: only kubelet probes and in-cluster scrapes hit these,
     # never the API server. Health probes need no extra port — the
     # adapter serves /healthz on 6443 itself.
@@ -81,8 +81,8 @@ resource "helm_release" "keda" {
     # now that gateway autoscaling defaults on) waits out the webhook
     # timeout and is admitted unvalidated. Port 9444: 9443 (chart
     # default) collides with aws-lbc's hostNetwork webhook one port
-    # down, and 10260 is taken by external-secrets/prometheus-operator
-    # on the same system nodes.
+    # down, and 10260 is taken by prometheus-operator (ESO holds
+    # 9445-9447 — see the main.tf allocation table).
     {
       name  = "webhooks.useHostNetwork"
       value = "true"
@@ -95,10 +95,10 @@ resource "helm_release" "keda" {
     # listeners: controller-runtime always binds its metrics endpoint
     # (prometheus.webhooks.port, default 8080) and health probe
     # (webhooks.healthProbePort, default 8081) regardless of whether
-    # anything scrapes them, and both defaults are taken on the system
-    # nodes by external-secrets'/aws-lbc's own hostNetwork metrics and
-    # probe endpoints. Distinct from the apiserver's 10271 so the two
-    # KEDA pods can share a node.
+    # anything scrapes them; 8080 is taken on the system nodes by
+    # aws-lbc's hostNetwork metrics endpoint, and staying in the 1027x
+    # block keeps both clear of such common defaults. Distinct from the
+    # apiserver's 10271 so the two KEDA pods can share a node.
     {
       name  = "prometheus.webhooks.port"
       value = "10272"

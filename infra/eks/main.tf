@@ -319,12 +319,35 @@ module "eks" {
       self        = true
     }
     # API server can't reach overlay pod IPs (cluster-pool IPAM), so
-    # admission webhooks run hostNetwork=true on shifted ports: aws-lbc
-    # on 9443, KEDA admission on 9444 (keda.tf), external-secrets +
-    # prom-operator on 10260 (kubelet has 10250). The module's default
-    # control-plane→node rule only covers 10250. Without this, fresh
-    # deploy fails: helm creates an ExternalSecret → webhook validation
-    # → 5s context-deadline.
+    # admission webhooks run hostNetwork=true on shifted ports. The
+    # module's default control-plane→node rule only covers 10250;
+    # every webhook *serving* port must sit inside this rule's range or
+    # a fresh deploy fails (helm creates an ExternalSecret → webhook
+    # validation → 5s context-deadline).
+    #
+    # Host-port allocation across hostNetwork pods (canonical table —
+    # add a row whenever a chart gains a host listener; the scheduler
+    # refuses to co-locate duplicate hostPorts and undeclared ones fail
+    # at bind time, so a collision here means Pending or CrashLoop):
+    #    6443  KEDA metrics-apiserver (serving)   keda.tf
+    #    8080  aws-lbc metrics                    addons.tf
+    #    9234  cilium-operator health             addons.tf (cilium)
+    #    9443  aws-lbc webhook                    addons.tf
+    #    9444  KEDA admission webhook             keda.tf
+    #    9445  ESO webhook                        secrets.tf
+    #    9446  ESO metrics                        secrets.tf
+    #    9447  ESO readyz                         secrets.tf
+    #    9963  cilium-operator metrics            addons.tf (cilium)
+    #   10260  prom-operator webhook              monitoring.tf
+    #   10271  KEDA metrics-apiserver (http)      keda.tf
+    #   10272  KEDA webhook metrics               keda.tf
+    #   10273  KEDA webhook healthz               keda.tf
+    # Every node also holds 22 (sshd), 80/2703 (pod-identity-agent),
+    # 4240/4244/9879/9890/9891 (cilium agent), 9100 (node-exporter),
+    # 10248/10250 (kubelet); aws-lbc additionally binds 61779 (healthz,
+    # not declared as a containerPort). New hostNetwork listener: pick
+    # a free port ≥ 9448 not in this table; webhook serving ports must
+    # stay within from_port..to_port below.
     webhooks_from_control_plane = {
       description                   = "API server to hostNetwork admission webhooks"
       protocol                      = "tcp"
