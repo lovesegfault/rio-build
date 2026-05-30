@@ -402,6 +402,95 @@ let
         fi
       '';
 
+  # Expect-violation check via the RUST SIMULATOR (`quint run`) instead
+  # of TLC. For violations that are real, confirmed, and load-bearing for
+  # the campaign record, but whose BFS level sits past a gate-compatible
+  # TLC budget (the closure-evidence post-0d triage record: TLC's BFS is
+  # correct and finds these given enough wall-clock — the per-level state
+  # growth at the affected scopes simply puts them in the
+  # tens-of-minutes-to-hours class). The simulator finds the same
+  # violations in seconds because a random walk pays no exhaustive
+  # frontier cost.
+  #
+  # Semantics: bounded random search, NOT a proof — exactly right for an
+  # expect-violation check, whose claim is existential ("this scenario is
+  # reachable"), not universal. A found violation is a found violation
+  # regardless of backend; only "no violation found" differs in strength,
+  # and for these checks that outcome is a FAILURE either way.
+  #
+  # Flake discipline: maxSamples must be sized so the per-run miss
+  # probability is negligible. With a per-trace hit rate p (measure it:
+  # the introducing commit records traces-to-first-hit), P(miss) =
+  # (1-p)^maxSamples ~= exp(-p*maxSamples); size maxSamples >= 25/p so
+  # P(miss) <= ~1e-11. Cost note: the simulator's early exit is
+  # per-worker-batch, not per-trace — high-hit-rate violations return in
+  # under a second, but a low-rate violation's run costs roughly the
+  # FULL sample budget's wall clock (measured: ~10s per million samples
+  # per step-of-14 at the closure-evidence duo scope), so keep
+  # maxSamples at the flake-math minimum rather than padding it. If a
+  # previously-green sim check starts failing, the model has drifted
+  # under the scenario (the same signal a TLC witness check gives) —
+  # investigate, never just bump samples.
+  mkQuintSimWitnessCheck =
+    {
+      name,
+      spec,
+      main ? spec,
+      # The witness `val` expected to be violated.
+      witness,
+      # Per-run sample / step bounds (see the flake-discipline note).
+      maxSamples ? 2000000,
+      maxSteps ? 15,
+      # Same semantics as mkQuintCheck's extraSpecs / step.
+      extraSpecs ? [ ],
+      step ? null,
+    }:
+    pkgs.runCommand "quint-${name}"
+      {
+        nativeBuildInputs = [ pkgs.quint ];
+        # Same fileset narrowing as mkQuintCheck.
+        src = lib.fileset.toSource {
+          root = modelsDir;
+          fileset = lib.fileset.unions (map (s: modelsDir + "/${s}.qnt") ([ spec ] ++ extraSpecs));
+        };
+        env = {
+          MODEL = spec;
+          MAIN = main;
+          WITNESS = witness;
+        };
+      }
+      ''
+        set -euo pipefail
+        cd "$TMPDIR"
+
+        # The violation is the EXPECTED outcome: `quint run` exits
+        # nonzero when it finds one, so don't let that abort the script.
+        status=0
+        quint run \
+          --backend=rust \
+          --main=${main} \
+          ${lib.optionalString (step != null) "--step=${step}"} \
+          --invariant=${witness} \
+          --max-samples=${toString maxSamples} \
+          --max-steps=${toString maxSteps} \
+          "$src/${spec}.qnt" 2>&1 | tee $out || status=$?
+
+        if grep -qF '[ok] No violation found' $out; then
+          echo "" >&2
+          echo "${name}: witness ${witness} was NOT violated in ${main} within ${toString maxSamples} samples x ${toString maxSteps} steps." >&2
+          echo "The scenario it probes is no longer reachable (or its hit rate collapsed); the regime's invariants may now hold vacuously." >&2
+          exit 1
+        fi
+
+        # Require the simulator's own violation report -- a crash or a
+        # typecheck error must not read as a successful expect-violation.
+        if ! grep -qF '[violation] Found an issue' $out; then
+          echo "" >&2
+          echo "${name}: quint run failed without reporting a violation of ${witness} (tool error?)." >&2
+          exit 1
+        fi
+      '';
+
   # Deterministic named-run replay: `quint test` over a regime module's
   # `run` definitions. The runs are the model's executable scenario pins
   # (the documented-divergence reproducers and the happy-path narratives);
@@ -456,7 +545,12 @@ in
   # Expose the constructors so a future cross-model aggregate (or an
   # ad-hoc spike) can build its own checks without going through the
   # attrs below.
-  inherit mkQuintCheck mkQuintWitnessCheck mkQuintRunCheck;
+  inherit
+    mkQuintCheck
+    mkQuintWitnessCheck
+    mkQuintSimWitnessCheck
+    mkQuintRunCheck
+    ;
 
   # Per-model checks. Imported by flake.nix as the quintChecks binding,
   # which merges them into checks.* and hands the same attrset to the
@@ -3418,23 +3512,43 @@ in
     #   quint verify --backend=tlc --main=closureEvidenceBaseEx \
     #     --invariant=asBuiltHoldInvariants docs/spec/models/closureEvidence.qnt
     #
-    # (asBuiltHoldInvariants = allInvariants minus C3, which is genuinely
-    # violated as built — the Phase 0c finding pinned by the
-    # probe-wrongful-terminal-failure check below.) The run records, the
-    # per-property verdicts and the held-back design-scale regimes are in
+    # (asBuiltHoldInvariants = allInvariants minus C3 — the Phase 0c
+    # finding pinned by the probe-wrongful-terminal-failure check below.
+    # Since the C3-adjudication model corrections, C3 itself HOLDS at the
+    # single-build BaseEx scope — the violation needs two live builds —
+    # so the exclusion there is cross-scope consistency of the
+    # conjunction, not a BaseEx-level necessity; the two-build scopes are
+    # where it is load-bearing.) The run records, the per-property
+    # verdicts and the held-back design-scale regimes are in
     # docs/spec/models/closure-evidence-invariant-map.md; the witness and
     # probe checks below keep every constrained scenario reachable in CI
     # in the meantime.
 
     # The fault-persist and failover exhaustive checks are NOT wired in
     # this stage: their reduced-scope modules
-    # (closureEvidenceFaultPersistEx / closureEvidenceFailoverEx) and
-    # the shared asBuiltHoldInvariants conjunction exist, but neither
-    # regime has a completed budget measurement yet (the lost-write and
-    # failover/recovery alphabets multiply the base scope's state count
-    # past what this stage could measure within its time budget). The
-    # invariant map's regime-scope record carries the held-back status;
-    # wiring follows the base check's pattern once a measurement
+    # (closureEvidenceFaultPersistEx / closureEvidenceFailoverEx) exist,
+    # but neither regime converges within a gate-compatible budget. The
+    # FailoverEx target's invariant is asBuiltHoldInvariantsFailoverEx
+    # (asBuiltHoldInvariants minus L3): the post-0d triage identified the
+    # FailoverEx as-built conjunction violation as L3
+    # (liveBuildTerminalOrProgressArmed), a REAL as-built finding — a
+    # failover kills a Substituting member's walk, recovery restores it
+    # Queued waiting on its persisted-Poisoned child, and a subsequent
+    # ClearPoison removes that child without re-evaluating the parent's
+    # readiness, stranding it Queued/childless/unarmed under a live
+    # build's interest. Like C3, the finding is recorded in the invariant
+    # map (post-0d triage record: trace + code walk + Phase-1 candidate
+    # disposition); unlike C3 its falsification is a documented manual
+    # target rather than a wired probe (the violation sits at ~2 M
+    # distinct states / minutes-to-tens-of-minutes of TLC, past the
+    # wired-check budget):
+    #
+    #   quint verify --backend=tlc --main=closureEvidenceFailoverEx \
+    #     --invariant=liveBuildTerminalOrProgressArmed \
+    #     docs/spec/models/closureEvidence.qnt
+    #
+    # The invariant map's regime-scope record carries the held-back
+    # status; wiring follows the base check's pattern once a measurement
     # establishes the per-check budget. The recovery- and
     # durability-direction witnesses below (hole-from-recovery,
     # recovery-clear, stale-intent-apply) keep those regimes'
@@ -3461,42 +3575,71 @@ in
     # leaves a stamped row and an activated build the new leader's
     # memory does not know about.
     #
-    # NOT wired as a TLC check (Phase 0d housekeeping finding): the 0c
-    # wiring at design-scale closureEvidenceStaleTenure never completed
-    # a build (40+ min of TLC reaching only BFS depth 3), and the
-    # duo-scale re-point (closureEvidenceStaleDuo) hits a
-    # quint->TLC-backend discrepancy — the rust simulator produces the
-    # 5-state counterexample (merge intent pending -> leader lost ->
-    # successor recovery -> stale apply) in under a second at both
-    # scopes, but TLC explores past that depth (BFS depth 7, 220 K+
-    # distinct states) without flagging it. Until the backend issue is
-    # resolved this probe is a documented manual target:
-    #
-    #   quint run --main=closureEvidenceStaleDuo \
-    #     --invariant=leaderClassEvidenceWrites \
-    #     --max-samples=200000 --max-steps=15 \
-    #     docs/spec/models/closureEvidence.qnt
-    #
-    # The invariant map's Phase 0d stage record carries the discrepancy
-    # record and the run evidence; the D14/§9.1 fencing evidence stands
-    # on that rust-simulator record.
+    # Wired through the rust-simulator constructor, NOT TLC — BUDGET, not
+    # backend correctness (the post-0d triage re-diagnosis of what the 0d
+    # record called a "TLC-backend discrepancy"): TLC's BFS at the
+    # stale-tenure scopes is correct and does find this violation, but
+    # the per-level state growth (~10x per BFS level at
+    # closureEvidenceStaleDuo) puts the 5-state counterexample's level
+    # past every gate-compatible budget; the 0d "TLC explores past the
+    # violation depth" reading rested on TLC's Progress(N) diameter
+    # metric, which reports dequeued-state depth, not completed BFS
+    # levels, and so overstates progress. The triage's link-bisection
+    # (each prefix of the violation path pinned by its own throwaway
+    # witness) showed every link is taken by TLC at its true depth; the
+    # full run record is in the invariant map's post-0d triage section.
+    # The simulator finds the 5-state counterexample in under a second,
+    # which restores this probe to the wired CI surface (it had been
+    # demoted to a manual target by the 0d housekeeping); the
+    # D14/§9.1 fencing evidence is thereby pinned by CI again.
+    quint-closure-evidence-probe-stale-evidence-write = mkQuintSimWitnessCheck {
+      name = "closure-evidence-probe-stale-evidence-write";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleDuo";
+      witness = "leaderClassEvidenceWrites";
+      maxSamples = 500000;
+    };
 
     # C3: with no failover, no store GC and no upstream withdrawal, no
     # build is wrongfully terminally failed — FAILS as-built (the Phase
-    # 0c finding, pre-registered as the 0b C3 observation): a stale
-    # ok=false walk verdict produced before the outputs became available
-    # is consumed after a directed resubmit re-pruned and stamped the
-    # root and a poison clear holed it, and the fail-fast terminally
-    # fails the resubmitted build although every output it wants is
-    # present. Pinned here as an expect-violation check until the
-    # Phase-1 disposition (fix or accepted-with-rationale); the
-    # asBuiltHoldInvariants conjunction (the manual exhaustive target's
+    # 0c finding, CONFIRMED by the C3 adjudication in its two-live-builds
+    # form): a narrow build's pruned merge stamps the root and cache-hits
+    # it; a wide co-build's duplicate submission demotes the
+    # stale-Produced root and spawns the wide walk; that walk genuinely
+    # fails on the wide-only output at check time; the co-build is
+    # cancelled, its child reaped and the root holed; the stale verdict's
+    # delivery then fail-fasts the narrow build although every output IT
+    # wants is present. Pinned here as an expect-violation check until
+    # the Phase-1 disposition (fix or accepted-with-rationale); the
+    # asBuiltHoldInvariants conjunction (the manual exhaustive targets'
     # invariant) excludes C3 for exactly this reason.
-    quint-closure-evidence-probe-wrongful-terminal-failure = mkQuintWitnessCheck {
+    #
+    # Scope and backend re-point (post-0d triage): the original wiring ran
+    # this probe at closureEvidenceBaseEx under TLC, where the violation
+    # rested on the REFUTED single-build trace (mailbox-reordering
+    # staleness + a resubmit cache-hitting a node the cancel chain would
+    # have cancelled). After the C3-adjudication model corrections that
+    # trace is gone — C3 HOLDS at BaseEx — and the faithful violation
+    # needs two live builds. At the two-build scopes the violation's BFS
+    # level is past a gate-compatible TLC budget (the post-0d triage
+    # budget record), so the wired pin uses the rust-simulator
+    # expect-violation constructor at closureEvidenceDuo, where the
+    # confirmed trace's many interleavings give a seconds-class hit
+    # (the per-trace hit rate and the maxSamples sizing are in the
+    # introducing commit's message). The TLC counterpart of this pin is
+    # the documented manual target at the dedicated
+    # closureEvidenceC3Duo probe scope:
+    #
+    #   quint verify --backend=tlc --main=closureEvidenceC3Duo \
+    #     --invariant=noWrongfulTerminalFailureSingleTenure \
+    #     docs/spec/models/closureEvidence.qnt
+    quint-closure-evidence-probe-wrongful-terminal-failure = mkQuintSimWitnessCheck {
       name = "closure-evidence-probe-wrongful-terminal-failure";
       spec = "closureEvidence";
-      main = "closureEvidenceBaseEx";
+      main = "closureEvidenceDuo";
       witness = "noWrongfulTerminalFailureSingleTenure";
+      maxSamples = 5000000;
+      maxSteps = 14;
     };
 
     # A17 (a clear/heal intent created under tenure g never erases a bit
@@ -3642,11 +3785,30 @@ in
     };
     # A forgiven-now-wanted downgrade re-spawns the walk (A12/A21's
     # chain-growth subject is exercised).
-    quint-closure-evidence-witness-downgrade-respawn = mkQuintWitnessCheck {
+    #
+    # Scope and backend re-point (post-0d triage): this witness's BaseEx
+    # reachability rested on the REFUTED single-build behavior (a
+    # poisoned build's Substituting node surviving with its
+    # narrow-spawned walk into the wide resubmit). With the
+    # C3-adjudication cancel-pass correction that path is gone — the
+    # faithful downgrade-respawn needs a narrow pruned merge and a wide
+    # pruned co-merge from two live builds, so the witness now runs at
+    # the two-build closureEvidenceC3Duo probe scope. The trace there is
+    # four actions deep, but TLC's multi-worker queue ordering still
+    # prices it at ~10 min (the post-0d triage budget record), so the
+    # wired form uses the rust-simulator constructor; the TLC form is a
+    # manual target:
+    #
+    #   quint verify --backend=tlc --main=closureEvidenceC3Duo \
+    #     --invariant=canReachDowngradeRespawn \
+    #     docs/spec/models/closureEvidence.qnt
+    quint-closure-evidence-witness-downgrade-respawn = mkQuintSimWitnessCheck {
       name = "closure-evidence-witness-downgrade-respawn";
       spec = "closureEvidence";
-      main = "closureEvidenceBaseEx";
+      main = "closureEvidenceC3Duo";
       witness = "canReachDowngradeRespawn";
+      maxSamples = 5000000;
+      maxSteps = 8;
     };
     # The terminal-build reap stamps a closure hole on a surviving
     # shared parent (H1) — needs the second build, hence duo scope.
@@ -3682,27 +3844,31 @@ in
     # The two stale-tenure witnesses (a deposed tenure's evidence intent
     # applying after the successor's recovery — canReachStaleIntentApply
     # — and a walk spawned by an older tenure consumed by a newer one —
-    # canReachCrossTenureWalkConsume) are NOT wired as TLC checks
-    # (Phase 0d housekeeping finding): the 0c design-scale
-    # closureEvidenceStaleTenure wirings never completed a build, and
-    # the duo-scale re-point hits the same quint->TLC-backend
-    # discrepancy as the A18 probe above (rust simulator reaches both
-    # in seconds at closureEvidenceStaleDuo; TLC explores past their
-    # depth without flagging). Documented manual targets until the
-    # backend issue is resolved:
-    #
-    #   quint run --main=closureEvidenceStaleDuo \
-    #     --invariant=canReachStaleIntentApply \
-    #     --max-samples=200000 --max-steps=15 \
-    #     docs/spec/models/closureEvidence.qnt
-    #   quint run --main=closureEvidenceStaleDuo \
-    #     --invariant=canReachCrossTenureWalkConsume \
-    #     --max-samples=200000 --max-steps=15 \
-    #     docs/spec/models/closureEvidence.qnt
-    #
-    # The stale-tenure regime's reachability evidence (these two
-    # witnesses plus the A18 probe) stands on the rust-simulator record
-    # in the invariant map's Phase 0d stage record.
+    # canReachCrossTenureWalkConsume) are wired through the
+    # rust-simulator constructor for the same budget reason as the A18
+    # probe above: the 0c design-scale closureEvidenceStaleTenure TLC
+    # wirings never completed a build, and the duo-scale re-point's BFS
+    # levels sit past a gate-compatible TLC budget (the post-0d triage
+    # re-diagnosis — TLC's BFS is correct but the per-level cost at the
+    # stale-tenure scopes puts even these shallow witnesses in the
+    # tens-of-minutes-to-hours class). The simulator reaches both in
+    # seconds; wiring them restores the stale-tenure regime's
+    # reachability pins to the CI surface (demoted to manual targets by
+    # the 0d housekeeping).
+    quint-closure-evidence-witness-stale-intent-apply = mkQuintSimWitnessCheck {
+      name = "closure-evidence-witness-stale-intent-apply";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleDuo";
+      witness = "canReachStaleIntentApply";
+      maxSamples = 500000;
+    };
+    quint-closure-evidence-witness-cross-tenure-walk = mkQuintSimWitnessCheck {
+      name = "closure-evidence-witness-cross-tenure-walk";
+      spec = "closureEvidence";
+      main = "closureEvidenceStaleDuo";
+      witness = "canReachCrossTenureWalkConsume";
+      maxSamples = 2000000;
+    };
 
     # ---- Closure-evidence Stage-C calibration witnesses ----------------
     # Phase 0d family-representative calibration overrides
