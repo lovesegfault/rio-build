@@ -96,8 +96,8 @@ pub struct LiveNode {
     pub allocatable: (u32, u64, u64),
     /// `(cores, mem_bytes, disk_bytes)` already requested by pods on
     /// the backing Node. `From<NodeClaim>` sets this to `(0,0,0)`;
-    /// `list_live_nodeclaims` post-fills it from
-    /// [`PodRequestedCache`](crate::reconcilers::node_informer::PodRequestedCache).
+    /// `list_live_nodeclaims` post-fills it from the per-tick
+    /// [`PodSnapshot`](super::pods::PodSnapshot) Pod LIST.
     pub requested: (u32, u64, u64),
     /// `metadata.creationTimestamp` as unix-epoch seconds. `None` only
     /// on a just-`create()`d object before the apiserver round-trip.
@@ -285,8 +285,8 @@ pub type Placement = (SpawnIntent, String, bool);
 /// node. Empty `A_open` from lead-time gating (all cells too slow) →
 /// unplaced.
 ///
-/// **Already-bound short-circuit**: an intent in `bound`
-/// (PodRequestedCache saw its pod with `spec.nodeName` set) goes
+/// **Already-bound short-circuit**: an intent in `bound` (the tick's
+/// Pod LIST saw its pod with `spec.nodeName` set) goes
 /// directly into `placeable` keyed to its actual node — no fit-check.
 /// Its own pod's `(c,m,d)` is already in `free()`'s `requested` term;
 /// fit-checking would double-count and evict it (then orphan-reap the
@@ -1550,7 +1550,7 @@ pub(crate) mod tests {
         assert_eq!(u.len(), 1);
     }
 
-    /// bug_069: an intent already bound (PodRequestedCache saw its pod
+    /// bug_069: an intent already bound (the tick's Pod LIST saw its pod
     /// with `spec.nodeName`) short-circuits to `placeable` with NO
     /// fit-check. Its own pod's (32c) is in `requested` so `free.0=0`;
     /// fit-checking would evict it → orphan-reap loop on the

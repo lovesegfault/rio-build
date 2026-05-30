@@ -770,8 +770,8 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
                 registered_cells: vec![],
                 observed_instance_types: vec![],
                 // nodeclaim_pool's report_unfulfillable owns the
-                // bound-intents stream (full set every tick from
-                // PodRequestedCache); the per-pool ack only arms
+                // bound-intents stream (full set every tick from its
+                // per-tick Pod LIST); the per-pool ack only arms
                 // dispatched_cells.
                 bound_intents: vec![],
             },

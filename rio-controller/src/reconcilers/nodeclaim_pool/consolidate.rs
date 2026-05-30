@@ -449,7 +449,7 @@ pub async fn reap_idle<F: Fn(&str, Option<&str>, &[String]) -> bool>(
 /// Edge-detect idle→busy transitions and record them as uncensored
 /// [`IdleGapEvent`]s. `prev_idle` is the reconciler's running
 /// `name → idle-since epoch-secs` map; a node present there whose
-/// `requested.0 > 0` (PodRequestedCache saw a binding) had an
+/// `requested.0 > 0` (the tick's Pod LIST saw a binding) had an
 /// arrival — record `{now − prev_idle[name], censored:false}` to its
 /// cell. r42 bug_020: `prev_idle` is the AUTHORITY for idle
 /// duration — Karpenter v1 does not write the `Empty` condition the

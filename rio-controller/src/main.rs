@@ -249,18 +249,6 @@ async fn main() -> anyhow::Result<()> {
         "hw-class-annotator",
         node_informer::run_pod_annotator(client.clone(), node_cache.clone(), shutdown.clone()),
     );
-    // ADR-023 §13b: per-node Σ pod `resources.requests` cache so the
-    // NodeClaim FFD sim's `LiveNode.free()` reflects what's already
-    // bound (otherwise over-reports → double-places).
-    let pod_requested = node_informer::PodRequestedCache::default();
-    rio_common::task::spawn_monitored(
-        "pod-requested-cache",
-        node_informer::run_pod_requested_cache(
-            client.clone(),
-            pod_requested.clone(),
-            shutdown.clone(),
-        ),
-    );
     // ADR-023 phase-13: SpotInterrupted Event → interrupt_samples
     // (λ\[h\] numerator). Node-DELETE in the informer above writes the
     // exposure denominator.
@@ -373,7 +361,6 @@ async fn main() -> anyhow::Result<()> {
                 hooks,
                 cfg.nodeclaim_pool.clone(),
                 hw_config.clone(),
-                pod_requested,
                 placeable_tx.take().expect("placeable_tx not yet taken"),
                 shutdown.clone(),
             ),

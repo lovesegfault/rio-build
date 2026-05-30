@@ -9,8 +9,11 @@
 //!    `(cores, mem, disk)` forecast. ⊥ on RPC failure → after
 //!    `BOT_TICKS_BEFORE_CONSOLIDATE_ONLY` consecutive ⊥-ticks, switch to
 //!    consolidate-only (don't grow the fleet on stale data).
-//! 2. FFD-simulate placing the intents onto live (Registered + in-flight)
-//!    NodeClaims with the same MostAllocated bin-select that
+//! 2. LIST the owned NodeClaims and the `rio.build/pool` pods (one
+//!    label-selected Pod LIST per tick → [`pods::PodSnapshot`]: per-node
+//!    requested sums + the bound-intent index), then FFD-simulate
+//!    placing the intents onto live (Registered + in-flight) NodeClaims
+//!    with the same MostAllocated bin-select that
 //!    `kube-scheduler-packed` uses.
 //! 3. Cover the unplaced deficit per `(hw_class, capacity_type)` cell
 //!    with 1×anchor + N×bulk NodeClaims, capped at
@@ -31,6 +34,7 @@ mod consolidate;
 mod cover;
 pub(crate) mod ffd;
 mod health;
+mod pods;
 pub mod sketch;
 mod wedge;
 
@@ -38,6 +42,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
+use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ListParams, PostParams};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, instrument, warn};
@@ -50,7 +55,7 @@ use rio_proto::types::{
     ListOpenAttemptsRequest, SpawnIntent,
 };
 
-use crate::reconcilers::node_informer::{HwClassConfig, PodRequestedCache};
+use crate::reconcilers::node_informer::HwClassConfig;
 use crate::reconcilers::pool;
 use crate::reconcilers::{AdminClient, admin_call};
 
@@ -663,11 +668,14 @@ pub struct NodeClaimPoolReconciler {
     /// [`HwClassConfig::labels_for`] to build NodeClaim
     /// `spec.requirements`.
     hw_config: HwClassConfig,
-    /// `spec.nodeName` → Σ pod requests, maintained by
-    /// `node_informer::run_pod_requested_cache`.
-    /// [`Self::list_live_nodeclaims`] post-fills `LiveNode.requested`
-    /// so `free()` reflects what's already bound.
-    pod_requested: PodRequestedCache,
+    /// Label-selected (`rio.build/pool`) Pod API for the per-tick
+    /// [`pods::PodSnapshot`] LIST (§4(a)1 — replaces the watch-fed
+    /// `PodRequestedCache`). [`Self::list_pool_pods`] derives the
+    /// per-node `requested` sums and the bound-intent index from one
+    /// LIST per tick; [`Self::list_live_nodeclaims`] post-fills
+    /// `LiveNode.requested` from it so `free()` reflects what's
+    /// already bound.
+    pods: Api<Pod>,
     /// Publish side of [`PlaceableGate`]. Written once per successful
     /// FFD tick with the `intent_id`s placed on `Registered=True`
     /// nodes; the `pool/jobs` reconciler reads it via `Ctx.placeable`.
@@ -849,7 +857,6 @@ impl NodeClaimPoolReconciler {
         hooks: ControllerLeaseHooks,
         cfg: NodeClaimPoolConfig,
         hw_config: HwClassConfig,
-        pod_requested: PodRequestedCache,
         placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     ) -> Self {
         // Load persisted sketches; fall back to empty on error (a fresh
@@ -879,13 +886,13 @@ impl NodeClaimPoolReconciler {
         };
         Self {
             nodeclaims: Api::all(kube.clone()),
-            pools: Api::all(kube),
+            pools: Api::all(kube.clone()),
+            pods: Api::all(kube),
             admin,
             pg,
             leader,
             cfg,
             hw_config,
-            pod_requested,
             placeable_tx,
             hooks,
             sketches,
@@ -1207,14 +1214,22 @@ impl NodeClaimPoolReconciler {
             }
         }
 
-        let live = self.list_live_nodeclaims().await?;
+        // §4(a)1: one label-selected Pod LIST per tick — the source of
+        // `LiveNode.requested`, FFD's bound-intent short-circuit, the
+        // OA2 wedge attribution fallback, and the scheduler-shipped
+        // `bound_intents`. Failure propagates (tick aborted, retried
+        // next tick): the same fail-closed posture as a failed
+        // NodeClaim LIST below, replacing the deleted watch cache's
+        // silent stale-data degradation.
+        let pod_snapshot = self.list_pool_pods().await?;
+        let live = self.list_live_nodeclaims(&pod_snapshot).await?;
         let now = now_epoch();
         // `registered_cells` feeds `report_unfulfillable`'s ICE-clear;
         // `observed_types` feeds the scheduler's `CostTable.cells`
         // (R24B7 instance-type autodiscovery).
         let (registered_cells, observed_types) = self.kube_only_observations(&live, now);
 
-        let bound = self.pod_requested.bound_intents();
+        let bound = pod_snapshot.bound_intents();
         // §13d STRIKE-7 (mb_012): the agnostic-fallback admit predicate
         // checks arch ∧ features. A `hw_class_names=[]` kvm intent must
         // NOT FFD-place onto a non-metal node (deficit appears covered →
@@ -1226,7 +1241,7 @@ impl NodeClaimPoolReconciler {
             &intents.intents,
             &live,
             &self.sketches,
-            &bound,
+            bound,
             self.cfg.fuse_cache_bytes,
             |h, a, f| {
                 self.hw_config.matches_arch(h, a)
@@ -1296,7 +1311,7 @@ impl NodeClaimPoolReconciler {
                 Vec::new()
             }
         };
-        let dead_input = self.wedge.update(&open_attempts, &bound, now);
+        let dead_input = self.wedge.update(&open_attempts, bound, now);
 
         // Reap unhealthy/ICE BEFORE cover_deficit so cells that just
         // hit ICE this tick are masked in the same tick's cover (don't
@@ -1335,17 +1350,13 @@ impl NodeClaimPoolReconciler {
         // entry per bound builder pod) so the scheduler's
         // `authoritative_binding` map stays current without delta
         // tracking; cardinality is O(active builds).
-        let bound_intents = self
-            .pod_requested
-            .bound_intents()
-            .into_iter()
-            .map(|(intent_id, node_name)| rio_proto::types::BoundIntent {
-                intent_id,
-                node_name,
-            })
-            .collect();
-        self.report_unfulfillable(&ice_cells, &registered_cells, observed_types, bound_intents)
-            .await?;
+        self.report_unfulfillable(
+            &ice_cells,
+            &registered_cells,
+            observed_types,
+            pod_snapshot.bound_intent_protos(),
+        )
+        .await?;
 
         // r42 bug_023: same gauge_universe as `emit_live_gauges` —
         // configured ∪ live cells ∪ one trailing tick of cells
@@ -1399,7 +1410,12 @@ impl NodeClaimPoolReconciler {
             consecutive_bot = self.consecutive_bot_ticks,
             "consolidate-only (scheduler unreachable)"
         );
-        let live = self.list_live_nodeclaims().await?;
+        // Same per-tick Pod LIST as `reconcile_once` (kube-only read):
+        // `requested` feeds the idle/busy observation and `reap_idle`'s
+        // busy guard. The bound-intent half goes unused here — every
+        // consumer of it needs the scheduler.
+        let pod_snapshot = self.list_pool_pods().await?;
+        let live = self.list_live_nodeclaims(&pod_snapshot).await?;
         let now = now_epoch();
         // r43 bug_023: same kube-only block as `reconcile_once`. Discard
         // the return — `report_unfulfillable` and the scheduler's
@@ -1618,10 +1634,33 @@ impl NodeClaimPoolReconciler {
             .set(on_inf as f64);
     }
 
+    /// One label-selected (`rio.build/pool`) Pod LIST → this tick's
+    /// [`pods::PodSnapshot`].
+    ///
+    /// §4(a)1: replaces the watch-fed `PodRequestedCache`. The LIST is
+    /// scoped to the same selector the deleted watcher used, so the
+    /// object count is O(active builds), not the cluster's pod set.
+    /// Errors propagate — the tick aborts and retries in `TICK`
+    /// seconds, the same fail-closed posture as a failed NodeClaim
+    /// LIST (and strictly safer than the watch cache's stale-data
+    /// degradation, which silently mis-sized FFD).
+    async fn list_pool_pods(&self) -> anyhow::Result<pods::PodSnapshot> {
+        let list = self
+            .pods
+            .list(&ListParams::default().labels(pool::POOL_LABEL))
+            .await?;
+        Ok(pods::PodSnapshot::derive(&list.items))
+    }
+
     /// List NodeClaims this reconciler owns (label-selected). Typed
     /// `Api<NodeClaim>` (B4) so `status.allocatable` / `conditions` are
     /// already decoded — no `serde_json::Value` paths.
-    async fn list_live_nodeclaims(&self) -> anyhow::Result<Vec<ffd::LiveNode>> {
+    /// `LiveNode.requested` is post-filled from `pod_snapshot` so
+    /// `free()` reflects what's already bound.
+    async fn list_live_nodeclaims(
+        &self,
+        pod_snapshot: &pods::PodSnapshot,
+    ) -> anyhow::Result<Vec<ffd::LiveNode>> {
         let list = self
             .nodeclaims
             .list(&ListParams::default().labels(OWNER_LABEL))
@@ -1632,7 +1671,7 @@ impl NodeClaimPoolReconciler {
             .map(|nc| {
                 let mut n = ffd::LiveNode::from(nc);
                 if let Some(node) = &n.node_name {
-                    n.requested = self.pod_requested.sum_for(node);
+                    n.requested = pod_snapshot.requested_for(node);
                 }
                 n
             })
@@ -1988,27 +2027,16 @@ pub async fn run_nodeclaim_pool(
     hooks: ControllerLeaseHooks,
     cfg: NodeClaimPoolConfig,
     hw_config: HwClassConfig,
-    pod_requested: PodRequestedCache,
     placeable_tx: tokio::sync::watch::Sender<PlaceableSet>,
     shutdown: rio_common::signal::Token,
 ) {
     let Some(pg) = connect_pg(&cfg.database_url, &shutdown).await else {
         return;
     };
-    NodeClaimPoolReconciler::new(
-        kube,
-        admin,
-        pg,
-        leader,
-        hooks,
-        cfg,
-        hw_config,
-        pod_requested,
-        placeable_tx,
-    )
-    .await
-    .run(shutdown)
-    .await;
+    NodeClaimPoolReconciler::new(kube, admin, pg, leader, hooks, cfg, hw_config, placeable_tx)
+        .await
+        .run(shutdown)
+        .await;
 }
 
 async fn connect_pg(
