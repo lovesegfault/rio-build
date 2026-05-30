@@ -2619,13 +2619,25 @@ impl DagActor {
                 r.resubmit_cycle = 0;
                 r
             });
-        if let Err(e) = self
+        match self
             .record_reset_with_clear_poison(drv_hash, reset_row)
             .await
         {
-            error!(drv_hash = %drv_hash, error = %e,
-                   "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
-            return false;
+            Ok(crate::db::FencedWrite::Applied(_)) => {}
+            // r[impl sched.evidence.durability]
+            // Fenced: this replica is deposed (a successor's claim is
+            // the floor). The PG clear did NOT happen, so the admin
+            // contract is the same as the PG-failure arm: report
+            // cleared=false, leave the in-memory state untouched. The
+            // operator retries against the live leader.
+            Ok(crate::db::FencedWrite::Fenced) => {
+                return false;
+            }
+            Err(e) => {
+                error!(drv_hash = %drv_hash, error = %e,
+                       "ClearPoison: PG clear failed (in-mem untouched; retry-safe)");
+                return false;
+            }
         }
         // Remove from DAG so next merge treats it as newly-inserted.
         // Resetting status in-place would strand stub fields from

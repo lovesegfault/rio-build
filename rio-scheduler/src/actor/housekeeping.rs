@@ -358,12 +358,23 @@ impl DagActor {
                     r.resubmit_cycle = 0;
                     r
                 });
-            if let Err(e) = self
+            match self
                 .record_reset_with_clear_poison(&drv_hash, reset_row)
                 .await
             {
-                error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
-                continue;
+                Ok(crate::db::FencedWrite::Applied(_)) => {}
+                // r[impl sched.evidence.durability]
+                // Fenced: deposed replica. The PG clear did not happen,
+                // so the PG-first contract skips the in-memory removal
+                // exactly like the PG-failure arm — the successor owns
+                // this poison's lifecycle now.
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    continue;
+                }
+                Err(e) => {
+                    error!(drv_hash = %drv_hash, error = %e, "failed to clear poison in PG");
+                    continue;
+                }
             }
             // Capture the parents AFTER the PG clear succeeded (only
             // then is the child actually removed below) and BEFORE
