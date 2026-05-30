@@ -479,7 +479,7 @@ module gwConnLifecycle {
       liveSess: newLive,
       sawZero: k.sawZero or newLive == 0,
       grace:
-        if (newLive == 0 and k.live and not(k.discQ) and not(k.expired) and not(k.herr) and k.grace != GFired)
+        if (newLive == 0 and k.live and not(k.discQ) and not(k.expired) and not(k.herr) and k.grace == GUnarmed)
           GArmed
         else
           k.grace
@@ -531,6 +531,7 @@ module gwConnLifecycle {
   def conn(c: str): ConnRec = conns.get(c)
   def chanAt(c: str, i: int): ChanRec = chans.get((c, i))
   def sessAt(c: str, i: int): SessRec = chans.get((c, i)).sess
+  def sessOf(k: (str, int)): SessRec = chans.get(k).sess
 
   /// Guard-held sessions (the owner-decision definition of "session" for
   /// capacity/autoscaling accounting).
@@ -565,9 +566,341 @@ module gwConnLifecycle {
   }
 
   // --- 6. invariants ---------------------------------------------------------
-  // (S1-S20 safety, P1-P6 permissiveness, L1-L8 settlement; added in the
-  //  properties change — placeholder kept minimal so the skeleton stays
-  //  checkable.)
+  // S1-S20 safety (design §3.1), P1-P6 permissiveness (§3.2), L1-L8
+  // settlement in armed-invariant style (§3.3, FB-1). Every settlement
+  // claim is a state invariant of the shape "every state still holding the
+  // resource has its designed reclamation path armed/enabled" per the §2d
+  // table; the firing/reclamation traces are pinned by the §6b witnesses
+  // and Stage-C named runs. The §6c strict variants are pre-registered
+  // expected as-built falsifications and are NOT in allInvariants.
+
+  // -- helper predicates --
+
+  /// A send or close-out budget is armed on some session of this connection.
+  def connBudgetArmed(c: str): bool =
+    CHANS.exists(i => sessAt(c, i).sendBudget or sessAt(c, i).coBudget)
+
+  /// A per-session stage deadline (handshake or opcode-idle) is armed on
+  /// some session of this connection.
+  def connSessDeadlineArmed(c: str): bool =
+    CHANS.exists(i => sessAt(c, i).hsArmed or sessAt(c, i).idleArmed)
+
+  /// L1's armed-path disjunction (§2d): some designed reclamation path for
+  /// the connection's current stage is armed or enabled. Stage deadlines
+  /// and graces count when armed (their §2d fire conditions protect
+  /// permissiveness, not armed-ness); the force-close counts when its
+  /// enforcement can reach the connection (the park-ordering bit); the
+  /// transport-reap letters count when their §2d enabling condition holds;
+  /// the inactivity backstop counts only where the regime admits the letter.
+  def reclaimPathArmed(c: str, allowInactivity: bool): bool = or {
+    conn(c).preAuth == PaArmed,
+    conn(c).grace == GArmed,
+    conn(c).grace == GChecked,
+    connBudgetArmed(c),
+    connSessDeadlineArmed(c),
+    fcEnforceable(c),
+    conn(c).expired,
+    conn(c).herr,
+    keepaliveEnabled(c),
+    tcpUtoEnabled(c),
+    allowInactivity and inactivityEnabled(c)
+  }
+
+  // -- 6a.1 capacity, bookkeeping, accounting (S1-S9) --
+
+  /// S1 ConnPermitConservation (gate form): permits in use match the live
+  /// holders and never exceed the cap; a connection past an auth callback
+  /// that is not being torn down holds a permit and is counted; a
+  /// permit-less (over-cap) connection is torn down at its first auth
+  /// callback. Reaching that callback permit-less is the legitimate
+  /// over-cap path and does not violate.
+  val s1ConnPermitConservation = and {
+    srv.connPermits == CONNS.filter(c => conn(c).exists and conn(c).permit).size(),
+    srv.connPermits <= MAX_CONNECTIONS,
+    CONNS.forall(c => and {
+      (conn(c).exists and conn(c).live and conn(c).stage != CTcp and not(conn(c).herr))
+        implies (conn(c).permit and conn(c).counted),
+      (conn(c).exists and conn(c).live and conn(c).stage != CTcp and not(conn(c).permit))
+        implies conn(c).herr
+    })
+  }
+
+  /// S2 SessionPermitConservation: held session permits equal live
+  /// SessionGuards and never exceed the session cap.
+  val s2SessionPermitConservation = and {
+    srv.sessPermits == heldGuards,
+    srv.sessPermits <= MAX_SESSIONS
+  }
+
+  /// S3 GaugeAccuracy: connections_active counts connections that reached
+  /// an auth callback and have not dropped; channels_active equals live
+  /// SessionGuards (the guard-held definition of "session").
+  val s3GaugeAccuracy = and {
+    srv.connsActive == CONNS.filter(c => conn(c).exists and conn(c).counted and conn(c).live).size(),
+    srv.chansActive == heldGuards
+  }
+
+  /// S4 PerConnLiveCount: each connection's live_sessions equals its live
+  /// SessionGuards, up to the increment leaked by the exec-gate panic
+  /// splitter (the documented fault-letter weakening).
+  val s4PerConnLiveCount =
+    CONNS.forall(c => conn(c).liveSess == connGuards(c) + (if (conn(c).live) conn(c).panicLeaks else 0))
+
+  /// S5 NoSessionOutlivesConnection (capacity half): when a connection's
+  /// transport has ended, none of its sessions still holds a SessionGuard;
+  /// the proto tasks' own exits (after at most the cancel obligation) are
+  /// armed by construction and pinned by the teardown witnesses.
+  val s5NoSessionOutlivesConnection =
+    CONNS.forall(c => (conn(c).exists and not(conn(c).live)) implies CHANS.forall(i => not(sessAt(c, i).guard)))
+
+  /// S6 SingleExecPerChannel: a channel's write half is consumed by at most
+  /// one admitted exec, ever.
+  val s6SingleExecPerChannel = CHKEYS.forall(k => chans.get(k).execs <= 1)
+
+  /// S7 ChannelAccounting: open_channels equals the accepted-and-open set,
+  /// stays within the per-connection bound, and execs are admitted only on
+  /// accepted, currently-open channels.
+  val s7ChannelAccounting = and {
+    CONNS.forall(c => and {
+      conn(c).openCh == CHANS.filter(i => chanAt(c, i).ch == ChAccepted).size(),
+      conn(c).openCh <= MAX_CHANNELS_PER_CONN
+    }),
+    not(viol.execOnNonOpenChannel)
+  }
+
+  /// S8 RejectReleasesCapacity: an exec gate interrupted by the panic
+  /// splitter never strands an acquired permit (no permit held with no
+  /// guard and no admission in progress). Outside the panic regime the
+  /// content is subsumed by S2/S9 (design scope note).
+  val s8RejectReleasesCapacity = not(viol.permitStranded)
+
+  /// S9 SingleRelease: no permit, gauge slot, live-count or map entry is
+  /// released twice — no negative counters, no double-release latch.
+  val s9SingleRelease = and {
+    not(viol.doubleRelease),
+    srv.connPermits >= 0, srv.sessPermits >= 0, srv.connsActive >= 0, srv.chansActive >= 0,
+    CONNS.forall(c => conn(c).openCh >= 0 and conn(c).liveSess >= 0)
+  }
+
+  // -- 6a.2 teardown obligations, force-close, drain (S10-S20) --
+
+  /// S10 CancelOnSessionEnd: on every non-panic session exit with a build
+  /// still tracked, a CancelBuild attempt was made before the proto task
+  /// ended (cancel_active_builds). The panic carve-out is the documented
+  /// weakening; S10-strict in §6c is the probe.
+  val s10CancelOnSessionEnd =
+    CHKEYS.forall(k =>
+      (sessOf(k).exists and sessOf(k).proto == PExited and sessOf(k).exitR != RPanic and sessOf(k).tracked)
+        implies sessOf(k).cancelSent)
+
+  /// S11 ForceCloseArmedSticky: an armed force-close is never cleared, and
+  /// after expiry no further bytes are accepted from or delivered to the
+  /// peer (latches; the as-built guards keep them false). Expiry only ever
+  /// follows arming. The numeric earliest-deadline-wins half lives in the
+  /// ForceClose fetch_min unit tests, not the model.
+  val s11ForceCloseArmedSticky = and {
+    not(viol.fcDisarmed),
+    not(viol.deliveredAfterExpiry),
+    CONNS.forall(c => conn(c).expired implies conn(c).fcArmed)
+  }
+
+  /// S12 DecideImpliesArmed: whenever a polite disconnect is queued
+  /// (auth-timeout, empty-grace), the force-close is armed at the same
+  /// decision point.
+  val s12DecideImpliesArmed = CONNS.forall(c => conn(c).discQ implies conn(c).fcArmed)
+
+  /// S13 WindowPacedEgress: data handed to russh never exceeds the
+  /// client-granted window plus the bounded handle-queue slot — the
+  /// unbounded pendingData path is never used and the queue stays within
+  /// its depth, so egress buffering is bounded independent of response
+  /// size.
+  val s13WindowPacedEgress = and {
+    CHKEYS.forall(k => chans.get(k).pending == 0),
+    CONNS.forall(c => conn(c).queue <= QUEUE_DEPTH)
+  }
+
+  /// S14 RusshResidueBounded: hidden russh channel-table residue stays
+  /// within the policy bound — any open that would grow it past the bound
+  /// (over-bound or non-session) terminates the connection instead.
+  val s14RusshResidueBounded = CONNS.forall(c => conn(c).residue <= RESIDUE_BOUND)
+
+  /// S15 ReleaseBeforeCloseOut: capacity release (guard drop) precedes the
+  /// close-out sends — a session in its close-out phase never still holds
+  /// its guard, so release never depends on the peer accepting the
+  /// close-out or on the handle queue draining.
+  val s15ReleaseBeforeCloseOut =
+    CHKEYS.forall(k => (sessOf(k).exists and sessOf(k).eg == EgCloseOut) implies not(sessOf(k).guard))
+
+  /// S16 TrackedBuildPolicy (as shipped): a build leaves the tracked set
+  /// only when a terminal outcome was processed or the stream error class
+  /// was non-Wire (the documented trade-off); never merely because the
+  /// session is ending. The strict variant in §6c is the W10 probe.
+  val s16TrackedBuildPolicy =
+    CHKEYS.forall(k => (sessOf(k).everTracked and not(sessOf(k).tracked))
+      implies (sessOf(k).terminal or sessOf(k).nonWireErr))
+
+  /// S17 DrainStageOrder: the shutdown stages advance only in order
+  /// (NOT_SERVING ≺ accept-stop ≺ sessions-done/expiry ≺ cancel ≺ exit)
+  /// and accept-stop terminates no established connection or session.
+  val s17DrainStageOrder = and {
+    not(viol.drainOrderViolated),
+    not(viol.acceptStopKilled)
+  }
+
+  /// S18 ListenerSurvivesAcceptErrors: transient accept errors (EMFILE
+  /// class) never stop the accept loop or the process.
+  val s18ListenerSurvivesAcceptErrors = not(viol.listenerDied)
+
+  /// S19 CloseOutOrder: the close-out attempts exit-status before eof
+  /// before close; delivery is best-effort and bounded by the close-out
+  /// budget (S15/L2 carry the budget half).
+  val s19CloseOutOrder = CHKEYS.forall(k => and {
+    sessOf(k).coEof implies sessOf(k).coStatus,
+    sessOf(k).coClose implies sessOf(k).coEof
+  })
+
+  /// S20 GraceArmedExactlyWhenEmpty: the grace is armed only on an
+  /// authenticated connection with zero live sessions (channel opens are
+  /// not activity), and a live healthy authenticated connection with zero
+  /// live sessions whose grace has not fired has it armed (or mid-check).
+  /// Admission disarms it.
+  val s20GraceArmedExactlyWhenEmpty = CONNS.forall(c => and {
+    (conn(c).grace == GArmed) implies and {
+      conn(c).stage == CAuthed or conn(c).stage == CChanOpen,
+      conn(c).liveSess == 0
+    },
+    and {
+      conn(c).exists, conn(c).live, not(conn(c).herr), not(conn(c).expired), not(conn(c).discQ),
+      conn(c).stage == CAuthed or conn(c).stage == CChanOpen,
+      conn(c).liveSess == 0,
+      conn(c).grace != GFired
+    } implies (conn(c).grace == GArmed or conn(c).grace == GChecked)
+  })
+
+  // -- 6a.3 permissiveness (P1-P6): guards must not fire on legitimate traces --
+
+  /// P1 MuxFanOutAdmitted: a single connection with in-bounds channel count
+  /// gets every exec admitted while global capacity remains — no
+  /// per-connection refusal below the global cap.
+  val p1MuxFanOutAdmitted = not(viol.execRefusedBelowCap)
+
+  /// P2 SurvivesSessionCountZero: a connection whose live-session count
+  /// touches zero is not disconnected before the grace fires.
+  val p2SurvivesSessionCountZero = not(viol.disconnectOnTouchZero)
+
+  /// P3 CapRejectsExecOnly: capacity exhaustion is signaled by exec
+  /// rejection (channel_failure + exit-status) only — never by refusing the
+  /// channel open, never by terminating the connection.
+  val p3CapRejectsExecOnly = not(viol.capRefusedOpenOrConn)
+
+  /// P4 WithinGraceExecSurvives: a connection that admits an exec before
+  /// the grace re-check passes is not disconnected by that grace cycle (the
+  /// post-check admit window is the documented W3 race, carved out — see
+  /// the L5-strict probe).
+  val p4WithinGraceExecSurvives = not(viol.gracePreCheckAdmitKilled)
+
+  /// P5 CompliantPeerNotForceClosed: against a connection whose peer has
+  /// played only legitimate letters, no send/close-out budget fires, no
+  /// keepalive / TCP_USER_TIMEOUT / inactivity reap fires, no force-close
+  /// is armed by a budget site, and no well-formed exec is rejected below
+  /// the global cap. (The empty grace may still fire on an idle compliant
+  /// connection — that is the as-built design, not a wedge response.)
+  val p5CompliantPeerNotForceClosed = and {
+    not(viol.budgetFiredOnCompliant),
+    not(viol.timerReapedCompliant),
+    not(viol.execRefusedBelowCap),
+    CONNS.forall(c => (conn(c).exists and compliant(c)) implies not(conn(c).fcByBudget))
+  }
+
+  /// P6 EstablishedSurviveAcceptStop: stopping the accept loop (drain stage
+  /// 2) terminates no established connection or session before the drain
+  /// window elapses.
+  val p6EstablishedSurviveAcceptStop = not(viol.acceptStopKilled)
+
+  // -- 6a.4 settlement (L1-L8): armed-style state invariants --
+
+  /// L1 ConnReclaimArmed: every connection holding capacity (fd, permit,
+  /// gauge slot, channel state) with no live admitted session has a
+  /// designed reclamation path armed/enabled for its current stage; the
+  /// inactivity backstop is acceptable only where the regime admits the
+  /// letter (fault-degraded — the W7 degraded tier).
+  val l1ConnReclaimArmed =
+    CONNS.forall(c => (conn(c).exists and conn(c).live and conn(c).liveSess == 0)
+      implies reclaimPathArmed(c, true))
+
+  /// L2 SendSettleArmed: every state where a session's output has ended, or
+  /// a send / close-out is pending toward a transport-withholding peer, has
+  /// the capacity already released or a send/close-out budget, an
+  /// enforceable force-close, or the pump's own exit armed for it — release
+  /// never requires a further peer letter (the wedge response).
+  val l2SendSettleArmed = CHKEYS.forall(k =>
+    (sessOf(k).exists and or {
+      sessOf(k).proto == PExited,
+      sessOf(k).eg == EgSendPend and conns.get(k._1).trW,
+      sessOf(k).eg == EgCloseOut
+    }) implies or {
+      not(sessOf(k).guard),
+      sessOf(k).sendBudget,
+      sessOf(k).coBudget,
+      fcEnforceable(k._1),
+      sessOf(k).proto == PExited and (sessOf(k).eg == EgFwd or sessOf(k).eg == EgSendPend)
+    })
+
+  /// L3 PreSessionOccupancyArmed: a session occupied pre-handshake has the
+  /// handshake deadline armed; a session idle between opcodes has the
+  /// opcode-idle deadline armed. Firing exits the occupancy (witness
+  /// pinned).
+  val l3PreSessionOccupancyArmed = CHKEYS.forall(k => and {
+    (sessOf(k).exists and sessOf(k).proto == PHandshaking) implies sessOf(k).hsArmed,
+    (sessOf(k).exists and sessOf(k).proto == PReady) implies sessOf(k).idleArmed
+  })
+
+  /// L4 DrainObligationsArmed (exit-quiescence half): the exit stage is
+  /// reachable only with zero remaining proto tasks and zero remaining
+  /// counted connections / permits. The per-stage "shutdown path enabled
+  /// without further client traffic" half is by construction (the fired
+  /// token enables every proto's observe action) and is pinned by the
+  /// drain named run.
+  val l4DrainObligationsArmed =
+    (srv.phase == SrvExited) implies and {
+      liveProtos == 0,
+      srv.connsActive == 0,
+      srv.connPermits == 0
+    }
+
+  /// L5 GraceNeverKillsLiveSession: the grace disconnect is never taken in
+  /// a state with a live SessionGuard outside the documented post-check
+  /// admit race (the carve-out); the un-carved form is the §6c probe.
+  val l5GraceNeverKillsLiveSession = not(viol.graceKilledLiveSession)
+
+  /// L6 RpcWaitDeadlineArmed: every session in in-opcode-rpc-wait has that
+  /// wait's upstream deadline armed (every unary/store RPC await carries a
+  /// deadline — the F9 surface). Deliberately NOT claimed for
+  /// in-opcode-build-event-wait, which has no deadline by design.
+  val l6RpcWaitDeadlineArmed =
+    CHKEYS.forall(k => (sessOf(k).exists and sessOf(k).proto == POpRpc) implies sessOf(k).rpcDl)
+
+  /// L7 UpstreamStreamReleasedOnExit: once a session's proto-phase has
+  /// exited and its finish/abort has run, the per-build upstream-stream
+  /// bit is cleared — the obligation is discharged by session exit itself,
+  /// with no peer letter (the W10 decision-rule observable).
+  val l7UpstreamStreamReleasedOnExit =
+    CHKEYS.forall(k =>
+      (sessOf(k).exists and sessOf(k).proto == PExited
+        and (sessOf(k).eg == EgDone or sessOf(k).eg == EgAborted))
+      implies not(sessOf(k).streamHeld))
+
+  /// L8 SessionTaskQuiescence: a session whose proto task has exited and
+  /// whose finish phase completed has no session-owned tasks left (the
+  /// GW-11 mux surface). A session whose pump is still unreaped always has
+  /// a finish/reap or self-exit action enabled without any peer letter —
+  /// by construction in the as-built encoding (every non-EgDone egress
+  /// state has one), so the reap omission is what a calibration override
+  /// breaks.
+  val l8SessionTaskQuiescence =
+    CHKEYS.forall(k =>
+      (sessOf(k).exists and sessOf(k).proto == PExited and sessOf(k).eg == EgDone)
+        implies not(sessOf(k).pump))
 
   /// Bounds discipline: every counter stays inside its ceiling (the
   /// ceilings are action preconditions, so this doubles as a check that no
@@ -589,6 +922,105 @@ module gwConnLifecycle {
     srv.sessPermits >= 0, srv.sessPermits <= MAX_SESSIONS,
     srv.connsActive >= 0, srv.chansActive >= 0
   }
+
+  /// The default invariant conjunction the wired regime checks assert
+  /// (Stage C): all 34 design-§3 properties plus the bounds discipline.
+  /// Witnesses (§6b) and the pre-registered strict probes (§6c) are wired
+  /// separately and are NOT part of this conjunction.
+  val allInvariants = and {
+    s1ConnPermitConservation, s2SessionPermitConservation, s3GaugeAccuracy,
+    s4PerConnLiveCount, s5NoSessionOutlivesConnection, s6SingleExecPerChannel,
+    s7ChannelAccounting, s8RejectReleasesCapacity, s9SingleRelease,
+    s10CancelOnSessionEnd, s11ForceCloseArmedSticky, s12DecideImpliesArmed,
+    s13WindowPacedEgress, s14RusshResidueBounded, s15ReleaseBeforeCloseOut,
+    s16TrackedBuildPolicy, s17DrainStageOrder, s18ListenerSurvivesAcceptErrors,
+    s19CloseOutOrder, s20GraceArmedExactlyWhenEmpty,
+    p1MuxFanOutAdmitted, p2SurvivesSessionCountZero, p3CapRejectsExecOnly,
+    p4WithinGraceExecSurvives, p5CompliantPeerNotForceClosed, p6EstablishedSurviveAcceptStop,
+    l1ConnReclaimArmed, l2SendSettleArmed, l3PreSessionOccupancyArmed,
+    l4DrainObligationsArmed, l5GraceNeverKillsLiveSession, l6RpcWaitDeadlineArmed,
+    l7UpstreamStreamReleasedOnExit, l8SessionTaskQuiescence,
+    boundsOK
+  }
+
+  // --- 6b. expect-violation witnesses (non-vacuity probes, design §5) --------
+  // Each is "the interesting state never happens"; a wired witness check
+  // passes only when the checker violates it, re-proving the contended
+  // state is reachable in that regime's explored space.
+
+  /// A stalled response send arms the force-close (C14 / GW-2 surface).
+  val canReachStallArmsForceClose = not(reach.stallFcArmed)
+  /// A server-side session ending releases capacity while the channel is
+  /// still open and the connection still live (W2 / guard-held semantics).
+  val canReachServerSideEndingReleasesEarly = not(reach.releaseWithChannelOpen)
+  /// The empty-connection grace fires on an idle authenticated connection.
+  val canReachGraceFiresOnIdleConn = not(reach.graceFired)
+  /// An exec admitted while the grace was armed disarms it (P4 happy half).
+  val canReachExecWithinGraceSurvives = not(reach.execDisarmedGrace)
+  /// A KEX-parked (or otherwise pre-auth-withholding) connection is
+  /// reclaimed (GW-3/GW-4 surface).
+  val canReachKexParkedReclaimed = not(reach.kexParkedReclaimed)
+  /// A forged/duplicate channel close is ignored (GW-5 surface).
+  val canReachForgedCloseIgnored = not(reach.forgedCloseIgnored)
+  /// An over-bound channel open terminates the connection (S14 surface).
+  val canReachOverBoundOpenTerminates = not(reach.overBoundTerminated)
+  /// A burst of opens reaches the per-connection bound (GW-6 surface).
+  val canReachBurstHitsBound = not(reach.burstHitBound)
+  /// A session-cap exec rejection occurs while the channel open succeeded
+  /// (P3 / GW-18 surface).
+  val canReachSessionCapExecRejected = not(reach.capExecRejected)
+  /// An over-cap connection reaches its first auth callback permit-less and
+  /// is torn down (S1 cap clause / GW-12; cap regime).
+  val canReachOverCapAuthTorn = not(reach.overCapAuthTorn)
+  /// A drain-expiry shutdown-token cancel fires on a tracked build (L4/S17).
+  val canReachDrainExpiryCancel = not(reach.drainCancelFired)
+  /// A connection touches zero live sessions and execs again (P1/P2 mux).
+  val canReachMuxTouchZeroThenExec = not(reach.muxReExec)
+  /// A session reaches tasks==0 while a sibling session on the same
+  /// connection stays live (L8 / GW-11 mux surface).
+  val canReachMuxSiblingQuiescence = not(reach.muxSiblingQuiesced)
+  /// A half-open vanish is reclaimed by a designed transport-reap letter
+  /// (W5 occupancy bound).
+  val canReachVanishReclaimedDesigned = not(reach.vanishReclaimedDesigned)
+  /// A parked-write connection is reclaimed via the inactivity letter (the
+  /// W7 degraded tier; fault-degraded regime only).
+  val canReachParkedReclaimedByInactivity = not(reach.parkedReclaimedByInactivity)
+  /// A non-Wire stream error removes a tracked build (S16 shipped policy).
+  val canReachNonWireRemovesTracked = not(reach.nonWireRemoved)
+  /// A close-out completes in order (exit-status, eof, close — S19).
+  val canReachCloseOutCompletesInOrder = not(reach.closeOutOrdered)
+
+  // --- 6c. pre-registered expected as-built falsifications (design §3/§4/§6) -
+  // Named probes, NOT in allInvariants. Stage C wires each as an
+  // expect-violation check in the regime named by the invariant map; a
+  // probe that stops falsifying means the model (or the code) moved.
+
+  /// L1 without the inactivity disjunct: expected to falsify only in
+  /// fault-degraded (the W7 ~1 h degraded tier — a parked write whose
+  /// force-close was armed after the park, with TCP_USER_TIMEOUT
+  /// unavailable, is reclaimed by nothing but the inactivity backstop).
+  val l1StrictNoInactivity =
+    CONNS.forall(c => (conn(c).exists and conn(c).live and conn(c).liveSess == 0)
+      implies reclaimPathArmed(c, false))
+
+  /// S16 strict variant (the W10 probe): a build leaves the tracked set
+  /// only on a processed terminal outcome. Expected to falsify on the
+  /// non-Wire removal trace (fault-upstream) — the orphan-watcher-bounded
+  /// leak the owner signs off on.
+  val s16StrictTerminalOnly =
+    CHKEYS.forall(k => (sessOf(k).everTracked and not(sessOf(k).tracked)) implies sessOf(k).terminal)
+
+  /// S10 strict variant: a CancelBuild attempt on every exit including the
+  /// panic path. Expected to falsify in fault-degraded (the panic letter);
+  /// the scheduler orphan watcher is the named backstop assumption.
+  val s10StrictIncludingPanic =
+    CHKEYS.forall(k => (sessOf(k).exists and sessOf(k).proto == PExited and sessOf(k).tracked)
+      implies sessOf(k).cancelSent)
+
+  /// L5 without the P4 carve-out: the grace never fires with a live
+  /// SessionGuard at all. Expected to falsify in base (the documented
+  /// post-check admit race, W3).
+  val l5StrictNoCarveOut = not(reach.graceFiredWithLiveSession)
 
   // --- 7. actions ------------------------------------------------------------
 
@@ -962,19 +1394,21 @@ module gwConnLifecycle {
   }
 
   /// The opcode idle timeout fires (600 s class): only between opcodes,
-  /// only against a peer that is withholding the next opcode (§2d).
+  /// never against a compliant peer (its next-opcode letter completes
+  /// first, §2d).
   action fireOpcodeIdle(c: str, i: int): bool = all {
     sessAt(c, i).exists, sessAt(c, i).proto == PReady, sessAt(c, i).idleArmed,
-    conn(c).occW,
+    not(compliant(c)),
     chans' = chans.set((c, i), { ...chanAt(c, i), sess: protoExit(sessAt(c, i), RIdle) }),
     conns' = conns, srv' = srv, viol' = viol, reach' = reach
   }
 
   /// The protocol handshake timeout fires (30 s class): only pre-handshake,
-  /// only against a peer withholding the handshake (§2d).
+  /// never against a compliant peer (its handshake letter completes first,
+  /// §2d).
   action fireHandshakeTimeout(c: str, i: int): bool = all {
     sessAt(c, i).exists, sessAt(c, i).proto == PHandshaking, sessAt(c, i).hsArmed,
-    conn(c).occW,
+    not(compliant(c)),
     chans' = chans.set((c, i), { ...chanAt(c, i), sess: protoExit(sessAt(c, i), RHandshakeFail) }),
     conns' = conns, srv' = srv, viol' = viol, reach' = reach
   }
@@ -1316,11 +1750,11 @@ module gwConnLifecycle {
 
   /// Pre-auth deadline, phase 1 (no SSH transport yet): the select drops
   /// the connection future silently — permit and fd released, the gauge was
-  /// never incremented (no auth callback fired). Enabled only against an
-  /// occupancy-withholding peer (§2d).
+  /// never incremented (no auth callback fired). Never fires against a
+  /// compliant peer (its banner/auth letters complete first, §2d).
   action firePreAuthPhase1(c: str): bool = all {
     conn(c).exists, conn(c).live, conn(c).preAuth == PaArmed,
-    not(conn(c).banner), conn(c).occW,
+    not(conn(c).banner), not(compliant(c)),
     conns' = conns.set(c, { ...connOnDrop(conn(c)), preAuth: PaFired }),
     chans' = CHKEYS.mapBy(k => if (k._1 == c) chanOnConnDrop(chans.get(k)) else chans.get(k)),
     srv' = { ...srv,
@@ -1339,7 +1773,7 @@ module gwConnLifecycle {
   action firePreAuthPhase2(c: str): bool = all {
     conn(c).exists, conn(c).live, conn(c).preAuth == PaArmed,
     conn(c).banner, conn(c).stage != CAuthed, conn(c).stage != CChanOpen,
-    conn(c).occW, not(conn(c).expired),
+    not(compliant(c)), not(conn(c).expired),
     conns' = conns.set(c, { ...conn(c), preAuth: PaFired, discQ: true, fcArmed: true }),
     chans' = chans, srv' = srv, viol' = viol, reach' = reach
   }
