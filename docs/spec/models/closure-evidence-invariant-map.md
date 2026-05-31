@@ -28,7 +28,9 @@ applied and the C3 probe re-pointed to the faithful two-build scope; the
 REAL as-built finding, the second Phase-1 candidate; and the 0d
 "TLC-backend discrepancy" stop-and-report item is re-diagnosed as a
 budget/metric issue, not a tool bug — no exhaustive verdict is
-downgraded. Phase 1 in progress: Wave 1 (the C3+D16 settlement, red-first)
+downgraded. **Phase 1 complete** (the per-wave stage records and the
+Phase-1 close-out are the last sections of this map): Wave 1 (the C3+D16
+settlement, red-first)
 is landed — `sched.evidence.settlement` is covered and the C3 wrongful
 fail-fast class is closed at all three call sites; Wave 2 corrected the
 model's recovery-condemnation encoding (review finding RT-2) and REFUTED
@@ -48,8 +50,11 @@ expect-violation calibration pin (closure-c3-no-reprobe /
 closure-a17-unfenced) that keeps the falsification direction permanently
 checkable; the A17/L2 wiring satisfies owner decision 4, the `longChecks`
 GHA-exclusion mechanism plus the measured manual-target table satisfies
-owner decision 3. See the Phase-1 Wave-2/2b/3/4 stage records (the last
-sections).**
+owner decision 3; Wave 5 (close-out) records the final dispositions, the
+acceptance-table deltas, the deployment-checklist deltas, and the
+owner-decision provenance. See the Phase-1 Wave-2/2b/3/4 stage records
+and the Phase-1 close-out (the last sections). Phase 2 (full-corpus
+acceptance table, counter-signatures) remains open.**
 
 ## Phase 0a spec-audit record
 
@@ -2136,5 +2141,172 @@ every wired check are in the introducing commits.
 6. The 0c carry-overs — unchanged: the design-scale regimes (§5 pre-exclusion) and the
    C1-strict probe.
 
-Later phases append here (Wave 5 / close-out: acceptance table over the full corpus,
-deployment-checklist deltas and counter-signatures).
+## Phase-1 close-out — defect dispositions, deployment deltas, Phase-2 handoff (Wave 5)
+
+Phase 1 of the closure-evidence campaign is complete: 18 commits on the `ce-phase1`
+worktree (Waves 1, 2, 2b, 3, 4 and this close-out), red-first at every production
+behavior change, every commit boundary green for clippy (stable) / rio-scheduler
+nextest / tracey-validate / treefmt / the wired quint battery. The branch is handed to
+integration only behind a green full gate (`/nixbuild --checks`); the gate run record
+and the rebase-onto-`formal-sprint` notes live with the orchestrator. The campaign's
+defect classes are fixed or refuted-with-record; the model, the wired checks and the
+spec rules now describe the FIXED system; and every flip is paired with a permanent
+expect-violation pin so each pre-fix defect class stays re-discoverable by CI.
+
+### Defect dispositions (final)
+
+| Defect | Found | Final disposition | Commits |
+|---|---|---|---|
+| **C3** — wrongful terminal failure on a stale walk verdict (`noWrongfulTerminalFailureSingleTenure`) | 0c model trace; adjudicated CONFIRMED as-built at 0d (two-build variant) | **FIXED red-first, Wave 1** — the settlement re-probe at all three production fail-fast sites (the dispatch-probe partition, the `handle_substitute_complete` Broken arm, the reap-survivor hook); spec amended to `sched.merge.substitute-topdown+12`. **Model flip HOLDS, Wave 4** (BaseEx + Duo at the retired probe's exact scope and budget). | `7c2d8ea31`, `2351a35ba`, `7b4a2e2d2`, `ae615fc49` (production + spec); `7e776cb0f` (model flip + wiring) |
+| **D16** — present-but-tried limbo cell | A1/A2 design window; settlement obligation owner-adopted 2026-05-29 | **FIXED, Wave 1** under the adopted obligation — `sched.evidence.settlement` implemented at the dispatch-probe partition (the same settlement decision as C3); the rule left `tracey query uncovered` at Wave 1 and stays covered (impl + verify). The L2 armed form + the now-demonstrable D16-cell witness are the model-side proof (Wave 4). | `7c2d8ea31`, `ae615fc49`; `7e776cb0f` (L2 armed form + `witness-d16-cell`) |
+| **L3** — failover + ClearPoison strands a parent under a live build | post-0d triage (the FailoverEx conjunction violation) | **REFUTED as a production defect, Wave 2** — a model artifact of the recovery-condemnation faithfulness gap (review finding RT-2): the corrected model cannot reach the strand (re-hunt explored ~9.4× the violation's coordinates with no violation, while the same setup re-finds it on the pre-correction model in 8 minutes), and the production code walk closes every path to the strand state. No production fix was needed for L3 as premised. | `55dd15105` |
+| **L3-residual** — production's unscoped recovery condemnation (the C3-class wrongful failure at the recovery decision point that the L3 refutation exposed; spec-vs-code divergence against `sched.recovery.failed-dep-cascade+2`) | Wave-2 stage record §5 | **FIXED red-first, Wave 2b** (owner disposition (b), 2026-05-30) — co-ownership scoping of the in-DAG recompute AND poison-clear survivor re-evaluation, both halves together; new rule `sched.poison.clear-survivor-reevaluation`. The red half (scoping without promotion) re-finds the 9-state strand under TLC — the recorded proof the pairing is load-bearing. | `7750a4d45` (production + spec), `e56a1b73c` (model) |
+| **D14/D15** — the deposed-believer evidence-write windows (entry-time gates only; no SQL fence on any evidence write) | A1 inventory HIGH findings; FENCE EVERYTHING owner-ratified 2026-05-30 | **CLOSED, Wave 3** — uniform claims-floor fence on every production evidence write (10 statements + the merge transaction + 8 owning transactions; tenure-tracking `serving_generation` capture; no migration); `sched.evidence.durability+2` makes the fence normative. **The A17/A18 model flips prove it, Wave 4**: both HOLD post-fence, and the `a17-unfenced` pin re-finds the pre-fence violation in <2 s. | `498db7410`, `889a575e6`, `55a1fa6cb`, `865b85dbe`, `26ad50144`, `c47de3ccc` (production + spec); `f004ca600` (model flips + wiring) |
+
+D17 (the in-memory-only Substituting reset) keeps its Phase-0 accepted-with-rationale
+disposition — no Phase-1 change.
+
+### Property-table final state
+
+Properties that flipped to HOLDS during Phase 1 (none of these held pre-fix), each with
+its permanent falsifiability pin:
+
+| Property | Pre-Phase-1 | Post-Phase-1 | Permanent pin |
+|---|---|---|---|
+| C3 `noWrongfulTerminalFailureSingleTenure` | VIOLATED as-built (wired expect-violation probe) | HOLDS (BaseEx 50 K, Duo 5 M×14); back in `asBuiltHoldInvariants`/`allInvariants`; wired `quint-closure-evidence-settlement-holds` | `quint-closure-calib-c3-no-reprobe` |
+| L2 `markedBrokenSettlementArmed` (armed form) | 0b state form never producible; probe deferred at 0c | HOLDS (Duo, C3Duo); wired via the same settlement-holds check; the cell's reachability is `quint-closure-evidence-witness-d16-cell` | same pin (`markedBrokenSettlementArmedPreFix` falsifies under the override) |
+| A17 `noStaleTenureClearOverride` | Expect-fail probe, never produced (deferred at 0c) | HOLDS (StaleDuo); wired `quint-closure-evidence-stale-fence-holds` | `quint-closure-calib-a17-unfenced` |
+| A18 `leaderClassEvidenceWrites` | VIOLATED as-built (wired expect-violation probe) | HOLDS (StaleDuo 2 M×15); wired via the same stale-fence-holds check | same pin |
+| L3 `liveBuildTerminalOrProgressArmed` | VIOLATED in the 0d model (FailoverEx) | No violation under the Wave-2-corrected + Wave-2b-scoped model (both backends; 21–24 M-state TLC prefixes); the survivor-promotion pairing is owned by `sched.poison.clear-survivor-reevaluation` | not a wired pin — the strand class needs TLC depth; the Wave-2b red half (scoping without promotion) is the recorded falsification setup |
+
+Every other Group A/B/C/L row keeps its 0c verdict (no Phase-1 change was needed; the
+full battery re-validated green at every model edit — Waves 2, 2b, 4). The witness set
+is 19 named predicates, all reachable: `canReachStaleIntentApply` is retired
+(unreachable post-fence, by design — replaced by `canReachFencedDiscard`), and
+`canReachD16Cell` / `canReachVerificationWalkConsumed` are the two Phase-1 additions.
+
+### Wired-check inventory: 25 → 29 (all Tier 1 / GHA-swept)
+
+Three checks removed (each replaced in the same commit as the flip that made it
+obsolete), seven added; the full delta table is the Wave-4 stage record §6:
+
+- REMOVED: the C3 expect-violation probe (`probe-wrongful-terminal-failure`), the A18
+  expect-violation probe (`probe-stale-evidence-write`), the stale-intent-apply witness
+  (its flag is unreachable post-fence).
+- ADDED: two holdsInSim checks (`settlement-holds`, `stale-fence-holds` — the decision-4
+  C3/L2/A17/A18 wiring), two expect-violation regression pins (`calib-c3-no-reprobe`,
+  `calib-a17-unfenced`), three witnesses (`witness-d16-cell`,
+  `witness-verification-walk`, `witness-fenced-discard`).
+- Harness additions: `mkQuintSimHoldsCheck` (every instance must name its
+  falsifiability pin), the optional `workers` argument (worker-count pinning for any
+  future wired TLC check), and the `longChecks` Tier-2 exclusion mechanism.
+
+### Exhaustive coverage — the honest statement
+
+**No exhaustive conjunction converges at the raised budget.** All seven post-fix
+conjunctions (BaseEx, FailoverEx, FaultPersistEx, Duo, C3Duo, StaleDuo,
+AdversarialStoreEx) were measured at 35 minutes / 60 TLC workers / 48 G heap on the
+192-core reference builder (Wave-4 stage record §5): every run stops unconverged at the
+cap with **zero violations** over prefixes of 0.9 M – 31.5 M distinct states, each
+strictly larger than the prefix where its scope's pre-fix violation (if any) was found.
+The five design-scale regimes stay pre-excluded on the recorded 0b/0c evidence (review
+finding SD-4). Stated plainly:
+
+- The campaign's exhaustive evidence is **bounded-prefix, not converged** — "no
+  violation found within N states", never "property proved over the scope".
+- All seven conjunctions are **documented manual targets**: command shapes in the
+  `nix/quint.nix` closure-evidence section comments, recorded coordinates in the Wave-4
+  measurement table, deployment-time runbook in checklist row CE-D6 below.
+- The `longChecks` Tier-2 mechanism (owner decision 3's wiring) **exists, is verified
+  end-to-end, and ships with an empty list** — empty by physics, not by omission:
+  nothing fits the 5–30-minute convergence window. A future conjunction that converges
+  (smaller scope, better reduction, bigger budget class) wires in by adding one name to
+  one list.
+
+### Acceptance-table deltas (the 0d rows Phase 1 changes)
+
+The Phase-0d acceptance table is a historical record and is not edited in place; these
+deltas supersede the named rows:
+
+| 0d row | 0d verdict | Phase-1 delta |
+|---|---|---|
+| C-group | "C3 is the confirmed as-built finding (cannot serve as a calibration baseline; Phase-1 fix candidate)" | C3 is **fixed and verified**: red tests at three sites (Wave 1, `7c2d8ea31`/`2351a35ba`/`7b4a2e2d2`), model HOLDS (Wave 4, `7e776cb0f`), regression-pinned by `quint-closure-calib-c3-no-reprobe`. C3 now also serves as a calibration baseline (the pin's baseline run holds C3 at 2 M samples). C1/C2/C4 unchanged; C5 deferral unchanged (Phase 2). |
+| F9 (hole stamping on poison-clear) | MET (re-routed rep) | **Phase-1 interaction re-validated**: Wave 2b (`7750a4d45`/`e56a1b73c`) adds the survivor-promotion arm to production poison-clear and the model `poisonClear`; `quint-closure-calib-f9-poison-clear-no-stamp` stays green and its falsification stays attributable (re-validated after Waves 2, 2b, and 4). |
+| F14 (recovery / Substituting) | MET (re-routed shape) | **Phase-1 interaction re-validated**: Waves 2/2b (`55dd15105`/`e56a1b73c`) change the model `recoverAsLeader` condemnation arms; the f14 evidence module still falsifies L1 (Wave-4 T-4.4: TLC, 15 s) and calib-f8 (which consumes production `recoverAsLeader`) stays green at every model edit. |
+| F11 (leader gating / stale tenure) | MET by regime comparison (A18 falsified on the rust simulator only; the TLC-backend discrepancy kept it un-wired) | **Superseded by the Wave-3/4 fence work**: the falsification direction is now permanently wired (`quint-closure-calib-a17-unfenced`, expect-violation, <2 s) and the production direction HOLDS as a wired check (`quint-closure-evidence-stale-fence-holds`, `f004ca600`). The F11 evidence no longer rests on an unwired simulator record. |
+
+Every other family row (F1–F8, F10, F12, F13, F15–F17) is unchanged by Phase 1; their
+representatives were re-validated against the post-fix model in the Wave-4 T-4.4 sweep
+(every falsification still falsifies, every baseline still holds).
+
+### Deployment-checklist deltas (the operator handoff for the one-time deployment)
+
+The closure-evidence rows handed to the deployment-time checklist (the house D0–D7
+pattern; CE-D1…CE-D6 are new or changed by Phase 1, CE-D7…CE-D9 are Phase-0 residuals
+carried unchanged):
+
+| ID | Item | What changes / what to do | Source |
+|---|---|---|---|
+| CE-D1 | **Fenced-write metric semantics + the leader alert** | `rio_scheduler_evidence_write_fenced_total` counts evidence writes refused by the claims-floor fence. On a replica that just lost the lease, nonzero during failover IS the fence working — deposed-leader evidence writes are now no-ops (pre-Phase-1 they landed; that was the D14/D15 window). On the CURRENT leader it must be ZERO: **alert on any sustained nonzero rate on the leader** (it means a capture bug or a PG floor regression). | Wave 3 |
+| CE-D2 | **Failover-time PG-flap alerts** | `rio_scheduler_generation_claim_failed_total` and `rio_scheduler_generation_floor_read_failed_total`: sustained nonzero means PG is flapping exactly at failover time and the affected term serves unclaimed — the deposed-before-persist collision window re-opens for that term. Alert and investigate PG availability at failover. | Wave 3 |
+| CE-D3 | **Merge `FAILED_PRECONDITION` during failover** | A SubmitBuild merge racing a failover can now surface gRPC `FAILED_PRECONDITION` (`StaleGeneration`) instead of silently landing the deposed leader's merge. Guidance: re-submit against the current leader (the normal client retry path); this is the fence refusing a stale-tenure write, not a data fault. | Wave 3 |
+| CE-D4 | **The wrongful-fail-fast class is gone; resubmit guidance changes** | Pre-Phase-1, a build could terminally fail with the resubmit-directing error while its wanted outputs were present or substitutable (the C3 class). Post-Phase-1, every fail-fast decision point re-probes live obtainability first, so a fail-fast now means a CONFIRMED missing-and-unsubstitutable output or a failed verification walk. Resubmit-after-fail-fast is no longer "try again, it may have been spurious": without an upstream/store change, a resubmitted build reaches the same (now genuine) verdict. Residual (FC-7): wrongful failures are bounded to ≤1 per (node, arming) and eliminated only in the no-failover / no-store-fault / no-withdrawal envelope; the verdict is per-node (a node with genuinely unobtainable wanted outputs still fails every interested build). | Wave 1 |
+| CE-D5 | **Poison-clear wakes spared parents** | Admin ClearPoison and the poison-TTL sweep now re-evaluate surviving parents (promotion / settlement) instead of leaving them parked, and recovery condemnation is co-ownership-scoped (a build no longer fails at recovery because ANOTHER build's poisoned child sits under its parent). Operationally: clearing a poison can immediately dispatch waiting work — expect build progress after a clear, not just state cleanup. | Wave 2b |
+| CE-D6 | **Manual-target runbook (pre-deployment formal sweep)** | Before the one-time deployment — and after any future change to scheduler evidence handling — run the seven exhaustive conjunctions manually at the largest affordable budget: `quint verify --backend=tlc --main=closureEvidence<Scope> --invariant=asBuiltHoldInvariants docs/spec/models/closureEvidence.qnt` for Scope ∈ {BaseEx, FailoverEx, FaultPersistEx, Duo, C3Duo}; AdversarialStoreEx uses `asBuiltHoldInvariantsAdversarialStore`; StaleDuo uses the A17+A18 invariant pair. TLC workers sized to the host. The Wave-4 §5 coordinates (35 min / 60 workers) are the floor to beat; zero violations at-or-past those coordinates is the deployment-time formal posture. | Wave 4 |
+| CE-D7 | KEEP: the AW1 lost-hole-stamp ∩ builds-row-purge bound | Unchanged Phase-0 accepted bound. | 0c |
+| CE-D8 | KEEP: the GC-after-vouch bounds | Unchanged (B2-strong stays an expect-violation probe; pin-at-vouch is deferred to the A3 substitution replacement design). | 0c |
+| CE-D9 | KEEP: the D10 expired-at-load poison residual | Unchanged. | 0a |
+
+### Owner-decision provenance
+
+Every owner decision this campaign executed under, with date and Phase-1 outcome:
+
+| Date | Decision (owner) | Phase-1 outcome |
+|---|---|---|
+| 2026-05-29 (design checkpoint) | D16 settlement obligation ADOPTED (normative MUST at 0a, red-first fix in Phase 1); fencing decision deferred until post-0c evidence; GC-after-vouch accepted as a known bound; calibration target = the formal-sprint tip | `sched.evidence.settlement` added at 0a (intentionally uncovered); FIXED Wave 1; covered (impl + verify) since. |
+| 2026-05-30 (Phase-0 checkpoint, decision 1) | Fix BOTH C3 and L3, red-first, model traces as oracles | C3: FIXED Wave 1. L3: the oracle itself was found defective (review finding RT-2), so Wave 2 repaired the model first; the re-derivation REFUTED L3 as premised, and the refuted premise went back to the owner instead of being silently re-scoped — the oracle-discipline reading of decision 1. The residual it exposed became the Wave-2b fix (next row). |
+| 2026-05-30 (Wave-2b checkpoint) | The Wave-2 residual finding takes disposition (b): spec-conformance fix, both halves together (co-ownership scoping AND poison-clear survivor re-evaluation) | FIXED Wave 2b red-first; new rule `sched.poison.clear-survivor-reevaluation`; the red-half TLC run (scoping without promotion re-finds the strand) is the recorded proof the halves are jointly load-bearing. |
+| 2026-05-30 (Phase-0 checkpoint, decision 2) | FENCE EVERYTHING — uniform claims-floor on every evidence write (~10 statements), not just the merge tx + W2/W5 | Implemented Wave 3: 10 statements + the merge tx + 8 owning transactions (the execution found 5 more owning transactions than the plan's enumeration — the Phase-1b failure-classification handlers; identical fence pattern). A17/A18 flipped to HOLDS, Wave 4. |
+| 2026-05-30 (Phase-0 checkpoint, decision 3) | RAISE THE MERGE-GATE BUDGET — 15–30 min checks allowed; wire every exhaustive conjunction that converges at 30 min; the rest stay documented manual targets | **The "wire every converging conjunction" set is empty — by physics, not by omission.** All seven candidates were measured at 35 min / 60 workers; none converges (Wave-4 §5). The pre-registered contingency (adjudication OQ6) applied: the `longChecks` Tier-2 mechanism is implemented, verified end-to-end, and ships empty; all seven conjunctions are documented manual targets with zero-violation bounded-prefix records. The owner counter-signs this as the accepted decision-3 residual, or commissions the Track E bare-metal formal-long lane. |
+| 2026-05-30 (Phase-0 checkpoint, decision 4) | A17 and L2 MUST be wired CI checks before close-out (long-budget TLC, or the rust-simulator constructor) | Delivered Wave 4 via the rust-simulator route the decision's text authorizes: holdsInSim + expect-violation-pin pairs (`stale-fence-holds` + `calib-a17-unfenced` for A17/A18; `settlement-holds` + `calib-c3-no-reprobe` for C3/L2). **L2 is wired in the ARMED form** — an orchestrator call within decision-4 intent (the 0b state form is unsatisfiable under the owner's own chosen fix design — findings RT-3/MCI-1/FC-3); flagged for owner counter-signature. |
+
+Orchestrator calls made within owner-decision intent, flagged for counter-signature at
+the Phase-2 / campaign close-out: (1) the L2 armed form (above); (2) the Wave-1 battery
+enumeration correction (8 tests / 9 cases updated vs the plan's 5, all sharing the
+pre-fix-pinning signature); (3) the Wave-3 fence enumeration correction (+5 owning
+transactions); (4) the Wave-4 C3-pin scope deviation (Duo constants instead of C3Duo,
+on measured hit rates).
+
+### What Phase 1 does NOT claim
+
+- **No serializability proof.** The fence narrows the deposed-believer window to one
+  floor-read-to-commit round trip per write (the merge transaction via its
+  commit-adjacent re-read); it does not eliminate the window.
+- **No exhaustive convergence** (above): every TLC "no violation" is bounded-prefix
+  evidence; the wired holds checks are bounded random simulation.
+- **The status/poison fence has no model coverage** (those writes are not modeled as
+  intents — ENC-0b-2); its verification is the Wave-3 db test pairs plus the actor-level
+  deposed-actor test.
+- **Walk-completion consumption is not fenced** (not a PG evidence write; model-covered
+  residual — `canReachCrossTenureWalkConsume` stays reachable by design), and the
+  documented Lease-deletion + PG-fault conjunction stands.
+- **No VM scenario exercises the closure-evidence lifecycle** (the A0 coverage gap is
+  unchanged); Phase-1 verification is unit/db/actor tests + the model + the wired
+  sim/TLC checks.
+- **Phase 2 is not done** — see the handoff below.
+
+### Phase-2 handoff (the open items)
+
+1. The C5 / CE-7 deferred manual target (0d).
+2. The F6 falsifications resting on the rust-simulator backend (0d).
+3. The CE-45 (F10) evidence-module-only falsification (0d; re-validated Wave 4).
+4. The Tier-3 manual-target posture — the decision-3 residual: owner counter-signature,
+   or a Track E bare-metal formal-long lane.
+5. The trailing structural evidence modules (CE-18, CE-25, CE-31, CE-40, CE-43) and the
+   full-corpus acceptance table.
+6. The design-scale regime conjunctions (the SD-4 pre-exclusion) and the C1-strict
+   probe.
+7. Campaign counter-signatures (the executor / gw-session close-out workflow pattern)
+   over this map's records.
+
+Phase 2 appends here.

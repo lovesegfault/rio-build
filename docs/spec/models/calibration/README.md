@@ -7,10 +7,16 @@ have no file), one file per fix family of the refcount corpus
 (`refcount-*.qnt` over `chunkLiveness.qnt` / `chunkCollect.qnt`), one
 file per fix family of the gateway connection-lifecycle corpus
 (`gw-f*.qnt` over `gwConnLifecycle.qnt`), one file per fix family of
-the closure-evidence corpus (`closure-*.qnt` over `closureEvidence.qnt`,
+the closure-evidence corpus (`closure-f*.qnt` over `closureEvidence.qnt`,
 the F1–F14 representatives of the closure-evidence-formal Phase 0d
 gate; the families whose members are NOT-ENCODED — F15/F16/F17 — have
-no file), and — the executor-lifecycle campaign — the single
+no file; the closure-evidence corpus additionally carries two Phase-1
+fix regression pins, `closure-c3-no-reprobe.qnt` and
+`closure-a17-unfenced.qnt`, which freeze the PRE-Phase-1-fix production
+actions — the settlement-less fail-fast and the unfenced PG apply —
+rather than a historical origin/main fix, so the wired expect-violation
+checks over them keep the fixed defect classes permanently
+re-discoverable), and — the executor-lifecycle campaign — the single
 re-encoded pull-era
 override (`executor-f4-pull-establish-early.qnt`, over the re-targeted
 live `executorSession.qnt` rather than a frozen as-built encoding). The
