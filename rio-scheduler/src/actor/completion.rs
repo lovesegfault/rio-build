@@ -9,7 +9,9 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use crate::db::attempts::AttemptRow;
-use crate::state::{DerivationStatus, DrvHash, ExecutorId, OutcomeClass, ReportingParty};
+use crate::state::{
+    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, OutcomeClass, ReportingParty,
+};
 
 use super::DagActor;
 
@@ -1963,7 +1965,14 @@ impl DagActor {
                 );
                 for build_id in interested {
                     self.events.emit(build_id, event.clone());
-                    if let Some(b) = self.builds.get_mut(&build_id) {
+                    // r[impl sched.build.terminal-status-settled]
+                    // A resident terminal build's served accounting is
+                    // frozen — the per-drv DerivationCached event above
+                    // still flows, but its cached_derivations count must
+                    // not drift after the terminal transition.
+                    if let Some(b) = self.builds.get_mut(&build_id)
+                        && !b.state().is_terminal()
+                    {
                         b.cached_count += 1;
                     }
                 }
@@ -2298,10 +2307,14 @@ impl DagActor {
             // fresh — root priority dropped when this drv went
             // terminal) and BEFORE check_build_completion (which may
             // emit BuildCompleted; a final Progress showing 0
-            // remaining is still useful right before that).
+            // remaining is still useful right before that) — so a build
+            // completing on THIS fan-out is still non-terminal here and
+            // gets its final Progress; only builds that were ALREADY
+            // terminal (resident shared-node interest) are skipped by
+            // the wrapper's freeze.
             // _with bypasses debounce: completion always carries
             // user-visible state change, and the scan is already paid.
-            self.events.emit_progress_with(build_id, &summary);
+            self.emit_progress_with(build_id, &summary);
             // r[impl gw.activity.progress-before-stop]
             // Per-drv terminal event AFTER Progress: nom marks an
             // actBuild ✔ only when Progress.done increments while the
@@ -2487,9 +2500,13 @@ impl DagActor {
             // doesn't go through release_downstream, so this is
             // emitted inline (cost: one extra build_summary scan per
             // failure — rare, and handle_derivation_failure recomputes
-            // it anyway after cascade mutates the DAG).
+            // it anyway after cascade mutates the DAG). This runs
+            // BEFORE handle_derivation_failure flips a !keep_going
+            // build terminal, so a build failing on THIS event still
+            // gets its final Progress; already-terminal resident builds
+            // are skipped by the wrapper's freeze.
             let summary = self.dag.build_summary(*build_id);
-            self.events.emit_progress_with(*build_id, &summary);
+            self.emit_progress_with(*build_id, &summary);
             self.events.emit(
                 *build_id,
                 rio_proto::types::build_event::Event::Derivation(
@@ -3735,6 +3752,21 @@ impl DagActor {
     }
 
     pub(super) async fn handle_derivation_failure(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
+        // r[impl sched.build.terminal-status-settled]
+        // A build that already reached a terminal state keeps its
+        // settled outcome: a shared node failing later (re-dispatched by
+        // another build during the cleanup window) must not rewrite this
+        // build's error_summary/failed_derivation, re-persist its counts
+        // from the mutated DAG, or re-run its failure handling. Interest
+        // cleanup for resident terminal builds is owned by
+        // handle_cleanup_terminal_build.
+        if self
+            .builds
+            .get(&build_id)
+            .is_some_and(|b| b.state().is_terminal())
+        {
+            return;
+        }
         // Sync counts from DAG ground truth. The cascade may have transitioned
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id).await;

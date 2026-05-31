@@ -154,6 +154,17 @@ impl BuildEventBus {
         // replay → events 42..100 lost). Reuse the last persisted seq
         // for these; the gateway tracker (build.rs) overwrites, so
         // monotonicity is preserved.
+        //
+        // TODO: if you are changing this seq-reuse rule (or the persist
+        // filter / replay / dedup machinery around it) to fix a replay
+        // bug, consult the build-event-sourcing rescope memo (C4,
+        // 2026-05-31) first. The WatchBuild resumability layer — this
+        // sequencing rule, the event-log persister, and the
+        // since_sequence replay — is retired-pending-trigger: a
+        // recurrence of a resumability-layer defect is that memo's
+        // re-open trigger #1, and the recorded disposition is to DELETE
+        // the layer in favor of snapshot-on-reconnect (the memo's §4.5
+        // work item) rather than repair it in place.
         let display_only = matches!(event, Event::SubstituteProgress(_));
         let seq = if display_only {
             self.sequences.get(&build_id).copied().unwrap_or(0)
@@ -218,6 +229,12 @@ impl BuildEventBus {
     /// Emit a `BuildProgress` from a precomputed summary, marking the
     /// debounce timestamp. Bypasses [`progress_debounced`] — the caller
     /// paid for the O(dag_nodes) scan, so emit unconditionally.
+    ///
+    /// Callers inside [`DagActor`] must go through
+    /// [`DagActor::emit_progress_with`], which adds the terminal-build
+    /// freeze (`sched.build.terminal-status-settled`); this bus-level
+    /// emitter cannot see `DagActor::builds` and emits whatever it is
+    /// handed.
     pub(super) fn emit_progress_with(
         &mut self,
         build_id: Uuid,
@@ -255,6 +272,17 @@ impl DagActor {
     /// dumb — no stateful reconstruction from the DerivationEvent
     /// stream.
     pub(super) fn emit_progress(&mut self, build_id: Uuid) {
+        // r[impl sched.build.terminal-status-settled]
+        // A terminal build's served progress is settled at its terminal
+        // transition: shared-node fan-outs (release_downstream,
+        // dispatch-time store hits, failure cascades) can still reach a
+        // resident terminal build during the cleanup window, and a
+        // post-`BuildCompleted` Progress recomputed from the mutating
+        // DAG would be sequenced, persisted to the event log, and
+        // replayed after the terminal event with shrunk totals.
+        if self.build_progress_frozen(build_id) {
+            return;
+        }
         // I-140: debounce. Progress is dashboard-only; `build_summary`
         // is O(dag_nodes). At 153k nodes that's ~60ms (debug) / ~15ms
         // (release) per call. Calling per-assign + per-complete +
@@ -269,6 +297,37 @@ impl DagActor {
         }
         let summary = self.dag.build_summary(build_id);
         self.events.emit_progress_with(build_id, &summary);
+    }
+
+    /// Whether `BuildProgress` emission for this build is frozen because
+    /// the build already reached a terminal state
+    /// (`sched.build.terminal-status-settled`). Terminal builds stay
+    /// resident — and in shared nodes' `interested_builds` — for the
+    /// terminal-cleanup window, so aggregate-progress emitters must skip
+    /// them.
+    pub(super) fn build_progress_frozen(&self, build_id: Uuid) -> bool {
+        use crate::state::BuildStateExt;
+        self.builds
+            .get(&build_id)
+            .is_some_and(|b| b.state().is_terminal())
+    }
+
+    /// [`BuildEventBus::emit_progress_with`] behind the terminal-build
+    /// freeze: the caller paid for the `build_summary` scan, but a
+    /// resident terminal build's progress must not be re-emitted from
+    /// the still-mutating DAG — it would be persisted to the event log
+    /// after the build's terminal event and replayed to re-subscribers
+    /// with shrunk totals.
+    // r[impl sched.build.terminal-status-settled]
+    pub(super) fn emit_progress_with(
+        &mut self,
+        build_id: Uuid,
+        summary: &crate::dag::BuildSummary,
+    ) {
+        if self.build_progress_frozen(build_id) {
+            return;
+        }
+        self.events.emit_progress_with(build_id, summary);
     }
 
     pub(super) fn get_interested_builds(&self, drv_hash: &DrvHash) -> Vec<Uuid> {

@@ -1934,6 +1934,29 @@ the Phase-1b cutover froze the column.
     or API call).
 ]
 
+#r("sched.build.terminal-status-settled")[
+  Once a build reaches a terminal state, its externally served progress and
+  outcome are settled: no further `BuildProgress` event may be emitted or
+  persisted to `build_event_log` for it, its served progress accounting
+  (`cached_derivations`) MUST NOT be mutated, and a later failure of a
+  shared derivation MUST NOT rewrite its settled error summary or re-run
+  its per-build failure handling --- aggregate fan-outs (dispatch-time
+  store hits, completion release, failure cascades) MUST skip interested
+  builds that are already terminal.
+]
+Terminal builds stay resident --- and re-subscribable via `WatchBuild` ---
+for the terminal-cleanup window while the global DAG keeps evolving for
+other builds that share their nodes (a stale-Completed reset, a re-dispatch,
+a dispatch-time store hit). A `BuildProgress` recomputed from that
+still-mutating DAG and sequenced after `BuildCompleted` would be persisted
+to the event log and replayed to re-subscribers with totals shrunk by
+whatever mutated the DAG since; a late shared-node failure routed through
+the per-build failure handler would overwrite the settled error summary of
+a build that already succeeded. Per-derivation events (`DerivationCached`,
+`DerivationFailed`) still flow to a resident terminal build's channel ---
+they are facts about the derivation, not aggregate progress of the finished
+build.
+
 = Leader Transition Protocol
 
 The scheduler uses a leader-elected model for the in-memory global DAG. On

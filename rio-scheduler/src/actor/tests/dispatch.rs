@@ -4299,3 +4299,128 @@ async fn compute_spawn_intents_carries_ice_masked_cells() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.build.terminal-status-settled]
+/// A dispatch-time store hit that fans out to a resident terminal build
+/// must not mutate its served accounting and must not persist a
+/// post-terminal `BuildProgress` to the event log.
+///
+/// Staging: B1 builds X and succeeds (terminal, resident for the cleanup
+/// window, interest retained on X). B2 re-merges X while X's output is
+/// missing from the store, so the stale-Completed verify resets X to
+/// Ready. The output then appears in the store and the next dispatch
+/// sweep's batched Ready probe completes X as cached, fanning out to
+/// every interested build — including terminal B1. B1's served
+/// accounting (cached_derivations) and its persisted event stream must
+/// both stay settled; a post-`BuildCompleted` `BuildProgress` row in
+/// `build_event_log` would be replayed to re-subscribers with totals
+/// recomputed from a DAG the finished build no longer describes.
+#[tokio::test]
+async fn test_terminal_build_frozen_on_dispatch_store_hit() -> TestResult {
+    use prost::Message;
+    use rio_proto::types::build_event::Event;
+
+    // Setup: mock store + a captured event-log persister channel.
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (persist_tx, mut persist_rx) = mpsc::channel::<crate::event_log::EventLogEntry>(256);
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |_, plumbing| {
+            plumbing.event_persist_tx = Some(persist_tx);
+        });
+
+    let x_out = test_store_path("tfz-x-out");
+
+    // B1: single node X. Nothing in the store at merge time → X Ready.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tfz-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    merge_dag(&handle, b1, vec![x.clone()], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Build X via the pull surface → B1 Succeeded.
+    pull_complete_success(&handle, "tfz-x", &x_out).await?;
+    wait_for_status(&handle, "tfz-x", DerivationStatus::Completed).await;
+    let settled = query_status(&handle, b1).await?;
+    assert_eq!(
+        settled.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "precondition: B1 finished"
+    );
+    assert_eq!(
+        settled.cached_derivations, 0,
+        "precondition: B1 built X from source — no cache hits"
+    );
+
+    // B2 re-merges X (+ a sibling root Z so B2 stays live). x_out is NOT
+    // in the mock store → the stale-Completed verify resets X to Ready.
+    // B1 (terminal, resident) keeps its interest in X.
+    let b2 = Uuid::new_v4();
+    let mut z = make_node("tfz-z");
+    z.expected_output_paths = vec![test_store_path("tfz-z-out")];
+    merge_dag(&handle, b2, vec![x, z], vec![], false).await?;
+    barrier(&handle).await;
+    let xs = expect_drv(&handle, "tfz-x").await;
+    assert!(
+        matches!(
+            xs.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "precondition: stale-Completed verify must reset X (its output is \
+         missing from the store); got {:?}",
+        xs.status
+    );
+
+    // Drain everything persisted so far. From here on, nothing for B1
+    // may be a BuildProgress.
+    while persist_rx.try_recv().is_ok() {}
+
+    // The output appears in the store → the next dispatch sweep's
+    // batched Ready probe completes X as cached and fans out to ALL
+    // interested builds — including terminal B1.
+    store.seed_with_content(&x_out, b"x");
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Sanity: the fan-out ran — the live build counted the store hit.
+    let s2 = query_status(&handle, b2).await?;
+    assert!(
+        s2.cached_derivations >= 1,
+        "the live build counts the dispatch-time store hit; got {}",
+        s2.cached_derivations
+    );
+
+    // 1. The terminal build's served accounting is frozen.
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(
+        after.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "B1 stays terminal"
+    );
+    assert_eq!(
+        after.cached_derivations, 0,
+        "a terminal build's cached_derivations must not drift after the \
+         terminal transition"
+    );
+
+    // 2. No post-terminal BuildProgress was persisted to the event log.
+    let mut post_terminal_progress: Vec<u64> = Vec::new();
+    while let Ok((build_id, seq, bytes)) = persist_rx.try_recv() {
+        if build_id != b1 {
+            continue;
+        }
+        let ev = rio_proto::types::BuildEvent::decode(&bytes[..])?;
+        if matches!(ev.event, Some(Event::Progress(_))) {
+            post_terminal_progress.push(seq);
+        }
+    }
+    assert!(
+        post_terminal_progress.is_empty(),
+        "no BuildProgress after BuildCompleted may be persisted to \
+         build_event_log (it would be replayed to re-subscribers with \
+         shrunk totals); got post-terminal Progress at seqs \
+         {post_terminal_progress:?}"
+    );
+    Ok(())
+}

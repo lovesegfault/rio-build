@@ -23,7 +23,8 @@ use rio_proto::types::FindMissingPathsRequest;
 
 use crate::dag::ClosureEvidence;
 use crate::state::{
-    DerivationStatus, DrvHash, ExecutorId, effective_wanted, verifiable_wanted_paths, wanted_subset,
+    BuildStateExt, DerivationStatus, DrvHash, ExecutorId, effective_wanted,
+    verifiable_wanted_paths, wanted_subset,
 };
 
 use super::DagActor;
@@ -1540,13 +1541,22 @@ impl DagActor {
             }
         }
         for (build_id, n) in cached_per_build {
-            if let Some(b) = self.builds.get_mut(&build_id) {
+            // r[impl sched.build.terminal-status-settled]
+            // Dispatch-time store hits can fan out to resident terminal
+            // builds that retained interest on the shared node (a
+            // stale-Completed reset under a later build re-dispatched
+            // it); their served accounting and progress are frozen at
+            // the terminal transition. The per-drv DerivationCached
+            // event above still flows.
+            if let Some(b) = self.builds.get_mut(&build_id)
+                && !b.state().is_terminal()
+            {
                 b.cached_count += n;
             }
             // I-140: one build_summary scan shared, not two.
             let summary = self.dag.build_summary(build_id);
             self.update_build_counts_with(build_id, &summary).await;
-            self.events.emit_progress_with(build_id, &summary);
+            self.emit_progress_with(build_id, &summary);
             self.check_build_completion(build_id).await;
         }
     }

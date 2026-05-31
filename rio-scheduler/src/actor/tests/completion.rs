@@ -4214,3 +4214,92 @@ async fn phase1b_e1_transient_threshold_non_distinct_mode_poisons() -> TestResul
     // in the ledger rows alone" is now structural.)
     Ok(())
 }
+
+// r[verify sched.build.terminal-status-settled]
+/// A late shared-node failure must not rewrite a settled build's outcome:
+/// `handle_derivation_failure` for a resident terminal build is a no-op.
+///
+/// Staging: B1 builds X and succeeds. B2 re-merges X while X's output is
+/// missing from the store (stale-Completed verify resets X to Ready),
+/// then X fails permanently under B2's re-dispatch. The failure fan-out
+/// reaches every interested build — including terminal B1, which is
+/// still resident in X's interested-build set for the cleanup window.
+/// B1's settled outcome (Succeeded, no error summary) must survive; B2
+/// owns the failure.
+#[tokio::test]
+async fn test_terminal_build_outcome_not_rewritten_by_late_shared_node_failure() -> TestResult {
+    let (_db, _store, handle, _tasks) = setup_with_mock_store().await?;
+
+    let x_out = test_store_path("tow-x-out");
+
+    // B1: single node X → built via pull → B1 Succeeded.
+    let b1 = Uuid::new_v4();
+    let mut x = make_node("tow-x");
+    x.expected_output_paths = vec![x_out.clone()];
+    merge_dag(&handle, b1, vec![x.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    pull_complete_success(&handle, "tow-x", &x_out).await?;
+    wait_for_status(&handle, "tow-x", DerivationStatus::Completed).await;
+    let settled = query_status(&handle, b1).await?;
+    assert_eq!(
+        settled.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "precondition: B1 finished"
+    );
+    assert_eq!(
+        settled.error_summary, "",
+        "precondition: a succeeded build has no error summary"
+    );
+
+    // B2 re-merges X (+ sibling root Z so B2 stays live). The store
+    // lacks x_out → the stale-Completed verify resets X to Ready. B1
+    // (terminal, resident) keeps its interest in X.
+    let b2 = Uuid::new_v4();
+    let mut z = make_node("tow-z");
+    z.expected_output_paths = vec![test_store_path("tow-z-out")];
+    merge_dag(&handle, b2, vec![x, z], vec![], false).await?;
+    barrier(&handle).await;
+    let xs = expect_drv(&handle, "tow-x").await;
+    assert!(
+        matches!(
+            xs.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "precondition: stale-Completed verify must reset X; got {:?}",
+        xs.status
+    );
+
+    // X fails permanently under B2's re-dispatch. The per-build failure
+    // handler runs for every interested build of X — including B1.
+    pull_complete_failure(
+        &handle,
+        "tow-x",
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "boom",
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // B2 owns the failure.
+    let s2 = query_status(&handle, b2).await?;
+    assert_eq!(
+        s2.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the live build that owns the failed re-dispatch fails"
+    );
+
+    // B1 keeps its settled outcome: still Succeeded, no error summary,
+    // no failed_derivation backfilled into a build that never failed.
+    let after = query_status(&handle, b1).await?;
+    assert_eq!(
+        after.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "a settled build's terminal state is immutable"
+    );
+    assert_eq!(
+        after.error_summary, "",
+        "a late shared-node failure must not rewrite a settled \
+         (succeeded) build's error summary"
+    );
+    Ok(())
+}
