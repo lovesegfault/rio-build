@@ -64,25 +64,12 @@ pub enum PullRejection {
     Internal(String),
 }
 
-/// The pure admission decision for one pull.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum PullDecision {
-    /// No open attempt for this identity: run the fenced mint
-    /// transaction and deliver a fresh payload.
-    DeliverNew,
-    /// The open attempt already belongs to the pulling identity:
-    /// re-deliver the identical payload/exec_id, write nothing.
-    DeliverExisting { exec_id: Uuid },
-    /// No longer wanted: cancelled, substituted/completed, skipped,
-    /// permanently failed/poisoned, or absent from the DAG.
-    Gone,
-    /// Still wanted but not deliverable to this pod right now.
-    NotYetReady,
-    /// Token↔intent binding failed.
-    RejectToken,
-    /// Serving generation below the durable claims floor.
-    RejectStaleGeneration,
-}
+/// The pure admission decision for one pull: the CBMC-verified
+/// [`rio_evidence_kernel::pull::PullAdmission`] alphabet, instantiated
+/// with the scheduler's exec-id type. The decision logic itself lives
+/// in the kernel ([`rio_evidence_kernel::pull::admit_pull`]); the
+/// scheduler's [`admit_pull`] is the projection shim over it.
+pub(crate) type PullDecision = rio_evidence_kernel::pull::PullAdmission<Uuid>;
 
 /// Everything [`admit_pull`] needs, already loaded by the caller.
 pub(crate) struct PullInputs<'a> {
@@ -112,70 +99,56 @@ pub(crate) struct PullInputs<'a> {
 
 // r[impl sched.executor.pull-gone]
 // r[impl sched.executor.pull-not-ready+2]
-/// Decide one pull from already-loaded state. Pure — no clocks, no IO,
-/// no `&self` — so it can be unit-tested exhaustively and lifted into a
-/// Kani harness without refactoring (decision P10).
+/// Decide one pull from already-loaded state. Projection shim over the
+/// CBMC-verified [`rio_evidence_kernel::pull::admit_pull`] (decision
+/// P10 — the decision was kept pure from its introduction precisely so
+/// it could be lifted into a kani kernel without refactoring; the
+/// closure-evidence campaign's Phase 2 did the lift): this function
+/// maps the scheduler vocabulary (`DerivationStatus`, `ExecutorId`,
+/// `Uuid`) onto the kernel's mirrored alphabet and returns the kernel's
+/// decision unchanged.
 ///
-/// Check order is load-bearing: identity first (a mis-bound token never
-/// learns anything about the drv), then the generation fence (a deposed
-/// believer answers nothing), then wantedness/deliverability.
+/// Check order (proven in the kernel): identity first (a mis-bound
+/// token never learns anything about the drv), then the generation
+/// fence (a deposed believer answers nothing), then
+/// wantedness/deliverability — including the must-substitute refusal
+/// (`r[sched.merge.substitute-topdown+12]`) and the advisory
+/// generation-fence half (`r[sched.lease.generation-fence+3]`), both of
+/// which now live at the kernel's marked arms.
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
-    // Token↔intent binding (mechanism #6, applied per-unary).
-    if let Some(auth) = inputs.auth_intent
-        && auth != inputs.intent_id
-    {
-        return PullDecision::RejectToken;
-    }
+    rio_evidence_kernel::pull::admit_pull(rio_evidence_kernel::pull::PullRequest {
+        intent_id: inputs.intent_id,
+        auth_intent: inputs.auth_intent,
+        serving_generation: inputs.serving_generation,
+        generation_floor: inputs.generation_floor,
+        status: inputs.status.map(pull_node_status),
+        must_substitute: inputs.must_substitute,
+        open_attempt: inputs.open_attempt,
+        pulling_identity: inputs.pulling_identity,
+    })
+}
 
-    // r[impl sched.lease.generation-fence+3]
-    // Transaction-side generation fence, advisory half: a serving
-    // generation below the durable claims floor answers nothing. The
-    // authoritative check re-runs inside the mint transaction.
-    if let Some(floor) = inputs.generation_floor
-        && floor >= 0
-        && inputs.serving_generation < floor as u64
-    {
-        return PullDecision::RejectStaleGeneration;
-    }
-
-    let Some(status) = inputs.status else {
-        // Not in the DAG: nothing wants it (never submitted, already
-        // reaped after completion, or cancelled and swept).
-        return PullDecision::Gone;
-    };
-
-    use DerivationStatus as S;
+/// `DerivationStatus` → kernel [`PullNodeStatus`] — variant-for-variant.
+/// The exhaustive `match` (no wildcard arm) pins the two alphabets in
+/// lockstep: adding a variant to either enum fails this compile, which
+/// is the same drift tripwire the retry kernel's db-enum mirrors use.
+///
+/// [`PullNodeStatus`]: rio_evidence_kernel::pull::PullNodeStatus
+fn pull_node_status(status: DerivationStatus) -> rio_evidence_kernel::pull::PullNodeStatus {
+    use rio_evidence_kernel::pull::PullNodeStatus as K;
     match status {
-        // No longer wanted: terminal or permanently failed states.
-        S::Completed | S::Cancelled | S::Skipped | S::Poisoned | S::DependencyFailed => {
-            PullDecision::Gone
-        }
-        // Wanted but not deliverable yet: deps unbuilt, substitution in
-        // flight, or a retry waiting to requeue. Never `Gone` (the
-        // reap→respawn churn loop), never a write.
-        S::Created | S::Queued | S::Substituting | S::Failed => PullDecision::NotYetReady,
-        // r[impl sched.merge.substitute-topdown+12]
-        // Ready but marked must-substitute (topdown-pruned with Broken
-        // closure evidence): never serve it from source. Refuse the
-        // mint — NotYetReady, no write, and deliberately NOT a
-        // fail-fast: the pull carries no store verdict, so the node is
-        // left for the Tick sweep's probe/walk/reap arms, which own the
-        // definitive outcomes (inline-complete, route to substitution,
-        // or the resubmit-directing fail-fast).
-        S::Ready if inputs.must_substitute => PullDecision::NotYetReady,
-        // Ready: deliverable now — mint a fresh attempt.
-        S::Ready => PullDecision::DeliverNew,
-        // Already open on some executor: idempotent re-delivery only
-        // for the same identity; anyone else waits (another pod's
-        // open attempt for the same drv).
-        S::Assigned | S::Running => match inputs.open_attempt {
-            Some((executor, exec_id)) if executor == inputs.pulling_identity => {
-                PullDecision::DeliverExisting { exec_id }
-            }
-            // Open elsewhere — or in-flight bookkeeping is missing its
-            // exec_id (never deliverable without an attempt to share).
-            _ => PullDecision::NotYetReady,
-        },
+        DerivationStatus::Created => K::Created,
+        DerivationStatus::Queued => K::Queued,
+        DerivationStatus::Ready => K::Ready,
+        DerivationStatus::Assigned => K::Assigned,
+        DerivationStatus::Running => K::Running,
+        DerivationStatus::Substituting => K::Substituting,
+        DerivationStatus::Completed => K::Completed,
+        DerivationStatus::Failed => K::Failed,
+        DerivationStatus::Poisoned => K::Poisoned,
+        DerivationStatus::DependencyFailed => K::DependencyFailed,
+        DerivationStatus::Cancelled => K::Cancelled,
+        DerivationStatus::Skipped => K::Skipped,
     }
 }
 

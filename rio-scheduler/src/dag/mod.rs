@@ -112,9 +112,9 @@ pub struct ReapOutcome {
 /// Trust classification of a node's current DAG child set as evidence
 /// about its dependency closure — the single judgment behind every
 /// `topdown_pruned` stamp gate, clear site, and dispatch-time guard.
-/// Computed by [`DerivationDag::closure_evidence`].
+/// Computed by `DerivationDag::closure_evidence`.
 ///
-/// Re-exported from [`rio_evidence_kernel`], the dependency-free
+/// Re-exported from `rio_evidence_kernel`, the dependency-free
 /// CBMC-verified decision kernel: the variant semantics, the case
 /// analysis that produces them, and the predicates layered on them
 /// (`must_substitute` / `closure_vouched`) are owned and proven there;
@@ -124,11 +124,15 @@ pub struct ReapOutcome {
 /// In this DAG, `Broken`'s "closure-holed" input is the `closure_hole`
 /// breadcrumb — an un-produced child was removed out from under the
 /// node, by the terminal-build reap (see the breadcrumb loop in
-/// [`DerivationDag::remove_build_interest_and_reap`]), by a
+/// `DerivationDag::remove_build_interest_and_reap`), by a
 /// poison-clear removal (admin ClearPoison or the poison-TTL sweep), or
 /// by leader-failover recovery dropping the edge to one (the
 /// recovery-time stamp in `load_dag_from_rows`) — so whatever children
 /// survive are a truncated view of its input closure.
+///
+/// (The references above are intentionally not intra-doc links: rustdoc
+/// resolves links on a `pub use` in the defining crate's namespace,
+/// where the DAG types do not exist.)
 /// The breadcrumb survives the node's own completion or skip (those
 /// transitions do not repair the truncation), is carried across a
 /// resubmit-reset of the node (a `rollback_merge` restores the prior

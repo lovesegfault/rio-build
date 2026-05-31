@@ -104,6 +104,8 @@
 //!   contracts** (`#[kani::ensures]`, verified by `proof_for_contract`
 //!   harnesses over their full input domains).
 
+pub mod pull;
+
 /// Trust classification of a node's current DAG child set as evidence
 /// about its dependency closure — the single judgment behind every
 /// `topdown_pruned` stamp gate, clear site, and dispatch-time guard.

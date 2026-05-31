@@ -262,21 +262,23 @@ in
   };
 
   # rio-evidence-kernel: the scheduler's closure-evidence decision kernel
-  # (the ClosureEvidence classifier and the must_substitute()/
-  # closure_vouched() predicates), extracted from
-  # rio-scheduler/src/dag/mod.rs + actor/merge.rs into a dependency-free
-  # crate so the harnesses' goto model closes over the kernel alone — the
+  # (the ClosureEvidence classifier, the must_substitute()/
+  # closure_vouched() predicates, and the pull-admission decision
+  # admit_pull()), extracted from rio-scheduler/src/dag/mod.rs +
+  # actor/merge.rs + actor/pull.rs into a dependency-free crate so the
+  # harnesses' goto model closes over the kernel alone — the
   # closure-evidence campaign's Phase-2 assurance deliverable, following
   # the rio-retry-kernel extraction precedent.
-  # DerivationDag::closure_evidence and the merge/dispatch predicates are
-  # the projection shims; the quint model (quint-closure-evidence-*, in
-  # quintChecks) checks the lifecycle protocol over these predicates,
-  # these harnesses prove the predicates themselves over their full
-  # bounded input domain.
+  # DerivationDag::closure_evidence, the merge/dispatch predicates, and
+  # the actor pull shim are the projections; the quint model
+  # (quint-closure-evidence-*, in quintChecks) checks the lifecycle
+  # protocol over these predicates, these harnesses prove the predicates
+  # themselves over their full bounded input domain.
   #
-  # Eight harnesses (in rio-evidence-kernel/src/lib.rs `mod proofs`),
-  # measured at ~0.06–0.65 s CBMC time each (~3 s total, ~12 s wall with
-  # the kani-compiler build) on the dev builder:
+  # Thirteen harnesses, measured at ~0.05–0.65 s CBMC time each (~4 s
+  # total, ~15 s wall with the kani-compiler build) on the dev builder.
+  #
+  # Classifier (rio-evidence-kernel/src/lib.rs `mod proofs`):
   #   - check_classifier_exhaustive_case_analysis: the classifier's
   #     five-case partition (absent/holed/childless → Broken; non-empty
   #     all-produced → Vouched; otherwise Pending) is exact, total, and
@@ -301,11 +303,33 @@ in
   #   - check_must_substitute_contract / check_closure_vouched_contract:
   #     proof_for_contract over the predicates' #[kani::ensures]
   #     clauses, full input domain.
+  #
+  # Pull admission (rio-evidence-kernel/src/pull.rs `mod proofs`):
+  #   - check_admit_pull_partition: the admission's exhaustive decision
+  #     table over (token, fence, status×13, must_substitute, attempt
+  #     identity) — total and panic-free.
+  #   - check_admit_pull_refuses_must_substitute: A11/pullRefusalNoMint
+  #     code half — a Ready must-substitute node is parked NotYetReady,
+  #     never DeliverNew; the only delivery a must-substitute node can
+  #     receive is the AW5 re-delivery of its own open attempt.
+  #   - check_admit_pull_rejections_dominate: the load-bearing check
+  #     order — a mismatched token answers RejectToken whatever else
+  #     holds; an authenticated below-floor pull answers
+  #     RejectStaleGeneration whatever the node state.
+  #   - check_admit_pull_identity_match: DeliverExisting only for an
+  #     Assigned/Running node whose open attempt is bound to the
+  #     pulling identity, carrying exactly that attempt's exec id.
+  #   - check_pull_refusal_chain: the end-to-end A11 chain through both
+  #     kernels — for ANY classifier input judged must-substitute, an
+  #     authenticated at-or-above-floor pull of that Ready node is
+  #     parked, never minted and never dismissed Gone.
   # r[verify sched.merge.substitute-topdown+12]
   # r[verify sched.evidence.closure-hole]
+  # r[verify sched.executor.pull-gone]
+  # r[verify sched.executor.pull-not-ready+2]
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 8;
+    expectedHarnesses = 13;
   };
 }
