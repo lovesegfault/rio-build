@@ -61,6 +61,10 @@
       "description": "Pure retry/poison decision kernels for the rio-build scheduler (CBMC-verified)"
     },
     {
+      "name": "rio-evidence-kernel",
+      "description": "Pure closure-evidence decision kernel for the rio-build scheduler (CBMC-verified)"
+    },
+    {
       "name": "xtask",
       "description": "Dev/ops tooling: codegen, local cluster lifecycle, AMI build, helm/k8s helpers"
     }
@@ -120,6 +124,11 @@
       "optional": [],
       "dev": []
     },
+    "rio-evidence-kernel": {
+      "prod": [],
+      "optional": [],
+      "dev": []
+    },
     "rio-gateway": {
       "prod": [
         "rio-auth",
@@ -173,6 +182,7 @@
       "prod": [
         "rio-auth",
         "rio-common",
+        "rio-evidence-kernel",
         "rio-lease",
         "rio-migrations",
         "rio-nix",

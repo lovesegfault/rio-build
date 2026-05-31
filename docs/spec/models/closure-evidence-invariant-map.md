@@ -53,8 +53,16 @@ GHA-exclusion mechanism plus the measured manual-target table satisfies
 owner decision 3; Wave 5 (close-out) records the final dispositions, the
 acceptance-table deltas, the deployment-checklist deltas, and the
 owner-decision provenance. See the Phase-1 Wave-2/2b/3/4 stage records
-and the Phase-1 close-out (the last sections). Phase 2 (full-corpus
-acceptance table, counter-signatures) remains open.**
+and the Phase-1 close-out. **Phase 2 complete** (the last section): the
+two queued C4-memo fixes (the post-terminal BuildProgress freeze,
+red-first, and the standby-drops-writes carve-out), the kani kernel
+extraction (rio-evidence-kernel — the closure-evidence classifier AND
+the pull-admission decision, 13 CBMC-verified harnesses wired as
+checks.kani-rio-evidence-kernel), and the full-corpus CE-1..CE-81
+acceptance table (81/81 rows dispositioned, no coverage gap). The
+campaign's remaining open work is the close-out counter-signature (A6)
+over this map's records plus the standing owner items listed in the
+Phase-2 stage record.**
 
 ## Phase 0a spec-audit record
 
@@ -2310,3 +2318,326 @@ on measured hit rates).
    over this map's records.
 
 Phase 2 appends here.
+
+---
+
+## Phase 2 — assurance: queued fixes, the kani kernel, the full-corpus acceptance table (this stage)
+
+Phase 2 of the closure-evidence campaign (the design §8 "Assurance" row), executed on the
+`ce-phase2` worktree on top of the C3 dispatch-mode retirement. Deliverables, in the order
+they landed: the two small queued fixes the C4 retirement memo commissioned into this
+worktree (the post-terminal BuildProgress freeze, red-first, and the standby-drops-writes
+spec carve-out); the kani kernel extraction the design named as the Phase-2 candidates
+(the `closure_evidence` classifier AND `admit_pull` — both extracted, neither omitted);
+and the full-corpus acceptance table over CE-1..CE-81 below — the campaign's final
+accounting. Every commit boundary in this stage is green for stable clippy, rio-scheduler
++ rio-evidence-kernel nextest, tracey-validate, and treefmt; the kani check was built and
+verified through the production nix pipeline at each wiring change.
+
+### The two queued fixes (the C4-memo items riding this worktree)
+
+#### Fix 1 — post-terminal BuildProgress freeze (red-first; commit `fcb7ff271`)
+
+The latent defect the build-event-sourcing rescope memo's adversarial review found and
+disclosed (memo §3.5; its preconditions verified against this tree): post-terminal
+`BuildProgress` events were sequenced after `BuildCompleted`, persisted to
+`build_event_log`, and replayed to re-subscribers with totals recomputed from a DAG the
+finished build no longer describes; the dispatch store-hit and Skipped emit loops kept
+incrementing a terminal build's `cached_count`; and `handle_derivation_failure` rewrote a
+settled build's error summary when a shared node failed after the build finished (a
+SUCCEEDED build gained an error summary).
+
+Red-first execution: two regression tests staged the defect through the production
+pull/merge surfaces (a stale-Completed reset of a shared node under a later build, then a
+dispatch-time store hit / a permanent failure fanning out to the resident terminal build)
+and FAILED for exactly the characterized reasons before any production change —
+`test_terminal_build_frozen_on_dispatch_store_hit` red on `cached_derivations` drift (1 ≠
+0), `test_terminal_build_outcome_not_rewritten_by_late_shared_node_failure` red on the
+rewritten error summary. The guard then landed: a DagActor-level terminal freeze
+(`build_progress_frozen` + an actor-level `emit_progress_with` wrapper) covering the
+debounced `emit_progress`, the three precomputed-summary emit sites
+(dispatch.rs store-hit loop, completion.rs release loop, completion.rs failure loop), the
+two `cached_count` writers, and `handle_derivation_failure`. Both tests green; the full
+1106-test scheduler suite green. New spec rule `sched.build.terminal-status-settled`
+(impl ×5, verify ×2) makes the freeze normative. The memo's third commissioned item — the
+trigger-1 breadcrumb at the event-bus seq-reuse branch — rides the same commit.
+
+#### Fix 2 — the standby-drops-writes carve-out (spec-only; commit `9d48e0044`)
+
+The C4 memo §3.4 contradiction: `sched.lease.standby-drops-writes` flatly forbids standby
+writes to `build_event_log`, but two deliberate ex-leader write paths remain in the code
+(the persister's bounded in-flight backlog, collision-resolved first-writer-wins by `ON
+CONFLICT (build_id, sequence) DO NOTHING`; and the per-build event-log GC DELETE on the
+ungated `CleanupTerminalBuild` arm) — the acknowledgment paragraph that priced them was
+over-deleted by the executor campaign's stream-era removal (7e60437a1) along with the dead
+ForwardPhase exception it was attached to. The carve-out is restored inside the rule body,
+narrowed to the two surviving paths with their idempotency rationale (the lossy-by-design
+display stream; acknowledge-without-persist on a standby is permitted for it). Rule bumped
+to `sched.lease.standby-drops-writes+2`; all impl/verify markers and bare references
+re-pointed; tracey validate green. Code fencing of the persister/GC stays rejected per the
+memo §4.4 (display-only, already idempotent; revisit only inside trigger-1 work).
+
+### Kani: the closure-evidence decision kernel (`rio-evidence-kernel`)
+
+The design §8 Phase-2 row named two kani candidates: the `closure_evidence` classifier and
+`admit_pull`, with the decision rule "recommend kani for admit_pull only if the classifier
+proof is not subsumed by the model (decide then)". Both were extracted; the decision
+record:
+
+- **The classifier proof is NOT subsumed by the model.** The model's classifier is a
+  Quint definition (`evidence()` over model state); its fidelity to the production Rust
+  (the early-return order, the `is_some_and` child lookup, the short-circuiting fold) was
+  carried by the Phase-0a single-classifier code audit — a manual re-audit obligation.
+  The kani proof replaces that manual obligation with a machine-checked one over the
+  production code itself, and makes the single-classifier discipline structural (below).
+- **admit_pull extracts cleanly — extraction, not reasoned omission.** The pure decision
+  was DESIGNED for this lift (decision P10: "Pure — no clocks, no IO, no `&self` — so it
+  can be … lifted into a Kani harness without refactoring"); its unit-test module was
+  literally named `kernel_tests`. The C3 dispatch-mode retirement (this worktree's base)
+  removed its last stream-coexistence references, and the SQL/async entanglement the
+  round-1 precedent warns about sits entirely in the CALLER (`pull_assignment_inner` loads
+  the inputs; the fenced mint transaction runs after the decision) — the decision itself
+  is a case analysis over already-loaded values. The round-1 "load-bearing logic is SQL"
+  omission rationale therefore does not apply to the admission decision; it applies to the
+  mint transaction, which stays in the scheduler and keeps its existing fencing test
+  coverage (`sched.lease.generation-fence+3` db tests).
+
+#### Extraction shape (commits `5965e4b0f`, `994a07fd6`)
+
+`rio-evidence-kernel` is a dependency-free workspace member (no `[dependencies]` at all),
+following the `rio-retry-kernel` precedent: hakari final-excluded, crate2nix-built, and
+compiled by `crateBuildKani` so the kani goto model closes over the kernel alone.
+
+| Kernel surface | Moved from | Scheduler shim left behind |
+|---|---|---|
+| `ClosureEvidence` enum + `closure_evidence(present, closure_hole, children)` (generic over a child produced-ness iterator; short-circuiting fold preserved) | `rio-scheduler/src/dag/mod.rs` | `DerivationDag::closure_evidence` — projects (node presence, breadcrumb bit, lazy per-child produced-ness) out of the node/edge maps; `crate::dag::ClosureEvidence` is a re-export |
+| `must_substitute(topdown_pruned, evidence)` / `closure_vouched(evidence)` | `rio-scheduler/src/actor/merge.rs` | `DagActor::must_substitute` / `closure_vouched` call the kernel; the dispatch probe partition's Broken arm (`deferred_settlement`) calls `rio_evidence_kernel::must_substitute` directly |
+| `pull::PullNodeStatus` (12-variant `DerivationStatus` mirror), `pull::PullAdmission<ExecId>`, `pull::PullRequest`, `pull::admit_pull` | `rio-scheduler/src/actor/pull.rs` | `actor::pull::admit_pull` becomes the projection shim; `PullDecision` = `PullAdmission<Uuid>` type alias; the status mirror is pinned variant-for-variant by an exhaustive `match` (compile error on drift, the retry-kernel db-enum convention) |
+| `pull::pull_refused_for_evidence` (the A11 composition: classifier → must_substitute → admission) | new (Phase 2) | consumed by the proofs and available to future callers |
+
+Behavior is unchanged by the move: the projections preserve the original lookup order and
+the short-circuiting child fold, and the full scheduler suite (1106 tests pre-existing + 8
+kernel + 5 pull-kernel) passes unmodified. `.config/tracey/config.styx` gains the kernel
+crate in the impl include set; the kernel functions carry the `r[impl]` markers for the
+clauses they now implement (`sched.evidence.closure-hole`,
+`sched.merge.substitute-topdown+12`, `sched.executor.pull-gone`,
+`sched.executor.pull-not-ready+2`, `sched.lease.generation-fence+3`).
+
+#### Proof inventory and measured budgets
+
+Thirteen harnesses, all verified. Local run: `cargo kani -Z function-contracts` inside
+`rio-evidence-kernel/` — 14.8 s wall including the kani-compiler build, ~3.9 s total CBMC
+time. Nix pipeline: `/nixbuild .#checks.x86_64-linux.kani-rio-evidence-kernel` — built and
+verified green (~15 s wall on a warm remote builder; "Complete - 13 successfully verified
+harnesses, 0 failures"). Wired into `checks.*` and promoted into the CI formal lane (the
+`kaniChecks` inherit in flake.nix; gen_matrix clusters kani-* checks as singletons), with
+`expectedHarnesses = 13` as the silent-drop tripwire.
+
+| Harness | Property (invariant-map name) | CBMC time |
+|---|---|---|
+| `check_classifier_exhaustive_case_analysis` | the classifier's five-case partition — exact, total, panic-free (the Phase-0a single-classifier audit, mechanized) | 0.61 s |
+| `check_marked_broken_must_substitute` | marked + Broken ⇒ must_substitute (A1's predicate level; the substitute-topdown MUST-NOT-dispatch clause) | 0.44 s |
+| `check_vouched_never_must_substitute` | Vouched/Pending ⇒ ¬must_substitute | 0.39 s |
+| `check_unmarked_evidence_inert` | ¬marked ⇒ ¬must_substitute (closure-hole inert-on-unmarked clause) | 0.38 s |
+| `check_hole_breaks_and_never_vouches` | hole ⇒ Broken, never vouches, never un-sets must_substitute (A8/brokenNeverVouches + the OR-monotonicity / stale-true-is-safe asymmetry) | 0.55 s |
+| `check_vouched_iff_nonempty_all_produced` | Vouched ⟺ present ∧ ¬hole ∧ non-empty ∧ all produced (the clear/stamp-exemption criterion) | 0.44 s |
+| `check_must_substitute_contract` | proof_for_contract over the `#[kani::ensures]` clause | 0.05 s |
+| `check_closure_vouched_contract` | proof_for_contract over the `#[kani::ensures]` clause | 0.05 s |
+| `pull::check_admit_pull_partition` | the admission's exhaustive decision table (13 statuses × token × fence × flag × identity) | 0.14 s |
+| `pull::check_admit_pull_refuses_must_substitute` | A11 code half: Ready + must_substitute is parked, never minted; AW5 re-delivery is the only delivery a flagged node can receive | 0.13 s |
+| `pull::check_admit_pull_rejections_dominate` | the load-bearing check order (token ≻ fence ≻ node state) | 0.11 s |
+| `pull::check_admit_pull_identity_match` | DeliverExisting only to the open attempt's own identity, carrying its exec id | 0.11 s |
+| `pull::check_pull_refusal_chain` | the end-to-end A11 chain through BOTH kernels: any classifier input judged must-substitute makes an authenticated Ready-node pull park | 0.43 s |
+
+What the proofs do and do not claim: they prove the decision predicates over their full
+(bounded-children, full-status-alphabet) input domains as implemented in the kernel crate;
+the scheduler's projections into those predicates (the DAG map lookups, the
+DerivationStatus mirror) are pinned by the exhaustive shim matches (compile-time) and the
+existing scheduler unit tests (runtime), not by CBMC. The model (quint) continues to own
+the lifecycle protocol AROUND the predicates — when stamps/holes/clears happen; the kernel
+owns what the predicates SAY. MBT remains not planned (unchanged from the design §8: the
+in-process actor battery + the model cover the surface; Phase 1 did not change handler
+structure).
+
+### The full-corpus acceptance table (CE-1..CE-81)
+
+The campaign's final accounting: every corpus row's disposition, with what carries its
+assurance on the as-fixed tree. Disposition vocabulary (the close-out categories):
+
+- **FIXED-P1** — the defect class was repaired by a Phase-1 wave (cite wave/commit).
+- **BY-CONSTRUCTION** — the current architecture makes the defect unrepresentable (cite
+  the mechanism). Where the mechanism is a model-abstraction argument (the all-or-nothing
+  merge intent), the production mechanism is cited alongside.
+- **WIRED-CHECK** — a permanent CI check guards the defect class (cite the check). Wired
+  calibration checks guard by falsification (removing the production guard class re-finds
+  the violation); holds checks and kani harnesses guard the property directly.
+- **TEST** — named unit/db/actor test coverage (the design §4 NOT-ENC alternative coverage
+  or the fix's own regression tests).
+- **RESIDUAL** — an explicitly accepted, recorded bound (cite the record).
+
+A row may cite secondary evidence after the primary. EM-(name) = committed evidence module
+under `docs/spec/models/calibration/` (re-runnable falsification record, not wired).
+
+| CE | Disposition | What carries the assurance now |
+|---|---|---|
+| CE-1 | BY-CONSTRUCTION | Merge-time classification re-checks the store unconditionally (`check_cached_outputs`); C4 falsification recorded as EM-closure-f1-skip-store-recheck; family guard WIRED `quint-closure-calib-f1-stale-produced` |
+| CE-2 | WIRED-CHECK | `quint-closure-calib-f1-stale-produced` (B9); production verify covered by `test_reprobe_unlocked_deferred_past_stale_reset` (I-047 class) |
+| CE-3 | TEST | JWT forwarding under `sched.merge.substitute-probe` + its merge tests; trichotomy guard EM-closure-f3-indet-failfast (B3) |
+| CE-4 | TEST | CA realisation lane (NOT-ENC, design §4): `reprobe_substitute_floating_ca…` tests + `sched.merge.ca-fod-substitute` |
+| CE-5 | WIRED-CHECK + TEST | Reset/Queued-gating half: `quint-closure-calib-f1-stale-produced` + `test_reprobe_unlocked_deferred_past_stale_reset` (the parent-stays-Queued-past-stale-reset pin); Skipped half: `test_stale_skipped_output_reset` (**re-added pull-mode THIS STAGE** — the design §2e noted the stream-era original was deleted) + dag/tests.rs H1/H2 |
+| CE-6 | WIRED-CHECK | Family rep CE-2 (`quint-closure-calib-f1-stale-produced`); single verify path by construction (`verify_preexisting_completed` is the one reset/routing decision site) |
+| CE-7 | RESIDUAL | The C5/CE-7 deferred manual target (0d record: falsifiability plan at 3-build constants; owner sign-off item). Production behavior covered by the effective-wanted unit tests (77c98e01b's regression suite) |
+| CE-8 | WIRED-CHECK | Family rep CE-9 (`quint-closure-calib-f2-seed-only-walk`); production fixed-point (`apply_cached_hits` gated on `all_deps_completed`) |
+| CE-9 | WIRED-CHECK | `quint-closure-calib-f2-seed-only-walk` (B2) |
+| CE-10 | WIRED-CHECK | Family rep CE-9 (same check); walk error propagation tests |
+| CE-11 | WIRED-CHECK | Family rep CE-9 + wired witness `quint-closure-evidence-witness-tried-demotion` (the `substitute_tried` one-shot) |
+| CE-12 | TEST | `verifiable_wanted_paths` ∃-guard (one shared predicate, 6e6fe5b8a) + B4 falsification EM-closure-f4-vacuous-prune |
+| CE-13 | TEST | Own-selector resolvability guard + its merge tests; B4 falsification EM-closure-f4-vacuous-prune |
+| CE-14 | TEST | Family rep CE-13 (same EM); both-guards tests (97fae90f5) |
+| CE-15 | TEST | Model property B7 (holds, 0c record); production prune/classification share the wanted-criterion helpers |
+| CE-16 | TEST | Union-on-conflict stored wanted (B5); falsification EM-closure-f5-wanted-overwrite; production union tests |
+| CE-17 | TEST | Walk-completion re-check against current wanted (model consumeWalk; B1/B2); production re-check tests (6609ce4fe) |
+| CE-18 | BY-CONSTRUCTION | Model: the all-or-nothing merge intent makes rollback-replay divergence unrepresentable (0d re-route record); production: `rollback_merge` restores wholesale snapshots; rollback tests in actor/tests/merge.rs |
+| CE-19 | BY-CONSTRUCTION | Same mechanism as CE-18 (+ the resubmit-reset wholesale restore); 2999c1bea regression tests |
+| CE-20 | TEST | Chain-scoped `never_forgive` + chain-end clears; A21 falsification EM-closure-f6-latch-outlives-chain (rust-simulator backend, the recorded TLC discrepancy); 71e37da5f tests |
+| CE-21 | TEST | Family rep (CE-21 co-rep with CE-20, same EM); setter-coverage tests (5113de5c8) |
+| CE-22 | WIRED-CHECK | `quint-closure-evidence-witness-downgrade-respawn` (the downgrade re-spawn arm is reachable); A12/A1 model properties; 29b5322e0 tests |
+| CE-23 | RESIDUAL | The accepted forgiveness residual hole — wired witness `quint-closure-evidence-witness-forgiven-residual` (the model REACHES it, negative calibration by design); 9bc7be84a documentation; deployment-checklist CE-D8-adjacent |
+| CE-24 | BY-CONSTRUCTION | The `topdown_pruned` state machine exists end-to-end (migration 063 + the mark lifecycle); WIRED `quint-closure-calib-f8-dispatch-no-evidence` (A1) + `kani-rio-evidence-kernel` (THIS STAGE) |
+| CE-25 | BY-CONSTRUCTION | Production: the stamp is a statement of the merge transaction itself (`persist_merge_to_db`, `sched.evidence.durability+2`); model: all-or-nothing intent (the 0d structural-override-inert record). The deferred structural override is closed as inert-at-abstraction — the abstraction IS the mechanism |
+| CE-26 | BY-CONSTRUCTION | Activation is the merge transaction's last statement (A13); wired witness `quint-closure-evidence-witness-rollback` |
+| CE-27 | TEST | Stamp gate requires dropped closure (`markImpliesClosureDropped`, A2 holds 0c); 03ff900e6 merge tests |
+| CE-28 | WIRED-CHECK | `quint-closure-calib-f7-clear-unbuilt` (co-rep with CE-30) |
+| CE-29 | FIXED-P1 (ii) + TEST (i) | (ii) the fail-open dispatch arm: Wave 1 settlement re-probe (every fail-fast/dispatch decision point now requires a definitive verdict; `7c2d8ea31`); (i) fail-fast consumes the mark: A9 (holds 0c) + c0431eb20 tests |
+| CE-30 | WIRED-CHECK | `quint-closure-calib-f7-clear-unbuilt` (A3) |
+| CE-31 | BY-CONSTRUCTION | The recovery clear gate is the strict SQL criterion over the durable relation (`load_parents_with_all_children_produced`, db/recovery.rs); A19 (holds; trigger pinned by recovery witnesses); db/tests/recovery.rs. The A19-direction structural override stays a recorded deferred target (0d) |
+| CE-32 | BY-CONSTRUCTION | Migration 063 + OR-on-conflict persistence; wired witness `quint-closure-evidence-witness-stamp`; recovery restore tests |
+| CE-33 | WIRED-CHECK | `quint-closure-calib-f8-dispatch-no-evidence` (A1) + `kani-rio-evidence-kernel` (`check_marked_broken_must_substitute`, `check_pull_refusal_chain` — THIS STAGE) |
+| CE-34 | TEST | A14 `terminalIsTerminal` (holds 0c); f09d16611 idempotence regression tests |
+| CE-35 | BY-CONSTRUCTION | **Strengthened THIS STAGE**: the single classifier is now a dependency-free pure kernel (`rio_evidence_kernel::closure_evidence`) and every scheduler site projects through `DerivationDag::closure_evidence` — a guard cannot bypass the classifier without bypassing the only function that exists; WIRED `kani-rio-evidence-kernel` (exhaustive case analysis) |
+| CE-36 | WIRED-CHECK | Wired witness `quint-closure-evidence-witness-hole-reap` + `kani-rio-evidence-kernel` (`check_hole_breaks_and_never_vouches`); A4 (holds 0c) |
+| CE-37 | FIXED-P1 (pairing) | The reap-time survivor re-evaluation (8c13186fa) plus Wave 2b's poison-clear survivor re-evaluation (`7750a4d45`, `sched.poison.clear-survivor-reevaluation`) — the L3 re-hunt proves the pairing closes the strand; reap-survivor tests |
+| CE-38 | FIXED-P1 | Wave 1 settlement (the fail-fast skips in-flight-walk survivors and re-probes; `7c2d8ea31`/`2351a35ba`/`7b4a2e2d2`); a6550006e's original in-flight-walk skip; Wave-1 battery tests |
+| CE-39 | BY-CONSTRUCTION | Migration 064 + OR-on-conflict; wired witnesses hole-reap/hole-recovery |
+| CE-40 | WIRED-CHECK | `quint-closure-evidence-witness-hole-recovery` (the recovery hole-stamp fires); recovery tests. The deferred structural override (A4-direction recovery copy) closed as covered-by-witness + tests |
+| CE-41 | WIRED-CHECK | `quint-closure-calib-f9-poison-clear-no-stamp` (A5) + wired witnesses hole-admin-clear / hole-ttl-sweep |
+| CE-42 | TEST | `test_closure_hole_survives_completion_and_stale_completed_reset` + A4–A8 model properties (resubmit carry encoded) |
+| CE-43 | TEST | Round-23 bug_006 regression test (2791da787) + A9 `failFastConsumesMarkKeepsHole` (holds 0c). The deferred structural override closed as covered-by-test + model property |
+| CE-44 | TEST | A20 `healCompleteness` (holds 0c); PG-side total heal filter; 6799b70b5 tests |
+| CE-45 | BY-CONSTRUCTION | The strict SQL vouch gate (live co-ownership joins); A3 falsification at the unscoped variant recorded as EM-closure-f10-recovery-vouch-unscoped (depth-17 TLC, evidence-module-only per 0d) |
+| CE-46 | FIXED-P1 | Wave 2b co-ownership scoping of the in-DAG recompute (`7750a4d45` production + `e56a1b73c` model; A22 + `pInDagCondemnCriterion`); the condemn direction was the Wave-2 residual finding |
+| CE-47 | BY-CONSTRUCTION | The recovery failed-dep cascade (`sched.recovery.failed-dep-cascade+2`) + Wave 2b scoping; A15 declared-children form; recovery tests |
+| CE-48 | TEST (i) + TEST (ii) | (i) recovered-Substituting reset: EM-closure-f14-recovery-keeps-substituting (L1 falsified) + recovery reset tests; (ii) orphan-Ready interest gate: A16 (holds 0c) + recovery interest-gate tests |
+| CE-49 | BY-CONSTRUCTION | All-or-nothing merge transaction (A13/B6); ENC-A CE-26; 8b22d0594 regression tests |
+| CE-50 | FIXED-P1 | Wave 3 FENCE EVERYTHING (uniform claims-floor fence on every evidence write; `498db7410`..`c47de3ccc`); WIRED `quint-closure-evidence-stale-fence-holds` + `quint-closure-calib-a17-unfenced` regression pin. Supersedes the 0d F11 rust-simulator-only posture |
+| CE-51 | WIRED-CHECK | `quint-closure-evidence-witness-tried-demotion` (the one-shot demotion is reachable, so the loop-suppression arm exists); L1 (holds 0c) |
+| CE-52 | TEST | The 0d absorption record (the re-probe lane cannot strand a node at this abstraction — merge-time resetNodes owns resurrection); `test_resubmit_poisoned_at_limit_substitutable` (the Poisoned→Substituting transition-table pin); L1 via EM-closure-f14 |
+| CE-53 | TEST | `test_resubmit_poisoned_at_limit_substitutable` (the pull-mode successor of c9107fc1e C5's stream-era test, both lanes) + the same family absorption record |
+| CE-54 | TEST | Revert-target completeness tests (6875c3769 C4); A15-adjacent model coverage |
+| CE-55 | TEST | Build-accounting (NOT-ENC F17): merge-over-poisoned-leaf verdict tests + `tick_recheck_stuck_completions` |
+| CE-56 | TEST | d91df7e9f regression (poison-removal updates interested builds' totals) |
+| CE-57 | TEST | `test_reprobe_completion_fans_out_to_earlier_build` (c9107fc1e C4) |
+| CE-58 | TEST | Probe-coverage union (merge-time + dispatch-time); B8 falsification EM-closure-f13-unprobed-dispatch; dispatch_time_substitutable_completes tests |
+| CE-59 | TEST | Spawn-intent probed gate (`sched.admin.spawn-intents.probed-gate+2` tests) — NOT-ENC (pods out of model) |
+| CE-60 | TEST | Probe trichotomy: EM-closure-f3-indet-failfast (B3) + EM-closure-f3-substitutable-demoted (C2); store cap-truncation tests |
+| CE-61 | TEST | Family rep (same EMs); 429/5xx-as-indeterminate store tests |
+| CE-62 | TEST | ENC-A CE-61 (same EMs); retry-before-demote (15aa844d7) walk tests |
+| CE-63 | TEST | Store probe-cache tenant keying tests — NOT-ENC (store-side) |
+| CE-64 | TEST | Store singleflight tests — NOT-ENC (store-side) |
+| CE-65 | TEST | Store placeholder reclaim tests (2d7e4f9fd) — NOT-ENC (store-side) |
+| CE-66 | WIRED-CHECK | `quint-closure-calib-f4-demand-drop` (B10) + `test_topdown_explicit_target_*` (85213119d, actor/tests/merge.rs) |
+| CE-67 | TEST | Gateway result verification (cb3f6bfbb/73bcad709 tests; `gw.dag.reconstruct+3`) — NOT-ENC (different component) |
+| CE-68 | BY-CONSTRUCTION | Duplicate-drv contribution union (production) + all-or-nothing intent (model); 8c594a527 tests |
+| CE-69 | WIRED-CHECK | ENC-A CE-30: `quint-closure-calib-f7-clear-unbuilt` (the clear-before-reconciliation weakening IS the F12 ordering shape); `sched.merge.reconcile-order` tests |
+| CE-70 | BY-CONSTRUCTION | The detached-walk asynchrony IS the design response to the stall family (NOT-ENC by design); the model's asynchronous walk encodes it; perf fixes' own tests |
+| CE-71 | TEST | Recovery preserves each build's full derivation set (891a6520d regression); recovery tests — NOT-ENC (build accounting) |
+| CE-72 | TEST | Recovery interest gate (998df909b, I-058/I-059) + A16 (holds 0c); recovery tests |
+| CE-73 | BY-CONSTRUCTION | The produced-status set is {Completed, Skipped} everywhere (model: the Produced collapse absorbs it; production: `all_deps_completed` / the verify candidates / the classifier projections all match on both); dag/tests.rs H1/H2 + `test_stale_skipped_output_reset` (re-added THIS STAGE) |
+| CE-74 | TEST | CA-cutoff candidate identity tests (d7cf1a4ce) — NOT-ENC (CA lane out of model) |
+| CE-75 | BY-CONSTRUCTION | ENC-A CE-18 (all-or-nothing + wholesale restore); a91d63026 rollback-restore tests |
+| CE-76 | TEST | `sched.merge.dep-failed-transitive` tests (e45f2d966 C4) — NOT-ENC (F17) |
+| CE-77 | TEST | Completion fan-out + completion-authenticity tests (4d20e7c28) — NOT-ENC (F17) |
+| CE-78 | TEST | `tick_recheck_stuck_completions` (71a7c8a9b) — NOT-ENC (F17) |
+| CE-79 | TEST | Recovery verdict-state restoration tests (5b4543c3a) — NOT-ENC (F10/F17 accounting); round-1 retry campaign owns the ledger-side restore |
+| CE-80 | TEST | Retry-lane persistence tests (84a692492); round-1 retry campaign (the ledger fold) — NOT-ENC here |
+| CE-81 | TEST | Recovery completion sweep tests (04581fcbb) — NOT-ENC (F17) |
+
+**Tally.** 81 rows, all dispositioned — no row without a disposition (no coverage gap; the
+stop-and-report condition did not fire). By primary category: 17 WIRED-CHECK, 15
+BY-CONSTRUCTION, 6 FIXED-P1 (CE-29ii, CE-37, CE-38, CE-46, CE-50 — plus CE-33/CE-35's
+Phase-2 kani strengthening counted under WIRED-CHECK/BY-CONSTRUCTION), 41 TEST, 2 RESIDUAL
+(CE-7, CE-23). Cross-checks against the design §4 sheet: the 19 NOT-ENC rows all land in
+TEST with their pre-registered named coverage (no NOT-ENC row was silently re-dispositioned);
+the 62 in-model rows land in WIRED-CHECK / BY-CONSTRUCTION / FIXED-P1 / TEST according to
+whether their falsification is wired, their mechanism is structural, their fix was Phase 1,
+or their record is an evidence module + production test.
+
+**Coverage actions taken by this stage** (rows whose disposition the table itself forced):
+
+1. CE-5 (Skipped half) / CE-73-adjacent: `test_stale_skipped_output_reset` re-added in
+   pull mode (the stream-era original was deleted with the session machinery; the design
+   §2e and the 0d ENC sheet both noted the re-add for Phase 2).
+2. CE-18 / CE-25 trailing structural overrides: closed as **inert-at-abstraction** (the
+   all-or-nothing merge intent is the model's mechanism; writing a "structural override"
+   would mean re-introducing behavior the abstraction excludes — the 0d re-route record
+   already establishes this; this stage makes it the final disposition rather than a
+   deferral).
+3. CE-31 / CE-40 / CE-43 trailing overrides: closed as covered (CE-31 by the strict
+   durable-relation gate + A19 + recovery tests; CE-40 by the wired hole-recovery witness;
+   CE-43 by the bug_006 regression test + A9) — the falsification-shaped overrides remain
+   unwritten and are no longer carried as open items; re-opening them requires a new
+   campaign decision, not a standing deferral.
+
+### Phase-1 handoff items — Phase-2 dispositions
+
+| # | Handoff item (Phase-1 close-out) | Phase-2 disposition |
+|---|---|---|
+| 1 | C5 / CE-7 deferred manual target | Stays deferred; carried as the CE-7 RESIDUAL row + owner sign-off line item below. The falsifiability plan (3-build constants, pgWanted-keyed override) remains recorded in the 0d record; not executed this stage (model work, not assurance work) |
+| 2 | F6 falsifications resting on the rust-simulator backend | Unchanged (the TLC-discrepancy record stands); CE-20/CE-21 dispositioned with the rust-sim EM cited explicitly |
+| 3 | CE-45 evidence-module-only falsification | Final disposition: BY-CONSTRUCTION (strict SQL gate) + the EM as the falsification record; no longer an open item |
+| 4 | Tier-3 manual-target posture (decision-3 residual) | Not Phase-2's to resolve — owner counter-signature item (below), unchanged |
+| 5 | Trailing structural EMs (CE-18/25/31/40/43) + the acceptance table | **Done this stage**: the acceptance table is above; the five trailing EMs have final dispositions (coverage actions 2–3 above) |
+| 6 | Design-scale regime conjunctions (SD-4) + C1-strict probe | Unchanged posture (pre-excluded on recorded 0b/0c evidence; C1-strict stays a recorded deviation — see the C1-strict row in Group C) |
+| 7 | Campaign counter-signatures | Line items prepared below; the counter-signature itself is the campaign close-out workflow (A6), not this stage |
+
+### Validation sweep and commits
+
+Per-commit gates (every commit in this stage): stable clippy `--deny warnings` for the
+touched crates, `cargo nextest run -p rio-scheduler -p rio-evidence-kernel` (1119 tests +
+the new ones green), `tracey query validate` (0 errors), treefmt, and the pre-commit hook
+battery (crate2nix-check / hakari-check on the workspace-touching commits). The kani check
+was additionally built through the production nix pipeline
+(`/nixbuild .#checks.x86_64-linux.kani-rio-evidence-kernel`) after each wiring change.
+The full `/nixbuild --checks` gate is run by the orchestrator at integration (per the
+worktree contract; not run here).
+
+| Commit | Subject |
+|---|---|
+| `fcb7ff271` | fix(rio-scheduler): freeze progress emission and served accounting for terminal builds |
+| `9d48e0044` | docs(spec): restore the standby event-log write carve-out under standby-drops-writes |
+| `5965e4b0f` | feat(rio-evidence-kernel): extract the closure-evidence classifier into a CBMC-verified kernel |
+| `994a07fd6` | feat(rio-evidence-kernel): lift the pull-admission decision into the verified kernel |
+| (this commit) | docs(spec): closure-evidence Phase-2 stage record + the CE-1..81 acceptance table; pull-mode re-add of test_stale_skipped_output_reset |
+
+### Counter-signature line items (for the campaign close-out / A6)
+
+Carried forward from Phase 1, plus this stage's additions:
+
+1. The L2 armed form (Phase-1 orchestrator call within owner decision 4).
+2. The Wave-1 battery enumeration correction (8 tests / 9 cases vs the plan's 5).
+3. The Wave-3 fence enumeration correction (+5 owning transactions).
+4. The Wave-4 C3-pin scope deviation (Duo constants).
+5. The decision-3 residual (the empty `longChecks` Tier-2 set / manual-target posture).
+6. **(Phase 2)** The C5/CE-7 deferral accepted as a RESIDUAL acceptance-table row rather
+   than executed (the only corpus row whose model falsifiability is still owned by a plan
+   rather than a run).
+7. **(Phase 2)** The CE-18/CE-25 inert-at-abstraction closure and the CE-31/40/43
+   covered-by-existing-evidence closure (this stage's coverage actions 2–3) — the five
+   "trailing structural evidence modules" are closed without writing the overrides.
+8. **(Phase 2)** The admit_pull extraction decision (extract rather than the design's
+   conditional "only if not subsumed") and the kernel's scope: the decision predicates are
+   CBMC-proven; the projections are compile-pinned + test-covered; the mint transaction
+   stays SQL with its existing fencing tests.
+
+Phase 2 is complete. The campaign's remaining open work is the close-out itself
+(counter-signatures over this map's records) plus the standing owner items above.

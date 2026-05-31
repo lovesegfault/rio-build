@@ -516,6 +516,18 @@
       "doc": "Pool CRD: spawns one-shot rio-builder Jobs (builder OR fetcher mode)."
     }
   ],
+  "rio-evidence-kernel": [
+    {
+      "path": "lib.rs",
+      "depth": 0,
+      "doc": "Pure closure-evidence decision kernel for the scheduler's"
+    },
+    {
+      "path": "pull.rs",
+      "depth": 0,
+      "doc": "The pull-admission decision kernel: [`admit_pull`]."
+    }
+  ],
   "rio-gateway": [
     {
       "path": "config.rs",

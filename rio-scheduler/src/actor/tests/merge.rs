@@ -7745,3 +7745,80 @@ async fn merge_from_deposed_generation_is_fenced() -> TestResult {
     );
     Ok(())
 }
+
+// r[verify sched.merge.stale-completed-verify+5]
+/// A pre-existing **Skipped** node whose recorded output has been GC'd
+/// must be reset by the stale-output verify when a new build merges
+/// over it — the verify's candidate filter covers Skipped (the
+/// CA-cutoff produced status), not just Completed. Without it,
+/// dependents unlock against a gone output and dispatch into ENOENT.
+///
+/// Pull-mode re-add of the stream-era `test_stale_skipped_output_reset`
+/// (deleted with the session machinery; the closure-evidence campaign's
+/// Phase-2 acceptance table tracks this as the CE-5 Skipped-half /
+/// CE-73-adjacent named coverage).
+#[tokio::test]
+async fn test_stale_skipped_output_reset() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+
+    // Build 1: app → dep. Build dep via the pull surface so it ends
+    // Completed with recorded output_paths.
+    let dep_out = test_store_path("sk-dep-out");
+    let mut dep = make_node("sk-dep");
+    dep.expected_output_paths = vec![dep_out.clone()];
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("sk-app"), dep],
+        vec![make_test_edge("sk-app", "sk-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    store.seed_with_content(&dep_out, b"d");
+    pull_complete_success(&handle, "sk-dep", &dep_out).await?;
+    wait_for_status(&handle, "sk-dep", DerivationStatus::Completed).await;
+
+    // Force dep to Skipped (the CA-cutoff produced status). The
+    // transition table has no Completed→Skipped edge; the debug handle
+    // sets it without validation (test-only staging).
+    handle
+        .debug_force_status("sk-dep", DerivationStatus::Skipped)
+        .await?;
+    let pre = expect_drv(&handle, "sk-dep").await;
+    assert_eq!(pre.status, DerivationStatus::Skipped, "precondition");
+    assert!(
+        !pre.output_paths.is_empty(),
+        "precondition: Skipped carries recorded output_paths"
+    );
+
+    // GC the recorded output out of the store.
+    store.state.paths.write().unwrap().remove(&dep_out);
+
+    // Build 2 references dep (pre-existing Skipped). The stale-output
+    // verify must reset it — Skipped is a verify candidate exactly like
+    // Completed.
+    merge_dag(
+        &handle,
+        Uuid::new_v4(),
+        vec![make_node("sk-app2"), make_node("sk-dep")],
+        vec![make_test_edge("sk-app2", "sk-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    let dep = expect_drv(&handle, "sk-dep").await;
+    assert!(
+        matches!(
+            dep.status,
+            DerivationStatus::Ready | DerivationStatus::Queued
+        ),
+        "a Skipped node with a GC'd output must be reset by the \
+         stale-output verify (Ready/Queued); got {:?} — a candidate \
+         filter that skips Skipped unlocks dependents against a gone \
+         output",
+        dep.status
+    );
+    Ok(())
+}
