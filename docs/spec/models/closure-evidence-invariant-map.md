@@ -39,8 +39,17 @@ now co-ownership-scoped AND both poison-removal paths re-evaluate
 surviving parents (`sched.poison.clear-survivor-reevaluation`), the model
 mirrors both halves, and the L3 re-hunt under the corrected pair keeps the
 strand closed (the red half — scoping without the promotion — re-finds it,
-the calibration that the pairing is load-bearing). See the Phase-1
-Wave-2/2b stage records (the last sections).**
+the calibration that the pairing is load-bearing); Wave 3 (owner decision
+2026-05-30, FENCE EVERYTHING) implemented the uniform claims-floor fence on
+every production evidence write (`sched.evidence.durability+2`); Wave 4
+encoded both Phase-1 fixes in the model and flipped the wired checks — C3,
+the L2 armed form, A17 and A18 all HOLD, each paired with an
+expect-violation calibration pin (closure-c3-no-reprobe /
+closure-a17-unfenced) that keeps the falsification direction permanently
+checkable; the A17/L2 wiring satisfies owner decision 4, the `longChecks`
+GHA-exclusion mechanism plus the measured manual-target table satisfies
+owner decision 3. See the Phase-1 Wave-2/2b/3/4 stage records (the last
+sections).**
 
 ## Phase 0a spec-audit record
 
@@ -1910,8 +1919,222 @@ Full rio-scheduler suite green at every commit boundary (1096 → 1104 tests, +8
 wave); the recovery/floor battery (`test(recovery)`, 66 tests) green with **zero assertion
 changes** (the OQ7 acceptance gate); merge battery (97) green; clippy (stable), tracey
 validate, treefmt green at every boundary. Model-side flips (A17/A18 → holds, the fence
-encoding) are Wave 4 (T-4.3); the A17/A18 rows in the per-property table above stay
-"expected-fail probe" until then.
+encoding) landed in Wave 4 — the next stage record.
 
-Later phases append here (Wave 4: model + CI updates; Wave 5 / close-out: acceptance table
-over the full corpus, deployment-checklist deltas and counter-signatures).
+### Phase 1 Wave 4 — model flips, calibration sync, A17/L2 CI wiring, raised-budget exhaustive measurements (this stage)
+
+**Headline: every Phase-1 fix is now encoded in the model, every flip is wired in CI, and every
+flip is paired with a falsifiability pin.** The Wave-1 settlement (C3+D16) and the Wave-3
+claims-floor fence (A17/A18) have model-level mirrors; C3, the L2 armed form, A17 and A18 all
+HOLD and sit in the exported conjunctions; each flip's pre-fix behavior is frozen in an
+expect-violation calibration override that must keep falsifying — red-first at model level
+means the same scopes and budgets that produced each violation pre-fix now produce none, and
+the overrides prove they still would against the pre-fix actions. Owner decision 4 (A17/L2
+wired before close-out) is delivered through holdsInSim+pin pairs; owner decision 3 (the raised
+merge-gate budget) is implemented as the `longChecks` GHA-exclusion mechanism plus the measured
+manual-target table below. The four commits: the settlement encoding, the fence encoding, the
+longChecks mechanism, this record.
+
+**1. The flips (before → after, with evidence).**
+
+| Property | Before Wave 4 | After Wave 4 | Falsifiability pin |
+|---|---|---|---|
+| C3 `noWrongfulTerminalFailureSingleTenure` | VIOLATED as-built; expect-violation probe `quint-closure-evidence-probe-wrongful-terminal-failure` (Duo, rust sim, ~1/150K per-trace hit rate, 5M-sample budget); excluded from `asBuiltHoldInvariants` | HOLDS: BaseEx 50K samples, Duo 5M×14 (~80 s, the retired probe's exact scope and budget — the red→green flip evidence); back in `asBuiltHoldInvariants`/`allInvariants`; wired holds check `quint-closure-evidence-settlement-holds` (Duo, 5M×14, paired with the pin) | `quint-closure-calib-c3-no-reprobe`: pre-fix consumeWalk + reapTerminalBuild + probeFailFastTried frozen at Duo constants; falsifies C3 6/6 independent 1M-sample runs (the MCI-2 second-family trace: pre-fix reap fail-fasts a marked+tried Queued survivor whose outputs are obtainable); baseline (production step, same constants) holds C3 at 2M |
+| L2 `markedBrokenSettlementArmed` | Expected-fail probe in the 0b STATE form (`not(exists d16Cell)`); never produced — the cell sat ≥16 steps deep (0c deferred-probe record); not in any conjunction | Restated in the ARMED form (every reachable D16 cell is covered by the settlement partition — the guard defs are shared with the settling actions so invariant and actions cannot drift); HOLDS at Duo (2M×14) and C3Duo; in the conjunctions; wired via the same settlement-holds check | Same pin; additionally `markedBrokenSettlementArmedPreFix` (the pre-fix partition coverage, defined in the override) FALSIFIES under the override's baseline (production) step — the pre/post distinguisher: the cell the post-fix model reaches is exactly what the pre-fix partition fails to cover |
+| D16 cell reachability `canReachD16Cell` | Unreachable in any hunted budget (the deferred L2 probe; no checker ever assembled the cell) | Reachable at shallow depth via the promotion transient (merge wide / walk fails / consume reverts Queued+tried / out-of-band ingest / prune-merge stamps / cancel / reap holes+promotes → the cell); 12/12 hits at C3Duo and 6/6 at Duo in 1M-sample runs; WIRED as `quint-closure-evidence-witness-d16-cell` (C3Duo, 5M×14) — the settlement's non-vacuity proof | n/a (a witness: its violation IS the pass condition) |
+| A18 `leaderClassEvidenceWrites` | VIOLATED as-built; expect-violation probe `quint-closure-evidence-probe-stale-evidence-write` (StaleDuo, rust sim, ~1/2.5K hit rate) | HOLDS at StaleDuo (2M×15, ~44 s); in the conjunctions; wired holds check `quint-closure-evidence-stale-fence-holds` (StaleDuo, 2M×15) | `quint-closure-calib-a17-unfenced`: frozen pre-fence `pgApplyAny` at StaleDuo constants; falsifies A18 in <2 s at 500K samples (the 5-state D14-leg trace); baseline (production fenced apply) holds at 2M |
+| A17 `noStaleTenureClearOverride` | Expected-fail probe; never produced (the clear-then-restamp interleaving needs ≥14 steps; 0c deferred-probe record) | HOLDS (the same fence closes it — the latch sits on the apply path that fenced intents never reach); in the conjunctions; wired via the same stale-fence-holds check | Same pin (the A18 falsification is the wired oracle for the shared unfenced-apply mechanism) |
+| `canReachStaleIntentApply` | Wired witness (StaleDuo, sim) — the stale-APPLY window | UNREACHABLE in the production model (the fence discards before the apply); check REMOVED and replaced by `quint-closure-evidence-witness-fenced-discard` (`canReachFencedDiscard`, <2 s hit): the same window observed at the fence's discard — A17/A18 hold because the fence fires, not because deposed intents stopped arriving | The a17-unfenced override's frozen apply still sets the old flag (the predicate stays meaningful as the override's oracle) |
+| `canReachVerificationWalkConsumed` (new) | n/a (the predicate did not exist) | The WALK_CONSUME_CEIL headroom witness (review finding FC-5): a second walk consumption on one node is reachable (~1/70K at C3Duo); WIRED as `quint-closure-evidence-witness-verification-walk` — if a future ceiling edit drops a holds-regime ceiling back to 1, the settlement can spawn but never complete and this check goes red | n/a |
+
+**2. Model changes (closureEvidence.qnt; the introducing commits carry the per-edit rationale).**
+
+- Settlement: `probeSettleTried` (new dispatch-partition settlement action), `probeFailFastTried`
+  narrowed to confirmed-unobtainable, the consumeWalk Broken-arm settlement branch
+  (untried+obtainable → spend the one-shot + verification respawn; the model's atomic respawn
+  abstracts the code's revert-for-respawn, CF-1/FC-1), the reapTerminalBuild survivor settlement
+  with the MQueued exclusion (exact code mirror — review finding MCI-2: without it the model
+  wrongfully fail-fasts the Queued+tried survivor the code promotes-and-completes). Shared
+  settlement-arm guard defs (`settleArmAvailable` / `failFastArmConfirmedMissing` /
+  `settlementEnabled`) couple the actions to the L2 armed form structurally.
+- Fence: `pgApplyAny` discards stale evidence intents — zero new state variables (review finding
+  MCI-4): `lead.gen` IS the durable claims floor at this abstraction because `recoverAsLeader`
+  claims atomically with recovery; the code earns the same equivalence via the Wave-3 T-3.1
+  claim-before-recovery reorder (the model cannot represent the unfixed ordering, which is why
+  that reorder is the fence's production prerequisite).
+- Ceilings (review finding FC-5): WALK_CONSUME_CEIL 2→3 at
+  BaseEx/FaultPersistEx/FailoverEx/Duo/StaleDuo/AdversarialStoreEx and 1→2 at C3Duo — the
+  settlement adds one verification-walk consumption per arming; design-scale regimes stay at 2
+  (original + verification fits; the third slot is only needed where a downgrade re-spawn can
+  also occur within the trace budget).
+- New Reach fields `secondWalkConsumed` / `fencedDiscard` (record fields, not state variables —
+  every frozen calibration copy constructs `reach'` by spread, so all 17 override modules stay
+  valid without edits).
+- Conjunctions: `asBuiltHoldInvariants` is again the FULL set (identical to `allInvariants`,
+  now with C3 + L2-armed + A17 + A18); new `asBuiltHoldInvariantsAdversarialStore` (minus B9,
+  the documented GC-after-produce trip) for the adversarial-store measurement.
+
+**3. Calibration sync (RT-5 same-commit discipline; no frozen copy retro-fitted).**
+
+- New override modules: `closure-c3-no-reprobe.qnt` (three pre-fix actions, Duo constants),
+  `closure-a17-unfenced.qnt` (frozen pre-fence apply, StaleDuo constants).
+- Seven existing modules' `calibStepDrv` alphabets gain `probeSettleTried` so each stays
+  "production minus exactly the frozen action(s)": f2, f3-indet, f3-subst, f6, f8, f9, f13. The
+  five modules that reference production `stepDrv`/`stepBuild` wholesale (f1-stale, f1-skip,
+  f4-demand, f4-vacuous, f7) and the two recoverAsLeader-copying modules (f10, f14) needed no
+  edit.
+- Frozen-copy BODIES are intentionally not retro-fitted with the settlement/fence (the f10/f14
+  precedent from the Wave-2 plan): each copy freezes the consumeWalk/poisonClear/pgApplyAny of
+  the era whose defect it documents. f6's header records that its frozen consumeWalk predates
+  the Phase-1 settlement and why that is intentional.
+- Scope deviation from the plan: the C3 pin and the settlement-holds check run at DUO constants,
+  not C3Duo. The C3Duo restriction (poison/attempts off, extra intent slot) was designed to
+  cheapen TLC BFS (the post-0d triage's purpose for that module); under the rust simulator it
+  DILUTES the per-trace hit rate by roughly an order of magnitude — measured this wave: the
+  pre-fix C3 falsification hits 6/6 at 1M samples at Duo constants vs ~1-in-2-to-5M at C3Duo
+  constants; the D16-cell witness hits 12/12 at 1M at C3Duo (where the cell needs no poison)
+  but the C3 violation needs the wider alphabet. Wiring follows the measured hit rates, not the
+  plan's scope guess.
+
+**4. Calibration re-validation (T-4.4) — every falsification still falsifies, every baseline holds.**
+
+Wired checks: all 29 `quint-closure-*` checks built green TWICE (after the settlement commit,
+again after the fence commit) — including the six 0d calibration checks, every witness, the
+B2-strong probe, and the four new Phase-1 entries. Unwired evidence modules, re-run via their
+header commands against the both-flips model:
+
+| Module | Property | Verdict (Wave-4 model) |
+|---|---|---|
+| f1-skip-store-recheck | C4 | still falsifies — TLC, 3.2 s, 171 distinct states (16 workers) |
+| f3-indet-failfast | B3 | still falsifies — TLC, 41 s, 77 K distinct (16 workers) |
+| f3-substitutable-demoted | C2 | still falsifies — TLC, 38 s, 73 K distinct (16 workers) |
+| f4-vacuous-prune | B4 | still falsifies — TLC, 1.7 s, 138 distinct (16 workers) |
+| f5-wanted-overwrite | B5 | still falsifies — TLC, 40 s, 53 K distinct (16 workers) |
+| f6-latch-outlives-chain | A21 | still falsifies — rust sim, 1.4 s (100 K × 12) |
+| f10-recovery-vouch-unscoped | A3 | still falsifies — TLC, 567 s, 4.73 M distinct (60 workers; consistent with its 0d depth-17 / 5.15 M / ~8.4 min-at-192-workers record) |
+| f13-unprobed-dispatch | B8 | still falsifies — TLC, 39 s, 72 K distinct (16 workers) |
+| f14-recovery-keeps-substituting | L1 | still falsifies — TLC, 15 s, 21 K distinct (16 workers) |
+
+Stop-and-report conditions 3 (a calibration stops falsifying) and 4 (a wired witness becomes
+unreachable, beyond the three planned flips) did not trigger.
+
+**5. Exhaustive measurements at the raised budget (T-4.5).**
+
+Conditions: 60 TLC workers per run, 35-minute wall-clock cap, -Xmx48G heap, the 192-core
+reference builder (the same host class as the 0c/0d/Wave-2/2b records), quint 0.32.0 /
+Apalache 0.56.1, dedicated warm apalache-server per run. Invariant: `asBuiltHoldInvariants`
+(the full post-flip conjunction) except where noted.
+
+| # | Conjunction × scope | Pre-fix reference (0c/0d/W2b records) | Post-fix measurement (this wave) | Verdict / Tier |
+|---|---|---|---|---|
+| 1 | `closureEvidenceBaseEx` × asBuiltHoldInvariants | 0c closing run: 16.4 M distinct / 70.1 M generated / depth 21 / ~15.5 min, unconverged (C3 excluded; full-width workers) | NO violation; stopped unconverged at the 35-min cap: 31.46 M distinct / 142.96 M generated / Progress(16), queue 10.94 M still growing | Tier 3 — manual target (post-fix prefix is ~1.9× the 0c pre-fix exploration with zero violations) |
+| 2 | `closureEvidenceFailoverEx` × asBuiltHoldInvariants (FULL, L3 included) | W2b re-hunt: 23.7 M distinct / 107.7 M generated / Progress(14) at 35-min cap, unconverged (60 workers) | NO violation; stopped unconverged at the 35-min cap: 18.80 M distinct / 84.69 M generated / Progress(14), queue 10.05 M still growing | Tier 3 — manual target (the full conjunction, L3 included, stays violation-free over a prefix comparable to the Wave-2b re-hunt) |
+| 3 | `closureEvidenceFaultPersistEx` × asBuiltHoldInvariants | never measured | NO violation; stopped unconverged at the 35-min cap: 25.51 M distinct / 114.84 M generated / Progress(15), queue 10.49 M still growing | Tier 3 — manual target (first-ever measurement of this scope) |
+| 4 | `closureEvidenceDuo` × asBuiltHoldInvariants | 0d/post-0d: C3 alone 540 K distinct / ~15 min unconverged (60 workers) | NO violation; unconverged at the 35-min cap: 889,030 distinct / 6,429,992 generated / Progress(8), queue 735,964 still growing (60 workers) | Tier 3 — manual target |
+| 5 | `closureEvidenceC3Duo` × asBuiltHoldInvariants | post-0d: C3 alone 573 K distinct / 4.0 M generated / ~15 min unconverged (60 workers; pre-raise ceiling) | NO violation; unconverged at the 35-min cap: 1,215,490 distinct / 8,404,107 generated / Progress(8), queue 954,546 still growing (60 workers) | Tier 3 — manual target |
+| 6 | `closureEvidenceStaleDuo` × A17+A18 (`leaderClassEvidenceWrites,noStaleTenureClearOverride`) | post-0d: pre-fence A18 violation found at 776 K distinct / 5.1 M generated / 14.8 min full-step at 100 workers | NO violation; unconverged at the 35-min cap: 1,260,071 distinct / 7,921,461 generated / Progress(8), queue 1,054,556 still growing (60 workers) | Tier 3 — manual target |
+| 7 | `closureEvidenceAdversarialStoreEx` × asBuiltHoldInvariantsAdversarialStore | B2-strong probe (expect-violation): depth 7 / ~40 s; the hold conjunction never measured | NO violation; unconverged at the 35-min cap: 4,801,915 distinct / 20,431,752 generated / Progress(11), queue 3,206,783 still growing (60 workers) | Tier 3 — manual target |
+
+Verdicts and tier assignment (adjudication OQ6's three-tier rule):
+
+| Tier (OQ6) | Definition | Members after this campaign |
+|---|---|---|
+| Tier 1 — GHA-swept | exhaustive TLC conjunction converging ≤ ~5 min at 60 workers → wired `mkQuintCheck` with `workers` pinned | none of the seven candidates qualified |
+| Tier 2 — [LONG], local gate only | converging in 5–30 min → wired into `checks.*` and named in `longChecks` (excluded from the GHA formal matrix) | none qualified — the `longChecks` list ships empty (the mechanism is implemented, verified, and dormant) |
+| Tier 3 — documented manual target | not converged at 30 min / 60 workers | ALL SEVEN candidates (table above); each remains re-runnable via the manual-target commands recorded at the nix/quint.nix closure-evidence section comments, now against the post-flip conjunctions |
+
+Decision-4 note: the A17/L2 GHA-wired deliverables do not depend on these verdicts — the
+holdsInSim+pin pairs are wired regardless (the OQ6 fallback chain: "the holdsInSim pair IS the
+deliverable; TLC conjunctions are additive when they fit a tier"). Decision-3 note: the raised
+15–30-minute local budget is implemented (the mechanism + this measurement record); what the
+budget could not buy at this state-space scale is convergence — the bounded-prefix evidence
+(every conjunction explored 3–20+ M distinct states with zero violations) is the merge gate's
+exhaustive posture until Phase 2 or a Track E bare-metal lane changes the budget class.
+
+Measurement-conditions note: runs 1–3 (BaseEx/FailoverEx/FaultPersistEx) ran as a clean
+3-concurrent batch (180 threads / 192 cores). Runs 4–7 (Duo/C3Duo/StaleDuo/AdversarialStoreEx)
+ran as a 4-concurrent batch (240 threads / 192 cores, ~1.25× thread oversubscription) — their
+figures are conservative lower bounds on a contention-free 35-minute exploration; the verdicts
+(unconverged, no violation) are unaffected by the contention.
+
+No measurement reported a violation: stop-and-report condition 7 (a violation other than the
+expected flips) did not trigger — the post-fix conjunctions hold over every explored prefix.
+
+Pre-excluded from measurement (review finding SD-4, recorded for the decision-3 close-out): the
+five design-scale regime conjunctions (closureEvidence{Base,FaultPersist,Failover,StaleTenure,
+AdversarialStore} × their conjunctions), on the recorded 0b/0c evidence — slice non-convergence
+and 40+ minutes to BFS depth 2–3 at design scale. They remain documented manual targets;
+re-opening them is an owner decision, not a budget increment.
+
+**6. Wired-check inventory delta (25 → 29; all Tier 1 / GHA-swept).**
+
+| Change | Check | Replaces / replaced by |
+|---|---|---|
+| REMOVED | quint-closure-evidence-probe-wrongful-terminal-failure (C3 expect-violation, Duo sim) | replaced by the settlement flip set below |
+| REMOVED | quint-closure-evidence-probe-stale-evidence-write (A18 expect-violation, StaleDuo sim) | replaced by the fence flip set below |
+| REMOVED | quint-closure-evidence-witness-stale-intent-apply (StaleDuo sim) | replaced by witness-fenced-discard (the flag is unreachable post-fence) |
+| NEW | quint-closure-calib-c3-no-reprobe (expect-violation pin, Duo constants, 5M×14) | the C3/L2 falsifiability half |
+| NEW | quint-closure-evidence-settlement-holds (holdsInSim: C3 + L2-armed, Duo, 5M×14) | the C3/L2 holds half; carries r[verify sched.evidence.settlement] + r[verify sched.merge.substitute-topdown+12] |
+| NEW | quint-closure-evidence-witness-d16-cell (C3Duo, 5M×14) | the L2 armed form's non-vacuity (the cell is reachable) |
+| NEW | quint-closure-evidence-witness-verification-walk (C3Duo, 2M×14) | the FC-5 ceiling-headroom pin |
+| NEW | quint-closure-calib-a17-unfenced (expect-violation pin, StaleDuo constants, 500K×15) | the A17/A18 falsifiability half |
+| NEW | quint-closure-evidence-stale-fence-holds (holdsInSim: A17 + A18, StaleDuo, 2M×15) | the A17/A18 holds half; carries r[verify sched.evidence.durability+2] |
+| NEW | quint-closure-evidence-witness-fenced-discard (StaleDuo, 500K×15) | the fence's non-vacuity (deposed intents still reach the apply site) |
+| unchanged | the remaining 22 checks (10 BaseEx TLC witnesses, downgrade-respawn, hole-reap, hole-recovery, recovery-clear, cross-tenure-walk, B2-strong probe, 6 calib checks) | rebuilt green against the Wave-4 model |
+
+Harness additions: `mkQuintSimHoldsCheck` (the bounded-simulation holds constructor — the dual
+of mkQuintSimWitnessCheck; every instance must name its falsifiability pin), the optional
+`workers` argument on mkQuintCheck/mkQuintWitnessCheck (MCI-6 worker-count pinning; the null
+default renders byte-identical scripts, verified no existing check rehashes), and the
+`longChecks` export + flake.nix `removeAttrs` exclusion (the Tier-2 mechanism — currently an
+empty list, see §5; verified end-to-end with a temporary entry: the named check leaves
+ciMatrix.formal and ciMatrix.checks while staying in checks.*).
+
+GHA-pod runtime caveat (recorded for the integration gate): the "Tier 1 / GHA-swept"
+assignment of the sim-backed checks follows the post-0d precedent (the retired 5M-sample C3
+probe occupied the same cost class), but no closure-evidence check has yet RUN in the GHA
+formal lane — the campaign lives on `formal-sprint`, which has not been pushed — so the
+per-check pod wall-clock at rio-ci vCPU counts is unmeasured. If a sim check exceeds the lane
+budget at integration time, the `longChecks` mechanism is the designated relief valve (move the
+check's name into the list — no flake.nix edit needed); the reference-builder wall-clocks of
+every wired check are in the introducing commits.
+
+**7. Deviations from the plan (recorded per the Wave-1 correction precedent).**
+
+1. The C3 pin and settlement-holds check run at Duo constants, not C3Duo (§3; measured hit-rate
+   justification).
+2. The holds checks landed in the same commits as their model flips (T-4.1/T-4.3) rather than in
+   a separate T-4.6 commit — the RT-5 self-contained-commit discipline takes precedence over the
+   plan's task-to-commit map. T-4.6's surviving separate content (the `workers` argument) landed
+   with T-4.7's mechanism commit.
+3. `mkQuintSimHoldsCheck` conjoins invariants with `" and "` (a quint expression) rather than
+   `","` — `quint run --invariant` rejects the comma form (`quint verify` accepts it).
+4. T-4.2 (the L3 model fix + pin) did not execute — Wave 2 took outcome B (L3 refuted as a
+   production defect) and Wave 2b's scoping+promotion pair already carries the L3 closure; the
+   FailoverEx measurement below runs the FULL conjunction (L3 included) per the Wave-2b record.
+5. The T-4.4 evidence-module re-runs used 16 TLC workers for the eight shallow falsifications
+   (they complete in seconds-to-a-minute; the worker count is irrelevant at that depth) and 60
+   for the deep f10 run; the 0d records they are compared against used 8–192 workers.
+
+**8. Updated owner sign-off items (supersedes the Wave-2b list; renumbered).**
+
+1. The C5 / CE-7 deferral — unchanged (0d item; Phase 2).
+2. The F6 falsifications resting on the rust simulator — unchanged.
+3. The CE-45 (F10) evidence-module-only falsification — unchanged (re-validated this wave:
+   567 s at 60 workers).
+4. ~~The mkQuintWitnessCheck rust-backend extension funding question~~ — superseded: the
+   sim-witness constructor exists since the post-0d triage and Wave 4 added its holds dual;
+   both are in production use with five wired instances.
+5. ~~A17/L2 wiring + the raised-budget exhaustive wiring (decisions 3+4)~~ — DELIVERED by this
+   stage: the holds+pin pairs are wired (decision 4), the exhaustive conjunctions are measured
+   at the raised budget and the `longChecks` mechanism implements the OQ6 adjudication
+   (decision 3). Residual for close-out sign-off: the Tier-3 manual-target table (§5) — every
+   exhaustive conjunction remains unconverged at 30 minutes / 60 workers, so the merge gate's
+   exhaustive evidence stays bounded-prefix rather than converged; the owner counter-signs this
+   as the accepted decision-3 residual, or commissions the Track E bare-metal formal-long lane
+   (out of Phase-1 scope per OQ6).
+6. The 0c carry-overs — unchanged: the design-scale regimes (§5 pre-exclusion) and the
+   C1-strict probe.
+
+Later phases append here (Wave 5 / close-out: acceptance table over the full corpus,
+deployment-checklist deltas and counter-signatures).
