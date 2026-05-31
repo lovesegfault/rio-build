@@ -1547,6 +1547,17 @@
                   # checks the protocol, these harnesses the decision
                   # arithmetic over bounded arbitrary inputs.
                   #
+                  # kani-rio-evidence-kernel: same pipeline over the
+                  # scheduler's closure-evidence decision kernel
+                  # (rio-evidence-kernel) — the ClosureEvidence
+                  # classifier's exhaustive case analysis and the
+                  # must_substitute()/closure_vouched() predicate
+                  # contracts. Seconds-class harnesses (the kernel is a
+                  # case analysis over bools, not a fold); the formal
+                  # model (quint-closure-evidence-*, in quintChecks)
+                  # checks the lifecycle protocol, these harnesses the
+                  # decision predicates it keys on.
+                  #
                   # This inherit is also what routes a kani proof into the
                   # CI `formal` matrix lane: ciMatrix.formal intersects
                   # (quintChecks // kaniChecks) with config.checks, so a
@@ -1554,7 +1565,12 @@
                   # be sharded into that lane (quint checks need no extra
                   # step — the whole quintChecks set is merged into
                   # checks.* above, so they flow through automatically).
-                  inherit (kaniChecks) kani-rio-lease kani-rio-store kani-rio-retry-kernel;
+                  inherit (kaniChecks)
+                    kani-rio-lease
+                    kani-rio-store
+                    kani-rio-retry-kernel
+                    kani-rio-evidence-kernel
+                    ;
                   # Regression: per-node profraw extract must not drop
                   # filename-colliding profraws across multi-worker nodes.
                   # No KVM needed (synthetic tarballs).

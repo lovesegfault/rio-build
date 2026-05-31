@@ -6313,6 +6313,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rio-evidence-kernel"
+version = "0.1.0"
+
+[[package]]
 name = "rio-gateway"
 version = "0.1.0"
 dependencies = [
@@ -6469,6 +6473,7 @@ dependencies = [
  "rand 0.10.1",
  "rio-auth",
  "rio-common",
+ "rio-evidence-kernel",
  "rio-lease",
  "rio-migrations",
  "rio-nix",

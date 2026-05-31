@@ -57,6 +57,7 @@ specs (
           rio-nix/src/**/*.rs
           rio-proto/src/**/*.rs
           rio-retry-kernel/src/**/*.rs
+          rio-evidence-kernel/src/**/*.rs
           rio-common/src/**/*.rs
           rio-auth/src/**/*.rs
           rio-cli/src/**/*.rs

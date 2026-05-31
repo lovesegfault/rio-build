@@ -260,4 +260,52 @@ in
     crate = crateBuildKani.members.rio-retry-kernel;
     expectedHarnesses = 6;
   };
+
+  # rio-evidence-kernel: the scheduler's closure-evidence decision kernel
+  # (the ClosureEvidence classifier and the must_substitute()/
+  # closure_vouched() predicates), extracted from
+  # rio-scheduler/src/dag/mod.rs + actor/merge.rs into a dependency-free
+  # crate so the harnesses' goto model closes over the kernel alone — the
+  # closure-evidence campaign's Phase-2 assurance deliverable, following
+  # the rio-retry-kernel extraction precedent.
+  # DerivationDag::closure_evidence and the merge/dispatch predicates are
+  # the projection shims; the quint model (quint-closure-evidence-*, in
+  # quintChecks) checks the lifecycle protocol over these predicates,
+  # these harnesses prove the predicates themselves over their full
+  # bounded input domain.
+  #
+  # Eight harnesses (in rio-evidence-kernel/src/lib.rs `mod proofs`),
+  # measured at ~0.06–0.65 s CBMC time each (~3 s total, ~12 s wall with
+  # the kani-compiler build) on the dev builder:
+  #   - check_classifier_exhaustive_case_analysis: the classifier's
+  #     five-case partition (absent/holed/childless → Broken; non-empty
+  #     all-produced → Vouched; otherwise Pending) is exact, total, and
+  #     panic-free over every bounded child set.
+  #   - check_marked_broken_must_substitute: marked + Broken evidence
+  #     (absent, holed, or childless) ⇒ must_substitute — the
+  #     "MUST NOT be dispatched as a from-source build" clause.
+  #   - check_vouched_never_must_substitute: Vouched (and Pending)
+  #     evidence never produces a must_substitute verdict, marked or
+  #     not.
+  #   - check_unmarked_evidence_inert: without the topdown_pruned mark
+  #     no evidence state forces substitution (the closure-hole rule's
+  #     inert-on-unmarked clause).
+  #   - check_hole_breaks_and_never_vouches: setting the closure_hole
+  #     bit forces Broken, never vouches however many surviving
+  #     children are produced, and never turns a must-substitute
+  #     verdict off (the OR-monotonicity / stale-true-is-safe
+  #     asymmetry).
+  #   - check_vouched_iff_nonempty_all_produced: Vouched exactly when
+  #     present ∧ un-holed ∧ non-empty ∧ all children produced — the
+  #     criterion the mark clear and stamp exemption key on.
+  #   - check_must_substitute_contract / check_closure_vouched_contract:
+  #     proof_for_contract over the predicates' #[kani::ensures]
+  #     clauses, full input domain.
+  # r[verify sched.merge.substitute-topdown+12]
+  # r[verify sched.evidence.closure-hole]
+  kani-rio-evidence-kernel = mkKaniCheck {
+    name = "rio-evidence-kernel";
+    crate = crateBuildKani.members.rio-evidence-kernel;
+    expectedHarnesses = 8;
+  };
 }

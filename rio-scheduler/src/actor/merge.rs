@@ -11,7 +11,6 @@ use uuid::Uuid;
 
 use rio_proto::types::FindMissingPathsRequest;
 
-use crate::dag::ClosureEvidence;
 use crate::state::{
     BuildInfo, BuildState, BuildStateExt, DerivationStatus, DrvHash, effective_wanted,
     union_wanted_saturating, verifiable_wanted_paths,
@@ -1900,7 +1899,7 @@ impl DagActor {
     }
 
     /// True when [`crate::dag::DerivationDag::closure_evidence`] judges
-    /// `drv_hash`'s child set [`ClosureEvidence::Vouched`]: at least
+    /// `drv_hash`'s child set [`ClosureEvidence::Vouched`](crate::dag::ClosureEvidence::Vouched): at least
     /// one DAG child, every one of them already produced
     /// (Completed/Skipped), and no `closure_hole` breadcrumb — the only
     /// children shape that says the node's dependency closure exists in
@@ -1914,17 +1913,17 @@ impl DagActor {
     /// post-reconciliation pass in `handle_merge_dag` and the
     /// completion-time `clear_topdown_pruned_for_produced_parents`;
     /// the lazy clear in `handle_substitute_complete` reads
-    /// [`ClosureEvidence::Vouched`] off
+    /// [`ClosureEvidence::Vouched`](crate::dag::ClosureEvidence::Vouched) off
     /// [`crate::dag::DerivationDag::closure_evidence`] directly rather
     /// than through this helper), so the stamps and the clears always
     /// judge the same criterion. Children that
     /// are merely *present* but unbuilt do NOT vouch
-    /// ([`ClosureEvidence::Pending`]) — they can belong to another
+    /// ([`ClosureEvidence::Pending`](crate::dag::ClosureEvidence::Pending)) — they can belong to another
     /// build and be reaped unbuilt later (cancel → cascade terminal →
     /// reap → `children` scrubbed), leaving the node childless or
     /// closure-holed with a never-produced closure; and produced
     /// SURVIVORS of such a reap do not vouch either
-    /// ([`ClosureEvidence::Broken`] via the hole) — they are a
+    /// ([`ClosureEvidence::Broken`](crate::dag::ClosureEvidence::Broken) via the hole) — they are a
     /// truncated view of the pruned closure. Deliberate trade: a node
     /// stamped alongside unbuilt children carries the mark only until
     /// those children are produced (the completion-time clear drops it
@@ -1940,12 +1939,12 @@ impl DagActor {
     /// also owns the parent); the dispatch-time and reap-time guards
     /// consume the inverse judgment via [`Self::must_substitute`].
     pub(super) fn closure_vouched(&self, drv_hash: &str) -> bool {
-        self.dag.closure_evidence(drv_hash) == ClosureEvidence::Vouched
+        rio_evidence_kernel::closure_vouched(self.dag.closure_evidence(drv_hash))
     }
 
     // r[impl sched.merge.substitute-topdown+12]
     /// True when `drv_hash` carries the `topdown_pruned` mark AND its
-    /// closure evidence is [`ClosureEvidence::Broken`] (childless or
+    /// closure evidence is [`ClosureEvidence::Broken`](crate::dag::ClosureEvidence::Broken) (childless or
     /// closure-holed): its dependency closure was dropped from the
     /// submission and the current child set cannot vouch for it, so the
     /// node must complete via substitution — a from-source dispatch is
@@ -1960,8 +1959,10 @@ impl DagActor {
     /// at every guard. Unmarked nodes are never affected, whatever
     /// their evidence.
     pub(super) fn must_substitute(&self, drv_hash: &str) -> bool {
-        self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned)
-            && self.dag.closure_evidence(drv_hash) == ClosureEvidence::Broken
+        rio_evidence_kernel::must_substitute(
+            self.dag.node(drv_hash).is_some_and(|s| s.topdown_pruned),
+            self.dag.closure_evidence(drv_hash),
+        )
     }
 
     /// Persist nodes and edges to the DB after a successful DAG merge,

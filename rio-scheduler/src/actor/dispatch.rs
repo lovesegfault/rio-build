@@ -951,7 +951,7 @@ impl DagActor {
         // the one-shot here would burn the verification credit on a
         // store outage; leave it unspent so the next dispatch sweep's
         // settlement-aware partition re-probes (r[sched.evidence.settlement]).
-        let deferred_settlement = topdown_pruned && evidence == ClosureEvidence::Broken;
+        let deferred_settlement = rio_evidence_kernel::must_substitute(topdown_pruned, evidence);
         if !(forgiven_now_wanted || deferred_settlement) {
             state.substitute_tried = true;
         }

@@ -114,12 +114,16 @@ pub struct ReapOutcome {
 /// `topdown_pruned` stamp gate, clear site, and dispatch-time guard.
 /// Computed by [`DerivationDag::closure_evidence`].
 ///
-/// `Broken` means "the current child set must NOT vouch for a
-/// from-source dispatch": the node is absent, has no children at all
-/// (a fired prune dropped its closure from the submission, or every
-/// child was reaped), or carries the `closure_hole` breadcrumb — an
-/// un-produced child was removed out from under it, by the
-/// terminal-build reap (see the breadcrumb loop in
+/// Re-exported from [`rio_evidence_kernel`], the dependency-free
+/// CBMC-verified decision kernel: the variant semantics, the case
+/// analysis that produces them, and the predicates layered on them
+/// (`must_substitute` / `closure_vouched`) are owned and proven there;
+/// this DAG owns only the projection of its node/edge maps into the
+/// kernel's inputs.
+///
+/// In this DAG, `Broken`'s "closure-holed" input is the `closure_hole`
+/// breadcrumb — an un-produced child was removed out from under the
+/// node, by the terminal-build reap (see the breadcrumb loop in
 /// [`DerivationDag::remove_build_interest_and_reap`]), by a
 /// poison-clear removal (admin ClearPoison or the poison-TTL sweep), or
 /// by leader-failover recovery dropping the edge to one (the
@@ -134,21 +138,7 @@ pub struct ReapOutcome {
 /// resubmit); it is dropped only by the merge-time heal when a full
 /// merge re-declares the node's edges (the post-reconciliation pass in
 /// `handle_merge_dag`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ClosureEvidence {
-    /// At least one child, every child produced (Completed/Skipped),
-    /// and no closure hole: the dependency closure is in the store, so
-    /// a from-source dispatch is not doomed and a `topdown_pruned`
-    /// mark may be cleared.
-    Vouched,
-    /// At least one child and no closure hole, but not every child is
-    /// produced yet: keep any mark (the children can still be reaped
-    /// unbuilt later) and re-judge once they are produced or reaped.
-    Pending,
-    /// Absent, childless, or closure-holed: the child set must not
-    /// vouch for a from-source dispatch.
-    Broken,
-}
+pub use rio_evidence_kernel::ClosureEvidence;
 
 /// The global derivation DAG maintained by the actor.
 #[derive(Debug, Default)]
@@ -902,6 +892,14 @@ impl DerivationDag {
     /// → `Broken`; no children → `Broken`; at least one child and all
     /// of them Completed/Skipped → `Vouched`; otherwise `Pending`.
     ///
+    /// Projection shim over [`rio_evidence_kernel::closure_evidence`] —
+    /// the CBMC-verified kernel owns the case analysis and the
+    /// child-set fold; this method gathers the kernel's inputs out of
+    /// the node/edge maps: presence, the breadcrumb bit, and one lazy
+    /// produced-ness bool per declared child (a child edge whose node
+    /// is missing from the DAG projects as un-produced, exactly as the
+    /// pre-extraction `is_some_and` lookup did).
+    ///
     /// Every `topdown_pruned` decision site (the stamp gates in
     /// `validate_and_ingest` / `persist_merge_to_db`, the
     /// produced-children clear sites, and the dispatch-time / reap-time
@@ -913,31 +911,21 @@ impl DerivationDag {
     /// poison-clear removals (admin `ClearPoison` and the poison-TTL
     /// sweep), and healed by the merge-time edge re-declaration.
     pub fn closure_evidence(&self, drv_hash: &str) -> ClosureEvidence {
-        let Some(node) = self.nodes.get(drv_hash) else {
-            return ClosureEvidence::Broken;
-        };
-        if node.closure_hole {
-            return ClosureEvidence::Broken;
-        }
-        let Some(children) = self.children.get(drv_hash) else {
-            return ClosureEvidence::Broken;
-        };
-        if children.is_empty() {
-            return ClosureEvidence::Broken;
-        }
-        let all_produced = children.iter().all(|child_hash| {
-            self.nodes.get(child_hash).is_some_and(|n| {
-                matches!(
-                    n.status(),
-                    DerivationStatus::Completed | DerivationStatus::Skipped
-                )
-            })
-        });
-        if all_produced {
-            ClosureEvidence::Vouched
-        } else {
-            ClosureEvidence::Pending
-        }
+        let node = self.nodes.get(drv_hash);
+        rio_evidence_kernel::closure_evidence(
+            node.is_some(),
+            node.is_some_and(|n| n.closure_hole),
+            self.children.get(drv_hash).map(|children| {
+                children.iter().map(|child_hash| {
+                    self.nodes.get(child_hash).is_some_and(|n| {
+                        matches!(
+                            n.status(),
+                            DerivationStatus::Completed | DerivationStatus::Skipped
+                        )
+                    })
+                })
+            }),
+        )
     }
 
     /// Check whether any dependency is in a terminal failure state.

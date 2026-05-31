@@ -1,0 +1,36 @@
+# Dependency-free home for the scheduler's closure-evidence decision
+# kernel: the ClosureEvidence classifier (closure_evidence()) and the
+# two predicates layered on it (must_substitute()/closure_vouched()).
+# Extracted from rio-scheduler/src/dag/mod.rs and actor/merge.rs so the
+# kani goto model for the proof harnesses closes over THIS crate only —
+# inside rio-scheduler's artifact context the same harnesses would
+# inherit the crate's full reachable code (HashMap/HashSet node storage,
+# Arc-backed identifiers, sqlx/tonic types) and CBMC would not converge
+# inside a merge-gate budget. Keep it that way: no dependencies. The
+# scheduler-facing vocabulary (DerivationDag, DerivationState, the
+# status enums) stays in rio-scheduler; DerivationDag::closure_evidence
+# and the merge/dispatch predicates are the projection shims.
+[package]
+name = "rio-evidence-kernel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Pure closure-evidence decision kernel for the rio-build scheduler (CBMC-verified)"
+
+[lints.rust]
+# `cfg(kani)` is set by kani-compiler (nix `crateBuildKani` passes
+# `--cfg=kani --check-cfg=cfg(kani)`); register it here so the regular
+# cargo build doesn't warn `unexpected_cfgs` on the
+# `#[cfg_attr(kani, kani::...)]` contracts and the `#[cfg(kani)]`
+# proofs module.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(kani)"] }
+
+# No [dependencies]: the whole point of this crate is that the CBMC
+# proof harnesses' call graph stays inside core/alloc/std. It is also
+# excluded from hakari's workspace-hack unification
+# (.config/hakari.toml [final-excludes]) so it does not even carry the
+# feature-unification stub.
+[dependencies]
