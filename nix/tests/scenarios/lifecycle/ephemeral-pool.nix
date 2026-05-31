@@ -64,11 +64,10 @@ scope: with scope; ''
           "  namespace: ${nsBuilders}\n"
           "spec:\n"
           "  kind: Builder\n"
-          # No dispatchMode: the CRD absent-means-Pull default (the 1c
-          # cutover) applies, so this subtest also exercises the
-          # defaulting path end-to-end. The Job-per-build assertions
-          # below are dispatch-mode-independent (the controller spawns
-          # one Job per intent either way).
+          # Pull is the only dispatch protocol (the dispatchMode knob
+          # is retired), so there is nothing to select here. The
+          # Job-per-build assertions below exercise the controller's
+          # one-Job-per-intent spawn loop.
           "  maxConcurrent: 4\n"
           "  systems: [x86_64-linux]\n"
           # rio-builder:dev — MUST match the ref from nix/docker.nix
@@ -80,7 +79,9 @@ scope: with scope; ''
           "  image: rio-builder:dev\n"
           "  imagePullPolicy: Never\n"
           "  privileged: true\n"
-          "  terminationGracePeriodSeconds: 60\n"
+          # No terminationGracePeriodSeconds: the field is retired with
+          # the dispatch-mode knob — every executor pod carries the
+          # fixed 45s AD5 abort grace.
           "  nodeSelector: null\n"
           "  tolerations: null\n"
           "EOF"

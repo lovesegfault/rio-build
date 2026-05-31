@@ -1326,8 +1326,10 @@ The builder does not register, heartbeat, or open a dispatch stream: it asks
 for its work with `ExecutorService.PullAssignment` and reports the outcome
 with `ExecutorService.ReportOutcome`, both retried until acked. This is the
 only delivery path — the stream session client was deleted with the
-executor-lifecycle 1d collapse (a pool-level `dispatchMode: Stream` value
-still renders, but the builder ignores the env and always pulls).
+executor-lifecycle 1d collapse, and the pool-level `dispatchMode` selector
+plus the `RIO_DISPATCH_MODE` pod discriminator were retired with it (the
+config loader still tolerates a stray env of that name, but nothing renders
+one).
 
 #r("builder.pull.retry-loop+2")[
   In pull mode the builder MUST retry a retryably-unservable `PullAssignment`

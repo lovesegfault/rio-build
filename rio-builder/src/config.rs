@@ -199,9 +199,10 @@ pub struct Config {
     #[schemars(with = "u64")]
     pub idle_timeout: std::time::Duration,
     // dispatch_mode removed with the stream client (executor-lifecycle
-    // 1d collapse): pull is the only delivery path. A stray
-    // `RIO_DISPATCH_MODE` env (older pod templates render it) is
-    // ignored by the config loader.
+    // 1d collapse): pull is the only delivery path. The pod-template
+    // discriminator (`RIO_DISPATCH_MODE`) retired with the Pool CRD
+    // dispatchMode knob; a stray env of that name is ignored by the
+    // config loader.
     // fod_proxy_url removed per ADR-019: builders are airgapped; FODs
     // route to fetchers which have direct egress. Squid proxy deleted.
 }

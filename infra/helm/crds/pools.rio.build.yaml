@@ -49,23 +49,6 @@ spec:
               wrapper, KubeSchema handles the schema internals (including
               the JsonSchema impl, so don't derive that separately).
             properties:
-              dispatchMode:
-                description: |-
-                  Executor dispatch mode (the executor-lifecycle replacement's
-                  per-pool selector). `Pull` (the default when the field is absent,
-                  since the 1c cutover) spawns pods that speak the pull/report
-                  unaries (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort
-                  semantics (SIGTERM aborts the build; the pod template renders the
-                  small pull-mode terminationGracePeriodSeconds instead of the 2 h
-                  drain grace). `Stream` keeps the legacy register/heartbeat/
-                  bidi-stream session protocol — selectable per pool until that path
-                  is deleted at the 1c'/1d slices. Flipping a deployed pool's
-                  template remains an operator action executed at deployment time.
-                enum:
-                - Stream
-                - Pull
-                nullable: true
-                type: string
               features:
                 default: []
                 description: |-
@@ -217,19 +200,6 @@ spec:
                 items:
                   type: string
                 type: array
-              terminationGracePeriodSeconds:
-                description: |-
-                  Pod terminationGracePeriodSeconds. SIGTERM → executor drain
-                  (DrainExecutor + wait for in-flight builds to complete). After
-                  this many seconds: SIGKILL, builds lost.
-
-                  `None` = per-kind default (7200 builders, 600 fetchers — nix
-                  builds can legitimately take 2h; fetches are short). Clusters
-                  with known-shorter builds should set this lower so Pool
-                  deletion doesn't stall on a stuck/never-Ready pod.
-                format: int64
-                nullable: true
-                type: integer
               tolerations:
                 description: |-
                   Tolerations for the Job pod spec. Typed `Toleration` (not

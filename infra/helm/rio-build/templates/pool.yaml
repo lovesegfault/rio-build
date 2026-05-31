@@ -24,14 +24,8 @@ spec:
   {{- with $p.maxConcurrent }}
   maxConcurrent: {{ . }}
   {{- end }}
-  {{- /* Executor dispatch protocol (Stream | Pull). Single-sourced from
-         poolDefaults so the whole fleet flips together; per-pool
-         overrides stay possible for a staged (canary-first) rollout or
-         to keep one pool on the stream protocol while it still exists
-         (it is deleted at the executor-lifecycle 1c'/1d slices). */}}
-  {{- with $p.dispatchMode }}
-  dispatchMode: {{ . }}
-  {{- end }}
+  {{- /* No dispatchMode: the pull protocol is the only delivery path
+         (the knob retired with the stream session protocol). */}}
   {{- /* fuseCacheBytes is NOT rendered for either kind. r35
          merged_bug_024: §13e routes Fetcher Pools through nodeclaim_pool
          too, so both single-source from [nodeclaim_pool].fuse_cache_bytes

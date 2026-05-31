@@ -80,12 +80,9 @@ pub(super) const KARPENTER_DO_NOT_DISRUPT: &str = "karpenter.sh/do-not-disrupt";
 ///     mid-build eviction protection.
 ///
 /// `termination_grace_period_seconds` is left to
-/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default+3]`:
-/// the 45s AD5 abort grace for pull-mode pools — the default since the
-/// 1c cutover — or 7200s builders / 600s fetchers / the `PoolSpec`
-/// override for explicit-Stream pools). The stream builder's SIGTERM
-/// handler blocks on its single in-flight build, so "ephemeral" ≠
-/// "fast exit" there; pull-mode pods abort and report instead.
+/// [`super::pod::build_executor_pod_spec`] (`r[ctrl.pod.tgps-default+4]`:
+/// the 45s AD5 abort grace, unconditional — pull-mode pods abort and
+/// report instead of draining).
 ///
 /// Consolidated here so the Job-lifecycle invariants (karpenter
 /// annotation, deadline backstop) can't drift between callers —
@@ -916,11 +913,10 @@ pub(super) fn select_closed_attempt_jobs<'a>(
 }
 
 // r[impl ctrl.drain.disruption-target+3]
-/// AD5 cancel arm (pull-mode pools only — the caller gates on the Pool
-/// CR's `dispatchMode`): each tick, foreground-delete an active Job
-/// whose pull-mode attempt has CLOSED while the Job is still active,
-/// so a scheduler-side cancel verdict aborts the pod now (Job deletion
-/// → SIGTERM → builder cgroup-kill) instead of at
+/// AD5 cancel arm: each tick, foreground-delete an active Job whose
+/// attempt has CLOSED while the Job is still active, so a
+/// scheduler-side cancel verdict aborts the pod now (Job deletion →
+/// SIGTERM → builder cgroup-kill) instead of at
 /// `activeDeadlineSeconds`.
 ///
 /// Evidence rule: a Job is cancelled only on the closed→active edge —
@@ -1403,33 +1399,23 @@ fn unified_attempt_reason(reason: TerminationReason) -> rio_proto::types::Attemp
 }
 
 /// The intent id a pod-terminal `ReportAttemptOutcome` should carry:
-/// the pod's `rio.build/intent-id` annotation for PULL-MODE pods
-/// (their attempt is keyed by the attested intent identity), the empty
-/// string for stream pods (their classification is keyed by pod name
-/// on the legacy path — an intent id on a stream report could resolve
-/// to another pod's open pull attempt for the same intent during
-/// coexistence and be consumed there).
+/// the pod's `rio.build/intent-id` annotation (the attested intent
+/// identity every attempt is keyed by). Empty when the annotation is
+/// absent (recovery-path pods spawned outside the intent loop) — the
+/// report then resolves by Job/pod name only.
 pub(super) fn report_intent_id_for_pod(pod: &Pod) -> String {
-    if super::pod::pod_is_pull_mode(pod) {
-        pod.metadata
-            .annotations
-            .as_ref()
-            .and_then(|a| a.get(super::jobs::INTENT_ID_ANNOTATION))
-            .cloned()
-            .unwrap_or_default()
-    } else {
-        String::new()
-    }
+    pod.metadata
+        .annotations
+        .as_ref()
+        .and_then(|a| a.get(super::jobs::INTENT_ID_ANNOTATION))
+        .cloned()
+        .unwrap_or_default()
 }
 
 /// The same population rule for the deadline-exceeded JOB report (the
-/// pull discriminator read from the Job's pod template).
+/// intent annotation read from the Job's pod template).
 pub(super) fn report_intent_id_for_job(job: &Job) -> String {
-    if super::pod::job_is_pull_mode(job) {
-        job_intent_id(job).unwrap_or_default().to_owned()
-    } else {
-        String::new()
-    }
+    job_intent_id(job).unwrap_or_default().to_owned()
 }
 
 /// How long a sampled Pod/Job name stays in `Ctx::terminal_report_sampled`
@@ -1519,15 +1505,8 @@ pub(super) async fn report_terminated_pods(ctx: &Ctx, ns: &str, pool: &str) {
         };
         // C4/C5 unification: the classification rides the unified
         // idempotent ReportAttemptOutcome, keyed by the pod/Job name
-        // plus — for pods carrying the pull-template env — the pod's
-        // intent annotation and kube-authoritative node (the AD2c
-        // attribution). `report_intent_id_for_pod` keeps the
-        // RIO_DISPATCH_MODE-keyed guard so a pod rendered from an
-        // explicit `dispatchMode: Stream` template (a CR value that
-        // still exists even though the builder always pulls) sends no
-        // intent id and resolves by name only — conservative against
-        // mis-attributing another pod's open attempt for the same
-        // intent.
+        // plus the pod's intent annotation and kube-authoritative node
+        // (the AD2c attribution).
         let intent_id = report_intent_id_for_pod(pod);
         let node_name = pod
             .spec
@@ -1623,12 +1602,9 @@ pub(super) async fn report_deadline_exceeded_jobs(ctx: &Ctx, jobs: &[Job]) {
             continue;
         };
         // C4/C5 unification: keyed by the JOB name (the pod is already
-        // deleted by the Job controller when the deadline fires); the
-        // scheduler's legacy prefix-match against recently_disconnected
-        // is unchanged behind the unified RPC. The intent id rides
-        // along only for pull-mode Jobs (`report_intent_id_for_job`,
-        // read from the pod template's RIO_DISPATCH_MODE), for the same
-        // coexistence-routing reason as report_terminated_pods.
+        // deleted by the Job controller when the deadline fires) plus
+        // the intent annotation read from the Job's pod template
+        // (`report_intent_id_for_job`).
         match admin_call(admin.report_attempt_outcome(
             rio_proto::types::ReportAttemptOutcomeRequest {
                 intent_id: report_intent_id_for_job(job),

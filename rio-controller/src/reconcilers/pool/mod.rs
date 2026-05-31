@@ -8,7 +8,7 @@
 // r[impl ctrl.pool.reconcile]
 // r[impl ctrl.crd.pool]
 // r[impl ctrl.reconcile.owner-refs]
-// r[impl ctrl.drain.sigterm+2]
+// r[impl ctrl.drain.sigterm+3]
 //!
 //! Server-side apply throughout: we PATCH with `fieldManager:
 //! rio-controller`, K8s merges. Idempotent — same patch twice is

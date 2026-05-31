@@ -3,18 +3,13 @@ scope: with scope; ''
   # ══════════════════════════════════════════════════════════════════
   # pull-mode — PullAssignment/ReportOutcome end-to-end on the new path
   # ══════════════════════════════════════════════════════════════════
-  # REQUIRES: no live builder pods (pull-mode pods never register, so a
-  # live stream-mode worker would steal the dispatch). ephemeral-pool
-  # already deleted the default x86-64 Pool and waited for its own pods
-  # to be gone; the precondition below re-checks the pod-level fact
-  # only. A lingering scheduler-side executor ENTRY (stream ghost whose
-  # pod is gone) cannot steal work — a dispatch to it fails and the drv
-  # requeues — so the precondition deliberately does NOT gate on the
-  # workers_active gauge.
+  # REQUIRES: no live builder pods. ephemeral-pool already deleted the
+  # default x86-64 Pool and waited for its own pods to be gone; the
+  # precondition below re-checks the pod-level fact only.
   #
-  # The pool opts in via the first-class `spec.dispatchMode: Pull`
-  # field (the controller injects RIO_DISPATCH_MODE=pull into its
-  # executor pods and renders the AD5 pull-mode termination grace).
+  # Pull is the only dispatch protocol (the dispatchMode knob is
+  # retired): the controller renders the AD5 abort grace on every
+  # executor pod, and the pool needs no opt-in field.
   #
   # Open-attempt observability used below: the ledger view via psql
   # (the same join ListOpenAttempts serves, cheap enough to poll) plus
@@ -55,7 +50,7 @@ scope: with scope; ''
           timeout=120,
       )
 
-      # ── Pull-mode pool (spec.dispatchMode: Pull) ──────────────────
+      # ── Pull pool ──────────────────────────────────────────────────
       k3s_server.succeed(
           "k3s kubectl apply -f - <<'EOF'\n"
           "apiVersion: rio.build/v1alpha1\n"
@@ -65,7 +60,6 @@ scope: with scope; ''
           "  namespace: ${nsBuilders}\n"
           "spec:\n"
           "  kind: Builder\n"
-          "  dispatchMode: Pull\n"
           "  maxConcurrent: 4\n"
           "  systems: [x86_64-linux]\n"
           "  image: rio-builder:dev\n"

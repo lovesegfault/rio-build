@@ -395,10 +395,10 @@ pkgs.testers.runNixOSTest {
             "metadata: {name: misplaced, namespace: ${fixture.nsFetchers}}\n"
             "spec:\n"
             "  kind: Builder\n"
-            # No dispatchMode: the CRD absent-means-Pull default (1c
-            # cutover) applies — the netns probes only need a Running
-            # build pod, which the pull path provides identically (the
-            # 300s sleeper keeps it alive through the probe sequence).
+            # Pull is the only dispatch protocol — the netns probes
+            # only need a Running build pod, which the pull path
+            # provides (the 300s sleeper keeps it alive through the
+            # probe sequence).
             "  image: rio-builder:dev\n"
             "  imagePullPolicy: IfNotPresent\n"
             "  systems: [x86_64-linux]\n"

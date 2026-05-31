@@ -28,7 +28,6 @@ Manages rio-build lifecycle on Kubernetes via CRDs.
     imagePullPolicy: IfNotPresent                # string?, optional — K8s default if omitted
     fuseThreads: 4                               # u32?, optional — Builder-only, CEL-forbidden for Fetcher
     fusePassthrough: true                        # bool?, optional — Builder-only, CEL-forbidden for Fetcher
-    terminationGracePeriodSeconds: 7200          # i64?, optional — K8s grace; defaults per-kind (r[ctrl.pod.tgps-default])
     privileged: false                            # bool?, optional — CEL-forbidden for Fetcher
     hostNetwork: false                           # bool?, optional — true requires privileged:true; CEL-forbidden for Fetcher
     seccompProfile:                              # SeccompProfileKind?, optional — CEL-forbidden for Fetcher
@@ -201,23 +200,16 @@ gone.
   check (applied to BOTH kinds since r35) as the safety net.
 ]
 
-#r("ctrl.pod.tgps-default+3")[
-  For pull-mode pools (`spec.dispatchMode` absent or `Pull` --- pull is the
-  default since the 1c cutover) the Job pod template MUST set the AD5 abort
-  grace of `45` seconds and MUST render `RIO_DISPATCH_MODE=pull` --- SIGTERM
-  is an abort (cgroup-kill plus one bounded report attempt plus log
-  finalization), not a drain, so the grace is sized to the abort-and-report
-  bound and an explicit `PoolSpec.terminationGracePeriodSeconds` is overridden
-  for pull-mode pools. For stream-mode pools (an explicit
-  `spec.dispatchMode: Stream`, selectable until that path's 1c'/1d deletion)
-  the Job pod spec MUST render `RIO_DISPATCH_MODE=stream` explicitly (the
-  builder image's compiled default is pull, so the opt-out must be carried by
-  the pod spec) and MUST default `terminationGracePeriodSeconds` to `7200`
-  (2h) when `PoolSpec.terminationGracePeriodSeconds` is unset --- SIGTERM →
-  executor drain (#rref("ctrl.drain.sigterm")) waits for the in-flight build
-  to complete before exit; nix builds can legitimately take 2h (LLVM, full
-  NixOS closure from cold cache), and the operator-owned grace value applies
-  to stream pools only.
+#r("ctrl.pod.tgps-default+4")[
+  Every executor Job pod template MUST set the AD5 abort grace of `45`
+  seconds as its `terminationGracePeriodSeconds` --- SIGTERM is an abort
+  (cgroup-kill plus one bounded report attempt plus log finalization,
+  #rref("ctrl.drain.sigterm")), not a drain, so the grace is sized to the
+  abort-and-report bound. The pod template MUST NOT render a dispatch-mode
+  discriminator (`RIO_DISPATCH_MODE`): pull is the only delivery protocol,
+  the Pool CRD carries no `dispatchMode` field, and the stream-era
+  `terminationGracePeriodSeconds` spec override (the 2 h / 600 s drain
+  graces for the deleted finish-if-you-can semantics) is retired with it.
 ]
 
 #r("ctrl.pool.kvm-device+2")[
@@ -322,15 +314,17 @@ two reads.
   excluded from the already-Pending re-ack set in the same tick.
 ]
 
-#r("ctrl.pool.fetcher-hardening+2")[
+#r("ctrl.pool.fetcher-hardening+3")[
   For `kind=Fetcher`, `executor_params` MUST apply ADR-019 hardening regardless
   of spec: `readOnlyRootFilesystem: true`, `seccompProfile: Localhost
   operator/rio-fetcher.json`, `hostUsers: false`, `privileged: false`, default
   `rio.build/fetcher: true` nodeSelector (§13e key, restored in B4) +
-  `rio.build/fetcher:NoSchedule` toleration, `terminationGracePeriodSeconds:
-  600`. CRD CEL rejects fetcher specs that set the overridden fields at
-  admission time; the reconciler override is belt-and-suspenders for pre-CEL
-  specs the apiserver already accepted.
+  `rio.build/fetcher:NoSchedule` toleration. CRD CEL rejects fetcher specs
+  that set the overridden fields at admission time; the reconciler override
+  is belt-and-suspenders for pre-CEL specs the apiserver already accepted.
+  (Fetcher pods carry the same 45 s AD5 abort grace as builders ---
+  #rref("ctrl.pod.tgps-default"); the former 600 s stream-drain grace retired
+  with the dispatch-mode knob.)
 ]
 
 #r("ctrl.pool.fetcher-spawn-builtin")[
@@ -747,14 +741,12 @@ Jobs is meaningless (eviction of a Job pod just reschedules the build via
 
 = Executor Lifecycle
 
-#r("ctrl.drain.sigterm+2")[
-  *Scale-down:* for stream-mode pools `terminationGracePeriodSeconds` is set
-  to `7200` (2 hours) to allow in-flight builds to complete. For pull-mode
-  pools there is no finish-if-you-can drain: pod termination (including
-  graceful node drain / scale-down) is an abort --- the pod template carries
-  the 45 s AD5 grace (#rref("ctrl.pod.tgps-default")), the builder
-  cgroup-kills the in-flight build and makes one bounded report attempt, and
-  the derivation requeues charge-free.
+#r("ctrl.drain.sigterm+3")[
+  *Scale-down:* there is no finish-if-you-can drain: pod termination
+  (including graceful node drain / scale-down) is an abort --- the pod
+  template carries the 45 s AD5 grace (#rref("ctrl.pod.tgps-default")), the
+  builder cgroup-kills the in-flight build and makes one bounded report
+  attempt, and the derivation requeues charge-free.
 ]
 
 *SIGTERM handling (no preStop hook needed):* the builder's main loop has a

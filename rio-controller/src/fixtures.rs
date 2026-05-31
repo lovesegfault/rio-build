@@ -35,11 +35,9 @@ pub fn test_pool_spec(kind: ExecutorKind) -> PoolSpec {
         fuse_cache_bytes: None,
         features: vec!["kvm".into()],
         image_pull_policy: None,
-        termination_grace_period_seconds: None,
         privileged: None,
         seccomp_profile: None,
         host_network: None,
-        dispatch_mode: None,
     }
 }
 

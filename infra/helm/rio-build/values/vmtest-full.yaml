@@ -158,12 +158,11 @@ pools:
 poolDefaults:
   enabled: true
   image: rio-builder
-  # No dispatchMode override: the chart default (Pull since the
-  # executor-lifecycle 1c cutover) reaches every helm-rendered VM pool.
-  # The T-1c.2b corpus re-point removed the temporary Stream pin that
-  # sat here; the one VM check that still needs a stream pool (the
-  # pull-canary stream-baseline arm, until the 1c' deletion retires
-  # it) pins it in values/vmtest-pull-canary.yaml instead.
+  # No dispatchMode: the knob is retired — the pull protocol is the
+  # only delivery path, so there is nothing to select. (The historical
+  # Stream pin that sat here, and the pull-canary stream-baseline pin
+  # in values/vmtest-pull-canary.yaml, retired with the stream
+  # machinery at the executor-lifecycle 1c'/1d slices.)
   # 4Gi. values.yaml prod default is 50Gi → ≥51Gi ephemeral-storage
   # request floor → Unschedulable on the 24G k3s node disks (~21Gi
   # allocatable). Layered nonpriv overlay inherits via deep-merge.

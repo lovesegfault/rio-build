@@ -906,7 +906,7 @@ fn disruption_filter_false_or_absent_returns_none() {
     assert_eq!(disruption::is_disruption_target(&healthy), None);
 }
 
-// r[verify ctrl.pod.tgps-default+3]
+// r[verify ctrl.pod.tgps-default+4]
 #[test]
 fn job_pod_termination_grace() {
     let wp = test_wp();
@@ -914,8 +914,8 @@ fn job_pod_termination_grace() {
     assert_eq!(
         pod.termination_grace_period_seconds,
         Some(pod::PULL_MODE_TGPS_SECS),
-        "the absent-mode default is pull since the 1c cutover, so the AD5 abort \
-         grace applies (the 2h drain grace remains for explicit Stream pools)"
+        "every executor pod carries the AD5 abort grace (the dispatch-mode \
+         knob and the stream drain graces are retired)"
     );
     assert_eq!(
         pod.automount_service_account_token,
@@ -923,8 +923,7 @@ fn job_pod_termination_grace() {
         "workers use gRPC, not K8s API — no SA token needed"
     );
     // The Job wrapper must NOT overwrite the pod-spec value: previously
-    // ephemeral_job stamped a flat 30s, making the CRD field + the
-    // per-mode defaults dead.
+    // ephemeral_job stamped a flat 30s, making the AD5 grace dead.
     let job = job::ephemeral_job(
         "j".into(),
         None,
@@ -1057,67 +1056,50 @@ fn job_pod_image_pull_policy_passthrough() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// AD5: pull-mode preemption decision (DisruptionTarget watcher)
+// AD5: preemption decision (DisruptionTarget watcher)
 // ───────────────────────────────────────────────────────────────────
 
 // r[verify ctrl.drain.disruption-target+3]
 /// Every disruption-targeted executor pod takes the
 /// synthesize-preempted + foreground-delete-the-Job path: the decision
 /// carries the owning Job, the intent identity, and the node
-/// attribution. The pod-template env no longer matters (the stream-era
-/// force-drain hop is gone), so a pod rendered without
-/// `RIO_DISPATCH_MODE=pull` projects to the same decision.
+/// attribution. The decision reads only the pod's metadata (owner ref,
+/// intent annotation, node binding) — the container env plays no part
+/// (the stream-era force-drain hop and the RIO_DISPATCH_MODE
+/// discriminator are gone).
 #[test]
-fn disruption_pull_mode_pod_preempts_via_job_delete() {
-    use k8s_openapi::api::core::v1::{Container, EnvVar, PodSpec as K8sPodSpec};
+fn disruption_pod_preempts_via_job_delete() {
+    use k8s_openapi::api::core::v1::{Container, PodSpec as K8sPodSpec};
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use std::collections::BTreeMap;
 
-    let mk_pod = |pull: bool| {
-        let mut pod = Pod::default();
-        pod.metadata.name = Some("rio-builder-pull-7abcd".into());
-        pod.metadata.namespace = Some("rio".into());
-        pod.metadata.owner_references = Some(vec![OwnerReference {
-            kind: "Job".into(),
-            name: "rio-builder-pull-7".into(),
-            api_version: "batch/v1".into(),
+    let mut pod = Pod::default();
+    pod.metadata.name = Some("rio-builder-pull-7abcd".into());
+    pod.metadata.namespace = Some("rio".into());
+    pod.metadata.owner_references = Some(vec![OwnerReference {
+        kind: "Job".into(),
+        name: "rio-builder-pull-7".into(),
+        api_version: "batch/v1".into(),
+        ..Default::default()
+    }]);
+    pod.metadata.annotations = Some(BTreeMap::from([(
+        jobs::INTENT_ID_ANNOTATION.to_string(),
+        "drv-pull-7".to_string(),
+    )]));
+    pod.spec = Some(K8sPodSpec {
+        node_name: Some("node-3".into()),
+        containers: vec![Container {
+            name: "builder".into(),
             ..Default::default()
-        }]);
-        pod.metadata.annotations = Some(BTreeMap::from([(
-            jobs::INTENT_ID_ANNOTATION.to_string(),
-            "drv-pull-7".to_string(),
-        )]));
-        pod.spec = Some(K8sPodSpec {
-            node_name: Some("node-3".into()),
-            containers: vec![Container {
-                name: "builder".into(),
-                env: pull.then(|| {
-                    vec![EnvVar {
-                        name: "RIO_DISPATCH_MODE".into(),
-                        value: Some("pull".into()),
-                        ..Default::default()
-                    }]
-                }),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-        pod
-    };
+        }],
+        ..Default::default()
+    });
 
     // The preemption decision, fully attributed.
-    let preempt = disruption::preemption_for_pod(&mk_pod(true), "rio-builder-pull-7abcd");
+    let preempt = disruption::preemption_for_pod(&pod, "rio-builder-pull-7abcd");
     assert_eq!(preempt.namespace, "rio");
     assert_eq!(preempt.job_name.as_deref(), Some("rio-builder-pull-7"));
     assert_eq!(preempt.intent_id, "drv-pull-7");
     assert_eq!(preempt.node_name, "node-3");
     assert_eq!(preempt.pod_name, "rio-builder-pull-7abcd");
-
-    // A pod rendered WITHOUT the pull env projects to the same
-    // decision — there is no per-mode gate left.
-    let no_env = disruption::preemption_for_pod(&mk_pod(false), "rio-builder-pull-7abcd");
-    assert_eq!(
-        no_env, preempt,
-        "the preemption decision is mode-independent (no force-drain hop remains)"
-    );
 }

@@ -45,64 +45,15 @@ pub(super) const KVM_FEATURE: &str = "kvm";
 /// keys the toleration set on it.
 const KVM_NODE_LABEL: &str = "rio.build/kvm";
 
-/// AD5 (P8): `terminationGracePeriodSeconds` for pull-mode pools. In
-/// pull mode SIGTERM is an abort (cgroup-kill + one bounded report
-/// attempt + log finalization), not a drain, so the grace is sized to
-/// "kill + one 10 s report attempt + slack" inside the design's
-/// 30–60 s band — never the 2 h drain default. `dispatchMode: Pull`
-/// FORCES this value: an explicit `terminationGracePeriodSeconds` on
-/// the spec is overridden for pull-mode pools (the operator-owned
-/// value applies to stream pools only).
+/// AD5 (P8): `terminationGracePeriodSeconds` for every executor pod.
+/// SIGTERM is an abort (cgroup-kill + one bounded report attempt + log
+/// finalization), not a drain, so the grace is sized to "kill + one
+/// 10 s report attempt + slack" inside the design's 30–60 s band —
+/// never the stream era's 2 h drain default. Pull is the only dispatch
+/// protocol (the `dispatchMode` knob is retired), so this value is
+/// unconditional: there is no spec override and no per-kind drain
+/// grace left.
 pub(super) const PULL_MODE_TGPS_SECS: i64 = 45;
-
-/// Whether `pool` selects the pull/report dispatch protocol. Since the
-/// 1c cutover the absent field means `Pull` (the default flipped;
-/// `DispatchMode::default()` is the single source of that default), so
-/// only an explicit `spec.dispatchMode: Stream` keeps the legacy
-/// session protocol — still selectable and fully functional until its
-/// 1c'/1d deletion. Replaces the 1a-era `rio.build/dispatch-mode`
-/// annotation seam.
-pub(super) fn is_pull_mode(pool: &Pool) -> bool {
-    pool.spec.dispatch_mode.unwrap_or_default() == rio_crds::pool::DispatchMode::Pull
-}
-
-/// Whether one already-rendered POD speaks the pull protocol: its
-/// executor container carries `RIO_DISPATCH_MODE=pull` (the rendering
-/// of `dispatchMode: Pull`). Gating on the pod's own env rather than
-/// the Pool CR keeps pods spawned before a `dispatchMode` flip
-/// correctly keyed — the protocol a pod speaks is fixed at render
-/// time, not at observation time. Used by the DisruptionTarget watcher
-/// and the pod-terminal report path.
-pub(super) fn pod_is_pull_mode(pod: &k8s_openapi::api::core::v1::Pod) -> bool {
-    pod.spec.as_ref().is_some_and(|s| {
-        s.containers.iter().any(|c| {
-            c.env.as_ref().is_some_and(|env| {
-                env.iter()
-                    .any(|e| e.name == "RIO_DISPATCH_MODE" && e.value.as_deref() == Some("pull"))
-            })
-        })
-    })
-}
-
-/// Whether one JOB's pod template speaks the pull protocol (the same
-/// `RIO_DISPATCH_MODE=pull` discriminator read from
-/// `spec.template.spec.containers[].env`). Used by the
-/// deadline-exceeded report path, where only the Job object is in
-/// hand.
-pub(super) fn job_is_pull_mode(job: &k8s_openapi::api::batch::v1::Job) -> bool {
-    job.spec
-        .as_ref()
-        .and_then(|s| s.template.spec.as_ref())
-        .is_some_and(|spec| {
-            spec.containers.iter().any(|c| {
-                c.env.as_ref().is_some_and(|env| {
-                    env.iter().any(|e| {
-                        e.name == "RIO_DISPATCH_MODE" && e.value.as_deref() == Some("pull")
-                    })
-                })
-            })
-        })
-}
 
 /// Pod label carrying the executor role. Scheduler routing, network
 /// policies, and `kubectl get pods -l rio.build/role=fetcher` all
@@ -618,7 +569,7 @@ pub fn job_name(pool_name: &str, role: ExecutorKind, suffix: &str) -> String {
 }
 
 /// The Job pod spec — shared by both pool kinds.
-// r[impl ctrl.pool.fetcher-hardening+2]
+// r[impl ctrl.pool.fetcher-hardening+3]
 pub fn build_executor_pod_spec(
     pool: &Pool,
     scheduler: &UpstreamAddrs,
@@ -828,19 +779,13 @@ pub fn build_executor_pod_spec(
         // to the right SA without a controller change.
         service_account_name: Some(pool.spec.kind.component_label().into()),
         automount_service_account_token: Some(false),
-        // r[impl ctrl.pod.tgps-default+3]
-        // Pull-mode pools (the default since the 1c cutover): the AD5
-        // abort grace (45 s), forced — the 2 h drain grace exists for
-        // the stream path's finish-if-you-can semantics, which pull
-        // mode does not have. Explicit-Stream pools: fetchers 10min —
-        // fetches are short; builders: spec or 2h.
-        termination_grace_period_seconds: Some(if is_pull_mode(pool) {
-            PULL_MODE_TGPS_SECS
-        } else {
-            pool.spec
-                .termination_grace_period_seconds
-                .unwrap_or(if fetcher { 600 } else { 7200 })
-        }),
+        // r[impl ctrl.pod.tgps-default+4]
+        // The AD5 abort grace (45 s), unconditional: SIGTERM is an
+        // abort, not a drain. The 2 h / 600 s drain graces and the
+        // operator spec override existed for the stream path's
+        // finish-if-you-can semantics, which retired with the
+        // dispatch-mode knob.
+        termination_grace_period_seconds: Some(PULL_MODE_TGPS_SECS),
         node_selector: {
             let mut ns = effective_node_selector(pool).unwrap_or_default();
             // r[impl ctrl.pod.arch-selector+2]
@@ -1018,19 +963,10 @@ fn build_executor_container(
                 // returns WrongKind without spawning).
                 env("RIO_EXECUTOR_KIND", pool.spec.kind.as_str()),
             ];
-            // Dispatch protocol, rendered EXPLICITLY for both modes
-            // since the 1c cutover (absent spec field = Pull): the
-            // builder binary's own default is pull now, so an explicit
-            // `stream` value is what keeps a `dispatchMode: Stream`
-            // pool's pods on the legacy session protocol regardless of
-            // the image's compiled default. The pod-level
-            // discriminators (`pod_is_pull_mode`/`job_is_pull_mode`)
-            // keep reading the rendered value, so pods spawned before
-            // a flip stay correctly keyed.
-            e.push(env(
-                "RIO_DISPATCH_MODE",
-                if is_pull_mode(pool) { "pull" } else { "stream" },
-            ));
+            // No dispatch-protocol discriminator: pull is the only
+            // delivery path (the builder binary ignores a stray
+            // RIO_DISPATCH_MODE env, and nothing renders one anymore —
+            // the knob retired with the stream path).
             if let Some(host) = &scheduler.balance_host {
                 e.push(env("RIO_SCHEDULER__BALANCE_HOST", host));
                 e.push(env(
@@ -1255,108 +1191,40 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
 
-    // r[verify ctrl.pod.tgps-default+3]
-    /// Since the 1c cutover the absent/default `dispatchMode` renders
-    /// the PULL template: `RIO_DISPATCH_MODE=pull` plus the AD5 abort
-    /// grace (45 s), the latter FORCED over an explicit spec value (P8
-    /// precedence). `Stream` remains selectable and fully functional:
-    /// it renders `RIO_DISPATCH_MODE=stream` explicitly (the builder
-    /// binary's own default is pull now, so the opt-out must be
-    /// carried by the pod spec) and keeps the per-kind/spec drain
-    /// grace. Everything else in the pod spec is identical between the
-    /// two modes.
+    // r[verify ctrl.pod.tgps-default+4]
+    /// Every pool renders the AD5 abort grace (45 s) and no
+    /// dispatch-mode discriminator: pull is the only delivery
+    /// protocol, so there is nothing to select — the stream era's
+    /// drain graces (2 h builders / 600 s fetchers / the spec
+    /// override) and the `RIO_DISPATCH_MODE` env are gone.
     #[test]
-    fn dispatch_mode_default_renders_pull_and_stream_stays_selectable() {
+    fn pod_template_renders_abort_grace_and_no_dispatch_discriminator() {
         let scheduler = crate::fixtures::test_sched_addrs();
         let store = crate::fixtures::test_store_addrs();
         let hw = crate::reconcilers::node_informer::HwClassConfig::default();
         let render = |pool: &Pool| build_executor_pod_spec(pool, &scheduler, &store, &hw);
-        let dispatch_env = |spec: &PodSpec| {
-            spec.containers[0]
-                .env
-                .as_ref()
-                .unwrap()
-                .iter()
-                .find(|e| e.name == "RIO_DISPATCH_MODE")
-                .and_then(|e| e.value.clone())
-        };
 
-        // Default (absent): the pull template — env + the AD5 abort
-        // grace. This is the 1c flip: defaults change, capabilities
-        // don't.
-        let plain = crate::fixtures::test_pool("plain", rio_crds::pool::ExecutorKind::Builder);
-        let plain_spec = render(&plain);
-        assert_eq!(dispatch_env(&plain_spec), Some("pull".into()));
-        assert_eq!(
-            plain_spec.termination_grace_period_seconds,
-            Some(PULL_MODE_TGPS_SECS)
-        );
-
-        // Explicit Pull: identical to absent.
-        let mut pull = crate::fixtures::test_pool("pull", rio_crds::pool::ExecutorKind::Builder);
-        pull.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Pull);
-        let pull_spec = render(&pull);
-        assert_eq!(dispatch_env(&pull_spec), Some("pull".into()));
-        assert_eq!(
-            pull_spec.termination_grace_period_seconds,
-            Some(PULL_MODE_TGPS_SECS)
-        );
-
-        // Explicit Stream: still selectable — explicit env opt-out, the
-        // 2 h builder drain grace, and nothing else differs from the
-        // pull rendering.
-        let mut stream =
-            crate::fixtures::test_pool("stream", rio_crds::pool::ExecutorKind::Builder);
-        stream.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Stream);
-        let stream_spec = render(&stream);
-        assert_eq!(dispatch_env(&stream_spec), Some("stream".into()));
-        assert_eq!(stream_spec.termination_grace_period_seconds, Some(7200));
-        // Everything-else-unchanged: blank out the two fields that are
-        // allowed to differ and the rendered specs must be identical.
-        let mut a = pull_spec.clone();
-        let mut b = stream_spec.clone();
-        for spec in [&mut a, &mut b] {
-            spec.termination_grace_period_seconds = None;
-            if let Some(env) = spec.containers[0].env.as_mut() {
-                env.retain(|e| e.name != "RIO_DISPATCH_MODE");
-            }
+        let builder = crate::fixtures::test_pool("plain", rio_crds::pool::ExecutorKind::Builder);
+        let fetcher = crate::fixtures::test_pool("fetch", rio_crds::pool::ExecutorKind::Fetcher);
+        for pool in [&builder, &fetcher] {
+            let spec = render(pool);
+            assert_eq!(
+                spec.termination_grace_period_seconds,
+                Some(PULL_MODE_TGPS_SECS),
+                "every executor pod carries the AD5 abort grace ({:?})",
+                pool.spec.kind
+            );
+            assert!(
+                spec.containers[0]
+                    .env
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .all(|e| e.name != "RIO_DISPATCH_MODE"),
+                "the RIO_DISPATCH_MODE discriminator is retired — no pod renders it ({:?})",
+                pool.spec.kind
+            );
         }
-        assert_eq!(
-            a, b,
-            "dispatch mode changes only the env flag and the grace"
-        );
-
-        // P8 precedence: an explicit spec grace is overridden for
-        // pull-mode pools (the AD5 abort grace wins) — including the
-        // absent-mode (default) pools that are pull now.
-        let mut pull_with_grace =
-            crate::fixtures::test_pool("pull-g", rio_crds::pool::ExecutorKind::Builder);
-        pull_with_grace.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Pull);
-        pull_with_grace.spec.termination_grace_period_seconds = Some(3600);
-        assert_eq!(
-            render(&pull_with_grace).termination_grace_period_seconds,
-            Some(PULL_MODE_TGPS_SECS),
-            "dispatchMode: Pull forces the AD5 grace over an explicit spec value"
-        );
-        let mut default_with_grace =
-            crate::fixtures::test_pool("default-g", rio_crds::pool::ExecutorKind::Builder);
-        default_with_grace.spec.termination_grace_period_seconds = Some(3600);
-        assert_eq!(
-            render(&default_with_grace).termination_grace_period_seconds,
-            Some(PULL_MODE_TGPS_SECS),
-            "the absent-mode default is pull, so the AD5 grace wins there too"
-        );
-        // …while an explicit Stream pool keeps honoring the operator's
-        // value (the stream drain semantics are untouched until their
-        // 1c'/1d deletion).
-        let mut stream_with_grace =
-            crate::fixtures::test_pool("stream-g", rio_crds::pool::ExecutorKind::Builder);
-        stream_with_grace.spec.dispatch_mode = Some(rio_crds::pool::DispatchMode::Stream);
-        stream_with_grace.spec.termination_grace_period_seconds = Some(3600);
-        assert_eq!(
-            render(&stream_with_grace).termination_grace_period_seconds,
-            Some(3600)
-        );
     }
 
     #[test]
@@ -1411,7 +1279,7 @@ mod tests {
         assert_eq!(nix_systems_to_k8s_arch(&[]), None);
     }
 
-    // r[verify ctrl.pool.fetcher-hardening+2]
+    // r[verify ctrl.pool.fetcher-hardening+3]
     // r[verify ctrl.crd.fetcher-no-features+2]
     /// `effective_features` is the single chokepoint: Fetcher →
     /// `[fetcher]` regardless of spec; Builder → verbatim. Both

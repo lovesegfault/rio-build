@@ -3,10 +3,10 @@
 # pull-fetcher: hosted by vm-pull-canary-k3s (after the pull-canary
 # fragment, which leaves the cluster with no Pools). Fetcher-kind pull
 # coverage for the 1c gate ("pool kinds the canary did not cover"):
-# a kind=Fetcher Pool with `dispatchMode: Pull` builds a fixed-output
-# derivation end-to-end on the pull path, and the pod follows the OA3
-# one-pull default — it pulls exactly one assignment, reports it, and
-# exits instead of retaining a session.
+# a kind=Fetcher Pool builds a fixed-output derivation end-to-end on
+# the pull path, and the pod follows the OA3 one-pull default — it
+# pulls exactly one assignment, reports it, and exits instead of
+# retaining a session.
 #
 # The FOD needs no network: it is a flat-hash fixed-output derivation
 # whose builder writes a known payload (outputHash is the sha256 of
@@ -16,14 +16,13 @@
 #
 # What this proves (1c gate items, T-1c.2):
 #   - the fetcher pool kind runs the pull path: the spawned pod carries
-#     RIO_EXECUTOR_KIND=fetcher and RIO_DISPATCH_MODE=pull, the FOD's
-#     execution is minted with dispatch_mode='pull', and the client
-#     gets its store path;
+#     RIO_EXECUTOR_KIND=fetcher, the FOD's execution is minted by the
+#     pull transaction, and the client gets its store path;
 #   - a clean fetcher pull build charges nothing (no drv_attempts row);
-#   - OA3 one-pull: exactly one pull-mode execution is minted for the
-#     FOD, and after the report the pod completes (Succeeded) instead
-#     of holding a session / pulling further work; the open-attempt
-#     view drains to empty.
+#   - OA3 one-pull: exactly one execution is minted for the FOD, and
+#     after the report the pod completes (Succeeded) instead of
+#     holding a session / pulling further work; the open-attempt view
+#     drains to empty.
 scope: with scope; ''
   import time
 
@@ -46,7 +45,7 @@ scope: with scope; ''
       # Karpenter label/taint chain is EKS-only.
       kubectl("label node k3s-agent rio.build/fetcher=true --overwrite", ns="kube-system")
 
-      # ── Fetcher pool, dispatchMode: Pull ───────────────────────────
+      # ── Fetcher pool ────────────────────────────────────────────────
       # hostUsers: true — the fetcher rendering is forced non-privileged
       # (CEL forbids privileged for kind=Fetcher) and k3s containerd
       # does not chown the pod cgroup for user namespaces, so the
@@ -61,7 +60,6 @@ scope: with scope; ''
           "  namespace: ${nsFetchers}\n"
           "spec:\n"
           "  kind: Fetcher\n"
-          "  dispatchMode: Pull\n"
           "  maxConcurrent: 2\n"
           "  systems: [x86_64-linux]\n"
           "  image: rio-builder:dev\n"
@@ -136,8 +134,9 @@ scope: with scope; ''
           "the fetcher pod should have pulled the FOD (one open pull-mode attempt)"
       )
 
-      # The pod doing the work is a fetcher-kind pull pod: it carries
-      # both RIO_EXECUTOR_KIND=fetcher and RIO_DISPATCH_MODE=pull.
+      # The pod doing the work is a fetcher-kind pod
+      # (RIO_EXECUTOR_KIND=fetcher); the retired RIO_DISPATCH_MODE
+      # discriminator must NOT be rendered.
       pod = k3s_server.succeed(
           "k3s kubectl -n ${nsFetchers} get pods "
           "-l rio.build/pool=pull-fetcher "
@@ -146,14 +145,14 @@ scope: with scope; ''
       assert pod, "a pull-fetcher pod should exist while the FOD builds"
       pod_env = k3s_server.succeed(
           f"k3s kubectl -n ${nsFetchers} get pod {pod} "
-          "-o jsonpath='{.spec.containers[0].env[?(@.name==\"RIO_DISPATCH_MODE\")].value} "
-          "{.spec.containers[0].env[?(@.name==\"RIO_EXECUTOR_KIND\")].value}'"
+          "-o jsonpath='{.spec.containers[0].env[?(@.name==\"RIO_EXECUTOR_KIND\")].value} "
+          "{.spec.containers[0].env[?(@.name==\"RIO_DISPATCH_MODE\")].value}'"
       ).split()
-      assert pod_env == ["pull", "fetcher"], (
-          "the fetcher pod must render RIO_DISPATCH_MODE=pull and "
-          f"RIO_EXECUTOR_KIND=fetcher, got {pod_env!r}"
+      assert pod_env == ["fetcher"], (
+          "the fetcher pod must render RIO_EXECUTOR_KIND=fetcher and no "
+          f"RIO_DISPATCH_MODE (the knob is retired), got {pod_env!r}"
       )
-      print(f"pull-fetcher: pod {pod} pulled the FOD (dispatch=pull, kind=fetcher)")
+      print(f"pull-fetcher: pod {pod} pulled the FOD (kind=fetcher)")
 
       # ── The report lands and the client gets its store path ────────
       client.wait_until_succeeds(

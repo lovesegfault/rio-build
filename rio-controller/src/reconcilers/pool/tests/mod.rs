@@ -89,7 +89,7 @@ pub(crate) fn test_ctx_with_admin(
     })
 }
 
-// r[verify ctrl.pool.fetcher-hardening+2]
+// r[verify ctrl.pool.fetcher-hardening+3]
 /// D3 belt-and-suspenders behind the CEL admission gate: a
 /// `Pool{kind=Fetcher}` whose spec slips past CEL with
 /// `seccompProfile: Unconfined` and `hostUsers: true` STILL

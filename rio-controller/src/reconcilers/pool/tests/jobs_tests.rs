@@ -1227,19 +1227,11 @@ async fn gated_intent_reports_no_eligible_source_once() {
 }
 
 // ───────────────────────────────────────────────────────────────────
-// Pod-terminal report identity (pull-gated intent id)
+// Pod-terminal report identity (the intent annotation)
 // ───────────────────────────────────────────────────────────────────
 
-/// A pod with the intent annotation, optionally carrying the pull-mode
-/// container env (`RIO_DISPATCH_MODE=pull`).
-fn annotated_pod(intent_id: &str, pull_mode: bool) -> Pod {
-    let env = pull_mode.then(|| {
-        vec![k8s_openapi::api::core::v1::EnvVar {
-            name: "RIO_DISPATCH_MODE".into(),
-            value: Some("pull".into()),
-            ..Default::default()
-        }]
-    });
+/// A pod carrying the intent annotation.
+fn annotated_pod(intent_id: &str) -> Pod {
     Pod {
         metadata: ObjectMeta {
             name: Some("rio-builder-p-pod1".into()),
@@ -1252,7 +1244,6 @@ fn annotated_pod(intent_id: &str, pull_mode: bool) -> Pod {
         spec: Some(k8s_openapi::api::core::v1::PodSpec {
             containers: vec![k8s_openapi::api::core::v1::Container {
                 name: "executor".into(),
-                env,
                 ..Default::default()
             }],
             ..Default::default()
@@ -1261,58 +1252,38 @@ fn annotated_pod(intent_id: &str, pull_mode: bool) -> Pod {
     }
 }
 
-/// A Job whose pod template carries the intent annotation, optionally
-/// with the pull-mode container env.
-fn annotated_job(intent_id: &str, pull_mode: bool) -> Job {
-    let mut j = running_job_for_intent("rio-builder-p-job1", intent_id);
-    if pull_mode && let Some(spec) = j.spec.as_mut() {
-        spec.template.spec = Some(k8s_openapi::api::core::v1::PodSpec {
-            containers: vec![k8s_openapi::api::core::v1::Container {
-                name: "executor".into(),
-                env: Some(vec![k8s_openapi::api::core::v1::EnvVar {
-                    name: "RIO_DISPATCH_MODE".into(),
-                    value: Some("pull".into()),
-                    ..Default::default()
-                }]),
-                ..Default::default()
-            }],
-            ..Default::default()
-        });
-    }
-    j
-}
-
 // r[verify ctrl.report.attempt-outcome]
-/// The unified pod-terminal report attaches the intent id ONLY for
-/// pull-mode pods/Jobs: a stream pod's report stays keyed by its pod
-/// name alone (legacy routing), so it can never be consumed by another
-/// pod's open pull attempt for the same intent during coexistence.
+/// The unified pod-terminal report carries the attempt identity: the
+/// pod's / Job template's intent annotation when present, empty (Job/
+/// pod-name-only resolution) when it is not. The former
+/// RIO_DISPATCH_MODE gate is retired — every executor pod is a pull
+/// pod, so the annotation is attached unconditionally.
 #[test]
-fn report_intent_id_is_populated_only_for_pull_mode() {
+fn report_intent_id_carries_the_intent_annotation() {
     use crate::reconcilers::pool::job::{report_intent_id_for_job, report_intent_id_for_pod};
 
     // Pod call site (report_terminated_pods).
     assert_eq!(
-        report_intent_id_for_pod(&annotated_pod("drv-p", true)),
+        report_intent_id_for_pod(&annotated_pod("drv-p")),
         "drv-p",
-        "a pull-mode pod's report carries its intent annotation"
+        "a pod's report carries its intent annotation"
     );
     assert_eq!(
-        report_intent_id_for_pod(&annotated_pod("drv-p", false)),
+        report_intent_id_for_pod(&Pod::default()),
         "",
-        "a stream pod's report carries no intent id"
+        "a pod with no annotation resolves by name only"
     );
 
     // Job call site (report_deadline_exceeded_jobs).
     assert_eq!(
-        report_intent_id_for_job(&annotated_job("drv-j", true)),
+        report_intent_id_for_job(&running_job_for_intent("rio-builder-p-job1", "drv-j")),
         "drv-j",
-        "a pull-mode Job's deadline report carries its intent annotation"
+        "a Job's deadline report carries its template's intent annotation"
     );
     assert_eq!(
-        report_intent_id_for_job(&annotated_job("drv-j", false)),
+        report_intent_id_for_job(&Job::default()),
         "",
-        "a stream Job's deadline report carries no intent id"
+        "a Job with no annotation resolves by name only"
     );
 }
 
@@ -1513,23 +1484,15 @@ async fn cancel_arm_fail_closed_on_view_error() {
     );
 }
 
-/// Structural guard: the cancel arm is invoked ONLY for pull-mode
-/// pools — the reconcile call site is gated on the Pool CR's
-/// dispatchMode, so a stream-pool Job (idle, mid-build, or
-/// just-completed) can never be touched by this arm. Reintroducing an
-/// ungated call trips this.
+/// Structural guard: the cancel arm is wired into the reconcile
+/// unconditionally — the former Pool-CR dispatchMode gate retired with
+/// the knob (every pool is a pull pool), so removing the call site
+/// altogether (e.g. in a refactor) trips this.
 #[test]
-fn cancel_arm_call_site_is_pull_gated() {
+fn cancel_arm_call_site_is_wired() {
     let src = include_str!("../jobs.rs");
-    let call = src
-        .find("cancel_closed_attempt_jobs(")
-        .expect("the cancel arm is wired into the reconcile");
-    let gate = src[..call]
-        .rfind("if pod::is_pull_mode(pool)")
-        .expect("a dispatchMode gate exists before the call");
     assert!(
-        call - gate < 600,
-        "the cancel-arm call must sit directly inside the is_pull_mode(pool) gate \
-         (stream pools must never reach it)"
+        src.contains("cancel_closed_attempt_jobs("),
+        "the cancel arm must stay wired into the reconcile"
     );
 }

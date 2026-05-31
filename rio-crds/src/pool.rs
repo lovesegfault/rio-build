@@ -288,17 +288,6 @@ pub struct PoolSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_pull_policy: Option<String>,
 
-    /// Pod terminationGracePeriodSeconds. SIGTERM → executor drain
-    /// (DrainExecutor + wait for in-flight builds to complete). After
-    /// this many seconds: SIGKILL, builds lost.
-    ///
-    /// `None` = per-kind default (7200 builders, 600 fetchers — nix
-    /// builds can legitimately take 2h; fetches are short). Clusters
-    /// with known-shorter builds should set this lower so Pool
-    /// deletion doesn't stall on a stuck/never-Ready pod.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub termination_grace_period_seconds: Option<i64>,
-
     /// Run the worker container privileged. None/false = the
     /// default granular caps (SYS_ADMIN + SYS_CHROOT), which is
     /// sufficient on most clusters. true = full privileged,
@@ -330,38 +319,13 @@ pub struct PoolSpec {
     /// CEL-forbidden for `kind=Fetcher`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_network: Option<bool>,
-
-    /// Executor dispatch mode. Absent/`Pull` = the pull/report unary
-    /// protocol (the default since the executor-lifecycle 1c cutover):
-    /// the pod gets `RIO_DISPATCH_MODE=pull` and the AD5 pull-mode
-    /// `terminationGracePeriodSeconds` (45 s — SIGTERM is an abort,
-    /// not a drain, so the 2 h grace no longer applies and an explicit
-    /// `terminationGracePeriodSeconds` on the spec is overridden for
-    /// pull-mode pools). `Stream` = the legacy session protocol
-    /// (register/heartbeat/stream), still selectable and fully
-    /// functional until its 1c'/1d deletion; stream pods get
-    /// `RIO_DISPATCH_MODE=stream` rendered explicitly.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub dispatch_mode: Option<DispatchMode>,
-}
-
-/// Executor dispatch mode (the executor-lifecycle replacement's
-/// per-pool selector). `Pull` (the default when the field is absent,
-/// since the 1c cutover) spawns pods that speak the pull/report
-/// unaries (`RIO_DISPATCH_MODE=pull`) and carries the AD5 abort
-/// semantics (SIGTERM aborts the build; the pod template renders the
-/// small pull-mode terminationGracePeriodSeconds instead of the 2 h
-/// drain grace). `Stream` keeps the legacy register/heartbeat/
-/// bidi-stream session protocol — selectable per pool until that path
-/// is deleted at the 1c'/1d slices. Flipping a deployed pool's
-/// template remains an operator action executed at deployment time.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
-pub enum DispatchMode {
-    /// The legacy session protocol (register/heartbeat/stream).
-    Stream,
-    /// The pull/report unary protocol (one pod, one drv, no session).
-    #[default]
-    Pull,
+    // The former `dispatchMode` selector and the operator
+    // `terminationGracePeriodSeconds` override are retired: the pull/
+    // report unary protocol is the only delivery path (the stream
+    // session protocol was deleted by the executor-lifecycle 1c'/1d
+    // slices), every executor pod carries the fixed AD5 abort grace,
+    // and a knob that selects nothing is not kept as a deprecated
+    // field — deployments are fresh-only, so removal is clean.
 }
 
 /// Seccomp profile selector — mirrors K8s `SeccompProfile` shape.

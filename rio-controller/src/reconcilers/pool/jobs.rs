@@ -806,15 +806,13 @@ pub(super) async fn reconcile(pool: &Pool, ctx: &Ctx) -> Result<Action> {
     // scheduler doesn't consider busy is deleted.
     reap_orphan_running(&jobs_api, &jobs.items, &reaped, ctx, &name).await;
 
-    // ---- AD5 cancel arm (pull-mode pools only) ----
+    // ---- AD5 cancel arm ----
     // A scheduler-side cancel/abort verdict closes the attempt; this
     // arm observes the closed→active edge and deletes the Job so the
     // pod's SIGTERM-abort fires now instead of at
-    // activeDeadlineSeconds. Stream pools never enter (gated on the
-    // Pool CR dispatchMode), so their Jobs are never touched by it.
-    if pod::is_pull_mode(pool) {
-        super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &ns, &name).await;
-    }
+    // activeDeadlineSeconds. Unconditional since the dispatch-mode
+    // knob retired: every pool is a pull pool.
+    super::job::cancel_closed_attempt_jobs(&jobs_api, &jobs.items, ctx, &ns, &name).await;
 
     // ---- Report terminations ----
     report_terminated_pods(ctx, &ns, &name).await;

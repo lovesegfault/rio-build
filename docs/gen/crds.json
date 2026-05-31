@@ -33,11 +33,9 @@
       "fuseCacheBytes",
       "features",
       "imagePullPolicy",
-      "terminationGracePeriodSeconds",
       "privileged",
       "seccompProfile",
-      "hostNetwork",
-      "dispatchMode"
+      "hostNetwork"
     ]
   }
 }

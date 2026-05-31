@@ -233,7 +233,6 @@ rec {
             echo "rio-pull-spawner: spawning rio-builder for intent $intent_id"
             export RIO_INTENT_ID="$intent_id"
             export RIO_EXECUTOR_TOKEN="$token"
-            export RIO_DISPATCH_MODE=pull
             # Bound the NotYetReady wait (a lost pull race) so the
             # worker frees up quickly; controller-spawned production
             # pods keep the builder default via their Job env.
@@ -550,20 +549,16 @@ rec {
       # token from the scheduler's admin surface (the controller's own
       # path) and execs rio-builder for exactly that intent;
       # Restart=always (worker module) brings the wrapper back for the
-      # next intent. RIO_DISPATCH_MODE=pull is set explicitly here as
-      # the discriminator (and again by the wrapper before exec) so
-      # extraServiceEnv overrides stay possible for targeted
-      # experiments while the stream path still exists.
+      # next intent. (The former RIO_DISPATCH_MODE discriminator is
+      # retired: pull is the only delivery path.)
       systemd.services.rio-builder = {
         serviceConfig.ExecStart = lib.mkForce "${pullSpawner}/bin/rio-pull-spawner";
-        environment = {
-          RIO_DISPATCH_MODE = "pull";
-        }
-        // lib.optionalAttrs (otelEndpoint != null) {
-          RIO_OTEL_ENDPOINT = otelEndpoint;
-        }
-        // extraServiceEnv
-        // covEnv;
+        environment =
+          lib.optionalAttrs (otelEndpoint != null) {
+            RIO_OTEL_ENDPOINT = otelEndpoint;
+          }
+          // extraServiceEnv
+          // covEnv;
       };
 
       systemd.tmpfiles.rules = covTmpfiles;

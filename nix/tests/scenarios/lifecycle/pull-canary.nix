@@ -9,7 +9,7 @@
 # What the fragment proves (the T-1b.8/T-1b.9 slice of the 1b gate):
 #
 #   - Pull retry-feed (fold input): a scripted {success,
-#     deterministic-failure} sequence on a dispatchMode:Pull pool. The
+#     deterministic-failure} sequence on a Builder pool. The
 #     failure leg is classified by the worker-report path as exactly
 #     one `permanent` worker-reported attempt row (never a double
 #     charge — exec_id is schema-unique), the success leg charges
@@ -207,7 +207,7 @@ scope: with scope; ''
 
   # ══════════════════════════════════════════════════════════════════
   # Arm 1 — pull retry-feed: the scripted {success, failure} sequence
-  # on a dispatchMode:Pull pool; assert the fold input directly.
+  # on a Builder pool; assert the fold input directly.
   # ══════════════════════════════════════════════════════════════════
   with subtest("pull-canary: pull-mode pool runs the scripted sequence (retry-feed)"):
       kubectl(
@@ -231,7 +231,6 @@ scope: with scope; ''
           "  namespace: ${nsBuilders}\n"
           "spec:\n"
           "  kind: Builder\n"
-          "  dispatchMode: Pull\n"
           "  maxConcurrent: 2\n"
           "  systems: [x86_64-linux]\n"
           "  image: rio-builder:dev\n"
