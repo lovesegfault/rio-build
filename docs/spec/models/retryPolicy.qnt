@@ -1952,20 +1952,20 @@ module retryPolicyPull {
   }
 
   /// Leader failover, pull-mode shape: the cached counter view is lost
-  /// and rebuilt by the fold over the durable attempt ledger exactly as
-  /// on the stream path (sched.retry.failover-budget,
+  /// and rebuilt by the fold over the durable attempt ledger
+  /// (sched.retry.failover-budget,
   /// sched.retry.recovery-projection+3) — but the open pull-mode
-  /// attempt SURVIVES the failover (the assignments/executions rows are
-  /// durable and the post-failover orphan reconcile skips
-  /// dispatch_mode='pull' rows; the establishment sweep, not the orphan
-  /// reconcile, owns them), and the controller's pending pod-terminal
-  /// report obligation is controller-side state that a scheduler
-  /// failover does not erase. Nothing is forgiven, nothing is
-  /// fabricated, and the open attempt is not re-dispatched out from
+  /// attempt SURVIVES the failover (the assignments/executions rows
+  /// are durable; the establishment sweep — never a recovery-time
+  /// reconcile — owns their repair), and the controller's pending
+  /// pod-terminal report obligation is controller-side state that a
+  /// scheduler failover does not erase. Nothing is forgiven, nothing
+  /// is fabricated, and the open attempt is not re-dispatched out from
   /// under its pod.
   // Mirrors: actor/mod.rs LeaderLost wipe + recovery.rs ledger-fold
-  //          rebuild + the reconcile_assignments pull carve-out
-  //          (collect_orphaned_assignments skips open pull attempts).
+  //          rebuild; open attempts come up behind the new leader
+  //          untouched and the establishment sweep is their only
+  //          time-based repair (sched.attempt.establishment-window+3).
   action pullLeaderFailover = all {
     failoversLeft > 0,
     val gone = dStatus == DAbsent or dStatus == DCompleted

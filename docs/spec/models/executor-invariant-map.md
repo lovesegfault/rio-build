@@ -4912,7 +4912,7 @@ development tree; all of them gate the staged rollout.
 | Item | Owner | Condition / where recorded |
 |---|---|---|
 | P12: drop the legacy pod-name exclusion key; re-state `sched.retry.per-executor-budget+3`'s establishment-vehicle list and key clause | Retry campaign (co-owned with this campaign's owner) | **Done (retry-campaign coda):** the kernel event identity is `Option<Id>`, the fold keys rows on `source_node` only, and `sched.retry.per-executor-budget+4` carries the re-stated key clause and vehicle list; record in the retry map's coda section, disposition noted in the blocker file |
-| Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side gates | Campaign owner | Retire once a deprecation path for existing CRs is chosen (CRD version bump + pod.rs/job.rs gates + helm knob); until then the value is selectable but the builder always pulls |
+| Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side gates | Campaign owner | **Done (PR #46 Track C, 2026-05-31):** the knob is retired end-to-end — no deprecation path was needed (the fresh-deployments-only directive recorded at M_072/M_075 makes a CRD version bump moot, the condition this row was waiting on). Scheduler half: `drv_executions.dispatch_mode` dropped (migration 076), the open-attempt view/intakes read the plain assignment ⋈ execution join (commit b20351002). CRD/controller/chart half: the `dispatchMode` field + `DispatchMode` enum + the stream-era `terminationGracePeriodSeconds` override removed from the Pool CRD, the pod.rs/job.rs/jobs.rs gates and the `RIO_DISPATCH_MODE` rendering deleted, helm knob and CRD YAML regenerated (commit dfef0ec36). See the dispatch-mode knob post-close-out section below |
 | Deployment-time validation checklist rows D0–D7 | Operator / campaign owner at deployment time | The finalized table below; the D6/D7 signal-shape note (the gauge and stub-counter series exist only on pre-deletion-stage releases — evaluate against the release being upgraded FROM; the 1d-stage watch falls back to error rates and gateway unknown-method observability) is part of row D6/D7 |
 | Controller-map counter-signatures (the 1b re-audit entry and the 1d delta entry) and the owner's G6/G7 signatures | Controller-campaign owner / campaign owner (same person, recorded as self-issued) | At the close-out review; nothing in the records is provisional on them beyond the signature itself |
 | Retire `executorSessionAsBuilt.qnt` + the as-built calibration evidence modules; re-point or drop the calibration README recipe | Whoever picks up the post-deployment items | **Done (2026-05-29, owner decision — retired ahead of the D7 condition):** the modeled stream machinery is deleted (1c'/1d), the revert-chain obligation ended at the campaign close-out, and git history is the archive; the post-close-out retirement record below has the file list and dispositions. The retry campaign's retirement section was the template, and the non-vacuity condition is satisfied by the live stack — the re-targeted Model S's 12 wired witnesses plus the re-encoded F4 falsification (`quint-executor-calib-f4-establishment-window`) carry every pin a live invariant needs |
@@ -5155,3 +5155,79 @@ Net delta: +108/−89 lines in rio-builder (the growth is the new
 enum's definition and documentation; every use site shrank). No
 shared-registry regeneration needed — no Cargo.toml, proto, or
 docs/gen surface changed.
+
+## Post-close-out — retirement of the dispatch-mode knob (PR #46 Track C, 2026-05-31)
+
+The deferred item executed: the close-out deferred-items table row
+"Pool CRD `dispatchMode: Stream` value, the `RIO_DISPATCH_MODE` pod
+discriminator, and the controller-side gates". The row's retirement
+condition was "once a deprecation path for existing CRs is chosen";
+the campaign owner's fresh-deployments-only directive (2026-05-27,
+recorded at M_072/M_075) dissolves that condition — there are no
+existing CRs to deprecate for, so the knob is removed outright.
+
+What was done, in two commits (each green for stable clippy, the
+touched crates' nextest, tracey-validate, and treefmt at its tree):
+
+- **Scheduler half (commit b20351002, `feat(rio-scheduler)!`):**
+  migration 076 drops `drv_executions.dispatch_mode` (M_076 records
+  the rationale; checksum pinned). The open-attempt view
+  (`find_attempt_by_exec_id`, `find_open_pull_attempt_by_drv_hash`,
+  `list_open_pull_attempts`) reads the plain assignment ⋈ execution
+  join — the pull transaction is the only execution writer, so the
+  filter discriminated nothing. The fenced pull mint stops writing
+  the column; the `ReportOutcome` abort arm and
+  `ReportAttemptOutcome` intake stop checking it. Spec rules
+  re-stated and bumped: `sched.executor.pull-transaction+2`,
+  `sched.executor.pull-not-ready+2`,
+  `sched.attempt.establishment-window+3`,
+  `sched.admin.list-open-attempts+2`. VM scenario SQL (pull-mode,
+  pull-canary, pull-fetcher, recovery) drops the `dispatch_mode`
+  filters; the structural assertions are unchanged. Net −44 lines.
+
+- **CRD/controller/chart half (commit dfef0ec36, `feat(rio-crds)!`):**
+  the `dispatchMode` field and `DispatchMode` enum are removed from
+  the Pool CRD, together with the `terminationGracePeriodSeconds`
+  spec override whose only reader was the stream branch of the
+  dispatch-mode gate (every executor pod now carries the fixed 45 s
+  AD5 abort grace). The controller's `is_pull_mode` /
+  `pod_is_pull_mode` / `job_is_pull_mode` gates and the
+  `RIO_DISPATCH_MODE` pod-template rendering are deleted; the AD5
+  cancel arm runs unconditionally; pod-terminal reports always carry
+  the intent annotation. Helm `poolDefaults.dispatchMode` and the
+  `pool.yaml` rendering block are removed; `infra/helm/crds/` and
+  `docs/gen/crds.json` regenerated. Spec rules re-stated and bumped:
+  `ctrl.pod.tgps-default+4`, `ctrl.drain.sigterm+3`,
+  `ctrl.pool.fetcher-hardening+3`. VM scenarios stop setting the
+  retired fields; pull-fetcher now asserts the discriminator is NOT
+  rendered. Net −313 lines.
+
+Spec/model prose treatment (the C3/C4 convention — historical records
+are not rewritten):
+
+- The phase records in this map (1a–1d, the acceptance table, the
+  close-out accounting) keep their `dispatchMode` / `dispatch_mode`
+  references as written: they describe what existed at those phases.
+- The deployment-time validation checklist (the operator handoff,
+  rows D0–D7) was finalized against the pre-retirement tree. Its
+  template-flip levers (D0's per-pool `dispatchMode` flips, D5's
+  rollback-by-template-flip drill) referenced a knob that no longer
+  exists; since the checklist already binds only deployments of the
+  pre-deletion-stage releases (which retain the knob in their own
+  trees), the checklist text stays as the historical record. A fresh
+  deployment of the current tree starts at the post-deletion stage,
+  where those rows were already recorded as not applicable.
+- `retryPolicy.qnt`'s pull-failover environment comment is re-pointed
+  at the current mechanism (open attempts survive failover because
+  the rows are durable and the establishment sweep owns them — there
+  is no dispatch_mode skip left to name).
+
+Verification at each commit: `cargo clippy --all-targets -- --deny
+warnings` (stable) for the touched crates; `cargo nextest run` —
+1109/1109 (rio-scheduler + rio-migrations, commit 1) and 623/623
+(rio-crds + rio-controller + rio-builder, commit 2); `tracey query
+validate` 0 errors; `treefmt` no drift; the `helm-lint` flake check
+green at commit 2 (chart renders without the knob).
+
+Net delta across the retirement: −357 lines (467 insertions,
+824 deletions over 42 files, excluding this record).
