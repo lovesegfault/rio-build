@@ -1504,6 +1504,8 @@ pub const M_072: () = ();
 /// column — `source_node IS NOT NULL` is NOT the discriminator,
 /// because it is only populated when known for pull attempts and would
 /// fail unsafe by dropping pull attempts from the sweep/busy view.
+/// Dropped by migration 076 once the stream path itself was deleted
+/// (see M_076).
 ///
 /// **Numbering:** 071/072 are the refcount campaign's Release B and
 /// column-drop migrations (see M_071/M_072). 074 stays reserved for
@@ -1526,7 +1528,7 @@ pub const M_073: () = ();
 /// pull mint writes the solved deadline here; the sweep takes
 /// `max(persisted, re-solved)` so the window can widen (estimate grew,
 /// floor bump) but never shrink while the attempt is open
-/// (`sched.attempt.establishment-window+2`). Nullable: pre-074 rows
+/// (`sched.attempt.establishment-window+3`). Nullable: pre-074 rows
 /// fall back to the sweep-time re-solve, and stream rows never
 /// populate it. Known residual: the Job's `activeDeadlineSeconds` is
 /// rendered slightly before the pull mint, so the persisted value can
@@ -1580,6 +1582,34 @@ pub const M_074: () = ();
 /// adjacent to 068 — matters to neither, so the drop takes the next
 /// free number and 069 stays a permanent, deliberate gap (see M_070).
 pub const M_075: () = ();
+
+/// `migrations/076_drop_dispatch_mode.sql`
+///
+/// Executor-lifecycle dispatch-mode knob retirement (PR #46 Track C):
+/// drops `drv_executions.dispatch_mode`, the pull/stream coexistence
+/// discriminator M_073 added. Metadata-only (catalog update, no table
+/// rewrite); `IF EXISTS` per the 035 style. The column's CHECK
+/// constraint goes with it.
+///
+/// **Why the column is dead:** the discriminator existed so pull-only
+/// consumers (the establishment sweep, the open-attempt view behind
+/// `ListOpenAttempts`, the controller's synthesize-on-delete arm, the
+/// open-attempts gauge) could exclude rows written by the as-built
+/// stream dispatch path during coexistence. The stream path was
+/// deleted by the executor campaign's 1c'/1d slices: the pull
+/// transaction is the only `drv_executions` writer left, every row it
+/// writes carried the constant `'pull'`, and a column whose value is
+/// invariant discriminates nothing. The Pool CRD `dispatchMode` field,
+/// the `RIO_DISPATCH_MODE` pod discriminator, and the controller-side
+/// gates retire in the same change set.
+///
+/// **Why a drop rather than freezing the column:** the campaign owner's
+/// fresh-deployments-only directive (2026-05-27, recorded at M_072 and
+/// M_075) means no database ever carries stream-era rows; on a fresh
+/// database the chain (… 073, 074, 075, 076) applies in order at first
+/// startup, so the add-then-drop pair is just history, not churn any
+/// live deployment observes.
+pub const M_076: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,

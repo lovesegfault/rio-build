@@ -73,12 +73,12 @@ service AdminService {
   rpc ReportAttemptOutcome(rio.types.ReportAttemptOutcomeRequest)
       returns (rio.types.ReportAttemptOutcomeResponse);
 
-  // Ledger-backed open-attempt view: every open pull-mode attempt
-  // (active assignment ⋈ execution, dispatch_mode = 'pull', no
-  // terminal fill yet). Serves the controller's busy-signal bridge
-  // (orphan-reap consults it), the cancel/preempt read, the OA2
-  // node-clustering aggregation, and the operator fleet view (OA5).
-  // ListExecutors is a coarser projection of the same view.
+  // Ledger-backed open-attempt view: every open attempt (active
+  // assignment ⋈ execution, no terminal fill yet). Serves the
+  // controller's busy-signal bridge (orphan-reap consults it), the
+  // cancel/preempt read, the OA2 node-clustering aggregation, and the
+  // operator fleet view (OA5). ListExecutors is a coarser projection
+  // of the same view.
   rpc ListOpenAttempts(rio.types.ListOpenAttemptsRequest)
       returns (rio.types.ListOpenAttemptsResponse);
 

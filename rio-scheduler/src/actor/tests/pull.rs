@@ -1,6 +1,6 @@
 //! Pull-mode dispatch: the `PullAssignment` red-first battery
 //! (idempotency, Gone/NotYetReady semantics, the generation fence, the
-//! token binding, coexistence with stream-dispatched attempts).
+//! token binding).
 
 use super::*;
 use crate::actor::pull::{PullOutcome, PullRejection};
@@ -54,18 +54,9 @@ async fn row_counts(pool: &sqlx::PgPool, drv_hash: &str) -> (i64, i64) {
     (assignments, executions)
 }
 
-async fn dispatch_mode_of(pool: &sqlx::PgPool, exec_id: uuid::Uuid) -> String {
-    sqlx::query_scalar("SELECT dispatch_mode FROM drv_executions WHERE exec_id = $1")
-        .bind(exec_id)
-        .fetch_one(pool)
-        .await
-        .expect("dispatch_mode")
-}
-
-// r[verify sched.executor.pull-transaction]
+// r[verify sched.executor.pull-transaction+2]
 /// (a) Double pull returns the identical payload and exec_id and mints
-/// exactly one assignments + drv_executions row pair; (g) the minted
-/// execution row carries dispatch_mode = 'pull'.
+/// exactly one assignments + drv_executions row pair.
 #[tokio::test]
 async fn pull_double_pull_is_idempotent() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -91,8 +82,6 @@ async fn pull_double_pull_is_idempotent() -> TestResult {
     let (assignments, executions) = row_counts(&db.pool, "pull-a").await;
     assert_eq!(assignments, 1, "exactly one assignments row");
     assert_eq!(executions, 1, "exactly one drv_executions row");
-    let exec_id: uuid::Uuid = first.exec_id.parse().expect("exec_id is a uuid");
-    assert_eq!(dispatch_mode_of(&db.pool, exec_id).await, "pull");
 
     // The drv is Running and bound to the intent identity.
     let info = expect_drv(&handle, "pull-a").await;
@@ -130,7 +119,7 @@ async fn pull_completed_drv_returns_gone() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.executor.pull-not-ready]
+// r[verify sched.executor.pull-not-ready+2]
 /// (c) A pull for a wanted-but-not-Ready drv answers
 /// NotYetReady{retry_after} and writes nothing (the OA6 consequence).
 #[tokio::test]
@@ -229,7 +218,7 @@ async fn pull_must_substitute_node_refused_and_settled_by_sweep() -> TestResult 
     Ok(())
 }
 
-// r[verify sched.executor.pull-transaction]
+// r[verify sched.executor.pull-transaction+2]
 /// (d) The generation fence: a pull whose serving generation is below
 /// the durable claims floor creates no row and is rejected with the
 /// retryable not-leader class; a claim at N+1 means a server at N can
@@ -263,7 +252,7 @@ async fn pull_below_floor_is_rejected_and_writes_nothing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.executor.pull-transaction]
+// r[verify sched.executor.pull-transaction+2]
 /// (e) Token↔intent mismatch is rejected per sec.executor.identity-token
 /// and writes nothing.
 #[tokio::test]

@@ -565,23 +565,19 @@ impl DagActor {
 
     /// Establishment sweep for open pull-mode attempts — the single
     /// scheduler-side time-based repair the pull path keeps. Every open
-    /// pull-mode attempt (the durable view, `dispatch_mode = 'pull'`
-    /// only) is visited every sweep; one whose age exceeds its intent
-    /// deadline plus `establishment_report_slack` with no terminal row
-    /// is resolved by the store-probe arm (all verifiable wanted
-    /// outputs present → adopted as completed, never charged) or
-    /// established exactly once as an unreported executor crash
-    /// (charged through the same append+decide discipline as every
-    /// other establishment vehicle) and requeued. Stream-mode attempts
-    /// are never visited — the as-built correlation machinery remains
-    /// their only establishment vehicle during coexistence. Also
-    /// refreshes `rio_scheduler_open_attempts` (one query serves both;
-    /// the gauge counts pull-mode attempts only and is durable-backed
-    /// so it survives failover exactly like the rows it counts).
-    /// Leader-only via the `handle_tick` early-return; the establishing
-    /// transaction additionally carries the same generation-floor fence
-    /// as the pull transaction.
-    // r[impl sched.attempt.establishment-window+2]
+    /// attempt (the durable view) is visited every sweep; one whose age
+    /// exceeds its intent deadline plus `establishment_report_slack`
+    /// with no terminal row is resolved by the store-probe arm (all
+    /// verifiable wanted outputs present → adopted as completed, never
+    /// charged) or established exactly once as an unreported executor
+    /// crash (charged through the same append+decide discipline as
+    /// every other establishment vehicle) and requeued. Also refreshes
+    /// `rio_scheduler_open_attempts` (one query serves both; the gauge
+    /// is durable-backed so it survives failover exactly like the rows
+    /// it counts). Leader-only via the `handle_tick` early-return; the
+    /// establishing transaction additionally carries the same
+    /// generation-floor fence as the pull transaction.
+    // r[impl sched.attempt.establishment-window+3]
     pub(super) async fn tick_sweep_open_pull_attempts(&mut self) {
         let opens = match self.db.list_open_pull_attempts().await {
             Ok(rows) => rows,

@@ -76,26 +76,26 @@ scope: with scope; ''
           return int(psql_k8s(k3s_server, sql).strip() or "0")
 
       def pf_open_count(marker):
-          """Open pull-mode attempts for marker (the ListOpenAttempts view)."""
+          """Open attempts for marker (the ListOpenAttempts view)."""
           return pf_count(
               "SELECT count(*) FROM assignments a "
               "JOIN drv_executions e ON e.exec_id = a.exec_id "
               "JOIN derivations d ON d.derivation_id = a.derivation_id "
               "WHERE a.status IN ('pending','acknowledged') "
-              "AND e.dispatch_mode = 'pull' "
               f"AND d.drv_path LIKE '%{marker}%' "
               "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
               " WHERE t.exec_id = a.exec_id "
               " AND t.termination_reason IS NOT NULL)"
           )
 
-      def pf_exec_count(marker, mode):
-          """All executions ever minted for marker with dispatch_mode=mode."""
+      def pf_exec_count(marker):
+          """All executions ever minted for marker (every execution row
+          is pull-minted — the pull transaction is the only writer)."""
           return pf_count(
               "SELECT count(*) FROM drv_executions e "
               "JOIN assignments a ON a.exec_id = e.exec_id "
               "JOIN derivations d ON d.derivation_id = a.derivation_id "
-              f"WHERE d.drv_path LIKE '%{marker}%' AND e.dispatch_mode = '{mode}'"
+              f"WHERE d.drv_path LIKE '%{marker}%'"
           )
 
       def pf_attempt_rows(marker):
@@ -168,12 +168,9 @@ scope: with scope; ''
       # Ledger facts: built on the pull path, charged nothing, exactly
       # one execution ever minted (OA3 one-pull — no re-pull, no second
       # assignment), and the open view drains.
-      assert pf_exec_count("pc-fetcher-fod", "pull") == 1, (
-          "exactly one pull-mode execution expected for the FOD, got "
-          f"{pf_exec_count('pc-fetcher-fod', 'pull')}"
-      )
-      assert pf_exec_count("pc-fetcher-fod", "stream") == 0, (
-          "the FOD must not have executed on the stream path"
+      assert pf_exec_count("pc-fetcher-fod") == 1, (
+          "exactly one execution expected for the FOD, got "
+          f"{pf_exec_count('pc-fetcher-fod')}"
       )
       assert pf_attempt_rows("pc-fetcher-fod") == 0, (
           "a clean fetcher pull build must charge nothing"

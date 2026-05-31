@@ -2498,26 +2498,27 @@ and `ExecutorService.ReportOutcome` --- and the controller folds pod/Job
 terminal status through `AdminService.ReportAttemptOutcome`. The stream
 session protocol it replaced is deleted (its RPCs are unconditional error
 stubs until the 1d proto sweep), so every in-flight build is an attempt
-minted by the pull transaction (`drv_executions.dispatch_mode = 'pull'`):
+minted by the pull transaction --- the only `drv_executions` writer; the
+former `dispatch_mode` coexistence discriminator is dropped (migration 076):
 the durable open-attempt row is the scheduler's only per-executor state, the
 establishment sweep is its only time-based repair, and the operator surfaces
 project that row set (#rref("sched.admin.list-open-attempts"),
 #rref("sched.admin.list-executors")).
 
-#r("sched.executor.pull-transaction")[
+#r("sched.executor.pull-transaction+2")[
   `PullAssignment(executor_token, intent_id)` MUST be leader-served and MUST
   perform its work as one atomic transaction: validate the token↔intent
   binding (#rref("sec.executor.identity-token") applied per-unary), resolve
   the derivation by intent id, transition it out of Ready, mint `exec_id`,
-  insert the `drv_executions` row (with `dispatch_mode = 'pull'` and
-  `source_node` when known), write or refresh the active `assignments` row
-  carrying the serving generation, pin GC live-inputs, and commit only if
-  the serving generation is not below the durable claims floor (GREATEST
-  over `leader_generation_claims` and `assignments`); a below-floor serving
-  generation MUST abort the transaction with no row written and return the
-  same retryable not-leader error `ensure_leader` produces. A re-pull while
-  the attempt is open and bound to the same pulling identity MUST return
-  the identical payload and `exec_id` without writing anything.
+  insert the `drv_executions` row (with `source_node` when known), write or
+  refresh the active `assignments` row carrying the serving generation, pin
+  GC live-inputs, and commit only if the serving generation is not below
+  the durable claims floor (GREATEST over `leader_generation_claims` and
+  `assignments`); a below-floor serving generation MUST abort the
+  transaction with no row written and return the same retryable not-leader
+  error `ensure_leader` produces. A re-pull while the attempt is open and
+  bound to the same pulling identity MUST return the identical payload and
+  `exec_id` without writing anything.
 ]
 The fence is transaction-side (the worker-side generation latch has no
 distribution channel without the stream); `WorkAssignment.generation` stays
@@ -2533,16 +2534,16 @@ work-binding authority lives.
   is charged.
 ]
 
-#r("sched.executor.pull-not-ready")[
+#r("sched.executor.pull-not-ready+2")[
   `PullAssignment` MUST return `NotYetReady{retry_after_seconds}` --- never
   `Gone`, never another attempt's payload, and never a write --- when the
   derivation is still wanted but not currently deliverable to the pulling
   pod: its dependencies are not yet built (forecast-spawned pod arrived
   early), it is being substituted, it is awaiting retry, or it is currently
-  open/Assigned/Running on a different executor (a stream-mode assignment
-  during coexistence, or an open attempt bound to another pod). The pod
-  re-pulls after the suggested delay and exits 0 charge-free if it has
-  received only `NotYetReady` for its idle-timeout bound.
+  open/Assigned/Running on a different executor (an open attempt bound to
+  another pod). The pod re-pulls after the suggested delay and exits 0
+  charge-free if it has received only `NotYetReady` for its idle-timeout
+  bound.
 ]
 This is the OA6(a) decision: returning `Gone` for a wanted-but-not-Ready
 derivation would produce a reap→respawn→Gone churn loop (the controller's
@@ -2598,10 +2599,10 @@ closure. Pod-initiated aborts of still-wanted work are platform terminations
 them as infrastructure failures would burn the infra budget on disruptions
 the design accepts as charge-free.
 
-#r("sched.attempt.establishment-window+2")[
-  The establishment sweep MUST visit every open pull-mode attempt
-  (`dispatch_mode = 'pull'`, no terminal classification) on every sweep, and
-  MUST establish an attempt only after its deadline plus the configured
+#r("sched.attempt.establishment-window+3")[
+  The establishment sweep MUST visit every open attempt (active assignment ⋈
+  execution, no terminal classification) on every sweep, and MUST establish
+  an attempt only after its deadline plus the configured
   `establishment_report_slack` has elapsed with no terminal row, where the
   deadline is anchored to the value the attempt was dispatched with (the
   solved deadline persisted by the pull mint): a sweep-time re-solve may
@@ -2610,26 +2611,22 @@ the design accepts as charge-free.
   completed when its outputs are present, otherwise the establishment
   appends exactly one executor-crash/unreported classification (charged per
   the existing C2 discipline) and requeues the derivation. Establishment
-  MUST never fire inside the window, MUST never visit stream-mode attempts,
-  and the establishing transaction MUST apply the same generation-floor
-  fence as the pull transaction.
+  MUST never fire inside the window, and the establishing transaction MUST
+  apply the same generation-floor fence as the pull transaction.
 ]
 The sweep reads durable rows --- not an in-memory claim a one-shot timer can
 forget --- so the post-failover "deferred claim forgotten" defect class is
-closed structurally. Stream-mode attempts keep the as-built 60 s correlation
-machinery as their only establishment vehicle during coexistence. Anchoring
-the window to the dispatched deadline (072's `deadline_secs`) keeps a fitted
-estimate or hw-table change that shrinks mid-flight from establishing a
-healthy attempt that is still inside the deadline its pod really runs under;
-the residual gap between the Job's `activeDeadlineSeconds` render and the
-mint-time solve is covered by the report slack.
+closed structurally. Anchoring the window to the dispatched deadline (072's
+`deadline_secs`) keeps a fitted estimate or hw-table change that shrinks
+mid-flight from establishing a healthy attempt that is still inside the
+deadline its pod really runs under; the residual gap between the Job's
+`activeDeadlineSeconds` render and the mint-time solve is covered by the
+report slack.
 
-#r("sched.admin.list-open-attempts")[
-  `AdminService.ListOpenAttempts` MUST return every open pull-mode attempt
-  --- an active `assignments` row joined to its `drv_executions` row with
-  `dispatch_mode = 'pull'` and no terminal `drv_attempts` fill --- and MUST
-  NOT list stream-mode executors or stream-mode in-flight builds (those
-  remain `ListExecutors`' surface). Each entry carries the intent id (drv
+#r("sched.admin.list-open-attempts+2")[
+  `AdminService.ListOpenAttempts` MUST return every open attempt --- an
+  active `assignments` row joined to its `drv_executions` row with no
+  terminal `drv_attempts` fill. Each entry carries the intent id (drv
   hash), derivation path, `exec_id`, executor identity, source node when
   known, the assignment's generation, and its age; the response carries
   `leader_for_secs` with the same fail-closed freshness semantics as

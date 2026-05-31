@@ -437,9 +437,7 @@ impl AdminService for AdminServiceImpl {
     /// write is the first-writer-wins reason fill on an existing
     /// classification row. A report for an identity with no attempt —
     /// a pod that died without ever completing a pull — is acknowledged
-    /// and charges nothing (the no-attempt no-op rule); stream-mode
-    /// attempts stay owned by `ReportExecutorTermination` during
-    /// coexistence.
+    /// and charges nothing (the no-attempt no-op rule).
     // r[impl ctrl.report.attempt-outcome]
     #[instrument(skip(self, request), fields(rpc = "ReportAttemptOutcome"))]
     async fn report_attempt_outcome(
@@ -499,15 +497,13 @@ impl AdminService for AdminServiceImpl {
         }
     }
 
-    /// Ledger-backed open pull-mode attempt view: the controller's
-    /// busy-signal bridge, the cancel/preempt read, the OA2 clustering
-    /// input, and the operator fleet view. Returns ONLY
-    /// `dispatch_mode = 'pull'` rows (the stream fleet stays on
-    /// `ListExecutors`, untouched), so every RPC consumer is
-    /// pull-filtered by construction. Leader-read with the same
-    /// `ensure_leader` discipline as `ListExecutors`; `leader_for_secs`
-    /// carries the same fail-closed freshness input.
-    // r[impl sched.admin.list-open-attempts]
+    /// Ledger-backed open-attempt view: the controller's busy-signal
+    /// bridge, the cancel/preempt read, the OA2 clustering input, and
+    /// the operator fleet view. Every row is an attempt minted by the
+    /// pull transaction (the only execution writer left). Leader-read
+    /// with the same `ensure_leader` discipline as `ListExecutors`;
+    /// `leader_for_secs` carries the same fail-closed freshness input.
+    // r[impl sched.admin.list-open-attempts+2]
     #[instrument(skip(self, request), fields(rpc = "ListOpenAttempts"))]
     async fn list_open_attempts(
         &self,

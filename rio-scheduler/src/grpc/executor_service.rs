@@ -78,7 +78,7 @@ impl ExecutorService for SchedulerGrpc {
     /// runs the admission kernel and (on Deliver) the one fenced
     /// transaction. A re-pull while the attempt is open returns the
     /// identical payload and exec_id.
-    // r[impl sched.executor.pull-transaction]
+    // r[impl sched.executor.pull-transaction+2]
     #[instrument(skip(self, request), fields(rpc = "PullAssignment"))]
     async fn pull_assignment(
         &self,

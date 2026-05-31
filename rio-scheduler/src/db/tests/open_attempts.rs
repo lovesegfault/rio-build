@@ -1,4 +1,4 @@
-//! Open pull-mode attempt view tests (the OA5 / busy-bridge read).
+//! Open attempt view tests (the OA5 / busy-bridge read).
 
 use rio_test_support::TestDb;
 use uuid::Uuid;
@@ -8,10 +8,9 @@ use crate::db::{AssignmentStatus, SchedulerDb};
 use crate::state::ExecutorId;
 
 /// Insert a `drv_executions` row the way the *pull transaction* writes
-/// it: explicit `dispatch_mode = 'pull'` plus the source-node binding
-/// when known. Direct SQL on purpose — the production writer lands with
-/// the `PullAssignment` handler; this fixture pins the row shape the
-/// view must read.
+/// it: the source-node binding when known. Direct SQL on purpose — the
+/// production writer lands with the `PullAssignment` handler; this
+/// fixture pins the row shape the view must read.
 async fn insert_pull_execution(
     pool: &sqlx::PgPool,
     exec_id: Uuid,
@@ -21,8 +20,8 @@ async fn insert_pull_execution(
 ) -> anyhow::Result<()> {
     sqlx::query(
         "INSERT INTO drv_executions \
-             (exec_id, drv_hash, executor_id, started_at, dispatch_mode, source_node) \
-         VALUES ($1, $2, $3, now(), 'pull', $4)",
+             (exec_id, drv_hash, executor_id, started_at, source_node) \
+         VALUES ($1, $2, $3, now(), $4)",
     )
     .bind(exec_id)
     .bind(drv_hash32)
@@ -39,17 +38,16 @@ fn log_hash(tag: &str) -> String {
     format!("{tag:0>32}")
 }
 
-// r[verify sched.admin.list-open-attempts]
-/// The pull-filtered open-attempt view returns exactly the open
-/// pull-mode attempt — not the terminal-filled one, and not the row
-/// pair written exactly as the as-built stream dispatch path writes it
-/// (no `dispatch_mode` marker → `'stream'` default).
+// r[verify sched.admin.list-open-attempts+2]
+/// The open-attempt view returns exactly the open attempt — not the
+/// terminal-filled one, and not an assignment that never got its
+/// execution row (the join requires the pull-minted pair).
 #[tokio::test]
-async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Result<()> {
+async fn open_attempt_view_filters_terminal_and_unminted_rows() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    // (1) Open pull-mode attempt: active assignment + pull execution.
+    // (1) Open attempt: active assignment + execution row.
     let open_drv = insert_test_derivation(&db, "oa-open").await?;
     let open_exec = Uuid::now_v7();
     db.insert_assignment(open_drv, &ExecutorId::from("oa-open"), 7, open_exec)
@@ -63,8 +61,8 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
     )
     .await?;
 
-    // (2) Terminal-filled pull-mode attempt: assignment closed AND the
-    // attempt row carries a terminal fill — excluded on both counts.
+    // (2) Terminal-filled attempt: assignment closed AND the attempt
+    // row carries a terminal fill — excluded on both counts.
     let term_drv = insert_test_derivation(&db, "oa-term").await?;
     let term_exec = Uuid::now_v7();
     db.insert_assignment(term_drv, &ExecutorId::from("oa-term"), 7, term_exec)
@@ -92,26 +90,19 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
     .execute(&test_db.pool)
     .await?;
 
-    // (3) Stream-mode in-flight build: written exactly as the as-built
-    // dispatch path writes it (insert_assignment + insert_drv_execution,
-    // no dispatch_mode marker → 'stream' default). Must NOT appear in
-    // the pull-filtered view.
-    let stream_drv = insert_test_derivation(&db, "oa-stream").await?;
-    let stream_exec = Uuid::now_v7();
-    db.insert_assignment(stream_drv, &ExecutorId::from("pool-pod-1"), 7, stream_exec)
+    // (3) Assignment with NO execution row: the pull mint writes the
+    // pair in one transaction, so a lone assignment row (a test
+    // shortcut, or a partial write that never committed) is not an
+    // attempt and must not appear in the view.
+    let bare_drv = insert_test_derivation(&db, "oa-bare").await?;
+    db.insert_assignment(bare_drv, &ExecutorId::from("oa-bare"), 7, Uuid::now_v7())
         .await?;
-    db.insert_drv_execution(
-        stream_exec,
-        &log_hash("oastream"),
-        &ExecutorId::from("pool-pod-1"),
-    )
-    .await?;
 
     let rows = db.list_open_pull_attempts().await?;
     assert_eq!(
         rows.len(),
         1,
-        "exactly the open pull-mode attempt is listed, got {rows:?}"
+        "exactly the open attempt is listed, got {rows:?}"
     );
     let row = &rows[0];
     assert_eq!(row.derivation_id, open_drv);
@@ -126,7 +117,6 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
     assert!(!row.is_fixed_output, "test derivation defaults to non-FOD");
     assert_eq!(row.source_node.as_deref(), Some("node-1"));
     assert_eq!(row.generation, 7);
-    assert_eq!(row.dispatch_mode, "pull");
     assert!(
         row.assigned_at_epoch_secs > 0.0,
         "assigned_at must be populated"
@@ -136,19 +126,6 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
         "age must be small for a row written moments ago, got {}",
         row.age_secs
     );
-
-    // The stream-written pair stays visible to stream-era consumers
-    // (the unrestricted assignments table) — only the pull view
-    // excludes it. Sanity-check the fixture actually defaulted.
-    let stream_mode: String =
-        sqlx::query_scalar("SELECT dispatch_mode FROM drv_executions WHERE exec_id = $1")
-            .bind(stream_exec)
-            .fetch_one(&test_db.pool)
-            .await?;
-    assert_eq!(
-        stream_mode, "stream",
-        "the as-built writer must keep relying on the column default"
-    );
     Ok(())
 }
 
@@ -156,7 +133,7 @@ async fn open_pull_attempt_view_filters_terminal_and_stream_rows() -> anyhow::Re
 /// assignment row is still active is NOT open (terminality is decided
 /// by the fill, not only by the assignment status).
 #[tokio::test]
-async fn open_pull_attempt_view_respects_terminal_fill_alone() -> anyhow::Result<()> {
+async fn open_attempt_view_respects_terminal_fill_alone() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
@@ -195,7 +172,7 @@ async fn open_pull_attempt_view_respects_terminal_fill_alone() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// The dispatched deadline persisted by the fenced mint round-trips
 /// through the open-attempt view (the establishment window's anchor).
 #[tokio::test]

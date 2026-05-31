@@ -793,10 +793,10 @@ in
       # pull + build + exit). Subtest deletes the default x86-64
       # Pool first so it doesn't steal dispatch.
       "ephemeral-pool"
-      # r[verify sched.executor.pull-transaction]
+      # r[verify sched.executor.pull-transaction+2]
       # r[verify builder.pull.exit-codes]
       # r[verify sched.attempt.no-attempt-no-op]
-      # r[verify sched.admin.list-open-attempts]
+      # r[verify sched.admin.list-open-attempts+2]
       #   pull-mode: ~360s — never-pulled kill + respawned pull build
       #   (30s sleep) + report + killed-mid-build arm (45s sleep +
       #   force-kill + requeue + 45s rebuild to a delivered store
@@ -820,7 +820,7 @@ in
   # activeDeadlineSeconds, and the establishment arm alone (~300s
   # window + rebuild) would blow that group's 1200s budget.
   #
-  # r[verify sched.attempt.establishment-window+2]
+  # r[verify sched.attempt.establishment-window+3]
   #   establishment arm: a pull-mode pod whose builder is SIGKILLed
   #   from the host (no SIGTERM-abort report, plain Error pod, nothing
   #   the controller classifies) stays an open uncharged attempt for
@@ -846,16 +846,16 @@ in
     name = "pull-canary";
     subtests = [
       "pull-canary"
-      # r[verify sched.executor.pull-transaction]
+      # r[verify sched.executor.pull-transaction+2]
       # r[verify sched.sla.fod-feature-derivation+3]
       #   pull-fetcher (T-1c.2): fetcher-kind pull coverage for the 1c
       #   gate's "pool kinds the canary did not cover". A kind=Fetcher
-      #   Pool with dispatchMode:Pull builds a network-free FOD on the
-      #   pull path (one open attempt minted by the pull, executes with
-      #   dispatch_mode=pull on a RIO_EXECUTOR_KIND=fetcher pod, charges
-      #   nothing) and the pod follows the OA3 one-pull default — it
-      #   completes after its single report instead of retaining a
-      #   session. Runs after pull-canary's cleanup (no Pools left).
+      #   Pool builds a network-free FOD on the pull path (one open
+      #   attempt minted by the pull transaction on a
+      #   RIO_EXECUTOR_KIND=fetcher pod, charges nothing) and the pod
+      #   follows the OA3 one-pull default — it completes after its
+      #   single report instead of retaining a session. Runs after
+      #   pull-canary's cleanup (no Pools left).
       "pull-fetcher"
     ];
     # Budget: ~240s k3s bring-up + ~80s prelude + pool swap & pull

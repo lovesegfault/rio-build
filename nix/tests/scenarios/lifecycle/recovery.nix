@@ -136,23 +136,22 @@ scope: with scope; ''
 
       # The in-flight slow build runs on the pull path (T-1c.2b
       # re-point): its execution row was minted by the pull
-      # transaction before the kill, so assert it carries
-      # dispatch_mode='pull'. The stream era waited here for the
-      # worker to RE-REGISTER with the new leader; pull pods hold no
-      # session, so there is nothing to re-establish — the report is
-      # a unary against whichever pod is leader when the sleep ends,
-      # and the end-of-subtest drain below is what proves the new
-      # leader accepts it.
+      # transaction (the only execution writer) before the kill, so
+      # assert the row exists and SURVIVED the failover. The stream
+      # era waited here for the worker to RE-REGISTER with the new
+      # leader; pull pods hold no session, so there is nothing to
+      # re-establish — the report is a unary against whichever pod is
+      # leader when the sleep ends, and the end-of-subtest drain below
+      # is what proves the new leader accepts it.
       pull_execs = int(psql_k8s(k3s_server,
           "SELECT COUNT(*) FROM drv_executions e "
           "JOIN assignments a ON a.exec_id = e.exec_id "
           "JOIN derivations d ON d.derivation_id = a.derivation_id "
-          "WHERE d.drv_path LIKE '%lifecycle-recovery-slow%' "
-          "AND e.dispatch_mode = 'pull'"
+          "WHERE d.drv_path LIKE '%lifecycle-recovery-slow%'"
       ))
       assert pull_execs >= 1, (
           f"the in-flight recovery build should have been dispatched "
-          f"on the pull path (>=1 dispatch_mode='pull' execution row), "
+          f"on the pull path (>=1 pull-minted execution row), "
           f"got {pull_execs}"
       )
 

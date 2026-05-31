@@ -20,8 +20,7 @@
 //! controller's `ReportAttemptOutcome`. A re-pull by the pod (or a
 //! replacement pod of the same intent) therefore converges on the same
 //! open attempt instead of minting a second one, and an attempt held by
-//! a *different* identity (a stream-mode executor during coexistence)
-//! is never re-delivered or re-pointed.
+//! a *different* identity is never re-delivered or re-pointed.
 
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
@@ -112,7 +111,7 @@ pub(crate) struct PullInputs<'a> {
 }
 
 // r[impl sched.executor.pull-gone]
-// r[impl sched.executor.pull-not-ready]
+// r[impl sched.executor.pull-not-ready+2]
 /// Decide one pull from already-loaded state. Pure — no clocks, no IO,
 /// no `&self` — so it can be unit-tested exhaustively and lifted into a
 /// Kani harness without refactoring (decision P10).
@@ -167,8 +166,8 @@ pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
         // Ready: deliverable now — mint a fresh attempt.
         S::Ready => PullDecision::DeliverNew,
         // Already open on some executor: idempotent re-delivery only
-        // for the same identity; anyone else waits (a stream-mode
-        // assignment during coexistence, or another pod's attempt).
+        // for the same identity; anyone else waits (another pod's
+        // open attempt for the same drv).
         S::Assigned | S::Running => match inputs.open_attempt {
             Some((executor, exec_id)) if executor == inputs.pulling_identity => {
                 PullDecision::DeliverExisting { exec_id }
@@ -195,7 +194,7 @@ impl DagActor {
         let _ = reply.send(result);
     }
 
-    // r[impl sched.executor.pull-transaction]
+    // r[impl sched.executor.pull-transaction+2]
     async fn pull_assignment_inner(
         &mut self,
         intent_id: &str,
@@ -665,20 +664,20 @@ impl DagActor {
             ReportAdmission::Process => {
                 let executor_id = ExecutorId::from(attempt.executor_id.as_str());
                 // r[impl sched.attempt.synthesized-verdict]
-                // AD5 abort charge class: a pull-mode pod reporting
-                // `Cancelled` for a derivation the scheduler still
-                // wants is the SIGTERM-abort report (preemption,
-                // scale-down, controller delete) — a platform
-                // termination, not a worker fault. It closes the
-                // attempt charge-free and requeues at this fold; it is
-                // never charged as an infrastructure failure. A
-                // genuinely-cancelled (no-longer-wanted) derivation
-                // falls through to the completion path's Cancelled
-                // early-return and stays exactly as the cancel arm
-                // leaves it (no row, no requeue).
+                // AD5 abort charge class: a pod reporting `Cancelled`
+                // for a derivation the scheduler still wants is the
+                // SIGTERM-abort report (preemption, scale-down,
+                // controller delete) — a platform termination, not a
+                // worker fault. It closes the attempt charge-free and
+                // requeues at this fold; it is never charged as an
+                // infrastructure failure. A genuinely-cancelled
+                // (no-longer-wanted) derivation falls through to the
+                // completion path's Cancelled early-return and stays
+                // exactly as the cancel arm leaves it (no row, no
+                // requeue).
                 let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
-                let abort_of_still_wanted = attempt.dispatch_mode == "pull"
-                    && payload.result.status() == rio_proto::types::BuildResultStatus::Cancelled
+                let abort_of_still_wanted = payload.result.status()
+                    == rio_proto::types::BuildResultStatus::Cancelled
                     && self.dag.node(&drv_hash).is_some_and(|s| {
                         matches!(
                             s.status(),
@@ -962,15 +961,6 @@ impl DagActor {
             return Ok(());
         };
 
-        // A non-pull attempt row can only come from the legacy stream
-        // dispatch plumbing (production-unreachable since the session
-        // machinery was deleted; the placement layer that can still
-        // mint such rows in tests retires with the next deletion
-        // commit). This intake never classifies those rows.
-        if attempt.dispatch_mode != "pull" {
-            debug!(%exec_id, "ReportAttemptOutcome for a non-pull attempt ignored");
-            return Ok(());
-        }
         if attempt.attempt_terminal {
             // Duplicate / already established: idempotent no-op.
             return Ok(());

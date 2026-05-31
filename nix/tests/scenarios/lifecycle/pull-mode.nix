@@ -81,16 +81,15 @@ scope: with scope; ''
       )
 
       def open_pull_count(marker=""):
-          """Open pull-mode attempts in the ledger (the view
-          ListOpenAttempts serves): active assignment ⋈ execution with
-          dispatch_mode='pull' and no terminal drv_attempts fill."""
+          """Open attempts in the ledger (the view ListOpenAttempts
+          serves): active assignment ⋈ execution with no terminal
+          drv_attempts fill."""
           like = f"AND d.drv_path LIKE '%{marker}%' " if marker else ""
           return int(psql_k8s(k3s_server,
               "SELECT count(*) FROM assignments a "
               "JOIN drv_executions e ON e.exec_id = a.exec_id "
               "JOIN derivations d ON d.derivation_id = a.derivation_id "
               "WHERE a.status IN ('pending','acknowledged') "
-              "AND e.dispatch_mode = 'pull' "
               f"{like}"
               "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
               " WHERE t.exec_id = a.exec_id "
@@ -106,7 +105,6 @@ scope: with scope; ''
               "JOIN drv_executions e ON e.exec_id = a.exec_id "
               "JOIN derivations d ON d.derivation_id = a.derivation_id "
               "WHERE a.status IN ('pending','acknowledged') "
-              "AND e.dispatch_mode = 'pull' "
               f"AND d.drv_path LIKE '%{marker}%' "
               "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
               " WHERE t.exec_id = a.exec_id "

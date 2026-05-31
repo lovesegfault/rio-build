@@ -2,18 +2,18 @@
 //!
 //! An **open attempt** is an active `assignments` row (status ∈
 //! {pending, acknowledged}) joined to its `drv_executions` row via
-//! `exec_id` — both written by the pull transaction exactly as the
-//! as-built assign path writes them — with terminality decided by the
-//! `drv_attempts` fill (a row whose `termination_reason` is filled is
-//! closed even if the assignment-close write has not landed yet).
+//! `exec_id` — both written by the pull transaction — with terminality
+//! decided by the `drv_attempts` fill (a row whose `termination_reason`
+//! is filled is closed even if the assignment-close write has not
+//! landed yet).
 //!
-//! The unrestricted join would also match in-flight *stream*-mode
-//! builds (the as-built dispatch path writes the same row pair), so
-//! every pull-only consumer — the establishment sweep, the
-//! `ListOpenAttempts` RPC, the open-attempts gauge, the controller's
-//! synthesize-on-delete arm — reads through this module's
-//! `dispatch_mode = 'pull'` filter. `source_node IS NOT NULL` is NOT
-//! the discriminator (it is only populated when known).
+//! The pull transaction is the only `drv_executions` writer (the
+//! stream dispatch path is deleted, and migration 076 dropped the
+//! `dispatch_mode` coexistence discriminator with it), so the plain
+//! assignment ⋈ execution join IS the open-attempt set; every consumer
+//! — the establishment sweep, the `ListOpenAttempts` RPC, the
+//! open-attempts gauge, the controller's synthesize-on-delete arm —
+//! reads it unfiltered.
 
 use uuid::Uuid;
 
@@ -38,9 +38,6 @@ pub(crate) struct AttemptByExecRow {
     /// A terminal `drv_attempts` fill exists for this exec
     /// (establishment or the controller's second installment).
     pub attempt_terminal: bool,
-    /// `drv_executions.dispatch_mode` for this exec ('stream' when the
-    /// execution row predates the pull path or was written by it).
-    pub dispatch_mode: String,
 }
 
 /// Row shape for [`SchedulerDb::find_open_pull_attempt_by_drv_hash`]
@@ -55,7 +52,6 @@ struct AttemptByExecByHashRow {
     assignment_active: bool,
     attempt_recorded: bool,
     attempt_terminal: bool,
-    dispatch_mode: String,
 }
 
 /// One open pull-mode attempt as read back from the view query.
@@ -89,12 +85,6 @@ pub(crate) struct OpenAttemptRow {
     pub assigned_at_epoch_secs: f64,
     /// Age of the assignment row in seconds (PG clock, non-negative).
     pub age_secs: f64,
-    /// `drv_executions.dispatch_mode` — always `'pull'` for rows
-    /// returned by [`SchedulerDb::list_open_pull_attempts`]; carried so
-    /// the view-contract tests can assert the filter, not consulted by
-    /// lib readers (the WHERE clause is the discriminator).
-    #[allow(dead_code)]
-    pub dispatch_mode: String,
     /// The deadline (seconds) this attempt was dispatched under,
     /// persisted by the pull mint (072). The establishment sweep's
     /// window anchor: the window may widen via the sweep-time re-solve
@@ -106,14 +96,13 @@ impl SchedulerDb {
     /// The fenced pull-mint transaction (the durable half of
     /// `PullAssignment`'s Deliver arm): write/refresh the active
     /// `assignments` row and insert the `drv_executions` row
-    /// (`dispatch_mode = 'pull'`, `source_node` when known) in ONE
-    /// transaction that commits only if `serving_generation` is not
-    /// below the durable claims floor (GREATEST over
-    /// `leader_generation_claims` and `assignments` — the same arms
-    /// `max_known_generation` reads). Returns `Ok(true)` when the
-    /// transaction committed and `Ok(false)` when the fence aborted it
-    /// (nothing written).
-    // r[impl sched.executor.pull-transaction]
+    /// (`source_node` when known) in ONE transaction that commits only
+    /// if `serving_generation` is not below the durable claims floor
+    /// (GREATEST over `leader_generation_claims` and `assignments` —
+    /// the same arms `max_known_generation` reads). Returns `Ok(true)`
+    /// when the transaction committed and `Ok(false)` when the fence
+    /// aborted it (nothing written).
+    // r[impl sched.executor.pull-transaction+2]
     // r[impl sched.lease.generation-fence+3]
     // The argument list mirrors the row pair this single transaction
     // writes (same precedent as the other multi-column writers).
@@ -163,15 +152,13 @@ impl SchedulerDb {
         .bind(exec_id)
         .execute(&mut *tx)
         .await?;
-        // The execution lifecycle row carries the pull discriminator,
-        // the controller-authoritative source attribution (071), and
-        // the dispatched-deadline anchor for the establishment window
-        // (072).
+        // The execution lifecycle row carries the controller-
+        // authoritative source attribution (071) and the dispatched-
+        // deadline anchor for the establishment window (072).
         sqlx::query(
             "INSERT INTO drv_executions \
-                 (exec_id, drv_hash, executor_id, started_at, dispatch_mode, source_node, \
-                  deadline_secs) \
-             VALUES ($1, $2, $3, now(), 'pull', $4, $5) \
+                 (exec_id, drv_hash, executor_id, started_at, source_node, deadline_secs) \
+             VALUES ($1, $2, $3, now(), $4, $5) \
              ON CONFLICT (exec_id) DO NOTHING",
         )
         .bind(exec_id)
@@ -226,11 +213,9 @@ impl SchedulerDb {
                         AS attempt_recorded, \
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
-                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
-                    COALESCE(e.dispatch_mode, 'stream') AS dispatch_mode \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
-             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE a.exec_id = $1 \
              ORDER BY a.assigned_at DESC \
              LIMIT 1",
@@ -242,8 +227,8 @@ impl SchedulerDb {
 
     /// Resolve the OPEN pull-mode attempt for one derivation (the
     /// `intent_id` arm of `ReportAttemptOutcome`'s identity
-    /// resolution): the active assignment for that drv whose execution
-    /// row carries `dispatch_mode = 'pull'`.
+    /// resolution): the active assignment for that drv joined to its
+    /// execution row.
     pub(crate) async fn find_open_pull_attempt_by_drv_hash(
         &self,
         drv_hash: &str,
@@ -256,14 +241,12 @@ impl SchedulerDb {
                         AS attempt_recorded, \
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
-                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
-                    e.dispatch_mode \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
              JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE d.drv_hash = $1 \
                AND a.status IN ('pending', 'acknowledged') \
-               AND e.dispatch_mode = 'pull' \
              ORDER BY a.assigned_at DESC \
              LIMIT 1",
         )
@@ -281,24 +264,22 @@ impl SchedulerDb {
                     assignment_active: r.assignment_active,
                     attempt_recorded: r.attempt_recorded,
                     attempt_terminal: r.attempt_terminal,
-                    dispatch_mode: r.dispatch_mode,
                 },
             )
         }))
     }
 
-    /// Every open **pull-mode** attempt: active assignment ⋈ execution
-    /// (`dispatch_mode = 'pull'`) with no terminal `drv_attempts` fill.
+    /// Every open attempt: active assignment ⋈ execution with no
+    /// terminal `drv_attempts` fill.
     ///
-    /// Stream-mode rows (the `'stream'` default) are excluded by the
-    /// `dispatch_mode` filter, never by executor-id heuristics, so the
-    /// pull-only consumers cannot visit rows the as-built dispatch
-    /// path wrote.
+    /// The pull transaction is the only execution writer, so the plain
+    /// join needs no discriminator — terminality (the `drv_attempts`
+    /// fill) is the only filter.
     pub(crate) async fn list_open_pull_attempts(&self) -> Result<Vec<OpenAttemptRow>, sqlx::Error> {
         let rows: Vec<OpenAttemptRow> = sqlx::query_as(
             "SELECT d.derivation_id, d.drv_hash, d.drv_path, d.system, d.is_fixed_output, \
                     a.exec_id, a.builder_id AS executor_id, a.generation, \
-                    e.source_node, e.dispatch_mode, e.deadline_secs, \
+                    e.source_node, e.deadline_secs, \
                     EXTRACT(EPOCH FROM a.assigned_at)::float8 AS assigned_at_epoch_secs, \
                     GREATEST(EXTRACT(EPOCH FROM (now() - a.assigned_at))::float8, 0.0) \
                         AS age_secs \
@@ -306,7 +287,6 @@ impl SchedulerDb {
              JOIN derivations d ON d.derivation_id = a.derivation_id \
              JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE a.status IN ('pending', 'acknowledged') \
-               AND e.dispatch_mode = 'pull' \
                AND NOT EXISTS ( \
                    SELECT 1 FROM drv_attempts t \
                    WHERE t.exec_id = a.exec_id \

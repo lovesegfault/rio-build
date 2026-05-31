@@ -1,6 +1,6 @@
 //! Establishment sweep for open pull-mode attempts: the red-first
-//! battery (window, store-probe adopt, charge+requeue, the generation
-//! fence, and the stream-mode exclusion).
+//! battery (window, store-probe adopt, charge+requeue, and the
+//! generation fence).
 
 use super::*;
 use crate::actor::pull::PullOutcome;
@@ -50,7 +50,7 @@ async fn assignment_statuses(pool: &sqlx::PgPool, drv_hash: &str) -> Vec<String>
     .expect("assignment statuses")
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// (a) An open pull-mode attempt past deadline + slack with no terminal
 /// row is established exactly once as executor_crash/unreported,
 /// charged to failure_count, and the drv requeues.
@@ -103,7 +103,7 @@ async fn establishment_charges_and_requeues_after_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// (b) The same attempt with its outputs present in the store is
 /// adopted as completed (store-probe arm) and never charged.
 #[tokio::test]
@@ -146,7 +146,7 @@ async fn establishment_store_probe_adopts_completed_attempt() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// (c) An attempt inside the window is never established.
 #[tokio::test]
 async fn establishment_never_fires_inside_window() -> TestResult {
@@ -171,7 +171,7 @@ async fn establishment_never_fires_inside_window() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// (d) The establishment transaction at a below-floor serving
 /// generation writes nothing (the fence applies to establishment too).
 #[tokio::test]
@@ -208,7 +208,7 @@ async fn establishment_below_floor_writes_nothing() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.attempt.establishment-window+2]
+// r[verify sched.attempt.establishment-window+3]
 /// (g) The window is anchored to the deadline the attempt was
 /// dispatched with: a sweep-time re-solve that is smaller than the
 /// persisted deadline must NOT shrink the window (no establishment

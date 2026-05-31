@@ -97,27 +97,27 @@ scope: with scope; ''
           f"WHERE drv_path LIKE '%{marker}%'"
       ).strip()
 
-  def pc_dispatch_modes(marker):
-      """Distinct dispatch_mode values of every execution minted for the
-      marker drv (joined through assignments — drv_executions.drv_hash
-      holds the log hash, not the DAG key)."""
-      return psql_k8s(k3s_server,
-          "SELECT DISTINCT e.dispatch_mode FROM drv_executions e "
+  def pc_exec_count(marker):
+      """Executions minted for the marker drv (joined through
+      assignments — drv_executions.drv_hash holds the log hash, not the
+      DAG key). Every execution row is pull-minted: the pull
+      transaction is the only writer."""
+      return pc_count(
+          "SELECT count(*) FROM drv_executions e "
           "JOIN assignments a ON a.exec_id = e.exec_id "
           "JOIN derivations d ON d.derivation_id = a.derivation_id "
           f"WHERE d.drv_path LIKE '%{marker}%'"
-      ).strip()
+      )
 
   def pc_open(marker):
-      """Open pull-mode attempts for marker: active assignment joined to
-      a dispatch_mode=pull execution with no terminal drv_attempts fill
-      (the same view ListOpenAttempts serves, scoped to one drv)."""
+      """Open attempts for marker: active assignment joined to an
+      execution with no terminal drv_attempts fill (the same view
+      ListOpenAttempts serves, scoped to one drv)."""
       return pc_count(
           "SELECT count(*) FROM assignments a "
           "JOIN drv_executions e ON e.exec_id = a.exec_id "
           "JOIN derivations d ON d.derivation_id = a.derivation_id "
           "WHERE a.status IN ('pending','acknowledged') "
-          "AND e.dispatch_mode = 'pull' "
           f"AND d.drv_path LIKE '%{marker}%' "
           "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
           " WHERE t.exec_id = a.exec_id "
@@ -125,14 +125,13 @@ scope: with scope; ''
       )
 
   def pc_open_exec(marker):
-      """exec_id of the currently-open pull attempt for marker (empty
+      """exec_id of the currently-open attempt for marker (empty
       string when none)."""
       return psql_k8s(k3s_server,
           "SELECT a.exec_id FROM assignments a "
           "JOIN drv_executions e ON e.exec_id = a.exec_id "
           "JOIN derivations d ON d.derivation_id = a.derivation_id "
           "WHERE a.status IN ('pending','acknowledged') "
-          "AND e.dispatch_mode = 'pull' "
           f"AND d.drv_path LIKE '%{marker}%' "
           "AND NOT EXISTS (SELECT 1 FROM drv_attempts t "
           " WHERE t.exec_id = a.exec_id "
@@ -275,9 +274,9 @@ scope: with scope; ''
       assert p_is_intent == "true", (
           f"pull rows are keyed by the attested intent identity, got executor_id={p_exec!r}"
       )
-      assert pc_dispatch_modes("pc-pull-fail") == "pull", (
-          f"the pull leg must execute with dispatch_mode=pull, "
-          f"got {pc_dispatch_modes('pc-pull-fail')!r}"
+      assert pc_exec_count("pc-pull-fail") >= 1, (
+          f"the failure leg must have minted an execution via the pull "
+          f"transaction, got {pc_exec_count('pc-pull-fail')}"
       )
       assert pc_drv_status("pc-pull-fail") == "poisoned", (
           f"the permanent pull failure must poison the drv, "
