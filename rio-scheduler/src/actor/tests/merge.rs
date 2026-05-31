@@ -1992,7 +1992,7 @@ async fn test_topdown_pruned_root_not_failed_when_produced_children_reaped_after
     Ok(())
 }
 
-// r[verify sched.lease.standby-drops-writes]
+// r[verify sched.lease.standby-drops-writes+2]
 /// A `CleanupTerminalBuild` drained by an ex-leader must NOT run the
 /// survivor re-evaluation: the fail-fast arm writes terminal build state
 /// and clears the persisted `topdown_pruned` mark, and the promote arm

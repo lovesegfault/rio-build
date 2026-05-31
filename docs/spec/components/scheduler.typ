@@ -3023,7 +3023,7 @@ condition, and the response-anchoring premise (the renew attempt deadline
 keeps the response-anchored fence within the commit-anchored bound the
 model assumes) so no constant moves without the others.
 
-#r("sched.lease.standby-drops-writes")[
+#r("sched.lease.standby-drops-writes+2")[
   A replica that has lost the lease MUST NOT write scheduler-owned PG state
   (`derivations`, `realisations`, `build_samples`, `build_event_log`). The
   pull-mode work surfaces are leader-gated at the gRPC layer and the fenced
@@ -3037,6 +3037,18 @@ model assumes) so no constant moves without the others.
   own chokepoint (the stream-era `ExecutorConnected`/`Disconnected`/
   `DrainExecutor`/`Heartbeat`/`ReportExecutorTermination`/`ForwardPhase` arms
   it used to ride behind are deleted with their commands).
+  Two narrow `build_event_log` write paths are deliberate, accepted
+  exceptions to the table list above, because that table is the
+  lossy-by-design display-event stream and both writes are idempotent: the
+  event-log persister task drains its bounded in-flight backlog without a
+  leader gate (a deposed replica's queued events still INSERT, colliding
+  with the new leader's rows first-writer-wins via
+  `ON CONFLICT (build_id, sequence) DO NOTHING`), and the per-build
+  event-log GC DELETE on the ungated `CleanupTerminalBuild` arm may delete
+  a terminal build's replay rows from a replica that has lost the lease
+  (acknowledge-without-persist on a standby is permitted for this stream
+  --- the rows it removes belong to that terminal build alone and the
+  DELETE is idempotent).
 ]
 
 - *Terminal-build cleanup:* the `CleanupTerminalBuild` arm also stays ungated
