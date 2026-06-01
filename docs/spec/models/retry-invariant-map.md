@@ -2504,3 +2504,94 @@ The deliberately-open items (A7 uniform backoff, A10 fencepost
 unification, A8 poison-reason strings, the ledger GC policy, the MBT
 omission with its reconsideration triggers) are unchanged by this coda
 and remain the campaign's only open list.
+
+## Cross-campaign addendum — the materialization attempt class (substitution-replacement campaign, Phase A, T-5.1/T-5.2)
+
+Added by the substitution-replacement campaign (Phase A plan T-5.1/T-5.2;
+design §2.5/§9.2, OQ1 amendments 1–2). `retryPolicy.qnt` now carries the
+materialization attempt class — the kind partition the campaign adds to
+the attempt ledger: materialization attempts (store-replica executed,
+`drv_executions.attempt_kind = 'materialization'`) charge their own
+bounded budget, are invisible to every build budget, and never poison;
+the establishment sweep charges a crashed materialization attempt as
+`materialization_infra`, never `executor_crash`.
+
+What changed in the model:
+
+- **Structural**: the pull-mode environment definitions moved verbatim
+  from the former standalone `retryPolicyPull` module into the core
+  `retryPolicy` module (no action text changed), so that regime modules
+  can instantiate them with per-regime constants — the one-model-N-
+  regimes discipline the rest of the model corpus follows. Two thin
+  regime modules now close the file: `retryPolicyPull` (the wired
+  build-only regime, `ENABLE_MATERIALIZATION = false`) and
+  `retryPolicyPullMat` (the materialization-coexistence regime,
+  `ENABLE_MATERIALIZATION = true`).
+- **The materialization attempt class** (core sections 11/11b/11c):
+  three bounded counters carried as the materialization ledger's fold
+  (`matInfraCount`, `matSchedulerInfraCount`, `matUnobtainableCount`,
+  each ceilinged by an action-precondition guard and checked by the
+  extended `boundsOK` — the SC-1 no-unbounded-variables rule), a
+  build-side snapshot ghost (`matObservedBuild`), three actions
+  (`materializationReportUnobtainable`, `materializationReportInfra`,
+  `establishMaterializationCrash` — the OQ1-amendment-1 channel), two
+  partition invariants and one witness.
+- **`pullStep`** composes every build-side disjunct with
+  `buildLeavesMatUntouched` and adds the three materialization
+  disjuncts, enabled only where `ENABLE_MATERIALIZATION = true`.
+
+The two new invariants (both encoded in the pre-state-snapshot tripwire
+style — the model's section-11 encoding note records why no predicate
+over the (build × materialization) product alone can catch a partition
+leak):
+
+| Invariant | Claim | Verdict (wired check) |
+|---|---|---|
+| `materializationNeverPoisons` | no materialization-kind charge — including establishment-written crash charges — ever produces a Poison/Cancel verdict or touches the cascade, at any budget level including park | HOLD (`quint-retry-policy-pull-materialization`) |
+| `materializationInvisibleToBuildBudgets` | materialization charges feed exactly one budget (their own); every build-side budget view (cached counters, reference fold, durable ledger fold, verdict, open attempt, dispatch ghost) is untouched by them | HOLD (`quint-retry-policy-pull-materialization`) |
+
+Wired checks after this addendum:
+
+| Check | Regime | Invariants / witness | Verdict |
+|---|---|---|---|
+| `quint-retry-policy-pull` | build-only (materialization dormant) | the pre-existing 14, **list unchanged** | HOLD — bit-identical state space to the pre-extension baseline (same generated count, same distinct count, same outdegree distribution; figures in the introducing commit message and the check transcripts) |
+| `quint-retry-policy-pull-witness-*` (9) | build-only | unchanged | all still violate (re-built and re-verified at the introducing commit) |
+| `quint-retry-policy-pull-materialization` (NEW) | materialization-coexistence | the same 14 **plus** the two partition invariants (16) | HOLD |
+| `quint-retry-policy-pull-witness-materialization-crash` (NEW) | materialization-coexistence | `noMaterializationCrashCharge` | violates (the establishment crash channel is reachable and charges the materialization budget) |
+
+The materialization-coexistence regime's alphabet: the worker-report
+charge channel (E1–E4), the no-report crash death and its build-side
+establishment (the OQ1 adjacency — both establishment channels are
+reachable, and the partition invariants pin that the materialization one
+never feeds the build fold), dispatch, the spawn-gate exhaust and the
+source-universe shrink. The controller-fill machinery, the resets and
+leader failover remain the build-only regime's exhaustively-proven
+concern; the materialization class is structurally independent of them
+(the partition invariants force exactly that). The wiring-decision
+record — why the partition invariants live in a separate regime check
+instead of growing the build-only check's own alphabet (the state-space
+product arithmetic vs the Phase-A stop-condition-8 wall-clock
+thresholds) — is in nix/quint.nix at the check definition and in the
+introducing commit's message.
+
+Calibration (the working-tree falsification discipline, OQ1 amendment
+1's "checked against the channel that can violate them"): performed
+before wiring, transcripts in the introducing commit's message and the
+Phase-A notes file. Direction materialization→build (scratch edit:
+`establishMaterializationCrash` writes `executor_crash` into the build
+ledger, full verdict-acting form): `materializationInvisibleToBuildBudgets`
+violated immediately, `materializationNeverPoisons` violated once the
+poison threshold is crossed, and — load-bearing for the encoding choice —
+the pre-existing `countersRefineHistory` does NOT catch it (the leak
+advances `live` and `spec` together), which is why the snapshot-ghost
+encoding exists. Direction build→materialization (scratch edit: the
+worker-report disjunct also bumps `matInfraCount`): the extended
+`boundsOK` violated (ceiling overrun — a build action carries no
+materialization ceiling guard), in both regimes.
+
+Phase C′ obligations recorded here: the calibration scratch edits become
+wired expect-violation pins (the Phase-A plan's T-5.1 step 5 records
+them as working-tree calibrations only); `materializationJob.qnt` (the
+draft this campaign's T-5.3 added) is completed and wired as the §9.1
+check set, at which point the partition invariants are checked in both
+models.

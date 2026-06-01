@@ -3137,6 +3137,93 @@ in
     };
 
     # ------------------------------------------------------------------
+    # Substitution-replacement Phase A (T-5.1/T-5.2): the materialization
+    # attempt class — the kind partition the campaign adds to the attempt
+    # ledger (design §2.5/§9.2, OQ1 amendments 1-2). Two invariants:
+    # materializationNeverPoisons (no materialization charge sequence —
+    # including establishment-written crash charges — ever produces a
+    # Poison/Cancel verdict or touches the cascade) and
+    # materializationInvisibleToBuildBudgets (materialization charges feed
+    # exactly one budget, their own; every build-side budget view is
+    # untouched by them). Both are encoded in the pre-state-snapshot
+    # tripwire style over bounded counters (the model's section-11
+    # encoding note explains why no product-state predicate can do it);
+    # both calibrated by working-tree falsification before wiring (the
+    # introducing commit records the transcripts).
+    #
+    # Why a separate regime instead of extending quint-retry-policy-pull's
+    # own alphabet: the materialization counters are independent state, so
+    # enabling them in a regime multiplies its reachable state space by
+    # the number of reachable counter combinations — a full product; the
+    # partition is the point. The build-only pull regime is the model's
+    # largest check, and any product factor >= 2 on it breaks the
+    # merge-gate wall-clock threshold (the Phase-A stop-condition-8
+    # 2x-baseline/5-min rule). The materialization-coexistence regime
+    # (retryPolicyPullMat) therefore carries the product over the build
+    # channels the partition is about — worker-report charges, the
+    # no-report crash and its build-side establishment (the OQ1
+    # adjacency: BOTH establishment channels are reachable, and the
+    # invariants pin that the materialization one never feeds the build
+    # fold), dispatch, the spawn-gate exhaust and the source-universe
+    # shrink. The controller-fill machinery, the resets and leader
+    # failover stay the build-only regime's concern: they explore
+    # build-internal lifecycles the materialization class is structurally
+    # independent of (the partition invariants force exactly that), so
+    # their exclusion does not weaken what this check proves about the
+    # partition.
+    #
+    # The dormant regime (retryPolicyPull, ENABLE_MATERIALIZATION = false)
+    # keeps a bit-identical reachable state space — the wired-check
+    # invariance half of Phase A's dormancy criterion 5, re-proven by
+    # quint-retry-policy-pull reporting the same distinct-state count and
+    # depth as its pre-extension baseline.
+    #
+    # The HOLD list is the build-only regime's full list PLUS the two
+    # partition invariants: the pre-existing invariants are re-proven
+    # over materialization interleavings (a materialization action
+    # between any two build events must not perturb any of them).
+    # r[verify sched.materialize.routing]
+    quint-retry-policy-pull-materialization = mkQuintCheck {
+      name = "retry-policy-pull-materialization";
+      spec = "retryPolicy";
+      main = "retryPolicyPullMat";
+      step = "pullStep";
+      invariants = [
+        "boundsOK"
+        "attemptsChargedOnce"
+        "countersRefineHistory"
+        "verdictMatchesFold"
+        "durableMirrorsCharges"
+        "noDoubleCount"
+        "poisonIsTerminalUntilCleared"
+        "cascadeReachesExactlyTheDependents"
+        "failoverPreservesHistory"
+        "recoveryNeverFabricatesFailures"
+        "placementSound"
+        "clearedPoisonClearsDurably"
+        "clearedPoisonScrubsExclusions"
+        "recoveryPreservesPoisonStatus"
+        "materializationNeverPoisons"
+        "materializationInvisibleToBuildBudgets"
+      ];
+    };
+
+    # Non-vacuity witness for the materialization-coexistence regime: the
+    # establishment crash channel (OQ1 amendment 1) is reachable and
+    # charges the materialization budget — the contended channel both
+    # partition invariants protect against (a crashed store replica's
+    # establishment is THE site that could plausibly write executor_crash
+    # into the build ledger; this witness pins that the model exercises
+    # it, so the invariants are never vacuously green).
+    quint-retry-policy-pull-witness-materialization-crash = mkQuintWitnessCheck {
+      name = "retry-policy-pull-witness-materialization-crash";
+      spec = "retryPolicy";
+      main = "retryPolicyPullMat";
+      step = "pullStep";
+      witness = "noMaterializationCrashCharge";
+    };
+
+    # ------------------------------------------------------------------
     # Gateway connection/session lifecycle campaign (gw-session-formal,
     # round-2 Track B), Phase 0 Stage C: the rio-gateway accept → auth →
     # channel open → exec admission → protocol session → teardown

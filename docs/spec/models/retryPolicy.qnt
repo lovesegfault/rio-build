@@ -219,6 +219,25 @@
 //   - The poison threshold uses the production distinct-workers mode;
 //     THRESHOLD is scaled to the executor-slot count so it is reachable.
 //
+// SUBSTITUTION-REPLACEMENT PHASE A (T-5.1): the model additionally
+// carries the materialization attempt class — the kind partition the
+// substitution-replacement design (§2.5/§9.2, OQ1 amendments 1-2) adds
+// to the attempt ledger. Materialization attempts (store-replica
+// executed) charge their own bounded budget, are invisible to every
+// build budget, and never poison; the establishment sweep charges a
+// crashed materialization attempt as materialization_infra, never
+// executor_crash. Sections 11/11b/11c hold the bounded counters, the two
+// partition invariants (materializationNeverPoisons,
+// materializationInvisibleToBuildBudgets), the crash-channel witness and
+// the three materialization actions; pullStep composes them behind the
+// ENABLE_MATERIALIZATION regime switch. The pull-mode environment
+// definitions (section 10) moved verbatim into this core module from the
+// former standalone retryPolicyPull module so that both regime modules —
+// retryPolicyPull (materialization dormant, the bit-identical pre-Phase-A
+// state space) and retryPolicyPullMat (the materialization-coexistence
+// regime) — instantiate one set of definitions; no action text changed
+// in that move.
+//
 // The invariants, their witnesses and the check wiring are documented at
 // their definitions and in nix/quint.nix. Measured state counts, depths
 // and wall-clocks live in the introducing commits' messages and the CI
@@ -413,6 +432,14 @@ module retryPolicy {
   const ENABLE_CRASH: bool      // the no-report crash death kind + establishment (C2)
   const ENABLE_WEDGE: bool      // the wedge end + backstop (E8)
   const ENABLE_RESETS: bool     // resubmit / cache-hit / TTL-admin clear
+  /// The materialization attempt class (substitution-replacement Phase A,
+  /// design §2.5/§9.2): false = the regime explores the build-only
+  /// alphabet (bit-identical to the pre-Phase-A state space; the three
+  /// materialization counters and the snapshot ghost stay frozen at
+  /// their init values); true = store-replica materialization attempts
+  /// and the establishment crash channel interleave with the build
+  /// alphabet (the kind-partition invariants' regime).
+  const ENABLE_MATERIALIZATION: bool
 
   // Scaled budget (the production values are configuration, not
   // normative numbers -- sched.retry.attempts-bounded+2). The scaling
@@ -753,6 +780,16 @@ module retryPolicy {
     // poisoned iff poisoned_at is stamped
     (dStatus == DPoisoned) implies live.poisonedAt != NoTime,
     (poisonSrc != NoPoison) iff (dStatus == DPoisoned),
+    // The materialization attempt class (substitution-replacement
+    // Phase A): the bounded-counter ceilings. The finiteness of the
+    // extended state space is itself a checked invariant, not an
+    // assumption (the SC-1 no-unbounded-variables rule); a build-side
+    // action edited to bump a materialization counter has no ceiling
+    // guard and overruns these bounds within one regime's attempt
+    // budget (the build->materialization tripwire direction).
+    matInfraCount >= 0 and matInfraCount <= MAX_MATERIALIZATION_ATTEMPTS,
+    matSchedulerInfraCount >= 0 and matSchedulerInfraCount <= matInfraCount,
+    matUnobtainableCount >= 0 and matUnobtainableCount <= MAX_MAT_UNOBTAINABLE,
   }
 
   /// The model-checked form of sched.retry.counters-refine-history+2:
@@ -1315,9 +1352,14 @@ module retryPolicy {
     lastPoisonReason' = RThreshold,
     justFailedOver' = false,
     everFailedBuilders' = Set(),
+    // The materialization attempt class (substitution-replacement Phase A).
+    matInfraCount' = 0,
+    matSchedulerInfraCount' = 0,
+    matUnobtainableCount' = 0,
+    matObservedBuild' = NoBuildSnap,
   }
 
-  // --- 9. shared step wrappers (composed by retryPolicyPull's pullStep) -----
+  // --- 9. shared step wrappers (composed by pullStep, section 12) ----------
   // Every disjunct is a named action with its nondet choices bound
   // directly inside it.
 
@@ -1339,10 +1381,8 @@ module retryPolicy {
   action ctrlReportLostAny = { nondet w = EXECUTORS.oneOf() ctrlReportLost(w) }
   action attemptTxFailsAny = { nondet w = EXECUTORS.oneOf() attemptTxFails(w) }
 
-}
-
 // ===========================================================================
-// THE PULL-MODE ENVIRONMENT REGIME (executor-lifecycle campaign, slice 1b —
+// --- 10. THE PULL-MODE ENVIRONMENT (executor-lifecycle campaign, slice 1b —
 // the T-0e.3 re-derivation executed). Same fold, same invariants, different
 // event-arrival environment: the events the fold consumes arrive through the
 // pull-path unaries (`PullAssignment` opens the attempt, `ReportOutcome`
@@ -1351,6 +1391,15 @@ module retryPolicy {
 // dispatch stream / disconnect / recently_disconnected correlation channels.
 // The as-built channel regimes above stay authoritative for the stream path
 // until the executor campaign's 1c' retires it; this regime is additive.
+//
+// (Substitution-replacement Phase A restructuring, T-5.1: these
+// definitions moved verbatim from the former standalone retryPolicyPull
+// module into the core so that every regime module — the build-only
+// retryPolicyPull and the materialization-coexistence retryPolicyPullMat,
+// both at the end of this file — can instantiate them with its own
+// constants. The action text is unchanged; only the module boundary and
+// the constant binding moved. The pull-mode regime's documentation below
+// is unchanged.)
 //
 // WHAT CHANGES (exactly the T-0e.3 list in
 // docs/spec/models/executor-invariant-map.md):
@@ -1444,20 +1493,7 @@ module retryPolicy {
 // nix/quint.nix (the executor-campaign appended block). Measured state
 // counts, depths and wall-clocks live in the introducing commit's message
 // and the checks' transcripts, never here.
-module retryPolicyPull {
-  import retryPolicy(
-    EXECUTORS = Set("n1", "n2"),
-    MAX_TIME = 3,
-    MAX_ATTEMPTS = 6,
-    ATTEMPT_BOUND = 6,
-    MAX_FAILOVERS = 1,
-    TX_FAULTS = 0,
-    ENABLE_WORKER = true,
-    ENABLE_PODDEATH = true,
-    ENABLE_CRASH = true,
-    ENABLE_WEDGE = false,
-    ENABLE_RESETS = true
-  ).*
+// ===========================================================================
 
   // --- derived state (pull-mode environment) ------------------------------
 
@@ -2047,29 +2083,374 @@ module retryPolicyPull {
   action pullEstablishAny = { nondet n = EXECUTORS.oneOf() pullEstablish(n) }
   action sourceLeavesPoolAny = { nondet n = EXECUTORS.oneOf() sourceLeavesPool(n) }
 
+  // --- 11. the materialization attempt class ------------------------------
+  // (substitution-replacement Phase A, T-5.1; design §2.5/§9.2, OQ1
+  // amendments 1-2)
+  //
+  // Models the kind partition the substitution-replacement campaign adds
+  // to the attempt ledger: materialization attempts (store-replica
+  // executed, drv_executions.attempt_kind = 'materialization') charge
+  // their own bounded budget and are INVISIBLE to every build budget;
+  // build attempts never charge the materialization budget. The class is
+  // carried as the FOLD of the materialization-kind ledger (bounded
+  // counters) — the same representation the build ledger uses
+  // (live/spec/pg.ledger) — never as a row list (the SC-1
+  // no-unbounded-variables rule: every variable below is ceilinged by an
+  // action-precondition guard, and the ceilings are themselves checked by
+  // boundsOK).
+  //
+  // ENCODING NOTE (the partition-tripwire style). The natural-language
+  // forms of the two partition invariants are counterfactual ("charging
+  // the materialization budget never changes the build verdict"), which a
+  // state invariant cannot express directly: the partition makes
+  // (build x materialization) state combinations a full product, so every
+  // post-state of a leaking edit is also reachable legitimately and no
+  // predicate over the two sides alone can distinguish them. The
+  // invariants are therefore encoded over a pre-state snapshot ghost:
+  // every materialization action captures the build-side budget view it
+  // observed (matObservedBuild), every build-side action clears it, and
+  // the invariants assert the post-state build view equals the captured
+  // one. A materialization action edited to write any build-side budget
+  // variable falsifies them in that very state (the
+  // materialization->build tripwire direction); a build-side action
+  // edited to bump a materialization counter overruns the boundsOK
+  // ceilings within one regime's attempt budget (the build->
+  // materialization direction). Both directions are calibrated by
+  // working-tree falsification before wiring (the introducing commit
+  // records the transcripts).
+
+  /// The materialization budget (production: materialization.max_attempts,
+  /// scaled per the model's budget-scaling discipline — every cap stays
+  /// reachable in a small state space; the witness proves the park state
+  /// is reached).
+  pure val MAX_MATERIALIZATION_ATTEMPTS = 2
+  /// Ceiling on modeled unobtainable reports. Unobtainable is a routing
+  /// verdict (the four-arm consumption), not a retry: it never charges
+  /// the infra budget and never counts toward parking, so it needs its
+  /// OWN ceiling to keep the state space finite (review finding SC-1 —
+  /// matParked alone would not bound it).
+  pure val MAX_MAT_UNOBTAINABLE = 1
+
+  /// The build-side budget view a materialization action observes (the
+  /// subject of the two partition invariants): the cached counters, the
+  /// reference-fold ghost, the durable row, the verdict, the derivation /
+  /// dependent / attempt status, the poison bookkeeping and the dispatch
+  /// ghost. Environment bookkeeping (the clock, executor slots, the floor
+  /// ladder, the failover/tx budgets, the last-observation ghost) is
+  /// deliberately not captured: the partition claim is about budgets,
+  /// verdicts and poison/cascade state, and pullStep's composition
+  /// already forces materialization actions to leave every build-side
+  /// variable unchanged.
+  type BuildView = {
+    dStatus: DStatus,
+    live: Counters,
+    spec: Counters,
+    specVerdict: Verdict,
+    pg: PgRow,
+    depStatus: DepStatus,
+    everFailureTerminal: bool,
+    poisonSrc: PoisonSrc,
+    lastPoisonReason: Reason,
+    attempt: Attempt,
+    physAttempts: int,
+    everFailedBuilders: Set[str],
+  }
+  type BuildSnap = | NoBuildSnap | CapturedAt(BuildView)
+
+  /// materialization_infra rows charged to the modeled job (worker-
+  /// reported AND establishment-written — both charge this one budget,
+  /// OQ1 amendment 1).
+  var matInfraCount: int
+  /// The establishment-written (charging party = scheduler) subset of
+  /// matInfraCount — carried separately so the crash-channel witness is
+  /// expressible.
+  var matSchedulerInfraCount: int
+  /// materialization_unobtainable rows (routing verdicts).
+  var matUnobtainableCount: int
+  /// GHOST: the build-side budget view captured by the most recent
+  /// materialization action; NoBuildSnap after every build-side action.
+  /// The two partition invariants compare it against the live build
+  /// state.
+  var matObservedBuild: BuildSnap
+
+  /// The modeled materialization job is parked (budget exhausted). Park
+  /// is the materialization analogue of a terminal budget verdict: the
+  /// attempt actions stop (their guards close), nothing is poisoned —
+  /// materializationNeverPoisons is checked at every budget level
+  /// including this one.
+  def matParked: bool = matInfraCount >= MAX_MATERIALIZATION_ATTEMPTS
+
+  /// The current build-side budget view (the snapshot constructor).
+  def currentBuildView: BuildView = {
+    dStatus: dStatus,
+    live: live,
+    spec: spec,
+    specVerdict: specVerdict,
+    pg: pg,
+    depStatus: depStatus,
+    everFailureTerminal: everFailureTerminal,
+    poisonSrc: poisonSrc,
+    lastPoisonReason: lastPoisonReason,
+    attempt: attempt,
+    physAttempts: physAttempts,
+    everFailedBuilders: everFailedBuilders,
+  }
+
+  // --- 11b. the partition invariants + witness ----------------------------
+
+  /// materializationNeverPoisons (design §2.5; sched.materialize.routing's
+  /// never-poison clause): no materialization-kind charge — worker-
+  /// reported Unobtainable or InfraFailure, or the establishment-written
+  /// crash charge (OQ1 amendment 1) — ever produces a Poison or Cancel
+  /// verdict or touches the cascade, at any budget level including
+  /// exhaustion (parking). State-invariant form: in the state right after
+  /// any materialization action, the derivation's terminal status, poison
+  /// bookkeeping, durable status and cascade state are exactly what the
+  /// action observed before it.
+  val materializationNeverPoisons = match matObservedBuild {
+    | NoBuildSnap => true
+    | CapturedAt(v) => and {
+        dStatus == DPoisoned implies v.dStatus == DPoisoned,
+        dStatus == DCancelled implies v.dStatus == DCancelled,
+        poisonSrc == v.poisonSrc,
+        lastPoisonReason == v.lastPoisonReason,
+        pg.status == v.pg.status,
+        depStatus == v.depStatus,
+        everFailureTerminal == v.everFailureTerminal,
+      }
+  }
+
+  /// materializationInvisibleToBuildBudgets (design §2.5; OQ1 amendment 2,
+  /// the typed carve-out): materialization charges feed exactly one
+  /// budget — their own — and are invisible to every build budget.
+  /// State-invariant form (the countersRefineHistory tripwire style): in
+  /// the state right after any materialization action, every build-side
+  /// budget view — the cached counters, the reference fold, the durable
+  /// ledger fold, the fold verdict, the open attempt and the dispatch
+  /// ghost — equals the view the action observed. A materialization
+  /// charge that leaks into any build fold falsifies this in that very
+  /// state.
+  val materializationInvisibleToBuildBudgets = match matObservedBuild {
+    | NoBuildSnap => true
+    | CapturedAt(v) => and {
+        live == v.live,
+        spec == v.spec,
+        specVerdict == v.specVerdict,
+        pg == v.pg,
+        dStatus == v.dStatus,
+        attempt == v.attempt,
+        physAttempts == v.physAttempts,
+        everFailedBuilders == v.everFailedBuilders,
+      }
+  }
+
+  /// Violated when a crash establishment has charged the materialization
+  /// budget (establishMaterializationCrash is reachable and counted) —
+  /// the OQ1-amendment-1 channel exists in the model and feeds the
+  /// materialization budget, never the build one. Wired as the
+  /// expect-violation check
+  /// quint-retry-policy-pull-witness-materialization-crash.
+  val noMaterializationCrashCharge = not(matSchedulerInfraCount > 0)
+
+  // --- 11c. the materialization actions ------------------------------------
+
+  /// Build-side step disjuncts leave the materialization attempt class
+  /// untouched and clear the snapshot ghost (the build->materialization
+  /// direction of the kind partition). Composed with every build-side
+  /// disjunct of pullStep; the build actions themselves are untouched.
+  action buildLeavesMatUntouched = all {
+    matInfraCount' = matInfraCount,
+    matSchedulerInfraCount' = matSchedulerInfraCount,
+    matUnobtainableCount' = matUnobtainableCount,
+    matObservedBuild' = NoBuildSnap,
+  }
+
+  /// Materialization actions leave every build-side variable untouched
+  /// (the materialization->build direction of the kind partition; the
+  /// snapshot the partition invariants compare against is captured by the
+  /// calling action). justFailedOver and last are preserved, not cleared:
+  /// a materialization action is invisible to the build side, so the
+  /// recovery-invariant scoping and the per-event ghosts must read
+  /// exactly as if it had not happened.
+  action matLeavesBuildUntouched = all {
+    now' = now,
+    dStatus' = dStatus,
+    live' = live,
+    poisonSrc' = poisonSrc,
+    spec' = spec,
+    specVerdict' = specVerdict,
+    pg' = pg,
+    depStatus' = depStatus,
+    everFailureTerminal' = everFailureTerminal,
+    attempt' = attempt,
+    execs' = execs,
+    promotionsLeft' = promotionsLeft,
+    physAttempts' = physAttempts,
+    everFailedBuilders' = everFailedBuilders,
+    failoversLeft' = failoversLeft,
+    txFaultsLeft' = txFaultsLeft,
+    last' = last,
+    lastPoisonReason' = lastPoisonReason,
+    justFailedOver' = justFailedOver,
+  }
+
+  /// A store replica's materialization attempt reports Unobtainable: a
+  /// routing verdict consumed by the four-arm consumption transaction,
+  /// not a retry — it never charges the infra budget and never counts
+  /// toward parking, so it carries its own ceiling.
+  // Mirrors: rio-store materialize executor reporting
+  //          MaterializationOutcome::Unobtainable -> the scheduler
+  //          consumption transaction's routing arms (T-3.5).
+  action materializationReportUnobtainable = all {
+    ENABLE_MATERIALIZATION,
+    matUnobtainableCount < MAX_MAT_UNOBTAINABLE,
+    matUnobtainableCount' = matUnobtainableCount + 1,
+    matInfraCount' = matInfraCount,
+    matSchedulerInfraCount' = matSchedulerInfraCount,
+    matObservedBuild' = CapturedAt(currentBuildView),
+    matLeavesBuildUntouched,
+  }
+
+  /// A store replica's materialization attempt reports InfraFailure: the
+  /// worker-reported channel of the materialization budget.
+  // Mirrors: MaterializationOutcome::InfraFailure -> the consumption
+  //          transaction's budget charge (rio-retry-kernel
+  //          materialization_decide).
+  action materializationReportInfra = all {
+    ENABLE_MATERIALIZATION,
+    not(matParked),
+    matInfraCount' = matInfraCount + 1,
+    matSchedulerInfraCount' = matSchedulerInfraCount,
+    matUnobtainableCount' = matUnobtainableCount,
+    matObservedBuild' = CapturedAt(currentBuildView),
+    matLeavesBuildUntouched,
+  }
+
+  /// The establishment sweep charges a crashed store replica's open
+  /// materialization attempt as materialization_infra — never
+  /// executor_crash (OQ1 amendment 1 / finding PP-4: the channel that
+  /// could violate the partition, modeled so the partition invariants are
+  /// non-vacuous against it). It charges the SAME budget as the
+  /// worker-reported infra channel; the scheduler-written subset is
+  /// carried separately for the witness.
+  // Mirrors: actor/housekeeping.rs establishment sweep, the
+  //          materialization branch (no adopt arm, materialization_infra
+  //          charge, never executor_crash).
+  action establishMaterializationCrash = all {
+    ENABLE_MATERIALIZATION,
+    not(matParked),
+    matInfraCount' = matInfraCount + 1,
+    matSchedulerInfraCount' = matSchedulerInfraCount + 1,
+    matUnobtainableCount' = matUnobtainableCount,
+    matObservedBuild' = CapturedAt(currentBuildView),
+    matLeavesBuildUntouched,
+  }
+
+  // --- 12. the pull-mode transition relation -------------------------------
+
   /// The pull-mode transition relation. The physical attempt-end events
   /// (buildEndsReported / buildEndsPodDeath) and the lost controller
-  /// report are the imported environment actions; the resets and the
-  /// clock are imported unchanged; everything channel-shaped is the
+  /// report are the shared environment actions; the resets and the
+  /// clock are composed unchanged; everything channel-shaped is the
   /// pull-path encoding above. The as-built `step` (dispatch stream,
   /// disconnect, correlation channels, backstop, respawn) is not
   /// reachable from here.
+  ///
+  /// Every build-side disjunct is composed with buildLeavesMatUntouched
+  /// (the kind partition, build->materialization direction); the build
+  /// actions' own text is unchanged. The three materialization disjuncts
+  /// are enabled only in regimes with ENABLE_MATERIALIZATION = true and
+  /// leave the build side untouched (the materialization->build
+  /// direction). In ENABLE_MATERIALIZATION = false regimes the
+  /// materialization variables are frozen at their init values, so the
+  /// reachable state space is bit-identical to the pre-Phase-A one.
   action pullStep = any {
-    tick,
-    pullOpensAttemptAny,
-    spawnGateExhaust,
-    buildEndsReportedAny,
-    buildEndsPodDeathAny,
-    pullReportOutcomeAny,
-    pullAttemptOutcomeOomAny,
-    pullAttemptOutcomeDeadlineAny,
-    pullAttemptOutcomeNoOpAny,
-    ctrlReportLostAny,
-    pullEstablishAny,
-    sourceLeavesPoolAny,
-    resubmitReset,
-    cacheHitClear,
-    poisonTtlExpires,
-    pullLeaderFailover,
+    all { tick, buildLeavesMatUntouched },
+    all { pullOpensAttemptAny, buildLeavesMatUntouched },
+    all { spawnGateExhaust, buildLeavesMatUntouched },
+    all { buildEndsReportedAny, buildLeavesMatUntouched },
+    all { buildEndsPodDeathAny, buildLeavesMatUntouched },
+    all { pullReportOutcomeAny, buildLeavesMatUntouched },
+    all { pullAttemptOutcomeOomAny, buildLeavesMatUntouched },
+    all { pullAttemptOutcomeDeadlineAny, buildLeavesMatUntouched },
+    all { pullAttemptOutcomeNoOpAny, buildLeavesMatUntouched },
+    all { ctrlReportLostAny, buildLeavesMatUntouched },
+    all { pullEstablishAny, buildLeavesMatUntouched },
+    all { sourceLeavesPoolAny, buildLeavesMatUntouched },
+    all { resubmitReset, buildLeavesMatUntouched },
+    all { cacheHitClear, buildLeavesMatUntouched },
+    all { poisonTtlExpires, buildLeavesMatUntouched },
+    all { pullLeaderFailover, buildLeavesMatUntouched },
+    // The materialization attempt class (substitution-replacement
+    // Phase A; disabled when ENABLE_MATERIALIZATION = false).
+    materializationReportUnobtainable,
+    materializationReportInfra,
+    establishMaterializationCrash,
   }
+}
+
+// ===========================================================================
+// REGIME MODULES — each is the --main of one or more wired checks in
+// nix/quint.nix; each instantiates the core with that regime's constants
+// (the one-model-N-regimes discipline). Measured state counts, depths and
+// wall-clocks live in the introducing commits' messages and the checks'
+// transcripts, never here.
+// ===========================================================================
+
+/// The pull-mode environment regime (executor-lifecycle campaign, slice
+/// 1b; the wired set since the 1c' retirement of the as-built-channel
+/// regimes). ENABLE_MATERIALIZATION = false: the materialization attempt
+/// class is dormant here, so this regime's reachable state space is
+/// bit-identical to the pre-Phase-A pull regime — the dormancy criterion
+/// the substitution-replacement campaign's wired-check invariance gate
+/// re-proves at every Phase A commit. Checks: quint-retry-policy-pull and
+/// the nine quint-retry-policy-pull-witness-* expect-violation probes.
+module retryPolicyPull {
+  import retryPolicy(
+    EXECUTORS = Set("n1", "n2"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 1,
+    TX_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = true,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = true,
+    ENABLE_MATERIALIZATION = false
+  ).*
+}
+
+/// The materialization-coexistence regime (substitution-replacement
+/// Phase A, T-5.1/T-5.2): the materialization attempt class enabled
+/// alongside the build channels the kind partition is about — the worker
+/// report charge channel (E1-E4), the no-report crash death and its
+/// build-side establishment (the OQ1-amendment-1 adjacency: BOTH
+/// establishment channels are reachable here, and the partition
+/// invariants pin that the materialization one never feeds the build
+/// fold), dispatch, the spawn-gate exhaust and the source-universe
+/// shrink. The controller-fill machinery (ENABLE_PODDEATH), the resets
+/// and leader failover are the build-only regime's concern: they explore
+/// build-internal lifecycles the materialization class is structurally
+/// independent of, and excluding them keeps this regime's product state
+/// space inside the merge-gate budget (the SC-1 wall-clock thresholds).
+/// Checks: quint-retry-policy-pull-materialization (exhaustive, the full
+/// invariant list including the two partition invariants) and
+/// quint-retry-policy-pull-witness-materialization-crash.
+module retryPolicyPullMat {
+  import retryPolicy(
+    EXECUTORS = Set("n1", "n2"),
+    MAX_TIME = 3,
+    MAX_ATTEMPTS = 6,
+    ATTEMPT_BOUND = 6,
+    MAX_FAILOVERS = 0,
+    TX_FAULTS = 0,
+    ENABLE_WORKER = true,
+    ENABLE_PODDEATH = false,
+    ENABLE_CRASH = true,
+    ENABLE_WEDGE = false,
+    ENABLE_RESETS = false,
+    ENABLE_MATERIALIZATION = true
+  ).*
 }
