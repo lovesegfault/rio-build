@@ -185,10 +185,8 @@ pub const FLAG_PREFETCH_SHORTFALL: &str = "prefetch-shortfall";
 /// Low-confidence flag: a timed run's recorded cadence was not honored
 /// (resume re-anchoring or a suspension window during timed execution).
 pub const FLAG_TIMING_DEGRADED: &str = "timing-degraded";
-/// Low-confidence flag (set at plan time): the campaign tenants' upstream
-/// sets were not verified by launch (`--skip-preflight` /
-/// `--allow-unverified-tenants`), so what the headline measured against is
-/// unconfirmed.
+/// Low-confidence flag (set at plan time): tenant upstreams unverified — `replay dev`
+/// runs, and `replay repro` of campaigns whose original record had unverified tenants.
 pub const FLAG_TENANT_UPSTREAMS_UNVERIFIED: &str = "tenant-upstreams-unverified";
 /// Low-confidence flag (set at bootstrap): interruption replay was requested
 /// but the archive records no cancellations or client disconnects, so the
