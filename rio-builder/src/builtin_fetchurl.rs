@@ -84,14 +84,23 @@ const RETRY_BACKOFF: Backoff = Backoff {
 /// body itself — the server cannot amplify.)
 const MAX_RESTORED_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 
-/// Where the request glue mounts the operator-configured CA bundle
-/// inside the sandbox (read-only, only when `RIO_CA_BUNDLE` is set on
-/// the worker). The fetch must keep working without it: fetcher pods
-/// have no system trust store of their own, and plain-HTTP origins and
-/// hashed mirrors are valid configurations — the FOD hash gate, not
-/// TLS, is the content-integrity boundary. TLS fetches simply require
-/// the bundle to be present.
-const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
+/// In-sandbox path of the operator-configured CA bundle.
+///
+/// This is the single source of truth for the writer/reader contract:
+/// the request glue mounts the host bundle here (the generic FOD path
+/// in `executor::glue::prepare_request` and the builtin path in
+/// `executor::glue::builtin::prepare_fetchurl` — both read-only,
+/// `optional: true`, only when the worker has a bundle configured),
+/// and the in-sandbox fetch half reads it from here. Operator-facing
+/// prose (`Config::ca_bundle`, `default_ca_bundle`) mirrors the value
+/// descriptively; any code that needs the path must use this constant.
+///
+/// The fetch must keep working without it: fetcher pods have no system
+/// trust store of their own, and plain-HTTP origins and hashed mirrors
+/// are valid configurations — the FOD hash gate, not TLS, is the
+/// content-integrity boundary. TLS fetches simply require the bundle
+/// to be present.
+pub const SANDBOX_CA_BUNDLE: &str = "/etc/ssl/certs/ca-certificates.crt";
 
 /// Everything the subcommand needs, parsed from `RIO_FETCHURL_*`.
 #[derive(Debug, Clone, PartialEq, Eq)]

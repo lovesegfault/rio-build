@@ -234,9 +234,15 @@ pub struct Config {
     // route to fetchers which have direct egress. Squid proxy deleted.
 }
 
-/// Default CA bundle location in the worker image (Debian/NixOS
+/// Default *host* CA bundle location in the worker image (Debian/NixOS
 /// convention). The sandbox mount is `optional`, so a missing file
 /// simply omits the mount instead of failing the build.
+///
+/// Distinct from the *in-sandbox* mount target,
+/// [`crate::builtin_fetchurl::SANDBOX_CA_BUNDLE`]: this is where the
+/// bundle is read from on the host; that constant is where readers
+/// inside the sandbox find it. The two coincide textually only because
+/// the conventional Linux location is used on both sides.
 fn default_ca_bundle() -> Option<std::path::PathBuf> {
     Some(std::path::PathBuf::from(
         "/etc/ssl/certs/ca-certificates.crt",

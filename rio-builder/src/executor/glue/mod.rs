@@ -322,8 +322,9 @@ pub(crate) struct SandboxOptions {
     pub extra_sandbox_paths: Vec<PathBuf>,
     /// Operator-configured impure environment for FOD `impureEnvVars`.
     pub impure_env: BTreeMap<String, String>,
-    /// Host CA bundle to expose at `/etc/ssl/certs/ca-certificates.crt`
-    /// for network (fixed-output) builds.
+    /// Host CA bundle to expose at
+    /// [`crate::builtin_fetchurl::SANDBOX_CA_BUNDLE`] for network
+    /// (fixed-output) builds.
     pub ca_bundle: Option<PathBuf>,
     /// Extra character devices to expose (e.g. `/dev/kvm` when the
     /// worker advertises the `kvm` feature).
@@ -531,7 +532,7 @@ pub(crate) fn derivation_into_request(
     if is_fod && let Some(ca) = &opts.ca_bundle {
         mounts.push(Mount {
             source: ca.clone(),
-            target: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            target: PathBuf::from(crate::builtin_fetchurl::SANDBOX_CA_BUNDLE),
             writable: false,
             optional: true,
         });
@@ -993,7 +994,7 @@ mod tests {
         assert!(
             !req.mounts
                 .iter()
-                .any(|m| m.target == Path::new("/etc/ssl/certs/ca-certificates.crt"))
+                .any(|m| m.target == Path::new(crate::builtin_fetchurl::SANDBOX_CA_BUNDLE))
         );
 
         // Isolation/limits.
@@ -1039,12 +1040,40 @@ mod tests {
         );
         let prepared = prepare(&fod);
         assert!(prepared.request.isolation.network);
+        assert!(prepared.request.mounts.iter().any(|m| m.target
+            == Path::new(crate::builtin_fetchurl::SANDBOX_CA_BUNDLE)
+            && m.optional));
+    }
+
+    /// The writer half of the CA-bundle contract: the glue's mount
+    /// targets exactly the path the in-sandbox reader
+    /// (`builtin_fetchurl`) opens — the shared
+    /// [`crate::builtin_fetchurl::SANDBOX_CA_BUNDLE`] symbol — read-only
+    /// and optional-if-missing. A drift between writer and reader can
+    /// now only happen by editing the one constant both sides import.
+    #[test]
+    fn ca_bundle_mount_targets_the_readers_path() {
+        let zeros = "00".repeat(32);
+        let out = fod_path("sha256", &zeros);
+        let fod = mk_drv(
+            vec![DerivationOutput::new("out", out.as_str(), "sha256", zeros.as_str()).unwrap()],
+            &[
+                ("name", "demo"),
+                ("out", out.as_str()),
+                ("outputHashMode", "flat"),
+            ],
+        );
+        let prepared = prepare(&fod);
+        let ca = prepared
+            .request
+            .mounts
+            .iter()
+            .find(|m| m.target == Path::new(crate::builtin_fetchurl::SANDBOX_CA_BUNDLE))
+            .expect("FOD request must mount the CA bundle at the reader's path");
+        assert!(!ca.writable, "CA bundle mount must be read-only");
         assert!(
-            prepared
-                .request
-                .mounts
-                .iter()
-                .any(|m| m.target == Path::new("/etc/ssl/certs/ca-certificates.crt") && m.optional)
+            ca.optional,
+            "CA bundle mount must be optional so a bundle-less worker image still builds"
         );
     }
 

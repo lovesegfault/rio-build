@@ -22,7 +22,7 @@ use rio_exec::{
 };
 use rio_nix::derivation::{BasicDerivation, DerivationLike as _};
 
-use crate::builtin_fetchurl::env_vars;
+use crate::builtin_fetchurl::{SANDBOX_CA_BUNDLE, env_vars};
 
 use super::{
     GlueError, PreparedBuild, SANDBOX_BUILD_DIR, SANDBOX_STORE_DIR, SandboxOptions, SandboxPaths,
@@ -190,7 +190,7 @@ pub(crate) fn prepare_fetchurl(
     if let Some(ca) = &opts.ca_bundle {
         mounts.push(Mount {
             source: ca.clone(),
-            target: PathBuf::from("/etc/ssl/certs/ca-certificates.crt"),
+            target: PathBuf::from(SANDBOX_CA_BUNDLE),
             writable: false,
             optional: true,
         });
@@ -391,7 +391,7 @@ mod tests {
             pb.request
                 .mounts
                 .iter()
-                .any(|m| m.target.as_path() == Path::new("/etc/ssl/certs/ca-certificates.crt"))
+                .any(|m| m.target.as_path() == Path::new(SANDBOX_CA_BUNDLE))
         );
         assert!(pb.request.isolation.network);
         // The netrc rides as an inline file with tight permissions.
