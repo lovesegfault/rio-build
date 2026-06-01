@@ -413,6 +413,53 @@ the winner's uncommitted row, then takes the dedup arm — both orders).
 Test: `flag_on_concurrent_probe_and_merge_create_one_job`
 (db/tests/materialization.rs).
 
+### OQ7 close-out — the zero-walk coexistence boundary audit (T-5.3)
+
+**The boundary statement (equivalence criterion 3, scoped per PD-B19):**
+flag-on, walks spawn ONLY for nodes carrying flag-off-era evidence state
+(`topdown_pruned` marks / `substitute_tried` / `Substituting` status), never
+for fresh flag-on work. Legacy-state walks are the documented, correct
+transition-window absorption (design §2.3 Substituting row + §4); fresh-work
+walks would be a criterion-3 violation (stop condition 2).
+
+**The static audit — every `spawn_substitute_fetches` call site at this
+commit (six sites; the count and gating are what the runtime test pins):**
+
+| # | Site | Fed by | Mechanism selection flag-on | Why fresh work cannot reach it |
+|---|---|---|---|---|
+| 1 | `dispatch.rs:309` (probe-partition spawn) | `to_spawn` pushes at `:251` (D16 present+tried cell), `:278` (substitutable cell), `:290` (tried+substitutable settlement cell) | `:278` is flag-gated (job creation instead — Phase A); `:251`/`:290` require `substitute_tried` ∧ `must_substitute` (mark + Broken evidence) | the gating cells' preconditions are flag-off-era evidence state; fresh flag-on work never sets `substitute_tried` (no walk ever ran for it) |
+| 2 | `dispatch.rs:952` (`handle_substitute_complete` downgrade re-spawn) | walk consumption | walk-consumption code | only runs as a consequence of a walk having completed — transitively unreachable for fresh work |
+| 3 | `dispatch.rs:1320` (`settle_broken_marked_root` verification walk) | mark-keyed settlement | mark-carrying nodes only | requires the `topdown_pruned` mark + as-built settlement state |
+| 4 | `merge.rs:935` (6d reprobe lane) | `reprobe_sub` | **flag-gated (PD-17 / T-1.5)**: `apply_reprobe_reset_in_memory` + in-tx `reprobe` jobs flag-on; walks flag-off | the gate is load-bearing — closed in Wave 1 |
+| 5 | `merge.rs:1017` (6g new_sub lane) | `new_sub` | **flag-gated (Phase A)**: in-tx `cache_opportunity` jobs flag-on; walks flag-off | gated since Phase A |
+| 6 | `merge.rs:2085` (`verify_preexisting_completed` stale-verify spawn) | `to_spawn` push at `:2001` | **flag-gated (PD-18 / T-1.6)**: standalone-fenced `stale_reset` jobs flag-on; walks flag-off | the gate is load-bearing for criterion 3 — a materialization-Completed node whose outputs are GC'd re-merges through exactly this lane (fresh flag-on work) |
+
+No seventh site exists (`grep -n "spawn_substitute_fetches\|to_spawn.push"
+rio-scheduler/src/actor/*.rs`, audited at this commit).
+
+**The runtime pin:** `flag_on_fresh_work_never_walks`
+(actor/tests/materialize.rs) — drives all five creation origins
+(new_sub, pruned, probe-partition, reprobe, stale_reset) plus Success/
+InfraFailure consumption arms from a clean flag-on DB and asserts
+`rio_scheduler_substitute_spawned_total == 0`, zero `QueryPathInfo` calls
+(the walk's fetch primitive), and one job per driven origin; then forces
+flag-off-era marks on a fresh node (the debug forcers) and asserts the D16
+settlement cell DOES walk it (metric 0 → 1) — the legacy-state arm is
+sanctioned absorption AND the proof that the metric capture is non-vacuous.
+
+**Mechanism-selection summary (which lane selects which mechanism, by flag
+state and node history):**
+
+| Lane | Flag-off | Flag-on, fresh node | Flag-on, legacy-state node (marks/tried) |
+|---|---|---|---|
+| merge new_sub / prune / reprobe / stale-verify | walk | job (in-tx or standalone fenced per the T-5.2 table) | n/a (these lanes classify fresh probe answers) |
+| dispatch probe partition | walk | job | D16/settlement cells → walk (absorption) |
+| walk-consumption re-spawn / marked-root settlement | walk | unreachable | walk (absorption) |
+
+T-1.7's clear-mirror narrows the legacy-mark population over time (resolved
+jobs clear their nodes' marks), but reaped/never-resolved legacy state can
+persist — the absorption arms stay documented, not deleted (deletion is D′).
+
 ---
 
 ## Cross-references

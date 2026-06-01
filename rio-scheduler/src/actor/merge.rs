@@ -1005,10 +1005,10 @@ impl DagActor {
                 // INSIDE the merge transaction (adjudication PDQ-9); the
                 // job row is the in-flight marker and the nodes stay
                 // Ready (claimable by store replicas) — no walk spawns.
-                // The reprobe lane (6d above) keeps spawning walks
-                // flag-on (the OQ7 partial-coexistence posture; its job
-                // creation is Phase B work together with the AS-5
-                // status-reset obligation).
+                // (The reprobe lane (6d above) and the stale-Completed
+                // verify (6c) are likewise job-routed flag-on since
+                // PD-17/PD-18 — the T-5.3 audit's criterion-3 statement:
+                // zero walks for fresh flag-on work, from any lane.)
                 debug!(
                     count = new_sub.len(),
                     "new_sub lane routed to materialization jobs; no walks spawned"

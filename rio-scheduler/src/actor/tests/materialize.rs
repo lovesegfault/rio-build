@@ -4467,3 +4467,296 @@ async fn flag_on_probe_job_backfills_wanted_relation_for_flag_off_era_builds() -
     );
     Ok(())
 }
+
+// ── T-5.3 (Phase B): the OQ7 zero-walk coexistence boundary audit ──────────
+
+// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing+2]
+/// T-5.3 (OQ7 close-out / equivalence criterion 3, scoped per PD-B19):
+/// flag-on, ZERO walks spawn for FRESH flag-on work — the complete
+/// creation-origin sweep over all five job origins plus consumption
+/// arms, audited against the runtime walk signals:
+///
+///   - `rio_scheduler_substitute_spawned_total` never increments (the
+///     counter increments at the single walk-spawn chokepoint,
+///     `spawn_substitute_fetches`, in the same actor pass that
+///     transitions nodes to Substituting — zero metric ⟺ zero walk
+///     transitions);
+///   - the mock store records zero `QueryPathInfo` calls (the walk's
+///     fetch primitive; the job mechanism uses FindMissingPaths probes
+///     and store-side execution only);
+///   - every driven origin produced a JOB (the work routed to the new
+///     mechanism, not nowhere).
+///
+/// Plus the legacy-state arm (the documented transition-window
+/// absorption — PD-B19, explicitly NOT a stop-condition trigger): a
+/// node carrying flag-off-era evidence state (topdown_pruned +
+/// substitute_tried, set via the debug forcers) MAY walk flag-on — the
+/// D16 settlement cell spawns its verification walk and the metric
+/// increments by exactly one. That arm is CORRECT coexistence;
+/// criterion 3 is scoped to fresh work only.
+///
+/// The static half of this audit (the six `spawn_substitute_fetches`
+/// call sites and their gates) is recorded in
+/// docs/spec/models/substitution-replacement-invariant-map.md.
+#[tokio::test]
+async fn flag_on_fresh_work_never_walks() -> TestResult {
+    use crate::sla::metrics::counter_map;
+    use metrics_util::debugging::DebuggingRecorder;
+
+    // Install the recorder BEFORE the actor spawns and hold it for the
+    // whole test: #[tokio::test] is current_thread, so the actor task's
+    // metric emissions land on this thread's local recorder.
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // ════ Origin 1: new_sub lane (cache_opportunity, in-tx) ════
+    let out_newsub = test_store_path("oq7-newsub-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_newsub.clone());
+    let mut n1 = make_node("oq7-newsub");
+    n1.expected_output_paths = vec![out_newsub.clone()];
+    n1.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![n1], vec![], false).await?;
+    barrier(&handle).await;
+
+    // ════ Origin 2: top-down prune (pruned, in-tx) ════
+    let out_root = test_store_path("oq7-pruned-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_root.clone());
+    let mut root = make_node("oq7-pruned-root");
+    root.expected_output_paths = vec![out_root.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let dep = make_node("oq7-pruned-dep");
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![root, dep],
+        vec![make_test_edge("oq7-pruned-root", "oq7-pruned-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // ════ Origin 3: dispatch probe partition (cache_opportunity, standalone) ════
+    let out_probe = test_store_path("oq7-probe-out");
+    let mut n3 = make_node("oq7-probe");
+    n3.expected_output_paths = vec![out_probe.clone()];
+    n3.wanted_output_names = vec!["out".into()];
+    let b3 = Uuid::new_v4();
+    merge_dag(&handle, b3, vec![n3], vec![], false).await?;
+    barrier(&handle).await;
+    // Substitutable only AFTER the merge → the dispatch-probe partition
+    // is the creating site (the keystone pattern).
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_probe.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // ════ Origin 4: reprobe lane (reprobe, in-tx + AS-5 reset) ════
+    let out_reprobe = test_store_path("oq7-reprobe-out");
+    let mut n4 = make_node("oq7-reprobe");
+    n4.expected_output_paths = vec![out_reprobe.clone()];
+    n4.wanted_output_names = vec!["out".into()];
+    let b4a = Uuid::new_v4();
+    merge_dag(&handle, b4a, vec![n4.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned("oq7-reprobe", crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_reprobe.clone());
+    let b4b = Uuid::new_v4();
+    merge_dag(&handle, b4b, vec![n4], vec![], false).await?;
+    barrier(&handle).await;
+
+    // ════ Origin 5: stale-Completed verify (stale_reset, standalone post-tx) ════
+    let out_stale = test_store_path("oq7-stale-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_stale.clone());
+    let mut n5 = make_node("oq7-stale");
+    n5.expected_output_paths = vec![out_stale.clone()];
+    n5.wanted_output_names = vec!["out".into()];
+    let b5a = Uuid::new_v4();
+    merge_dag(&handle, b5a, vec![n5.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    // Complete the node via materialization (also exercises the Success
+    // consumption arm on fresh work).
+    let assignment = match claim_materialization(&handle, "oq7-stale", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the stale-setup job must be claimable, got {other:?}"),
+    };
+    let exec: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out_stale, b"oq7-stale-v1");
+    report_materialization_outcome(
+        &handle,
+        exec,
+        "oq7-stale",
+        mat_success_outcome(vec![out_stale.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "oq7-stale").await.status,
+        DerivationStatus::Completed,
+        "precondition: the node completed via materialization"
+    );
+    // GC the output (still substitutable upstream), re-merge → the
+    // stale-Completed verify demotes and creates the stale_reset job.
+    store.state.paths.write().unwrap().remove(&out_stale);
+    let b5b = Uuid::new_v4();
+    merge_dag(&handle, b5b, vec![n5], vec![], false).await?;
+    barrier(&handle).await;
+
+    // ════ Consumption arms on fresh work (still zero walks) ════
+    // InfraFailure → re-arm (the budget arm).
+    let assignment = match claim_materialization(&handle, "oq7-newsub", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the new_sub job must be claimable, got {other:?}"),
+    };
+    let exec: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec,
+        "oq7-newsub",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Success consumption on the probe-partition job.
+    let assignment = match claim_materialization(&handle, "oq7-probe", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the probe job must be claimable, got {other:?}"),
+    };
+    let exec: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out_probe, b"oq7-probe-content");
+    report_materialization_outcome(
+        &handle,
+        exec,
+        "oq7-probe",
+        mat_success_outcome(vec![out_probe.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // ════ THE AUDIT: every origin created a job; zero walks. ════
+    let origins: Vec<String> =
+        sqlx::query_scalar("SELECT origin FROM materialization_jobs ORDER BY origin")
+            .fetch_all(&db.pool)
+            .await?;
+    let count_of = |o: &str| origins.iter().filter(|x| x.as_str() == o).count();
+    assert_eq!(
+        count_of("cache_opportunity"),
+        3,
+        "new_sub + probe partition + the stale-setup job, got {origins:?}"
+    );
+    assert_eq!(
+        count_of("pruned"),
+        1,
+        "the pruned root's job, got {origins:?}"
+    );
+    assert_eq!(
+        count_of("reprobe"),
+        1,
+        "the reprobe lane's job, got {origins:?}"
+    );
+    assert_eq!(
+        count_of("stale_reset"),
+        1,
+        "the stale-verify job, got {origins:?}"
+    );
+
+    // Zero walk spawns: the metric never moved...
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_substitute_spawned_total")
+            .copied()
+            .unwrap_or(0),
+        0,
+        "criterion 3: zero walk spawns for fresh flag-on work; counters={counters:?}"
+    );
+    // ...the job-creation counter moved for every driven origin...
+    assert!(
+        counters
+            .get("rio_scheduler_materialization_jobs_created_total")
+            .copied()
+            .unwrap_or(0)
+            >= 6,
+        "every driven origin created a job (6 jobs across 5 origins); counters={counters:?}"
+    );
+    // ...and the walk's fetch primitive was never called.
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            qpi.is_empty(),
+            "zero QueryPathInfo calls (the walk's fetch primitive); qpi_calls={qpi:?}"
+        );
+    }
+
+    // ════ The legacy-state arm (PD-B19: sanctioned absorption) ════
+    let out_legacy = test_store_path("oq7-legacy-out");
+    let mut n6 = make_node("oq7-legacy");
+    n6.expected_output_paths = vec![out_legacy.clone()];
+    n6.wanted_output_names = vec!["out".into()];
+    let b6 = Uuid::new_v4();
+    merge_dag(&handle, b6, vec![n6], vec![], false).await?;
+    barrier(&handle).await;
+    // Flag-off-era evidence state, forced: the mark + the spent one-shot.
+    assert!(handle.debug_set_topdown_pruned("oq7-legacy", true).await?);
+    assert!(
+        handle
+            .debug_set_substitute_tried("oq7-legacy", true)
+            .await?
+    );
+    // The output is locally present → the D16 settlement cell (present +
+    // tried + must-substitute) spawns its verification walk on the next
+    // dispatch-probe pass.
+    store.seed_with_content(&out_legacy, b"oq7-legacy-content");
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    let counters = counter_map(&snap);
+    assert_eq!(
+        counters
+            .get("rio_scheduler_substitute_spawned_total")
+            .copied()
+            .unwrap_or(0),
+        1,
+        "the legacy-state arm DOES walk (the documented PD-B19 transition-window \
+         absorption: flag-off-era marks select the as-built mechanism, and that \
+         is correct coexistence, not a criterion-3 violation); counters={counters:?}"
+    );
+    Ok(())
+}
