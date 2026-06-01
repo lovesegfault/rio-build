@@ -211,6 +211,18 @@ struct SubstAids {
     copy: u64,
 }
 
+/// Cap on the error text retained per requested root in
+/// [`BuildActivityState::terminal`]. The FULL message always reaches the
+/// client in-stream via the `derivation '…' failed: …` stderr line the
+/// moment the event is relayed; the retained copy only feeds the final
+/// per-root `BuildResult.errorMsg`, and the scheduler puts the failure
+/// cause first (`dependency '<drv>' failed: …`, `max_infra_retries=…`),
+/// so capping the tail loses nothing that identifies the failure.
+/// Scheduler-side messages run up to 16 KiB (its `MAX_ERROR_MSG_LEN`
+/// per-event cap); 4 KiB here bounds a multi-root batch's retention at
+/// roots × 4 KiB even when a cascade saturates that cap.
+const RETAINED_ERROR_MSG_CAP: usize = 4 * 1024;
+
 struct BuildActivityState {
     /// Per-derivation activity IDs (for `actBuild` start/stop and for
     /// attaching `BuildLogLine`/`SetPhase` results to the right build).
@@ -234,10 +246,26 @@ struct BuildActivityState {
     /// (`machineName`). NOT per-pod — see the comment at the
     /// `Status::Started` arm. Read once from `RIO_GATEWAY_MACHINE_NAME`.
     machine_name: String,
-    /// Per-derivation terminal results recorded from `DerivationEvent`s
-    /// (Completed/Cached/Failed) so multi-root build opcodes can report
-    /// each requested root's own outcome instead of the DAG-level result.
-    /// First terminal per drv wins; later duplicates are ignored.
+    /// The requested-root drv paths whose terminals are worth retaining:
+    /// the only consumer of [`Self::terminal`] is
+    /// `handle_build_paths_with_results`, which looks up exactly the
+    /// roots the client named — known before submission. Empty for the
+    /// opcodes that report a single DAG-level result (9, 36).
+    result_roots: HashSet<String>,
+    /// Terminal results for the requested roots, recorded from
+    /// `DerivationEvent`s (Completed/Cached/Failed) so multi-root build
+    /// opcodes can report each requested root's own outcome instead of
+    /// the DAG-level result. First terminal per drv wins; later
+    /// duplicates are ignored.
+    ///
+    /// Keyed-down to [`Self::result_roots`] on insert: the scheduler
+    /// emits a `DerivationEvent` for EVERY derivation in the DAG
+    /// (including one Failed per cascaded ancestor under keep-going,
+    /// each carrying up-to-16 KiB of error text), and unlike the
+    /// sibling maps `drv`/`subst` — removed at the same terminal arms —
+    /// a terminal entry has no removal path before build terminus.
+    /// Retaining all of them grows with total DAG size for the lifetime
+    /// of the submission while everything but the roots is never read.
     terminal: HashMap<String, BuildResult>,
 }
 
@@ -249,7 +277,21 @@ impl Default for BuildActivityState {
             builds_root: None,
             subst_expected: 0,
             machine_name: rio_common::config::env_or("RIO_GATEWAY_MACHINE_NAME", String::new()),
+            result_roots: HashSet::default(),
             terminal: HashMap::default(),
+        }
+    }
+}
+
+impl BuildActivityState {
+    /// Record `drv`'s terminal result iff it is a requested root
+    /// ([`Self::result_roots`]); `make` runs only then. First terminal
+    /// wins — a duplicate (re-dispatch replay) cannot overwrite it.
+    /// The single chokepoint for [`Self::terminal`] inserts, so the
+    /// roots-only projection cannot be bypassed by one arm.
+    fn record_terminal(&mut self, drv: &str, make: impl FnOnce() -> BuildResult) {
+        if self.result_roots.contains(drv) {
+            self.terminal.entry(drv.to_string()).or_insert_with(make);
         }
     }
 }
@@ -438,13 +480,10 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             act.drv.insert(drv_event.derivation_path.clone(), aid);
         }
         types::DerivationEventKind::Completed => {
-            // Record this drv's own terminal so multi-root opcodes can
-            // report it per root. First terminal wins — a duplicate
-            // (re-dispatch replay) cannot overwrite it. `success()` sets
+            // Record a requested root's own terminal so multi-root
+            // opcodes can report it per root. `success()` sets
             // timesBuilt = 1, matching what an executed build reports.
-            act.terminal
-                .entry(drv_event.derivation_path.clone())
-                .or_insert_with(BuildResult::success);
+            act.record_terminal(&drv_event.derivation_path, BuildResult::success);
             // Terminal: close any dangling actSubstitute + actCopyPath.
             // Substituting → Completed shouldn't happen via the normal
             // scheduler FSM, but terminal-arm symmetry costs nothing
@@ -471,18 +510,18 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
             }
         }
         types::DerivationEventKind::Failed => {
-            // Record this drv's own terminal failure (status + message)
-            // so multi-root opcodes can report it per root. First
-            // terminal wins; the message is cloned because the relay
-            // log line below still needs `drv_event.error_message`.
-            act.terminal
-                .entry(drv_event.derivation_path.clone())
-                .or_insert_with(|| {
-                    BuildResult::failure(
-                        drv_event.failure_status().into(),
-                        drv_event.error_message.clone(),
-                    )
-                });
+            // Record a requested root's own terminal failure (status +
+            // message) so multi-root opcodes can report it per root.
+            // The message is cloned because the relay log line below
+            // still needs `drv_event.error_message`, and the retained
+            // clone is capped — the log line below carries the full
+            // text, so nothing the client sees is lost (see
+            // RETAINED_ERROR_MSG_CAP).
+            act.record_terminal(&drv_event.derivation_path, || {
+                let mut msg = drv_event.error_message.clone();
+                rio_common::grpc::truncate_utf8(&mut msg, RETAINED_ERROR_MSG_CAP);
+                BuildResult::failure(drv_event.failure_status().into(), msg)
+            });
             // Terminal: close any dangling actSubstitute. Scheduler
             // path Substituting → (silent revert to Queued via
             // `handle_substitute_complete(ok=false)` with
@@ -537,15 +576,13 @@ async fn relay_derivation_status<W: AsyncWrite + Unpin>(
                 .await?;
         }
         types::DerivationEventKind::Cached => {
-            // Record this drv's own terminal (fetched from a
+            // Record a requested root's own terminal (fetched from a
             // substituter, not executed) so multi-root opcodes can
-            // report it per root. First terminal wins.
-            act.terminal
-                .entry(drv_event.derivation_path.clone())
-                .or_insert_with(|| BuildResult {
-                    status: BuildStatus::Substituted,
-                    ..Default::default()
-                });
+            // report it per root.
+            act.record_terminal(&drv_event.derivation_path, || BuildResult {
+                status: BuildStatus::Substituted,
+                ..Default::default()
+            });
             // Substituting → Cached: close the actSubstitute +
             // actCopyPath pair. Merge-time cache hits never went
             // Substituting → no aids → no-op.
@@ -929,21 +966,33 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     Ok((build_id, event_stream))
 }
 
-/// One processed DAG submission: the DAG-level result plus every
-/// per-derivation terminal recorded while relaying its events.
+/// One processed DAG submission: the DAG-level result plus the
+/// requested roots' terminals recorded while relaying its events.
 struct ProcessedBuild {
     /// DAG-level outcome (Completed/Failed/Cancelled or stream error),
     /// exactly what the single-result opcodes (9, 36) report.
     result: BuildResult,
-    /// Per-derivation terminal results captured from `DerivationEvent`s,
-    /// keyed by drv path. Multi-root opcodes use these to report each
-    /// requested root's own outcome; roots without an entry fall back
-    /// to `result`.
+    /// Terminal results captured from `DerivationEvent`s for the
+    /// requested roots passed to `submit_and_process_build` — and ONLY
+    /// those (the relay never retains the rest of the DAG). Multi-root
+    /// opcodes use these to report each requested root's own outcome;
+    /// roots without an entry fall back to `result`. Empty for the
+    /// opcodes that pass no roots (9, 36).
     per_drv: HashMap<String, BuildResult>,
 }
 
 /// Submit a build to the scheduler and process events, returning the
-/// DAG-level BuildResult plus the recorded per-derivation terminals.
+/// DAG-level BuildResult plus the recorded terminals for
+/// `result_roots`.
+///
+/// `result_roots` declares, up front, the only per-derivation
+/// terminals the caller will read back (`ProcessedBuild::per_drv`).
+/// The event relay retains nothing else: the scheduler emits an event
+/// for every DAG derivation, and a keep-going failure cascade emits
+/// one Failed (with up-to-16 KiB of error text) per cascaded ancestor
+/// — retention proportional to that is unbounded gateway memory under
+/// large client DAGs. Pass an empty set when only the DAG-level
+/// `result` matters.
 #[instrument(
     skip_all,
     fields(tenant = %request.tenant_name, build_id = tracing::field::Empty)
@@ -954,6 +1003,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     request: types::SubmitBuildRequest,
     active_build_ids: &mut HashMap<String, u64>,
     jwt_token: Option<&str>,
+    result_roots: HashSet<String>,
 ) -> anyhow::Result<ProcessedBuild> {
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
     // with_jwt injects the enclosing span's context + tenant JWT — this
@@ -992,7 +1042,10 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // Activity-ID state survives reconnects so a WatchBuild resume can
     // stop_activity derivations whose Started arrived on the prior
     // stream and keep attaching log lines / phase to the right aid.
-    let mut act = BuildActivityState::default();
+    let mut act = BuildActivityState {
+        result_roots,
+        ..Default::default()
+    };
 
     let outcome = loop {
         match process_build_events(
@@ -1333,11 +1386,12 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
         request,
         active_build_ids,
         jwt.token(),
+        // Single-derivation opcode: the DAG-level result IS this drv's
+        // result, so no per-root terminals are recorded or consulted.
+        HashSet::new(),
     )
     .await
     {
-        // Single-derivation opcode: the DAG-level result IS this drv's
-        // result, so the per-drv map is not consulted.
         Ok(p) => p.result,
         Err(e) => {
             warn!(error = %e, "build submission failed");
@@ -1738,6 +1792,10 @@ enum DagSubmitOutcome {
 /// extraction the two handlers ran inline at different points relative
 /// to rate/quota — harmless but inconsistent.
 ///
+/// `result_roots` is forwarded to `submit_and_process_build`: the
+/// requested-root drv paths whose terminals the caller will read from
+/// `ProcessedBuild::per_drv` (empty = none, for opcode 9).
+///
 /// Returns `Err` only when `submit_and_process_build` itself errors
 /// (scheduler transport/timeout); caller decides whether that is
 /// session-terminal (`stderr_err!`) or a per-path `TransientFailure`.
@@ -1746,6 +1804,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
     ctx: &mut SessionContext,
     mut nodes: Vec<types::DerivationNode>,
     mut edges: Vec<types::DerivationEdge>,
+    result_roots: HashSet<String>,
 ) -> anyhow::Result<DagSubmitOutcome> {
     let SessionContext {
         store_client,
@@ -1792,6 +1851,7 @@ async fn submit_dag<W: AsyncWrite + Unpin>(
         request,
         active_build_ids,
         jwt.token(),
+        result_roots,
     )
     .await?;
     Ok(DagSubmitOutcome::Built(result))
@@ -1886,7 +1946,9 @@ pub(super) async fn handle_build_paths<R: AsyncRead + Unpin, W: AsyncWrite + Unp
     }
 
     if !all_nodes.is_empty() {
-        match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        // Opcode 9 reports a single success word, never per-path
+        // results — no per-root terminals to record.
+        match submit_dag(stderr, ctx, all_nodes, all_edges, HashSet::new()).await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => {
                 stderr_err!(stderr, "build rejected: {reason}")
@@ -2014,7 +2076,15 @@ pub(super) async fn handle_build_paths_with_results<R: AsyncRead + Unpin, W: Asy
     }
 
     if !all_nodes.is_empty() {
-        let processed = match submit_dag(stderr, ctx, all_nodes, all_edges).await {
+        // The per-root terminals to retain are exactly the Built
+        // targets the client named — the only keys the result loop
+        // below ever looks up in `per_drv`. Declared here, before
+        // submission, so the event relay retains nothing else.
+        let result_roots: HashSet<String> = drv_for_idx
+            .values()
+            .map(|demand| demand.drv_path.clone())
+            .collect();
+        let processed = match submit_dag(stderr, ctx, all_nodes, all_edges, result_roots).await {
             Ok(DagSubmitOutcome::Gated) => return Ok(()),
             Ok(DagSubmitOutcome::Rejected(reason)) => ProcessedBuild {
                 result: BuildResult::failure(BuildStatus::InputRejected, reason),
@@ -2674,5 +2744,176 @@ mod tests {
             "no surplus frames after drain"
         );
         let _ = aid_a;
+    }
+
+    /// Only requested roots get their terminals retained. The scheduler
+    /// emits a `DerivationEvent` for EVERY derivation in the DAG, but
+    /// the per-root results consumer (opcode 46) looks up only the
+    /// client-named roots — retaining interior terminals is memory
+    /// growth proportional to DAG size with no reader, held for the
+    /// lifetime of the submission. Covers all three terminal arms
+    /// (Completed/Failed/Cached) on both sides of the root set, plus
+    /// first-terminal-wins for a retained root.
+    #[tokio::test]
+    async fn terminal_retains_only_requested_roots() {
+        use types::DerivationEventKind::*;
+        let root_ok = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-ok.drv";
+        let root_fail = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fail.drv";
+        let root_cached = "/nix/store/cccccccccccccccccccccccccccccccc-cached.drv";
+        let dep_ok = "/nix/store/dddddddddddddddddddddddddddddddd-dep-ok.drv";
+        let dep_fail = "/nix/store/ffffffffffffffffffffffffffffffff-dep-fail.drv";
+        let dep_cached = "/nix/store/11111111111111111111111111111111-dep-cached.drv";
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState {
+            result_roots: [root_ok, root_fail, root_cached]
+                .into_iter()
+                .map(String::from)
+                .collect(),
+            ..Default::default()
+        };
+
+        // Interior derivations reach their terminals (keep-going order:
+        // deps finish before roots) — none may be retained.
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, dep_ok, &[]))
+            .await
+            .unwrap();
+        let mut dep_fail_ev = ev(Failed, dep_fail, &[]);
+        dep_fail_ev.error_message = "interior failure".into();
+        relay_derivation_status(&mut stderr, &mut act, dep_fail_ev)
+            .await
+            .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, dep_cached, &[]))
+            .await
+            .unwrap();
+        assert!(
+            act.terminal.is_empty(),
+            "interior (non-root) terminals must not be retained, got: {:?}",
+            act.terminal.keys().collect::<Vec<_>>()
+        );
+
+        // Roots reach their terminals — one per arm.
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, root_ok, &[]))
+            .await
+            .unwrap();
+        let mut fail_ev = ev(Failed, root_fail, &[]);
+        fail_ev.error_message = "builder failed".into();
+        fail_ev.failure_status = types::BuildResultStatus::PermanentFailure as i32;
+        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+            .await
+            .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, root_cached, &[]))
+            .await
+            .unwrap();
+
+        assert_eq!(act.terminal.len(), 3, "exactly the requested roots");
+        assert_eq!(act.terminal[root_ok].status, BuildStatus::Built);
+        assert_eq!(act.terminal[root_ok].times_built, 1);
+        assert_eq!(
+            act.terminal[root_fail].status,
+            BuildStatus::PermanentFailure
+        );
+        assert_eq!(act.terminal[root_fail].error_msg, "builder failed");
+        assert_eq!(act.terminal[root_cached].status, BuildStatus::Substituted);
+
+        // First terminal wins: a duplicate (re-dispatch replay) for an
+        // already-recorded root cannot overwrite it.
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, root_fail, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            act.terminal[root_fail].status,
+            BuildStatus::PermanentFailure,
+            "first terminal must win for a retained root"
+        );
+    }
+
+    /// An empty root set — the shape opcodes 9 and 36 pass, since they
+    /// only ever read the DAG-level result — records nothing at all.
+    /// `terminal` is the one event-relay map without a removal path
+    /// before build terminus; with no reader there must be no retention.
+    #[tokio::test]
+    async fn terminal_empty_root_set_records_nothing() {
+        use types::DerivationEventKind::*;
+        let drvs = [
+            "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-a.drv",
+            "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-b.drv",
+            "/nix/store/cccccccccccccccccccccccccccccccc-c.drv",
+        ];
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState::default();
+
+        relay_derivation_status(&mut stderr, &mut act, ev(Completed, drvs[0], &[]))
+            .await
+            .unwrap();
+        let mut fail_ev = ev(Failed, drvs[1], &[]);
+        fail_ev.error_message = "boom".into();
+        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+            .await
+            .unwrap();
+        relay_derivation_status(&mut stderr, &mut act, ev(Cached, drvs[2], &[]))
+            .await
+            .unwrap();
+
+        assert!(
+            act.terminal.is_empty(),
+            "no requested roots → no retained terminals, got: {:?}",
+            act.terminal.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The retained copy of a failed root's error message is capped at
+    /// [`RETAINED_ERROR_MSG_CAP`] — a keep-going cascade emits one
+    /// Failed per cascaded ancestor, each embedding the trigger's error
+    /// text up to the scheduler's 16 KiB per-event cap — while the
+    /// stderr relay still carries the FULL text to the client at the
+    /// moment the event arrives, so nothing the client sees is lost.
+    #[tokio::test]
+    async fn terminal_failed_root_error_message_capped() {
+        use rio_nix::protocol::stderr::STDERR_NEXT;
+        use types::DerivationEventKind::*;
+        let root = "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-root.drv";
+        let huge = "x".repeat(RETAINED_ERROR_MSG_CAP + 1000);
+
+        let mut buf = Vec::new();
+        let mut w = &mut buf;
+        let mut stderr = StderrWriter::new(&mut w);
+        let mut act = BuildActivityState {
+            result_roots: HashSet::from([root.to_string()]),
+            ..Default::default()
+        };
+
+        let mut fail_ev = ev(Failed, root, &[]);
+        fail_ev.error_message = huge.clone();
+        fail_ev.failure_status = types::BuildResultStatus::PermanentFailure as i32;
+        relay_derivation_status(&mut stderr, &mut act, fail_ev)
+            .await
+            .unwrap();
+
+        let retained = &act.terminal[root];
+        assert_eq!(
+            retained.error_msg.len(),
+            RETAINED_ERROR_MSG_CAP,
+            "retained message must be capped"
+        );
+        assert!(
+            huge.starts_with(&retained.error_msg),
+            "the cap keeps the head of the message (where the cause is)"
+        );
+        assert_eq!(retained.status, BuildStatus::PermanentFailure);
+
+        // The full text still reached the client via the relay log line.
+        let mut r = std::io::Cursor::new(buf);
+        assert_eq!(wire::read_u64(&mut r).await.unwrap(), STDERR_NEXT);
+        let line = wire::read_string(&mut r).await.unwrap();
+        assert!(
+            line.contains(&huge),
+            "the stderr relay must carry the full, uncapped message"
+        );
     }
 }
