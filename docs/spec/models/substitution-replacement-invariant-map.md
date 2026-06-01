@@ -355,6 +355,66 @@ new materialization-channel actions go; the build-only regime
 
 ---
 
+## Phase B obligation records (Wave 5)
+
+Working records for the two named Phase B obligations (the handoff section
+above) plus the OQ7 close-out audit. Wave 7's stage record extends these;
+nothing here is a stage claim on its own.
+
+### Obligation 1 — instance attestation binding (T-5.1, discharged)
+
+`ServiceClaims` carries an optional `instance` claim (serde `default` +
+`skip_serializing_if`, `deny_unknown_fields` kept — the AssignmentClaims
+tenant pattern, adjudication PDB-8). The store's materialization transport
+binds its HOSTNAME-derived `executor_instance` into every minted token
+(`ServiceTokenInterceptor::with_instance`); the scheduler requires an
+instance-bound credential on the materialization WORK surfaces
+(kind=MATERIALIZATION PullAssignment, ListMaterializationJobs,
+materialization ReportOutcome) and rejects claims whose request
+`executor_instance` differs from the token's bound instance
+(`PermissionDenied "instance claim mismatch"`). The display-only progress
+relay keeps the fleet-level credential. Commit `520fc26fb`.
+
+Wire-compat record (the three legs, each test-pinned):
+
+| Leg | Behavior | Pin |
+|---|---|---|
+| old token → new verifier | parses, `instance = None` (serde default) | `service_claims_without_instance_round_trips` |
+| new instance-less token → old verifier | byte-identical wire shape (skip_serializing_if) | same test + `assignment_claims`-pattern shape assertion |
+| instance-bound token → pre-T-5.1 verifier | REJECTED `unknown field 'instance'` — **fail-closed** (no mixed-version window can authenticate an instance-bound token while skipping the binding check; the failure mode is claim retries, never unenforced binding) | `service_claims_instance_forward_skew` |
+
+### Obligation 2 — PDQ-9 creation-site transaction posture (T-5.2)
+
+The Phase A handoff required re-confirming the per-§2.1-row split once
+PD-17/PD-18 added creation sites. The audit over all five sites at this
+commit:
+
+| Creation site | Origin | Posture (audited) | §2.1 row | Why |
+|---|---|---|---|---|
+| merge classification (new_sub lane) | `cache_opportunity` | **in-tx** (merge-tx batch, `create_materialization_jobs_in_tx`) | row 1 | the classification IS the merge transaction's content |
+| top-down prune | `pruned` | **in-tx** (same batch) | row 2 | the prune verdict commits with the merge |
+| reprobe lane (PD-17 / T-1.5) | `reprobe` | **in-tx** (same batch + the AS-5 6d status reset) | reprobe row | the reprobe classification is hoisted pre-tx and rides the same commit |
+| dispatch probe partition | `cache_opportunity` | **standalone fenced helper** (`create_materialization_job_fenced`) | row 3 | no enclosing transaction exists at the probe site |
+| stale-Completed verify (PD-18 / T-1.6) | `stale_reset` | **standalone fenced helper** | row 4 | the verify runs POST-tx (reconcile 6c — `persist_merge_to_db` committed long before); there is no transaction to join |
+
+**Verdict (PD-B9, kept):** the split is per-position, structural, and total
+over all five sites — sites that run inside the merge transaction join it
+(one fence per transaction); sites with no enclosing transaction (the probe
+partition and the post-tx stale verify) use the standalone fenced helper,
+which is itself exactly "a transaction whose only content is the job
+INSERT". A uniform in-tx rule would manufacture transactions that already
+exist under another name. No change.
+
+**The one property the split could break — pinned:** cross-site dedup. The
+dispatch-probe site and a concurrent merge racing to create a job for the
+same derivation converge on ONE row (the `materialization_jobs_unresolved`
+partial-unique index arbitrates across creation layers; the loser blocks on
+the winner's uncommitted row, then takes the dedup arm — both orders).
+Test: `flag_on_concurrent_probe_and_merge_create_one_job`
+(db/tests/materialization.rs).
+
+---
+
 ## Cross-references
 
 - `closure-evidence-invariant-map.md` — the predecessor campaign's map; its

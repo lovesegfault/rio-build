@@ -469,6 +469,163 @@ async fn job_create_in_rolled_back_tx_leaves_no_row() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// (h) T-5.2 (PDQ-9 disposition, Phase B obligation 2): the CROSS-SITE
+/// dedup — the dispatch-probe site (the standalone fenced helper, §2.1
+/// row 3) and a concurrent merge (the in-tx core riding an open merge
+/// transaction, §2.1 rows 1/2/4 + reprobe) race to create a job for the
+/// same derivation. The `materialization_jobs_unresolved` partial-unique
+/// index arbitrates ACROSS the two creation layers, not just within
+/// one:
+///
+///   - the loser's INSERT blocks behind the winner's uncommitted row
+///     (PG speculative-insertion xact wait), then takes the dedup arm;
+///   - exactly one pending row survives, both sites converge on its
+///     job_id;
+///   - the property holds in both orders (merge-first and probe-first).
+///
+/// This is the one structural property the per-§2.1-row transaction-
+/// posture split (in-tx for merge origins, standalone fenced for the
+/// probe origin — the kept PDQ-9 verdict, PD-B9) could break; pinning it
+/// is what makes keeping the split safe.
+// r[verify sched.materialize.job]
+#[tokio::test]
+async fn flag_on_concurrent_probe_and_merge_create_one_job() -> anyhow::Result<()> {
+    let (test_db, db, drv) = setup("job-cross-site-hash").await?;
+
+    // ── Order 1: the merge transaction opens and creates its job in-tx
+    //    but has NOT committed yet (a mid-flight merge). ──
+    let mut merge_tx = db.pool().begin().await?;
+    let merge_created = SchedulerDb::create_materialization_jobs_in_tx(
+        &mut merge_tx,
+        &[NewJobRow {
+            derivation_id: drv,
+            drv_hash: "job-cross-site-hash",
+            tenant_id: None,
+            origin: JobOrigin::CacheOpportunity,
+        }],
+        1,
+    )
+    .await?;
+    assert!(merge_created[0].1, "the merge's in-tx create inserts");
+    let merge_job_id = merge_created[0].0;
+
+    // The dispatch-probe site fires CONCURRENTLY on a separate pool
+    // connection: its INSERT ... ON CONFLICT DO NOTHING must block on
+    // the uncommitted conflicting row until the merge tx resolves
+    // (cross-site arbitration is the database's, not the actor's).
+    let probe_db = SchedulerDb::new(test_db.pool.clone());
+    let probe_task = tokio::spawn(async move {
+        probe_db
+            .create_materialization_job_fenced(
+                drv,
+                "job-cross-site-hash",
+                None,
+                JobOrigin::CacheOpportunity,
+                1,
+            )
+            .await
+    });
+
+    // The probe-site insert must be BLOCKED behind the open merge tx —
+    // if it completed while the merge is uncommitted, the index did not
+    // arbitrate across sites.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !probe_task.is_finished(),
+        "the probe-site create must block behind the open merge transaction \
+         (the partial-unique index is the cross-site arbiter)"
+    );
+
+    // The merge commits → the probe unblocks, hits the conflict, and
+    // takes the dedup arm.
+    merge_tx.commit().await?;
+    let probe_outcome = probe_task.await??;
+    let FencedJobCreate::Applied {
+        job_id: probe_job,
+        created,
+    } = probe_outcome
+    else {
+        anyhow::bail!("the probe-site create must apply (dedup), got {probe_outcome:?}");
+    };
+    assert!(
+        !created,
+        "the probe site must find the merge's job (created=false), never insert a second"
+    );
+    assert_eq!(
+        probe_job, merge_job_id,
+        "both creation sites converge on the same job row"
+    );
+    assert_eq!(
+        job_count(&test_db.pool, drv).await?,
+        1,
+        "exactly one job row after the cross-site race"
+    );
+
+    // ── Order 2 (the reverse): the probe site committed first; a merge
+    //    transaction's in-tx core then encounters the existing row. ──
+    let drv2 = insert_test_derivation(&db, "job-cross-site-hash-2").await?;
+    let probe_first = db
+        .create_materialization_job_fenced(
+            drv2,
+            "job-cross-site-hash-2",
+            None,
+            JobOrigin::CacheOpportunity,
+            1,
+        )
+        .await?;
+    let FencedJobCreate::Applied {
+        job_id: probe_first_id,
+        created: true,
+    } = probe_first
+    else {
+        anyhow::bail!("the probe-first create must insert, got {probe_first:?}");
+    };
+    let mut merge_tx = db.pool().begin().await?;
+    let merge_second = SchedulerDb::create_materialization_jobs_in_tx(
+        &mut merge_tx,
+        &[NewJobRow {
+            derivation_id: drv2,
+            drv_hash: "job-cross-site-hash-2",
+            tenant_id: None,
+            origin: JobOrigin::Pruned,
+        }],
+        1,
+    )
+    .await?;
+    merge_tx.commit().await?;
+    assert!(
+        !merge_second[0].1,
+        "the merge's in-tx core must take the dedup arm against the probe's row"
+    );
+    assert_eq!(
+        merge_second[0].0, probe_first_id,
+        "the merge converges on the probe site's job"
+    );
+    assert_eq!(job_count(&test_db.pool, drv2).await?, 1);
+
+    // The surviving rows keep the WINNER's origin in both orders (the
+    // dedup never rewrites an existing row).
+    let origins: Vec<(String, String)> =
+        sqlx::query_as("SELECT drv_hash, origin FROM materialization_jobs ORDER BY drv_hash")
+            .fetch_all(&test_db.pool)
+            .await?;
+    assert_eq!(
+        origins,
+        vec![
+            (
+                "job-cross-site-hash".to_string(),
+                "cache_opportunity".to_string()
+            ),
+            (
+                "job-cross-site-hash-2".to_string(),
+                "cache_opportunity".to_string()
+            ),
+        ],
+        "each surviving row keeps its creating site's origin"
+    );
+    Ok(())
+}
+
 /// The Rust-side `JobOrigin`/`JobState` alphabets and the migration-078
 /// CHECK constraints stay in lockstep: every enum variant is accepted
 /// by PG, and every literal PG accepts has an enum variant (the
