@@ -2052,8 +2052,38 @@ impl DagActor {
         }
 
         if !to_spawn.is_empty() {
-            let auth = self.substitute_auth_for_tenant(tenant_id);
-            self.spawn_substitute_fetches(to_spawn, auth).await;
+            if self.materialization_cfg.enabled {
+                // r[impl sched.materialize.job]
+                // PD-18 (Phase B, design §2.1 row 4): the substitutable
+                // stale-reset subset routes to materialization jobs
+                // (origin=stale_reset) instead of this site's OWN walks
+                // — closing the SECOND of the two merge-lane walk-spawn
+                // sites (walk unreachability for fresh flag-on work is
+                // provable from here on: a node Completed via
+                // materialization whose outputs are GC'd re-merges
+                // through exactly this lane). The pass-2 demote already
+                // put the node at Ready and persisted it; the job row
+                // is the in-flight marker a store replica claims.
+                //
+                // Posture (PDQ-9's per-§2.1-row split, recorded for the
+                // T-5.2 table): this site runs POST-tx (reconcile 6c —
+                // persist_merge_to_db committed long before), so the
+                // job INSERT uses the standalone fenced helper (the
+                // probe-origin posture), not batch 5. The wanted
+                // relation for this (build, node) pair already rode the
+                // merge transaction.
+                for (drv_hash, _) in to_spawn {
+                    self.create_materialization_job_if_enabled(
+                        &drv_hash,
+                        crate::state::JobOrigin::StaleReset,
+                        None,
+                    )
+                    .await;
+                }
+            } else {
+                let auth = self.substitute_auth_for_tenant(tenant_id);
+                self.spawn_substitute_fetches(to_spawn, auth).await;
+            }
         }
 
         reset

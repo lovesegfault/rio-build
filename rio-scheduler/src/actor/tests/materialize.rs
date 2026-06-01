@@ -1926,3 +1926,134 @@ async fn flag_on_reprobe_job_orphan_no_longer_forms() -> TestResult {
     }
     Ok(())
 }
+
+// ── T-1.6 (Phase B): PD-18 — stale-Completed-verify job creation ──
+
+// r[verify sched.materialize.job]
+/// PD-18 (design §2.1 row 4): flag-on, the stale-Completed verify (6c)
+/// routes the substitutable subset of demoted nodes to materialization
+/// jobs (origin='stale_reset') instead of spawning its OWN walks (the
+/// to_spawn lane — the SECOND of the two ungated merge-lane spawn
+/// sites; criterion 3's walk-unreachability for fresh flag-on work is
+/// provable from this change on, since this site is reachable for a
+/// node that completed VIA materialization and then lost its outputs
+/// to GC).
+///
+/// The trace (the design §2.4 C3-trace's stale-Completed origin):
+///   build #1 completes a node via materialization (job → claim →
+///   Success → consumption) → the outputs vanish from the store (GC) →
+///   build #2 merges the same node → the verify demotes it (Completed →
+///   Ready), creates the stale_reset job, spawns NO walk → the new job
+///   resolves build #2.
+#[tokio::test]
+async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let tag = "pd18-stale";
+    let out = test_store_path("pd18-stale-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+    node.wanted_output_names = vec!["out".into()];
+
+    // ── Build #1: complete the node via materialization. ──
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("build #1's job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out, b"materialized-v1");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Completed,
+        "build #1 completed the node via materialization"
+    );
+    assert_eq!(
+        query_status(&handle, b1).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+
+    // ── GC: the output vanishes from the store (still substitutable
+    //    upstream — the missing-but-substitutable shape). ──
+    store.state.paths.write().unwrap().remove(&out);
+
+    // ── Build #2: merges the same (now stale-Completed) node. ──
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, b2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The verify demoted the node and created the stale_reset job — it
+    // did NOT spawn a walk (the node would be Substituting; the walk's
+    // transition is synchronous inside the merge turn).
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Ready,
+        "the stale-Completed verify demotes to Ready; the job (not a walk) owns re-materialization"
+    );
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&out),
+            "the stale-verify lane must not spawn walks flag-on; qpi_calls={qpi:?}"
+        );
+    }
+
+    // The new pending job carries origin='stale_reset' (build #1's
+    // resolved job is a separate, terminal row).
+    let (origin, job_state): (String, String) = sqlx::query_as(
+        "SELECT origin, state FROM materialization_jobs \
+          WHERE drv_hash = $1 AND state = 'pending'",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(origin, "stale_reset", "the stale-verify lane's job origin");
+    assert_eq!(job_state, "pending");
+    let resolved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE drv_hash = $1 AND state = 'resolved_success'",
+    )
+    .bind(tag)
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(resolved, 1, "build #1's resolved job row is untouched");
+
+    // ── The new job resolves build #2. ──
+    let assignment = match claim_materialization(&handle, tag, "store-test-1").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the stale_reset job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out, b"materialized-v2");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Completed,
+        "the stale_reset job's consumption re-completes the node"
+    );
+    assert_eq!(
+        query_status(&handle, b2).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build #2 succeeds through the stale_reset job"
+    );
+    Ok(())
+}
