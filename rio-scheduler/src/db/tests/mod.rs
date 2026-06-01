@@ -19,6 +19,7 @@ mod open_attempts;
 mod recovery;
 mod tenants;
 mod transactions;
+mod wanted;
 
 /// Terminal status set as a test-time `&[&str]`. Drift-checked against
 /// both `TERMINAL_STATUS_SQL` (same-file string form) and

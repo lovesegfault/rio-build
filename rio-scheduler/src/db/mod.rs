@@ -29,6 +29,13 @@ mod live_pins;
 pub(crate) mod open_attempts;
 mod recovery;
 mod tenants;
+// Substitution-replacement Phase A (design §6): the durable per-(build,
+// derivation) wanted relation. Dead code by design until the Wave-3
+// scheduler wiring calls it flag-gated from the merge transaction and
+// the actor (the campaign plan's T-3.4); the db/tests/wanted.rs battery
+// exercises it now.
+#[allow(dead_code)]
+pub(crate) mod wanted;
 
 #[cfg(test)]
 mod tests;
