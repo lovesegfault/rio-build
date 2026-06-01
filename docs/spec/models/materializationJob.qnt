@@ -1,89 +1,152 @@
 // -*- mode: Bluespec; -*-
 //
-// DRAFT (substitution-replacement Phase A deliverable, T-5.3).
+// Substitution-replacement Phase C-prime model (re-targeted from the
+// Phase A draft, T-5.3 -> C-prime step 1): the store-owned
+// materialization-job lifecycle AS BUILT at the Phase B tip — the six
+// Phase-B behavior deltas the draft predated are encoded here (the
+// stage record's "C-prime handoff" delta list,
+// substitution-replacement-invariant-map.md):
 //
-// Wired as CI checks at Phase C-prime — the design §8 go/no-go gate.
-// Until then this file MUST typecheck and its `run` smoke MUST execute,
-// but NO property here is claimed verified: the properties are the §9.1
-// successor table drafted as named predicates so Phase C-prime completes
-// and verifies them against this skeleton instead of designing them from
-// scratch. Draft-stage property violations found by simulation are
-// expected and are NOT defects of the shipped system (the shipped Phase-A
-// code is dormant; this model describes the flag-on end-state).
+//   Delta 1 — the finding-11 mark discriminator (c952e5a51,
+//     sched.materialize.routing+2) + the §4 clear-mirror (7c9b9f949):
+//     a per-drv `topdownPruned` ghost set by pruned-origin creation,
+//     consumed by every resolution arm (success / from-source / the
+//     fail-fast itself — dispatch.rs:1126 clears on fail-fast too);
+//     arm-3 FailFast requires the FOUR-conjunct corner (Broken evidence
+//     AND the mark AND a live-wanted path missing AND
+//     confirmed-missing-or-spent-one-shot); an UNMARKED node's arm 3
+//     resolves from source (the walk-equivalent disposition,
+//     materialize.rs route_unobtainable :576).
+//   Delta 2a — the finding-18 transport (ce17c6445,
+//     store.materialize.executor+2): per-replica channel-staleness
+//     state; failover pins every executor channel to the deposed
+//     replica (the kube-proxy ClusterIP shape) and claims/reports are
+//     blocked until `redialChannel` — the model of the
+//     abandon-and-redial-on-UNAVAILABLE behavior
+//     (rio-store/src/materialize/client.rs:338-365). The pre-fix
+//     dead-end (no redial: claims blocked forever) is the
+//     witness-flip calibration (canReachPostFailoverClaim).
+//   Delta 2b — the finding-18 wanted backfill (056bfc9b6): legacy
+//     (flag-off-era) interest is representable (`legacyInterest`:
+//     in-memory interest with NO wanted rows); probe-partition and
+//     stale-reset creation BACKFILL the relation for every live
+//     legacy-interested build (materialize.rs:184-217, the
+//     create_materialization_job_if_enabled live_interested loop);
+//     the new invariant `creationLeavesTenantResolvable` pins it.
+//   Delta 3 — the park re-evaluation split (642fe9fb7, T-6.1/PD-20):
+//     `parkReevaluate` resolves Vouched/Pending-evidence parked jobs
+//     from source per tick (materialize.rs
+//     tick_reevaluate_parked_materialization_jobs); Broken-evidence
+//     jobs STAY parked (the stalled-gauge population — the
+//     `stalledJobs` derived val) until `parkBackoffExpires`. The
+//     budget counter is NOT reset at unpark (as built:
+//     park_materialization_job derives backoff from the surviving
+//     count); the park itself rides the InfraFailure consumption
+//     (materialize.rs:826), not a separate transition, and the
+//     establishment sweep never parks (materialize.rs:1243 — the job
+//     stays pending claimable, however large the count).
+//   Delta 4 — five origins, split posture (T-1.5/T-1.6/T-5.2,
+//     finding 20): `OReprobe` added (carries the AS-5 6d status
+//     reset, merge.rs:934 apply_reprobe_reset_in_memory);
+//     `OStaleReset` resets FROM Completed in the same action
+//     (merge.rs verify_preexisting_completed — the NCompleted
+//     precondition the draft carried is REVERSED for this origin);
+//     the 3-in-tx/2-standalone-fenced posture is below this model's
+//     atomicity granularity (every creation is one fenced atomic
+//     action either way) — recorded, not encoded; the in-tx origins
+//     require the creating tenant's wanted rows present (the same-tx
+//     batch), the standalone sites backfill instead.
+//   Delta 5 — recovery rebuilds the job view (4e57180fd, T-4.3): an
+//     explicit in-memory `view` layer (the kernel admission's input —
+//     recovery.rs:197 rebuild_materialization_job_view); failover
+//     rebuilds it EAGERLY and faithfully (claim holders, park
+//     expiries); the dispatch-probe dedup re-feed (`dedupRefeed`)
+//     preserves armament state (the or_insert discipline,
+//     materialize.rs:160-176); `unresolvedJobAlwaysArmed` is
+//     re-encoded as view-faithfulness (view == projection of the
+//     durable state), which the F10/L1 view-drop and B5a
+//     refeed-overwrite calibrations falsify.
+//   Delta 6 — Queued claims + the must_substitute claim upgrade
+//     (8d5caee2d + 7c9b9f949/B1): `claimJob` admits NQueued|NReady
+//     and carries NO mark conjunct (the claim IS the substitution —
+//     pull.rs admit_pull_kinded:790-810, the two upgraded cells);
+//     `builderPull` (kind=Build, JobView::None) DOES carry the A11
+//     must_substitute refusal (marked AND Broken => refused). The B1
+//     regression guard is the canReachMarkedClaim witness.
 //
-// WHAT THIS MODELS (design §2, §9.1): the store-owned materialization-job
-// lifecycle that replaces the scheduler-side substitution walk —
+// WHAT THIS MODELS (design §2, §9.1) — unchanged from the draft:
+// job creation at the scheduler's classification sites; the durable
+// per-(build, derivation) wanted relation (§6) and the interest
+// derived from it; store-replica claim through the pull protocol
+// (kind=MATERIALIZATION, the one-winner admission arm); in-store
+// per-path ingest + pin-at-ingest; outcome reporting and the
+// consumption transactions (Success coverage, the four-arm
+// Unobtainable routing); the establishment sweep
+// (materialization_infra, never executor_crash, never adopt, never
+// park); the charge-free cancellation closer; obsolete-on-produced;
+// the materialization budget with park-not-fail; the §5.3 pin release
+// (job resolved AND all interest terminal) and store GC vs pins; the
+// build-side environment (builder pulls, from-source dispatch, the
+// dispatch-time store short-circuit); leader failover; upstream
+// availability drift.
 //
-//   - job creation at the scheduler's classification sites (durable rows,
-//     fenced writes, one unresolved job per derivation);
-//   - the durable per-(build, derivation) wanted relation (§6) and the
-//     interest DERIVED from it by a live-build join (never registered
-//     separately — finding AS-1);
-//   - store-replica claim through the pull protocol (kind=MATERIALIZATION,
-//     per-replica executor identity, the admission arm as the one-winner
-//     arbiter — finding AS-3);
-//   - in-store execution: per-path ingest + pin-at-ingest, tenant-scoped
-//     (finding AS-4);
-//   - outcome reporting (Success / Unobtainable / InfraFailure) and the
-//     consumption transactions: the Success coverage check (the CE-17
-//     class) and the four-arm Unobtainable routing (the C3-settlement
-//     successor — findings AS-2/PP-1/BC-5);
-//   - the establishment sweep for crashed replicas (materialization_infra,
-//     never executor_crash — OQ1 amendment 1 / finding PP-4), the
-//     charge-free cancellation closer (finding BC-2), obsolete-on-produced;
-//   - the materialization budget with park-not-fail exhaustion (§2.5) and
-//     the housekeeping park re-evaluation;
-//   - the build-side environment that makes the anchor properties
-//     non-vacuous (finding BC-6): builder pulls (NotYetReady while a job
-//     is unresolved), from-source dispatch, build terminality;
-//   - leader failover (jobs/attempts/relations are durable; the in-memory
-//     view is droppable), store GC vs pins, upstream availability drift.
+// WHAT IS NOT MODELED (priced omissions; each cites its out-of-model
+// owner):
+//   - Walk machinery and the Substituting status: fresh flag-on work
+//     never reaches them (the T-5.3 six-site zero-walk audit +
+//     flag_on_fresh_work_never_walks); legacy-state absorption is
+//     VM-tested. The F14 calibration family is by-construction here.
+//   - DAG edges / multi-node closures: the closure walk is "ingest
+//     the wanted set path by path" (closure incompleteness surfaces
+//     as a wanted path still missing); parent/child soundness stays
+//     with the closureEvidence survivors (B9/B10 kept guards).
+//   - Poison: the reprobe origin's poison_cleared row is recorded as
+//     out-of-model (no poison state exists here; the retryPolicy
+//     coexistence regime owns the poison-partition invariants).
+//   - The probe's advisory verdict at creation, byte progress,
+//     gateway events, metrics (display-only).
+//   - The backoff clock: park/expiry are states, not timers.
+//   - The probe-site backfill's per-write fence failure (a failed
+//     standalone wanted write degrades to the MD-D1 park-alert
+//     posture as built; the model folds the backfill into the
+//     creation atom).
+//   - The build-failure fan-out of the fail-fast: as built the NODE
+//     goes Queued+interest-stripped while the BUILDS fail
+//     (dispatch.rs:1102); the model's NFailed carries the verdict on
+//     the node — the per-build projection is out of scope.
+//   - The resubmit-after-fail-fast lane (merge resetNodes): out of
+//     the §9.1 alphabet; consequence: the drv-level one-shot ledger
+//     never resets in-model, which matches the as-built
+//     count_materialization_rows_in_history read (drv history, NOT
+//     per-job — the draft's per-job read was a wrong-verdict
+//     encoding; see the C-prime stage record).
 //
-// WHAT IS NOT MODELED (deliberate draft scope; Phase C-prime revisits)
-//   - Multiple outputs per derivation beyond the OUTPUTS constant and
-//     per-output reference closures: the closure walk is abstracted to
-//     "ingest the wanted set path by path" — closure incompleteness
-//     surfaces as a wanted path still missing.
-//   - The probe's advisory verdict at creation (§2.1/OQ4): creation is
-//     enabled whenever wanted outputs are missing locally; the probe's
-//     wrong-answer cost (one wasted round trip) is priced by the routing
-//     arms, not by a creation guard.
-//   - Byte progress, gateway events, metrics (display-only, droppable).
-//   - The backoff clock: parking and re-claim eligibility are modeled as
-//     states, not timers (the park re-evaluation action covers both the
-//     backoff expiry and the housekeeping sweep).
-//   - Per-path singleflight and concurrent ingest of the same path by two
-//     jobs (the store's per-(tenant,path) singleflight is assumed).
+// THE BOUNDED REPRESENTATION (SC-1): bounded per-drv counters for the
+// kind-partitioned ledger suffix; ceilings as action preconditions
+// (MAX_EXECS, MAX_GEN, MAX_UPSTREAM_FLIPS, MAX_LEGACY, the
+// MAT_BUDGET+2 ledger ceilings). Ghost latches (the at-decision-time
+// justification family) are monotone and constant-true under the
+// as-built actions — they add zero reachable states and exist for the
+// calibration overrides to falsify.
 //
-// THE BOUNDED REPRESENTATION (the SC-1 no-unbounded-variables rule): the
-// kind-partitioned ledger suffix is carried as bounded per-derivation
-// counters (matInfra / matUnobtainable / buildCrash), exactly as
-// retryPolicy.qnt carries the build ledger as its fold; exec ids and
-// lease generations are ceilinged consts; every counter's ceiling is an
-// action-precondition guard.
-//
-// PHASE C-PRIME COMPLETION CONTRACT (what "wired and green" requires):
-//   1. Every property below either HOLDS exhaustively (TLC) in every
-//      regime it names, or is re-encoded with the violation documented
-//      and adjudicated (the §9.3 calibration-transfer discipline).
-//   2. Every property has at least one expect-violation witness proving
-//      its contended state reachable (the non-vacuity discipline of
-//      .claude/rules/quint.md), wired via mkQuintWitnessCheck.
-//   3. The §9.3 calibration-transfer table gets a verdict per family
-//      (closure-evidence F1-F14, C1-C5, the executor-campaign rows).
-//   4. The regimes below are each the --main of at least one wired check
-//      in nix/quint.nix.
-//   5. The budget: per-check minutes-class (the state space is dominated
-//      by 2 builds x 2 drvs x job lifecycle — well under the
-//      closureEvidence slice that needed the reduction ladder).
-//
-// Budget note (§9.1): 2 builds x 2 derivations; one job record per
-// derivation; 2 store replicas; 2 outputs per derivation.
+// PROPERTIES: the §9.1 successor table (17 named vals) + the three
+// C-prime re-encodes (routingRequiresDurableVouchOrFailFast /
+// noWrongfulTerminalFailure / noWrongfulFromSourceRouting are
+// at-decision-time ghost latches now, not current-state reads) + the
+// delta-derived invariants (creationLeavesTenantResolvable,
+// materializationCrashChargedOnce, crossBuildWantedIsolation).
+// Witnesses: one canReach* per contended scenario (see section 6b).
+// The calibration-transfer table (which override falsifies which
+// property, and the by-construction rows) lives in
+// substitution-replacement-invariant-map.md's C-prime stage record;
+// the override modules are docs/spec/models/calibration/mat-*.qnt.
+// Measured state counts / depths / wall-clocks live in the
+// introducing commits and the check transcripts, never here.
 module materializationJob {
   // --- 1. types -----------------------------------------------------------
 
-  /// Job lifecycle states (§2.4, §6). Parked is NOT a state: it is a flag
-  /// on a pending job (state stays pending; the §2.5 park).
+  /// Job lifecycle states (§2.4, §6). Parked is NOT a state: it is a
+  /// flag on a pending job (state stays pending; the §2.5 park).
   type JobState =
     | JPending
     | JClaimed
@@ -93,8 +156,12 @@ module materializationJob {
     | JObsolete
     | JCancelled
 
-  /// Where the job came from (§2.1's creation sites).
-  type JobOrigin = | OProbe | OMerge | OPruned | OStaleReset
+  /// Where the job came from — the FIVE §2.1 creation sites (delta 4).
+  /// OProbe and OMerge are both `cache_opportunity` rows as built (the
+  /// dispatch-probe standalone-fenced site vs the merge new_sub in-tx
+  /// site); the model keeps them distinct because their POSTURE
+  /// differs (the standalone sites backfill legacy interest, delta 2b).
+  type JobOrigin = | OProbe | OMerge | OPruned | OReprobe | OStaleReset
 
   /// One job record (state x origin x park x resolution-exec-id), plus
   /// the §6 columns the properties read (tenant, the budget counters).
@@ -109,8 +176,8 @@ module materializationJob {
   }
   type JobOpt = | NoJob | SomeJob(Job)
 
-  /// Node (derivation) status — the §2.3 table's status machine with
-  /// Substituting deleted (adjudication OQ6).
+  /// Node (derivation) status. NFailed carries the fail-fast verdict
+  /// (see the priced-omission note on the build fan-out).
   type NodeStatus =
     | NQueued
     | NReady
@@ -122,10 +189,8 @@ module materializationJob {
   /// Attempt kind (drv_executions.attempt_kind / dispatch_mode).
   type AttemptKind = | KBuild | KMaterialization
 
-  /// The open attempt on a derivation (closed attempts live on as ledger
-  /// counters). instance is the per-replica executor identity for
-  /// materialization attempts (finding BC-1) and the builder-pod intent
-  /// identity for build attempts.
+  /// The open attempt on a derivation (closed attempts live on as
+  /// ledger counters).
   type Attempt = {
     kind: AttemptKind,
     instance: str,
@@ -133,30 +198,29 @@ module materializationJob {
   }
   type AttemptOpt = | NoAttempt | OpenAttempt(Attempt)
 
-  /// Pin state for one (derivation, output) store path (§5): unpinned, or
-  /// pinned with a kind (build_input / materialization + the owning job's
-  /// resolution identity is abstracted away — the release rule reads the
-  /// interest join, not the id).
+  /// Pin state for one (derivation, output) store path (§5).
   type PinKind = | NoPin | PinBuildInput | PinMaterialization
 
   /// The durable declared-relation classification the routing arms read
-  /// (§2.4 arms 1/2: Vouched = declared closure produced, Pending = deps
-  /// declared but not all produced, Broken = neither).
+  /// (§2.4 arms 1/2: Vouched / Pending; Broken = childless or holed).
   type DurableRelation = | RVouched | RPending | RBroken
+
+  /// The in-memory job view per derivation (delta 5) — the kernel
+  /// admission's JobView input. VPending carries the parked flag;
+  /// VClaimed carries the holder identity.
+  type ViewState = | VNone | VPending(bool) | VClaimed(str)
 
   // --- 2. constants (const = overridable per regime) -----------------------
 
-  /// Builds (the interest universe). §9.1 budget: 2.
+  /// Builds (the interest universe).
   const BUILDS: Set[str]
-  /// Derivations. §9.1 budget: 2.
+  /// Derivations.
   const DRVS: Set[str]
-  /// Output names per derivation (every drv declares the same names at
-  /// this scale; the wanted relation selects subsets).
+  /// Output names per derivation.
   const OUTPUTS: Set[str]
   /// Store replicas (materialization executors).
   const REPLICAS: Set[str]
-  /// Builder-pod identities (build-kind pulls; kindMatchesWorker's
-  /// non-vacuity needs at least one).
+  /// Builder-pod identities (build-kind pulls).
   const BUILDERS: Set[str]
   /// The materialization budget (max_materialization_attempts).
   const MAT_BUDGET: int
@@ -164,9 +228,10 @@ module materializationJob {
   const MAX_EXECS: int
   /// Ceiling on lease generations (failovers).
   const MAX_GEN: int
-  /// Ceiling on upstream-availability flips (keeps the environment
-  /// finite).
+  /// Ceiling on upstream-availability flips.
   const MAX_UPSTREAM_FLIPS: int
+  /// Ceiling on legacy (flag-off-era) interest arrivals (delta 2b).
+  const MAX_LEGACY: int
   /// Regime switches.
   const ENABLE_FAILOVER: bool
   const ENABLE_GC: bool
@@ -196,17 +261,54 @@ module materializationJob {
       }
   }
 
+  /// The faithful view projection of the durable state (delta 5): what
+  /// the T-4.3 recovery rebuild produces and what every as-built view
+  /// write maintains. unresolvedJobAlwaysArmed asserts view == this.
+  pure def projView(j: JobOpt, a: AttemptOpt): ViewState = match j {
+    | NoJob => VNone
+    | SomeJob(job) =>
+      if (job.state == JClaimed)
+        match a {
+          | OpenAttempt(at) => VClaimed(at.instance)
+          | NoAttempt => VPending(job.parked)
+        }
+      else if (job.state == JPending) VPending(job.parked)
+      else VNone
+  }
+
+  /// The as-built A11 judgment (rio-evidence-kernel must_substitute):
+  /// marked AND Broken closure evidence — the from-source-build
+  /// refusal (delta 6: it gates builderPull, never the claim).
+  pure def mustSubstitute(marked: bool, rel: DurableRelation): bool =
+    marked and rel == RBroken
+
   // --- 4. state variables ----------------------------------------------------
 
-  /// One job record per derivation (atMostOneUnresolvedJobPerDrv is the
-  /// partial-unique index; the model carries it structurally as a single
-  /// slot whose creation action requires the slot resolved-or-empty).
+  /// One job record per derivation (the partial-unique index carried
+  /// structurally as a single slot; `dupJob` is the widened-slot ghost
+  /// — see atMostOneUnresolvedJobPerDrv).
   var jobs: str -> JobOpt
+  /// GHOST (the C-prime slot widening): a second unresolved job row
+  /// was created for the drv. Unreachable as built (the creation guard
+  /// is the partial-unique index); the dedup-removed override latches it.
+  var dupJob: str -> bool
+  /// The in-memory job view (delta 5) — the kernel admission's input.
+  var view: str -> ViewState
 
-  /// The durable per-(build, derivation) wanted relation (§6): which
-  /// output names each live build wants from each derivation. Empty set =
-  /// no relation row.
+  /// The durable per-(build, derivation) wanted relation (§6). Empty
+  /// set = no relation row.
   var wanted: (str, str) -> Set[str]
+  /// GHOST (F5 cross-build isolation): the last wanted set THIS build
+  /// wrote for the pair (its own write history). As built it always
+  /// equals `wanted` (the PK makes cross-build overwrites structurally
+  /// impossible); the F5 overwrite override diverges them.
+  var lastWritten: (str, str) -> Set[str]
+  /// Delta 2b: build b holds in-memory interest in d WITHOUT wanted
+  /// rows (the flag-off-era build). Cleared by the build's own merge
+  /// (recordWantedRelation) or by a creation-site backfill.
+  var legacyInterest: (str, str) -> bool
+  /// Delta 2b ceiling: legacy arrivals left.
+  var legacyBudget: int
 
   /// The open attempt per derivation (at most one; the §2.2 arbiter).
   var attempts: str -> AttemptOpt
@@ -214,81 +316,160 @@ module materializationJob {
   /// Node status per derivation.
   var nodeStatus: str -> NodeStatus
 
+  /// Delta 1: the topdown-pruned mark per derivation. Set by
+  /// pruned-origin creation (the merge stamp rides the same tx);
+  /// consumed by success / from-source resolution (the §4
+  /// clear-mirror) and by the fail-fast itself (dispatch.rs:1126).
+  var topdownPruned: str -> bool
+
   /// Store presence per (derivation, output).
   var present: (str, str) -> bool
-
   /// Pin state per (derivation, output) (§5).
   var pins: (str, str) -> PinKind
+  /// GHOST (B2-strong successor): the path was ingested by a
+  /// materialization execution. Monotone-true; gives
+  /// pinCoversIngestUntilAllInterestTerminal an antecedent the
+  /// no-pin-at-ingest override cannot erase.
+  var ingested: (str, str) -> bool
 
-  /// The kind-partitioned ledger suffix, carried as bounded counters
-  /// (the SC-1 rule): materialization-kind charges per drv...
+  /// The kind-partitioned ledger suffix, bounded counters (SC-1).
   var matInfraLedger: str -> int
   var matUnobtainableLedger: str -> int
-  /// ...and build-kind charges per drv (the partition's other side;
-  /// materializationInvisibleToBuildBudgets reads this).
   var buildCrashLedger: str -> int
+  /// GHOST (PP-4 ii): establishment events observed per drv; the
+  /// charge-once invariant compares it to the infra ledger.
+  var establishCount: str -> int
+  /// GHOST (PP-4 i): a BUILD-kind crash establishment happened for d —
+  /// the legitimate writer of buildCrashLedger.
+  var buildCrashEstablished: str -> bool
+  /// GHOST (F3 i): every materialization_unobtainable charge for d was
+  /// evidence-backed (written by a report whose missing paths were
+  /// verified absent upstream). Constant-true as built (the report
+  /// precondition); the infra-as-unobtainable override breaks it, which
+  /// un-justifies the spent-one-shot fail-fast conjunct.
+  var unobChargeBacked: str -> bool
 
-  /// The lease generation (fencing token). Job/relation writes carry it;
-  /// stale writes are discards (fencedJobWritesOnly).
+  /// The lease generation (fencing token).
   var leaseGen: int
   /// GHOST: a stale-generation write was attempted and discarded (the
   /// stale-tenure regime's probe).
   var staleWriteDiscarded: bool
+  /// GHOST (F11): a stale-generation job write APPLIED. Unreachable as
+  /// built (the fence discards); the unfenced-resolve override latches.
+  var staleJobWriteApplied: bool
+  /// Delta 2a: the executor replica's scheduler channel is pinned to a
+  /// deposed/standby replica (answers UNAVAILABLE). Set for every
+  /// replica by failover; cleared per replica by redialChannel.
+  var channelStale: str -> bool
+  /// GHOST (delta 2a witness): a failover happened / a claim was
+  /// minted after one — the redial liveness probe.
+  var failedOver: bool
+  var claimAfterFailover: bool
+  /// GHOST (delta 5 / A10): a failover dropped durable job rows.
+  /// Constant-false as built (jobs are PG rows); the view-drop
+  /// override targets the VIEW instead, and a hypothetical
+  /// row-dropping override would latch this.
+  var failoverDroppedJobs: bool
 
   /// Build liveness (the interest join's left side).
   var buildLive: str -> bool
 
-  /// Upstream availability per (derivation, output) — the world the
-  /// executor probes.
+  /// Upstream availability per (derivation, output).
   var upstreamAvail: (str, str) -> bool
   var upstreamFlipsLeft: int
 
-  /// The durable declared-relation classification per derivation (the
-  /// routing arms' input; driven by the environment, abstracting the
-  /// build DAG's progress).
+  /// The durable declared-relation classification per derivation.
   var durableRel: str -> DurableRelation
 
   /// Exec-id mint counter (bounded).
   var execsMinted: int
 
-  /// GHOST: per-derivation count of fail-fast verdicts delivered
-  /// (wrongfulFailFastBoundedPerJob).
+  /// Per-derivation count of fail-fast verdicts delivered.
   var failFastCount: str -> int
 
-  /// GHOST: the last consumption's routing took the fail-fast arm only
-  /// after a re-probe confirmed a live-wanted path missing or the
-  /// one-shot was spent (noWrongfulTerminalFailure's evidence).
-  var lastFailFastJustified: bool
+  // --- 4b. at-decision-time ghost latches (the three re-encodes) -----------
+  // Each is monotone-down (once false, stays false) and constant-true
+  // under the as-built actions: the latch conjoins the justification
+  // predicate evaluated AT THE DECISION SITE, in the same atomic
+  // action — the T-5.3 known-violating current-state reads are gone.
+
+  /// Every fail-fast was the four-conjunct corner (delta 1): marked,
+  /// Broken, live-wanted missing (structural at the site) AND
+  /// confirmed-missing-or-(spent-one-shot-with-evidence-backed-charges).
+  var ffJustifiedAll: bool
+  /// Every from-source resolution was a justified disposition (the
+  /// 6-row B2 table): arm 1/2 (Vouched/Pending), the unmarked arm-3
+  /// disposition, or the park re-evaluation (Vouched/Pending).
+  var fsJustifiedAll: bool
+  /// Every from-source ROUTING consumed a report whose live-missing
+  /// paths were verified absent-and-unavailable at decision time (the
+  /// C2 successor).
+  var fsReportSoundAll: bool
+  /// Every success resolution's coverage held at decision time (the
+  /// CE-17 class; survives benign post-resolution GC).
+  var covAtResolveAll: bool
+  /// Every consumption coverage decision ranged over the LIVE-only
+  /// wanted union (the C5/B4 successor).
+  var covLiveOnlyAll: bool
+  /// Every job creation left the job tenant-resolvable: >=1 live build
+  /// with wanted rows at creation commit (delta 2b — the B4 backfill).
+  var creationResolvableAll: bool
 
   // --- 5. derived state -------------------------------------------------------
 
-  /// Derived interest (finding AS-1): the live builds holding a non-empty
-  /// wanted relation for d. Never registered separately.
+  /// In-memory interest (the DAG's interested_builds x liveness):
+  /// relation-backed OR legacy (delta 2b).
+  def memInterest(d: str): Set[str] =
+    BUILDS.filter(b => buildLive.get(b) and
+      (wanted.get((b, d)) != Set() or legacyInterest.get((b, d))))
+
+  /// Derived relation-backed interest (finding AS-1): the live builds
+  /// holding a non-empty wanted relation for d.
   def interest(d: str): Set[str] =
     BUILDS.filter(b => buildLive.get(b) and wanted.get((b, d)) != Set())
 
-  /// The live effective wanted set for d (the §6 join): the union of
-  /// live interested builds' wanted output names.
+  /// The live effective wanted set for d (the §6 join the executor and
+  /// the consumption read): the union of live builds' RELATION rows.
+  /// Legacy interest contributes NOTHING here — that gap is exactly
+  /// the delta-2b bug class.
   def liveWanted(d: str): Set[str] =
     OUTPUTS.filter(o => BUILDS.exists(b => and {
       buildLive.get(b),
       wanted.get((b, d)).contains(o),
     }))
 
+  /// The in-memory live wanted union the CLASSIFIER reads (legacy
+  /// builds want their node-level union — modeled as all OUTPUTS).
+  def memLiveWanted(d: str): Set[str] =
+    if (BUILDS.exists(b => buildLive.get(b) and legacyInterest.get((b, d))))
+      OUTPUTS
+    else liveWanted(d)
+
   /// Every live-wanted output of d is present in the store.
   def liveWantedCovered(d: str): bool =
     liveWanted(d).forall(o => present.get((d, o)))
 
-  /// d has an unresolved materialization job.
+  /// d has an unresolved materialization job (PG truth).
   def hasUnresolvedJob(d: str): bool = jobUnresolved(jobs.get(d))
 
-  // --- 6. properties (the §9.1 successor table, drafted) ---------------------
-  // Each carries the §3 rows it succeeds. DRAFT: encodings are first
-  // approximations for Phase C-prime to complete; none is claimed
-  // verified at Phase A.
+  /// The §2.5 stalled population (delta 3): parked jobs whose evidence
+  /// is Broken — exactly what the rio_scheduler_materialization_stalled
+  /// gauge counts (Vouched/Pending parks are re-evaluation transients).
+  def stalledJobs: Set[str] =
+    DRVS.filter(d => and {
+      match jobs.get(d) {
+        | NoJob => false
+        | SomeJob(j) => j.state == JPending and j.parked
+      },
+      durableRel.get(d) == RBroken,
+    })
 
-  /// A1/A11 (+ the F8/F13 anchor): a node never runs a from-source build
-  /// attempt while its materialization job is unresolved.
+  // --- 6. properties (the §9.1 successor table, C-prime re-encodes) ---------
+
+  /// A1/A11 (+ the F8/F13 anchor): a node never runs a from-source
+  /// build attempt while its materialization job is unresolved. Reads
+  /// PG truth (jobs), so a view-divergence override (F8: pull ignores
+  /// the job; F10: dropped view) is caught here.
   val noFromSourceWhileJobUnresolved = DRVS.forall(d =>
     hasUnresolvedJob(d) implies
       match attempts.get(d) {
@@ -297,9 +478,8 @@ module materializationJob {
       }
   )
 
-  /// A3: a resolved job's verdict is sound — resolved_success means the
-  /// live wanted set (at resolution) was covered; the model checks the
-  /// weaker always-form "resolved_success nodes are Completed".
+  /// A3: resolved_success nodes are Completed (resolution and node
+  /// completion ride the same consumption transaction).
   val jobResolutionSound = DRVS.forall(d =>
     match jobs.get(d) {
       | NoJob => true
@@ -308,99 +488,69 @@ module materializationJob {
     }
   )
 
-  /// A8/C3: from-source routing requires the durable relation to say
-  /// Vouched or Pending at the routing decision (never from a Broken
-  /// declared closure without a fail-fast).
-  val routingRequiresDurableVouchOrFailFast = DRVS.forall(d =>
-    match jobs.get(d) {
-      | NoJob => true
-      | SomeJob(j) => j.state == JResolvedFromSource implies
-          (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
-    }
-  )
+  /// A8/C3 (delta-1 re-encode): every from-source disposition and
+  /// every fail-fast was justified AT DECISION TIME per the as-built
+  /// 6-row routing table — from-source on durable Vouched/Pending OR
+  /// the unmarked re-probe dispositions OR the park re-evaluation;
+  /// FailFast only on the four-conjunct corner.
+  val routingRequiresDurableVouchOrFailFast = and {
+    fsJustifiedAll,
+    ffJustifiedAll,
+  }
 
-  /// L1/L2/settlement: an unresolved job always has an armed action —
-  /// pending and unparked (claimable), claimed (attempt open, report or
-  /// establishment will arrive), or parked (the housekeeping
-  /// re-evaluation owns it). Drafted structurally: an unresolved job is
-  /// pending or claimed (park keeps state pending).
+  /// L1/L2/settlement (delta-5 re-encode): the in-memory view is a
+  /// faithful projection of the durable job + attempt state — which IS
+  /// the armed-action totality: pending-unparked projects claimable,
+  /// parked projects NotYetReady-until-expiry, claimed projects
+  /// re-delivery to the holder, resolved projects VNone (so builder
+  /// pulls and new claims see the truth). The F10 view-drop and B5a
+  /// refeed-overwrite calibrations falsify exactly this.
   val unresolvedJobAlwaysArmed = DRVS.forall(d =>
-    hasUnresolvedJob(d) implies
-      match jobs.get(d) {
-        | NoJob => false
-        | SomeJob(j) => or {
-            j.state == JPending,
-            j.state == JClaimed and attempts.get(d) != NoAttempt,
-          }
-      }
+    view.get(d) == projView(jobs.get(d), attempts.get(d))
   )
 
-  /// C3 (the wired-check headline): a node is never failed while every
-  /// live-wanted output is actually obtainable (present, or available
-  /// upstream) — the wrongful-failure class.
-  val noWrongfulTerminalFailure = DRVS.forall(d =>
-    nodeStatus.get(d) == NFailed implies
-      not(liveWanted(d).forall(o => or {
-        present.get((d, o)),
-        upstreamAvail.get((d, o)),
-      }))
-  )
+  /// C3 (re-encode): a node is Failed only through the fail-fast door,
+  /// and every fail-fast was justified at decision time.
+  val noWrongfulTerminalFailure = and {
+    DRVS.forall(d =>
+      nodeStatus.get(d) == NFailed implies failFastCount.get(d) > 0),
+    ffJustifiedAll,
+  }
 
-  /// C2/B3: from-source resolution never happens while the live wanted
-  /// set is fully present (that would be a wasted build) — the inverse
-  /// permissiveness bound. DRAFT: weak form.
-  val noWrongfulFromSourceRouting = DRVS.forall(d =>
-    match jobs.get(d) {
-      | NoJob => true
-      | SomeJob(j) => (j.state == JResolvedFromSource and j.resolutionExec > 0) implies
-          not(liveWantedCovered(d))
-    }
-  )
+  /// C2/B3 (re-encode): every from-source ROUTING consumed evidence-
+  /// backed reports (live-missing paths verified absent-and-unavailable
+  /// at the decision).
+  val noWrongfulFromSourceRouting = fsReportSoundAll
 
-  /// B1/B4/A12 (the CE-17 class): success consumption covers the live
-  /// wanted set re-read at consumption.
-  val successConsumptionCoversLiveWanted = DRVS.forall(d =>
-    match jobs.get(d) {
-      | NoJob => true
-      | SomeJob(j) => j.state == JResolvedSuccess implies liveWantedCovered(d)
-    }
-  )
+  /// B1/B4/A12 (the CE-17 class; re-encode): success consumption's
+  /// coverage held at decision time.
+  val successConsumptionCoversLiveWanted = covAtResolveAll
 
-  /// C5/B4: interest is derived from live builds only — a dead build
-  /// contributes nothing to any wanted set.
-  val interestUnionLiveOnly = DRVS.forall(d =>
-    liveWanted(d).forall(o => BUILDS.exists(b => and {
-      buildLive.get(b),
-      wanted.get((b, d)).contains(o),
-    }))
-  )
+  /// C5/B4 (re-encode): consumption decisions ranged over the LIVE-only
+  /// wanted union (a dead build's rows drive nothing).
+  val interestUnionLiveOnly = covLiveOnlyAll
 
-  /// B2-strong (finding PP-2): every output a materialization job
-  /// ingested stays pinned until every interested build is terminal.
+  /// B2-strong (PD-10/§5.3): an ingested path stays present while its
+  /// job is unresolved or any live in-memory interest remains — the
+  /// pin-at-ingest guarantee, releasable only at
+  /// job-resolved-and-all-interest-terminal.
   val pinCoversIngestUntilAllInterestTerminal = DRVS.forall(d =>
     OUTPUTS.forall(o =>
-      (pins.get((d, o)) == PinMaterialization and interest(d) != Set()) implies
+      (ingested.get((d, o)) and (hasUnresolvedJob(d) or memInterest(d) != Set())) implies
         present.get((d, o))
     )
   )
 
-  /// A10: failover preserves jobs (they are durable rows; the in-memory
-  /// view is droppable). Drafted as: jobs never silently disappear —
-  /// every derivation that had a job before a failover has the same job
-  /// after it. (The draft encodes the stronger structural form: failover
-  /// does not write jobs at all; C-prime refines with a pre/post ghost.)
-  val failoverPreservesJobs = true
+  /// A10 (delta-5): failover never drops durable job rows. The frame
+  /// keeps it constant-false as built; a row-dropping override latches.
+  val failoverPreservesJobs = not(failoverDroppedJobs)
 
-  /// A17/A18: every job write is fenced — a stale-generation write is a
-  /// discard, never an apply. The stale-tenure regime drives
-  /// staleWriteDiscarded; the property says discards never mutate state
-  /// (drafted via the ghost: a discard happened and the job slot it
-  /// targeted is unchanged — structural in this draft).
-  val fencedJobWritesOnly = true
+  /// A17/A18 (F11): no stale-generation job write ever applies — the
+  /// claims-floor fence discards them (staleWriteDiscarded is the
+  /// non-vacuity ghost; this latch is the violation).
+  val fencedJobWritesOnly = not(staleJobWriteApplied)
 
-  /// §3.6: the attempt kind matches the worker class — materialization
-  /// attempts carry store-replica identities, build attempts carry
-  /// builder identities (non-vacuous via builderPull).
+  /// §3.6: the attempt kind matches the worker class.
   val kindMatchesWorker = DRVS.forall(d =>
     match attempts.get(d) {
       | NoAttempt => true
@@ -411,39 +561,27 @@ module materializationJob {
     }
   )
 
-  /// §2.5/§3.5: no materialization-kind charge sequence ever produces a
-  /// node failure attributable to it — the budget exhaustion parks the
-  /// job, never fails the node. (The retryPolicy.qnt twin is the wired
-  /// Phase-A form; this one covers the job-lifecycle side.)
+  /// §2.5/§3.5: materialization charges never fail a node except
+  /// through the (justified) fail-fast door — budget exhaustion parks,
+  /// the establishment re-arms; neither fails. The park-exhaustion-
+  /// fail-fasts override falsifies this.
   val materializationNeverPoisons = DRVS.forall(d =>
-    (matInfraLedger.get(d) > 0 or matUnobtainableLedger.get(d) > 0) implies
-      (nodeStatus.get(d) == NFailed implies failFastCount.get(d) > 0)
+    nodeStatus.get(d) == NFailed implies failFastCount.get(d) > 0
   )
 
-  /// §2.5/§3.5: materialization-kind ledger rows are invisible to the
-  /// build-kind ledger — the partition is structural (separate counters);
-  /// the invariant pins that no action couples them (drafted as: build
-  /// crash charges only come from build-kind establishments, which the
-  /// crash-loop regime exercises).
+  /// §2.5/§3.5 (PP-4 i): the build-kind crash ledger moves only
+  /// through the build-kind establishment channel.
   val materializationInvisibleToBuildBudgets = DRVS.forall(d =>
-    (matInfraLedger.get(d) + matUnobtainableLedger.get(d) > 0 and buildCrashLedger.get(d) == 0) implies
-      match attempts.get(d) {
-        | NoAttempt => true
-        | OpenAttempt(a) => a.kind == KMaterialization implies buildCrashLedger.get(d) == 0
-      }
+    buildCrashLedger.get(d) > 0 implies buildCrashEstablished.get(d)
   )
 
-  /// The dedup / C3-class guard: at most one unresolved job per
-  /// derivation (the partial-unique index; structural in this model — the
-  /// job slot is a single record — kept as a property so the C-prime
-  /// completion can widen the state to a job multiset and re-check).
-  val atMostOneUnresolvedJobPerDrv = true
+  /// The dedup (partial-unique index), slot-widened per the C-prime
+  /// handoff: the second-slot ghost is never latched.
+  val atMostOneUnresolvedJobPerDrv = DRVS.forall(d => not(dupJob.get(d)))
 
-  /// The §2.2 arbiter (finding AS-3): at most one open materialization
-  /// attempt per derivation, and a second claim by a different replica is
-  /// refused (encoded structurally: the attempt slot is single; the claim
-  /// action's guard refuses on an open attempt with a different
-  /// instance).
+  /// The §2.2 arbiter: at most one open attempt per drv (structural —
+  /// the slot) carrying a worker-class identity; the claim guard
+  /// (attempts == NoAttempt + the view holder) is the one-winner arm.
   val atMostOneClaimWinner = DRVS.forall(d =>
     match attempts.get(d) {
       | NoAttempt => true
@@ -451,97 +589,359 @@ module materializationJob {
     }
   )
 
-  /// C1 + C1-strict: fail-fast verdicts per job are bounded (at most one
-  /// re-probe-driven re-arm, then at most one fail-fast), and every
-  /// fail-fast was justified by a confirmed-missing re-probe or a spent
-  /// one-shot.
+  /// C1 + C1-strict: at most one fail-fast per drv lifetime (the
+  /// drv-level one-shot ledger — see the priced-omission note on
+  /// resubmits), every one justified.
   val wrongfulFailFastBoundedPerJob = DRVS.forall(d => and {
     failFastCount.get(d) <= 1,
-    failFastCount.get(d) == 1 implies lastFailFastJustified,
+    failFastCount.get(d) == 1 implies ffJustifiedAll,
   })
 
-  // --- 6b. draft witnesses (non-vacuity probes; wired at C-prime) ------------
+  /// Delta 2b (B4): every creation left the job tenant-resolvable.
+  val creationLeavesTenantResolvable = creationResolvableAll
 
-  /// Violated when a job resolves successfully (the happy path is
-  /// reachable).
+  /// PP-4 (ii): every establishment charged the materialization budget
+  /// (establishments never outrun the infra ledger).
+  val materializationCrashChargedOnce = DRVS.forall(d =>
+    establishCount.get(d) <= matInfraLedger.get(d)
+  )
+
+  /// F5 (PP-5 i): a build's wanted row is exactly its own last write —
+  /// no other build's write ever replaced it (the PK isolation).
+  val crossBuildWantedIsolation = BUILDS.forall(b => DRVS.forall(d =>
+    wanted.get((b, d)) == lastWritten.get((b, d))
+  ))
+
+  /// Ceiling tripwire (house style): every bounded counter is within
+  /// its ceiling — a guard regression surfaces here, not as a silent
+  /// state-space change.
+  val boundsOK = and {
+    execsMinted <= MAX_EXECS,
+    leaseGen <= MAX_GEN,
+    upstreamFlipsLeft >= 0,
+    legacyBudget >= 0,
+    DRVS.forall(d => and {
+      matInfraLedger.get(d) <= MAT_BUDGET + 2,
+      matUnobtainableLedger.get(d) <= MAT_BUDGET + 2,
+      buildCrashLedger.get(d) <= MAT_BUDGET,
+      failFastCount.get(d) <= 2,
+    }),
+  }
+
+  // --- 6b. witnesses (non-vacuity probes; expect-violation) ------------------
+  // Each canReach* is encoded as no* = not(<interesting state>); the
+  // check passes only when the checker VIOLATES it.
+
+  /// The happy path is reachable.
   val noSuccessResolution = DRVS.forall(d =>
     match jobs.get(d) { | NoJob => true | SomeJob(j) => j.state != JResolvedSuccess }
   )
-  /// Violated when the four-arm routing fail-fasts (the arm-3 terminal is
-  /// reachable).
+  /// The arm-3b fail-fast is reachable (needs a pruned-origin trace —
+  /// delta 1 keeps this non-vacuous through the mark conjunct).
   val noFailFast = DRVS.forall(d => failFastCount.get(d) == 0)
-  /// Violated when a job parks on budget exhaustion.
+  /// A job parks on budget exhaustion.
   val noPark = DRVS.forall(d =>
     match jobs.get(d) { | NoJob => true | SomeJob(j) => not(j.parked) }
   )
-  /// Violated when a crashed replica's attempt is established.
+  /// A crashed replica's attempt is established.
   val noCrashEstablishment = DRVS.forall(d => matInfraLedger.get(d) == 0)
-  /// Violated when a build-kind attempt opens (the build environment is
-  /// live — kindMatchesWorker non-vacuity).
+  /// A build-kind attempt opens (kindMatchesWorker non-vacuity).
   val noBuildAttempt = DRVS.forall(d =>
     match attempts.get(d) {
       | NoAttempt => true
       | OpenAttempt(a) => a.kind != KBuild
     }
   )
+  /// Delta 6 / B1 regression guard: a MARKED node's job is claimed
+  /// (the must_substitute upgrade — pre-B1 this was unreachable; if
+  /// this witness stops violating, the B1 admission gap is back).
+  val noMarkedClaim = DRVS.forall(d =>
+    not(and {
+      topdownPruned.get(d),
+      match attempts.get(d) {
+        | NoAttempt => false
+        | OpenAttempt(a) => a.kind == KMaterialization
+      },
+    })
+  )
+  /// Delta 1: the unmarked arm-3 from-source disposition is reachable
+  /// (the B2-fix row of the 6-row table).
+  val noUnmarkedArm3FromSource = DRVS.forall(d =>
+    not(and {
+      not(topdownPruned.get(d)),
+      durableRel.get(d) == RBroken,
+      match jobs.get(d) {
+        | NoJob => false
+        | SomeJob(j) => j.state == JResolvedFromSource and j.resolutionExec > 0
+      },
+    })
+  )
+  /// Delta 4: a stale-reset job is created (reset-from-Completed).
+  val noStaleResetCreation = DRVS.forall(d =>
+    match jobs.get(d) {
+      | NoJob => true
+      | SomeJob(j) => j.origin != OStaleReset
+    }
+  )
+  /// Delta 4: a reprobe-origin job is created (the AS-5 reset lane).
+  val noReprobeCreation = DRVS.forall(d =>
+    match jobs.get(d) {
+      | NoJob => true
+      | SomeJob(j) => j.origin != OReprobe
+    }
+  )
+  /// Delta 2b: a legacy build's relation is backfilled at creation
+  /// (legacy interest existed and the creation converted it to rows).
+  val noLegacyBackfill = BUILDS.forall(b => DRVS.forall(d =>
+    not(and {
+      wanted.get((b, d)) == OUTPUTS,
+      not(legacyInterest.get((b, d))),
+      legacyBudget < MAX_LEGACY,
+      hasUnresolvedJob(d),
+    })
+  ))
+  /// Delta 2a: a claim is minted AFTER a failover staled every
+  /// channel — the redial is what makes this reachable; the no-redial
+  /// (pre-B3) override makes it unreachable (the dead-end).
+  val noPostFailoverClaim = not(claimAfterFailover)
+  /// Delta 3: a parked Vouched/Pending job is resolved by the
+  /// re-evaluation arm.
+  val noParkReevalResolve = DRVS.forall(d =>
+    not(and {
+      match jobs.get(d) {
+        | NoJob => false
+        | SomeJob(j) => j.state == JResolvedFromSource and j.resolutionExec == 0
+      },
+    })
+  )
+  /// Delta 3: a Broken-evidence parked job (the stalled population) is
+  /// reachable — the MD-D1 alert constrains a real state.
+  val noStalledBrokenPark = stalledJobs == Set()
+  /// §5.3: the pin release fires (job resolved, all interest terminal).
+  val noPinRelease = DRVS.forall(d => OUTPUTS.forall(o =>
+    not(and {
+      ingested.get((d, o)),
+      pins.get((d, o)) == NoPin,
+    })
+  ))
+  /// F5 (PP-5 ii): a same-build wanted REWRITE happens (the documented
+  /// intended narrowing — recorded as reachable, not a violation).
+  val noWantedRewrite = BUILDS.forall(b => DRVS.forall(d =>
+    not(and {
+      wanted.get((b, d)) != Set(),
+      wanted.get((b, d)) != OUTPUTS,
+      lastWritten.get((b, d)) == wanted.get((b, d)),
+      hasUnresolvedJob(d),
+    })
+  ))
+  /// The store short-circuit completes a node by other means while its
+  /// materialization job is still open (the obsoleteOnProduced
+  /// pre-state — produced-by-other-means is reachable).
+  val noStoreShortCircuit = DRVS.forall(d =>
+    not(and {
+      nodeStatus.get(d) == NCompleted,
+      hasUnresolvedJob(d),
+    })
+  )
+  /// The zero-interest cancellation closes a job.
+  val noCancelOnZeroInterest = DRVS.forall(d =>
+    match jobs.get(d) { | NoJob => true | SomeJob(j) => j.state != JCancelled }
+  )
+  /// Obsolete-on-produced fires.
+  val noObsolete = DRVS.forall(d =>
+    match jobs.get(d) { | NoJob => true | SomeJob(j) => j.state != JObsolete }
+  )
+  /// The stale-tenure discard fires (fence non-vacuity).
+  val noStaleDiscard = not(staleWriteDiscarded)
 
-  // --- 7. actions -------------------------------------------------------------
+  // --- 7. frame helpers --------------------------------------------------------
 
-  /// §2.1: a scheduler classification site creates a job for d (probe /
-  /// merge / prune / stale-Completed origins; reprobe-lane origins reset
-  /// the node status to its dep-derived value in the same transaction —
-  /// modeled as Queued). Creation requires: some live-wanted output
-  /// missing locally, no unresolved job already (the partial-unique
-  /// upsert), and the node not terminal.
-  action createJob(d: str, origin: JobOrigin, tenant: str): bool = all {
-    liveWanted(d) != Set(),
-    not(liveWantedCovered(d)),
-    not(hasUnresolvedJob(d)),
-    nodeStatus.get(d) != NCompleted,
-    nodeStatus.get(d) != NFailed,
-    BUILDS.contains(tenant),
-    buildLive.get(tenant),
-    jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: origin, tenant: tenant })),
-    // reprobe-lane origins (stale reset) recompute the status in the same
-    // transaction (finding AS-5); other origins leave it.
-    nodeStatus' = if (origin == OStaleReset)
-      nodeStatus.put(d, NQueued)
-    else nodeStatus,
-    wanted' = wanted, attempts' = attempts, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+  /// Relation-layer vars unchanged.
+  action relUnchanged = all {
+    wanted' = wanted, lastWritten' = lastWritten,
+    legacyInterest' = legacyInterest, legacyBudget' = legacyBudget,
+  }
+  /// Store-layer vars unchanged.
+  action storeUnchanged = all {
+    present' = present, pins' = pins, ingested' = ingested,
+  }
+  /// Ledger vars unchanged.
+  action ledgerUnchanged = all {
+    matInfraLedger' = matInfraLedger,
+    matUnobtainableLedger' = matUnobtainableLedger,
+    buildCrashLedger' = buildCrashLedger,
+    establishCount' = establishCount,
+    buildCrashEstablished' = buildCrashEstablished,
+    unobChargeBacked' = unobChargeBacked,
+  }
+  /// Environment vars unchanged.
+  action envUnchanged = all {
+    buildLive' = buildLive, upstreamAvail' = upstreamAvail,
+    upstreamFlipsLeft' = upstreamFlipsLeft, durableRel' = durableRel,
+  }
+  /// Tenure/transport vars unchanged.
+  action tenureUnchanged = all {
+    leaseGen' = leaseGen, staleWriteDiscarded' = staleWriteDiscarded,
+    staleJobWriteApplied' = staleJobWriteApplied,
+    channelStale' = channelStale, failedOver' = failedOver,
+    claimAfterFailover' = claimAfterFailover,
+    failoverDroppedJobs' = failoverDroppedJobs,
+  }
+  /// Decision-ghost latches unchanged.
+  action ghostsUnchanged = all {
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
+  }
+  /// Job-core vars unchanged.
+  action jobCoreUnchanged = all {
+    jobs' = jobs, dupJob' = dupJob, view' = view, attempts' = attempts,
+    nodeStatus' = nodeStatus, topdownPruned' = topdownPruned,
+    execsMinted' = execsMinted,
   }
 
-  /// §6: a build's merge writes its wanted relation rows for d (every
-  /// (build, node) pair, regardless of routing — finding AS-1).
+  // --- 8. actions ----------------------------------------------------------------
+
+  /// §6: a build's merge writes (or REWRITES — the as-built upsert,
+  /// PP-5 ii) its wanted relation rows for d, clearing any legacy
+  /// marker for the pair (the merge is what backfills a re-merging
+  /// build). Both `wanted` and the per-build write history move
+  /// together (crossBuildWantedIsolation's two sides).
   action recordWantedRelation(b: str, d: str, outs: Set[str]): bool = all {
     buildLive.get(b),
     outs != Set(),
     outs.subseteq(OUTPUTS),
-    wanted.get((b, d)) == Set(),
+    wanted.get((b, d)) != outs,
     wanted' = wanted.put((b, d), outs),
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    lastWritten' = lastWritten.put((b, d), outs),
+    legacyInterest' = legacyInterest.put((b, d), false),
+    legacyBudget' = legacyBudget,
+    jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.2/§2.3: a store replica claims d's pending job — the admission
-  /// arm (the one-winner arbiter under the actor's serialized loop,
-  /// finding AS-3) + the fenced mint. Legal from Queued or Ready;
-  /// refused (not enabled) when an attempt by a different identity is
-  /// open or the job is parked.
+  /// Delta 2b: a flag-off-era build's in-memory interest surfaces —
+  /// live interest with NO wanted rows (the FP-4(b) transition-window
+  /// shape). Bounded by MAX_LEGACY.
+  action legacyBuildArrives(b: str, d: str): bool = all {
+    legacyBudget > 0,
+    buildLive.get(b),
+    wanted.get((b, d)) == Set(),
+    not(legacyInterest.get((b, d))),
+    legacyInterest' = legacyInterest.put((b, d), true),
+    legacyBudget' = legacyBudget - 1,
+    wanted' = wanted, lastWritten' = lastWritten,
+    jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// §2.1: a scheduler classification site creates a job for d — FIVE
+  /// origins (delta 4). Per-origin status guards and effects:
+  ///   - OProbe / OMerge / OPruned / OReprobe: node Queued or Ready;
+  ///     OPruned additionally stamps the topdown mark (the merge-tx
+  ///     stamp, delta 1); OReprobe applies the AS-5 status reset
+  ///     (-> Queued, merge.rs:934).
+  ///   - OStaleReset: node COMPLETED with a live-wanted output absent
+  ///     (the GC'd-outputs re-merge); resets the node to Queued in the
+  ///     same action (delta 4's relaxed precondition).
+  /// The standalone-fenced sites (OProbe, OStaleReset) BACKFILL the
+  /// wanted relation for every live legacy-interested build (delta 2b,
+  /// the B4 fix); the in-tx sites require the creating tenant's rows
+  /// present (the same-tx merge batch wrote them).
+  /// The creation-time presence re-check (`not covered`) is the §2.1
+  /// classification's local store re-check (the F1-permissiveness kept
+  /// guard, data source re-pointed to the relation/mem union).
+  action createJob(d: str, origin: JobOrigin, tenant: str): bool = all {
+    BUILDS.contains(tenant),
+    buildLive.get(tenant),
+    or {
+      wanted.get((tenant, d)) != Set(),
+      legacyInterest.get((tenant, d)),
+    },
+    not(memLiveWanted(d).forall(o => present.get((d, o)))),
+    not(hasUnresolvedJob(d)),
+    nodeStatus.get(d) != NFailed,
+    nodeStatus.get(d) != NDepFailed,
+    nodeStatus.get(d) != NRunning,
+    if (origin == OStaleReset)
+      nodeStatus.get(d) == NCompleted
+    else
+      nodeStatus.get(d) == NQueued or nodeStatus.get(d) == NReady,
+    // in-tx origins ride the merge tx whose batch wrote the tenant's
+    // rows; the standalone sites accept legacy tenants and backfill.
+    (origin == OMerge or origin == OPruned or origin == OReprobe) implies
+      wanted.get((tenant, d)) != Set(),
+    val standalone = origin == OProbe or origin == OStaleReset
+    val backfills = BUILDS.filter(b => and {
+      standalone,
+      buildLive.get(b),
+      legacyInterest.get((b, d)),
+    })
+    val wantedNew = backfills.fold(wanted, (acc, b) => acc.put((b, d), OUTPUTS))
+    all {
+      jobs' = jobs.put(d, SomeJob({ ...freshJob, origin: origin, tenant: tenant })),
+      view' = view.put(d, VPending(false)),
+      dupJob' = dupJob,
+      topdownPruned' = if (origin == OPruned) topdownPruned.put(d, true) else topdownPruned,
+      nodeStatus' = if (origin == OStaleReset or origin == OReprobe)
+        nodeStatus.put(d, NQueued)
+      else nodeStatus,
+      wanted' = wantedNew,
+      lastWritten' = backfills.fold(lastWritten, (acc, b) => acc.put((b, d), OUTPUTS)),
+      legacyInterest' = backfills.fold(legacyInterest, (acc, b) => acc.put((b, d), false)),
+      // delta 2b invariant latch: resolvable at creation commit —
+      // some live build holds wanted rows AFTER the backfill.
+      creationResolvableAll' = and {
+        creationResolvableAll,
+        BUILDS.exists(b => buildLive.get(b) and wantedNew.get((b, d)) != Set()),
+      },
+    },
+    legacyBudget' = legacyBudget,
+    attempts' = attempts, execsMinted' = execsMinted,
+    storeUnchanged, ledgerUnchanged, envUnchanged, tenureUnchanged,
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+  }
+
+  /// Delta 5: the dispatch-probe dedup re-encounters an existing
+  /// unresolved job (created==false). As built the view feed is
+  /// entry().or_insert() — armament state (park, holder) is PRESERVED
+  /// — and the live_interested backfill loop still runs (the lazy heal
+  /// for legacy interest that arrived after creation). The view write
+  /// is a no-op here BECAUSE the view is already faithful; the B5a
+  /// override replaces this action with the pre-fix overwrite.
+  action dedupRefeed(d: str): bool = all {
+    hasUnresolvedJob(d),
+    // fire only when the backfill half has work (economy: the pure
+    // no-op self-loop adds nothing; the or_insert half is exercised
+    // by the override's calibration).
+    BUILDS.exists(b => buildLive.get(b) and legacyInterest.get((b, d))),
+    val backfills = BUILDS.filter(b => buildLive.get(b) and legacyInterest.get((b, d)))
+    all {
+      wanted' = backfills.fold(wanted, (acc, b) => acc.put((b, d), OUTPUTS)),
+      lastWritten' = backfills.fold(lastWritten, (acc, b) => acc.put((b, d), OUTPUTS)),
+      legacyInterest' = backfills.fold(legacyInterest, (acc, b) => acc.put((b, d), false)),
+    },
+    legacyBudget' = legacyBudget,
+    jobCoreUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// §2.2/§2.3: a store replica claims d's pending job — the kinded
+  /// admission arm reading the VIEW (delta 5) + the fenced mint.
+  /// Delta 6: legal from Queued or Ready (PD-6) and carries NO
+  /// must_substitute conjunct — the claim IS the substitution (B1);
+  /// the marked-node claim is ENABLED (canReachMarkedClaim).
+  /// Delta 2a: blocked while the replica's channel is stale.
   action claimJob(d: str, replica: str): bool = all {
     REPLICAS.contains(replica),
     execsMinted < MAX_EXECS,
+    not(channelStale.get(replica)),
+    view.get(d) == VPending(false),
     match jobs.get(d) {
       | NoJob => false
       | SomeJob(j) => j.state == JPending and not(j.parked)
@@ -555,22 +955,23 @@ module materializationJob {
         | NoJob => NoJob
         | SomeJob(j) => SomeJob({ ...j, state: JClaimed })
       }),
+      view' = view.put(d, VClaimed(replica)),
       nodeStatus' = nodeStatus.put(d, NRunning),
       execsMinted' = newExec,
+      claimAfterFailover' = or { claimAfterFailover, failedOver },
     },
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    dupJob' = dupJob, topdownPruned' = topdownPruned,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    leaseGen' = leaseGen, staleWriteDiscarded' = staleWriteDiscarded,
+    staleJobWriteApplied' = staleJobWriteApplied,
+    channelStale' = channelStale, failedOver' = failedOver,
+    failoverDroppedJobs' = failoverDroppedJobs,
+    ghostsUnchanged,
   }
 
-  /// §2.2 item 3 / §5: the claiming replica ingests one upstream-available
-  /// live-wanted path and pins it at ingest (tenant-scoped; the tenant
-  /// re-resolution is abstracted — the job's tenant is live or any live
-  /// interested build's).
+  /// §2.2 item 3 / §5: the claiming replica ingests one
+  /// upstream-available live-wanted path and PINS IT AT INGEST
+  /// (store-internal — no scheduler channel involved).
   action executeStep(d: str, o: str): bool = all {
     OUTPUTS.contains(o),
     match attempts.get(d) {
@@ -582,25 +983,20 @@ module materializationJob {
     upstreamAvail.get((d, o)),
     present' = present.put((d, o), true),
     pins' = pins.put((d, o), PinMaterialization),
-    jobs' = jobs, wanted' = wanted, attempts' = attempts, nodeStatus' = nodeStatus,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    ingested' = ingested.put((d, o), true),
+    jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.4: the executor's Success report + the consumption transaction's
-  /// coverage check, collapsed to one action at this draft's resolution
-  /// (the report-then-consume split is C-prime work; the COVERAGE CHECK
-  /// is the load-bearing part and is modeled): if the live wanted set
-  /// re-read at consumption is covered, the node completes and the job
-  /// resolves; else (interest grew) the job re-arms.
+  /// §2.4: the executor's Success report + the consumption
+  /// transaction's coverage check (collapsed; the report travels the
+  /// channel — delta 2a gates on the holder's channel). Covered =>
+  /// resolved_success + node Completed + the §4 clear-mirror (delta
+  /// 1); else (interest grew) the job re-arms.
   action consumeSuccess(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
-      | OpenAttempt(a) => a.kind == KMaterialization
+      | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
     val covered = liveWantedCovered(d)
@@ -612,119 +1008,180 @@ module materializationJob {
             state: if (covered) JResolvedSuccess else JPending,
             resolutionExec: if (covered) execId else j.resolutionExec })
       }),
+      view' = if (covered) view.put(d, VNone) else view.put(d, VPending(false)),
       nodeStatus' = if (covered) nodeStatus.put(d, NCompleted) else nodeStatus.put(d, NQueued),
       attempts' = attempts.put(d, NoAttempt),
+      // delta 1 clear-mirror: success resolution consumes the mark.
+      topdownPruned' = if (covered) topdownPruned.put(d, false) else topdownPruned,
+      // CE-17 latch: coverage held at the decision (covered arm), and
+      // the decision ranged over the live-only union (structural).
+      covAtResolveAll' = and { covAtResolveAll, covered implies covered },
+      covLiveOnlyAll' = covLiveOnlyAll,
     },
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    dupJob' = dupJob, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged,
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll, fsJustifiedAll' = fsJustifiedAll,
+    fsReportSoundAll' = fsReportSoundAll,
+    creationResolvableAll' = creationResolvableAll,
   }
 
-  /// §2.4: the executor's Unobtainable report + the four-arm consumption
-  /// routing, collapsed to one action (the routing core is what the
-  /// properties constrain):
-  ///   arm 0 (moot): no live-wanted path is missing -> success-for-live-
-  ///     interest or re-arm; never fail-fast;
-  ///   arm 1/2 (durable Vouched/Pending): resolved_from_source;
-  ///   arm 3: re-probe (the upstreamAvail map is the probe oracle);
-  ///     all obtainable -> re-arm once (the one-shot), else fail-fast.
+  /// §2.4: the executor's Unobtainable report + the four-arm
+  /// consumption routing (collapsed), AS BUILT at the Phase B tip
+  /// (delta 1 — materialize.rs route_unobtainable):
+  ///   arm 0 (moot): no live-wanted path missing -> covered ?
+  ///     success-for-live-interest (clears the mark) : re-arm;
+  ///   arm 1/2 (durable Vouched/Pending): resolved_from_source
+  ///     (clears the mark);
+  ///   arm 3 (Broken): the re-probe gate — Obtainable + unspent
+  ///     one-shot -> re-arm; else MARKED -> FailFast (the
+  ///     four-conjunct corner; consumes the mark, dispatch.rs:1126);
+  ///     UNMARKED -> resolved_from_source (the B2 walk-equivalent
+  ///     disposition).
+  /// The one-shot reads the DRV-level unobtainable ledger (as built:
+  /// count_materialization_rows_in_history — NOT the per-job count).
+  /// The report precondition (missing paths verified absent AND
+  /// unavailable) is the evidence the fsReportSound latch records.
   action consumeUnobtainable(d: str, missing: Set[str]): bool = all {
     missing != Set(),
     missing.subseteq(OUTPUTS),
     match attempts.get(d) {
       | NoAttempt => false
-      | OpenAttempt(a) => a.kind == KMaterialization
+      | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) { | NoJob => false | SomeJob(j) => j.state == JClaimed },
     // the report's missing paths really are missing-and-unavailable
+    // (the executor verified them; B3's evidence-backed direction).
     missing.forall(o => not(present.get((d, o))) and not(upstreamAvail.get((d, o)))),
     matUnobtainableLedger.get(d) < MAT_BUDGET + 2,
     val w = liveWanted(d)
     val missingLive = missing.intersect(w)
     val execId = match attempts.get(d) { | NoAttempt => 0 | OpenAttempt(a) => a.execId }
-    val oneShotSpent = match jobs.get(d) { | NoJob => false | SomeJob(j) => j.matUnobtainableCount > 0 }
-    // arm selection
+    val marked = topdownPruned.get(d)
+    // drv-level one-shot (the as-built history read).
+    val oneShotSpent = matUnobtainableLedger.get(d) > 0
     val arm0 = missingLive == Set()
+    val arm0covered = arm0 and liveWantedCovered(d)
     val arm12 = not(arm0) and (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
     val reprobeAllObtainable = w.forall(o => present.get((d, o)) or upstreamAvail.get((d, o)))
     val arm3rearm = not(arm0) and not(arm12) and reprobeAllObtainable and not(oneShotSpent)
-    val arm3fail = not(arm0) and not(arm12) and not(arm3rearm)
+    val arm3 = not(arm0) and not(arm12) and not(arm3rearm)
+    val arm3fail = arm3 and marked
+    val arm3fs = arm3 and not(marked)
     all {
       jobs' = jobs.put(d, match jobs.get(d) {
         | NoJob => NoJob
         | SomeJob(j) => SomeJob({ ...j,
-            state: if (arm0 and liveWantedCovered(d)) JResolvedSuccess
+            state: if (arm0covered) JResolvedSuccess
               else if (arm0) JPending
-              else if (arm12) JResolvedFromSource
+              else if (arm12 or arm3fs) JResolvedFromSource
               else if (arm3rearm) JPending
               else JResolvedUnobtainable,
-            resolutionExec: if (arm0 and liveWantedCovered(d)) execId
-              else if (arm12 or arm3fail) execId
+            resolutionExec: if (arm0covered or arm12 or arm3fs or arm3fail) execId
               else j.resolutionExec,
             matUnobtainableCount: j.matUnobtainableCount + 1 })
       }),
-      nodeStatus' = if (arm0 and liveWantedCovered(d))
+      view' = if (arm0 and not(arm0covered)) view.put(d, VPending(false))
+        else if (arm3rearm) view.put(d, VPending(false))
+        else view.put(d, VNone),
+      nodeStatus' = if (arm0covered)
         nodeStatus.put(d, NCompleted)
       else if (arm3fail)
         nodeStatus.put(d, NFailed)
-      else if (arm12)
+      else if (arm12 or arm3fs)
         nodeStatus.put(d, NReady)
       else
         nodeStatus.put(d, NQueued),
       attempts' = attempts.put(d, NoAttempt),
+      // delta 1: the mark is consumed by success (arm0covered),
+      // from-source (arm12; arm3fs is unmarked already) AND the
+      // fail-fast itself (dispatch.rs:1126).
+      topdownPruned' = if (arm0covered or arm12 or arm3fail)
+        topdownPruned.put(d, false)
+      else topdownPruned,
       matUnobtainableLedger' = matUnobtainableLedger.put(d, matUnobtainableLedger.get(d) + 1),
       failFastCount' = if (arm3fail) failFastCount.put(d, failFastCount.get(d) + 1) else failFastCount,
-      lastFailFastJustified' = if (arm3fail) and {
-        // the fail-fast is justified: a live-wanted path is confirmed
-        // missing at the re-probe, or the one-shot was spent
-        or { not(reprobeAllObtainable), oneShotSpent }
-      } else lastFailFastJustified,
+      // delta 1: the four-conjunct justification, at decision time.
+      // marked/Broken/missing-live are structural at the arm3fail
+      // site; the latch records the fourth conjunct, with the spent
+      // one-shot only counting when its charges were evidence-backed.
+      ffJustifiedAll' = and {
+        ffJustifiedAll,
+        arm3fail implies or {
+          not(reprobeAllObtainable),
+          oneShotSpent and unobChargeBacked.get(d),
+        },
+      },
+      // the 6-row from-source justification, at decision time.
+      fsJustifiedAll' = and {
+        fsJustifiedAll,
+        arm12 implies (durableRel.get(d) == RVouched or durableRel.get(d) == RPending),
+        arm3fs implies (durableRel.get(d) == RBroken and not(marked)),
+      },
+      // C2: the from-source routing consumed evidence-backed missing
+      // paths (verified absent-and-unavailable at this decision).
+      fsReportSoundAll' = and {
+        fsReportSoundAll,
+        (arm12 or arm3fs) implies
+          missingLive.forall(o => not(present.get((d, o))) and not(upstreamAvail.get((d, o)))),
+      },
+      // CE-17 latch: the moot-covered arm is a success resolution.
+      covAtResolveAll' = and { covAtResolveAll, arm0covered implies liveWantedCovered(d) },
+      covLiveOnlyAll' = covLiveOnlyAll,
     },
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
+    dupJob' = dupJob, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, envUnchanged,
+    matInfraLedger' = matInfraLedger, buildCrashLedger' = buildCrashLedger,
+    establishCount' = establishCount, buildCrashEstablished' = buildCrashEstablished,
+    unobChargeBacked' = unobChargeBacked,
+    tenureUnchanged,
+    creationResolvableAll' = creationResolvableAll,
   }
 
-  /// §2.5: the executor's InfraFailure report — the job re-arms within
-  /// the materialization budget (the charge); never routes from-source,
-  /// never fail-fasts (B3).
+  /// §2.5: the executor's InfraFailure report — the charge rides the
+  /// materialization budget; AT the budget the job PARKS in the same
+  /// consumption (delta 3, materialize.rs:826 — park is not a separate
+  /// transition), else it re-arms. Never fail-fasts, never routes
+  /// from-source (B3). The budget counter survives the park cycle
+  /// (ceiling MAT_BUDGET+2 bounds the model).
   action reportInfra(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
-      | OpenAttempt(a) => a.kind == KMaterialization
+      | OpenAttempt(a) => a.kind == KMaterialization and not(channelStale.get(a.instance))
     },
     match jobs.get(d) {
       | NoJob => false
-      | SomeJob(j) => j.state == JClaimed and j.matInfraCount < MAT_BUDGET
+      | SomeJob(j) => j.state == JClaimed and j.matInfraCount < MAT_BUDGET + 2
     },
-    jobs' = jobs.put(d, match jobs.get(d) {
-      | NoJob => NoJob
-      | SomeJob(j) => SomeJob({ ...j, state: JPending, matInfraCount: j.matInfraCount + 1 })
-    }),
+    val newCount = match jobs.get(d) { | NoJob => 0 | SomeJob(j) => j.matInfraCount + 1 }
+    val parks = newCount >= MAT_BUDGET
+    all {
+      jobs' = jobs.put(d, match jobs.get(d) {
+        | NoJob => NoJob
+        | SomeJob(j) => SomeJob({ ...j, state: JPending, parked: parks, matInfraCount: newCount })
+      }),
+      view' = view.put(d, VPending(parks)),
+    },
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus.put(d, NQueued),
     matInfraLedger' = matInfraLedger.put(d, matInfraLedger.get(d) + 1),
-    wanted' = wanted, present' = present, pins' = pins,
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, envUnchanged,
     matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    buildCrashLedger' = buildCrashLedger,
+    establishCount' = establishCount, buildCrashEstablished' = buildCrashEstablished,
+    unobChargeBacked' = unobChargeBacked,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.4 establishment (findings BC-2/BC-3/PP-4, OQ1 amendment 1): a
-  /// crashed worker's open attempt is established — BOTH kinds modeled so
-  /// the partition invariants are non-vacuous. Materialization kind: the
-  /// charge is materialization_infra (no adopt arm); build kind: the
-  /// charge is executor_crash into the build ledger.
+  /// §2.4 establishment (BC-2/BC-3/PP-4): a crashed worker's open
+  /// attempt is established — BOTH kinds modeled. Materialization
+  /// kind: materialization_infra charge, NO adopt arm, NO park (as
+  /// built, materialize.rs:1243 — the job stays pending claimable
+  /// whatever the count); build kind: executor_crash into the build
+  /// ledger (+ the legitimate-channel ghost). Scheduler-internal —
+  /// no channel gate.
   action establishCrashedAttempt(d: str): bool = all {
     ENABLE_CRASH,
     attempts.get(d) != NoAttempt,
@@ -732,10 +1189,8 @@ module materializationJob {
       | NoAttempt => false
       | OpenAttempt(a) =>
         if (a.kind == KMaterialization)
-          // materialization arm: infra charge within budget
-          match jobs.get(d) { | NoJob => false | SomeJob(j) => j.matInfraCount < MAT_BUDGET }
+          matInfraLedger.get(d) < MAT_BUDGET + 2
         else
-          // build arm: crash-charge ceiling
           buildCrashLedger.get(d) < MAT_BUDGET
     },
     val isMat = match attempts.get(d) {
@@ -748,36 +1203,44 @@ module materializationJob {
         | NoJob => NoJob
         | SomeJob(j) => SomeJob({ ...j, state: JPending, matInfraCount: j.matInfraCount + 1 })
       }) else jobs,
+      view' = if (isMat) view.put(d, match jobs.get(d) {
+        | NoJob => VNone
+        | SomeJob(j) => VPending(j.parked)
+      }) else view,
       nodeStatus' = nodeStatus.put(d, NQueued),
       matInfraLedger' = if (isMat) matInfraLedger.put(d, matInfraLedger.get(d) + 1) else matInfraLedger,
+      establishCount' = if (isMat) establishCount.put(d, establishCount.get(d) + 1) else establishCount,
       buildCrashLedger' = if (isMat) buildCrashLedger else buildCrashLedger.put(d, buildCrashLedger.get(d) + 1),
+      buildCrashEstablished' = if (isMat) buildCrashEstablished else buildCrashEstablished.put(d, true),
     },
-    wanted' = wanted, present' = present, pins' = pins,
-    matUnobtainableLedger' = matUnobtainableLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, envUnchanged,
+    matUnobtainableLedger' = matUnobtainableLedger,
+    unobChargeBacked' = unobChargeBacked,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.4 / finding BC-2: zero live interest cancels the job and closes
-  /// any open attempt charge-free in the same transaction.
+  /// §2.4 / BC-2: zero live in-memory interest cancels the job and
+  /// closes any open attempt charge-free. The mark is NOT cleared
+  /// (cancellation is not a resolution — only the §4 clear sites
+  /// consume it).
   action cancelOnZeroInterest(d: str): bool = all {
     hasUnresolvedJob(d),
-    interest(d) == Set(),
+    memInterest(d) == Set(),
     jobs' = jobs.put(d, match jobs.get(d) {
       | NoJob => NoJob
       | SomeJob(j) => SomeJob({ ...j, state: JCancelled })
     }),
+    view' = view.put(d, VNone),
     attempts' = attempts.put(d, NoAttempt),
-    // charge-free: no ledger counter moves
     nodeStatus' = nodeStatus,
-    jobsUnchangedRest,
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.4: the node was Produced by other means (deps built it from
-  /// source, another tenant's build): the report's consumption is a no-op
-  /// and the job goes obsolete.
+  /// §2.4: the node was Produced by other means: the job goes
+  /// obsolete (no clear — obsolete is not a §4 clear site).
   action obsoleteOnProduced(d: str): bool = all {
     hasUnresolvedJob(d),
     nodeStatus.get(d) == NCompleted,
@@ -785,78 +1248,92 @@ module materializationJob {
       | NoJob => NoJob
       | SomeJob(j) => SomeJob({ ...j, state: JObsolete })
     }),
+    view' = view.put(d, VNone),
     attempts' = attempts.put(d, NoAttempt),
     nodeStatus' = nodeStatus,
-    jobsUnchangedRest,
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.5: budget exhaustion parks the job (state stays pending; the park
-  /// flag arms the housekeeping re-evaluation). Never a failure.
-  action parkOnBudgetExhaustion(d: str): bool = all {
-    match jobs.get(d) {
-      | NoJob => false
-      | SomeJob(j) => and {
-          j.state == JPending,
-          not(j.parked),
-          j.matInfraCount >= MAT_BUDGET,
-        }
-    },
-    jobs' = jobs.put(d, match jobs.get(d) {
-      | NoJob => NoJob
-      | SomeJob(j) => SomeJob({ ...j, parked: true })
-    }),
-    attempts' = attempts, nodeStatus' = nodeStatus,
-    jobsUnchangedRest,
-  }
-
-  /// §2.5: the housekeeping sweep re-evaluates a parked job — if the
-  /// durable relation has become Vouched/Pending (deps produced by other
-  /// builds), the job resolves from-source; else it un-parks for another
-  /// claim cycle (the backoff-expiry re-claim).
-  action housekeepingReevaluatePark(d: str): bool = all {
+  /// Delta 3 arm 1: the per-tick park RE-EVALUATION
+  /// (tick_reevaluate_parked_materialization_jobs): a parked job whose
+  /// durable evidence is Vouched/Pending resolves from_source NOW (no
+  /// exec — resolutionExec stays 0), clears any stale mark, and
+  /// requeues the node. Broken-evidence jobs are NOT touched (they are
+  /// the stalled population; their armed action is the backoff expiry).
+  action parkReevaluate(d: str): bool = all {
     match jobs.get(d) {
       | NoJob => false
       | SomeJob(j) => j.state == JPending and j.parked
     },
-    val vouchedOrPending = durableRel.get(d) == RVouched or durableRel.get(d) == RPending
+    durableRel.get(d) == RVouched or durableRel.get(d) == RPending,
     jobs' = jobs.put(d, match jobs.get(d) {
       | NoJob => NoJob
-      | SomeJob(j) =>
-        if (vouchedOrPending)
-          SomeJob({ ...j, state: JResolvedFromSource, parked: false })
-        else
-          SomeJob({ ...j, parked: false, matInfraCount: 0 })
+      | SomeJob(j) => SomeJob({ ...j, state: JResolvedFromSource, parked: false })
     }),
+    view' = view.put(d, VNone),
+    topdownPruned' = topdownPruned.put(d, false),
+    nodeStatus' = nodeStatus.put(d, NReady),
     attempts' = attempts,
-    nodeStatus' = if (durableRel.get(d) == RVouched or durableRel.get(d) == RPending)
-      nodeStatus.put(d, NReady) else nodeStatus,
-    jobsUnchangedRest,
+    dupJob' = dupJob, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged,
+    failFastCount' = failFastCount,
+    ffJustifiedAll' = ffJustifiedAll,
+    fsJustifiedAll' = and {
+      fsJustifiedAll,
+      durableRel.get(d) == RVouched or durableRel.get(d) == RPending,
+    },
+    fsReportSoundAll' = fsReportSoundAll, covAtResolveAll' = covAtResolveAll,
+    covLiveOnlyAll' = covLiveOnlyAll,
+    creationResolvableAll' = creationResolvableAll,
   }
 
-  /// A build reaches a terminal state (completes or is cancelled): it
-  /// leaves the live set; its wanted rows drop out of the interest join.
+  /// Delta 3 arm 2: the durable backoff lapses — the job un-parks for
+  /// another claim cycle. The budget counter is NOT reset (as built:
+  /// the surviving count drives the next park's exponential backoff).
+  /// Enabled for any evidence (as built the expiry races the
+  /// re-evaluation tick for Vouched/Pending parks; Broken parks have
+  /// ONLY this arm).
+  action parkBackoffExpires(d: str): bool = all {
+    match jobs.get(d) {
+      | NoJob => false
+      | SomeJob(j) => j.state == JPending and j.parked
+    },
+    jobs' = jobs.put(d, match jobs.get(d) {
+      | NoJob => NoJob
+      | SomeJob(j) => SomeJob({ ...j, parked: false })
+    }),
+    view' = view.put(d, VPending(false)),
+    attempts' = attempts, nodeStatus' = nodeStatus,
+    dupJob' = dupJob, topdownPruned' = topdownPruned, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// A build reaches a terminal state: it leaves the live set; its
+  /// wanted rows drop out of the §6 join atomically (the live-join —
+  /// no stored-union residue, the C5 by-construction).
   action buildTerminal(b: str): bool = all {
     buildLive.get(b),
     buildLive' = buildLive.put(b, false),
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded,
     upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    durableRel' = durableRel,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// §2.3 (finding BC-6): a builder pull for d — the BUILD column of the
-  /// kind table. NotYetReady while a materialization job is unresolved
-  /// (the must-substitute refusal's successor — the action is disabled);
-  /// DeliverNew when the job is resolved from_source (or no job exists)
-  /// and the node is Ready.
+  /// §2.3 / delta 6: a builder pull for d — the BUILD column of the
+  /// kinded table. The kernel reads the VIEW (JobView::None required
+  /// for DeliverNew) AND the as-built A11 must_substitute refusal
+  /// stays active for job-less nodes (marked AND Broken => refused —
+  /// the dual-predicate window, pull.rs:706-714).
   action builderPull(d: str, builder: str): bool = all {
     BUILDERS.contains(builder),
     execsMinted < MAX_EXECS,
-    not(hasUnresolvedJob(d)),
+    view.get(d) == VNone,
+    not(mustSubstitute(topdownPruned.get(d), durableRel.get(d))),
     nodeStatus.get(d) == NReady,
     attempts.get(d) == NoAttempt,
     val newExec = execsMinted + 1
@@ -865,18 +1342,13 @@ module materializationJob {
       nodeStatus' = nodeStatus.put(d, NRunning),
       execsMinted' = newExec,
     },
-    jobs' = jobs, wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// The from-source dispatch completes (the build attempt produces the
-  /// outputs): the node completes, outputs become present with build
-  /// pins.
+  /// The from-source dispatch completes: the node completes, outputs
+  /// become present with build pins.
   action dispatchFromSource(d: str): bool = all {
     match attempts.get(d) {
       | NoAttempt => false
@@ -888,142 +1360,190 @@ module materializationJob {
       if (liveWanted(d).contains(o)) acc.put((d, o), true) else acc),
     pins' = OUTPUTS.fold(pins, (acc, o) =>
       if (liveWanted(d).contains(o)) acc.put((d, o), PinBuildInput) else acc),
-    jobs' = jobs, wanted' = wanted,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    ingested' = ingested,
+    jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
+    execsMinted' = execsMinted,
+    relUnchanged, ledgerUnchanged, envUnchanged, tenureUnchanged,
+    ghostsUnchanged,
   }
 
-  /// Leader failover: the lease generation bumps; jobs, attempts,
-  /// relations, ledger counters and pins are durable and survive
-  /// untouched (failoverPreservesJobs); the in-memory job view (not
-  /// modeled separately — it is a cache) is dropped and rebuilt.
+  /// The dispatch-time store short-circuit (the D16 probe partition's
+  /// present cell / complete_ready_from_store) AND the merge-time
+  /// cache-hit completion (apply_cached_hits — Queued nodes complete
+  /// from store presence regardless of dep state): a node whose
+  /// live-wanted outputs are all present completes without any
+  /// attempt. Job-carrying nodes that complete this way are closed by
+  /// obsoleteOnProduced (the produced-by-other-means closer).
+  action completeReadyFromStore(d: str): bool = all {
+    nodeStatus.get(d) == NQueued or nodeStatus.get(d) == NReady,
+    attempts.get(d) == NoAttempt,
+    liveWanted(d) != Set(),
+    liveWantedCovered(d),
+    nodeStatus' = nodeStatus.put(d, NCompleted),
+    jobs' = jobs, dupJob' = dupJob, view' = view, topdownPruned' = topdownPruned,
+    attempts' = attempts, execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// Leader failover (delta 5 + delta 2a): the lease generation bumps;
+  /// jobs/attempts/relations/ledgers/pins are durable; the in-memory
+  /// view is dropped and EAGERLY rebuilt from PG (T-4.3) — claim
+  /// holders and park expiries mirrored, so the rebuilt view equals
+  /// the faithful projection. Every executor channel goes STALE (the
+  /// kube-proxy ClusterIP pinned to the deposed replica — finding 18).
   action failover = all {
     ENABLE_FAILOVER,
     leaseGen < MAX_GEN,
     leaseGen' = leaseGen + 1,
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    view' = DRVS.mapBy(d => projView(jobs.get(d), attempts.get(d))),
+    channelStale' = REPLICAS.mapBy(r => true),
+    failedOver' = true,
+    // the pre/post ghost: durable rows are untouched (the frame); a
+    // row-dropping override would compute and latch a difference here.
+    failoverDroppedJobs' = failoverDroppedJobs,
+    jobs' = jobs, dupJob' = dupJob, attempts' = attempts,
+    nodeStatus' = nodeStatus, topdownPruned' = topdownPruned,
+    execsMinted' = execsMinted,
+    relUnchanged, storeUnchanged, ledgerUnchanged, envUnchanged,
+    staleWriteDiscarded' = staleWriteDiscarded,
+    staleJobWriteApplied' = staleJobWriteApplied,
+    claimAfterFailover' = claimAfterFailover,
+    ghostsUnchanged,
   }
 
-  /// A write from a previous lease generation arrives (stale tenure): it
-  /// is discarded — no state changes except the ghost recording that the
-  /// discard happened (fencedJobWritesOnly's probe).
-  action staleTenureWriteDiscarded = all {
+  /// Delta 2a: the executor abandons its standby-pinned channel and
+  /// re-dials (the UNAVAILABLE answer's inspect-outcome hook,
+  /// client.rs:348 — the trigger RPC is collapsed into this action).
+  /// Without this action (the pre-B3 calibration) every post-failover
+  /// claim/report is blocked forever — canReachPostFailoverClaim goes
+  /// unreachable.
+  action redialChannel(replica: str): bool = all {
+    REPLICAS.contains(replica),
+    channelStale.get(replica),
+    channelStale' = channelStale.put(replica, false),
+    leaseGen' = leaseGen, staleWriteDiscarded' = staleWriteDiscarded,
+    staleJobWriteApplied' = staleJobWriteApplied,
+    failedOver' = failedOver, claimAfterFailover' = claimAfterFailover,
+    failoverDroppedJobs' = failoverDroppedJobs,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    envUnchanged, ghostsUnchanged,
+  }
+
+  /// A job write from a previous lease generation arrives (stale
+  /// tenure): the claims-floor fence DISCARDS it — no state changes
+  /// except the ghost (F11: the same fence that covers every evidence
+  /// write covers job-table and wanted-relation writes; the unfenced
+  /// override applies the write instead and latches
+  /// staleJobWriteApplied).
+  action staleTenureWriteDiscarded(d: str): bool = all {
     ENABLE_STALE_TENURE,
     leaseGen > 0,
+    hasUnresolvedJob(d),
     not(staleWriteDiscarded),
     staleWriteDiscarded' = true,
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    leaseGen' = leaseGen, staleJobWriteApplied' = staleJobWriteApplied,
+    channelStale' = channelStale, failedOver' = failedOver,
+    claimAfterFailover' = claimAfterFailover,
+    failoverDroppedJobs' = failoverDroppedJobs,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    envUnchanged, ghostsUnchanged,
   }
 
-  /// Store GC visits a (derivation, output) path: deletion is blocked by
-  /// pins of either kind (§5); an unpinned, un-wanted path can be
-  /// collected.
+  /// §5.3: the pin release — job resolved (or none) AND all in-memory
+  /// interest terminal releases the materialization pins (PD-10; the
+  /// all-interest-terminal release site). Build pins release through
+  /// the build-input paths (out of model).
+  action releasePins(d: str): bool = all {
+    not(hasUnresolvedJob(d)),
+    memInterest(d) == Set(),
+    OUTPUTS.exists(o => pins.get((d, o)) == PinMaterialization),
+    pins' = OUTPUTS.fold(pins, (acc, o) =>
+      if (acc.get((d, o)) == PinMaterialization) acc.put((d, o), NoPin) else acc),
+    present' = present, ingested' = ingested,
+    jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
+  }
+
+  /// Store GC visits a (derivation, output) path: deletion is blocked
+  /// by pins of either kind (§5).
   action storeGc(d: str, o: str): bool = all {
     ENABLE_GC,
     OUTPUTS.contains(o),
     present.get((d, o)),
     pins.get((d, o)) == NoPin,
     present' = present.put((d, o), false),
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    pins' = pins, ingested' = ingested,
+    jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// The upstream world changes: one (derivation, output)'s availability
-  /// flips (bounded by MAX_UPSTREAM_FLIPS).
+  /// The upstream world changes (bounded).
   action upstreamChange(d: str, o: str): bool = all {
     upstreamFlipsLeft > 0,
     OUTPUTS.contains(o),
     upstreamAvail' = upstreamAvail.put((d, o), not(upstreamAvail.get((d, o)))),
     upstreamFlipsLeft' = upstreamFlipsLeft - 1,
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    buildLive' = buildLive, durableRel' = durableRel,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  /// The build DAG's durable declared-relation classification for d
-  /// changes (deps produced by other builds, children declared): the
-  /// environment input the routing arms 1/2 and the park re-evaluation
-  /// read.
+  /// The durable declared-relation classification changes (deps
+  /// produced by other builds, children declared).
   action durableRelationChange(d: str, r: DurableRelation): bool = all {
     durableRel.get(d) != r,
     durableRel' = durableRel.put(d, r),
-    jobs' = jobs, attempts' = attempts, nodeStatus' = nodeStatus,
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
+    buildLive' = buildLive, upstreamAvail' = upstreamAvail,
+    upstreamFlipsLeft' = upstreamFlipsLeft,
+    jobCoreUnchanged, relUnchanged, storeUnchanged, ledgerUnchanged,
+    tenureUnchanged, ghostsUnchanged,
   }
 
-  // --- 7b. shared frame helper ------------------------------------------------
-
-  /// The variables the small job-lifecycle actions never touch (frame
-  /// helper — keeps those actions readable; every action still assigns
-  /// every variable exactly once through this).
-  action jobsUnchangedRest = all {
-    wanted' = wanted, present' = present, pins' = pins,
-    matInfraLedger' = matInfraLedger, matUnobtainableLedger' = matUnobtainableLedger,
-    buildCrashLedger' = buildCrashLedger, leaseGen' = leaseGen,
-    staleWriteDiscarded' = staleWriteDiscarded, buildLive' = buildLive,
-    upstreamAvail' = upstreamAvail, upstreamFlipsLeft' = upstreamFlipsLeft,
-    durableRel' = durableRel, execsMinted' = execsMinted,
-    failFastCount' = failFastCount, lastFailFastJustified' = lastFailFastJustified,
-  }
-
-  // --- 8. init ------------------------------------------------------------------
+  // --- 9. init ------------------------------------------------------------------
 
   action init = all {
     jobs' = DRVS.mapBy(d => NoJob),
+    dupJob' = DRVS.mapBy(d => false),
+    view' = DRVS.mapBy(d => VNone),
     wanted' = tuples(BUILDS, DRVS).mapBy(p => Set()),
+    lastWritten' = tuples(BUILDS, DRVS).mapBy(p => Set()),
+    legacyInterest' = tuples(BUILDS, DRVS).mapBy(p => false),
+    legacyBudget' = MAX_LEGACY,
     attempts' = DRVS.mapBy(d => NoAttempt),
     nodeStatus' = DRVS.mapBy(d => NQueued),
+    topdownPruned' = DRVS.mapBy(d => false),
     present' = tuples(DRVS, OUTPUTS).mapBy(p => false),
     pins' = tuples(DRVS, OUTPUTS).mapBy(p => NoPin),
+    ingested' = tuples(DRVS, OUTPUTS).mapBy(p => false),
     matInfraLedger' = DRVS.mapBy(d => 0),
     matUnobtainableLedger' = DRVS.mapBy(d => 0),
     buildCrashLedger' = DRVS.mapBy(d => 0),
+    establishCount' = DRVS.mapBy(d => 0),
+    buildCrashEstablished' = DRVS.mapBy(d => false),
+    unobChargeBacked' = DRVS.mapBy(d => true),
     leaseGen' = 0,
     staleWriteDiscarded' = false,
+    staleJobWriteApplied' = false,
+    channelStale' = REPLICAS.mapBy(r => false),
+    failedOver' = false,
+    claimAfterFailover' = false,
+    failoverDroppedJobs' = false,
     buildLive' = BUILDS.mapBy(b => true),
     upstreamAvail' = tuples(DRVS, OUTPUTS).mapBy(p => true),
     upstreamFlipsLeft' = MAX_UPSTREAM_FLIPS,
     durableRel' = DRVS.mapBy(d => RBroken),
     execsMinted' = 0,
     failFastCount' = DRVS.mapBy(d => 0),
-    lastFailFastJustified' = true,
+    ffJustifiedAll' = true,
+    fsJustifiedAll' = true,
+    fsReportSoundAll' = true,
+    covAtResolveAll' = true,
+    covLiveOnlyAll' = true,
+    creationResolvableAll' = true,
   }
 
-  // --- 9. step --------------------------------------------------------------------
+  // --- 10. step --------------------------------------------------------------------
 
   action step = {
     nondet d = DRVS.oneOf()
@@ -1031,13 +1551,15 @@ module materializationJob {
     nondet o = OUTPUTS.oneOf()
     nondet replica = REPLICAS.oneOf()
     nondet builder = BUILDERS.oneOf()
-    nondet origin = Set(OProbe, OMerge, OPruned, OStaleReset).oneOf()
+    nondet origin = Set(OProbe, OMerge, OPruned, OReprobe, OStaleReset).oneOf()
     nondet outs = OUTPUTS.powerset().oneOf()
     nondet missing = OUTPUTS.powerset().oneOf()
     nondet rel = Set(RVouched, RPending, RBroken).oneOf()
     any {
       recordWantedRelation(b, d, outs),
+      legacyBuildArrives(b, d),
       createJob(d, origin, b),
+      dedupRefeed(d),
       claimJob(d, replica),
       executeStep(d, o),
       consumeSuccess(d),
@@ -1046,26 +1568,27 @@ module materializationJob {
       establishCrashedAttempt(d),
       cancelOnZeroInterest(d),
       obsoleteOnProduced(d),
-      parkOnBudgetExhaustion(d),
-      housekeepingReevaluatePark(d),
+      parkReevaluate(d),
+      parkBackoffExpires(d),
       buildTerminal(b),
       builderPull(d, builder),
       dispatchFromSource(d),
+      completeReadyFromStore(d),
       failover,
-      staleTenureWriteDiscarded,
+      redialChannel(replica),
+      staleTenureWriteDiscarded(d),
+      releasePins(d),
       storeGc(d, o),
       upstreamChange(d, o),
       durableRelationChange(d, rel),
     }
   }
 
-  // --- 10. runs (the smoke scenario) -----------------------------------------------
+  // --- 11. runs (deterministic scenario pins) -----------------------------------
 
-  /// The §9.1 happy path: a build records its wanted relation, a job is
-  /// created at the probe gate, a store replica claims it, ingests the
-  /// wanted output, and the success consumption completes the node and
-  /// resolves the job. Proves the action skeleton composes.
-  run happyPathTest = {
+  /// The §9.1 happy path: relation, probe-origin job, claim, ingest,
+  /// success consumption -> resolved_success, node Completed, pinned.
+  run happyPathRun = {
     init
       .then(recordWantedRelation("b1", "d1", Set("o1")))
       .then(createJob("d1", OProbe, "b1"))
@@ -1080,13 +1603,15 @@ module materializationJob {
         nodeStatus.get("d1") == NCompleted,
         present.get(("d1", "o1")),
         pins.get(("d1", "o1")) == PinMaterialization,
+        view.get("d1") == VNone,
       })
   }
 
-  /// The park path: infra failures exhaust the budget, the job parks
-  /// (never fails the node), and the housekeeping re-evaluation un-parks
-  /// it for another cycle.
-  run parkPathTest = {
+  /// Delta 3: infra failures park IN the consumption at the budget
+  /// (no separate park transition); the Broken-evidence park is the
+  /// stalled population; the backoff expiry un-parks WITHOUT resetting
+  /// the count; the re-evaluation resolves a Vouched park from source.
+  run parkSplitRun = {
     init
       .then(recordWantedRelation("b1", "d1", Set("o1")))
       .then(createJob("d1", OProbe, "b1"))
@@ -1094,32 +1619,215 @@ module materializationJob {
       .then(reportInfra("d1"))
       .then(claimJob("d1", "r1"))
       .then(reportInfra("d1"))
-      .then(parkOnBudgetExhaustion("d1"))
       .expect(and {
         match jobs.get("d1") {
           | NoJob => false
-          | SomeJob(j) => j.parked and j.state == JPending
+          | SomeJob(j) => j.parked and j.state == JPending and j.matInfraCount == 2
         },
-        // park is not failure: the node is not failed
         nodeStatus.get("d1") != NFailed,
+        stalledJobs == Set("d1"),
+        view.get("d1") == VPending(true),
       })
-      .then(housekeepingReevaluatePark("d1"))
+      .then(parkBackoffExpires("d1"))
       .expect(match jobs.get("d1") {
         | NoJob => false
-        | SomeJob(j) => not(j.parked)
+        | SomeJob(j) => not(j.parked) and j.matInfraCount == 2
+      })
+      .then(claimJob("d1", "r2"))
+      .then(reportInfra("d1"))
+      .expect(match jobs.get("d1") {
+        | NoJob => false
+        | SomeJob(j) => j.parked and j.matInfraCount == 3
+      })
+      .then(durableRelationChange("d1", RVouched))
+      .then(parkReevaluate("d1"))
+      .expect(and {
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JResolvedFromSource and j.resolutionExec == 0
+        },
+        nodeStatus.get("d1") == NReady,
+        view.get("d1") == VNone,
+      })
+  }
+
+  /// Delta 1: the four-conjunct fail-fast — pruned-origin (marked),
+  /// Broken evidence, live-wanted path confirmed missing upstream.
+  /// The fail-fast consumes the mark.
+  run prunedFailFastRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OPruned, "b1"))
+      .expect(topdownPruned.get("d1"))
+      .then(upstreamChange("d1", "o1"))
+      .then(claimJob("d1", "r1"))
+      .then(consumeUnobtainable("d1", Set("o1")))
+      .expect(and {
+        nodeStatus.get("d1") == NFailed,
+        failFastCount.get("d1") == 1,
+        ffJustifiedAll,
+        not(topdownPruned.get("d1")),
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JResolvedUnobtainable
+        },
+      })
+  }
+
+  /// Delta 1 (the B2 fix row): the SAME shape UNMARKED resolves from
+  /// source — the walk-equivalent disposition — and the build then
+  /// dispatches from source.
+  run unmarkedArm3FromSourceRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(upstreamChange("d1", "o1"))
+      .then(claimJob("d1", "r1"))
+      .then(consumeUnobtainable("d1", Set("o1")))
+      .expect(and {
+        nodeStatus.get("d1") == NReady,
+        failFastCount.get("d1") == 0,
+        fsJustifiedAll,
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JResolvedFromSource
+        },
+      })
+      .then(builderPull("d1", "w1"))
+      .then(dispatchFromSource("d1"))
+      .expect(nodeStatus.get("d1") == NCompleted)
+  }
+
+  /// Delta 6 / B1: a MARKED Ready node with an unparked pending job is
+  /// claimable (the must_substitute upgrade) while the builder pull of
+  /// the same node is refused (the A11 arm holds for the build kind).
+  run markedClaimUpgradeRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OPruned, "b1"))
+      .then(claimJob("d1", "r1"))
+      .expect(and {
+        topdownPruned.get("d1"),
+        match attempts.get("d1") {
+          | NoAttempt => false
+          | OpenAttempt(a) => a.kind == KMaterialization
+        },
+      })
+  }
+
+  /// Delta 2b: a legacy (flag-off-era) build's interest is backfilled
+  /// into the relation by the probe-partition creation; the job is
+  /// tenant-resolvable at creation commit.
+  run legacyBackfillRun = {
+    init
+      .then(legacyBuildArrives("b1", "d1"))
+      .expect(liveWanted("d1") == Set())
+      .then(createJob("d1", OProbe, "b1"))
+      .expect(and {
+        wanted.get(("b1", "d1")) == OUTPUTS,
+        not(legacyInterest.get(("b1", "d1"))),
+        liveWanted("d1") != Set(),
+        creationResolvableAll,
+      })
+  }
+
+  /// Delta 4: the stale-Completed verify — a Completed node whose
+  /// live-wanted output vanished gets a stale_reset job and the node
+  /// resets to Queued in the same action.
+  run staleResetRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(claimJob("d1", "r1"))
+      .then(executeStep("d1", "o1"))
+      .then(consumeSuccess("d1"))
+      .expect(nodeStatus.get("d1") == NCompleted)
+      .then(buildTerminal("b1"))
+      .then(releasePins("d1"))
+      .then(storeGc("d1", "o1"))
+      .expect(not(present.get(("d1", "o1"))))
+      .then(recordWantedRelation("b2", "d1", Set("o1")))
+      .then(createJob("d1", OStaleReset, "b2"))
+      .expect(and {
+        nodeStatus.get("d1") == NQueued,
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.state == JPending and j.origin == OStaleReset
+        },
+      })
+  }
+
+  /// Delta 4: the reprobe lane — an existing Ready node re-merged
+  /// creates a reprobe-origin job WITH the AS-5 status reset.
+  run reprobeResetRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(durableRelationChange("d1", RVouched))
+      .then(createJob("d1", OReprobe, "b1"))
+      .expect(and {
+        nodeStatus.get("d1") == NQueued,
+        match jobs.get("d1") {
+          | NoJob => false
+          | SomeJob(j) => j.origin == OReprobe
+        },
+      })
+  }
+
+  /// Delta 2a: failover stales every executor channel; the claim is
+  /// blocked until the redial; after the redial the claim lands (the
+  /// post-failover liveness the B3 fix restored).
+  run failoverRedialRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(failover)
+      .expect(and {
+        channelStale.get("r1"),
+        view.get("d1") == VPending(false),
+      })
+      .then(redialChannel("r1"))
+      .then(claimJob("d1", "r1"))
+      .expect(and {
+        claimAfterFailover,
+        match attempts.get("d1") {
+          | NoAttempt => false
+          | OpenAttempt(a) => a.instance == "r1"
+        },
+      })
+  }
+
+  /// Delta 5: the view survives failover faithfully — a parked job
+  /// stays parked (NotYetReady) across the rebuild; a claimed job
+  /// re-delivers to its holder.
+  run failoverViewRebuildRun = {
+    init
+      .then(recordWantedRelation("b1", "d1", Set("o1")))
+      .then(createJob("d1", OProbe, "b1"))
+      .then(claimJob("d1", "r1"))
+      .then(reportInfra("d1"))
+      .then(claimJob("d1", "r1"))
+      .then(reportInfra("d1"))
+      .expect(view.get("d1") == VPending(true))
+      .then(failover)
+      .expect(and {
+        view.get("d1") == VPending(true),
+        unresolvedJobAlwaysArmed,
       })
   }
 }
 
 // ===========================================================================
 // REGIME MODULES (the §9.1 regime vocabulary, mirroring closureEvidence so
-// the §9.3 calibration transfer reads 1:1 at Phase C-prime). DRAFT: none is
-// wired as a CI check yet; Phase C-prime wires each as the --main of at
-// least one check.
+// the §9.3 calibration transfer reads 1:1). The design-scale modules are
+// the §9.1 budget (2 builds x 2 drvs); the reduced "Ex" modules are the
+// exhaustive-TLC scopes (the closure-evidence reduction-ladder precedent:
+// 1 drv keeps every per-drv lifecycle interleaving — no §9.1 property
+// couples two drvs — while the 2-build interest dynamics stay).
+// Measured budgets per scope live in the C-prime stage record.
 // ===========================================================================
 
-/// Base regime: single tenure, no faults, no GC. The §9.1 budget
-/// (2 builds x 2 drvs, 2 replicas, 2 outputs).
+/// Base regime: single tenure, no faults, no GC; one legacy arrival
+/// (delta 2b non-vacuity).
 module materializationJobBase {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
@@ -1131,6 +1839,7 @@ module materializationJobBase {
     MAX_EXECS = 4,
     MAX_GEN = 0,
     MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 1,
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
@@ -1138,8 +1847,29 @@ module materializationJobBase {
   ).*
 }
 
-/// Failover regime: leader changes mid-lifecycle; jobs/attempts/relations
-/// are durable and must survive (failoverPreservesJobs, A10).
+/// Reduced exhaustive base scope (the ladder): one drv, two builds,
+/// two outputs, two replicas.
+module materializationJobBaseEx {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 1,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = false,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = false
+  ).*
+}
+
+/// Failover regime: leader changes mid-lifecycle; the view rebuild and
+/// the channel staling/redial (deltas 2a/5) are the contended surface.
 module materializationJobFailover {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
@@ -1151,6 +1881,7 @@ module materializationJobFailover {
     MAX_EXECS = 4,
     MAX_GEN = 2,
     MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
@@ -1158,8 +1889,28 @@ module materializationJobFailover {
   ).*
 }
 
-/// Adversarial-store regime: GC races pins (pinCoversIngest...), upstream
-/// availability drifts under the executor.
+/// Reduced exhaustive failover scope.
+module materializationJobFailoverEx {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 2,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
+    ENABLE_FAILOVER = true,
+    ENABLE_GC = false,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = false
+  ).*
+}
+
+/// Adversarial-store regime: GC races pins; upstream availability
+/// drifts under the executor; the §5.3 release lifecycle is live.
 module materializationJobAdversarialStore {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
@@ -1171,6 +1922,7 @@ module materializationJobAdversarialStore {
     MAX_EXECS = 4,
     MAX_GEN = 0,
     MAX_UPSTREAM_FLIPS = 4,
+    MAX_LEGACY = 0,
     ENABLE_FAILOVER = false,
     ENABLE_GC = true,
     ENABLE_CRASH = false,
@@ -1178,8 +1930,29 @@ module materializationJobAdversarialStore {
   ).*
 }
 
-/// Stale-tenure regime: writes from previous lease generations arrive and
-/// must be discarded (fencedJobWritesOnly, A17/A18).
+/// Reduced exhaustive adversarial-store scope.
+module materializationJobAdversarialStoreEx {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 4,
+    MAX_LEGACY = 0,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = true,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = false
+  ).*
+}
+
+/// Stale-tenure regime: writes from previous lease generations arrive
+/// and must be discarded (fencedJobWritesOnly, F11 extended to job
+/// writes).
 module materializationJobStaleTenure {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
@@ -1191,6 +1964,27 @@ module materializationJobStaleTenure {
     MAX_EXECS = 4,
     MAX_GEN = 2,
     MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
+    ENABLE_FAILOVER = true,
+    ENABLE_GC = false,
+    ENABLE_CRASH = false,
+    ENABLE_STALE_TENURE = true
+  ).*
+}
+
+/// Reduced exhaustive stale-tenure scope.
+module materializationJobStaleTenureEx {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 4,
+    MAX_GEN = 2,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
     ENABLE_FAILOVER = true,
     ENABLE_GC = false,
     ENABLE_CRASH = false,
@@ -1199,9 +1993,9 @@ module materializationJobStaleTenure {
 }
 
 /// Crash-loop regime (the PP-4 channel): repeated establishment of
-/// crashed attempts of BOTH kinds — the partition invariants' contended
-/// regime (materialization crashes charge materialization_infra and park;
-/// build crashes charge executor_crash; neither leaks into the other).
+/// crashed attempts of BOTH kinds — the partition invariants' and the
+/// charge-once invariant's contended regime. The establishment never
+/// parks (as built) — the loop is bounded by the ledger ceilings.
 module materializationJobCrashLoop {
   import materializationJob(
     BUILDS = Set("b1", "b2"),
@@ -1213,6 +2007,27 @@ module materializationJobCrashLoop {
     MAX_EXECS = 6,
     MAX_GEN = 0,
     MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
+    ENABLE_FAILOVER = false,
+    ENABLE_GC = false,
+    ENABLE_CRASH = true,
+    ENABLE_STALE_TENURE = false
+  ).*
+}
+
+/// Reduced exhaustive crash-loop scope.
+module materializationJobCrashLoopEx {
+  import materializationJob(
+    BUILDS = Set("b1", "b2"),
+    DRVS = Set("d1"),
+    OUTPUTS = Set("o1", "o2"),
+    REPLICAS = Set("r1", "r2"),
+    BUILDERS = Set("w1"),
+    MAT_BUDGET = 2,
+    MAX_EXECS = 6,
+    MAX_GEN = 0,
+    MAX_UPSTREAM_FLIPS = 2,
+    MAX_LEGACY = 0,
     ENABLE_FAILOVER = false,
     ENABLE_GC = false,
     ENABLE_CRASH = true,
