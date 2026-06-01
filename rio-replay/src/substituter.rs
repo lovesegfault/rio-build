@@ -70,6 +70,13 @@ impl Substituter {
     /// back to the ambient AWS configuration (env / profile / IMDS) at call
     /// time. Credentials always come from the ambient configuration and are
     /// resolved lazily on first request, so parsing needs no network access.
+    ///
+    /// The HTTP client re-screens every redirect hop (see
+    /// `crate::nixcache::substituter_redirect_policy`): a cache may
+    /// redirect within its own origin or to a public HTTPS host, but a hop
+    /// at a non-public address or a non-https scheme aborts the fetch —
+    /// spec- and archive-provided caches must not be able to steer the
+    /// engine at internal endpoints via `Location` headers.
     pub async fn parse(url: &str) -> Result<Self> {
         let parsed =
             reqwest::Url::parse(url).with_context(|| format!("invalid substituter URL {url:?}"))?;
@@ -102,6 +109,11 @@ impl Substituter {
                 let mut builder = reqwest::Client::builder()
                     .user_agent(crate::user_agent(None))
                     .connect_timeout(CONNECT_TIMEOUT)
+                    // Cache URLs come from campaign specs and archive
+                    // manifests; the admission screen covers only the URL
+                    // itself, so every redirect hop is re-screened against
+                    // the same contract (same origin, or public HTTPS).
+                    .redirect(crate::nixcache::substituter_redirect_policy())
                     .https_only(https);
                 if !https {
                     // Plaintext cache: TLS never engages, so skip loading
@@ -752,6 +764,92 @@ References:
         let mut out = Vec::new();
         reader.read_to_end(&mut out).await.unwrap();
         assert_eq!(out, nar);
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn narinfo_redirect_to_non_public_address_is_refused() {
+        // The substituter URL itself passed the admission screen (or is a
+        // dev/test loopback); a probe answered with a redirect at a
+        // non-public address must abort instead of following it.
+        use axum::response::IntoResponse as _;
+        use axum::routing::get;
+
+        let app = axum::Router::new().route(
+            "/d4444444444444444444444444444444.narinfo",
+            get(|| async {
+                (
+                    axum::http::StatusCode::FOUND,
+                    [(
+                        axum::http::header::LOCATION,
+                        "https://10.0.0.1/internal.narinfo",
+                    )],
+                )
+                    .into_response()
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let sub = Substituter::parse(&format!("http://{addr}")).await.unwrap();
+        let err = sub
+            .narinfo("d4444444444444444444444444444444")
+            .await
+            .expect_err("a redirect at a non-public address must abort the probe");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("https://10.0.0.1/internal.narinfo"),
+            "error must name the refused redirect target: {msg}"
+        );
+        assert!(
+            msg.contains("non-public address 10.0.0.1"),
+            "error must name the non-public address: {msg}"
+        );
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fetch_nar_follows_same_origin_redirect() {
+        // A cache may relocate objects within itself (relative `Location`);
+        // the per-hop redirect screen must keep that working.
+        use axum::response::IntoResponse as _;
+        use axum::routing::get;
+
+        let nar: Vec<u8> = b"redirected NAR payload 0123456789".repeat(64);
+        let zstd_body = zstd_compress(&nar).await;
+        let app = axum::Router::new()
+            .route(
+                "/nar/moved.nar.zst",
+                get(|| async {
+                    (
+                        axum::http::StatusCode::FOUND,
+                        [(axum::http::header::LOCATION, "/nar/relocated.nar.zst")],
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/nar/relocated.nar.zst",
+                get(move || async move { zstd_body }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let sub = Substituter::parse(&format!("http://{addr}")).await.unwrap();
+        let info = narinfo_for(&nar, "nar/moved.nar.zst", "zstd");
+        assert_eq!(
+            sub.fetch_nar(&info).await.unwrap(),
+            nar,
+            "a same-origin redirect must be followed and the NAR verified"
+        );
 
         server.abort();
     }

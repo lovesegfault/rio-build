@@ -56,14 +56,39 @@ pub struct NixCacheClient {
 }
 
 impl NixCacheClient {
+    /// Build a narinfo client for `base_url`.
+    ///
+    /// Deliberately not built on `crate::http_client` (the recorder-side
+    /// constructor for Hydra and tarball downloads, which legitimately
+    /// follow redirects wherever they lead): cache base URLs come from
+    /// replay archives, so this client re-screens every redirect hop
+    /// through `substituter_redirect_policy` — a screened cache must not
+    /// be able to 302 the engine at an endpoint the screen would have
+    /// rejected.
     pub fn new(base_url: &str, user_agent: &str) -> anyhow::Result<Self> {
         let mut base = base_url.to_string();
         if !base.ends_with('/') {
             base.push('/');
         }
-        Ok(Self {
-            http: crate::http_client(user_agent, std::time::Duration::from_secs(60))
+        // Same construction shape as `crate::http_client`: try the
+        // platform trust store first, fall back to an explicit empty root
+        // store when none is available (the hermetic test sandbox); see
+        // there for the full rationale.
+        let builder = || {
+            reqwest::Client::builder()
+                .user_agent(user_agent)
+                .timeout(std::time::Duration::from_secs(60))
+                .redirect(substituter_redirect_policy())
+        };
+        let http = match builder().build() {
+            Ok(client) => client,
+            Err(_) => builder()
+                .tls_certs_only(std::iter::empty())
+                .build()
                 .context("build cache HTTP client")?,
+        };
+        Ok(Self {
+            http,
             base: reqwest::Url::parse(&base).with_context(|| format!("parse cache URL {base}"))?,
         })
     }
@@ -134,6 +159,11 @@ impl NixCacheClient {
 /// ranges. The check is purely syntactic: hostnames are never resolved, so a
 /// DNS name that happens to resolve to a private address is out of scope
 /// here.
+///
+/// Redirects are not a way around this screen: it covers only the URL the
+/// client is pointed at, so the [`NixCacheClient`] handed a validated URL
+/// re-screens every redirect hop with the same contract (see
+/// `substituter_redirect_policy`).
 pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
     let parsed = reqwest::Url::parse(url).with_context(|| {
         format!(
@@ -175,7 +205,10 @@ pub fn validate_probe_substituter(url: &str) -> anyhow::Result<()> {
 /// Everything else — plain `http://`, `file://`, loopback or private-address
 /// HTTPS hosts — is rejected: these URLs are external input and must not be
 /// able to steer the engine's HTTP client at internal endpoints. Like the
-/// probe validator, the check is purely syntactic (no DNS resolution).
+/// probe validator, the check is purely syntactic (no DNS resolution), and
+/// like there, redirects cannot bypass it: the substituter's HTTP client
+/// re-screens every redirect hop with the same contract (see
+/// `substituter_redirect_policy`).
 pub fn validate_supply_substituter(url: &str) -> anyhow::Result<()> {
     let parsed = reqwest::Url::parse(url)
         .with_context(|| format!("supply substituter {url:?} is not a valid URL"))?;
@@ -240,6 +273,80 @@ fn non_public_ip_literal(host: &str) -> Option<IpAddr> {
         },
     };
     private.then_some(ip)
+}
+
+/// Redirect-chain cap for the engine-facing substituter clients. A custom
+/// reqwest policy replaces the built-in loop protection, so reqwest's
+/// default limit of 10 hops is re-imposed here.
+const MAX_REDIRECT_HOPS: usize = 10;
+
+/// Redirect policy for the engine-facing substituter clients
+/// ([`NixCacheClient`] and the HTTP client in [`crate::substituter`]).
+///
+/// [`validate_probe_substituter`] / [`validate_supply_substituter`] screen
+/// the URL an archive or campaign spec nominates, but that is only the
+/// first hop: a host that passes the screen can still answer every request
+/// with a redirect, and a default reqwest client would follow it anywhere —
+/// straight past the screen to loopback, link-local, or RFC 1918 space.
+/// This policy re-applies the screen's contract to every hop via
+/// [`validate_redirect_hop`]: a redirect may stay on the origin that issued
+/// it (e.g. a relative `Location` relocating an object within the cache) or
+/// move to public HTTPS space (the cache-in-front-of-CDN layout, where NAR
+/// requests bounce to a different public host); anything else aborts the
+/// request with an error naming the refused target. Chains longer than
+/// [`MAX_REDIRECT_HOPS`] are refused, matching the default policy's cap.
+pub(crate) fn substituter_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() > MAX_REDIRECT_HOPS {
+            return attempt.error(format!(
+                "substituter redirect chain exceeded {MAX_REDIRECT_HOPS} hops"
+            ));
+        }
+        let Some(from) = attempt.previous().last() else {
+            // Unreachable — a redirect always has at least the original URL
+            // in its chain — but refuse rather than guess if it ever isn't.
+            return attempt.error("substituter redirect with an empty redirect chain");
+        };
+        match validate_redirect_hop(from, attempt.url()) {
+            Ok(()) => attempt.follow(),
+            Err(err) => attempt.error(err),
+        }
+    })
+}
+
+/// Screen one redirect hop from `from` (the URL that answered with the
+/// redirect) to `next` (the resolved target) for the engine-facing
+/// substituter clients — the per-hop core of
+/// [`substituter_redirect_policy`].
+///
+/// A hop is accepted when it stays on the origin that issued it (scheme,
+/// host, and port unchanged — the server is redirecting to itself, so no
+/// endpoint the initial screen did not already vet becomes reachable), or
+/// when the target is public HTTPS: scheme exactly `https` and a host that
+/// passes [`non_public_ip_literal`]. Everything else — scheme downgrades,
+/// loopback/link-local/private/CGNAT/ULA targets — is an error naming the
+/// refused target. Like the URL validators above, the check is purely
+/// syntactic: hostnames are never resolved.
+fn validate_redirect_hop(from: &reqwest::Url, next: &reqwest::Url) -> anyhow::Result<()> {
+    if next.origin() == from.origin() {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        next.scheme() == "https",
+        "refusing substituter redirect from {from} to {next}: redirects leaving the cache's \
+         origin must use https"
+    );
+    let host = next.host_str().with_context(|| {
+        format!("refusing substituter redirect from {from} to {next}: target has no host")
+    })?;
+    if let Some(ip) = non_public_ip_literal(host) {
+        anyhow::bail!(
+            "refusing substituter redirect from {from} to {next}: the target points at the \
+             non-public address {ip}; substituter redirects must stay on the cache's own \
+             origin or move to a public HTTPS host"
+        );
+    }
+    Ok(())
 }
 
 /// Upstream narinfo facts for one store path, as collected by
@@ -720,6 +827,206 @@ NarSize: 4242
         assert!(
             format!("{err:#}").contains("cccccccccccccccccccccccccccccccc"),
             "error names the path"
+        );
+    }
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn redirect_hop_screen_allows_same_origin_and_public_https() {
+        // Same origin (scheme+host+port): the cache redirecting within
+        // itself, e.g. a relative `Location`. Plain-http loopback is what
+        // offline tests and dev flows use, so it must stay followable.
+        validate_redirect_hop(
+            &url("http://127.0.0.1:8080/a.narinfo"),
+            &url("http://127.0.0.1:8080/moved/a.narinfo"),
+        )
+        .unwrap();
+        validate_redirect_hop(
+            &url("https://cache.example.org/a.narinfo"),
+            &url("https://cache.example.org/b.narinfo?token=x"),
+        )
+        .unwrap();
+        // Cross-origin to public HTTPS: the cache-in-front-of-CDN layout
+        // (e.g. a Cachix-style 302 handing a NAR GET to a CDN host).
+        validate_redirect_hop(
+            &url("https://cache.example.org/nar/x.nar.zst"),
+            &url("https://cdn.example.net/nar/x.nar.zst"),
+        )
+        .unwrap();
+        validate_redirect_hop(
+            &url("https://cache.example.org/x"),
+            &url("https://151.101.65.55/x"),
+        )
+        .unwrap();
+        // Same host but a different port is cross-origin — still fine while
+        // it stays public https (ports are not screened, matching the URL
+        // validators).
+        validate_redirect_hop(
+            &url("https://cache.example.org/x"),
+            &url("https://cache.example.org:8443/x"),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn redirect_hop_screen_refuses_downgrades_and_non_public_targets() {
+        let refused = [
+            // Scheme downgrade off the issuing origin, even to the same
+            // host: a plaintext hop would expose the request path and could
+            // be re-steered by an on-path attacker.
+            ("https://cache.example.org/x", "http://cache.example.org/x"),
+            ("https://cache.example.org/x", "ftp://cache.example.org/x"),
+            // Cross-origin plain http (different loopback port: leaving the
+            // origin means the public-HTTPS contract applies).
+            ("http://127.0.0.1:8080/x", "http://127.0.0.1:9090/x"),
+            // Non-public targets across the screened address classes.
+            ("https://cache.example.org/x", "https://10.0.0.1/x"),
+            (
+                "https://cache.example.org/x",
+                "https://169.254.169.254/latest/meta-data",
+            ),
+            ("https://cache.example.org/x", "https://127.0.0.1/x"),
+            ("https://cache.example.org/x", "https://[::1]/x"),
+            ("https://cache.example.org/x", "https://[::ffff:10.0.0.1]/x"),
+            ("https://cache.example.org/x", "https://192.168.1.5/x"),
+            ("https://cache.example.org/x", "https://172.16.0.1:8443/x"),
+            ("https://cache.example.org/x", "https://100.64.0.1/x"),
+            (
+                "https://cache.example.org/x",
+                "https://[fd12:3456:789a::1]/x",
+            ),
+            ("https://cache.example.org/x", "https://0.0.0.0/x"),
+        ];
+        for (from, next) in refused {
+            let next_url = url(next);
+            let err = validate_redirect_hop(&url(from), &next_url)
+                .expect_err(&format!("redirect {from} -> {next} must be refused"));
+            let msg = format!("{err:#}");
+            assert!(
+                msg.contains("refusing substituter redirect") && msg.contains(next_url.as_str()),
+                "error for {from} -> {next} must name the refused target: {msg}"
+            );
+        }
+    }
+
+    /// Loopback cache that answers narinfo GETs with redirects: one hash
+    /// 302s within the same origin to `/moved/...` (where a valid narinfo
+    /// is served), one 302s at a non-public HTTPS address, and one 302s to
+    /// itself forever.
+    async fn spawn_redirecting_cache() -> (String, tokio::task::JoinHandle<()>) {
+        use axum::response::IntoResponse;
+        use axum::routing::get;
+        async fn narinfo(
+            axum::extract::Path(file): axum::extract::Path<String>,
+        ) -> axum::response::Response {
+            match file.as_str() {
+                "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr.narinfo" => (
+                    axum::http::StatusCode::FOUND,
+                    [(
+                        axum::http::header::LOCATION,
+                        "/moved/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr.narinfo",
+                    )],
+                )
+                    .into_response(),
+                "ssssssssssssssssssssssssssssssss.narinfo" => (
+                    axum::http::StatusCode::FOUND,
+                    [(
+                        axum::http::header::LOCATION,
+                        "https://10.0.0.1/internal.narinfo",
+                    )],
+                )
+                    .into_response(),
+                "llllllllllllllllllllllllllllllll.narinfo" => (
+                    axum::http::StatusCode::FOUND,
+                    [(
+                        axum::http::header::LOCATION,
+                        "/llllllllllllllllllllllllllllllll.narinfo",
+                    )],
+                )
+                    .into_response(),
+                _ => (axum::http::StatusCode::NOT_FOUND, "404").into_response(),
+            }
+        }
+        async fn moved(
+            axum::extract::Path(file): axum::extract::Path<String>,
+        ) -> axum::response::Response {
+            if file == "rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr.narinfo" {
+                let body = "\
+StorePath: /nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-relocated-1.0
+URL: nar/2222222222222222222222222222222222222222222222222222.nar.xz
+Compression: xz
+NarHash: sha256:0000000000000000000000000000000000000000000000000000
+NarSize: 7777
+";
+                (
+                    [(axum::http::header::CONTENT_TYPE, "text/x-nix-narinfo")],
+                    body,
+                )
+                    .into_response()
+            } else {
+                (axum::http::StatusCode::NOT_FOUND, "404").into_response()
+            }
+        }
+        let app = axum::Router::new()
+            .route("/{file}", get(narinfo))
+            .route("/moved/{file}", get(moved));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    #[tokio::test]
+    async fn same_origin_narinfo_redirect_is_followed() {
+        let (base, _srv) = spawn_redirecting_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let info = c
+            .fetch_narinfo("/nix/store/rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr-relocated-1.0")
+            .await
+            .unwrap()
+            .expect("a same-origin redirect to the relocated narinfo must be followed");
+        assert_eq!(info.nar_size, 7777);
+    }
+
+    #[tokio::test]
+    async fn redirect_to_non_public_address_is_refused() {
+        let (base, _srv) = spawn_redirecting_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let err = c
+            .fetch_narinfo("/nix/store/ssssssssssssssssssssssssssssssss-redirector-1.0")
+            .await
+            .expect_err("a redirect at a non-public address must abort the fetch");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("https://10.0.0.1/internal.narinfo"),
+            "error must name the refused redirect target: {msg}"
+        );
+        assert!(
+            msg.contains("non-public address 10.0.0.1"),
+            "error must name the non-public address: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redirect_loops_are_capped() {
+        // Same-origin hops are followed, so loop protection must come from
+        // the policy's own hop cap (a custom reqwest policy replaces the
+        // built-in one).
+        let (base, _srv) = spawn_redirecting_cache().await;
+        let c = NixCacheClient::new(&base, &crate::user_agent(None)).unwrap();
+        let err = c
+            .fetch_narinfo("/nix/store/llllllllllllllllllllllllllllllll-loop-1.0")
+            .await
+            .expect_err("a redirect loop must error out, not spin");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("redirect chain exceeded"),
+            "error must name the hop cap: {msg}"
         );
     }
 }

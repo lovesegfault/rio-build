@@ -40,8 +40,14 @@ pub fn user_agent(contact: Option<&str>) -> String {
 }
 
 /// Build a reqwest client carrying the politeness `User-Agent` and a
-/// request timeout — the shared constructor for every HTTP client in
-/// this crate (Hydra, binary cache, tarball download).
+/// request timeout — the shared constructor for the recorder-side HTTP
+/// clients in this crate (Hydra, tarball download). These talk to
+/// operator-chosen endpoints and follow redirects freely, which Hydra and
+/// tarball mirrors rely on. The engine-facing substituter clients
+/// (`nixcache::NixCacheClient`, `substituter::Substituter`) deliberately do
+/// NOT use this constructor: their base URLs come from campaign specs and
+/// replay archives, so they build their own clients with a redirect policy
+/// that re-screens every hop (`nixcache::substituter_redirect_policy`).
 ///
 /// Construction first tries the default TLS configuration (platform
 /// root certificates). When that fails because no system CA bundle is
