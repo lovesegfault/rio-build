@@ -35,6 +35,7 @@ use clap::Args;
 use super::{NS_REPLAY, TENANT_MATRIX, jobs, launch, preflight};
 use crate::config::XtaskConfig;
 use crate::k8s::client as kclient;
+use crate::k8s::eks::deploy::{DRIFT_SKIP_NODEPOOLS, wait_drift_settled};
 use crate::k8s::eks::{Eks, TF_DIR, push};
 use crate::k8s::provider::Provider;
 use crate::k8s::{NS, NS_STORE, shared};
@@ -52,6 +53,10 @@ pub struct SetupArgs {
     /// checksum changes). Required for non-interactive runs.
     #[arg(long)]
     pub yes: bool,
+    /// Wait for Karpenter node drift to settle after enabling replay
+    /// (same semantics as `k8s up --wait-drift`).
+    #[arg(long)]
+    pub wait_drift: bool,
 }
 
 pub async fn run(a: SetupArgs, cfg: &XtaskConfig) -> Result<()> {
@@ -157,6 +162,14 @@ pub async fn run(a: SetupArgs, cfg: &XtaskConfig) -> Result<()> {
     // already-enabled idempotent path).
     let client = kclient::client().await?;
     kclient::wait_rollout(&client, NS, "rio-gateway", Duration::from_secs(300)).await?;
+
+    // Same drift-settle wait as `k8s up --wait-drift`, run on both the
+    // enable and already-enabled paths: recordings/campaigns started on a
+    // cluster with Drifted NodeClaims can be evicted mid-run when the
+    // disruption controller replaces those nodes.
+    if a.wait_drift {
+        wait_drift_settled(&client, DRIFT_SKIP_NODEPOOLS).await?;
+    }
 
     // -- Bootstrap the replay namespace resources ---------------------------
     // Same idempotent helpers `replay launch`/`record` call: namespace +

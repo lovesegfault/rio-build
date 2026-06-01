@@ -269,30 +269,22 @@ pub fn campaign_job(c: &EngineJobCommon, campaign_id: &str, args: &[String]) -> 
     Ok(job)
 }
 
-/// Eval Job: one-shot replay-archive recording. Scoped (M1/M2) shape by
-/// default; `full_scale` sizes for a full nixpkgs/NixOS evaluation
-/// (r8a.48xlarge-class: ~160 vCPU / 1.2Ti, ephemeral-storage capped at
-/// 400Gi of the 500Gi node root volume).
+/// Eval Job: one-shot replay-archive recording, always sized for a full
+/// nixpkgs/NixOS evaluation (r8a.48xlarge-class: ~160 vCPU / 1.2Ti,
+/// ephemeral-storage capped at 400Gi of the 500Gi node root volume).
+/// Scoped recordings finish long before the node is reclaimed, and one
+/// sizing means the recorder can never OOM because the operator forgot a
+/// scale flag.
 ///
 /// One-shot semantics: TTL after finished + a small backoffLimit (eval
 /// is expensive and has no resume — retry once, then let the operator
 /// read the logs). The eval engine only talks to Hydra, the nixpkgs
 /// tarball host, cache.nixos.org and S3 — it mounts no campaign
 /// Secrets.
-pub fn eval_job(
-    c: &EngineJobCommon,
-    job_name: &str,
-    args: &[String],
-    full_scale: bool,
-) -> Result<Job> {
-    // Scoped (M1/M2) vs full-scope sizing. Full scope keeps the
-    // ephemeral-storage request at 400Gi, under the 500Gi root volume of
-    // the node class it targets; scoped runs fit ordinary general nodes.
-    let (cpu, mem_req, mem_lim, eph) = if full_scale {
-        ("160", "1200Gi", "1450Gi", "400Gi")
-    } else {
-        ("16", "64Gi", "96Gi", "200Gi")
-    };
+pub fn eval_job(c: &EngineJobCommon, job_name: &str, args: &[String]) -> Result<Job> {
+    // Full-scale sizing: the ephemeral-storage request stays at 400Gi,
+    // under the 500Gi root volume of the node class it targets.
+    let (cpu, mem_req, mem_lim, eph) = ("160", "1200Gi", "1450Gi", "400Gi");
     let job = serde_json::from_value(json!({
         "apiVersion": "batch/v1",
         "kind": "Job",
@@ -541,29 +533,27 @@ mod tests {
     }
 
     #[test]
-    fn eval_job_scoped_vs_full_scale_resources() {
+    fn eval_job_always_gets_full_scale_resources() {
         let name = "replay-eval-1824219-ab12cd34";
-        let scoped = eval_job(&common(), name, &["eval".into()], false).unwrap();
-        let full = eval_job(&common(), name, &["eval".into()], true).unwrap();
+        let job = eval_job(&common(), name, &["eval".into()]).unwrap();
 
-        let req = |j: &Job| {
-            pod_spec(j).containers[0]
-                .resources
-                .clone()
-                .unwrap()
-                .requests
-                .unwrap()
-        };
-        assert_eq!(req(&scoped).get("cpu").unwrap().0, "16");
-        assert_eq!(req(&full).get("cpu").unwrap().0, "160");
-        assert_eq!(req(&full).get("memory").unwrap().0, "1200Gi");
+        // Every eval Job is sized for a full nixpkgs/NixOS evaluation —
+        // there is no scoped shape and no scale flag to forget.
+        let req = pod_spec(&job).containers[0]
+            .resources
+            .clone()
+            .unwrap()
+            .requests
+            .unwrap();
+        assert_eq!(req.get("cpu").unwrap().0, "160");
+        assert_eq!(req.get("memory").unwrap().0, "1200Gi");
         // Keep the eval Job's ephemeral-storage request at 400Gi, under
         // the 500Gi root volume of the node class it targets.
-        assert_eq!(req(&full).get("ephemeral-storage").unwrap().0, "400Gi");
+        assert_eq!(req.get("ephemeral-storage").unwrap().0, "400Gi");
 
         // One-shot semantics: TTL after finished + small backoffLimit;
         // the deadline (if any) is the operator's, not the pod's.
-        let spec = scoped.spec.clone().unwrap();
+        let spec = job.spec.clone().unwrap();
         assert_eq!(spec.ttl_seconds_after_finished, Some(86400));
         assert_eq!(spec.backoff_limit, Some(1));
         assert_eq!(spec.active_deadline_seconds, None);
@@ -571,7 +561,7 @@ mod tests {
         // Same node-role pin and Karpenter disruption opt-out as the
         // campaign Job: a full-scope eval holds a large node for 1-2h.
         assert_eq!(
-            pod_spec(&scoped)
+            pod_spec(&job)
                 .node_selector
                 .as_ref()
                 .unwrap()
@@ -587,14 +577,14 @@ mod tests {
         // Eval Jobs mount no campaign secrets and upload via the
         // RIO_REPLAY_S3_BUCKET env the eval CLI reads.
         assert!(
-            pod_spec(&scoped)
+            pod_spec(&job)
                 .volumes
                 .unwrap()
                 .iter()
                 .all(|v| v.secret.is_none())
         );
         assert!(
-            env_names(&pod_spec(&scoped))
+            env_names(&pod_spec(&job))
                 .iter()
                 .any(|e| e == "RIO_REPLAY_S3_BUCKET")
         );
@@ -604,13 +594,7 @@ mod tests {
     fn both_job_shapes_run_nonroot_with_the_cnp_label() {
         let campaign =
             campaign_job(&common(), "replay-leaf-20260601-ab12", &["run".into()]).unwrap();
-        let eval = eval_job(
-            &common(),
-            "replay-eval-1824219-ab12cd34",
-            &["eval".into()],
-            false,
-        )
-        .unwrap();
+        let eval = eval_job(&common(), "replay-eval-1824219-ab12cd34", &["eval".into()]).unwrap();
         for j in [&campaign, &eval] {
             assert_eq!(j.metadata.namespace.as_deref(), Some(NS_REPLAY));
             // The chart's CNPs admit the engine by namespace + this pod

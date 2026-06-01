@@ -44,10 +44,6 @@ pub struct EvalArgs {
     /// keys (e.g. nixos/trunk-combined).
     #[arg(long)]
     pub jobset: Option<String>,
-    /// Size the Job for a full nixpkgs/NixOS evaluation
-    /// (r8a.48xlarge-class: ~160 vCPU / 1.2Ti / 400Gi scratch).
-    #[arg(long)]
-    pub full_scale: bool,
     /// Tell the engine to record a new archive even if this recipe has
     /// already been recorded (the engine salts the recipe digest, which
     /// bypasses the by-recipe idempotency skip; published archives are
@@ -141,7 +137,7 @@ pub async fn run(a: EvalArgs) -> Result<()> {
         log_level: a.log_level.clone(),
     };
     let name = job_name(&a, &tag);
-    let job = jobs::eval_job(&common, &name, &engine_args(&a), a.full_scale)?;
+    let job = jobs::eval_job(&common, &name, &engine_args(&a))?;
     ui::step(&format!("apply Job {name}"), || {
         jobs::create_job(&client, &job)
     })
@@ -157,9 +153,9 @@ pub async fn run(a: EvalArgs) -> Result<()> {
          find it: aws s3 ls s3://{bucket}/{prefix} — a prefix is complete once complete.json \
          exists; `replay launch --eval {}` discovers it from the archive's provenance (use \
          --eval-digest <recipe digest> to disambiguate)\n  \
-         full-scope evals need ~1-2h on an r8a.48xlarge-class node (~$15-31), and with \
-         --full-scale the pod sits Pending for a few minutes while Karpenter provisions that \
-         node — that is normal; scoped evals take minutes",
+         eval Jobs are sized for a full evaluation (r8a.48xlarge-class), so the pod sits Pending \
+         for a few minutes while Karpenter provisions that node — that is normal. Full-scope \
+         evals need ~1-2h on it (~$15-31); scoped evals take minutes",
         a.eval
     );
     Ok(())
@@ -175,7 +171,6 @@ mod tests {
             systems: vec!["x86_64-linux".into()],
             scope: "constituents:tested".into(),
             jobset: Some("nixos/trunk-combined".into()),
-            full_scale: false,
             force: false,
             log_level: "info".into(),
         }

@@ -9,7 +9,10 @@ use crate::{sh, tofu, ui};
 
 pub mod ami;
 mod bootstrap;
-pub(super) mod deploy;
+// pub(crate) so `replay setup --wait-drift` can reuse the Karpenter
+// drift-settle wait (`deploy::wait_drift_settled`) instead of
+// duplicating it.
+pub(crate) mod deploy;
 pub(in crate::k8s) mod destroy;
 // pub(crate) so the replay record/launch path can reuse the ECR
 // presence guard (`push::assert_in_ecr`) for the rio-replay image.
