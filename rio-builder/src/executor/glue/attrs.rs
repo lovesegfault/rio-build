@@ -76,14 +76,21 @@ pub(crate) fn prepare_structured_attrs(
             // writer below skips non-identifier keys exactly like
             // CppNix's `writeStructuredAttrsShell`. Rejecting here would
             // refuse derivations real Nix builds.
-            let targets: Vec<String> = match val {
-                Value::String(s) => vec![s.clone()],
-                Value::Array(a) => a
-                    .iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect(),
-                _ => Vec::new(),
-            };
+            //
+            // The VALUE is the oracle's recursive `flatten`
+            // (derivation-options.cc:106-114) into a string SET:
+            // nested arrays are CppNix-legal and accepted; numbers,
+            // bools, objects and null are errors — never silently
+            // emptied or dropped.
+            // r[impl builder.exec.structured-attrs-typed]
+            let mut target_set = std::collections::BTreeSet::new();
+            rio_nix::derivation::typed::flatten_strings(val, &mut target_set).map_err(|e| {
+                GlueError::ExportRefsValueWrongType {
+                    key: key.clone(),
+                    found: e.to_string(),
+                }
+            })?;
+            let targets: Vec<String> = target_set.into_iter().collect();
             let info = closure.closure_info_json(&targets)?;
             map.insert(key.clone(), info);
         }
@@ -358,6 +365,81 @@ mod tests {
             !sh.contains("closure info.json") && !sh.contains("escape"),
             ".attrs.sh must skip non-identifier keys:\n{sh}"
         );
+    }
+
+    /// A wrong-typed `exportReferencesGraph` leaf is an error (oracle
+    /// `flatten` throws), never silently emptied or skipped.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn erg_wrong_typed_value_rejects() {
+        for bad in [
+            json!({"exportReferencesGraph": {"refs": 42}}),
+            json!({"exportReferencesGraph": {"refs": true}}),
+            json!({"exportReferencesGraph": {"refs": {"k": "v"}}}),
+            json!({"exportReferencesGraph": {"refs": ["ok", 7]}}),
+            json!({"exportReferencesGraph": {"refs": [["nested", null]]}}),
+        ] {
+            let err = prepare_structured_attrs(
+                &bad,
+                &["out".to_string()],
+                &empty_closure(),
+                &BTreeMap::new(),
+            )
+            .expect_err(&format!("must reject: {bad}"));
+            assert!(
+                err.to_string()
+                    .contains("'exportReferencesGraph' value is not an array or a string"),
+                "{err}"
+            );
+            assert!(!err.is_transient_io(), "wrong types are permanent");
+        }
+    }
+
+    /// Nested arrays are CppNix-legal (`flatten` recurses) — the
+    /// pre-fix reader silently emptied them, producing a wrong (empty)
+    /// closure file where the oracle exports the real closure.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn erg_nested_array_flattens_recursively() {
+        use rio_nix::store_path::StorePath;
+        use rio_proto::validated::ValidatedPathInfo;
+
+        let p = "/nix/store/dddddddddddddddddddddddddddddddd-dep";
+        let infos = vec![ValidatedPathInfo {
+            store_path: StorePath::parse(p).unwrap(),
+            store_path_hash: vec![],
+            deriver: None,
+            nar_hash: [1u8; 32],
+            nar_size: 100,
+            references: vec![],
+            registration_time: 0,
+            ultimate: false,
+            signatures: vec![],
+            content_address: None,
+        }];
+        let closure_paths = vec![p.to_string()];
+        let index = ClosureIndex::new(&infos, &closure_paths);
+
+        let nested = json!({"exportReferencesGraph": {"refs": [[p]]}});
+        let flat = json!({"exportReferencesGraph": {"refs": [p]}});
+        let render = |j: &Value| -> Value {
+            let files = prepare_structured_attrs(j, &["out".to_string()], &index, &BTreeMap::new())
+                .unwrap();
+            serde_json::from_slice(&files.attrs_json).unwrap()
+        };
+        // The EXPANDED graph key must be identical for the nested and
+        // flat spellings (the original `exportReferencesGraph` attr is
+        // echoed verbatim by both rio and the oracle, so it
+        // legitimately differs between the two spellings).
+        let nested_out = render(&nested);
+        let flat_out = render(&flat);
+        assert_eq!(
+            nested_out.get("refs"),
+            flat_out.get("refs"),
+            "nested and flat forms must export the identical closure"
+        );
+        let arr = nested_out.get("refs").and_then(Value::as_array).unwrap();
+        assert_eq!(arr.len(), 1, "the closure member is exported: {nested_out}");
     }
 
     #[test]

@@ -129,6 +129,28 @@ pub(crate) enum GlueError {
     )]
     ExportRefsCyclicMetadata { paths: Vec<String> },
 
+    /// A structured-attrs `exportReferencesGraph` value has a
+    /// wrong-typed leaf. The oracle's `flatten`
+    /// (derivation-options.cc:106-114) recursively accepts arrays and
+    /// strings and THROWS on anything else; the pre-fix reader
+    /// silently emptied nested arrays and skipped non-string leaves —
+    /// both produced a wrong (empty) closure file where the oracle
+    /// fails the build.
+    // r[impl builder.exec.structured-attrs-typed]
+    #[error("'exportReferencesGraph' value is not an array or a string (key {key}: {found})")]
+    ExportRefsValueWrongType { key: String, found: String },
+
+    /// A behavioral structured attribute the request glue reads
+    /// (`passAsFile`, `impureEnvVars`) is wrong-typed or the `__json`
+    /// blob is unparseable. Fail-closed per the oracle's typed getters
+    /// — never "treat as absent".
+    // r[impl builder.exec.structured-attrs-typed]
+    #[error("structured attrs read failed: {source}")]
+    StructuredAttrWrongType {
+        #[from]
+        source: rio_nix::derivation::StructuredAttrError,
+    },
+
     #[error("exportReferencesGraph value is malformed (expected `name path` pairs): {value}")]
     ExportRefsMalformed { value: String },
 
@@ -415,7 +437,7 @@ pub(crate) fn derivation_into_request(
         build_cores: opts.build_cores,
         impure_env: &opts.impure_env,
     };
-    let env::BuilderEnv { env, passed_files } = env::build_env(drv, &input_rewrites, &env_opts);
+    let env::BuilderEnv { env, passed_files } = env::build_env(drv, &input_rewrites, &env_opts)?;
 
     // ---- inline files ---------------------------------------------------
     let closure =

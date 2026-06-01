@@ -74,6 +74,7 @@ pub(crate) struct PassedFile {
 }
 
 /// The materialized environment plus the files it requires.
+#[derive(Debug)]
 pub(crate) struct BuilderEnv {
     /// Final `KEY=VALUE` map, sorted by key (CppNix's env is a
     /// `std::map`, so the sandboxed process sees sorted environ too).
@@ -154,11 +155,12 @@ const LAYER_ORDER: [EnvLayer; 6] = [
 /// `.attrs.json` / `.attrs.sh` files themselves are produced by
 /// [`super::attrs`].
 // r[impl builder.exec.env-precedence]
+// r[impl builder.exec.structured-attrs-typed]
 pub(crate) fn build_env(
     drv: &BasicDerivation,
     rewrites: &BTreeMap<String, String>,
     opts: &EnvOptions<'_>,
-) -> BuilderEnv {
+) -> Result<BuilderEnv, super::GlueError> {
     let senv = StructuredEnv::new(drv.env());
     let structured = senv.is_structured_attrs();
     let is_fod = drv.is_fixed_output();
@@ -187,9 +189,12 @@ pub(crate) fn build_env(
                 } else {
                     // passAsFile: the listed attrs become files instead of
                     // env vars. (Ignored under structuredAttrs, matching
-                    // CppNix's desugaring.)
+                    // CppNix's desugaring.) Fail-closed read: a
+                    // wrong-typed list errors instead of degrading to
+                    // "no passAsFile" (which would leak the attr's
+                    // contents into the env).
                     let pass_as_file: std::collections::BTreeSet<String> = senv
-                        .strings("passAsFile")
+                        .string_list_attr("passAsFile")?
                         .unwrap_or_default()
                         .into_iter()
                         .collect();
@@ -226,7 +231,9 @@ pub(crate) fn build_env(
             }
             EnvLayer::ImpureEnv => {
                 if is_fod {
-                    for name in senv.strings("impureEnvVars").unwrap_or_default() {
+                    // Fail-closed read (oracle getStringSetAttr →
+                    // getStringSet: every element must be a string).
+                    for name in senv.string_list_attr("impureEnvVars")?.unwrap_or_default() {
                         let value = opts.impure_env.get(&name).cloned().unwrap_or_default();
                         env.insert(name, value);
                     }
@@ -239,7 +246,7 @@ pub(crate) fn build_env(
         }
     }
 
-    BuilderEnv { env, passed_files }
+    Ok(BuilderEnv { env, passed_files })
 }
 
 /// `nixbase32(sha256(attr_name))` — the suffix Nix uses for
@@ -321,7 +328,7 @@ mod tests {
             ("name", "x"),
         ]);
         let BuilderEnv { env, passed_files } =
-            build_env(&drv, &no_rewrites(), &default_opts(&impure));
+            build_env(&drv, &no_rewrites(), &default_opts(&impure)).expect("build_env");
         assert!(passed_files.is_empty());
         assert_eq!(env["PATH"], "/path-not-set");
         assert_eq!(env["HOME"], "/homeless-shelter");
@@ -345,7 +352,9 @@ mod tests {
             ("NIX_LOG_FD", "7"),
             ("TEMP", "/tmp"),
         ]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["TMPDIR"], "/build");
         assert_eq!(env["TEMP"], "/build");
         assert_eq!(env["TERM"], "xterm-256color");
@@ -358,7 +367,9 @@ mod tests {
         // stdenv sets PATH in the drv env; it must win over the
         // /path-not-set base value (base → drv → forced ordering).
         let drv = drv_with_env(&[("PATH", "/nix/store/dddddddddddddddddddddddddddddddd-sd/bin")]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(
             env["PATH"],
             "/nix/store/dddddddddddddddddddddddddddddddd-sd/bin"
@@ -375,7 +386,9 @@ mod tests {
             ph.clone(),
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".to_string(),
         );
-        let env = build_env(&drv, &rewrites, &default_opts(&impure)).env;
+        let env = build_env(&drv, &rewrites, &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(
             env["configureFlags"],
             "--prefix=/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"
@@ -395,7 +408,8 @@ mod tests {
             ph,
             "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x".to_string(),
         );
-        let BuilderEnv { env, passed_files } = build_env(&drv, &rewrites, &default_opts(&impure));
+        let BuilderEnv { env, passed_files } =
+            build_env(&drv, &rewrites, &default_opts(&impure)).expect("build_env");
 
         // The attr itself is NOT in the env; <attr>Path is.
         assert!(!env.contains_key("buildScript"));
@@ -431,7 +445,9 @@ mod tests {
             ("__json", r#"{"name":"x","configurePhase":"true"}"#),
             ("out", "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-x"),
         ]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["NIX_ATTRS_JSON_FILE"], "/build/.attrs.json");
         assert_eq!(env["NIX_ATTRS_SH_FILE"], "/build/.attrs.sh");
         // The drv env (including $out and __json) is NOT copied in.
@@ -455,7 +471,9 @@ mod tests {
             ("urls", "https://example.org/src.tar.gz"),
             ("outputHash", "sha256-aaaa"),
         ]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["NIX_OUTPUT_CHECKED"], "1");
         assert_eq!(env["https_proxy"], "http://proxy:3128");
         // Listed but not in the operator map → empty string (CppNix
@@ -483,7 +501,9 @@ mod tests {
     fn fod_drv_attr_cannot_override_output_checked() {
         let impure = BTreeMap::new();
         let drv = fod_with_env(&[("NIX_OUTPUT_CHECKED", "0")]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["NIX_OUTPUT_CHECKED"], "1");
     }
 
@@ -497,7 +517,9 @@ mod tests {
         impure.insert("NIX_LOG_FD".to_string(), "9".to_string());
         impure.insert("TERM".to_string(), "vt100".to_string());
         let drv = fod_with_env(&[("impureEnvVars", "NIX_LOG_FD TERM")]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["NIX_LOG_FD"], "2");
         assert_eq!(env["TERM"], "xterm-256color");
     }
@@ -511,7 +533,9 @@ mod tests {
         let mut impure = BTreeMap::new();
         impure.insert("TMPDIR".to_string(), "/var/big-scratch".to_string());
         let drv = fod_with_env(&[("impureEnvVars", "TMPDIR")]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["TMPDIR"], "/var/big-scratch");
         // The unlisted siblings stay forced.
         assert_eq!(env["TEMPDIR"], "/build");
@@ -542,7 +566,9 @@ mod tests {
             // beats impure:
             ("impureEnvVars", "NIX_OUTPUT_CHECKED TMPDIR NIX_LOG_FD TERM"),
         ]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(
             env["PATH"], "/nix/store/dddddddddddddddddddddddddddddddd-sd/bin",
             "drv env beats the /path-not-set base"
@@ -559,6 +585,34 @@ mod tests {
         assert_eq!(env["TERM"], "xterm-256color", "forced-last beats impure");
     }
 
+    /// A structured FOD whose `impureEnvVars` is wrong-typed is a
+    /// glue rejection (oracle getStringSet throws) — never "no impure
+    /// vars" (which would silently break the fetch's proxy config) and
+    /// never an element drop.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn structured_fod_wrong_typed_impure_env_vars_rejects() {
+        let impure = BTreeMap::new();
+        for bad_json in [
+            r#"{"impureEnvVars":"https_proxy"}"#,
+            r#"{"impureEnvVars":["https_proxy",7]}"#,
+            r#"{"impureEnvVars":{"k":"v"}}"#,
+        ] {
+            let drv = fod_with_env(&[("__json", bad_json)]);
+            let err = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+                .expect_err(&format!("must reject: {bad_json}"));
+            assert!(
+                err.to_string().contains("impureEnvVars"),
+                "error names the attribute: {err}"
+            );
+            assert!(!err.is_transient_io(), "wrong types are permanent");
+        }
+        // Malformed __json on a FOD errors too (the read is
+        // fail-closed, not best-effort).
+        let drv = fod_with_env(&[("__json", "{not json")]);
+        assert!(build_env(&drv, &no_rewrites(), &default_opts(&impure)).is_err());
+    }
+
     /// A structured-attrs FOD cannot smuggle `NIX_OUTPUT_CHECKED`
     /// through `__json`: the structured branch exports only the two
     /// `NIX_ATTRS_*` paths, so the forced "1" survives.
@@ -570,7 +624,9 @@ mod tests {
             ("__structuredAttrs", "1"),
             ("__json", r#"{"NIX_OUTPUT_CHECKED":"0"}"#),
         ]);
-        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure)).env;
+        let env = build_env(&drv, &no_rewrites(), &default_opts(&impure))
+            .expect("build_env")
+            .env;
         assert_eq!(env["NIX_OUTPUT_CHECKED"], "1");
         assert!(!env.contains_key("__json"));
     }

@@ -624,6 +624,115 @@ rec {
         ];
       };
 
+  # outputChecks.out.maxSize as a FLOAT: nlohmann's implicit uint64
+  # conversion truncates (1024.9 → 1024) and the truncated cap is
+  # ENFORCED. The output is 4096 bytes > 1024, so both sides fail with
+  # the size violation. Pre-fix rio dropped the non-u64 value entirely
+  # — no cap at all — and SUCCEEDED while the oracle failed.
+  outputchecks-maxsize-float =
+    mkDrv "rio-diff-maxsize-float"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        head -c 4096 /dev/zero > ''${outputs[out]}/blob
+      ''
+      {
+        __structuredAttrs = true;
+        outputChecks.out.maxSize = 1024.9;
+      };
+
+  # outputChecks.out.maxSize as a STRING: nlohmann get<uint64_t> throws
+  # (no string→number coercion); the build must fail on both sides.
+  # Pre-fix rio silently skipped the cap and succeeded.
+  outputchecks-maxsize-string =
+    mkDrv "rio-diff-maxsize-string"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        head -c 4096 /dev/zero > ''${outputs[out]}/blob
+      ''
+      {
+        __structuredAttrs = true;
+        outputChecks.out.maxSize = "1024";
+      };
+
+  # outputChecks list with a wrong-typed element: getStringList throws
+  # on the 42 — the element is never dropped. Pre-fix rio filter_map'd
+  # it away, silently widening the allowed set.
+  outputchecks-list-wrong-type =
+    mkDrv "rio-diff-oc-list-wrong-type"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        echo ok > ''${outputs[out]}/f
+      ''
+      {
+        __structuredAttrs = true;
+        outputChecks.out.allowedReferences = [
+          "out"
+          42
+        ];
+      };
+
+  # outputChecks.<name> that is not an object: getObject throws.
+  outputchecks-spec-not-object =
+    mkDrv "rio-diff-oc-spec-not-object"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        echo ok > ''${outputs[out]}/f
+      ''
+      {
+        __structuredAttrs = true;
+        outputChecks.out = "not-an-object";
+      };
+
+  # unsafeDiscardReferences flag that is a string, not a bool:
+  # getBoolean throws. Pre-fix rio unwrap_or(false)'d it — the discard
+  # silently OFF where the oracle fails the build.
+  unsafe-discard-wrong-type =
+    mkDrv "rio-diff-unsafe-discard-wrong-type"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        echo ok > ''${outputs[out]}/f
+      ''
+      {
+        __structuredAttrs = true;
+        unsafeDiscardReferences.out = "true";
+      };
+
+  # exportReferencesGraph value that is a number: the oracle's flatten
+  # throws ("'exportReferencesGraph' value is not an array or a
+  # string"); rio rejects in the request glue before any build runs.
+  erg-wrong-type =
+    mkDrv "rio-diff-erg-wrong-type"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        echo ok > ''${outputs[out]}/f
+      ''
+      {
+        __structuredAttrs = true;
+        exportReferencesGraph.refs = 42;
+      };
+
+  # exportReferencesGraph with a NESTED array: CppNix-legal (flatten
+  # recurses), so the exported closure must be byte-identical to the
+  # flat spelling. Pre-fix rio silently emptied nested arrays — an
+  # empty closure file where the oracle exports busybox's closure.
+  erg-nested-array =
+    mkDrv "rio-diff-erg-nested-array"
+      ''
+        . "$NIX_ATTRS_SH_FILE"
+        mkdir -p ''${outputs[out]}
+        cp "$NIX_ATTRS_JSON_FILE" ''${outputs[out]}/attrs.json
+      ''
+      {
+        __structuredAttrs = true;
+        exportReferencesGraph.refs = [ [ "${busybox}" ] ];
+      };
+
   # ── Floating content-addressed derivations ───────────────────────────
   # Native-side CA finalization lands with the M6b milestone; until then
   # these entries are recorded as known divergences (the native side

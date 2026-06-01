@@ -278,6 +278,13 @@ in
   #   structured-attrs entry (the .attrs.sh byte-comparer) carries
   #   bigInt/negBigInt/roundEdgeFloat: the int32 wrap and f32-gate
   #   rounding edges are executed against the oracle, byte-for-byte.
+  # r[verify builder.exec.structured-attrs-typed]
+  #   outputchecks-maxsize-{float,string} / outputchecks-list-wrong-type /
+  #   outputchecks-spec-not-object / unsafe-discard-wrong-type /
+  #   erg-wrong-type / erg-nested-array entries: wrong-typed structured
+  #   attrs reject on both sides (and the float cap truncates+enforces,
+  #   and nested erg arrays flatten) — executed against the oracle, so a
+  #   future fail-open reader regression turns the merge gate red.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };

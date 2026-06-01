@@ -204,6 +204,36 @@ let
     fod-env-precedence = {
       expect = "parity";
     };
+    # Wrong-typed structured-attrs policy values: the oracle's typed
+    # getters throw; rio's fail-closed parse rejects. Each entry pins
+    # one fail-open shape the pre-fix readers had.
+    outputchecks-maxsize-float = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    outputchecks-maxsize-string = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    outputchecks-list-wrong-type = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    outputchecks-spec-not-object = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    unsafe-discard-wrong-type = {
+      expect = "both-fail";
+      rio_status = "OutputRejected";
+    };
+    erg-wrong-type = {
+      expect = "both-fail";
+      rio_glue_error = "is not an array or a string";
+    };
+    erg-nested-array = {
+      expect = "parity";
+    };
     ca-multi-output = {
       # M6b floating-CA finalization is merged: the native side must
       # now realize the same content-addressed paths as the oracle.

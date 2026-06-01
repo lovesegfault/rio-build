@@ -21,13 +21,39 @@
 //! A derivation in structuredAttrs mode has only `__json` in its env, so
 //! a parser that read only the legacy keys would silently skip every
 //! check for exactly the derivations nixpkgs is migrating toward.
-//
-// TODO: move the __json navigation to the shared StructuredEnv parser
-// (the request glue has one) so the gateway, the request glue, and this
-// module read structured attrs through a single implementation instead
-// of three hand-rolled ones.
+//!
+//! Parsing is FAIL-CLOSED through `rio_nix::derivation::typed` (the
+//! oracle's `json-utils.cc` getter semantics): malformed `__json`,
+//! wrong-typed `outputChecks` values, and wrong-typed
+//! `unsafeDiscardReferences` flags are [`PolicyParseError`]s that
+//! reject the whole result — never a silent fallback to the legacy
+//! keys, a dropped list element, or a vanished size limit. The oracle
+//! throws on exactly the same shapes (`derivation-options.cc`), so
+//! fail-open here was a parity bug, not just a hardening gap.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+use rio_nix::derivation::typed;
+
+/// Structured-attrs policy parsing failed: the derivation claims
+/// behavioral attributes this module cannot faithfully read. The whole
+/// result is rejected (the oracle fails such builds at options-parse
+/// time).
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub(crate) enum PolicyParseError {
+    /// `__json` present but unparseable. The pre-fix reader silently
+    /// fell back to the (empty) legacy env keys — i.e. an unparseable
+    /// blob switched every output check off.
+    #[error("structured attrs (__json) do not parse: {error}")]
+    MalformedJson { error: String },
+    /// A policy attribute exists with the wrong JSON type. Mirrors the
+    /// oracle's `addTrace` framing around its typed-getter throw.
+    #[error("while parsing attribute '{attr}': {source}")]
+    WrongType {
+        attr: String,
+        source: typed::TypedError,
+    },
+}
 
 /// Per-output checks (the structuredAttrs `outputChecks.<name>` object,
 /// or the legacy global lists applied to every output).
@@ -81,14 +107,18 @@ pub(crate) struct OutputPolicy {
 impl OutputPolicy {
     /// Parse the policy from a derivation's environment.
     ///
-    /// structuredAttrs detection follows Nix: the presence of a parseable
+    /// structuredAttrs detection follows Nix: the presence of the
     /// `__json` key. In that mode the legacy env keys are ignored (they
     /// do not exist as separate keys anyway — everything lives in the
-    /// JSON blob).
-    pub(crate) fn parse(env: &BTreeMap<String, String>) -> Self {
-        if let Some(json) = env.get("__json")
-            && let Ok(value) = serde_json::from_str::<serde_json::Value>(json)
-        {
+    /// JSON blob), and the blob MUST parse: a malformed blob is an
+    /// error, never a fallback to the legacy (empty) keys.
+    // r[impl builder.exec.structured-attrs-typed]
+    pub(crate) fn parse(env: &BTreeMap<String, String>) -> Result<Self, PolicyParseError> {
+        if let Some(json) = env.get("__json") {
+            let value: serde_json::Value =
+                serde_json::from_str(json).map_err(|e| PolicyParseError::MalformedJson {
+                    error: e.to_string(),
+                })?;
             return Self::from_structured(&value);
         }
 
@@ -96,7 +126,7 @@ impl OutputPolicy {
             env.get(key)
                 .map(|v| v.split_whitespace().map(String::from).collect())
         };
-        OutputPolicy {
+        Ok(OutputPolicy {
             legacy: OutputChecks {
                 allowed_references: list("allowedReferences"),
                 disallowed_references: list("disallowedReferences").unwrap_or_default(),
@@ -109,58 +139,93 @@ impl OutputPolicy {
             per_output: BTreeMap::new(),
             discard_references: BTreeMap::new(),
             structured: false,
-        }
+        })
     }
 
-    fn from_structured(json: &serde_json::Value) -> Self {
-        let str_list = |v: &serde_json::Value| -> Vec<String> {
-            v.as_array()
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|e| e.as_str().map(String::from))
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-
+    // r[impl builder.exec.structured-attrs-typed]
+    fn from_structured(json: &serde_json::Value) -> Result<Self, PolicyParseError> {
         let mut per_output = BTreeMap::new();
-        if let Some(checks) = json.get("outputChecks").and_then(|v| v.as_object()) {
-            for (output, spec) in checks {
-                let get = |key: &str| spec.get(key);
+        if let Some(checks_value) = json.get("outputChecks") {
+            // Oracle: getObject(*outputChecks) — a non-object is an
+            // error, not a skip (derivation-options.cc:211-213).
+            let checks =
+                typed::object(checks_value).map_err(|source| PolicyParseError::WrongType {
+                    attr: "outputChecks".to_string(),
+                    source,
+                })?;
+            for (output, spec_value) in checks {
+                let spec =
+                    typed::object(spec_value).map_err(|source| PolicyParseError::WrongType {
+                        attr: format!("outputChecks.\"{output}\""),
+                        source,
+                    })?;
+                // Oracle get_: getStringList — every element must be a
+                // string; one bad element fails the attribute (the
+                // pre-fix filter_map silently shrank the list).
+                let list = |key: &str| -> Result<Option<Vec<String>>, PolicyParseError> {
+                    spec.get(key)
+                        .map(|v| {
+                            typed::string_list(v).map_err(|source| PolicyParseError::WrongType {
+                                attr: format!("outputChecks.\"{output}\".{key}"),
+                                source,
+                            })
+                        })
+                        .transpose()
+                };
+                // Oracle ptrToOwned<uint64_t>: nlohmann's implicit
+                // conversion — floats truncate (and the truncated cap
+                // is ENFORCED), signed wraps, non-numbers error.
+                let size = |key: &str| -> Result<Option<u64>, PolicyParseError> {
+                    spec.get(key)
+                        .map(|v| {
+                            typed::unsigned_lossy(v).map_err(|source| PolicyParseError::WrongType {
+                                attr: format!("outputChecks.\"{output}\".{key}"),
+                                source,
+                            })
+                        })
+                        .transpose()
+                };
                 per_output.insert(
                     output.clone(),
                     OutputChecks {
-                        allowed_references: get("allowedReferences").map(&str_list),
-                        disallowed_references: get("disallowedReferences")
-                            .map(&str_list)
-                            .unwrap_or_default(),
-                        allowed_requisites: get("allowedRequisites").map(&str_list),
-                        disallowed_requisites: get("disallowedRequisites")
-                            .map(&str_list)
-                            .unwrap_or_default(),
-                        max_size: get("maxSize").and_then(serde_json::Value::as_u64),
-                        max_closure_size: get("maxClosureSize").and_then(serde_json::Value::as_u64),
+                        allowed_references: list("allowedReferences")?,
+                        disallowed_references: list("disallowedReferences")?.unwrap_or_default(),
+                        allowed_requisites: list("allowedRequisites")?,
+                        disallowed_requisites: list("disallowedRequisites")?.unwrap_or_default(),
+                        max_size: size("maxSize")?,
+                        max_closure_size: size("maxClosureSize")?,
                     },
                 );
             }
         }
 
         let mut discard_references = BTreeMap::new();
-        if let Some(discard) = json
-            .get("unsafeDiscardReferences")
-            .and_then(|v| v.as_object())
-        {
-            for (output, flag) in discard {
-                discard_references.insert(output.clone(), flag.as_bool().unwrap_or(false));
+        if let Some(discard_value) = json.get("unsafeDiscardReferences") {
+            // Oracle: getObject + getBoolean per output, wrapped in
+            // addTrace("while parsing attribute
+            // 'unsafeDiscardReferences'") — a non-bool flag is an
+            // error, never unwrap_or(false).
+            let discard =
+                typed::object(discard_value).map_err(|source| PolicyParseError::WrongType {
+                    attr: "unsafeDiscardReferences".to_string(),
+                    source,
+                })?;
+            for (output, flag_value) in discard {
+                let flag =
+                    typed::boolean(flag_value).map_err(|source| PolicyParseError::WrongType {
+                        attr: "unsafeDiscardReferences".to_string(),
+                        source,
+                    })?;
+                discard_references.insert(output.clone(), flag);
             }
         }
 
-        OutputPolicy {
+        Ok(OutputPolicy {
             legacy: OutputChecks::default(),
             per_output,
             discard_references,
             structured: true,
-        }
+        })
     }
 
     /// Whether the scanned references of `output` should be discarded
@@ -478,7 +543,7 @@ mod tests {
 
     #[test]
     fn empty_policy_passes_everything() {
-        let policy = OutputPolicy::parse(&legacy_env(&[]));
+        let policy = OutputPolicy::parse(&legacy_env(&[])).expect("parse");
         assert!(policy.is_empty());
         let outs = [output("out", &out_path(), &[&input_path()], 10)];
         check_outputs(&outs, &policy, &closure_info()).unwrap();
@@ -487,7 +552,7 @@ mod tests {
     #[test]
     fn legacy_disallowed_references_rejects() {
         let env = legacy_env(&[("disallowedReferences", &bootstrap_path())]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output("out", &out_path(), &[&bootstrap_path()], 10)];
         let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
         assert_eq!(err.rule, "disallowedReferences");
@@ -498,7 +563,7 @@ mod tests {
     fn illegal_requisite_specifier_rejects() {
         // Same validation on the closure-side lists.
         let env = legacy_env(&[("allowedRequisites", "totally-bogus")]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output("out", &out_path(), &[], 10)];
         let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
         assert_eq!(err.rule, "allowedRequisites");
@@ -508,7 +573,7 @@ mod tests {
     #[test]
     fn legacy_allowed_references_rejects_unlisted() {
         let env = legacy_env(&[("allowedReferences", "")]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         // Empty allowed list = no references allowed at all.
         let outs = [output("out", &out_path(), &[&input_path()], 10)];
         let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
@@ -524,7 +589,7 @@ mod tests {
         // `allowedReferences = [ "out" ]` style: the entry is an output
         // NAME, resolved to its store path.
         let env = legacy_env(&[("allowedReferences", "out")]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [
             output("out", &out_path(), &[], 10),
             output("dev", &dev_path(), &[&out_path()], 10),
@@ -538,7 +603,7 @@ mod tests {
         // is neither a sibling output name nor a store path; keeping it
         // as an inert literal would silently unenforce the intended ban.
         let env = legacy_env(&[("disallowedReferences", "lib")]); // no "lib" output exists
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output("out", &out_path(), &[], 10)];
         let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
         assert_eq!(err.rule, "disallowedReferences");
@@ -551,7 +616,7 @@ mod tests {
         // Mixed valid specifiers: a sibling output name and a literal
         // store path must keep working exactly as before.
         let env = legacy_env(&[("allowedReferences", &format!("out {}", input_path()))]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output("out", &out_path(), &[&input_path()], 10)];
         check_outputs(&outs, &policy, &closure_info()).unwrap();
     }
@@ -561,7 +626,7 @@ mod tests {
         // out → dev (sibling) → bootstrap-tools: the bootstrap path is
         // nowhere in out's DIRECT references but is in its closure.
         let env = legacy_env(&[("disallowedRequisites", &bootstrap_path())]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let mut info = closure_info();
         info.insert(input_path(), (vec![bootstrap_path()], 1000));
         let outs = [output("out", &out_path(), &[&input_path()], 10)];
@@ -574,7 +639,7 @@ mod tests {
         // A self-referencing output with allowedRequisites that does NOT
         // list itself: legacy semantics exclude self, so it passes.
         let env = legacy_env(&[("allowedRequisites", &input_path())]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output(
             "out",
             &out_path(),
@@ -591,7 +656,7 @@ mod tests {
         let env = structured_env(serde_json::json!({
             "outputChecks": { "out": { "allowedRequisites": [input_path()] } }
         }));
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output(
             "out",
             &out_path(),
@@ -607,7 +672,7 @@ mod tests {
         let env = structured_env(serde_json::json!({
             "outputChecks": { "dev": { "disallowedReferences": [input_path()] } }
         }));
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         // "out" references the disallowed path but the check names "dev".
         let outs = [
             output("out", &out_path(), &[&input_path()], 10),
@@ -630,7 +695,7 @@ mod tests {
         let env = structured_env(serde_json::json!({
             "outputChecks": { "out": { "maxSize": 100, "maxClosureSize": 500 } }
         }));
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
 
         // Over maxSize.
         let outs = [output("out", &out_path(), &[], 200)];
@@ -651,7 +716,7 @@ mod tests {
     #[test]
     fn unknown_closure_path_rejects_instead_of_passing() {
         let env = legacy_env(&[("disallowedRequisites", &bootstrap_path())]);
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         // Reference to a path with no metadata anywhere.
         let ghost = p("eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee", "ghost");
         let outs = [output("out", &out_path(), &[&ghost], 10)];
@@ -665,7 +730,7 @@ mod tests {
         let env = structured_env(serde_json::json!({
             "unsafeDiscardReferences": { "out": true, "dev": false }
         }));
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         assert!(policy.discard_references_for("out"));
         assert!(!policy.discard_references_for("dev"));
         assert!(!policy.discard_references_for("lib"));
@@ -680,8 +745,103 @@ mod tests {
         }));
         // Even a stray legacy env key (impossible in practice) is ignored.
         env.insert("disallowedReferences".into(), input_path());
-        let policy = OutputPolicy::parse(&env);
+        let policy = OutputPolicy::parse(&env).expect("parse");
         let outs = [output("out", &out_path(), &[&input_path()], 10)];
+        check_outputs(&outs, &policy, &closure_info()).unwrap();
+    }
+
+    /// Wrong-typed policy values are parse ERRORS (oracle getter
+    /// throws), never silent skips — and a malformed `__json` is an
+    /// error, never a fallback to the legacy keys.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn wrong_typed_policy_values_reject() {
+        // Malformed __json: pre-fix this fell back to legacy parsing
+        // (i.e. NO checks at all).
+        let mut env = BTreeMap::new();
+        env.insert("__json".to_string(), "{not json".to_string());
+        assert!(matches!(
+            OutputPolicy::parse(&env),
+            Err(PolicyParseError::MalformedJson { .. })
+        ));
+
+        // Each wrong-typed shape errors with the offending attribute.
+        let cases: &[(serde_json::Value, &str)] = &[
+            (
+                serde_json::json!({"outputChecks": "not-an-object"}),
+                "outputChecks",
+            ),
+            (
+                serde_json::json!({"outputChecks": {"out": "not-an-object"}}),
+                "outputChecks.\"out\"",
+            ),
+            (
+                serde_json::json!({"outputChecks": {"out": {"maxSize": "1024"}}}),
+                "outputChecks.\"out\".maxSize",
+            ),
+            (
+                serde_json::json!({"outputChecks": {"out": {"allowedReferences": ["ok", 42]}}}),
+                "outputChecks.\"out\".allowedReferences",
+            ),
+            (
+                serde_json::json!({"outputChecks": {"out": {"disallowedReferences": "x y"}}}),
+                "outputChecks.\"out\".disallowedReferences",
+            ),
+            (
+                serde_json::json!({"unsafeDiscardReferences": {"out": "true"}}),
+                "unsafeDiscardReferences",
+            ),
+            (
+                serde_json::json!({"unsafeDiscardReferences": {"out": 1}}),
+                "unsafeDiscardReferences",
+            ),
+            (
+                serde_json::json!({"unsafeDiscardReferences": ["out"]}),
+                "unsafeDiscardReferences",
+            ),
+        ];
+        for (json, attr) in cases {
+            let err = OutputPolicy::parse(&structured_env(json.clone())).unwrap_err();
+            match &err {
+                PolicyParseError::WrongType { attr: got, .. } => {
+                    assert_eq!(got, attr, "json: {json}")
+                }
+                other => panic!("expected WrongType for {json}, got {other:?}"),
+            }
+        }
+    }
+
+    /// nlohmann's implicit uint64 conversion ACCEPTS floats — and the
+    /// truncated cap is then enforced (oracle ptrToOwned<uint64_t> +
+    /// derivation-check.cc). A float maxSize is not a parse error and
+    /// not a skipped check.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn float_max_size_truncates_and_enforces() {
+        let env = structured_env(serde_json::json!({
+            "outputChecks": {"out": {"maxSize": 1024.9}}
+        }));
+        let policy = OutputPolicy::parse(&env).expect("floats are accepted");
+        // Truncated to 1024 — a 1025-byte output violates the cap.
+        let outs = [output("out", &out_path(), &[], 1025)];
+        let err = check_outputs(&outs, &policy, &closure_info()).unwrap_err();
+        assert_eq!(err.rule, "maxSize");
+        // ...and a 1024-byte output is exactly at the cap (allowed).
+        let outs = [output("out", &out_path(), &[], 1024)];
+        check_outputs(&outs, &policy, &closure_info()).unwrap();
+    }
+
+    /// Signed values wrap modulo 2^64 (static_cast<uint64_t>(int64_t))
+    /// instead of erroring or saturating: maxSize -1 is u64::MAX — an
+    /// effectively unlimited cap, exactly like the oracle.
+    // r[verify builder.exec.structured-attrs-typed]
+    #[test]
+    fn negative_max_size_wraps_like_nlohmann() {
+        let env = structured_env(serde_json::json!({
+            "outputChecks": {"out": {"maxSize": -1}}
+        }));
+        let policy = OutputPolicy::parse(&env).expect("signed values wrap");
+        let outs = [output("out", &out_path(), &[], u64::from(u32::MAX))];
         check_outputs(&outs, &policy, &closure_info()).unwrap();
     }
 }

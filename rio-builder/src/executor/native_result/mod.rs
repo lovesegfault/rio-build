@@ -46,7 +46,7 @@ use rio_proto::types::BuildResultStatus;
 use rio_proto::validated::ValidatedPathInfo;
 
 use canonicalise::{CanonicaliseError, canonicalise_output};
-use policy::{OutputForPolicy, OutputPolicy, PolicyViolation};
+use policy::{OutputForPolicy, OutputPolicy, PolicyParseError, PolicyViolation};
 
 /// Free-space floor below which a non-zero exit is attributed to the
 /// worker's disk rather than the build itself (CppNix's
@@ -236,6 +236,15 @@ pub(crate) enum OutputRejection {
     Canonicalise(#[from] CanonicaliseError),
     #[error("{0}")]
     Policy(#[from] PolicyViolation),
+    /// The output policy itself could not be parsed (malformed __json,
+    /// wrong-typed outputChecks/unsafeDiscardReferences). Gates the
+    /// whole pipeline — matching the oracle, which fails such builds at
+    /// options-parse time — and precedes the pass-1 consumption of
+    /// unsafeDiscardReferences, so a wrong-typed discard flag can never
+    /// have already influenced scanning by the time it is rejected.
+    // r[impl builder.exec.structured-attrs-typed]
+    #[error("{0}")]
+    PolicyParse(#[from] PolicyParseError),
     #[error("reference scan of output '{output}' failed: {message}")]
     Scan { output: String, message: String },
     /// CppNix `BasicDerivation::type()`: "can't mix derivation output
@@ -321,7 +330,7 @@ fn process_outputs_inner(
     build_uid: u32,
     input_closure: &[ValidatedPathInfo],
 ) -> Result<ProcessedOutputs, OutputRejection> {
-    let policy = OutputPolicy::parse(drv.env());
+    let policy = OutputPolicy::parse(drv.env())?;
     let ca_spec = ca::FloatingCaSpec::from_outputs(drv.outputs())?;
     let candidates = reference_candidates(outputs, input_closure);
 
