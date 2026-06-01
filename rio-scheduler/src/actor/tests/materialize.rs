@@ -5062,3 +5062,139 @@ async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
     );
     Ok(())
 }
+
+// ── T-6.2 (Phase B): the job-lifecycle metrics ──────────────────────────────
+
+// r[verify obs.metric.scheduler]
+// r[verify sched.materialize.job]
+/// T-6.2 (red-first): the job-lifecycle counters the dashboards and
+/// alerts consume —
+///
+///   rio_scheduler_materialization_claims_total: one increment per
+///     delivered materialization claim (the open attempt's mint);
+///   rio_scheduler_materialization_jobs_resolved_total{outcome}: one
+///     increment per APPLIED terminal resolution, labeled by outcome
+///     (success | from_source | unobtainable | cancelled | obsolete);
+///     at-most-once — a re-resolution no-op never double-counts.
+///
+/// Together with rio_scheduler_materialization_jobs_created_total
+/// (Phase A) and rio_scheduler_materialization_stalled (T-6.1), these
+/// close the lifecycle: created → claimed → resolved, with the park
+/// backlog as the gauge.
+#[tokio::test]
+async fn job_lifecycle_metrics_count_claims_and_resolutions() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // ── Job 1: claim → Success consumption. ──
+    let out1 = test_store_path("lcm-success-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out1.clone());
+    let mut n1 = make_node("lcm-success");
+    n1.expected_output_paths = vec![out1.clone()];
+    n1.wanted_output_names = vec!["out".into()];
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![n1], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "lcm-success", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("job 1 must be claimable, got {other:?}"),
+    };
+    let exec1: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out1, b"lcm-success-content");
+    report_materialization_outcome(
+        &handle,
+        exec1,
+        "lcm-success",
+        mat_success_outcome(vec![out1.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // ── Job 2: created, then its build cancels → cancelled resolution. ──
+    let out2 = test_store_path("lcm-cancel-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out2.clone());
+    let mut n2 = make_node("lcm-cancel");
+    n2.expected_output_paths = vec![out2.clone()];
+    n2.wanted_output_names = vec!["out".into()];
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, b2, vec![n2], vec![], false).await?;
+    barrier(&handle).await;
+    cancel_build(&handle, b2).await?;
+    barrier(&handle).await;
+    tick(&handle).await?; // the zero-interest cancellation closer
+    barrier(&handle).await;
+
+    // ── The counters (ONE snapshot — the Snapshotter drains counter
+    //    values on every snapshot() call, so all assertions must read
+    //    from a single snapshot; the counter_map_by drain caveat). ──
+    {
+        use metrics_util::debugging::DebugValue;
+        let mut claims: u64 = 0;
+        let mut resolved: std::collections::BTreeMap<String, u64> = Default::default();
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            let k = ck.key();
+            match k.name() {
+                "rio_scheduler_materialization_claims_total" => claims += c,
+                "rio_scheduler_materialization_jobs_resolved_total" => {
+                    let outcome = k
+                        .labels()
+                        .find(|l| l.key() == "outcome")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default();
+                    *resolved.entry(outcome).or_default() += c;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(claims, 1, "exactly one delivered claim (job 1) is counted");
+        assert_eq!(
+            resolved.get("success").copied().unwrap_or(0),
+            1,
+            "job 1 resolved success; resolved map: {resolved:?}"
+        );
+        assert_eq!(
+            resolved.get("cancelled").copied().unwrap_or(0),
+            1,
+            "job 2 resolved cancelled (zero-interest closer); resolved map: {resolved:?}"
+        );
+        // The pre-registration (flag-on actor construction) makes every
+        // outcome label present even at 0 — what gives the alerts and
+        // dashboards series to evaluate from boot.
+        for outcome in ["from_source", "unobtainable", "obsolete"] {
+            assert_eq!(
+                resolved.get(outcome).copied().unwrap_or(u64::MAX),
+                0,
+                "outcome {outcome:?} is pre-registered at 0; resolved map: {resolved:?}"
+            );
+        }
+    }
+
+    // The db agrees (the counters mirror the authoritative rows).
+    let states: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs ORDER BY state")
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        states,
+        vec!["cancelled".to_string(), "resolved_success".to_string()],
+        "the counters mirror the job rows"
+    );
+    Ok(())
+}

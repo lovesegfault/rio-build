@@ -313,6 +313,27 @@ pub fn describe_metrics() {
          upstream cache health and tenant upstream configuration. Absent while \
          scheduler.materialization.enabled = false."
     );
+    describe_counter!(
+        "rio_scheduler_materialization_claims_total",
+        "Materialization claims delivered to store replicas (one per minted open \
+         attempt). Pairs with jobs_created_total (supply) and jobs_resolved_total \
+         (drain) for the lifecycle rates: created-vs-claimed divergence means store \
+         executors are not keeping up (or are partitioned from the leader); \
+         claimed-vs-resolved divergence means executions are failing or reports are \
+         not landing. Absent while scheduler.materialization.enabled = false."
+    );
+    describe_counter!(
+        "rio_scheduler_materialization_jobs_resolved_total",
+        "Materialization jobs terminally resolved, labeled by outcome \
+         (success|from_source|unobtainable|cancelled|obsolete). At-most-once per \
+         job (re-resolution no-ops never double-count). success = the wanted set \
+         was materialized from upstream; from_source = the job released the node \
+         to normal from-source dispatch (durable Vouched/Pending evidence or the \
+         PD-20 park re-evaluation); unobtainable = the fail-fast settlement; \
+         cancelled = zero live interest remained. A high infra-failure or \
+         unobtainable rate is the upstream-health signal. Absent while \
+         scheduler.materialization.enabled = false."
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

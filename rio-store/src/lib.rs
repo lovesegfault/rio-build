@@ -379,6 +379,26 @@ pub fn describe_metrics() {
          upstream instability or aggressive pod rollouts."
     );
     describe_counter!(
+        "rio_store_materialization_executions_total",
+        "Materialization job executions finished by this replica's executor, \
+         labeled by outcome (success | unobtainable | infra). The store-side \
+         half of the substitution-replacement lifecycle rates: pairs with the \
+         scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. \
+         A rising infra share means upstream/network trouble (executions are \
+         retried within the scheduler's materialization budget); a rising \
+         unobtainable share means requested paths genuinely left the upstreams. \
+         Absent while store materialization.enabled = false."
+    );
+    describe_counter!(
+        "rio_store_materialization_pinned_paths_total",
+        "Store paths pinned at materialization ingest (pin_kind='materialization', \
+         design §5.1 pin-at-ingest). Pairs with the scheduler's §5.3 release \
+         lifecycle: a sustained pinned-paths rate with no matching pin releases \
+         after jobs resolve and interest goes terminal means materialization \
+         pins are accumulating (GC pressure). Absent while store \
+         materialization.enabled = false."
+    );
+    describe_counter!(
         "rio_store_substitute_integrity_failures_total",
         "Upstream substitution NAR hash or size mismatches, labeled by \
          tenant (UUID). Nonzero is a security-relevant signal: upstream \

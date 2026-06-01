@@ -102,7 +102,9 @@
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_materialization_claims_total",
     "rio_scheduler_materialization_jobs_created_total",
+    "rio_scheduler_materialization_jobs_resolved_total",
     "rio_scheduler_materialization_stalled",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_open_attempts",
@@ -184,6 +186,8 @@
     "rio_store_log_tail_proxied_total",
     "rio_store_log_tail_proxy_failures_total",
     "rio_store_log_tail_subscribers",
+    "rio_store_materialization_executions_total",
+    "rio_store_materialization_pinned_paths_total",
     "rio_store_pg_pool_utilization",
     "rio_store_put_path_bytes_total",
     "rio_store_put_path_duration_seconds",
@@ -727,9 +731,19 @@
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
       },
       {
+        "name": "rio_scheduler_materialization_claims_total",
+        "kind": "counter",
+        "help": "Materialization claims delivered to store replicas (one per minted open attempt). Pairs with jobs_created_total (supply) and jobs_resolved_total (drain) for the lifecycle rates: created-vs-claimed divergence means store executors are not keeping up (or are partitioned from the leader); claimed-vs-resolved divergence means executions are failing or reports are not landing. Absent while scheduler.materialization.enabled = false."
+      },
+      {
         "name": "rio_scheduler_materialization_jobs_created_total",
         "kind": "counter",
         "help": "Materialization jobs created (substitution-replacement campaign), labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). Dedup-found existing jobs do not count. Always zero while scheduler.materialization.enabled = false (the Phase A deployed state) — a nonzero value flag-off is a dormancy violation."
+      },
+      {
+        "name": "rio_scheduler_materialization_jobs_resolved_total",
+        "kind": "counter",
+        "help": "Materialization jobs terminally resolved, labeled by outcome (success|from_source|unobtainable|cancelled|obsolete). At-most-once per job (re-resolution no-ops never double-count). success = the wanted set was materialized from upstream; from_source = the job released the node to normal from-source dispatch (durable Vouched/Pending evidence or the PD-20 park re-evaluation); unobtainable = the fail-fast settlement; cancelled = zero live interest remained. A high infra-failure or unobtainable rate is the upstream-health signal. Absent while scheduler.materialization.enabled = false."
       },
       {
         "name": "rio_scheduler_materialization_stalled",
@@ -1137,6 +1151,16 @@
         "name": "rio_store_log_tail_subscribers",
         "kind": "gauge",
         "help": "Live TailLog follow-subscriptions currently attached to this replica's ingest sessions."
+      },
+      {
+        "name": "rio_store_materialization_executions_total",
+        "kind": "counter",
+        "help": "Materialization job executions finished by this replica's executor, labeled by outcome (success | unobtainable | infra). The store-side half of the substitution-replacement lifecycle rates: pairs with the scheduler's rio_scheduler_materialization_{claims,jobs_resolved}_total. A rising infra share means upstream/network trouble (executions are retried within the scheduler's materialization budget); a rising unobtainable share means requested paths genuinely left the upstreams. Absent while store materialization.enabled = false."
+      },
+      {
+        "name": "rio_store_materialization_pinned_paths_total",
+        "kind": "counter",
+        "help": "Store paths pinned at materialization ingest (pin_kind='materialization', design §5.1 pin-at-ingest). Pairs with the scheduler's §5.3 release lifecycle: a sustained pinned-paths rate with no matching pin releases after jobs resolve and interest goes terminal means materialization pins are accumulating (GC pressure). Absent while store materialization.enabled = false."
       },
       {
         "name": "rio_store_pg_pool_utilization",

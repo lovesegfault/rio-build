@@ -39,7 +39,7 @@
       "id": 2,
       "type": "stat",
       "title": "Derivations in flight",
-      "description": "queued + running. Throughput numerator; sustained high with low running = dispatch stall.",
+      "description": "queued + running. Throughput numerator; sustained high with low running = dispatch stall. NOTE (substitution-replacement Phase B): derivations whose materialization job is pending/parked sit in the SUBSTITUTING bucket, which is excluded from queued — they are visible on the dispatch-flow dashboard's materialization panels and via rio-cli status (substituting_derivations), not here.",
       "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
       "datasource": {"type": "prometheus", "uid": "${datasource}"},
       "targets": [{"expr": "rio_scheduler_derivations_queued + rio_scheduler_derivations_running", "refId": "A"}],

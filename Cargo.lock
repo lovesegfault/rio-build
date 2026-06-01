@@ -6529,6 +6529,7 @@ dependencies = [
  "httpdate",
  "itf",
  "metrics",
+ "metrics-util",
  "moka",
  "proptest",
  "quint-connect",

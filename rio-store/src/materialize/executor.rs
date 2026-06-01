@@ -80,7 +80,31 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// cheap and non-blocking (it runs on the walk); the caller forwards it
 /// to `ReportMaterializationProgress` fire-and-forget.
 // r[impl store.materialize.executor+2]
+// r[impl obs.metric.store]
 pub async fn execute_job_with_progress(
+    ctx: &ExecutorContext,
+    claimed: &ClaimedJob,
+    on_progress: impl Fn(u64, u64, &str) + Send + Sync,
+) -> MaterializationOutcome {
+    let outcome = execute_job_inner(ctx, claimed, on_progress).await;
+    // T-6.2 lifecycle counter: one increment per finished execution,
+    // labeled by outcome class — the dashboard's execution rates and
+    // the upstream-health signal (a rising infra/unobtainable share).
+    // Sited at this single chokepoint so every return path of the
+    // walk is counted exactly once.
+    let label = match &outcome.outcome {
+        Some(materialization_outcome::Outcome::Success(_)) => "success",
+        Some(materialization_outcome::Outcome::Unobtainable(_)) => "unobtainable",
+        Some(materialization_outcome::Outcome::InfraFailure(_)) | None => "infra",
+    };
+    metrics::counter!("rio_store_materialization_executions_total", "outcome" => label)
+        .increment(1);
+    outcome
+}
+
+/// The walk body behind [`execute_job_with_progress`] (split so the
+/// outcome counter has a single increment site over every return path).
+async fn execute_job_inner(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
     on_progress: impl Fn(u64, u64, &str) + Send + Sync,
@@ -368,6 +392,7 @@ async fn live_wanted_paths(
 /// an existing build_input pin UPWARD (PD-10 as rewritten per DF-3):
 /// release moves later, never earlier.
 // r[impl sched.materialize.pinning]
+// r[impl obs.metric.store]
 async fn pin_materialized_path(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
@@ -386,6 +411,11 @@ async fn pin_materialized_path(
     .bind(claimed.job_id)
     .execute(&ctx.pool)
     .await?;
+    // T-6.2: the pin-supply counter — pairs with the scheduler's §5.3
+    // release lifecycle for pin-leak detection (a pinned-paths rate with
+    // no matching release activity after jobs resolve means pins are
+    // accumulating).
+    metrics::counter!("rio_store_materialization_pinned_paths_total").increment(1);
     Ok(())
 }
 
@@ -1146,6 +1176,89 @@ mod tests {
         assert_eq!(
             *final_expected, total_nar_bytes,
             "the final report's expected equals the closure total ({calls:?})"
+        );
+    }
+
+    // r[verify obs.metric.store]
+    // r[verify store.materialize.executor+2]
+    /// T-6.2 (red-first): the execution-outcome and pin counters the
+    /// dashboards consume —
+    ///
+    ///   rio_store_materialization_executions_total{outcome}: one
+    ///     increment per finished job execution, labeled
+    ///     success | unobtainable | infra;
+    ///   rio_store_materialization_pinned_paths_total: one increment
+    ///     per path pinned at ingest (the §5.3 pin lifecycle's supply
+    ///     side).
+    #[tokio::test]
+    async fn execution_metrics_count_outcomes_and_pins() {
+        use metrics_util::debugging::DebuggingRecorder;
+        let rec = DebuggingRecorder::new();
+        let snap = rec.snapshotter();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-metrics").await;
+
+        // A two-node closure: root references dep (both pinned on
+        // success → pinned_paths_total = 2).
+        let root = store_path(7, "matm-root");
+        let dep = store_path(8, "matm-dep");
+        let (root_nar, _) = rio_test_support::fixtures::make_nar(b"matm root");
+        let (dep_nar, _) = rio_test_support::fixtures::make_nar(b"matm dep");
+        let upstream = spawn_multi_upstream(
+            vec![
+                (root.clone(), root_nar, vec![dep.clone()]),
+                (dep.clone(), dep_nar, vec![]),
+            ],
+            "cache.metrics",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+        let seeded = seed_job(
+            &db.pool,
+            "matm-drv",
+            &[("out", root.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+        let ctx = make_ctx(db.pool.clone());
+        let outcome = execute_job(&ctx, &seeded.claimed).await;
+        assert!(
+            outcome_success(&outcome).is_some(),
+            "precondition: the execution succeeds, got {outcome:?}"
+        );
+
+        // The counters: one success execution, two pinned paths.
+        use metrics_util::debugging::DebugValue;
+        let mut executions: std::collections::BTreeMap<String, u64> = Default::default();
+        let mut pinned: u64 = 0;
+        for (ck, _, _, v) in snap.snapshot().into_vec() {
+            let DebugValue::Counter(c) = v else { continue };
+            let k = ck.key();
+            match k.name() {
+                "rio_store_materialization_executions_total" => {
+                    let outcome_label = k
+                        .labels()
+                        .find(|l| l.key() == "outcome")
+                        .map(|l| l.value().to_owned())
+                        .unwrap_or_default();
+                    *executions.entry(outcome_label).or_default() += c;
+                }
+                "rio_store_materialization_pinned_paths_total" => pinned += c,
+                _ => {}
+            }
+        }
+        assert_eq!(
+            executions.get("success").copied().unwrap_or(0),
+            1,
+            "one success execution counted; executions: {executions:?}"
+        );
+        assert_eq!(
+            pinned, 2,
+            "both closure members pinned at ingest are counted"
         );
     }
 }

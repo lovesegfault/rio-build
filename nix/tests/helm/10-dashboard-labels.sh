@@ -27,6 +27,8 @@ rio_controller_component_scaler_learned_ratio:cs
 rio_controller_component_scaler_observed_load:cs
 rio_scheduler_builds_total:outcome
 rio_scheduler_actor_cmd_seconds_bucket:cmd
+rio_scheduler_materialization_jobs_resolved_total:outcome
+rio_store_materialization_executions_total:outcome
 '
 
 scratch=$TMPDIR/dashlabels

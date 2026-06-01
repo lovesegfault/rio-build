@@ -457,6 +457,71 @@ spec:
               `kubectl get nodeclaims -o wide` to find the stuck object.
               See docs/ops/sla-model.typ#rionodeclaimpool-stuckterminating.
 
+        # Substitution-replacement Phase B (PD-20 / design §2.5): the
+        # parked-materialization backlog. The housekeeping re-evaluation
+        # arm resolves every parked job whose node has a buildable
+        # dependency closure from-source within one tick, so every job
+        # this gauge counts has NO from-source fallback (Broken closure
+        # evidence) — a dead or misconfigured upstream is the only thing
+        # between its builds and progress. Builds WAIT (never fail) while
+        # parked; this alert is the operator's cue to fix the upstream.
+        # The gauge is leader-published and pre-registered at 0 flag-on,
+        # so the expr has a series from boot; max() collapses the
+        # leader/old-leader series duplication across a failover.
+        # for: 15m — park backoffs start at 30 s with exponential
+        # doubling; 15 minutes of sustained backlog means the re-claim
+        # ladder keeps failing, not a transient upstream blip.
+        - alert: RioSchedulerMaterializationStalled
+          expr: max(rio_scheduler_materialization_stalled) > 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: materialization jobs parked >15m (upstream dead or misconfigured)
+            description: >-
+              {{`{{ $value | humanize }}`}} materialization job(s) have been
+              parked for over 15 minutes. These jobs' derivations have no
+              buildable dependency closure, so only upstream recovery can
+              unblock them; their builds wait (never fail) while parked.
+              Check the tenant's upstream cache configuration and health
+              (rio_store_substitute_total{result="error"} rate, the store
+              logs for the upstream URL), then either fix the upstream or
+              cancel the affected builds.
+
+        # Substitution-replacement Phase B (T-6.2; the CE-D1 deployment-
+        # checklist row's alert, extended to the materialization tables):
+        # rio_scheduler_evidence_write_fenced_total counts evidence writes
+        # refused by the claims-floor generation fence — topdown/closure
+        # stamps, status persists, merge transactions, AND (since Phase A)
+        # materialization job-table/wanted-relation writes, which carry
+        # the same fence. On a replica that just lost the lease, a BURST
+        # of refusals during the failover window is the fence WORKING
+        # (deposed-leader writes are now no-ops). On the current leader it
+        # must be zero. The discrimination is temporal, not per-pod: a
+        # failover burst stops within seconds (the deposed actor stops
+        # serving on LeaderLost), so a rate that stays nonzero across
+        # 15 minutes means the SERVING leader is being fenced — a
+        # generation-capture bug or a PG floor regression. Investigate
+        # immediately: evidence writes (including materialization job
+        # resolutions) are being silently dropped.
+        - alert: RioSchedulerEvidenceWriteFenced
+          expr: sum(rate(rio_scheduler_evidence_write_fenced_total[5m])) > 0
+          for: 15m
+          labels:
+            severity: critical
+          annotations:
+            summary: evidence writes are being fenced for >15m (not a failover burst)
+            description: >-
+              rio_scheduler_evidence_write_fenced_total has been increasing
+              for over 15 minutes ({{`{{ $value | humanize }}`}}/s). A
+              failover burst self-clears in seconds; a sustained rate means
+              the serving leader's writes (derivation evidence AND
+              materialization job state) are being refused by the
+              claims-floor fence — a generation-capture bug or a PG floor
+              regression. Check which pod holds the Lease, its
+              serving_generation log lines, and the
+              leader_generation_claims table.
+
         # Forward-compat: rio_store_putpath_retries_total lands in P0539d.
         # Until then this expr evaluates empty (no series) → never fires.
         # >10/s sustained means S3/PG backpressure or the chunk-dedup

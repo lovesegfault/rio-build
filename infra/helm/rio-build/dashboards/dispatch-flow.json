@@ -152,6 +152,83 @@
         "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull"]},
         "tooltip": {"mode": "multi", "sort": "desc"}
       }
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Materialization job lifecycle",
+      "description": "Substitution-replacement (Phase B): jobs created (by origin) vs claims delivered to store replicas vs terminal resolutions (by outcome). created >> claimed = store executors not keeping up or partitioned from the leader; claimed >> resolved = executions failing or reports not landing; a rising unobtainable/from_source share = upstream losing paths.",
+      "gridPos": {"x": 0, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "sum(rate(rio_scheduler_materialization_jobs_created_total[5m]))",
+          "legendFormat": "created",
+          "refId": "A"
+        },
+        {
+          "expr": "sum(rate(rio_scheduler_materialization_claims_total[5m]))",
+          "legendFormat": "claimed",
+          "refId": "B"
+        },
+        {
+          "expr": "sum by (outcome) (rate(rio_scheduler_materialization_jobs_resolved_total[5m]))",
+          "legendFormat": "resolved: {{outcome}}",
+          "refId": "C"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Materialization: stalled (parked) jobs + store executions",
+      "description": "rio_scheduler_materialization_stalled — parked jobs with NO from-source fallback (only upstream recovery unblocks them; the RioSchedulerMaterializationStalled alert fires at >0 for 15m). Overlaid with the store-side execution outcome rates (rio_store_materialization_executions_total): a rising infra share explains parks; a rising unobtainable share means paths left the upstreams.",
+      "gridPos": {"x": 12, "y": 24, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "${datasource}"},
+      "targets": [
+        {
+          "expr": "max(rio_scheduler_materialization_stalled)",
+          "legendFormat": "stalled (parked)",
+          "refId": "A"
+        },
+        {
+          "expr": "sum by (outcome) (rate(rio_store_materialization_executions_total[5m]))",
+          "legendFormat": "exec: {{outcome}}",
+          "refId": "B"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"drawStyle": "line", "lineInterpolation": "linear", "fillOpacity": 10, "spanNulls": false}
+        },
+        "overrides": [
+          {
+            "matcher": {"id": "byName", "options": "stalled (parked)"},
+            "properties": [
+              {"id": "custom.fillOpacity", "value": 40},
+              {"id": "color", "value": {"mode": "fixed", "fixedColor": "orange"}}
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "right", "showLegend": true, "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi", "sort": "desc"}
+      }
     }
   ]
 }

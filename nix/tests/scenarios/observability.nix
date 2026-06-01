@@ -135,6 +135,14 @@ pkgs.testers.runNixOSTest {
             # it is present even at 0 — the same set-every-tick
             # registration mechanism as rio_scheduler_open_attempts.
             "rio_scheduler_materialization_stalled",
+            # T-6.2 lifecycle counters: pre-registered at 0 by the
+            # flag-on actor construction (the gc-collect .absolute(0)
+            # pattern) so alerts/dashboards have series from boot —
+            # present here even though this scenario's chain build is
+            # not substitutable and never increments them.
+            "rio_scheduler_materialization_claims_total",
+            "rio_scheduler_materialization_jobs_created_total",
+            "rio_scheduler_materialization_jobs_resolved_total",
         ],
         (${gatewayHost}, 9092, "store"): [
             "rio_store_put_path_total",
@@ -144,6 +152,11 @@ pkgs.testers.runNixOSTest {
             # wired end-to-end; the floor assertion below proves the
             # marker lines actually arrived.
             "rio_store_log_ingest_lines_total",
+            # T-6.2: the store-side materialization lifecycle counters,
+            # pre-registered at 0 by the flag-on executor spawn (the
+            # deployment default since the T-2.3 flip).
+            "rio_store_materialization_executions_total",
+            "rio_store_materialization_pinned_paths_total",
         ],
     }
     with subtest("metrics-registered: spec'd metrics present on /metrics"):

@@ -326,10 +326,16 @@ impl DagActor {
     /// Note a materialization claim in the in-memory view (called by
     /// the pull mint after the fenced transaction committed for a
     /// materialization-kind delivery). Reachable only flag-on.
+    // r[impl obs.metric.scheduler]
     pub(super) fn note_materialization_claimed(&mut self, drv_hash: &DrvHash, holder: &ExecutorId) {
         if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
             entry.claimed_by = Some(holder.clone());
         }
+        // T-6.2 lifecycle counter: one increment per delivered claim
+        // (the open attempt's mint committed — this is called only on
+        // that path). Pairs with jobs_created_total (supply) and
+        // jobs_resolved_total (drain) for the dashboard rates.
+        metrics::counter!("rio_scheduler_materialization_claims_total").increment(1);
     }
 
     // r[impl sched.materialize.job]
@@ -997,6 +1003,7 @@ impl DagActor {
 
     /// Resolve the job terminally (fenced, exec_id-keyed, at-most-once)
     /// and note a fence refusal.
+    // r[impl obs.metric.scheduler]
     async fn resolve_materialization_job(
         &mut self,
         job_id: Uuid,
@@ -1009,7 +1016,18 @@ impl DagActor {
             .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
             .await
         {
-            Ok(crate::db::FencedWrite::Applied(_)) => {
+            Ok(crate::db::FencedWrite::Applied(rows)) => {
+                // T-6.2 lifecycle counter: one increment per APPLIED
+                // terminal resolution, labeled by outcome. rows == 0 is
+                // the at-most-once no-op (already resolved) and never
+                // double-counts.
+                if rows > 0 {
+                    metrics::counter!(
+                        "rio_scheduler_materialization_jobs_resolved_total",
+                        "outcome" => Self::resolution_outcome_label(to_state)
+                    )
+                    .increment(1);
+                }
                 // r[impl sched.materialize.pinning]
                 // §5.3 release site (i): the resolution may have made
                 // this job's pins releasable (resolved AND no live
@@ -1026,6 +1044,23 @@ impl DagActor {
             Err(e) => {
                 warn!(%job_id, error = %e, "materialization job resolve failed");
             }
+        }
+    }
+
+    /// The `outcome` label vocabulary for
+    /// `rio_scheduler_materialization_jobs_resolved_total` — the
+    /// JobState terminal alphabet minus its `resolved_`/state prefixes
+    /// (Pending is unreachable here; resolve targets are terminal by
+    /// the caller's debug_assert).
+    fn resolution_outcome_label(state: crate::state::JobState) -> &'static str {
+        use crate::state::JobState;
+        match state {
+            JobState::ResolvedSuccess => "success",
+            JobState::ResolvedFromSource => "from_source",
+            JobState::ResolvedUnobtainable => "unobtainable",
+            JobState::Cancelled => "cancelled",
+            JobState::Obsolete => "obsolete",
+            JobState::Pending => "pending",
         }
     }
 

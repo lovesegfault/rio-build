@@ -91,6 +91,19 @@ pub fn spawn_materialization_executor(
         authenticated = service_signer.is_some(),
         "materialization executor enabled; spawning claim loops"
     );
+    // T-6.2 (Phase B): pre-register the executor lifecycle counters at 0
+    // (the gc-collect pre-registration pattern) so dashboards/alerts have
+    // series from boot and the metrics-registered VM assertion sees them
+    // before the first job executes. Flag-off this whole function returns
+    // above — the flag-off /metrics surface stays byte-identical.
+    for outcome in ["success", "unobtainable", "infra"] {
+        metrics::counter!(
+            "rio_store_materialization_executions_total",
+            "outcome" => outcome
+        )
+        .absolute(0);
+    }
+    metrics::counter!("rio_store_materialization_pinned_paths_total").absolute(0);
     let mut spawned = 0;
     for worker in 0..cfg.executor_concurrency {
         let transport = match client::SchedulerTransport::connect_lazy(

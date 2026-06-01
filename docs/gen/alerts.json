@@ -13,6 +13,8 @@
     "RioNodeclaimPoolStuckTerminating",
     "RioSchedulerActorSlow",
     "RioSchedulerAttemptEstablishmentCluster",
+    "RioSchedulerEvidenceWriteFenced",
+    "RioSchedulerMaterializationStalled",
     "RioSlaHwCostStale",
     "RioSlaPredictionDrift",
     "RioSlaPriorDivergenceClamped",
