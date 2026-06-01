@@ -102,6 +102,9 @@ pub(crate) async fn insert_manifest_uploading(
 ///
 /// `castore` is `None` only in metadata-layer tests that seed
 /// non-NAR placeholder bytes; such paths are not GetPath-servable.
+///
+/// `tenant` is the uploader's resolved tenant for the `path_tenants`
+/// junction (`r[store.put.tenant-junction]`); `None` writes no row.
 #[instrument(skip(pool, info, blob_stream, castore), fields(store_path = %info.store_path.as_str(), blob_len = blob_stream.len()))]
 pub(crate) async fn complete_manifest_inline(
     pool: &PgPool,
@@ -109,10 +112,18 @@ pub(crate) async fn complete_manifest_inline(
     claim: uuid::Uuid,
     blob_stream: Bytes,
     castore: Option<&crate::cas::ParsedNar>,
+    tenant: Option<uuid::Uuid>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, Some(blob_stream.as_ref()), castore)
-        .await?;
+    super::complete_manifest_in_conn(
+        &mut tx,
+        info,
+        claim,
+        Some(blob_stream.as_ref()),
+        castore,
+        tenant,
+    )
+    .await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "inline upload completed");
     Ok(())

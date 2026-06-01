@@ -134,6 +134,7 @@ impl StoreServiceImpl {
         let n_outputs = validated.outputs.len();
 
         // r[impl store.castore.tenant-scope]
+        // r[impl store.put.tenant-junction]
         // Tenant for the `path_tenants` junction writes. The production
         // caller is the builder, which authenticates with the HMAC
         // assignment token only (no gateway JWT), so this MUST fall
@@ -141,11 +142,10 @@ impl StoreServiceImpl {
         // castore read side uses — or every junction write in this RPC
         // is a no-op for the builder and the just-committed outputs are
         // invisible to (and unpinned for) their own tenant until the
-        // scheduler's best-effort completion upsert. P0591's broader
-        // ingest-ownership work (legacy PutPath/PutPathBatch, gateway,
-        // backfill) remains; this pulls only the chunked-upload
-        // fallback forward. Signing-key selection deliberately keeps
-        // using the JWT-only `auth.tenant_id` (unchanged behavior).
+        // scheduler's best-effort completion upsert. PutPath and
+        // PutPathBatch resolve their junction tenant the same way.
+        // Signing-key selection deliberately keeps using the JWT-only
+        // `auth.tenant_id` (unchanged behavior).
         let junction_tenant = super::resolve_tenant_id(auth.tenant_id, auth.hmac_claims.as_ref());
 
         // The backend and cache are constructed together (`None` iff the
@@ -370,9 +370,10 @@ impl StoreServiceImpl {
     /// Used by the all-outputs-skipped early returns, where there is no
     /// commit transaction to carry the inserts; the spec requires the
     /// junction for idempotent-skipped outputs too (the prior commit
-    /// may have been another tenant's, or a legacy `PutPath` that
-    /// never wrote it). Idempotent; a `None` tenant writes nothing.
+    /// may belong to another tenant or predate tenancy). Idempotent; a
+    /// `None` tenant writes nothing.
     // r[impl store.castore.tenant-scope]
+    // r[impl store.put.tenant-junction]
     async fn insert_path_tenants_for_all(
         &self,
         output_claims: &[OutputClaim],

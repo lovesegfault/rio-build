@@ -179,6 +179,19 @@ pub enum PersistError {
 /// Caller must hold a [`PlaceholderClaim::Owned`] for
 /// `info.store_path_hash`. Emits `rio_store_chunk_dedup_ratio` on the
 /// chunked branch.
+///
+/// `tenant` is the uploader's resolved tenant for the `path_tenants`
+/// junction (`r[store.put.tenant-junction]`), written atomically with
+/// the completion on both branches; `None` writes no row. Upload RPCs
+/// pass the caller's resolved tenant; the substituter MUST pass `None`
+/// — substituted paths are signature-visible cross-tenant
+/// (`r[store.substitute.tenant-sig-visibility+2]`), and a junction row
+/// here would launder them into "built"
+/// (`r[store.substitute.find-missing-gated]`).
+// Parameter list mirrors the completion transaction's inputs (same
+// shape as `cas::put_chunked`); a struct would relocate the same
+// fields without removing any.
+#[allow(clippy::too_many_arguments)]
 pub async fn persist_nar(
     pool: &PgPool,
     chunk_backend: Option<&Arc<dyn ChunkBackend>>,
@@ -187,6 +200,7 @@ pub async fn persist_nar(
     nar_data: Vec<u8>,
     chunk_upload_max_concurrent: usize,
     hooks: IngestHooks,
+    tenant: Option<Uuid>,
 ) -> Result<(), PersistError> {
     // Derive the castore representation (entries + Directory DAG +
     // encoded index) ONCE, while the NAR bytes are in hand. Both
@@ -211,6 +225,7 @@ pub async fn persist_nar(
             &nar_data,
             &parsed,
             chunk_upload_max_concurrent,
+            tenant,
         )
         .await
         .map_err(PersistError::Chunked)?;
@@ -224,9 +239,16 @@ pub async fn persist_nar(
         metrics::gauge!("rio_store_chunk_dedup_ratio").set(stats.dedup_ratio());
     } else {
         let blob = parsed.blob_stream(&nar_data);
-        metadata::complete_manifest_inline(pool, info, claim, Bytes::from(blob), Some(&parsed))
-            .await
-            .map_err(PersistError::Inline)?;
+        metadata::complete_manifest_inline(
+            pool,
+            info,
+            claim,
+            Bytes::from(blob),
+            Some(&parsed),
+            tenant,
+        )
+        .await
+        .map_err(PersistError::Inline)?;
         debug!(store_path = %info.store_path.as_str(), "{}: inline upload completed", hooks.ctx_label);
     }
     Ok(())

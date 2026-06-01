@@ -127,6 +127,11 @@ impl StoreServiceImpl {
         });
 
         let auth = self.authorize(&request)?;
+        // r[impl store.put.tenant-junction]
+        // Same caller→tenant resolution the castore read side uses
+        // (resolve_tenant_id doc): JWT sub first (gateway), else the HMAC
+        // assignment token's tenant claim (builder/worker).
+        let junction_tenant = super::resolve_tenant_id(auth.tenant_id, auth.hmac_claims.as_ref());
         let mut stream = request.into_inner();
 
         let raw_info = common::read_first_metadata(&mut stream).await?;
@@ -166,6 +171,11 @@ impl StoreServiceImpl {
                 }
                 Ok(None) => {
                     common::drain_stream("PutPath", &mut stream).await;
+                    // Idempotent skip still grants the skipping tenant
+                    // castore read access + a GC pin
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, junction_tenant)
+                        .await?;
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
                 Err(e) => {
@@ -201,12 +211,18 @@ impl StoreServiceImpl {
                         Some(self.spawn_placeholder_guard(store_path_hash.clone(), c));
                     claim = Some(c);
                 }
-                None => return Ok(Response::new(PutPathResponse { created: false })),
+                None => {
+                    // Same idempotent-skip junction write as the IA arm
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, junction_tenant)
+                        .await?;
+                    return Ok(Response::new(PutPathResponse { created: false }));
+                }
             }
         }
         let claim = claim.expect("claim populated in IA pre-ingest or CA post-ingest arm");
 
-        self.finalize_single(info, claim, nar_data, auth.tenant_id)
+        self.finalize_single(info, claim, nar_data, auth.tenant_id, junction_tenant)
             .await?;
         if let Some(g) = placeholder_guard {
             g.defuse();

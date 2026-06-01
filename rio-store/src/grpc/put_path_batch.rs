@@ -91,6 +91,11 @@ impl StoreServiceImpl {
         });
 
         let auth = self.authorize(&request)?;
+        // r[impl store.put.tenant-junction]
+        // Same caller→tenant resolution the castore read side uses
+        // (resolve_tenant_id doc): JWT sub first (gateway), else the HMAC
+        // assignment token's tenant claim (builder/worker).
+        let junction_tenant = super::resolve_tenant_id(auth.tenant_id, auth.hmac_claims.as_ref());
         let mut stream = request.into_inner();
 
         // --- Phase 1: drain the stream, route by output_index ---
@@ -188,7 +193,7 @@ impl StoreServiceImpl {
 
         // --- Phase 3: ONE transaction, N completions, one commit ---
         let created = match self
-            .commit_batch(&mut outputs, resolved_signer.as_ref())
+            .commit_batch(&mut outputs, resolved_signer.as_ref(), junction_tenant)
             .await
         {
             Ok(c) => c,
@@ -350,12 +355,21 @@ impl StoreServiceImpl {
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
     /// return; caller's `PlaceholderGuard`s reap placeholders on Drop +
     /// staged chunk refcounts (committed in phase-2's separate txs).
+    ///
+    /// `junction_tenant` is recorded as a `path_tenants` row for every
+    /// output — both fresh completions (atomic with the visibility
+    /// flip, inside `complete_manifest_in_conn`) and `already_complete`
+    /// skips (the prior commit may belong to another tenant or predate
+    /// tenancy; the skipping caller still needs castore read access and
+    /// a GC pin).
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.tenant-junction]
     async fn commit_batch(
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
         resolved_signer: Option<&(crate::signing::Signer, bool)>,
+        junction_tenant: Option<uuid::Uuid>,
     ) -> Result<Vec<bool>, Status> {
         let mut tx = self
             .pool
@@ -407,6 +421,21 @@ impl StoreServiceImpl {
         // transaction.
         for (idx, accum) in outputs.iter_mut() {
             if accum.already_complete {
+                // Idempotent skip still grants the skipping tenant
+                // castore read access + a GC pin, atomic with the batch
+                // commit (r[store.put.tenant-junction]). Tolerant
+                // variant: a tenant deleted mid-upload skips the write
+                // instead of failing the whole batch.
+                if let Err(e) = metadata::insert_path_tenant_skipping_deleted_in_tx(
+                    &mut tx,
+                    &accum.store_path_hash,
+                    junction_tenant,
+                )
+                .await
+                {
+                    drop(tx);
+                    return Err(putpath_metadata_status("PutPathBatch: path_tenants", e));
+                }
                 continue;
             }
             let mut info = accum.info.clone().expect("validated in phase 2");
@@ -427,6 +456,7 @@ impl StoreServiceImpl {
                 claim,
                 inline_blob.as_deref(),
                 Some(&castore),
+                junction_tenant,
             )
             .await
             {

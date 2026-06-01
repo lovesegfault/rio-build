@@ -273,6 +273,10 @@ impl PutChunkedStats {
     store_path = %info.store_path.as_str(),
     nar_size = nar_data.len(),
 ))]
+// Parameter list mirrors the completion transaction's inputs (same
+// shape as `commit_chunked_output_in_conn`); a struct would relocate
+// the same fields without removing any.
+#[allow(clippy::too_many_arguments)]
 pub async fn put_chunked(
     pool: &PgPool,
     backend: &Arc<dyn ChunkBackend>,
@@ -281,11 +285,14 @@ pub async fn put_chunked(
     nar_data: &[u8],
     parsed: &ParsedNar,
     max_concurrent: usize,
+    tenant: Option<uuid::Uuid>,
 ) -> anyhow::Result<PutChunkedStats> {
     let stats = stage_chunked(pool, backend, info, claim, nar_data, parsed, max_concurrent).await?;
 
     // --- Step 5: Complete ---
-    if let Err(e) = metadata::complete_manifest_chunked(pool, info, claim, Some(parsed)).await {
+    if let Err(e) =
+        metadata::complete_manifest_chunked(pool, info, claim, Some(parsed), tenant).await
+    {
         warn!(error = %e, "complete_manifest_chunked failed; rolling back");
         // Chunks are uploaded to S3. reap_one decrements refcounts →
         // GC-eligible. We DON'T delete from S3 — GC sweep's job.
