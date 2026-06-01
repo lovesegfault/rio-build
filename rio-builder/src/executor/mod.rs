@@ -1162,16 +1162,35 @@ async fn run_native_lifecycle(
         netrc: None,
     };
 
-    let plan = match glue::derivation_into_request(
-        drv_path,
-        basic_drv,
-        input_paths,
-        input_metadata,
-        &paths,
-        &glue_opts,
-    ) {
-        Ok(plan) => plan,
-        Err(e) => {
+    // The glue is synchronous filesystem work against the FUSE-backed
+    // merged store (`exportReferencesGraph` closure expansion, `.drv`
+    // reads, `passAsFile` staging): a cold read can block for seconds.
+    // Run it on the blocking pool like its sibling stages (overlay
+    // setup/teardown, output processing). This matters structurally, not
+    // just for latency: tokio's worker count equals the pod's
+    // quota-clamped `available_parallelism()` (see `cgroup::nproc`), so a
+    // 1-CPU pod runs a single-worker runtime and a blocking call here
+    // would suspend the limit watchdogs, heartbeats, and every other task
+    // on that worker for the duration of the stall.
+    let drv_path_owned = drv_path.to_owned();
+    let basic_drv_owned = basic_drv.clone();
+    let input_paths_owned = input_paths.to_vec();
+    let input_metadata_owned = input_metadata.to_vec();
+    let glue_join = tokio::task::spawn_blocking(move || {
+        glue::derivation_into_request(
+            &drv_path_owned,
+            &basic_drv_owned,
+            &input_paths_owned,
+            &input_metadata_owned,
+            &paths,
+            &glue_opts,
+        )
+    })
+    .await;
+
+    let plan = match glue_join {
+        Ok(Ok(plan)) => plan,
+        Ok(Err(e)) => {
             // Input-shaped rejection: report through the normal result
             // channel (the caller maps Glue → InputRejected) after the
             // cgroup has been drained below. The one exception is a
@@ -1193,6 +1212,23 @@ async fn run_native_lifecycle(
             });
             return Ok(NativeOutcome {
                 build_result,
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+        Err(join_err) => {
+            // The glue task panicked — a worker-side bug, never an input
+            // property. Same teardown as the rejection arm; classified as
+            // sandbox setup (infra-transient) so the scheduler retries on
+            // another worker instead of poisoning the derivation.
+            monitors.stop();
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Err(ExecutorError::SandboxSetup(format!(
+                    "request glue task panicked: {join_err}"
+                ))),
                 peak_memory_bytes: 0,
                 peak_cpu_cores: 0.0,
                 final_line_count: opts.batcher_seed,
