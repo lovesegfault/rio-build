@@ -110,6 +110,25 @@ pub(crate) enum GlueError {
     )]
     ExportRefsDrvOutputMissing { drv: String, path: String },
 
+    /// The reference metadata reachable from an `exportReferencesGraph`
+    /// target contains a reference cycle (other than a self-reference).
+    /// CppNix can never face this: its local store's `registerValidPaths`
+    /// topological sort makes cyclic metadata unrepresentable, so there is
+    /// no defined oracle output to produce. rio-store deliberately admits
+    /// cycles (for GC reclamation), which moves the rejection here — and it
+    /// MUST stay a permanent input rejection: classifying it as
+    /// worker-transient would convert hostile metadata into an infinite
+    /// retry storm. The blame is on the registered *metadata*, not on the
+    /// derivation being built (its author may be the squatter's victim).
+    // r[impl builder.exec.refs-graph-acyclic]
+    #[error(
+        "exportReferencesGraph: the reference metadata of the requested closure is cyclic \
+         (store metadata no Nix toolchain could have produced); paths involved: {}{}",
+        paths.iter().take(8).cloned().collect::<Vec<_>>().join(", "),
+        if paths.len() > 8 { format!(" (+{} more)", paths.len() - 8) } else { String::new() }
+    )]
+    ExportRefsCyclicMetadata { paths: Vec<String> },
+
     #[error("exportReferencesGraph value is malformed (expected `name path` pairs): {value}")]
     ExportRefsMalformed { value: String },
 
@@ -210,6 +229,12 @@ impl GlueError {
     /// rather than of the derivation. The executor maps these to its
     /// infra-transient bucket so the build is retried elsewhere instead
     /// of being permanently rejected.
+    ///
+    /// This set MUST NOT be widened to cover structural metadata problems
+    /// — in particular [`GlueError::ExportRefsCyclicMetadata`]: cyclic
+    /// metadata is identical on every worker, so transient classification
+    /// would turn one hostile registration into an unbounded retry storm
+    /// (the exact failure mode the cycle rejection exists to prevent).
     pub(crate) fn is_transient_io(&self) -> bool {
         matches!(self, GlueError::ExportRefsDrvIo { .. })
     }

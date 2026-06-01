@@ -30,8 +30,15 @@
 //! and size) — no store round-trips; the only file access is reading
 //! `.drv` text from the already-materialized input store during the
 //! expansion above.
+//!
+//! All graph traversal (closure expansion, cycle detection, closure
+//! sizing) is delegated to [`rio_nix::closure`] — this module contains
+//! zero hand-rolled graph loops. Cyclic reference metadata, which
+//! rio-store can represent but CppNix's local store cannot, is rejected
+//! fail-closed as the tenant's input error (never worker-transient): see
+//! `closure_of`'s cycle gate.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use rio_nix::derivation::Derivation;
@@ -98,41 +105,44 @@ impl<'a> ClosureIndex<'a> {
         self
     }
 
+    /// The references of an index entry, as `&'a str` borrowed from the
+    /// metadata (the resolver shape `rio_nix::closure` walks over).
+    fn refs_of_known(info: &'a ValidatedPathInfo) -> impl Iterator<Item = &'a str> {
+        info.references.iter().map(|r| r.as_str())
+    }
+
     /// The closure of `targets` (BFS over references), all of which must
     /// lie inside the build's input closure. Returned sorted (store-path
     /// order), which is also the order CppNix's `StorePathSet` iterates.
+    ///
+    /// All graph traversal is delegated to [`rio_nix::closure`]
+    /// (cycle-safe by construction); this function owns only the
+    /// CppNix-mirroring policy: target normalization, the input-closure
+    /// containment gate, `.drv` output expansion, and the fail-closed
+    /// cycle rejection.
     fn closure_of(&self, targets: &[String]) -> Result<BTreeSet<&'a str>, GlueError> {
-        let mut closure: BTreeSet<&'a str> = BTreeSet::new();
-        let mut queue: Vec<&str> = Vec::new();
+        let mut set = rio_nix::closure::ClosureSet::new();
 
+        // CppNix normalizes each target with `toStorePath()` before the
+        // closure walk, so sub-paths inside a store path are valid
+        // targets; the containment gate then applies to the containing
+        // store path.
+        let mut roots: Vec<&'a str> = Vec::new();
         for t in targets {
-            // CppNix normalizes each target with `toStorePath()` before
-            // the closure walk, so sub-paths inside a store path are
-            // valid targets; the containment gate then applies to the
-            // containing store path.
             let root = to_store_path_root(t)?;
             let Some(canonical) = self.input_closure.get(root.as_str()) else {
                 return Err(GlueError::ExportRefsOutsideClosure { path: t.clone() });
             };
-            queue.push(canonical);
+            roots.push(canonical);
         }
 
-        while let Some(p) = queue.pop() {
-            let Some(info) = self.by_path.get(p) else {
-                // Every input-closure path has an entry in the build's
-                // input metadata index; a miss means the caller passed
-                // inconsistent inputs.
-                return Err(GlueError::ExportRefsMissingMetadata { path: p.to_owned() });
-            };
-            if !closure.insert(info.store_path.as_str()) {
-                continue;
-            }
-            for r in &info.references {
-                // Self-references are common (path referencing itself);
-                // the insert() above already de-duplicates cycles.
-                queue.push(r.as_str());
-            }
-        }
+        // BFS over references. Every reached path must have an entry in
+        // the build's input metadata index; a miss means the caller
+        // passed inconsistent inputs.
+        set.extend(roots, |p| match self.by_path.get(p) {
+            Some(info) => Ok(Self::refs_of_known(info)),
+            None => Err(GlueError::ExportRefsMissingMetadata { path: p.to_owned() }),
+        })?;
 
         // CppNix (`LocalDerivationGoal::exportReferences`) post-processes
         // the closure: every `.drv` file in it is parsed and the closure
@@ -142,7 +152,8 @@ impl<'a> ClosureIndex<'a> {
         // details mirrored exactly:
         //   - the expansion runs over a snapshot of the closure, so a
         //     `.drv` that only appears inside an expanded output closure
-        //     is not itself expanded;
+        //     is not itself expanded (`ClosureSet::extend` additionally
+        //     guarantees an already-visited path is never re-resolved);
         //   - an output without a statically-known path (content-
         //     addressed derivation) is an error, as in CppNix.
         // CppNix reads output closures from the global store DB; the
@@ -151,11 +162,7 @@ impl<'a> ClosureIndex<'a> {
         // deriving expression used `drvPath`-style context the resolver
         // has already pulled those outputs into the input set, so this
         // is the common case rather than an extra requirement.
-        let drvs: Vec<&'a str> = closure
-            .iter()
-            .copied()
-            .filter(|p| p.ends_with(".drv"))
-            .collect();
+        let drvs: Vec<&'a str> = set.members().filter(|p| p.ends_with(".drv")).collect();
         for drv_path in drvs {
             for (output, out_path) in self.drv_outputs(drv_path)? {
                 if out_path.is_empty() {
@@ -164,30 +171,51 @@ impl<'a> ClosureIndex<'a> {
                         output,
                     });
                 }
-                // BFS the output's closure out of the index. Unlike the
-                // requested graph targets, the output is not required to
-                // be inside the *input closure* (the registration file
-                // may name paths the sandbox cannot read — same as
-                // CppNix), but it must be known to the index.
-                let mut queue: Vec<&str> = vec![out_path.as_str()];
-                while let Some(p) = queue.pop() {
-                    let Some(info) = self.by_path.get(p) else {
-                        return Err(GlueError::ExportRefsDrvOutputMissing {
+                // The declared output and its whole closure must be known
+                // to the index. Unlike the requested graph targets, they
+                // are not required to be inside the *input closure* (the
+                // registration file may name paths the sandbox cannot
+                // read — same as CppNix).
+                let Some(out_info) = self.by_path.get(out_path.as_str()) else {
+                    return Err(GlueError::ExportRefsDrvOutputMissing {
+                        drv: drv_path.to_owned(),
+                        path: out_path.clone(),
+                    });
+                };
+                set.extend([out_info.store_path.as_str()], |p| {
+                    match self.by_path.get(p) {
+                        Some(info) => Ok(Self::refs_of_known(info)),
+                        None => Err(GlueError::ExportRefsDrvOutputMissing {
                             drv: drv_path.to_owned(),
                             path: p.to_owned(),
-                        });
-                    };
-                    if !closure.insert(info.store_path.as_str()) {
-                        continue;
+                        }),
                     }
-                    for r in &info.references {
-                        queue.push(r.as_str());
-                    }
-                }
+                })?;
             }
         }
 
-        Ok(closure)
+        // Fail-closed cycle gate, covering BOTH render forms (the flat
+        // registration text and the structured-attrs JSON call through
+        // here). Cyclic reference metadata has no defined CppNix
+        // equivalent — the oracle's local store cannot represent it — so
+        // reject it as the tenant-visible input error rather than emit
+        // bytes no Nix toolchain could have produced (or hang computing
+        // them, which is what the pre-rio_nix::closure implementation
+        // did).
+        // r[impl builder.exec.refs-graph-acyclic]
+        let cyclic = rio_nix::closure::find_cycle(set.members(), |p| {
+            self.by_path
+                .get(p)
+                .into_iter()
+                .flat_map(|info| Self::refs_of_known(info))
+        });
+        if !cyclic.is_empty() {
+            return Err(GlueError::ExportRefsCyclicMetadata {
+                paths: cyclic.iter().map(|p| (*p).to_owned()).collect(),
+            });
+        }
+
+        Ok(set.members().collect())
     }
 
     /// Read and parse a `.drv` from the materialized input store and
@@ -265,13 +293,23 @@ impl<'a> ClosureIndex<'a> {
     /// sorted maps.
     pub(crate) fn closure_info_json(&self, targets: &[String]) -> Result<Value, GlueError> {
         let closure = self.closure_of(targets)?;
-        // Per-path closure SETS are memoized across the member loop:
-        // closureInfo-style graphs (NixOS images) have thousands of
-        // members whose closures overlap almost entirely, and the naive
-        // per-member BFS is O(N²) traversals. set(p) = {p} ∪ ⋃ set(ref)
-        // computed once per path in dependency-first order; sizes are
-        // then a sum over the memoized set.
-        let mut memo: BTreeMap<&str, std::rc::Rc<BTreeSet<&str>>> = BTreeMap::new();
+        // Per-member closure sizes, computed by rio_nix::closure with one
+        // reusable scratch set: closureInfo-style graphs (NixOS images)
+        // have thousands of members whose closures overlap almost
+        // entirely, and holding a memoized closure SET per member is
+        // O(N²) memory. Paths outside the index contribute size 0 and no
+        // references (cannot happen for closure_of output, but keeps the
+        // sum defined).
+        let sizes = rio_nix::closure::closure_sizes(
+            closure.iter().copied(),
+            |p| {
+                self.by_path
+                    .get(p)
+                    .into_iter()
+                    .flat_map(|info| Self::refs_of_known(info))
+            },
+            |p| self.by_path.get(p).map_or(0, |info| info.nar_size),
+        );
         let arr: Vec<Value> = closure
             .iter()
             .map(|p| {
@@ -287,7 +325,7 @@ impl<'a> ClosureIndex<'a> {
                     "narHash": nar_hash.to_colon(),
                     "narSize": info.nar_size,
                     "references": refs,
-                    "closureSize": self.closure_size_memo(p, &mut memo),
+                    "closureSize": sizes[p],
                     // pathInfoToJSON marks every existing path as valid;
                     // every closure member here exists by construction.
                     "valid": true,
@@ -307,53 +345,6 @@ impl<'a> ClosureIndex<'a> {
             })
             .collect();
         Ok(Value::Array(arr))
-    }
-
-    /// Sum of `narSize` over the closure of one path (which is fully
-    /// inside the index by construction — `closure_of` validated it),
-    /// using `memo` to share already-computed closure sets between
-    /// calls. Self-references are tolerated (a path is always in its
-    /// own set); store-path reference graphs are otherwise acyclic.
-    fn closure_size_memo(
-        &'a self,
-        path: &'a str,
-        memo: &mut BTreeMap<&'a str, std::rc::Rc<BTreeSet<&'a str>>>,
-    ) -> u64 {
-        // Iterative post-order: a path is finalized only after all its
-        // references are, so each set is built exactly once.
-        let mut stack: Vec<(&str, bool)> = vec![(path, false)];
-        while let Some((p, children_done)) = stack.pop() {
-            if memo.contains_key(p) {
-                continue;
-            }
-            let Some(info) = self.by_path.get(p) else {
-                // Outside the index (cannot happen for closure_of
-                // output); treat as empty so the sum stays defined.
-                memo.insert(p, std::rc::Rc::new(BTreeSet::new()));
-                continue;
-            };
-            if children_done {
-                let mut set: BTreeSet<&str> = BTreeSet::new();
-                set.insert(info.store_path.as_str());
-                for r in &info.references {
-                    if let Some(child) = memo.get(r.as_str()) {
-                        set.extend(child.iter().copied());
-                    }
-                }
-                memo.insert(p, std::rc::Rc::new(set));
-            } else {
-                stack.push((p, true));
-                for r in &info.references {
-                    if r.as_str() != p && !memo.contains_key(r.as_str()) {
-                        stack.push((r.as_str(), false));
-                    }
-                }
-            }
-        }
-        memo[path]
-            .iter()
-            .map(|p| self.by_path.get(p).map_or(0, |i| i.nar_size))
-            .sum()
     }
 }
 
@@ -780,6 +771,109 @@ mod tests {
         assert_eq!(arr[1]["closureSize"], serde_json::json!(60));
         assert_eq!(arr[2]["closureSize"], serde_json::json!(40));
         assert_eq!(arr[2]["narSize"], serde_json::json!(40));
+    }
+
+    /// The merged_bug_009 reproducer: mutually-referencing metadata
+    /// (A↔B, NOT a self-reference) must be rejected by both render
+    /// forms, naming the cyclic paths. On the pre-`rio_nix::closure`
+    /// implementation this test does not fail — it HANGS (the
+    /// closure-size memo recursed forever), which is why the cycle gate
+    /// and this test land in the same commit.
+    // r[verify builder.exec.refs-graph-acyclic]
+    #[test]
+    fn cyclic_reference_metadata_is_rejected_not_hung() {
+        let infos = vec![info(A, 10, &[B]), info(B, 20, &[A])];
+        let paths = vec![A.to_string(), B.to_string()];
+        let index = ClosureIndex::new(&infos, &paths);
+
+        let text_err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(
+                &text_err,
+                GlueError::ExportRefsCyclicMetadata { paths }
+                    if paths.contains(&A.to_string()) && paths.contains(&B.to_string())
+            ),
+            "registration_text: expected ExportRefsCyclicMetadata naming A and B, got {text_err}"
+        );
+
+        let json_err = index.closure_info_json(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(&json_err, GlueError::ExportRefsCyclicMetadata { .. }),
+            "closure_info_json: expected ExportRefsCyclicMetadata, got {json_err}"
+        );
+    }
+
+    /// Cycle rejection MUST stay a permanent input rejection. If it ever
+    /// becomes worker-transient, one hostile registration turns into an
+    /// unbounded retry storm — the exact failure mode being fixed.
+    // r[verify builder.exec.refs-graph-acyclic]
+    #[test]
+    fn cycle_rejection_is_permanent_not_transient() {
+        let infos = vec![info(A, 10, &[B]), info(B, 20, &[A])];
+        let paths = vec![A.to_string(), B.to_string()];
+        let index = ClosureIndex::new(&infos, &paths);
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(matches!(err, GlueError::ExportRefsCyclicMetadata { .. }));
+        assert!(
+            !err.is_transient_io(),
+            "cyclic metadata must never be classified infra-transient"
+        );
+    }
+
+    /// A cycle that is only reachable through a `.drv` output-closure
+    /// expansion is rejected identically — the gate runs after the full
+    /// expansion, not just over the directly-requested targets.
+    // r[verify builder.exec.refs-graph-acyclic]
+    #[test]
+    fn cycle_via_drv_expansion_is_rejected() {
+        // A → DRV; DRV's output DOUT → C; C ↔ OUT2 form the cycle.
+        let infos = vec![
+            info(A, 10, &[DRV]),
+            info(DRV, 5, &[]),
+            info(DOUT, 30, &[C]),
+            info(C, 40, &[OUT2]),
+            info(OUT2, 15, &[C]),
+        ];
+        let paths = vec![A.to_string(), DRV.to_string()];
+        let tmp = tempfile::tempdir().unwrap();
+        write_drv(tmp.path(), DRV, &[("out", DOUT, "", "")]);
+        let index = ClosureIndex::new(&infos, &paths).with_store_dir(tmp.path());
+
+        let err = index.registration_text(&[A.to_string()]).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                GlueError::ExportRefsCyclicMetadata { paths }
+                    if paths.contains(&C.to_string()) && paths.contains(&OUT2.to_string())
+            ),
+            "expected cycle naming C and OUT2, got {err}"
+        );
+    }
+
+    /// Diamond-shaped closures (shared dependencies) are not cycles and
+    /// must keep rendering — the false-positive trap for cycle gates.
+    #[test]
+    fn diamond_closure_is_not_misreported_as_cycle() {
+        // A → {B, DOUT}, B → C, DOUT → C, C → (nothing but itself).
+        let infos = vec![
+            info(A, 10, &[B, DOUT]),
+            info(B, 20, &[C]),
+            info(DOUT, 30, &[C]),
+            info(C, 40, &[C]),
+        ];
+        let paths = vec![
+            A.to_string(),
+            B.to_string(),
+            DOUT.to_string(),
+            C.to_string(),
+        ];
+        let index = ClosureIndex::new(&infos, &paths);
+        let v = index.closure_info_json(&[A.to_string()]).unwrap();
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 4);
+        // A's closure: 10 + 20 + 30 + 40; C counted once despite the
+        // diamond and its self-reference.
+        assert_eq!(arr[0]["closureSize"], serde_json::json!(100));
     }
 
     #[test]

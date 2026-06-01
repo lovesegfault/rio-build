@@ -523,6 +523,27 @@ fetcher component (#rref("fetcher.fetchurl.sandboxed")).
   `NIX_ATTRS_JSON_FILE`/`NIX_ATTRS_SH_FILE` alongside the base environment.
 ]
 
+#r("builder.exec.refs-graph-acyclic")[
+  `exportReferencesGraph` materialization MUST terminate with auxiliary
+  memory linear in the closure size, and MUST reject cyclic reference
+  metadata (any cycle other than a self-reference) as a permanent input
+  rejection naming the paths involved --- never as a worker-transient
+  failure. Both render forms --- the flat registration-text file and the
+  structured-attrs JSON array --- MUST reject identically, before any
+  graph output is produced.
+]
+
+CppNix never faces this case: its local store's `registerValidPaths` runs a
+topological sort that makes cyclic reference metadata unrepresentable, so
+`exportReferences` may assume acyclic input. rio-store deliberately admits
+cycles so GC can reclaim mutually-referencing garbage
+(#rref("store.gc.sweep-cycle-reclaim")), which moves the acyclicity check to
+the consumer. Transient classification would convert one hostile
+registration into an unbounded retry storm: the rejection is structurally
+excluded from the glue's transient-I/O bucket, and the traversal itself is
+delegated to `rio_nix::closure` (#rref("nix.closure.cycle-safe")) so no
+hand-rolled walk can reintroduce the hang.
+
 #r("builder.exec.ca-finalize")[
   Floating content-addressed outputs are built at deterministic scratch paths
   and finalized by the result pipeline in topological order: accumulated

@@ -464,4 +464,43 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, GlueError::StructuredAttrsNotObject));
     }
+
+    /// The structured-attrs path propagates the cycle rejection from the
+    /// closure walk: a derivation whose exportReferencesGraph target has
+    /// cyclic reference metadata is rejected (never hung, never rendered).
+    // r[verify builder.exec.refs-graph-acyclic]
+    #[test]
+    fn structured_attrs_propagates_cycle_rejection() {
+        use rio_nix::store_path::StorePath;
+        use rio_proto::validated::ValidatedPathInfo;
+
+        let p_x = "/nix/store/xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx-x";
+        let p_y = "/nix/store/yyyyyyyyyyyyyyyyyyyyyyyyyyyyyyyy-y";
+        let mk = |path: &str, reference: &str| ValidatedPathInfo {
+            store_path: StorePath::parse(path).unwrap(),
+            store_path_hash: vec![],
+            deriver: None,
+            nar_hash: [1u8; 32],
+            nar_size: 1,
+            references: vec![StorePath::parse(reference).unwrap()],
+            registration_time: 0,
+            ultimate: false,
+            signatures: vec![],
+            content_address: None,
+        };
+        // x → y → x: a two-cycle (not a self-reference).
+        let infos = vec![mk(p_x, p_y), mk(p_y, p_x)];
+        let closure_paths: Vec<String> = vec![p_x.to_string(), p_y.to_string()];
+        let index = ClosureIndex::new(&infos, &closure_paths);
+
+        let json = json!({
+            "exportReferencesGraph": {"closure": [p_x]}
+        });
+        let err = prepare_structured_attrs(&json, &["out".to_string()], &index, &BTreeMap::new())
+            .unwrap_err();
+        assert!(
+            matches!(err, GlueError::ExportRefsCyclicMetadata { .. }),
+            "expected cycle rejection through the structured-attrs path, got {err}"
+        );
+    }
 }
