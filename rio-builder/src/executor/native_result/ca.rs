@@ -37,9 +37,13 @@
 //! whose content does not change (no sibling hits, no self-reference)
 //! skip the restore entirely and are renamed in place.
 //!
-//! Inputs-addressed and fixed-output outputs pass through untouched
-//! (their references still get sibling-remapped so a non-CA output that
-//! refers to a CA sibling carries the final path).
+//! Mixed shapes (a floating-CA output next to an input-addressed or
+//! fixed-output sibling) are rejected outright — CppNix's
+//! `BasicDerivation::type()` refuses to even classify them ("can't mix
+//! derivation output types"), and finalizing one here would remap the
+//! non-CA sibling's references without ever rewriting its bytes. The
+//! request glue rejects the shape before planning; `from_outputs`
+//! re-checks it as defense in depth.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -70,6 +74,13 @@ impl FloatingCaSpec {
     /// Identify the floating-CA outputs of a derivation: `path` empty,
     /// `hash_algo` set, `hash` empty (a set hash would make it a
     /// fixed-output derivation, which is verified — not finalized).
+    ///
+    /// Rejects mixed shapes: when ANY output is floating-CA, EVERY output
+    /// must be (CppNix "can't mix derivation output types"). Defense in
+    /// depth — the request glue's `validate_output_type_shape` is the
+    /// primary gate; the pipeline must never finalize a shape where a
+    /// non-CA sibling's bytes would be left unrewritten.
+    // r[impl builder.exec.output-types-unmixed]
     pub(crate) fn from_outputs(outputs: &[DerivationOutput]) -> Result<Self, OutputRejection> {
         let mut methods = HashMap::new();
         for o in outputs {
@@ -93,6 +104,16 @@ impl FloatingCaSpec {
                 }
             };
             methods.insert(o.name().to_owned(), (recursive, algo));
+        }
+        if !methods.is_empty() && methods.len() != outputs.len() {
+            let other: Vec<String> = outputs
+                .iter()
+                .filter(|o| !methods.contains_key(o.name()))
+                .map(|o| o.name().to_owned())
+                .collect();
+            let mut floating: Vec<String> = methods.keys().cloned().collect();
+            floating.sort();
+            return Err(OutputRejection::MixedOutputTypes { floating, other });
         }
         Ok(Self { methods })
     }

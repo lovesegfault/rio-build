@@ -41,7 +41,7 @@ use std::time::Duration;
 use rio_exec::{
     ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
 };
-use rio_nix::derivation::{BasicDerivation, DerivationLike as _, StructuredEnv};
+use rio_nix::derivation::{BasicDerivation, DerivationLike as _, DerivationOutput, StructuredEnv};
 use rio_nix::store_path::{self, hash_placeholder};
 use rio_proto::validated::ValidatedPathInfo;
 
@@ -161,6 +161,23 @@ pub(crate) enum GlueError {
         output: String,
         path: String,
         message: String,
+    },
+
+    /// CppNix `BasicDerivation::type()` (derivations.cc): "can't mix
+    /// derivation output types". A floating content-addressed output
+    /// cannot coexist with any other output kind in one derivation.
+    /// Without this rule the result pipeline's CA finalization would
+    /// remap a non-CA sibling's *references* to the final CA paths but
+    /// never rewrite its *bytes* (only floating outputs are restored
+    /// through the rewriting sink), shipping a corrupt artifact whose
+    /// content still names scratch paths.
+    #[error(
+        "can't mix derivation output types: floating content-addressed output(s) {floating:?} \
+         cannot coexist with non-floating output(s) {other:?}"
+    )]
+    MixedOutputTypes {
+        floating: Vec<String>,
+        other: Vec<String>,
     },
 
     #[error("builtin:fetchurl derivation has no (non-empty) `url` attribute")]
@@ -365,9 +382,10 @@ pub(crate) fn derivation_into_request(
     paths: &SandboxPaths,
     opts: &SandboxOptions,
 ) -> Result<GluePlan, GlueError> {
-    // CppNix-parity fixed-output validation runs before ANY planning —
-    // including the builtin:fetchurl dispatch below, whose declared
-    // output path is just as tenant-controlled as a sandboxed FOD's.
+    // CppNix-parity shape rules run before ANY planning — including the
+    // builtin:fetchurl dispatch below, whose declared output path is
+    // just as tenant-controlled as a sandboxed FOD's.
+    validate_output_type_shape(drv)?;
     validate_fixed_output_declarations(drv_path, drv)?;
 
     // builtin: builders never get a generic sandbox request — they
@@ -549,6 +567,44 @@ pub(crate) fn derivation_into_request(
         request,
         outputs,
     })))
+}
+
+/// CppNix `BasicDerivation::type()` shape rule (derivations.cc): output
+/// types cannot be mixed in one derivation. rio enforces the floating-CA
+/// half here — a derivation with any floating-CA output must be ALL
+/// floating-CA. (The fixed-output half — exactly one output, named
+/// `out` — is `validate_fixed_output_declarations`' shape rule, and
+/// plain IA + deferred-IA mixing is resolved upstream before the worker
+/// ever sees the derivation.)
+///
+/// Run before any planning so the sandbox, builtin, and differential
+/// paths all share it. The differential corpus cannot pin this rule:
+/// `nix-instantiate` refuses to even produce the mixed shape, which is
+/// exactly why an honest client can never hit this error.
+// r[impl builder.exec.output-types-unmixed]
+fn validate_output_type_shape(drv: &BasicDerivation) -> Result<(), GlueError> {
+    let is_floating =
+        |o: &DerivationOutput| o.path().is_empty() && o.has_hash_algo() && o.hash().is_empty();
+
+    let floating: Vec<String> = drv
+        .outputs()
+        .iter()
+        .filter(|o| is_floating(o))
+        .map(|o| o.name().to_owned())
+        .collect();
+    if floating.is_empty() {
+        return Ok(());
+    }
+    let other: Vec<String> = drv
+        .outputs()
+        .iter()
+        .filter(|o| !is_floating(o))
+        .map(|o| o.name().to_owned())
+        .collect();
+    if !other.is_empty() {
+        return Err(GlueError::MixedOutputTypes { floating, other });
+    }
+    Ok(())
 }
 
 /// CppNix-parity validation of declared fixed-output (`CAFixed`)
@@ -1071,6 +1127,79 @@ mod tests {
             }
             other => panic!("want FixedOutputBadShape, got: {other}"),
         }
+    }
+
+    /// CppNix `BasicDerivation::type()`: a floating-CA output cannot
+    /// coexist with any other output kind ("can't mix derivation output
+    /// types"). The glue rejects the shape before any planning, on every
+    /// path (sandbox, builtin, differential).
+    // r[verify builder.exec.output-types-unmixed]
+    #[test]
+    fn derivation_into_request_rejects_mixed_output_types() {
+        let (input_paths, input_meta) = closure();
+
+        // Floating-CA + declared-path IA sibling → rejected.
+        let mixed = mk_drv(
+            vec![
+                DerivationOutput::new("out", "", "r:sha256", "").unwrap(),
+                DerivationOutput::new("lib", OUT, "", "").unwrap(),
+            ],
+            &[
+                ("name", "demo"),
+                ("out", &hash_placeholder("out")),
+                ("lib", OUT),
+            ],
+        );
+        let err =
+            derivation_into_request(DRV, &mixed, &input_paths, &input_meta, &paths(), &opts())
+                .unwrap_err();
+        assert!(
+            matches!(err, GlueError::MixedOutputTypes { .. }),
+            "mixed floating-CA + IA must be rejected, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("can't mix derivation output types"),
+            "error carries the oracle's wording: {err}"
+        );
+
+        // All-floating still plans (two floating-CA outputs).
+        let all_floating = mk_drv(
+            vec![
+                DerivationOutput::new("out", "", "r:sha256", "").unwrap(),
+                DerivationOutput::new("doc", "", "r:sha256", "").unwrap(),
+            ],
+            &[
+                ("name", "demo"),
+                ("out", &hash_placeholder("out")),
+                ("doc", &hash_placeholder("doc")),
+            ],
+        );
+        assert!(
+            derivation_into_request(
+                DRV,
+                &all_floating,
+                &input_paths,
+                &input_meta,
+                &paths(),
+                &opts()
+            )
+            .is_ok(),
+            "all-floating-CA derivations keep planning"
+        );
+
+        // Single FOD still plans (fixed-output is its own legal type).
+        let zeros = "00".repeat(32);
+        let fod_out = fod_path("sha256", &zeros);
+        let fod = mk_drv(
+            vec![DerivationOutput::new("out", fod_out.as_str(), "sha256", zeros.as_str()).unwrap()],
+            &[("name", "demo"), ("out", fod_out.as_str())],
+        );
+        assert!(
+            derivation_into_request(DRV, &fod, &input_paths, &input_meta, &paths(), &opts())
+                .is_ok(),
+            "single fixed-output derivations keep planning"
+        );
     }
 
     #[test]

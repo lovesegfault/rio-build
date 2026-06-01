@@ -562,6 +562,23 @@ hand-rolled walk can reintroduce the hang.
   at planning time — never a re-derivation from the raw declared string.
 ]
 
+#r("builder.exec.output-types-unmixed")[
+  The request glue and the result pipeline MUST reject any derivation in
+  which a floating content-addressed output coexists with an output of any
+  other kind (CppNix `BasicDerivation::type()`: "can't mix derivation output
+  types").
+]
+
+Only floating outputs are restored through the CA finalization's rewriting
+sink; a non-CA sibling in the same derivation would get its *references*
+remapped to the final CA paths while its *bytes* still name the scratch
+paths — a corrupt artifact that no honest toolchain can produce
+(`nix-instantiate` refuses the shape, which is also why the differential
+corpus cannot pin this rule; unit tests against the oracle's wording are the
+evidence). The glue check covers the sandbox, builtin, and differential
+planning paths; the pipeline check is defense in depth for results that
+arrive without passing through planning.
+
 Defense in depth under #rref("sec.trust.workers-untrusted"): the
 authoritative rejection is the gateway's binding gate
 (#rref("gw.reject.output-path-mismatch+2")) and the scheduler's ingress shape

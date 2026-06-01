@@ -238,6 +238,21 @@ pub(crate) enum OutputRejection {
     Policy(#[from] PolicyViolation),
     #[error("reference scan of output '{output}' failed: {message}")]
     Scan { output: String, message: String },
+    /// CppNix `BasicDerivation::type()`: "can't mix derivation output
+    /// types". Defense-in-depth twin of the request glue's
+    /// `GlueError::MixedOutputTypes` — the pipeline must never finalize a
+    /// derivation whose floating-CA outputs coexist with other kinds,
+    /// because only floating outputs are restored through the rewriting
+    /// sink (a non-CA sibling would get its references remapped but its
+    /// bytes never rewritten).
+    #[error(
+        "can't mix derivation output types: floating content-addressed output(s) cannot \
+         coexist with other outputs (floating: {floating:?}, other: {other:?})"
+    )]
+    MixedOutputTypes {
+        floating: Vec<String>,
+        other: Vec<String>,
+    },
     #[error(
         "outputs reference each other in a cycle ({involving:?}); cyclic outputs cannot be \
          registered"
@@ -1355,11 +1370,18 @@ mod tests {
     }
 
     #[test]
-    fn mixed_ca_and_input_addressed_outputs() {
+    fn mixed_ca_and_input_addressed_outputs_rejected() {
         // "lib" is input-addressed (declared path); "out" is floating-CA.
-        // lib references out → after finalization lib's reference must
-        // point at out's final path, and lib's own path must be
-        // untouched.
+        // CppNix refuses this shape outright ("can't mix derivation output
+        // types", BasicDerivation::type()), and finalizing it here would
+        // remap lib's REFERENCES to out's final path while leaving lib's
+        // BYTES naming the scratch path — a corrupt artifact. The pipeline
+        // must reject, not half-finalize.
+        //
+        // The legal all-floating sibling case (references remapped AND
+        // bytes rewritten) is pinned by
+        // `floating_ca_sibling_reference_finalized`.
+        // r[verify builder.exec.output-types-unmixed]
         let lib_p = sp('a', "demo-lib");
         let out_scratch = sp('s', "demo");
         let (_tmp, outputs) = fake_outputs(&[
@@ -1367,16 +1389,15 @@ mod tests {
             ("out", &out_scratch, b"ca content"),
         ]);
         let drv = drv_from_aterm_ca(&[("lib", &lib_p, "", ""), ("out", "", "r:sha256", "")], &[]);
-        let processed = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap();
-        let lib = processed.outputs.iter().find(|o| o.name == "lib").unwrap();
-        let out = processed.outputs.iter().find(|o| o.name == "out").unwrap();
-        assert_eq!(lib.store_path, lib_p, "input-addressed path untouched");
-        assert!(lib.content_address.is_none());
-        assert_ne!(out.store_path, out_scratch);
-        assert_eq!(
-            lib.references,
-            vec![out.store_path.clone()],
-            "IA output's reference to the CA sibling is remapped to the final path"
+        let err = process_outputs(&drv, &outputs, my_uid(), &[]).unwrap_err();
+        assert!(
+            matches!(err, OutputRejection::MixedOutputTypes { .. }),
+            "mixed IA + floating-CA must be rejected, got: {err}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("can't mix derivation output types"),
+            "error carries the oracle's wording: {msg}"
         );
     }
 
