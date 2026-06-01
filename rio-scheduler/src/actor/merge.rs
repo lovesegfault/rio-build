@@ -583,7 +583,18 @@ impl DagActor {
         // prevents the leak where a cyclic submission left permanent entries
         // in build_events/build_sequences/builds with no cleanup scheduled.
         let edges_len = edges.len();
-        let merge_result = match self.dag.merge(build_id, &nodes, &edges, &traceparent) {
+        // Production entry into the merge gate: the store-evidence set
+        // is empty until the pre-merge enrichment
+        // (sched.merge.store-evidence-displacement) populates it for
+        // store-backed nodes whose settled identity conflict was
+        // verified against the store's own text-CA `.drv` bytes.
+        let merge_result = match self.dag.merge_with_evidence(
+            build_id,
+            &nodes,
+            &edges,
+            &traceparent,
+            &std::collections::HashSet::new(),
+        ) {
             Ok(r) => r,
             Err(e) => {
                 // Best-effort: clean up the orphan build row.
@@ -987,7 +998,7 @@ impl DagActor {
         // both sides are driven by displaced_prior_interest so they
         // cannot diverge. Runs after the point of no return (the build
         // is already committed), so a later rollback can no longer occur.
-        // r[impl sched.merge.authoritative-conflict+5]
+        // r[impl sched.merge.authoritative-conflict+6]
         let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
             let interest = self.displaced_prior_interest(merge_result, hash, ingest.build_id);
@@ -2300,11 +2311,19 @@ impl DagActor {
                     // resolve only at dispatch time).
                     ca_modular_hash: node.ca_modular_hash,
                     // r[impl sched.derivation.evidence-rank]
-                    // Same pure shape mapping as try_from_node — the
-                    // persisted rank and the in-memory rank are
-                    // computed by the SAME function from the SAME
-                    // node, so they cannot disagree at creation.
-                    evidence_rank: crate::state::DefinitionEvidence::from_node_shape(node),
+                    // Read from the in-memory node the merge just
+                    // created — NOT recomputed from shape — so a
+                    // store-evidence-raised creation
+                    // (sched.merge.evidence-ranked-displacement
+                    // PathBoundBytes standing) persists the same rank
+                    // the DAG carries. The shape fallback is defensive
+                    // only: the node was inserted by this merge, so the
+                    // lookup cannot miss.
+                    evidence_rank: self
+                        .dag
+                        .node(node.drv_hash.as_str())
+                        .map(|s| s.evidence)
+                        .unwrap_or_else(|| crate::state::DefinitionEvidence::from_node_shape(node)),
                 }
             })
             .collect();
@@ -2375,7 +2394,7 @@ impl DagActor {
         // builds only (terminal builds keep links and counts as settled
         // history), never the displacer. Per-hash loop is fine —
         // displacement is a rare, adversarial-only path.
-        // r[impl sched.merge.authoritative-conflict+5]
+        // r[impl sched.merge.authoritative-conflict+6]
         let mut evidence_persisted: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
             let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {

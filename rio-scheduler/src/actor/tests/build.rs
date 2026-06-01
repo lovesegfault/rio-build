@@ -1584,7 +1584,7 @@ async fn test_watch_build_terminal_resend_replays_captured_output_paths() -> Tes
     // that RECOMPUTED from the DAG would observe different paths than
     // the ones captured at completion. (Round 12 staged this with a
     // displacement of the Completed node; that operation is now
-    // structurally rejected — sched.merge.authoritative-conflict+5 — so
+    // structurally rejected — sched.merge.authoritative-conflict+6 — so
     // the divergence is injected directly.)
     let mutated = handle
         .debug_set_output_paths(

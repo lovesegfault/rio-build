@@ -2574,7 +2574,7 @@ fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
     n
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[test]
 fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2601,7 +2601,7 @@ fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[test]
 fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2620,7 +2620,7 @@ fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Res
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Displacement of a conflicting authoritative squat is scoped to
 /// terminal FAILURE states: the verifiable store-backed definition wins
 /// against a parked failure, but never against a settled success (see
@@ -2662,7 +2662,7 @@ fn conflicting_identity_displaces_terminal_authoritative_node(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A conflicting store-backed submission against a SETTLED
 /// (Completed/Skipped) authoritative node is rejected, never displaces:
 /// the settled record — its identity, inline bytes, and interest
@@ -2700,7 +2700,7 @@ fn conflicting_identity_rejected_on_settled_authoritative_node(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[test]
 fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2724,7 +2724,7 @@ fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[test]
 fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2924,7 +2924,7 @@ fn authoritative_claim_without_evidence_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Match-displacement of a poison-locked squat: an identity-MATCHING
 /// store-backed submission must DISPLACE (not join) an authoritative
 /// node that sits in a terminal failure state no longer retriable on
@@ -2979,7 +2979,7 @@ fn fod_matching_identity_displaces_poisoned_over_budget_squat() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Match-displacement is scoped to LOCKED terminal failures only: a
 /// successfully finished authoritative node (Completed or Skipped)
 /// keeps the join semantics for an identity-matching store-backed
@@ -3015,7 +3015,7 @@ fn matching_identity_joins_completed_authoritative_node(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 // r[verify sched.merge.displaced-failure-reset+2]
 /// An UNDER-budget poisoned squat is still retriable on resubmit, so an
 /// identity-matching store-backed submission takes the normal
@@ -3135,7 +3135,7 @@ fn store_backed_resubmit_is_not_an_authority_takeover() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A merge that match-displaces a poison-locked squat but fails on a
 /// LATER node in the same submission must restore the squat exactly —
 /// the match-displacement rides the same rollback container as the
@@ -3182,7 +3182,7 @@ fn rollback_restores_a_match_displaced_poisoned_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node that is merely `Failed` (non-terminal — the retry machinery
 /// still owns it) cannot be silently redefined by different
@@ -3233,7 +3233,7 @@ fn authoritative_redefinition_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A byte-different authoritative submission DISPLACES an authoritative
 /// claim parked in a terminal failure state (Poisoned at any budget,
 /// Cancelled, DependencyFailed): the hook-fallback population submits
@@ -3298,7 +3298,7 @@ fn authoritative_redefinition_displaces_parked_terminal_failure(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A successfully finished authoritative definition (Completed or
 /// Skipped) is never redefined: byte-different authoritative content is
 /// still rejected, so an attacker cannot rewrite an already-built
@@ -3330,7 +3330,7 @@ fn authoritative_redefinition_still_rejected_after_success(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A merge that auth-displaces a poison-locked squat but fails on a
 /// LATER node in the same submission must restore the squat exactly —
 /// the auth-vs-auth displacement rides the same rollback container as
@@ -3374,7 +3374,7 @@ fn rollback_restores_an_auth_displaced_locked_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A poison-budget-exhausted authoritative squat is terminal and gets
 /// displaced by the conflicting verifiable (store-backed) definition —
 /// fresh node without inherited interest or failure history, surfaced in
@@ -3414,7 +3414,7 @@ fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Cancelled is terminal: a conflicting store-backed definition takes the
 /// displacement path (fresh node, no inherited interest), NOT the
 /// interest-carrying resubmit-reset.
@@ -3450,7 +3450,7 @@ fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Failed is NOT terminal (the retry machinery still owns it): a
 /// conflicting store-backed submission is rejected, not displaced.
 #[test]
@@ -3482,7 +3482,7 @@ fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A merge that displaces a poisoned-over-budget squat but fails on a
 /// LATER node in the same submission must restore the squat exactly
 /// (status, bytes, interest, poison accumulator) — displacement rides the
@@ -4385,7 +4385,7 @@ fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Floating-CA squat scenario: public attributes (system, output names,
 /// flags) are copyable from the victim's public derivation and floating-CA
 /// expected paths are empty by construction, so a store-backed submission
@@ -4423,7 +4423,7 @@ fn floating_ca_squat_without_evidence_conflicts_in_flight() -> anyhow::Result<()
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Once the no-evidence conflict target sits in a terminal FAILURE
 /// state, the store-backed definition displaces it instead of being
 /// rejected — same displacement semantics as any other
@@ -4460,7 +4460,7 @@ fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// Fixed-output derivations carry their content commitment in the expected
 /// output path (derived from the declared hash and bound to the bytes at
 /// ingress), so agreement on a non-empty path is sufficient evidence — no
@@ -4491,7 +4491,7 @@ fn fod_path_agreement_is_sufficient_evidence() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// The conflict gate must keep holding for a node REBUILT FROM PG after a
 /// leader failover (bug_007): `from_poisoned_row` restores the
 /// authoritative bytes/flag/identity, so a recovered poisoned squat is
@@ -4578,5 +4578,275 @@ fn recovered_poisoned_squat_keeps_authoritative_gate() -> anyhow::Result<()> {
     assert!(!node.drv_content_authoritative);
     assert_eq!(node.system, "aarch64-linux");
     assert_eq!(node.interested_builds, HashSet::from([victim]));
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// THE displacement primitive's verdict matrix: every cell of
+/// (victim anchoring × victim status × victim rank × displacer rank)
+/// that the contract distinguishes, asserted directly against
+/// `displace()` so the decision order (store-anchored → in-flight →
+/// settled-rank → displaced) and the rank rule cannot drift from the
+/// spec. Includes the deliberate strict-inequality cell: a settled
+/// `ContentBoundClaim` squat IS displaced by a `PathBoundBytes`
+/// displacer (its bytes were text-CA-bound at ingress — no store
+/// fetch needed), while `VerifiedBuilt` is unreachable by any
+/// displacer.
+#[rstest]
+// Store-anchored victims: categorical refusal, regardless of status or ranks.
+#[case::store_anchored_running(
+    false,
+    DerivationStatus::Running,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedStoreAnchored
+)]
+#[case::store_anchored_poisoned(
+    false,
+    DerivationStatus::Poisoned,
+    DefinitionEvidence::UnverifiedClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedStoreAnchored
+)]
+#[case::store_anchored_completed(
+    false,
+    DerivationStatus::Completed,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedStoreAnchored
+)]
+// In-flight victims: live and Failed (non-terminal) keep first-writer-wins.
+#[case::live_running(
+    true,
+    DerivationStatus::Running,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedInFlight
+)]
+#[case::live_failed(
+    true,
+    DerivationStatus::Failed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedInFlight
+)]
+#[case::live_ready(
+    true,
+    DerivationStatus::Ready,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::VerifiedBuilt,
+    DisplaceVerdict::RefusedInFlight
+)]
+// Terminal-failure victims: displaced REGARDLESS of rank (anti-squat).
+#[case::failure_poisoned_low_displacer(
+    true,
+    DerivationStatus::Poisoned,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+#[case::failure_cancelled(
+    true,
+    DerivationStatus::Cancelled,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+#[case::failure_dep_failed(
+    true,
+    DerivationStatus::DependencyFailed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::Displaced
+)]
+// Settled victims: strict-inequality rank rule.
+#[case::settled_echo_refused(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::UnverifiedClaim,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_equal_refused(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::ContentBoundClaim,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_strictly_outranked_displaced(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
+)]
+#[case::settled_skipped_strictly_outranked(
+    true,
+    DerivationStatus::Skipped,
+    DefinitionEvidence::ContentBoundClaim,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::Displaced
+)]
+#[case::settled_verified_built_unreachable(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::VerifiedBuilt,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+#[case::settled_path_bound_vs_path_bound(
+    true,
+    DerivationStatus::Completed,
+    DefinitionEvidence::PathBoundBytes,
+    DefinitionEvidence::PathBoundBytes,
+    DisplaceVerdict::RefusedSettledOutranked
+)]
+fn displace_verdict_matrix(
+    #[case] victim_authoritative: bool,
+    #[case] victim_status: DerivationStatus,
+    #[case] victim_rank: DefinitionEvidence,
+    #[case] displacer_rank: DefinitionEvidence,
+    #[case] expected: DisplaceVerdict,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let owner = Uuid::new_v4();
+    let node = if victim_authoritative {
+        authoritative_node("verdict", b"Derive-squat")
+    } else {
+        make_node("verdict", "x86_64-linux")
+    };
+    dag.merge(owner, &[node], &[], "")?;
+    {
+        let n = dag.nodes.get_mut("verdict").unwrap();
+        n.set_status_for_test(victim_status);
+        n.evidence = victim_rank;
+    }
+
+    let mut removed_retriable = Vec::new();
+    let mut displaced_scrubbed_edges = Vec::new();
+    let mut displaced = Vec::new();
+    let verdict = dag.displace(
+        &"verdict".into(),
+        displacer_rank,
+        &mut DisplacementBookkeeping {
+            removed_retriable: &mut removed_retriable,
+            displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+            displaced: &mut displaced,
+        },
+    );
+    assert_eq!(verdict, expected);
+
+    if expected == DisplaceVerdict::Displaced {
+        assert!(dag.node("verdict").is_none(), "victim removed");
+        assert_eq!(removed_retriable.len(), 1, "prior state rides rollback");
+        assert_eq!(removed_retriable[0].0.as_str(), "verdict");
+        assert_eq!(removed_retriable[0].1.status(), victim_status);
+        assert_eq!(displaced, vec![DrvHash::from("verdict")]);
+    } else {
+        let n = dag.node("verdict").expect("refusal leaves the victim");
+        assert_eq!(n.status(), victim_status, "victim untouched");
+        assert_eq!(n.evidence, victim_rank, "victim rank untouched");
+        assert!(removed_retriable.is_empty());
+        assert!(displaced.is_empty());
+        assert!(displaced_scrubbed_edges.is_empty());
+    }
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// The deliberate strict-inequality cell END TO END through the merge
+/// gate: an ingress-byte-bound store-backed submission (non-empty
+/// non-authoritative `drv_content` → `PathBoundBytes` at ingress)
+/// whose identity conflicts with a SETTLED content-bound squat
+/// displaces it — no store fetch, no operator — while the bare echo
+/// form of the same submission stays rejected. Pins the R7 sentence
+/// of the spec rule.
+#[test]
+fn settled_squat_displaced_by_ingress_byte_bound_submission() -> anyhow::Result<()> {
+    // Bare store-backed echo first: rejected (must-not-regress half).
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("squat", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("squat")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+    let mut echo = make_node("squat", "aarch64-linux");
+    echo.is_content_addressed = true;
+    let err = dag.merge(victim, &[echo.clone()], &[], "").unwrap_err();
+    assert!(
+        matches!(err, DagError::ConflictingInFlightContent { .. }),
+        "bare echo (UnverifiedClaim) cannot erase a settled record: {err}"
+    );
+    assert!(dag.node("squat").is_some(), "squat survives the echo");
+
+    // Same submission shape, but ingress-byte-bound: the inline bytes
+    // were text-CA-validated at SubmitBuild admission
+    // (sched.merge.ingress-inline-drv-binding), so the node ranks
+    // PathBoundBytes and strictly outranks the settled
+    // ContentBoundClaim squat.
+    let mut byte_bound = echo;
+    byte_bound.drv_content = b"Derive-genuine".to_vec();
+    byte_bound.drv_content_authoritative = false;
+    let res = dag.merge(victim, &[byte_bound], &[], "")?;
+    assert!(
+        res.displaced.contains(&"squat".into()),
+        "ingress-byte-bound submission displaces the settled squat"
+    );
+    let node = dag.node("squat").unwrap();
+    assert!(!node.drv_content_authoritative);
+    assert_eq!(node.system, "aarch64-linux", "displacer's identity wins");
+    assert_eq!(node.evidence, DefinitionEvidence::PathBoundBytes);
+    assert_eq!(node.interested_builds, HashSet::from([victim]));
+    Ok(())
+}
+
+// r[verify sched.merge.evidence-ranked-displacement]
+/// merge_with_evidence's store-evidence set raises a bare store-backed
+/// displacer to PathBoundBytes standing — the c3 enrichment's contract
+/// with the gate — while the same submission without the set entry
+/// stays rejected (the empty-set delegation of merge() is
+/// behavior-identical to HEAD).
+#[test]
+fn store_evidence_set_raises_displacer_standing() -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let squatter = Uuid::new_v4();
+    let victim = Uuid::new_v4();
+    dag.merge(
+        squatter,
+        &[authoritative_node("sev", b"Derive-squat")],
+        &[],
+        "",
+    )?;
+    dag.nodes
+        .get_mut("sev")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Completed);
+
+    let mut echo = make_node("sev", "aarch64-linux");
+    echo.is_content_addressed = true;
+
+    // Without evidence: rejected.
+    let err = dag
+        .merge_with_evidence(victim, &[echo.clone()], &[], "", &HashSet::new())
+        .unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // With the hash in the store-evidence set: displaced.
+    let evidence: HashSet<DrvHash> = HashSet::from(["sev".into()]);
+    let res = dag.merge_with_evidence(victim, &[echo], &[], "", &evidence)?;
+    assert!(res.displaced.contains(&"sev".into()));
+    assert_eq!(
+        dag.node("sev").unwrap().evidence,
+        DefinitionEvidence::PathBoundBytes,
+        "store-evidence-backed creation ranks PathBoundBytes"
+    );
     Ok(())
 }

@@ -1176,7 +1176,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// `delete_displaced_build_links` removes exactly the passed prior builds'
 /// links to the displaced derivation — the displacing build's link and
 /// other derivations' links are untouched.
@@ -1248,7 +1248,7 @@ async fn test_delete_displaced_build_links_scoped() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// `delete_displaced_build_links` decrements the pruned builds'
 /// `builds.total_drvs` in the same statement when (and only when) the
 /// caller asks for it — i.e. when the displaced result had not been

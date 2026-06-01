@@ -2487,7 +2487,7 @@ mod tests {
         );
     }
 
-    // r[verify sched.merge.authoritative-conflict+5]
+    // r[verify sched.merge.authoritative-conflict+6]
     /// Poisoned-row recovery must restore the same creation-time snapshot
     /// as non-poisoned recovery (bug_007): the merge gate keys on the
     /// existing node's authoritative content, flag, and verifiable

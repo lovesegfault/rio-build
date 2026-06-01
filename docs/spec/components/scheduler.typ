@@ -1896,12 +1896,12 @@ registration is already covered by the content-addressed flag. This
 supersedes the earlier posture that the resolve flag was wholly lossy on
 recovery.
 
-#r("sched.merge.authoritative-conflict+5")[
+#r("sched.merge.authoritative-conflict+6")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
   `drv_hash`: a submission that itself claims authoritative content with
   bytes that are not identical to the existing node's MUST be rejected
-  while the existing node is live, `Failed`, or finished successfully, and
+  while the existing node is live or `Failed`, and
   MUST displace it as a fresh node once it sits in a terminal failure
   state (`Poisoned`, `Cancelled`, or `DependencyFailed`); a store-backed
   (non-authoritative) submission MUST only join the node when its
@@ -1911,9 +1911,16 @@ recovery.
   on a non-empty fixed-output expected path, or a byte-equal CA modular
   hash. A store-backed submission whose identity conflicts --- or that
   carries no content-bound evidence --- MUST be rejected while the node is
-  non-terminal *or finished successfully* (`Completed`/`Skipped`), and MUST
-  displace it as a fresh node only once it sits in a terminal failure
-  state. A store-backed submission whose identity matches MUST also
+  non-terminal, and MUST
+  displace it as a fresh node once it sits in a terminal failure
+  state. A node that finished successfully (`Completed`/`Skipped`) MUST be
+  rejected unless the displacer presents STRICTLY higher definition
+  evidence than the settled node's persisted rank
+  (#rref("sched.derivation.evidence-rank")) --- a settled record is never
+  erased by an equal-or-lower-ranked claim, and every settled-displacement
+  decision MUST be made by the single displacement primitive
+  (#rref("sched.merge.evidence-ranked-displacement")), never by a per-arm
+  carve-out. A store-backed submission whose identity matches MUST also
   displace the node --- rather than join it --- when the node sits in a
   terminal failure state that is no longer retriable on resubmit, so a
   poison-locked authoritative claim cannot capture later legitimate
@@ -1943,19 +1950,21 @@ finished claim is never redefined, so an attacker cannot use the arm to
 rewrite a built derivation; while the claim is live the rejection is
 unchanged, so nothing can yank a definition out from under a running
 build. The Completed/Skipped carve-out is uniform across both conflict
-arms: the store-backed displacement leg refuses settled victims for the
-same reason the authoritative leg does --- displacement erases the
+arms: both delegate the settled decision to the displacement
+primitive's strict rank comparison --- displacement erases the
 record (interest accounting, registered outputs, the inline bytes) of a
 build that finished, and an unverified submitter claim must never
-out-rank verified-built state. The accepted trade is that a
-content-bound squat that *completes* before its victim submits now
-locks the hash until an operator clears it (previously the victim's
-store-backed submission displaced it); that lockout is
-availability-only, requires the squatter to have actually built
-something under the squatted identity, and is restored to victim
-self-service by store-evidence displacement (Follow-up PR 3), which can
-prove from the store's text-CA-bound `.drv` which definition the path
-belongs to. Public attributes alone are copyable from the victim's public
+out-rank verified-built state. Under the rank rule the lockout a
+content-bound squat that *completes* before its victim submits can
+impose is scoped to displacers that do not outrank it: a bare
+store-backed echo (`unverified_claim`) is still rejected, while an
+ingress-byte-bound submission (`path_bound_bytes` --- its bytes were
+text-CA-bound to the declared `.drv` path at SubmitBuild admission)
+strictly outranks the squat's `content_bound_claim` and reclaims the
+hash with no store round-trip; merge-time store-evidence displacement
+extends the same self-service to bare store-backed resubmissions by
+fetching the proof from the store's text-CA-bound `.drv`.
+Public attributes alone are copyable from the victim's public
 derivation, and floating-CA expected paths are empty by construction, so a
 match must additionally rest on content evidence. The two forms guarantee
 different things: for a floating-CA derivation the modular hash is
@@ -1995,6 +2004,44 @@ keeps both the credit and the total. The removal is made durable by
 deleting those prior builds' `build_derivations` links in the same
 transaction as the recreate-refresh, so a recovery rebuilt purely from
 the database cannot re-point them at the displacing definition.
+
+#r("sched.merge.evidence-ranked-displacement")[
+  Exactly one displacement primitive MUST exist in the merge gate, and
+  every arm that removes a pre-existing node in favor of an incoming
+  definition MUST delegate both the decision and the bookkeeping to it.
+  The primitive MUST refuse, in order: a store-anchored victim (no
+  authoritative bytes --- its definition lives in the store, which holds
+  at most one text-CA `.drv` per path), categorically and regardless of
+  rank; a non-terminal victim (live or `Failed` --- first-writer-wins
+  while a claim is in flight or owned by the retry machinery); and a
+  settled victim (`Completed`/`Skipped`) whose definition-evidence rank
+  (#rref("sched.derivation.evidence-rank")) is greater than or equal to
+  the displacer's. A victim parked in a terminal failure state
+  (`Poisoned`, `Cancelled`, `DependencyFailed`) MUST be displaced
+  regardless of rank. A displacement MUST apply the full shared
+  bookkeeping: prior state recorded for rollback, dependency edges
+  scrubbed, and the displaced hash surfaced for the durable link prune,
+  accumulator reset, and accounting.
+]
+The primitive is the structural fix for the per-arm carve-out class: the
+settled-protection predicate (`bug_076`) previously existed as two
+open-coded `Completed`/`Skipped` matches that had to agree, and a future
+arm could ship without either. Centralizing decision AND bookkeeping
+means a new merge arm cannot displace at all except through the
+primitive, and the rank comparison gives the protection a single
+monotone vocabulary instead of a per-arm boolean. The deliberate
+strict-inequality consequence: an ingress-validated inline
+`path_bound_bytes` submission displaces a settled `content_bound_claim`
+squat with NO store fetch --- its bytes were already text-CA-bound to
+the declared `.drv` path at SubmitBuild admission, which is exactly the
+store-anchoring the squat's self-bound bytes lack. The store-anchored
+refusal is categorical rather than ranked because no claim about a
+store-backed definition can outrank the store itself; the in-flight
+refusal preserves the long-standing guarantee that nothing yanks a
+definition out from under a running build; and terminal-failure
+displacement stays rank-free because the anti-squat arms exist
+precisely so a parked failure cannot lock later legitimate submissions
+out of the hash.
 
 #r("sched.merge.authoritative-claim-no-redefine")[
   A submission claiming authoritative inline content that lands on an

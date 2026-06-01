@@ -5180,7 +5180,7 @@ async fn test_recovery_registers_realisation_for_deferred_ia_node() -> TestResul
 /// displacing submission's `.drv` path, not the squatter's decoy path —
 /// so recovery rebuilds (and re-dispatches) that definition — not the
 /// squatter's — and without the squatter's stale authoritative bytes.
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 // r[verify sched.persist.recreate-refresh+2]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
@@ -5190,7 +5190,7 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
         // Squatter: authoritative single-node build, failed permanently
         // by an x86_64 worker → node parked Poisoned (terminal failure,
         // displaceable; a COMPLETED squat is never displaced under
-        // sched.merge.authoritative-conflict+5). It declares a DECOY
+        // sched.merge.authoritative-conflict+6). It declares a DECOY
         // .drv path (nothing binds drv_hash to drv_path for a direct
         // submitter); the recreate-refresh must replace it with the
         // displacing submission's real path or post-failover dispatch
@@ -5247,7 +5247,7 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// The displacement interest prune must survive leader failover (bug_001):
 /// recovery rebuilds `interested_builds` purely from `build_derivations`,
 /// so a surviving link would re-point a prior-interested build at the
@@ -5507,7 +5507,7 @@ async fn test_recovery_after_takeover_does_not_inherit_squatter_edges() -> TestR
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// The displacement total adjustment must survive leader failover: the
 /// pruned build's `builds.total_drvs` was decremented in the displacing
 /// merge's transaction, so recovery — which re-seeds totals from that

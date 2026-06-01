@@ -11,7 +11,9 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use uuid::Uuid;
 
-use crate::state::{DerivationState, DerivationStatus, DrvHash, union_wanted_saturating};
+use crate::state::{
+    DefinitionEvidence, DerivationState, DerivationStatus, DrvHash, union_wanted_saturating,
+};
 
 /// CA-cutoff cascade result-size cap. Bounds the number of nodes
 /// transitioned `Queued`→`Skipped` per cascade so an adversarial DAG
@@ -37,12 +39,16 @@ pub enum DagError {
     /// node that already holds DIFFERENT authoritative content. Those
     /// bytes are the only copy of their derivation anywhere, so silently
     /// joining would let the second submitter redefine what the first
-    /// one's build runs and what recovery rebuilds. Returned only while
-    /// the existing claim is live, `Failed` (still owned by the retry
-    /// machinery), or finished successfully — once it parks in a
-    /// terminal failure state the byte-different submission displaces it
-    /// instead of being rejected. Maps to `FAILED_PRECONDITION`
-    /// (client-actionable conflict, not an internal invariant breach).
+    /// one's build runs and what recovery rebuilds. Returned while the
+    /// existing claim is live or `Failed` (still owned by the retry
+    /// machinery — `RefusedInFlight`), or settled with a definition-
+    /// evidence rank ≥ the displacer's (`RefusedSettledOutranked`;
+    /// authoritative displacers carry `content_bound_claim`, so a
+    /// settled authoritative claim is never redefined by another
+    /// authoritative claim) — once it parks in a terminal failure
+    /// state the byte-different submission displaces it instead of
+    /// being rejected. Maps to `FAILED_PRECONDITION` (client-actionable
+    /// conflict, not an internal invariant breach).
     #[error(
         "conflicting authoritative derivation content for {drv_path}: a node \
          with different inline content already exists"
@@ -53,19 +59,23 @@ pub enum DagError {
     /// declared expected output paths, plus content-bound evidence — a
     /// shared fixed-output path or a matching CA modular hash) conflicts
     /// with a node that carries authoritative inline content and is
-    /// either still in flight or finished successfully. Joining would
-    /// attribute that node's results to a derivation that either provably
-    /// differs or cannot be shown to be the same; displacing a settled
-    /// (Completed/Skipped) node would erase the record of a successful
-    /// build. Maps to `FAILED_PRECONDITION`; once the conflicting node
-    /// sits in a terminal FAILURE state the verifiable definition
-    /// displaces it instead. (An identity-MATCHING store-backed
-    /// submission never sees this error: it joins the node, or displaces
-    /// it without error when the node is poison-locked — terminal
-    /// failure, no longer retriable on resubmit.) A legitimate claimant
-    /// hitting this against a settled squat needs operator remediation
-    /// (clear the settled record) until store-evidence displacement
-    /// lands.
+    /// either still in flight or settled without being strictly
+    /// outranked. Joining would attribute that node's results to a
+    /// derivation that either provably differs or cannot be shown to be
+    /// the same; erasing a settled (Completed/Skipped) record takes
+    /// STRICTLY higher definition evidence than the settled node's rank
+    /// (`sched.merge.evidence-ranked-displacement`) — a bare store-backed
+    /// echo (`unverified_claim`) never qualifies, while an
+    /// ingress-byte-bound submission (`path_bound_bytes`) displaces a
+    /// content-bound squat. Maps to `FAILED_PRECONDITION`; once the
+    /// conflicting node sits in a terminal FAILURE state the verifiable
+    /// definition displaces it regardless of rank. (An identity-MATCHING
+    /// store-backed submission never sees this error: it joins the node,
+    /// or displaces it without error when the node is poison-locked —
+    /// terminal failure, no longer retriable on resubmit.) A legitimate
+    /// bare-resubmission claimant hitting this against a settled squat
+    /// needs operator remediation (clear the settled record) until
+    /// store-evidence displacement lands.
     #[error(
         "derivation {drv_path} carries authoritative inline content that \
          conflicts with this submission's declared identity; if the \
@@ -304,6 +314,42 @@ pub struct MergeResult {
     /// rollback removes the former wholesale and restores the latter's
     /// full prior state.
     pub contributions_recorded: Vec<(DrvHash, Option<Vec<String>>)>,
+}
+
+/// Verdict of [`DerivationDag::displace`] — the single displacement
+/// primitive every merge arm delegates to
+/// (`sched.merge.evidence-ranked-displacement`). Non-`Displaced`
+/// verdicts leave the victim untouched; the calling arm maps them to
+/// its own `DagError`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DisplaceVerdict {
+    /// The victim was removed with full displacement bookkeeping.
+    Displaced,
+    /// The victim is live / `Failed` (non-terminal): first-writer-wins
+    /// while a claim is in flight or owned by the retry machinery.
+    RefusedInFlight,
+    /// The victim is store-anchored (no authoritative bytes):
+    /// categorical refusal — the store holds at most one text-CA
+    /// `.drv` per path, so nothing outranks it about a store-backed
+    /// definition.
+    RefusedStoreAnchored,
+    /// The victim settled (`Completed`/`Skipped`) and its evidence
+    /// rank is ≥ the displacer's: a settled record is erased only by
+    /// STRICTLY higher definition evidence.
+    RefusedSettledOutranked,
+}
+
+/// Borrowed displacement bookkeeping threaded into
+/// [`DerivationDag::displace`] by the merge loop: the same three
+/// accumulators every arm already feeds (`removed_retriable` for
+/// rollback, `displaced_scrubbed_edges` for edge restoration and the
+/// durable parent-side delete, `displaced` for the link prune /
+/// accumulator reset / accounting). A struct instead of three
+/// parameters so the primitive's call sites cannot mis-wire one.
+pub(crate) struct DisplacementBookkeeping<'a> {
+    pub(crate) removed_retriable: &'a mut Vec<(DrvHash, DerivationState)>,
+    pub(crate) displaced_scrubbed_edges: &'a mut Vec<(DrvHash, HashSet<DrvHash>)>,
+    pub(crate) displaced: &'a mut Vec<DrvHash>,
 }
 
 /// Result of [`DerivationDag::remove_build_interest_and_reap`].
@@ -548,6 +594,79 @@ impl DerivationDag {
         self.nodes.values()
     }
 
+    // r[impl sched.merge.evidence-ranked-displacement]
+    /// THE displacement primitive: every merge arm that removes a
+    /// pre-existing node in favor of an incoming definition delegates
+    /// the decision AND the bookkeeping here, so the
+    /// settled-protection predicate exists exactly once and a future
+    /// arm cannot re-introduce a divergent carve-out.
+    ///
+    /// Verdict contract (in evaluation order):
+    /// - victim absent → `debug_assert` (caller bug: arms only call
+    ///   this for resident victims) and `RefusedInFlight` as the safe
+    ///   release no-op;
+    /// - store-anchored victim (no authoritative bytes — its truth
+    ///   lives in the store, which holds at most one text-CA `.drv`
+    ///   per path) → `RefusedStoreAnchored`, categorically: nothing
+    ///   outranks the store about a store-backed definition;
+    /// - non-terminal victim → `RefusedInFlight` (first-writer-wins
+    ///   while the claim is live or owned by the retry machinery);
+    /// - settled victim (`Completed`/`Skipped`) with
+    ///   `victim.evidence >= displacer` → `RefusedSettledOutranked`
+    ///   (strict-inequality rank rule: a settled record is erased
+    ///   only by STRICTLY higher definition evidence);
+    /// - otherwise → `Displaced` with the shared bookkeeping: the
+    ///   prior state rides `removed_retriable` for rollback, the
+    ///   children edges are scrubbed
+    ///   (`sched.merge.displaced-edge-scrub`), and the hash joins
+    ///   `displaced` for the durable link prune / accumulator reset /
+    ///   accounting. Terminal-FAILURE victims (Poisoned / Cancelled /
+    ///   DependencyFailed) displace REGARDLESS of rank — the
+    ///   anti-squat arms' existing semantics: a parked failure must
+    ///   not lock later legitimate submissions out of the hash.
+    fn displace(
+        &mut self,
+        drv_hash: &DrvHash,
+        displacer: DefinitionEvidence,
+        bk: &mut DisplacementBookkeeping<'_>,
+    ) -> DisplaceVerdict {
+        let Some(victim) = self.nodes.get(drv_hash) else {
+            debug_assert!(false, "displace() called for an absent victim");
+            return DisplaceVerdict::RefusedInFlight;
+        };
+        if !victim.drv_content_authoritative {
+            return DisplaceVerdict::RefusedStoreAnchored;
+        }
+        let status = victim.status();
+        if !status.is_terminal() {
+            return DisplaceVerdict::RefusedInFlight;
+        }
+        let settled = matches!(
+            status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        );
+        if settled && victim.evidence >= displacer {
+            return DisplaceVerdict::RefusedSettledOutranked;
+        }
+        let old = self
+            .nodes
+            .remove(drv_hash)
+            .expect("resident victim checked above");
+        bk.removed_retriable.push((drv_hash.clone(), old));
+        // r[impl sched.merge.displaced-edge-scrub+2]
+        // The displacing submission is a different definition: drop
+        // the dependency edges earlier submissions attached to this
+        // hash so the fresh node's dep set is exactly this
+        // submission's edge list (recorded for rollback restoration).
+        let scrubbed = self.scrub_dependency_edges(drv_hash);
+        if !scrubbed.is_empty() {
+            bk.displaced_scrubbed_edges
+                .push((drv_hash.clone(), scrubbed));
+        }
+        bk.displaced.push(drv_hash.clone());
+        DisplaceVerdict::Displaced
+    }
+
     /// Merge a set of nodes and edges from a new build into the global DAG.
     ///
     /// Returns a `MergeResult` with the hashes of newly-inserted nodes,
@@ -561,13 +680,47 @@ impl DerivationDag {
     /// successful merge should call `rollback_merge()` with the returned
     /// `MergeResult` fields if their persistence fails, to avoid in-memory
     /// DAG state drifting from the DB.
-    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    ///
+    /// Equivalent to [`Self::merge_with_evidence`] with an empty
+    /// store-evidence set: every displacement decision sees only the
+    /// submission's ingress shape rank.
+    // Production enters via merge_with_evidence (the actor threads the
+    // store-evidence set); this convenience wrapper keeps the ~190
+    // existing test call sites stable, so outside cfg(test) it has no
+    // callers by design.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn merge(
         &mut self,
         build_id: Uuid,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
         submitter_traceparent: &str,
+    ) -> Result<MergeResult, DagError> {
+        self.merge_with_evidence(
+            build_id,
+            nodes,
+            edges,
+            submitter_traceparent,
+            &HashSet::new(),
+        )
+    }
+
+    /// [`Self::merge`] with merge-time STORE evidence: hashes in
+    /// `store_evidence` were verified by the actor against the store's
+    /// own text-CA-enforced `.drv` bytes
+    /// (`sched.merge.store-evidence-displacement`), so their incoming
+    /// nodes displace with `PathBoundBytes` standing instead of their
+    /// bare ingress shape rank. The set only ever RAISES a displacer's
+    /// rank — victims' protection ranks are read from their own state.
+    // r[impl sched.merge.poisoned-resubmit-bounded+2]
+    // r[impl sched.merge.evidence-ranked-displacement]
+    pub fn merge_with_evidence(
+        &mut self,
+        build_id: Uuid,
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
+        submitter_traceparent: &str,
+        store_evidence: &HashSet<DrvHash>,
     ) -> Result<MergeResult, DagError> {
         let mut newly_inserted = HashSet::new();
         let mut reset_on_resubmit = Vec::new();
@@ -627,7 +780,7 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // r[impl sched.merge.authoritative-conflict+5]
+            // r[impl sched.merge.authoritative-conflict+6]
             // Authoritative-content protection. Evaluated BEFORE the
             // resubmit-reset below so the existing node is examined in
             // EVERY lifecycle state — running it after the reset would
@@ -677,33 +830,46 @@ impl DerivationDag {
             // or terminal but not retriable on resubmit: their truth
             // lives in the store, so a later submission's bytes are
             // ignored and the node joins as before.
+            // Per-node displacer standing: the ingress shape rank,
+            // raised to PathBoundBytes when the actor verified this
+            // hash against the store's own text-CA-enforced bytes
+            // (sched.merge.store-evidence-displacement). Computed once
+            // per node, consumed by every displace() call in the arms.
+            let displacer_evidence = {
+                let shape = DefinitionEvidence::from_node_shape(node);
+                if store_evidence.contains(&drv_hash) {
+                    shape.max(DefinitionEvidence::PathBoundBytes)
+                } else {
+                    shape
+                }
+            };
             if let Some(existing) = self.nodes.get(&drv_hash) {
                 if node.drv_content_authoritative && existing.drv_content_authoritative {
                     if existing.drv_content != node.drv_content {
-                        // Byte-different authoritative content. A claim
-                        // that finished successfully (Completed/Skipped)
-                        // is never redefined, and a live or Failed claim
-                        // keeps first-writer-wins; but a claim parked in
-                        // a terminal failure state is displaced by the
-                        // redefinition — same bookkeeping as the
-                        // store-backed displacement arm below, so the
-                        // link prune, in-tx accumulator reset, edge
-                        // scrub, and accounting all apply to it.
-                        let terminal_failure = existing.status().is_terminal()
-                            && !matches!(
-                                existing.status(),
-                                DerivationStatus::Completed | DerivationStatus::Skipped
-                            );
-                        if terminal_failure {
-                            let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                            removed_retriable.push((drv_hash.clone(), old));
-                            // r[impl sched.merge.displaced-edge-scrub+2]
-                            let scrubbed = self.scrub_dependency_edges(&drv_hash);
-                            if !scrubbed.is_empty() {
-                                displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
-                            }
-                            displaced.push(drv_hash.clone());
-                        } else {
+                        // Byte-different authoritative content. The
+                        // displacement primitive owns the inner
+                        // decision (sched.merge.evidence-ranked-
+                        // displacement): a claim that finished
+                        // successfully (Completed/Skipped) is never
+                        // redefined by an equal-or-lower-ranked
+                        // claimant, a live or Failed claim keeps
+                        // first-writer-wins (RefusedInFlight), and a
+                        // claim parked in a terminal failure state is
+                        // displaced by the redefinition — same
+                        // bookkeeping as the store-backed displacement
+                        // arm below, so the link prune, in-tx
+                        // accumulator reset, edge scrub, and
+                        // accounting all apply to it.
+                        let verdict = self.displace(
+                            &drv_hash,
+                            displacer_evidence,
+                            &mut DisplacementBookkeeping {
+                                removed_retriable: &mut removed_retriable,
+                                displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                                displaced: &mut displaced,
+                            },
+                        );
+                        if verdict != DisplaceVerdict::Displaced {
                             self.rollback_merge(
                                 &newly_inserted,
                                 &new_edges,
@@ -739,46 +905,40 @@ impl DerivationDag {
                         )
                         && !existing.is_retriable_on_resubmit();
                     if !identity_matches || locked_terminal_failure {
-                        // Same Completed/Skipped carve-out as the
-                        // authoritative-vs-authoritative arm above: a claim
-                        // that finished successfully is never displaced.
-                        // Its outputs are registered (or registering) under
-                        // this identity, so a conflicting later submission
-                        // is rejected instead — displacing a settled node
-                        // would let an unverified store-backed claim erase
-                        // the record of a successful build (bug_076).
-                        let terminal_failure = existing.status().is_terminal()
-                            && !matches!(
-                                existing.status(),
-                                DerivationStatus::Completed | DerivationStatus::Skipped
-                            );
-                        if terminal_failure {
-                            // Displacement: remove the squat so the fresh
-                            // store-backed definition is inserted below as a
-                            // brand-new node (prior=None → no interest carry,
-                            // resubmit_cycles=0, not in reset_on_resubmit).
-                            // The prior state still rides in removed_retriable
-                            // so rollback_merge restores it if a LATER node in
-                            // this same submission fails the merge.
-                            let old = self.nodes.remove(&drv_hash).expect("just checked is_some");
-                            removed_retriable.push((drv_hash.clone(), old));
-                            // r[impl sched.merge.displaced-edge-scrub+2]
-                            // The displacing submission is a different
-                            // definition: drop the dependency edges earlier
-                            // submissions attached to this hash so the fresh
-                            // node's dep set is exactly this submission's
-                            // edge list (recorded for rollback restoration).
-                            let scrubbed = self.scrub_dependency_edges(&drv_hash);
-                            if !scrubbed.is_empty() {
-                                displaced_scrubbed_edges.push((drv_hash.clone(), scrubbed));
-                            }
-                            displaced.push(drv_hash.clone());
-                        } else {
-                            // Reachable on an identity conflict against a
-                            // live, Failed, or settled (Completed/Skipped)
-                            // node — a poison-locked node is a terminal
-                            // failure by construction, so the
-                            // identity-MATCHING case never lands here.
+                        // The displacement primitive owns the inner
+                        // decision (sched.merge.evidence-ranked-
+                        // displacement). Settled (Completed/Skipped)
+                        // victims are protected by the strict rank
+                        // rule — a bare store-backed echo
+                        // (UnverifiedClaim) never erases the record of
+                        // a successful build (bug_076), while an
+                        // ingress-byte-bound or store-evidence-backed
+                        // displacer (PathBoundBytes) strictly outranks
+                        // a content-bound squat and reclaims the hash.
+                        // Terminal-failure victims displace regardless
+                        // of rank: the fresh store-backed definition is
+                        // inserted below as a brand-new node
+                        // (prior=None → no interest carry,
+                        // resubmit_cycles=0, not in reset_on_resubmit);
+                        // the prior state rides removed_retriable so
+                        // rollback_merge restores it if a LATER node in
+                        // this same submission fails the merge.
+                        let verdict = self.displace(
+                            &drv_hash,
+                            displacer_evidence,
+                            &mut DisplacementBookkeeping {
+                                removed_retriable: &mut removed_retriable,
+                                displaced_scrubbed_edges: &mut displaced_scrubbed_edges,
+                                displaced: &mut displaced,
+                            },
+                        );
+                        if verdict != DisplaceVerdict::Displaced {
+                            // Reachable on an identity conflict against
+                            // a live, Failed, or settled-and-outranking
+                            // (Completed/Skipped) node — a poison-locked
+                            // node is a terminal failure by
+                            // construction, so the identity-MATCHING
+                            // case never lands here.
                             self.rollback_merge(
                                 &newly_inserted,
                                 &new_edges,
@@ -1012,6 +1172,15 @@ impl DerivationDag {
                 // featureless pools count it (subset vacuously true),
                 // kvm pool skips it (I-181 ∅ guard).
                 self.apply_soft_features(&mut state);
+                // r[impl sched.merge.evidence-ranked-displacement]
+                // Merge-time store evidence is a PathBoundBytes SOURCE
+                // (sched.derivation.evidence-rank): the actor verified
+                // this hash's incoming identity against the store's own
+                // text-CA-enforced bytes, so the created node — and the
+                // row the creation-scoped upsert persists from it —
+                // carries the verified standing, not the bare echo's
+                // shape rank. Same value the displacement verdict used.
+                state.evidence = state.evidence.max(displacer_evidence);
                 state.interested_builds.insert(build_id);
                 // The submitting build's per-build contribution — the
                 // counterpart of the existing-node path's insert.

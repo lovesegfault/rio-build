@@ -9083,7 +9083,7 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 /// identity is what PG persists, the displaced hash stops counting toward
 /// prior interested builds (they complete instead of hanging Active), and
 /// the displaced fresh node belongs to the displacer only.
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[tokio::test]
 async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -9310,7 +9310,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// A successfully completed authoritative node is NEVER displaced: a
 /// later store-backed submission with a conflicting (fabricated)
 /// identity is rejected with FAILED_PRECONDITION, the persisted row
@@ -9662,7 +9662,7 @@ async fn test_displacement_resets_resource_floor() -> TestResult {
 /// the fresh node dispatches and completes, the persisted failure
 /// accounting is reset, and the squatter's still-running build loses
 /// its durable link to the displaced hash.
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 #[tokio::test]
 async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
@@ -10225,7 +10225,7 @@ async fn test_reaped_authoritative_squat_row_resets_on_fresh_store_backed_merge(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// End-to-end auth-vs-auth displacement: a poison-locked authoritative
 /// squat must not lock a later authoritative (hook-fallback) submission
 /// of byte-different content out of the hash for the rest of its poison
@@ -10332,7 +10332,7 @@ async fn test_authoritative_displacement_unblocks_hook_fallback_victim() -> Test
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+5]
+// r[verify sched.merge.authoritative-conflict+6]
 /// When the displaced result had NOT been received by a still-running
 /// prior build, the prune removes the slot from the build's absolute
 /// totals — in the same transaction durably (`builds.total_drvs`) and in
@@ -10473,7 +10473,7 @@ async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
 
     // Force the node into a terminal FAILURE state (cfg-test injection —
     // a Completed node is never displaceable under
-    // sched.merge.authoritative-conflict+5, so the displacement below
+    // sched.merge.authoritative-conflict+6, so the displacement below
     // needs a poison-parked target; the finished build's settled
     // accounting must be indifferent to either mutation).
     assert!(
