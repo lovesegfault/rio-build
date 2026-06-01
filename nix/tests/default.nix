@@ -1146,9 +1146,13 @@ in
   # Cilium enforces (eBPF) — k3s's bundled kube-router netpol controller
   # is disabled (--disable-network-policy in k3s-full.nix).
   #
-  # r[verify store.netpol.egress+2]
+  # r[verify store.netpol.egress+3]
   #   store-egress IMDS-deny + postgres-allow probe via nsenter into
   #   rio-store pod netns (netpol-store-egress subtest).
+  #   netpol-store-scheduler-egress: store pod → rio-scheduler:9001
+  #   handshake allowed (the materialization executor edge —
+  #   substitution-replacement campaign); IMDS still denied (existing
+  #   assertion unchanged). Connectivity-only, flag-independent (PD-11).
   # r[verify builder.netpol.airgap]
   #   builder-egress IMDS-deny + k8s-API-deny + DNS-TCP-allow probes
   #   (netpol-kubeapi / netpol-imds / netpol-dns-tcp subtests).

@@ -102,15 +102,18 @@ scheduler knows the expected hash before dispatch; the fetcher re-derives
   reached via the `64:ff9b::/96` synthesised prefix, which `world` matches.
 ]
 
-#r("store.netpol.egress+2")[
+#r("store.netpol.egress+3")[
   `store-egress` CiliumNetworkPolicy (in `rio-store`) allows: CoreDNS:53
   (UDP+TCP), postgres:5432 (in-cluster via `toEndpoints` label match;
   out-of-cluster via `toCIDRSet` on the deployment's `postgresCidr` --- the VPC
-  IPv6 block in EKS), optionally S3 VPC endpoint:443. Nothing else. The store
-  pod holds S3 and postgres credentials; a compromised store MUST NOT reach
-  IMDS (`fd00:ec2::254` / `169.254.169.254`) for role escalation or arbitrary
-  public IPs for exfiltration. Default-deny egress is the same defense-in-depth
-  posture as `builder-egress`.
+  IPv6 block in EKS), the scheduler's ExecutorService:9001 (in-cluster via
+  `toEndpoints` label match --- the materialization executor's
+  poll/claim/report edge; the rule allows, the materialization flag decides
+  whether anything uses it), optionally S3 VPC endpoint:443. Nothing else. The
+  store pod holds S3 and postgres credentials; a compromised store MUST NOT
+  reach IMDS (`fd00:ec2::254` / `169.254.169.254`) for role escalation or
+  arbitrary public IPs for exfiltration. Default-deny egress is the same
+  defense-in-depth posture as `builder-egress`.
 ]
 
 The Squid FOD proxy is deleted. The FOD hash check is the integrity boundary;

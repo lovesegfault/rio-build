@@ -270,6 +270,14 @@ spec:
         - matchLabels: {app.kubernetes.io/component: rio-fetcher}
           matchExpressions:
             - {key: k8s:io.kubernetes.pod.namespace, operator: Exists}
+        # Substitution-replacement: the store's materialization executor
+        # polls/claims/reports against ExecutorService (the mirror of the
+        # store-egress scheduler rule below). Cross-namespace (the store
+        # lives in {{ $ns.store.name }}), so the namespace label is
+        # mandatory.
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.store.name }}
+            k8s:app.kubernetes.io/name: rio-store
       toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # Metrics: Prometheus scrape from host-network kubelet.
     # `cluster` covers apiserver pods/proxy (kubectl get --raw).
@@ -317,12 +325,12 @@ spec:
         - ports:
             - {port: "9092", protocol: TCP}
 ---
-# r[impl store.netpol.egress+2]
+# r[impl store.netpol.egress+3]
 #
-# Store egress: DNS + postgres + S3 VPC endpoint. The store holds S3
-# creds + postgres creds — a compromised store should NOT reach IMDS
-# or arbitrary public IPs. No `world` rule, no `kube-apiserver` entity
-# → both DENIED.
+# Store egress: DNS + postgres + scheduler ExecutorService + S3 VPC
+# endpoint. The store holds S3 creds + postgres creds — a compromised
+# store should NOT reach IMDS or arbitrary public IPs. No `world` rule,
+# no `kube-apiserver` entity → both DENIED.
 #
 # Postgres reachability needs BOTH selector forms: in-cluster PG (VM
 # tests, dev) is a pod with a Cilium identity → `toEndpoints` matches
@@ -369,6 +377,18 @@ spec:
     - toEndpoints:
         - matchLabels: {app.kubernetes.io/name: rio-store}
       toPorts: [{ports: [{port: "9002", protocol: TCP}]}]
+    # Store egress to the scheduler's ExecutorService: the
+    # materialization executor's ListMaterializationJobs /
+    # PullAssignment / ReportOutcome edge (substitution-replacement
+    # campaign). Additive: rendered unconditionally — the rule allows,
+    # the materialization flag decides whether anything uses it.
+    # Cross-namespace, so the namespace label is mandatory (a bare
+    # label match would be scoped to the policy's own namespace).
+    - toEndpoints:
+        - matchLabels:
+            k8s:io.kubernetes.pod.namespace: {{ $ns.system.name }}
+            k8s:app.kubernetes.io/name: rio-scheduler
+      toPorts: [{ports: [{port: "9001", protocol: TCP}]}]
     # In-cluster postgres (bitnami chart, VM tests / dev). Subchart
     # deploys into the helm release namespace (system), not store.
     - toEndpoints:

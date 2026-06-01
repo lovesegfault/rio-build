@@ -230,6 +230,11 @@ spec:
               value: "6"  # readinessProbe.periodSeconds (5) + 1
             - name: RIO_STORE__ADDR
               value: {{ $s.storeAddr | quote }}
+            # Substitution-replacement campaign (Phase A: dormant —
+            # enabled=false everywhere). No `default` filter on the
+            # boolean: helm's `default` treats `false` as empty.
+            - name: RIO_MATERIALIZATION__ENABLED
+              value: {{ $s.materialization.enabled | quote }}
             - name: RIO_DATABASE_URL
               valueFrom:
                 secretKeyRef:

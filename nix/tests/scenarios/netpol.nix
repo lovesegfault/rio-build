@@ -358,6 +358,31 @@ pkgs.testers.runNixOSTest {
         print(f"netpol-store IMDS PASS: blocked (curl rc={rc})")
 
     # ══════════════════════════════════════════════════════════════════
+    # netpol-store-scheduler-egress — store → scheduler:9001 ALLOWED
+    # ══════════════════════════════════════════════════════════════════
+    # Substitution-replacement campaign: store-egress carries an allow
+    # rule to the scheduler's ExecutorService (the materialization
+    # executor's poll/claim/report edge), mirrored by scheduler-ingress.
+    # Connectivity-only (PD-11): the materialization flag stays off —
+    # the rule allows, the flag decides whether anything uses it. The
+    # nc -z handshake from the store pod's netns proves Cilium compiled
+    # the cross-namespace allow into the endpoint program; without the
+    # rule this connect is DROPPED (store-egress is default-deny).
+    # Reuses store_netns from the subtest above (same pod, same nsenter
+    # PID) and sched_ip from netpol-positive (same ClusterIP).
+    with subtest("netpol-store-scheduler-egress: store → scheduler:9001 allowed"):
+        rc, out = store_netns(f"${nc} -z -w5 {sched_ip} 9001")
+        assert rc == 0, (
+            f"nc -z from store netns to rio-scheduler {sched_ip}:9001 "
+            f"FAILED (rc={rc}). store-egress ALLOWS the scheduler "
+            "ExecutorService edge (the materialization executor edge) "
+            "and scheduler-ingress accepts rio-store — if blocked, the "
+            f"new netpol pair did not render or Cilium has not synced.\n{out}"
+        )
+        print(f"netpol-store-scheduler-egress PASS: scheduler {sched_ip}:9001 "
+              "reachable from store netns (the materialization executor edge)")
+
+    # ══════════════════════════════════════════════════════════════════
     # netpol-cross-ns — D3a: Pool{kind=Builder} in fetcher ns airgapped
     # ══════════════════════════════════════════════════════════════════
     # D3a regression: with one Pool CRD, an operator can apply a
