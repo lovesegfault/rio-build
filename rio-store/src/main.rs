@@ -177,7 +177,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Arc::new(s)
     };
-    let store_service = store_service.with_substituter(substituter);
+    // Clone (not move) into the StoreService: the materialization
+    // executor spawner below shares the same Substituter instance —
+    // one admission gate, one singleflight, one HTTP pool per replica.
+    let store_service = store_service.with_substituter(Arc::clone(&substituter));
 
     // r[impl store.shutdown.drain-getpath]
     // Three-stage shutdown — see rio_common::server::spawn_drain_task
@@ -324,6 +327,25 @@ async fn main() -> anyhow::Result<()> {
         pool.clone(),
         Arc::clone(&log_chunk_store),
         std::time::Duration::from_secs(u64::from(cfg.log_retention_days) * 86_400),
+        shutdown.clone(),
+    );
+
+    // Substitution-replacement Phase A: the materialization-job
+    // executor (design §2.2). The spawner carries the dormancy gate —
+    // enabled=false (the default) spawns NOTHING and this call is a
+    // no-op; enabled=true runs cfg.materialization.executor_concurrency
+    // claim loops against the scheduler's ExecutorService, presenting
+    // the kind-attested store-service credential minted from the same
+    // service-HMAC key file the verifier side mounts.
+    let materialization_signer =
+        rio_auth::hmac::HmacSigner::load(cfg.service_hmac_key_path.as_deref())
+            .map_err(|e| anyhow::anyhow!("service-HMAC key load (materialization): {e}"))?
+            .map(Arc::new);
+    rio_store::materialize::spawn_materialization_executor(
+        cfg.materialization.clone(),
+        pool.clone(),
+        Arc::clone(&substituter),
+        materialization_signer,
         shutdown.clone(),
     );
 
