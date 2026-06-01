@@ -596,7 +596,7 @@ in
   #   of 4 substitutable nodes creates exactly 4 cache_opportunity jobs in
   #   the merge transaction; all resolve resolved_success; the
   #   jobs-created metric moves by 4 while the walk-spawn metric stays 0.
-  # r[verify sched.materialize.routing]
+  # r[verify sched.materialize.routing+2]
   #   substitute-scheduler-owned + materialization-active: every job's
   #   Success outcome is consumed — nodes complete, the build succeeds,
   #   no unresolved jobs remain (all-resolved assertion).
@@ -666,7 +666,7 @@ in
   # (criterion 1 / review eq-5); only the mechanism blocks differ.
   #
   # ── Flag-ON: the §2.4 routing arms + §2.5 park + §5.3 pins ──────────
-  # r[verify sched.materialize.routing]
+  # r[verify sched.materialize.routing+2]
   #   routing-fail-fast: a topdown-pruned root whose output is confirmed
   #   missing upstream fails every interested build with the
   #   resubmit-directing error (arm 3: Unobtainable → consumption
@@ -1343,7 +1343,7 @@ in
   #   the job rows survive byte-identically (count + job_ids); all 10
   #   resolve and the build succeeds. PG is the authority — no job is
   #   lost with the leader.
-  # r[verify sched.materialize.routing]
+  # r[verify sched.materialize.routing+2]
   #   mixed-flag: scheduler-on/store-off (the rollout-race window the
   #   chart AND-guard cannot close) is a visible wait — jobs pending,
   #   build active, backlog reported via substituting_derivations — and

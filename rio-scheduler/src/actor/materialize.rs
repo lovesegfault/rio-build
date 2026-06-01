@@ -417,9 +417,18 @@ pub(crate) struct RoutingInputs<'a> {
     /// fetches it only when arms 0–2 do not apply (purity by
     /// parameterization — design §9.4).
     pub reprobe: Option<ReprobeAnswer>,
+    /// Whether the node carries the `topdown_pruned` mark (the arm-3
+    /// settlement discriminator — finding 11): only a MARKED node may
+    /// fail-fast (the prune deliberately dropped its closure, so
+    /// from-source is doomed); an unmarked node whose evidence is
+    /// Broken by structure (childless leaf / probe blip) releases to
+    /// from-source dispatch, exactly as the as-built walk does
+    /// (`must_substitute` = marked AND Broken — unmarked nodes are
+    /// never affected, whatever their evidence).
+    pub topdown_pruned: bool,
 }
 
-// r[impl sched.materialize.routing]
+// r[impl sched.materialize.routing+2]
 /// The four-arm routing core. PURE (no IO, no clocks) — kani-liftable
 /// per design §9.4; the FMP re-probe answer is an input.
 ///
@@ -460,13 +469,27 @@ pub(crate) fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRout
         // Re-probe confirms missing, or the one-shot is spent. (A
         // missing probe is mapped to ReArm by the caller before this
         // core runs — see the doc above.)
-        _ => UnobtainableRouting::FailFast,
+        //
+        // The settlement discriminates on the topdown-pruned mark
+        // (finding 11): only a MARKED node fail-fasts — the prune
+        // deliberately dropped its closure ("this was not built
+        // because outputs were expected available"), so from-source
+        // is doomed and the resubmit-directing error is the correct
+        // verdict. An UNMARKED node — a genuine leaf whose evidence
+        // is Broken by structure (childless) or by a probe blip —
+        // releases to from-source dispatch instead, exactly as the
+        // as-built walk does (`must_substitute` = marked AND Broken;
+        // unmarked nodes are never affected, whatever their
+        // evidence). Flag-state outcome equivalence (OQ7) requires
+        // the two mechanisms to agree on this verdict.
+        _ if inputs.topdown_pruned => UnobtainableRouting::FailFast,
+        _ => UnobtainableRouting::ResolveFromSource,
     }
 }
 
 /// Success-consumption coverage check (the CE-17 closer): the live
 /// wanted set is covered by what the execution ingested or verified.
-// r[impl sched.materialize.routing]
+// r[impl sched.materialize.routing+2]
 pub(crate) fn success_covers_live_wanted(
     ingested: &[String],
     verified: &[String],
@@ -478,7 +501,7 @@ pub(crate) fn success_covers_live_wanted(
 }
 
 impl DagActor {
-    // r[impl sched.materialize.routing]
+    // r[impl sched.materialize.routing+2]
     /// Consume one materialization outcome (the §2.4 consumption
     /// transaction). Reachable only flag-on in practice (no
     /// materialization attempt can exist otherwise) — but ALWAYS wired
@@ -581,6 +604,14 @@ impl DagActor {
                     rio_evidence_kernel::ClosureEvidence::Pending => DurableEvidence::Pending,
                     rio_evidence_kernel::ClosureEvidence::Broken => DurableEvidence::Broken,
                 };
+                // The arm-3 mark discriminator (finding 11): read the
+                // node's topdown_pruned mark inside the same consumption
+                // pass so the routing core can refuse to fail-fast
+                // unmarked nodes.
+                let topdown_pruned = self
+                    .dag
+                    .node(drv_hash.as_str())
+                    .is_some_and(|s| s.topdown_pruned);
                 let needs_probe = u
                     .missing_paths
                     .iter()
@@ -609,6 +640,7 @@ impl DagActor {
                     durable_evidence,
                     prior_unobtainable_count: prior_unobtainable,
                     reprobe,
+                    topdown_pruned,
                 });
                 // 3. Execute the routing.
                 match routing {
@@ -836,7 +868,7 @@ impl DagActor {
         }
     }
 
-    // r[impl sched.materialize.routing]
+    // r[impl sched.materialize.routing+2]
     /// The §4 clear-mirror (Phase B / PD-B16): when a materialization
     /// job resolves successfully (`resolved_success` — the
     /// covered-success and moot arms) or from-source
@@ -1063,7 +1095,7 @@ impl DagActor {
     /// (BC-2: the charge feeds the materialization budget and nothing
     /// else). Mirrors `close_pull_attempt_uncharged`'s transaction
     /// shape WITH the charge row.
-    // r[impl sched.materialize.routing]
+    // r[impl sched.materialize.routing+2]
     pub(super) async fn establish_materialization_attempt(
         &mut self,
         attempt: &crate::db::open_attempts::OpenAttemptRow,

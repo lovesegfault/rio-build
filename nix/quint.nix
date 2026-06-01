@@ -3182,7 +3182,7 @@ in
     # partition invariants: the pre-existing invariants are re-proven
     # over materialization interleavings (a materialization action
     # between any two build events must not perturb any of them).
-    # r[verify sched.materialize.routing]
+    # r[verify sched.materialize.routing+2]
     quint-retry-policy-pull-materialization = mkQuintCheck {
       name = "retry-policy-pull-materialization";
       spec = "retryPolicy";

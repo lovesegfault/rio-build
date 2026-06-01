@@ -253,7 +253,7 @@ fn paths(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| (*s).to_string()).collect()
 }
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// Arm 0 (moot-failure / the C3 arm): missing ∩ live-wanted = ∅ and
 /// verified ⊇ live-wanted → CompleteForLiveInterest. The design's
 /// §2.4 confirmed-C3-trace replay, steps 4–5: b2 cancelled in the
@@ -267,6 +267,7 @@ fn routing_moot_failure_completes_for_live_interest() {
         durable_evidence: DurableEvidence::Broken, // irrelevant for arm 0
         prior_unobtainable_count: 0,
         reprobe: None,
+        topdown_pruned: false,
     });
     assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
 }
@@ -281,6 +282,7 @@ fn routing_moot_but_uncovered_rearms() {
         durable_evidence: DurableEvidence::Broken,
         prior_unobtainable_count: 0,
         reprobe: None,
+        topdown_pruned: false,
     });
     assert_eq!(routing, UnobtainableRouting::ReArm);
 }
@@ -295,6 +297,7 @@ fn routing_durable_vouched_resolves_from_source() {
         durable_evidence: DurableEvidence::Vouched,
         prior_unobtainable_count: 0,
         reprobe: None,
+        topdown_pruned: false,
     });
     assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
 }
@@ -309,12 +312,15 @@ fn routing_durable_pending_resolves_from_source() {
         durable_evidence: DurableEvidence::Pending,
         prior_unobtainable_count: 0,
         reprobe: None,
+        topdown_pruned: false,
     });
     assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
 }
 
 /// Arm 3a: Broken + live-wanted missing + re-probe says obtainable +
-/// one-shot unspent → re-arm.
+/// one-shot unspent → re-arm. MARKED node: the one-shot-spent shape
+/// fail-fasts (the prune deliberately dropped the closure — the
+/// resubmit-directing error is the correct verdict).
 #[test]
 fn routing_broken_with_obtainable_reprobe_rearms_once() {
     // hold the path vecs alive for the borrow
@@ -328,6 +334,9 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
         durable_evidence: DurableEvidence::Broken,
         prior_unobtainable_count: prior,
         reprobe,
+        // The marked (topdown-pruned root) shape: the only shape where
+        // the one-shot-spent settlement may fail-fast (finding 11).
+        topdown_pruned: true,
     };
     // One-shot unspent + obtainable → ReArm.
     assert_eq!(
@@ -335,74 +344,133 @@ fn routing_broken_with_obtainable_reprobe_rearms_once() {
         UnobtainableRouting::ReArm
     );
     // One-shot SPENT (a prior unobtainable row exists) → FailFast even
-    // when the re-probe says obtainable.
+    // when the re-probe says obtainable — for a MARKED node.
     assert_eq!(
         route_unobtainable(&mk(1, Some(ReprobeAnswer::Obtainable))),
         UnobtainableRouting::FailFast
     );
 }
 
-/// Arm 3b: Broken + live-wanted missing + (re-probe confirms missing OR
-/// one-shot spent) → FailFast. The ONLY arm that fail-fasts, and it
-/// requires all three conjuncts (the design's §2.4 closing claim).
+// r[verify sched.materialize.routing+2]
+/// FINDING 11 (the C3-class equivalence divergence, orchestrator
+/// ruling): the arm-3 settlement MUST discriminate on the
+/// topdown-pruned mark. An UNMARKED node — a genuine leaf whose
+/// closure evidence is Broken by structure (childless), not by
+/// pruning — whose live-wanted path is confirmed missing upstream
+/// releases to from-source dispatch, NEVER fail-fast. The as-built
+/// walk only ever fail-fasts MARKED roots (`must_substitute` =
+/// marked AND Broken; unmarked nodes are never affected, whatever
+/// their evidence), so flag-state outcome equivalence (OQ7) requires
+/// the same here.
 #[test]
-fn routing_fail_fast_requires_all_three_conjuncts() {
+fn routing_unmarked_broken_confirmed_missing_resolves_from_source() {
+    // hold the path vecs alive for the borrow
+    let missing = paths(&["out-path"]);
+    let verified = paths(&[]);
+    let live = paths(&["out-path"]);
+    let mk = |prior: u32, reprobe| RoutingInputs {
+        missing_paths: &missing,
+        verified_paths: &verified,
+        live_wanted_paths: &live,
+        durable_evidence: DurableEvidence::Broken,
+        prior_unobtainable_count: prior,
+        reprobe,
+        topdown_pruned: false,
+    };
+    // Confirmed-missing re-probe, one-shot unspent: the unmarked node
+    // must release to from-source — the build attempt proceeds.
+    assert_eq!(
+        route_unobtainable(&mk(0, Some(ReprobeAnswer::ConfirmedMissing))),
+        UnobtainableRouting::ResolveFromSource,
+        "an unmarked Broken-evidence node with a confirmed-missing live-wanted \
+         path must release to from-source dispatch (the as-built walk never \
+         fail-fasts unmarked nodes) — never fail-fast"
+    );
+    // One-shot spent: still never fail-fast for an unmarked node.
+    assert_eq!(
+        route_unobtainable(&mk(1, Some(ReprobeAnswer::Obtainable))),
+        UnobtainableRouting::ResolveFromSource,
+        "the one-shot-spent settlement releases unmarked nodes to from-source \
+         (the fail-fast verdict and its resubmit-directing error are reserved \
+         for topdown-pruned roots)"
+    );
+    // Both spent AND confirmed missing: still from-source for unmarked.
+    assert_eq!(
+        route_unobtainable(&mk(2, Some(ReprobeAnswer::ConfirmedMissing))),
+        UnobtainableRouting::ResolveFromSource,
+        "no combination of re-probe answer and one-shot state may fail-fast \
+         an unmarked node"
+    );
+}
+
+/// Arm 3b: Broken + live-wanted missing + (re-probe confirms missing OR
+/// one-shot spent) + the topdown-pruned MARK → FailFast. The ONLY arm
+/// that fail-fasts, and it requires all FOUR conjuncts (the design's
+/// §2.4 closing claim, sharpened by the finding-11 mark discriminator:
+/// only a deliberately-pruned root may be failed for unobtainability —
+/// unmarked nodes always release to from-source instead).
+#[test]
+fn routing_fail_fast_requires_all_four_conjuncts() {
     let missing_hit = paths(&["out-path"]);
     let missing_miss = paths(&["unwanted-path"]);
     let verified = paths(&[]);
     let verified_covering = paths(&["out-path"]);
     let live = paths(&["out-path"]);
-    // Exhaustive over the 8 combinations of (missing∩W≠∅, evidence
-    // Broken, reprobe-confirms-or-spent): exactly one yields FailFast.
+    // Exhaustive over the 16 combinations of (missing∩W≠∅, evidence
+    // Broken, reprobe-confirms-or-spent, marked): exactly one yields
+    // FailFast.
     let mut fail_fast_count = 0;
     for missing_intersects in [false, true] {
         for broken in [false, true] {
             for confirms_or_spent in [false, true] {
-                let inputs = RoutingInputs {
-                    missing_paths: if missing_intersects {
-                        &missing_hit
-                    } else {
-                        &missing_miss
-                    },
-                    // When the missing set does not intersect, make the
-                    // live set covered so arm 0 takes its Complete arm
-                    // (the uncovered residual is ReArm — also not
-                    // FailFast, so either choice serves the conjunct
-                    // counting).
-                    verified_paths: if missing_intersects {
-                        &verified
-                    } else {
-                        &verified_covering
-                    },
-                    live_wanted_paths: &live,
-                    durable_evidence: if broken {
-                        DurableEvidence::Broken
-                    } else {
-                        DurableEvidence::Vouched
-                    },
-                    prior_unobtainable_count: u32::from(confirms_or_spent),
-                    reprobe: Some(if confirms_or_spent {
-                        ReprobeAnswer::ConfirmedMissing
-                    } else {
-                        ReprobeAnswer::Obtainable
-                    }),
-                };
-                let routing = route_unobtainable(&inputs);
-                if routing == UnobtainableRouting::FailFast {
-                    fail_fast_count += 1;
-                    assert!(
-                        missing_intersects && broken && confirms_or_spent,
-                        "FailFast outside the three-conjunct corner: \
-                         missing∩W={missing_intersects} broken={broken} \
-                         confirmed/spent={confirms_or_spent}"
-                    );
+                for marked in [false, true] {
+                    let inputs = RoutingInputs {
+                        missing_paths: if missing_intersects {
+                            &missing_hit
+                        } else {
+                            &missing_miss
+                        },
+                        // When the missing set does not intersect, make the
+                        // live set covered so arm 0 takes its Complete arm
+                        // (the uncovered residual is ReArm — also not
+                        // FailFast, so either choice serves the conjunct
+                        // counting).
+                        verified_paths: if missing_intersects {
+                            &verified
+                        } else {
+                            &verified_covering
+                        },
+                        live_wanted_paths: &live,
+                        durable_evidence: if broken {
+                            DurableEvidence::Broken
+                        } else {
+                            DurableEvidence::Vouched
+                        },
+                        prior_unobtainable_count: u32::from(confirms_or_spent),
+                        reprobe: Some(if confirms_or_spent {
+                            ReprobeAnswer::ConfirmedMissing
+                        } else {
+                            ReprobeAnswer::Obtainable
+                        }),
+                        topdown_pruned: marked,
+                    };
+                    let routing = route_unobtainable(&inputs);
+                    if routing == UnobtainableRouting::FailFast {
+                        fail_fast_count += 1;
+                        assert!(
+                            missing_intersects && broken && confirms_or_spent && marked,
+                            "FailFast outside the four-conjunct corner: \
+                             missing∩W={missing_intersects} broken={broken} \
+                             confirmed/spent={confirms_or_spent} marked={marked}"
+                        );
+                    }
                 }
             }
         }
     }
     assert_eq!(
         fail_fast_count, 1,
-        "exactly one of the 8 combinations may fail-fast"
+        "exactly one of the 16 combinations may fail-fast"
     );
 }
 
@@ -452,6 +520,8 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
         durable_evidence: DurableEvidence::Broken,
         prior_unobtainable_count: 99,
         reprobe: Some(ReprobeAnswer::ConfirmedMissing),
+        // Even a MARKED node: an empty missing set can never fail-fast.
+        topdown_pruned: true,
     });
     assert!(
         matches!(
@@ -465,7 +535,7 @@ fn infra_failure_never_failfasts_never_routes_from_source() {
 
 // ── The consumption transaction (handler level, PG-backed) ─────────────
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// A BUILD attempt receiving a payload with materialization_outcome set
 /// is acknowledged-and-ignored: no ledger row appended, no status
 /// change, no job state touched. Reachable FLAG-OFF (any builder could
@@ -528,7 +598,7 @@ async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestR
     Ok(())
 }
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// FLAG ON: an InfraFailure consumption charges materialization_infra
 /// (kind=materialization — invisible to every build budget), the job
 /// stays pending and claimable (under budget — never a fail-fast, B3),
@@ -634,7 +704,7 @@ async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
 
 // ── Establishment + cancellation (T-3.6) ───────────────────────────────
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// A dead store replica's open materialization attempt is established
 /// as materialization_infra — never executor_crash, never adopted —
 /// and the job returns to pending (claimable again). BC-2/BC-3: no
@@ -883,7 +953,7 @@ async fn list_materialization_jobs(
 }
 
 // r[verify sched.materialize.job]
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 // r[verify sched.materialize.pinning]
 /// THE Phase A keystone: one materialization job, end-to-end, flag-on,
 /// exercising every dormant mechanism this campaign added in one
@@ -1072,7 +1142,7 @@ async fn flag_on_materialization_job_end_to_end() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// The Unobtainable moot arm (the C3 trace), flag-on, end-to-end through
 /// the actor: report Unobtainable for a path no LIVE build wants → the
 /// node completes for live interest, NEVER fail-fasts. The design §2.4
@@ -1197,6 +1267,159 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
     .await?;
     assert_eq!(class, "materialization_unobtainable");
     assert_eq!(joined_kind, "materialization");
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// FINDING 11 (the C3-class equivalence divergence; orchestrator ruling,
+/// red-first), actor level: an UNMARKED genuine leaf — childless, so its
+/// closure evidence is structurally `Broken` — whose wanted output the
+/// executor confirms missing-and-unsubstitutable upstream must NOT fail
+/// the build. The node releases to from-source dispatch (Ready), the job
+/// resolves `resolved_from_source`, and the build stays Active.
+///
+/// Flag-off oracle: the as-built walk's fail-fast
+/// (`fail_fast_topdown_pruned_root`) is reachable only for nodes carrying
+/// the `topdown_pruned` mark (`must_substitute` = marked AND Broken —
+/// "unmarked nodes are never affected, whatever their evidence"); an
+/// unmarked node whose walk fails reverts to Ready and falls through to
+/// from-source dispatch. Flag-on must produce the same client-visible
+/// outcome (OQ7): the resubmit-directing fail-fast error class is
+/// reserved for deliberately-pruned roots.
+///
+/// The reachable divergence this pins (finding 11's trace): probe-time
+/// blip says substitutable (job created per B3) → upstream entry vanishes
+/// → executor reports Unobtainable → consumption re-probe confirms
+/// missing → pre-fix arm 3 failed the build with "topdown-pruned root …
+/// resubmit" for a node that was never pruned.
+#[tokio::test]
+async fn flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    // Service signer + a real tenant: the consumption re-probe can only
+    // CONFIRM missing under Service auth (B3: an unauthenticated probe
+    // is indeterminate and never fail-fasts) — without these the arm-3
+    // settlement is unreachable and this test would be vacuous.
+    let service_key = b"test-finding11-service-key-32-byt".to_vec();
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let _tasks = (store_task, actor_task);
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "finding11-tenant").await;
+
+    // 1. Merge a 1-node build (childless leaf, never pruned) under the
+    //    tenant. Nothing is substitutable at merge time, so the merge
+    //    classifies nothing; the node seeds Ready and stays UNMARKED.
+    let out = test_store_path("unmarked-leaf-out");
+    let mut leaf = make_node("unmarked-leaf");
+    leaf.expected_output_paths = vec![out.clone()];
+    leaf.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![leaf],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // 2. The probe blip: the upstream claims the path is substitutable →
+    //    the dispatch probe creates a cache_opportunity job (B3
+    //    optimistic creation). The node stays Ready, unmarked.
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "unmarked-leaf").await;
+    assert!(
+        !drv.topdown_pruned,
+        "precondition: the leaf must be unmarked (never pruned)"
+    );
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "precondition: the probe blip created one job");
+
+    // 3. Claim the job as a store replica, then withdraw the upstream
+    //    entry (the blip ends): the path is now genuinely missing AND
+    //    not substitutable — the re-probe will confirm it missing.
+    let assignment = match claim_materialization(&handle, "unmarked-leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &out);
+
+    // 4. The executor reports Unobtainable: the wanted path is missing
+    //    upstream. The consumption re-probe (Service auth + tenant)
+    //    confirms it missing-and-unsubstitutable → arm 3 → the node is
+    //    UNMARKED → the settlement must release to from-source.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "unmarked-leaf",
+        mat_unobtainable_outcome(
+            vec![out.clone()],
+            vec![],
+            "upstream 404 on the wanted output",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // THE FINDING-11 ASSERTIONS: the build is NOT failed; the node is
+    // released to from-source dispatch; the job resolved from-source;
+    // no resubmit-directing error was recorded.
+    let st = query_status(&handle, build_id).await?;
+    assert_ne!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "an unmarked leaf must NEVER be failed by the materialization \
+         settlement (the fail-fast verdict is reserved for topdown-pruned \
+         roots); the build must remain Active for from-source dispatch. \
+         Error summary: {:?}",
+        st.error_summary
+    );
+    let drv = expect_drv(&handle, "unmarked-leaf").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Ready,
+        "the unmarked node must release to Ready (from-source dispatchable)"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        job_state, "resolved_from_source",
+        "the job must resolve from_source — the build attempt proceeds"
+    );
+    // The build proceeds from source: a builder pull for the node is
+    // now admissible (job resolved → JobView::None → as-built admission;
+    // the node is Ready and unmarked so the pull mints).
+    let pull = try_pull_attempt(&handle, "unmarked-leaf").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::Deliver(_))),
+        "after the from-source release a builder pull must mint (the build \
+         attempt proceeds from source), got {pull:?}"
+    );
     Ok(())
 }
 
@@ -2060,7 +2283,7 @@ async fn flag_on_stale_completed_demote_creates_stale_reset_job() -> TestResult 
 
 // ── T-1.7 (Phase B): the §4 consumption-transaction topdown_pruned clear-mirror ──
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// PD-B16 / design §4 ("Which writers stay live — normative"): when a
 /// PRUNED-origin materialization job resolves ResolvedSuccess, the
 /// consumption clears the node's own topdown_pruned mark — in-memory
@@ -2150,7 +2373,7 @@ async fn flag_on_resolved_job_clears_pruned_mark() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// The §4 clear-mirror's resolved_from_source half: a pruned root whose
 /// re-declared child is NOT yet produced (durable evidence Pending) gets
 /// an Unobtainable report → the routing resolves from-source → the mark
@@ -2246,7 +2469,7 @@ async fn flag_on_from_source_resolution_clears_pruned_mark() -> TestResult {
     Ok(())
 }
 
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 /// THE FP-4(a) revert-with-state test (PD-B16's reason to exist): a
 /// node materialized successfully under flag-ON, then the deployment
 /// reverts to flag-OFF (actor re-created flag-off against the same PG).

@@ -359,7 +359,7 @@ async fn insert_execution_with_kind(
 /// property (the kernel half is the
 /// `check_materialization_rows_invisible_to_build_decision` CBMC
 /// harness).
-// r[verify sched.materialize.routing]
+// r[verify sched.materialize.routing+2]
 #[tokio::test]
 async fn test_suffix_load_carries_attempt_kind_and_partition() -> anyhow::Result<()> {
     let (test_db, db, drv_id) = setup("attempt-kind-hash").await?;

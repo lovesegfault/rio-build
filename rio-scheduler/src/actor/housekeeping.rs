@@ -629,7 +629,7 @@ impl DagActor {
         // materialization budget and toward NOTHING else), never
         // executor_crash. The branch is an early return for a kind no
         // build attempt carries — the as-built arms below are untouched.
-        // r[impl sched.materialize.routing]
+        // r[impl sched.materialize.routing+2]
         if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
             self.establish_materialization_attempt(attempt).await;
             return;

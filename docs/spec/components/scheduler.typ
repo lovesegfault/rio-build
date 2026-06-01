@@ -1418,7 +1418,7 @@ the same derivation concurrently produce one job, enforced by the
 `materialization_jobs_unresolved` partial-unique index instead of by in-memory
 status checks.
 
-#r("sched.materialize.routing")[
+#r("sched.materialize.routing+2")[
   A materialization outcome MUST be consumed in exactly one fenced transaction
   keyed by its exec_id, and that transaction MUST re-read live interest and the
   live effective wanted set before acting: a Success outcome completes the node
@@ -1429,14 +1429,28 @@ status checks.
   durable-Pending arm (deps still buildable → from-source via normal gating),
   and only then --- after a same-transaction store re-probe of the live wanted
   set confirms a live-wanted path missing-and-unsubstitutable, or after the
-  per-job re-probe one-shot is spent --- the fail-fast arm. An InfraFailure
+  per-job re-probe one-shot is spent --- the settlement arm, which MUST
+  discriminate on the topdown-pruned mark: a MARKED node fail-fasts every live
+  DAG-interested build with the resubmit-directing error (the prune
+  deliberately dropped its closure --- from-source is doomed); an UNMARKED node
+  MUST instead resolve from-source (the as-built walk never fail-fasts unmarked
+  nodes, whatever their evidence --- flag-state outcome equivalence requires
+  the same verdict from the materialization settlement). An InfraFailure
   outcome MUST never fail-fast and never route from-source; it re-arms the job
   within the materialization budget and parks it on exhaustion.
 ]
 The four-arm routing is the C3-settlement successor (design §2.4; review
 findings AS-2/PP-1/PP-3/BC-5). The same-transaction re-probe preserves CE-D4's
 recorded contract ("every fail-fast decision point re-probes live obtainability
-first") at the single surviving fail-fast site. The Success coverage re-check
+first") at the single surviving fail-fast site. The mark discriminator is the
+flag-state reachability mirror of that site: as-built, `must_substitute`
+(marked AND Broken closure evidence) is the only gate to
+`fail_fast_topdown_pruned_root`, so a node that was never pruned can never
+receive the resubmit-directing terminal error flag-off --- the settlement arm
+reserves the same verdict for marked nodes flag-on (the C3-class equivalence
+divergence; Phase B finding 11). Genuine leaves whose evidence is Broken by
+structure (childless) release to from-source dispatch and the build attempt
+proceeds. The Success coverage re-check
 closes the CE-17 class (interest grew between execution and consumption). The
 park-not-fail posture preserves B3 ("unknown never demotes"): infra evidence is
 never confirmation. Parking becomes *visible and alertable* (a dedicated
