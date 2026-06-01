@@ -244,14 +244,18 @@ impl SchedulerDb {
     /// Persist a still-running build's sticky first-failure summary
     /// without touching its status — `COALESCE` keeps an already-persisted
     /// summary, so the first write wins (mirroring the in-memory
-    /// `get_or_insert_with`). Executor-scoped: the displacement path calls
-    /// this inside the merge transaction
-    /// (`sched.merge.displaced-failure-evidence`) so the evidence commits
-    /// or rolls back together with the link prune that would otherwise
-    /// erase the only recoverable trace of the failure; the poison-clear
-    /// prune paths reach the same statement through the pool-level
-    /// [`Self::persist_build_error_summary`] wrapper. Plain runtime
-    /// query — no `.sqlx/` impact.
+    /// `get_or_insert_with`). Three writer tiers share this statement:
+    /// the at-source chokepoint (`record_failure_evidence`,
+    /// `sched.build.failure-evidence-at-source`) persists in the same
+    /// actor turn the failure is observed — the PRIMARY durability
+    /// mechanism; the displacement / resubmit-reset path calls this
+    /// inside the merge transaction
+    /// (`sched.merge.displaced-failure-evidence`) and the poison-clear
+    /// prune paths call it through the pool-level wrapper
+    /// (`sched.poison.clear-failure-evidence`) — both BACKSTOPS for the
+    /// case where the at-source write failed and no retry has succeeded
+    /// yet. Idempotence (COALESCE) is what lets all three coexist
+    /// without coordination. Plain runtime query — no `.sqlx/` impact.
     // r[impl sched.merge.displaced-failure-evidence]
     pub(crate) async fn persist_build_error_summary_tx(
         conn: &mut sqlx::PgConnection,
@@ -269,12 +273,16 @@ impl SchedulerDb {
     }
 
     /// Pool-level wrapper around [`Self::persist_build_error_summary_tx`]
-    /// for the prune paths that have no surrounding transaction
-    /// (`AdminService.ClearPoison` and the poison-TTL sweep): `clear_poison`
-    /// is a single pool UPDATE, so evidence-first ordering plus the
-    /// idempotent COALESCE write is what makes the sticky failure durable
-    /// across a failover — there is no joint transaction to ride.
+    /// for callers with no surrounding transaction: the at-source
+    /// chokepoint and its tick-retry sweep
+    /// (`sched.build.failure-evidence-at-source`), and the poison-clear
+    /// prune paths (`AdminService.ClearPoison` and the poison-TTL sweep,
+    /// `sched.poison.clear-failure-evidence`) where `clear_poison` is a
+    /// single pool UPDATE and evidence-first ordering plus the
+    /// idempotent COALESCE write is what makes the sticky failure
+    /// durable across a failover.
     // r[impl sched.poison.clear-failure-evidence]
+    // r[impl sched.build.failure-evidence-at-source]
     pub(crate) async fn persist_build_error_summary(
         &self,
         build_id: Uuid,

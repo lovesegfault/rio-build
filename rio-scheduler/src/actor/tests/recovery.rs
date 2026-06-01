@@ -5813,6 +5813,218 @@ async fn test_recovery_keep_going_sticky_failure_survives_pre_failover_clear_poi
     Ok(())
 }
 
+// r[verify sched.build.failure-evidence-at-source]
+/// THE wrong-success regression for the resubmit-reset eraser (the
+/// fourth instance of the "failure evidence lost on path X" class —
+/// rounds 12/13 fixed displacement and the poison-clear paths; this
+/// round closes the class at the source instead of patching the path).
+///
+/// A keep_going build's failed derivation is re-submitted by another
+/// build: the same-definition resubmit-reset re-creates the row (status
+/// back to non-failed, poison fields cleared), so nothing about the row
+/// or its links reconstructs the failure at recovery. The build's
+/// outcome must not depend on that — the evidence was made durable at
+/// the moment the failure was observed.
+#[tokio::test]
+async fn test_recovery_keep_going_sticky_failure_survives_resubmit_reset() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let resubmitter = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        // Watcher (keep_going): a node that will fail + a filler on
+        // another arch still pending at failover time.
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("rsr-n"),
+                make_test_node("rsr-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-rsr", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("rsr-n"));
+        complete_failure(
+            &handle,
+            "w-rsr",
+            &test_drv_path("rsr-n"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "rsr-n", DerivationStatus::Poisoned).await;
+
+        // The at-source persist already happened — BEFORE any eraser.
+        let (evidence,): (Option<String>,) =
+            sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+                .bind(watcher)
+                .fetch_one(&pool)
+                .await?;
+        assert!(
+            evidence.is_some(),
+            "first failure must be durable at the source, before any eraser path runs"
+        );
+
+        // Disconnect the worker so the re-created node stays queued.
+        drop(rx);
+
+        // The resubmitter re-submits the SAME definition: the
+        // resubmit-reset re-creates the row — the eraser this test is
+        // about. Post-reset the row carries no failure state at all.
+        merge_dag(
+            &handle,
+            resubmitter,
+            vec![make_node("rsr-n")],
+            vec![],
+            false,
+        )
+        .await?;
+        barrier(&handle).await;
+        let (status,): (String,) =
+            sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'rsr-n'")
+                .fetch_one(&pool)
+                .await?;
+        assert_ne!(
+            status, "poisoned",
+            "fixture premise: the resubmit-reset erased the row's failure state"
+        );
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+
+    // Post-failover: the watcher recovers Active with its sticky failure
+    // seeded from PG. Completing everything must end it Failed — never
+    // the silent wrong-success.
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let mut rx = connect_executor(&handle, "w-rsr-r", "x86_64-linux").await?;
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(
+        assn.drv_path,
+        test_drv_path("rsr-n"),
+        "the re-created node re-dispatches post-failover"
+    );
+    complete_success(
+        &handle,
+        "w-rsr-r",
+        &assn.drv_path,
+        &test_store_path("rsr-n-out"),
+    )
+    .await?;
+    let mut rx_arm = connect_executor(&handle, "w-rsr-r-arm", "aarch64-linux").await?;
+    let assn_arm = recv_assignment(&mut rx_arm).await;
+    assert_eq!(assn_arm.drv_path, test_drv_path("rsr-fill"));
+    complete_success(
+        &handle,
+        "w-rsr-r-arm",
+        &assn_arm.drv_path,
+        &test_store_path("rsr-fill-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "keep_going build must end Failed post-failover: the at-source evidence \
+         survived the resubmit-reset eraser (was: silent wrong-success)"
+    );
+    assert!(
+        !query_status(&handle, watcher)
+            .await?
+            .error_summary
+            .is_empty(),
+        "recovered build serves the persisted failure summary"
+    );
+    // The resubmitter is unaffected by the watcher's evidence.
+    assert_eq!(
+        query_status(&handle, resubmitter).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the resubmitting build succeeds — no evidence inheritance"
+    );
+    Ok(())
+}
+
+// r[verify sched.build.failure-evidence-at-source]
+/// Recovery's failed_count fallback reconstruction is itself a fresh
+/// failure observation and must be re-persisted before the new leader
+/// serves traffic — otherwise the reconstructed evidence is exactly as
+/// failover-fragile as the in-memory evidence it replaced.
+///
+/// Staging: the failure IS still reconstructible at recovery (the
+/// poisoned row is linked), but builds.error_summary is NULL (simulating
+/// a lost at-source write — PG blip at observation time). After
+/// recovery, the reconstruction must be durable in PG.
+#[tokio::test]
+async fn test_recovery_fallback_reconstruction_persisted_at_source() -> TestResult {
+    let watcher = Uuid::new_v4();
+    let f = RecoveryFixture::run(async move |handle, pool| {
+        merge_dag(
+            &handle,
+            watcher,
+            vec![
+                make_node("rfr-n"),
+                make_test_node("rfr-fill", "aarch64-linux"),
+            ],
+            vec![],
+            true,
+        )
+        .await?;
+        let mut rx = connect_executor(&handle, "w-rfr", "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert_eq!(assn.drv_path, test_drv_path("rfr-n"));
+        complete_failure(
+            &handle,
+            "w-rfr",
+            &test_drv_path("rfr-n"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "builder exploded",
+        )
+        .await?;
+        wait_for_status(&handle, "rfr-n", DerivationStatus::Poisoned).await;
+
+        // Simulate a lost at-source write: NULL out the persisted
+        // evidence. The poisoned row + link stay (reconstructible).
+        sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+            .bind(watcher)
+            .execute(&pool)
+            .await?;
+        Ok(())
+    })
+    .await?;
+    let handle = f.handle;
+    let pool = &f.db.pool;
+
+    // Post-failover: the reconstruction ran AND was re-persisted before
+    // the leader serves traffic.
+    assert_eq!(
+        query_status(&handle, watcher).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "watcher recovered Active"
+    );
+    let (evidence,): (Option<String>,) =
+        sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
+            .bind(watcher)
+            .fetch_one(pool)
+            .await?;
+    assert!(
+        evidence.is_some(),
+        "the failed_count fallback reconstruction must itself be persisted \
+         at the end of recovery (a reconstruction is a fresh observation)"
+    );
+    assert!(
+        evidence.unwrap().contains("failed derivation"),
+        "the persisted evidence is the reconstruction-format summary"
+    );
+    Ok(())
+}
+
 // r[verify sched.persist.ca-modular-hash+2]
 // r[verify sched.merge.authoritative-claim-no-redefine]
 /// End-to-end bug_005 regression: a store-backed floating-CA node parked

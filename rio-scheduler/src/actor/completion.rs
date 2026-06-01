@@ -2116,14 +2116,22 @@ impl DagActor {
     /// Persist the sticky first-failure summary of every still-running
     /// interested build BEFORE a poison-clear prune removes `drv_hash`.
     ///
+    /// DEFENSE-IN-DEPTH BACKSTOP. Since the at-source persist
+    /// (`record_failure_evidence`, sched.build.failure-evidence-at-source)
+    /// landed, a build's first failure is normally already durable in
+    /// `builds.error_summary` by the time any eraser path runs — this
+    /// pre-clear persist only matters when the at-source write failed
+    /// (PG blip at observation time) AND no tick-retry sweep has
+    /// succeeded since. It stays because it is cheap (the COALESCE write
+    /// is a no-op when the evidence is already durable) and because it
+    /// keeps the eraser paths' fail-closed contract self-contained
+    /// rather than dependent on another component's earlier success.
+    ///
     /// `db.clear_poison` resets the derivation row to `status='created'`
     /// (poison fields NULLed), so the surviving `build_derivations` link
     /// reconstructs nothing at recovery: the row loads back as a
-    /// non-failed node and contributes zero to `failed_count`. The
-    /// in-memory `error_summary` set by `handle_derivation_failure` is
-    /// therefore the only failure evidence left, and it dies with the
-    /// leader — `builds.error_summary` is the only failover-surviving
-    /// copy. Mirrors the displacement-path persist
+    /// non-failed node and contributes zero to `failed_count`. Mirrors
+    /// the displacement-path persist
     /// (`sched.merge.displaced-failure-evidence`); not gated on
     /// `keep_going` because a non-terminal `!keep_going` interested build
     /// cannot exist at poison time, and the COALESCE write is an
@@ -2150,6 +2158,97 @@ impl DagActor {
                 .await?;
         }
         Ok(())
+    }
+
+    // r[impl sched.build.failure-evidence-at-source]
+    /// THE failure-evidence chokepoint: record a build's first observed
+    /// derivation failure in memory and make it durable in the SAME
+    /// actor turn it is observed.
+    ///
+    /// This closes the recurring "failure evidence lost on path X"
+    /// class structurally: with evidence persisted at the source, no
+    /// row-erasing operation (displacement, ClearPoison, poison-TTL,
+    /// resubmit-reset, or any future eraser) needs to know that some
+    /// Active keep_going build's only durable failure evidence was
+    /// reconstructible from the row it is about to erase. The per-path
+    /// pre-erase persists remain as defense-in-depth backstops.
+    ///
+    /// Persistence failure is non-fatal here (warn + flag left false):
+    /// the tick-retry sweep (`persist_pending_failure_evidence`) and the
+    /// eraser-path backstops re-attempt it. Losing evidence now requires
+    /// a PG outage at observation time AND a failover before any retry
+    /// succeeded — three independent failures instead of one.
+    pub(super) async fn record_failure_evidence(&mut self, build_id: Uuid, drv_hash: &DrvHash) {
+        let Some(build) = self.builds.get_mut(&build_id) else {
+            return;
+        };
+        if build.state().is_terminal() {
+            return;
+        }
+        // First-failure wins, in memory exactly as in PG (COALESCE).
+        build
+            .error_summary
+            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
+        build
+            .failed_derivation
+            .get_or_insert_with(|| drv_hash.to_string());
+        self.persist_evidence_if_pending(build_id).await;
+    }
+
+    /// Shared persist half of [`Self::record_failure_evidence`] and
+    /// [`Self::persist_pending_failure_evidence`] — one implementation so
+    /// the chokepoint and its retry sweep cannot diverge. Persists one
+    /// build's in-memory evidence iff the build is non-terminal, the
+    /// evidence is not yet durable, and a summary exists.
+    async fn persist_evidence_if_pending(&mut self, build_id: Uuid) {
+        let Some(build) = self.builds.get(&build_id) else {
+            return;
+        };
+        if build.state().is_terminal() || build.failure_evidence_durable {
+            return;
+        }
+        let Some(summary) = build.error_summary.clone() else {
+            return;
+        };
+        match self
+            .db
+            .persist_build_error_summary(build_id, &summary)
+            .await
+        {
+            Ok(()) => {
+                if let Some(b) = self.builds.get_mut(&build_id) {
+                    b.failure_evidence_durable = true;
+                }
+            }
+            Err(e) => {
+                warn!(
+                    build_id = %build_id, error = %e,
+                    "failed to persist failure evidence at source \
+                     (left pending; tick sweep and eraser-path backstops will retry)"
+                );
+            }
+        }
+    }
+
+    // r[impl sched.build.failure-evidence-at-source]
+    /// Tick-retry sweep: re-attempt the at-source persist for every
+    /// build whose in-memory failure evidence is not yet durable.
+    /// Runs every housekeeping tick BEFORE the poison-TTL eraser, and
+    /// once at the end of recovery (a failed_count-based reconstruction
+    /// is a fresh observation that must be re-persisted before the new
+    /// leader serves traffic).
+    pub(super) async fn persist_pending_failure_evidence(&mut self) {
+        let pending: Vec<Uuid> = self
+            .builds
+            .iter()
+            .filter(|(_, b)| {
+                !b.state().is_terminal() && !b.failure_evidence_durable && b.error_summary.is_some()
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for build_id in pending {
+            self.persist_evidence_if_pending(build_id).await;
+        }
     }
 
     // r[impl sched.admin.clear-poison]
@@ -2840,23 +2939,22 @@ impl DagActor {
         // additional parents to DependencyFailed; those must be counted here.
         self.update_build_counts(build_id).await;
 
-        let Some(build) = self.builds.get_mut(&build_id) else {
+        // r[impl sched.build.keep-going]
+        // r[impl sched.build.failure-evidence-at-source]
+        // Record FIRST-failure summary regardless of keep_going — and
+        // persist it durably in this same actor turn, through the
+        // evidence chokepoint. The previous `!keep_going`-only
+        // assignment meant a keep_going build's eventual `BuildFailed`
+        // had `error_message=""`; the previous memory-only recording
+        // meant a failover before the build terminated lost the
+        // evidence whenever an eraser path had dropped the failed row
+        // (the 4-rounds-recurring bug class). First failure wins across
+        // multiple calls under keep_going.
+        self.record_failure_evidence(build_id, drv_hash).await;
+
+        let Some(build) = self.builds.get(&build_id) else {
             return;
         };
-
-        // r[impl sched.build.keep-going]
-        // Record FIRST-failure summary regardless of keep_going. The
-        // previous `!keep_going`-only assignment meant a keep_going
-        // build's eventual `BuildFailed` had `error_message=""` and
-        // `failed_derivation=""` (transition_build_to_failed
-        // `.unwrap_or_default()`s both). `get_or_insert` keeps the
-        // first failure across multiple calls under keep_going.
-        build
-            .error_summary
-            .get_or_insert_with(|| format!("derivation {drv_hash} failed"));
-        build
-            .failed_derivation
-            .get_or_insert_with(|| drv_hash.to_string());
 
         if !build.keep_going {
             // Fail the entire build immediately. Cancel remaining

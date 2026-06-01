@@ -2278,18 +2278,20 @@ impl DagActor {
             debug!(drv_hash = %hash, pruned, "pruned displaced node from prior builds' links");
 
             // r[impl sched.merge.displaced-failure-evidence]
-            // For a still-running keep_going build, the link just deleted
-            // was the only durable evidence that it ever had a failed
-            // derivation: its sticky error_summary lives in memory only
-            // (persisted at the terminal transition), and recovery
-            // reconstructs the sticky flag from failed nodes still LINKED
-            // to the build. Persist the in-memory first-failure summary in
-            // the same transaction, so a leader failover before the
-            // build's remaining derivations finish cannot flip its
-            // outcome to a silent wrong-success. Builds with no observed
-            // failure (e.g. the displaced node had Completed for them)
-            // are left untouched — joining a later-displaced node is not
-            // a failure.
+            // DEFENSE-IN-DEPTH BACKSTOP: since the at-source persist
+            // (sched.build.failure-evidence-at-source) landed, a
+            // still-running keep_going build's first failure is normally
+            // already durable in builds.error_summary by the time a
+            // displacement prunes its link — this in-tx persist only
+            // matters when the at-source write failed (PG blip at
+            // observation time) and no retry has succeeded since. It
+            // stays because it rides an existing transaction (free
+            // atomicity), keeps the displacement path's evidence
+            // contract self-contained, and the COALESCE write is a no-op
+            // when the evidence is already durable. Builds with no
+            // observed failure (e.g. the displaced node had Completed
+            // for them) are left untouched — joining a later-displaced
+            // node is not a failure.
             for prior_build in &interest.prior_builds {
                 if !evidence_persisted.insert(*prior_build) {
                     continue;

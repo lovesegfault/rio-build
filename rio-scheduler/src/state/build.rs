@@ -135,6 +135,17 @@ pub struct BuildInfo {
     pub error_summary: Option<String>,
     /// The derivation that caused the failure (if any).
     pub failed_derivation: Option<String>,
+    // r[impl sched.build.failure-evidence-at-source]
+    /// Whether `error_summary` has been durably persisted to
+    /// `builds.error_summary`. Pure write-suppression flag for the
+    /// at-source persist (`record_failure_evidence`) and its tick-retry
+    /// sweep (`persist_pending_failure_evidence`) — never a correctness
+    /// gate: the persist itself is COALESCE first-write-wins, so a
+    /// spurious re-persist is a no-op. `false` on fresh builds; recovery
+    /// seeds it from PG presence (a summary restored from
+    /// `builds.error_summary` is durable by definition; one
+    /// reconstructed from row state is not, and gets re-persisted).
+    pub failure_evidence_durable: bool,
     /// Root output paths captured at the successful terminal transition
     /// (`complete_build`). Empty until then. The `WatchBuild` terminal
     /// re-send replays this settled value instead of re-walking the DAG,
@@ -182,6 +193,7 @@ impl BuildInfo {
             failed_count: 0,
             error_summary: None,
             failed_derivation: None,
+            failure_evidence_durable: false,
             output_paths: Vec::new(),
             submitted_at: Instant::now(),
             orphaned_since: None,

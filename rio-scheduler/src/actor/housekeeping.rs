@@ -172,6 +172,12 @@ impl DagActor {
         self.tick_process_backstop_timeouts(&backstop_timeouts)
             .await;
         self.tick_check_build_timeouts().await;
+        // r[impl sched.build.failure-evidence-at-source]
+        // Retry any failure evidence whose at-source persist failed (PG
+        // blip at observation time). Must run BEFORE the poison-TTL
+        // eraser below so pending evidence reaches PG before any eraser
+        // can drop the row that would otherwise reconstruct it.
+        self.persist_pending_failure_evidence().await;
         self.tick_recheck_stuck_completions().await;
         self.tick_check_orphaned_builds().await;
         self.tick_process_expired_poisons(expired_poisons).await;

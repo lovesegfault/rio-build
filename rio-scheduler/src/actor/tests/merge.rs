@@ -10241,11 +10241,16 @@ async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
 }
 
 // r[verify sched.merge.displaced-failure-evidence]
-/// Displacing a failed derivation out of a still-running keep_going
-/// build persists that build's sticky first-failure summary in the same
-/// transaction as the link prune — and the build's live outcome is
-/// unchanged: it still ends Failed once its remaining derivations
-/// resolve.
+// r[verify sched.build.failure-evidence-at-source]
+/// Two independent layers keep a displaced failure's evidence durable:
+/// the at-source persist (fires the moment the failure is observed) and
+/// the in-transaction backstop (rides the displacing merge's link
+/// prune). This test pins BOTH: the evidence is durable before the
+/// displacement (at-source), and — after artificially erasing it to
+/// simulate a lost at-source write — the displacement transaction
+/// independently re-persists it (backstop). The build's live outcome is
+/// unchanged either way: it still ends Failed once its remaining
+/// derivations resolve.
 #[tokio::test]
 async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -10267,7 +10272,7 @@ async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult
     .await?;
 
     // The squat fails permanently on a real worker → the watcher records
-    // its sticky first failure in memory and (keep_going) stays Active.
+    // its sticky first failure and (keep_going) stays Active.
     let mut rx = connect_executor(&handle, "w-evi", "x86_64-linux").await?;
     let assn = recv_assignment(&mut rx).await;
     assert_eq!(
@@ -10288,18 +10293,34 @@ async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult
         rio_proto::types::BuildState::Active as i32,
         "keep_going build stays live after the failure"
     );
-    // Nothing persisted yet: the sticky failure is in-memory only while
-    // the build runs (the terminal transition would normally write it).
+    // Layer 1 — at-source: the evidence is ALREADY durable, in the same
+    // actor turn the failure was observed, before any eraser runs.
     let (pre,): (Option<String>,) =
         sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
             .bind(watcher)
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(pre, None, "no evidence persisted before the displacement");
+    assert_eq!(
+        pre.as_deref(),
+        Some("derivation squatW failed"),
+        "at-source layer: evidence persisted the moment the failure was observed"
+    );
 
-    // A conflicting store-backed submission displaces the poisoned squat:
-    // the watcher's link (its only failed-node link) is pruned, so the
-    // same transaction must persist the failure evidence.
+    // Simulate a lost at-source write (PG blip at observation time +
+    // no successful retry yet) so the backstop below is verified
+    // INDEPENDENTLY of the at-source layer. Note: in-memory state still
+    // believes the evidence is durable (write-suppression flag), which
+    // is exactly the situation the in-tx backstop exists for.
+    sqlx::query("UPDATE builds SET error_summary = NULL WHERE build_id = $1")
+        .bind(watcher)
+        .execute(&db.pool)
+        .await?;
+
+    // Layer 2 — the in-tx backstop: a conflicting store-backed
+    // submission displaces the poisoned squat; the watcher's link (its
+    // only failed-node link) is pruned, and the same transaction
+    // re-persists the failure evidence even though the at-source copy
+    // was lost.
     let displacer = Uuid::new_v4();
     merge_dag(
         &handle,
@@ -10318,7 +10339,8 @@ async fn test_displacement_persists_prior_build_failure_evidence() -> TestResult
     assert_eq!(
         evidence.as_deref(),
         Some("derivation squatW failed"),
-        "first-failure evidence persisted in the displacing merge's transaction"
+        "backstop layer: first-failure evidence re-persisted in the \
+         displacing merge's transaction, independent of the at-source layer"
     );
 
     // Live outcome unchanged: completing the watcher's remaining node

@@ -1582,6 +1582,37 @@ Queue-level preemption is fully supported:
     or API call).
 ]
 
+#r("sched.build.failure-evidence-at-source")[
+  A build's first observed derivation failure MUST be made durable in
+  `builds.error_summary` in the same actor turn it is observed (first write
+  wins), independent of any later operation on the failed derivation's row.
+  If that persist fails, the scheduler MUST retry it on every housekeeping
+  tick --- before the poison-TTL eraser runs --- until it succeeds or the
+  build terminates; recovery MUST treat PG-restored evidence as already
+  durable and MUST persist any failure summary it reconstructs from
+  still-linked failed derivations before the new leader serves traffic.
+]
+
+This rule closes a four-times-recurring bug class structurally. Rounds 12,
+13, and 14 of adversarial review each found another path that erases a
+failed derivation's row while an Active `keepGoing` build's only durable
+failure evidence was reconstructible from that row (displacement, admin
+poison clear, poison-TTL expiry, same-definition resubmit-reset) ---
+each previously fixed by adding a pre-erase persist to that path. The root
+cause was the dependency itself: evidence durability relied on row state
+surviving until the build terminated. With the failure persisted at the
+*source* --- the moment it is observed --- no eraser path needs to know
+about build evidence at all, and a future eraser cannot reintroduce the
+class: losing evidence now requires a PG outage at the failure-observation
+moment AND a leader failover before any tick retry or eraser-side backstop
+succeeded, instead of a single unfortunate failover. The per-path persists
+(#rref("sched.merge.displaced-failure-evidence"),
+#rref("sched.poison.clear-failure-evidence")) are retained as
+defense-in-depth backstops for exactly that narrowed window. Behavioral
+note: `builds.error_summary` is now populated for Active `keepGoing` builds
+that have observed a failure, not only for terminal or pruned-evidence
+builds --- admin build listings surface the pending failure earlier.
+
 #r("sched.build.terminal-status-settled+2")[
   Once a build reaches a terminal state, the progress and result data
   served for it MUST be the values settled at its terminal transition:
@@ -1965,24 +1996,22 @@ parent-side edges it left behind survive until a future row-level sweep.
   non-terminal build's sticky failure from that persisted value. A prior
   build with no observed failure MUST NOT be marked failed by the prune.
 ]
-For a still-running `keepGoing` build the deleted `build_derivations`
-link was the only failover-recoverable evidence that the build ever had a
-failed derivation: its sticky failure lives in memory until the terminal
-transition, and recovery reconstructs the flag only from failed
-derivations still linked to the build. Without the in-transaction
-persist, a leader failover between the displacement and the build's
-remaining derivations finishing recovers the build with no failure
-evidence and it terminates `succeeded` --- a silent wrong-success whose
-outcome depends on whether a failover happened. Riding the merge
-transaction means the evidence cannot be lost once the prune is durable,
-and the no-observed-failure clause keeps joining a later-displaced node
-from being treated as a failure (the displaced result, if already
-received, stays credited per
-#rref("sched.merge.authoritative-conflict")). The pre-existing
-administrative prune paths (poison clear, TTL expiry) keep the
-`build_derivations` link but reset the derivation row to a non-failed
-state (`'created'`), so the link alone preserves nothing across a
-failover --- they carry the same hazard and persist the same evidence per
+This rule predates #rref("sched.build.failure-evidence-at-source") and is
+retained as its defense-in-depth backstop. With evidence persisted at the
+source, the deleted `build_derivations` link is normally no longer the only
+failover-recoverable trace of the failure --- the in-transaction persist
+matters only when the at-source write failed (PG unavailable at the
+observation moment) and no tick retry has succeeded since. It rides an
+existing transaction (atomicity is free), keeps the displacement path's
+evidence contract self-contained rather than dependent on another
+component's earlier success, and the COALESCE first-write-wins makes the
+overlap idempotent. The no-observed-failure clause keeps joining a
+later-displaced node from being treated as a failure (the displaced
+result, if already received, stays credited per
+#rref("sched.merge.authoritative-conflict")). The administrative prune
+paths (poison clear, TTL expiry) reset the derivation row to a non-failed
+state (`'created'`), so they carry the same residual hazard and persist
+the same backstop evidence per
 #rref("sched.poison.clear-failure-evidence").
 
 #r("sched.poison.clear-failure-evidence")[
@@ -1994,18 +2023,22 @@ failover --- they carry the same hazard and persist the same evidence per
   MUST NOT clear the poison if that persist fails, and MUST NOT mark a
   build with no observed failure as failed.
 ]
-The cleared row recovers as `'created'`: it contributes nothing to the
-failed-count reconstruction, so `builds.error_summary` is the only
-evidence of the failure that survives a leader failover, and recovery
-seeds the recovered build's sticky failure from it exactly as on the
-displacement path. Persisting evidence first preserves the PG-first retry
-contract of both prune paths: a failed persist leaves the node Poisoned
-in memory and in PG, so the operator retry (or the next sweep tick)
-re-runs the whole sequence; the COALESCE first-write-wins makes the
-retry idempotent. Out of scope: the recovery-time expired-at-load clear
-(the in-memory evidence already died with the old leader --- an accepted
-narrow gap) and the re-probe cache-hit `clear_poison` callers, which
-neither remove the node nor touch its links.
+This rule predates #rref("sched.build.failure-evidence-at-source") and is
+retained as its defense-in-depth backstop on the poison-clear paths. The
+cleared row recovers as `'created'`: it contributes nothing to the
+failed-count reconstruction, so `builds.error_summary` is what survives a
+leader failover --- normally written at the failure's observation moment
+by the at-source chokepoint, with this pre-clear persist covering the
+window where that write failed and no retry has succeeded yet. Persisting
+evidence first preserves the PG-first retry contract of both prune paths:
+a failed persist leaves the node Poisoned in memory and in PG, so the
+operator retry (or the next sweep tick) re-runs the whole sequence; the
+COALESCE first-write-wins makes the retry idempotent. The formerly
+out-of-scope paths --- the recovery-time expired-at-load clear and the
+re-probe cache-hit `clear_poison` callers --- are now covered by the
+at-source rule itself: the former because recovery re-persists
+reconstructed evidence before serving traffic, the latter because they
+never erased evidence in the first place.
 
 #r("sched.persist.creation-scoped")[
   The scheduler MUST write a derivation's persisted recovery row only from

@@ -669,14 +669,21 @@ impl DagActor {
             info.recovered_completed = row.completed_drvs as u32;
             info.cached_count = row.cached_drvs as u32;
             // r[impl sched.merge.displaced-failure-evidence]
+            // r[impl sched.build.failure-evidence-at-source]
             // Sticky first-failure evidence persisted while the build was
-            // running (displacement prune). Seeding it here keeps a
-            // keep_going build's outcome failover-independent even when
-            // the failed derivation is no longer linked to it; the
+            // running (at-source chokepoint, or one of the eraser-path
+            // backstops). Seeding it here keeps a keep_going build's
+            // outcome failover-independent even when the failed
+            // derivation is no longer linked to it; the
             // failed_count-based reconstruction in
             // finalize_recovered_builds stays as the fallback for builds
-            // whose failed nodes are still linked.
+            // whose failed nodes are still linked. PG-seeded evidence is
+            // durable by definition — mark it so the tick sweep does not
+            // re-write it; a reconstructed summary (set later, with the
+            // durable flag still false) IS re-persisted by the
+            // end-of-recovery sweep.
             info.error_summary = row.error_summary;
+            info.failure_evidence_durable = info.error_summary.is_some();
             // Seed submitted_at from PG so r[sched.timeout.per-build]
             // and rio_scheduler_build_duration_seconds survive failover
             // (otherwise each failover grants a fresh full
@@ -982,7 +989,10 @@ impl DagActor {
             // r[sched.recovery.poisoned-failed-count]). Without this,
             // a later ClearPoison/TTL removes the node →
             // failed_count=0 → keep_going build spuriously Succeeds.
-            // error_summary is the sticky; failed_count is not.
+            // error_summary is the sticky; failed_count is not. The
+            // reconstruction leaves `failure_evidence_durable` false —
+            // it is a fresh observation, re-persisted by the sweep
+            // below before the new leader serves traffic.
             if let Some(b) = self.builds.get_mut(&build_id)
                 && b.failed_count > 0
                 && b.error_summary.is_none()
@@ -994,6 +1004,13 @@ impl DagActor {
             }
             self.check_build_completion(build_id).await;
         }
+
+        // r[impl sched.build.failure-evidence-at-source]
+        // A failed_count-based reconstruction above is a fresh failure
+        // observation: persist it durably NOW, before the new leader
+        // serves any traffic, so a second failover (or an eraser path
+        // running before the first housekeeping tick) cannot lose it.
+        self.persist_pending_failure_evidence().await;
     }
 
     /// Handle `LeaderAcquired`: run recovery, then set the
