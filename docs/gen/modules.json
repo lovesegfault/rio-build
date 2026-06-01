@@ -78,6 +78,11 @@
       "doc": "Read-path checks: byte integrity on the cold (streaming) and warm"
     },
     {
+      "path": "bin/xfstests_runner/checks/support.rs",
+      "depth": 3,
+      "doc": "Shared types and assertion helpers for the check modules: the [`Ctx`]"
+    },
+    {
       "path": "bin/xfstests_runner/checks/write_attack.rs",
       "depth": 3,
       "doc": "Page-cache write attacks that never go through a FUSE write op, so"
@@ -90,7 +95,7 @@
     {
       "path": "bin/xfstests_runner/checks.rs",
       "depth": 2,
-      "doc": "The check registry and shared helpers."
+      "doc": "The check registry — the table of contents of every ported check."
     },
     {
       "path": "bin/xfstests_runner/main.rs",
