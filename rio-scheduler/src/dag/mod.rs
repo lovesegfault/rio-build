@@ -52,18 +52,25 @@ pub enum DagError {
     /// (system, output names, fixed-output flag, content-addressed flag,
     /// declared expected output paths, plus content-bound evidence — a
     /// shared fixed-output path or a matching CA modular hash) conflicts
-    /// with an in-flight node that carries authoritative inline content.
-    /// Joining would attribute that in-flight build's results to a
-    /// derivation that either provably differs or cannot be shown to be
-    /// the same. Maps to `FAILED_PRECONDITION`; once the conflicting node
-    /// is terminal the verifiable definition displaces it instead. (An
-    /// identity-MATCHING store-backed submission never sees this error:
-    /// it joins the node, or displaces it without error when the node is
-    /// poison-locked — terminal failure, no longer retriable on
-    /// resubmit.)
+    /// with a node that carries authoritative inline content and is
+    /// either still in flight or finished successfully. Joining would
+    /// attribute that node's results to a derivation that either provably
+    /// differs or cannot be shown to be the same; displacing a settled
+    /// (Completed/Skipped) node would erase the record of a successful
+    /// build. Maps to `FAILED_PRECONDITION`; once the conflicting node
+    /// sits in a terminal FAILURE state the verifiable definition
+    /// displaces it instead. (An identity-MATCHING store-backed
+    /// submission never sees this error: it joins the node, or displaces
+    /// it without error when the node is poison-locked — terminal
+    /// failure, no longer retriable on resubmit.) A legitimate claimant
+    /// hitting this against a settled squat needs operator remediation
+    /// (clear the settled record) until store-evidence displacement
+    /// lands.
     #[error(
-        "in-flight derivation {drv_path} carries authoritative inline content \
-         that conflicts with this submission's declared identity"
+        "derivation {drv_path} carries authoritative inline content that \
+         conflicts with this submission's declared identity; if the \
+         existing record is a squat on your derivation's path, ask an \
+         operator to clear it"
     )]
     ConflictingInFlightContent { drv_path: String },
     /// The inverse direction of [`Self::ConflictingInFlightContent`]: a
@@ -620,7 +627,7 @@ impl DerivationDag {
                 .canonical(node.drv_hash.as_str())
                 .unwrap_or_else(|| node.drv_hash.as_str().into());
 
-            // r[impl sched.merge.authoritative-conflict+4]
+            // r[impl sched.merge.authoritative-conflict+5]
             // Authoritative-content protection. Evaluated BEFORE the
             // resubmit-reset below so the existing node is examined in
             // EVERY lifecycle state — running it after the reset would
@@ -645,18 +652,20 @@ impl DerivationDag {
             //     rest of its poison TTL;
             //   - a store-backed (non-authoritative) submission whose
             //     verifiable identity conflicts is rejected while the
-            //     node is in flight, and DISPLACES it once the node is
-            //     terminal — `is_terminal()`, which includes a
-            //     poison-budget-exhausted squat — (the verifiable
-            //     definition wins; prior interest is NOT carried and the
-            //     fresh node starts with a fresh poison budget: it is a
-            //     different definition, not a retry of the old one); an
-            //     identity-MATCHING store-backed submission joins as
-            //     usual, EXCEPT when the node sits in a poison-locked
-            //     terminal failure state (no longer retriable on
-            //     resubmit): then it displaces the node too, so a locked
-            //     claim cannot capture later legitimate submissions for
-            //     the rest of its poison TTL;
+            //     node is in flight OR finished successfully
+            //     (Completed/Skipped — a settled record is never
+            //     erased by an unverified claim), and DISPLACES it once
+            //     the node sits in a terminal FAILURE state — which
+            //     includes a poison-budget-exhausted squat — (the
+            //     verifiable definition wins; prior interest is NOT
+            //     carried and the fresh node starts with a fresh poison
+            //     budget: it is a different definition, not a retry of
+            //     the old one); an identity-MATCHING store-backed
+            //     submission joins as usual, EXCEPT when the node sits
+            //     in a poison-locked terminal failure state (no longer
+            //     retriable on resubmit): then it displaces the node
+            //     too, so a locked claim cannot capture later legitimate
+            //     submissions for the rest of its poison TTL;
             //   - the INVERSE direction is gated too
             //     (sched.merge.authoritative-claim-no-redefine): an
             //     authoritative claim landing on a STORE-BACKED node
@@ -730,7 +739,20 @@ impl DerivationDag {
                         )
                         && !existing.is_retriable_on_resubmit();
                     if !identity_matches || locked_terminal_failure {
-                        if existing.status().is_terminal() {
+                        // Same Completed/Skipped carve-out as the
+                        // authoritative-vs-authoritative arm above: a claim
+                        // that finished successfully is never displaced.
+                        // Its outputs are registered (or registering) under
+                        // this identity, so a conflicting later submission
+                        // is rejected instead — displacing a settled node
+                        // would let an unverified store-backed claim erase
+                        // the record of a successful build (bug_076).
+                        let terminal_failure = existing.status().is_terminal()
+                            && !matches!(
+                                existing.status(),
+                                DerivationStatus::Completed | DerivationStatus::Skipped
+                            );
+                        if terminal_failure {
                             // Displacement: remove the squat so the fresh
                             // store-backed definition is inserted below as a
                             // brand-new node (prior=None → no interest carry,
@@ -752,10 +774,11 @@ impl DerivationDag {
                             }
                             displaced.push(drv_hash.clone());
                         } else {
-                            // Only reachable on an identity conflict — a
-                            // poison-locked node is terminal by
-                            // construction, so the matching case never
-                            // lands here.
+                            // Reachable on an identity conflict against a
+                            // live, Failed, or settled (Completed/Skipped)
+                            // node — a poison-locked node is a terminal
+                            // failure by construction, so the
+                            // identity-MATCHING case never lands here.
                             self.rollback_merge(
                                 &newly_inserted,
                                 &new_edges,

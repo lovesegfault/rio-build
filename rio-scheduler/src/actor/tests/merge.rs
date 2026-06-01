@@ -9083,7 +9083,7 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 /// identity is what PG persists, the displaced hash stops counting toward
 /// prior interested builds (they complete instead of hanging Active), and
 /// the displaced fresh node belongs to the displacer only.
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[tokio::test]
 async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResult {
     let (db, handle, _task) = setup().await;
@@ -9106,6 +9106,8 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     // Build 2 (prior-interested victim of the prune): joins the in-flight
     // squat with a MATCHING identity (including the shared expected output
     // path as content evidence) and brings one extra node of its own.
+    // keep_going so the squat's failure below leaves it non-terminal
+    // (the displacement-time link prune only covers non-terminal builds).
     let joiner = Uuid::new_v4();
     let mut squat_join = make_node("squatA");
     squat_join.expected_output_paths = vec![test_store_path("squatA-out")];
@@ -9114,23 +9116,32 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         joiner,
         vec![squat_join, make_node("fillerB")],
         vec![],
-        false,
+        true,
     )
     .await?;
 
-    // Complete the squat only — build1 succeeds, build2 stays Active on
-    // fillerB.
-    complete_success(&handle, "w1", &squat_path, &test_store_path("squatA-out")).await?;
-    wait_for_status(&handle, "squatA", DerivationStatus::Completed).await;
+    // Fail the squat permanently — it parks Poisoned (a terminal failure
+    // state, displaceable). build1 fails; the keep_going build2 stays
+    // Active on fillerB. (A squat that COMPLETES is never displaced —
+    // see test_completed_authoritative_node_survives_conflicting_submission.)
+    complete_failure(
+        &handle,
+        "w1",
+        &squat_path,
+        rio_proto::types::BuildResultStatus::PermanentFailure,
+        "squat build failed permanently",
+    )
+    .await?;
+    wait_for_status(&handle, "squatA", DerivationStatus::Poisoned).await;
     assert_eq!(
         query_status(&handle, squatter).await?.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "squatter build completes"
+        rio_proto::types::BuildState::Failed as i32,
+        "squatter build fails with its poisoned node"
     );
     assert_eq!(
         query_status(&handle, joiner).await?.state,
         rio_proto::types::BuildState::Active as i32,
-        "joiner still waiting on fillerB"
+        "keep_going joiner still waiting on fillerB"
     );
     // Settled accounting of the terminal squatter, captured before the
     // displacement — it must never be rewritten afterwards.
@@ -9217,24 +9228,41 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "terminal squatter's persisted counts frozen at its terminal transition"
     );
     // r[verify sched.merge.displaced-failure-evidence]
-    // The still-running joiner never observed a failure (the squat
-    // Completed for it before the displacement), so the prune must not
-    // persist failure evidence for it.
+    // r[verify sched.build.failure-evidence-at-source]
+    // The still-running keep_going joiner observed the squat's permanent
+    // failure before the displacement, so its first-failure evidence is
+    // durable (persisted at source) and the displacement prune must keep
+    // it — pruning the link removes the accounting slot, never the
+    // observed-failure record.
     let (joiner_summary,): (Option<String>,) =
         sqlx::query_as("SELECT error_summary FROM builds WHERE build_id = $1")
             .bind(joiner)
             .fetch_one(&db.pool)
             .await?;
-    assert_eq!(
-        joiner_summary, None,
-        "no failure evidence persisted for a build with no observed failure"
+    assert!(
+        joiner_summary.is_some(),
+        "joiner's observed-failure evidence survives the displacement prune"
     );
 
-    // The joiner's accounting no longer includes the displaced hash:
-    // completing fillerB is enough to finish the build (no Active hang).
-    // Executors are one-shot (drain after their completion), so a second
-    // worker runs fillerB; the displaced fresh node is aarch64-only and
-    // cannot be what gets dispatched here.
+    // The joiner stays Active after the displacement: the displaced slot
+    // is gone from its accounting (total 2 → 1; the squat's result was a
+    // failure, not delivered output, so no credit is kept) and its
+    // failed_count is recomputed from the live DAG — the displaced node
+    // no longer counts. What DOES persist is the failure evidence
+    // (error_summary, asserted above): displacement prunes accounting,
+    // never observed history.
+    assert_eq!(
+        query_status(&handle, joiner).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "keep_going joiner stays Active on fillerB after the displacement prune"
+    );
+    // Completing fillerB is enough to SETTLE the joiner (no Active hang
+    // on the displaced hash). It settles Failed, not Succeeded: the
+    // squat failure it observed pre-displacement is sticky evidence
+    // even though the failed node itself was displaced out of its
+    // accounting. Executors are one-shot, so a second worker runs
+    // fillerB; the displaced fresh node is aarch64-only and cannot be
+    // what gets dispatched here.
     let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
     let assn = recv_assignment(&mut rx2).await;
     assert_eq!(assn.drv_path, filler_path, "unexpected assignment");
@@ -9242,27 +9270,25 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
     barrier(&handle).await;
     assert_eq!(
         query_status(&handle, joiner).await?.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "prior-interested build completes after displacement (hash pruned)"
+        rio_proto::types::BuildState::Failed as i32,
+        "joiner settles Failed once its own node completes (sticky observed failure)"
     );
-    // The joiner had already RECEIVED the squat's result before the
-    // displacement, so the prune keeps both the slot and the credit: its
-    // served and persisted accounting end at 2/2, not 2/1.
+    // Frozen terminal accounting: displaced slot gone (total 1), fillerB
+    // completed (1), and the failure COUNT is 0 — the failed node was
+    // displaced out of the live accounting; the build's Failed outcome
+    // rests on the sticky evidence, not the count.
     let joiner_status = query_status(&handle, joiner).await?;
-    assert_eq!(joiner_status.total_derivations, 2, "joiner keeps its slot");
     assert_eq!(
-        joiner_status.completed_derivations, 2,
-        "joiner keeps the received result's credit after the prune"
+        joiner_status.total_derivations, 1,
+        "displaced slot removed from the joiner's frozen total"
     );
-    let joiner_counts: (i32, i32) =
-        sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
-            .bind(joiner)
-            .fetch_one(&db.pool)
-            .await?;
     assert_eq!(
-        joiner_counts,
-        (2, 2),
-        "persisted joiner counts keep slot + credit for the received result"
+        joiner_status.completed_derivations, 1,
+        "fillerB is the joiner's one completed derivation"
+    );
+    assert_eq!(
+        joiner_status.failed_derivations, 0,
+        "the displaced node's failure is evidence (error_summary), not a live count"
     );
     // The displacer owns the fresh node (aarch64 → never dispatched to w1).
     assert_eq!(
@@ -9271,7 +9297,7 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
         "displacer build is live on the fresh node"
     );
     // And the terminal squatter's settled accounting is still untouched
-    // after the joiner's completion fan-out.
+    // after the displacement + joiner-settlement fan-out.
     let counts_at_end: (i32, i32) =
         sqlx::query_as("SELECT total_drvs, completed_drvs FROM builds WHERE build_id = $1")
             .bind(squatter)
@@ -9279,7 +9305,92 @@ async fn test_displacement_refreshes_row_and_prunes_prior_interest() -> TestResu
             .await?;
     assert_eq!(
         counts_at_end, squatter_counts,
-        "terminal squatter's counts still frozen after later completions"
+        "terminal squatter's counts still frozen after later transitions"
+    );
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+5]
+/// A successfully completed authoritative node is NEVER displaced: a
+/// later store-backed submission with a conflicting (fabricated)
+/// identity is rejected with FAILED_PRECONDITION, the persisted row
+/// keeps the settled identity and status, and the squatter build's
+/// Succeeded record is untouched (bug_076: an unverified submitter
+/// claim must not erase the record of a successful build).
+#[tokio::test]
+async fn test_completed_authoritative_node_survives_conflicting_submission() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: single authoritative node, completed successfully.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settledA");
+    node.drv_content = b"Derive-settled".to_vec();
+    node.drv_content_authoritative = true;
+    node.expected_output_paths = vec![test_store_path("settledA-out")];
+    merge_dag(&handle, owner, vec![node], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settledA");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(&handle, "w1", &drv_path, &test_store_path("settledA-out")).await?;
+    wait_for_status(&handle, "settledA", DerivationStatus::Completed).await;
+    assert_eq!(
+        query_status(&handle, owner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "owner build completes"
+    );
+
+    // Build 2: conflicting store-backed identity (different system) for
+    // the same drv_hash → rejected at the merge gate, never displaces.
+    let attacker = Uuid::new_v4();
+    let result = merge_dag(
+        &handle,
+        attacker,
+        vec![make_test_node("settledA", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "conflicting submission against a settled node must be rejected"
+    );
+    let err_text = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_text.contains("authoritative inline content"),
+        "rejection names the conflict, got: {err_text}"
+    );
+
+    // The persisted row is untouched: settled identity, completed status.
+    let (system, status, content): (String, String, Option<Vec<u8>>) =
+        sqlx::query_as("SELECT system, status, drv_content FROM derivations WHERE drv_path = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(system, "x86_64-linux", "settled identity kept");
+    assert_eq!(status, "completed", "settled status kept");
+    assert_eq!(
+        content.as_deref(),
+        Some(b"Derive-settled".as_slice()),
+        "authoritative bytes kept"
+    );
+
+    // The owner's build record is untouched.
+    assert_eq!(
+        query_status(&handle, owner).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "owner build record survives the conflicting submission"
+    );
+
+    // The attacker's build was rolled back (never inserted).
+    let attacker_row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(attacker)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        attacker_row.is_none() || attacker_row.unwrap().0 == "pending",
+        "attacker build never activated"
     );
     Ok(())
 }
@@ -9392,7 +9503,7 @@ async fn test_displacement_resets_resource_floor() -> TestResult {
 /// the fresh node dispatches and completes, the persisted failure
 /// accounting is reset, and the squatter's still-running build loses
 /// its durable link to the displaced hash.
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[tokio::test]
 async fn test_matching_identity_displacement_unblocks_victim_build() -> TestResult {
     use crate::state::POISON_RESUBMIT_RETRY_LIMIT;
@@ -9955,7 +10066,7 @@ async fn test_reaped_authoritative_squat_row_resets_on_fresh_store_backed_merge(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// End-to-end auth-vs-auth displacement: a poison-locked authoritative
 /// squat must not lock a later authoritative (hook-fallback) submission
 /// of byte-different content out of the hash for the rest of its poison
@@ -10062,7 +10173,7 @@ async fn test_authoritative_displacement_unblocks_hook_fallback_victim() -> Test
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// When the displaced result had NOT been received by a still-running
 /// prior build, the prune removes the slot from the build's absolute
 /// totals — in the same transaction durably (`builds.total_drvs`) and in
@@ -10201,7 +10312,19 @@ async fn test_terminal_build_status_settled_after_displacement() -> TestResult {
         (1, 1)
     );
 
-    // A conflicting store-backed submission displaces the (terminal)
+    // Force the node into a terminal FAILURE state (cfg-test injection —
+    // a Completed node is never displaceable under
+    // sched.merge.authoritative-conflict+5, so the displacement below
+    // needs a poison-parked target; the finished build's settled
+    // accounting must be indifferent to either mutation).
+    assert!(
+        handle
+            .debug_force_status("squatU", DerivationStatus::Poisoned)
+            .await?,
+        "node still resident for the poison flip"
+    );
+
+    // A conflicting store-backed submission displaces the poison-parked
     // node while the finished build is still resident in its cleanup
     // window.
     let displacer = Uuid::new_v4();

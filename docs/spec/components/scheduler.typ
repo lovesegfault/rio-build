@@ -1831,7 +1831,7 @@ registration is already covered by the content-addressed flag. This
 supersedes the earlier posture that the resolve flag was wholly lossy on
 recovery.
 
-#r("sched.merge.authoritative-conflict+4")[
+#r("sched.merge.authoritative-conflict+5")[
   A node whose in-memory state carries authoritative inline derivation
   content MUST NOT be redefined by a later submission for the same
   `drv_hash`: a submission that itself claims authoritative content with
@@ -1846,12 +1846,13 @@ recovery.
   on a non-empty fixed-output expected path, or a byte-equal CA modular
   hash. A store-backed submission whose identity conflicts --- or that
   carries no content-bound evidence --- MUST be rejected while the node is
-  non-terminal and MUST displace it as a fresh node once it is terminal. A
-  store-backed submission whose identity matches MUST also displace the
-  node --- rather than join it --- when the node sits in a terminal failure
-  state that is no longer retriable on resubmit, so a poison-locked
-  authoritative claim cannot capture later legitimate submissions for the
-  remainder of its poison TTL. Displacement MUST NOT carry the displaced
+  non-terminal *or finished successfully* (`Completed`/`Skipped`), and MUST
+  displace it as a fresh node only once it sits in a terminal failure
+  state. A store-backed submission whose identity matches MUST also
+  displace the node --- rather than join it --- when the node sits in a
+  terminal failure state that is no longer retriable on resubmit, so a
+  poison-locked authoritative claim cannot capture later legitimate
+  submissions for the remainder of its poison TTL. Displacement MUST NOT carry the displaced
   node's interest or failure accounting into the fresh node, MUST refresh
   the persisted recovery row to the displacing submission's verifiable
   identity with its status reset to the creation snapshot, and MUST remove
@@ -1876,7 +1877,20 @@ exactly the lockout the store-backed arms already refuse. A successfully
 finished claim is never redefined, so an attacker cannot use the arm to
 rewrite a built derivation; while the claim is live the rejection is
 unchanged, so nothing can yank a definition out from under a running
-build. Public attributes alone are copyable from the victim's public
+build. The Completed/Skipped carve-out is uniform across both conflict
+arms: the store-backed displacement leg refuses settled victims for the
+same reason the authoritative leg does --- displacement erases the
+record (interest accounting, registered outputs, the inline bytes) of a
+build that finished, and an unverified submitter claim must never
+out-rank verified-built state. The accepted trade is that a
+content-bound squat that *completes* before its victim submits now
+locks the hash until an operator clears it (previously the victim's
+store-backed submission displaced it); that lockout is
+availability-only, requires the squatter to have actually built
+something under the squatted identity, and is restored to victim
+self-service by store-evidence displacement (Follow-up PR 3), which can
+prove from the store's text-CA-bound `.drv` which definition the path
+belongs to. Public attributes alone are copyable from the victim's public
 derivation, and floating-CA expected paths are empty by construction, so a
 match must additionally rest on content evidence. The two forms guarantee
 different things: for a floating-CA derivation the modular hash is

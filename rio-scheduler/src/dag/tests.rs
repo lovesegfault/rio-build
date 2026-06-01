@@ -2574,7 +2574,7 @@ fn authoritative_node(tag: &str, content: &[u8]) -> DerivationNode {
     n
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[test]
 fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2601,7 +2601,7 @@ fn authoritative_collision_requires_byte_equality() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[test]
 fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2620,9 +2620,18 @@ fn conflicting_identity_against_inflight_authoritative_rejected() -> anyhow::Res
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
-#[test]
-fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Result<()> {
+// r[verify sched.merge.authoritative-conflict+5]
+/// Displacement of a conflicting authoritative squat is scoped to
+/// terminal FAILURE states: the verifiable store-backed definition wins
+/// against a parked failure, but never against a settled success (see
+/// `conflicting_identity_rejected_on_settled_authoritative_node`).
+#[rstest]
+#[case::poisoned(DerivationStatus::Poisoned)]
+#[case::cancelled(DerivationStatus::Cancelled)]
+#[case::dependency_failed(DerivationStatus::DependencyFailed)]
+fn conflicting_identity_displaces_terminal_authoritative_node(
+    #[case] parked: DerivationStatus,
+) -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
     let b1 = Uuid::new_v4();
     let b2 = Uuid::new_v4();
@@ -2631,10 +2640,11 @@ fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Resul
     dag.nodes
         .get_mut("squat2")
         .unwrap()
-        .set_status_for_test(DerivationStatus::Completed);
+        .set_status_for_test(parked);
 
-    // Once the squatting node is terminal, the verifiable definition
-    // displaces it: fresh node, no inherited interest, no rejection.
+    // Once the squatting node is parked in a terminal failure state, the
+    // verifiable definition displaces it: fresh node, no inherited
+    // interest, no rejection.
     let mut victim = make_node("squat2", "aarch64-linux");
     victim.is_content_addressed = true;
     let res = dag.merge(b2, &[victim], &[], "")?;
@@ -2652,7 +2662,45 @@ fn conflicting_identity_displaces_terminal_authoritative_node() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
+/// A conflicting store-backed submission against a SETTLED
+/// (Completed/Skipped) authoritative node is rejected, never displaces:
+/// the settled record — its identity, inline bytes, and interest
+/// accounting — survives intact. Displacing it would let an unverified
+/// submitter claim erase the record of a successful build (bug_076).
+#[rstest]
+#[case::completed(DerivationStatus::Completed)]
+#[case::skipped(DerivationStatus::Skipped)]
+fn conflicting_identity_rejected_on_settled_authoritative_node(
+    #[case] settled: DerivationStatus,
+) -> anyhow::Result<()> {
+    let mut dag = DerivationDag::new();
+    let b1 = Uuid::new_v4();
+    let b2 = Uuid::new_v4();
+
+    dag.merge(b1, &[authoritative_node("settled", b"Derive-A")], &[], "")?;
+    dag.nodes
+        .get_mut("settled")
+        .unwrap()
+        .set_status_for_test(settled);
+
+    let mut conflicting = make_node("settled", "aarch64-linux");
+    conflicting.is_content_addressed = true;
+    let err = dag.merge(b2, &[conflicting], &[], "").unwrap_err();
+    assert!(matches!(err, DagError::ConflictingInFlightContent { .. }));
+
+    // The settled node is byte-for-byte what it was before the attempt.
+    let node = dag.node("settled").unwrap();
+    assert_eq!(node.status(), settled, "settled status untouched");
+    assert_eq!(node.system, "x86_64-linux");
+    assert_eq!(node.drv_content, b"Derive-A");
+    assert!(node.drv_content_authoritative);
+    assert!(node.interested_builds.contains(&b1));
+    assert!(!node.interested_builds.contains(&b2));
+    Ok(())
+}
+
+// r[verify sched.merge.authoritative-conflict+5]
 #[test]
 fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2676,7 +2724,7 @@ fn matching_identity_joins_authoritative_node() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[test]
 fn authoritative_bytes_ignored_when_existing_node_is_store_backed() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -2876,7 +2924,7 @@ fn authoritative_claim_without_evidence_is_rejected() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Match-displacement of a poison-locked squat: an identity-MATCHING
 /// store-backed submission must DISPLACE (not join) an authoritative
 /// node that sits in a terminal failure state no longer retriable on
@@ -2931,7 +2979,7 @@ fn fod_matching_identity_displaces_poisoned_over_budget_squat() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Match-displacement is scoped to LOCKED terminal failures only: a
 /// successfully finished authoritative node (Completed or Skipped)
 /// keeps the join semantics for an identity-matching store-backed
@@ -2967,7 +3015,7 @@ fn matching_identity_joins_completed_authoritative_node(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 // r[verify sched.merge.displaced-failure-reset+2]
 /// An UNDER-budget poisoned squat is still retriable on resubmit, so an
 /// identity-matching store-backed submission takes the normal
@@ -3087,7 +3135,7 @@ fn store_backed_resubmit_is_not_an_authority_takeover() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A merge that match-displaces a poison-locked squat but fails on a
 /// LATER node in the same submission must restore the squat exactly —
 /// the match-displacement rides the same rollback container as the
@@ -3134,7 +3182,7 @@ fn rollback_restores_a_match_displaced_poisoned_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// The gate is evaluated BEFORE the resubmit-reset, so an authoritative
 /// node that is merely `Failed` (non-terminal — the retry machinery
 /// still owns it) cannot be silently redefined by different
@@ -3185,7 +3233,7 @@ fn authoritative_redefinition_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A byte-different authoritative submission DISPLACES an authoritative
 /// claim parked in a terminal failure state (Poisoned at any budget,
 /// Cancelled, DependencyFailed): the hook-fallback population submits
@@ -3250,7 +3298,7 @@ fn authoritative_redefinition_displaces_parked_terminal_failure(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A successfully finished authoritative definition (Completed or
 /// Skipped) is never redefined: byte-different authoritative content is
 /// still rejected, so an attacker cannot rewrite an already-built
@@ -3282,7 +3330,7 @@ fn authoritative_redefinition_still_rejected_after_success(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A merge that auth-displaces a poison-locked squat but fails on a
 /// LATER node in the same submission must restore the squat exactly —
 /// the auth-vs-auth displacement rides the same rollback container as
@@ -3326,7 +3374,7 @@ fn rollback_restores_an_auth_displaced_locked_squat() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A poison-budget-exhausted authoritative squat is terminal and gets
 /// displaced by the conflicting verifiable (store-backed) definition —
 /// fresh node without inherited interest or failure history, surfaced in
@@ -3366,7 +3414,7 @@ fn conflicting_identity_displaces_poisoned_over_budget_squat() -> anyhow::Result
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Cancelled is terminal: a conflicting store-backed definition takes the
 /// displacement path (fresh node, no inherited interest), NOT the
 /// interest-carrying resubmit-reset.
@@ -3402,7 +3450,7 @@ fn conflicting_identity_displaces_cancelled_authoritative_node_without_interest(
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Failed is NOT terminal (the retry machinery still owns it): a
 /// conflicting store-backed submission is rejected, not displaced.
 #[test]
@@ -3434,7 +3482,7 @@ fn conflicting_identity_rejected_while_failed() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// A merge that displaces a poisoned-over-budget squat but fails on a
 /// LATER node in the same submission must restore the squat exactly
 /// (status, bytes, interest, poison accumulator) — displacement rides the
@@ -4337,7 +4385,7 @@ fn test_foreign_skip_classified_by_parent_hole() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Floating-CA squat scenario: public attributes (system, output names,
 /// flags) are copyable from the victim's public derivation and floating-CA
 /// expected paths are empty by construction, so a store-backed submission
@@ -4375,10 +4423,13 @@ fn floating_ca_squat_without_evidence_conflicts_in_flight() -> anyhow::Result<()
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
-/// Once the no-evidence conflict target is terminal, the store-backed
-/// definition displaces it instead of being rejected — same displacement
-/// semantics as any other verifiable-identity conflict.
+// r[verify sched.merge.authoritative-conflict+5]
+/// Once the no-evidence conflict target sits in a terminal FAILURE
+/// state, the store-backed definition displaces it instead of being
+/// rejected — same displacement semantics as any other
+/// verifiable-identity conflict. (A settled Completed/Skipped target is
+/// rejected instead — see
+/// `conflicting_identity_rejected_on_settled_authoritative_node`.)
 #[test]
 fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Result<()> {
     let mut dag = DerivationDag::new();
@@ -4394,7 +4445,7 @@ fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Resul
     dag.nodes
         .get_mut("squat-ev2")
         .unwrap()
-        .set_status_for_test(DerivationStatus::Completed);
+        .set_status_for_test(DerivationStatus::Poisoned);
 
     let mut no_hash = make_node("squat-ev2", "x86_64-linux");
     no_hash.is_content_addressed = true;
@@ -4409,7 +4460,7 @@ fn floating_ca_squat_without_evidence_displaced_when_terminal() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// Fixed-output derivations carry their content commitment in the expected
 /// output path (derived from the declared hash and bound to the bytes at
 /// ingress), so agreement on a non-empty path is sufficient evidence — no
@@ -4440,7 +4491,7 @@ fn fod_path_agreement_is_sufficient_evidence() -> anyhow::Result<()> {
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// The conflict gate must keep holding for a node REBUILT FROM PG after a
 /// leader failover (bug_007): `from_poisoned_row` restores the
 /// authoritative bytes/flag/identity, so a recovered poisoned squat is

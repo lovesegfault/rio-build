@@ -875,7 +875,7 @@ impl DagActor {
         // both sides are driven by displaced_prior_interest so they
         // cannot diverge. Runs after the point of no return (the build
         // is already committed), so a later rollback can no longer occur.
-        // r[impl sched.merge.authoritative-conflict+4]
+        // r[impl sched.merge.authoritative-conflict+5]
         let mut displaced_prune_builds: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
             let interest = self.displaced_prior_interest(merge_result, hash, ingest.build_id);
@@ -2257,7 +2257,7 @@ impl DagActor {
         // builds only (terminal builds keep links and counts as settled
         // history), never the displacer. Per-hash loop is fine —
         // displacement is a rare, adversarial-only path.
-        // r[impl sched.merge.authoritative-conflict+4]
+        // r[impl sched.merge.authoritative-conflict+5]
         let mut evidence_persisted: HashSet<Uuid> = HashSet::new();
         for hash in &merge_result.displaced {
             let Some((displaced_id, _)) = id_map.get(hash.as_str()) else {

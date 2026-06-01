@@ -1248,7 +1248,7 @@ async fn test_submit_build_rejects_authoritative_modular_hash_mismatch() {
 // cannot redefine an in-flight authoritative node, and a joining
 // submission cannot rewrite or clear its persisted recovery row.
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 #[tokio::test]
 async fn test_submit_build_authoritative_conflict_is_failed_precondition() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;

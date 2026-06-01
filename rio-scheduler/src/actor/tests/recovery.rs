@@ -5180,19 +5180,21 @@ async fn test_recovery_registers_realisation_for_deferred_ia_node() -> TestResul
 /// displacing submission's `.drv` path, not the squatter's decoy path —
 /// so recovery rebuilds (and re-dispatches) that definition — not the
 /// squatter's — and without the squatter's stale authoritative bytes.
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 // r[verify sched.persist.recreate-refresh+2]
 #[tokio::test]
 async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> TestResult {
     let squatter = Uuid::new_v4();
     let displacer = Uuid::new_v4();
     let f = RecoveryFixture::run(async move |handle, _| {
-        // Squatter: authoritative single-node build, completed by an
-        // x86_64 worker → node terminal. It declares a DECOY .drv path
-        // (nothing binds drv_hash to drv_path for a direct submitter);
-        // the recreate-refresh must replace it with the displacing
-        // submission's real path or post-failover dispatch would tell
-        // workers to fetch a .drv that exists in no store.
+        // Squatter: authoritative single-node build, failed permanently
+        // by an x86_64 worker → node parked Poisoned (terminal failure,
+        // displaceable; a COMPLETED squat is never displaced under
+        // sched.merge.authoritative-conflict+5). It declares a DECOY
+        // .drv path (nothing binds drv_hash to drv_path for a direct
+        // submitter); the recreate-refresh must replace it with the
+        // displacing submission's real path or post-failover dispatch
+        // would tell workers to fetch a .drv that exists in no store.
         let mut squat = make_node("squat-recover");
         squat.drv_path = test_drv_path("squat-recover-decoy");
         squat.drv_content = b"Derive-squat".to_vec();
@@ -5200,18 +5202,19 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
         merge_dag(&handle, squatter, vec![squat], vec![], false).await?;
         let mut rx = connect_executor(&handle, "w-x86", "x86_64-linux").await?;
         let assn = recv_assignment(&mut rx).await;
-        complete_success(
+        complete_failure(
             &handle,
             "w-x86",
             &assn.drv_path,
-            &test_store_path("squat-out"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "squat failed permanently",
         )
         .await?;
-        wait_for_status(&handle, "squat-recover", DerivationStatus::Completed).await;
+        wait_for_status(&handle, "squat-recover", DerivationStatus::Poisoned).await;
 
         // Displacer: conflicting verifiable identity (different system)
-        // displaces the terminal squat; its fresh node is still pending
-        // at failover time.
+        // displaces the poison-parked squat; its fresh node is still
+        // pending at failover time.
         merge_dag(
             &handle,
             displacer,
@@ -5244,13 +5247,13 @@ async fn test_recovery_rebuilds_displaced_node_with_displacing_identity() -> Tes
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// The displacement interest prune must survive leader failover (bug_001):
 /// recovery rebuilds `interested_builds` purely from `build_derivations`,
 /// so a surviving link would re-point a prior-interested build at the
 /// displacing definition — one it never submitted and that may never
 /// complete — and that build would hang Active. With the durable prune the
-/// joiner finishes as soon as its own remaining node completes.
+/// joiner settles as soon as its own remaining nodes complete.
 #[tokio::test]
 async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() -> TestResult {
     let squatter = Uuid::new_v4();
@@ -5269,33 +5272,40 @@ async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() 
         let assn = recv_assignment(&mut rx).await;
         assert_eq!(assn.drv_path, test_drv_path("squat-prune"));
 
-        // Joiner: joins the in-flight squat with matching identity and
-        // content evidence, plus its own fillerC node.
+        // Joiner: keep_going build that joins the in-flight squat with
+        // matching identity and content evidence, plus TWO nodes of its
+        // own — so it stays Active (non-terminal) both when the squat
+        // fails below and when displacement prunes the squat slot, which
+        // is what makes its link prune-eligible and the post-failover
+        // re-point hazard real.
         let mut squat_join = make_node("squat-prune");
         squat_join.expected_output_paths = vec![test_store_path("squat-prune-out")];
         merge_dag(
             &handle,
             joiner,
-            vec![squat_join, make_node("fillerC")],
+            vec![squat_join, make_node("fillerC"), make_node("fillerD")],
             vec![],
-            false,
+            true,
         )
         .await?;
 
-        // Complete the squat: the squatter succeeds, the joiner stays
-        // Active on fillerC (w-x86 is one-shot, so fillerC is undispatched).
-        complete_success(
+        // Fail the squat permanently: it parks Poisoned (terminal failure
+        // — displaceable; a Completed squat never is). The squatter build
+        // fails; the keep_going joiner records the failure and stays
+        // Active on fillerC + fillerD.
+        complete_failure(
             &handle,
             "w-x86",
             &test_drv_path("squat-prune"),
-            &test_store_path("squat-prune-out"),
+            rio_proto::types::BuildResultStatus::PermanentFailure,
+            "squat failed permanently",
         )
         .await?;
-        wait_for_status(&handle, "squat-prune", DerivationStatus::Completed).await;
+        wait_for_status(&handle, "squat-prune", DerivationStatus::Poisoned).await;
 
         // Displacer: conflicting verifiable identity displaces the
-        // now-terminal squat. The joiner's link must be pruned in the same
-        // transaction so the failover below cannot resurrect it.
+        // poison-parked squat. The joiner's link must be pruned in the
+        // same transaction so the failover below cannot resurrect it.
         merge_dag(
             &handle,
             displacer,
@@ -5310,29 +5320,36 @@ async fn test_recovery_does_not_repoint_prior_builds_at_displacing_definition() 
     .await?;
     let handle = f.handle;
 
-    // Post-failover: an x86_64 worker can only receive fillerC (the
-    // displaced definition is aarch64-only). Completing it must finish the
-    // joiner — pre-fix the stale build_derivations link re-pointed the
-    // joiner at the displacing definition and it hung Active forever.
-    let mut rx = connect_executor(&handle, "w-x86-2", "x86_64-linux").await?;
-    let assn = recv_assignment(&mut rx).await;
-    assert_eq!(
-        assn.drv_path,
-        test_drv_path("fillerC"),
-        "only the joiner's own node is dispatchable on x86_64 post-failover"
-    );
-    complete_success(
-        &handle,
-        "w-x86-2",
-        &assn.drv_path,
-        &test_store_path("fillerC-out"),
-    )
-    .await?;
-    barrier(&handle).await;
+    // Post-failover: an x86_64 worker can only receive the joiner's own
+    // nodes (the displaced definition is aarch64-only). Completing them
+    // must SETTLE the joiner — pre-fix the stale build_derivations link
+    // re-pointed the joiner at the displacing definition and it hung
+    // Active forever. (It settles Failed, not Succeeded: the squat
+    // failure it observed pre-failover is durable evidence.)
+    for worker in ["w-x86-2", "w-x86-3"] {
+        let mut rx = connect_executor(&handle, worker, "x86_64-linux").await?;
+        let assn = recv_assignment(&mut rx).await;
+        assert!(
+            assn.drv_path == test_drv_path("fillerC") || assn.drv_path == test_drv_path("fillerD"),
+            "only the joiner's own nodes are dispatchable on x86_64 post-failover, got {}",
+            assn.drv_path
+        );
+        let out = format!(
+            "{}-out",
+            if assn.drv_path == test_drv_path("fillerC") {
+                "fillerC"
+            } else {
+                "fillerD"
+            }
+        );
+        complete_success(&handle, worker, &assn.drv_path, &test_store_path(&out)).await?;
+        barrier(&handle).await;
+    }
     assert_eq!(
         query_status(&handle, joiner).await?.state,
-        rio_proto::types::BuildState::Succeeded as i32,
-        "joiner completes from its own nodes; not re-pointed at the displacing definition"
+        rio_proto::types::BuildState::Failed as i32,
+        "joiner settles from its own nodes (not re-pointed at the displacing definition); \
+         Failed because the observed squat failure is durable"
     );
     assert_eq!(
         query_status(&handle, displacer).await?.state,
@@ -5490,7 +5507,7 @@ async fn test_recovery_after_takeover_does_not_inherit_squatter_edges() -> TestR
     Ok(())
 }
 
-// r[verify sched.merge.authoritative-conflict+4]
+// r[verify sched.merge.authoritative-conflict+5]
 /// The displacement total adjustment must survive leader failover: the
 /// pruned build's `builds.total_drvs` was decremented in the displacing
 /// merge's transaction, so recovery — which re-seeds totals from that

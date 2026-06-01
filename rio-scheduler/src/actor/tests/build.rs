@@ -1580,18 +1580,19 @@ async fn test_watch_build_terminal_resend_replays_captured_output_paths() -> Tes
     );
     drop(original_rx);
 
-    // Displace the (terminal) node out from under the finished build
-    // while it is still resident in its cleanup window.
-    let displacer = Uuid::new_v4();
-    merge_dag(
-        &handle,
-        displacer,
-        vec![make_test_node("watch-replay", "aarch64-linux")],
-        vec![],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
+    // Overwrite the (still-resident) node's output_paths so a re-send
+    // that RECOMPUTED from the DAG would observe different paths than
+    // the ones captured at completion. (Round 12 staged this with a
+    // displacement of the Completed node; that operation is now
+    // structurally rejected — sched.merge.authoritative-conflict+5 — so
+    // the divergence is injected directly.)
+    let mutated = handle
+        .debug_set_output_paths(
+            "watch-replay",
+            vec![test_store_path("watch-replay-MUTATED")],
+        )
+        .await?;
+    assert!(mutated, "node still resident for the overwrite");
 
     // Late WatchBuild: the re-sent BuildCompleted must carry the settled
     // output paths, not a re-computed (now empty) set.
