@@ -211,6 +211,10 @@ pub struct Config {
     /// `rio_store_log_tail_proxy_failures_total`); it never fails a
     /// read. Env: `RIO_LOG_PEER_URL_TEMPLATE`.
     pub log_peer_url_template: String,
+    /// Substitution-replacement campaign (design §8): the store-side
+    /// materialization-job executor. `[materialization]` table in
+    /// store.toml. Env: `RIO_MATERIALIZATION__*`.
+    pub materialization: MaterializationConfig,
     /// Build-log retention, in days since the execution *started*
     /// (`drv_executions.started_at` — the only timestamp every
     /// execution has). The hourly TTL sweep deletes older executions'
@@ -253,7 +257,42 @@ impl Default for Config {
             log_cut_threshold_bytes: crate::logs::ingest::DEFAULT_CUT_THRESHOLD_BYTES,
             log_cors_allow_origins: String::new(),
             log_peer_url_template: crate::logs::DEFAULT_PEER_URL_TEMPLATE.to_string(),
+            materialization: MaterializationConfig::default(),
             log_retention_days: 30,
+        }
+    }
+}
+
+/// Substitution-replacement campaign (design §8): store-owned
+/// materialization jobs. Phase A lands the per-replica executor task
+/// set dormant behind `enabled = false`; Phase B turns it on. The
+/// deployment-ordering constraint (store executor flag first ON, last
+/// OFF — design §4/AS-6) is enforced by helm value structure, not here.
+#[derive(Debug, Clone, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(default)]
+pub struct MaterializationConfig {
+    /// Master switch for the per-replica materialization-job executor
+    /// task set. false = the executor never polls; the store is
+    /// byte-for-byte the as-built store.
+    pub enabled: bool,
+    /// Concurrent jobs per replica (design §2.2 item 1: default 8).
+    pub executor_concurrency: usize,
+    /// Poll interval for ListMaterializationJobs (seconds; jitter added).
+    pub poll_interval_secs: u64,
+    /// Scheduler ExecutorService address (the store→scheduler edge:
+    /// ListMaterializationJobs / PullAssignment / ReportOutcome).
+    /// Empty = executor cannot run (`enabled = true` requires it);
+    /// Phase A's VM/helm wiring sets it explicitly.
+    pub scheduler_addr: String,
+}
+
+impl Default for MaterializationConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            executor_concurrency: 8,
+            poll_interval_secs: 1,
+            scheduler_addr: String::new(),
         }
     }
 }
@@ -418,6 +457,32 @@ impl rio_common::config::ValidateConfig for Config {
             "log_peer_url_template must contain the literal `{{pod}}` \
              placeholder (got {:?}); set RIO_LOG_PEER_URL_TEMPLATE",
             self.log_peer_url_template
+        );
+        // Substitution-replacement materialization executor (Phase A:
+        // dormant; the bounds hold whether or not the flag is on so a
+        // flip-on never trips over degenerate knobs).
+        // 0 → zero claim loops: `enabled = true` silently does nothing.
+        anyhow::ensure!(
+            self.materialization.executor_concurrency >= 1,
+            "materialization.executor_concurrency must be >= 1, got {} \
+             (0 spawns no claim loops); set RIO_MATERIALIZATION__EXECUTOR_CONCURRENCY",
+            self.materialization.executor_concurrency
+        );
+        // 0 → a busy poll loop against the scheduler's leader.
+        anyhow::ensure!(
+            self.materialization.poll_interval_secs >= 1,
+            "materialization.poll_interval_secs must be >= 1, got {} \
+             (0 busy-polls the scheduler); set RIO_MATERIALIZATION__POLL_INTERVAL_SECS",
+            self.materialization.poll_interval_secs
+        );
+        // The executor cannot poll without a scheduler address; failing
+        // at startup beats a task set that logs connection errors
+        // forever against an empty URI.
+        anyhow::ensure!(
+            !self.materialization.enabled || !self.materialization.scheduler_addr.is_empty(),
+            "materialization.enabled = true requires a non-empty \
+             materialization.scheduler_addr (the scheduler ExecutorService \
+             address); set RIO_MATERIALIZATION__SCHEDULER_ADDR"
         );
         Ok(())
     }

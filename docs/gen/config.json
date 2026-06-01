@@ -510,6 +510,30 @@
         "description": "URL template the cross-replica `TailLog` proxy uses to dial the store replica holding an execution's live ingest stream."
       },
       {
+        "key": "materialization.enabled",
+        "type": "boolean",
+        "default": "false",
+        "description": "Master switch for the per-replica materialization-job executor task set. false = the executor never polls; the store is byte-for-byte the as-built store."
+      },
+      {
+        "key": "materialization.executor_concurrency",
+        "type": "uint",
+        "default": "8",
+        "description": "Concurrent jobs per replica (design §2.2 item 1: default 8)."
+      },
+      {
+        "key": "materialization.poll_interval_secs",
+        "type": "uint64",
+        "default": "1",
+        "description": "Poll interval for ListMaterializationJobs (seconds; jitter added)."
+      },
+      {
+        "key": "materialization.scheduler_addr",
+        "type": "string",
+        "default": "",
+        "description": "Scheduler ExecutorService address (the store→scheduler edge: ListMaterializationJobs / PullAssignment / ReportOutcome)."
+      },
+      {
         "key": "log_retention_days",
         "type": "uint32",
         "default": "30",

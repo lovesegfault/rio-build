@@ -198,6 +198,16 @@
         "type": "string",
         "default": "http://{pod}.rio-store-headless.rio-store.svc:9002"
       },
+      "materialization": {
+        "description": "Substitution-replacement campaign (design §8): the store-side\nmaterialization-job executor. `[materialization]` table in\nstore.toml. Env: `RIO_MATERIALIZATION__*`.",
+        "$ref": "#/$defs/MaterializationConfig",
+        "default": {
+          "enabled": false,
+          "executor_concurrency": 8,
+          "poll_interval_secs": 1,
+          "scheduler_addr": ""
+        }
+      },
       "log_retention_days": {
         "description": "Build-log retention, in days since the execution *started*\n(`drv_executions.started_at` — the only timestamp every\nexecution has). The hourly TTL sweep deletes older executions'\nmanifest rows and chunk objects. The S3 lifecycle rule on the\n`logs/` prefix is the orphan backstop and should be set to this\nvalue plus a few days of slack. Default 30. Env:\n`RIO_LOG_RETENTION_DAYS`.",
         "type": "integer",
@@ -281,6 +291,36 @@
             "default": null
           }
         }
+      },
+      "MaterializationConfig": {
+        "description": "Substitution-replacement campaign (design §8): store-owned\nmaterialization jobs. Phase A lands the per-replica executor task\nset dormant behind `enabled = false`; Phase B turns it on. The\ndeployment-ordering constraint (store executor flag first ON, last\nOFF — design §4/AS-6) is enforced by helm value structure, not here.",
+        "type": "object",
+        "properties": {
+          "enabled": {
+            "description": "Master switch for the per-replica materialization-job executor\ntask set. false = the executor never polls; the store is\nbyte-for-byte the as-built store.",
+            "type": "boolean",
+            "default": false
+          },
+          "executor_concurrency": {
+            "description": "Concurrent jobs per replica (design §2.2 item 1: default 8).",
+            "type": "integer",
+            "format": "uint",
+            "minimum": 0,
+            "default": 8
+          },
+          "poll_interval_secs": {
+            "description": "Poll interval for ListMaterializationJobs (seconds; jitter added).",
+            "type": "integer",
+            "format": "uint64",
+            "minimum": 0,
+            "default": 1
+          },
+          "scheduler_addr": {
+            "description": "Scheduler ExecutorService address (the store→scheduler edge:\nListMaterializationJobs / PullAssignment / ReportOutcome).\nEmpty = executor cannot run (`enabled = true` requires it);\nPhase A's VM/helm wiring sets it explicitly.",
+            "type": "string",
+            "default": ""
+          }
+        }
       }
     }
   },
@@ -320,6 +360,12 @@
     "log_cut_threshold_bytes": 8388608,
     "log_cors_allow_origins": "",
     "log_peer_url_template": "http://{pod}.rio-store-headless.rio-store.svc:9002",
+    "materialization": {
+      "enabled": false,
+      "executor_concurrency": 8,
+      "poll_interval_secs": 1,
+      "scheduler_addr": ""
+    },
     "log_retention_days": 30
   }
 }
