@@ -121,9 +121,20 @@ impl SchedulerDb {
 
     /// Unpin all live inputs for a drv. Called on terminal status.
     /// Idempotent: unpinning a never-pinned drv = 0 rows deleted.
+    ///
+    /// Build-input pins ONLY (`pin_kind = 'build_input'`): a
+    /// materialization pin for the same drv survives — its release is
+    /// the all-interest-terminal rule
+    /// ([`Self::release_materialization_pins_for_resolved_jobs`]),
+    /// never the pinning build's terminal status (PP-2, design §5.3).
+    /// Dormant flag-off: every as-built pin row carries the 078
+    /// `'build_input'` default, so the predicate selects exactly the
+    /// rows it always did.
+    // r[impl sched.materialize.pinning]
     pub async fn unpin_live_inputs(&self, drv_hash: &DrvHash) -> Result<(), sqlx::Error> {
         sqlx::query!(
-            "DELETE FROM scheduler_live_pins WHERE drv_hash = $1",
+            "DELETE FROM scheduler_live_pins \
+             WHERE drv_hash = $1 AND pin_kind = 'build_input'",
             drv_hash.as_str(),
         )
         .execute(&self.pool)
@@ -136,14 +147,19 @@ impl SchedulerDb {
     /// [`update_derivation_status_batch`] for the cancel-build path
     /// where N sequential unpins stalled the actor.
     ///
+    /// Build-input pins only — same kind exclusion (and same dormancy
+    /// argument) as [`unpin_live_inputs`].
+    ///
     /// [`unpin_live_inputs`]: Self::unpin_live_inputs
     /// [`update_derivation_status_batch`]: Self::update_derivation_status_batch
+    // r[impl sched.materialize.pinning]
     pub async fn unpin_live_inputs_batch(&self, drv_hashes: &[&str]) -> Result<u64, sqlx::Error> {
         if drv_hashes.is_empty() {
             return Ok(0);
         }
         let result = sqlx::query!(
-            "DELETE FROM scheduler_live_pins WHERE drv_hash = ANY($1::text[])",
+            "DELETE FROM scheduler_live_pins \
+             WHERE drv_hash = ANY($1::text[]) AND pin_kind = 'build_input'",
             drv_hashes as &[&str],
         )
         .execute(&self.pool)
@@ -159,19 +175,102 @@ impl SchedulerDb {
     /// The subquery matches `load_nonterminal_derivations`' filter
     /// (both splice `terminal_status_sql!`): a drv NOT in that
     /// set is terminal (or deleted entirely).
+    ///
+    /// Build-input pins only: the sweep's premise ("terminal drv ⇒
+    /// inputs no longer in use") is false for materialization pins,
+    /// whose release is the all-interest-terminal rule (PP-2).
+    // r[impl sched.materialize.pinning]
     pub async fn sweep_stale_live_pins(&self) -> Result<u64, sqlx::Error> {
         // Compile-time splice of the terminal-status tuple — see
         // terminal_status_sql! for why it isn't a bind param.
         let result = sqlx::query(terminal_status_sql!(
             r"
             DELETE FROM scheduler_live_pins
-             WHERE drv_hash NOT IN (
+             WHERE pin_kind = 'build_input'
+               AND drv_hash NOT IN (
                SELECT drv_hash FROM derivations
                 WHERE status NOT IN ",
             r"
              )
             "
         ))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    /// Pin store paths a materialization execution ingested or verified
+    /// present (`pin_kind = 'materialization'`, `job_id` stamped) — the
+    /// design §5.1 pin-at-ingest write, issued BEFORE the Success
+    /// report is sent.
+    ///
+    /// `ON CONFLICT … DO UPDATE` re-kinds an existing build_input pin
+    /// for the same (path, drv) UPWARD to materialization (PD-10 as
+    /// rewritten per review finding DF-3): re-kinding moves the pin's
+    /// release LATER (job resolved AND no live interest, instead of the
+    /// build-terminal release), so the build that originally pinned the
+    /// path cannot be harmed — the path stays protected strictly
+    /// longer.
+    ///
+    /// This SchedulerDb method serves the PG test battery and any
+    /// scheduler-side caller. The store-side executor
+    /// (`rio-store/src/materialize/executor.rs`) carries its own copy
+    /// of this INSERT against the shared PG (PD-13: rio-store cannot
+    /// link rio-scheduler). Keep both SQL texts in sync.
+    // r[impl sched.materialize.pinning]
+    pub async fn pin_materialized_paths(
+        &self,
+        job_id: Uuid,
+        drv_hash: &DrvHash,
+        store_paths: &[String],
+    ) -> Result<(), sqlx::Error> {
+        if store_paths.is_empty() {
+            return Ok(());
+        }
+        use sha2::Digest;
+        let hashes: Vec<Vec<u8>> = store_paths
+            .iter()
+            .map(|p| sha2::Sha256::digest(p.as_bytes()).to_vec())
+            .collect();
+        let drv_hashes: Vec<String> = vec![drv_hash.as_str().to_string(); hashes.len()];
+        sqlx::query(
+            "INSERT INTO scheduler_live_pins (store_path_hash, drv_hash, pin_kind, job_id) \
+             SELECT h, d, 'materialization', $3 \
+               FROM UNNEST($1::bytea[], $2::text[]) AS u(h, d) \
+             ON CONFLICT (store_path_hash, drv_hash) DO UPDATE \
+                 SET pin_kind = 'materialization', job_id = EXCLUDED.job_id",
+        )
+        .bind(&hashes)
+        .bind(&drv_hashes)
+        .bind(job_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// The design §5.3 materialization release rule (release site iii —
+    /// the recovery/housekeeping sweep arm): delete materialization
+    /// pins whose job is RESOLVED (state ≠ 'pending') and for which NO
+    /// live interest remains (no live build carries a wanted-relation
+    /// row for the job's derivation — the `materialization_interest`
+    /// view). Pins of unresolved jobs, and pins whose job still has a
+    /// live interested build, always survive. Returns released-row
+    /// count.
+    ///
+    /// Phase A wires no production caller (the consumption-site and
+    /// build-terminal-site release wiring is Phase B); the function and
+    /// its battery pin the rule.
+    // r[impl sched.materialize.pinning]
+    pub async fn release_materialization_pins_for_resolved_jobs(&self) -> Result<u64, sqlx::Error> {
+        let result = sqlx::query(
+            "DELETE FROM scheduler_live_pins p \
+              WHERE p.pin_kind = 'materialization' \
+                AND EXISTS (SELECT 1 FROM materialization_jobs j \
+                             WHERE j.job_id = p.job_id \
+                               AND j.state <> 'pending') \
+                AND NOT EXISTS (SELECT 1 FROM materialization_interest i \
+                                 WHERE i.job_id = p.job_id)",
+        )
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected())
