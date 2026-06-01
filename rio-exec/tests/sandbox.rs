@@ -610,3 +610,166 @@ async fn missing_program_surfaces_as_an_exec_setup_failure() {
         other => panic!("expected an Exec setup failure, got {other:?}"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Control-plane isolation: enforcement under stalled/slow/dropped consumers.
+// ---------------------------------------------------------------------------
+
+/// THE merged_bug_019 executor pin: the wall-clock timeout fires while
+/// the events receiver is alive but never drained. Pre-isolation, the
+/// supervision loop parked on the awaited event send the moment the
+/// channel filled, and the deadline arms parked with it — this test
+/// hung until the harness gave up.
+// r[verify builder.exec.limits-isolated]
+#[tokio::test]
+#[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
+async fn timeout_fires_with_stalled_receiver() {
+    require_root!();
+    let env = TestEnv::new();
+    // Endlessly chatty: the event channel and every internal buffer
+    // fill long before the deadline.
+    let mut req = env.request("while true; do echo chatter; done");
+    req.limits.timeout = Some(Duration::from_secs(2));
+
+    let chroot = tempfile::tempdir().expect("chroot tempdir");
+    let host = HostLayout {
+        chroot_dir: chroot.path().to_path_buf(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    // The receiver is HELD, never drained, for the whole execution.
+    let started = Instant::now();
+    let result = execute(&req, &host, tx).await;
+    drop(rx);
+
+    let outcome = result.expect("execution itself succeeds");
+    assert_eq!(outcome.exit, ExitOutcome::TimedOut);
+    assert!(
+        started.elapsed() < Duration::from_secs(7),
+        "the kill must fire near the 2s deadline with zero consumption, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// The post-reap drain bound, pinned with a receiver that exists but
+/// never consumes: a naturally exiting build must not park execute()
+/// on undelivered events past the drain budget. (This is the bound
+/// the round-14 drain commit deferred to a non-vacuous staging: the
+/// build here produces real queued output, unlike a SetupFailed run.)
+// r[verify builder.exec.limits-isolated]
+#[tokio::test]
+#[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
+async fn drain_bound_holds_with_stalled_receiver_at_exit() {
+    require_root!();
+    let env = TestEnv::new();
+    // Chatty but FINITE: the program exits on its own with output
+    // still queued upstream of the held receiver.
+    let req = env.request("i=0; while [ $i -lt 5000 ]; do echo line-$i; i=$((i+1)); done");
+
+    let chroot = tempfile::tempdir().expect("chroot tempdir");
+    let host = HostLayout {
+        chroot_dir: chroot.path().to_path_buf(),
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let started = Instant::now();
+    let result = execute(&req, &host, tx).await;
+    drop(rx);
+
+    let outcome = result.expect("execution itself succeeds");
+    assert_eq!(outcome.exit, ExitOutcome::Exited(0));
+    // Generous multiple of FINAL_DRAIN_TIMEOUT (2s): the build itself
+    // takes a moment; the point is "no unbounded park".
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "execute() must return within the drain budget of the exit, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// Nothing drops while the receiver LIVES: a slow but draining
+/// consumer receives every line the program emitted, in order —
+/// backpressure pauses the build, it never discards.
+#[tokio::test]
+#[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
+async fn no_drop_with_slow_draining_receiver() {
+    require_root!();
+    let env = TestEnv::new();
+    const LINES: usize = 2000;
+    let req = env.request(&format!(
+        "i=0; while [ $i -lt {LINES} ]; do echo line-$i; i=$((i+1)); done"
+    ));
+
+    let chroot = tempfile::tempdir().expect("chroot tempdir");
+    let host = HostLayout {
+        chroot_dir: chroot.path().to_path_buf(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+    let collector = tokio::spawn(async move {
+        let mut lines = Vec::new();
+        while let Some(event) = rx.recv().await {
+            // Slow consumer: a small per-event delay forces sustained
+            // backpressure through the queue, channel, and pipe.
+            tokio::time::sleep(Duration::from_micros(200)).await;
+            if let ExecEvent::Log { line, .. } = event {
+                lines.push(
+                    std::str::from_utf8(&line)
+                        .expect("test scripts emit UTF-8 output")
+                        .to_owned(),
+                );
+            }
+        }
+        lines
+    });
+    let result = execute(&req, &host, tx).await;
+    let lines = collector.await.expect("collector");
+
+    let outcome = result.expect("execution itself succeeds");
+    assert_eq!(outcome.exit, ExitOutcome::Exited(0));
+    let expected: Vec<String> = (0..LINES).map(|i| format!("line-{i}")).collect();
+    assert_eq!(
+        lines, expected,
+        "a live receiver must observe every line, in order"
+    );
+}
+
+/// A receiver dropped MID-BUILD discards events and lets the build run
+/// free: chunk consumption continues (the readers never block on a
+/// consumer that no longer exists) and the build completes promptly.
+#[tokio::test]
+#[ignore = "requires root + CAP_SYS_ADMIN; run via the privileged test harness"]
+async fn receiver_dropped_build_runs_free() {
+    require_root!();
+    let env = TestEnv::new();
+    // Enough output to overrun every buffer if consumption stopped
+    // mattering, then a clean exit.
+    let req = env.request(
+        "i=0; while [ $i -lt 20000 ]; do echo chatter-line-$i; i=$((i+1)); done; echo done-marker",
+    );
+
+    let chroot = tempfile::tempdir().expect("chroot tempdir");
+    let host = HostLayout {
+        chroot_dir: chroot.path().to_path_buf(),
+    };
+    let (tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let started = Instant::now();
+    let exec = tokio::spawn({
+        let req = req.clone();
+        let host = HostLayout {
+            chroot_dir: host.chroot_dir.clone(),
+        };
+        async move { execute(&req, &host, tx).await }
+    });
+    // Take a few events, then vanish mid-build.
+    for _ in 0..3 {
+        let _ = rx.recv().await;
+    }
+    drop(rx);
+
+    let result = exec.await.expect("execute task");
+    let outcome = result.expect("execution itself succeeds");
+    assert_eq!(outcome.exit, ExitOutcome::Exited(0));
+    assert!(
+        started.elapsed() < Duration::from_secs(60),
+        "a dropped receiver must not throttle the build, took {:?}",
+        started.elapsed()
+    );
+}

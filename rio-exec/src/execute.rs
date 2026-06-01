@@ -54,13 +54,16 @@
 //!
 //! # Caller contract
 //!
-//! **Event channel:** the caller must keep draining the [`ExecEvent`]
-//! receiver: log delivery awaits channel capacity, so a stalled (but
-//! alive) receiver suspends log processing and with it **all** limit
-//! enforcement — silence, log-volume, and the wall-clock timeout alike
-//! (the supervision loop cannot reach its deadline arms while parked
-//! on the send). A *dropped* receiver is fine — events are discarded
-//! and execution continues.
+//! **Event channel:** limit enforcement is unconditional — it runs in
+//! a dedicated [`LimitWatchdog`] task fed by the capture readers at
+//! raw-read time, and no receiver behavior can delay a kill. A stalled
+//! (but alive) receiver affects only data delivery: events queue in a
+//! bounded pending buffer ([`PENDING_BYTES_CAP`]), and once it fills,
+//! backpressure cascades to the build itself (chunk channel → blocking
+//! readers → pipe), bounding the executor's buffering at ≈ 3 MiB. A
+//! *dropped* receiver discards events and execution continues
+//! unthrottled. After the tree is reaped, delivery of whatever remains
+//! is bounded by [`FINAL_DRAIN_TIMEOUT`].
 //!
 //! **Serialization:** the executor performs no execution-level
 //! locking; the caller MUST NOT overlap executions. Two reasons: the
@@ -104,6 +107,73 @@ const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// to the reader thread (and ultimately the build's own writes) instead
 /// of buffering without limit.
 const LOG_CHUNK_CHANNEL_CAPACITY: usize = 64;
+
+/// Byte budget of the pending-event queue between the supervision loop
+/// and the caller's receiver. Once the queued line bytes reach the cap
+/// the loop stops consuming chunks, which fills the chunk channel,
+/// parks the blocking readers, fills the pipe, and finally write-blocks
+/// the build itself — the same backpressure cascade as before, one
+/// queue deeper.
+///
+/// The hard memory bound is slightly above the cap: the gate is checked
+/// before each chunk, so one chunk's worth of splitter output can land
+/// after the queue is already at the cap — up to one cap-forced
+/// fragment ([`MAX_PENDING_LINE_BYTES`]) plus the chunk remainder
+/// (≤ 8 KiB), for ≈ 3 MiB total per execution.
+const PENDING_BYTES_CAP: usize = 2 << 20;
+
+/// FIFO of events awaiting a receiver permit, with byte accounting.
+///
+/// The queue is the *only* path to the caller: the supervision loop
+/// never awaits `events.send()` directly, so a stalled receiver can
+/// park delivery — never supervision, and never the [`LimitWatchdog`].
+struct PendingEvents {
+    queue: std::collections::VecDeque<ExecEvent>,
+    bytes: usize,
+}
+
+impl PendingEvents {
+    fn new() -> PendingEvents {
+        PendingEvents {
+            queue: std::collections::VecDeque::new(),
+            bytes: 0,
+        }
+    }
+
+    /// Queued cost of one event: the log payload's length (`Started`
+    /// is metadata-only and effectively free).
+    fn cost(event: &ExecEvent) -> usize {
+        match event {
+            ExecEvent::Log { line, .. } => line.len(),
+            ExecEvent::Started { .. } => 0,
+        }
+    }
+
+    fn push(&mut self, event: ExecEvent) {
+        self.bytes += Self::cost(&event);
+        self.queue.push_back(event);
+    }
+
+    fn pop(&mut self) -> Option<ExecEvent> {
+        let event = self.queue.pop_front()?;
+        self.bytes -= Self::cost(&event);
+        Some(event)
+    }
+
+    fn clear(&mut self) {
+        self.queue.clear();
+        self.bytes = 0;
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queue.is_empty()
+    }
+
+    /// Stop consuming chunks once the queued bytes reach the cap.
+    fn at_cap(&self) -> bool {
+        self.bytes >= PENDING_BYTES_CAP
+    }
+}
 
 /// Why the executor killed the process tree before it finished on its
 /// own. Takes precedence over the raw exit status when mapping the
@@ -479,8 +549,9 @@ pub async fn execute(
 
     // ---- The supervision loop ----------------------------------------------
     let mut splitter = LineSplitter::default();
+    let mut pending = PendingEvents::new();
     let mut events_open = true;
-    let mut started_sent = false;
+    let mut started_queued = false;
     let mut status_report: Option<StatusReport> = None;
     let mut wait_status: Option<Result<i32, std::io::Error>> = None;
     let mut chunks_done = false;
@@ -489,6 +560,29 @@ pub async fn execute(
 
     while wait_status.is_none() {
         tokio::select! {
+            // Queued delivery — the ONLY path events reach the caller.
+            // `reserve()` is its own arm, so the loop never parks on
+            // the receiver: no capacity simply means this arm stays
+            // pending while the others keep running.
+            // r[impl builder.exec.limits-isolated]
+            permit = events.reserve(), if events_open && !pending.is_empty() => {
+                match permit {
+                    Ok(permit) => {
+                        permit.send(pending.pop().expect("arm guarded on non-empty queue"));
+                    }
+                    Err(_) => {
+                        // Receiver dropped: per the caller contract,
+                        // events are discarded and execution continues
+                        // unthrottled. From here on splitter output is
+                        // dropped at push time — re-queueing it would
+                        // fill the queue, disable the chunk arm, and
+                        // write-block a build whose receiver is gone
+                        // forever.
+                        events_open = false;
+                        pending.clear();
+                    }
+                }
+            }
             // Status pipe resolution: either the program exec'd or
             // setup failed somewhere.
             report = &mut status_task, if status_report.is_none() => {
@@ -496,14 +590,9 @@ pub async fn execute(
                 status_report = Some(report);
                 match report {
                     StatusReport::ExecStarted => {
-                        started_sent = true;
-                        if events_open
-                            && events
-                                .send(ExecEvent::Started { pid: intermediate.as_raw() })
-                                .await
-                                .is_err()
-                        {
-                            events_open = false;
+                        if events_open {
+                            started_queued = true;
+                            pending.push(ExecEvent::Started { pid: intermediate.as_raw() });
                         }
                     }
                     StatusReport::SetupFailed(_) | StatusReport::Corrupt => {
@@ -514,18 +603,24 @@ pub async fn execute(
                     }
                 }
             }
-            // Captured output. Disabled once the readers hit EOF — the
-            // wait arm below stays live regardless. Limit enforcement
-            // lives in the watchdog, fed at raw-read time, so nothing
-            // in this delivery path can delay a kill.
-            chunk = chunk_rx.recv(), if !chunks_done => {
+            // Captured output. Disabled once the readers hit EOF, and
+            // paused while the pending queue is at its byte cap (the
+            // backpressure cascade: queue → chunk channel → readers →
+            // pipe → the build's own writes). The wait arm below stays
+            // live regardless. Limit enforcement lives in the watchdog,
+            // fed at raw-read time, so nothing in this delivery path
+            // can delay a kill.
+            chunk = chunk_rx.recv(), if !chunks_done && !pending.at_cap() => {
                 match chunk {
                     Some(chunk) => {
-                        for line in splitter.push(chunk.stream, &chunk.bytes) {
-                            if events_open && events.send(line).await.is_err() {
-                                events_open = false;
+                        if events_open {
+                            for line in splitter.push(chunk.stream, &chunk.bytes) {
+                                pending.push(line);
                             }
                         }
+                        // A closed receiver consumes chunks without
+                        // splitting: the readers must never block on a
+                        // consumer that no longer exists.
                     }
                     // Both readers finished (EOF / EIO). The reap (and
                     // the watchdog's deadlines) finish the loop.
@@ -548,17 +643,47 @@ pub async fn execute(
     // no-ops against the reaped tree without recording a reason.
     watchdog.abort();
 
-    // Drain whatever output is still buffered, bounded.
-    // One shared budget for the chunk drain AND the partial-line
-    // flush: the tree is already gone, so a stalled (but alive) events
-    // receiver must not be able to park execute() past the budget. If
-    // the budget expires mid-drain the remaining lines are dropped —
-    // best-effort by design once the receiver has stopped consuming.
+    // The status report normally resolved long ago; give a straggler
+    // (e.g. a setup failure racing the reap, or a program so fast that
+    // the reap won the final select) a bounded window — before the
+    // drain, so an owed `Started` joins the queued delivery below
+    // instead of needing its own post-drain send.
+    if status_report.is_none() {
+        status_report = Some(
+            tokio::time::timeout(FINAL_DRAIN_TIMEOUT, &mut status_task)
+                .await
+                .map(|r| r.unwrap_or(StatusReport::Corrupt))
+                .unwrap_or(StatusReport::Corrupt),
+        );
+    }
+    if !started_queued && status_report == Some(StatusReport::ExecStarted) && events_open {
+        pending.push(ExecEvent::Started {
+            pid: intermediate.as_raw(),
+        });
+    }
+
+    // Drain: queued events first (FIFO with the lines below), then
+    // whatever output is still buffered, then the partial-line flush —
+    // one shared budget for all of it. The tree is already gone, so a
+    // stalled (but alive) events receiver must not be able to park
+    // execute() past the budget. If the budget expires mid-drain the
+    // remaining events are dropped — best-effort by design once the
+    // receiver has stopped consuming.
     let _ = tokio::time::timeout(FINAL_DRAIN_TIMEOUT, async {
+        while let Some(event) = pending.pop() {
+            if !events_open || events.send(event).await.is_err() {
+                events_open = false;
+                break;
+            }
+        }
         while let Some(chunk) = chunk_rx.recv().await {
+            if !events_open {
+                continue; // keep consuming so the readers can exit
+            }
             for line in splitter.push(chunk.stream, &chunk.bytes) {
-                if events_open && events.send(line).await.is_err() {
+                if events.send(line).await.is_err() {
                     events_open = false;
+                    break;
                 }
             }
         }
@@ -571,31 +696,6 @@ pub async fn execute(
         }
     })
     .await;
-    // The status report normally resolved long ago; give a straggler
-    // (e.g. a setup failure racing the reap, or a program so fast that
-    // the reap won the final select) a bounded window.
-    if status_report.is_none() {
-        status_report = Some(
-            tokio::time::timeout(FINAL_DRAIN_TIMEOUT, &mut status_task)
-                .await
-                .map(|r| r.unwrap_or(StatusReport::Corrupt))
-                .unwrap_or(StatusReport::Corrupt),
-        );
-    }
-    // A very fast program can be reaped before the status arm ever ran;
-    // the Started event is still owed to the caller. Best-effort and
-    // bounded: it is the last event this execution emits, so a closed
-    // channel needs no bookkeeping and a stalled receiver only costs
-    // the drain budget, never an unbounded park.
-    if !started_sent && status_report == Some(StatusReport::ExecStarted) && events_open {
-        let _ = tokio::time::timeout(
-            FINAL_DRAIN_TIMEOUT,
-            events.send(ExecEvent::Started {
-                pid: intermediate.as_raw(),
-            }),
-        )
-        .await;
-    }
 
     // ---- Interpret ----------------------------------------------------------
     match status_report {
@@ -1713,6 +1813,52 @@ mod tests {
             }
         }
         tree.mark_reaped();
+    }
+
+    // -- PendingEvents -------------------------------------------------------
+
+    fn log_event(text: &[u8]) -> ExecEvent {
+        ExecEvent::Log {
+            stream: LogStream::Merged,
+            line: text.to_vec(),
+            terminated: true,
+        }
+    }
+
+    /// FIFO order and byte accounting across push/pop, including the
+    /// metadata-only `Started` event.
+    #[test]
+    fn pending_events_fifo_and_byte_accounting() {
+        let mut q = PendingEvents::new();
+        assert!(q.is_empty());
+        q.push(log_event(b"abc"));
+        q.push(ExecEvent::Started { pid: 7 });
+        q.push(log_event(b"defgh"));
+        assert_eq!(q.bytes, 8, "Started costs nothing; lines cost their length");
+        assert!(!q.at_cap());
+
+        assert!(matches!(q.pop(), Some(ExecEvent::Log { line, .. }) if line == b"abc"));
+        assert_eq!(q.bytes, 5);
+        assert!(matches!(q.pop(), Some(ExecEvent::Started { pid: 7 })));
+        assert!(matches!(q.pop(), Some(ExecEvent::Log { line, .. }) if line == b"defgh"));
+        assert_eq!(q.bytes, 0);
+        assert!(q.pop().is_none());
+    }
+
+    /// The cap gate trips at the byte budget and clear() resets both
+    /// the queue and the accounting (the dropped-receiver path).
+    #[test]
+    fn pending_events_cap_and_clear() {
+        let mut q = PendingEvents::new();
+        q.push(log_event(&vec![b'x'; PENDING_BYTES_CAP - 1]));
+        assert!(!q.at_cap());
+        q.push(log_event(b"y"));
+        assert!(q.at_cap(), "the gate trips exactly at the cap");
+
+        q.clear();
+        assert!(q.is_empty());
+        assert_eq!(q.bytes, 0);
+        assert!(!q.at_cap(), "a cleared queue accepts chunks again");
     }
 
     // -- LimitWatchdog -------------------------------------------------------
