@@ -1670,6 +1670,41 @@ pub const M_077: () = ();
 /// verify-then-simplify gate (design §4).
 pub const M_078: () = ();
 
+/// `migrations/079_materialization_outcome_classes.sql`
+///
+/// Substitution-replacement Phase A: expands the `drv_attempts.
+/// outcome_class` CHECK alphabet with `materialization_unobtainable`
+/// and `materialization_infra` (DROP CONSTRAINT + ADD CONSTRAINT with a
+/// strict-superset literal list — 068 itself stays frozen).
+///
+/// **The typed E5 carve-out (design §2.5 / adjudication OQ1):** these
+/// classes exist so materialization outcomes enter the SAME durable
+/// ledger as build attempts (one history, one fold input) instead of a
+/// side table — but they are partitioned OUT of every build budget by
+/// the attempt *kind* (`drv_executions.attempt_kind`, M_078), never by
+/// class-keyed special cases. `materialization_infra` counts toward
+/// `max_materialization_attempts` and toward NOTHING else;
+/// `materialization_unobtainable` is a routing verdict, not a retry
+/// charge. This supersedes the old structural carve-out ("substitution
+/// is deliberately NOT in the alphabet"): the substitution-replacement
+/// campaign brings the work into the alphabet precisely because the
+/// kind partition makes that safe.
+///
+/// **Lockstep commit requirement (design FP-2):** this migration MUST
+/// land in the same commit as the Rust enum variants in
+/// `rio-scheduler/src/state/derivation.rs::OutcomeClass` and
+/// `rio-retry-kernel::OutcomeClass`, the two retry_policy.rs bridges,
+/// and the kernel's `row_to_event` arms — the
+/// `test_attempt_outcome_class_alphabet_matches_check_constraint` test
+/// is green only when the SQL alphabet and the Rust alphabet carry the
+/// same 15 literals.
+///
+/// **Dormancy:** no code path constructs either class while
+/// `scheduler.materialization.enabled` is false; the consumption
+/// transaction (Wave 3) and the establishment-sweep materialization
+/// branch (Wave 3) are the only writers, both flag-gated.
+pub const M_079: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

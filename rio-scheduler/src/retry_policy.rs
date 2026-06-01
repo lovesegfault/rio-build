@@ -178,6 +178,10 @@ fn kernel_outcome_class(class: OutcomeClass) -> rio_retry_kernel::OutcomeClass {
         OutcomeClass::ResubmitReset => rio_retry_kernel::OutcomeClass::ResubmitReset,
         OutcomeClass::CacheHitClear => rio_retry_kernel::OutcomeClass::CacheHitClear,
         OutcomeClass::PoisonCleared => rio_retry_kernel::OutcomeClass::PoisonCleared,
+        OutcomeClass::MaterializationUnobtainable => {
+            rio_retry_kernel::OutcomeClass::MaterializationUnobtainable
+        }
+        OutcomeClass::MaterializationInfra => rio_retry_kernel::OutcomeClass::MaterializationInfra,
     }
 }
 
@@ -207,6 +211,10 @@ fn db_outcome_class(class: rio_retry_kernel::OutcomeClass) -> OutcomeClass {
         rio_retry_kernel::OutcomeClass::ResubmitReset => OutcomeClass::ResubmitReset,
         rio_retry_kernel::OutcomeClass::CacheHitClear => OutcomeClass::CacheHitClear,
         rio_retry_kernel::OutcomeClass::PoisonCleared => OutcomeClass::PoisonCleared,
+        rio_retry_kernel::OutcomeClass::MaterializationUnobtainable => {
+            OutcomeClass::MaterializationUnobtainable
+        }
+        rio_retry_kernel::OutcomeClass::MaterializationInfra => OutcomeClass::MaterializationInfra,
     }
 }
 

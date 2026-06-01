@@ -1187,6 +1187,18 @@ pub enum OutcomeClass {
     CacheHitClear,
     /// Reset row: admin `ClearPoison` or the poison-TTL expiry.
     PoisonCleared,
+    /// Substitution-replacement: a materialization attempt confirmed a
+    /// live-wanted path absent upstream after the full per-path retry
+    /// ladder. A routing verdict, never a retry charge — invisible to
+    /// every build budget (the kind partition, design §2.5).
+    MaterializationUnobtainable,
+    /// Substitution-replacement: a materialization attempt hit
+    /// infrastructure failure (upstream 5xx/timeout/store-internal/
+    /// no-tenant-context) or its executing replica crashed
+    /// (establishment-written). Counts toward the materialization
+    /// budget and toward NOTHING else — invisible to every build
+    /// budget (the kind partition, design §2.5).
+    MaterializationInfra,
 }
 
 /// Which party observed/reported the event behind an attempt-ledger
@@ -1544,6 +1556,16 @@ fn row_to_event<Id: Clone>(row: &LedgerRow<Id>) -> Option<AttemptEvent<Id>> {
         OutcomeClass::ResubmitReset | OutcomeClass::CacheHitClear | OutcomeClass::PoisonCleared => {
             None
         }
+        // Substitution-replacement (PD-16): a materialization-class row
+        // should never reach the build fold once the kind partition
+        // (decide()'s materialization-kind skip arm) exists; this arm is
+        // defense-in-depth ONLY — the partition is by attempt kind,
+        // never by class (design §2.5). Folding a malformed
+        // pre-partition row as a no-op follows the same precedent as
+        // the malformed reset-class arms above. Nothing constructs
+        // these classes yet (dormant until the materialization flags
+        // enable the consumption/establishment writers).
+        OutcomeClass::MaterializationUnobtainable | OutcomeClass::MaterializationInfra => None,
     }
 }
 

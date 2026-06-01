@@ -551,14 +551,20 @@ db_str_enum! {
 
 db_str_enum! {
     /// Outcome classification of one attempt-ledger row
-    /// (`drv_attempts.outcome_class`, migration 068). This is the
+    /// (`drv_attempts.outcome_class`, migration 068; alphabet expanded
+    /// by 079). This is the
     /// `classify()` alphabet: the CHECK constraint in the migration and
     /// this enum MUST stay in lockstep — extending the alphabet is a new
     /// migration plus a variant here, verified by the
     /// `outcome_class_alphabet_matches_check_constraint` test.
     ///
-    /// `substitution` is deliberately NOT in the alphabet: the
-    /// substitution-failure decider stays outside the retry collapse.
+    /// The materialization classes ARE in the alphabet (the
+    /// substitution-replacement campaign's typed carve-out, superseding
+    /// the old structural carve-out that kept `substitution` out): they
+    /// enter the fold but are partitioned by attempt kind so they feed
+    /// exactly one budget (max_materialization_attempts) and are
+    /// invisible to every build budget. See `rio_retry_kernel::decide`'s
+    /// kind partition.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum OutcomeClass {
         /// E1 — worker-reported `TransientFailure` (build ran, exited
@@ -598,6 +604,18 @@ db_str_enum! {
         CacheHitClear = "cache_hit_clear",
         /// Reset row: admin `ClearPoison` or the poison-TTL expiry.
         PoisonCleared = "poison_cleared",
+        /// Substitution-replacement: a materialization attempt confirmed
+        /// a live-wanted path absent upstream after the full per-path
+        /// retry ladder. A verdict consumed by the four-arm routing
+        /// (sched.materialize.routing) — never retried by a budget.
+        MaterializationUnobtainable = "materialization_unobtainable",
+        /// Substitution-replacement: a materialization attempt hit
+        /// infrastructure failure (upstream 5xx/timeout/store-internal/
+        /// no-tenant-context) or its executing replica crashed
+        /// (establishment-written). Counts toward
+        /// max_materialization_attempts and toward NOTHING else —
+        /// invisible to every build budget.
+        MaterializationInfra = "materialization_infra",
     }
     parse_err(_s) = &'static str:
         "invalid outcome class (not in the migration-066 alphabet)";
