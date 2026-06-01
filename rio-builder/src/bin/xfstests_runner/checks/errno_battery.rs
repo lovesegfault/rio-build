@@ -144,13 +144,17 @@ pub fn generic_126_exec_access(ctx: &Ctx) -> anyhow::Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// generic/050 (adapted): every mutation attempted by the build uid
-/// fails — EACCES from the kernel's default_permissions check over the
-/// served root-owned 0444/0555 modes (EPERM for the ownership-gated
-/// setattr calls) — and the tree is byte-identical afterwards. A
-/// regression here lets builds scribble on (or appear to scribble on)
-/// shared inputs. The mount is not MS_RDONLY, so EROFS is structurally
-/// impossible on this leg; the EROFS intent is covered by the root leg.
+/// generic/050 + generic/123 (adapted): every mutation attempted by
+/// the build uid fails — EACCES from the kernel's default_permissions
+/// check over the served root-owned 0444/0555 modes (EPERM for the
+/// ownership-gated setattr calls) — and the tree is byte-identical
+/// afterwards. generic/123's four operations (overwrite, append,
+/// delete, move of a root-created file) are exactly the O_TRUNC,
+/// O_APPEND, unlink, and rename probes below, so it folds in here
+/// rather than as a separate check. A regression lets builds scribble
+/// on (or appear to scribble on) shared inputs. The mount is not
+/// MS_RDONLY, so EROFS is structurally impossible on this leg; the
+/// EROFS intent is covered by the root leg.
 pub fn generic_050_write_protection_unprivileged(ctx: &Ctx) -> anyhow::Result<Outcome> {
     let plain = plain_unique_file(ctx)?;
     let exec = ctx

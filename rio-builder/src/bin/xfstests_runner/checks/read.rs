@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use anyhow::{Context, ensure};
 
-use super::{Ctx, Outcome, wait_for};
+use super::{Ctx, Outcome, first_divergence, wait_for};
 
 /// generic/075 + generic/091 (read-only adaptation of fsx): bytes read
 /// through the mount must equal the locally regenerated oracle on both
@@ -113,12 +113,14 @@ pub fn generic_075_091_read_integrity(ctx: &Ctx) -> anyhow::Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-/// generic/095 + generic/113 + generic/310 (read-only adaptation):
+/// generic/095 + generic/310 + generic/113 (read-only adaptation):
 /// concurrent whole-file readers agree with the oracle, repeated
 /// open/close cycles of one file keep working (the per-digest
 /// passthrough backing id must be reused, not re-registered — the
 /// kernel EBUSYs a re-registration), and readdir racing read on the
-/// same directory neither errors nor wedges. Guards the per-digest
+/// same directory neither errors nor wedges. Only generic/113's sync
+/// open/close cycling is ported here; its io_uring/AIO readers are the
+/// deferred P3 extension and are NOT exercised. Guards the per-digest
 /// singleflight (`fills`), shared `FillState` joins, and `Opener`'s
 /// concurrent map updates under fuser's thread pool.
 pub fn generic_095_113_310_concurrency(ctx: &Ctx) -> anyhow::Result<Outcome> {
@@ -202,14 +204,6 @@ pub fn generic_095_113_310_concurrency(ctx: &Ctx) -> anyhow::Result<Outcome> {
 }
 
 // ─── helpers ───────────────────────────────────────────────────────────
-
-/// First byte offset at which `actual` differs from `expected` (or the
-/// length difference if one is a prefix of the other).
-fn first_divergence(expected: &[u8], actual: &[u8]) -> Option<usize> {
-    let prefix_mismatch = expected.iter().zip(actual.iter()).position(|(a, b)| a != b);
-    let len_mismatch = (expected.len() != actual.len()).then_some(expected.len().min(actual.len()));
-    prefix_mismatch.or(len_mismatch)
-}
 
 /// pread until EOF or the buffer is full; returns the byte count.
 fn read_fully_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> anyhow::Result<usize> {

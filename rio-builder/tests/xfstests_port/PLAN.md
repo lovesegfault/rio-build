@@ -143,23 +143,23 @@ inside the VM tier.
 | 13 | generic/095 | concurrent mixed I/O on the same files | 8 parallel whole-file readers must agree with the oracle: guards the per-digest singleflight (`fills`), shared `FillState` joins, and concurrent passthrough opens. Plus the castore-specific check that identical bytes share one inode and the exec-bit splits it (content-addressed identity). | VM | P1 | ported |
 | 14 | generic/113 | aio-stress | Folded with #13 as repeated open/close cycles of one file — guards the per-digest `BackingRef` refcount reuse (the kernel EBUSYs a re-registration of a different backing id for the same inode). True io_uring/AIO readers are the P3 extension. | VM | P1 | ported (sync legs) |
 | 15 | generic/310 | concurrent readdir vs read on one directory | Races between `readdir` and `open/read` on the same subtree must not error or wedge (InoMap is immutable; the contention is in `Opener`'s maps and fuser's thread pool). | VM (folded) | P1 | ported |
-| 16 | generic/020 | get/list extended attributes | Castore deliberately answers getxattr→ENODATA, listxattr→empty (overlay probes `user.overlay.*` on every lower inode; the EIO trap is documented on `XattrListReply`). Port pins those errnos from the kernel side; setfattr must fail. | VM; needs `pkgs.attr` in the client VM | P2 | — |
-| 17 | generic/062 | getfattr/setfattr across object types (file/dir/symlink) | Same as #16 across node kinds, incl. trusted/system namespaces returning ENODATA (not EPERM/ENOTSUP surprises) — exactly what `ovl_copy_xattr` sees during copy-up. | VM; with #16 | P2 | — |
-| 18 | generic/097 | basic EA set/get/list/remove | Read-side legs only (list empty, get ENODATA); write legs are failure checks. | VM; with #16 | P2 | — |
-| 19 | generic/423 | statx field correctness | statx mask handling, stx_{mode,size,nlink,ino,blocks,btime} consistency with stat; FUSE answers via the same getattr/readdirplus attrs. | VM (statx via python3 on the client) | P2 | — |
-| 20 | generic/285 | SEEK_DATA/SEEK_HOLE sanity | No lseek implementation → ENOSYS → kernel default treats the whole file as data; that minimum must still be POSIX-conformant (SEEK_HOLE→size, SEEK_DATA<size→offset). Read-only subset. | VM (xfs_io is already in the client via xfsprogs) | P2 | — |
-| 21 | generic/448 | SEEK_HOLE/DATA with negative offsets | Error-path leg of #20 (EINVAL/ENXIO), cheap to fold in. | VM (with #20) | P2 | — |
-| 22 | generic/706 | SEEK_DATA on a 1-byte file returns 0 | Degenerate-size leg of #20. | VM (with #20) | P2 | — |
-| 23 | generic/471 | rewinddir POSIX semantics | rewinddir on an open fd re-yields the full identical listing (offset-0 reset against FOPEN_CACHE_DIR'd dirent pages). Needs a small readdir helper (python3 or C). | VM + helper | P2 | — |
-| 24 | generic/676 | seekdir to valid and invalid positions | `InoMap::readdir` trusts the kernel-provided resume offset; arbitrary seekdir offsets must produce a sane (possibly empty) listing, never EIO/panic/duplicates. The Rust exhaustive-offset test covers in-range offsets; this adds the kernel/glibc seekdir cookie path and out-of-range offsets. | VM + helper (telldir/seekdir) | P2 | — |
+| 16 | generic/020 | get/list extended attributes | Castore deliberately answers getxattr→ENODATA, listxattr→empty (overlay probes `user.overlay.*` on every lower inode; the EIO trap is documented on `XattrListReply`). Port pins those errnos from the kernel side; setfattr must fail. | Rust `xattr_statx::generic_020_062_097_xattr_read_legs` (native `lgetxattr`/`llistxattr` — no `pkgs.attr` needed) | P2 | ported (read legs: getxattr→ENODATA, listxattr→empty, across file/dir/symlink) |
+| 17 | generic/062 | getfattr/setfattr across object types (file/dir/symlink) | Same as #16 across node kinds, incl. trusted/system namespaces returning ENODATA (not EPERM/ENOTSUP surprises) — exactly what `ovl_copy_xattr` sees during copy-up. | Rust, with #16 (probes `user.*` + `trusted.overlay.*` on each kind) | P2 | ported (folded into #16) |
+| 18 | generic/097 | basic EA set/get/list/remove | Read-side legs only (list empty, get ENODATA); write legs are failure checks. | Rust, with #16 | P2 | ported (read legs; write legs are covered by the EROFS battery) |
+| 19 | generic/423 | statx field correctness | statx mask handling, stx_{mode,size,nlink,ino,blocks,btime} consistency with stat; FUSE answers via the same getattr/readdirplus attrs. | Rust `xattr_statx::generic_423_statx_field_correctness` (native `statx(2)` via libc — no python); generic/532 (attributes ⊆ attributes_mask) folded in as `generic_532_statx_attributes_mask_sanity` | P2 | ported (statx vs lstat agreement on mode/size/ino/nlink/blocks/mtime across all node kinds; mask completeness; 532 subset invariant) |
+| 20 | generic/285 | SEEK_DATA/SEEK_HOLE sanity | No lseek implementation → ENOSYS → kernel default treats the whole file as data; that minimum must still be POSIX-conformant (SEEK_HOLE→size, SEEK_DATA<size→offset). Read-only subset. | VM (xfs_io is already in the client via xfsprogs) | P2 |ported (`io_paths::generic_285_448_706_seek_hole_data`); no-holes adaptation SEEK_HOLE to size |
+| 21 | generic/448 | SEEK_HOLE/DATA with negative offsets | Error-path leg of #20 (EINVAL/ENXIO), cheap to fold in. | VM (with #20) | P2 |ported (with #20; ENXIO/EINVAL error legs) |
+| 22 | generic/706 | SEEK_DATA on a 1-byte file returns 0 | Degenerate-size leg of #20. | VM (with #20) | P2 |ported (with #20; smallest non-empty file stands in for the 1-byte case) |
+| 23 | generic/471 | rewinddir POSIX semantics | rewinddir on an open fd re-yields the full identical listing (offset-0 reset against FOPEN_CACHE_DIR'd dirent pages); a rewind after a partial read restarts at the first entry. The readdir helper is the runner's own `libc` dir stream (`dir_locks.rs`), not a shell/python helper. | VM (`dir_locks::generic_471_rewinddir`) | P2 | ported |
+| 24 | generic/676 | seekdir to valid and invalid positions | `InoMap::readdir` trusts the kernel-provided resume offset; arbitrary seekdir offsets must produce a sane (possibly empty) listing, never EIO/panic/duplicates. The Rust exhaustive-offset test covers in-range offsets; this adds the glibc telldir/seekdir cookie path and out-of-range/garbage offsets against the live mount. | VM (`dir_locks::generic_676_seekdir`) | P2 | ported |
 | 25 | generic/011 | dirstress | Read-only adaptation: many concurrent processes walking/listing the same tree (FUSE_PARALLEL_DIROPS is negotiated). Complements #13 on the lookup/readdir side. | VM | P2 | — |
-| 26 | generic/074 | fstest (read/mmap patterns) | mmap-read == read() comparison through the mount; with passthrough the mapping is backed by the cache file, in KEEP_CACHE fallback by FUSE pages — both must serve identical bytes. | VM; python3 (mmap) on the client | P2 | — |
-| 27 | generic/127 | fsx incl. memory-mapped reads | Larger mmap-read coverage once #26's helper exists; also worth one run with `RIO_DISABLE_PASSTHROUGH=1` (the escape hatch changes the read path entirely). | VM (with #26) | P2 | — |
+| 26 | generic/074 | fstest (read/mmap patterns) | mmap-read == read() comparison through the mount; with passthrough the mapping is backed by the cache file, in KEEP_CACHE fallback by FUSE pages — both must serve identical bytes. | VM; python3 (mmap) on the client | P2 |ported (`io_paths::generic_074_127_mmap_reads`) |
+| 27 | generic/127 | fsx incl. memory-mapped reads | Larger mmap-read coverage once #26's helper exists; also worth one run with `RIO_DISABLE_PASSTHROUGH=1` (the escape hatch changes the read path entirely). | VM (with #26) | P2 |ported (with #26; MAP_PRIVATE+MAP_SHARED legs) |
 | 28 | generic/028 | path resolution / getcwd correctness | cd deep into the mount, `pwd -P`, resolve `..` — `..` of a content-addressed dir resolves through the dcache (the readdir dot entries deliberately self-point); a regression here breaks relative-path builds. | VM | P2 | — |
-| 29 | generic/088 | permission checks for unprivileged users (DAC) | With `default_permissions` the kernel enforces the served 0444/0555 root-owned modes for arbitrary uids — probe R/W/X as a second unprivileged uid (not the mount's builder uid) to pin allow_other + DAC interplay. | VM + extra user | P2 | — |
-| 30 | generic/249 | splice(2) read | splice/sendfile from a FUSE-backed file is a distinct kernel read path; with passthrough it should hit the backing file directly — bytes must match on both passthrough and KEEP_CACHE handles. | VM | P2 | — |
-| 31 | generic/430 | copy_file_range basic copies (FUSE as source) | copy_file_range from the mount to a writable fs falls back to splice/read for FUSE; bytes must match, no EIO. Overlay copy-up of a lower file is the production analogue (covered e2e by vm-castore-e2e, but the syscall-level check is cheap). | VM (xfs_io copy_range) | P2 | — |
-| 32 | generic/131 | POSIX/fcntl lock smoke on read-only files | Read locks via flock/fcntl on a RO FUSE file must work locally (no lock support in the daemon → kernel-local locks). Configure scripts and sqlite-using builds take read locks on inputs. | VM | P2 | — |
+| 29 | generic/088 | permission checks for unprivileged users (DAC) | With `default_permissions` the kernel enforces the served 0444/0555 root-owned modes for arbitrary uids — probes R/W/X as a second unprivileged uid (1001/991, distinct from the build uid the other batteries use) to pin allow_other + DAC interplay. | VM (`dir_locks::generic_088_second_uid_dac`, second-uid PrivDrop) | P2 | ported |
+| 30 | generic/249 | splice(2) read | splice/sendfile from a FUSE-backed file is a distinct kernel read path; with passthrough it should hit the backing file directly — bytes must match on both passthrough and KEEP_CACHE handles. | VM | P2 |ported (`io_paths::generic_249_splice_read`) |
+| 31 | generic/430 | copy_file_range basic copies (FUSE as source) | Since kernel 5.19, userspace cross-fs cfr without a native FS op is EXDEV by policy — and EXDEV is the errno coreutils' fallback path expects, so the contract is "byte-exact copy or exactly EXDEV, nothing else". Any other errno turns `cp` from the mount into a hard error. Overlay copy-up is NOT this path (it uses the kernel-internal COPY_FILE_SPLICE flag; covered e2e by vm-castore-e2e). | VM (`io_paths::generic_430_553_copy_file_range`, native libc cfr) | P2 |ported (EXDEV-contract assertion; oracle + generic/553 EOF legs activate if a future kernel/FS allows the copy) |
+| 32 | generic/131 | POSIX/fcntl lock smoke on read-only files | Read locks via fcntl/flock on a RO FUSE file must be granted and tracked kernel-locally (the daemon implements no lock ops). Cross-process F_GETLK proves the kernel is the lock manager; F_WRLCK through an RO fd is EBADF; flock is best-effort (ENOSYS accepted, a grant must be enforced). Configure scripts and sqlite-using builds take read locks on inputs. | VM (`dir_locks::generic_131_read_locks`) | P2 | ported |
 | 33 | generic/614 | st_blocks consistency | Non-empty files report st_blocks == ceil(size/512) (`make_attr`); `du` on the mount stays sane (it is how builds estimate input size). | VM (cheap; fold into the meta subtest); Rust attr check | P2 | partially ported (Rust) |
 | 34 | generic/436 | further SEEK_DATA/SEEK_HOLE sanity | Only adds value beyond #20 if backing-cache files become sparse (they are written by sequential fetch, so currently never). | VM | P3 | — |
 | 35 | generic/445 | another SEEK_DATA/SEEK_HOLE pattern | Same caveat as #34. | VM | P3 | — |
@@ -256,9 +256,27 @@ that surfaced findings F-C and F-D against the pre-EROFS castore-FUSE;
 both are fixed (see Findings) and the legs now pin the conformant
 behavior.
 
-Next: P2 rows 16–24 (xattr trio, statx/mmap/seekdir — all natural
-runner checks now that probes are Rust syscalls, no extra VM packages
-needed), then #29 (second unprivileged uid) and #30/#31
-(splice/copy_file_range). After that, decide whether F-A warrants a
-real `statfs` implementation and convert the informational probe into
-an assertion.
+P2 batch (this round): rows 16–24 and 26–32 are ported — the xattr
+read trio (`xattr_statx.rs`), statx field/mask correctness, the
+mmap/splice/copy_file_range alternate read paths and SEEK_HOLE/DATA
+conformance (`io_paths.rs`), rewinddir/seekdir cookie handling, the
+second-uid DAC probe and read-lock smoke (`dir_locks.rs`). All probes
+are native Rust syscalls (libc/nix) — no extra VM packages.
+
+Security batch: generic/680 (Dirty Pipe, CVE-2022-0847) is ported as
+`write_attack::generic_680_dirty_pipe` — a page-cache write attack
+that reaches the F-C blast radius through a path the EROFS guards
+cannot see; the module doc has the full analysis. generic/123 needed
+no new check: its four operations are exactly the unprivileged
+`generic_050` probes, so it is folded into that check's provenance.
+
+Label corrections: `statfs_zero_totals` is castore-specific (no
+upstream statfs-totals test exists; generic/361 is "remount on I/O
+errors"); `generic_002` asserts the inverse of upstream (nlink==1,
+no hardlinks — F-B); `generic_095_113_310` carries only generic/113's
+sync legs (AIO/io_uring readers remain the deferred P3 extension).
+
+Next: #25 (generic/011 dirstress, read-only adaptation) and #28
+(generic/028 getcwd/`..` resolution), then the P3 tier. After that,
+decide whether F-A warrants a real `statfs` implementation and convert
+the informational probe into an assertion.
