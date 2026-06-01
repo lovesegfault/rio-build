@@ -779,3 +779,495 @@ async fn cancellation_closes_open_attempt_charge_free() -> TestResult {
     assert_eq!(open, 0, "the open attempt was closed");
     Ok(())
 }
+
+// ── T-6.2: the Phase A flag-on smoke battery (the dormancy proof's
+//    "dormant ≠ vestigial" half) ─────────────────────────────────────────
+
+/// A materialization Success outcome covering `ingested` + `verified`.
+fn mat_success_outcome(
+    ingested: Vec<String>,
+    verified: Vec<String>,
+) -> rio_proto::types::MaterializationOutcome {
+    rio_proto::types::MaterializationOutcome {
+        outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+            rio_proto::types::materialization_outcome::Success {
+                ingested_paths: ingested,
+                verified_paths: verified,
+            },
+        )),
+    }
+}
+
+/// A materialization Unobtainable outcome.
+fn mat_unobtainable_outcome(
+    missing: Vec<String>,
+    verified: Vec<String>,
+    cause: &str,
+) -> rio_proto::types::MaterializationOutcome {
+    rio_proto::types::MaterializationOutcome {
+        outcome: Some(
+            rio_proto::types::materialization_outcome::Outcome::Unobtainable(
+                rio_proto::types::materialization_outcome::Unobtainable {
+                    missing_paths: missing,
+                    verified_paths: verified,
+                    cause: cause.into(),
+                },
+            ),
+        ),
+    }
+}
+
+/// A materialization InfraFailure outcome.
+fn mat_infra_outcome(detail: &str) -> rio_proto::types::MaterializationOutcome {
+    rio_proto::types::MaterializationOutcome {
+        outcome: Some(
+            rio_proto::types::materialization_outcome::Outcome::InfraFailure(
+                rio_proto::types::materialization_outcome::InfraFailure {
+                    detail: detail.into(),
+                },
+            ),
+        ),
+    }
+}
+
+/// Claim the materialization job for `drv` as store replica `instance`
+/// (kind=Materialization; the BC-1 composite identity `{drv}@{instance}`).
+async fn claim_materialization(
+    handle: &ActorHandle,
+    drv: &str,
+    instance: &str,
+) -> Result<PullOutcome, PullRejection> {
+    handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: drv.into(),
+            auth_intent: Some(drv.into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some(instance.into()),
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// Report a materialization outcome against an open attempt's exec_id
+/// through the production report intake.
+async fn report_materialization_outcome(
+    handle: &ActorHandle,
+    exec_id: Uuid,
+    intent: &str,
+    outcome: rio_proto::types::MaterializationOutcome,
+) -> Result<(), PullRejection> {
+    let mut payload = pull_payload(rio_proto::types::BuildResult::default());
+    payload.materialization_outcome = Some(outcome);
+    handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some(intent.into()),
+            payload,
+            reply,
+        })
+        .await
+        .expect("actor alive")
+}
+
+/// List claimable jobs through the production actor command (the path
+/// `ExecutorService.ListMaterializationJobs` drives).
+async fn list_materialization_jobs(
+    handle: &ActorHandle,
+    limit: u32,
+) -> Vec<crate::actor::materialize::JobDescriptor> {
+    handle
+        .query_unchecked(|reply| ActorCommand::ListMaterializationJobs { limit, reply })
+        .await
+        .expect("actor alive")
+}
+
+// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing]
+// r[verify sched.materialize.pinning]
+/// THE Phase A keystone: one materialization job, end-to-end, flag-on,
+/// exercising every dormant mechanism this campaign added in one
+/// composed pass:
+///
+///   merge (interest recorded, wanted relation written)
+///   → probe partition (job created instead of walk; node stays Ready)
+///   → ListMaterializationJobs (the job is listed via the actor command)
+///   → claim kind=MATERIALIZATION as "store-test-0" (fenced mint;
+///     attempt_kind=materialization; node Running; one-winner: a second
+///     claim from "store-test-1" gets NotYetReady)
+///   → report InfraFailure (the materialization budget charge — the job
+///     re-arms under budget; the charge row is the kind-partition
+///     witness for the budget assertion below)
+///   → re-claim → report Success covering the wanted set
+///   → consumption (coverage check passes; node Completed; job
+///     resolved_success; build Succeeded)
+///
+/// Plus the two partition pins:
+///   - budget partition (`materializationInvisibleToBuildBudgets`,
+///     production half): the node's ledger suffix — one
+///     materialization_infra row — folds to the SAME build verdict as
+///     an empty history.
+///   - pin partition (review finding RB-5): a materialization mint
+///     writes ZERO scheduler_live_pins rows for the drv (pin-at-ingest
+///     is store-side).
+///
+/// NOTE (RT-4): this is an integration PIN, not a red-first test — the
+/// individual mechanisms were red-first tested in Waves 3/4; this test
+/// proves they compose.
+#[tokio::test]
+async fn flag_on_materialization_job_end_to_end() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // 1. Merge a 1-node build; the wanted output becomes substitutable
+    //    only AFTER merge so the dispatch-probe partition (not the
+    //    merge new_sub lane) is the creating site.
+    let out = test_store_path("mat-e2e-out");
+    let mut d1 = make_node("mat-e2e");
+    d1.expected_output_paths = vec![out.clone()];
+    d1.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![d1], vec![], false).await?;
+    barrier(&handle).await;
+
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?; // probe partition runs → job created
+
+    // 2. The job exists and is listed through the production actor
+    //    command; the node stays Ready (claimable), no walk spawned.
+    let jobs = list_materialization_jobs(&handle, 16).await;
+    assert_eq!(jobs.len(), 1, "exactly one job listed, got {jobs:?}");
+    assert_eq!(jobs[0].drv_hash, "mat-e2e");
+    assert_eq!(jobs[0].origin, JobOrigin::CacheOpportunity);
+    assert_eq!(
+        expect_drv(&handle, "mat-e2e").await.status,
+        DerivationStatus::Ready,
+        "the job row is the in-flight marker; the node stays Ready"
+    );
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(!qpi.contains(&out), "no walk spawned; qpi_calls={qpi:?}");
+    }
+
+    // 3. Claim it as store replica 0; verify the one-winner arbiter.
+    let assignment = match claim_materialization(&handle, "mat-e2e", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the first claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let second = claim_materialization(&handle, "mat-e2e", "store-test-1").await;
+    assert!(
+        matches!(second, Ok(PullOutcome::NotYetReady { .. })),
+        "one-winner arbitration: a second replica's claim parks, got {second:?}"
+    );
+    let kind: String =
+        sqlx::query_scalar("SELECT attempt_kind FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(kind, "materialization", "the mint persists the work class");
+    assert_eq!(
+        expect_drv(&handle, "mat-e2e").await.status,
+        DerivationStatus::Running,
+        "the open attempt holds the node Running"
+    );
+
+    // 4. The winner reports an infrastructure failure → exactly one
+    //    materialization_infra charge; the job re-arms (1 < max_attempts).
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "mat-e2e",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // 5. Re-claim (the re-armed job) and report Success covering the
+    //    wanted set.
+    let assignment = match claim_materialization(&handle, "mat-e2e", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the re-claim after re-arm must deliver, got {other:?}"),
+    };
+    let exec_id2: Uuid = assignment.exec_id.parse()?;
+    assert_ne!(exec_id, exec_id2, "the re-claim opens a fresh attempt");
+    store.seed_with_content(&out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id2,
+        "mat-e2e",
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // 6. Consumption: node Completed, job resolved_success, build
+    //    Succeeded, no unresolved job remains.
+    assert_eq!(
+        expect_drv(&handle, "mat-e2e").await.status,
+        DerivationStatus::Completed,
+        "the Success consumption completes the node"
+    );
+    let st = query_status(&handle, build_id).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the creating build succeeds through the consumption"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "resolved_success");
+    let unresolved: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM materialization_jobs WHERE state = 'pending'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(unresolved, 0, "no unresolved job remains");
+
+    // 7. The budget partition (`materializationInvisibleToBuildBudgets`,
+    //    production half): the suffix carries exactly the stage-4 infra
+    //    charge — kind=materialization — and decide() folds it to the
+    //    SAME verdict as an empty history for build budgets.
+    let derivation_id: Uuid =
+        sqlx::query_scalar("SELECT derivation_id FROM derivations WHERE drv_hash = $1")
+            .bind("mat-e2e")
+            .fetch_one(&db.pool)
+            .await?;
+    let suffix = sdb(&db.pool).load_attempt_suffix(&[derivation_id]).await?;
+    let rows = suffix.get(&derivation_id).cloned().unwrap_or_default();
+    assert_eq!(
+        rows.len(),
+        1,
+        "exactly the stage-4 infra charge row, got {rows:?}"
+    );
+    assert_eq!(
+        rows[0].attempt_kind,
+        crate::state::AttemptKind::Materialization
+    );
+    assert_eq!(
+        rows[0].outcome_class,
+        crate::state::OutcomeClass::MaterializationInfra
+    );
+    let records: Vec<crate::state::AttemptRecord> = rows.iter().map(|r| r.to_record()).collect();
+    let now = crate::db::attempts::epoch_now() as crate::retry_policy::AbsTime;
+    let budget = crate::retry_policy::Budget::default();
+    assert_eq!(
+        crate::retry_policy::decide(&records, &budget, now),
+        crate::retry_policy::decide(&[], &budget, now),
+        "the materialization charge must be invisible to every build budget"
+    );
+
+    // 8. The pin partition (RB-5): zero scheduler_live_pins rows for the
+    //    drv — both mints skipped pin_live_inputs.
+    let pins: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM scheduler_live_pins WHERE drv_hash = $1")
+            .bind("mat-e2e")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        pins, 0,
+        "materialization mints must not write build_input pins"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing]
+/// The Unobtainable moot arm (the C3 trace), flag-on, end-to-end through
+/// the actor: report Unobtainable for a path no LIVE build wants → the
+/// node completes for live interest, NEVER fail-fasts. The design §2.4
+/// confirmed-C3-trace replay as a production test (AS-2/PP-1): b2 (the
+/// build wanting the missing output) joins and then cancels INSIDE the
+/// claim→consume window; b1's narrower wants are fully covered by the
+/// verified set.
+///
+/// Sequencing note (the OQ7/PD-17 partial-coexistence boundary): b2
+/// merges while the materialization attempt is OPEN (node Running). A
+/// merge against a Ready node would route it through the I-099
+/// existing-node reprobe lane, which keeps spawning as-built walks
+/// flag-on (PD-17 — its job creation is Phase B work); the open
+/// attempt is what keeps the C3 window walk-free, exactly as the
+/// design's trace has it.
+#[tokio::test]
+async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // One 2-output node; two builds with different wants:
+    //   b1 wants out1 only; b2 wants out1 + out2.
+    let out1 = test_store_path("mat-moot-out1");
+    let out2 = test_store_path("mat-moot-out2");
+    // Substitutable BEFORE merge → the merge new_sub lane creates the job.
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(out1.clone());
+        subs.push(out2.clone());
+    }
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("mat-moot");
+        n.output_names = vec!["out1".into(), "out2".into()];
+        n.expected_output_paths = vec![out1.clone(), out2.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // b1 merges → the new_sub lane creates the job in-tx; the node
+    // stays Ready (no walk).
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![mk(&["out1"])], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "mat-moot").await.status,
+        DerivationStatus::Ready,
+        "flag-on the merge creates the job and the node stays Ready"
+    );
+
+    // Claim it as a store replica → the attempt opens, node Running.
+    let assignment = match claim_materialization(&handle, "mat-moot", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // b2 joins while the attempt is open (the node is Running, so b2's
+    // merge does NOT reprobe it — no walk spawns), widening live
+    // interest to out1+out2.
+    let b2 = Uuid::new_v4();
+    merge_dag(&handle, b2, vec![mk(&["out1", "out2"])], vec![], false).await?;
+    barrier(&handle).await;
+
+    // One job (the dedup), both builds' wanted relations recorded.
+    let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(
+        (jobs, wanted),
+        (1, 2),
+        "one deduped job, two wanted-relation rows"
+    );
+
+    // b2 cancels in the claim→consume window: its wants leave the live
+    // join; only b1's narrower wants (out1) remain live.
+    cancel_build(&handle, b2).await?;
+    barrier(&handle).await;
+
+    // Report Unobtainable{missing=[out2], verified=[out1]}: out2 is
+    // confirmed absent upstream but NO live build wants it (the moot
+    // conjunct), and everything live interest wants (out1) was verified
+    // present.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "mat-moot",
+        mat_unobtainable_outcome(
+            vec![out2.clone()],
+            vec![out1.clone()],
+            "upstream 404 on out2",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // The moot arm (arm 0): node Completed for live interest, b1
+    // Succeeded, job resolved_success — NEVER a fail-fast.
+    assert_eq!(
+        expect_drv(&handle, "mat-moot").await.status,
+        DerivationStatus::Completed,
+        "the C3/moot arm completes the node for live interest"
+    );
+    let st = query_status(&handle, b1).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "b1 (the surviving build) succeeds — never a fail-fast"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "resolved_success");
+
+    // The charge row exists (Unobtainable IS a fold event for the
+    // materialization budget) but carries the materialization kind —
+    // invisible to build budgets — and the node was never poisoned.
+    let (class, joined_kind): (String, String) = sqlx::query_as(
+        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
+           FROM drv_attempts t \
+           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(class, "materialization_unobtainable");
+    assert_eq!(joined_kind, "materialization");
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// The PD-6 boundary pin (adjudication PDQ-6): a Queued node (a parent
+/// behind an unproduced dep) with a pending job REFUSES a flag-on
+/// materialization claim — NotYetReady, ZERO drv_executions rows
+/// minted, node still Queued. Never a stranded mint (the as-built mint
+/// commits durable rows BEFORE the in-memory transition; refusing at
+/// admission is what prevents the strand). Phase B's Queued work item
+/// (the Queued→Assigned edge + the mint-ordering rework + the
+/// `sched.state.machine` test updates) flips this pin red-first.
+#[tokio::test]
+async fn flag_on_queued_node_refuses_materialization_claim() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // 3-node chain root → mid → leaf where only MID's output is
+    // substitutable:
+    //   - the topdown prune does NOT fire (the demanded root is not
+    //     substitutable),
+    //   - the merge new_sub lane creates mid's job in-tx,
+    //   - seed_initial_states leaves mid Queued (leaf is unproduced).
+    let mid_out = test_store_path("mat-queued-mid-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(mid_out.clone());
+
+    let root = make_node("mat-queued-root");
+    let mut mid = make_node("mat-queued-mid");
+    mid.expected_output_paths = vec![mid_out.clone()];
+    let leaf = make_node("mat-queued-leaf");
+    let nodes = vec![root, mid, leaf];
+    let edges = vec![
+        make_test_edge("mat-queued-root", "mat-queued-mid"),
+        make_test_edge("mat-queued-mid", "mat-queued-leaf"),
+    ];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    // The job exists for mid (created by the merge new_sub lane) and
+    // mid is Queued behind the unproduced leaf.
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "the merge new_sub lane created mid's job");
+    assert_eq!(
+        expect_drv(&handle, "mat-queued-mid").await.status,
+        DerivationStatus::Queued,
+        "mid is Queued behind the unproduced leaf"
+    );
+
+    // The boundary pin: a flag-on materialization claim against the
+    // Queued node refuses NotYetReady.
+    let claim = claim_materialization(&handle, "mat-queued-mid", "store-test-0").await;
+    assert!(
+        matches!(claim, Ok(PullOutcome::NotYetReady { .. })),
+        "PDQ-6: materialization claims are Ready-only in Phase A, got {claim:?}"
+    );
+
+    // ZERO drv_executions rows were minted (never a stranded mint) and
+    // the node is still Queued.
+    let execs: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_executions")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(execs, 0, "a refused claim must never mint durable rows");
+    assert_eq!(
+        expect_drv(&handle, "mat-queued-mid").await.status,
+        DerivationStatus::Queued,
+        "the refusal leaves the node untouched"
+    );
+    Ok(())
+}

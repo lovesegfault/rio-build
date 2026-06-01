@@ -695,3 +695,184 @@ async fn executor_token_report_with_materialization_outcome_rejected() -> anyhow
         .expect("build reports with executor tokens are unaffected");
     Ok(())
 }
+
+// ── T-6.2: the wire-level flag-on lifecycle (review finding dormancy-5;
+//    PD-14 as amended) ────────────────────────────────────────────────────
+
+// r[verify sched.materialize.job]
+// r[verify store.materialize.executor]
+/// The store-to-scheduler seam, flag-on, through the REAL wire: a real
+/// in-process tonic `ExecutorService` server with BOTH HMAC key families
+/// configured (the production posture), driven by a real tonic client
+/// presenting the kind-attested store-service credential
+/// (`ServiceClaims{caller="rio-store"}` signed with the service key,
+/// carried on `x-rio-service-token` — stop condition 9's assumption
+/// converted into checked fact):
+///
+///   ListMaterializationJobs → the flag-on job is listed
+///   → PullAssignment(kind=MATERIALIZATION, executor_instance="store-test-0")
+///     → the assignment delivers; the fenced mint persisted
+///       attempt_kind='materialization'
+///   → PullAssignment with EMPTY executor_instance → InvalidArgument
+///     (the BC-1 identity-mandatory rule, proven flag-on)
+///   → ReportOutcome(materialization_outcome: Success) → consumption
+///     (node Completed, build Succeeded, job resolved_success)
+///
+/// PD-14 (amended by dormancy-5): the store's *role* is played by this
+/// test through a real client — the real store executor against the
+/// real scheduler is Phase B's VM matrix — but the wire and auth seam
+/// Phase B depends on are real here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> {
+    use crate::actor::tests::{
+        barrier, expect_drv, merge_dag, query_status, setup_actor_configured, test_store_path, tick,
+    };
+    use crate::state::DerivationStatus;
+    use rio_auth::hmac::HmacKey;
+
+    // The flag-on actor + MockStore (the probe target the job-creation
+    // gate consults).
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+        });
+
+    // The production auth posture: BOTH key families, distinct keys.
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    let mut grpc = SchedulerGrpc::new_for_tests(handle.clone());
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+    let store_token = store_service_token(&service_key, "rio-store");
+
+    // The REAL wire: in-process tonic server + connected client.
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = ExecutorServiceClient::new(channel);
+
+    // Drive the scheduler to a claimable job through the actor (merge,
+    // then the dispatch-probe partition against the substitutable
+    // answer) — the same path the keystone actor test pins.
+    let out = test_store_path("mat-wire-out");
+    let mut node = make_node("mat-wire");
+    node.expected_output_paths = vec![out.clone()];
+    node.wanted_output_names = vec!["out".into()];
+    let build_id = uuid::Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+
+    // 1. ListMaterializationJobs through the wire → the job is listed.
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let resp = client.list_materialization_jobs(req).await?.into_inner();
+    assert_eq!(
+        resp.jobs.len(),
+        1,
+        "the flag-on job is listed through the wire, got {:?}",
+        resp.jobs
+    );
+    assert_eq!(resp.jobs[0].drv_hash, "mat-wire");
+    assert_eq!(resp.jobs[0].origin, "cache_opportunity");
+
+    // 2. The BC-1 identity-mandatory rule, proven flag-on through the
+    //    wire: an EMPTY executor_instance is InvalidArgument.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "mat-wire".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: String::new(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let err = client
+        .pull_assignment(req)
+        .await
+        .expect_err("an empty executor_instance must be rejected flag-on too");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument);
+
+    // 3. The claim through the wire → the assignment delivers; the
+    //    fenced mint persisted the materialization work class.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "mat-wire".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-test-0".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let resp = client.pull_assignment(req).await?.into_inner();
+    let assignment = match resp.outcome {
+        Some(rio_proto::types::pull_assignment_response::Outcome::Assignment(a)) => a,
+        other => panic!("the flag-on claim through the wire must deliver, got {other:?}"),
+    };
+    let exec_id = assignment.exec_id.clone();
+    let kind: String =
+        sqlx::query_scalar("SELECT attempt_kind FROM drv_executions WHERE exec_id = $1")
+            .bind(uuid::Uuid::parse_str(&exec_id)?)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        kind, "materialization",
+        "the wire-level mint persists the work class"
+    );
+
+    // 4. ReportOutcome(Success) through the wire → consumption.
+    store.seed_with_content(&out, b"materialized");
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: exec_id.clone(),
+        report: None,
+        materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+            outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+                rio_proto::types::materialization_outcome::Success {
+                    ingested_paths: vec![out.clone()],
+                    verified_paths: vec![],
+                },
+            )),
+        }),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    client
+        .report_outcome(req)
+        .await
+        .expect("the store-credential Success report consumes the attempt");
+
+    // 5. The consumption's effects, observed through the actor: node
+    //    Completed, build Succeeded, job resolved_success.
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "mat-wire").await.status,
+        DerivationStatus::Completed,
+        "the wire-level Success consumption completes the node"
+    );
+    let st = query_status(&handle, build_id).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the creating build succeeds through the wire-level lifecycle"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        job_state, "resolved_success",
+        "the job resolved through the wire-level lifecycle"
+    );
+    Ok(())
+}
