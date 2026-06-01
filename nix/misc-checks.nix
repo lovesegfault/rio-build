@@ -775,6 +775,57 @@ in
   # device in both spec variants; the vm-security-nonpriv-k3s
   # passthrough subtest proves the entries reach runc, this proves they
   # leave the spec with a usable mode.
+  # rio-exec is the build-system-AGNOSTIC sandbox layer: its Cargo.toml
+  # bans rio-crate deps and Nix conventions so the executor stays
+  # reusable for non-Nix build systems. The dependency half is enforced
+  # by Cargo itself; this check enforces the conventions half by
+  # banning the tokens through which Nix-isms have historically leaked
+  # in. '/nix/store' is deliberately NOT banned: tests legitimately
+  # bind the host store as an opaque mount source.
+  rio-exec-boundary =
+    let
+      rioExecSrc = pkgs.lib.fileset.toSource {
+        root = unfilteredRoot;
+        fileset = pkgs.lib.fileset.unions [
+          ../rio-exec/src
+          ../rio-exec/tests
+          ../rio-exec/Cargo.toml
+        ];
+      };
+    in
+    pkgs.runCommand "rio-rio-exec-boundary" { nativeBuildInputs = [ pkgs.ripgrep ]; } ''
+      status=0
+      ban() {
+        # $1 = fixed-string token, $2 = which leak it bans.
+        if rg --fixed-strings --with-filename --line-number "$1" ${rioExecSrc}/rio-exec; then
+          echo "FAIL: forbidden token '$1' in rio-exec — $2" >&2
+          status=1
+        fi
+      }
+      # The Nix sandbox user identity: lives in rio-builder's
+      # nix_sandbox_identity(); the executor takes it via the mandatory
+      # SandboxIdentity request field.
+      ban 'nixbld' 'the build-user name is a SandboxIdentity request field'
+      ban 'Nix build user' 'the GECOS field is a SandboxIdentity request field'
+      # The Nix structured-log side channel: rio-builder's NixLogFilter
+      # owns the protocol; the executor only carries framing metadata
+      # (ExecEvent::Log.terminated).
+      ban '@nix' 'the structured-log protocol belongs to rio-builder NixLogFilter'
+      # Nix environment-variable conventions (NIX_LOG_FD,
+      # NIX_BUILD_CORES, ...): the request env is caller-provided and
+      # verbatim; the executor must not know any key.
+      ban 'NIX_' 'Nix env-var conventions belong to the request glue'
+      if [ "$status" -ne 0 ]; then
+        echo "" >&2
+        echo "rio-exec is build-system-agnostic (see its Cargo.toml ARCHITECTURAL RULE" >&2
+        echo "and spec rule exec.request.identity): Nix names/conventions belong in" >&2
+        echo "rio-builder's glue (nix_sandbox_identity, NixLogFilter, env assembly)," >&2
+        echo "passed to the executor through the ExecutionRequest." >&2
+        exit 1
+      fi
+      touch $out
+    '';
+
   base-runtime-spec-devices =
     let
       baseRuntimeSpec = import ./base-runtime-spec.nix { inherit pkgs; };
