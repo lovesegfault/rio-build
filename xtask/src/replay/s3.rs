@@ -111,6 +111,24 @@ impl CampaignStore {
     }
 }
 
+/// Render a byte count in human-readable binary units — the precision an
+/// operator needs to eyeball an archive's transfer cost, not an exact
+/// accounting (`replay record`'s summary and `replay list` both use it).
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = bytes as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{bytes} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
 /// Download an S3 object as UTF-8 text. `Ok(None)` when the key does not
 /// exist yet (campaign/stage not reached); other errors propagate.
 pub async fn get_text(region: &str, bucket: &str, key: &str) -> Result<Option<String>> {
@@ -149,6 +167,20 @@ mod tests {
             campaign_key("c1", "report/summary.md"),
             "replay/campaigns/c1/report/summary.md"
         );
+    }
+
+    #[test]
+    fn human_bytes_picks_the_right_unit() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(512), "512 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1536), "1.5 KiB");
+        assert_eq!(human_bytes(3 * 1024 * 1024), "3.0 MiB");
+        assert_eq!(human_bytes(2_147_483_648), "2.0 GiB");
+        // Beyond the largest unit it keeps scaling in TiB instead of
+        // overflowing into nonsense.
+        assert_eq!(human_bytes(5 * 1024_u64.pow(4)), "5.0 TiB");
+        assert_eq!(human_bytes(2048 * 1024_u64.pow(4)), "2048.0 TiB");
     }
 
     #[test]

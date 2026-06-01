@@ -375,25 +375,47 @@ pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
     Ok(())
 }
 
+/// Whether [`try_create_job`] created the Job or found one with the same
+/// name already in place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateOutcome {
+    Created,
+    AlreadyExists,
+}
+
 /// Create the Job in [`NS_REPLAY`] — the only namespace campaign/eval
 /// Jobs run in (the `job` built by [`campaign_job`]/[`eval_job`] already
-/// pins its metadata there). A 409 (already exists) is turned into
-/// actionable guidance instead of an SSA overwrite (Job templates are
-/// immutable).
-pub async fn create_job(client: &kube::Client, job: &Job) -> Result<()> {
+/// pins its metadata there) — reporting a same-name 409 as
+/// [`CreateOutcome::AlreadyExists`] instead of an error. Job templates
+/// are immutable, so what an existing Job means is the caller's call:
+/// `replay record` re-attaches to it (the eval Job name encodes the
+/// request digest, so same name ⇒ same request), while `replay
+/// launch`/`repro` refuse via [`create_job`].
+pub async fn try_create_job(client: &kube::Client, job: &Job) -> Result<CreateOutcome> {
     let name = job.metadata.name.clone().unwrap_or_default();
     let api: Api<Job> = Api::namespaced(client.clone(), NS_REPLAY);
     match api.create(&PostParams::default(), job).await {
         Ok(_) => {
             tracing::info!("created Job {NS_REPLAY}/{name}");
-            Ok(())
+            Ok(CreateOutcome::Created)
         }
-        Err(::kube::Error::Api(ae)) if ae.code == 409 => bail!(
+        Err(::kube::Error::Api(ae)) if ae.code == 409 => Ok(CreateOutcome::AlreadyExists),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Create the Job in [`NS_REPLAY`], turning a 409 (already exists) into
+/// actionable guidance instead of an SSA overwrite (Job templates are
+/// immutable).
+pub async fn create_job(client: &kube::Client, job: &Job) -> Result<()> {
+    let name = job.metadata.name.clone().unwrap_or_default();
+    match try_create_job(client, job).await? {
+        CreateOutcome::Created => Ok(()),
+        CreateOutcome::AlreadyExists => bail!(
             "Job {NS_REPLAY}/{name} already exists (Job templates are immutable). \
              Inspect it with `kubectl -n {NS_REPLAY} get job {name}`, then delete it with \
              `kubectl -n {NS_REPLAY} delete job {name}` before re-running."
         ),
-        Err(e) => Err(e.into()),
     }
 }
 

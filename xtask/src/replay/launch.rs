@@ -977,15 +977,82 @@ async fn archive_capabilities_from_s3(
 }
 
 /// One archive prefix found under `replay/archives/`, with the provenance
-/// fields candidate filtering reads from its manifest.json.
+/// fields candidate filtering reads from its manifest.json. Shared
+/// (`pub(super)`) with `replay record`'s post-completion summary and
+/// `replay list`, which render additional manifest fields via the
+/// `*_summary` helpers below.
 #[derive(Debug)]
-struct ArchiveCandidate {
-    archive_id_short: String,
-    s3_prefix: String,
-    archive_id: String,
-    recipe_digest: String,
-    hydra_eval_id: u64,
-    created_at: String,
+pub(super) struct ArchiveCandidate {
+    pub(super) archive_id_short: String,
+    pub(super) s3_prefix: String,
+    pub(super) archive_id: String,
+    pub(super) recipe_digest: String,
+    pub(super) hydra_eval_id: u64,
+    pub(super) created_at: String,
+    /// The full parsed manifest.json document, kept so summary/list
+    /// rendering can read fields beyond the filtering ones above (counts,
+    /// capabilities, fidelity, scope) without a second S3 GET.
+    pub(super) manifest: serde_json::Value,
+}
+
+impl ArchiveCandidate {
+    /// Human-readable scope from the manifest provenance — the recorder's
+    /// scope re-rendered (`constituents:<aggregate>`, `jobs:<count>`,
+    /// `full`); `?` for archives whose provenance has no scope block
+    /// (archives published by something other than the recorder).
+    pub(super) fn scope_summary(&self) -> String {
+        let scope = &self.manifest["provenance"]["scope"];
+        match scope["kind"].as_str() {
+            Some("constituents") => format!(
+                "constituents:{}",
+                scope["aggregate_job"].as_str().unwrap_or("?")
+            ),
+            Some("jobs") => format!(
+                "jobs:{}",
+                scope["jobs"].as_array().map(Vec::len).unwrap_or(0)
+            ),
+            Some(kind) => kind.to_string(),
+            None => "?".to_string(),
+        }
+    }
+
+    /// Recorded systems from the manifest provenance, comma-joined; `?`
+    /// when absent.
+    pub(super) fn systems_summary(&self) -> String {
+        let joined = self.manifest["provenance"]["systems"]
+            .as_array()
+            .map(|systems| {
+                systems
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .unwrap_or_default();
+        if joined.is_empty() {
+            "?".to_string()
+        } else {
+            joined
+        }
+    }
+
+    /// Fidelity verdict from the manifest provenance: `matched/checked`
+    /// when the recorder's drvPath fidelity gate ran, with `DIVERGENT`
+    /// prepended when it found mismatches; `?` when the archive carries no
+    /// fidelity block.
+    pub(super) fn fidelity_summary(&self) -> String {
+        let fidelity = &self.manifest["provenance"]["fidelity"];
+        let (Some(matched), Some(checked)) =
+            (fidelity["matched"].as_u64(), fidelity["checked"].as_u64())
+        else {
+            return "?".to_string();
+        };
+        if fidelity["divergent"].as_bool() == Some(true) {
+            format!("DIVERGENT {matched}/{checked}")
+        } else {
+            format!("{matched}/{checked}")
+        }
+    }
 }
 
 /// Whether `--eval-digest` is a full lowercase-hex recipe digest (64
@@ -1047,7 +1114,7 @@ async fn resolve_archive(
 /// Read one archive prefix's standalone `manifest.json` and extract the
 /// fields candidate filtering needs. `Ok(None)` when the manifest is not
 /// there yet (an upload in flight, or a foreign prefix).
-async fn read_candidate(
+pub(super) async fn read_candidate(
     region: &str,
     bucket: &str,
     archive_id_short: &str,
@@ -1076,12 +1143,13 @@ async fn read_candidate(
             .as_str()
             .unwrap_or_default()
             .to_string(),
+        manifest,
     }))
 }
 
 /// Listing path: every per-archive prefix under `replay/archives/` whose
 /// standalone manifest is already uploaded becomes a candidate.
-async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCandidate>> {
+pub(super) async fn listed_candidates(region: &str, bucket: &str) -> Result<Vec<ArchiveCandidate>> {
     let archives_prefix = s3::archives_prefix();
     let shorts = s3::list_subprefixes(region, bucket, &archives_prefix).await?;
     let mut candidates = Vec::new();
@@ -1593,7 +1661,10 @@ mod tests {
     }
 
     /// Candidate fixture for the pure archive-filtering tests; `archive_id`
-    /// is irrelevant to filtering and left obviously fake.
+    /// is irrelevant to filtering and left obviously fake. The manifest is
+    /// shaped like what the recorder publishes (provenance scope/systems/
+    /// fidelity + top-level counts/capabilities) so the summary helpers
+    /// are exercised against the real document shape.
     fn candidate(
         short: &str,
         eval: u64,
@@ -1607,7 +1678,65 @@ mod tests {
             recipe_digest: recipe_digest.to_string(),
             hydra_eval_id: eval,
             created_at: created_at.to_string(),
+            manifest: json!({
+                "created_at": created_at,
+                "capabilities": {"expected_outcomes": true, "output_hashes": true},
+                "counts": {
+                    "requests": 12,
+                    "workload_units": 12,
+                    "expected_outcomes": 12,
+                    "embedded_drvs": 340,
+                    "embedded_store_paths": 7,
+                },
+                "provenance": {
+                    "recipe_digest": recipe_digest,
+                    "source": {"kind": "hydra", "hydra_eval_id": eval},
+                    "fidelity": {
+                        "mode": "exhaustive",
+                        "checked": 12,
+                        "matched": 12,
+                        "mismatch_count": 0,
+                        "divergent": false,
+                    },
+                    "systems": ["x86_64-linux"],
+                    "scope": {"kind": "constituents", "aggregate_job": "tested"},
+                },
+            }),
         }
+    }
+
+    #[test]
+    fn candidate_summaries_render_provenance_fields() {
+        let c = candidate(
+            "aaaaaaaaaaaaaaaa",
+            1824219,
+            &"11".repeat(32),
+            "2026-05-01T00:00:00Z",
+        );
+        assert_eq!(c.scope_summary(), "constituents:tested");
+        assert_eq!(c.systems_summary(), "x86_64-linux");
+        assert_eq!(c.fidelity_summary(), "12/12");
+
+        // Jobs scope renders the job count; full scope renders "full"; a
+        // divergent fidelity gate is loud.
+        let mut jobs_scoped = candidate("b", 1, "22", "2026-05-01T00:00:00Z");
+        jobs_scoped.manifest["provenance"]["scope"] =
+            json!({"kind": "jobs", "jobs": ["a.x86_64-linux", "b.x86_64-linux"]});
+        jobs_scoped.manifest["provenance"]["fidelity"]["divergent"] = json!(true);
+        jobs_scoped.manifest["provenance"]["fidelity"]["matched"] = json!(11);
+        assert_eq!(jobs_scoped.scope_summary(), "jobs:2");
+        assert_eq!(jobs_scoped.fidelity_summary(), "DIVERGENT 11/12");
+        let mut full_scoped = candidate("c", 1, "33", "2026-05-01T00:00:00Z");
+        full_scoped.manifest["provenance"]["scope"] = json!({"kind": "full"});
+        assert_eq!(full_scoped.scope_summary(), "full");
+
+        // Archives without recorder provenance (published via --archive)
+        // degrade to "?" everywhere instead of panicking or lying.
+        let mut foreign = candidate("d", 0, "", "2026-05-01T00:00:00Z");
+        foreign.manifest = json!({"created_at": "2026-05-01T00:00:00Z"});
+        assert_eq!(foreign.scope_summary(), "?");
+        assert_eq!(foreign.systems_summary(), "?");
+        assert_eq!(foreign.fidelity_summary(), "?");
     }
 
     fn outcome() -> PreflightOutcome {

@@ -11,11 +11,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Pod, Secret, Service};
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::CustomResourceDefinition;
 use kube::ResourceExt;
-use kube::api::{Api, ListParams, Patch, PatchParams};
+use kube::api::{Api, ListParams, LogParams, Patch, PatchParams};
 use serde::Serialize;
 use serde_json::json;
 
@@ -503,6 +504,146 @@ fn chrono_now() -> String {
     format!("{secs}")
 }
 
+// -- Job log following ---------------------------------------------------
+
+/// Whether a Job has reached a terminal state, and which: `Some(true)` =
+/// Complete, `Some(false)` = Failed, `None` = still running. Reads the
+/// Job controller's authoritative conditions rather than counting pods —
+/// pod phases race the controller's own bookkeeping (a succeeded pod's
+/// Job stays non-terminal until the controller records the condition).
+pub fn job_terminal_outcome(job: &Job) -> Option<bool> {
+    job.status
+        .as_ref()?
+        .conditions
+        .as_ref()?
+        .iter()
+        .filter(|c| c.status == "True")
+        .find_map(|c| match c.type_.as_str() {
+            "Complete" => Some(true),
+            "Failed" => Some(false),
+            _ => None,
+        })
+}
+
+/// Pick the pod to stream logs from among a Job's pods: the most recently
+/// created one that is past `Pending` (the kubelet serves logs only once a
+/// container has started). Pure so the selection is unit-testable.
+fn streamable_pod(pods: &[Pod]) -> Option<String> {
+    pods.iter()
+        .filter(|p| {
+            let phase = p
+                .status
+                .as_ref()
+                .and_then(|s| s.phase.as_deref())
+                .unwrap_or("");
+            !matches!(phase, "" | "Pending" | "Unknown")
+        })
+        .max_by_key(|p| p.metadata.creation_timestamp.clone().map(|t| t.0))
+        .map(|p| p.name_any())
+}
+
+/// What one wait iteration of [`follow_job_logs`] found to act on next.
+enum FollowEvent {
+    /// A pod whose logs can be streamed.
+    PodReady(String),
+    /// The Job reached a terminal state (possibly without any streamable
+    /// pod left, e.g. backoff exceeded after its pods were reaped).
+    JobDone(bool),
+}
+
+/// Follow a Job's pod logs to stdout until the Job reaches a terminal
+/// state, re-attaching across container restarts and pod reschedules.
+/// Returns whether the Job succeeded.
+///
+/// Watch-only: interrupting this (Ctrl-C) or any error from it never
+/// cancels the in-cluster Job. Re-attaching to a still-running pod
+/// re-prints its logs from the start (same as a fresh
+/// `kubectl logs -f job/<name>`).
+///
+/// `pending_timeout` bounds each wait for a streamable pod — generous
+/// values are expected (a pod can sit Pending for minutes while Karpenter
+/// provisions its node), but a Job whose pod can never schedule fails
+/// here instead of hanging forever.
+#[allow(clippy::print_stdout)]
+pub async fn follow_job_logs(
+    client: &Client,
+    ns: &str,
+    job_name: &str,
+    pending_timeout: Duration,
+) -> Result<bool> {
+    use futures_util::{AsyncBufReadExt, TryStreamExt};
+
+    let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+    let pods: Api<Pod> = Api::namespaced(client.clone(), ns);
+    // The Job controller stamps every pod it creates with this label.
+    let lp = ListParams::default().labels(&format!("job-name={job_name}"));
+
+    loop {
+        // Wait until there is something to act on: a streamable pod, or
+        // the Job going terminal without one.
+        let event = ui::poll(
+            &format!("pod of Job {job_name} started"),
+            Duration::from_secs(5),
+            (pending_timeout.as_secs() / 5) as u32,
+            || async {
+                if let Some(succeeded) = job_terminal_outcome(&jobs.get(job_name).await?) {
+                    return Ok(Some(FollowEvent::JobDone(succeeded)));
+                }
+                Ok(streamable_pod(&pods.list(&lp).await?.items).map(FollowEvent::PodReady))
+            },
+        )
+        .await?;
+        let pod_name = match event {
+            FollowEvent::JobDone(succeeded) => return Ok(succeeded),
+            FollowEvent::PodReady(name) => name,
+        };
+
+        // Stream this pod's logs until the stream ends (container exit,
+        // pod deletion, or connection drop). Stream errors are not fatal —
+        // the Job keeps running in-cluster; only the watch was lost.
+        tracing::info!("streaming logs of pod {ns}/{pod_name}");
+        let params = LogParams {
+            follow: true,
+            ..Default::default()
+        };
+        match pods.log_stream(&pod_name, &params).await {
+            Ok(stream) => {
+                let mut lines = stream.lines();
+                loop {
+                    match lines.try_next().await {
+                        Ok(Some(line)) => println!("{line}"),
+                        Ok(None) => break,
+                        Err(e) => {
+                            tracing::warn!(
+                                "log stream of pod {pod_name} interrupted ({e}); re-attaching"
+                            );
+                            break;
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                // The pod can vanish between the list and the stream open
+                // (evicted, reaped); wait a beat and re-resolve.
+                tracing::warn!("could not open log stream of pod {pod_name} ({e}); retrying");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
+            }
+        }
+
+        // Stream ended. Give the Job controller a grace window to record
+        // the terminal condition before re-attaching, so a finished pod's
+        // logs are not re-dumped while the status write is in flight.
+        for _ in 0..15 {
+            if let Some(succeeded) = job_terminal_outcome(&jobs.get(job_name).await?) {
+                return Ok(succeeded);
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        tracing::info!("Job {job_name} not terminal after its log stream ended — re-attaching");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -608,5 +749,101 @@ mod tests {
             },
         );
         assert!(ds_status(&d).ok);
+    }
+
+    fn job_with_conditions(conds: &[(&str, &str)]) -> Job {
+        use k8s_openapi::api::batch::v1::{JobCondition, JobStatus};
+        Job {
+            status: Some(JobStatus {
+                conditions: Some(
+                    conds
+                        .iter()
+                        .map(|(type_, status)| JobCondition {
+                            type_: (*type_).into(),
+                            status: (*status).into(),
+                            ..Default::default()
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn job_terminal_outcome_reads_controller_conditions() {
+        // No status / no conditions / no true terminal condition → still
+        // running.
+        assert_eq!(job_terminal_outcome(&Job::default()), None);
+        assert_eq!(job_terminal_outcome(&job_with_conditions(&[])), None);
+        // A False terminal condition (the controller writes those during
+        // transitions) is not terminal.
+        assert_eq!(
+            job_terminal_outcome(&job_with_conditions(&[("Complete", "False")])),
+            None
+        );
+        // Suspended/other conditions never read as terminal.
+        assert_eq!(
+            job_terminal_outcome(&job_with_conditions(&[("Suspended", "True")])),
+            None
+        );
+        // The controller's verdicts.
+        assert_eq!(
+            job_terminal_outcome(&job_with_conditions(&[("Complete", "True")])),
+            Some(true)
+        );
+        assert_eq!(
+            job_terminal_outcome(&job_with_conditions(&[
+                ("FailureTarget", "True"),
+                ("Failed", "True")
+            ])),
+            Some(false)
+        );
+    }
+
+    fn named_pod(name: &str, phase: &str, created_secs: i64) -> Pod {
+        use k8s_openapi::api::core::v1::PodStatus;
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time};
+        Pod {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                creation_timestamp: Some(Time(jiff::Timestamp::from_second(created_secs).unwrap())),
+                ..Default::default()
+            },
+            status: Some(PodStatus {
+                phase: Some(phase.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn streamable_pod_skips_pending_and_prefers_newest() {
+        // No pods / only Pending pods → nothing to stream yet.
+        assert_eq!(streamable_pod(&[]), None);
+        assert_eq!(streamable_pod(&[named_pod("p0", "Pending", 0)]), None);
+        // Running beats nothing; phase-less pods are skipped.
+        assert_eq!(
+            streamable_pod(&[Pod::default(), named_pod("p1", "Running", 10)]),
+            Some("p1".to_string())
+        );
+        // Across multiple streamable pods (a failed first attempt + its
+        // running replacement), the newest one wins — that is the attempt
+        // whose logs are still being written.
+        assert_eq!(
+            streamable_pod(&[
+                named_pod("old-failed", "Failed", 10),
+                named_pod("new-running", "Running", 20),
+                named_pod("waiting", "Pending", 30),
+            ]),
+            Some("new-running".to_string())
+        );
+        // A finished pod is still streamable (its logs are complete).
+        assert_eq!(
+            streamable_pod(&[named_pod("done", "Succeeded", 5)]),
+            Some("done".to_string())
+        );
     }
 }

@@ -88,9 +88,14 @@ enum ReplayCmd {
     /// and tenant-key Secrets. Idempotent — safe to re-run; required
     /// again after `k8s up --wipe` (a wipe resets the release values).
     Setup(setup::SetupArgs),
-    /// Create the evaluation-recorder Job (alias: eval): record (or
-    /// reuse) a replay archive for one Hydra evaluation (publishes under
-    /// `replay/archives/…` in S3).
+    /// Record (or reuse) a replay archive for one Hydra evaluation
+    /// (alias: eval): create the evaluation-recorder Job, follow its
+    /// logs to completion, and summarize the archive it published under
+    /// `replay/archives/…` in S3 (--detach restores fire-and-forget).
+    ///
+    /// Interrupting the follow (Ctrl-C) does NOT cancel the in-cluster
+    /// Job — re-running `record` with the same arguments re-attaches to
+    /// it.
     #[command(alias = "eval")]
     Record(eval::EvalArgs),
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
