@@ -626,6 +626,23 @@ impossible by construction: pids exist only inside the state machine, and
 every transition that could race (adopt vs. guard drop, kill vs. reap) is
 serialized by it.
 
+#r("builder.exec.caller-serialization")[
+  rio-exec performs no execution-level concurrency control: the caller MUST
+  NOT overlap executions of the same executor instance. The sandbox identity
+  is a singleton host uid (no user namespace), and `fork(2)` copies the fd
+  table, so overlapping executions could observe and signal each other's
+  process trees and inherit each other's pipes. rio-builder satisfies this
+  contract with `BuildSlot`: one build per pod; an assignment arriving while
+  the slot is busy is rejected, never queued.
+]
+
+The rule's home matters as much as its text: the implementation marker sits
+on `BuildSlot::try_claim` --- the code that actually enforces the contract
+--- not on rio-exec, which only documents it. A future claim that "the
+executor rejects concurrent executions" (the rustdoc fiction this rule
+replaces) would now be a tracey-visible broken reference instead of prose
+nobody can falsify.
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup

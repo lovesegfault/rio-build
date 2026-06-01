@@ -60,6 +60,13 @@ impl BuildSlot {
     ///
     /// The returned guard owns the cancel flag for this build; callers
     /// reach it via [`BuildSlotGuard::cancelled`].
+    ///
+    /// This is where rio-exec's caller-serialization contract is
+    /// actually enforced: the executor performs no concurrency control
+    /// of its own, and this slot is what guarantees executions never
+    /// overlap (one build per pod; busy assignments rejected, never
+    /// queued).
+    // r[impl builder.exec.caller-serialization]
     pub fn try_claim(self: &Arc<Self>, drv_path: &str) -> Option<BuildSlotGuard> {
         let mut inner = self.inner.lock().ignore_poison();
         if inner.is_some() {

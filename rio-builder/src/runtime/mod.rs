@@ -1792,6 +1792,7 @@ mod tests {
     /// is nondeterministic, and nextest's per-process model means a
     /// stray SIGTERM kills the test binary. The k3s VM scenarios do
     /// real SIGTERM via `k3s kubectl delete pod`.
+    // r[verify builder.exec.caller-serialization]
     #[tokio::test]
     async fn drain_wait_slot_synchronization() {
         let slot = Arc::new(BuildSlot::default());
@@ -1802,6 +1803,8 @@ mod tests {
             .expect("idle slot → wait_idle returns immediately");
 
         let guard = slot.try_claim("/nix/store/aaa-x.drv").unwrap();
+        // The caller-serialization contract: a second claim while busy
+        // is rejected (never queued).
         assert!(slot.try_claim("/nix/store/bbb-y.drv").is_none(), "busy");
         assert_eq!(slot.running().as_deref(), Some("/nix/store/aaa-x.drv"));
 

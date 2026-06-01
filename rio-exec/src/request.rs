@@ -135,8 +135,12 @@ pub struct Isolation {
     /// stays with the caller.
     pub network: bool,
     /// uid the process runs as inside the sandbox. Without a user
-    /// namespace this is a host uid — a singleton identity, which is
-    /// why the executor rejects concurrent executions.
+    /// namespace this is a host uid — a singleton identity: two
+    /// concurrent executions under the same uid could observe and
+    /// signal each other's processes. The executor itself performs
+    /// **no** concurrency control; serializing executions is the
+    /// caller's responsibility (rio-builder's `BuildSlot` enforces one
+    /// build per pod — see the executor module docs' caller contract).
     pub uid: u32,
     /// gid the process runs as inside the sandbox.
     pub gid: u32,

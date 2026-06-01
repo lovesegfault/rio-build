@@ -52,15 +52,26 @@
 //! path, including the [spawn-blocking submission, await resumption]
 //! window.
 //!
-//! # Caller contract for the event channel
+//! # Caller contract
 //!
-//! The caller must keep draining the [`ExecEvent`] receiver: log
-//! delivery awaits channel capacity, so a stalled (but alive) receiver
-//! suspends log processing and with it **all** limit enforcement —
-//! silence, log-volume, and the wall-clock timeout alike (the
-//! supervision loop cannot reach its deadline arms while parked on the
-//! send). A *dropped* receiver is fine — events are discarded and
-//! execution continues.
+//! **Event channel:** the caller must keep draining the [`ExecEvent`]
+//! receiver: log delivery awaits channel capacity, so a stalled (but
+//! alive) receiver suspends log processing and with it **all** limit
+//! enforcement — silence, log-volume, and the wall-clock timeout alike
+//! (the supervision loop cannot reach its deadline arms while parked
+//! on the send). A *dropped* receiver is fine — events are discarded
+//! and execution continues.
+//!
+//! **Serialization:** the executor performs no execution-level
+//! locking; the caller MUST NOT overlap executions. Two reasons: the
+//! sandbox identity ([`Isolation::uid`](crate::Isolation::uid)) is a
+//! singleton host uid without a user namespace, so overlapping builds
+//! could observe and signal each other's processes; and `fork(2)`
+//! copies the whole fd table, so a second execution's pipes would be
+//! inherited by the first's forked children (the keep-set sweep bounds
+//! that exposure but does not license overlap). rio-builder satisfies
+//! this contract with `BuildSlot`: one build per pod, busy assignments
+//! rejected, never queued.
 
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
