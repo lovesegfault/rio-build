@@ -347,7 +347,15 @@ in
   #     delivered only when no open attempt is held by a different
   #     identity (BC-1/AS-3): fresh claims need an unparked Pending job
   #     on a Ready node; re-deliveries carry exactly the holder's exec
-  #     id; a claim held by another identity never yields a delivery.
+  #     id, bound to the pulling identity, and never escape the
+  #     identity/fence gates; a claim held by another identity never
+  #     yields a delivery.
+  #   - check_kinded_rejections_dominate: the token/fence dominance
+  #     order over the FULL flag-on (kind × job-view) domain — every
+  #     arm of the kinded table including the Claimed re-delivery arm
+  #     answers RejectToken on a mis-bound token and
+  #     RejectStaleGeneration on a below-floor pull; nothing else is
+  #     ever rejected.
   # r[verify sched.merge.substitute-topdown+12]
   # r[verify sched.evidence.closure-hole]
   # r[verify sched.executor.pull-gone]
@@ -356,6 +364,6 @@ in
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 16;
+    expectedHarnesses = 17;
   };
 }

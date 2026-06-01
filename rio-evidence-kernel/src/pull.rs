@@ -778,15 +778,25 @@ where
             }
         }
         (PullKind::Materialization, JobView::Claimed { held_by_puller }) => {
-            if held_by_puller {
-                // Re-delivery: the open attempt's exec_id is in the
-                // request (same plumbing as the build re-delivery arm).
-                match request.open_attempt {
-                    Some((_, exec_id)) => PullAdmission::DeliverExisting { exec_id },
-                    None => PullAdmission::NotYetReady,
+            // The as-built gates run FIRST (gate-ordering: a mis-bound
+            // token or a below-floor generation must never receive a
+            // re-delivery — the same dominance every other arm
+            // enforces), and the re-delivery is exactly what the
+            // as-built kernel itself re-delivers: an Assigned/Running
+            // attempt whose open-attempt identity equals the pulling
+            // identity. The job view's held_by_puller must AGREE
+            // (defense in depth, BC-1: the request-level identity
+            // comparison and the scheduler's view projection are both
+            // required; a stale view never re-delivers another
+            // identity's attempt).
+            match admit_pull(request) {
+                PullAdmission::RejectToken => PullAdmission::RejectToken,
+                PullAdmission::RejectStaleGeneration => PullAdmission::RejectStaleGeneration,
+                PullAdmission::Gone => PullAdmission::Gone,
+                PullAdmission::DeliverExisting { exec_id } if held_by_puller => {
+                    PullAdmission::DeliverExisting { exec_id }
                 }
-            } else {
-                PullAdmission::NotYetReady
+                _ => PullAdmission::NotYetReady,
             }
         }
     }
@@ -1056,6 +1066,48 @@ mod kinded_tests {
             admit_pull_kinded(req, mat(JobView::None)),
             PullAdmission::RejectStaleGeneration
         );
+        // ...INCLUDING the Claimed re-delivery arm (the gate-ordering
+        // pin: held_by_puller must never bypass the identity/fence
+        // gates — a mis-bound token or a deposed believer must never
+        // receive a re-delivery, exactly as the build-kind arms behave).
+        let mut req = request(Some(S::Running), false, Some((&me, 9)), &me);
+        req.auth_intent = Some(&8);
+        assert_eq!(
+            admit_pull_kinded(
+                req,
+                mat(JobView::Claimed {
+                    held_by_puller: true
+                })
+            ),
+            PullAdmission::RejectToken,
+            "a mis-bound token must never receive a re-delivery"
+        );
+        let mut req = request(Some(S::Running), false, Some((&me, 9)), &me);
+        req.serving_generation = 2;
+        assert_eq!(
+            admit_pull_kinded(
+                req,
+                mat(JobView::Claimed {
+                    held_by_puller: true
+                })
+            ),
+            PullAdmission::RejectStaleGeneration,
+            "a below-floor pull must never receive a re-delivery"
+        );
+        // Defense in depth: a view that says held_by_puller while the
+        // REQUEST's open attempt is bound to a different identity never
+        // re-delivers — the request-level identity comparison and the
+        // view's projection must both agree (BC-1).
+        assert_eq!(
+            admit_pull_kinded(
+                request(Some(S::Running), false, Some((&other, 9)), &me),
+                mat(JobView::Claimed {
+                    held_by_puller: true
+                })
+            ),
+            PullAdmission::NotYetReady,
+            "a stale/mismatched view projection must never re-deliver another identity's attempt"
+        );
     }
 
     /// kindMatchesWorker (§3.6) at the kernel level: a materialization pull
@@ -1310,7 +1362,11 @@ mod kinded_proofs {
             PullAdmission::DeliverExisting { exec_id } => {
                 // Re-deliveries happen only to the identity already
                 // holding the claim (the Claimed{held_by_puller} arm),
-                // and carry exactly the open attempt's exec id.
+                // and carry exactly the open attempt's exec id — which
+                // must itself be bound to the pulling identity (the
+                // request-level comparison and the view projection must
+                // BOTH hold; a stale view never re-delivers another
+                // identity's attempt).
                 assert!(matches!(
                     job,
                     JobView::Claimed {
@@ -1318,9 +1374,19 @@ mod kinded_proofs {
                     }
                 ));
                 match inputs.open {
-                    Some((_, open_exec)) => assert_eq!(exec_id, open_exec),
+                    Some((open_ident, open_exec)) => {
+                        assert_eq!(exec_id, open_exec);
+                        assert_eq!(open_ident, inputs.pulling);
+                    }
                     None => unreachable!("DeliverExisting requires an open attempt"),
                 }
+                // And it never escapes the identity/fence gates.
+                assert!(!inputs.auth.is_some_and(|a| a != inputs.intent));
+                assert!(
+                    !inputs
+                        .floor
+                        .is_some_and(|f| f >= 0 && inputs.serving < f as u64)
+                );
             }
             _ => {}
         }
@@ -1337,6 +1403,52 @@ mod kinded_proofs {
             assert!(!matches!(
                 decision,
                 PullAdmission::DeliverNew | PullAdmission::DeliverExisting { .. }
+            ));
+        }
+    }
+
+    /// The dominance order of the two rejections holds over the FULL
+    /// flag-on (kind × job-view) domain — every arm of the kinded
+    /// table, including the Claimed re-delivery arm: a mismatched token
+    /// always answers RejectToken, an authenticated below-floor pull
+    /// always answers RejectStaleGeneration, and no other input is ever
+    /// rejected. The kinded-table mirror of
+    /// `check_admit_pull_rejections_dominate` (the flag-off half is
+    /// covered by `check_kinded_flag_off_identity`: build delegates to
+    /// the as-built kernel — whose own dominance proof applies — and
+    /// materialization parks without delivering anything).
+    #[kani::proof]
+    fn check_kinded_rejections_dominate() {
+        let inputs = any_inputs();
+        let kind = if kani::any() {
+            PullKind::Build
+        } else {
+            PullKind::Materialization
+        };
+        let job = any_job_view();
+
+        let decision = run_kinded(
+            &inputs,
+            MaterializationInputs {
+                enabled: true,
+                kind,
+                job,
+            },
+        );
+
+        let token_mismatch = inputs.auth.is_some_and(|a| a != inputs.intent);
+        let below_floor = inputs
+            .floor
+            .is_some_and(|f| f >= 0 && inputs.serving < f as u64);
+
+        if token_mismatch {
+            assert_eq!(decision, PullAdmission::RejectToken);
+        } else if below_floor {
+            assert_eq!(decision, PullAdmission::RejectStaleGeneration);
+        } else {
+            assert!(!matches!(
+                decision,
+                PullAdmission::RejectToken | PullAdmission::RejectStaleGeneration
             ));
         }
     }
