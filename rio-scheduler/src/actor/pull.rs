@@ -655,6 +655,11 @@ pub struct PullReportPayload {
     pub hw_class: Option<String>,
     pub final_resources: Option<rio_proto::types::ResourceUsage>,
     pub final_line_count: u64,
+    /// Substitution-replacement: set INSTEAD of `result` for
+    /// materialization attempts (the gRPC layer rejects requests
+    /// carrying both). `None` for every build report — the as-built
+    /// shape, bit-identical.
+    pub materialization_outcome: Option<rio_proto::types::MaterializationOutcome>,
 }
 
 impl DagActor {
@@ -708,6 +713,34 @@ impl DagActor {
             // r[impl sec.executor.identity-token+2]
             warn!(%exec_id, "ReportOutcome rejected: executor token bound to a different intent");
             return Err(PullRejection::TokenMismatch);
+        }
+        // Substitution-replacement: materialization attempts route to
+        // their own consumption transaction; kind mismatch is
+        // acknowledged-and-ignored (the kindMatchesWorker rule at the
+        // report intake). Both arms are reachable FLAG-OFF from a
+        // buggy/hostile reporter, so the warn+ack posture is a dormancy
+        // guarantee, not just a flag-on routing rule.
+        if attempt.attempt_kind == crate::state::AttemptKind::Materialization.as_str() {
+            return match payload.materialization_outcome {
+                Some(outcome) => {
+                    if attempt.attempt_terminal || attempt.attempt_recorded {
+                        // Terminal-row-wins: a duplicate/late report for
+                        // an already-consumed attempt is acknowledged.
+                        debug!(%exec_id, "duplicate materialization report acknowledged-and-ignored");
+                        return Ok(());
+                    }
+                    self.consume_materialization_outcome(exec_id, &attempt, outcome)
+                        .await
+                }
+                None => {
+                    warn!(%exec_id, "build-report payload for a materialization attempt; ignoring");
+                    Ok(())
+                }
+            };
+        }
+        if payload.materialization_outcome.is_some() {
+            warn!(%exec_id, "materialization payload for a build attempt; acknowledged-and-ignored");
+            return Ok(());
         }
         match fold_report(
             attempt.assignment_active,

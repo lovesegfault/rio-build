@@ -1452,7 +1452,9 @@ impl DagActor {
     /// variant in `batch_probe_cached_ready`'s locally-present branch
     /// was 3 sequential PG awaits × ≤2048 candidates → 12-30s actor
     /// stall on warm-restart of a large closure.
-    async fn complete_ready_from_store_batch(&mut self, hashes: &[DrvHash]) {
+    // pub(super): also called by the materialization consumption handler
+    // (the Success/moot-covered arms complete through this same chokepoint).
+    pub(super) async fn complete_ready_from_store_batch(&mut self, hashes: &[DrvHash]) {
         if hashes.is_empty() {
             return;
         }

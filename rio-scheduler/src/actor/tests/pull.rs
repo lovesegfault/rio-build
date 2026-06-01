@@ -314,6 +314,8 @@ async fn report(
                 hw_class: None,
                 final_resources: None,
                 final_line_count: 0,
+                // Mechanical flag-off default (carve-out 1c).
+                materialization_outcome: None,
             },
             reply,
         })

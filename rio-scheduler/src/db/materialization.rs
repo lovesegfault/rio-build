@@ -334,6 +334,23 @@ impl SchedulerDb {
         Ok(FencedWrite::Applied(result.rows_affected()))
     }
 
+    /// The unresolved (pending) job for one derivation, if any — the
+    /// consumption transaction's job lookup (PG is the authority; the
+    /// actor's in-memory view is a cache).
+    pub(crate) async fn unresolved_job_for_derivation(
+        &self,
+        derivation_id: Uuid,
+    ) -> Result<Option<Uuid>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT job_id FROM materialization_jobs \
+              WHERE derivation_id = $1 AND state = 'pending' \
+              LIMIT 1",
+        )
+        .bind(derivation_id)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     /// Dormancy probe (Wave 6 / VM subtest support): row counts of
     /// `(materialization_jobs, build_wanted_outputs)`.
     pub(crate) async fn count_materialization_rows(&self) -> Result<(i64, i64), sqlx::Error> {

@@ -241,3 +241,393 @@ async fn flag_on_pruned_root_creates_job_at_merge() -> TestResult {
     );
     Ok(())
 }
+
+// ── The four-arm Unobtainable routing core (pure — no PG) ──────────────
+
+use crate::actor::materialize::{
+    DurableEvidence, ReprobeAnswer, RoutingInputs, UnobtainableRouting, route_unobtainable,
+    success_covers_live_wanted,
+};
+
+fn paths(v: &[&str]) -> Vec<String> {
+    v.iter().map(|s| (*s).to_string()).collect()
+}
+
+// r[verify sched.materialize.routing]
+/// Arm 0 (moot-failure / the C3 arm): missing ∩ live-wanted = ∅ and
+/// verified ⊇ live-wanted → CompleteForLiveInterest. The design's
+/// §2.4 confirmed-C3-trace replay, steps 4–5: b2 cancelled in the
+/// report→consume window; b1's narrower wants are covered.
+#[test]
+fn routing_moot_failure_completes_for_live_interest() {
+    let routing = route_unobtainable(&RoutingInputs {
+        missing_paths: &paths(&["out2-path"]),
+        verified_paths: &paths(&["out1-path"]),
+        live_wanted_paths: &paths(&["out1-path"]), // b2 gone; b1 wants out1 only
+        durable_evidence: DurableEvidence::Broken, // irrelevant for arm 0
+        prior_unobtainable_count: 0,
+        reprobe: None,
+    });
+    assert_eq!(routing, UnobtainableRouting::CompleteForLiveInterest);
+}
+
+/// Arm 0 residual: moot but not covered → re-arm (never fail-fast).
+#[test]
+fn routing_moot_but_uncovered_rearms() {
+    let routing = route_unobtainable(&RoutingInputs {
+        missing_paths: &paths(&["out2-path"]),
+        verified_paths: &paths(&[]),
+        live_wanted_paths: &paths(&["out1-path"]),
+        durable_evidence: DurableEvidence::Broken,
+        prior_unobtainable_count: 0,
+        reprobe: None,
+    });
+    assert_eq!(routing, UnobtainableRouting::ReArm);
+}
+
+/// Arm 1: durable Vouched → ResolveFromSource.
+#[test]
+fn routing_durable_vouched_resolves_from_source() {
+    let routing = route_unobtainable(&RoutingInputs {
+        missing_paths: &paths(&["out-path"]),
+        verified_paths: &paths(&[]),
+        live_wanted_paths: &paths(&["out-path"]),
+        durable_evidence: DurableEvidence::Vouched,
+        prior_unobtainable_count: 0,
+        reprobe: None,
+    });
+    assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
+}
+
+/// Arm 2: durable Pending → ResolveFromSource (normal dep gating).
+#[test]
+fn routing_durable_pending_resolves_from_source() {
+    let routing = route_unobtainable(&RoutingInputs {
+        missing_paths: &paths(&["out-path"]),
+        verified_paths: &paths(&[]),
+        live_wanted_paths: &paths(&["out-path"]),
+        durable_evidence: DurableEvidence::Pending,
+        prior_unobtainable_count: 0,
+        reprobe: None,
+    });
+    assert_eq!(routing, UnobtainableRouting::ResolveFromSource);
+}
+
+/// Arm 3a: Broken + live-wanted missing + re-probe says obtainable +
+/// one-shot unspent → re-arm.
+#[test]
+fn routing_broken_with_obtainable_reprobe_rearms_once() {
+    // hold the path vecs alive for the borrow
+    let missing = paths(&["out-path"]);
+    let verified = paths(&[]);
+    let live = paths(&["out-path"]);
+    let mk = |prior: u32, reprobe| RoutingInputs {
+        missing_paths: &missing,
+        verified_paths: &verified,
+        live_wanted_paths: &live,
+        durable_evidence: DurableEvidence::Broken,
+        prior_unobtainable_count: prior,
+        reprobe,
+    };
+    // One-shot unspent + obtainable → ReArm.
+    assert_eq!(
+        route_unobtainable(&mk(0, Some(ReprobeAnswer::Obtainable))),
+        UnobtainableRouting::ReArm
+    );
+    // One-shot SPENT (a prior unobtainable row exists) → FailFast even
+    // when the re-probe says obtainable.
+    assert_eq!(
+        route_unobtainable(&mk(1, Some(ReprobeAnswer::Obtainable))),
+        UnobtainableRouting::FailFast
+    );
+}
+
+/// Arm 3b: Broken + live-wanted missing + (re-probe confirms missing OR
+/// one-shot spent) → FailFast. The ONLY arm that fail-fasts, and it
+/// requires all three conjuncts (the design's §2.4 closing claim).
+#[test]
+fn routing_fail_fast_requires_all_three_conjuncts() {
+    let missing_hit = paths(&["out-path"]);
+    let missing_miss = paths(&["unwanted-path"]);
+    let verified = paths(&[]);
+    let verified_covering = paths(&["out-path"]);
+    let live = paths(&["out-path"]);
+    // Exhaustive over the 8 combinations of (missing∩W≠∅, evidence
+    // Broken, reprobe-confirms-or-spent): exactly one yields FailFast.
+    let mut fail_fast_count = 0;
+    for missing_intersects in [false, true] {
+        for broken in [false, true] {
+            for confirms_or_spent in [false, true] {
+                let inputs = RoutingInputs {
+                    missing_paths: if missing_intersects {
+                        &missing_hit
+                    } else {
+                        &missing_miss
+                    },
+                    // When the missing set does not intersect, make the
+                    // live set covered so arm 0 takes its Complete arm
+                    // (the uncovered residual is ReArm — also not
+                    // FailFast, so either choice serves the conjunct
+                    // counting).
+                    verified_paths: if missing_intersects {
+                        &verified
+                    } else {
+                        &verified_covering
+                    },
+                    live_wanted_paths: &live,
+                    durable_evidence: if broken {
+                        DurableEvidence::Broken
+                    } else {
+                        DurableEvidence::Vouched
+                    },
+                    prior_unobtainable_count: u32::from(confirms_or_spent),
+                    reprobe: Some(if confirms_or_spent {
+                        ReprobeAnswer::ConfirmedMissing
+                    } else {
+                        ReprobeAnswer::Obtainable
+                    }),
+                };
+                let routing = route_unobtainable(&inputs);
+                if routing == UnobtainableRouting::FailFast {
+                    fail_fast_count += 1;
+                    assert!(
+                        missing_intersects && broken && confirms_or_spent,
+                        "FailFast outside the three-conjunct corner: \
+                         missing∩W={missing_intersects} broken={broken} \
+                         confirmed/spent={confirms_or_spent}"
+                    );
+                }
+            }
+        }
+    }
+    assert_eq!(
+        fail_fast_count, 1,
+        "exactly one of the 8 combinations may fail-fast"
+    );
+}
+
+/// Success coverage: reported ⊇ live-wanted → covered (Complete); else
+/// not covered (ReArm — the CE-17 class: interest grew between
+/// execution and consumption).
+#[test]
+fn success_consumption_coverage_check() {
+    // Covered: ingested + verified together cover the live wanted set.
+    assert!(success_covers_live_wanted(
+        &paths(&["out1"]),
+        &paths(&["out2"]),
+        &paths(&["out1", "out2"]),
+    ));
+    // Not covered: a live-wanted path is in neither set.
+    assert!(!success_covers_live_wanted(
+        &paths(&["out1"]),
+        &paths(&[]),
+        &paths(&["out1", "out2"]),
+    ));
+    // Empty live-wanted set is vacuously covered.
+    assert!(success_covers_live_wanted(
+        &paths(&[]),
+        &paths(&[]),
+        &paths(&[])
+    ));
+}
+
+/// InfraFailure routing is decided by the budget (the kernel's
+/// materialization_decide), never by route_unobtainable: the routing
+/// core has no infra arm at all — there is no input that produces a
+/// FailFast or ResolveFromSource from an infra failure (B3). This pin
+/// asserts the core's domain is the Unobtainable report only, by
+/// checking that a moot infra-shaped input (no missing paths at all)
+/// routes to the non-failing arms.
+#[test]
+fn infra_failure_never_failfasts_never_routes_from_source() {
+    // An infra failure carries NO missing/verified paths (nothing was
+    // confirmed). Mapped onto the core's vocabulary that is the
+    // empty-missing input — which can only ever produce arm 0
+    // (Complete when covered / ReArm when not), never FailFast.
+    let live = paths(&["out-path"]);
+    let routing = route_unobtainable(&RoutingInputs {
+        missing_paths: &paths(&[]),
+        verified_paths: &paths(&[]),
+        live_wanted_paths: &live,
+        durable_evidence: DurableEvidence::Broken,
+        prior_unobtainable_count: 99,
+        reprobe: Some(ReprobeAnswer::ConfirmedMissing),
+    });
+    assert!(
+        matches!(
+            routing,
+            UnobtainableRouting::ReArm | UnobtainableRouting::CompleteForLiveInterest
+        ),
+        "an empty missing set (the infra shape) can never fail-fast or route from source, \
+         got {routing:?}"
+    );
+}
+
+// ── The consumption transaction (handler level, PG-backed) ─────────────
+
+// r[verify sched.materialize.routing]
+/// A BUILD attempt receiving a payload with materialization_outcome set
+/// is acknowledged-and-ignored: no ledger row appended, no status
+/// change, no job state touched. Reachable FLAG-OFF (any builder could
+/// send this) — the warn+ack arm is a dormancy guarantee, not just a
+/// flag-on routing rule (review finding RB-5).
+#[tokio::test]
+async fn build_attempt_with_materialization_payload_acked_and_ignored() -> TestResult {
+    let (db, handle, _task) = setup().await; // flag-off
+    let _ev =
+        merge_single_node(&handle, Uuid::new_v4(), "rb5-pin", PriorityClass::Scheduled).await?;
+
+    // Mint a BUILD attempt via the as-built pull path.
+    let assignment = pull_attempt(&handle, "rb5-pin").await;
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Report a MATERIALIZATION payload against the build attempt.
+    let result = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("rb5-pin".into()),
+            payload: crate::actor::pull::PullReportPayload {
+                result: rio_proto::types::BuildResult::default(),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+                materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+                    outcome: Some(
+                        rio_proto::types::materialization_outcome::Outcome::InfraFailure(
+                            rio_proto::types::materialization_outcome::InfraFailure {
+                                detail: "hostile payload".into(),
+                            },
+                        ),
+                    ),
+                }),
+            },
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(result.is_ok(), "acknowledged, never an error: {result:?}");
+    barrier(&handle).await;
+
+    // Nothing changed: no ledger row, the node is still Running on its
+    // open attempt, and no materialization rows exist.
+    let attempts: i64 = sqlx::query_scalar("SELECT count(*) FROM drv_attempts")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(attempts, 0, "no ledger row appended");
+    let drv = expect_drv(&handle, "rb5-pin").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Running,
+        "the open build attempt is untouched"
+    );
+    let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!((jobs, wanted), (0, 0), "no materialization state touched");
+    Ok(())
+}
+
+// r[verify sched.materialize.routing]
+/// FLAG ON: an InfraFailure consumption charges materialization_infra
+/// (kind=materialization — invisible to every build budget), the job
+/// stays pending and claimable (under budget — never a fail-fast, B3),
+/// and the node returns to Ready.
+#[tokio::test]
+async fn flag_on_infra_failure_charges_and_rearms() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // Job via the merge new_sub lane (substitutable before merge).
+    let out = test_store_path("maton-infra-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("maton-infra");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Claim it as a store replica (kind=Materialization, BC-1 identity).
+    let outcome = handle
+        .query_unchecked(|reply| ActorCommand::PullAssignment {
+            intent_id: "maton-infra".into(),
+            auth_intent: Some("maton-infra".into()),
+            kind: rio_evidence_kernel::pull::PullKind::Materialization,
+            executor_instance: Some("store-replica-0".into()),
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    let assignment = match outcome {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("flag-on materialization claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The execution row carries the materialization kind.
+    let kind: String =
+        sqlx::query_scalar("SELECT attempt_kind FROM drv_executions WHERE exec_id = $1")
+            .bind(exec_id)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(kind, "materialization", "the mint persists the work class");
+
+    // Report an infrastructure failure.
+    let result = handle
+        .query_unchecked(|reply| ActorCommand::ReportPullOutcome {
+            exec_id,
+            auth_intent: Some("maton-infra".into()),
+            payload: crate::actor::pull::PullReportPayload {
+                result: rio_proto::types::BuildResult::default(),
+                peak_memory_bytes: 0,
+                peak_cpu_cores: 0.0,
+                node_name: None,
+                hw_class: None,
+                final_resources: None,
+                final_line_count: 0,
+                materialization_outcome: Some(rio_proto::types::MaterializationOutcome {
+                    outcome: Some(
+                        rio_proto::types::materialization_outcome::Outcome::InfraFailure(
+                            rio_proto::types::materialization_outcome::InfraFailure {
+                                detail: "upstream 503".into(),
+                            },
+                        ),
+                    ),
+                }),
+            },
+            reply,
+        })
+        .await
+        .expect("actor alive");
+    assert!(result.is_ok(), "consumption must succeed: {result:?}");
+    barrier(&handle).await;
+
+    // The charge: exactly one ledger row, class=materialization_infra,
+    // joined kind=materialization (invisible to build budgets by the
+    // kernel's kind partition).
+    let (class, joined_kind): (String, String) = sqlx::query_as(
+        "SELECT t.outcome_class, COALESCE(e.attempt_kind, 'build') \
+           FROM drv_attempts t \
+           LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(class, "materialization_infra");
+    assert_eq!(joined_kind, "materialization");
+
+    // The job is still pending and claimable again (under budget:
+    // 1 infra row < max_attempts=3; the closed assignment no longer
+    // blocks the anti-join).
+    let jobs = sdb(&db.pool)
+        .list_claimable_materialization_jobs(16)
+        .await?;
+    assert_eq!(
+        jobs.len(),
+        1,
+        "the job re-armed (pending, unclaimed, unparked), got {jobs:?}"
+    );
+
+    // The node returned to Ready (re-claimable / dispatchable).
+    let drv = expect_drv(&handle, "maton-infra").await;
+    assert_eq!(drv.status, DerivationStatus::Ready, "the node requeued");
+    Ok(())
+}

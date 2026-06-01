@@ -38,6 +38,11 @@ pub(crate) struct AttemptByExecRow {
     /// A terminal `drv_attempts` fill exists for this exec
     /// (establishment or the controller's second installment).
     pub attempt_terminal: bool,
+    /// Work class of the execution (`drv_executions.attempt_kind`,
+    /// COALESCE'd to 'build' — substitution-replacement). Routes the
+    /// report intake: materialization attempts go to the consumption
+    /// transaction, build attempts to the as-built completion path.
+    pub attempt_kind: String,
 }
 
 /// Row shape for [`SchedulerDb::find_open_pull_attempt_by_drv_hash`]
@@ -52,6 +57,7 @@ struct AttemptByExecByHashRow {
     assignment_active: bool,
     attempt_recorded: bool,
     attempt_terminal: bool,
+    attempt_kind: String,
 }
 
 /// One open pull-mode attempt as read back from the view query.
@@ -220,9 +226,11 @@ impl SchedulerDb {
                         AS attempt_recorded, \
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
-                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
+                    COALESCE(e.attempt_kind, 'build') AS attempt_kind \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
+             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              WHERE a.exec_id = $1 \
              ORDER BY a.assigned_at DESC \
              LIMIT 1",
@@ -248,7 +256,8 @@ impl SchedulerDb {
                         AS attempt_recorded, \
                     EXISTS (SELECT 1 FROM drv_attempts t \
                             WHERE t.exec_id = a.exec_id \
-                              AND t.termination_reason IS NOT NULL) AS attempt_terminal \
+                              AND t.termination_reason IS NOT NULL) AS attempt_terminal, \
+                    COALESCE(e.attempt_kind, 'build') AS attempt_kind \
              FROM assignments a \
              JOIN derivations d ON d.derivation_id = a.derivation_id \
              JOIN drv_executions e ON e.exec_id = a.exec_id \
@@ -271,6 +280,7 @@ impl SchedulerDb {
                     assignment_active: r.assignment_active,
                     attempt_recorded: r.attempt_recorded,
                     attempt_terminal: r.attempt_terminal,
+                    attempt_kind: r.attempt_kind,
                 },
             )
         }))

@@ -51,9 +51,12 @@ use super::SchedulerGrpc;
 //   report.drv_path                   → never read (exec_id names the attempt) → dropped before the actor
 //   report numerics (peak_*, final_resources.*) → build_samples row       → validated actor-side (completion.rs
 //                                       record_build_sample: finite/in-domain or NULL; .min(i64::MAX) clamps)
-//   materialization_outcome.*         → never read in Phase A (dormant: the intake treats the
-//                                       request exactly as one without it) → bounds land with the
-//                                       Wave-3 consumption transaction (T-3.5)
+//   materialization_outcome.*         → routed to the materialization consumption transaction for
+//                                       materialization-kind attempts; acknowledged-and-ignored for
+//                                       build attempts (kindMatchesWorker). Mutually exclusive with
+//                                       report (reject RPC when both set). Path/cause strings land in
+//                                       ledger error_msg / routing inputs → reject RPC if report also set;
+//                                       per-field truncation rides MAX_ERROR_MSG_LEN at the ledger append
 // ListMaterializationJobs RPC (leader-served store poll):
 //   service_token                     → HMAC-verified then dropped (the body fallback carrier;
 //                                       same family as executor tokens)   → reject RPC > MAX_EXECUTOR_TOKEN_LEN
@@ -330,6 +333,7 @@ impl ExecutorService for SchedulerGrpc {
             .exec_id
             .parse()
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
+        let has_report = req.report.is_some();
         let report = req.report.unwrap_or_default();
         // The exec_id names the attempt; the report's drv_path is not
         // used for routing (and is therefore not length-gated here —
@@ -345,6 +349,14 @@ impl ExecutorService for SchedulerGrpc {
         });
         // r[impl sched.executor.input-bounds+2]
         rio_common::grpc::truncate_utf8(&mut result.error_msg, MAX_ERROR_MSG_LEN);
+        // Substitution-replacement: a request carrying BOTH a build
+        // report and a materialization outcome is malformed (the proto
+        // documents them as mutually exclusive).
+        if req.materialization_outcome.is_some() && has_report {
+            return Err(Status::invalid_argument(
+                "report and materialization_outcome are mutually exclusive",
+            ));
+        }
         let payload = crate::actor::pull::PullReportPayload {
             result,
             peak_memory_bytes: report.peak_memory_bytes,
@@ -353,6 +365,7 @@ impl ExecutorService for SchedulerGrpc {
             hw_class: report.hw_class.filter(|s| s.len() <= MAX_IDENT_LEN),
             final_resources: report.final_resources,
             final_line_count: report.final_line_count,
+            materialization_outcome: req.materialization_outcome,
         };
 
         // send_unchecked: a dropped report would strand the attempt

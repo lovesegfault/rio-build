@@ -2209,6 +2209,8 @@ async fn test_completion_writes_build_sample() -> TestResult {
             hw_class: None,
             final_resources: None,
             final_line_count: 0,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;
@@ -2328,6 +2330,8 @@ async fn test_completion_peak_memory_clamps_to_i64_max() -> TestResult {
             hw_class: None,
             final_resources: None,
             final_line_count: 0,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;
@@ -2396,6 +2400,8 @@ async fn test_completion_valid_final_resources_round_trip() -> TestResult {
                 ..Default::default()
             }),
             final_line_count: 0,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;
@@ -3358,6 +3364,8 @@ async fn terminal_stamps_drv_executions() -> TestResult {
             hw_class: None,
             final_resources: None,
             final_line_count: 405,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;
@@ -3439,6 +3447,8 @@ async fn terminal_with_zero_line_count_writes_null() -> TestResult {
                 hw_class: None,
                 final_resources: None,
                 final_line_count: reported_count,
+                // Mechanical flag-off default (carve-out 1c).
+                materialization_outcome: None,
             },
         )
         .await?;
@@ -3646,6 +3656,8 @@ async fn failure_terminal_stamps_report_final_line_count() -> TestResult {
             hw_class: None,
             final_resources: None,
             final_line_count: 37,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;
@@ -3815,6 +3827,8 @@ async fn attempt_ledger_e3_permanent_row() -> TestResult {
             hw_class: None,
             final_resources: None,
             final_line_count: 21,
+            // Mechanical flag-off default (carve-out 1c).
+            materialization_outcome: None,
         },
     )
     .await?;

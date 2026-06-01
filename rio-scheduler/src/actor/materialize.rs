@@ -296,3 +296,594 @@ impl DagActor {
         }
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// The consumption transaction (design §2.4): Success coverage + the
+// four-arm Unobtainable routing. The routing core is PURE (no IO, no
+// clocks — kani-liftable per design §9.4); the consumption handler
+// wires it to the fenced db operations.
+// ──────────────────────────────────────────────────────────────────────
+
+/// What the Unobtainable routing decided (design §2.4's four arms).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UnobtainableRouting {
+    /// Arm 0, covered: consume as success-for-live-interest.
+    CompleteForLiveInterest,
+    /// Arms 0 (uncovered) / 3a: job returns to pending.
+    ReArm,
+    /// Arms 1/2: node becomes from-source dispatchable.
+    ResolveFromSource,
+    /// Arm 3b: fail-fast every live DAG-interested build.
+    FailFast,
+}
+
+/// The durable declared-relation classification (computed by the caller
+/// from the dependency relation + statuses; the routing core never
+/// touches the DAG).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DurableEvidence {
+    /// Children all produced, no closure hole: from-source is viable.
+    Vouched,
+    /// Children exist but not all produced yet: normal dep gating.
+    Pending,
+    /// Absent/childless/holed: from-source is doomed.
+    Broken,
+}
+
+/// The same-transaction FMP re-probe answer over the live wanted paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReprobeAnswer {
+    /// Every live-wanted path present, substitutable, or indeterminate.
+    Obtainable,
+    /// Some live-wanted path confirmed missing-and-unsubstitutable.
+    ConfirmedMissing,
+}
+
+/// The inputs of one Unobtainable routing decision.
+pub(crate) struct RoutingInputs<'a> {
+    /// Paths the executor confirmed absent upstream.
+    pub missing_paths: &'a [String],
+    /// Paths the executor verified present (and pinned).
+    pub verified_paths: &'a [String],
+    /// The live effective wanted PATHS (the §6 join, resolved to store
+    /// paths by the caller inside the consumption transaction).
+    pub live_wanted_paths: &'a [String],
+    pub durable_evidence: DurableEvidence,
+    /// Prior materialization_unobtainable rows for THIS job (the
+    /// re-probe one-shot; design §2.4 arm 3).
+    pub prior_unobtainable_count: u32,
+    /// The same-transaction FMP re-probe answer over live_wanted_paths.
+    /// `None` = not fetched (arms 0–2 decided without it); the caller
+    /// fetches it only when arms 0–2 do not apply (purity by
+    /// parameterization — design §9.4).
+    pub reprobe: Option<ReprobeAnswer>,
+}
+
+// r[impl sched.materialize.routing]
+/// The four-arm routing core. PURE (no IO, no clocks) — kani-liftable
+/// per design §9.4; the FMP re-probe answer is an input.
+///
+/// The probe-failure case: the consumption HANDLER maps "the re-probe
+/// RPC itself failed/timed out" to ReArm before calling this core (B3:
+/// an indeterminate answer never fail-fasts) — the core's `None`
+/// reprobe arm is therefore only reachable as one-shot-spent.
+pub(crate) fn route_unobtainable(inputs: &RoutingInputs<'_>) -> UnobtainableRouting {
+    let missing_live: Vec<&String> = inputs
+        .missing_paths
+        .iter()
+        .filter(|p| inputs.live_wanted_paths.contains(p))
+        .collect();
+    // Arm 0 — moot-failure (the C3 arm).
+    if missing_live.is_empty() {
+        let covered = inputs
+            .live_wanted_paths
+            .iter()
+            .all(|w| inputs.verified_paths.contains(w));
+        return if covered {
+            UnobtainableRouting::CompleteForLiveInterest
+        } else {
+            UnobtainableRouting::ReArm
+        };
+    }
+    // Arms 1/2 — durable Vouched / Pending: from-source.
+    match inputs.durable_evidence {
+        DurableEvidence::Vouched | DurableEvidence::Pending => {
+            return UnobtainableRouting::ResolveFromSource;
+        }
+        DurableEvidence::Broken => {}
+    }
+    // Arm 3 — Broken + live-wanted missing: the re-probe gate.
+    match inputs.reprobe {
+        Some(ReprobeAnswer::Obtainable) if inputs.prior_unobtainable_count == 0 => {
+            UnobtainableRouting::ReArm
+        }
+        // Re-probe confirms missing, or the one-shot is spent. (A
+        // missing probe is mapped to ReArm by the caller before this
+        // core runs — see the doc above.)
+        _ => UnobtainableRouting::FailFast,
+    }
+}
+
+/// Success-consumption coverage check (the CE-17 closer): the live
+/// wanted set is covered by what the execution ingested or verified.
+// r[impl sched.materialize.routing]
+pub(crate) fn success_covers_live_wanted(
+    ingested: &[String],
+    verified: &[String],
+    live_wanted: &[String],
+) -> bool {
+    live_wanted
+        .iter()
+        .all(|w| ingested.contains(w) || verified.contains(w))
+}
+
+impl DagActor {
+    // r[impl sched.materialize.routing]
+    /// Consume one materialization outcome (the §2.4 consumption
+    /// transaction). Reachable only flag-on in practice (no
+    /// materialization attempt can exist otherwise) — but ALWAYS wired
+    /// (design §4 "always-on regardless of flags": reports for existing
+    /// attempts must drain after an ON→OFF flip).
+    pub(super) async fn consume_materialization_outcome(
+        &mut self,
+        exec_id: Uuid,
+        attempt: &crate::db::open_attempts::AttemptByExecRow,
+        outcome: rio_proto::types::MaterializationOutcome,
+    ) -> Result<(), super::pull::PullRejection> {
+        use rio_proto::types::materialization_outcome::Outcome;
+        let drv_hash = DrvHash::from(attempt.drv_hash.as_str());
+        let serving_generation = self.serving_generation();
+        let executor = ExecutorId::from(attempt.executor_id.as_str());
+
+        // The unresolved job this attempt executes (PG is the
+        // authority; the in-memory view is a cache).
+        let job_id = self
+            .db
+            .unresolved_job_for_derivation(attempt.derivation_id)
+            .await
+            .map_err(|e| {
+                super::pull::PullRejection::Internal(format!("materialization job lookup: {e}"))
+            })?;
+
+        // 1. The live effective wanted set (the §6 join), resolved to
+        //    store paths — the presence-re-check half of D7's closure.
+        let live_wanted_paths = self
+            .live_wanted_paths_for(attempt.derivation_id, &drv_hash)
+            .await
+            .map_err(|e| super::pull::PullRejection::Internal(format!("wanted-union read: {e}")))?;
+
+        match outcome.outcome {
+            Some(Outcome::Success(s)) => {
+                // Success appends NOTHING to the ledger (design §2.4 —
+                // success is not a fold event). Coverage decides
+                // Complete vs ReArm (the CE-17 class).
+                self.close_materialization_attempt(exec_id, &drv_hash, None, serving_generation)
+                    .await;
+                if success_covers_live_wanted(
+                    &s.ingested_paths,
+                    &s.verified_paths,
+                    &live_wanted_paths,
+                ) {
+                    if let Some(job_id) = job_id {
+                        self.resolve_materialization_job(
+                            job_id,
+                            Some(exec_id),
+                            crate::state::JobState::ResolvedSuccess,
+                            serving_generation,
+                        )
+                        .await;
+                    }
+                    self.materialization_jobs.remove(&drv_hash);
+                    // The build-success path: outputs are present and
+                    // verified in the store; complete the node for live
+                    // interest through the same chokepoint the
+                    // dispatch-time store short-circuit uses.
+                    self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
+                        .await;
+                } else {
+                    // Interest grew between execution and consumption:
+                    // the job stays pending; the next claim covers it.
+                    self.rearm_materialization_job(&drv_hash, &executor).await;
+                }
+                Ok(())
+            }
+            Some(Outcome::Unobtainable(u)) => {
+                // The charge row: kind=materialization — visible only to
+                // the materialization budget, never to build budgets.
+                let mut row = crate::db::attempts::AttemptRow::new(
+                    attempt.derivation_id,
+                    crate::state::OutcomeClass::MaterializationUnobtainable,
+                    crate::state::ReportingParty::Worker,
+                );
+                row.exec_id = Some(exec_id);
+                row.executor_id = Some(executor.clone());
+                row.attempt_kind = crate::state::AttemptKind::Materialization;
+                row.error_msg = (!u.cause.is_empty()).then(|| u.cause.clone());
+                let prior_unobtainable = self.count_materialization_rows_in_history(
+                    &drv_hash,
+                    crate::state::OutcomeClass::MaterializationUnobtainable,
+                );
+                self.close_materialization_attempt(
+                    exec_id,
+                    &drv_hash,
+                    Some(row),
+                    serving_generation,
+                )
+                .await;
+
+                // 2. The four-arm routing. Arms 0–2 decide without the
+                //    re-probe; the probe is fetched only for arm 3.
+                let durable_evidence = match self.dag.closure_evidence(drv_hash.as_str()) {
+                    rio_evidence_kernel::ClosureEvidence::Vouched => DurableEvidence::Vouched,
+                    rio_evidence_kernel::ClosureEvidence::Pending => DurableEvidence::Pending,
+                    rio_evidence_kernel::ClosureEvidence::Broken => DurableEvidence::Broken,
+                };
+                let needs_probe = u
+                    .missing_paths
+                    .iter()
+                    .any(|p| live_wanted_paths.contains(p))
+                    && durable_evidence == DurableEvidence::Broken;
+                let reprobe = if needs_probe {
+                    match self
+                        .reprobe_live_wanted_paths(&drv_hash, &live_wanted_paths)
+                        .await
+                    {
+                        Some(answer) => Some(answer),
+                        None => {
+                            // B3: the re-probe RPC itself failed — an
+                            // indeterminate answer never fail-fasts.
+                            self.rearm_materialization_job(&drv_hash, &executor).await;
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    None
+                };
+                let routing = route_unobtainable(&RoutingInputs {
+                    missing_paths: &u.missing_paths,
+                    verified_paths: &u.verified_paths,
+                    live_wanted_paths: &live_wanted_paths,
+                    durable_evidence,
+                    prior_unobtainable_count: prior_unobtainable,
+                    reprobe,
+                });
+                // 3. Execute the routing.
+                match routing {
+                    UnobtainableRouting::CompleteForLiveInterest => {
+                        if let Some(job_id) = job_id {
+                            self.resolve_materialization_job(
+                                job_id,
+                                Some(exec_id),
+                                crate::state::JobState::ResolvedSuccess,
+                                serving_generation,
+                            )
+                            .await;
+                        }
+                        self.materialization_jobs.remove(&drv_hash);
+                        self.complete_ready_from_store_batch(std::slice::from_ref(&drv_hash))
+                            .await;
+                    }
+                    UnobtainableRouting::ReArm => {
+                        self.rearm_materialization_job(&drv_hash, &executor).await;
+                    }
+                    UnobtainableRouting::ResolveFromSource => {
+                        if let Some(job_id) = job_id {
+                            self.resolve_materialization_job(
+                                job_id,
+                                Some(exec_id),
+                                crate::state::JobState::ResolvedFromSource,
+                                serving_generation,
+                            )
+                            .await;
+                        }
+                        self.materialization_jobs.remove(&drv_hash);
+                        // The node returns to its dep-derived status
+                        // (the normal Ready path) — requeue it.
+                        self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                            .await;
+                    }
+                    UnobtainableRouting::FailFast => {
+                        if let Some(job_id) = job_id {
+                            self.resolve_materialization_job(
+                                job_id,
+                                Some(exec_id),
+                                crate::state::JobState::ResolvedUnobtainable,
+                                serving_generation,
+                            )
+                            .await;
+                        }
+                        self.materialization_jobs.remove(&drv_hash);
+                        self.fail_fast_topdown_pruned_root(
+                            &drv_hash,
+                            "materialization confirmed a live-wanted output missing upstream \
+                             and not substitutable",
+                        )
+                        .await;
+                    }
+                }
+                Ok(())
+            }
+            Some(Outcome::InfraFailure(f)) => {
+                // The infra charge: counts toward the materialization
+                // budget and toward NOTHING else. Never fail-fasts,
+                // never routes from source (B3).
+                let mut row = crate::db::attempts::AttemptRow::new(
+                    attempt.derivation_id,
+                    crate::state::OutcomeClass::MaterializationInfra,
+                    crate::state::ReportingParty::Worker,
+                );
+                row.exec_id = Some(exec_id);
+                row.executor_id = Some(executor.clone());
+                row.attempt_kind = crate::state::AttemptKind::Materialization;
+                row.error_msg = (!f.detail.is_empty()).then(|| f.detail.clone());
+                self.close_materialization_attempt(
+                    exec_id,
+                    &drv_hash,
+                    Some(row),
+                    serving_generation,
+                )
+                .await;
+                // Budget: at max_attempts the job parks (durable
+                // park_until + the view), else it re-arms claimable.
+                let infra_count = self.count_materialization_rows_in_history(
+                    &drv_hash,
+                    crate::state::OutcomeClass::MaterializationInfra,
+                );
+                if infra_count >= self.materialization_cfg.max_attempts {
+                    self.park_materialization_job(
+                        &drv_hash,
+                        job_id,
+                        infra_count,
+                        serving_generation,
+                    )
+                    .await;
+                } else {
+                    self.rearm_materialization_job(&drv_hash, &executor).await;
+                }
+                // Either way the node itself returns to the queue
+                // (claimable again / from-source dispatchable per the
+                // admission table).
+                self.reassign_derivations(std::slice::from_ref(&drv_hash), Some(&executor))
+                    .await;
+                Ok(())
+            }
+            None => {
+                warn!(%exec_id, "materialization outcome with no payload; acknowledged-and-ignored");
+                Ok(())
+            }
+        }
+    }
+
+    /// The live effective wanted PATHS for a node: the §6 wanted-union
+    /// (joined over live builds' contributions), resolved to store
+    /// paths against the node's declared outputs. Falls back to the
+    /// node-level union when no live contribution exists.
+    async fn live_wanted_paths_for(
+        &self,
+        derivation_id: Uuid,
+        drv_hash: &DrvHash,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let union = self.db.effective_wanted_union(derivation_id).await?;
+        let Some(state) = self.dag.node(drv_hash) else {
+            return Ok(Vec::new());
+        };
+        let wanted_names: Vec<String> = match union {
+            // No live contribution: fall back to the node-level union.
+            None => state.wanted_output_names.clone(),
+            // '{}' saturation = all declared outputs.
+            Some(v) if v.is_empty() => Vec::new(),
+            Some(v) => v,
+        };
+        let paths: Vec<String> = if wanted_names.is_empty() {
+            state.expected_output_paths.clone()
+        } else {
+            state
+                .output_names
+                .iter()
+                .zip(state.expected_output_paths.iter())
+                .filter(|(name, _)| wanted_names.iter().any(|w| w == *name))
+                .map(|(_, path)| path.clone())
+                .collect()
+        };
+        Ok(paths.into_iter().filter(|p| !p.is_empty()).collect())
+    }
+
+    /// Count this node's in-memory ledger rows of one materialization
+    /// outcome class (the budget/one-shot inputs). The in-memory
+    /// history mirrors committed rows (read-through cache).
+    fn count_materialization_rows_in_history(
+        &self,
+        drv_hash: &DrvHash,
+        class: crate::state::OutcomeClass,
+    ) -> u32 {
+        self.dag
+            .node(drv_hash)
+            .map(|s| {
+                s.attempt_history()
+                    .iter()
+                    .filter(|r| {
+                        r.attempt_kind == crate::state::AttemptKind::Materialization
+                            && r.outcome_class == class
+                    })
+                    .count() as u32
+            })
+            .unwrap_or(0)
+    }
+
+    /// Close the open materialization attempt (assignment row) and
+    /// append the charge row when one is given, in ONE transaction
+    /// carrying the same claims-floor fence as every other attempt
+    /// closer. Mirrors `close_pull_attempt_uncharged`'s shape WITH an
+    /// optional charge. Idempotent: a row already present for the exec
+    /// makes the append a no-op (terminal-row-wins).
+    async fn close_materialization_attempt(
+        &mut self,
+        exec_id: Uuid,
+        drv_hash: &DrvHash,
+        charge_row: Option<crate::db::attempts::AttemptRow>,
+        serving_generation: i64,
+    ) {
+        let result: Result<Option<bool>, sqlx::Error> = async {
+            let mut tx = self.db.pool().begin().await?;
+            let floor = crate::db::SchedulerDb::claims_floor(&mut tx).await?;
+            if !crate::db::SchedulerDb::at_or_above_floor(floor, serving_generation) {
+                tx.rollback().await?;
+                return Ok(None);
+            }
+            let mut inserted = false;
+            if let Some(row) = &charge_row {
+                inserted = crate::db::SchedulerDb::append_attempt(&mut tx, row).await?;
+            }
+            sqlx::query(
+                "UPDATE assignments SET status = 'completed', completed_at = now() \
+                 WHERE exec_id = $1 AND status IN ('pending', 'acknowledged')",
+            )
+            .bind(exec_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+            Ok(Some(inserted))
+        }
+        .await;
+        match result {
+            Ok(Some(inserted)) => {
+                if inserted && let Some(row) = charge_row {
+                    if let Some(state) = self.dag.node_mut(drv_hash) {
+                        state.push_attempt_record(row.to_record());
+                    }
+                    self.refresh_retry_view(drv_hash);
+                }
+            }
+            Ok(None) => {
+                self.note_fenced_evidence_write("materialization attempt close");
+            }
+            Err(e) => {
+                warn!(drv_hash = %drv_hash, %exec_id, error = %e,
+                      "materialization attempt close failed; the establishment sweep remains \
+                       the backstop");
+            }
+        }
+    }
+
+    /// Resolve the job terminally (fenced, exec_id-keyed, at-most-once)
+    /// and note a fence refusal.
+    async fn resolve_materialization_job(
+        &mut self,
+        job_id: Uuid,
+        exec_id: Option<Uuid>,
+        to_state: crate::state::JobState,
+        serving_generation: i64,
+    ) {
+        match self
+            .db
+            .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
+            .await
+        {
+            Ok(crate::db::FencedWrite::Applied(_)) => {}
+            Ok(crate::db::FencedWrite::Fenced) => {
+                self.note_fenced_evidence_write("materialization job resolve");
+            }
+            Err(e) => {
+                warn!(%job_id, error = %e, "materialization job resolve failed");
+            }
+        }
+    }
+
+    /// Re-arm the job: it stays pending (claimable); the in-memory view
+    /// drops the claim so the next pull's one-winner arbitration sees
+    /// Pending again.
+    async fn rearm_materialization_job(&mut self, drv_hash: &DrvHash, _executor: &ExecutorId) {
+        if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+            entry.claimed_by = None;
+        }
+    }
+
+    /// Park the job (infra-budget exhaustion, design §2.5): durable
+    /// `park_until` + the in-memory view. Never a fail-fast.
+    async fn park_materialization_job(
+        &mut self,
+        drv_hash: &DrvHash,
+        job_id: Option<Uuid>,
+        infra_count: u32,
+        serving_generation: i64,
+    ) {
+        let base = self.materialization_cfg.park_backoff_base_secs;
+        let cap = self.materialization_cfg.park_backoff_cap_secs;
+        let exp = infra_count.saturating_sub(self.materialization_cfg.max_attempts);
+        let backoff_secs = base.saturating_mul(2u64.saturating_pow(exp)).min(cap);
+        if let Some(job_id) = job_id {
+            let park_until_epoch = crate::db::attempts::epoch_now() + backoff_secs as f64;
+            match self
+                .db
+                .park_materialization_job_fenced(job_id, park_until_epoch, serving_generation)
+                .await
+            {
+                Ok(crate::db::FencedWrite::Applied(_)) => {}
+                Ok(crate::db::FencedWrite::Fenced) => {
+                    self.note_fenced_evidence_write("materialization job park");
+                }
+                Err(e) => warn!(%job_id, error = %e, "materialization job park failed"),
+            }
+        }
+        if let Some(entry) = self.materialization_jobs.get_mut(drv_hash) {
+            entry.claimed_by = None;
+            entry.parked_until =
+                Some(std::time::Instant::now() + std::time::Duration::from_secs(backoff_secs));
+        }
+    }
+
+    /// The arm-3 FMP re-probe over the live wanted paths. `None` = the
+    /// probe could not answer (no store client / RPC failure / timeout)
+    /// — the caller maps that to ReArm (B3).
+    ///
+    /// Without a service signer the store cannot run its upstream
+    /// substitution check (no `x-rio-probe-tenant-id`), so a missing
+    /// path is indeterminate, never confirmed-missing — the probe then
+    /// cannot produce the fail-fast conjunct (B3's conservative
+    /// direction).
+    async fn reprobe_live_wanted_paths(
+        &mut self,
+        drv_hash: &DrvHash,
+        live_wanted: &[String],
+    ) -> Option<ReprobeAnswer> {
+        if live_wanted.is_empty() {
+            return Some(ReprobeAnswer::Obtainable);
+        }
+        let store = self.store_client.clone()?;
+        let tenant = self
+            .dag
+            .node(drv_hash)
+            .into_iter()
+            .flat_map(|s| s.interested_builds.iter())
+            .filter_map(|bid| self.builds.get(bid))
+            .find_map(|b| b.tenant_id);
+        let auth = self.substitute_auth_for_tenant(tenant);
+        let can_confirm = matches!(auth, super::dispatch::SubstituteAuth::Service { .. });
+        let mut req = tonic::Request::new(rio_proto::types::FindMissingPathsRequest {
+            store_paths: live_wanted.to_vec(),
+        });
+        for (k, v) in auth.mint() {
+            if let Ok(mv) = tonic::metadata::MetadataValue::try_from(v.as_str()) {
+                req.metadata_mut().insert(k, mv);
+            }
+        }
+        let resp = tokio::time::timeout(self.grpc_timeout, store.clone().find_missing_paths(req))
+            .await
+            .ok()?
+            .ok()?
+            .into_inner();
+        let missing: std::collections::HashSet<String> = resp.missing_paths.into_iter().collect();
+        let substitutable: std::collections::HashSet<String> =
+            resp.substitutable_paths.into_iter().collect();
+        let indeterminate: std::collections::HashSet<String> =
+            resp.indeterminate_paths.into_iter().collect();
+        let obtainable = live_wanted.iter().all(|p| {
+            !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
+        });
+        Some(if obtainable || !can_confirm {
+            ReprobeAnswer::Obtainable
+        } else {
+            ReprobeAnswer::ConfirmedMissing
+        })
+    }
+}

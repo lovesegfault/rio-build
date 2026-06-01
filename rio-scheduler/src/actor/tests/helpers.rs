@@ -1104,6 +1104,8 @@ pub(crate) fn pull_payload(result: rio_proto::types::BuildResult) -> PullReportP
         hw_class: None,
         final_resources: None,
         final_line_count: 0,
+        // Mechanical flag-off default (carve-out 1c).
+        materialization_outcome: None,
     }
 }
 
