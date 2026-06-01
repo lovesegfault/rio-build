@@ -184,6 +184,34 @@ impl DagActor {
 
         self.restore_builds(build_rows, build_drv_hashes).await?;
 
+        // r[impl sched.materialize.job]
+        // Substitution-replacement Phase B (T-4.3): rebuild the
+        // in-memory materialization job view from PG. Flag-gated:
+        // flag-off the view is permanently empty and the query never
+        // runs (criterion 2 — flag-off recovery is byte-identical to
+        // as-built). Without the rebuild, the failed-over leader
+        // answers `Gone` to every materialization claim until a
+        // dispatch-probe tick lazily re-feeds the view (the F10/L1
+        // stranded-armed-action class); claim holders and park
+        // expiries would be lost entirely.
+        if self.materialization_cfg.enabled {
+            match self.db.load_unresolved_materialization_jobs().await {
+                Ok(rows) => {
+                    let jobs = rows.len();
+                    self.rebuild_materialization_job_view(rows);
+                    if jobs > 0 {
+                        info!(jobs, "rebuilt materialization job view from PG (recovery)");
+                    }
+                }
+                Err(e) => {
+                    warn!(error = %e,
+                          "failed to rebuild the materialization job view (the dispatch \
+                           probe's create-job dedup re-feeds it lazily; claims answer \
+                           NotYetReady/Gone until then)");
+                }
+            }
+        }
+
         self.seed_ready_queue(&failed_dep_parents).await;
 
         self.enforce_recovered_verdicts().await;

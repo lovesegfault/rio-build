@@ -1378,6 +1378,24 @@ impl DagActor {
                 continue;
             }
             let status = node.status();
+            // r[impl sched.materialize.job]
+            // Substitution-replacement Phase B (T-4.3): a survivor
+            // carrying an unresolved materialization job needs NOTHING
+            // from this loop — the job is already the armed action
+            // (design §2.1: "survivors with an unresolved job need
+            // nothing"), and both arms below would race it: the
+            // settlement spends the verification one-shot and spawns a
+            // walk (a flag-on walk spawn for fresh work — the
+            // criterion-3 violation) or fail-fasts the surviving builds
+            // outright; the promotion arm would push a Ready node whose
+            // builder pulls the kinded admission refuses anyway. The
+            // job's own §2.4 consumption settlement is the survivor's
+            // settlement authority. Flag-gated: flag-off the view is
+            // empty and this gate never fires (byte-identical as-built
+            // reap behavior).
+            if self.materialization_cfg.enabled && self.has_unresolved_job(parent.as_str()) {
+                continue;
+            }
             // `must_substitute` = marked AND closure evidence Broken
             // (childless OR closure-holed): a closure hole means the
             // surviving children are a removal-truncated view of the

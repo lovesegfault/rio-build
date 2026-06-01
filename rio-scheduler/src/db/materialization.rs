@@ -362,4 +362,40 @@ impl SchedulerDb {
         .await?;
         Ok(row)
     }
+
+    /// Recovery view-rebuild load (Phase B, T-4.3): every unresolved
+    /// job plus the holder of its open materialization attempt (if
+    /// any). Unlike [`Self::list_claimable_materialization_jobs`] this
+    /// does NOT filter parked or claimed jobs — the in-memory view must
+    /// mirror ALL unresolved state so pull admission answers correctly
+    /// from the very first post-failover claim (a parked job answers
+    /// NotYetReady, a held attempt re-delivers to its holder, and
+    /// nothing answers the stranding `Gone`).
+    pub(crate) async fn load_unresolved_materialization_jobs(
+        &self,
+    ) -> Result<Vec<RecoveredJobRow>, sqlx::Error> {
+        sqlx::query_as(
+            "SELECT j.job_id, j.drv_hash, \
+                    EXTRACT(EPOCH FROM (j.park_until - now()))::float8 AS park_remaining_secs, \
+                    a.builder_id AS claimed_by \
+               FROM materialization_jobs j \
+               LEFT JOIN assignments a ON a.derivation_id = j.derivation_id \
+                                      AND a.status IN ('pending', 'acknowledged') \
+              WHERE j.state = 'pending'",
+        )
+        .fetch_all(&self.pool)
+        .await
+    }
+}
+
+/// One unresolved job as the recovery view rebuild loads it (T-4.3).
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct RecoveredJobRow {
+    pub job_id: Uuid,
+    pub drv_hash: String,
+    /// Seconds until the park expires; `None` or non-positive = not
+    /// parked (or the park already lapsed).
+    pub park_remaining_secs: Option<f64>,
+    /// The open attempt's holder identity; `None` = unclaimed.
+    pub claimed_by: Option<String>,
 }

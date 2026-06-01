@@ -157,14 +157,23 @@ impl DagActor {
             .await
         {
             Ok(FencedJobCreate::Applied { job_id, created }) => {
-                self.materialization_jobs.insert(
-                    drv_hash.clone(),
-                    JobViewEntry {
+                // entry().or_insert(): the dedup arm (created == false)
+                // re-encounters jobs the view may already track — the
+                // dispatch probe re-probing a PARKED node every tick,
+                // or the post-recovery probe pass running over the
+                // T-4.3 rebuilt view — and must NOT reset their
+                // armament state (park backoff, claim holder) to a
+                // fresh unparked/unclaimed entry. A genuinely new job
+                // (created == true) cannot have a view entry (the
+                // partial-unique index guarantees no unresolved job
+                // existed), so or_insert inserts it.
+                self.materialization_jobs
+                    .entry(drv_hash.clone())
+                    .or_insert(JobViewEntry {
                         job_id,
                         parked_until: None,
                         claimed_by: None,
-                    },
-                );
+                    });
                 if created {
                     metrics::counter!(
                         "rio_scheduler_materialization_jobs_created_total",
@@ -354,6 +363,51 @@ impl DagActor {
         self.materialization_jobs
             .get(drv_hash)
             .is_some_and(|entry| entry.claimed_by.is_none())
+    }
+
+    /// Whether ANY unresolved job exists for the node (pending,
+    /// claimed, or parked) — the reap-survivor armament predicate
+    /// (T-4.3): a survivor carrying an unresolved job needs nothing
+    /// from the removal-survivor settlement, whatever the job's
+    /// sub-state, because every job state has its own armed action
+    /// (the §3.3 settlement totality).
+    pub(super) fn has_unresolved_job(&self, drv_hash: &str) -> bool {
+        self.materialization_jobs.contains_key(drv_hash)
+    }
+
+    // r[impl sched.materialize.job]
+    /// T-4.3 (Phase B): rebuild the in-memory job view from PG at
+    /// recovery. Without this, a failed-over leader's empty view
+    /// answers `JobView::None` to every materialization claim → the
+    /// kernel's kinded table answers `Gone` → the store executor
+    /// (which treats Gone as "job resolved, skip") never claims again
+    /// and the armed action is stranded until a dispatch-probe tick
+    /// happens to lazily re-feed the view (the F10/L1 class).
+    ///
+    /// The rebuild mirrors ALL unresolved state: claim holders (so the
+    /// open attempt re-delivers to its holder and refuses everyone
+    /// else) and park expiries (so parked jobs keep answering
+    /// NotYetReady until their durable backoff lapses).
+    pub(super) fn rebuild_materialization_job_view(
+        &mut self,
+        rows: Vec<crate::db::materialization::RecoveredJobRow>,
+    ) {
+        self.materialization_jobs.clear();
+        for row in rows {
+            self.materialization_jobs.insert(
+                DrvHash::from(row.drv_hash.as_str()),
+                JobViewEntry {
+                    job_id: row.job_id,
+                    parked_until: row
+                        .park_remaining_secs
+                        .filter(|secs| *secs > 0.0)
+                        .map(|secs| {
+                            std::time::Instant::now() + std::time::Duration::from_secs_f64(secs)
+                        }),
+                    claimed_by: row.claimed_by.map(ExecutorId::from),
+                },
+            );
+        }
     }
 }
 

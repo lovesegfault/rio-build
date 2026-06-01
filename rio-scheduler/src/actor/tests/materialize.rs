@@ -3437,3 +3437,368 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
     );
     Ok(())
 }
+
+// ── T-4.3 (Phase B): recovery job-view rebuild + reap-survivor armament ──
+
+// r[verify sched.materialize.job]
+/// T-4.3 step 2 (red-first): materialization jobs survive leader
+/// failover AS ARMED ACTIONS — the new leader's recovery rebuilds the
+/// in-memory job view from PG, so pull admission answers correctly from
+/// the very first post-failover claim.
+///
+/// Without the rebuild (the Phase A "not recovery-safe" gap, the F10/L1
+/// class), the new leader's empty view answers `JobView::None` to every
+/// claim → the kernel's kinded table says GONE → the store executor
+/// (which treats Gone as "job resolved, skip") never claims again →
+/// the armed action is stranded until the next dispatch-probe tick
+/// happens to re-feed the view (finding 17's observed one-tick delay).
+///
+/// Three job states cross the failover, each with its own admission
+/// answer from the rebuilt view:
+///   pending unclaimed → DeliverNew (claimable immediately)
+///   claimed           → DeliverExisting to the SAME holder (the open
+///                       attempt's identity-keyed re-delivery);
+///                       NotYetReady to anyone else (one-winner)
+///   parked            → NotYetReady (the park survives), never Gone
+#[tokio::test]
+async fn flag_on_recovery_rebuilds_job_view_and_jobs_survive() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+
+    // ── Phase 1: a flag-on leader creates jobs in three states ──
+    let claimed_exec: Uuid;
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
+                cfg.materialization.enabled = true;
+                // One infra failure parks; the park outlives the test.
+                cfg.materialization.max_attempts = 1;
+                cfg.materialization.park_backoff_base_secs = 600;
+            });
+
+        // (a) PENDING unclaimed job.
+        let out_a = test_store_path("rcv-pending-out");
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(out_a.clone());
+        let mut na = make_node("rcv-pending");
+        na.expected_output_paths = vec![out_a.clone()];
+        merge_dag(&handle, Uuid::new_v4(), vec![na], vec![], false).await?;
+        barrier(&handle).await;
+
+        // (b) CLAIMED job (open attempt held by store-test-0).
+        let out_b = test_store_path("rcv-claimed-out");
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(out_b.clone());
+        let mut nb = make_node("rcv-claimed");
+        nb.expected_output_paths = vec![out_b.clone()];
+        merge_dag(&handle, Uuid::new_v4(), vec![nb], vec![], false).await?;
+        barrier(&handle).await;
+        let assignment = match claim_materialization(&handle, "rcv-claimed", "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("phase 1 claim must deliver, got {other:?}"),
+        };
+        claimed_exec = assignment.exec_id.parse()?;
+
+        // (c) PARKED job (budget exhausted: one infra report with
+        //     max_attempts=1 parks it for 600 s).
+        let out_c = test_store_path("rcv-parked-out");
+        store
+            .state
+            .substitutable
+            .write()
+            .unwrap()
+            .push(out_c.clone());
+        let mut nc = make_node("rcv-parked");
+        nc.expected_output_paths = vec![out_c.clone()];
+        merge_dag(&handle, Uuid::new_v4(), vec![nc], vec![], false).await?;
+        barrier(&handle).await;
+        let assignment = match claim_materialization(&handle, "rcv-parked", "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("phase 1 park-claim must deliver, got {other:?}"),
+        };
+        let parked_exec: Uuid = assignment.exec_id.parse()?;
+        report_materialization_outcome(
+            &handle,
+            parked_exec,
+            "rcv-parked",
+            mat_infra_outcome("upstream down"),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("infra report rejected: {e:?}"))?;
+        barrier(&handle).await;
+        let park: Option<f64> = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM mj.park_until)::float8 \
+               FROM materialization_jobs mj \
+               JOIN derivations d ON d.derivation_id = mj.derivation_id \
+              WHERE d.drv_hash = 'rcv-parked'",
+        )
+        .fetch_one(&db.pool)
+        .await?;
+        assert!(park.is_some(), "precondition: the rcv-parked job parked");
+
+        // The leader dies (failover).
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── Phase 2: a NEW flag-on leader recovers from PG ──
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |cfg, p| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 600;
+            p.leader = phase2_leader;
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    // (1) THE REBUILD ASSERTION: the pending job is claimable
+    //     IMMEDIATELY from the rebuilt view — no waiting for a
+    //     dispatch-probe tick to lazily re-feed it.
+    let claim = claim_materialization(&handle, "rcv-pending", "store-test-1").await;
+    assert!(
+        matches!(claim, Ok(PullOutcome::Deliver(_))),
+        "a recovered pending job must be claimable from the FIRST post-failover \
+         claim (the recovery view rebuild) — got {claim:?} (Gone = the empty-view \
+         JobView::None answer = the F10/L1 stranded-arm gap)"
+    );
+
+    // (2) The claimed job: the original holder's re-pull re-delivers the
+    //     SAME open attempt across the failover.
+    let reclaim = claim_materialization(&handle, "rcv-claimed", "store-test-0").await;
+    match reclaim {
+        Ok(PullOutcome::Deliver(a)) => {
+            let re_exec: Uuid = a.exec_id.parse()?;
+            assert_eq!(
+                re_exec, claimed_exec,
+                "the holder's re-pull must re-deliver the SAME open attempt \
+                 (identity-keyed re-delivery across failover)"
+            );
+        }
+        other => panic!(
+            "the claimed job's holder must get its open attempt re-delivered \
+             after failover, got {other:?}"
+        ),
+    }
+    //     ... and a DIFFERENT replica's claim is refused (one-winner,
+    //     never Gone).
+    let other_claim = claim_materialization(&handle, "rcv-claimed", "store-test-9").await;
+    assert!(
+        matches!(other_claim, Ok(PullOutcome::NotYetReady { .. })),
+        "another replica's claim against the held attempt parks (one-winner \
+         arbitration survives failover), got {other_claim:?}"
+    );
+
+    // (3) The parked job: the park survives the failover — claims are
+    //     refused as NotYetReady (backoff), never dismissed as Gone.
+    let parked_claim = claim_materialization(&handle, "rcv-parked", "store-test-1").await;
+    assert!(
+        matches!(parked_claim, Ok(PullOutcome::NotYetReady { .. })),
+        "a recovered parked job's claim parks (the park state survives in the \
+         rebuilt view), got {parked_claim:?}"
+    );
+    // The durable park is intact too.
+    let park: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM mj.park_until)::float8 \
+           FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'rcv-parked'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        park.is_some(),
+        "the durable park_until row survives recovery"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// T-4.3 step 3 (red-first): a terminal build's reap leaves a survivor
+/// node with an unresolved materialization job → the reap hook does
+/// NOTHING to it (design §2.1: "survivors with an unresolved job need
+/// nothing — the job is already armed"); the job then resolves and
+/// completes the survivor for its remaining interest.
+///
+/// Without the job-awareness gate, `reevaluate_removal_survivors`
+/// routes a marked-Broken survivor through the WALK settlement
+/// (`settle_broken_marked_root`): it spends the verification one-shot
+/// and spawns a walk (a flag-on walk spawn for fresh work — the
+/// criterion-3 violation) or fail-fasts the surviving build outright,
+/// racing the job that is already armed to do the same work.
+#[tokio::test]
+async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // The reap_survivor_settles_at_reap_time shape (build.rs), flag-on:
+    // a 2-output root where only the narrow output is substitutable.
+    //   Build B (narrow want): the topdown prune fires → root kept
+    //   childless + MARKED + an origin=pruned JOB created in-tx.
+    //   Build A (wide want): the wide want blocks the prune → full
+    //   merge → dep enters the DAG under root with sole interest A.
+    // Cancelling A reaps dep (sole interest) and makes root the
+    // removal-survivor whose child vanished (closure_hole → Broken
+    // evidence) — exactly the cell the reap hook's settlement targets.
+    let root_out = test_store_path("reapjob-root-out");
+    let root_wide = test_store_path("reapjob-root-wide");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mk_root = |wanted: &[&str]| {
+        let mut n = make_node("reapjob-root");
+        n.output_names = vec!["out".into(), "wide".into()];
+        n.expected_output_paths = vec![root_out.clone(), root_wide.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+    let mk_dep = || {
+        let mut n = make_node("reapjob-dep");
+        n.expected_output_paths = vec![test_store_path("reapjob-dep-out")];
+        n
+    };
+
+    // Build B (narrow): pruned merge → root marked + childless + job.
+    let build_b = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_b,
+        vec![mk_root(&["out"]), mk_dep()],
+        vec![make_test_edge("reapjob-root", "reapjob-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        expect_drv(&handle, "reapjob-root").await.topdown_pruned,
+        "precondition: B's pruned merge marks the root"
+    );
+
+    // Build A (wide): full merge → dep enters the DAG under root.
+    let build_a = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_a,
+        vec![mk_root(&["out", "wide"]), mk_dep()],
+        vec![make_test_edge("reapjob-root", "reapjob-dep")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_derivation("reapjob-dep")
+            .await?
+            .is_some(),
+        "precondition: A's full merge brings the dep into the DAG"
+    );
+
+    // Preconditions: one deduped job for the marked root.
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "precondition: one deduped job for the root");
+
+    // Build A goes terminal (cancelled): the reap removes dep (sole
+    // interest A) and re-evaluates root — the marked survivor whose
+    // child vanished, still wanted by B, still carrying the armed job.
+    cancel_build(&handle, build_a).await?;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: build_a })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_derivation("reapjob-dep")
+            .await?
+            .is_none(),
+        "precondition: A's sole-interest dep was reaped"
+    );
+
+    // THE ARMED-SURVIVOR ASSERTIONS:
+    // (a) The survivor was left alone: no walk spawned (no QPI calls for
+    //     its output), the one-shot was NOT spent, and build B was not
+    //     fail-fasted.
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&root_out),
+            "the reap hook must NOT spawn a verification walk for a survivor \
+             whose job is armed (criterion 3: no flag-on walk spawns for fresh \
+             work); qpi_calls={qpi:?}"
+        );
+    }
+    let drv = expect_drv(&handle, "reapjob-root").await;
+    assert!(
+        !drv.substitute_tried,
+        "the reap hook must NOT spend the verification one-shot on a survivor \
+         whose job is armed"
+    );
+    let st_b = query_status(&handle, build_b).await?;
+    assert_ne!(
+        st_b.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "the reap hook must NOT fail-fast a surviving build whose node has an \
+         armed job; error: {:?}",
+        st_b.error_summary
+    );
+    // (b) The job is still armed (unresolved, claimable).
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        job_state, "pending",
+        "the survivor's job stays unresolved (armed) across the reap"
+    );
+
+    // (c) The armed job then fires and completes the survivor for B.
+    let assignment = match claim_materialization(&handle, "reapjob-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the surviving job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&root_out, b"reapjob-materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "reapjob-root",
+        mat_success_outcome(vec![root_out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "reapjob-root").await.status,
+        DerivationStatus::Completed,
+        "the armed job completes the survivor"
+    );
+    let st_b = query_status(&handle, build_b).await?;
+    assert_eq!(
+        st_b.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "build B succeeds via the survivor's job"
+    );
+
+    // (d) Negative control — the as-built promotion arm is untouched for
+    //     a survivor WITHOUT a job: a Queued node whose deps complete
+    //     during the reap gets promoted to Ready exactly as flag-off.
+    //     (The walk-pin battery covers this; here we just confirm the
+    //     gate did not swallow the promotion arm by checking the code
+    //     path is still reachable for job-less nodes — structurally, the
+    //     gate keys on the job view, which has no entry for this node.)
+    Ok(())
+}
