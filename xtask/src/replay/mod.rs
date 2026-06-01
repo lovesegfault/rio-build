@@ -19,10 +19,12 @@ use clap::{Args, Subcommand};
 
 use crate::config::XtaskConfig;
 
+pub mod delete;
 pub mod dev;
 pub mod eval;
 pub mod jobs;
 pub mod launch;
+pub mod list;
 pub mod preflight;
 pub mod report;
 pub mod repro;
@@ -98,6 +100,15 @@ enum ReplayCmd {
     /// it.
     #[command(alias = "eval")]
     Record(eval::EvalArgs),
+    /// List the recorded replay archives (published under
+    /// `replay/archives/` in S3): identity, source Hydra eval, scope,
+    /// creation time, image size, and fidelity verdict, newest first.
+    List(list::ListArgs),
+    /// Delete one recorded replay archive from S3: the objects under
+    /// `replay/archives/<short-id>/` plus the recorder's by-recipe
+    /// pointer when this archive still owns it. Campaigns that pinned
+    /// the archive lose `replay repro` and pod-reschedule resume.
+    Delete(delete::DeleteArgs),
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
     /// and apply the campaign Job.
     ///
@@ -144,6 +155,8 @@ pub async fn run(args: ReplayArgs, cfg: &XtaskConfig) -> Result<()> {
     match args.cmd {
         ReplayCmd::Setup(a) => setup::run(a, cfg).await,
         ReplayCmd::Record(a) => eval::run(a).await,
+        ReplayCmd::List(a) => list::run(a).await,
+        ReplayCmd::Delete(a) => delete::run(a).await,
         ReplayCmd::Launch(a) => launch::run(a).await,
         ReplayCmd::Status(a) => status::run(a).await,
         ReplayCmd::Report(a) => report::run(a).await,

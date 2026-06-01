@@ -2161,6 +2161,11 @@
       "doc": "`cargo xtask replay` — operator surface for build-replay campaigns."
     },
     {
+      "path": "replay/delete.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay delete` — delete one recorded replay archive from S3."
+    },
+    {
       "path": "replay/dev.rs",
       "depth": 1,
       "doc": "`cargo xtask replay dev` — local engine run and the offline dry-run."
@@ -2179,6 +2184,11 @@
       "path": "replay/launch.rs",
       "depth": 1,
       "doc": "`cargo xtask replay launch` — provision the campaign tenants, keys and"
+    },
+    {
+      "path": "replay/list.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay list` — list the recorded replay archives in S3."
     },
     {
       "path": "replay/preflight.rs",

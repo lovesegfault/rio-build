@@ -884,7 +884,9 @@ The unified subsystem keeps one xtask family. The family name follows the subsys
 
 | Today | Converged | Role | Where it executes |
 |---|---|---|---|
-| `cargo xtask parity eval` | `cargo xtask replay record` (alias `eval` kept for one release) | Create the evaluation-recorder Job (§5 Recorders); its output is a v1 archive in S3 | xtask creates the Job; the recorder runs in-cluster |
+| `cargo xtask parity eval` | `cargo xtask replay record` (alias `eval` kept for one release) | Create the evaluation-recorder Job (§5 Recorders), follow it to completion, and summarize the published v1 archive | xtask creates and follows the Job; the recorder runs in-cluster |
+| — | `cargo xtask replay list` | List the published archives under `replay/archives/` (identity, eval, scope, size, fidelity), newest first | local, read-only |
+| — | `cargo xtask replay delete <short-id>` | Delete one published archive (objects + the by-recipe pointer it owns) | local |
 | `cargo xtask parity launch` | `cargo xtask replay launch` | Provision tenants/secrets, write the spec ConfigMap, create the campaign Job | xtask runs locally; the engine runs in-cluster |
 | — | `cargo xtask replay launch --archive <path\|s3://…>` | Same launcher, fed by any v1 archive instead of a recorder-addressed one; local paths are uploaded first | same |
 | `cargo xtask parity status` | `cargo xtask replay status` | Job state + summarized `progress.json`; `--watch` re-polls every 30 s | local, read-only |

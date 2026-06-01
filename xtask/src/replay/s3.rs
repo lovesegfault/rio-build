@@ -111,6 +111,20 @@ impl CampaignStore {
     }
 }
 
+/// Delete one S3 object. Deleting a missing object is not an error (S3
+/// DeleteObject is idempotent), so an interrupted `replay delete` re-run
+/// converges instead of failing on the objects it already removed.
+pub async fn delete_object(region: &str, bucket: &str, key: &str) -> Result<()> {
+    let s3 = aws_sdk_s3::Client::new(crate::aws::config(Some(region)).await);
+    s3.delete_object()
+        .bucket(bucket)
+        .key(key)
+        .send()
+        .await
+        .with_context(|| format!("DeleteObject s3://{bucket}/{key}"))?;
+    Ok(())
+}
+
 /// Render a byte count in human-readable binary units — the precision an
 /// operator needs to eyeball an archive's transfer cost, not an exact
 /// accounting (`replay record`'s summary and `replay list` both use it).
