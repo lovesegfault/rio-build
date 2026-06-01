@@ -333,6 +333,14 @@ pub async fn spawn_build_task(
         return; // Guard drops, no build spawned.
     }
 
+    // Display-stream sender for this assignment: every LogBatch/Phase
+    // (the log loop's batches, the header and footer banners) goes
+    // through it and sheds on a full sink instead of blocking. Control
+    // messages (the ACK above, CompletionReport, PrefetchComplete)
+    // stay on the raw `ctx.stream_tx` with awaited, guaranteed sends.
+    // r[impl builder.relay.log-shed]
+    let shedding_log_tx = crate::log_stream::SheddingLogSender::new(ctx.stream_tx.clone());
+
     // ADR-023 phase-10: now that we have an assignment token, harvest
     // the resolve→bench task (spawned at init, runs concurrently with
     // FUSE mount; normally long since done by the time the first
@@ -513,7 +521,7 @@ pub async fn spawn_build_task(
                 &assignment,
                 &build_env,
                 &mut store_client,
-                &ctx.stream_tx,
+                &shedding_log_tx,
                 prev_line_count,
             )
             .await;
@@ -590,7 +598,7 @@ pub async fn spawn_build_task(
             cancelled.load(std::sync::atomic::Ordering::Acquire),
         ) {
             executor::send_banner_batch(
-                &ctx.stream_tx,
+                &shedding_log_tx,
                 &drv_path,
                 &build_env.executor_id,
                 final_line_count,
@@ -599,8 +607,7 @@ pub async fn spawn_build_task(
                     footer_result,
                     assignment_start.elapsed(),
                 ),
-            )
-            .await;
+            );
         }
         let stamp = ctx.completion_stamp(peak_disk_bytes);
         let completion = match result {
@@ -1231,7 +1238,7 @@ enum StreamEnd {
 /// "in tonic's body buffer", which a raw `build_stream` drop discards
 /// via h2 RST_STREAM(CANCEL); the `BuildComplete` arm's park+drain
 /// gives tonic a graceful end-of-stream to flush against.
-// r[impl builder.relay.reconnect]
+// r[impl builder.relay.reconnect+1]
 pub(super) async fn relay_loop(
     mut sink_rx: mpsc::Receiver<ExecutorMessage>,
     mut target: watch::Receiver<Option<mpsc::Sender<ExecutorMessage>>>,
@@ -1702,7 +1709,7 @@ mod tests {
     /// message whose `send()` failed AFTER the drop. The negative half
     /// of this test demonstrates that loss path so the swap-after-Ok
     /// ordering in `run()` is visibly load-bearing.
-    // r[verify builder.relay.reconnect]
+    // r[verify builder.relay.reconnect+1]
     #[tokio::test]
     async fn relay_sink_preserved_across_failed_connect_window() {
         // ── Positive: fixed connect sequence (no swap on failed try) ──

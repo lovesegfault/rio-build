@@ -140,6 +140,16 @@ pub fn describe_metrics() {
          high rate = pathological producer."
     );
     describe_counter!(
+        "rio_builder_log_messages_shed_total",
+        "Display-stream messages (BuildLogBatch / BuildPhase, by `kind`) \
+         shed because the permanent sink was full — scheduler-link \
+         backpressure. The build and its limit enforcement continue; the \
+         next delivered batch carries a `[rio: N log messages shed …]` \
+         marker. Sustained growth = degraded scheduler link, not a build \
+         problem. Control messages (CompletionReport, PrefetchComplete) \
+         are never shed."
+    );
+    describe_counter!(
         "rio_builder_cgroup_oom_total",
         "Builds killed by the cgroup OOM watcher (memory.events oom_kill \
          incremented during build). Reported as InfrastructureFailure for \

@@ -61,7 +61,8 @@ async fn run(kind: ExecutorKind, drv: &[u8], assignment_flag: bool) -> Result<()
     let assignment = make_assignment(drv, assignment_flag);
     // dead_channel: never dials — the gate fires before any gRPC call.
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
-    let (log_tx, _rx) = tokio::sync::mpsc::channel(1);
+    let (raw_log_tx, _rx) = tokio::sync::mpsc::channel(1);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     execute_build(&assignment, &env, &mut store, &log_tx, 0)
         .await
         .result
@@ -194,7 +195,8 @@ async fn banner_header_gated_on_first_attempt() {
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
     // First attempt (`first_line == 0`): header at line 0.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 0).await;
     drop(log_tx);
     assert!(
@@ -231,7 +233,8 @@ async fn banner_header_gated_on_first_attempt() {
     );
 
     // Retry attempt (`first_line > 0`): no header re-sent; offset held.
-    let (log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(8);
+    let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
     let outcome = execute_build(&assignment, &env, &mut store, &log_tx, 3).await;
     drop(log_tx);
     assert!(outcome.result.is_err());
@@ -261,7 +264,8 @@ async fn pre_header_error_carries_caller_offset() {
     let mut store = StoreServiceClient::new(rio_test_support::grpc::dead_channel());
 
     for first_line in [0u64, 7u64] {
-        let (log_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let (raw_log_tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let log_tx = rio_builder::log_stream::SheddingLogSender::new(raw_log_tx);
         let outcome = execute_build(&assignment, &env, &mut store, &log_tx, first_line).await;
         drop(log_tx);
         assert!(matches!(

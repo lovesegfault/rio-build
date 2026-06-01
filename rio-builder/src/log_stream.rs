@@ -14,9 +14,12 @@
 //! legitimate bursty builds (kernel `make oldconfig` emits ~18k prompts in
 //! one burst).
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use rio_proto::types::BuildLogBatch;
+use rio_proto::types::{BuildLogBatch, BuildPhase, ExecutorMessage, executor_message};
+use tokio::sync::mpsc;
 
 /// Maximum lines per batch.
 const MAX_BATCH_LINES: usize = 64;
@@ -290,6 +293,102 @@ impl LogBatcher {
     /// "pending" with no lines would send an empty batch every 100ms.
     pub fn has_pending(&self) -> bool {
         !self.lines.is_empty()
+    }
+
+    /// Inject an out-of-band marker line (the relay shed marker).
+    ///
+    /// Mirrors the rate-suppression marker mechanics exactly: the line
+    /// is pushed directly — never through [`add_line`](Self::add_line),
+    /// so it cannot recurse and cannot itself be rate-dropped — counts
+    /// toward `total_bytes` (it IS transmitted; the same accepted
+    /// ~one-marker overshoot of the size limit applies), and consumes a
+    /// line number through the normal flush path.
+    pub fn push_marker(&mut self, text: String) {
+        let marker = text.into_bytes();
+        if self.lines.is_empty() {
+            self.batch_start = Instant::now();
+        }
+        self.total_bytes += marker.len() as u64;
+        self.lines.push(marker);
+    }
+}
+
+/// Outcome of a [`SheddingLogSender`] submission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSendOutcome {
+    /// Delivered to the sink.
+    Sent,
+    /// The sink was full: the message was dropped and tallied. The
+    /// caller continues — display traffic never blocks the worker.
+    Shed,
+    /// The sink is closed (worker shutdown). Senders should stop.
+    Closed,
+}
+
+/// Best-effort sender for the *display* stream: `BuildLogBatch` and
+/// `BuildPhase` only.
+///
+/// The type IS the boundary: control messages (`CompletionReport`,
+/// `PrefetchComplete`, `WorkAssignmentAck`, `ExecutorRegister`) cannot
+/// be constructed through it — they keep their awaited, guaranteed
+/// sends on the raw sink sender. Display messages go through
+/// `try_send`: a full sink (scheduler-link backpressure filling the
+/// permanent 256-slot buffer) sheds the message, counts it in
+/// `rio_builder_log_messages_shed_total`, and the next delivered batch
+/// carries one suppression marker line — so a degraded scheduler link
+/// degrades the log stream, never the build or its enforcement.
+///
+/// Clones share one shed tally: the banner senders and the log loop
+/// report through the same counter, and the loop's marker covers both.
+// r[impl builder.relay.log-shed]
+#[derive(Clone)]
+pub struct SheddingLogSender {
+    tx: mpsc::Sender<ExecutorMessage>,
+    shed: Arc<AtomicU64>,
+}
+
+impl SheddingLogSender {
+    pub fn new(tx: mpsc::Sender<ExecutorMessage>) -> SheddingLogSender {
+        SheddingLogSender {
+            tx,
+            shed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn try_send_batch(&self, batch: BuildLogBatch) -> LogSendOutcome {
+        self.try_send(
+            ExecutorMessage {
+                msg: Some(executor_message::Msg::LogBatch(batch)),
+            },
+            "log_batch",
+        )
+    }
+
+    pub fn try_send_phase(&self, phase: BuildPhase) -> LogSendOutcome {
+        self.try_send(
+            ExecutorMessage {
+                msg: Some(executor_message::Msg::Phase(phase)),
+            },
+            "phase",
+        )
+    }
+
+    /// Drain the shed tally (for suppression-marker injection).
+    pub fn take_shed(&self) -> u64 {
+        self.shed.swap(0, Ordering::Relaxed)
+    }
+
+    fn try_send(&self, msg: ExecutorMessage, kind: &'static str) -> LogSendOutcome {
+        match self.tx.try_send(msg) {
+            Ok(()) => LogSendOutcome::Sent,
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                self.shed.fetch_add(1, Ordering::Relaxed);
+                metrics::counter!("rio_builder_log_messages_shed_total", "kind" => kind)
+                    .increment(1);
+                LogSendOutcome::Shed
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => LogSendOutcome::Closed,
+        }
     }
 }
 
@@ -749,5 +848,124 @@ mod tests {
         // a, marker, c — real line c MUST be present.
         assert_eq!(batch.lines.last().unwrap(), b"c");
         assert!(batch.lines.iter().any(|l| l.starts_with(b"[rio:")));
+    }
+
+    // -- push_marker / SheddingLogSender -------------------------------------
+
+    /// The relay-shed marker mirrors the rate-marker mechanics: counts
+    /// toward total_bytes, consumes a line number through flush, never
+    /// recurses through add_line.
+    #[test]
+    fn push_marker_counts_bytes_and_line_numbers() {
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.add_line(b"real".to_vec());
+        let before = b.total_bytes;
+        b.push_marker("[rio: 3 log messages shed (scheduler link backpressure)]".into());
+        assert_eq!(
+            b.total_bytes - before,
+            "[rio: 3 log messages shed (scheduler link backpressure)]".len() as u64,
+            "the marker is transmitted, so it counts toward the byte cap"
+        );
+        let batch = b.flush();
+        assert_eq!(batch.lines.len(), 2);
+        assert!(batch.lines[1].starts_with(b"[rio: 3 log messages shed"));
+        // The marker consumed a line number: the next batch starts at 2.
+        b.add_line(b"next".to_vec());
+        assert_eq!(b.flush().first_line_number, 2);
+    }
+
+    /// A marker pushed into an empty batcher still flushes via the
+    /// batch timeout (batch_start is initialized).
+    #[test]
+    fn push_marker_into_empty_batcher_is_flushable() {
+        let mut b = mk(LogLimits::UNLIMITED);
+        b.push_marker("[rio: 1 log messages shed (scheduler link backpressure)]".into());
+        assert!(b.has_pending());
+        let batch = b.flush();
+        assert_eq!(batch.lines.len(), 1);
+    }
+
+    /// Display sends shed on a full sink (counted, metric'd) and report
+    /// Closed on a dropped sink; the tally drains once.
+    #[test]
+    fn shedding_sender_sheds_counts_and_closes() {
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (tx, mut rx) = mpsc::channel(1);
+        let sender = SheddingLogSender::new(tx);
+        let batch = || BuildLogBatch {
+            derivation_path: "/rio/store/aaa-x.drv".into(),
+            executor_id: "w0".into(),
+            first_line_number: 0,
+            lines: vec![b"l".to_vec()],
+        };
+        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Sent);
+        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Shed);
+        assert_eq!(
+            sender.try_send_phase(BuildPhase {
+                derivation_path: "/rio/store/aaa-x.drv".into(),
+                phase: "buildPhase".into(),
+            }),
+            LogSendOutcome::Shed
+        );
+        assert_eq!(sender.take_shed(), 2);
+        assert_eq!(sender.take_shed(), 0, "the tally drains once");
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=log_batch}"),
+            1
+        );
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=phase}"),
+            1
+        );
+
+        // Closed sink: the loop-exit signal, not a shed.
+        rx.close();
+        assert_eq!(sender.try_send_batch(batch()), LogSendOutcome::Closed);
+        assert_eq!(sender.take_shed(), 0, "Closed is not tallied as shed");
+    }
+
+    /// The guaranteed path is the raw sink sender: a CompletionReport
+    /// send BLOCKS on a full sink (backpressure) instead of shedding —
+    /// pinned with a timeout probe that must elapse, then delivery
+    /// once the sink drains.
+    #[tokio::test]
+    async fn completion_send_blocks_not_sheds() {
+        use rio_proto::types::{CompletionReport, executor_message};
+
+        let (tx, mut rx) = mpsc::channel::<ExecutorMessage>(1);
+        // Fill the sink with a display message.
+        let shedder = SheddingLogSender::new(tx.clone());
+        assert_eq!(
+            shedder.try_send_batch(BuildLogBatch {
+                derivation_path: "/rio/store/aaa-x.drv".into(),
+                executor_id: "w0".into(),
+                first_line_number: 0,
+                lines: vec![b"l".to_vec()],
+            }),
+            LogSendOutcome::Sent
+        );
+
+        let completion = ExecutorMessage {
+            msg: Some(executor_message::Msg::Completion(CompletionReport {
+                drv_path: "/rio/store/aaa-x.drv".into(),
+                ..Default::default()
+            })),
+        };
+        let send = tokio::spawn(async move { tx.send(completion).await });
+        // The guaranteed send must still be pending while the sink is
+        // full…
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!send.is_finished(), "a control send must block, not shed");
+        // …and deliver once the sink drains.
+        let _ = rx.recv().await;
+        send.await
+            .expect("send task")
+            .expect("completion delivered after drain");
+        assert!(matches!(
+            rx.recv().await.unwrap().msg,
+            Some(executor_message::Msg::Completion(_))
+        ));
     }
 }

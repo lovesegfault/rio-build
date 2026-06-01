@@ -32,7 +32,7 @@ use tracing::instrument;
 use futures_util::stream::{self, StreamExt, TryStreamExt};
 use rio_nix::derivation::{Derivation, DerivationLike};
 use rio_proto::StoreServiceClient;
-use rio_proto::types::{BuildResult as ProtoBuildResult, ExecutorMessage, WorkAssignment};
+use rio_proto::types::{BuildResult as ProtoBuildResult, WorkAssignment};
 use rio_proto::validated::ValidatedPathInfo;
 
 use crate::log_stream::{LogBatcher, LogLimits};
@@ -489,7 +489,7 @@ pub async fn execute_build(
     assignment: &WorkAssignment,
     env: &ExecutorEnv,
     store_client: &mut StoreServiceClient<Channel>,
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+    log_tx: &crate::log_stream::SheddingLogSender,
     first_line: u64,
 ) -> ExecuteOutcome {
     let drv_path = &assignment.drv_path;
@@ -626,8 +626,7 @@ pub async fn execute_build(
                 assignment.assigned_mem_bytes,
                 assignment.assigned_disk_bytes,
             ),
-        )
-        .await;
+        );
         crate::banner::HEADER_LINE_COUNT
     } else {
         first_line
@@ -1043,7 +1042,7 @@ struct NativeLifecycleArgs<'a> {
     input_metadata: &'a [ValidatedPathInfo],
     opts: BuildOpts,
     is_fod: bool,
-    log_tx: &'a mpsc::Sender<ExecutorMessage>,
+    log_tx: &'a crate::log_stream::SheddingLogSender,
 }
 
 /// What the native pipeline produced for one build attempt.
@@ -1570,6 +1569,30 @@ struct LogLoopResult {
     log_limit_exceeded: bool,
 }
 
+/// Inject the relay-shed suppression marker when any display messages
+/// were shed since the last delivery, then submit the batch.
+///
+/// The marker rides the batcher (it consumes a line number and counts
+/// toward the byte cap, exactly like the rate-suppression marker), so
+/// it lands in the *next* delivered batch — "single marker on
+/// recovery". Returns `false` only when the sink is closed.
+fn deliver_batch(
+    batcher: &mut LogBatcher,
+    log_tx: &crate::log_stream::SheddingLogSender,
+    batch: rio_proto::types::BuildLogBatch,
+) -> bool {
+    let shed = log_tx.take_shed();
+    if shed > 0 {
+        batcher.push_marker(format!(
+            "[rio: {shed} log messages shed (scheduler link backpressure)]"
+        ));
+    }
+    !matches!(
+        log_tx.try_send_batch(batch),
+        crate::log_stream::LogSendOutcome::Closed
+    )
+}
+
 /// Consume the rio-exec event stream: classify each captured line with
 /// the `@nix` filter, batch ordinary lines, forward `setPhase` frames,
 /// and enforce the line/byte caps — the message-side bookkeeping that
@@ -1585,24 +1608,27 @@ struct LogLoopResult {
 /// - the byte cap (`LogLimits.total_bytes`) and the line cap
 ///   (`MAX_BUILD_LOG_LINES`) abort the build by killing the cgroup; the
 ///   lifecycle then reports `LogLimitExceeded`.
+///
+/// Delivery is best-effort by construction: every `LogBatch`/`Phase`
+/// goes through the
+/// [`SheddingLogSender`](crate::log_stream::SheddingLogSender) — a full
+/// sink sheds (counted + marked) instead of parking this loop, so the
+/// rio-exec event channel is ALWAYS drained and a stalled scheduler
+/// link can neither freeze the build's output pipeline nor back up
+/// into the executor.
+// r[impl builder.relay.log-shed]
 async fn native_log_loop(
     mut events: mpsc::Receiver<rio_exec::ExecEvent>,
     mut batcher: LogBatcher,
-    log_tx: mpsc::Sender<ExecutorMessage>,
+    log_tx: crate::log_stream::SheddingLogSender,
     cgroup_path: std::path::PathBuf,
 ) -> LogLoopResult {
-    use crate::log_stream::AddLineResult;
-    use rio_proto::types::executor_message;
+    use crate::log_stream::{AddLineResult, LogSendOutcome};
 
     let mut filter = glue::log::NixLogFilter::new();
     let mut log_limit_exceeded = false;
     let mut flush_tick = tokio::time::interval(Duration::from_millis(100));
     flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    let send = |msg: ExecutorMessage, log_tx: &mpsc::Sender<ExecutorMessage>| {
-        let log_tx = log_tx.clone();
-        async move { log_tx.send(msg).await.is_ok() }
-    };
 
     loop {
         tokio::select! {
@@ -1620,10 +1646,7 @@ async fn native_log_loop(
                     glue::log::LineAction::Forward(l) => match batcher.add_line(l) {
                         AddLineResult::Buffered => {}
                         AddLineResult::BatchReady(batch) => {
-                            let msg = ExecutorMessage {
-                                msg: Some(executor_message::Msg::LogBatch(batch)),
-                            };
-                            if !send(msg, &log_tx).await {
+                            if !deliver_batch(&mut batcher, &log_tx, batch) {
                                 break;
                             }
                         }
@@ -1635,20 +1658,16 @@ async fn native_log_loop(
                     glue::log::LineAction::Phase(phase) => {
                         // r[impl builder.stderr.forward-set-phase+2]
                         if batcher.has_pending() {
-                            let msg = ExecutorMessage {
-                                msg: Some(executor_message::Msg::LogBatch(batcher.flush())),
-                            };
-                            if !send(msg, &log_tx).await {
+                            let batch = batcher.flush();
+                            if !deliver_batch(&mut batcher, &log_tx, batch) {
                                 break;
                             }
                         }
-                        let msg = ExecutorMessage {
-                            msg: Some(executor_message::Msg::Phase(rio_proto::types::BuildPhase {
-                                derivation_path: batcher.drv_path().to_owned(),
-                                phase,
-                            })),
+                        let phase = rio_proto::types::BuildPhase {
+                            derivation_path: batcher.drv_path().to_owned(),
+                            phase,
                         };
-                        if !send(msg, &log_tx).await {
+                        if log_tx.try_send_phase(phase) == LogSendOutcome::Closed {
                             break;
                         }
                     }
@@ -1660,25 +1679,28 @@ async fn native_log_loop(
                 }
             }
             _ = flush_tick.tick() => {
-                if let Some(batch) = batcher.maybe_flush() {
-                    let msg = ExecutorMessage {
-                        msg: Some(executor_message::Msg::LogBatch(batch)),
-                    };
-                    if !send(msg, &log_tx).await {
-                        break;
-                    }
+                if let Some(batch) = batcher.maybe_flush()
+                    && !deliver_batch(&mut batcher, &log_tx, batch)
+                {
+                    break;
                 }
             }
         }
     }
 
     // Final flush: whatever is still buffered when the build's capture
-    // stream closes.
+    // stream closes — including a trailing shed marker, which would
+    // otherwise have no later batch to ride (the marker is itself
+    // best-effort: a shed final flush leaves a bounded display gap,
+    // and the scheduler ring buffer accepts forward line-number gaps).
+    let final_shed = log_tx.take_shed();
+    if final_shed > 0 {
+        batcher.push_marker(format!(
+            "[rio: {final_shed} log messages shed (scheduler link backpressure)]"
+        ));
+    }
     if batcher.has_pending() {
-        let msg = ExecutorMessage {
-            msg: Some(executor_message::Msg::LogBatch(batcher.final_flush())),
-        };
-        let _ = log_tx.send(msg).await;
+        let _ = log_tx.try_send_batch(batcher.final_flush());
     }
 
     LogLoopResult {
@@ -1932,17 +1954,18 @@ pub fn sanitize_build_id(drv_path: &str) -> String {
 /// created inside [`run_native_lifecycle`] and consumed by the log
 /// loop — not in scope at the call sites).
 ///
-/// Best-effort: a closed channel means the scheduler stream is gone,
-/// in which case the build's `CompletionReport` won't reach the
-/// scheduler either — `runtime/` handles that. The banner is
-/// display-only; dropping it is harmless.
+/// Best-effort twice over: a closed sink means the worker is shutting
+/// down, and a *full* sink sheds the banner like any other display
+/// message (counted in the shared shed tally, so the log loop's next
+/// suppression marker covers it). The banner is display-only; the
+/// build's `CompletionReport` keeps its guaranteed path regardless.
 ///
 /// `pub(crate)` because the banner footer is sent from
 /// `runtime::spawn_build_task` (after the infra-transient retry loop —
 /// once per assignment) rather than from `execute_build` (once per
 /// attempt). See `execute_build`'s `first_line` param doc and bug_013.
-pub(crate) async fn send_banner_batch(
-    log_tx: &mpsc::Sender<ExecutorMessage>,
+pub(crate) fn send_banner_batch(
+    log_tx: &crate::log_stream::SheddingLogSender,
     drv_path: &str,
     executor_id: &str,
     first_line_number: u64,
@@ -1954,13 +1977,10 @@ pub(crate) async fn send_banner_batch(
         first_line_number,
         lines,
     };
-    let msg = ExecutorMessage {
-        msg: Some(rio_proto::types::executor_message::Msg::LogBatch(batch)),
-    };
-    if log_tx.send(msg).await.is_err() {
+    if log_tx.try_send_batch(batch) == crate::log_stream::LogSendOutcome::Closed {
         tracing::debug!(
             drv_path = %drv_path,
-            "banner batch dropped: log channel closed (scheduler stream gone)"
+            "banner batch dropped: log channel closed (worker shutting down)"
         );
     }
 }
@@ -2406,6 +2426,133 @@ mod tests {
         assert_eq!(
             footer_result_native(&Err(ExecutorError::Cancelled)),
             "failed (executor error)"
+        );
+    }
+
+    /// THE merged_bug_019 decoupling pin at the loop level: with the
+    /// sink full and NEVER drained, the log loop keeps consuming the
+    /// rio-exec event stream (shedding batches) instead of parking on
+    /// the first send — pre-FU1 this test times out at the second
+    /// batch boundary.
+    // r[verify builder.relay.log-shed]
+    #[tokio::test]
+    async fn log_loop_drains_exec_events_while_sink_full() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (sink_tx, _sink_rx) = tokio::sync::mpsc::channel(1);
+        let shedder = crate::log_stream::SheddingLogSender::new(sink_tx);
+        let batcher = LogBatcher::new(
+            "/rio/store/aaa-x.drv".into(),
+            "w0".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+            0,
+        );
+        let (event_tx, event_rx) = mpsc::channel::<rio_exec::ExecEvent>(8);
+        let loop_task = tokio::spawn(native_log_loop(
+            event_rx,
+            batcher,
+            shedder,
+            tmp.path().to_path_buf(),
+        ));
+
+        // 500 lines: ~8 batches, far past the single sink slot. Every
+        // send must complete promptly because the loop always drains.
+        let feed = async {
+            for i in 0..500u32 {
+                event_tx
+                    .send(rio_exec::ExecEvent::Log {
+                        stream: rio_exec::LogStream::Merged,
+                        line: format!("line-{i}").into_bytes(),
+                        terminated: true,
+                    })
+                    .await
+                    .expect("event send");
+            }
+            drop(event_tx);
+        };
+        tokio::time::timeout(Duration::from_secs(10), feed)
+            .await
+            .expect("the loop must keep draining events while the sink is full");
+
+        let result = tokio::time::timeout(Duration::from_secs(10), loop_task)
+            .await
+            .expect("loop must exit after the event stream closes")
+            .expect("loop task");
+        assert!(
+            result.final_line_count >= 500,
+            "every line was numbered (delivered or shed): {}",
+            result.final_line_count
+        );
+        assert!(!result.log_limit_exceeded);
+    }
+
+    /// Shed accounting end to end: a full sink sheds a batch (counted),
+    /// and the next delivered batch is preceded by a single suppression
+    /// marker whose line numbering exposes the forward gap of the shed
+    /// span.
+    // r[verify builder.relay.log-shed]
+    #[tokio::test]
+    async fn shed_on_full_counts_and_marks() {
+        use crate::log_stream::AddLineResult;
+
+        let rec = rio_test_support::metrics::CountingRecorder::default();
+        let _guard = metrics::set_default_local_recorder(&rec);
+
+        let (sink_tx, mut sink_rx) = tokio::sync::mpsc::channel(1);
+        let shedder = crate::log_stream::SheddingLogSender::new(sink_tx);
+        let mut batcher = LogBatcher::new(
+            "/rio/store/aaa-x.drv".into(),
+            "w0".into(),
+            crate::log_stream::LogLimits::UNLIMITED,
+            0,
+        );
+
+        let fill_batch = |batcher: &mut LogBatcher| loop {
+            if let AddLineResult::BatchReady(b) = batcher.add_line(b"x".to_vec()) {
+                break b;
+            }
+        };
+
+        // Batch 1 (lines 0-63) occupies the only sink slot.
+        let b1 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&mut batcher, &shedder, b1));
+        // Batch 2 (lines 64-127) sheds — the sink is full.
+        let b2 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&mut batcher, &shedder, b2), "shed ≠ closed");
+        assert_eq!(
+            rec.get("rio_builder_log_messages_shed_total{kind=log_batch}"),
+            1
+        );
+
+        // Sink drains; batch 3 delivers and injects the marker first.
+        let delivered1 = sink_rx.try_recv().expect("batch 1 was delivered");
+        let b3 = fill_batch(&mut batcher);
+        assert!(deliver_batch(&mut batcher, &shedder, b3));
+        let delivered3 = sink_rx.try_recv().expect("batch 3 was delivered");
+
+        let first_line = |msg: &rio_proto::types::ExecutorMessage| match &msg.msg {
+            Some(rio_proto::types::executor_message::Msg::LogBatch(b)) => b.first_line_number,
+            other => panic!("expected a LogBatch, got {other:?}"),
+        };
+        assert_eq!(first_line(&delivered1), 0);
+        assert_eq!(
+            first_line(&delivered3),
+            128,
+            "the shed batch's span (64-127) is a forward line-number gap"
+        );
+
+        // The marker rides the batcher: the next flush carries exactly
+        // one suppression marker naming the shed count.
+        let tail = batcher.flush();
+        assert_eq!(tail.first_line_number, 192);
+        let markers: Vec<_> = tail
+            .lines
+            .iter()
+            .filter(|l| l.starts_with(b"[rio: "))
+            .collect();
+        assert_eq!(markers.len(), 1, "single marker on recovery");
+        assert_eq!(
+            std::str::from_utf8(markers[0]).unwrap(),
+            "[rio: 1 log messages shed (scheduler link backpressure)]"
         );
     }
 }

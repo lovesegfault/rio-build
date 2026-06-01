@@ -16,6 +16,7 @@
     "rio_builder_fuse_jit_lookup_total",
     "rio_builder_jit_inputs_registered",
     "rio_builder_log_lines_suppressed_total",
+    "rio_builder_log_messages_shed_total",
     "rio_builder_memory_fraction",
     "rio_builder_overlay_teardown_failures_total",
     "rio_builder_prefetch_filtered_total",
@@ -292,6 +293,11 @@
         "name": "rio_builder_log_lines_suppressed_total",
         "kind": "counter",
         "help": "Log lines dropped by rate suppression (log_rate_limit). Build continues with a `[rio: N lines suppressed …]` marker. Nonzero is normal for bursty builds (kernel oldconfig, autoconf); sustained high rate = pathological producer."
+      },
+      {
+        "name": "rio_builder_log_messages_shed_total",
+        "kind": "counter",
+        "help": "Display-stream messages (BuildLogBatch / BuildPhase, by `kind`) shed because the permanent sink was full — scheduler-link backpressure. The build and its limit enforcement continue; the next delivered batch carries a `[rio: N log messages shed …]` marker. Sustained growth = degraded scheduler link, not a build problem. Control messages (CompletionReport, PrefetchComplete) are never shed."
       },
       {
         "name": "rio_builder_memory_fraction",

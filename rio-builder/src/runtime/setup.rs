@@ -205,7 +205,7 @@ pub async fn setup(
     // (mpsc::error::SendError<T> holds the unsent message) and
     // blocks on watch.changed() until the reconnect loop swaps
     // in a fresh gRPC channel.
-    // r[impl builder.relay.reconnect]
+    // r[impl builder.relay.reconnect+1]
     let (sink_tx, sink_rx) = mpsc::channel::<ExecutorMessage>(256);
 
     // Relay target: Some(grpc_tx) while connected, None during

@@ -788,8 +788,7 @@ semantics shift, accepted: a build whose *writes* are blocked by a
 worker-internal stalled consumer can now be silence-killed where it
 previously froze alongside its enforcement --- reaching that state
 requires a worker bug, since the worker's own consumer is structurally
-non-stalling (the relay-side log-shed rule, which lands with the
-rio-builder half of this change, is what guarantees that).
+non-stalling (#rref("builder.relay.log-shed")).
 
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
@@ -846,6 +845,10 @@ requirement and the display-only / no-pod-identity rationale live in
   max-silent deadline is governed by the builder's raw output, which
   includes the frame itself; see #rref("builder.silence.timeout-kill")).
 ]
+
+Phase delivery is subject to the relay's log-shed policy
+(#rref("builder.relay.log-shed")): a phase edge shed under scheduler-link
+backpressure is display loss only, never control-plane loss.
 
 #r("builder.stderr.msg-cap")[
   The build-log loop enforces a hard cap of 10M captured lines per build,
@@ -1519,10 +1522,14 @@ is stable (post Phase 3).
   anyway.
 ]
 
-#r("builder.relay.reconnect")[
+#r("builder.relay.reconnect+1")[
   Running builds send `CompletionReport`/`BuildLogBatch`/`PrefetchComplete` to
   a process-lifetime `mpsc::channel(256)` (the permanent sink), NOT to the
-  gRPC outbound channel directly. A `relay_loop` task pumps the sink into
+  gRPC outbound channel directly. Submission into the sink is split by
+  message class: `CompletionReport`, `PrefetchComplete`, and the pre-build
+  `WorkAssignmentAck` are awaited, guaranteed sends; `BuildLogBatch` and
+  `BuildPhase` reach the sink only through the shedding log sender
+  (#rref("builder.relay.log-shed")). A `relay_loop` task pumps the sink into
   whichever gRPC outbound channel is currently live, tracked via
   `watch::channel<Option<Sender>>`. On `BuildExecution` stream close/error the
   reconnect loop swaps the watch to `None` (relay blocks on `changed()`, sink
@@ -1533,10 +1540,37 @@ is stable (post Phase 3).
   `biased;` on `target.changed()` BEFORE `sink_rx.recv()` --- `grpc_tx.send()`
   may keep succeeding into a zombie tonic `ReceiverStream` that outlived its
   network stream (I-032: completions silently lost for \~20min after scheduler
-  failover). Why a permanent sink: `stderr_loop` breaks the build with
-  `MiscFailure` if its log send fails; handing build tasks the gRPC channel
-  directly would kill every running build on scheduler failover.
+  failover). Why a permanent sink: handing build tasks the gRPC channel
+  directly would kill every running build on scheduler failover; the sink
+  decouples build lifetime from stream lifetime, and the shed/guaranteed
+  split decouples build *progress* from sink occupancy.
 ]
+
+#r("builder.relay.log-shed")[
+  `BuildLogBatch` and `BuildPhase` messages MUST be submitted to the
+  permanent sink with a non-blocking `try_send` through the worker's
+  shedding log sender: a full sink sheds the message, counts it in
+  `rio_builder_log_messages_shed_total` (by `kind`), and the next
+  delivered batch MUST carry a single suppression marker line reporting
+  the shed count. `CompletionReport`, `PrefetchComplete`, and
+  `WorkAssignmentAck` MUST remain awaited, guaranteed sends, and MUST
+  NOT be constructible through the shedding sender.
+]
+
+The type is the boundary: `SheddingLogSender` exposes only
+`try_send_batch`/`try_send_phase`, so routing a control message through the
+best-effort path is a compile error, not a review catch. Every display
+construction site goes through it --- the log loop's five sends and
+`send_banner_batch` with both its callers (the executor header, the runtime
+footer) --- so a degraded scheduler link degrades the *display* stream only:
+builds keep running, limit kills keep firing
+(#rref("builder.exec.limits-isolated")), completions keep their guaranteed
+delivery. The suppression marker consumes a line number and counts toward
+the byte cap exactly like the rate-suppression marker, so persisted logs
+show a forward line-number gap over the shed span (the `obs.log.gap-span`
+shape the scheduler ring buffer already accepts); the marker itself is
+best-effort --- a shed final flush leaves a bounded display gap with no
+later carrier.
 
 #r("builder.result.input-materialization-is-infra+3")[
   A build failure caused by an input path that was verified present in
@@ -1810,7 +1844,7 @@ and multiplexes all communication; natural backpressure prevents worker
 overload without explicit rate limiting; incremental log streaming gives
 dashboard users real-time build output. On the negative side: long-lived
 streams are sensitive to network instability and require robust reconnection
-logic with state reconciliation (#rref("builder.relay.reconnect")), and
+logic with state reconciliation (#rref("builder.relay.reconnect+1")), and
 debugging stream-level issues is harder than debugging individual
 request/response RPCs.
 
