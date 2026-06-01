@@ -331,13 +331,31 @@ in
   #     kernels — for ANY classifier input judged must-substitute, an
   #     authenticated at-or-above-floor pull of that Ready node is
   #     parked, never minted and never dismissed Gone.
+  #
+  # Kinded coexistence wrapper (rio-evidence-kernel/src/pull.rs
+  # `mod kinded_proofs` — substitution-replacement Phase A, design §2.3):
+  #   - check_kinded_flag_off_identity: the dormancy theorem — with the
+  #     materialization flag off, admit_pull_kinded(Build) is
+  #     extensionally equal to the as-built admit_pull over the full
+  #     bounded domain, and a materialization pull parks harmlessly
+  #     (never errors, never writes, never delivers).
+  #   - check_kinded_no_build_delivery_while_job_unresolved: flag-on, a
+  #     build pull is never delivered (new or re-delivery) while the
+  #     node has an unresolved materialization job; rejections keep
+  #     their dominance order.
+  #   - check_kinded_one_winner_arbitration: a materialization pull is
+  #     delivered only when no open attempt is held by a different
+  #     identity (BC-1/AS-3): fresh claims need an unparked Pending job
+  #     on a Ready node; re-deliveries carry exactly the holder's exec
+  #     id; a claim held by another identity never yields a delivery.
   # r[verify sched.merge.substitute-topdown+12]
   # r[verify sched.evidence.closure-hole]
   # r[verify sched.executor.pull-gone]
   # r[verify sched.executor.pull-not-ready+2]
+  # r[verify sched.materialize.job]
   kani-rio-evidence-kernel = mkKaniCheck {
     name = "rio-evidence-kernel";
     crate = crateBuildKani.members.rio-evidence-kernel;
-    expectedHarnesses = 13;
+    expectedHarnesses = 16;
   };
 }

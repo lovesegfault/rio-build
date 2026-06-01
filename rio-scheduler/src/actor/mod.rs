@@ -310,6 +310,13 @@ pub struct DagActor {
     /// former `POISON_THRESHOLD` const (3). Default matches prior
     /// behavior: 3 distinct workers.
     poison_config: PoisonConfig,
+    /// Substitution-replacement materialization config
+    /// (`[materialization]` table, config `materialization`). Phase A
+    /// deployed state is `enabled = false`: the pull-admission shim
+    /// passes the flag to the kernel's kinded wrapper (bit-identical to
+    /// as-built when off), and every other consumer (job creation,
+    /// consumption, establishment) is flag-gated on it.
+    materialization_cfg: crate::config::MaterializationConfig,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -725,6 +732,7 @@ impl DagActor {
             retry_policy: cfg.retry_policy,
             poison_config: cfg.poison,
             establishment_report_slack: cfg.establishment_report_slack,
+            materialization_cfg: cfg.materialization,
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
@@ -850,6 +858,9 @@ impl DagActor {
             retry_policy: _,
             establishment_report_slack: _,
             poison_config: _,
+            // Retained: operator deploy config, not per-term state — a
+            // leader transition doesn't change the materialization flag.
+            materialization_cfg: _,
             db: _,
             store_client: _,
             grpc_timeout: _,

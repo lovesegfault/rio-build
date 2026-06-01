@@ -95,6 +95,18 @@ pub(crate) struct PullInputs<'a> {
     pub serving_generation: u64,
     /// The durable claims floor (`None` = fresh cluster, no rows).
     pub generation_floor: Option<i64>,
+    /// `scheduler.materialization.enabled` (substitution-replacement
+    /// Phase A). False — the deployed Phase A state — makes the kinded
+    /// kernel wrapper bit-identical to the as-built admission.
+    pub materialization_enabled: bool,
+    /// The pull's claimed work class. Build until the gRPC intake
+    /// plumbs the proto `kind` field; materialization claims arrive
+    /// only flag-on.
+    pub pull_kind: rio_evidence_kernel::pull::PullKind,
+    /// The node's materialization-job state, projected from the actor's
+    /// in-memory job view. Always `None` flag-off (the view is never
+    /// loaded).
+    pub job_view: rio_evidence_kernel::pull::JobView,
 }
 
 // r[impl sched.executor.pull-gone]
@@ -116,16 +128,29 @@ pub(crate) struct PullInputs<'a> {
 /// generation-fence half (`r[sched.lease.generation-fence+3]`), both of
 /// which now live at the kernel's marked arms.
 pub(crate) fn admit_pull(inputs: &PullInputs<'_>) -> PullDecision {
-    rio_evidence_kernel::pull::admit_pull(rio_evidence_kernel::pull::PullRequest {
-        intent_id: inputs.intent_id,
-        auth_intent: inputs.auth_intent,
-        serving_generation: inputs.serving_generation,
-        generation_floor: inputs.generation_floor,
-        status: inputs.status.map(pull_node_status),
-        must_substitute: inputs.must_substitute,
-        open_attempt: inputs.open_attempt,
-        pulling_identity: inputs.pulling_identity,
-    })
+    // Substitution-replacement Phase A: the shim routes through the
+    // kind-aware coexistence wrapper. Flag-off (the deployed state) the
+    // wrapper delegates straight to the as-built kernel for build pulls
+    // — proven bit-identical by the kernel's flag-off identity theorem
+    // (`kinded_wrapper_flag_off_equals_as_built` + the
+    // `check_kinded_flag_off_identity` CBMC harness).
+    rio_evidence_kernel::pull::admit_pull_kinded(
+        rio_evidence_kernel::pull::PullRequest {
+            intent_id: inputs.intent_id,
+            auth_intent: inputs.auth_intent,
+            serving_generation: inputs.serving_generation,
+            generation_floor: inputs.generation_floor,
+            status: inputs.status.map(pull_node_status),
+            must_substitute: inputs.must_substitute,
+            open_attempt: inputs.open_attempt,
+            pulling_identity: inputs.pulling_identity,
+        },
+        rio_evidence_kernel::pull::MaterializationInputs {
+            enabled: inputs.materialization_enabled,
+            kind: inputs.pull_kind,
+            job: inputs.job_view,
+        },
+    )
 }
 
 /// `DerivationStatus` → kernel [`PullNodeStatus`] — variant-for-variant.
@@ -214,6 +239,14 @@ impl DagActor {
             pulling_identity: &pulling_identity,
             serving_generation,
             generation_floor,
+            materialization_enabled: self.materialization_cfg.enabled,
+            // The kind/job-view intake: the gRPC layer's proto `kind`
+            // field and the in-memory job view land with the
+            // materialization listing/creation handlers; until then
+            // every pull is a build pull of a job-less node — exactly
+            // the as-built admission domain.
+            pull_kind: rio_evidence_kernel::pull::PullKind::Build,
+            job_view: rio_evidence_kernel::pull::JobView::None,
         });
 
         match decision {
@@ -433,6 +466,11 @@ mod kernel_tests {
             pulling_identity: pulling,
             serving_generation: 3,
             generation_floor: Some(3),
+            // Flag-off defaults (mechanical carve-out 1c): the kinded
+            // wrapper is bit-identical to the as-built kernel for these.
+            materialization_enabled: false,
+            pull_kind: rio_evidence_kernel::pull::PullKind::Build,
+            job_view: rio_evidence_kernel::pull::JobView::None,
         }
     }
 
