@@ -79,6 +79,96 @@ pkgs.testers.runNixOSTest {
         timeout=90,
     )
 
+    # ── canary gate: positive evidence the Stage machinery is live ───
+    # The restart above is exposed to the same discovery race it works
+    # around: the restarted kwok-controller re-runs RESTMapper
+    # discovery on Stage add, and a miss drops the NodeClaim
+    # resourceRef permanently again — the Deployment reports Ready but
+    # never acts on a NodeClaim (observed in CI: only the 4 startup
+    # log lines, no Stage activity). Waiting longer cannot recover
+    # that state, so before the real test runs, a throwaway canary
+    # NodeClaim must reach Launched=True (the first Stage rule, 2s
+    # delay). The canary carries NO labels: the rio-controller's
+    # owner-label watch and every label-selector assertion below are
+    # blind to it.
+    canary = _json.dumps({
+        "apiVersion": "karpenter.sh/v1",
+        "kind": "NodeClaim",
+        "metadata": {"name": "canary-stage-liveness"},
+        "spec": {
+            # Minimal admission-passing shape: nodeClassRef +
+            # requirements are CRD-required; resources.requests must
+            # carry all three keys the nodeclaim-launched Stage's
+            # statusTemplate indexes.
+            "nodeClassRef": {
+                "group": "karpenter.k8s.aws",
+                "kind": "EC2NodeClass",
+                "name": "rio-default",
+            },
+            "requirements": [
+                {
+                    "key": "kubernetes.io/os",
+                    "operator": "In",
+                    "values": ["linux"],
+                },
+            ],
+            "resources": {
+                "requests": {
+                    "cpu": "1",
+                    "memory": "1Gi",
+                    "ephemeral-storage": "1Gi",
+                },
+            },
+        },
+    })
+
+    def stage_machinery_live():
+        # Apply the canary and give the Stage 15s to set Launched=True.
+        # The canary is deleted on every path so it can never leak into
+        # the real test's nodeclaim listings.
+        try:
+            k3s_server.succeed(
+                "k3s kubectl apply -f - <<'EOF'\n" + canary + "\nEOF"
+            )
+            k3s_server.wait_until_succeeds(
+                "k3s kubectl get nodeclaims canary-stage-liveness "
+                "-o jsonpath='{.status.conditions[?(@.type==\"Launched\")].status}' "
+                "| grep -q True",
+                timeout=15,
+            )
+            return True
+        except Exception:
+            return False
+        finally:
+            k3s_server.succeed(
+                "k3s kubectl delete nodeclaims canary-stage-liveness "
+                "--ignore-not-found"
+            )
+
+    for attempt in range(1, 4):
+        if stage_machinery_live():
+            break
+        print(f"=== canary NodeClaim not Launched (attempt {attempt}/3) ===")
+        if attempt == 3:
+            print(k3s_server.execute(
+                "k3s kubectl get stages.kwok.x-k8s.io -o yaml; "
+                "k3s kubectl -n kube-system logs deploy/kwok-controller --tail=200"
+            )[1])
+            raise Exception(
+                "kwok Stage machinery dead after 3 kwok-controller "
+                "restarts — not a flake; check the dumped Stage objects "
+                "and kwok-controller log (resourceRef discovery, kwok "
+                "image)"
+            )
+        k3s_server.succeed(
+            "k3s kubectl -n kube-system rollout restart deploy/kwok-controller"
+        )
+        k3s_server.wait_until_succeeds(
+            "k3s kubectl -n kube-system rollout status deploy/kwok-controller "
+            "--timeout=60s",
+            timeout=90,
+        )
+
     # ── submit a build → scheduler emits SpawnIntents ────────────────
     # 4-leaf fanout: enough to produce ≥1 unplaced intent (zero
     # NodeClaims initially → EVERY intent unplaced on tick 1). The
