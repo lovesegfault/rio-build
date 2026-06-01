@@ -60,6 +60,7 @@ let
   substitute = import ./scenarios/substitute.nix;
   log-service = import ./scenarios/log-service.nix;
   substitute-scale = import ./scenarios/substitute-scale.nix;
+  materialize = import ./scenarios/materialize.nix;
   sla-sizing = import ./scenarios/sla-sizing.nix;
   forecast-provisioning = import ./scenarios/forecast-provisioning.nix;
   kwok = import ./fixtures/kwok.nix { inherit pkgs; };
@@ -317,6 +318,89 @@ let
       );
     };
 
+  # ── materialize scenario builder (both flag states — T-3.1/PD-B3) ───
+  # The §2.4 routing-arms / §2.5 park / §5.3 gc-pin scenario
+  # (scenarios/materialize.nix) — the substitution failure paths the
+  # substitute scenarios' success paths never reach. Same
+  # one-builder-two-attrs pattern as mkSubstituteStandalone. Fixture
+  # knobs that are load-bearing for determinism:
+  #   - withHmac: the consumption re-probe can only CONFIRM a missing
+  #     path with service-auth probes (x-rio-service-token +
+  #     x-rio-probe-tenant-id); without it, arm 3's fail-fast is
+  #     structurally unreachable (B3's conservative direction) and the
+  #     scenario would hang instead of failing fast.
+  #   - tickIntervalSecs=600: keeps the dispatch-time re-probe
+  #     (housekeeping-advanced probe generation) out of every subtest
+  #     window, so flag-on the §2.4 consumption routing is the ONLY
+  #     decision path for reported outcomes — mechanism assertions
+  #     (job end-states) are deterministic, not racing the as-built
+  #     dispatch-probe fail-fast cell. All subtest progress is
+  #     event-driven (claim/report/consumption, park-expiry re-claim,
+  #     completion hooks), never tick-driven.
+  #   - PARK_BACKOFF_BASE_SECS=5: test-speed park expiry (default 30 s).
+  #   - Store [jwt] config: the scenario submits gRPC-direct WITH a
+  #     minted tenant JWT, because the topdown-prune probe
+  #     (check_roots_topdown) propagates ONLY the client JWT to the
+  #     store — without it the prune can never fire and the
+  #     marked-root fail-fast sequence is unreachable. The store
+  #     verifies that JWT for its upstream probes (the same
+  #     gateway-JWT-propagation path substitute.nix exercises).
+  mkMaterializeStandalone =
+    materializationEnabled:
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+    in
+    materialize {
+      inherit pkgs common materializationEnabled;
+      fixture = standalone (
+        {
+          workers = { };
+          withHmac = true;
+          extraStoreConfig = {
+            # [jwt]: verify the scenario's minted tenant tokens (see the
+            # builder comment above).
+            #
+            # [materialization] poll_interval_secs=3600: the executor
+            # polls (and therefore claims) ONLY at store startup — each
+            # claim wave is an explicit `restart_store()` step in the
+            # scenario, so a claim can never be in flight when the
+            # scenario restarts the store and no open attempt can be
+            # orphaned mid-execution (establishment is tick-driven and
+            # the tick is 600 s here). The env layer still owns
+            # `enabled` (the flag under test); this file key only paces
+            # the executor.
+            extraConfig = ''
+              [jwt]
+              key_path = "${jwtPubkey}"
+
+              [materialization]
+              poll_interval_secs = 3600
+            '';
+          };
+          extraSchedulerEnv = {
+            RIO_MATERIALIZATION__PARK_BACKOFF_BASE_SECS = "5";
+          };
+          extraSchedulerConfig = {
+            tickIntervalSecs = 600;
+          };
+          extraPackages = [
+            pkgs.grpcurl
+            pkgs.postgresql_18
+          ];
+          extraClientModules = [
+            { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+          ];
+        }
+        # The flag-on attr inherits the fixture's flipped default; the
+        # -walk oracle pins flag-off explicitly, OVERRIDING the default
+        # (criterion 2's revertability posture).
+        // pkgs.lib.optionalAttrs (!materializationEnabled) {
+          materializationEnabled = false;
+        }
+      );
+    };
+
   # ── substitute-scale scenario builder (both flag states) ────────────
   # Same one-builder-two-attrs pattern as mkSubstituteStandalone, on the
   # k3s fixture: the materialization flag is threaded to the scenario
@@ -546,6 +630,68 @@ in
   #   fragment, which has real builder traffic), plus the systemd-unit
   #   env guard on scheduler + store.
   vm-substitute-standalone-walk = mkSubstituteStandalone false;
+
+  # ── materialization routing/park/gc-pin (both flag states — T-3.1) ──
+  # The substitution FAILURE paths at deployment level: the §2.4
+  # Unobtainable routing arms, the §2.5 infra park, and the §5.3 pin
+  # lifecycle against a real GC sweep — what the substitute scenarios'
+  # success paths never reach. One mode-switched fake upstream drives
+  # every arm (per-path 404/503/head-only narinfo answers); the flag-on
+  # and flag-off attrs script the SAME sequences and assert the SAME
+  # client-visible outcome triple through shared assertion text
+  # (criterion 1 / review eq-5); only the mechanism blocks differ.
+  #
+  # ── Flag-ON: the §2.4 routing arms + §2.5 park + §5.3 pins ──────────
+  # r[verify sched.materialize.routing]
+  #   routing-fail-fast: a topdown-pruned root whose output is confirmed
+  #   missing upstream fails every interested build with the
+  #   resubmit-directing error (arm 3: Unobtainable → consumption
+  #   re-probe confirms → fail-fast); the job resolves
+  #   resolved_unobtainable, exactly one materialization_unobtainable
+  #   charge row, zero build-kind rows.
+  #   routing-vouched-from-source: the same Unobtainable verdict on a
+  #   node whose only dep is produced routes ResolveFromSource (arm 1) —
+  #   the node returns to from-source eligibility, the build stays live,
+  #   never a fail-fast.
+  #   infra-park: upstream 5xx burns the materialization budget → the
+  #   job parks (pending + park_until, claimable after backoff) and the
+  #   build NEVER fails (B3); healing the upstream completes the build.
+  # r[verify sched.materialize.pinning]
+  #   gc-pin: pin-at-ingest rows (pin_kind='materialization') protect
+  #   materialized paths from a real TriggerGC sweep while any
+  #   interested build is live; the §5.3 all-interest-terminal release
+  #   frees them and the next sweep collects. The unpinned control path
+  #   collected in sweep #1 is the non-vacuity proof that the sweep ran.
+  # r[verify sched.materialize.job]
+  #   routing-fail-fast: the topdown prune creates the origin=pruned job
+  #   inside the merge transaction (and the pruned dep never enters the
+  #   DAG); routing-vouched-from-source: the indeterminate probe creates
+  #   the cache_opportunity job (B3's optimistic creation).
+  vm-materialization-standalone = mkMaterializeStandalone true;
+
+  # ── Flag-OFF oracle: the as-built walk path, same sequences ─────────
+  # The OQ7 comparison legs for unobtainable-then-fail-fast,
+  # unobtainable-then-from-source, and infra-retry (review eq-1): the
+  # same submissions and upstream behavior, served by the as-built walk;
+  # identical client-visible outcome assertions (shared assert_outcome
+  # text), per-branch mechanism assertions (walk metrics, zero
+  # materialization rows). Plus the five-clause dormancy zero-count over
+  # all that walk traffic (criterion 2). No gc-pin oracle: the walk
+  # creates no materialization pins (as-built pin behavior is covered by
+  # vm-lifecycle-gc-k3s).
+  # r[verify sched.merge.substitute-topdown+12]
+  #   walk-unobtainable: the marked pruned root's failed walk settles
+  #   through the verification one-shot then fail-fasts with the same
+  #   resubmit-directing error the flag-on arm-3 routing produces.
+  # r[verify sched.evidence.settlement]
+  #   walk-unobtainable: the settlement path (re-probe → verification
+  #   walk → spent one-shot → fail-fast) is what disposes the marked
+  #   root; the build's terminal verdict is its observable outcome.
+  # r[verify sched.substitute.detached+5]
+  #   walk-vouched-from-source + walk-infra-retry: the detached walk
+  #   serves both sequences — exhaustion reverts the node to from-source
+  #   eligibility; in-ladder upstream recovery completes the build.
+  vm-materialization-standalone-walk = mkMaterializeStandalone false;
 
   # ── log-service (standalone fixture, no workers) ─────────────────────
   # rio-store LogService end-to-end: authenticated AppendLog ingest →
