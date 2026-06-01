@@ -216,6 +216,97 @@ fn every_proto_has_a_snapshot_test() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// Back-compat decode tests for the substitution-replacement Phase-A
+// additions (PullAssignmentRequest.kind / .executor_instance,
+// ReportOutcomeRequest.materialization_outcome).
+//
+// The absent-vs-zero analysis per the module-docs ritual:
+//   - `kind`: absent ⇒ 0 (ATTEMPT_KIND_UNSPECIFIED) ⇒ the scheduler treats
+//     it as BUILD. Zero IS the back-compat meaning, so no `optional`.
+//   - `executor_instance`: absent ⇒ "" ⇒ ignored for BUILD pulls. No
+//     `optional`.
+//   - `materialization_outcome`: message-typed ⇒ proto3 tracks presence
+//     natively (None = build report, exactly as before).
+// ---------------------------------------------------------------------------
+
+/// A `PullAssignmentRequest` encoded WITHOUT the Phase-A fields (what
+/// every deployed builder pod sends) decodes with kind=UNSPECIFIED and
+/// empty executor_instance — the values the scheduler maps to as-built
+/// BUILD behavior. And the recompiled builder's request (new fields at
+/// their defaults) encodes to exactly those legacy bytes — prost omits
+/// default-valued fields, so the sender side is wire-identical too.
+/// Pins both halves of the frozen-contract addendum.
+#[test]
+fn pull_assignment_request_decodes_without_phase_a_fields() {
+    use prost::Message;
+    // The legacy wire image: field 1 ("tok") + field 2 ("drv-x") only —
+    // byte-for-byte what a pre-Phase-A builder pod sends.
+    let legacy_bytes: &[u8] = &[
+        0x0A, 0x03, b't', b'o', b'k', // executor_token = "tok"
+        0x12, 0x05, b'd', b'r', b'v', b'-', b'x', // intent_id = "drv-x"
+    ];
+
+    // Decode half: legacy bytes read back with the new fields at their
+    // proto3 zero values (UNSPECIFIED kind, empty executor_instance).
+    let decoded = rio_proto::types::PullAssignmentRequest::decode(legacy_bytes).unwrap();
+    assert_eq!(decoded.executor_token, "tok");
+    assert_eq!(decoded.intent_id, "drv-x");
+    assert_eq!(
+        decoded.kind,
+        rio_proto::types::AttemptKind::Unspecified as i32
+    );
+    assert!(decoded.executor_instance.is_empty());
+
+    // Encode half: a recompiled builder constructing the same request
+    // with the new fields defaulted produces byte-identical output.
+    let recompiled = rio_proto::types::PullAssignmentRequest {
+        executor_token: "tok".into(),
+        intent_id: "drv-x".into(),
+        ..Default::default()
+    };
+    assert_eq!(
+        recompiled.encode_to_vec(),
+        legacy_bytes,
+        "prost must omit default-valued Phase-A fields (wire-identical sender)"
+    );
+}
+
+/// A `ReportOutcomeRequest` without `materialization_outcome` (every
+/// builder report) decodes with the field `None` — the build-report
+/// path — and a recompiled builder's report encodes byte-identically
+/// to the legacy wire image.
+#[test]
+fn report_outcome_request_decodes_without_materialization_outcome() {
+    use prost::Message;
+    // The legacy wire image: field 1 (exec_id) only (a report-less
+    // request — `report` itself is message-typed and absent here so the
+    // byte image stays hand-checkable; presence of `report` is
+    // orthogonal to the new field).
+    let legacy_bytes: &[u8] = &[
+        0x0A, 0x06, b'e', b'x', b'e', b'c', b'-', b'1', // exec_id = "exec-1"
+    ];
+
+    let decoded = rio_proto::types::ReportOutcomeRequest::decode(legacy_bytes).unwrap();
+    assert_eq!(decoded.exec_id, "exec-1");
+    assert!(decoded.report.is_none());
+    assert!(
+        decoded.materialization_outcome.is_none(),
+        "absent materialization_outcome must decode as None (the build-report path)"
+    );
+
+    let recompiled = rio_proto::types::ReportOutcomeRequest {
+        exec_id: "exec-1".into(),
+        report: None,
+        ..Default::default()
+    };
+    assert_eq!(
+        recompiled.encode_to_vec(),
+        legacy_bytes,
+        "prost must omit the absent materialization_outcome (wire-identical sender)"
+    );
+}
+
 /// Pin the extraction helper's normalisation behaviour: leading
 /// modifiers, generics, trailing comments, comment-only lines,
 /// `reserved` statements, and enum values.

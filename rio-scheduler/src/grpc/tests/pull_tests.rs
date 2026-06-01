@@ -43,6 +43,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
         .report_outcome(rio_proto::types::ReportOutcomeRequest {
             exec_id: uuid::Uuid::now_v7().to_string(),
             report: None,
+            ..Default::default()
         })
         .await
         .expect_err("token-less ReportOutcome must be rejected when HMAC is configured");
@@ -53,6 +54,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
     let mut req = tonic::Request::new(rio_proto::types::ReportOutcomeRequest {
         exec_id: uuid::Uuid::now_v7().to_string(),
         report: None,
+        ..Default::default()
     });
     req.metadata_mut()
         .insert(rio_proto::EXECUTOR_TOKEN_HEADER, token.parse()?);
@@ -68,6 +70,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
         .pull_assignment(rio_proto::types::PullAssignmentRequest {
             executor_token: token.clone(),
             intent_id: "intent-pull".into(),
+            ..Default::default()
         })
         .await
         .expect("body-token PullAssignment is accepted")
@@ -85,6 +88,7 @@ async fn pull_unaries_enforce_executor_identity_when_hmac_configured() -> anyhow
         .pull_assignment(rio_proto::types::PullAssignmentRequest {
             executor_token: String::new(),
             intent_id: "intent-pull".into(),
+            ..Default::default()
         })
         .await
         .expect_err("credential-less PullAssignment must be rejected when HMAC is configured");

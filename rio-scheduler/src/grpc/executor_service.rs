@@ -34,6 +34,10 @@ use super::SchedulerGrpc;
 //   intent_id                         → DAG lookup, assignments/executions rows → reject RPC > MAX_IDENT_LEN
 //   executor_token                    → HMAC-verified then dropped        → reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //                                       (verification fails on any tamper; the bound only caps the hash work)
+//   kind                              → n/a (enum/i32; never read in Phase A — the
+//                                       materialization claim intake is Wave-3/T-3.3 work)
+//   executor_instance                 → never read in Phase A (dormant)   → bound lands with the T-3.3
+//                                       identity intake (per-replica ExecutorId binding)
 // ReportOutcome RPC (pull-mode dispatch):
 //   exec_id                           → UUID parse → attempt lookup       → reject RPC if not a valid UUID
 //   report.result.error_msg           → event ring, terminal payload      → truncate to MAX_ERROR_MSG_LEN
@@ -41,6 +45,14 @@ use super::SchedulerGrpc;
 //   report.drv_path                   → never read (exec_id names the attempt) → dropped before the actor
 //   report numerics (peak_*, final_resources.*) → build_samples row       → validated actor-side (completion.rs
 //                                       record_build_sample: finite/in-domain or NULL; .min(i64::MAX) clamps)
+//   materialization_outcome.*         → never read in Phase A (dormant: the intake treats the
+//                                       request exactly as one without it) → bounds land with the
+//                                       Wave-3 consumption transaction (T-3.5)
+// ListMaterializationJobs RPC (Phase A dormant stub — always the disabled-state empty list):
+//   service_token / limit             → never read in Phase A             → bounds land with T-3.3
+// ReportMaterializationProgress RPC (Phase A: acknowledge-and-drop, per the wire contract):
+//   exec_id / upstream_uri / bytes_*  → never read in Phase A             → bounds land with the
+//                                       Phase-B progress relay
 
 /// Upper bound on worker-supplied identifier/label fields: `intent_id`,
 /// `node_name`, and `hw_class`. All are either k8s object names (≤253
@@ -283,5 +295,41 @@ impl ExecutorService for SchedulerGrpc {
             }
             Err(crate::actor::PullRejection::Internal(msg)) => Err(Status::internal(msg)),
         }
+    }
+
+    /// Store-replica poll for claimable materialization jobs
+    /// (substitution-replacement Phase A).
+    ///
+    /// Phase A dormant stub: materialization dispatch is never enabled,
+    /// so this always answers the wire contract's documented
+    /// disabled-state response — an empty list, read-only, no state
+    /// change, request fields never read. Wave 3 (T-3.3) replaces this
+    /// with the leader-served, service-token-verified handler backed by
+    /// the actor's claimable-job query.
+    #[instrument(skip(self, _request), fields(rpc = "ListMaterializationJobs"))]
+    async fn list_materialization_jobs(
+        &self,
+        _request: Request<rio_proto::types::ListMaterializationJobsRequest>,
+    ) -> Result<Response<rio_proto::types::ListMaterializationJobsResponse>, Status> {
+        Ok(Response::new(
+            rio_proto::types::ListMaterializationJobsResponse { jobs: Vec::new() },
+        ))
+    }
+
+    /// Fire-and-forget byte progress for a running materialization
+    /// attempt. Display-only, droppable.
+    ///
+    /// Phase A: acknowledges and drops, exactly as the wire contract
+    /// documents — no materialization attempt can exist while the
+    /// flags are off, and progress is droppable by contract even when
+    /// one does. Phase B wires the relay to build events.
+    #[instrument(skip(self, _request), fields(rpc = "ReportMaterializationProgress"))]
+    async fn report_materialization_progress(
+        &self,
+        _request: Request<rio_proto::types::ReportMaterializationProgressRequest>,
+    ) -> Result<Response<rio_proto::types::ReportMaterializationProgressResponse>, Status> {
+        Ok(Response::new(
+            rio_proto::types::ReportMaterializationProgressResponse {},
+        ))
     }
 }

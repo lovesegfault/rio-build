@@ -426,6 +426,15 @@ message PullAssignmentRequest {
   // The SpawnIntent.intent_id (== drv hash) this pod was spawned for
   // (RIO_INTENT_ID). Must match the token's attested intent.
   string intent_id = 2;
+  // NEW (additive, substitution-replacement Phase A): the attempt class
+  // this pull claims. Absent/UNSPECIFIED = BUILD — deployed builder pods
+  // that predate this field send nothing and behave bit-for-bit as
+  // before (the frozen pull-contract addendum).
+  AttemptKind kind = 3;
+  // NEW (additive): per-replica executor identity for materialization
+  // pulls (the store replica's pod name). Ignored for kind=BUILD —
+  // build-pull identity remains the attested intent (the as-built rule).
+  string executor_instance = 4;
 }
 
 // The drv is no longer wanted (cancelled, substituted, completed,
@@ -464,11 +473,92 @@ message ReportOutcomeRequest {
   // Today's completion payload, unchanged (drv_path, BuildResult,
   // telemetry, final_line_count).
   CompletionReport report = 2;
+  // NEW (additive, substitution-replacement Phase A): set INSTEAD of
+  // `report` for materialization attempts. Message-typed => proto3
+  // tracks presence; absent = build report, exactly as before. A
+  // request carrying both is rejected.
+  MaterializationOutcome materialization_outcome = 3;
 }
 
 // Empty ack. Returned only after the scheduler's appending transaction
 // committed — the pod may exit 0 once it has this.
 message ReportOutcomeResponse {}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Materialization attempts (substitution-replacement campaign, Phase A).
+// Additive and dormant: builder pods never set these fields; a request
+// without them is a build pull, bit-for-bit as before.
+// ─────────────────────────────────────────────────────────────────────────
+
+// The attempt class a pull claims. Proto3 zero value (UNSPECIFIED) is
+// treated as BUILD by the scheduler — deployed builder pods that predate
+// this field send nothing and must keep working unchanged (the frozen
+// pull-contract addendum, executor-invariant-map.md).
+enum AttemptKind {
+  ATTEMPT_KIND_UNSPECIFIED = 0;
+  ATTEMPT_KIND_BUILD = 1;
+  ATTEMPT_KIND_MATERIALIZATION = 2;
+}
+
+// Outcome payload for a materialization attempt (design §2.4's alphabet).
+// Carried by ReportOutcomeRequest.materialization_outcome; mutually
+// exclusive with `report` (a request carrying both is rejected).
+message MaterializationOutcome {
+  message Success {
+    // Paths this execution ingested (fetched + put).
+    repeated string ingested_paths = 1;
+    // Paths verified already-present (and pinned).
+    repeated string verified_paths = 2;
+  }
+  message Unobtainable {
+    // Paths confirmed absent upstream after the full per-path retry ladder.
+    repeated string missing_paths = 1;
+    repeated string verified_paths = 2;
+    // Human-readable cause (the demotion-reason taxonomy successor).
+    string cause = 3;
+  }
+  message InfraFailure {
+    // upstream 5xx/timeout/store-internal/no-tenant-context — nothing
+    // is confirmed; never routes from-source, never fail-fasts (B3).
+    string detail = 1;
+  }
+  oneof outcome {
+    Success success = 1;
+    Unobtainable unobtainable = 2;
+    InfraFailure infra_failure = 3;
+  }
+}
+
+// ── ListMaterializationJobs (the GetSpawnIntents analogue for store
+//    replicas; leader-served; design §2.2 item 1) ──
+message ListMaterializationJobsRequest {
+  // Store-service token (same HMAC family as executor tokens).
+  string service_token = 1;
+  // Cap on returned descriptors (server clamps to its own max).
+  uint32 limit = 2;
+}
+message MaterializationJobDescriptor {
+  string job_id = 1;
+  string drv_hash = 2;
+  // Empty = no tenant context (the executor re-resolves; design §2.2 item 3).
+  string tenant_id = 3;
+  // pruned | cache_opportunity | stale_reset | reprobe (observability).
+  string origin = 4;
+}
+message ListMaterializationJobsResponse {
+  repeated MaterializationJobDescriptor jobs = 1;
+}
+
+// ── ReportMaterializationProgress (display-only, droppable; emission
+//    wiring is Phase B — the proto lands now so the wire contract is
+//    complete in one addendum) ──
+message ReportMaterializationProgressRequest {
+  string exec_id = 1;
+  uint64 bytes_done = 2;
+  uint64 bytes_expected = 3;
+  string upstream_uri = 4;
+}
+message ReportMaterializationProgressResponse {}
 
 // ───────────────────────────────────────────────────────────────────────────
 // Build status (QueryBuildStatus)

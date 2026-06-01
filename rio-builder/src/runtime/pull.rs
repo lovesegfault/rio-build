@@ -214,6 +214,10 @@ pub(super) async fn pull_until_resolved<T: PullTransport>(
         let req = PullAssignmentRequest {
             executor_token: executor_token.to_owned(),
             intent_id: intent_id.to_owned(),
+            // Phase-A additive fields (attempt kind, executor_instance):
+            // builders never set them; prost omits default values on the
+            // wire, so this request encodes byte-identically to before.
+            ..Default::default()
         };
         let delay = match transport.pull(req).await {
             Ok(resp) => match resp.outcome {
@@ -294,6 +298,10 @@ pub(super) async fn report_until_acked<T: PullTransport>(
         let req = ReportOutcomeRequest {
             exec_id: exec_id.to_owned(),
             report: Some(report.clone()),
+            // Phase-A additive field (materialization_outcome): builders
+            // never set it; prost omits the absent message on the wire,
+            // so this request encodes byte-identically to before.
+            ..Default::default()
         };
         if shutdown.is_cancelled() {
             // SIGTERM: one bounded best-effort attempt, then out.

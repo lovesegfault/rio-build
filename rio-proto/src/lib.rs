@@ -51,6 +51,22 @@ pub mod validated;
 /// `build_types.proto` (build lifecycle + pull-mode dispatch payloads), and
 /// `admin_types.proto` (admin RPC data types). All four share
 /// `package rio.types;`, so prost merges them into ONE module here.
+///
+/// ## Materialization wire types (substitution-replacement Phase A)
+///
+/// `build_types.proto` also carries the materialization-attempt addendum
+/// to the frozen pull contract: [`AttemptKind`](types::AttemptKind) (the
+/// work class a pull claims; UNSPECIFIED ⇒ BUILD for back-compat),
+/// `PullAssignmentRequest.{kind,executor_instance}` (per-replica store
+/// identity for materialization pulls; ignored for builds),
+/// [`MaterializationOutcome`](types::MaterializationOutcome) (the
+/// Success / Unobtainable / InfraFailure outcome alphabet, carried by
+/// `ReportOutcomeRequest.materialization_outcome` INSTEAD of `report`),
+/// and the `ListMaterializationJobs` / `ReportMaterializationProgress`
+/// payloads. All additive and dormant: deployed builder pods never set
+/// these fields, and a request without them is a build pull,
+/// bit-for-bit as before (pinned by the back-compat decode tests in
+/// `tests/proto_field_presence.rs`).
 // r[impl proto.executor.kind]
 // (Tracey doesn't scan .proto — the documentary annotations live in
 // build_types.proto next to the wire definitions; this marker is the

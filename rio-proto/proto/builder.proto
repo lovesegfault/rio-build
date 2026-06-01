@@ -40,4 +40,19 @@ service ExecutorService {
   // report whose exec_id matches no open attempt acknowledges and
   // writes nothing.
   rpc ReportOutcome(rio.types.ReportOutcomeRequest) returns (rio.types.ReportOutcomeResponse);
+
+  // Store-replica poll for claimable materialization jobs
+  // (substitution-replacement Phase A; dormant until the materialization
+  // flags enable it). Leader-served; returns an empty list when
+  // materialization dispatch is disabled or no jobs are pending.
+  // Read-only (no state change).
+  rpc ListMaterializationJobs(rio.types.ListMaterializationJobsRequest)
+      returns (rio.types.ListMaterializationJobsResponse);
+
+  // Fire-and-forget byte progress for a running materialization attempt.
+  // Display-only, droppable (the same semantics as the legacy walk's
+  // try_send progress relay). The scheduler relays to build events in
+  // Phase B; in Phase A the handler acknowledges and drops.
+  rpc ReportMaterializationProgress(rio.types.ReportMaterializationProgressRequest)
+      returns (rio.types.ReportMaterializationProgressResponse);
 }
