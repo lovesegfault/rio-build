@@ -1303,7 +1303,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             }
         }
         Err(e) => {
-            // r[impl gw.reject.output-path-mismatch]
+            // r[impl gw.reject.output-path-mismatch+2]
             // Declared-hash (fixed-output) outputs on the inline
             // BasicDerivation get the same trusted-plane binding the
             // cached path gets via validate_dag: declared path must
@@ -1329,7 +1329,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                 );
                 stderr_err!(stderr, "{reason}");
             }
-            // r[impl gw.reject.output-path-mismatch]
+            // r[impl gw.reject.output-path-mismatch+2]
             // The precedent for inline checks is the __noChroot check
             // above; this one closes the same bypass for output paths.
             //
@@ -1344,11 +1344,14 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             // (the path-binding gate only sees cached full
             // derivations). Mirror that posture fail-closed: the
             // single-node fallback is acceptable only when every
-            // statically-declared output is content-bound
-            // (fixed-output / floating-CA — their paths are governed
-            // by the content-hash rules). Declared paths that are not
-            // store paths cannot alias a real store object and keep
-            // failing later exactly as before.
+            // output is content-bound (fixed-output / floating-CA —
+            // their paths are governed by the content-hash rules).
+            // ANY input-addressed output rejects: a parseable declared
+            // path is the squat shape, a malformed declared path is a
+            // tenant-controlled string the trusted plane must not
+            // forward to workers, and an empty declared path
+            // (deferred IA) has no validatable identity at all — the
+            // oracle's isCA() check draws the same line.
             //
             // Conforming clients never hit this for IA derivations:
             // the handshake reports NotTrusted (2), so build-remote in
@@ -1360,7 +1363,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
             if let Some(out) = basic_drv
                 .outputs()
                 .iter()
-                .find(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
+                .find(|o| o.hash_algo().is_empty())
             {
                 warn!(
                     drv_path = %drv_path_str,
@@ -1369,18 +1372,23 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
                     "rejecting inline input-addressed derivation: full .drv unavailable, \
                      declared output path cannot be validated"
                 );
+                let declared_desc = if out.path().is_empty() {
+                    "no declared path (deferred input-addressed output)".to_owned()
+                } else {
+                    format!("declares '{}'", out.path())
+                };
                 stderr_err!(
                     stderr,
                     "cannot build '{}': the full derivation is not in the store ({}) and \
                      inline input-addressed derivations cannot be validated — upload the \
-                     .drv first (output '{}' declares '{}'). Nix >= 2.16 and Lix handle \
+                     .drv first (output '{}' {}). Nix >= 2.16 and Lix handle \
                      this automatically because the gateway reports itself untrusted; \
                      otherwise use --store ssh-ng:// or `nix copy --derivation` before \
                      building",
                     drv_path_str,
                     e,
                     out.name(),
-                    out.path()
+                    declared_desc
                 );
             }
             // r[impl gw.reject.unsupported-hash-algo+4]

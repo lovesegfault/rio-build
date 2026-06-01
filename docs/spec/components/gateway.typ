@@ -901,7 +901,7 @@ rio-build currently advertises an empty feature set.
 rio is multi-tenant and has no CppNix trusted-user concept: reporting
 trusted would invite inline input-addressed `wopBuildDerivation`
 submissions whose declared output paths cannot be validated (the
-path-squatting shape #rref("gw.reject.output-path-mismatch") exists to
+path-squatting shape #rref("gw.reject.output-path-mismatch+2") exists to
 prevent), while not-trusted steers stock `build-remote` (Nix ≥ 2.16,
 Lix) onto the copy-the-`.drv`-closure + `wopBuildPathsWithResults` flow
 that the gateway fully supports and gates. Beyond `build-remote`'s flow
@@ -1030,11 +1030,11 @@ the handshake before the client will send any opcodes.
     parse (#rref("gw.reject.floating-ca-declared-path"));
   - declared-hash (fixed-output) outputs whose declared path does not derive
     from the declared hash, including CppNix's single-`out` shape rule
-    (#rref("gw.reject.output-path-mismatch")).
+    (#rref("gw.reject.output-path-mismatch+2")).
   The expensive input-addressed output-path binding over the full closure
   runs later in the pipeline --- after the per-tenant rate-limit and quota
   gates, on the blocking pool --- but still before `SubmitBuild`
-  (#rref("gw.reject.output-path-mismatch")). `validate_dag` is invoked from
+  (#rref("gw.reject.output-path-mismatch+2")). `validate_dag` is invoked from
   all three build handlers (`wopBuildDerivation`, `wopBuildPaths`,
   `wopBuildPathsWithResults`).
 + *The reconstructed DAG is sent to the scheduler via `SubmitBuild`.* The
@@ -1128,32 +1128,36 @@ No legitimate client can produce this shape, so the rule rejects only
 crafted submissions; proper floating-CA outputs (empty declared path) are
 unaffected.
 
-#r("gw.reject.output-path-mismatch")[
+#r("gw.reject.output-path-mismatch+2")[
   The gateway MUST NOT trust declared output paths. For input-addressed
   outputs it MUST re-derive the paths from the derivation contents
   (`hashDerivationModulo` + output-path derivation, CppNix parity) over the
-  submitted closure and reject any mismatch before `SubmitBuild`; the check
-  MUST be fail-closed when derivation is impossible (incomplete `inputDrvs`
-  closure, mixed content-bound and static-path shapes), and submissions MUST
-  NOT be rejected on derivation-chain depth (only the documented size caps
-  apply). For declared-hash (fixed-output) outputs it MUST require the
-  declared path to equal the path derived from the declared hash
-  (`makeFixedOutputPath`) and enforce CppNix's fixed-output shape rule
-  (exactly one output, named `out`). On `wopBuildDerivation`'s single-node
-  fallback (full `.drv` unresolvable) the gateway MUST reject inline
-  derivations that declare a parseable static input-addressed output path
-  and MUST apply the same declared-hash binding to inline fixed-output
+  submitted closure and reject any mismatch before `SubmitBuild`; a non-empty
+  declared output path that does not parse as a store path MUST be rejected
+  (empty paths — deferred shapes — are skipped); the check MUST be
+  fail-closed when derivation is impossible (incomplete `inputDrvs` closure,
+  mixed content-bound and static-path shapes), and submissions MUST NOT be
+  rejected on derivation-chain depth (only the documented size caps apply).
+  For declared-hash (fixed-output) outputs it MUST require the declared path
+  to equal the path derived from the declared hash (`makeFixedOutputPath`)
+  and enforce CppNix's fixed-output shape rule (exactly one output, named
+  `out`). On `wopBuildDerivation`'s single-node fallback (full `.drv`
+  unresolvable) the gateway MUST reject inline derivations with ANY
+  input-addressed output — declared, malformed, or deferred (empty) — and
+  MUST apply the same declared-hash binding to inline fixed-output
   declarations.
 ]
 Workers are untrusted (#rref("sec.trust.workers-untrusted")), so this is the
 authoritative half of output-path enforcement; the builder-side checks are
 defense in depth and the store additionally verifies content-addressed
-uploads at registration time. Declared paths that do not parse as store
-paths are out of scope --- they cannot alias a real store object and keep
-failing later exactly as before. Content-bound outputs (fixed-output /
-floating-CA) have no static derivation-derived path; their binding is the
-declared-hash rule above and the store-side content verification, and a
-floating-CA output that nevertheless declares a path is rejected outright
+uploads at registration time. Malformed declared paths cannot alias a store
+object, but they CAN reach the worker glue and the result pipeline as
+tenant-controlled strings where store paths are expected — rejecting them at
+the trusted plane is what keeps every downstream `Path::join` over a declared
+path total. Content-bound outputs (fixed-output / floating-CA) have no static
+derivation-derived path; their binding is the declared-hash rule above and
+the store-side content verification, and a floating-CA output that
+nevertheless declares a path is rejected outright
 (#rref("gw.reject.floating-ca-declared-path")) rather than exempted.
 
 #r("gw.dag.drv-cache-text-ca")[
@@ -1913,7 +1917,7 @@ untrusted handshake):*
   `wopAddMultipleToStore`), then drives `wopBuildPathsWithResults`. The
   gateway runs the normal full-DAG reconstruction
   (#rref("gw.dag.reconstruct+4")) and every submission gate, including the
-  output-path binding (#rref("gw.reject.output-path-mismatch")).
+  output-path binding (#rref("gw.reject.output-path-mismatch+2")).
 - *Content-bound derivations (any client):* the inline `wopBuildDerivation`
   single-node fallback still applies when the full `.drv` is unavailable ---
   the output paths are governed by the content-hash rules, not by trust in
@@ -1974,7 +1978,7 @@ hits.
 
 Pre-2.16 hook clients that send inline input-addressed derivations without
 uploading the `.drv` receive the rejection described in
-#rref("gw.reject.output-path-mismatch"); the documented client floor for
+#rref("gw.reject.output-path-mismatch+2"); the documented client floor for
 hook-mode input-addressed builds is Nix 2.16 or Lix.
 
 *Scheduling optimizations lost in build hook mode:*

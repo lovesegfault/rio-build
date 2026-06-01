@@ -505,7 +505,7 @@ pub fn validate_dag(
     // parsed), but the floating-CA shape rule still applies to them.
     // Input-addressed outputs (no hash, no algo) are untouched.
     //
-    // r[impl gw.reject.output-path-mismatch]
+    // r[impl gw.reject.output-path-mismatch+2]
     // Declared-hash (fixed-output) outputs: bind the declared path to
     // the declared hash and enforce CppNix's single-'out' shape rule.
     // Without this a junk outputHash would exempt an arbitrary declared
@@ -742,14 +742,17 @@ pub(crate) async fn reject_unrealized_fod_offenders(
 /// derivation (hashDerivationModulo + makeOutputPath) and never
 /// trusts the declared ones.
 ///
-/// Scope: only outputs whose declared path parses as a store path
-/// are compared — a malformed declared path cannot alias any real
-/// store object (the store rejects it at PutPath), so it is not a
-/// squatting vector; legacy fixtures and degenerate clients keep
-/// failing later with their existing errors. Fixed-output outputs
-/// are bound to their declared hash by the declared-hash gate in
-/// [`validate_dag`], and floating-CA / deferred outputs have no
-/// static path to check. Nodes without a cached full derivation
+/// Scope: every input-addressed output with a NON-EMPTY declared path
+/// is validated — paths that match the derivation are accepted, paths
+/// that do not parse as store paths are rejected outright. (A malformed
+/// declared path cannot alias a store object, but it CAN reach the
+/// worker glue and the result pipeline as a tenant-controlled string
+/// where a store path is expected; workers are untrusted
+/// (`sec.trust.workers-untrusted`), so the trusted plane must not
+/// forward it.) Empty declared paths (deferred IA) have nothing to
+/// validate. Fixed-output outputs are bound to their declared hash by
+/// the declared-hash gate in [`validate_dag`], and floating-CA outputs
+/// have no static path to check. Nodes without a cached full derivation
 /// (BasicDerivation fallback) are skipped like the cheap checks;
 /// closure-incomplete derivations are rejected fail-closed — an
 /// attacker must not be able to dodge the check by withholding an
@@ -762,7 +765,7 @@ pub(crate) async fn reject_unrealized_fod_offenders(
 /// `handler::build::enforce_output_path_bindings` — so a single
 /// adversarial closure cannot stall the session reactor or bypass the
 /// per-tenant limiter.
-// r[impl gw.reject.output-path-mismatch]
+// r[impl gw.reject.output-path-mismatch+2]
 pub(crate) fn validate_output_path_bindings(
     nodes: &[types::DerivationNode],
     drv_cache: &HashMap<StorePath, Derivation>,
@@ -794,7 +797,7 @@ pub(crate) fn validate_output_path_bindings(
         if !drv
             .outputs()
             .iter()
-            .any(|o| o.hash_algo().is_empty() && StorePath::parse(o.path()).is_ok())
+            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty())
         {
             continue;
         }
@@ -816,8 +819,24 @@ pub(crate) fn validate_output_path_bindings(
             if !output.hash_algo().is_empty() {
                 continue;
             }
-            if StorePath::parse(output.path()).is_err() {
+            // Deferred IA (empty declared path): the path is computed at
+            // resolution time; nothing to bind yet.
+            if output.path().is_empty() {
                 continue;
+            }
+            // A non-empty declared path that does not parse as a store
+            // path is rejected fail-closed: it can never equal the
+            // derivation-derived path, and forwarding it would hand the
+            // worker glue and result pipeline a tenant-controlled string
+            // where a store path is expected.
+            if let Err(e) = StorePath::parse(output.path()) {
+                return Err(format!(
+                    "derivation {} declares output '{}' at {:?}, which is not a valid store \
+                     path: {e} — declared output paths must parse as store paths",
+                    node.drv_path,
+                    output.name(),
+                    output.path(),
+                ));
             }
             match derived.get(output.name()) {
                 Some(expected) if expected.as_str() == output.path() => {}
@@ -859,13 +878,13 @@ pub(crate) fn validate_output_path_bindings(
 /// cached full [`Derivation`] and the wire `BasicDerivation` can be
 /// checked with one implementation.
 ///
-/// Scope: outputs whose declared path does not parse as a store path
-/// are skipped (they cannot alias a real store object — same rule as
-/// the input-addressed binding gate); for parseable declared paths any
-/// malformed algo/hash or any mismatch with
-/// `StorePath::make_fixed_output(declared hash)` is rejected
-/// fail-closed — otherwise a junk outputHash would exempt an arbitrary
-/// declared path from validation.
+/// Scope: a non-empty declared path must parse as a store path
+/// (rejected otherwise — same fail-closed rule as the input-addressed
+/// binding gate); empty declared paths (deferred fixed-output shape)
+/// are skipped. For parseable declared paths any malformed algo/hash
+/// or any mismatch with `StorePath::make_fixed_output(declared hash)`
+/// is rejected fail-closed — otherwise a junk outputHash would exempt
+/// an arbitrary declared path from validation.
 ///
 /// Keep the accepted algo set in sync with [`fod_algo_verifiable`]
 /// (the algo gate runs first, so unsupported algos already carry their
@@ -911,11 +930,19 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
         ));
     }
 
-    // Out-of-scope declared paths (empty / not a store path) cannot
-    // alias a real store object; the build keeps failing later exactly
-    // as before.
-    if StorePath::parse(declared_path).is_err() {
+    // Deferred (empty) declared path: the fixed-output path is computed at
+    // resolution time; nothing to bind yet.
+    if declared_path.is_empty() {
         return Ok(());
+    }
+    // A non-empty declared path that does not parse as a store path is
+    // rejected fail-closed — the trusted plane must not forward a
+    // tenant-controlled non-store-path string to untrusted workers.
+    if let Err(e) = StorePath::parse(declared_path) {
+        return Err(format!(
+            "derivation {drv_path} output '{name}' declares path {declared_path:?}, which is \
+             not a valid store path: {e} — declared output paths must parse as store paths"
+        ));
     }
 
     let drv_sp = StorePath::parse(drv_path)
@@ -1614,7 +1641,7 @@ mod tests {
     /// paths it derives to) passes; declaring somebody else's
     /// well-formed path is rejected; malformed declared paths are out
     /// of scope for this gate (they cannot alias a real store object).
-    // r[verify gw.reject.output-path-mismatch]
+    // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn validate_dag_binds_ia_declared_paths_to_the_derivation() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mine.drv";
@@ -1666,12 +1693,52 @@ mod tests {
         );
         assert!(err.contains(victim), "error names the declared path: {err}");
 
-        // Malformed declared path (not a store path) → out of scope here.
+        // Malformed declared path (not a store path) → rejected fail-closed.
+        // The trusted plane must not forward a tenant-controlled
+        // non-store-path string to untrusted workers.
         let mut cache = HashMap::new();
         cache.insert(key.clone(), aterm_with("/nix/store/zzz-output"));
+        let err = validate_output_path_bindings(std::slice::from_ref(&node), &cache).unwrap_err();
+        assert!(
+            err.contains("not a valid store path"),
+            "malformed declared path must be rejected naming the reason: {err}"
+        );
+        assert!(
+            err.contains("/nix/store/zzz-output"),
+            "error names the offending path: {err}"
+        );
+
+        // Deferred IA (EMPTY declared path) stays out of scope — nothing
+        // to validate until resolution computes the path.
+        let mut cache = HashMap::new();
+        cache.insert(key.clone(), aterm_with(""));
         assert!(
             validate_output_path_bindings(std::slice::from_ref(&node), &cache).is_ok(),
-            "malformed declared paths are not this gate's concern"
+            "deferred (empty) declared paths have nothing to validate"
+        );
+    }
+
+    /// The declared-hash gate likewise rejects a non-empty declared path
+    /// that does not parse as a store path (and keeps skipping empty ones).
+    // r[verify gw.reject.output-path-mismatch+2]
+    #[test]
+    fn declared_hash_gate_rejects_malformed_declared_path() {
+        let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";
+        let hex_hash = "5a".repeat(32);
+
+        // Non-empty, unparseable declared path → rejected.
+        let outputs = vec![("out", "/nix/store/zzz-evil", "sha256", hex_hash.as_str())];
+        let err = validate_declared_hash_outputs(drv_path, outputs.into_iter()).unwrap_err();
+        assert!(
+            err.contains("not a valid store path"),
+            "malformed declared path must be rejected: {err}"
+        );
+
+        // Empty declared path (deferred fixed-output) → still skipped.
+        let outputs = vec![("out", "", "sha256", hex_hash.as_str())];
+        assert!(
+            validate_declared_hash_outputs(drv_path, outputs.into_iter()).is_ok(),
+            "empty declared path keeps the deferred carve-out"
         );
     }
 
@@ -1679,7 +1746,7 @@ mod tests {
     /// well-formed static path must not dodge the gate via the
     /// content-bound fast path; genuinely all-content-bound derivations
     /// (all-floating-CA, single-output FOD) keep their fast path.
-    // r[verify gw.reject.output-path-mismatch]
+    // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn validate_dag_rejects_squatted_path_next_to_floating_ca() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-camix.drv";
@@ -1732,7 +1799,7 @@ mod tests {
     /// A crafted derivation pairing a deferred (empty-path) output with a
     /// squatted well-formed one must not dodge the path gate via any
     /// drv-level skip.
-    // r[verify gw.reject.output-path-mismatch]
+    // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn validate_dag_rejects_squatted_path_next_to_deferred_output() {
         let drv_path = "/nix/store/cccccccccccccccccccccccccccccccc-mixed.drv";
@@ -1831,7 +1898,7 @@ mod tests {
     /// (Regression test for the former 512-level recursion cap, which
     /// turned deep-but-legitimate DAGs into whole-submission
     /// rejections.)
-    // r[verify gw.reject.output-path-mismatch]
+    // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn validate_output_path_bindings_accepts_deep_ia_chain() {
         let (nodes, cache) = honest_ia_chain(600);
@@ -2422,7 +2489,7 @@ mod tests {
     /// hash at submission: the declared path must equal
     /// `make_fixed_output(declared hash)`. A junk hash can no longer
     /// exempt an arbitrary (victim) path from validation.
-    // r[verify gw.reject.output-path-mismatch]
+    // r[verify gw.reject.output-path-mismatch+2]
     #[test]
     fn validate_dag_binds_declared_hash_outputs() {
         let drv_path = "/nix/store/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb-fetch.drv";

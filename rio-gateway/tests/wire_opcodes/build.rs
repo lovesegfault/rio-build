@@ -4,7 +4,7 @@
 // r[verify gw.wire.derived-path]
 // r[verify gw.dag.reconstruct+4]
 // r[verify gw.hook.single-node-dag+2]
-// r[verify gw.reject.output-path-mismatch]
+// r[verify gw.reject.output-path-mismatch+2]
 // r[verify gw.reject.unsupported-hash-algo+4]
 // r[verify gw.hook.ifd-detection+3]
 // r[verify gw.hook.inline-drv-content+4]
@@ -12,16 +12,71 @@
 
 use super::*;
 
-/// Minimal valid ATerm derivation text. One output ("out"), no inputs,
-/// trivial builder. Used by every test that needs reconstruct_dag to
-/// resolve a .drv. Tests choose their own store path; this is just the
-/// body.
-const TEST_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","/nix/store/zzz-output")])"#;
+/// Minimal single-output IA ATerm body, parameterized by declared output
+/// path and builder command. Flow-level tests get SELF-CONSISTENT fixtures
+/// from [`seed_flow_drv`] (declared path == derived path), because the
+/// gateway's IA binding gate (gw.reject.output-path-mismatch+2) rejects
+/// anything else and the build-result store verification
+/// (gw.opcode.build-results-honest) asks the store about every parseable
+/// declared path.
+fn ia_aterm_body(out_path: &str, cmd: &str) -> String {
+    format!(
+        r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","{cmd}"],[("out","{out_path}")])"#
+    )
+}
 
-/// ATerm derivation with __noChroot=1 in env. Triggers validate_dag rejection.
-/// Seeded into the store so resolve_derivation populates drv_cache; the inline
-/// BasicDerivation sent on the wire stays CLEAN so the :466 inline check passes.
-const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","/nix/store/zzz-output","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","/nix/store/zzz-output")])"#;
+/// Compute the self-consistent ATerm + derived output path for `drv_path`:
+/// the declared output path equals what `input_addressed_output_paths`
+/// derives — i.e. what `nix-instantiate` would have produced.
+fn consistent_ia_fixture(drv_path: &str, cmd: &str) -> (String, String) {
+    let probe =
+        rio_nix::derivation::Derivation::parse(&ia_aterm_body("", cmd)).expect("probe parses");
+    let mut cache = std::collections::HashMap::new();
+    let derived = rio_nix::derivation::input_addressed_output_paths(
+        &probe,
+        drv_path,
+        &|_: &str| None,
+        &mut cache,
+    )
+    .expect("single-output IA derivation derives");
+    let out = derived["out"].as_str().to_owned();
+    (ia_aterm_body(&out, cmd), out)
+}
+
+/// Seed a self-consistent `.drv` at `drv_path` AND mark its derived output
+/// present in the mock store; returns the derived output path. This is the
+/// standard fixture for flow-level tests: the IA binding gate accepts it
+/// and the post-build store verification finds the output, so the test
+/// outcome is governed purely by the mocked scheduler outcome.
+fn seed_flow_drv(h: &GatewaySession, drv_path: &str) -> String {
+    seed_flow_drv_cmd(h, drv_path, "echo hi")
+}
+
+/// [`seed_flow_drv`] with a distinct builder command (so two seeded `.drv`s
+/// can have different contents).
+fn seed_flow_drv_cmd(h: &GatewaySession, drv_path: &str, cmd: &str) -> String {
+    let (aterm, out) = consistent_ia_fixture(drv_path, cmd);
+    h.store.seed_with_content(drv_path, aterm.as_bytes());
+    h.store.seed_with_content(&out, b"flow-test output");
+    out
+}
+
+/// Seed a self-consistent `.drv` whose output is NOT in the store — the
+/// fixture for failure/cancellation-path tests, where the build never
+/// produced anything and the result must reflect the scheduler outcome
+/// (a present output would legitimately be reported as built).
+fn seed_unbuilt_drv(h: &GatewaySession, drv_path: &str) -> String {
+    let (aterm, out) = consistent_ia_fixture(drv_path, "echo hi");
+    h.store.seed_with_content(drv_path, aterm.as_bytes());
+    out
+}
+
+/// ATerm derivation with __noChroot=1 in env. Triggers validate_dag rejection
+/// (which fires before the output-path binding gate, so the deferred output
+/// shape never reaches it). Seeded into the store so resolve_derivation
+/// populates drv_cache; the inline BasicDerivation sent on the wire stays
+/// CLEAN so the :466 inline check passes.
+const NOCHROOT_DRV_ATERM: &str = r#"Derive([("out","","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("__noChroot","1"),("out","")])"#;
 
 // ===========================================================================
 // Build opcode tests
@@ -35,8 +90,7 @@ async fn test_build_paths_success() -> anyhow::Result<()> {
 
     // Seed a .drv in store so translate::reconstruct_dag can resolve it.
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -65,8 +119,7 @@ async fn test_build_paths_scheduler_error_returns_stderr_error() -> anyhow::Resu
         .set_submit_outcome(SubmitOutcome::Error(tonic::Code::Unavailable));
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -118,8 +171,7 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
     });
 
     let drv_path = "/nix/store/00000000000000000000000000000000-early-close.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -163,8 +215,7 @@ async fn test_build_paths_with_results_keyed_format() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     let derived_path = format!("{drv_path}!out");
     wire_send!(&mut h.stream;
@@ -224,6 +275,11 @@ async fn test_build_derivation_basic_format() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
+    // Seed the full .drv: the inline single-node fallback rejects ALL
+    // input-addressed shapes (gw.reject.output-path-mismatch+2), so the
+    // wire-format properties this test pins are exercised on the
+    // resolve-success (full-DAG) path.
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 36,                                 // wopBuildDerivation
@@ -656,6 +712,61 @@ async fn test_build_derivation_inline_ia_unresolvable_rejected() -> anyhow::Resu
         h.scheduler.submit_calls.read().unwrap().len(),
         0,
         "inline IA rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+/// wopBuildDerivation (36): the inline single-node fallback rejects ALL
+/// input-addressed shapes, including DEFERRED IA (empty hash_algo + empty
+/// declared path). Pre-fix, the gate keyed on "declares a PARSEABLE path",
+/// so a deferred-IA inline fallback slipped past it and was submitted —
+/// only for the scheduler to unconditionally reject it (and the rejection
+/// to be misreported as a transient failure). The gateway and scheduler
+/// must agree: no IA shape is acceptable without a resolvable .drv.
+// r[verify gw.reject.output-path-mismatch+2]
+#[tokio::test]
+async fn test_build_derivation_inline_deferred_ia_unresolvable_rejected() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    // Store is EMPTY — resolve_derivation fails, single-node fallback.
+    let drv_path = "/nix/store/00000000000000000000000000000044-inline-deferred-ia.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "",                              // declared path EMPTY (deferred IA)
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo hi"],
+        u64: 1,                                  // 1 env pair
+        string: "out",
+        string: "",
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("input-addressed"),
+        "error should say why inline IA is refused: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("deferred") || err.message.contains("no declared path"),
+        "error should name the deferred variant: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "deferred-IA inline rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;
@@ -1214,7 +1325,10 @@ async fn test_build_derivation_after_drv_upload_submitted() -> anyhow::Result<()
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000009-uploaded.drv";
-    let (nar, hash) = make_nar(TEST_DRV_ATERM.as_bytes());
+    let (uploaded_aterm, uploaded_out) = consistent_ia_fixture(drv_path, "echo hi");
+    // The output must be present for the post-build store verification.
+    h.store.seed_with_content(&uploaded_out, b"uploaded output");
+    let (nar, hash) = make_nar(uploaded_aterm.as_bytes());
 
     // Upload the .drv exactly like `nix copy --derivation` does.
     wire_send!(&mut h.stream;
@@ -1785,8 +1899,17 @@ fn ev(e: build_event::Event) -> types::BuildEvent {
 /// needs this so translate::reconstruct_dag has something to resolve.
 fn seed_minimal_drv(h: &GatewaySession) -> &'static str {
     let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(h, drv_path);
+    drv_path
+}
+
+/// [`seed_minimal_drv`] without the built output — for tests whose scheduler
+/// outcome is a failure/cancellation (the build never produced outputs, so
+/// the store must not contain them or result verification would honestly
+/// report the target as built).
+fn seed_minimal_drv_unbuilt(h: &GatewaySession) -> &'static str {
+    let drv_path = "/nix/store/00000000000000000000000000000000-scripted.drv";
+    seed_unbuilt_drv(h, drv_path);
     drv_path
 }
 
@@ -2336,7 +2459,7 @@ async fn test_build_paths_with_results_cancelled_outcome() -> anyhow::Result<()>
             reason: "user abort".into(),
         })),
     ]));
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46, // wopBuildPathsWithResults
@@ -2619,7 +2742,7 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
                 reason: "early cancel".into(),
             }),
         )]));
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46, // wopBuildPathsWithResults — read back the BuildResult
@@ -2957,7 +3080,7 @@ async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Resul
         fail_count: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(11)),
         scripted_events: None, // irrelevant — fail_count blocks
     });
-    let drv_path = seed_minimal_drv(&h);
+    let drv_path = seed_minimal_drv_unbuilt(&h);
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -3392,8 +3515,7 @@ async fn over_quota_sends_stderr_error() -> anyhow::Result<()> {
     );
 
     let drv_path = "/nix/store/00000000000000000000000000000000-quota.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -3453,8 +3575,7 @@ async fn under_quota_passes_through() -> anyhow::Result<()> {
         .insert("team-under".to_string(), (50, Some(100)));
 
     let drv_path = "/nix/store/00000000000000000000000000000000-under.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,
@@ -3491,8 +3612,7 @@ async fn unknown_tenant_fails_open() -> anyhow::Result<()> {
     // QuotaCache caches the negative → classify → Unlimited.
 
     let drv_path = "/nix/store/00000000000000000000000000000000-unseeded.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,
@@ -3739,11 +3859,9 @@ async fn test_disconnect_cancel_propagates_jwt() -> anyhow::Result<()> {
 // binding gate rejects submissions whose declared paths don't match the
 // derivation before the store verification is ever reached. (Recompute the
 // paths with `input_addressed_output_paths` if an ATerm's
-// system/builder/args/env ever changes.) This is unlike TEST_DRV_ATERM's
-// `/nix/store/zzz-output`, which is not a valid store path and therefore
-// cannot be asked of the store at all (verification defers to the
-// scheduler outcome for such paths, which is what keeps the older tests
-// above byte-for-byte unchanged).
+// system/builder/args/env ever changes.) The flow-level tests above use
+// the same property via `seed_flow_drv`, which also marks the derived
+// output present so verification reflects a successful build.
 
 use rio_nix::protocol::build::{BuildResult, BuildStatus, read_build_result};
 use rio_nix::protocol::handshake::PROTOCOL_VERSION;
@@ -4276,8 +4394,7 @@ async fn test_bpwr_hook_shape_first_is_interactive() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 46,                                 // wopBuildPathsWithResults
@@ -4299,8 +4416,7 @@ async fn test_bpwr_named_output_first_is_ci() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -4322,13 +4438,8 @@ async fn test_bpwr_multi_target_first_is_ci() -> anyhow::Result<()> {
 
     let drv_a = "/nix/store/00000000000000000000000000000000-test.drv";
     let drv_b = "/nix/store/00000000000000000000000000000001-other.drv";
-    h.store.seed_with_content(drv_a, TEST_DRV_ATERM.as_bytes());
-    h.store.seed_with_content(
-        drv_b,
-        TEST_DRV_ATERM
-            .replace("zzz-output", "yyy-output")
-            .as_bytes(),
-    );
+    seed_flow_drv(&h, drv_a);
+    seed_flow_drv_cmd(&h, drv_b, "echo other");
 
     wire_send!(&mut h.stream;
         u64: 46,
@@ -4350,8 +4461,7 @@ async fn test_bpwr_hook_shape_second_is_ci() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     for _ in 0..2 {
         wire_send!(&mut h.stream;
@@ -4386,8 +4496,7 @@ async fn test_build_paths_single_all_outputs_is_ci() -> anyhow::Result<()> {
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
 
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
 
     wire_send!(&mut h.stream;
         u64: 9,                                  // wopBuildPaths
@@ -4412,8 +4521,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
     let drv_path = "/nix/store/00000000000000000000000000000000-test.drv";
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
     wire_send!(&mut h.stream;
         u64: 36,
         string: drv_path,
@@ -4441,8 +4549,7 @@ async fn test_build_derivation_ifd_heuristic_unchanged() -> anyhow::Result<()> {
     // A bPWR first, then wopBuildDerivation → the latter is "ci".
     let mut h = GatewaySession::new_with_handshake().await?;
     h.scheduler.set_submit_outcome(SubmitOutcome::completed());
-    h.store
-        .seed_with_content(drv_path, TEST_DRV_ATERM.as_bytes());
+    seed_flow_drv(&h, drv_path);
     wire_send!(&mut h.stream;
         u64: 46,
         strings: &[format!("{drv_path}!out")],
