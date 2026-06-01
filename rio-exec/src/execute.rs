@@ -79,10 +79,21 @@ use crate::plan::{HostLayout, SandboxPlan};
 use crate::request::{ExecutionRequest, OutputCapture};
 use crate::{ExecError, skeleton};
 
-/// How long the parent keeps draining buffered log output after the
-/// process tree has been reaped. Bounds the gap between "the build
-/// exited" and "execute() returned" when the pty buffer still holds
-/// data; EOF normally arrives well before this.
+/// The budget for every post-reap event operation: draining buffered
+/// log output, the partial-line flush, the straggler status read, and
+/// the late `Started` send. Bounds the gap between "the build exited"
+/// and "execute() returned" even when the events receiver is alive but
+/// stalled; EOF and channel capacity normally arrive well before this.
+///
+/// What this does NOT bound: an in-loop park on a stalled receiver
+/// while the build is still running (the supervision loop's own
+/// `events.send(...).await`), which suspends limit enforcement for as
+/// long as the receiver stalls. That suspension is bounded today only
+/// by the caller-side backstop timeout in rio-builder.
+/// TODO: move limit enforcement off the event-send path entirely (a
+/// dedicated watchdog owning kills, queued sends) so consumer behavior
+/// can never delay a kill — the worker control-plane isolation
+/// follow-up.
 const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Capacity of the internal raw-chunk channel between the blocking
@@ -377,6 +388,11 @@ pub async fn execute(
     // inert from here on and simply drops when execute() returns.
 
     // Drain whatever output is still buffered, bounded.
+    // One shared budget for the chunk drain AND the partial-line
+    // flush: the tree is already gone, so a stalled (but alive) events
+    // receiver must not be able to park execute() past the budget. If
+    // the budget expires mid-drain the remaining lines are dropped —
+    // best-effort by design once the receiver has stopped consuming.
     let _ = tokio::time::timeout(FINAL_DRAIN_TIMEOUT, async {
         while let Some(chunk) = chunk_rx.recv().await {
             log_bytes += chunk.bytes.len() as u64;
@@ -386,14 +402,15 @@ pub async fn execute(
                 }
             }
         }
+        for line in splitter.flush() {
+            // The channel may already be gone; the lines are
+            // best-effort.
+            if events_open && events.send(line).await.is_err() {
+                events_open = false;
+            }
+        }
     })
     .await;
-    for line in splitter.flush() {
-        // The channel may already be gone; the lines are best-effort.
-        if events_open && events.send(line).await.is_err() {
-            events_open = false;
-        }
-    }
     // The status report normally resolved long ago; give a straggler
     // (e.g. a setup failure racing the reap, or a program so fast that
     // the reap won the final select) a bounded window.
@@ -406,15 +423,18 @@ pub async fn execute(
         );
     }
     // A very fast program can be reaped before the status arm ever ran;
-    // the Started event is still owed to the caller. Best-effort: it is
-    // the last event this execution emits, so a closed channel needs no
-    // bookkeeping.
+    // the Started event is still owed to the caller. Best-effort and
+    // bounded: it is the last event this execution emits, so a closed
+    // channel needs no bookkeeping and a stalled receiver only costs
+    // the drain budget, never an unbounded park.
     if !started_sent && status_report == Some(StatusReport::ExecStarted) && events_open {
-        let _ = events
-            .send(ExecEvent::Started {
+        let _ = tokio::time::timeout(
+            FINAL_DRAIN_TIMEOUT,
+            events.send(ExecEvent::Started {
                 pid: intermediate.as_raw(),
-            })
-            .await;
+            }),
+        )
+        .await;
     }
 
     // ---- Interpret ----------------------------------------------------------
