@@ -106,6 +106,10 @@ pub(crate) fn attach_service_token<T>(
             .map(|d| d.as_secs())
             .unwrap_or(0)
             + 60,
+        // Gateway tokens are not replica-bound (substitution-replacement
+        // T-5.1: only the store's materialization client mints Some) —
+        // the wire shape stays byte-identical (skip_serializing_if).
+        instance: None,
     };
     // Token is base64url(ascii) — always a valid metadata value.
     req.metadata_mut().insert(

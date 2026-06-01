@@ -232,6 +232,7 @@ fn req_with_token<T>(signer: &rio_auth::hmac::HmacSigner, caller: &str, body: T)
     let claims = rio_auth::hmac::ServiceClaims {
         caller: caller.into(),
         expiry_unix: rio_auth::now_unix().unwrap() + 60,
+        instance: None,
     };
     let mut req = Request::new(body);
     req.metadata_mut().insert(

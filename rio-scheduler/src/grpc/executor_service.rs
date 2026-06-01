@@ -49,7 +49,11 @@ use super::SchedulerGrpc;
 //                                       ExecutorId and assignments/executions rows → reject RPC unless a
 //                                       DNS-1123 label (lowercase alnum + interior hyphens, ≤63; excludes
 //                                       '@' so the composite stays unambiguous); reject RPC empty for
-//                                       kind=MATERIALIZATION (mandatory); ignored/dropped for kind=BUILD
+//                                       kind=MATERIALIZATION (mandatory); ignored/dropped for kind=BUILD.
+//                                       AUTHZ (T-5.1): under the enforced posture the field must EQUAL the
+//                                       instance bound inside the signed store-service claims → reject RPC
+//                                       PermissionDenied on mismatch (the claim is the authority; this
+//                                       request field is defense in depth)
 // ReportOutcome RPC (pull-mode dispatch):
 //   exec_id                           → UUID parse → attempt lookup       → reject RPC if not a valid UUID
 //   report.result.error_msg           → event ring, terminal payload      → truncate to MAX_ERROR_MSG_LEN
@@ -134,10 +138,13 @@ pub(super) fn is_dns1123_label(s: &str) -> bool {
 const MATERIALIZATION_SERVICE_CALLERS: &[&str] = &["rio-store"];
 
 /// Outcome of the store-service credential gate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum StoreServiceAuth {
     /// A valid `ServiceClaims{caller="rio-store"}` token was presented.
-    Authorized,
+    /// Carries the verified instance claim from the signed body —
+    /// `None` for a pre-T-5.1 or non-store-minted (gateway-style)
+    /// instance-less token.
+    Authorized { instance: Option<String> },
     /// Full dev mode (no executor HMAC key AND no service verifier):
     /// open, the flag gate decides — the same posture every other
     /// ExecutorService unary has in dev mode.
@@ -213,7 +220,60 @@ impl SchedulerGrpc {
                 claims.caller
             )));
         }
-        Ok(StoreServiceAuth::Authorized)
+        Ok(StoreServiceAuth::Authorized {
+            instance: claims.instance,
+        })
+    }
+
+    /// The instance token-claim binding (substitution-replacement Phase B
+    /// security obligation 1 / T-5.1) layered on
+    /// [`Self::require_store_service`]: the materialization WORK surfaces
+    /// (claim, listing, outcome report — everything with a state effect)
+    /// require the store-service credential to be **instance-bound**
+    /// (`ServiceClaims.instance = Some(_)`, minted only by the store's
+    /// flag-gated materialization client), and — when the request itself
+    /// asserts an `executor_instance` (the claim path) — the claimed
+    /// instance MUST equal the request's. The claim is the authority; the
+    /// request field is now defense in depth (its DNS-1123 validation
+    /// stays).
+    ///
+    /// Privilege narrowing: gateway-PutPath-style instance-less
+    /// ServiceClaims tokens (and every pre-T-5.1 in-flight token) no
+    /// longer authorize materialization work — they were never minted for
+    /// it. The display-only progress relay is NOT routed through this
+    /// gate (no state effect to bind; the fleet-level credential
+    /// suffices there).
+    ///
+    /// Dev mode passes through unchanged (no claims exist to bind).
+    // r[impl sched.materialize.job]
+    pub(super) fn require_store_service_instance_bound<T>(
+        &self,
+        req: &tonic::Request<T>,
+        body_token: &str,
+        request_instance: Option<&str>,
+    ) -> Result<StoreServiceAuth, Status> {
+        let auth = self.require_store_service(req, body_token)?;
+        match &auth {
+            StoreServiceAuth::DevMode => Ok(auth),
+            StoreServiceAuth::Authorized { instance } => {
+                let Some(claimed) = instance else {
+                    return Err(Status::permission_denied(
+                        "the store-service token does not carry the instance claim \
+                         (materialization operations require an instance-bound \
+                         credential since Phase B)",
+                    ));
+                };
+                if let Some(requested) = request_instance
+                    && claimed != requested
+                {
+                    return Err(Status::permission_denied(format!(
+                        "instance claim mismatch: the store-service token is bound to \
+                         {claimed:?} but the request asserts executor_instance {requested:?}"
+                    )));
+                }
+                Ok(auth)
+            }
+        }
     }
 
     /// Whether the request presents a token that VERIFIES as an
@@ -301,79 +361,94 @@ impl ExecutorService for SchedulerGrpc {
         // x-rio-service-token key family) is what does. Full dev mode
         // (neither key family configured) falls through to the flag
         // gate, which parks while materialization dispatch is disabled.
-        let auth_claims: Option<rio_auth::hmac::ExecutorClaims> =
-            if kind == rio_evidence_kernel::pull::PullKind::Materialization {
-                let body_token = request.get_ref().executor_token.as_str();
-                if self
-                    .verified_executor_claims(&request, body_token)
-                    .is_some()
-                {
-                    metrics::counter!(
-                        "rio_scheduler_pull_rejected_total",
-                        "rpc" => "pull_assignment",
-                        "reason" => "kind_unauthorized"
-                    )
-                    .increment(1);
-                    return Err(Status::permission_denied(
-                        "executor tokens do not authorize materialization pulls \
+        let auth_claims: Option<rio_auth::hmac::ExecutorClaims> = if kind
+            == rio_evidence_kernel::pull::PullKind::Materialization
+        {
+            let body_token = request.get_ref().executor_token.as_str();
+            if self
+                .verified_executor_claims(&request, body_token)
+                .is_some()
+            {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "pull_assignment",
+                    "reason" => "kind_unauthorized"
+                )
+                .increment(1);
+                return Err(Status::permission_denied(
+                    "executor tokens do not authorize materialization pulls \
                      (a store-service credential is required)",
-                    ));
-                }
-                // r[impl sched.materialize.job]
-                if let Err(e) = self.require_store_service(&request, "") {
-                    metrics::counter!(
-                        "rio_scheduler_pull_rejected_total",
-                        "rpc" => "pull_assignment",
-                        "reason" => "kind_unauthorized"
-                    )
-                    .increment(1);
-                    return Err(e);
-                }
-                // The store credential is fleet-level, not per-intent: the
-                // pulling identity is the composite (intent, replica) pair
-                // the kernel arbitrates on, so there is no auth_intent.
-                None
-            } else {
-                match self.require_executor(&request) {
-                    Ok(claims) => claims,
-                    Err(metadata_err) => {
-                        let body_token = request.get_ref().executor_token.as_str();
-                        if body_token.is_empty() {
+                ));
+            }
+            // r[impl sched.materialize.job]
+            // T-5.1 (Phase B security obligation 1): the credential
+            // must be INSTANCE-BOUND, and the instance bound inside
+            // the signed claims must equal the request's
+            // executor_instance — the claim is the authority, the
+            // request field is defense in depth. An empty request
+            // instance skips the match here and is rejected
+            // InvalidArgument by the BC-1 validation below (the
+            // mandatory-identity rule precedes the binding rule).
+            let request_instance = {
+                let asserted = request.get_ref().executor_instance.as_str();
+                (!asserted.is_empty()).then(|| asserted.to_owned())
+            };
+            if let Err(e) =
+                self.require_store_service_instance_bound(&request, "", request_instance.as_deref())
+            {
+                metrics::counter!(
+                    "rio_scheduler_pull_rejected_total",
+                    "rpc" => "pull_assignment",
+                    "reason" => "kind_unauthorized"
+                )
+                .increment(1);
+                return Err(e);
+            }
+            // The store credential is fleet-level, not per-intent: the
+            // pulling identity is the composite (intent, replica) pair
+            // the kernel arbitrates on, so there is no auth_intent.
+            None
+        } else {
+            match self.require_executor(&request) {
+                Ok(claims) => claims,
+                Err(metadata_err) => {
+                    let body_token = request.get_ref().executor_token.as_str();
+                    if body_token.is_empty() {
+                        metrics::counter!(
+                            "rio_scheduler_pull_rejected_total",
+                            "rpc" => "pull_assignment",
+                            "reason" => "unauthenticated"
+                        )
+                        .increment(1);
+                        return Err(metadata_err);
+                    }
+                    // r[impl sched.executor.input-bounds+2]
+                    rio_common::grpc::check_bound(
+                        "executor_token bytes",
+                        body_token.len(),
+                        MAX_EXECUTOR_TOKEN_LEN,
+                    )?;
+                    let Some(key) = &self.hmac_key else {
+                        // require_executor only fails when a key is
+                        // configured; unreachable, but stay closed.
+                        return Err(metadata_err);
+                    };
+                    let claims: rio_auth::hmac::ExecutorClaims =
+                        key.verify(body_token).map_err(|e| {
                             metrics::counter!(
                                 "rio_scheduler_pull_rejected_total",
                                 "rpc" => "pull_assignment",
                                 "reason" => "unauthenticated"
                             )
                             .increment(1);
-                            return Err(metadata_err);
-                        }
-                        // r[impl sched.executor.input-bounds+2]
-                        rio_common::grpc::check_bound(
-                            "executor_token bytes",
-                            body_token.len(),
-                            MAX_EXECUTOR_TOKEN_LEN,
-                        )?;
-                        let Some(key) = &self.hmac_key else {
-                            // require_executor only fails when a key is
-                            // configured; unreachable, but stay closed.
-                            return Err(metadata_err);
-                        };
-                        let claims: rio_auth::hmac::ExecutorClaims =
-                            key.verify(body_token).map_err(|e| {
-                                metrics::counter!(
-                                    "rio_scheduler_pull_rejected_total",
-                                    "rpc" => "pull_assignment",
-                                    "reason" => "unauthenticated"
-                                )
-                                .increment(1);
-                                Status::unauthenticated(format!(
-                                    "executor_token verification failed: {e}"
-                                ))
-                            })?;
-                        Some(claims)
-                    }
+                            Status::unauthenticated(format!(
+                                "executor_token verification failed: {e}"
+                            ))
+                        })?;
+                    Some(claims)
                 }
-            };
+            }
+        };
         let auth_intent = auth_claims.as_ref().map(|c| c.intent_id.clone());
         let req = request.into_inner();
         if req.intent_id.is_empty() {
@@ -512,7 +587,12 @@ impl ExecutorService for SchedulerGrpc {
             Err(metadata_err) => {
                 if request.get_ref().materialization_outcome.is_some() {
                     // r[impl sched.materialize.job]
-                    match self.require_store_service(&request, "") {
+                    // T-5.1: outcome reports consume attempts (a state
+                    // effect), so they require the instance-bound store
+                    // credential. The report has no executor_instance
+                    // field to match against — Some-ness is the check;
+                    // the exec_id names the attempt.
+                    match self.require_store_service_instance_bound(&request, "", None) {
                         // Authorized store replica (or full dev mode):
                         // fleet-level credential, no per-intent binding.
                         Ok(_) => None,
@@ -680,7 +760,10 @@ impl ExecutorService for SchedulerGrpc {
         // service_token field, verified as ServiceClaims by the
         // service-HMAC key with caller="rio-store". Full dev mode
         // passes through to the flag gate (empty list).
-        self.require_store_service(&request, body_token)?;
+        // T-5.1: the listing exposes cross-tenant job descriptors, so it
+        // requires the instance-bound credential (Some-ness; the listing
+        // request carries no executor_instance to match).
+        self.require_store_service_instance_bound(&request, body_token, None)?;
         let req = request.into_inner();
 
         // send_unchecked: the store polls on an interval; a dropped

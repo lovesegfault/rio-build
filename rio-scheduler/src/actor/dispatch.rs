@@ -2257,6 +2257,9 @@ impl SubstituteAuth {
                         .map(|d| d.as_secs())
                         .unwrap_or(0)
                         + super::SUBSTITUTE_FETCH_TIMEOUT.as_secs(),
+                    // Probe tokens are not replica-bound (T-5.1: only the
+                    // store's materialization client mints Some).
+                    instance: None,
                 };
                 vec![
                     (rio_proto::SERVICE_TOKEN_HEADER, signer.sign(&claims)),

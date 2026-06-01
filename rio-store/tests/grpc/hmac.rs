@@ -61,6 +61,7 @@ fn sign_service(caller: &str, expiry_offset_secs: i64) -> String {
     let claims = ServiceClaims {
         caller: caller.into(),
         expiry_unix: (now_unix() as i64 + expiry_offset_secs) as u64,
+        instance: None,
     };
     HmacSigner::from_key(SERVICE_KEY.to_vec()).sign(&claims)
 }
@@ -153,6 +154,7 @@ async fn service_token_wrong_key_rejected() -> TestResult {
     let forged = HmacSigner::from_key(TEST_KEY.to_vec()).sign(&ServiceClaims {
         caller: "rio-gateway".into(),
         expiry_unix: now_unix() + 60,
+        instance: None,
     });
     let err = put_path_with_header(
         &mut s.client,

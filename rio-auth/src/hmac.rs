@@ -153,6 +153,36 @@ pub struct ServiceClaims {
     /// expiry. No nonce — replay-within-60s is a no-op given
     /// idempotent PutPath (`r[store.put.idempotent]`).
     pub expiry_unix: u64,
+    /// Substitution-replacement Phase B (security obligation 1): the
+    /// store replica's pod identity (DNS-1123 label), bound into the
+    /// signed claims so the scheduler VERIFIES the `executor_instance`
+    /// a materialization pull asserts — a compromised or misconfigured
+    /// replica cannot claim under another replica's identity (the
+    /// composite-identity injection class, Phase A finding 4). `None`
+    /// for every non-materialization mint (gateway PutPath, controller,
+    /// rio-cli, the scheduler's own probe tokens).
+    ///
+    /// **Wire-compat (the bug_011 pattern, same as
+    /// [`AssignmentClaims::tenant`] — scoped per the precedent's own
+    /// documentation):**
+    ///
+    /// - (i) old token → new verifier: missing key → `None` (serde
+    ///   default; `deny_unknown_fields` rejects only *extra* keys).
+    /// - (ii) new token minting `instance: None` → old verifier: the key
+    ///   is never emitted (`skip_serializing_if`) → byte-identical wire
+    ///   shape (gateway PutPath tokens and all in-flight pre-T-5.1
+    ///   tokens are this leg).
+    /// - (iii) new token with `instance: Some(_)` → pre-T-5.1 verifier:
+    ///   REJECTED (`unknown field 'instance'` — same as the
+    ///   AssignmentClaims forward-skew test's half 1, fail-closed).
+    ///   Unreachable in any supported deployment: the only Some-minter
+    ///   is the store's flag-gated materialization client; the flag is
+    ///   a pod-template env var that rolls atomically with the image (a
+    ///   pod is either {old binary + flag off} or {new binary + flag
+    ///   on}, never a cross); production deployment is post-D′. Pinned
+    ///   by `service_claims_instance_forward_skew`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub instance: Option<String>,
 }
 
 impl HmacClaims for ServiceClaims {
@@ -219,11 +249,38 @@ impl HmacClaims for ExecutorClaims {
 pub struct ServiceTokenInterceptor {
     signer: Option<std::sync::Arc<HmacSigner>>,
     caller: &'static str,
+    /// Replica identity bound into every minted token
+    /// ([`ServiceClaims::instance`]). `None` for every control-plane
+    /// caller except the store's materialization client — see the
+    /// field's wire-compat documentation.
+    instance: Option<String>,
 }
 
 impl ServiceTokenInterceptor {
     pub fn new(signer: Option<std::sync::Arc<HmacSigner>>, caller: &'static str) -> Self {
-        Self { signer, caller }
+        Self {
+            signer,
+            caller,
+            instance: None,
+        }
+    }
+
+    /// An interceptor whose minted tokens are instance-bound
+    /// ([`ServiceClaims::instance`] = `Some(instance)`): the store's
+    /// materialization client, which must prove WHICH replica is
+    /// claiming (substitution-replacement Phase B obligation 1). Every
+    /// other caller uses [`Self::new`] (instance-less, wire-identical
+    /// to pre-Phase-B tokens).
+    pub fn with_instance(
+        signer: Option<std::sync::Arc<HmacSigner>>,
+        caller: &'static str,
+        instance: String,
+    ) -> Self {
+        Self {
+            signer,
+            caller,
+            instance: Some(instance),
+        }
     }
 }
 
@@ -237,6 +294,7 @@ impl tonic::service::Interceptor for ServiceTokenInterceptor {
                 expiry_unix: crate::now_unix()
                     .map_err(|e| tonic::Status::internal(e.to_string()))?
                     + 60,
+                instance: self.instance.clone(),
             };
             // sign() output is base64url + '.' — always ASCII.
             if let Ok(v) = signer.sign(&claims).parse() {
@@ -268,6 +326,7 @@ pub fn ensure_service_caller(
         return Ok(ServiceClaims {
             caller: "dev-mode".to_string(),
             expiry_unix: u64::MAX,
+            instance: None,
         });
     };
     let tok = md
@@ -678,6 +737,7 @@ mod tests {
         let svc = ServiceClaims {
             caller: "rio-gateway".into(),
             expiry_unix: now + 60,
+            instance: None,
         };
         let svc_token = signer.sign(&svc);
         assert_eq!(
@@ -833,6 +893,201 @@ mod tests {
             .expect("pre-tenant store must accept a tenant-less body");
         assert_eq!(parsed.executor_id, without_tenant.executor_id);
         assert_eq!(parsed.expiry_unix, without_tenant.expiry_unix);
+    }
+
+    /// Back-compat (T-5.1, the instance-binding analog of
+    /// `assignment_claims_tenant_backcompat`): a service token minted
+    /// WITHOUT the `instance` field (every pre-T-5.1 minter, and every
+    /// post-T-5.1 non-store minter) must still verify under the new
+    /// struct — `#[serde(default)]` on `instance` is load-bearing for
+    /// gateway PutPath tokens and all in-flight tokens at deploy time.
+    #[test]
+    fn service_claims_without_instance_round_trips() {
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        // Hand-roll the pre-instance claims JSON (no `instance` key).
+        let old_json = serde_json::json!({
+            "caller": "rio-gateway",
+            "expiry_unix": now + 60,
+        });
+        let old_bytes = serde_json::to_vec(&old_json).unwrap();
+        let mut mac = HmacSha256::new_from_slice(TEST_KEY).unwrap();
+        mac.update(&old_bytes);
+        let tag = mac.finalize().into_bytes();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let token = format!("{}.{}", b64.encode(&old_bytes), b64.encode(tag));
+
+        let claims = key
+            .verify::<ServiceClaims>(&token)
+            .expect("pre-instance service token still verifies (serde default)");
+        assert_eq!(claims.instance, None);
+        assert_eq!(claims.caller, "rio-gateway");
+
+        // The new struct minting `instance: None` produces the
+        // byte-identical pre-instance wire shape (skip_serializing_if).
+        let minted = ServiceClaims {
+            caller: "rio-gateway".into(),
+            expiry_unix: now + 60,
+            instance: None,
+        };
+        let body = serde_json::to_vec(&minted).unwrap();
+        assert!(
+            !String::from_utf8(body).unwrap().contains("instance"),
+            "instance: None must never emit the key (wire-identity for every \
+             non-materialization mint)"
+        );
+    }
+
+    /// T-5.1: an instance-bound service token round-trips the replica
+    /// identity through sign → verify, and the verifying side reads it
+    /// from the CLAIMS (the signed body), never from anything the
+    /// caller could tamper with.
+    #[test]
+    fn service_claims_instance_signed_and_verified() {
+        let signer = HmacSigner::from_key(TEST_KEY.to_vec());
+        let verifier = HmacVerifier::from_key(TEST_KEY.to_vec());
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims = ServiceClaims {
+            caller: "rio-store".into(),
+            expiry_unix: now + 60,
+            instance: Some("rio-store-7d4b8f9c6-x2vpl".into()),
+        };
+        let token = signer.sign(&claims);
+        let verified = verifier
+            .verify::<ServiceClaims>(&token)
+            .expect("instance-bound token verifies");
+        assert_eq!(verified, claims);
+        assert_eq!(
+            verified.instance.as_deref(),
+            Some("rio-store-7d4b8f9c6-x2vpl"),
+            "the replica identity survives the round trip inside the signed body"
+        );
+
+        // Tampering with the instance inside the claims body breaks the
+        // signature (the binding is what makes the claim an authority).
+        let parts: Vec<&str> = token.split('.').collect();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let mut tampered_claims: ServiceClaims =
+            serde_json::from_slice(&b64.decode(parts[0]).unwrap()).unwrap();
+        tampered_claims.instance = Some("evil-replica".into());
+        let tampered_body = b64.encode(serde_json::to_vec(&tampered_claims).unwrap());
+        let tampered = format!("{tampered_body}.{}", parts[1]);
+        assert!(matches!(
+            verifier.verify::<ServiceClaims>(&tampered),
+            Err(HmacError::InvalidSignature)
+        ));
+
+        // The interceptor's with_instance constructor mints exactly this
+        // shape; ensure_service_caller still accepts it (the instance
+        // claim narrows nothing at the generic service-caller gate — the
+        // narrowing is the materialization verifier's job).
+        use tonic::service::Interceptor;
+        let arc_signer = std::sync::Arc::new(HmacSigner::from_key(TEST_KEY.to_vec()));
+        let mut int = ServiceTokenInterceptor::with_instance(
+            Some(arc_signer),
+            "rio-store",
+            "store-replica-0".into(),
+        );
+        let req = int.call(tonic::Request::new(())).unwrap();
+        let c = ensure_service_caller(req.metadata(), Some(&verifier), &["rio-store"])
+            .expect("instance-bound tokens pass the generic service-caller gate");
+        assert_eq!(c.instance.as_deref(), Some("store-replica-0"));
+    }
+
+    /// Forward-skew direction (T-5.1, adjudication PDB-8's required pin,
+    /// mirroring `assignment_claims_tenant_forward_skew`): a service
+    /// token minted by a post-T-5.1 store (instance-bound), presented to
+    /// a PRE-T-5.1 verifier. With `deny_unknown_fields` on the OLD
+    /// struct and `"instance"` in the NEW struct's wire body, the old
+    /// verifier rejects with `unknown field 'instance'` — **fail-closed,
+    /// never fail-open**: a pre-Phase-B scheduler can never accept an
+    /// instance-bound token while silently skipping the instance check
+    /// (there is no enforcement gap in any mixed-version window; the
+    /// failure mode is claim retries, not unenforced binding).
+    ///
+    /// This leg is unreachable in any supported deployment (the only
+    /// Some-minter is the store's flag-gated materialization client; the
+    /// flag is a pod-template env var that rolls atomically with the
+    /// image; production deployment is post-D′) — see the
+    /// `ServiceClaims::instance` doc-comment, leg (iii).
+    ///
+    /// If this test starts failing on the `Some(_)` half — i.e. the
+    /// pre-instance struct started ACCEPTING `"instance"` — somebody
+    /// dropped `deny_unknown_fields` from `ServiceClaims`, which
+    /// destroys the cross-type isolation between claims families and is
+    /// a different rollout strategy entirely (stop condition 9).
+    #[test]
+    fn service_claims_instance_forward_skew() {
+        // Pre-T-5.1 verifier struct (hand-rolled snapshot of
+        // `ServiceClaims` before `instance` was added). Deliberately
+        // local so it never drifts to track the real struct.
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)] // fields read by serde, not by the test body
+        struct OldServiceClaims {
+            caller: String,
+            expiry_unix: u64,
+        }
+
+        let key = HmacKey::from_key(TEST_KEY.to_vec());
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let claims_body = |c: &ServiceClaims| -> Vec<u8> {
+            let token = key.sign(c);
+            let (claims_b64, _) = token.split_once('.').unwrap();
+            b64.decode(claims_b64).unwrap()
+        };
+
+        // Half 1 — `instance: Some(_)` is a wire break against a
+        // pre-T-5.1 verifier: REJECTED, fail-closed. The old verifier
+        // can never authenticate-but-not-enforce an instance-bound
+        // token.
+        let bound = ServiceClaims {
+            caller: "rio-store".into(),
+            expiry_unix: now + 60,
+            instance: Some("store-replica-0".into()),
+        };
+        let body = claims_body(&bound);
+        assert!(
+            std::str::from_utf8(&body).unwrap().contains("\"instance\""),
+            "Some(_) must emit the instance key (precondition for the rejection assertion)"
+        );
+        let err = serde_json::from_slice::<OldServiceClaims>(&body)
+            .expect_err("a pre-T-5.1 verifier must reject an instance-bearing body");
+        assert!(
+            err.to_string().contains("unknown field `instance`"),
+            "expected `unknown field 'instance'`, got: {err}"
+        );
+
+        // Half 2 — `instance: None` is wire-compatible with a pre-T-5.1
+        // verifier: skip_serializing_if omits the key, so the body has
+        // the exact pre-instance shape. This is what keeps every
+        // non-store mint (gateway PutPath, controller, rio-cli) and the
+        // flag-off store deployable in any order against pre-T-5.1
+        // verifiers.
+        let unbound = ServiceClaims {
+            caller: "rio-gateway".into(),
+            expiry_unix: now + 60,
+            instance: None,
+        };
+        let body = claims_body(&unbound);
+        assert!(
+            !std::str::from_utf8(&body).unwrap().contains("instance"),
+            "None must NOT emit the instance key (skip_serializing_if)"
+        );
+        let parsed = serde_json::from_slice::<OldServiceClaims>(&body)
+            .expect("a pre-T-5.1 verifier must accept an instance-less body");
+        assert_eq!(parsed.caller, unbound.caller);
+        assert_eq!(parsed.expiry_unix, unbound.expiry_unix);
     }
 
     #[test]

@@ -231,9 +231,12 @@ type ExecutorClient = rio_proto::ExecutorServiceClient<
 /// The store-service-authenticated `ExecutorServiceClient`: a lazy
 /// channel to the scheduler with
 /// [`rio_auth::hmac::ServiceTokenInterceptor`] minting a fresh
-/// `ServiceClaims { caller: "rio-store" }` token (60 s expiry) onto
-/// every request's `x-rio-service-token` metadata — the kind-attested
-/// credential the scheduler's materialization operations require.
+/// `ServiceClaims { caller: "rio-store", instance: Some(<pod>) }` token
+/// (60 s expiry) onto every request's `x-rio-service-token` metadata —
+/// the kind-attested, **instance-bound** credential the scheduler's
+/// materialization operations require (T-5.1: the scheduler verifies
+/// the claimed replica identity against the request's
+/// `executor_instance` instead of trusting the request field).
 /// Signer `None` = dev mode: no header, only meaningful against a
 /// keyless scheduler.
 ///
@@ -250,6 +253,11 @@ pub struct SchedulerTransport {
     /// scheduler Deployment rollout).
     scheduler_addr: String,
     signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+    /// The replica identity bound into every minted token (T-5.1) —
+    /// the same [`super::executor_instance`] value the claim loop
+    /// asserts as `executor_instance`, so claim and credential always
+    /// agree.
+    instance: String,
 }
 
 impl SchedulerTransport {
@@ -261,15 +269,22 @@ impl SchedulerTransport {
     /// Deployment rolls, DNS re-resolves, and the channel must follow
     /// the Service's current endpoint instead of pinning the boot-time
     /// pod IP. Never fails on connection (only on a malformed addr).
+    ///
+    /// `instance` is this replica's pod identity
+    /// ([`super::executor_instance`]); it is bound into every minted
+    /// service token so the scheduler can verify (not trust) the
+    /// `executor_instance` field of every claim.
     pub fn connect_lazy(
         scheduler_addr: &str,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+        instance: &str,
     ) -> anyhow::Result<Self> {
-        let client = Self::build_client(scheduler_addr, signer.clone())?;
+        let client = Self::build_client(scheduler_addr, signer.clone(), instance)?;
         Ok(Self {
             client,
             scheduler_addr: scheduler_addr.to_owned(),
             signer,
+            instance: instance.to_owned(),
         })
     }
 
@@ -278,6 +293,7 @@ impl SchedulerTransport {
     fn build_client(
         scheduler_addr: &str,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+        instance: &str,
     ) -> anyhow::Result<ExecutorClient> {
         let endpoint = tonic::transport::Channel::from_shared(format!("http://{scheduler_addr}"))?
             .connect_timeout(Duration::from_secs(10))
@@ -287,8 +303,11 @@ impl SchedulerTransport {
             .keep_alive_timeout(Duration::from_secs(10))
             .keep_alive_while_idle(true);
         let channel = endpoint.connect_lazy();
-        let interceptor =
-            rio_auth::hmac::ServiceTokenInterceptor::new(signer, STORE_SERVICE_CALLER);
+        let interceptor = rio_auth::hmac::ServiceTokenInterceptor::with_instance(
+            signer,
+            STORE_SERVICE_CALLER,
+            instance.to_owned(),
+        );
         let max = rio_common::grpc::max_message_size();
         Ok(
             rio_proto::ExecutorServiceClient::with_interceptor(channel, interceptor)
@@ -317,7 +336,7 @@ impl SchedulerTransport {
     /// Failure to rebuild keeps the old client (the addr parsed at
     /// construction, so this is unreachable in practice).
     fn abandon_connection(&mut self) {
-        match Self::build_client(&self.scheduler_addr, self.signer.clone()) {
+        match Self::build_client(&self.scheduler_addr, self.signer.clone(), &self.instance) {
             Ok(client) => self.client = client,
             Err(e) => warn!(
                 scheduler_addr = %self.scheduler_addr, error = %e,
@@ -846,7 +865,8 @@ mod tests {
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
         let mut transport =
-            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None).unwrap();
+            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
+                .unwrap();
 
         // The executor's connection gets pinned to the standby: the
         // poll pass comes back empty (UNAVAILABLE answers).
@@ -895,7 +915,8 @@ mod tests {
         let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
 
         let mut transport =
-            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None).unwrap();
+            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None, "store-replica-0")
+                .unwrap();
 
         // Pin the connection to the standby with one failing pass.
         let _ = poll_and_claim(&mut transport, "store-replica-0", 1).await;

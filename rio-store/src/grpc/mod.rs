@@ -881,6 +881,7 @@ mod tests {
                 let tok = HmacSigner::from_key(key.clone()).sign(&ServiceClaims {
                     caller: c.into(),
                     expiry_unix: u64::MAX,
+                    instance: None,
                 });
                 r.metadata_mut()
                     .insert(rio_proto::SERVICE_TOKEN_HEADER, tok.parse().unwrap());

@@ -192,6 +192,7 @@ fn sign_service(caller: &str) -> String {
         &rio_auth::hmac::ServiceClaims {
             caller: caller.into(),
             expiry_unix: now + 300,
+            instance: None,
         },
     )
 }

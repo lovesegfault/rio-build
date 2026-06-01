@@ -487,7 +487,9 @@ async fn pull_intent_id_with_separator_rejected() -> anyhow::Result<()> {
 // ── The store-service credential (Wave-4 security obligation:
 //    the kind-attested materialization credential) ──
 
-/// Sign a `ServiceClaims` store credential with `key`.
+/// Sign an INSTANCE-LESS `ServiceClaims` credential with `key` — the
+/// pre-T-5.1 wire shape (and the shape every non-store caller still
+/// mints: gateway PutPath, controller, rio-cli).
 fn store_service_token(key: &rio_auth::hmac::HmacKey, caller: &str) -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -496,6 +498,27 @@ fn store_service_token(key: &rio_auth::hmac::HmacKey, caller: &str) -> String {
     key.sign(&rio_auth::hmac::ServiceClaims {
         caller: caller.to_string(),
         expiry_unix: now + 60,
+        instance: None,
+    })
+}
+
+/// Sign an INSTANCE-BOUND `ServiceClaims` store credential — what the
+/// store's materialization client mints since T-5.1 (the replica
+/// identity is inside the signed body, so the scheduler VERIFIES the
+/// `executor_instance` a claim asserts instead of trusting it).
+fn store_service_token_bound(
+    key: &rio_auth::hmac::HmacKey,
+    caller: &str,
+    instance: &str,
+) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_secs();
+    key.sign(&rio_auth::hmac::ServiceClaims {
+        caller: caller.to_string(),
+        expiry_unix: now + 60,
+        instance: Some(instance.to_string()),
     })
 }
 
@@ -512,13 +535,15 @@ fn mat_success_outcome() -> rio_proto::types::MaterializationOutcome {
 }
 
 // r[verify sched.materialize.job]
-/// Wave-4 kind-attested credential: `ServiceClaims{caller="rio-store"}`
-/// signed with the SERVICE HMAC key (the separate x-rio-service-token
-/// family) authorizes exactly the materialization operations —
-/// ListMaterializationJobs (both carriers), kind=MATERIALIZATION
-/// PullAssignment, and materialization ReportOutcome — while the
-/// executor HMAC posture stays fully enforced. The flag-off answers
-/// stay dormant: empty list, NotYetReady, acknowledged-and-ignored.
+/// Wave-4 kind-attested credential (T-5.1: now also INSTANCE-BOUND —
+/// the enumerated Phase A assertion change): `ServiceClaims{caller=
+/// "rio-store", instance: Some(<replica>)}` signed with the SERVICE
+/// HMAC key (the separate x-rio-service-token family) authorizes
+/// exactly the materialization operations — ListMaterializationJobs
+/// (both carriers), kind=MATERIALIZATION PullAssignment, and
+/// materialization ReportOutcome — while the executor HMAC posture
+/// stays fully enforced. The flag-off answers stay dormant: empty
+/// list, NotYetReady, acknowledged-and-ignored.
 #[tokio::test]
 async fn materialization_ops_accept_store_service_credential() -> anyhow::Result<()> {
     use rio_auth::hmac::HmacKey;
@@ -533,7 +558,7 @@ async fn materialization_ops_accept_store_service_credential() -> anyhow::Result
     ));
     grpc.hmac_key = Some(executor_key);
     grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
-    let store_token = store_service_token(&service_key, "rio-store");
+    let store_token = store_service_token_bound(&service_key, "rio-store", "store-replica-0");
 
     // 1. ListMaterializationJobs, metadata carrier → flag-off empty list.
     let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
@@ -706,6 +731,199 @@ async fn store_service_credential_scoping_is_exact() -> anyhow::Result<()> {
         .await
         .expect_err("a store token without a configured service verifier must not authorize");
     assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    Ok(())
+}
+
+// ── T-5.1 (Phase B): the instance token-claim binding ──────────────────────
+
+// r[verify sched.materialize.job]
+/// T-5.1 (security obligation 1, red-first): the scheduler VERIFIES the
+/// `executor_instance` a materialization claim asserts against the
+/// instance bound INSIDE the signed store-service credential — a
+/// compromised or misconfigured replica cannot claim under another
+/// replica's identity by lying in the request field.
+///
+///   token instance = "store-a", request executor_instance = "store-b"
+///   → PermissionDenied("instance claim mismatch")
+///
+/// The Phase A DNS-1123 validation of the request field stays (defense
+/// in depth); the CLAIM is now the authority.
+#[tokio::test]
+async fn materialization_claim_with_mismatched_instance_rejected() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+
+    // The token attests replica "store-a"; the request asserts "store-b".
+    let token_a = store_service_token_bound(&service_key, "rio-store", "store-a");
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-instance-mismatch".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-b".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("a claim asserting a different instance than its token must be rejected");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "instance mismatch → PermissionDenied, got {err:?}"
+    );
+    assert!(
+        err.message().contains("instance claim mismatch"),
+        "the rejection names the mismatch, got: {}",
+        err.message()
+    );
+
+    // The same token claiming AS "store-a" (claim == request) is
+    // admitted: flag-off it parks NotYetReady (the AS-6 posture), which
+    // proves the gate passed and the kernel answered.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-instance-mismatch".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-a".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, token_a.parse()?);
+    let resp = grpc
+        .pull_assignment(req)
+        .await
+        .expect("a claim whose instance matches its token's binding is admitted")
+        .into_inner();
+    assert!(
+        matches!(
+            resp.outcome,
+            Some(rio_proto::types::pull_assignment_response::Outcome::NotYetReady(_))
+        ),
+        "matching instance + flag-off parks NotYetReady, got {resp:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// T-5.1 privilege narrowing (red-first): an INSTANCE-LESS ServiceClaims
+/// token — the gateway-PutPath-style credential every non-store caller
+/// mints — no longer authorizes materialization operations. The work
+/// surfaces (claim, listing, outcome report) require the instance-bound
+/// form; only the display-only progress relay keeps accepting the
+/// fleet-level credential.
+#[tokio::test]
+async fn materialization_claim_without_instance_claim_rejected() -> anyhow::Result<()> {
+    use rio_auth::hmac::HmacKey;
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+    // A validly-signed, correctly-callered, but INSTANCE-LESS token.
+    let unbound = store_service_token(&service_key, "rio-store");
+
+    // (a) The materialization claim → PermissionDenied.
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "drv-unbound-token".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-replica-0".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
+    let err = grpc
+        .pull_assignment(req)
+        .await
+        .expect_err("an instance-less service token must not authorize a materialization claim");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "instance-less claim → PermissionDenied, got {err:?}"
+    );
+
+    // (b) The job listing → PermissionDenied (both carriers).
+    let mut req = Request::new(rio_proto::types::ListMaterializationJobsRequest {
+        service_token: String::new(),
+        limit: 16,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
+    let err = grpc
+        .list_materialization_jobs(req)
+        .await
+        .expect_err("an instance-less service token must not authorize the job listing");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    let err = grpc
+        .list_materialization_jobs(Request::new(
+            rio_proto::types::ListMaterializationJobsRequest {
+                service_token: unbound.clone(),
+                limit: 16,
+            },
+        ))
+        .await
+        .expect_err("body-carried instance-less token: same rejection");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // (c) The materialization outcome report → PermissionDenied.
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: None,
+        materialization_outcome: Some(mat_success_outcome()),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
+    let err = grpc
+        .report_outcome(req)
+        .await
+        .expect_err("an instance-less service token must not authorize an outcome report");
+    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+    // (d) The display-only progress relay keeps accepting the
+    //     fleet-level credential (no state effect to bind — and the
+    //     Phase A progress battery stays byte-identical).
+    let mut req = Request::new(rio_proto::types::ReportMaterializationProgressRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        bytes_done: 1,
+        bytes_expected: 2,
+        upstream_uri: String::new(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, unbound.parse()?);
+    grpc.report_materialization_progress(req)
+        .await
+        .expect("the display-only progress relay accepts the fleet-level credential");
+
+    // (e) An instance-bound token presented to the NON-materialization
+    //     surfaces is unaffected: a build report still requires the
+    //     executor token (Unauthenticated, not a new acceptance) — the
+    //     binding narrows materialization privileges, it grants nothing.
+    let bound = store_service_token_bound(&service_key, "rio-store", "store-replica-0");
+    let mut req = Request::new(rio_proto::types::ReportOutcomeRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        report: Some(rio_proto::types::CompletionReport::default()),
+        materialization_outcome: None,
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, bound.parse()?);
+    let err = grpc
+        .report_outcome(req)
+        .await
+        .expect_err("build reports still require the per-intent executor token");
+    assert_eq!(err.code(), tonic::Code::Unauthenticated);
     Ok(())
 }
 
@@ -908,7 +1126,9 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
     let mut grpc = SchedulerGrpc::new_for_tests(handle.clone());
     grpc.hmac_key = Some(executor_key);
     grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
-    let store_token = store_service_token(&service_key, "rio-store");
+    // T-5.1 (enumerated change): the credential is instance-bound to the
+    // replica identity this test claims under ("store-test-0").
+    let store_token = store_service_token_bound(&service_key, "rio-store", "store-test-0");
 
     // The REAL wire: in-process tonic server + connected client.
     let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
@@ -1073,7 +1293,9 @@ async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
     let mut grpc = SchedulerGrpc::new_for_tests_with_pool(handle.clone(), db.pool.clone());
     grpc.hmac_key = Some(executor_key);
     grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
-    let store_token = store_service_token(&service_key, "rio-store");
+    // T-5.1 (enumerated change): the credential is instance-bound to the
+    // replica identity this test claims under ("store-test-0").
+    let store_token = store_service_token_bound(&service_key, "rio-store", "store-test-0");
 
     let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
     let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;

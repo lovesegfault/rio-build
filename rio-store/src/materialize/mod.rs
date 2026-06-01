@@ -18,19 +18,21 @@
 //!
 //! **Identity** (BC-1 + the Wave-3/4 security obligations):
 //! - The *credential* is the kind-attested store-service token —
-//!   `ServiceClaims { caller: "rio-store" }` signed with the service
-//!   HMAC key (`service_hmac_key_path`), attached per-request by
-//!   [`rio_auth::hmac::ServiceTokenInterceptor`]. Executor tokens are
-//!   builder/fetcher pod-class credentials and never authorize
-//!   materialization operations; the scheduler rejects them.
+//!   `ServiceClaims { caller: "rio-store", instance: Some(<pod>) }`
+//!   signed with the service HMAC key (`service_hmac_key_path`),
+//!   attached per-request by
+//!   [`rio_auth::hmac::ServiceTokenInterceptor::with_instance`].
+//!   Executor tokens are builder/fetcher pod-class credentials and
+//!   never authorize materialization operations; the scheduler rejects
+//!   them.
 //! - The *replica identity* (`executor_instance`) is derived from this
 //!   pod's own identity ([`executor_instance`]: the `HOSTNAME` pod
-//!   name, a DNS-1123 label) and validated again scheduler-side. The
-//!   full token-claim binding of the instance (the scheduler verifying
-//!   rather than trusting it) is a recorded Phase B obligation — it
-//!   requires a ServiceClaims field addition, which is a cross-cutting
-//!   rio-auth wire change (`deny_unknown_fields` skew, the bug_011
-//!   class).
+//!   name, a DNS-1123 label), bound INTO the signed claims (T-5.1 —
+//!   the Phase B instance-attestation obligation, discharged), and
+//!   verified scheduler-side: a claim whose `executor_instance` differs
+//!   from the token's bound instance is rejected, so a compromised or
+//!   misconfigured replica cannot claim under another replica's
+//!   identity.
 //!
 //! Spec: `store.materialize.executor`; design §2.2 (store as pull
 //! client), §5 (pin-at-ingest).
@@ -94,6 +96,11 @@ pub fn spawn_materialization_executor(
         let transport = match client::SchedulerTransport::connect_lazy(
             &cfg.scheduler_addr,
             service_signer.clone(),
+            // T-5.1: the same identity the claim loop asserts as
+            // executor_instance is bound INTO every minted service
+            // token, so the scheduler verifies the pair instead of
+            // trusting the request field.
+            &instance,
         ) {
             Ok(t) => t,
             Err(e) => {
