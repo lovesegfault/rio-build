@@ -61,9 +61,33 @@ in
   extraClientModules ? [ ],
   # Threaded to mkClientNode's nix.package. Default = nixpkgs CppNix.
   clientNixPackage ? pkgs.nix,
+  # Substitution-replacement Phase B (design §8-B): the deployment-layer
+  # materialization flag for the standalone (systemd) deployment path —
+  # the analog of the helm chart's scheduler.materialization.enabled /
+  # store.materialization.enabled pair. The Rust struct defaults stay
+  # false (PD-B1); the deployment layer is the cutover switch. The
+  # substitution scenarios' flag-on attrs and `-walk` oracle attrs in
+  # default.nix pin this explicitly; T-2.3 flips the default to true.
+  materializationEnabled ? false,
 }:
 let
   hmacKeys = if withHmac then mkHmacKeys { } else null;
+
+  # ── Materialization env (substitution-replacement Phase B) ──────────
+  # Rendered unconditionally with the value tracking the parameter —
+  # the same shape the helm chart renders into both Deployments
+  # (templates/scheduler.yaml, templates/store.yaml). The gateway gets
+  # neither var (no materialization config exists there, matching the
+  # chart's env surface). The store additionally needs the scheduler
+  # ExecutorService address: its config validation requires a non-empty
+  # address whenever the executor is enabled, and the standalone
+  # deployment co-locates scheduler and store on `control`.
+  materializationEnv = {
+    RIO_MATERIALIZATION__ENABLED = if materializationEnabled then "true" else "false";
+  };
+  storeMaterializationEnv = {
+    RIO_MATERIALIZATION__SCHEDULER_ADDR = "localhost:9001";
+  };
 
   # ── HMAC env (no-op {} when withHmac=false) ──────────────────────────
   # Scheduler+store share the assignment-token key; gateway+store share
@@ -199,45 +223,54 @@ let
       })
       otelModule
     ];
+    # Per-service knobs on top of mkControlNode's shared env:
+    #   - environment: gateway-only HMAC override (mkControlNode's
+    #     extraServiceEnv applies controlHmacEnv to ALL three services;
+    #     mapAttrs mkForce makes the gateway env win unambiguously;
+    #     extraGatewayEnv merges alongside) + the materialization flag
+    #     plumbing (scheduler + store, never gateway — mirrors the helm
+    #     chart's env surface; distinct keys from extraServiceEnv, so
+    #     the module merge is clean).
+    #   - rio-scheduler.preStart: serialize migration runs — migration
+    #     011's CREATE INDEX CONCURRENTLY deadlocks with sqlx's
+    #     pg_advisory_lock when store and scheduler race on a fresh DB.
+    #     The module-level After=rio-store.service (scheduler.nix) only
+    #     orders the fork (Type=simple), not readiness — both still hit
+    #     migrate!() near-simultaneously. Block scheduler until store's
+    #     gRPC port is open, which happens post-migration. k8s
+    #     deployments dodge this via pod startup jitter; standalone VM
+    #     boot is deterministic enough to trigger the race reliably.
+    #     Restart=always (module-level) covers any residual window.
+    #   - after: OTel ordering — rio-* services on control must start
+    #     AFTER otelcol. Without this, the services boot, try to connect
+    #     to each other during boot churn, and the restart dance adds
+    #     ~10s of flake. After= doesn't block startup if otelcol is
+    #     disabled (unit doesn't exist → no-op), so the mkIf guard is
+    #     belt-and-suspenders.
     systemd.services = {
-      # Gateway-only HMAC env override. mkControlNode's extraServiceEnv
-      # applies controlHmacEnv to ALL three services (including gateway).
-      # NixOS module merge of two string values for the same key →
-      # conflict. mapAttrs mkForce makes the gateway env win
-      # unambiguously. extraGatewayEnv merges alongside (no mkForce —
-      # it's gateway-only, no conflict with extraServiceEnv's shared
-      # keys).
-      rio-gateway.environment =
-        (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
+      rio-gateway = {
+        environment =
+          (lib.optionalAttrs withHmac (lib.mapAttrs (_: lib.mkForce) gatewayHmacEnv)) // extraGatewayEnv;
+        after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      };
 
-      # Serialize migration runs — migration 011's CREATE INDEX
-      # CONCURRENTLY deadlocks with sqlx's pg_advisory_lock when store
-      # and scheduler race on a fresh DB. The module-level
-      # After=rio-store.service (scheduler.nix) only orders the fork
-      # (Type=simple), not readiness — both still hit migrate!() near-
-      # simultaneously. Block scheduler until store's gRPC port is open,
-      # which happens post-migration. k8s deployments dodge this via
-      # pod startup jitter; standalone VM boot is deterministic enough
-      # to trigger the race reliably. Restart=always (module-level)
-      # covers any residual window.
-      rio-scheduler.preStart = ''
-        for _ in $(seq 1 60); do
-          ${pkgs.netcat}/bin/nc -z localhost 9002 && exit 0
-          sleep 0.5
-        done
-        echo "rio-store port 9002 not open after 30s" >&2
-        exit 1
-      '';
+      rio-scheduler = {
+        environment = materializationEnv;
+        preStart = ''
+          for _ in $(seq 1 60); do
+            ${pkgs.netcat}/bin/nc -z localhost 9002 && exit 0
+            sleep 0.5
+          done
+          echo "rio-store port 9002 not open after 30s" >&2
+          exit 1
+        '';
+        after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      };
 
-      # OTel ordering: rio-* services on control must start AFTER
-      # otelcol. Without this, the services boot, try to connect to
-      # each other during boot churn, and the restart dance adds ~10s
-      # of flake. After= doesn't block startup if otelcol is disabled
-      # (unit doesn't exist → no-op), so the mkIf guard is belt-and-
-      # suspenders.
-      rio-store.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
-      rio-scheduler.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
-      rio-gateway.after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      rio-store = {
+        environment = materializationEnv // storeMaterializationEnv;
+        after = lib.mkIf withOtel [ "opentelemetry-collector.service" ];
+      };
     };
   };
 

@@ -30,14 +30,35 @@
 # is content-addressed (fixed input → fixed hash) so it's deterministic
 # across runs.
 #
+# ── Both flag states (substitution-replacement Phase B, design §8-B) ──
+# The scenario is parametrized on `materializationEnabled` and wired
+# twice in default.nix:
+#   vm-substitute-standalone       — flag-ON (the deployed default after
+#                                    the Phase B cutover): scheduler-owned
+#                                    substitution routes through
+#                                    materialization jobs (store-executor
+#                                    pull), never the walk.
+#   vm-substitute-standalone-walk  — flag-OFF oracle: the as-built walk
+#                                    path, byte-original Phase A
+#                                    assertions (criterion 2's
+#                                    deployment-level revertability proof).
+# The six store-side subtests and the gateway-path progress-e2e subtest
+# are flag-independent and run identically in both attrs; the
+# scheduler-owned subtest runs in both attrs with per-mechanism
+# assertions; the store end-state block (PD-B21) is identical text in
+# both attrs; the dormancy subtest's posture selects on the flag
+# (materialization-active flag-on / materialization-dormant flag-off).
+#
 # store.substitute.{upstream,sig-mode,tenant-sig-visibility} — verify
-# markers at default.nix:vm-substitute-standalone subtests entries
+# markers at default.nix:vm-substitute-standalone(-walk) subtests entries
 {
   pkgs,
   common,
   fixture,
+  materializationEnabled ? true,
 }:
 let
+  inherit (pkgs) lib;
   inherit (fixture) gatewayHost;
 
   jwtKeys = import ../lib/jwt-keys.nix;
@@ -89,6 +110,35 @@ let
   '';
   bbArg = "--arg busybox '(builtins.storePath ${common.busybox})'";
 
+  # 4 INDEPENDENT derivations (no edges) for the scheduler-owned
+  # subtest. Independence matters: with edges + a substitutable root the
+  # merge's topdown prune collapses the submission to one node; with no
+  # edges every node is its own demand-set member, so the scheduler must
+  # make one substitution decision PER NODE — flag-off: one walk each;
+  # flag-on: one materialization job each. Distinct names from
+  # progressClosure so the two subtests' store paths never collide.
+  matjobClosure = pkgs.writeText "matjob-closure.nix" ''
+    { busybox }:
+    let
+      sh = "''${busybox}/bin/sh";
+      bb = "''${busybox}/bin/busybox";
+      mk = i: derivation {
+        name = "rio-matjob-''${toString i}";
+        system = builtins.currentSystem;
+        builder = sh;
+        args = [
+          "-c"
+          "''${bb} mkdir -p $out && ''${bb} echo matjob-''${toString i}-v1 > $out/x"
+        ];
+      };
+    in {
+      a = mk 0;
+      b = mk 1;
+      c = mk 2;
+      d = mk 3;
+    }
+  '';
+
   # Sign a JWT with the jwt-keys.nix test seed. Output on stdout so
   # testScript captures into a Python var. PyJWT's EdDSA wants a PEM
   # private key (not raw 32-byte seed), so we wrap via cryptography.
@@ -102,14 +152,472 @@ let
     claims = {"sub": sys.argv[1], "iat": now, "exp": now + 3600, "jti": "vm-sub-test"}
     print(jwt.encode(claims, sk, algorithm="EdDSA"))
   '';
+
+  # ════════════════════════════════════════════════════════════════════
+  # Store end-state equivalence block (criterion 1 / PD-B21)
+  # ════════════════════════════════════════════════════════════════════
+  # IDENTICAL text in both flag states — interpolated unconditionally.
+  # A substitution mechanism that records metadata but loses data (or
+  # drops references) fails here, in whichever flag state it happens.
+  storeEndState = ''
+    # ══════════════════════════════════════════════════════════════════
+    # substitute-store-end-state — criterion 1 "same store end-state"
+    # ══════════════════════════════════════════════════════════════════
+    # Substitution-replacement equivalence (PD-B21): identical assertion
+    # text in both flag states. After the progress-e2e build completes,
+    # every path in its 4-node closure must be present in rio-store
+    # (narinfo row), carry the upstream signature, and the NAR bytes must
+    # be retrievable through the gateway — a fresh chroot-store copy
+    # forces a full metadata + CAS round-trip per path.
+    with subtest("substitute-store-end-state: closure paths present, signed, fetchable"):
+        closure_paths = [
+            p
+            for p in client.succeed(f"nix-store -qR {root_path}").splitlines()
+            if "rio-progress-" in p
+        ]
+        assert len(closure_paths) == 4, (
+            f"expected the 4-node progress closure (root, mid, 2 leaves), "
+            f"got {closure_paths!r}"
+        )
+        for p in closure_paths:
+            n = psql(
+                ${gatewayHost},
+                f"SELECT count(*) FROM narinfo WHERE store_path = '{p}'",
+            )
+            assert n == "1", (
+                f"store end-state: expected exactly 1 narinfo row for {p}, got {n}"
+            )
+            sigs = psql(
+                ${gatewayHost},
+                f"SELECT signatures FROM narinfo WHERE store_path = '{p}'",
+            )
+            assert "test-cache-1:" in sigs, (
+                f"store end-state: narinfo for {p} missing upstream signature: {sigs}"
+            )
+        # NAR-bytes round-trip: copy the closure out of rio-store into a
+        # fresh chroot store. nix verifies every received NAR against the
+        # narinfo metadata, so corrupt or missing CAS data fails the copy;
+        # dropped references leave dangling paths that fail the test -e.
+        client.succeed("rm -rf /tmp/sub-verify")
+        client.succeed(
+            "nix copy --no-check-sigs --from 'ssh-ng://${gatewayHost}' "
+            f"--to 'local?root=/tmp/sub-verify' {root_path}"
+        )
+        for p in closure_paths:
+            client.succeed(f"test -e /tmp/sub-verify{p}")
+        print(
+            f"substitute-store-end-state PASS: {len(closure_paths)} paths "
+            f"present, signed, NAR round-trip OK"
+        )
+  '';
+
+  # ════════════════════════════════════════════════════════════════════
+  # Scheduler-owned substitution (both flag states; the OQ7 cache-hit
+  # sequence comparison — design §8-B vm-materialization-basic, PD-B2)
+  # ════════════════════════════════════════════════════════════════════
+  # The gateway-path progress-e2e subtest above can never reach the
+  # scheduler's substitution machinery: nix's own wopQueryMissing /
+  # EnsurePath loop has the STORE substitute every output before the
+  # build is even submitted, so the scheduler just sees present paths
+  # (the as-built "outputs already in store; skipping dispatch" lane).
+  # This subtest submits DIRECTLY to the scheduler via gRPC — the same
+  # pattern as substitute-scale.nix — so the SCHEDULER owns the
+  # substitution decision:
+  #   flag-off: merge probe → 4 detached walks → SubstituteComplete
+  #   flag-on:  merge probe → 4 materialization jobs → store-executor
+  #             claim/fetch/report → consumption (Wave 1's T-1.1/T-1.2/
+  #             T-1.8 mechanisms at deployment level)
+  # The submission, completion wait, WatchBuild activity count, and
+  # store end-state assertions are IDENTICAL text in both branches (the
+  # client-visible outcome equivalence); only the mechanism block at the
+  # end selects on the flag.
+  schedulerOwned = ''
+    # ══════════════════════════════════════════════════════════════════
+    # substitute-scheduler-owned — the scheduler's own substitution path
+    # ══════════════════════════════════════════════════════════════════
+    with subtest("substitute-scheduler-owned: direct submission substitutes via the scheduler"):
+        # Build 4 independent derivations locally, sign, publish to the
+        # upstream. These never go through the gateway's ssh-ng path, so
+        # rio-store stays cold for them until the scheduler acts.
+        client.succeed(
+            "nix-build --no-out-link "
+            "${bbArg} ${matjobClosure} 2>&1"
+        )
+        matjob_drvs = sorted(
+            client.succeed(
+                "nix-instantiate "
+                "${bbArg} ${matjobClosure} 2>/dev/null"
+            ).split()
+        )
+        assert len(matjob_drvs) == 4, f"expected 4 matjob drvs, got {matjob_drvs!r}"
+        matjob_outs = dict(
+            l.split(" ", 1)
+            for l in client.succeed(
+                "for d in " + " ".join(matjob_drvs) + "; do "
+                'echo "$d $(nix-store -q --outputs $d)"; done'
+            ).splitlines()
+        )
+        outs_sh = " ".join(matjob_outs.values())
+        client.succeed(f"nix store sign --key-file /tmp/sub/sec {outs_sh}")
+        client.succeed(
+            "nix copy --no-check-sigs "
+            f"--to 'file:///srv/cache?compression=none' {outs_sh}"
+        )
+
+        # Precondition: rio-store is cold for every matjob path — the
+        # scheduler-owned mechanism below is what must ingest them.
+        cold = psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM narinfo WHERE store_path LIKE '%rio-matjob-%'",
+        )
+        assert cold == "0", (
+            f"precondition FAIL: {cold} matjob narinfo row(s) already exist — "
+            f"the scheduler-owned substitution below would be VACUOUS"
+        )
+
+        # Submit directly to the scheduler (no gateway, no tenant token —
+        # dev-mode tenantName fallback per r[sched.tenant.resolve]). The
+        # WatchBuild stream goes to the journal via systemd-run.
+        nodes = [
+            {"drvPath": d, "drvHash": d,
+             "system": "${pkgs.stdenv.hostPlatform.system}",
+             "outputNames": ["out"],
+             "expectedOutputPaths": [matjob_outs[d]]}
+            for d in matjob_drvs
+        ]
+        payload = json.dumps(
+            {"nodes": nodes, "edges": [], "tenantName": "sub-tenant-ssh"}
+        )
+        ${gatewayHost}.succeed(f"cat > /tmp/matjob-dag.json <<'EOF'\n{payload}\nEOF")
+        ${gatewayHost}.succeed(
+            "systemd-run --unit=matjob-submit "
+            "sh -c "
+            "'${grpcurl} -plaintext -max-time 180 "
+            "-protoset ${protoset}/rio.protoset "
+            "-d @ "
+            "localhost:9001 rio.scheduler.SchedulerService/SubmitBuild "
+            "< /tmp/matjob-dag.json'"
+        )
+
+        # The build completes without any worker (the fixture has none):
+        # every node resolves through the scheduler's substitution
+        # mechanism, whichever one the flag selects.
+        ${gatewayHost}.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc "
+            "\"SELECT count(*) FROM derivations"
+            " WHERE drv_hash LIKE '%rio-matjob-%' AND status = 'completed'\""
+            " | grep -qx 4",
+            timeout=180,
+        )
+
+        # ── Client-visible outcome equivalence (criterion 1) ──────────
+        # Build verdict: both this build and progress-e2e succeeded.
+        builds = psql(
+            ${gatewayHost},
+            "SELECT count(*), count(*) FILTER (WHERE status = 'succeeded') FROM builds",
+        )
+        n_builds, n_ok = (int(x) for x in builds.split("|"))
+        assert n_builds == 2 and n_ok == 2, (
+            f"expected 2 builds (progress-e2e + scheduler-owned), both "
+            f"succeeded; got total={n_builds} succeeded={n_ok}"
+        )
+        # Activity equivalence (BC-4): every node's substitution is
+        # client-visible as a SUBSTITUTING event in the WatchBuild
+        # stream — flag-off at walk spawn, flag-on at claim intake. Same
+        # count either way.
+        sub_events = int(${gatewayHost}.succeed(
+            "journalctl -u matjob-submit --no-pager"
+            " | grep -c DERIVATION_EVENT_KIND_SUBSTITUTING || true"
+        ).strip() or "0")
+        assert sub_events == 4, (
+            f"expected 4 SUBSTITUTING events in the WatchBuild stream "
+            f"(one per node), got {sub_events}"
+        )
+        # Store end-state (criterion 1 / PD-B21, identical text in both
+        # flag states): every matjob path present, signed, and the NAR
+        # bytes retrievable through the gateway.
+        for p in matjob_outs.values():
+            n = psql(
+                ${gatewayHost},
+                f"SELECT count(*) FROM narinfo WHERE store_path = '{p}'",
+            )
+            assert n == "1", f"expected 1 narinfo row for {p}, got {n}"
+            sigs = psql(
+                ${gatewayHost},
+                f"SELECT signatures FROM narinfo WHERE store_path = '{p}'",
+            )
+            assert "test-cache-1:" in sigs, (
+                f"missing upstream signature for {p}: {sigs}"
+            )
+        client.succeed("rm -rf /tmp/matjob-verify")
+        client.succeed(
+            "nix copy --no-check-sigs --from 'ssh-ng://${gatewayHost}' "
+            f"--to 'local?root=/tmp/matjob-verify' {outs_sh}"
+        )
+        for p in matjob_outs.values():
+            client.succeed(f"test -e /tmp/matjob-verify{p}")
+        print(
+            f"substitute-scheduler-owned PASS (outcome): build succeeded, "
+            f"{sub_events} SUBSTITUTING events, {len(matjob_outs)} paths "
+            f"present + signed + fetchable"
+        )
+  ''
+  # ── The mechanism subtest: what did the scheduler route through? ────
+  # Its own `with subtest` block (not a continuation of the one above)
+  # so failures attribute to the right subtest and the Python
+  # indentation survives nixfmt's indented-string normalization.
+  + lib.optionalString materializationEnabled ''
+    with subtest("substitute-scheduler-owned: flag-on mechanism — jobs, never walks"):
+        # The merge's new_sub lane created one cache_opportunity job per
+        # matjob node inside the merge transaction (T-1.1's lane); the
+        # store executor claimed and fetched them (design §2.2);
+        # consumption completed the nodes (sched.materialize.routing).
+        # Scoped to the matjob drvs: the progress-e2e build above ALSO
+        # created one job flag-on (origin=pruned — its substitutable root
+        # fires the topdown prune, exactly as flag-off it fires one
+        # pruned-root walk); materialization-active below asserts that one.
+        jobs = psql(
+            ${gatewayHost},
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE state = 'resolved_success'),"
+            " count(*) FILTER (WHERE origin = 'cache_opportunity')"
+            " FROM materialization_jobs WHERE drv_hash LIKE '%rio-matjob-%'",
+        )
+        total, resolved, cache_opp = (int(x) for x in jobs.split("|"))
+        assert total == 4 and resolved == 4 and cache_opp == 4, (
+            f"expected exactly 4 cache_opportunity materialization jobs, all "
+            f"resolved_success (one per matjob node); got total={total} "
+            f"resolved_success={resolved} cache_opportunity={cache_opp}"
+        )
+        # Walk unreachability for fresh flag-on work (criterion 3): the
+        # walk-spawn counter never moved. Absent metric (never
+        # incremented) counts as 0.
+        walks = ${gatewayHost}.succeed(
+            "curl -s localhost:9091/metrics"
+            " | grep '^rio_scheduler_substitute_spawned_total'"
+            " || echo 'rio_scheduler_substitute_spawned_total 0'"
+        )
+        assert walks.strip().endswith(" 0"), (
+            f"flag-on deployment spawned walks for fresh work: {walks}"
+        )
+        # And the flag-on twin metric DID move: one creation per matjob
+        # node (plus the progress-e2e build's pruned-origin job).
+        created = ${gatewayHost}.succeed(
+            "curl -s localhost:9091/metrics"
+            " | grep '^rio_scheduler_materialization_jobs_created_total'"
+            " || echo 'rio_scheduler_materialization_jobs_created_total 0'"
+        )
+        created_n = float(created.strip().rsplit(" ", 1)[1])
+        assert created_n >= 4, (
+            f"rio_scheduler_materialization_jobs_created_total should be >=4 "
+            f"(one per matjob node), got {created_n}"
+        )
+        print("substitute-scheduler-owned PASS (mechanism): 4 jobs resolved, zero walks")
+  ''
+  + lib.optionalString (!materializationEnabled) ''
+    with subtest("substitute-scheduler-owned: flag-off mechanism — walks, never jobs"):
+        # The merge probe spawned one detached walk per node
+        # (spawn_substitute_fetches); SubstituteComplete completed them.
+        # This is the -walk oracle's pin of the as-built mechanism.
+        spawned = ${gatewayHost}.succeed(
+            "curl -s localhost:9091/metrics"
+            " | grep '^rio_scheduler_substitute_spawned_total'"
+            " || echo 'rio_scheduler_substitute_spawned_total 0'"
+        )
+        spawned_n = float(spawned.strip().rsplit(" ", 1)[1])
+        assert spawned_n >= 4, (
+            f"flag-off the scheduler walks all 4 nodes "
+            f"(rio_scheduler_substitute_spawned_total >= 4), got {spawned_n}"
+        )
+        # And no materialization state exists (the dormancy oracle —
+        # re-asserted in full by materialization-dormant below).
+        jobs = psql(${gatewayHost}, "SELECT count(*) FROM materialization_jobs")
+        assert jobs == "0", (
+            f"flag-off deployment created {jobs} materialization job(s)"
+        )
+        print(f"substitute-scheduler-owned PASS (mechanism): {spawned_n:.0f} walks, zero jobs")
+  '';
+
+  # ════════════════════════════════════════════════════════════════════
+  # Flag-ON: materialization-active (the Phase A dormancy successor)
+  # ════════════════════════════════════════════════════════════════════
+  materializationActive = ''
+    # ══════════════════════════════════════════════════════════════════
+    # materialization-active — Phase B flag-on cutover proof
+    # ══════════════════════════════════════════════════════════════════
+    # The dormancy subtest's successor (PD-B5): after all the substitution
+    # subtests above, the flag-on deployment's residue must show the
+    # materialization mechanism — and only it — did the scheduler-side
+    # work: jobs all resolved, the durable wanted relation written by the
+    # merges, every execution materialization-kind, pins released after
+    # the interested builds went terminal (§5.3 / T-1.8), the walk-spawn
+    # counter at zero (criterion 3), and the flag genuinely ON in both
+    # units' environment.
+    with subtest("materialization-active: flag-on deployment substitutes via jobs, never walks"):
+        # The exact job ledger of this scenario flag-on, mirroring the
+        # flag-off walk ledger one-to-one:
+        #   1 origin=pruned          — progress-e2e's substitutable root
+        #     fires the topdown prune; flag-off the same root fires one
+        #     pruned-root WALK whose closure walk fetches all 4 paths;
+        #     flag-on it is one pruned-origin JOB whose executor walk
+        #     fetches the same 4 paths.
+        #   4 origin=cache_opportunity — the scheduler-owned subtest's
+        #     independent nodes; flag-off these are 4 walks.
+        # All resolved_success: every job was claimed, executed, and
+        # consumed (no pending/parked/unobtainable residue).
+        jobs = psql(
+            ${gatewayHost},
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE state = 'resolved_success'),"
+            " count(*) FILTER (WHERE origin = 'pruned'),"
+            " count(*) FILTER (WHERE origin = 'cache_opportunity')"
+            " FROM materialization_jobs",
+        )
+        total, resolved, pruned, cache_opp = (int(x) for x in jobs.split("|"))
+        assert total == 5 and resolved == 5 and pruned == 1 and cache_opp == 4, (
+            f"expected exactly 5 materialization jobs (1 pruned from "
+            f"progress-e2e + 4 cache_opportunity from scheduler-owned), all "
+            f"resolved_success; got total={total} resolved_success={resolved} "
+            f"pruned={pruned} cache_opportunity={cache_opp}"
+        )
+        # The durable wanted relation (design §6/AS-1): written by every
+        # merge flag-on. The scheduler-owned build contributes exactly 4
+        # rows (one per node); the gateway-path progress-e2e build
+        # contributes its merged nodes on top.
+        wanted = psql(
+            ${gatewayHost},
+            "SELECT count(*) FROM build_wanted_outputs w"
+            " JOIN derivations d USING (derivation_id)"
+            " WHERE d.drv_hash LIKE '%rio-matjob-%'",
+        )
+        assert wanted == "4", (
+            f"the scheduler-owned build must have one wanted-relation row "
+            f"per node; expected 4, got {wanted}"
+        )
+        wanted_total = int(psql(${gatewayHost}, "SELECT count(*) FROM build_wanted_outputs"))
+        assert wanted_total >= 4, (
+            f"the durable wanted relation must be written by every merge: {wanted_total}"
+        )
+        # Kind boundary: every execution row is materialization-kind (the
+        # fixture has zero workers — a build-kind row would mean a builder
+        # was dispatched for substitutable work).
+        execs = psql(
+            ${gatewayHost},
+            "SELECT count(*),"
+            " count(*) FILTER (WHERE attempt_kind = 'materialization')"
+            " FROM drv_executions",
+        )
+        n_execs, n_mat = (int(x) for x in execs.split("|"))
+        assert n_execs > 0 and n_execs == n_mat, (
+            f"flag-on substitution must mint only materialization-kind "
+            f"executions; got {n_execs} total, {n_mat} materialization-kind"
+        )
+        # Pins released after all-interest-terminal (§5.3 / T-1.8). The
+        # release rides the build-terminal hook, which can land just after
+        # the client sees its build result — poll briefly.
+        live_pins = "?"
+        for _ in range(30):
+            live_pins = psql(
+                ${gatewayHost},
+                "SELECT count(*) FROM scheduler_live_pins"
+                " WHERE pin_kind = 'materialization'",
+            )
+            if live_pins == "0":
+                break
+            ${gatewayHost}.sleep(1)
+        assert live_pins == "0", (
+            f"{live_pins} materialization pin(s) still live after all "
+            f"interested builds went terminal — the §5.3 release did not fire"
+        )
+        # Non-vacuity for the release: the scheduler logged an actual
+        # release (pins were created at ingest, then released) — guards
+        # against a skipped pin-at-ingest making the zero above vacuous.
+        ${gatewayHost}.succeed(
+            "journalctl -u rio-scheduler --no-pager"
+            " | grep -q 'materialization pins released'"
+        )
+        # Walk unreachability over the WHOLE scenario (criterion 3).
+        walks = ${gatewayHost}.succeed(
+            "curl -s localhost:9091/metrics"
+            " | grep '^rio_scheduler_substitute_spawned_total'"
+            " || echo 'rio_scheduler_substitute_spawned_total 0'"
+        )
+        assert walks.strip().endswith(" 0"), (
+            f"flag-on deployment spawned walks: {walks}"
+        )
+        # And the flags really are ON in the units' environment (the
+        # deployment-layer cutover this scenario proves). Asserted against
+        # the units' real environment via systemd, mirroring the dormant
+        # oracle's inverse guard.
+        for unit in ["rio-scheduler", "rio-store"]:
+            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
+            assert "RIO_MATERIALIZATION__ENABLED=true" in env, (
+                f"{unit} not flag-on: {env}"
+            )
+        print(
+            f"materialization-active PASS: {total} jobs all resolved, "
+            f"{wanted_total} wanted rows, {n_mat} materialization execution(s), "
+            f"pins released, zero walks, flags on"
+        )
+  '';
+
+  # ════════════════════════════════════════════════════════════════════
+  # Flag-OFF: materialization-dormant (the Phase A oracle, byte-original)
+  # ════════════════════════════════════════════════════════════════════
+  materializationDormant = ''
+    # ══════════════════════════════════════════════════════════════════
+    # materialization-dormant — Phase A dormancy criterion 2 (flag-off)
+    # ══════════════════════════════════════════════════════════════════
+    # Substitution-replacement campaign: after the substitution subtests
+    # above (cold-fetch, sig-mode-add, cross-tenant-gate,
+    # built-path-cross-tenant-gate, ssh-ng, progress-e2e,
+    # scheduler-owned) have driven the full merge → probe → walk →
+    # completion path — exactly the path that would create
+    # materialization jobs flag-on — the materialization tables must be
+    # EMPTY and no ledger/execution row may carry a materialization
+    # kind/class. Asserted against a real deployment doing real
+    # substitution work with the flags off (the -walk oracle attr). The
+    # attempt/execution/pin clauses are vacuously zero here (this fixture
+    # has zero workers); the lifecycle-core fragment proves those against
+    # real builder traffic.
+    with subtest("materialization-dormant: flag-off deployment creates no materialization state"):
+        rows = psql(
+            ${gatewayHost},
+            "SELECT (SELECT count(*) FROM materialization_jobs)"
+            " + (SELECT count(*) FROM build_wanted_outputs)"
+            " + (SELECT count(*) FROM drv_attempts WHERE outcome_class LIKE 'materialization%')"
+            " + (SELECT count(*) FROM drv_executions WHERE attempt_kind = 'materialization')"
+            " + (SELECT count(*) FROM scheduler_live_pins WHERE pin_kind = 'materialization')",
+        )
+        assert rows == "0", (
+            f"flag-off deployment created materialization state: {rows} row(s) "
+            f"across the five dormancy tables/clauses (Phase A criterion 2 violation)"
+        )
+
+        # And the flags really are off in the SERVICES' environment (not
+        # the test driver's shell — printenv in a fresh succeed() shell
+        # can never see the unit's env, so that guard could never fail).
+        # Assert against the units' real environment via systemd.
+        for unit in ["rio-scheduler", "rio-store"]:
+            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
+            assert "RIO_MATERIALIZATION__ENABLED=true" not in env, (
+                f"scenario unexpectedly enables materialization on {unit}: {env}"
+            )
+        print("materialization-dormant PASS: zero rows in all five clauses, flags off")
+  '';
 in
 pkgs.testers.runNixOSTest {
-  name = "rio-substitute";
+  # Distinct derivation names per flag state so the two check attrs
+  # (vm-substitute-standalone / vm-substitute-standalone-walk) never
+  # collide and CI logs name the right one.
+  name = "rio-substitute" + lib.optionalString (!materializationEnabled) "-walk";
   skipTypeCheck = true;
 
   # ~60s boot + cache setup ~10s + grpcurl round-trips + ssh-ng build
-  # for substitute-progress-e2e (~40s). No worker builds, no k3s.
-  globalTimeout = 480 + common.covTimeoutHeadroom;
+  # for substitute-progress-e2e (~40s) + the scheduler-owned direct
+  # submission (~30s: local build + publish + submit + mechanism wait +
+  # NAR round-trip copies). No worker builds, no k3s.
+  globalTimeout = 600 + common.covTimeoutHeadroom;
 
   inherit (fixture) nodes;
 
@@ -698,46 +1206,11 @@ pkgs.testers.runNixOSTest {
             f"{n_progress} resProgress events all done≤expected and monotone"
         )
 
-    # ══════════════════════════════════════════════════════════════════
-    # materialization-dormant — Phase A dormancy criterion 2 (flag-off)
-    # ══════════════════════════════════════════════════════════════════
-    # Substitution-replacement campaign: after the six substitution
-    # subtests above (cold-fetch, sig-mode-add, cross-tenant-gate,
-    # built-path-cross-tenant-gate, ssh-ng, progress-e2e) have driven
-    # the full merge → probe → walk → completion path — exactly the
-    # path that would create materialization jobs flag-on — the
-    # materialization tables must be EMPTY and no ledger/execution row
-    # may carry a materialization kind/class. Asserted against a real
-    # deployment doing real substitution work with the flags at their
-    # default (false). The attempt/execution/pin clauses are vacuously
-    # zero here (this fixture has zero workers); the lifecycle-core
-    # fragment proves those against real builder traffic.
-    with subtest("materialization-dormant: flag-off deployment creates no materialization state"):
-        rows = psql(
-            ${gatewayHost},
-            "SELECT (SELECT count(*) FROM materialization_jobs)"
-            " + (SELECT count(*) FROM build_wanted_outputs)"
-            " + (SELECT count(*) FROM drv_attempts WHERE outcome_class LIKE 'materialization%')"
-            " + (SELECT count(*) FROM drv_executions WHERE attempt_kind = 'materialization')"
-            " + (SELECT count(*) FROM scheduler_live_pins WHERE pin_kind = 'materialization')",
-        )
-        assert rows == "0", (
-            f"flag-off deployment created materialization state: {rows} row(s) "
-            f"across the five dormancy tables/clauses (Phase A criterion 2 violation)"
-        )
-
-        # And the flags really are off in the SERVICES' environment (not
-        # the test driver's shell — printenv in a fresh succeed() shell
-        # can never see the unit's env, so that guard could never fail).
-        # Assert against the units' real environment via systemd.
-        for unit in ["rio-scheduler", "rio-store"]:
-            env = ${gatewayHost}.succeed(f"systemctl show {unit} --property=Environment")
-            assert "RIO_MATERIALIZATION__ENABLED=true" not in env, (
-                f"scenario unexpectedly enables materialization on {unit}: {env}"
-            )
-        print("materialization-dormant PASS: zero rows in all five clauses, flags off")
-
+    ${storeEndState}
+    ${schedulerOwned}
+    ${if materializationEnabled then materializationActive else materializationDormant}
     client.execute("systemctl stop test-cache 2>/dev/null || true")
+    ${gatewayHost}.execute("systemctl stop matjob-submit 2>/dev/null || true")
 
     ${common.collectCoverage fixture.pyNodeVars}
   '';

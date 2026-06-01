@@ -255,6 +255,59 @@ let
     inherit pkgs common;
     fixture = k3sProdParity { };
   };
+
+  # ── substitute scenario builder (both flag states — PD-B3/PD-B13) ────
+  # One builder, two attrs: the materialization flag is threaded to BOTH
+  # the scenario (selects the assertion branch) and the fixture (sets the
+  # deployment env), so each attr's assertions and deployment posture
+  # flip together — a commit can never leave either attr red because the
+  # fixture flipped without its assertions (commit rule 3).
+  #
+  # Fixture notes (shared by both attrs):
+  #   - Service-HMAC so the scheduler's substitution probe / walk mints
+  #     `x-rio-service-token` + `x-rio-probe-tenant-id`; without it the
+  #     store's `request_tenant_id` returns None → NotFound. Flag-on, the
+  #     same key authenticates the store's materialization executor
+  #     against the scheduler's ExecutorService.
+  #   - Gateway-only signing seed so mint_session_jwt works (ssh auth →
+  #     resolve_tenant → mint JWT → attach to outbound gRPC; P0465).
+  #   - grpcurl + postgresql on control for direct probing + psql.
+  #   - Client :8080 open for the fake-upstream http.server.
+  mkSubstituteStandalone =
+    materializationEnabled:
+    let
+      jwtKeys = import ./lib/jwt-keys.nix;
+      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
+      # Gateway's signing seed — same keypair as the store verifies
+      # against. Gateway SIGNS with seed, store VERIFIES with pubkey.
+      jwtSeed = pkgs.writeText "jwt-seed" jwtKeys.seedB64;
+      # 32×0x55 seed, base64-encoded. Distinct from jwtKeys (0x42) so
+      # a JWT-sig/narinfo-sig mixup would fail loudly.
+      rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
+    in
+    substitute {
+      inherit pkgs common materializationEnabled;
+      fixture = standalone {
+        inherit materializationEnabled;
+        workers = { };
+        withHmac = true;
+        extraStoreConfig = {
+          signingKeyFile = "${rioSigningKey}";
+          extraConfig = ''
+            [jwt]
+            key_path = "${jwtPubkey}"
+          '';
+        };
+        extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
+        extraPackages = [
+          pkgs.grpcurl
+          pkgs.postgresql_18
+        ];
+        extraClientModules = [
+          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+        ];
+      };
+    };
 in
 {
   # ── nixos-node AMI bootstrap (mocked IMDS, no AWS) ────────────────────
@@ -375,22 +428,47 @@ in
 
   # Upstream binary-cache substitution: fake cache on client VM, store
   # fetches + ingests on QueryPathInfo miss. Validates the P0462/P0463
-  # chain at the store-gRPC level (NOT through ssh-ng — gateway read-
-  # opcode handlers don't yet propagate x-rio-tenant-token; see
-  # TODO(P0465) in the scenario file).
+  # chain at the store-gRPC level plus the ssh-ng path (P0465 JWT
+  # propagation), in BOTH materialization flag states (PD-B3): the
+  # flag-on attr below is the deployed-default posture; the -walk attr
+  # is the flag-off as-built-walk oracle. Fixture/JWT/signing notes live
+  # on mkSubstituteStandalone (the shared builder).
   #
-  # JWT: store needs RIO_JWT__KEY_PATH set so the interceptor attaches
-  # TenantClaims → request_tenant_id() → Some(tid) → substitution fires.
-  # jwt-keys.nix test pubkey (seed=0x42×32) via pkgs.writeText →
-  # store-path in VM closure. The scenario signs matching JWTs with the
-  # seed via PyJWT.
+  # ── Flag-ON (design §8-B vm-materialization-basic — PD-B2) ──────────
+  # Scheduler-owned substitution routes through materialization jobs:
+  # merge probe → cache_opportunity job rows (in the merge transaction)
+  # → store-executor claim/fetch/report → consumption. The walk never
+  # spawns for fresh flag-on work (criterion 3). Explicit `true` pin
+  # until T-2.3 flips the fixture default; T-2.3 drops the pin (a
+  # behavioral no-op that proves the default plumb).
   #
-  # signingKeyFile: sig_mode=add needs a rio-side Signer. Fixed test
-  # seed → key name "rio-vm-test-1" (the scenario asserts this exact
-  # name in narinfo.signatures). Nix secret-key format: name:base64seed.
-  #
-  # 0 workers: no builds, pure store-side test. workers={} → empty
-  # workerNodes attrset → just control+client VMs.
+  # r[verify sched.materialize.job]
+  #   substitute-scheduler-owned: a direct (gateway-bypassing) submission
+  #   of 4 substitutable nodes creates exactly 4 cache_opportunity jobs in
+  #   the merge transaction; all resolve resolved_success; the
+  #   jobs-created metric moves by 4 while the walk-spawn metric stays 0.
+  # r[verify sched.materialize.routing]
+  #   substitute-scheduler-owned + materialization-active: every job's
+  #   Success outcome is consumed — nodes complete, the build succeeds,
+  #   no unresolved jobs remain (all-resolved assertion).
+  # r[verify sched.materialize.pinning]
+  #   materialization-active: pin-at-ingest rows (pin_kind=
+  #   'materialization') are released once the interested builds go
+  #   terminal (§5.3 / T-1.8 wiring), with the scheduler's release log
+  #   line as the non-vacuity witness.
+  # r[verify gw.activity.subst-progress]
+  #   substitute-progress-e2e: 4-path closure submitted via ssh-ng;
+  #   captured internal-json wire stream asserts every actCopyPath
+  #   start has a matching stop, every resProgress has done≤expected,
+  #   and per-aid done is monotone non-decreasing — the §8-B
+  #   basic-scenario pair-rendering obligation, preserved flag-on.
+  vm-substitute-standalone = mkSubstituteStandalone true;
+
+  # ── Flag-OFF oracle (design §8-B "both flag states") ────────────────
+  # The as-built scheduler walk path, with the Phase A assertions
+  # byte-original (criterion 2's deployment-level revertability proof:
+  # flipping back must always work). Explicit `false` pin — after T-2.3
+  # this OVERRIDES the flipped default.
   #
   # r[verify store.substitute.upstream]
   #   substitute-cold-fetch: miss → HTTP GET narinfo → sig-verify →
@@ -415,69 +493,18 @@ in
   #   substitute-ssh-ng: gateway propagates JWT through wopQueryPathInfo
   #   → store's try_substitute_on_miss fires → path substitutable via
   #   the real ssh-ng protocol path (not grpcurl backdoor).
-  # r[verify gw.activity.subst-progress]
   # r[verify sched.merge.substitute-probe-indeterminate]
-  #   substitute-progress-e2e: 4-path closure submitted via ssh-ng;
-  #   captured internal-json wire stream asserts every actCopyPath
-  #   start has a matching stop, every resProgress has done≤expected,
-  #   and per-aid done is monotone non-decreasing. The store-side
-  #   indeterminate→hits unit tests cover the probe; this proves the
-  #   full scheduler→gateway→client wire path.
-  # r[verify sched.materialize.job]
-  # r[verify sched.materialize.pinning]
-  #   materialization-dormant: after the six substitution subtests, the
-  #   five-table zero-count proves flag-off dormancy at deployment level
-  #   (jobs/wanted tables non-vacuously — substitution traffic is exactly
-  #   what would create jobs flag-on; the attempt/execution/pin clauses
-  #   are covered by the lifecycle-core fragment, which has real builder
-  #   traffic). Plus the systemd-unit env guard on scheduler + store.
-  vm-substitute-standalone =
-    let
-      jwtKeys = import ./lib/jwt-keys.nix;
-      jwtPubkey = pkgs.writeText "jwt-pubkey" jwtKeys.pubkeyB64;
-      # Gateway's signing seed — same keypair as the store verifies
-      # against. Gateway SIGNS with seed, store VERIFIES with pubkey.
-      jwtSeed = pkgs.writeText "jwt-seed" jwtKeys.seedB64;
-      # 32×0x55 seed, base64-encoded. Distinct from jwtKeys (0x42) so
-      # a JWT-sig/narinfo-sig mixup would fail loudly.
-      rioSigningKey = pkgs.writeText "rio-signing-key" "rio-vm-test-1:VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVU=";
-    in
-    substitute {
-      inherit pkgs common;
-      fixture = standalone {
-        workers = { };
-        # Service-HMAC so scheduler's `walk_substitute_closure` →
-        # `SubstituteAuth::Service` mints `x-rio-service-token` +
-        # `x-rio-probe-tenant-id`; without it `SubstituteAuth::Jwt([])`
-        # → store's `request_tenant_id` returns None →
-        # `substitute_path_impl` NotFound. Only the
-        # substitute-progress-e2e subtest exercises this path.
-        withHmac = true;
-        extraStoreConfig = {
-          signingKeyFile = "${rioSigningKey}";
-          extraConfig = ''
-            [jwt]
-            key_path = "${jwtPubkey}"
-          '';
-        };
-        # Gateway-only: signing seed so mint_session_jwt works. With
-        # this set, ssh auth (tenant-name comment) → scheduler
-        # resolve_tenant → UUID → mint JWT → attach to all outbound
-        # gRPC (P0465 threaded this through opcodes_read.rs).
-        extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
-        # grpcurl + postgresql (psql) on control for direct store
-        # probing + narinfo table inspection.
-        extraPackages = [
-          pkgs.grpcurl
-          pkgs.postgresql_18
-        ];
-        # Open :8080 on client for the fake-upstream http.server. The
-        # store (on control) fetches http://client:8080/<hash>.narinfo.
-        extraClientModules = [
-          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
-        ];
-      };
-    };
+  #   substitute-scheduler-owned (flag-off branch): the merge probe
+  #   routes 4 substitutable nodes to detached walks
+  #   (rio_scheduler_substitute_spawned_total >= 4, zero job rows) —
+  #   the as-built mechanism pinned at deployment level. Plus
+  #   materialization-dormant: the five-table zero-count after all the
+  #   walk traffic (jobs/wanted clauses non-vacuously — substitution
+  #   traffic is exactly what would create jobs flag-on; the
+  #   attempt/execution/pin clauses are covered by the lifecycle-core
+  #   fragment, which has real builder traffic), plus the systemd-unit
+  #   env guard on scheduler + store.
+  vm-substitute-standalone-walk = mkSubstituteStandalone false;
 
   # ── log-service (standalone fixture, no workers) ─────────────────────
   # rio-store LogService end-to-end: authenticated AppendLog ingest →
