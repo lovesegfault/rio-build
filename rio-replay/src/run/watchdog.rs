@@ -247,8 +247,17 @@ impl Watchdog {
             } else {
                 self.idle_streak = 0;
             }
+            // Idle executors are a dispatch failure only while work is
+            // queued (the documented contract, mirroring the idle predicate
+            // above). The queued guard is also what keeps this pause
+            // self-clearing: the run loop stops submission on this component,
+            // so the predicate must only persist on state that can still
+            // change while paused. Queued work can drain while paused; an
+            // empty queue cannot refill itself — without the guard, a drained
+            // cluster would hold the pause, the pause would keep the queue
+            // empty, and the campaign would wedge until its deadline.
             let gap = i64::from(cluster.active_executors) - i64::from(cluster.running_derivations);
-            if gap > self.knobs.dispatch_gap_threshold {
+            if cluster.queued_derivations > 0 && gap > self.knobs.dispatch_gap_threshold {
                 self.dispatch_streak += 1;
             } else {
                 self.dispatch_streak = 0;
@@ -628,6 +637,90 @@ mod tests {
         assert!(!o.dispatch_pause);
         assert!(!o.suspended);
         assert!(o.closed_window.is_some(), "dispatch window closed");
+    }
+
+    #[test]
+    fn dispatch_streak_needs_queued_work() {
+        // A drained cluster — plenty of registered executors, nothing queued,
+        // nothing running — is benign idleness, not a dispatch failure. The
+        // gap (100 - 0) stays far above the threshold on every poll, but with
+        // no queued work the streak must never build, no matter how long the
+        // state persists.
+        let mut wd = Watchdog::new(knobs());
+        for i in 0..8 {
+            let o = wd.on_tick(&tick(i * 60, cluster(0, 0, 0, 100)));
+            assert!(!o.dispatch_pause, "poll {i}: no queued work, no pause");
+            assert!(!o.suspended, "poll {i}: drained cluster is not suspended");
+        }
+    }
+
+    #[test]
+    fn dispatch_pause_lifts_when_the_queue_drains() {
+        let mut wd = Watchdog::new(knobs());
+        // A legitimate dispatch gap: queued work, idle executors → paused.
+        for i in 0..5 {
+            wd.on_tick(&tick(i * 60, cluster(100, 10, 0, 100)));
+        }
+        let o = wd.on_tick(&tick(5 * 60, cluster(100, 10, 0, 100)));
+        assert!(o.dispatch_pause, "gap with queued work → submission paused");
+        // While paused the engine submits nothing, so once the cluster works
+        // off its queue the counts settle at queued=0, running=0 — exactly
+        // the state the pause itself produces. The pause must lift here: if
+        // the empty queue kept the streak alive, paused submission would keep
+        // the queue empty and the campaign would wedge until its deadline.
+        let o = wd.on_tick(&tick(6 * 60, cluster(0, 0, 0, 100)));
+        assert!(!o.dispatch_pause, "drained queue clears the pause");
+        assert!(!o.suspended);
+        assert!(o.closed_window.is_some(), "dispatch window closed");
+    }
+
+    #[test]
+    fn suspension_components_match_documented_predicates() {
+        // Truth table over (queued × running × executors), checked against
+        // the documented predicate sentences (module doc):
+        //   idle:     queued derivations but nothing running or substituting
+        //   dispatch: executors sit idle WHILE WORK IS QUEUED (gap above
+        //             threshold), sustained over consecutive polls
+        // Each combination is held steady long enough to saturate both
+        // streaks (idle needs 3 polls, dispatch 5), then the saturated
+        // tick's components must match the sentences exactly.
+        let k = knobs();
+        for queued in [0u32, 1, 100] {
+            for running in [0u32, 49, 50, 100] {
+                for executors in [0u32, 50, 51, 100, 151] {
+                    let expect_idle = queued > 0 && running == 0;
+                    let expect_dispatch = queued > 0
+                        && i64::from(executors) - i64::from(running) > k.dispatch_gap_threshold;
+                    let mut wd = Watchdog::new(k.clone());
+                    let mut last = TickOutcome::default();
+                    for i in 0..6 {
+                        last = wd.on_tick(&tick(i * 60, cluster(queued, running, 0, executors)));
+                    }
+                    let state = format!("queued={queued} running={running} executors={executors}");
+                    assert_eq!(
+                        last.components.contains(&COMPONENT_IDLE),
+                        expect_idle,
+                        "idle predicate for {state}: {:?}",
+                        last.components
+                    );
+                    assert_eq!(
+                        last.components.contains(&COMPONENT_DISPATCH),
+                        expect_dispatch,
+                        "dispatch predicate for {state}: {:?}",
+                        last.components
+                    );
+                    assert_eq!(
+                        last.dispatch_pause, expect_dispatch,
+                        "dispatch_pause mirrors the component for {state}"
+                    );
+                    assert_eq!(
+                        last.suspended,
+                        expect_idle || expect_dispatch,
+                        "suspension is the OR of the active components for {state}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
