@@ -84,6 +84,19 @@ pub struct LogReport {
     /// Whether any forwarded line still carried the `@nix ` prefix —
     /// must always be false.
     pub forwarded_atnix: bool,
+    /// Filter-INDEPENDENT leak oracle: per-stream, the collector
+    /// re-derives each logical line's class from the RAW event
+    /// metadata (head bytes + the splitter's `terminated` framing) and
+    /// flags any fragment of an `@nix`-headed logical line that the
+    /// filter forwarded. Catches tail leaks `forwarded_atnix` cannot
+    /// see (tails do not carry the prefix). Must always be false.
+    pub atnix_tail_forwarded: bool,
+    /// Events with `terminated == false` — i.e. splitter fragments
+    /// (cap force-emits and EOF flushes). The harness uses this as an
+    /// anti-vacuity guard: an entry built to exercise the splitter cap
+    /// must observe at least one split, otherwise raising the cap
+    /// would silently turn the leak assertion into a no-op.
+    pub split_lines: u64,
     /// setPhase values seen, in order.
     pub phases: Vec<String>,
     pub cap_exceeded: bool,
@@ -285,17 +298,52 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     let collector = tokio::spawn(async move {
         let mut filter = NixLogFilter::new();
         let mut log = LogReport::default();
+        // Raw-event leak oracle, independent of NixLogFilter's own
+        // state machine: tracks, per stream, whether the OPEN logical
+        // line's head carried the `@nix ` prefix.
+        let mut raw_open: Vec<(rio_exec::LogStream, bool)> = Vec::new();
         while let Some(ev) = rx.recv().await {
-            if let ExecEvent::Log { line, .. } = ev {
+            if let ExecEvent::Log {
+                stream,
+                line,
+                terminated,
+            } = ev
+            {
                 log.total_lines += 1;
+                if !terminated {
+                    log.split_lines += 1;
+                }
+                let raw_atnix = match raw_open.iter().position(|(s, _)| *s == stream) {
+                    Some(idx) => {
+                        let (_, head_was_atnix) = raw_open[idx];
+                        if terminated {
+                            raw_open.swap_remove(idx);
+                        }
+                        head_was_atnix
+                    }
+                    None => {
+                        let head_was_atnix = line.starts_with(b"@nix ");
+                        if !terminated {
+                            raw_open.push((stream, head_was_atnix));
+                        }
+                        head_was_atnix
+                    }
+                };
                 if line.starts_with(b"@nix ") {
                     log.atnix_lines += 1;
                 }
-                match filter.handle(&line) {
+                match filter.handle(stream, &line, terminated) {
                     LineAction::Forward(l) => {
                         log.forwarded_lines += 1;
                         if l.starts_with(b"@nix ") {
                             log.forwarded_atnix = true;
+                        }
+                        if raw_atnix {
+                            // Any fragment of an @nix-headed logical
+                            // line reaching the forward path is a leak,
+                            // whether or not the fragment itself shows
+                            // the prefix.
+                            log.atnix_tail_forwarded = true;
                         }
                         if log.tail.len() == LOG_TAIL_LINES {
                             log.tail.remove(0);

@@ -843,6 +843,28 @@ rec {
     echo '@nix {"action":"setPhase","phase":"installPhase"}' >&2
   '' { };
 
+  # An @nix frame far larger than the executor's 1 MiB pending-line cap:
+  # the splitter force-emits it in fragments, and the log filter must
+  # consume EVERY fragment (head classifies, tails inherit) — none of
+  # the frame body may reach the forwarded log. The driver's report
+  # carries a filter-independent leak oracle (atnix_tail_forwarded) and
+  # a split counter (split_lines); the harness asserts the former is
+  # false and the latter nonzero, so raising the splitter cap above
+  # this frame's size fails the entry instead of passing it vacuously.
+  # Built by doubling: 64 bytes shifted left 16 times = 4 MiB of
+  # payload, no shell loops over megabyte strings byte-by-byte.
+  oversized-atnix-frame = mkDrv "rio-diff-oversized-atnix" ''
+    big=AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA
+    i=0
+    while [ $i -lt 16 ]; do
+      big=$big$big
+      i=$((i+1))
+    done
+    printf '@nix {"action":"msg","level":7,"msg":"%s"}\n' $big >&2
+    echo "after the frame" >&2
+    echo done > $out
+  '' { };
+
   # ── 32-bit (i686) builds ─────────────────────────────────────────────
 
   # Baseline 32-bit build: catches gross divergence in exec/personality

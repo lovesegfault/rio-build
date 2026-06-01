@@ -130,6 +130,14 @@ let
         "installPhase"
       ];
     };
+    oversized-atnix-frame = {
+      expect = "parity";
+      # Anti-vacuity: the 4 MiB frame must actually exceed the
+      # executor's pending-line cap and be split — if the cap is ever
+      # raised past the frame size this trips instead of letting the
+      # tail-leak assertion pass on an unsplit line.
+      min_split_lines = 1;
+    };
     erg-with-drv = {
       expect = "parity";
     };
@@ -508,6 +516,20 @@ pkgs.testers.runNixOSTest {
             assert not report["log"]["forwarded_atnix"], (
                 f"{name}: an @nix line leaked into the forwarded log"
             )
+            # Filter-independent oracle: no fragment of an @nix-headed
+            # logical line may be forwarded either (tails of oversized
+            # frames do not carry the prefix, so forwarded_atnix alone
+            # cannot see them).
+            assert not report["log"]["atnix_tail_forwarded"], (
+                f"{name}: a fragment of an @nix frame leaked into the forwarded log"
+            )
+            if "min_split_lines" in meta:
+                assert report["log"]["split_lines"] >= meta["min_split_lines"], (
+                    f"{name}: expected ≥{meta['min_split_lines']} splitter "
+                    f"fragments, saw {report['log']['split_lines']} — the "
+                    f"pending-line cap no longer splits this entry's frame, "
+                    f"so the tail-leak assertion would be vacuous"
+                )
 
             expect = meta["expect"]
             if expect == "parity":

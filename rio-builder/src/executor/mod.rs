@@ -1601,7 +1601,7 @@ async fn native_log_loop(
         tokio::select! {
             ev = events.recv() => {
                 let Some(ev) = ev else { break };
-                let rio_exec::ExecEvent::Log { line, .. } = ev else {
+                let rio_exec::ExecEvent::Log { stream, line, terminated } = ev else {
                     continue;
                 };
                 if log_limit_exceeded {
@@ -1609,7 +1609,7 @@ async fn native_log_loop(
                     // reader threads never block on a full channel.
                     continue;
                 }
-                match filter.handle(&line) {
+                match filter.handle(stream, &line, terminated) {
                     glue::log::LineAction::Forward(l) => match batcher.add_line(l) {
                         AddLineResult::Buffered => {}
                         AddLineResult::BatchReady(batch) => {
