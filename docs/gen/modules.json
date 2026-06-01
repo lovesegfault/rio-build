@@ -1027,6 +1027,11 @@
       "doc": "scheduler_live_pins — auto-pin live-build input closure."
     },
     {
+      "path": "db/materialization.rs",
+      "depth": 1,
+      "doc": "Materialization-job persistence (design §6 / §2.4, migration 078"
+    },
+    {
       "path": "db/open_attempts.rs",
       "depth": 1,
       "doc": "The ledger-backed open-attempt view (pull-mode dispatch)."
@@ -1040,6 +1045,11 @@
       "path": "db/tenants.rs",
       "depth": 1,
       "doc": "Tenant CRUD + auth queries — `tenants` and `jwt_revoked` tables."
+    },
+    {
+      "path": "db/wanted.rs",
+      "depth": 1,
+      "doc": "Durable per-(build, derivation) wanted relation — the"
     },
     {
       "path": "domain.rs",
