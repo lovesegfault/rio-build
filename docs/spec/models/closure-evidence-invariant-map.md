@@ -2641,3 +2641,19 @@ Carried forward from Phase 1, plus this stage's additions:
 
 Phase 2 is complete. The campaign's remaining open work is the close-out itself
 (counter-signatures over this map's records) plus the standing owner items above.
+
+### Successor-campaign cross-reference (substitution replacement, Phase A landed 2026-06-01)
+
+The **substitution-replacement campaign** (Phase A landed 2026-06-01,
+additive-dormant) is the successor owner of the substitution-related rows in
+this map: the topdown-prune / substitution-walk machinery this campaign's
+properties protect (A1/A2/A11, the C3 settlement, the B-family walk shapes)
+is scheduled for replacement by store-owned materialization jobs in that
+campaign's Phases B–D′, with every property's successor home named in its
+design §10 / FP-6 disposition table. Until that campaign's Phase D′ executes,
+every row in this map remains authoritative and its wired checks remain the
+merge gate; nothing is retired by Phase A (which is dormant by construction —
+its dormancy criterion 5 requires this map's checks to stay untouched and
+green). See `substitution-replacement-invariant-map.md` for that campaign's
+stage records, the §9.1 successor property skeleton, and the Phase B entry
+criteria.
