@@ -102,7 +102,9 @@ const LOG_TAIL_LINES: usize = 40;
 #[derive(Debug, Serialize)]
 pub struct Report {
     pub drv: String,
-    /// "sandbox" | "builtin-fetchurl".
+    /// Always "sandbox": the driver runs without a builder binary, so a
+    /// `builtin:` derivation is rejected by the glue's gates before any
+    /// plan exists and surfaces in [`Report::glue_error`] instead.
     pub plan: String,
     /// Set when the request glue rejected the derivation (no build ran).
     pub glue_error: Option<String>,
@@ -229,9 +231,11 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
         timeout: Some(cfg.timeout),
         max_silent: None,
         max_log_bytes: None,
-        // The driver never dispatches builtin:fetchurl entries (they are
-        // reported as unsupported below), so the re-exec binary, mirror
-        // list, and netrc are irrelevant here.
+        // The driver never executes a fetch: with no builder binary, a
+        // builtin:fetchurl derivation is REJECTED by the glue's own
+        // gates (FetchurlBuilderBinaryUnknown — and the FOD/SSRF gates
+        // before it) and lands in report.glue_error before any plan is
+        // produced. The mirror list and netrc are likewise irrelevant.
         builder_binary: None,
         hashed_mirrors: Vec::new(),
         netrc: None,
@@ -258,8 +262,14 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     ) {
         Ok(GluePlan::Sandbox(p)) => p,
         Ok(GluePlan::BuiltinFetchurl(_)) => {
-            report.plan = "builtin-fetchurl".to_string();
-            return Ok(report);
+            // SandboxOptions::builder_binary is None above, and the glue
+            // rejects builtin derivations without it before planning
+            // (missing_builder_binary_is_rejected pins this premise) —
+            // a BuiltinFetchurl plan here means that gate was deleted.
+            unreachable!(
+                "glue produced a builtin:fetchurl plan without a builder binary; \
+                 the FetchurlBuilderBinaryUnknown gate no longer holds"
+            );
         }
         Err(e) => {
             report.glue_error = Some(e.to_string());
@@ -309,7 +319,15 @@ pub async fn run(cfg: DriverConfig) -> anyhow::Result<Report> {
     let outcome = rio_exec::execute(&prepared.request, &host, tx)
         .await
         .context("rio-exec execute")?;
-    report.log = collector.await.unwrap_or_default();
+    // A panicked collector loses the parity evidence (phases, tail,
+    // cap signal) the harness compares — that must fail the entry
+    // loudly, not let it pass vacuously on empty data. The production
+    // counterpart (executor/mod.rs native_log_loop await) deliberately
+    // stays tolerant: there the build result is the product and the log
+    // tail is best-effort; here the log REPORT is the product.
+    report.log = collector
+        .await
+        .context("differential log collector panicked; parity evidence lost")?;
 
     // ---- Classify + process outputs ---------------------------------------
     let is_fod = basic.is_fixed_output();
