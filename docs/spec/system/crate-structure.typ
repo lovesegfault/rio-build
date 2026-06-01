@@ -166,6 +166,10 @@ Notable edges:
       "nix.drv.parse-from-nar",
     )[`Derivation::parse_from_nar` extracts the single regular file from a NAR, UTF-8-decodes it, and runs the ATerm parser — the convenience path for `.drv` blobs that arrive NAR-wrapped over the wire.]
 
+    #r(
+      "nix.closure.cycle-safe",
+    )[`closure::ClosureSet::extend` (incremental visited-set BFS, the `computeFSClosure` shape), `closure::find_cycle` (Kahn-style peeling over a closed member set, self-references ignored), and `closure::closure_sizes` (per-member BFS with one reusable scratch set, O(largest closure) auxiliary memory) MUST terminate on arbitrary reference graphs — including cyclic ones — and every rio consumer that traverses adversary-influenceable reference metadata MUST delegate to these primitives instead of hand-rolling the walk. Cycle-safety is a per-consumer obligation in rio because rio-store deliberately admits reference cycles (#rref("store.gc.sweep-cycle-reclaim")) for GC reclamation, unlike CppNix's local store where `registerValidPaths`' topological sort makes cycles unrepresentable.]
+
     Fuzz targets for the parsers live in `fuzz/rio-nix/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `fuzz/rio-store/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd fuzz/<crate> && cargo update -p <crate>` to sync the independent lockfile.
   ],
   "rio-test-support": [

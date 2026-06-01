@@ -7,6 +7,7 @@
 //! live in `fuzz/rio-nix/`.
 
 pub mod ca;
+pub mod closure;
 pub mod derivation;
 pub mod hash;
 pub mod nar;

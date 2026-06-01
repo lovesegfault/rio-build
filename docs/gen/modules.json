@@ -736,6 +736,11 @@
       "doc": "Content-addressing primitives for floating-CA outputs."
     },
     {
+      "path": "closure.rs",
+      "depth": 0,
+      "doc": "Cycle-safe reference-closure traversal primitives."
+    },
+    {
       "path": "derivation/",
       "depth": 0,
       "doc": "Nix ATerm derivation (`.drv`) parser and serializer."
