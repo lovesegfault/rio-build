@@ -447,7 +447,7 @@ async fn drain_build_result_tail(stream: &mut tokio::io::DuplexStream) -> anyhow
 }
 
 // r[verify gw.stderr.error-before-return+2]
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildDerivation (36): DAG-validation failure (cached drv has __noChroot)
 /// sends STDERR_LAST + failure BuildResult, NOT STDERR_ERROR.
 ///
@@ -530,7 +530,7 @@ async fn test_build_derivation_dag_reject_clean_stderr_last() -> anyhow::Result<
 }
 
 // r[verify gw.stderr.error-before-return+2]
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildPathsWithResults (46): DAG-validation failure sends STDERR_LAST +
 /// per-path failure results, NOT STDERR_ERROR. Sibling of the opcode-36 test
 /// above, covering the second bug site at build.rs:799-806.
@@ -585,7 +585,7 @@ async fn test_build_paths_with_results_dag_reject_clean_stderr_last() -> anyhow:
     Ok(())
 }
 
-// r[verify gw.reject.nochroot]
+// r[verify gw.reject.nochroot+2]
 /// wopBuildDerivation (36): __noChroot=1 in the INLINE BasicDerivation's
 /// env is rejected at the handler's early check (build.rs:592-613), before
 /// resolve_derivation / validate_dag ever run.
@@ -656,6 +656,60 @@ async fn test_build_derivation_inline_nochroot_rejected() -> anyhow::Result<()> 
         h.scheduler.submit_calls.read().unwrap().len(),
         0,
         "inline __noChroot rejection happens BEFORE SubmitBuild"
+    );
+
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.reject.nochroot+2]
+/// wopBuildDerivation (36): a WRONG-TYPED `__noChroot` in the inline
+/// BasicDerivation's `__json` (number, not boolean) is rejected
+/// fail-closed — the gateway does not guess at sandbox attributes it
+/// cannot type (oracle getBoolean throws on non-bools). Pre-fix, the
+/// lenient reader degraded the wrong-typed value to "absent" and waved
+/// the derivation through to the scheduler.
+#[tokio::test]
+async fn build_derivation_rejects_wrong_typed_nochroot() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+
+    let drv_path = "/nix/store/00000000000000000000000000000004-inline-typed.drv";
+
+    wire_send!(&mut h.stream;
+        u64: 36,                                 // wopBuildDerivation
+        string: drv_path,
+        // BasicDerivation:
+        u64: 1,                                  // 1 output
+        string: "out",
+        string: "/nix/store/zzz-output",
+        string: "",                              // hash_algo (input-addressed)
+        string: "",                              // hash
+        strings: wire::NO_STRINGS,               // input_srcs
+        string: "x86_64-linux",
+        string: "/bin/sh",
+        strings: &["-c", "echo evil"],
+        u64: 1,                                  // 1 env pair: __json with a numeric __noChroot
+        string: "__json",
+        string: r#"{"__noChroot":1}"#,
+        u64: 0,                                  // build_mode
+    );
+
+    let err = drain_stderr_expecting_error(&mut h.stream).await?;
+    assert!(
+        err.message.contains("__noChroot"),
+        "error names the attribute: {:?}",
+        err.message
+    );
+    assert!(
+        err.message.contains("not permitted"),
+        "error is a rejection: {:?}",
+        err.message
+    );
+
+    assert_eq!(
+        h.scheduler.submit_calls.read().unwrap().len(),
+        0,
+        "wrong-typed __noChroot rejection happens BEFORE SubmitBuild"
     );
 
     h.finish().await;

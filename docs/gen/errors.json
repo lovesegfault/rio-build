@@ -373,6 +373,13 @@
     },
     {
       "enum": "GatewayError",
+      "name": "SchedulerRejected",
+      "crate": "rio-gateway",
+      "msg": "scheduler rejected the submission: {0}",
+      "doc": "The scheduler VALIDATED the submission and refused it (`INVALID_ARGUMENT` / `FAILED_PRECONDITION`). Unlike [`GatewayError::Scheduler`] this is not infrastructure trouble: retrying the identical submission can never succeed, so callers that convert errors into `BuildResult`s must report `InputRejected`, never `TransientFailure`."
+    },
+    {
+      "enum": "GatewayError",
       "name": "Store",
       "crate": "rio-gateway",
       "msg": "store gRPC: {0}",
@@ -586,6 +593,13 @@
       "name": "WrongDigestLength",
       "crate": "rio-nix",
       "msg": "wrong digest length for {algo}: expected {expected}, got {got}",
+      "doc": ""
+    },
+    {
+      "enum": "HashError",
+      "name": "WrongEncodedLength",
+      "crate": "rio-nix",
+      "msg": "hash {hash:?} has wrong length {len} for hash algorithm '{algo}': expected {b16} (base16), {b32} (nixbase32), or {b64} (base64) characters",
       "doc": ""
     },
     {
@@ -820,6 +834,41 @@
       "doc": ""
     },
     {
+      "enum": "StructuredAttrError",
+      "name": "MalformedJson",
+      "crate": "rio-nix",
+      "msg": "structured attrs (__json) do not parse: {error}",
+      "doc": "`__json` is present but does not parse — the derivation claims structured attrs and the claim is unreadable. Fail-closed consumers MUST NOT degrade this to \"attr absent\" (the pre-fix readers did, which let an unparseable blob neutralize every behavioral attribute at once)."
+    },
+    {
+      "enum": "StructuredAttrError",
+      "name": "WrongType",
+      "crate": "rio-nix",
+      "msg": "while parsing attribute \"{key}\": {source}",
+      "doc": "The attribute exists in the parsed blob with the wrong type. Mirrors the oracle's `e.addTrace(... \"while parsing attribute \\\"%s\\\"\")` framing around its `get*` throw."
+    },
+    {
+      "enum": "TypedError",
+      "name": "NotStringOrArray",
+      "crate": "rio-nix",
+      "msg": "value is not an array or a string: {dump}",
+      "doc": "Oracle `flatten` (derivation-options.cc:106-114)."
+    },
+    {
+      "enum": "TypedError",
+      "name": "NotUnsigned",
+      "crate": "rio-nix",
+      "msg": "Expected JSON value to be an unsigned integral number but it is of type '{got}': {dump}",
+      "doc": "Oracle `getUnsigned` (json-utils.cc:62-73) — kept distinct because its message names the refined numeric storage class. Raised here only for non-numbers (see [`unsigned_lossy`])."
+    },
+    {
+      "enum": "TypedError",
+      "name": "WrongType",
+      "crate": "rio-nix",
+      "msg": "Expected JSON value to be of type '{want}' but it is of type '{got}': {dump}",
+      "doc": "Oracle `ensureType` (json-utils.cc:35-45)."
+    },
+    {
       "enum": "WireError",
       "name": "CollectionTooLarge",
       "crate": "rio-nix",
@@ -982,6 +1031,13 @@
     },
     {
       "enum": "ActorError",
+      "name": "SettledIdentityConflict",
+      "crate": "rio-scheduler",
+      "msg": "derivation {drv_path} has a settled (successfully built) record with a different identity; re-creating it would erase that record. If the settled record is a squat, ask an operator to clear it; if this is a legitimate rebuild, resubmit with the original declared identity",
+      "doc": "`r[sched.persist.settled-identity-freeze]`: a submission tried to (re)create a derivation whose persisted row is SETTLED (completed/skipped — the durable record of a successful build, possibly already reaped from the DAG) under a conflicting identity, or without the content-bound evidence needed to prove it is the same derivation. Maps to FAILED_PRECONDITION (client-actionable conflict): if the settled record is a squat on this derivation's hash, ask an operator to clear it; if this is a legitimate rebuild, resubmit with the same declared identity the original carried."
+    },
+    {
+      "enum": "ActorError",
       "name": "StoreUnavailable",
       "crate": "rio-scheduler",
       "msg": "store service unavailable (cache-check circuit breaker open)",
@@ -1005,8 +1061,8 @@
       "enum": "DagError",
       "name": "ConflictingInFlightContent",
       "crate": "rio-scheduler",
-      "msg": "in-flight derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity",
-      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with an in-flight node that carries authoritative inline content. Joining would attribute that in-flight build's results to a derivation that either provably differs or cannot be shown to be the same. Maps to `FAILED_PRECONDITION`; once the conflicting node is terminal the verifiable definition displaces it instead. (An identity-MATCHING store-backed submission never sees this error: it joins the node, or displaces it without error when the node is poison-locked — terminal failure, no longer retriable on resubmit.)"
+      "msg": "derivation {drv_path} carries authoritative inline content that conflicts with this submission's declared identity; if the existing record is a squat on your derivation's path, ask an operator to clear it",
+      "doc": "A store-backed (non-authoritative) submission's verifiable identity (system, output names, fixed-output flag, content-addressed flag, declared expected output paths, plus content-bound evidence — a shared fixed-output path or a matching CA modular hash) conflicts with a node that carries authoritative inline content and is either still in flight or finished successfully. Joining would attribute that node's results to a derivation that either provably differs or cannot be shown to be the same; displacing a settled (Completed/Skipped) node would erase the record of a successful build. Maps to `FAILED_PRECONDITION`; once the conflicting node sits in a terminal FAILURE state the verifiable definition displaces it instead. (An identity-MATCHING store-backed submission never sees this error: it joins the node, or displaces it without error when the node is poison-locked — terminal failure, no longer retriable on resubmit.) A legitimate claimant hitting this against a settled squat needs operator remediation (clear the settled record) until store-evidence displacement lands."
     },
     {
       "enum": "DagError",
@@ -1449,6 +1505,16 @@
       "name": "StorePathError",
       "crate": "rio-nix",
       "doc": ""
+    },
+    {
+      "name": "StructuredAttrError",
+      "crate": "rio-nix",
+      "doc": "A typed structured-attrs read failed."
+    },
+    {
+      "name": "TypedError",
+      "crate": "rio-nix",
+      "doc": "A typed read failed: the value exists but is not the expected type."
     },
     {
       "name": "WireError",

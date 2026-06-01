@@ -604,7 +604,7 @@ in
 
   # r[verify gw.jwt.dual-mode+2]
   # r[verify sec.boundary.grpc-hmac]
-  # r[verify gw.reject.nochroot]
+  # r[verify gw.reject.nochroot+2]
   # r[verify gw.rate.per-tenant]
   # r[verify store.gc.tenant-quota-enforce]
   # r[verify sec.executor.identity-token+2]

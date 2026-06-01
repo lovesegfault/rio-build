@@ -1238,7 +1238,7 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
 
     let is_ifd_hint = !*has_seen_build_paths_with_results;
 
-    // r[impl gw.reject.nochroot]
+    // r[impl gw.reject.nochroot+2]
     // Check __noChroot on the BasicDerivation DIRECTLY. validate_dag
     // (called below) checks drv_cache entries, but if the full drv
     // isn't available (single-node fallback below), the drv is never
@@ -1248,12 +1248,24 @@ pub(super) async fn handle_build_derivation<R: AsyncRead + Unpin, W: AsyncWrite 
     // A malicious client could send __noChroot=1 via wopBuildDerivation
     // (which sends an inline BasicDerivation, not a store path) to
     // escape the sandbox. This catches it at the gateway.
-    if translate::StructuredEnv::new(basic_drv.env()).bool("__noChroot") == Some(true) {
-        warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
-        stderr_err!(
-            stderr,
-            "derivation requests __noChroot (sandbox escape) — not permitted"
-        );
+    match translate::StructuredEnv::new(basic_drv.env()).bool_attr("__noChroot") {
+        Ok(Some(true)) => {
+            warn!(drv_path = %drv_path_str, "rejecting __noChroot via inline BasicDerivation");
+            stderr_err!(
+                stderr,
+                "derivation requests __noChroot (sandbox escape) — not permitted"
+            );
+        }
+        Ok(_) => {}
+        // Fail-closed: wrong-typed __noChroot or an unparseable __json
+        // blob is rejected, never guessed at (oracle getBoolean throws).
+        Err(e) => {
+            warn!(drv_path = %drv_path_str, error = %e, "rejecting unreadable __noChroot via inline BasicDerivation");
+            stderr_err!(
+                stderr,
+                "derivation __noChroot is unreadable (wrong-typed sandbox attribute) — not permitted"
+            );
+        }
     }
 
     // r[impl gw.reject.unsupported-hash-algo+4]

@@ -1037,7 +1037,7 @@ the handshake before the client will send any opcodes.
     gateway-side early reject saves the submission);
   - any derivation with `__noChroot=1` in its env (sandbox escape --- this
     check is ONLY at the gateway; the scheduler does not re-check;
-    #rref("gw.reject.nochroot"));
+    #rref("gw.reject.nochroot+2"));
   - any output declaring an `outputHash`/`outputHashAlgo` the builder cannot
     verify or finalize, unless every declared output of that derivation is
     already realized for the submitting tenant or substitutable from its
@@ -1089,9 +1089,12 @@ semantics: a node whose closure the gateway could not fully parse
 submits without evidence, and the scheduler's fail-closed rules decide
 what that node may then claim.
 
-#r("gw.reject.nochroot")[
+#r("gw.reject.nochroot+2")[
   The gateway MUST reject any derivation (at SubmitBuild time) whose env
-  contains `__noChroot = "1"`. This is a sandbox-escape request that rio-build
+  contains `__noChroot = "1"` --- and, fail-closed, any derivation whose
+  `__noChroot` is present but not a JSON boolean or whose `__json` blob does
+  not parse: a sandbox-shape attribute the gateway cannot type is rejected,
+  never guessed at. This is a sandbox-escape request that rio-build
   does not honor. Rejection happens at two points with different frame
   semantics: (1) `validate_dag` rejects via `BuildResult::failure` →
   `STDERR_LAST` (opcodes 36/46 wrap the error; session stays open); (2)
@@ -1100,6 +1103,15 @@ what that node may then claim.
   the `__noChroot` env (DerivationNode doesn't carry it), so this check is
   gateway-only.
 ]
+
+The fail-closed clause is oracle parity, not extra strictness: CppNix's
+`getBoolAttr("__noChroot")` routes through `getBoolean`, which THROWS on a
+non-boolean — there is no coercion of `1` or `"true"`, and an unparseable
+structured-attrs blob fails the build before options are read. The pre-fix
+gateway read the attribute through a lenient accessor where a wrong-typed
+value (or a malformed blob) degraded to "absent" — i.e. exactly the
+derivations whose sandbox intent could not be read were the ones waved
+through.
 
 #r("gw.reject.unsupported-hash-algo+4")[
   The gateway MUST reject at submission any derivation output declaring an

@@ -17,7 +17,7 @@
 # HMAC-verifier proves the trust boundary: service-HMAC gates the
 # gateway PutPath bypass; assignment-HMAC gates worker PutPath.
 #
-# gw.reject.nochroot — verify marker at default.nix:vm-security-standalone
+# gw.reject.nochroot+2 — verify marker at default.nix:vm-security-standalone
 # gateway-validate subtest: nix-build a .drv with __noChroot=true via
 # ssh-ng://. Gateway rejects with "sandbox escape" pre-SubmitBuild;
 # builds row count unchanged proves scheduler never saw it. Exercises

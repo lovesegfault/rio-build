@@ -192,19 +192,46 @@ impl<'a> StructuredEnv<'a> {
         }
     }
 
-    /// Lenient string read, bounded to the [`SizingHint`] tier.
+    /// Lenient string read, bounded to the [`SizingHint`] tier:
+    /// JSON first, then raw env; wrong types and malformed `__json`
+    /// degrade to the fallback chain (a bad hint costs sizing
+    /// accuracy, never correctness).
     pub fn lenient_string(&self, hint: SizingHint) -> Option<String> {
-        self.string(hint.key())
+        let key = hint.key();
+        self.json()
+            .and_then(|j| j.get(key)?.as_str().map(String::from))
+            .or_else(|| self.env.get(key).cloned())
     }
 
-    /// Lenient boolean read, bounded to the [`SizingHint`] tier.
+    /// Lenient boolean read, bounded to the [`SizingHint`] tier. The
+    /// env arm accepts `"1"` and `"true"` (Nix encodes eval-time bools
+    /// as `"1"`/`""`; `"true"` kept for robustness).
     pub fn lenient_bool(&self, hint: SizingHint) -> Option<bool> {
-        self.bool(hint.key())
+        let key = hint.key();
+        self.json()
+            .and_then(|j| j.get(key)?.as_bool())
+            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
     }
 
-    /// Lenient string-list read, bounded to the [`SizingHint`] tier.
+    /// Lenient string-list read, bounded to the [`SizingHint`] tier
+    /// (non-string JSON elements dropped; env arm whitespace-split).
     pub fn lenient_strings(&self, hint: SizingHint) -> Option<Vec<String>> {
-        self.strings(hint.key())
+        let key = hint.key();
+        self.json()
+            .and_then(|j| {
+                Some(
+                    j.get(key)?
+                        .as_array()?
+                        .iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect(),
+                )
+            })
+            .or_else(|| {
+                self.env
+                    .get(key)
+                    .map(|s| s.split_whitespace().map(String::from).collect())
+            })
     }
 
     /// The parsed blob's value for `key`, with malformed `__json`
@@ -247,54 +274,6 @@ impl<'a> StructuredEnv<'a> {
     pub fn json(&self) -> Option<&serde_json::Value> {
         self.json.as_ref().ok().and_then(Option::as_ref)
     }
-
-    /// Lenient string attribute: JSON first, then raw env. Wrong types
-    /// and malformed `__json` degrade to the fallback chain.
-    ///
-    /// Pending deletion: behavioral consumers use [`Self::string_attr`];
-    /// hint consumers use [`Self::lenient_string`].
-    pub fn string(&self, key: &str) -> Option<String> {
-        self.json()
-            .and_then(|j| j.get(key)?.as_str().map(String::from))
-            .or_else(|| self.env.get(key).cloned())
-    }
-
-    /// Lenient boolean attribute: JSON first (real JSON bool), then raw
-    /// env (Nix encodes eval-time bools as `"1"` / `""`; accept `"true"`
-    /// for robustness).
-    ///
-    /// Pending deletion: behavioral consumers use [`Self::bool_attr`];
-    /// hint consumers use [`Self::lenient_bool`].
-    pub fn bool(&self, key: &str) -> Option<bool> {
-        self.json()
-            .and_then(|j| j.get(key)?.as_bool())
-            .or_else(|| self.env.get(key).map(|v| v == "1" || v == "true"))
-    }
-
-    /// Lenient string-list attribute: JSON array of strings first
-    /// (non-string elements DROPPED), then the whitespace-split raw env
-    /// value.
-    ///
-    /// Pending deletion: behavioral consumers use
-    /// [`Self::string_list_attr`]; hint consumers use
-    /// [`Self::lenient_strings`].
-    pub fn strings(&self, key: &str) -> Option<Vec<String>> {
-        self.json()
-            .and_then(|j| {
-                Some(
-                    j.get(key)?
-                        .as_array()?
-                        .iter()
-                        .filter_map(|v| v.as_str().map(String::from))
-                        .collect(),
-                )
-            })
-            .or_else(|| {
-                self.env
-                    .get(key)
-                    .map(|s| s.split_whitespace().map(String::from).collect())
-            })
-    }
 }
 
 #[cfg(test)]
@@ -317,15 +296,15 @@ mod tests {
         ]);
         let s = StructuredEnv::new(&env);
         assert!(!s.is_structured_attrs());
-        assert_eq!(s.bool("preferLocalBuild"), Some(true));
+        assert_eq!(s.lenient_bool(SizingHint::PreferLocalBuild), Some(true));
         assert_eq!(
-            s.strings("requiredSystemFeatures"),
+            s.lenient_strings(SizingHint::RequiredSystemFeatures),
             Some(vec!["kvm".into(), "big-parallel".into()])
         );
-        assert_eq!(s.string("pname"), Some("hello".into()));
-        assert_eq!(s.string("missing"), None);
-        assert_eq!(s.bool("missing"), None);
-        assert_eq!(s.strings("missing"), None);
+        assert_eq!(s.lenient_string(SizingHint::Pname), Some("hello".into()));
+        // Absent hints are None on every accessor shape.
+        assert_eq!(s.lenient_string(SizingHint::Version), None);
+        assert_eq!(s.lenient_bool(SizingHint::EnableParallelBuilding), None);
     }
 
     #[test]
@@ -340,10 +319,13 @@ mod tests {
         ]);
         let s = StructuredEnv::new(&env);
         assert!(s.is_structured_attrs());
-        assert_eq!(s.string("pname"), Some("from-json".into()));
-        assert_eq!(s.bool("preferLocalBuild"), Some(true));
         assert_eq!(
-            s.strings("requiredSystemFeatures"),
+            s.lenient_string(SizingHint::Pname),
+            Some("from-json".into())
+        );
+        assert_eq!(s.lenient_bool(SizingHint::PreferLocalBuild), Some(true));
+        assert_eq!(
+            s.lenient_strings(SizingHint::RequiredSystemFeatures),
             Some(vec!["kvm".into()])
         );
         assert!(s.json().is_some());
@@ -354,7 +336,7 @@ mod tests {
         let env = env_of(&[("__json", "{not json"), ("pname", "fallback")]);
         let s = StructuredEnv::new(&env);
         assert!(s.json().is_none());
-        assert_eq!(s.string("pname"), Some("fallback".into()));
+        assert_eq!(s.lenient_string(SizingHint::Pname), Some("fallback".into()));
         // The key is present, so the derivation still routes down the
         // structured path — materialization then fails loudly on the
         // malformed blob instead of silently building with a flat env.

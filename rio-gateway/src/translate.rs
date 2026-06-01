@@ -8,7 +8,7 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use rio_common::tenant::NormalizedName;
-use rio_nix::derivation::{Derivation, DerivationLike};
+use rio_nix::derivation::{Derivation, DerivationLike, SizingHint};
 use rio_nix::protocol::derived_path::OutputSpec;
 use rio_nix::store_path::StorePath;
 use rio_proto::StoreServiceClient;
@@ -471,7 +471,7 @@ pub fn validate_dag(
         ));
     }
 
-    // r[impl gw.reject.nochroot]
+    // r[impl gw.reject.nochroot+2]
     // __noChroot check: iterate nodes, look up each drv in the
     // cache (it was populated during BFS), check env. Nodes
     // without a cached drv (BasicDerivation fallback) are
@@ -488,13 +488,28 @@ pub fn validate_dag(
     // user Nix for bootstrap derivations; NEVER allowed in a
     // multi-tenant build farm. A malicious .drv could use this
     // to exfiltrate secrets from the worker.
-    if let Some((_, node, _)) = iter_cached_drvs(nodes, drv_cache, "validate_dag")
-        .find(|(_, _, drv)| StructuredEnv::new(drv.env()).bool("__noChroot") == Some(true))
-    {
-        return Err(format!(
-            "derivation {} requests __noChroot (sandbox escape) — not permitted",
-            node.drv_path
-        ));
+    for (_, node, drv) in iter_cached_drvs(nodes, drv_cache, "validate_dag") {
+        match StructuredEnv::new(drv.env()).bool_attr("__noChroot") {
+            Ok(Some(true)) => {
+                return Err(format!(
+                    "derivation {} requests __noChroot (sandbox escape) — not permitted",
+                    node.drv_path
+                ));
+            }
+            Ok(_) => {}
+            // Fail-closed: a sandbox-shape attribute the gateway cannot
+            // type (wrong-typed __noChroot, unparseable __json) is
+            // rejected — never guessed at. Oracle parity: getBoolAttr →
+            // getBoolean THROWS on non-bools; "absent" is the only safe
+            // default, and an unreadable blob is not "absent".
+            Err(e) => {
+                return Err(format!(
+                    "derivation {}: __noChroot is unreadable ({e}) — \
+                     wrong-typed sandbox attributes are not permitted",
+                    node.drv_path
+                ));
+            }
+        }
     }
 
     // r[impl gw.reject.unsupported-hash-algo+4]
@@ -1066,7 +1081,7 @@ pub(crate) trait ClampedAttrs {
     /// the per-tenant `SlaEstimator` cache key + `build_samples.pname`
     /// PG column; a 1 MiB pname is otherwise carried verbatim through
     /// proto → DerivationNode → ModelKey → cache key → PG.
-    fn string_clamped(&self, key: &str) -> Option<String>;
+    fn string_clamped(&self, hint: SizingHint) -> Option<String>;
 
     /// String-list attr with a `MAX_LIST_LEN`-element / `MAX_ATTR_LEN`-
     /// char clamp. ADR-023 §Threat-model: `requiredSystemFeatures` is
@@ -1078,12 +1093,12 @@ pub(crate) trait ClampedAttrs {
     /// post-translate scheduler-side bound) and `snapshot.rs`'s LRU
     /// debounce-key clamp — both are second-line defenses behind this
     /// gateway-side bound at the trust boundary.
-    fn strings_clamped(&self, key: &str) -> Option<Vec<String>>;
+    fn strings_clamped(&self, hint: SizingHint) -> Option<Vec<String>>;
 }
 
 impl ClampedAttrs for StructuredEnv<'_> {
-    fn string_clamped(&self, key: &str) -> Option<String> {
-        self.string(key).map(|mut s| {
+    fn string_clamped(&self, hint: SizingHint) -> Option<String> {
+        self.lenient_string(hint).map(|mut s| {
             if s.chars().count() > MAX_ATTR_LEN {
                 s = s.chars().take(MAX_ATTR_LEN).collect();
             }
@@ -1091,8 +1106,8 @@ impl ClampedAttrs for StructuredEnv<'_> {
         })
     }
 
-    fn strings_clamped(&self, key: &str) -> Option<Vec<String>> {
-        self.strings(key).map(|mut v| {
+    fn strings_clamped(&self, hint: SizingHint) -> Option<Vec<String>> {
+        self.lenient_strings(hint).map(|mut v| {
             v.truncate(MAX_LIST_LEN);
             for s in &mut v {
                 if s.chars().count() > MAX_ATTR_LEN {
@@ -1152,20 +1167,20 @@ pub fn build_node<D: DerivationLike>(drv_path: &str, drv: &D) -> types::Derivati
         // rows), but some history beats none. Clamped at MAX_ATTR_LEN
         // (§Threat-model: tenant-controlled, becomes a cache key).
         pname: env
-            .string_clamped("pname")
-            .or_else(|| env.string_clamped("name"))
+            .string_clamped(SizingHint::Pname)
+            .or_else(|| env.string_clamped(SizingHint::Name))
             .unwrap_or_default(),
         // ADR-023 sizing attrs. Nix bool env values are "1"/"" (older
         // stdenv) or "true"/"false" (newer). Absent stays None — for
         // enableParallelBuilding in particular, absent ≠ false (nixpkgs
         // is migrating to default-true; None means "unknown, explore").
-        version: env.string_clamped("version"),
-        enable_parallel_building: env.bool("enableParallelBuilding"),
-        enable_parallel_checking: env.bool("enableParallelChecking"),
-        prefer_local_build: env.bool("preferLocalBuild"),
+        version: env.string_clamped(SizingHint::Version),
+        enable_parallel_building: env.lenient_bool(SizingHint::EnableParallelBuilding),
+        enable_parallel_checking: env.lenient_bool(SizingHint::EnableParallelChecking),
+        prefer_local_build: env.lenient_bool(SizingHint::PreferLocalBuild),
         system: drv.platform().to_string(),
         required_features: env
-            .strings_clamped("requiredSystemFeatures")
+            .strings_clamped(SizingHint::RequiredSystemFeatures)
             .unwrap_or_default(),
         output_names,
         is_fixed_output: drv.is_fixed_output(),
@@ -1656,14 +1671,75 @@ mod tests {
         assert!(validate_dag(&nodes, &empty_cache).is_ok());
     }
 
-    // __noChroot rejection is hard to unit-test here because it
-    // needs a Derivation in drv_cache with __noChroot=1 in env,
-    // and constructing a full Derivation (not BasicDerivation)
-    // requires ATerm parsing or a complex builder. Coverage comes
-    // from the golden tests at tests/wire_opcodes/build.rs (seed
-    // NOCHROOT_DRV_ATERM into the mock store so resolve_derivation
-    // populates drv_cache, then drive opcodes 36 + 46 and assert
-    // the failure BuildResult carries the "sandbox escape" message).
+    // The __noChroot=1 happy-path rejection is wire-tested at
+    // tests/wire_opcodes/build.rs (seed NOCHROOT_DRV_ATERM into the
+    // mock store so resolve_derivation populates drv_cache, then drive
+    // opcodes 36 + 46 and assert the failure BuildResult carries the
+    // "sandbox escape" message). The typed matrix below covers the
+    // fail-closed arms via hand-built ATerms.
+
+    /// Helper: a cached single-node DAG whose drv carries `extra_env`.
+    fn nochroot_fixture(
+        extra_env: &str,
+    ) -> (Vec<types::DerivationNode>, HashMap<StorePath, Derivation>) {
+        let drv_path = "/nix/store/nnnnnnnnnnnnnnnnnnnnnnnnnnnnnnnn-nochroot-probe.drv";
+        let aterm = format!(
+            r#"Derive([("out","/nix/store/oooooooooooooooooooooooooooooooo-out","","")],[],[],"x86_64-linux","/bin/sh",[],[("out","/nix/store/oooooooooooooooooooooooooooooooo-out"){extra_env}])"#
+        );
+        let drv = Derivation::parse(&aterm).expect("test ATerm parses");
+        let node = types::DerivationNode {
+            drv_path: drv_path.into(),
+            drv_hash: drv_path.into(),
+            ..Default::default()
+        };
+        let mut cache = HashMap::new();
+        cache.insert(sp(drv_path), drv);
+        (vec![node], cache)
+    }
+
+    /// Wrong-typed `__noChroot` is rejected fail-closed (oracle
+    /// `getBoolean` throws — `1` and `"true"` are NOT booleans);
+    /// `false`/absent stay accepted; `true` keeps the sandbox-escape
+    /// rejection.
+    // r[verify gw.reject.nochroot+2]
+    #[test]
+    fn validate_dag_rejects_wrong_typed_nochroot() {
+        // JSON number 1: the classic "truthy but not a boolean".
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":1}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+
+        // JSON string "true": also not a boolean.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":\"true\"}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+
+        // JSON false: a real boolean, sandbox stays on → accepted.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":false}")"#);
+        assert!(validate_dag(&nodes, &cache).is_ok());
+
+        // JSON true: the original sandbox-escape rejection.
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{\"__noChroot\":true}")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("sandbox escape"), "{err}");
+
+        // Flat env "1" (the non-structured spelling): still rejected.
+        let (nodes, cache) = nochroot_fixture(r#",("__noChroot","1")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("sandbox escape"), "{err}");
+    }
+
+    /// An unparseable `__json` blob on a cached drv is rejected — the
+    /// gateway cannot read the derivation's sandbox intent, so it does
+    /// not guess (pre-fix: the lenient reader degraded the whole blob
+    /// to "no structured attrs" and waved the derivation through).
+    // r[verify gw.reject.nochroot+2]
+    #[test]
+    fn validate_dag_rejects_unparseable_json_blob() {
+        let (nodes, cache) = nochroot_fixture(r#",("__json","{not json")"#);
+        let err = validate_dag(&nodes, &cache).unwrap_err();
+        assert!(err.contains("__noChroot is unreadable"), "{err}");
+    }
 
     /// A consistent input-addressed derivation (declared paths == the
     /// paths it derives to) passes; declaring somebody else's

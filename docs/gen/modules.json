@@ -761,6 +761,11 @@
       "doc": "`__structuredAttrs`-aware attribute lookup."
     },
     {
+      "path": "derivation/typed.rs",
+      "depth": 1,
+      "doc": "Fail-closed typed accessors over structured-attrs JSON values."
+    },
+    {
       "path": "hash.rs",
       "depth": 0,
       "doc": "Nix hash types: SHA-256, SHA-512, SHA-1."
