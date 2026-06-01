@@ -657,21 +657,42 @@ let
         )
 
         # Burn the materialization budget (max_attempts=3, the default):
-        # each claim wave hits the 503 upstream -> InfraFailure -> the
-        # job re-arms (failures 1, 2) then parks (failure 3). The build
-        # stays live the whole way (B3: infra trouble is never
+        # each claim wave hits the 503 upstream -> InfraFailure. ONE
+        # restart can charge MORE than one infra row: the executor runs
+        # 8 concurrent claim workers, and a worker whose claim lands
+        # after another worker's full claim->report cycle (the 503
+        # answer is local and sub-millisecond) mints a FRESH attempt
+        # against the re-armed job instead of the open attempt's
+        # re-delivery. The budget cap still holds (one open attempt at
+        # a time; the park fires at exactly max_attempts charges), but
+        # the per-wave count can advance by 2 — so wait for MONOTONE
+        # progress (>= wave) and stop as soon as the park lands. The
+        # build stays live the whole way (B3: infra trouble is never
         # confirmation, never a fail-fast, never a from-source route).
-        for expected_infra in (1, 2, 3):
+        for wave in (1, 2, 3):
             restart_store()
             ${gatewayHost}.wait_until_succeeds(
-                "sudo -u postgres psql rio -qtAc \"SELECT"
+                "test \"$(sudo -u postgres psql rio -qtAc \"SELECT"
                 " count(*) FILTER (WHERE a.outcome_class = 'materialization_infra')"
                 " FROM drv_attempts a JOIN derivations d USING (derivation_id)"
-                f" WHERE d.drv_hash = '{park_drv}'\" | grep -qx {expected_infra}",
+                f" WHERE d.drv_hash = '{park_drv}'\")\" -ge {wave}",
                 timeout=60,
             )
+            already_parked = psql(
+                ${gatewayHost},
+                "SELECT count(*) FROM materialization_jobs"
+                f" WHERE drv_hash = '{park_drv}' AND park_until IS NOT NULL",
+            )
+            if already_parked == "1":
+                break
         # Budget exhausted -> parked: pending + park_until set, claimable
         # again after the backoff (5 s in this fixture).
+        ${gatewayHost}.wait_until_succeeds(
+            "sudo -u postgres psql rio -qtAc \"SELECT count(*) FROM materialization_jobs"
+            f" WHERE drv_hash = '{park_drv}' AND state = 'pending'"
+            " AND park_until IS NOT NULL\" | grep -qx 1",
+            timeout=60,
+        )
         parked = psql(
             ${gatewayHost},
             "SELECT count(*) FROM materialization_jobs"
