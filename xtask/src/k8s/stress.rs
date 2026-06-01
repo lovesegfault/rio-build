@@ -81,10 +81,18 @@ pub(super) async fn cmd_run(
     let mut builds: Vec<(u16, tokio::process::Child)> = Vec::with_capacity(parallel as usize);
 
     for i in 0..parallel {
-        let port = base_port + u16::from(i);
-        super::shared::kill_port_listeners(port);
-        info!("tunnel[{port}]: establishing");
-        tunnels.push(p.tunnel(port).await?);
+        // base_port 0 → each tunnel on its own ephemeral port.
+        let req = if base_port == 0 {
+            0
+        } else {
+            base_port + u16::from(i)
+        };
+        if req != 0 {
+            super::shared::kill_port_listeners(req);
+        }
+        info!("tunnel[{i}]: establishing");
+        let (port, guard) = p.tunnel(req).await?;
+        tunnels.push(guard);
 
         let log_path = dir.join(format!("build-{port}.log"));
         let log_file = File::create(&log_path)?;

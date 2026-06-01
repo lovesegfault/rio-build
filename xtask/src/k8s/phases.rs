@@ -359,7 +359,7 @@ mod tests {
         async fn smoke(&self, _: &XtaskConfig) -> Result<()> {
             unimplemented!()
         }
-        async fn tunnel(&self, _: u16) -> Result<shared::ProcessGuard> {
+        async fn tunnel(&self, _: u16) -> Result<(u16, shared::ProcessGuard)> {
             unimplemented!()
         }
         async fn tunnel_grpc(

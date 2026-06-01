@@ -35,9 +35,6 @@ pub const TENANT: &str = "smoke-test";
 pub const UPSTREAM_URL: &str = "https://cache.nixos.org";
 pub const UPSTREAM_KEY: &str = "cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=";
 pub const SSH_KEY: &str = "/tmp/rio-smoke-key";
-const LOCAL_PORT: u16 = 2222;
-const SCHED_PORT: u16 = 19001;
-const STORE_PORT: u16 = 19002;
 // Pool names from deploy.rs POOLS_JSON.
 const BUILDER_POOL: &str = "x86-64";
 const FETCHER_POOL: &str = "x86-64-fetcher";
@@ -153,13 +150,11 @@ in builtins.derivation {
 pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
     let client = kube::client().await?;
     let region = tofu::output(TF_DIR, "region")?;
-    let store_url = format!("ssh-ng://rio@localhost:{LOCAL_PORT}?ssh-key={SSH_KEY}");
 
     ui::step("smoke", || async {
-        let cli = ui::step("open cli tunnel", || {
-            CliCtx::open(&client, SCHED_PORT, STORE_PORT)
-        })
-        .await?;
+        // Ephemeral ports (0, 0): fixed ports collide with stale
+        // tunnels and foreign listeners.
+        let cli = ui::step("open cli tunnel", || CliCtx::open(&client, 0, 0)).await?;
         ui::step("bootstrap tenant", || step_tenant(&cli, TENANT)).await?;
         ui::step("configure upstream cache", || step_upstream(&cli, TENANT)).await?;
         ui::step("install ssh key", || step_install_key(&client)).await?;
@@ -170,7 +165,11 @@ pub async fn run(_cfg: &XtaskConfig) -> Result<()> {
         // forward — the actual NLB ingress path is what
         // vm-ingress-v4v6-k3s covers.
         ui::step("NLB target health", || step_nlb_health(&client, &region)).await?;
-        let _tunnel = ui::step("port-forward gateway", || gateway_port_forward(LOCAL_PORT)).await?;
+        // Ephemeral port: fixed ports collide with foreign listeners
+        // (e.g. a remote-dev workspace's own sshd on 2222).
+        let (gw_port, _tunnel) =
+            ui::step("port-forward gateway", || gateway_port_forward(0)).await?;
+        let store_url = format!("ssh-ng://rio@localhost:{gw_port}?ssh-key={SSH_KEY}");
         ui::step("builder pool reconcile", || {
             step_pool_reconciled(&client, NS_BUILDERS, BUILDER_POOL)
         })
@@ -429,36 +428,26 @@ async fn find_gateway_tg(elbv2: &aws_sdk_elasticloadbalancingv2::Client) -> Resu
 /// rules; the NLB ingress path itself is what vm-ingress-v4v6-k3s
 /// covers.
 ///
-/// `local_port` MUST be non-zero. `port_forward` accepts `0` (kubectl
-/// picks an ephemeral port and we read it back), but this wrapper
-/// discards the actual port — the caller needs to know `local_port`
-/// up-front to build `ssh-ng://rio@localhost:{local_port}`. Passing
-/// `0` would hand the SSH-banner poll `127.0.0.1:0`, which can never
-/// connect, and produce a 75s silent timeout. Use [`gateway_tunnel`]
-/// (returns the port) when the caller doesn't care which port.
-pub async fn gateway_port_forward(local_port: u16) -> Result<ProcessGuard> {
-    if local_port == 0 {
-        anyhow::bail!(
-            "gateway_port_forward(0) is unsupported — port_forward picks an \
-             ephemeral local port that this wrapper discards, and the SSH \
-             banner read then targets 127.0.0.1:0 which can never connect. \
-             pass a fixed port (e.g. 2250) or use gateway_tunnel() which \
-             returns the bound port."
-        );
+/// `local_port = 0` binds an ephemeral local port; the returned port
+/// is the one actually bound — build store URLs from that.
+pub async fn gateway_port_forward(local_port: u16) -> Result<(u16, ProcessGuard)> {
+    if local_port != 0 {
+        // Reap stale tunnels from a SIGKILL'd xtask. Ephemeral ports
+        // can't be stale.
+        crate::k8s::shared::kill_port_listeners(local_port);
     }
-    crate::k8s::shared::kill_port_listeners(local_port);
-    let (_, guard) =
+    let (port, guard) =
         crate::k8s::shared::port_forward(NS, "svc/rio-gateway", local_port, 22).await?;
     ui::poll_debug("reading SSH banner", Duration::from_secs(3), 25, || async {
         Ok(
-            tokio::time::timeout(Duration::from_secs(3), ssh_banner(local_port))
+            tokio::time::timeout(Duration::from_secs(3), ssh_banner(port))
                 .await
                 .ok()
                 .flatten(),
         )
     })
     .await?;
-    Ok(guard)
+    Ok((port, guard))
 }
 
 /// Connect to `127.0.0.1:port` and read the server's SSH version
@@ -603,34 +592,23 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn gateway_port_forward_rejects_port_zero() {
-        // gateway_port_forward(0) must bail BEFORE touching the
-        // network. `port_forward(... 0, ...)` hands a random local
-        // port back, but `gateway_port_forward` discards it (`let (_,
-        // guard) = ...`) and reads the SSH banner from the *requested*
-        // port — `127.0.0.1:0` — which can never connect. The previous
-        // behavior was a silent 75s timeout (25 attempts × 3s); the QA
-        // suite's load stage hit it on its first-ever full run because
-        // `qa/mod.rs` passed `base_port=0` (lost in `e7707afa1`'s
-        // smoke/stress→qa CLI migration; the old `--base-port` default
-        // was 2250). The 500ms outer timeout here makes the *test*
-        // fail loud-and-fast if the guard ever regresses, instead of
-        // hanging on whatever the CI sandbox does with kubectl.
+    async fn gateway_port_forward_supports_ephemeral_port() {
+        // gateway_port_forward(0) must attempt the port-forward, not
+        // bail with the old "unsupported" guard — ephemeral ports are
+        // how callers avoid colliding with foreign listeners on fixed
+        // ports. Sandbox: kubectl errors fast (must not be the guard's
+        // bail). Live cluster: Ok or 500ms timeout, either proves the
+        // guard is gone (it returned in microseconds).
         let result = tokio::time::timeout(
             std::time::Duration::from_millis(500),
             gateway_port_forward(0),
         )
-        .await
-        .expect("gateway_port_forward(0) must bail before any network I/O, not time out");
-        // `ProcessGuard` is intentionally `!Debug` (it carries a raw
-        // pid + Child); match instead of `expect_err`.
-        let err = match result {
-            Ok(_) => panic!("port 0 is unrepresentable in the resulting store URL — must Err"),
-            Err(e) => e,
-        };
-        assert!(
-            format!("{err:#}").contains("unsupported"),
-            "wrong error: {err:#}"
-        );
+        .await;
+        if let Ok(Err(err)) = result {
+            assert!(
+                !format!("{err:#}").contains("unsupported"),
+                "ephemeral-port guard regressed: {err:#}"
+            );
+        }
     }
 }

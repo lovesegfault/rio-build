@@ -106,8 +106,10 @@ pub trait Provider: Send + Sync {
 
     /// Open a tunnel to the gateway's SSH port, waiting until the SSH
     /// banner reads through. SSM→NLB (eks) | kubectl port-forward (k3s).
-    /// Drop the guard to tear down.
-    async fn tunnel(&self, local_port: u16) -> Result<super::shared::ProcessGuard>;
+    /// `local_port = 0` binds an ephemeral port; the returned port is
+    /// the one actually bound — build store URLs from that. Drop the
+    /// guard to tear down.
+    async fn tunnel(&self, local_port: u16) -> Result<(u16, super::shared::ProcessGuard)>;
 
     /// Open port-forwards to scheduler:9001 and store:9002, waiting
     /// until both accept TCP. Drop the guards to tear down. Unlike
