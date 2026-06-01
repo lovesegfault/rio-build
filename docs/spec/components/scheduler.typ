@@ -1761,7 +1761,7 @@ tables) during state recovery.
   partially-loaded DAG from issuing assignments.
 ]
 
-#r("sched.recovery.inline-drv-durability+2")[
+#r("sched.recovery.inline-drv-durability+3")[
   A `DerivationNode` submitted with authoritative inline derivation content
   (`drv_content_authoritative`, the content-bound hook fallback) MUST have
   those bytes persisted with the derivation row at merge time and restored
@@ -1774,8 +1774,13 @@ tables) during state recovery.
   a floating output), and `ca_modular_hash` --- submitters are untrusted,
   and unvalidated authoritative bytes would let one tenant poison the
   persisted content rebuilt under another derivation's identity after a
-  failover. The persisted bytes are dispatch payload only --- they MUST
-  never be written to any store or served as a store object.
+  failover. When any output declares a fixed hash, the derivation MUST
+  have exactly one output and it MUST be named `out` (CppNix: "only one
+  fixed output is allowed for now" / "single fixed output must be named
+  `out`") --- a multi-output or differently-named fixed shape is rejected
+  before any per-output binding is checked. The persisted bytes are
+  dispatch payload only --- they MUST never be written to any store or
+  served as a store object.
 ]
 The column is `NULL` for every other derivation. Refresh and clearing follow
 node lifecycle, not submission order: the row is written by the submission

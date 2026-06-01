@@ -252,7 +252,7 @@ impl SchedulerService for SchedulerGrpc {
                 )));
             }
         }
-        // r[impl sched.recovery.inline-drv-durability+2]
+        // r[impl sched.recovery.inline-drv-durability+3]
         // Authoritative inline derivations are persisted and rebuilt
         // verbatim after a failover, so the scheduler must not take the
         // submitter's word for them (workers and direct submitters are
@@ -556,6 +556,137 @@ impl SchedulerService for SchedulerGrpc {
     }
 }
 
+/// Oracle-parity fixed-output SHAPE rule, shared by both inline-content
+/// validators (`validate_authoritative_drv_content` and
+/// `validate_inline_drv_content`) so they cannot drift: if any output of
+/// the parsed derivation declares a fixed hash (`hash_algo` AND `hash`
+/// set), the derivation MUST have exactly one output and it MUST be
+/// named `out`.
+///
+/// CppNix 2.34.7 `BasicDerivation::type()` (src/libstore/derivations.cc):
+/// "only one fixed output is allowed for now" /
+/// "single fixed output must be named \"out\"". The gateway gate and the
+/// worker glue enforce the same shape via `DerivationLike::is_fixed_output`
+/// (single-out strict predicate).
+///
+/// r[impl sched.recovery.inline-drv-durability+3]
+fn validate_inline_fod_shape(
+    drv: &rio_nix::derivation::Derivation,
+    context: &str,
+) -> Result<(), Status> {
+    let fixed: Vec<&str> = drv
+        .outputs()
+        .iter()
+        .filter(|o| !o.hash_algo().is_empty() && !o.hash().is_empty())
+        .map(|o| o.name())
+        .collect();
+    if fixed.is_empty() {
+        return Ok(());
+    }
+    if drv.outputs().len() != 1 {
+        return Err(Status::invalid_argument(format!(
+            "{context}: only one fixed output is allowed (got {} outputs, {} fixed)",
+            drv.outputs().len(),
+            fixed.len()
+        )));
+    }
+    if fixed[0] != "out" {
+        return Err(Status::invalid_argument(format!(
+            "{context}: single fixed output must be named \"out\" (got '{}')",
+            fixed[0]
+        )));
+    }
+    Ok(())
+}
+
+/// Per-output fixed-output BINDING validation, shared by both inline-content
+/// validators so they cannot drift: decode the declared hash with the
+/// shared length-discriminated parser, derive the store path it commits
+/// to (per-output name handling via `output_path_name`), and require that
+/// path to equal both the ATerm-declared path and the node's
+/// `expected_output_paths` entry (which must be present and non-empty —
+/// the merge gate uses fixed-output path agreement as content evidence).
+///
+/// Returns the derived path on success.
+///
+/// r[impl sched.recovery.inline-drv-durability+3]
+#[allow(clippy::too_many_arguments)]
+fn validate_fixed_output_binding(
+    drv_name: &str,
+    out_name: &str,
+    aterm_path: &str,
+    algo: &str,
+    hash: &str,
+    expected: Option<&str>,
+    context: &str,
+) -> Result<String, Status> {
+    use rio_nix::hash::NixHash;
+    use rio_nix::store_path::{StorePath, output_path_name};
+
+    let (recursive, algo_str) = match algo.strip_prefix("r:") {
+        Some(rest) => (true, rest),
+        None => (false, algo),
+    };
+    let parsed_algo = algo_str.parse().map_err(|_| {
+        Status::invalid_argument(format!(
+            "{context} output '{out_name}' declares unsupported outputHashAlgo '{algo}'"
+        ))
+    })?;
+    // Shared length-discriminated decode (base16 / nixbase32 / base64) —
+    // identical to the gateway gate and the worker glue, so no component
+    // can decode the same declaration differently.
+    // r[impl nix.hash.fod-decode]
+    let nix_hash = NixHash::parse_nonsri_unprefixed(parsed_algo, hash).map_err(|e| {
+        Status::invalid_argument(format!(
+            "{context} output '{out_name}': outputHash is not a valid base16, nixbase32, or \
+             base64 hash: {e}"
+        ))
+    })?;
+    // Defense in depth: derive with the per-output path NAME
+    // (`<drv-name>` for "out", `<drv-name>-<output>` otherwise — CppNix
+    // outputPathName). Unreachable for non-"out" outputs once the
+    // single-out shape rule above is enforced, but a future relaxation
+    // of that rule must not silently derive every output to the same
+    // path.
+    let path_name = output_path_name(drv_name, out_name);
+    let derived =
+        StorePath::make_fixed_output(&path_name, &nix_hash, recursive, &[]).map_err(|e| {
+            Status::invalid_argument(format!(
+                "{context} output '{out_name}': cannot derive fixed-output path: {e}"
+            ))
+        })?;
+    if derived.as_str() != aterm_path {
+        return Err(Status::invalid_argument(format!(
+            "{context} output '{out_name}' declares path {aterm_path} but its declared hash \
+             derives to {} — content and identity do not match",
+            derived.as_str()
+        )));
+    }
+    match expected {
+        Some(exp) if !exp.is_empty() => {
+            if exp != derived.as_str() {
+                return Err(Status::invalid_argument(format!(
+                    "node.expected_output_paths['{out_name}'] = {exp} does not match the \
+                     fixed-output path {} derived from the {context}",
+                    derived.as_str()
+                )));
+            }
+        }
+        // The entry MUST be present and non-empty: the merge gate uses
+        // fixed-output path agreement as content evidence, so an
+        // undeclared path would leave the persisted identity unbound to
+        // the bytes.
+        _ => {
+            return Err(Status::invalid_argument(format!(
+                "node.expected_output_paths['{out_name}'] must declare the fixed-output path {} \
+                 derived from the {context}",
+                derived.as_str()
+            )));
+        }
+    }
+    Ok(derived.as_str().to_owned())
+}
+
 /// Validate a node that claims `drv_content_authoritative`.
 ///
 /// The flag means "persist these bytes and rebuild them verbatim after a
@@ -593,7 +724,6 @@ fn validate_authoritative_drv_content(
     nodes: &[rio_proto::types::DerivationNode],
 ) -> Result<(), Status> {
     use rio_nix::derivation::{Derivation, DerivationLike};
-    use rio_nix::hash::NixHash;
     use rio_nix::store_path::StorePath;
 
     let Some(node) = nodes.iter().find(|n| n.drv_content_authoritative) else {
@@ -653,6 +783,10 @@ fn validate_authoritative_drv_content(
             "node.is_content_addressed does not match the authoritative drv_content",
         ));
     }
+    // Oracle-parity FOD shape rule (single output named "out") — shared
+    // helper so this validator and validate_inline_drv_content cannot
+    // drift.
+    validate_inline_fod_shape(&drv, "authoritative drv_content")?;
     if node.expected_output_paths.len() != node.output_names.len() {
         return Err(Status::invalid_argument(format!(
             "authoritative submissions must declare exactly one expected_output_paths entry per \
@@ -684,62 +818,18 @@ fn validate_authoritative_drv_content(
         if !algo.is_empty() && !hash.is_empty() {
             // Fixed output: the declared hash must derive to the path the
             // ATerm declares AND to the node's expected output path.
-            let (recursive, algo_str) = match algo.strip_prefix("r:") {
-                Some(rest) => (true, rest),
-                None => (false, algo),
-            };
-            let parsed_algo = algo_str.parse().map_err(|_| {
-                Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}' declares unsupported \
-                     outputHashAlgo '{algo}'"
-                ))
-            })?;
-            // Shared length-discriminated decode (base16 / nixbase32 /
-            // base64) — identical to the gateway gate and the worker glue,
-            // so no component can decode the same declaration differently.
-            // r[impl nix.hash.fod-decode]
-            let nix_hash = NixHash::parse_nonsri_unprefixed(parsed_algo, hash).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}': outputHash is not a valid \
-                     base16, nixbase32, or base64 hash: {e}"
-                ))
-            })?;
-            let derived = StorePath::make_fixed_output(&drv_name, &nix_hash, recursive, &[])
-                .map_err(|e| {
-                    Status::invalid_argument(format!(
-                        "authoritative drv_content output '{name}': cannot derive fixed-output \
-                         path: {e}"
-                    ))
-                })?;
-            if derived.as_str() != path {
-                return Err(Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}' declares path {path} but its \
-                     declared hash derives to {} — content and identity do not match",
-                    derived.as_str()
-                )));
-            }
-            match expected.get(name) {
-                Some(exp) if !exp.is_empty() => {
-                    if *exp != derived.as_str() {
-                        return Err(Status::invalid_argument(format!(
-                            "node.expected_output_paths['{name}'] = {exp} does not match the \
-                             fixed-output path {} derived from the authoritative drv_content",
-                            derived.as_str()
-                        )));
-                    }
-                }
-                // The entry MUST be present and non-empty: the merge gate
-                // uses fixed-output path agreement as content evidence, so
-                // an undeclared path would leave the persisted identity
-                // unbound to the bytes.
-                _ => {
-                    return Err(Status::invalid_argument(format!(
-                        "node.expected_output_paths['{name}'] must declare the fixed-output \
-                         path {} derived from the authoritative drv_content",
-                        derived.as_str()
-                    )));
-                }
-            }
+            // Shared binding helper (decode → derive → compare) — also
+            // used by validate_inline_drv_content so the two validators
+            // cannot drift.
+            validate_fixed_output_binding(
+                &drv_name,
+                name,
+                path,
+                algo,
+                hash,
+                expected.get(name).copied(),
+                "authoritative drv_content",
+            )?;
         } else if !algo.is_empty() {
             // Floating-CA output: no static path exists yet anywhere.
             has_floating = true;

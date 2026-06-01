@@ -1010,7 +1010,7 @@ async fn revoked_jti_rejected_by_cancel_watch_query() {
 // word for them: the bytes must describe a content-bound derivation
 // consistent with the node's claimed identity, and the flag is only valid
 // for the single-node hook-fallback shape.
-// r[verify sched.recovery.inline-drv-durability+2]
+// r[verify sched.recovery.inline-drv-durability+3]
 
 /// Helper: a floating-CA ATerm + the node fields that legitimately
 /// describe it (what the gateway's content-bound fallback produces).
@@ -1105,6 +1105,84 @@ async fn test_submit_build_rejects_authoritative_input_addressed_content() {
     assert!(
         status.message().contains("content-bound"),
         "should require content-bound outputs: {}",
+        status.message()
+    );
+}
+
+/// Oracle-parity FOD shape rule: a derivation with more than one output
+/// where any output declares a fixed hash is rejected ("only one fixed
+/// output is allowed for now" — CppNix derivations.cc). Without the shape
+/// rule, per-output path derivation could alias multi-output fixed
+/// declarations onto single-output identities.
+// r[verify sched.recovery.inline-drv-durability+3]
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_multi_output_fixed() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let aterm = format!(
+        r#"Derive([("out","/nix/store/{p1}-multi","r:sha256","{h}"),("dev","/nix/store/{p2}-multi-dev","r:sha256","{h}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[])"#,
+        p1 = "f".repeat(32),
+        p2 = "e".repeat(32),
+    );
+    let mut node = make_node("auth-multi-fixed");
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = true;
+    node.output_names = vec!["out".into(), "dev".into()];
+    // 2-output fixed shape: rio-nix's strict predicates report
+    // is_fixed_output=false / is_content_addressed=false for it, so the
+    // node flags must agree to reach the shape rule.
+    node.is_fixed_output = false;
+    node.is_content_addressed = false;
+    node.expected_output_paths = vec![String::new(), String::new()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("only one fixed output"),
+        "shape rule names the oracle constraint: {}",
+        status.message()
+    );
+}
+
+/// Oracle-parity FOD shape rule: a single fixed output not named `out`
+/// is rejected ("single fixed output must be named \"out\"" — CppNix
+/// derivations.cc).
+// r[verify sched.recovery.inline-drv-durability+3]
+#[tokio::test]
+async fn test_submit_build_rejects_authoritative_fixed_output_not_named_out() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+    let h = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    let aterm = format!(
+        r#"Derive([("lib","/nix/store/{p}-libonly","r:sha256","{h}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[])"#,
+        p = "f".repeat(32),
+    );
+    let mut node = make_node("auth-fixed-lib");
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = true;
+    node.output_names = vec!["lib".into()];
+    // Single fixed output named "lib": the strict predicates report
+    // false for both flags (they require the name "out").
+    node.is_fixed_output = false;
+    node.is_content_addressed = false;
+    node.expected_output_paths = vec![String::new()];
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("must be named"),
+        "shape rule names the oracle constraint: {}",
         status.message()
     );
 }

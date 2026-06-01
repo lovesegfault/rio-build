@@ -5015,7 +5015,7 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
 /// survive scheduler failover: the bytes are the only copy of the
 /// derivation anywhere, so the recovered node's dispatch must carry
 /// exactly what the gateway submitted.
-// r[verify sched.recovery.inline-drv-durability+2]
+// r[verify sched.recovery.inline-drv-durability+3]
 #[tokio::test]
 async fn test_recovery_preserves_authoritative_drv_content() -> TestResult {
     let build_id = Uuid::new_v4();

@@ -622,7 +622,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
 /// round-trip through batch upsert, be refreshed by a later
 /// authoritative re-upsert, be cleared by a later non-authoritative
 /// re-upsert (last write wins), and come back from the recovery query.
-// r[verify sched.recovery.inline-drv-durability+2]
+// r[verify sched.recovery.inline-drv-durability+3]
 #[tokio::test]
 async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
