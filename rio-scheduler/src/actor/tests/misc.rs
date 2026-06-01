@@ -1279,7 +1279,7 @@ async fn cluster_snapshot_queued_by_system_sums_to_scalar() {
 /// DOWN exactly when it was the bottleneck. The match is now
 /// exhaustive over `DerivationStatus` so a future variant addition is
 /// a compile-time break, not a silently-zero autoscaler input.
-// r[verify sched.admin.snapshot-substituting]
+// r[verify sched.admin.snapshot-substituting+2]
 #[tokio::test]
 async fn snapshot_counts_substituting() {
     let db = TestDb::new(&MIGRATOR).await;

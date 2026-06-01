@@ -1200,6 +1200,153 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
     Ok(())
 }
 
+// ── T-1.1 (Phase B): §2.6 consumer re-sourcing — the snapshot buckets ──
+
+// r[verify sched.admin.snapshot-substituting+2]
+// r[verify ctrl.scaler.signal-substituting+2]
+/// §2.6 re-sourcing: pending (unclaimed) materialization jobs ARE the
+/// substituting bucket flag-on. A Ready or Queued node carrying an
+/// unresolved unclaimed job counts in `substituting_derivations` and is
+/// EXCLUDED from `queued_derivations`/`queued_by_system` (the buckets
+/// stay disjoint — builder autoscalers must not scale on work that will
+/// be materialized); a claimed job's node is Assigned/Running and counts
+/// in `running_derivations` by construction.
+#[tokio::test]
+async fn flag_on_pending_jobs_count_as_substituting_bucket() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // 3-node chain root → mid → leaf where mid and leaf are
+    // substitutable but the demanded root is NOT (so the topdown prune
+    // does not fire). The merge new_sub lane creates jobs for mid +
+    // leaf in-tx; seed_initial_states leaves leaf Ready, mid Queued
+    // (behind the unproduced leaf), root Queued.
+    let mid_out = test_store_path("sub-bucket-mid-out");
+    let leaf_out = test_store_path("sub-bucket-leaf-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(mid_out.clone());
+        subs.push(leaf_out.clone());
+    }
+
+    let root = make_node("sub-bucket-root");
+    let mut mid = make_node("sub-bucket-mid");
+    mid.expected_output_paths = vec![mid_out.clone()];
+    let mut leaf = make_node("sub-bucket-leaf");
+    leaf.expected_output_paths = vec![leaf_out.clone()];
+    let nodes = vec![root, mid, leaf];
+    let edges = vec![
+        make_test_edge("sub-bucket-root", "sub-bucket-mid"),
+        make_test_edge("sub-bucket-mid", "sub-bucket-leaf"),
+    ];
+    let build_id = Uuid::new_v4();
+    // Hold the event receiver: cfg(test) ORPHAN_BUILD_GRACE is ZERO, so a
+    // dropped receiver + two ticks auto-cancels the build mid-test.
+    let _ev = merge_dag(&handle, build_id, nodes, edges, false).await?;
+    barrier(&handle).await;
+
+    // Both jobs exist; leaf is Ready, mid is Queued.
+    assert_eq!(
+        expect_drv(&handle, "sub-bucket-leaf").await.status,
+        DerivationStatus::Ready
+    );
+    assert_eq!(
+        expect_drv(&handle, "sub-bucket-mid").await.status,
+        DerivationStatus::Queued
+    );
+
+    // Tick refreshes the cached snapshot.
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.substituting_derivations, 2,
+        "one Ready+job and one Queued+job node both count as substitution backlog \
+         (the §2.6 re-sourcing); got {snap:?}"
+    );
+    assert_eq!(
+        snap.queued_derivations, 0,
+        "pending-job nodes are excluded from queued_derivations (bucket disjointness)"
+    );
+    assert_eq!(
+        snap.queued_by_system.values().sum::<u32>(),
+        0,
+        "pending-job nodes are excluded from queued_by_system"
+    );
+    assert_eq!(snap.running_derivations, 0);
+
+    // Claim the leaf's job → the node goes Assigned/Running (claimed
+    // jobs leave the substituting bucket and surface as running).
+    let claim = claim_materialization(&handle, "sub-bucket-leaf", "store-test-0").await;
+    assert!(
+        matches!(claim, Ok(PullOutcome::Deliver(_))),
+        "the leaf's job must be claimable, got {claim:?}"
+    );
+    tick(&handle).await?;
+    let snap = handle.cluster_snapshot_cached();
+    assert_eq!(
+        snap.substituting_derivations, 1,
+        "the claimed job's node leaves the substituting bucket (mid's pending job remains)"
+    );
+    assert_eq!(
+        snap.running_derivations, 1,
+        "the claimed job's node counts as running (Assigned/Running by the mint)"
+    );
+    assert_eq!(snap.queued_derivations, 0);
+    Ok(())
+}
+
+// r[verify sched.admin.snapshot-substituting+2]
+/// Equivalence criterion 2 / stop condition 8: flag-OFF the snapshot
+/// buckets are byte-identical to the as-built status-only semantics —
+/// Substituting counts in substituting_derivations, Ready in
+/// queued_derivations — EVEN IF the in-memory job view somehow carries
+/// entries (defense in depth: the bucket re-sourcing is gated on the
+/// flag itself, not just on the view being empty). This test PINS
+/// criterion 2 and must never change.
+#[tokio::test]
+async fn flag_off_snapshot_buckets_match_baseline() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let mut actor = bare_actor(db.pool.clone()); // flag-off default
+
+    // 1 Substituting, 1 Ready, 1 Running — the as-built disjoint counts.
+    actor.test_inject_ready("off-sub", None, "x86_64-linux", false);
+    actor
+        .dag
+        .node_mut("off-sub")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Substituting);
+    actor.test_inject_ready("off-ready", None, "x86_64-linux", false);
+    actor.test_inject_ready("off-run", None, "x86_64-linux", false);
+    actor
+        .dag
+        .node_mut("off-run")
+        .unwrap()
+        .set_status_for_test(DerivationStatus::Running);
+
+    // Defense-in-depth: even with a (production-unreachable) job-view
+    // entry for the Ready node, flag-off buckets stay status-only.
+    actor.materialization_jobs.insert(
+        DrvHash::from("off-ready"),
+        crate::actor::materialize::JobViewEntry {
+            job_id: Uuid::new_v4(),
+            parked_until: None,
+            claimed_by: None,
+        },
+    );
+
+    let snap = actor.compute_cluster_snapshot();
+    assert_eq!(
+        snap.substituting_derivations, 1,
+        "flag-off: substituting counts ONLY Substituting-status nodes"
+    );
+    assert_eq!(
+        snap.queued_derivations, 1,
+        "flag-off: a Ready node counts in queued even when a job-view entry exists"
+    );
+    assert_eq!(snap.running_derivations, 1);
+    assert_eq!(snap.queued_by_system.values().sum::<u32>(), 1);
+    Ok(())
+}
+
 // r[verify sched.materialize.job]
 /// The PD-6 boundary pin (adjudication PDQ-6): a Queued node (a parent
 /// behind an unproduced dep) with a pending job REFUSES a flag-on

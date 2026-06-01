@@ -1504,10 +1504,15 @@ for materialization output pins.
   `any_co_owned_dep_terminally_failed` for its dependents.
 ]
 
-#r("sched.admin.snapshot-substituting")[
+#r("sched.admin.snapshot-substituting+2")[
   `ClusterStatus` MUST report `substituting_derivations`. The snapshot match
   over `DerivationStatus` MUST be exhaustive so future status additions are
-  compile-time caught, not silently-zero.
+  compile-time caught, not silently-zero. When materialization dispatch is
+  enabled, the substituting bucket MUST additionally count derivations carrying
+  an unresolved, unclaimed materialization job (whatever their status), and
+  those derivations MUST be excluded from `queued_derivations` and
+  `queued_by_system` --- the three buckets stay disjoint, and their sum never
+  reads zero mid-cascade.
 ]
 
 #r("sched.substitute.detached+5")[

@@ -248,33 +248,65 @@ impl DagActor {
         let mut queued_derivations = 0u32;
         let mut substituting_derivations = 0u32;
         let mut queued_by_system: HashMap<String, u32> = HashMap::new();
-        // r[impl sched.admin.snapshot-substituting]
+        // r[impl sched.admin.snapshot-substituting+2]
         // Exhaustive over DerivationStatus so a future variant addition
         // is a compile-time break here, not a silently-zero autoscaler
         // input. The `_ => {}` this replaces dropped Substituting on
         // the floor — substitution cascades read as `builders=0` to
         // the ComponentScaler and the store scaled DOWN exactly when
         // it was the bottleneck.
-        for (_, s) in self.dag.iter_nodes() {
+        //
+        // Substitution-replacement Phase B (§2.6 re-sourcing): flag-on,
+        // the substituting bucket is additionally sourced from the
+        // materialization-job view — a node with an unresolved unclaimed
+        // job is substitution backlog whatever its status. The status
+        // arm stays (flag-off-era Substituting nodes keep counting); the
+        // job-view disjunct is flag-gated so flag-off values are
+        // byte-identical to baseline (criterion 2 / stop condition 8).
+        for (drv_hash, s) in self.dag.iter_nodes() {
             match s.status() {
                 DerivationStatus::Assigned | DerivationStatus::Running => {
                     running_derivations += 1;
                 }
                 DerivationStatus::Ready => {
-                    // The scalar and the I-107 per-system breakdown are
-                    // counted in the same arm so the sum across keys
-                    // equals the scalar by construction (the ready-queue
-                    // membership the scalar used to read was not
-                    // dequeued by pull mints — the recorded over-count).
-                    queued_derivations += 1;
-                    *queued_by_system.entry(s.system.clone()).or_default() += 1;
+                    // r[impl sched.materialize.job]
+                    // §2.6: a Ready node carrying an unresolved,
+                    // unclaimed materialization job is substitution
+                    // backlog, not builder-queue backlog — count it in
+                    // the substituting bucket and keep it OUT of
+                    // queued_derivations/queued_by_system so the buckets
+                    // stay disjoint and builder autoscalers don't scale
+                    // on work that will be materialized, not built.
+                    if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash)
+                    {
+                        substituting_derivations += 1;
+                    } else {
+                        // The scalar and the I-107 per-system breakdown
+                        // are counted in the same arm so the sum across
+                        // keys equals the scalar by construction (the
+                        // ready-queue membership the scalar used to read
+                        // was not dequeued by pull mints — the recorded
+                        // over-count).
+                        queued_derivations += 1;
+                        *queued_by_system.entry(s.system.clone()).or_default() += 1;
+                    }
                 }
-                // r[impl ctrl.scaler.signal-substituting]
+                // r[impl ctrl.scaler.signal-substituting+2]
                 DerivationStatus::Substituting => substituting_derivations += 1,
                 // Pre-ready: not yet store/builder load. Created has no
                 // deps probed; Queued has unmet deps. Neither drives
-                // any RPC traffic.
-                DerivationStatus::Created | DerivationStatus::Queued => {}
+                // any RPC traffic — EXCEPT a Queued node carrying a
+                // pending materialization job (flag-on): materialization
+                // does not wait for deps, so that node is store-side
+                // backlog exactly like its Ready sibling above.
+                DerivationStatus::Created | DerivationStatus::Queued => {
+                    if self.materialization_cfg.enabled
+                        && s.status() == DerivationStatus::Queued
+                        && self.has_pending_unclaimed_job(drv_hash)
+                    {
+                        substituting_derivations += 1;
+                    }
+                }
                 // Terminal (or transient-mid-retry for Failed): no
                 // ongoing load.
                 DerivationStatus::Completed

@@ -840,11 +840,16 @@ busyness (or its absence) from anything other than the durable view.
   and limited to −1/tick. Reconcile interval: 10s.
 ]
 
-#r("ctrl.scaler.signal-substituting")[
+#r("ctrl.scaler.signal-substituting+2")[
   The predictive `builders` signal MUST include `substituting_derivations` at
   1:1 weight with `queued`/`running`. A substitution cascade with zero
   queued/running MUST NOT produce `builders=0` --- that scales the store toward
-  `min` exactly when it is the bottleneck.
+  `min` exactly when it is the bottleneck. The field's source is the
+  scheduler's: Substituting-status nodes (the walk mechanism) plus, when
+  materialization dispatch is enabled, derivations with pending materialization
+  jobs (the job mechanism). The scaler reads the same proto field either way;
+  pending-job backlog is thereby visible to the predictive signal before any
+  store replica claims the work.
 ]
 
 #r("ctrl.scaler.ratio-learn+2")[

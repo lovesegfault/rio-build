@@ -291,6 +291,28 @@ impl DagActor {
             entry.claimed_by = Some(holder.clone());
         }
     }
+
+    /// Whether the node carries an unresolved, UNCLAIMED materialization
+    /// job — the §2.6 "substitution backlog" predicate read by the
+    /// snapshot bucket re-sourcing and the spawn-intent filter.
+    ///
+    /// Pending AND parked jobs both count: the consumers' question is
+    /// "does store-side substitution work exist for this node", and a
+    /// parked job is exactly that (work the store will resume once its
+    /// backoff expires). Claimed jobs do NOT count — their nodes are
+    /// Assigned/Running and surface through `running_derivations`.
+    ///
+    /// Reads only the in-memory view, which is populated exclusively by
+    /// the flag-gated creation paths — flag-off it is permanently empty,
+    /// so this is always false there. Callers still gate on
+    /// `materialization_cfg.enabled` (defense in depth: criterion 2 /
+    /// stop condition 8 — flag-off snapshot values must be byte-identical
+    /// to baseline regardless of view contents).
+    pub(super) fn has_pending_unclaimed_job(&self, drv_hash: &str) -> bool {
+        self.materialization_jobs
+            .get(drv_hash)
+            .is_some_and(|entry| entry.claimed_by.is_none())
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────────

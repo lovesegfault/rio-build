@@ -1019,7 +1019,7 @@ in
     };
   };
 
-  # r[verify ctrl.scaler.signal-substituting]
+  # r[verify ctrl.scaler.signal-substituting+2]
   # r[verify store.substitute.admission]
   # r[verify store.admin.get-load+2]
   #   Substitution → ComponentScaler closed loop. 30-leaf substitutable
