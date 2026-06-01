@@ -1390,6 +1390,73 @@ no-failover / no-store-fault / no-upstream-withdrawal envelope (C3's scope);
 a co-build with genuinely unobtainable wanted outputs still fails all
 interested builds of the node (the verdict is per-node, not per-build).
 
+#r("sched.materialize.job")[
+  When materialization dispatch is enabled, the scheduler MUST express "make
+  this derivation's live-wanted outputs present in rio-store" as a durable
+  materialization-job row created atomically with the classification that
+  demanded it --- inside the merge transaction for merge-originated
+  classifications (merge classification, prune, stale-Completed verify),
+  through its own claims-floor-fenced transaction for the dispatch-probe
+  partition --- with at most one unresolved job per derivation
+  (database-enforced), with the creating build's tenant recorded, and with
+  every job-table write fenced by the durable claims floor. A job MUST
+  resolve only through: an exec_id-keyed consumption outcome, obsolescence
+  on the node producing by other means, or cancellation when no live
+  DAG-interested build remains.
+]
+This is the substitution-replacement campaign's job lifecycle (design §2.1/§6,
+adjudications OQ3/OQ6). Phase A lands the mechanism dormant behind
+`scheduler.materialization.enabled = false`; Phase B activates it. The
+per-(build, derivation) wanted relation (`build_wanted_outputs`) is written by
+every merge for every pair when the flag is on, and materialization interest is
+always DERIVED from it by a live-build join --- never registered separately
+(review finding AS-1). The dedup mirrors the C3 protection: N builds requesting
+the same derivation concurrently produce one job, enforced by the
+`materialization_jobs_unresolved` partial-unique index instead of by in-memory
+status checks.
+
+#r("sched.materialize.routing")[
+  A materialization outcome MUST be consumed in exactly one fenced transaction
+  keyed by its exec_id, and that transaction MUST re-read live interest and the
+  live effective wanted set before acting: a Success outcome completes the node
+  only when the reported paths cover the re-read live wanted set (else the job
+  re-arms); an Unobtainable outcome MUST route through, in order: the
+  moot-failure arm (no live-wanted path is missing → never fail-fast), the
+  durable-Vouched arm (declared closure produced → from-source), the
+  durable-Pending arm (deps still buildable → from-source via normal gating),
+  and only then --- after a same-transaction store re-probe of the live wanted
+  set confirms a live-wanted path missing-and-unsubstitutable, or after the
+  per-job re-probe one-shot is spent --- the fail-fast arm. An InfraFailure
+  outcome MUST never fail-fast and never route from-source; it re-arms the job
+  within the materialization budget and parks it on exhaustion.
+]
+The four-arm routing is the C3-settlement successor (design §2.4; review
+findings AS-2/PP-1/PP-3/BC-5). The same-transaction re-probe preserves CE-D4's
+recorded contract ("every fail-fast decision point re-probes live obtainability
+first") at the single surviving fail-fast site. The Success coverage re-check
+closes the CE-17 class (interest grew between execution and consumption). The
+park-not-fail posture preserves B3 ("unknown never demotes"): infra evidence is
+never confirmation. Parking becomes *visible and alertable* (the
+`rio_scheduler_materialization_stalled` metric, design §2.5) and re-evaluable
+(the housekeeping Vouched/Pending → from-source arm) in Phase B --- PD-20
+records that deferral; Phase A's park is a durable `park_until` row only.
+
+#r("sched.materialize.pinning")[
+  Every store path a materialization job ingests or verifies present MUST be
+  pinned against garbage collection at ingest time, under a pin kind
+  distinguishable from build-input pins; materialization pins MUST be released
+  only when the job is terminally resolved AND no live DAG-interested build
+  remains for the derivation; and no build-input pin lifecycle (terminal-status
+  release, recovery sweep) may delete a materialization pin.
+]
+Pin-at-ingest closes the GC-after-vouch window (B2-strong) for the window
+ingest → all-interest-terminal (design §5; adjudication OQ5; review finding
+PP-2). The kind discrimination exists because the as-built release machinery
+(`unpin_live_inputs` on terminal status, `sweep_stale_live_pins` at recovery)
+fires at exactly the wrong time for materialization output pins --- its premise
+"terminal drv ⇒ inputs no longer in use" is true for build-input pins and false
+for materialization output pins.
+
 #r("sched.dispatch.fod-substitute+2")[
   The dispatch-time store-check (`batch_probe_cached_ready` and the
   per-derivation `ready_check_or_spawn` fallback) MUST probe upstream

@@ -1027,6 +1027,31 @@ content-addressed output mappings independently of narinfo signatures.
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
+#r("store.materialize.executor")[
+  When the store-side materialization executor is enabled, each store replica
+  MUST execute materialization jobs as a pull-protocol client: discover jobs by
+  polling the scheduler, claim exactly one open attempt per job through
+  PullAssignment carrying the materialization kind and a per-replica executor
+  instance identity, perform the reference-closure walk in-process against its
+  own substitution machinery (never via per-path RPC to another component),
+  pin every ingested or verified path at ingest, and report the outcome through
+  ReportOutcome retried until acknowledged. The executor MUST re-resolve the
+  job's tenant context against live interest at execution start (the recorded
+  creating-build tenant is honored only while a live interested build carries
+  it) before fetching: a job whose tenant cannot be resolved or has no
+  configured upstreams MUST be reported as InfraFailure, never as Unobtainable
+  and never silently completed.
+]
+The store-as-pull-client decision is design §2.2 (adjudication OQ3): the work of
+materialization is upstream-fetch-and-ingest, which is already store-internal;
+only the control loop moves. The per-replica identity (`executor_instance`) is
+the recorded extension to the frozen pull contract (review finding BC-1): unlike
+builders --- where a replacement pod of the same intent converges on the same open
+attempt --- two store replicas must NOT both execute, so materialization attempts
+are keyed per replica and the scheduler's open-attempt arm is the one-winner
+arbiter. The tenant rule is review finding AS-4 (the 2026-05-23 incident class:
+tenant-less probes degrading to definitive miss).
+
 = Two-Phase Garbage Collection
 
 #r("store.gc.two-phase+2")[
