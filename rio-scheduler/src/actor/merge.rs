@@ -81,11 +81,12 @@ pub(super) struct MergeReconcile {
 /// Submission roots: nodes that appear as no edge's child. Edges key by
 /// `drv_path`, so collect child paths and filter.
 ///
-/// THE single root definition — `validate_and_ingest` maps it to the
-/// `submission_roots` hash set (force-build gates +
-/// `build_derivations.is_root` persistence) and `check_roots_topdown`
-/// consumes the node refs for the top-down prune, so the gate logic and
-/// the persisted `is_root` can never drift apart.
+/// THE single STRUCTURAL root definition — [`DemandSet::compute`] folds
+/// it into the demand set (force-build gates +
+/// `build_derivations.is_root` persistence + the top-down prune), and
+/// step 0's topdown-blocking sticky-OR consumes it directly (that gate
+/// deliberately tests structural roots only — see the comment at the
+/// gate).
 fn submission_root_nodes<'a>(
     nodes: &'a [crate::domain::DerivationNode],
     edges: &[crate::domain::DerivationEdge],
@@ -95,6 +96,65 @@ fn submission_root_nodes<'a>(
         .iter()
         .filter(|n| !children.contains(n.drv_path.as_str()))
         .collect()
+}
+
+/// The submission's demand set: what the client actually asked for.
+///
+/// Structural roots ([`submission_root_nodes`] — no parent edge in this
+/// submission) ∪ every node the gateway marked `explicitly_requested`
+/// (a client-named target that another requested target's closure
+/// swallowed during multi-target dedup, hence NOT a structural root of
+/// the combined submission).
+///
+/// THE single demand definition — computed once at merge entry
+/// (`validate_and_ingest`) and consumed by BOTH the top-down prune
+/// ([`DagActor::check_roots_topdown`]) and the force-build protection
+/// set (`BuildInfo::root_hashes`, the step-4 `pending_substitute`
+/// filter, the `build_derivations.is_root` persistence that recovery
+/// re-derives the protection from). One type for "client demand" makes
+/// the prune's notion of demand and the force gates' protected set
+/// structurally unable to drift: a client-named target folded inside a
+/// sibling target's closure is exactly as protected as a structural
+/// root. The newtype (rather than a bare `HashSet<DrvHash>`) exists so
+/// the demand set cannot be confused with the structural-roots set —
+/// step 0's topdown-BLOCKING sticky-OR deliberately takes the narrower
+/// structural set (see the comment at that gate).
+pub(super) struct DemandSet {
+    hashes: HashSet<DrvHash>,
+}
+
+impl DemandSet {
+    /// Compute from the submission's nodes + edges. The protected set
+    /// of rule `sched.merge.force-build-roots+2` and the prune target
+    /// of rule `sched.merge.substitute-topdown+10`.
+    fn compute(
+        nodes: &[crate::domain::DerivationNode],
+        edges: &[crate::domain::DerivationEdge],
+    ) -> Self {
+        let structural: Vec<&crate::domain::DerivationNode> = submission_root_nodes(nodes, edges);
+        let hashes: HashSet<DrvHash> = structural
+            .into_iter()
+            .map(|n| DrvHash::from(n.drv_hash.as_str()))
+            .chain(
+                nodes
+                    .iter()
+                    .filter(|n| n.explicitly_requested)
+                    .map(|n| DrvHash::from(n.drv_hash.as_str())),
+            )
+            .collect();
+        Self { hashes }
+    }
+
+    /// Demand membership by drv hash (`DrvHash` borrows as `str`).
+    pub(super) fn contains(&self, drv_hash: &str) -> bool {
+        self.hashes.contains(drv_hash)
+    }
+
+    /// The demanded hashes — cloned into `BuildInfo::root_hashes` and
+    /// consulted by the `is_root` persistence.
+    pub(super) fn hashes(&self) -> &HashSet<DrvHash> {
+        &self.hashes
+    }
 }
 
 impl DagActor {
@@ -362,17 +422,21 @@ impl DagActor {
         let nodes = crate::domain::nodes_from_proto(nodes);
         let edges = crate::domain::edges_from_proto(edges);
 
-        // Submission roots ([`submission_root_nodes`] — same root
-        // definition check_roots_topdown consumes). Used by the
-        // force-build gates (r[sched.merge.force-build-roots]) and
-        // persisted as build_derivations.is_root. Computed BEFORE the
-        // top-down prune so `topdown_blocked` can consult it; pruning
-        // only drops deps, never roots, so the set is identical either
-        // way.
+        // Demand set ([`DemandSet`] — structural roots ∪ explicitly
+        // requested; the SAME set check_roots_topdown prunes to). Feeds
+        // the force-build gates (r[sched.merge.force-build-roots+2]):
+        // `BuildInfo::root_hashes`, the step-4 filter, and the
+        // `build_derivations.is_root` persistence. The structural
+        // subset (`submission_roots`) feeds only step 0's
+        // topdown-BLOCKING sticky-OR. Both are computed BEFORE the
+        // top-down prune; the prune keeps exactly the demanded nodes
+        // (and never fires for a force submission), so the sets are
+        // identical either way.
         let submission_roots: HashSet<DrvHash> = submission_root_nodes(&nodes, &edges)
             .into_iter()
             .map(|n| DrvHash::from(n.drv_hash.as_str()))
             .collect();
+        let demand_set = DemandSet::compute(&nodes, &edges);
 
         let mut t_phase = Instant::now();
         macro_rules! phase {
@@ -420,29 +484,33 @@ impl DagActor {
         // step 4 handles fall-through correctly — this is a fast-path,
         // not a replacement.
         //
-        // r[impl sched.merge.force-build-roots]
+        // r[impl sched.merge.force-build-roots+2]
         // Sticky-OR at the top-down shortcut: skip it when THIS request
-        // is force-build, or when any of this submission's roots is a
-        // live force-build build's root already in the DAG (a later
-        // non-force submission must not substitute it out from under
-        // that build). Pruning deps would also guarantee a doomed
+        // is force-build, or when any of this submission's structural
+        // roots is force-protected by a live build already in the DAG
+        // (a later non-force submission must not substitute it out from
+        // under that build). Pruning deps would also guarantee a doomed
         // dispatch (inputs never merged).
         //
-        // Deliberately keyed on structural roots, NOT the full demand
-        // set check_roots_topdown prunes to (roots ∪
-        // explicitly_requested): an explicitly-requested non-root that
-        // is another live build's force-build root does not block this
-        // submission's prune. It still cannot be substituted — the
-        // step-4 pending_substitute filter and the dispatch-time probes
-        // gate on is_force_build_root independently of any prune — and
-        // it completes via that build's from-source dispatch. If that
+        // The TESTED nodes are deliberately this submission's
+        // structural roots, NOT its full demand set: an
+        // explicitly-requested non-root of THIS submission that another
+        // live build force-protects does not block this submission's
+        // prune. It still cannot be substituted — the step-4
+        // pending_substitute filter and the dispatch-time probes gate
+        // on is_force_build_root independently of any prune — and it
+        // completes via that build's from-source dispatch. If that
         // build is cancelled first, its terminal reap leaves the kept
         // node with Broken closure evidence (childless or
         // closure-holed), so it either re-opens for substitution (the
         // force gate dies with its build) or takes the standard topdown
         // fail-fast; a doomed from-source dispatch cannot happen, so
-        // widening this gate would only trade the prune away for
-        // closure-pinning the other build already provides.
+        // widening the TESTED set would only trade the prune away for
+        // closure-pinning the other build already provides. The
+        // PROTECTED set consulted per tested node (`is_force_build_root`
+        // → the other build's `root_hashes`) is that build's full
+        // demand set — protection is demand-wide even though the
+        // prune-block test is structural-only.
         //
         // Liveness reviewed for this site: `is_force_build_root` counts
         // only LIVE force builds, so a force submission that already
@@ -462,7 +530,7 @@ impl DagActor {
             (nodes, edges, false, HashSet::new())
         } else {
             match self
-                .check_roots_topdown(&nodes, &edges, jwt_token.as_deref())
+                .check_roots_topdown(&nodes, &edges, &demand_set, jwt_token.as_deref())
                 .await
             {
                 Some(demanded) => {
@@ -546,7 +614,7 @@ impl DagActor {
             nodes.iter().map(|n| n.drv_hash.as_str().into()).collect(),
         );
         build_info.force_build_roots = force_build_roots;
-        build_info.root_hashes = submission_roots.clone();
+        build_info.root_hashes = demand_set.hashes().clone();
         self.builds.insert(build_id, build_info);
 
         // Index proto nodes by hash for efficient lookup during cache-check + transitions.
@@ -613,7 +681,7 @@ impl DagActor {
                 return Err(e);
             }
         };
-        // r[impl sched.merge.force-build-roots]
+        // r[impl sched.merge.force-build-roots+2]
         // Sticky-OR at the cache check's upstream-substitutable arm:
         // exclude (a) THIS submission's roots when it is force-build and
         // (b) any node that is a live force-build build's root (a later
@@ -633,10 +701,17 @@ impl DagActor {
         // tenant's spurious fail-fast). Arm (a) is request-local and
         // deliberately liveness-free: THIS build was inserted Pending/
         // Active a step ago and is live by construction.
+        //
+        // Both arms key on the DEMAND SET (structural roots ∪
+        // explicitly requested), not structural roots alone: a
+        // client-named target that a sibling target's closure swallowed
+        // is exactly what the flag exists to force through the build
+        // path, and the top-down prune already treats it as client
+        // demand.
         let pending_substitute: Vec<(DrvHash, Vec<String>)> = pending_substitute
             .into_iter()
             .filter(|(h, _)| {
-                let this_submission = force_build_roots && submission_roots.contains(h);
+                let this_submission = force_build_roots && demand_set.contains(h.as_str());
                 !(this_submission || self.is_force_build_root(h))
             })
             .collect();
@@ -655,7 +730,7 @@ impl DagActor {
                 &edges,
                 &merge_result,
                 &pruned_closure_parents,
-                &submission_roots,
+                demand_set.hashes(),
             )
             .await
         {
@@ -773,7 +848,7 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
-        submission_roots: &HashSet<DrvHash>,
+        demanded: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         self.persist_merge_to_db(
             build_id,
@@ -781,7 +856,7 @@ impl DagActor {
             edges,
             &merge_result.newly_inserted,
             topdown_pruned_parents,
-            submission_roots,
+            demanded,
         )
         .await
         .inspect_err(
@@ -1859,7 +1934,7 @@ impl DagActor {
             // dispatch-time batch probe (cap-truncated, fail-open)
             // stands between the node and a from-source re-dispatch.
             //
-            // r[impl sched.merge.force-build-roots]
+            // r[impl sched.merge.force-build-roots+2]
             // Force-build roots are never re-fetched from upstream even
             // when their vanished output is substitutable — push to the
             // ready queue and let the dispatch-time probes
@@ -2017,7 +2092,7 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
         topdown_pruned_parents: &HashSet<String>,
-        submission_roots: &HashSet<DrvHash>,
+        demanded: &HashSet<DrvHash>,
     ) -> Result<(), ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -2099,12 +2174,17 @@ impl DagActor {
         // Batch 1: upsert all derivations, get back drv_hash -> db_id map.
         let id_map = crate::db::SchedulerDb::batch_upsert_derivations(&mut tx, &node_rows).await?;
 
-        // Batch 2: link all nodes to this build. Submission roots get
+        // Batch 2: link all nodes to this build. The submission's DEMAND
+        // SET (structural roots ∪ explicitly requested) gets
         // is_root = TRUE (recovery re-derives the per-build force-build
-        // root set from these rows; non-roots stay FALSE).
+        // protection set from these rows; undemanded deps stay FALSE).
+        // Rows persisted before is_root covered explicit requests carry
+        // structural roots only — across a failover that spans that
+        // deploy, such builds are protected as structural roots only
+        // (see the M_065 doc-const in rio-migrations).
         let db_ids: Vec<(Uuid, bool)> = id_map
             .iter()
-            .map(|(hash, (id, _))| (*id, submission_roots.contains(hash.as_str())))
+            .map(|(hash, (id, _))| (*id, demanded.contains(hash.as_str())))
             .collect();
         crate::db::SchedulerDb::batch_insert_build_derivations(&mut tx, build_id, &db_ids).await?;
 
@@ -2760,6 +2840,7 @@ impl DagActor {
         &mut self,
         nodes: &[crate::domain::DerivationNode],
         edges: &[crate::domain::DerivationEdge],
+        demand: &DemandSet,
         jwt_token: Option<&str>,
     ) -> Option<Vec<crate::domain::DerivationNode>> {
         let store_client = self.store_client.as_ref()?;
@@ -2773,18 +2854,14 @@ impl DagActor {
             return None;
         }
 
-        // --- Compute the demand set ---------------------------------
-        // Structural roots ([`submission_root_nodes`] — the shared
-        // definition the force-build gates / is_root persistence use,
-        // so the gate logic and the persisted is_root can never drift)
-        // ∪ gateway-flagged explicitly requested nodes.
-        let structural_roots: HashSet<&str> = submission_root_nodes(nodes, edges)
-            .into_iter()
-            .map(|n| n.drv_path.as_str())
-            .collect();
+        // --- Resolve the demand set to node refs ---------------------
+        // [`DemandSet`] is computed once at merge entry — the same set
+        // the force-build gates protect and the is_root persistence
+        // records, so the prune target and the protected set can never
+        // drift apart.
         let demanded: Vec<&crate::domain::DerivationNode> = nodes
             .iter()
-            .filter(|n| structural_roots.contains(n.drv_path.as_str()) || n.explicitly_requested)
+            .filter(|n| demand.contains(n.drv_hash.as_str()))
             .collect();
 
         if demanded.is_empty() || demanded.len() == nodes.len() {

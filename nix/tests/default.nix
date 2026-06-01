@@ -452,7 +452,7 @@ in
         extraClientModules = [
           { networking.firewall.allowedTCPPorts = [ 8080 ]; }
         ];
-        # r[verify sched.merge.force-build-roots]
+        # r[verify sched.merge.force-build-roots+2]
         #   force-build-roots-not-substituted: tenant "force-build" has
         #   force_build_roots in the gateway build-policy; its ssh-ng
         #   submission of an upstream-available path stays queued for a

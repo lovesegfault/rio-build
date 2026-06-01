@@ -104,9 +104,13 @@ pub struct BuildInfo {
     /// persisted on builds. Defaulted false by [`new_pending`](Self::new_pending);
     /// merge (and recovery) set it explicitly from the request / PG row.
     pub force_build_roots: bool,
-    /// Submission-root drv hashes of THIS build — the set the force-build
-    /// gates consult; persisted as `build_derivations.is_root`. Empty by
-    /// default; set explicitly by merge and recovery.
+    /// Demand-set drv hashes of THIS build (structural submission roots
+    /// ∪ explicitly-requested nodes) — the set the force-build gates
+    /// consult; persisted as `build_derivations.is_root`. Empty by
+    /// default; set explicitly by merge and recovery. Builds persisted
+    /// before `is_root` covered explicit requests recover with
+    /// structural roots only (see the M_065 doc-const in
+    /// rio-migrations).
     pub root_hashes: HashSet<DrvHash>,
     /// Build options propagated from the client.
     pub options: BuildOptions,

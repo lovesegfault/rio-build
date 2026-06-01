@@ -849,23 +849,32 @@ submitted after the failover record contributions as usual).
   roots never enter this fetch path (#rref("sched.merge.force-build-roots")).
 ]
 
-#r("sched.merge.force-build-roots")[
+#r("sched.merge.force-build-roots+2")[
   When a submission carries `force_build_roots`, the scheduler MUST NOT
-  substitute that submission's root derivations from upstream at any of the
+  substitute the derivations in that submission's *demand set* --- its
+  structural roots ∪ every node the client explicitly requested, the same
+  demand definition the top-down prune uses
+  (#rref("sched.merge.substitute-topdown")) --- from upstream at any of the
   substitution decision points --- the merge-time top-down root check, the
   merge-time cache check's upstream-substitutable arm, the stale-output
-  re-substitution arm (#rref("sched.merge.stale-substitutable")), and the
-  dispatch-time Ready probe's substitute-spawn arms --- and MUST instead let
-  them dispatch as builds; roots whose outputs are already locally present
-  still short-circuit to Completed, and the submission's dependencies remain
-  substitutable. The per-node decision is a sticky OR over the node's
-  interested builds (any live interested build with `force_build_roots` that
-  names the node among its submission roots), so a later non-force submission
-  of the same derivation does not strip the protection while the force-build
+  re-substitution arm (#rref("sched.merge.stale-substitutable")), the
+  dispatch-time Ready probe's substitute-spawn arms, and the detached-fetch
+  completion handler (an upstream fetch already in flight when the
+  force-build submission merged MUST be discarded at completion, never
+  applied as a substitution) --- and MUST instead let them dispatch as
+  builds; demanded nodes whose outputs are already locally present still
+  short-circuit to Completed, and the submission's undemanded dependencies
+  remain substitutable. The per-node decision is a sticky OR over the node's
+  interested builds (any live interested build with `force_build_roots`
+  whose demand set names the node), so a later non-force submission of the
+  same derivation does not strip the protection while the force-build
   submission is live. The inputs to that decision are persisted via
-  `builds.force_build_roots` and `build_derivations.is_root` and re-derived at
-  recovery, so a leader failover cannot turn a force-build root that was not
-  yet terminal at failover into a substitution.
+  `builds.force_build_roots` and `build_derivations.is_root` and re-derived
+  at recovery, so a leader failover cannot turn a force-build root that was
+  not yet terminal at failover into a substitution. Demand-set membership
+  persisted before `is_root` covered explicit requests is structural roots
+  only, so builds persisted by a pre-widening leader are protected as
+  structural roots only across a failover that spans that deploy.
 ]
 
 The flag exists for validation campaigns such as nixpkgs-parity: without it

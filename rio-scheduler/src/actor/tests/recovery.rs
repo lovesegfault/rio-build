@@ -5015,13 +5015,13 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
 // force_build_roots / root_hashes survive failover
 // ---------------------------------------------------------------------------
 
-/// A force-build root that was Ready at failover is BUILT, not
+/// A force-build demanded node that was Ready at failover is BUILT, not
 /// substituted, by the new leader: recovery re-derives
 /// `force_build_roots` + `root_hashes` from PG (`builds.force_build_roots`
 /// + `build_derivations.is_root`), so the dispatch-time probes' substitute
 /// arms stay closed even though the outputs are upstream-substitutable.
 ///
-/// Three recovered nodes drive every post-failover substitution lane in
+/// Four recovered nodes drive every post-failover substitution lane in
 /// the first dispatch pass:
 /// - `force-rec-root-a` (force root, Ready at failover): gated at the
 ///   batch probe (`batch_probe_cached_ready`) → assigned to a builder.
@@ -5030,26 +5030,35 @@ async fn test_failover_recovery_records_closure_hole_for_dropped_unproduced_term
 ///   it inline and root-b is promoted to Ready MID-pass — its substitute
 ///   decision goes through the per-drv `ready_check_or_spawn` fallback,
 ///   which must consult the same recovered fields → assigned to a builder.
+/// - `force-rec-exp` (explicitly-requested NON-root inside
+///   `force-rec-root-c`'s closure, Ready at failover): persisted
+///   is_root = TRUE as part of the demand set, so recovery re-derives
+///   the same protection a structural root gets → assigned to a
+///   builder, not substituted. (root-c exists only as exp's structural
+///   parent; it stays Queued behind the assigned-but-never-completed
+///   exp and is never itself probed or dispatched.)
 /// - `force-rec-ctrl` (separate NON-force control build): persisted with
-///   `force_build_roots = FALSE` but `is_root = TRUE` (is_root is
-///   structural, not force-only), and after recovery it DOES leave Ready
+///   `force_build_roots = FALSE` but `is_root = TRUE` (is_root marks
+///   demand, not force), and after recovery it DOES leave Ready
 ///   via the substitute lane — the recovered gate is per-build, not
 ///   global, and the lane itself is live (the roots' absence from it is
 ///   load-bearing, not vacuous).
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 #[tokio::test]
 async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> TestResult {
     let root_a_out = test_store_path("force-rec-root-a-out");
     let root_b_out = test_store_path("force-rec-root-b-out");
+    let exp_out = test_store_path("force-rec-exp-out");
     let dep_out = test_store_path("force-rec-dep-out");
     let ctrl_out = test_store_path("force-rec-ctrl-out");
     let force_build = Uuid::new_v4();
     let ctrl_build = Uuid::new_v4();
 
-    // MockStore for the PHASE-2 (post-failover) actor: both force roots
-    // and the control node are upstream-substitutable (an ungated probe
-    // would substitute them); the force build's dep is locally present
-    // (so the batch completes it inline and promotes root-b mid-pass).
+    // MockStore for the PHASE-2 (post-failover) actor: both force roots,
+    // the explicitly-requested non-root, and the control node are
+    // upstream-substitutable (an ungated probe would substitute them);
+    // the force build's dep is locally present (so the batch completes
+    // it inline and promotes root-b mid-pass).
     // The phase-1 seeding actor has no store client — same as merge_chain
     // in the neighbouring tests — so everything merges straight to
     // Ready/Queued and is persisted, not substituted, at seed time.
@@ -5059,6 +5068,7 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
         let mut subs = store.state.substitutable.write().unwrap();
         subs.push(root_a_out.clone());
         subs.push(root_b_out.clone());
+        subs.push(exp_out.clone());
         subs.push(ctrl_out.clone());
     }
     store
@@ -5069,15 +5079,30 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
         .insert(dep_out.clone(), Default::default());
 
     let f = RecoveryFixture::run_with_store(Some(store_client), async |handle, _pool| {
-        // Force build: two submission roots + one dep (root-b → dep).
+        // Force build: three submission roots + an explicitly-requested
+        // non-root inside root-c's closure + one dep (root-b → dep).
         let mut root_a = make_node("force-rec-root-a");
         root_a.expected_output_paths = vec![root_a_out.clone()];
         let mut root_b = make_node("force-rec-root-b");
         root_b.expected_output_paths = vec![root_b_out.clone()];
+        let mut root_c = make_node("force-rec-root-c");
+        root_c.expected_output_paths = vec![test_store_path("force-rec-root-c-out")];
+        let mut exp = make_node("force-rec-exp");
+        exp.expected_output_paths = vec![exp_out.clone()];
+        exp.explicitly_requested = true;
         let mut dep = make_node("force-rec-dep");
         dep.expected_output_paths = vec![dep_out.clone()];
-        let edges = vec![make_test_edge("force-rec-root-b", "force-rec-dep")];
-        merge_dag_force_roots(&handle, force_build, vec![root_a, root_b, dep], edges).await?;
+        let edges = vec![
+            make_test_edge("force-rec-root-c", "force-rec-exp"),
+            make_test_edge("force-rec-root-b", "force-rec-dep"),
+        ];
+        merge_dag_force_roots(
+            &handle,
+            force_build,
+            vec![root_a, root_b, root_c, exp, dep],
+            edges,
+        )
+        .await?;
 
         // Non-force control build (plain merge_dag).
         let mut ctrl = make_node("force-rec-ctrl");
@@ -5120,6 +5145,12 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
     let is_root = |h: &str| rows.iter().find(|(hash, _)| hash == h).map(|(_, r)| *r);
     assert_eq!(is_root("force-rec-root-a"), Some(true));
     assert_eq!(is_root("force-rec-root-b"), Some(true));
+    assert_eq!(is_root("force-rec-root-c"), Some(true));
+    assert_eq!(
+        is_root("force-rec-exp"),
+        Some(true),
+        "explicitly-requested non-root must persist is_root = TRUE (demand set)"
+    );
     assert_eq!(is_root("force-rec-dep"), Some(false));
     let (ctrl_is_root,): (bool,) = sqlx::query_as(
         "SELECT bd.is_root FROM build_derivations bd
@@ -5134,27 +5165,37 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
         "control build's root link must still be is_root = TRUE (structural, not force-only)"
     );
 
-    // New leader: two builders connect; the recovered force-build roots
-    // must be ASSIGNED (built), not routed to the substitute lane —
-    // root-a via the batch probe, root-b via the per-drv
-    // ready_check_or_spawn fallback once the locally-present dep
-    // completes mid-pass. recv_assignment skips PrefetchHint variants,
-    // the same way the dispatch-gate test
+    // New leader: three builders connect; the recovered force-build
+    // demanded nodes must be ASSIGNED (built), not routed to the
+    // substitute lane — root-a and the explicitly-requested non-root
+    // via the batch probe, root-b via the per-drv ready_check_or_spawn
+    // fallback once the locally-present dep completes mid-pass.
+    // recv_assignment skips PrefetchHint variants, the same way the
+    // dispatch-gate test
     // `dispatch_time_force_build_root_dispatches_not_substitutes`
     // (tests/dispatch.rs) does.
     let mut rx1 = connect_executor(&handle, "exec-rec-1", "x86_64-linux").await?;
     let mut rx2 = connect_executor(&handle, "exec-rec-2", "x86_64-linux").await?;
+    let mut rx3 = connect_executor(&handle, "exec-rec-3", "x86_64-linux").await?;
+    // The connect-time inline dispatch passes share the per-Tick
+    // BECAME_IDLE_INLINE_CAP budget with the ctrl substitution's
+    // completion-time pass; the third connect can land past the cap and
+    // defer its pass to the next Tick — send it explicitly.
+    tick(&handle).await?;
     let a1 = recv_assignment(&mut rx1).await;
     let a2 = recv_assignment(&mut rx2).await;
-    let assigned: std::collections::HashSet<String> = [a1.drv_path, a2.drv_path].into();
+    let a3 = recv_assignment(&mut rx3).await;
+    let assigned: std::collections::HashSet<String> =
+        [a1.drv_path, a2.drv_path, a3.drv_path].into();
     let expected: std::collections::HashSet<String> = [
         test_drv_path("force-rec-root-a"),
         test_drv_path("force-rec-root-b"),
+        test_drv_path("force-rec-exp"),
     ]
     .into();
     assert_eq!(
         assigned, expected,
-        "both recovered force-build roots must be dispatched to builders"
+        "all recovered force-build demanded nodes must be dispatched to builders"
     );
 
     // The non-force control leaves Ready via the substitute lane after
@@ -5179,25 +5220,26 @@ async fn test_recovery_force_build_root_ready_is_built_not_substituted() -> Test
     {
         let qpi = store.calls.qpi_calls.read().unwrap();
         assert!(
-            !qpi.contains(&root_a_out) && !qpi.contains(&root_b_out),
-            "no substitute fetch for a recovered force-build root; qpi_calls={qpi:?}"
+            !qpi.contains(&root_a_out) && !qpi.contains(&root_b_out) && !qpi.contains(&exp_out),
+            "no substitute fetch for a recovered force-build demanded node; qpi_calls={qpi:?}"
         );
         assert!(
             qpi.contains(&ctrl_out),
             "control's substitute fetch must have hit the store; qpi_calls={qpi:?}"
         );
     }
-    // Structural: 1 batch FindMissingPaths (root-a/dep/ctrl, Ready at
-    // pass start) + 1 per-drv FindMissingPaths (root-b, promoted
+    // Structural: 1 batch FindMissingPaths (root-a/exp/dep/ctrl, Ready
+    // at pass start) + 1 per-drv FindMissingPaths (root-b, promoted
     // mid-pass) — proves root-b's decision went through
-    // ready_check_or_spawn, not the batch. The count is stable because
-    // probe_generation only advances on Tick — which this test never
-    // sends — so the inline connect-time dispatch passes cannot
-    // re-probe and inflate it.
+    // ready_check_or_spawn, not the batch — + 1 batch from the explicit
+    // Tick above (probe_generation advances on Tick, so its dispatch
+    // pass re-probes whatever is still Ready before assigning it). The
+    // inline connect-time passes between those points share one
+    // generation and cannot inflate the count.
     assert_eq!(
         store.calls.find_missing_calls.load(Ordering::SeqCst),
-        2,
-        "expected exactly one batch + one per-drv (cascade) FindMissingPaths"
+        3,
+        "expected one batch + one per-drv (cascade) + one Tick-driven batch FindMissingPaths"
     );
     Ok(())
 }

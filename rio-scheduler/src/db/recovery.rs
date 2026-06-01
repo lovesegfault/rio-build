@@ -343,8 +343,9 @@ impl SchedulerDb {
     /// Load (build_id, derivation_id, is_root) links for a set of builds.
     /// `recover_from_pg` uses this to rebuild `interested_builds`
     /// on each DerivationState and `derivation_hashes` on BuildInfo;
-    /// `is_root` (migration 065) re-derives `BuildInfo::root_hashes` so
-    /// the force-build substitution gates survive failover.
+    /// `is_root` (migration 065, demand-set semantics per the M_065
+    /// doc-const) re-derives `BuildInfo::root_hashes` so the force-build
+    /// substitution gates survive failover.
     pub(crate) async fn load_build_derivations(
         &self,
         build_ids: &[Uuid],

@@ -1181,6 +1181,28 @@ pub const M_064: () = ();
 /// batch_insert_build_derivations, plus the single-row
 /// insert_build_derivation); no backfill — pre-existing rows keep FALSE,
 /// which preserves their original (non-forced) semantics.
+///
+/// **Writer-semantics widening (no schema change, frozen .sql
+/// untouched):** `is_root = TRUE` originally marked structural
+/// submission roots only. The scheduler now writes it for the
+/// submission's full *demand set* — structural roots ∪ every node the
+/// gateway marked `explicitly_requested` (a client-named target folded
+/// inside a sibling target's closure by multi-target dedup). The
+/// force-build gates and the top-down prune both key on that demand
+/// set, and recovery re-derives the protection from these rows, so the
+/// two consumers cannot drift.
+///
+/// Mixed-era consequence, decided deliberately: rows persisted by a
+/// pre-widening leader carry structural roots only, so across a
+/// failover that spans the deploy such builds are protected **as
+/// structural roots only** — an explicitly-requested non-root of an
+/// old-era build is not re-protected by recovery. No backfill: the
+/// submission-time `explicitly_requested` flags are not recoverable
+/// from persisted state (the gateway flag is not stored anywhere
+/// else), and the affected window is one deploy's worth of in-flight
+/// builds. New submissions are demand-set-protected from their own
+/// merge onward. The spec rule `sched.merge.force-build-roots` carries
+/// the same carve-out wording.
 pub const M_065: () = ();
 
 // Add M_NNN consts for other migrations as commentary accumulates.

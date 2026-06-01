@@ -60,10 +60,15 @@ struct RecoveryLoad {
     /// raw rows again to count per-build links for the orphan guard.
     bd_rows: Vec<(Uuid, Uuid, bool)>,
     build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>>,
-    /// Per-build submission-root hash sets (rows with
-    /// `build_derivations.is_root = TRUE`). `restore_builds` re-derives
-    /// `BuildInfo::root_hashes` from this so the force-build substitution
-    /// gates (`is_force_build_root`) survive failover.
+    /// Per-build demand-set hash sets (rows with
+    /// `build_derivations.is_root = TRUE` — structural submission roots
+    /// ∪ explicitly-requested nodes, as persisted at merge time).
+    /// `restore_builds` re-derives `BuildInfo::root_hashes` from this so
+    /// the force-build substitution gates (`is_force_build_root`)
+    /// survive failover for roots not yet terminal at failover. Builds
+    /// persisted before `is_root` covered explicit requests carry
+    /// structural roots only (see the M_065 doc-const in
+    /// rio-migrations).
     build_root_hashes: HashMap<Uuid, HashSet<DrvHash>>,
     /// Recovered parents with ≥1 `poisoned`/`dependency_failed`/
     /// `cancelled` child in PG that a live co-owning build vouches
@@ -522,8 +527,8 @@ impl DagActor {
         // --- Load build_derivations + rebuild interested_builds ---
         let bd_rows = self.db.load_build_derivations(&build_ids).await?;
         // Also accumulate derivation_hashes per build (for BuildInfo) and
-        // the per-build submission-root sets (rows with is_root = TRUE)
-        // from which restore_builds re-derives BuildInfo::root_hashes.
+        // the per-build demand sets (rows with is_root = TRUE) from
+        // which restore_builds re-derives BuildInfo::root_hashes.
         let mut build_drv_hashes: HashMap<Uuid, HashSet<DrvHash>> = HashMap::new();
         let mut build_root_hashes: HashMap<Uuid, HashSet<DrvHash>> = HashMap::new();
         for (build_id, drv_id, is_root) in &bd_rows {
@@ -638,8 +643,9 @@ impl DagActor {
     /// `now() - submitted_at` (so `r[sched.timeout.per-build]` survives
     /// failover); total/completed/cached counts are seeded from PG
     /// denorm columns (I-111); the force-build substitution-gate inputs
-    /// (`force_build_roots`, `root_hashes`) are re-derived from
-    /// `builds.force_build_roots` + `build_derivations.is_root`.
+    /// (`force_build_roots`, `root_hashes` — the per-build demand set)
+    /// are re-derived from `builds.force_build_roots` +
+    /// `build_derivations.is_root`.
     async fn restore_builds(
         &mut self,
         build_rows: Vec<RecoveryBuildRow>,
@@ -684,10 +690,13 @@ impl DagActor {
                 options,
                 hashes,
             );
-            // r[impl sched.merge.force-build-roots]
+            // r[impl sched.merge.force-build-roots+2]
             // Re-derive the force-build sticky-OR inputs after failover:
-            // per-build flag from builds.force_build_roots, per-build root
-            // set from build_derivations.is_root.
+            // per-build flag from builds.force_build_roots, per-build
+            // demand set from build_derivations.is_root. The recovered
+            // protection covers roots not yet terminal at failover; for
+            // builds persisted before is_root covered explicit requests
+            // it covers structural roots only (M_065 doc-const).
             info.force_build_roots = row.force_build_roots;
             info.root_hashes = build_root_hashes.remove(&row.build_id).unwrap_or_default();
             info.total_count = row.total_drvs as u32;

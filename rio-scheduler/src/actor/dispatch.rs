@@ -810,7 +810,7 @@ impl DagActor {
         self.substitute_auth_for_tenant(tid)
     }
 
-    // r[impl sched.merge.force-build-roots]
+    // r[impl sched.merge.force-build-roots+2]
     /// Sticky-OR over interested builds: true iff any LIVE interested
     /// build has `force_build_roots` and names this node as one of its
     /// submission roots. Such a node must never enter the substitute-
@@ -911,7 +911,7 @@ impl DagActor {
         }
         let mut spawned: Vec<Spawned> = Vec::with_capacity(candidates.len());
         for (drv_hash, paths) in candidates {
-            // r[impl sched.merge.force-build-roots]
+            // r[impl sched.merge.force-build-roots+2]
             // Chokepoint enforcement of the force-build gate at the one
             // spawn site, so every caller — including the forgiven-now-
             // wanted downgrade re-spawn in `handle_substitute_complete`
@@ -1165,7 +1165,7 @@ impl DagActor {
                    "SubstituteComplete: not Substituting (cancelled/re-merged); dropping");
             return;
         }
-        // r[impl sched.merge.force-build-roots]
+        // r[impl sched.merge.force-build-roots+2]
         // Completion-time re-derivation of the force-build gate. The
         // spawn-time gates only stop NEW fetches; a `force_build_roots`
         // build that merged DURING the (potentially minutes-long)

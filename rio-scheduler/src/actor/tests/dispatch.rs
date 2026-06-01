@@ -1452,7 +1452,7 @@ async fn batch_probe_classifies_against_live_builds_effective_wanted(
 /// A Ready force-build root whose output is upstream-substitutable is
 /// dispatched to a builder (assignment sent), not routed to the
 /// substitute lane by the dispatch-time probe.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 // r[verify sched.dispatch.fod-substitute+3]
 #[tokio::test]
 async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResult {
@@ -1499,7 +1499,7 @@ async fn dispatch_time_force_build_root_dispatches_not_substitutes() -> TestResu
 /// lingering until the delayed cleanup (a cancel would strip the DAG
 /// interest immediately and never exercise the gate) — the probe must
 /// release X to the substitute lane.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 #[rstest::rstest]
 #[case::force_build_live(false)]
 #[case::force_build_terminal(true)]
@@ -1592,7 +1592,7 @@ async fn dispatch_probe_substitution_follows_force_build_liveness(
 /// ok=true. The handler re-derives the gate, discards the verdict
 /// (without burning the one-shot `substitute_tried` flag), and the node
 /// dispatches from source.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 // r[verify sched.substitute.detached+5]
 #[tokio::test]
 async fn force_merge_mid_fetch_discards_substitute_completion() -> TestResult {

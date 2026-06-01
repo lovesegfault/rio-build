@@ -1,5 +1,5 @@
 //! pol02: per-tenant force_build_roots over ssh-ng
-//! (`r[sched.merge.force-build-roots]`).
+//! (`r[sched.merge.force-build-roots+2]`).
 //!
 //! Live-cluster PLUMBING check, not a substitution-behavior check — the
 //! `force-build-roots-not-substituted` VM subtest

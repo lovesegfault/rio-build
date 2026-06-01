@@ -25,9 +25,10 @@ pub struct BuildPolicy {
     /// rest of the submission. See `r[gw.build.per-tenant-policy]`.
     pub keep_going: bool,
     /// `SubmitBuildRequest.force_build_roots`: do not substitute this
-    /// tenant's submission roots from upstream; locally-present roots
-    /// still short-circuit to Completed. See
-    /// `r[sched.merge.force-build-roots]`.
+    /// tenant's demanded targets (submission roots and explicitly
+    /// requested targets folded inside a sibling target's closure) from
+    /// upstream; locally-present targets still short-circuit to
+    /// Completed. See `r[sched.merge.force-build-roots+2]`.
     pub force_build_roots: bool,
 }
 

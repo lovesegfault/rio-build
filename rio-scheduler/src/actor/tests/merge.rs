@@ -8792,19 +8792,29 @@ async fn merge_probe_whole_dag_substituting() -> TestResult {
 // ===========================================================================
 
 /// force_build_roots is stamped on the builds row and is_root on the
-/// submission's root link rows (recovery re-derivation input).
-// r[verify sched.merge.force-build-roots]
+/// submission's DEMAND-SET link rows — structural roots and
+/// explicitly-requested non-roots alike (recovery re-derivation input);
+/// undemanded deps stay FALSE.
+// r[verify sched.merge.force-build-roots+2]
 #[tokio::test]
 async fn test_force_build_roots_persisted() -> TestResult {
     let (db, _store, handle, _tasks) = setup_with_mock_store().await?;
 
     let mut root = make_node("fbr-root");
     root.expected_output_paths = vec![test_store_path("fbr-root-out")];
+    // A client-named target that root's closure swallowed: not a
+    // structural root, but gateway-marked explicitly_requested.
+    let mut exp = make_node("fbr-exp");
+    exp.expected_output_paths = vec![test_store_path("fbr-exp-out")];
+    exp.explicitly_requested = true;
     let mut dep = make_node("fbr-dep");
     dep.expected_output_paths = vec![test_store_path("fbr-dep-out")];
-    let edges = vec![make_test_edge("fbr-root", "fbr-dep")];
+    let edges = vec![
+        make_test_edge("fbr-root", "fbr-exp"),
+        make_test_edge("fbr-exp", "fbr-dep"),
+    ];
     let build_id = Uuid::new_v4();
-    merge_dag_force_roots(&handle, build_id, vec![root, dep], edges).await?;
+    merge_dag_force_roots(&handle, build_id, vec![root, exp, dep], edges).await?;
     barrier(&handle).await;
 
     let (fbr,): (bool,) =
@@ -8825,10 +8835,78 @@ async fn test_force_build_roots_persisted() -> TestResult {
     let is_root = |h: &str| rows.iter().find(|(hash, _)| hash == h).map(|(_, r)| *r);
     assert_eq!(is_root("fbr-root"), Some(true), "root link must be is_root");
     assert_eq!(
+        is_root("fbr-exp"),
+        Some(true),
+        "explicitly-requested non-root link must be is_root (demand set)"
+    );
+    assert_eq!(
         is_root("fbr-dep"),
         Some(false),
-        "dep link must not be is_root"
+        "undemanded dep link must not be is_root"
     );
+    Ok(())
+}
+
+/// Demand-set protection beyond structural roots: a force-build
+/// submission names targets A and B where B sits inside A's closure —
+/// after multi-target dedup B is NOT a structural root, only
+/// gateway-marked `explicitly_requested`. B's output is
+/// upstream-substitutable; the step-4 filter must keep B out of the
+/// substitute lane exactly like a structural root, while the
+/// UNREQUESTED dep C remains substitutable (the flag protects client
+/// demand, not the whole closure).
+// r[verify sched.merge.force-build-roots+2]
+#[tokio::test]
+async fn force_build_protects_explicitly_requested_non_root() -> TestResult {
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
+    let b_out = test_store_path("fdr-b-out");
+    let c_out = test_store_path("fdr-c-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(b_out.clone());
+        subs.push(c_out.clone());
+    }
+
+    // A → B → C. B was explicitly requested by the client; C is plain
+    // closure.
+    let mut node_a = make_node("fdr-a");
+    node_a.expected_output_paths = vec![test_store_path("fdr-a-out")];
+    let mut node_b = make_node("fdr-b");
+    node_b.expected_output_paths = vec![b_out.clone()];
+    node_b.explicitly_requested = true;
+    let mut node_c = make_node("fdr-c");
+    node_c.expected_output_paths = vec![c_out.clone()];
+    let edges = vec![
+        make_test_edge("fdr-a", "fdr-b"),
+        make_test_edge("fdr-b", "fdr-c"),
+    ];
+    let build_id = Uuid::new_v4();
+    merge_dag_force_roots(&handle, build_id, vec![node_a, node_b, node_c], edges).await?;
+    barrier(&handle).await;
+
+    // C (undemanded dep) takes the substitute lane and completes...
+    settle_substituting(&handle, &["fdr-c"]).await;
+    assert_eq!(
+        expect_drv(&handle, "fdr-c").await.status,
+        crate::state::DerivationStatus::Completed,
+        "an undemanded dep must remain substitutable under force_build_roots"
+    );
+    // ...while B (explicitly-requested non-root) must not: it waits for
+    // a builder like any demanded target.
+    let st_b = expect_drv(&handle, "fdr-b").await;
+    assert_ne!(st_b.status, crate::state::DerivationStatus::Substituting);
+    assert_ne!(st_b.status, crate::state::DerivationStatus::Completed);
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&b_out),
+            "no substitute fetch for an explicitly-requested target; qpi={qpi:?}"
+        );
+        assert!(
+            qpi.contains(&c_out),
+            "the undemanded dep's fetch must have hit the store; qpi={qpi:?}"
+        );
+    }
     Ok(())
 }
 
@@ -8836,7 +8914,7 @@ async fn test_force_build_roots_persisted() -> TestResult {
 /// upstream-substitutable root is NOT routed to the substitute lane (no
 /// QueryPathInfo fetch, not Substituting/Completed), and the build stays
 /// Active waiting for a builder.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 // r[verify sched.merge.substitute-topdown+10]
 #[tokio::test]
 async fn test_force_build_root_not_substituted_at_merge() -> TestResult {
@@ -8899,7 +8977,7 @@ async fn test_force_build_root_not_substituted_at_merge() -> TestResult {
 /// the force gate dies with the build, and the root the failed force
 /// build left Poisoned takes the reprobe-substitutable lane instead of
 /// fail-fasting B against the stale poison.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 #[rstest::rstest]
 #[case::force_build_live(false)]
 #[case::force_build_terminal(true)]
@@ -9002,7 +9080,7 @@ async fn non_force_merge_substitution_follows_force_build_liveness(
 /// immediately) interest + BuildInfo linger until the delayed cleanup
 /// — the prune must fire: B's demand set {X} is substitutable, D never
 /// enters the DAG, and X completes via the detached fetch.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 #[rstest::rstest]
 #[case::force_build_live(false)]
 #[case::force_build_terminal(true)]
@@ -9107,7 +9185,7 @@ async fn topdown_prune_block_follows_force_build_liveness(#[case] a_terminal: bo
 ///
 /// Once A is TERMINAL (Succeeded after R2 lands; BuildInfo lingering),
 /// the same reset must release R1 to the detached re-substitution lane.
-// r[verify sched.merge.force-build-roots]
+// r[verify sched.merge.force-build-roots+2]
 // r[verify sched.merge.stale-substitutable+2]
 #[rstest::rstest]
 #[case::force_build_live(false)]

@@ -582,7 +582,7 @@ pub(crate) async fn merge_dag(
     Ok(reply_rx.await??.state)
 }
 
-/// `merge_dag` with `force_build_roots = true` (r[sched.merge.force-build-roots]).
+/// `merge_dag` with `force_build_roots = true` (r[sched.merge.force-build-roots+2]).
 pub(crate) async fn merge_dag_force_roots(
     handle: &ActorHandle,
     build_id: Uuid,

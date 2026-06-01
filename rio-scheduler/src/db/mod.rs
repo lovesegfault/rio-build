@@ -188,7 +188,7 @@ pub(crate) struct RecoveryBuildRow {
     pub status: String,
     pub priority_class: String,
     pub keep_going: bool,
-    /// `r[sched.merge.force-build-roots]`: per-build force-build flag
+    /// `r[sched.merge.force-build-roots+2]`: per-build force-build flag
     /// (migration 065). Recovery re-stamps `BuildInfo::force_build_roots`
     /// from this so the substitution gates survive failover.
     pub force_build_roots: bool,
