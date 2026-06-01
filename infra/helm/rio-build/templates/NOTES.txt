@@ -62,3 +62,30 @@ Ingress/LoadBalancer URL in values:
       allowOrigins:
         - "https://rio.<your-domain>"
 {{- end }}
+{{- if and .Values.scheduler.materialization.enabled .Values.store.materialization.enabled }}
+
+── Substitution via materialization jobs (Phase B default) ────────────
+Scheduler-side substitution routes through store-owned materialization
+jobs (substitution-replacement design §8-B): the scheduler creates job
+rows for upstream-substitutable derivations; store replicas claim and
+execute them through the ExecutorService pull protocol, presenting the
+store-service credential.
+
+Rollback (the flag-off walk path, kept through Phase C′):
+  helm upgrade {{ .Release.Name }} . \
+    --reuse-values \
+    --set scheduler.materialization.enabled=false \
+    --set store.materialization.enabled=false
+
+Pending materialization job rows left behind are inert flag-off
+(design §4 leftover-row semantics). Flag-on-era materialization pins
+release through the always-on §5.3 lifecycle (consumption /
+build-terminal / recovery sweep), so no store path stays GC-pinned
+after the rollback drains.
+
+Deployment ordering (AS-6): the chart's AND-guard renders the
+scheduler flag as (scheduler.materialization.enabled AND
+store.materialization.enabled), so the persistent hazardous state
+(job creation on, executor off) cannot be rendered from values. When
+rolling the flags in stages, flip the store first ON and last OFF.
+{{- end }}

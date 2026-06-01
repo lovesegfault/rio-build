@@ -65,10 +65,11 @@ in
   # materialization flag for the standalone (systemd) deployment path —
   # the analog of the helm chart's scheduler.materialization.enabled /
   # store.materialization.enabled pair. The Rust struct defaults stay
-  # false (PD-B1); the deployment layer is the cutover switch. The
-  # substitution scenarios' flag-on attrs and `-walk` oracle attrs in
-  # default.nix pin this explicitly; T-2.3 flips the default to true.
-  materializationEnabled ? false,
+  # false (PD-B1); the deployment layer is the cutover switch. Default
+  # TRUE since the Phase B cutover (the T-2.3 flip) — every standalone
+  # deployment runs materialization unless a scenario pins it off (the
+  # `-walk` oracle attrs in default.nix pass false explicitly).
+  materializationEnabled ? true,
 }:
 let
   hmacKeys = if withHmac then mkHmacKeys { } else null;

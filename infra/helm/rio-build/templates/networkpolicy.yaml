@@ -380,8 +380,12 @@ spec:
     # Store egress to the scheduler's ExecutorService: the
     # materialization executor's ListMaterializationJobs /
     # PullAssignment / ReportOutcome edge (substitution-replacement
-    # campaign). Additive: rendered unconditionally — the rule allows,
-    # the materialization flag decides whether anything uses it.
+    # campaign). Load-bearing by default since the Phase B cutover
+    # (materialization enabled in values.yaml): every store replica's
+    # executor polls/claims/reports through this edge. Rendered
+    # unconditionally — the rule allows; the flag decides whether
+    # anything uses it (a flag-off rollback leaves it as an inert
+    # allow).
     # Cross-namespace, so the namespace label is mandatory (a bare
     # label match would be scoped to the policy's own namespace).
     - toEndpoints:

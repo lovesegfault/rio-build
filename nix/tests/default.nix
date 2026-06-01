@@ -287,26 +287,34 @@ let
     in
     substitute {
       inherit pkgs common materializationEnabled;
-      fixture = standalone {
-        inherit materializationEnabled;
-        workers = { };
-        withHmac = true;
-        extraStoreConfig = {
-          signingKeyFile = "${rioSigningKey}";
-          extraConfig = ''
-            [jwt]
-            key_path = "${jwtPubkey}"
-          '';
-        };
-        extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
-        extraPackages = [
-          pkgs.grpcurl
-          pkgs.postgresql_18
-        ];
-        extraClientModules = [
-          { networking.firewall.allowedTCPPorts = [ 8080 ]; }
-        ];
-      };
+      fixture = standalone (
+        {
+          workers = { };
+          withHmac = true;
+          extraStoreConfig = {
+            signingKeyFile = "${rioSigningKey}";
+            extraConfig = ''
+              [jwt]
+              key_path = "${jwtPubkey}"
+            '';
+          };
+          extraGatewayEnv.RIO_JWT__KEY_PATH = "${jwtSeed}";
+          extraPackages = [
+            pkgs.grpcurl
+            pkgs.postgresql_18
+          ];
+          extraClientModules = [
+            { networking.firewall.allowedTCPPorts = [ 8080 ]; }
+          ];
+        }
+        # The flag-on attr inherits the fixture's flipped default (the
+        # T-2.3 default-plumb proof); the -walk oracle pins flag-off
+        # explicitly, OVERRIDING the default (criterion 2's
+        # revertability posture).
+        // pkgs.lib.optionalAttrs (!materializationEnabled) {
+          materializationEnabled = false;
+        }
+      );
     };
 
   # ── substitute-scale scenario builder (both flag states) ────────────
@@ -327,11 +335,17 @@ let
           "componentScaler.store.max" = 4;
           "componentScaler.store.seedRatio" = 10;
           "store.substituteAdmissionPermits" = 1;
-          # Substitution-replacement Phase B: the per-attr flag pins
-          # (PD-B13 — assertions and posture flip together; the AS-6
-          # pairing keeps creation and execution flags equal).
-          "scheduler.materialization.enabled" = materializationEnabled;
-          "store.materialization.enabled" = materializationEnabled;
+        }
+        # Substitution-replacement Phase B (PD-B13): the flag-on attr
+        # inherits the chart's flipped values.yaml default (the T-2.3
+        # default-plumb proof: no --set override, the rendered env
+        # comes straight from values.yaml); the -walk oracle pins both
+        # chart flags OFF explicitly, OVERRIDING the default
+        # (criterion 2's revertability posture; the AS-6 pairing keeps
+        # creation and execution flags equal).
+        // pkgs.lib.optionalAttrs (!materializationEnabled) {
+          "scheduler.materialization.enabled" = false;
+          "store.materialization.enabled" = false;
         };
       };
     };
@@ -465,9 +479,9 @@ in
   # Scheduler-owned substitution routes through materialization jobs:
   # merge probe → cache_opportunity job rows (in the merge transaction)
   # → store-executor claim/fetch/report → consumption. The walk never
-  # spawns for fresh flag-on work (criterion 3). Explicit `true` pin
-  # until T-2.3 flips the fixture default; T-2.3 drops the pin (a
-  # behavioral no-op that proves the default plumb).
+  # spawns for fresh flag-on work (criterion 3). No explicit pin: the
+  # attr inherits the fixture's flipped default (the Phase B cutover) —
+  # its green-ness IS the standalone default-plumb proof.
   #
   # r[verify sched.materialize.job]
   #   substitute-scheduler-owned: a direct (gateway-bypassing) submission
@@ -494,8 +508,8 @@ in
   # ── Flag-OFF oracle (design §8-B "both flag states") ────────────────
   # The as-built scheduler walk path, with the Phase A assertions
   # byte-original (criterion 2's deployment-level revertability proof:
-  # flipping back must always work). Explicit `false` pin — after T-2.3
-  # this OVERRIDES the flipped default.
+  # flipping back must always work). Explicit `false` pin, OVERRIDING
+  # the flipped fixture default.
   #
   # r[verify store.substitute.upstream]
   #   substitute-cold-fetch: miss → HTTP GET narinfo → sig-verify →
@@ -808,14 +822,16 @@ in
       #   with the subtests above), so it folds into core rather than
       #   paying a separate k3s boot.
       "pool-lifecycle"
-      # r[verify sched.materialize.job]      (traffic half: builds mint only build-kind rows)
-      # r[verify sched.materialize.pinning]  (traffic half: builds write only build_input pins)
-      #   materialization-dormant: the five-table zero-count against a
-      #   deployment whose builder traffic (cancel-cgroup-kill,
-      #   build-timeout above) HAS minted executions — proving the
-      #   attempt/execution/pin dormancy clauses non-vacuously. Placed
-      #   LAST: it audits the residue of everything before it.
-      "materialization-dormant"
+      # r[verify sched.materialize.job]      (kind boundary: flag-on build traffic mints only build-kind rows; the wanted relation is written)
+      # r[verify sched.materialize.pinning]  (kind boundary: flag-on builds write only build_input pins)
+      #   materialization-boundary: against a flag-on deployment whose
+      #   builder traffic (cancel-cgroup-kill, build-timeout above) HAS
+      #   minted executions — the durable wanted relation is written
+      #   (>0, design §6/AS-1) while jobs/attempts/executions/pins stay
+      #   strictly build-kind (zero materialization rows), and the helm
+      #   default plumb renders =true on both deployments. Placed LAST:
+      #   it audits the residue of everything before it.
+      "materialization-boundary"
     ];
   };
 
@@ -1096,15 +1112,15 @@ in
   # desiredReplicas never moves. Set via the chart key (not extraEnv)
   # so the values.yaml → store.yaml templating is exercised.
   #
-  # The materialization flag is pinned per attr via extraValuesTyped on
-  # BOTH chart components (the scenario's Python branch selects the
-  # matching mechanism assertions): assertions and deployment posture
-  # flip together (commit rule 3 / PD-B13). The flag-on attr's explicit
-  # `true` pins are scaffolding T-2.3 removes when the chart default
-  # catches up; the -walk attr's `false` pins then OVERRIDE the flipped
-  # default.
+  # The deployed flag posture per attr (the scenario's Python branch
+  # selects the matching mechanism assertions; assertions and posture
+  # flip together — commit rule 3 / PD-B13): the flag-on attr inherits
+  # the chart's flipped values.yaml default (its green-ness IS the
+  # values.yaml default-plumb proof); the -walk attr pins both chart
+  # flags off via extraValuesTyped, OVERRIDING the default.
 
   # ── Flag-ON: substitution routes through materialization jobs ───────
+  # (no explicit chart pins — inherits the flipped values.yaml default)
   # r[verify ctrl.scaler.signal-substituting+2]
   #   cascade: the §2.6 re-sourced substituting bucket (pending unclaimed
   #   jobs) drives the P1 closed loop — desiredReplicas rises and never
