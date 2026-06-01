@@ -172,6 +172,7 @@ module spawnCoherence {
     | EGateBlockedSpawn
     | EAcked
     | EExcessSuppressed
+    | EMatJobFiltered
 
   /// Violation latches. Each invariant below is `not(contains(...))`;
   /// in a correct model every latch stays unset forever, so these add
@@ -185,6 +186,7 @@ module spawnCoherence {
     | VDegraded
     | VGate
     | VFreedSlotUnused
+    | VMatJobServed
 
   // ------------------------------------------------------------------
   // 2. Constants (regime modules instantiate these)
@@ -205,6 +207,15 @@ module spawnCoherence {
   /// The intent poll may read the previous tick's queue snapshot
   /// (fault-stale regime).
   const ENABLE_STALE_POLL: bool
+  /// Materialization jobs exist (substitution-replacement Phase B,
+  /// PD-7 / bbb607447): an intent's node can carry an unresolved
+  /// materialization job, and GetSpawnIntents FILTERS such intents
+  /// from the served set (the spawn-intent gate's job conjunct —
+  /// design §9.2: "spawnCoherence's intent-emission precondition
+  /// gains the job filter"). false = the var stays constant-false and
+  /// the regime's reachable state space is unchanged (the dormancy
+  /// posture of every pre-existing regime).
+  const ENABLE_MAT_JOBS: bool
 
   pure val INTENTS: Set[IntentId] = Set("i1", "i2")
 
@@ -263,6 +274,10 @@ module spawnCoherence {
   var effects: Set[Effect]
   /// Violation latches (must stay empty).
   var violations: Set[Violation]
+  /// PD-7: the intent's node carries an unresolved materialization
+  /// job (driven by the matJobOpens/matJobResolves environment;
+  /// constant-false unless ENABLE_MAT_JOBS).
+  var matJob: IntentId -> bool
 
   // ------------------------------------------------------------------
   // 5. Invariants
@@ -275,6 +290,11 @@ module spawnCoherence {
   val degradedPolarity = not(violations.contains(VDegraded))
   val gateFailClosed = not(violations.contains(VGate))
   val freedSlotsSpendable = not(violations.contains(VFreedSlotUnused))
+  /// PD-7: a fresh, successful GetSpawnIntents serve never contains a
+  /// job-carrying intent (the spawn-intent filter; the stale-poll
+  /// in-flight window is the documented as-built race and is excluded
+  /// — the served-set claim is at serve time).
+  val matJobFilteredFromIntents = not(violations.contains(VMatJobServed))
 
   // Witnesses (expected to be VIOLATED — see the module header).
   val canReachExcessReap = not(effects.contains(EExcessReap))
@@ -290,6 +310,9 @@ module spawnCoherence {
   /// has no Job yet, so it never contributes to the surplus).
   val canReachUngatedSpawn = not(effects.contains(ESpawned))
   val canReachSuppressedExcess = not(effects.contains(EExcessSuppressed))
+  /// PD-7: the job filter actually filters (a queued, job-carrying
+  /// intent existed at a successful fresh poll).
+  val canReachMatJobFiltered = not(effects.contains(EMatJobFiltered))
 
   // ------------------------------------------------------------------
   // 6. The tick (one action; helper pure defs first)
@@ -331,7 +354,13 @@ module spawnCoherence {
     nondet useStalePoll = boolChoices(ENABLE_STALE_POLL).oneOf()
 
     // ---- 1. Intent poll (fail-open: ⊥ reads as empty) --------------
-    val currentQueue = INTENTS.filter(i => queued.get(i))
+    // PD-7 (bbb607447): the served set excludes intents whose node
+    // carries an unresolved materialization job — the filter applies
+    // AT SERVE TIME, so the stale snapshot inherits the filter as of
+    // its own tick (an in-flight response raced by a job creation is
+    // the documented as-built window, not a violation).
+    val matFiltered = INTENTS.filter(i => queued.get(i) and matJob.get(i))
+    val currentQueue = INTENTS.filter(i => queued.get(i) and not(matJob.get(i)))
     val polled = if (pollFails) Set()
                  else if (useStalePoll) prevQueuedSnap
                  else currentQueue
@@ -451,6 +480,8 @@ module spawnCoherence {
         .union(if (gateBlocked) Set(EGateBlockedSpawn) else Set())
         .union(if (ackHappens) Set(EAcked) else Set())
         .union(if (excessSuppressed) Set(EExcessSuppressed) else Set())
+        .union(if (matFiltered.size() > 0 and not(pollFails) and not(useStalePoll))
+          Set(EMatJobFiltered) else Set())
 
     // ---- Violation checks ----------------------------------------------
     // I4: spawns never push active-minus-freed past the ceiling.
@@ -517,6 +548,10 @@ module spawnCoherence {
         and headroom >= 1
         and not(toSpawn.contains(i))
       ).size() > 0
+    // PD-7: a fresh successful serve containing a job-carrying intent.
+    val vMatServed =
+      not(pollFails) and not(useStalePoll)
+      and polled.filter(i => matJob.get(i)).size() > 0
     val newViolations =
       Set()
         .union(if (vCeil) Set(VCeiling) else Set())
@@ -527,6 +562,7 @@ module spawnCoherence {
         .union(if (vDegr) Set(VDegraded) else Set())
         .union(if (vGateV) Set(VGate) else Set())
         .union(if (vFreed) Set(VFreedSlotUnused) else Set())
+        .union(if (vMatServed) Set(VMatJobServed) else Set())
 
     all {
       job' = jobsAfter,
@@ -540,6 +576,7 @@ module spawnCoherence {
       execr' = execr,
       leaderOld' = leaderOld,
       gate' = gate,
+      matJob' = matJob,
     }
   }
 
@@ -553,6 +590,7 @@ module spawnCoherence {
     effects' = effects,
     violations' = violations,
     prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
   }
 
   /// A drv becomes Ready: the intent (re-)appears in the queue.
@@ -711,6 +749,7 @@ module spawnCoherence {
     dispatched' = Set(),
     queued' = queued, intentFp' = intentFp, job' = job, gate' = gate,
     effects' = effects, violations' = violations, prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
   }
 
   /// A dispatched_cells entry is consumed scheduler-side (heartbeat
@@ -721,6 +760,7 @@ module spawnCoherence {
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld, gate' = gate,
     effects' = effects, violations' = violations, prevQueuedSnap' = prevQueuedSnap,
+    matJob' = matJob,
   }
 
   /// The L10 producer publishes a placeable set (assume-guarantee: any
@@ -732,6 +772,31 @@ module spawnCoherence {
     queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
     leaderOld' = leaderOld,
     bookkeepingUnchanged,
+  }
+
+  /// PD-7: a materialization job is created for the intent's node
+  /// (merge/probe classification) — the node stays Ready and queued
+  /// scheduler-side; GetSpawnIntents stops serving it.
+  action matJobOpens(i: IntentId): bool = all {
+    ENABLE_MAT_JOBS,
+    not(matJob.get(i)),
+    matJob' = matJob.set(i, true),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap,
+  }
+
+  /// PD-7: the job resolves (success / from-source / cancelled) — the
+  /// intent is servable again.
+  action matJobResolves(i: IntentId): bool = all {
+    ENABLE_MAT_JOBS,
+    matJob.get(i),
+    matJob' = matJob.set(i, false),
+    queued' = queued, intentFp' = intentFp, job' = job, execr' = execr,
+    leaderOld' = leaderOld, gate' = gate,
+    dispatched' = dispatched, effects' = effects, violations' = violations,
+    prevQueuedSnap' = prevQueuedSnap,
   }
 
   /// The producer loses its lease (or restarts): the gate is unarmed
@@ -760,6 +825,7 @@ module spawnCoherence {
     prevQueuedSnap' = Set(),
     effects' = Set(),
     violations' = Set(),
+    matJob' = INTENTS.mapBy(i => false),
   }
 
   action step = {
@@ -785,6 +851,8 @@ module spawnCoherence {
       dispatchedCleared(i),
       gatePublishes,
       gateUnarms,
+      matJobOpens(i),
+      matJobResolves(i),
     }
   }
 }
@@ -803,7 +871,8 @@ module spawnCoherenceBase {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).*
 }
 
@@ -816,7 +885,8 @@ module spawnCoherenceFaultRpc {
     CEILING = 1,
     ENABLE_RPC_FAULT = true,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).*
 }
 
@@ -830,7 +900,8 @@ module spawnCoherenceFaultLease {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = true,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).*
 }
 
@@ -844,7 +915,8 @@ module spawnCoherenceFaultStale {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = true
+    ENABLE_STALE_POLL = true,
+    ENABLE_MAT_JOBS = false
   ).*
 }
 
@@ -858,7 +930,8 @@ module spawnCoherenceCrdAbsent {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
   ).*
 }
 
@@ -871,6 +944,25 @@ module spawnCoherenceFetcher {
     CEILING = 1,
     ENABLE_RPC_FAULT = false,
     ENABLE_LEASE_FAULT = false,
-    ENABLE_STALE_POLL = false
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = false
+  ).*
+}
+
+/// PD-7 regime (substitution-replacement Phase B): materialization
+/// jobs open and resolve under the healthy Builder configuration —
+/// the GetSpawnIntents job filter is live. matJobFilteredFromIntents
+/// is the headline; canReachMatJobFiltered keeps it non-vacuous.
+/// Deleting the serve-time filter conjunct re-finds VMatJobServed
+/// (the weakened-test procedure; depth in the introducing commit).
+module spawnCoherenceMatJobs {
+  import spawnCoherence(
+    IS_BUILDER = true,
+    CRD_PRESENT = true,
+    CEILING = 1,
+    ENABLE_RPC_FAULT = false,
+    ENABLE_LEASE_FAULT = false,
+    ENABLE_STALE_POLL = false,
+    ENABLE_MAT_JOBS = true
   ).*
 }

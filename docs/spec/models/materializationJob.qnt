@@ -717,11 +717,16 @@ module materializationJob {
   /// Delta 3: a Broken-evidence parked job (the stalled population) is
   /// reachable — the MD-D1 alert constrains a real state.
   val noStalledBrokenPark = stalledJobs == Set()
-  /// §5.3: the pin release fires (job resolved, all interest terminal).
+  /// §5.3: the pin release fires (job resolved, all interest terminal)
+  /// — observed at the released-path footprint: a still-present,
+  /// now-unpinned output of a resolved-job derivation (presence only
+  /// ever arises pinned, so this state is reachable only through the
+  /// release).
   val noPinRelease = DRVS.forall(d => OUTPUTS.forall(o =>
     not(and {
-      ingested.get((d, o)),
+      present.get((d, o)),
       pins.get((d, o)) == NoPin,
+      jobResolved(jobs.get(d)),
     })
   ))
   /// F5 (PP-5 ii): a same-build wanted REWRITE happens (the documented
@@ -1453,14 +1458,21 @@ module materializationJob {
   /// §5.3: the pin release — job resolved (or none) AND all in-memory
   /// interest terminal releases the materialization pins (PD-10; the
   /// all-interest-terminal release site). Build pins release through
-  /// the build-input paths (out of model).
+  /// the build-input paths (out of model). The release CLOSES the
+  /// ingest-guarantee window: the `ingested` ghost is cleared with the
+  /// pin, so the B2-strong invariant ranges over the CURRENT window
+  /// only — interest arriving after a legitimate release+GC is the
+  /// stale_reset re-materialization lane (T-1.6), not a pin hole (the
+  /// baseline-protocol catch recorded in the C-prime stage record).
   action releasePins(d: str): bool = all {
     not(hasUnresolvedJob(d)),
     memInterest(d) == Set(),
     OUTPUTS.exists(o => pins.get((d, o)) == PinMaterialization),
     pins' = OUTPUTS.fold(pins, (acc, o) =>
       if (acc.get((d, o)) == PinMaterialization) acc.put((d, o), NoPin) else acc),
-    present' = present, ingested' = ingested,
+    ingested' = OUTPUTS.fold(ingested, (acc, o) =>
+      if (pins.get((d, o)) == PinMaterialization) acc.put((d, o), false) else acc),
+    present' = present,
     jobCoreUnchanged, relUnchanged, ledgerUnchanged, envUnchanged,
     tenureUnchanged, ghostsUnchanged,
   }
