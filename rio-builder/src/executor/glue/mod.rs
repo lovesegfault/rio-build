@@ -618,13 +618,17 @@ fn validate_fixed_output_declarations(
                 output: o.name().to_owned(),
                 message: format!("unsupported outputHashAlgo '{raw_algo}'"),
             })?;
-        let digest = hex::decode(o.hash()).map_err(|_| GlueError::FixedOutputHashInvalid {
-            output: o.name().to_owned(),
-            message: format!("outputHash is not valid base16: {}", o.hash()),
-        })?;
-        let hash = NixHash::new(algo, digest).map_err(|e| GlueError::FixedOutputHashInvalid {
-            output: o.name().to_owned(),
-            message: e.to_string(),
+        // Length-discriminated decode (base16 / nixbase32 / base64) — the
+        // shared CppNix-parity parser. Defense-in-depth: the gateway gate
+        // already decoded the same declaration with the same function.
+        // r[impl nix.hash.fod-decode]
+        let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {
+            GlueError::FixedOutputHashInvalid {
+                output: o.name().to_owned(),
+                message: format!(
+                    "outputHash is not a valid base16, nixbase32, or base64 hash: {e}"
+                ),
+            }
         })?;
         let path_name = if o.name() == "out" {
             drv_name.to_owned()
@@ -967,6 +971,29 @@ mod tests {
             let prepared = prepare(&drv);
             assert_eq!(prepared.outputs[0].path, out, "algo {algo}");
         }
+    }
+
+    /// CppNix accepts `outputHash` in nixbase32 (and base64) too, length-
+    /// discriminated: the same digest in another encoding plans to the same
+    /// derived output path. (The full three-encoding matrix is pinned in
+    /// rio-nix's own tests; base64 is omitted here so rio-builder needs no
+    /// base64 dependency.)
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn fixed_output_nixbase32_declaration_is_accepted() {
+        let digest = vec![0u8; 32];
+        let zeros_hex = "00".repeat(32);
+        let out = fod_path("sha256", &zeros_hex);
+        let declared = rio_nix::store_path::nixbase32::encode(&digest);
+        let drv = mk_drv(
+            vec![DerivationOutput::new("out", out.as_str(), "sha256", declared.as_str()).unwrap()],
+            &[("name", "demo"), ("out", out.as_str())],
+        );
+        let prepared = prepare(&drv);
+        assert_eq!(
+            prepared.outputs[0].path, out,
+            "declared encoding {declared:?} must plan to the canonical path"
+        );
     }
 
     #[test]

@@ -1092,6 +1092,56 @@ async fn test_submit_build_accepts_authoritative_fod_fallback() {
     assert!(result.is_ok(), "honest FOD fallback accepted: {result:?}");
 }
 
+/// CppNix accepts `outputHash` in nixbase32/base64 too — an authoritative
+/// FOD fallback whose ATerm declares the hash in nixbase32 must be accepted,
+/// and must derive to the same fixed-output path as its base16 spelling.
+// r[verify nix.hash.fod-decode]
+#[tokio::test]
+async fn test_submit_build_accepts_nixbase32_authoritative_fod() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-fod-b32").await;
+
+    let mut node = make_node("auth-fod-b32");
+    let digest =
+        hex::decode("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855").unwrap();
+    let declared_b32 = rio_nix::store_path::nixbase32::encode(&digest);
+    let nix_hash = rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest).unwrap();
+    let drv_name = {
+        let sp = rio_nix::store_path::StorePath::parse(&node.drv_path).unwrap();
+        sp.name()
+            .strip_suffix(".drv")
+            .unwrap_or(sp.name())
+            .to_owned()
+    };
+    // The derived path comes from the DECODED digest, so it is identical to
+    // what the base16 spelling derives to.
+    let honest = rio_nix::store_path::StorePath::make_fixed_output(&drv_name, &nix_hash, true, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+    let aterm = format!(
+        r#"Derive([("out","{honest}","r:sha256","{declared_b32}")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{honest}")])"#
+    );
+    node.drv_content = aterm.into_bytes();
+    node.drv_content_authoritative = true;
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+    node.expected_output_paths = vec![honest];
+
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            tenant_name: "team-fod-b32".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "nixbase32-declared authoritative FOD accepted: {result:?}"
+    );
+}
+
 #[tokio::test]
 async fn test_submit_build_accepts_authoritative_floating_ca_fallback() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;

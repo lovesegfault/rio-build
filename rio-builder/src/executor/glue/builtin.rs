@@ -130,7 +130,23 @@ pub(crate) fn prepare_fetchurl(
             opts.hashed_mirrors.join(" ").into(),
         ));
         env.push((env_vars::HASH_ALGO.into(), algo.into()));
-        env.push((env_vars::HASH_B16.into(), drv_output.hash().into()));
+        // Canonical lowercase base16 — the oracle builds hashed-mirror URLs
+        // from `dof->ca.hash.to_string(HashFormat::Base16, false)`
+        // (fetchurl.cc), so a nixbase32- or base64-declared hash must be
+        // re-encoded or the mirror URL is garbage. The declaration was
+        // already validated by validate_fixed_output_declarations (which
+        // runs before any builtin planning), so decoding cannot fail here;
+        // fall back to the raw string defensively rather than panicking.
+        // r[impl nix.hash.fod-decode]
+        let canonical_b16 = algo
+            .parse::<rio_nix::hash::HashAlgo>()
+            .ok()
+            .and_then(|a| {
+                rio_nix::hash::NixHash::parse_nonsri_unprefixed(a, drv_output.hash()).ok()
+            })
+            .map(|h| h.to_hex())
+            .unwrap_or_else(|| drv_output.hash().to_owned());
+        env.push((env_vars::HASH_B16.into(), canonical_b16.into()));
     }
 
     // ---- mounts + inline files --------------------------------------------
@@ -333,6 +349,8 @@ mod tests {
         assert_eq!(env[env_vars::EXECUTABLE], "1");
         assert_eq!(env[env_vars::MIRRORS], "http://mirror/");
         assert_eq!(env[env_vars::HASH_ALGO], "sha256");
+        // Hex-declared hash → canonical hex is the identity.
+        assert_eq!(env[env_vars::HASH_B16], "00".repeat(32));
         assert_eq!(env[env_vars::NETRC], "/build/.netrc");
 
         // The binary is mounted read-only at the program path; the host
@@ -394,6 +412,48 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k == &OsString::from(env_vars::MIRRORS)),
             "recursive-mode FODs must not receive hashed mirrors"
+        );
+    }
+
+    /// The hashed-mirror env always carries CANONICAL lowercase base16,
+    /// regardless of the encoding the .drv declared — the oracle builds
+    /// `<mirror>/<algo>/<base16>` URLs (fetchurl.cc), so a nixbase32
+    /// declaration passed through raw would produce a garbage URL.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn hashed_mirror_env_canonicalizes_declared_hash() {
+        let digest = vec![0u8; 32];
+        let canonical_hex = "00".repeat(32);
+        let declared_b32 = rio_nix::store_path::nixbase32::encode(&digest);
+
+        let env_pairs: Vec<(&str, &str)> =
+            vec![("url", "https://example.org/src.tar.xz"), ("out", OUT)];
+        let drv = BasicDerivation::new(
+            vec![DerivationOutput::new("out", OUT, "sha256", declared_b32.as_str()).unwrap()],
+            BTreeSet::new(),
+            "builtin".into(),
+            "builtin:fetchurl".into(),
+            vec![],
+            env_pairs
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+        )
+        .unwrap();
+
+        let mut o = opts();
+        o.hashed_mirrors = vec!["http://mirror/".into()];
+        let pb = prepare_fetchurl("/nix/store/x.drv", &drv, &paths(), &o).expect("prepare");
+        let hash_b16 = pb
+            .request
+            .env
+            .iter()
+            .find(|(k, _)| k == &OsString::from(env_vars::HASH_B16))
+            .map(|(_, v)| v.to_str().expect("utf-8 env value").to_owned())
+            .expect("HASH_B16 env present for flat FOD with mirrors");
+        assert_eq!(
+            hash_b16, canonical_hex,
+            "nixbase32-declared hash must be re-encoded to canonical base16"
         );
     }
 

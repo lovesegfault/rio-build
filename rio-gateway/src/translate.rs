@@ -934,11 +934,15 @@ pub(crate) fn validate_declared_hash_outputs<'a>(
             "derivation {drv_path} output '{name}' declares unsupported outputHashAlgo '{raw_algo}'"
         )
     })?;
-    let digest = hex::decode(raw_hash).map_err(|_| {
-        format!("derivation {drv_path} output '{name}': outputHash is not valid base16: {raw_hash}")
+    // Length-discriminated decode (base16 / nixbase32 / base64) — CppNix
+    // accepts all three encodings for outputHash, so the gate must too.
+    // r[impl nix.hash.fod-decode]
+    let hash = NixHash::parse_nonsri_unprefixed(algo, raw_hash).map_err(|e| {
+        format!(
+            "derivation {drv_path} output '{name}': outputHash is not a valid base16, \
+             nixbase32, or base64 {algo} hash: {e}"
+        )
     })?;
-    let hash = NixHash::new(algo, digest)
-        .map_err(|e| format!("derivation {drv_path} output '{name}': invalid outputHash: {e}"))?;
     let expected = StorePath::make_fixed_output(drv_name, &hash, recursive, &[]).map_err(|e| {
         format!("derivation {drv_path} output '{name}': cannot derive fixed-output path: {e}")
     })?;
@@ -2439,16 +2443,26 @@ mod tests {
             rio_nix::hash::NixHash::new("sha256".parse().unwrap(), digest.clone()).unwrap();
         let hex_hash = hex::encode(&digest);
 
-        // Honest flat-sha256 and r:sha256 declarations → accepted.
+        // Honest flat-sha256 and r:sha256 declarations → accepted, in
+        // every encoding CppNix accepts (base16 / nixbase32 / base64).
+        // r[verify nix.hash.fod-decode]
+        use base64::Engine;
+        let encodings = [
+            hex_hash.clone(),
+            rio_nix::store_path::nixbase32::encode(&digest),
+            base64::engine::general_purpose::STANDARD.encode(&digest),
+        ];
         for recursive in [false, true] {
             let algo = if recursive { "r:sha256" } else { "sha256" };
             let honest = StorePath::make_fixed_output("fetch", &nix_hash, recursive, &[]).unwrap();
-            let mut cache = HashMap::new();
-            cache.insert(key.clone(), fod_at(algo, &hex_hash, honest.as_str()));
-            assert!(
-                validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
-                "honest {algo} declaration must pass"
-            );
+            for declared in &encodings {
+                let mut cache = HashMap::new();
+                cache.insert(key.clone(), fod_at(algo, declared, honest.as_str()));
+                assert!(
+                    validate_dag(std::slice::from_ref(&node), &cache).is_ok(),
+                    "honest {algo} declaration with hash {declared:?} must pass"
+                );
+            }
         }
 
         // Junk hash + somebody else's well-formed path → rejected,
@@ -2468,11 +2482,15 @@ mod tests {
         let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
         assert!(err.contains("base16"), "{err}");
 
-        // Wrong-length digest (sha512 algo, 32-byte hash) → rejected.
+        // Wrong-length digest (sha512 algo, 32-byte hash) → rejected: the
+        // length matches none of sha512's three encodings.
         let mut cache = HashMap::new();
         cache.insert(key.clone(), fod_at("sha512", &hex_hash, victim));
         let err = validate_dag(std::slice::from_ref(&node), &cache).unwrap_err();
-        assert!(err.contains("invalid outputHash"), "{err}");
+        assert!(
+            err.contains("outputHash") && err.contains("base16"),
+            "{err}"
+        );
 
         // Empty declared path → out of scope for this gate.
         let mut cache = HashMap::new();

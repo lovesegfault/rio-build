@@ -40,6 +40,35 @@ pub fn hash_derivation_modulo<'c>(
     hash_modulo_walk(drv, drv_path, resolve_input, hash_cache, mask_outputs)
 }
 
+/// Canonicalize a declared FOD `outputHash` for the modulo fingerprint.
+///
+/// CppNix renders the fingerprint hash as
+/// `dof.ca.hash.to_string(HashFormat::Base16, false)` (derivations.cc:904)
+/// — canonical lowercase hex — regardless of which encoding the `.drv`
+/// declared, so a nixbase32- or base64-declared hash must produce the SAME
+/// modulo hash (and therefore the same realisation keys) as its base16
+/// spelling.
+///
+/// Undecodable hashes (unsupported algorithm, junk digest) fall back to the
+/// raw declared string. LOAD-BEARING: the gateway's offender-exemption flow
+/// (`gw.reject.unsupported-hash-algo`) deliberately admits already-realized
+/// FODs whose hashes rio cannot verify, and their fingerprints must stay
+/// stable — failing here would turn an admission-policy decision into a
+/// hash error deep inside the modulo walk.
+// r[impl nix.hash.fod-decode]
+fn canonical_fod_hash(raw_algo: &str, raw_hash: &str) -> String {
+    use crate::hash::{HashAlgo, NixHash};
+
+    raw_algo
+        .strip_prefix("r:")
+        .unwrap_or(raw_algo)
+        .parse::<HashAlgo>()
+        .ok()
+        .and_then(|algo| NixHash::parse_nonsri_unprefixed(algo, raw_hash).ok())
+        .map(|h| h.to_hex())
+        .unwrap_or_else(|| raw_hash.to_owned())
+}
+
 /// One entry on the explicit traversal stack of [`hash_modulo_walk`].
 enum WalkFrame<'c> {
     /// First touch of a derivation: memo/cycle checks, then push its
@@ -145,7 +174,7 @@ fn hash_modulo_walk<'c>(
                     let fingerprint = format!(
                         "fixed:out:{}:{}:{}",
                         output.hash_algo(),
-                        output.hash(),
+                        canonical_fod_hash(output.hash_algo(), output.hash()),
                         output.path()
                     );
                     Sha256::digest(fingerprint.as_bytes()).into()
@@ -301,6 +330,87 @@ mod hash_derivation_modulo_tests {
         .into();
 
         assert_eq!(hash, expected);
+        Ok(())
+    }
+
+    /// CppNix parity: the modulo fingerprint canonicalizes the declared
+    /// outputHash to lowercase hex (derivations.cc:904 renders
+    /// `HashFormat::Base16`), so the same digest declared in base16,
+    /// nixbase32, or base64 yields the SAME modulo hash — and therefore
+    /// the same realisation keys.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn fod_hash_canonicalizes_declared_encoding() -> anyhow::Result<()> {
+        use base64::Engine;
+        use sha2::{Digest, Sha256};
+
+        use crate::store_path::nixbase32;
+
+        let digest_hex = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let digest = hex::decode(digest_hex)?;
+        let declared = [
+            digest_hex.to_owned(),
+            nixbase32::encode(&digest),
+            base64::engine::general_purpose::STANDARD.encode(&digest),
+        ];
+
+        // All three encodings must produce the fingerprint built from the
+        // canonical hex rendering.
+        let expected: [u8; 32] = Sha256::digest(format!(
+            "fixed:out:sha256:{digest_hex}:/nix/store/xyz-fixed"
+        ))
+        .into();
+
+        for declared_hash in declared {
+            let aterm = format!(
+                r#"Derive([("out","/nix/store/xyz-fixed","sha256","{declared_hash}")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","{declared_hash}"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#
+            );
+            let drv = Derivation::parse(&aterm)?;
+            assert!(drv.is_fixed_output());
+
+            let mut cache = HashMap::new();
+            let resolve = |_: &str| -> Option<&Derivation> { None };
+            let hash =
+                hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+            assert_eq!(
+                hash, expected,
+                "declared encoding {declared_hash:?} must canonicalize to the hex fingerprint"
+            );
+        }
+        Ok(())
+    }
+
+    /// An undecodable declared hash (unsupported algo, junk digest) keeps
+    /// the raw string in the fingerprint — stable across versions, never an
+    /// error. The gateway's offender-exemption flow depends on this.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn fod_hash_undecodable_falls_back_to_raw() -> anyhow::Result<()> {
+        use sha2::{Digest, Sha256};
+
+        // md5 is not a supported HashAlgo; the raw declared string must be
+        // used verbatim.
+        let aterm = r#"Derive([("out","/nix/store/xyz-fixed","md5","0123456789abcdef0123456789abcdef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","0123456789abcdef0123456789abcdef"),("outputHashAlgo","md5"),("system","x86_64-linux")])"#;
+        let drv = Derivation::parse(aterm)?;
+
+        let mut cache = HashMap::new();
+        let resolve = |_: &str| -> Option<&Derivation> { None };
+        let hash = hash_derivation_modulo(&drv, "/nix/store/xyz-fixed.drv", &resolve, &mut cache)?;
+
+        let expected: [u8; 32] =
+            Sha256::digest(b"fixed:out:md5:0123456789abcdef0123456789abcdef:/nix/store/xyz-fixed")
+                .into();
+        assert_eq!(hash, expected);
+
+        // A wrong-length sha256 digest also falls back to raw.
+        let aterm_junk = r#"Derive([("out","/nix/store/xyz-fixed","sha256","deadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo"],[("name","fixed"),("out","/nix/store/xyz-fixed"),("outputHash","deadbeef"),("outputHashAlgo","sha256"),("system","x86_64-linux")])"#;
+        let drv_junk = Derivation::parse(aterm_junk)?;
+        let mut cache2 = HashMap::new();
+        let hash_junk =
+            hash_derivation_modulo(&drv_junk, "/nix/store/xyz-fixed.drv", &resolve, &mut cache2)?;
+        let expected_junk: [u8; 32] =
+            Sha256::digest(b"fixed:out:sha256:deadbeef:/nix/store/xyz-fixed").into();
+        assert_eq!(hash_junk, expected_junk);
         Ok(())
     }
 

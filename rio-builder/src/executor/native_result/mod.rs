@@ -423,10 +423,11 @@ fn canonicalise_and_scan_outputs(
 /// exempts fetched sources from the store's "non-CA path with zero
 /// references" heuristics.
 ///
-/// The declared `outputHash` in a `.drv` is base16; the descriptor uses
-/// the canonical nixbase32 rendering, so the hash is re-encoded here.
-/// Malformed declarations are rejected (fail-closed), consistent with
-/// the FOD hash verification gate.
+/// The declared `outputHash` in a `.drv` may be base16, nixbase32, or
+/// base64 (length-discriminated, CppNix parity); the descriptor uses the
+/// canonical nixbase32 rendering, so the hash is decoded with the shared
+/// parser and re-encoded here. Malformed declarations are rejected
+/// (fail-closed), consistent with the FOD hash verification gate.
 fn populate_fixed_output_descriptors(
     processed: &mut [ProcessedOutput],
     drv: &Derivation,
@@ -457,16 +458,16 @@ fn populate_fixed_output_descriptors(
                     output: o.name().to_owned(),
                     message: format!("unsupported outputHashAlgo '{raw_algo}'"),
                 })?;
-        let digest =
-            hex::decode(o.hash()).map_err(|_| OutputRejection::FodDeclaredHashInvalid {
+        // Shared length-discriminated decode (base16 / nixbase32 / base64).
+        // r[impl nix.hash.fod-decode]
+        let hash = NixHash::parse_nonsri_unprefixed(algo, o.hash()).map_err(|e| {
+            OutputRejection::FodDeclaredHashInvalid {
                 output: o.name().to_owned(),
-                message: format!("outputHash is not valid base16: {}", o.hash()),
-            })?;
-        let hash =
-            NixHash::new(algo, digest).map_err(|e| OutputRejection::FodDeclaredHashInvalid {
-                output: o.name().to_owned(),
-                message: e.to_string(),
-            })?;
+                message: format!(
+                    "outputHash is not a valid base16, nixbase32, or base64 hash: {e}"
+                ),
+            }
+        })?;
         let descriptor = format!(
             "fixed:{}{}",
             if recursive { "r:" } else { "" },

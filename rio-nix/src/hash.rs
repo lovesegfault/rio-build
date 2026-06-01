@@ -31,6 +31,19 @@ pub enum HashError {
         expected: usize,
         got: usize,
     },
+
+    #[error(
+        "hash {hash:?} has wrong length {len} for hash algorithm '{algo}': expected {b16} \
+         (base16), {b32} (nixbase32), or {b64} (base64) characters"
+    )]
+    WrongEncodedLength {
+        algo: &'static str,
+        hash: String,
+        len: usize,
+        b16: usize,
+        b32: usize,
+        b64: usize,
+    },
 }
 
 /// Supported hash algorithms.
@@ -63,6 +76,23 @@ impl HashAlgo {
             HashAlgo::SHA512 => 64,
             HashAlgo::SHA1 => 20,
         }
+    }
+
+    /// Length of this algorithm's digest when base16 (lowercase hex) encoded.
+    fn base16_len(&self) -> usize {
+        self.digest_len() * 2
+    }
+
+    /// Length of this algorithm's digest when nixbase32 encoded.
+    ///
+    /// nixbase32 packs 5 bits per character: `ceil(bits / 5)`.
+    fn nixbase32_len(&self) -> usize {
+        (self.digest_len() * 8).div_ceil(5)
+    }
+
+    /// Length of this algorithm's digest when standard (padded) base64 encoded.
+    fn base64_len(&self) -> usize {
+        self.digest_len().div_ceil(3) * 4
     }
 
     /// Return the algorithm name as a lowercase string.
@@ -154,6 +184,44 @@ impl NixHash {
                 "unrecognized hash format: {s:?}"
             )))
         }
+    }
+
+    /// Parse a bare digest string (no algorithm prefix, no SRI separator),
+    /// discriminating the encoding — base16, nixbase32, or base64 — by its
+    /// length for the given algorithm.
+    ///
+    /// This is CppNix `Hash::parseNonSRIUnprefixed` (`hash.cc`:
+    /// `baseFromSize` + `parseLowLevel`) and is the ONLY decoder for
+    /// declared `outputHash` values: a fixed-output derivation may declare
+    /// its hash in any of the three encodings and every component must
+    /// decode it identically. Within one algorithm the three encoded
+    /// lengths are always distinct, so the discrimination is unambiguous.
+    ///
+    /// NOT for wire `narHash` fields — those are hex-only by protocol
+    /// (`gw.wire.narhash-hex`) and keep using `hex::decode` + `NixHash::new`.
+    // r[impl nix.hash.fod-decode]
+    pub fn parse_nonsri_unprefixed(algo: HashAlgo, s: &str) -> Result<Self, HashError> {
+        let digest = if s.len() == algo.base16_len() {
+            hex::decode(s)
+                .map_err(|_| HashError::InvalidFormat(format!("hash {s:?} is not valid base16")))?
+        } else if s.len() == algo.nixbase32_len() {
+            nixbase32::decode(s)?
+        } else if s.len() == algo.base64_len() {
+            use base64::Engine;
+            base64::engine::general_purpose::STANDARD
+                .decode(s)
+                .map_err(|_| HashError::InvalidBase64)?
+        } else {
+            return Err(HashError::WrongEncodedLength {
+                algo: algo.as_str(),
+                hash: s.to_owned(),
+                len: s.len(),
+                b16: algo.base16_len(),
+                b32: algo.nixbase32_len(),
+                b64: algo.base64_len(),
+            });
+        };
+        Self::new(algo, digest)
     }
 
     /// Render as lowercase hex digest (no algorithm prefix).
@@ -280,6 +348,91 @@ mod tests {
         assert!(NixHash::new(HashAlgo::SHA256, vec![0u8; 32]).is_ok());
     }
 
+    /// CppNix `Hash::parseNonSRIUnprefixed` parity: every algorithm accepts
+    /// its digest in all three encodings, discriminated by length, and the
+    /// three decode to the same digest.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn test_parse_nonsri_unprefixed_encoding_matrix() -> anyhow::Result<()> {
+        use base64::Engine;
+        for algo in [HashAlgo::SHA256, HashAlgo::SHA512, HashAlgo::SHA1] {
+            let reference = NixHash::compute(algo, b"rio parity probe");
+
+            let b16 = hex::encode(reference.digest());
+            let b32 = nixbase32::encode(reference.digest());
+            let b64 = base64::engine::general_purpose::STANDARD.encode(reference.digest());
+
+            // The three encoded lengths are pairwise distinct for every algo,
+            // making the length discrimination unambiguous.
+            assert_ne!(b16.len(), b32.len());
+            assert_ne!(b16.len(), b64.len());
+            assert_ne!(b32.len(), b64.len());
+
+            for encoded in [&b16, &b32, &b64] {
+                let parsed = NixHash::parse_nonsri_unprefixed(algo, encoded)?;
+                assert_eq!(
+                    parsed, reference,
+                    "{algo} digest must decode identically from {encoded:?}"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// The decode for each discriminated encoding is strict: a string of the
+    /// right LENGTH but invalid alphabet for that encoding is rejected, never
+    /// reinterpreted as another encoding.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn test_parse_nonsri_unprefixed_strict_per_encoding() {
+        // 64 chars (sha256 base16 length) but not valid hex.
+        let bad_b16 = "zz".repeat(32);
+        assert!(matches!(
+            NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &bad_b16),
+            Err(HashError::InvalidFormat(_))
+        ));
+
+        // 52 chars (sha256 nixbase32 length) but contains 'e' (not in the
+        // nixbase32 alphabet).
+        let bad_b32 = "e".repeat(52);
+        assert!(NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &bad_b32).is_err());
+
+        // 44 chars (sha256 base64 length) but invalid base64 bytes.
+        let bad_b64 = "!".repeat(44);
+        assert!(matches!(
+            NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &bad_b64),
+            Err(HashError::InvalidBase64)
+        ));
+    }
+
+    /// A digest whose length matches none of the three encodings for the
+    /// algorithm is rejected with the oracle's "wrong length" error shape.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn test_parse_nonsri_unprefixed_wrong_length_rejected() {
+        for len in [0usize, 1, 43, 45, 51, 53, 63, 65, 129] {
+            let s = "a".repeat(len);
+            let result = NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &s);
+            assert!(
+                matches!(result, Err(HashError::WrongEncodedLength { .. })),
+                "length {len} must be rejected as wrong-length for sha256, got {result:?}"
+            );
+        }
+    }
+
+    /// Round-trip: parse each encoding then re-render canonical hex — the
+    /// canonicalization every consumer (modulo fingerprint, hashed-mirror
+    /// env) relies on.
+    // r[verify nix.hash.fod-decode]
+    #[test]
+    fn test_parse_nonsri_unprefixed_canonical_hex() -> anyhow::Result<()> {
+        let reference = NixHash::compute(HashAlgo::SHA256, b"canonical");
+        let b32 = nixbase32::encode(reference.digest());
+        let parsed = NixHash::parse_nonsri_unprefixed(HashAlgo::SHA256, &b32)?;
+        assert_eq!(parsed.to_hex(), hex::encode(reference.digest()));
+        Ok(())
+    }
+
     mod proptests {
         use super::*;
         use proptest::prelude::*;
@@ -315,6 +468,23 @@ mod tests {
                 let s = h.to_sri();
                 let parsed = NixHash::parse_sri(&s)?;
                 prop_assert_eq!(parsed, h);
+            }
+
+            /// Any digest round-trips through all three non-SRI encodings via
+            /// the length-discriminated parser.
+            // r[verify nix.hash.fod-decode]
+            #[test]
+            fn nonsri_unprefixed_roundtrip_all_encodings(h in arb_nixhash()) {
+                use base64::Engine;
+                let encodings = [
+                    hex::encode(h.digest()),
+                    nixbase32::encode(h.digest()),
+                    base64::engine::general_purpose::STANDARD.encode(h.digest()),
+                ];
+                for s in encodings {
+                    let parsed = NixHash::parse_nonsri_unprefixed(h.algo(), &s)?;
+                    prop_assert_eq!(&parsed, &h);
+                }
             }
 
             /// Any byte sequence of wrong length must be rejected by NixHash::new.

@@ -147,6 +147,12 @@ Notable edges:
     )[`NixHash::parse_sri`/`to_sri` handle the SRI form (`sha256-BASE64=`); `parse_colon`/`to_colon` handle the Nix colon form (`sha256:nixbase32`). `NixHash::parse` auto-detects by separator.]
 
     #r(
+      "nix.hash.fod-decode",
+    )[`NixHash::parse_nonsri_unprefixed(algo, s)` MUST be the only decoder for declared `outputHash` values (fixed-output derivations): it discriminates base16 / nixbase32 / base64 by encoded length for the given algorithm and decodes strictly with the discriminated codec, exactly like CppNix `Hash::parseNonSRIUnprefixed` (`hash.cc`). Every consumer of a declared hash — the gateway declared-hash gate, the scheduler's authoritative-content validation, the worker glue's FOD declaration check, the result pipeline's descriptor stamping, the fetcher's hash verification, the hashed-mirror env, and the modulo-hash FOD fingerprint — calls this one function, so no two components can decode the same declaration differently.]
+
+    Wire `narHash` fields are deliberately excluded from `nix.hash.fod-decode`: the Nix worker protocol sends them hex-only (`gw.wire.narhash-hex`), so those sites keep `hex::decode` + `NixHash::new`. The modulo fingerprint and the hashed-mirror env additionally re-encode the decoded hash to canonical lowercase base16 (CppNix `derivations.cc:904` / `fetchurl.cc` parity); undecodable hashes (unsupported algorithm, junk digest) fall back to the raw declared string there, preserving the gateway's realized-offender exemption flow. Unit-level oracle parity is the test evidence — `nix-instantiate` always emits base16, so the differential corpus cannot exercise the other encodings.
+
+    #r(
       "nix.narinfo.verify-sig",
     )[`NarInfo::verify_sig` checks each `Sig:` line against a list of trusted `name:base64(ed25519-pubkey)` keys. The fingerprint is reconstructed from `store_path`/`nar_hash`/`nar_size`/`references` (basenames re-prefixed with the store dir, sorted). Malformed keys or sigs are treated as non-matching, never errors. Returns the first matching key name or `None`.]
 

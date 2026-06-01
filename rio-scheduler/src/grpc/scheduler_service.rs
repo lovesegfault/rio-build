@@ -661,14 +661,14 @@ fn validate_authoritative_drv_content(
                      outputHashAlgo '{algo}'"
                 ))
             })?;
-            let digest = hex::decode(hash).map_err(|_| {
+            // Shared length-discriminated decode (base16 / nixbase32 /
+            // base64) — identical to the gateway gate and the worker glue,
+            // so no component can decode the same declaration differently.
+            // r[impl nix.hash.fod-decode]
+            let nix_hash = NixHash::parse_nonsri_unprefixed(parsed_algo, hash).map_err(|e| {
                 Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}': outputHash is not valid base16"
-                ))
-            })?;
-            let nix_hash = NixHash::new(parsed_algo, digest).map_err(|e| {
-                Status::invalid_argument(format!(
-                    "authoritative drv_content output '{name}': invalid outputHash: {e}"
+                    "authoritative drv_content output '{name}': outputHash is not a valid \
+                     base16, nixbase32, or base64 hash: {e}"
                 ))
             })?;
             let derived = StorePath::make_fixed_output(&drv_name, &nix_hash, recursive, &[])

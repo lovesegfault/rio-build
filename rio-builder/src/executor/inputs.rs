@@ -43,6 +43,17 @@ impl FodHashAlgo {
             _ => None,
         }
     }
+
+    /// The corresponding `rio_nix::hash::HashAlgo` — used to decode the
+    /// DECLARED hash with the shared length-discriminated parser, while
+    /// this enum drives the local hash COMPUTATION.
+    fn as_nix_hash_algo(self) -> rio_nix::hash::HashAlgo {
+        match self {
+            Self::Sha1 => rio_nix::hash::HashAlgo::SHA1,
+            Self::Sha256 => rio_nix::hash::HashAlgo::SHA256,
+            Self::Sha512 => rio_nix::hash::HashAlgo::SHA512,
+        }
+    }
 }
 
 /// Writer adapter that feeds every byte written into a digest.
@@ -137,9 +148,6 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
             continue;
         }
 
-        let expected = hex::decode(output.hash())
-            .with_context(|| format!("FOD outputHash is not valid hex: {}", output.hash()))?;
-
         // Dispatch on outputHashAlgo. Unknown algo → reject. This gate
         // is the only content verification between an egress-open
         // fetcher and the signed cache; an algorithm we cannot verify
@@ -156,6 +164,22 @@ pub(super) fn verify_fod_hashes(drv: &Derivation, upper_store: &Path) -> anyhow:
                 output.hash_algo(),
             );
         };
+
+        // Decode the declared hash with the shared length-discriminated
+        // parser (base16 / nixbase32 / base64) — the same function every
+        // other component uses, so a declaration accepted at submission
+        // can never fail to decode here.
+        // r[impl nix.hash.fod-decode]
+        let expected =
+            rio_nix::hash::NixHash::parse_nonsri_unprefixed(algo.as_nix_hash_algo(), output.hash())
+                .with_context(|| {
+                    format!(
+                        "FOD outputHash {:?} is not a valid base16, nixbase32, or base64 hash",
+                        output.hash()
+                    )
+                })?
+                .digest()
+                .to_vec();
 
         let is_recursive = output.hash_algo().starts_with("r:");
 
