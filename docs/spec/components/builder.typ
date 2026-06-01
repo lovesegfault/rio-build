@@ -763,6 +763,34 @@ executor rejects concurrent executions" (the rustdoc fiction this rule
 replaces) would now be a tracey-visible broken reference instead of prose
 nobody can falsify.
 
+#r("builder.exec.limits-isolated")[
+  The executor's limit enforcement --- the wall-clock timeout, the
+  max-silent deadline, and the log-volume cap --- MUST execute in a
+  dedicated watchdog task that performs no channel sends and owns only
+  the kill handle, its deadline timers, and an activity watch fed at
+  raw-read time by the capture readers. No event-consumer behavior may
+  delay a limit kill. A limit deadline that fires after the process
+  tree has been reaped MUST NOT override the natural exit outcome.
+]
+
+This is CppNix parity at the architectural level: the daemon's worker
+loop updates `lastOutput` when it *reads* builder output
+(`worker.cc:491`), computes its deadlines from that clock and the build
+start (`worker.cc:426-431`), and kills on expiry (`worker.cc:500-507`)
+--- none of which waits on any log consumer. Pre-FU1, rio-exec's
+deadline arms lived in the same `select!` as the awaited event send, so
+a stalled receiver (scheduler-link backpressure filling the worker's
+channels --- merged_bug_019) suspended every kill with it. The watchdog
+records its kill reason only when the kill actually *acted* on a live
+tree (kill-under-the-reason-mutex), so a deadline racing a natural exit
+can never relabel a clean completion as `TimedOut`. One residual
+semantics shift, accepted: a build whose *writes* are blocked by a
+worker-internal stalled consumer can now be silence-killed where it
+previously froze alongside its enforcement --- reaching that state
+requires a worker bug, since the worker's own consumer is structurally
+non-stalling (the relay-side log-shed rule, which lands with the
+rio-builder half of this change, is what guarantees that).
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup

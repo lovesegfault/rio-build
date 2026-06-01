@@ -76,10 +76,11 @@
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::child::{self, ChildFds, SETUP_ERROR_WIRE_LEN, SetupError, SetupPhase};
 use crate::outcome::{
@@ -95,16 +96,6 @@ use crate::{ExecError, skeleton};
 /// the late `Started` send. Bounds the gap between "the build exited"
 /// and "execute() returned" even when the events receiver is alive but
 /// stalled; EOF and channel capacity normally arrive well before this.
-///
-/// What this does NOT bound: an in-loop park on a stalled receiver
-/// while the build is still running (the supervision loop's own
-/// `events.send(...).await`), which suspends limit enforcement for as
-/// long as the receiver stalls. That suspension is bounded today only
-/// by the caller-side backstop timeout in rio-builder.
-/// TODO: move limit enforcement off the event-send path entirely (a
-/// dedicated watchdog owning kills, queued sends) so consumer behavior
-/// can never delay a kill — the worker control-plane isolation
-/// follow-up.
 const FINAL_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Capacity of the internal raw-chunk channel between the blocking
@@ -151,6 +142,156 @@ enum StatusReport {
 struct LogChunk {
     stream: LogStream,
     bytes: Vec<u8>,
+}
+
+/// Activity accounting fed by the blocking capture readers, at read
+/// time — before the bytes enter any channel. The recorded volume and
+/// the change notification reflect what the program actually wrote,
+/// independent of every downstream consumer (the chunk channel, the
+/// line splitter, the caller's event receiver). Mirrors the position
+/// where the upstream daemon resets its own activity clock: when the
+/// supervisor *reads* program output, not when it forwards it.
+///
+/// Held only by the readers; the parent drops its handle right after
+/// spawning them so the watch channel closes when the last reader
+/// exits.
+struct ActivityMeter {
+    /// Cumulative captured bytes, shared with the [`LimitWatchdog`].
+    bytes: Arc<AtomicU64>,
+    /// Change notification carrying the cumulative total.
+    tick: watch::Sender<u64>,
+}
+
+impl ActivityMeter {
+    /// Returns the meter (for the readers), the shared byte counter,
+    /// and the watch receiver (both for the watchdog).
+    fn new() -> (Arc<ActivityMeter>, Arc<AtomicU64>, watch::Receiver<u64>) {
+        let (tick, rx) = watch::channel(0u64);
+        let bytes = Arc::new(AtomicU64::new(0));
+        (
+            Arc::new(ActivityMeter {
+                bytes: Arc::clone(&bytes),
+                tick,
+            }),
+            bytes,
+            rx,
+        )
+    }
+
+    /// Record `n` freshly read bytes and wake the watchdog.
+    // r[impl builder.exec.limits-isolated]
+    fn record(&self, n: usize) {
+        let total = self.bytes.fetch_add(n as u64, Ordering::Relaxed) + n as u64;
+        self.tick.send_replace(total);
+    }
+}
+
+/// The limit-enforcement task: wall-clock timeout, max-silent deadline,
+/// and log-volume cap, isolated from event delivery.
+///
+/// Owns only the kill handle, its deadline timers, and the
+/// receive-only activity watch — no channel `Sender` of any kind, so
+/// "enforcement parked on a channel send" is unwritable here, not just
+/// unwritten. No event-consumer behavior can delay a kill.
+struct LimitWatchdog {
+    tree: Arc<TreeState>,
+    timeout: Option<Duration>,
+    max_silent: Option<Duration>,
+    max_log_bytes: Option<u64>,
+    /// The pre-fork instant: the timeout base is unchanged from the
+    /// previous in-loop enforcement.
+    started: Instant,
+    activity: watch::Receiver<u64>,
+    bytes: Arc<AtomicU64>,
+    /// Why the watchdog killed, if it did and the kill acted. Read by
+    /// `execute()` after the reap to map the final exit outcome.
+    reason: Arc<std::sync::Mutex<Option<KillReason>>>,
+}
+
+impl LimitWatchdog {
+    /// Enforce until a limit fires (kill, then return) or nothing can
+    /// ever fire again (return without killing).
+    // r[impl builder.exec.limits-isolated]
+    async fn run(mut self) {
+        // Tokio instants throughout: identical to the monotonic clock
+        // in production, virtualizable under `start_paused` tests.
+        let started = tokio::time::Instant::from_std(self.started);
+        // Silence base: the watchdog starts right after the go byte,
+        // the same instant the old in-loop clock was initialized.
+        let mut last_activity = tokio::time::Instant::now();
+        let mut activity_open = true;
+        loop {
+            let timeout_at = self.timeout.map(|t| started + t);
+            let silent_at = self.max_silent.map(|t| last_activity + t);
+            // Totality: return once no arm can ever fire again — no
+            // deadlines configured and the activity arm is either
+            // closed or pointless (no log cap to enforce and no
+            // silence clock to reset).
+            if timeout_at.is_none()
+                && silent_at.is_none()
+                && (!activity_open || self.max_log_bytes.is_none())
+            {
+                return;
+            }
+            tokio::select! {
+                changed = self.activity.changed(), if activity_open => {
+                    match changed {
+                        Ok(()) => {
+                            last_activity = tokio::time::Instant::now();
+                            if self
+                                .max_log_bytes
+                                .is_some_and(|max| self.bytes.load(Ordering::Relaxed) > max)
+                            {
+                                self.kill(KillReason::LogLimit);
+                                return;
+                            }
+                        }
+                        Err(_) => {
+                            // Every reader exited (EOF). If the tree is
+                            // already settled there is nothing left to
+                            // bound; otherwise keep the deadline arms
+                            // live with the silence clock frozen at the
+                            // last real output — a program that closed
+                            // its own stdout/stderr and keeps running
+                            // is still bounded.
+                            if self.tree.is_settled() {
+                                return;
+                            }
+                            activity_open = false;
+                        }
+                    }
+                }
+                () = sleep_until_opt(timeout_at), if timeout_at.is_some() => {
+                    self.kill(KillReason::Timeout);
+                    return;
+                }
+                // A second implementation site for the silence kill: the
+                // deadline is reset by the raw captured bytes, upstream
+                // of classification and delivery.
+                // r[impl builder.silence.timeout-kill+3]
+                () = sleep_until_opt(silent_at), if silent_at.is_some() => {
+                    self.kill(KillReason::Silent);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Kill the tree and record why — but only when the kill actually
+    /// acted on a live tree.
+    ///
+    /// Kill-under-the-reason-mutex: the kill happens while the reason
+    /// slot is locked, so the exit it causes cannot be mapped before
+    /// the slot is consistent; and a deadline that fires after the
+    /// tree was reaped is a no-op that records nothing, so a late
+    /// timer can never misattribute a natural exit as a limit kill.
+    // r[impl builder.exec.limits-isolated]
+    fn kill(&self, reason: KillReason) {
+        let mut slot = self.reason.lock().unwrap_or_else(|e| e.into_inner());
+        if self.tree.kill_tree() && slot.is_none() {
+            *slot = Some(reason);
+        }
+    }
 }
 
 /// Run one sandboxed execution to completion.
@@ -305,27 +446,48 @@ pub async fn execute(
     // ---- Readers -----------------------------------------------------------
     let status_task = tokio::task::spawn_blocking(move || read_status_pipe(status_r));
     let (chunk_tx, mut chunk_rx) = mpsc::channel::<LogChunk>(LOG_CHUNK_CHANNEL_CAPACITY);
-    spawn_log_readers(parent_capture, &chunk_tx);
+    let (meter, meter_bytes, activity_rx) = ActivityMeter::new();
+    spawn_log_readers(parent_capture, &chunk_tx, &meter);
     // The select loop below must observe channel closure when the
-    // readers finish, so the parent's own sender clone goes away now.
+    // readers finish, so the parent's own sender clone goes away now —
+    // and the watchdog must observe the activity watch closing, so the
+    // parent's meter handle goes with it.
     drop(chunk_tx);
+    drop(meter);
+
+    // ---- Limit enforcement -------------------------------------------------
+    // Isolated in its own task: the watchdog owns the kill handle, its
+    // deadline timers, and the receive-only activity watch — and
+    // nothing else. It performs no channel sends, so no consumer
+    // behavior (a stalled events receiver, a full chunk channel) can
+    // delay a limit kill.
+    let limit_reason: Arc<std::sync::Mutex<Option<KillReason>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let watchdog = tokio::spawn(
+        LimitWatchdog {
+            tree: Arc::clone(&tree),
+            timeout: request.limits.timeout,
+            max_silent: request.limits.max_silent,
+            max_log_bytes: request.limits.max_log_bytes,
+            started,
+            activity: activity_rx,
+            bytes: meter_bytes,
+            reason: Arc::clone(&limit_reason),
+        }
+        .run(),
+    );
 
     // ---- The supervision loop ----------------------------------------------
     let mut splitter = LineSplitter::default();
     let mut events_open = true;
     let mut started_sent = false;
     let mut status_report: Option<StatusReport> = None;
-    let mut kill_reason: Option<KillReason> = None;
     let mut wait_status: Option<Result<i32, std::io::Error>> = None;
     let mut chunks_done = false;
-    let mut log_bytes: u64 = 0;
-    let mut last_output = Instant::now();
     let mut status_task = status_task;
     let mut wait_task = wait_task;
 
     while wait_status.is_none() {
-        let timeout_at = request.limits.timeout.map(|t| started + t);
-        let silent_at = request.limits.max_silent.map(|t| last_output + t);
         tokio::select! {
             // Status pipe resolution: either the program exec'd or
             // setup failed somewhere.
@@ -346,35 +508,27 @@ pub async fn execute(
                     }
                     StatusReport::SetupFailed(_) | StatusReport::Corrupt => {
                         // The tree is exiting on its own; the kill is a
-                        // no-op safety net. Keep looping until reaped.
+                        // no-op safety net (lifecycle hygiene, not limit
+                        // enforcement). Keep looping until reaped.
                         tree.kill_tree();
                     }
                 }
             }
             // Captured output. Disabled once the readers hit EOF — the
-            // wait/timeout/silence arms below stay live regardless, so
-            // a program that closes its own stdout/stderr and keeps
-            // running is still bounded by the limits.
+            // wait arm below stays live regardless. Limit enforcement
+            // lives in the watchdog, fed at raw-read time, so nothing
+            // in this delivery path can delay a kill.
             chunk = chunk_rx.recv(), if !chunks_done => {
                 match chunk {
                     Some(chunk) => {
-                        last_output = Instant::now();
-                        log_bytes += chunk.bytes.len() as u64;
                         for line in splitter.push(chunk.stream, &chunk.bytes) {
                             if events_open && events.send(line).await.is_err() {
                                 events_open = false;
                             }
                         }
-                        if kill_reason.is_none()
-                            && request.limits.max_log_bytes.is_some_and(|max| log_bytes > max)
-                        {
-                            kill_reason = Some(KillReason::LogLimit);
-                            tree.kill_tree();
-                        }
                     }
-                    // Both readers finished (EOF / EIO). Nothing more to
-                    // enforce on the log side; the reap (and the
-                    // deadlines) finish the loop.
+                    // Both readers finished (EOF / EIO). The reap (and
+                    // the watchdog's deadlines) finish the loop.
                     None => chunks_done = true,
                 }
             }
@@ -382,21 +536,17 @@ pub async fn execute(
             status = &mut wait_task, if wait_status.is_none() => {
                 wait_status = Some(status.unwrap_or_else(|e| Err(std::io::Error::other(e))));
             }
-            // Wall-clock deadline.
-            () = sleep_until_opt(timeout_at), if timeout_at.is_some() && kill_reason.is_none() => {
-                kill_reason = Some(KillReason::Timeout);
-                tree.kill_tree();
-            }
-            // Silence deadline.
-            () = sleep_until_opt(silent_at), if silent_at.is_some() && kill_reason.is_none() => {
-                kill_reason = Some(KillReason::Silent);
-                tree.kill_tree();
-            }
         }
     }
     let stop = SystemTime::now();
     // The tree is reaped (the wait task marked it so); the guard is
     // inert from here on and simply drops when execute() returns.
+
+    // Enforcement is over: stop the watchdog before any drain work so
+    // a deadline cannot fire mid-drain. A kill already in flight
+    // completes (kills are synchronous under the reason mutex) and
+    // no-ops against the reaped tree without recording a reason.
+    watchdog.abort();
 
     // Drain whatever output is still buffered, bounded.
     // One shared budget for the chunk drain AND the partial-line
@@ -406,7 +556,6 @@ pub async fn execute(
     // best-effort by design once the receiver has stopped consuming.
     let _ = tokio::time::timeout(FINAL_DRAIN_TIMEOUT, async {
         while let Some(chunk) = chunk_rx.recv().await {
-            log_bytes += chunk.bytes.len() as u64;
             for line in splitter.push(chunk.stream, &chunk.bytes) {
                 if events_open && events.send(line).await.is_err() {
                     events_open = false;
@@ -481,6 +630,10 @@ pub async fn execute(
         Err(e) => return Err(ExecError::Spawn(e)),
     };
 
+    // Read the watchdog's verdict after the abort: the lock serializes
+    // with a kill in flight, and a reason exists only when the kill
+    // actually acted on the live tree.
+    let kill_reason = *limit_reason.lock().unwrap_or_else(|e| e.into_inner());
     let exit = map_exit(raw_status, kill_reason);
     let outputs = {
         let request = request.clone();
@@ -671,6 +824,12 @@ impl TreeState {
         matches!(*self.lock(), TreePhase::Dead)
     }
 
+    /// Is the tree past the point where a kill could ever act —
+    /// reaped, or never adopted because the caller vanished first?
+    fn is_settled(&self) -> bool {
+        matches!(*self.lock(), TreePhase::Reaped | TreePhase::Dead)
+    }
+
     /// Publish a freshly forked pid. **The only path by which a pid
     /// becomes known to the rest of the executor.**
     ///
@@ -728,7 +887,12 @@ impl TreeState {
     }
 
     /// Kill the adopted process tree, once, and never after it was
-    /// reaped.
+    /// reaped. Returns whether the kill *acted* — the tree was live
+    /// (adopted, not yet killed, not yet reaped) and the signal was
+    /// sent. Callers attributing an exit outcome to their kill (the
+    /// [`LimitWatchdog`]) record their reason only on `true`: a kill
+    /// that no-opped on an already-settled tree must not override the
+    /// natural exit.
     ///
     /// Writes `cgroup.kill` when a cgroup was given (kills every
     /// process in the cgroup, including fork bombs the parent has
@@ -742,7 +906,7 @@ impl TreeState {
     /// `child::setup`), and the sandbox child is pid 1 of the PID
     /// namespace, so the kernel then kills everything else in it.
     // r[impl builder.exec.tree-ownership]
-    fn kill_tree(&self) {
+    fn kill_tree(&self) -> bool {
         let mut phase = self.lock();
         if let TreePhase::Adopted { pid, killed, .. } = &mut *phase
             && !*killed
@@ -753,6 +917,9 @@ impl TreeState {
             // and a kill(2)), and it means mark_reaped can never
             // interleave between the killed=true flip and the signal.
             kill_pid_and_cgroup(self.cgroup.as_deref(), pid);
+            true
+        } else {
+            false
         }
     }
 }
@@ -941,10 +1108,10 @@ fn collect_outputs(request: &ExecutionRequest) -> Vec<OutputReport> {
 }
 
 /// A `sleep_until` that is pending forever when there is no deadline.
-/// Lets the select arms above stay declarative.
-async fn sleep_until_opt(deadline: Option<Instant>) {
+/// Lets the watchdog's select arms stay declarative.
+async fn sleep_until_opt(deadline: Option<tokio::time::Instant>) {
     match deadline {
-        Some(deadline) => tokio::time::sleep_until(deadline.into()).await,
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
         None => std::future::pending().await,
     }
 }
@@ -1108,15 +1275,27 @@ impl CaptureFds {
 /// Spawn one blocking reader per capture fd, feeding raw chunks into
 /// `chunk_tx`. The readers exit on EOF, on EIO (how a pty master
 /// reports that every slave fd is gone), or when the channel closes.
-fn spawn_log_readers(capture: ParentCapture, chunk_tx: &mpsc::Sender<LogChunk>) {
+///
+/// Activity is recorded on the meter at *read* time, before the chunk
+/// enters the channel: the silence clock and the log-volume cap track
+/// what the program wrote even when every downstream consumer is
+/// parked.
+fn spawn_log_readers(
+    capture: ParentCapture,
+    chunk_tx: &mpsc::Sender<LogChunk>,
+    meter: &Arc<ActivityMeter>,
+) {
     for (fd, stream) in capture.0 {
         let tx = chunk_tx.clone();
+        let meter = Arc::clone(meter);
         tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 8192];
             loop {
                 match nix::unistd::read(&fd, &mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
+                        // r[impl builder.exec.limits-isolated]
+                        meter.record(n);
                         let chunk = LogChunk {
                             stream,
                             bytes: buf[..n].to_vec(),
@@ -1534,6 +1713,203 @@ mod tests {
             }
         }
         tree.mark_reaped();
+    }
+
+    // -- LimitWatchdog -------------------------------------------------------
+
+    /// Build a watchdog over `tree` plus the meter that feeds it and
+    /// the reason slot it reports through. Tests drive activity by
+    /// calling `meter.record()` directly — the watchdog cannot tell a
+    /// test body from a blocking capture reader, which is the point:
+    /// enforcement consumes only the raw-read signal.
+    fn watchdog_parts(
+        tree: &Arc<TreeState>,
+        timeout: Option<Duration>,
+        max_silent: Option<Duration>,
+        max_log_bytes: Option<u64>,
+    ) -> (
+        Arc<ActivityMeter>,
+        LimitWatchdog,
+        Arc<std::sync::Mutex<Option<KillReason>>>,
+    ) {
+        let (meter, bytes, activity) = ActivityMeter::new();
+        let reason = Arc::new(std::sync::Mutex::new(None));
+        let watchdog = LimitWatchdog {
+            tree: Arc::clone(tree),
+            timeout,
+            max_silent,
+            max_log_bytes,
+            started: Instant::now(),
+            activity,
+            bytes,
+            reason: Arc::clone(&reason),
+        };
+        (meter, watchdog, reason)
+    }
+
+    fn reason_of(slot: &std::sync::Mutex<Option<KillReason>>) -> Option<KillReason> {
+        *slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The merged_bug_019 executor pin at the unit level: the timeout
+    /// kill fires with ZERO event consumers anywhere — no chunk
+    /// channel, no events receiver, nothing draining. Enforcement
+    /// owns no send path to park on.
+    // r[verify builder.exec.limits-isolated]
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_timeout_kills_with_zero_consumers() {
+        let tree = TreeState::new(None);
+        let _guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper(); // the test reaps below
+
+        let (_meter, watchdog, reason) =
+            watchdog_parts(&tree, Some(Duration::from_secs(10)), None, None);
+        tokio::spawn(watchdog.run())
+            .await
+            .expect("watchdog task panicked");
+
+        assert_eq!(reason_of(&reason), Some(KillReason::Timeout));
+        assert!(
+            matches!(*tree.lock(), TreePhase::Adopted { killed: true, .. }),
+            "the timeout must have killed the tree"
+        );
+        blocking_reap(pid);
+        tree.mark_reaped();
+    }
+
+    /// Activity recorded by the meter resets the silence clock; its
+    /// absence fires the silence kill.
+    // r[verify builder.exec.limits-isolated]
+    // r[verify builder.silence.timeout-kill+3]
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_silence_resets_on_activity() {
+        let tree = TreeState::new(None);
+        let _guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+
+        let (meter, watchdog, reason) =
+            watchdog_parts(&tree, None, Some(Duration::from_secs(5)), None);
+        let task = tokio::spawn(watchdog.run());
+
+        // Feed activity at +3s: the silence deadline moves to +8s.
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        meter.record(1);
+        // At +7s (4s after the last activity) the tree must be alive.
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        assert_eq!(reason_of(&reason), None, "activity must reset the clock");
+        assert!(matches!(
+            *tree.lock(),
+            TreePhase::Adopted { killed: false, .. }
+        ));
+        // No further activity: the kill fires at +8s.
+        task.await.expect("watchdog task panicked");
+        assert_eq!(reason_of(&reason), Some(KillReason::Silent));
+        assert!(matches!(
+            *tree.lock(),
+            TreePhase::Adopted { killed: true, .. }
+        ));
+        blocking_reap(pid);
+        tree.mark_reaped();
+    }
+
+    /// The byte cap is checked against the meter's raw-read total.
+    // r[verify builder.exec.limits-isolated]
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_log_cap_kills_at_threshold() {
+        let tree = TreeState::new(None);
+        let _guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+
+        let (meter, watchdog, reason) = watchdog_parts(&tree, None, None, Some(100));
+        let task = tokio::spawn(watchdog.run());
+
+        meter.record(60);
+        tokio::task::yield_now().await;
+        assert_eq!(reason_of(&reason), None, "under the cap: no kill");
+
+        meter.record(60); // total 120 > 100
+        task.await.expect("watchdog task panicked");
+        assert_eq!(reason_of(&reason), Some(KillReason::LogLimit));
+        blocking_reap(pid);
+        tree.mark_reaped();
+    }
+
+    /// THE misattribution pin: a deadline that fires after the tree
+    /// was reaped records no reason — the natural exit status wins
+    /// structurally, not by luck of timer ordering.
+    // r[verify builder.exec.limits-isolated]
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_records_reason_only_when_kill_acted() {
+        let tree = TreeState::new(None);
+        let (mut child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+        // The build finishes (and is reaped) before the deadline.
+        child.kill().expect("kill sleeper");
+        blocking_reap(pid);
+        tree.mark_reaped();
+
+        let (_meter, watchdog, reason) =
+            watchdog_parts(&tree, Some(Duration::from_secs(1)), None, None);
+        tokio::spawn(watchdog.run())
+            .await
+            .expect("watchdog task panicked");
+
+        assert_eq!(
+            reason_of(&reason),
+            None,
+            "a kill that never acted must not claim the exit"
+        );
+        assert!(matches!(*tree.lock(), TreePhase::Reaped));
+    }
+
+    /// Readers gone + tree settled = nothing left to enforce: the
+    /// watchdog returns instead of idling on dead timers.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_activity_closed_with_settled_tree_exits() {
+        let tree = TreeState::new(None);
+        let (mut child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper();
+        child.kill().expect("kill sleeper");
+        blocking_reap(pid);
+        tree.mark_reaped();
+
+        // Only the log cap is configured: the activity arm is the one
+        // live arm, and closing it against a settled tree must end the
+        // task.
+        let (meter, watchdog, reason) = watchdog_parts(&tree, None, None, Some(1_000_000));
+        let task = tokio::spawn(watchdog.run());
+        drop(meter);
+        task.await.expect("watchdog task panicked");
+        assert_eq!(reason_of(&reason), None);
+    }
+
+    /// Totality: with no limits configured there is nothing to watch.
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_no_limits_no_activity_returns() {
+        let tree = TreeState::new(None);
+        let (_meter, watchdog, reason) = watchdog_parts(&tree, None, None, None);
+        tokio::spawn(watchdog.run())
+            .await
+            .expect("watchdog task panicked");
+        assert_eq!(reason_of(&reason), None);
+        assert!(
+            matches!(*tree.lock(), TreePhase::Armed),
+            "no kill may be issued when no limit exists"
+        );
     }
 
     // -- LineSplitter --------------------------------------------------------
