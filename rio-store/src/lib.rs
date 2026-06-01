@@ -57,6 +57,11 @@ pub mod logs;
 // Manifest::deserialize. The fuzz crate is a separate workspace root.
 #[cfg(feature = "server")]
 pub mod manifest;
+// Substitution-replacement campaign (design §2.2/§5): the store-side
+// materialization-job executor. Dormant in Phase A — nothing spawns it
+// unless `materialization.enabled = true` (default false).
+#[cfg(feature = "server")]
+pub mod materialize;
 #[cfg(feature = "server")]
 pub(crate) mod metadata;
 #[cfg(feature = "server")]
