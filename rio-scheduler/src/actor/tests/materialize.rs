@@ -3121,3 +3121,319 @@ async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
     );
     Ok(())
 }
+
+// ── T-4.2 (Phase B): settlement totality — the D16-class limbo is
+//    structurally impossible flag-on ─────────────────────────────────────
+
+// r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.job]
+/// T-4.2: every non-terminal materialization-job state has an armed
+/// action, and that action FIRES. The D16 limbo (flag-off: a
+/// marked+tried+present node refused by every decision cell, hanging
+/// Active forever) is unconstructible flag-on because the job state
+/// machine has no no-action state — no decision cell can refuse to act
+/// on a job (§3.3 settlement totality).
+///
+/// | Job state                 | Armed action proven                     |
+/// |---------------------------|-----------------------------------------|
+/// | pending, unclaimed        | listed by ListMaterializationJobs       |
+/// | pending, node Queued      | still listed AND claimable (PD-6)       |
+/// | claimed, executor alive   | report consumption resolves the job     |
+/// | claimed, executor dead    | establishment sweep charges + re-arms   |
+/// | parked (budget exhausted) | durable park_until; refused while       |
+/// |                           | parked; re-claimable after expiry       |
+/// | zero live interest        | cancellation closer fires charge-free   |
+///
+/// Plus the D16-shape probe: the exact D16 inputs (topdown_pruned mark
+/// + substitute_tried + output present in the store) exist on a node —
+/// flag-on its job completes normally, the T-1.7 clear-mirror clears
+/// the mark, and the limbo never forms. Protecting structure: (a) the
+/// job is always armed (this table), and (b) the consumption clear
+/// removes the mark when the job resolves, so mark-keyed refusals
+/// cannot outlive the job.
+///
+/// Pin, not red (plan T-4.2 / review RFB-5): the protecting mechanisms
+/// (listing, Queued claims, establishment, park, cancellation closer,
+/// the clear-mirror) all exist by this task — first-try pass recorded
+/// as a pin under commit rule 1's pure-addition clause.
+#[tokio::test]
+async fn flag_on_every_job_state_has_armed_action() -> TestResult {
+    // Tight budget/backoff so the park arm is provable in-test:
+    // max_attempts=1 → the first WORKER-reported infra failure that
+    // lands on top of any prior charge parks the job; backoff base 1 s
+    // (exp doubling) keeps the parked window short but observable.
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 1;
+        });
+    let _tasks = (store_task, actor_task);
+
+    // ════ State 1: pending, unclaimed → LISTED (the poll IS the arm) ════
+    let out1 = test_store_path("tot-pending-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out1.clone());
+    let mut n1 = make_node("tot-pending");
+    n1.expected_output_paths = vec![out1.clone()];
+    let b1 = Uuid::new_v4();
+    merge_dag(&handle, b1, vec![n1], vec![], false).await?;
+    barrier(&handle).await;
+    let listed = list_materialization_jobs(&handle, 16).await;
+    assert!(
+        listed.iter().any(|j| j.drv_hash == "tot-pending"),
+        "state 1 (pending unclaimed): the job must be listed — the store's \
+         poll is the armed action; got {listed:?}"
+    );
+
+    // ════ State 2: pending, node QUEUED (dep-blocked) → listed + claimable ════
+    // The 3-node chain shape (root → mid → leaf) where only MID is
+    // substitutable: the root is not substitutable so the topdown prune
+    // cannot fire (a substitutable ROOT would be pruned and seed Ready,
+    // not Queued); mid's job is created by the merge new_sub lane and
+    // mid sits Queued behind the unproduced leaf.
+    let mid_out = test_store_path("tot-queued-mid-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(mid_out.clone());
+    let root2 = make_node("tot-queued-root");
+    let mut mid2 = make_node("tot-queued-mid");
+    mid2.expected_output_paths = vec![mid_out.clone()];
+    let leaf2 = make_node("tot-queued-leaf");
+    let b2 = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        b2,
+        vec![root2, mid2, leaf2],
+        vec![
+            make_test_edge("tot-queued-root", "tot-queued-mid"),
+            make_test_edge("tot-queued-mid", "tot-queued-leaf"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, "tot-queued-mid").await.status,
+        DerivationStatus::Queued,
+        "precondition: mid is dep-blocked (Queued) behind the unproduced leaf"
+    );
+    let listed = list_materialization_jobs(&handle, 16).await;
+    assert!(
+        listed.iter().any(|j| j.drv_hash == "tot-queued-mid"),
+        "state 2 (pending, node Queued): the job must still be listed \
+         (materialization does not wait for deps); got {listed:?}"
+    );
+    let assignment = match claim_materialization(&handle, "tot-queued-mid", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!(
+            "state 2: the Queued node's pending job must be CLAIMABLE \
+             (PD-6: the dep-racing claim is legal), got {other:?}"
+        ),
+    };
+
+    // ════ State 3: claimed, executor alive → report consumption resolves ════
+    let exec3: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&mid_out, b"tot-queued-mid-content");
+    report_materialization_outcome(
+        &handle,
+        exec3,
+        "tot-queued-mid",
+        mat_success_outcome(vec![mid_out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state 3 report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let st: String = sqlx::query_scalar(
+        "SELECT mj.state FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'tot-queued-mid'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        st, "resolved_success",
+        "state 3 (claimed, executor alive): the report consumption resolves the job"
+    );
+
+    // ════ State 4: claimed, executor DEAD → establishment charges + re-arms ════
+    let assignment = match claim_materialization(&handle, "tot-pending", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("state 4 claim must deliver, got {other:?}"),
+    };
+    let exec4: Uuid = assignment.exec_id.parse()?;
+    // The replica dies (never reports). Age the open attempt past every
+    // deadline+slack, then sweep.
+    sqlx::query(
+        "UPDATE assignments SET assigned_at = now() - interval '100 days' WHERE exec_id = $1",
+    )
+    .bind(exec4)
+    .execute(&db.pool)
+    .await?;
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (job_state, infra_rows): (String, i64) = sqlx::query_as(
+        "SELECT mj.state, \
+                (SELECT count(*) FROM drv_attempts a \
+                  WHERE a.derivation_id = mj.derivation_id \
+                    AND a.outcome_class = 'materialization_infra') \
+           FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'tot-pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        job_state, "pending",
+        "state 4 (claimed, executor dead): the establishment sweep re-arms the job"
+    );
+    assert_eq!(
+        infra_rows, 1,
+        "state 4: the establishment charged exactly one materialization_infra row"
+    );
+
+    // ════ State 5: parked (budget exhausted) → durable park_until; refused
+    //      while parked; re-claimable after the backoff expires ════
+    // Re-claim the re-armed job and report a WORKER infra failure: the
+    // history now holds 2 infra rows (1 establishment + 1 worker) >=
+    // max_attempts(1) → the job parks.
+    let assignment = match claim_materialization(&handle, "tot-pending", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("state 5 re-claim must deliver, got {other:?}"),
+    };
+    let exec5: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec5,
+        "tot-pending",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state 5 infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let park_until: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM mj.park_until)::float8 \
+           FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'tot-pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        park_until.is_some(),
+        "state 5 (parked): the budget exhaustion writes a durable park_until row"
+    );
+    // While parked: the claim is refused (NotYetReady — backoff unexpired).
+    let refused = claim_materialization(&handle, "tot-pending", "store-test-0").await;
+    assert!(
+        matches!(refused, Ok(PullOutcome::NotYetReady { .. })),
+        "state 5: a parked job's claim is refused while the backoff runs, got {refused:?}"
+    );
+    // The park is a WAIT, not a terminal state: after the backoff
+    // expires (1 s base, exp 2 → 2 s here) the job is claimable again.
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    let reclaimed = claim_materialization(&handle, "tot-pending", "store-test-0").await;
+    assert!(
+        matches!(reclaimed, Ok(PullOutcome::Deliver(_))),
+        "state 5: the park backoff expiry re-arms the claim (the park is a \
+         visible wait, never a strand), got {reclaimed:?}"
+    );
+
+    // ════ State 6: zero live interest → cancellation closer fires ════
+    let out6 = test_store_path("tot-zero-interest-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out6.clone());
+    let mut n6 = make_node("tot-zero-interest");
+    n6.expected_output_paths = vec![out6.clone()];
+    let b6 = Uuid::new_v4();
+    merge_dag(&handle, b6, vec![n6], vec![], false).await?;
+    barrier(&handle).await;
+    cancel_build(&handle, b6).await?;
+    barrier(&handle).await;
+    tick(&handle).await?; // the flag-gated housekeeping backstop
+    barrier(&handle).await;
+    let (job_state, charge_rows): (String, i64) = sqlx::query_as(
+        "SELECT mj.state, \
+                (SELECT count(*) FROM drv_attempts a \
+                  WHERE a.derivation_id = mj.derivation_id) \
+           FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'tot-zero-interest'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        job_state, "cancelled",
+        "state 6 (zero live interest): the cancellation closer fires"
+    );
+    assert_eq!(charge_rows, 0, "state 6: the cancellation is charge-free");
+
+    // ════ The D16-shape probe: marked + tried + present → no limbo ════
+    let dout16 = test_store_path("tot-d16-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(dout16.clone());
+    let mut n16 = make_node("tot-d16");
+    n16.expected_output_paths = vec![dout16.clone()];
+    let b16 = Uuid::new_v4();
+    merge_dag(&handle, b16, vec![n16], vec![], false).await?;
+    barrier(&handle).await;
+    // Force the exact D16 inputs: the mark, the spent one-shot, and the
+    // output present in the store.
+    assert!(handle.debug_set_topdown_pruned("tot-d16", true).await?);
+    assert!(handle.debug_set_substitute_tried("tot-d16", true).await?);
+    store.seed_with_content(&dout16, b"tot-d16-present-content");
+    // Flag-off these inputs form the D16 limbo (every walk decision cell
+    // refuses: marked → no from-source; tried → no re-walk; present →
+    // nothing to fetch). Flag-on the JOB is still armed: claim → Success
+    // → resolves; the clear-mirror removes the mark; the node completes.
+    let assignment = match claim_materialization(&handle, "tot-d16", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("D16 probe: the job must still be claimable, got {other:?}"),
+    };
+    let exec16: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec16,
+        "tot-d16",
+        mat_success_outcome(vec![dout16.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("D16 probe report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "tot-d16").await;
+    assert_eq!(
+        drv.status,
+        DerivationStatus::Completed,
+        "D16 probe: the node completes — the limbo never forms flag-on"
+    );
+    assert!(
+        !drv.topdown_pruned,
+        "D16 probe: the T-1.7 clear-mirror cleared the mark on resolution \
+         (mark-keyed refusals cannot outlive the job)"
+    );
+    let st16 = query_status(&handle, b16).await?;
+    assert_eq!(
+        st16.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "D16 probe: the build succeeds; no decision cell refused to act"
+    );
+    Ok(())
+}
