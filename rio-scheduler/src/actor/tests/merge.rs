@@ -3527,13 +3527,15 @@ async fn test_topdown_pruned_holed_survivor_fails_fast_at_dispatch_not_assigned_
 // r[verify sched.merge.substitute-topdown+10]
 /// Guard companion: a closure hole alone — no `topdown_pruned` mark —
 /// must not defer or fail-fast anything at dispatch time. Same staging
-/// as the stamp test above (BC keeps R + D, B2's cancel reaps the
-/// un-produced E out from under R) but no prune ever fires for R: its
-/// wanted output is neither present nor substitutable, so the probes
-/// leave it Ready and the generic dispatch hands it to a worker from
-/// source — the correct outcome for an unmarked node whose closure no
-/// prune ever dropped. Pins that the must-substitute judgment requires
-/// the mark, not just broken closure evidence.
+/// as the stamp test above (B2 — the build that declares E — CREATES R
+/// with its full child set so the creation-scoped edge gate accepts
+/// R→E; BC then joins R→D to keep R and D alive across B2's reap) but
+/// no prune ever fires for R: its wanted output is neither present nor
+/// substitutable, so the probes leave it Ready and the generic dispatch
+/// hands it to a worker from source — the correct outcome for an
+/// unmarked node whose closure no prune ever dropped. Pins that the
+/// must-substitute judgment requires the mark, not just broken closure
+/// evidence.
 #[tokio::test]
 async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> TestResult {
     let (_db, store, handle, _tasks) = setup_with_mock_store().await?;
@@ -3556,30 +3558,14 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
         n
     };
 
-    // BC: full merge R → D; D cache-hits to Completed, R stays unbuilt
-    // and unmarked (its output is neither present nor substitutable).
+    // B2: full merge app → R → {D, E}. B2 CREATES R, so R's full child
+    // set — including the never-built E — is declared by R's creating
+    // submission (under sched.merge.edge-creation-scoped a later join
+    // could not extend it). D's output is seeded upstream so it
+    // cache-hits to Completed at merge; R's output is neither present
+    // nor substitutable, so no prune fires and R carries no mark. E
+    // (unbuilt) and app are B2's sole interest.
     store.seed_with_content(&d_out, b"d-out");
-    let bc = Uuid::new_v4();
-    let _evc = merge_dag(
-        &handle,
-        bc,
-        vec![mk_r(), mk_d()],
-        vec![make_test_edge("tdnm-r", "tdnm-d")],
-        false,
-    )
-    .await?;
-    barrier(&handle).await;
-    assert!(
-        matches!(
-            expect_drv(&handle, "tdnm-d").await.status,
-            DerivationStatus::Completed | DerivationStatus::Skipped
-        ),
-        "fixture premise: D is produced at BC's merge"
-    );
-
-    // B2: full merge app → R → {D, E}; E (unbuilt) and app are B2's
-    // sole interest. Cancel + cleanup reaps E un-produced out from
-    // under R (closure hole) while the produced D survives via BC.
     let mut app = make_node("tdnm-app");
     app.expected_output_paths = vec![test_store_path("tdnm-app-out")];
     let b2 = Uuid::new_v4();
@@ -3596,6 +3582,31 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     )
     .await?;
     barrier(&handle).await;
+    assert!(
+        matches!(
+            expect_drv(&handle, "tdnm-d").await.status,
+            DerivationStatus::Completed | DerivationStatus::Skipped
+        ),
+        "fixture premise: D is produced at B2's merge"
+    );
+
+    // BC: later full merge of R → D only — joins the resident R and D
+    // (duplicate edge is a no-op under the creation-scoped gate) and
+    // keeps them alive across B2's reap below.
+    let bc = Uuid::new_v4();
+    let _evc = merge_dag(
+        &handle,
+        bc,
+        vec![mk_r(), mk_d()],
+        vec![make_test_edge("tdnm-r", "tdnm-d")],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Cancel B2 and reap its sole-interest nodes: E — never produced —
+    // is reaped out from under R (closure hole) while the produced D
+    // survives via BC.
     let (ctx, crx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::CancelBuild {
@@ -3617,6 +3628,14 @@ async fn test_unmarked_closure_holed_node_still_dispatches_from_source() -> Test
     assert!(
         handle.debug_query_derivation("tdnm-d").await?.is_some(),
         "D must survive the reap (BC still holds interest in it)"
+    );
+    // Fixture premise the rest of this test depends on: the reap really
+    // did stamp the closure-hole breadcrumb on R. Without R having been
+    // CREATED by B2 (full child set accepted), E would never have been
+    // R's child and every assertion below would pass vacuously.
+    assert!(
+        expect_drv(&handle, "tdnm-r").await.closure_hole,
+        "fixture premise: B2's reap must stamp the closure hole on R"
     );
     assert!(
         !expect_drv(&handle, "tdnm-r").await.topdown_pruned,
