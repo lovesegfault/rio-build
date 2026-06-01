@@ -264,8 +264,31 @@ pub fn input_addressed_output_paths<'c>(
     // Hash every input drv exactly the way the input frames of
     // `hash_derivation_modulo` do: mask=false — only the top-level
     // subject of the path computation is masked.
+    //
+    // Cache-first: a pre-seeded modulo hash for an input replaces the
+    // need to resolve and walk that input at all (mirroring
+    // `hash_modulo_walk`'s own cache-first input expansion). This is what
+    // lets a caller compute IA output paths for a derivation whose
+    // inputs it cannot resolve (no inline bytes, no store access) but
+    // whose modulo hashes it knows from elsewhere — e.g. the scheduler
+    // seeding the cache from sibling nodes' ingress-validated
+    // `ca_modular_hash` values.
+    //
+    // Soundness (squat resistance): the derived output path is
+    // `make_output(name, sha256(masked ATerm with input hashes
+    // substituted), drv_name)`. A caller that seeds a WRONG hash for an
+    // input does not gain the ability to produce someone else's path —
+    // it moves the derived path into a namespace no honest resolver
+    // computes (finding a seed that collides an honest path requires a
+    // SHA-256 second preimage). Callers remain responsible for seeding
+    // only hashes they have verified (the scheduler only seeds
+    // ingress-validated values).
     let mut input_rewrites: BTreeMap<String, String> = BTreeMap::new();
     for input_drv_path in drv.input_drvs().keys() {
+        if let Some(cached) = hash_cache.get(input_drv_path) {
+            input_rewrites.insert(input_drv_path.clone(), hex::encode(cached));
+            continue;
+        }
         let input_drv = resolve_input(input_drv_path)
             .ok_or_else(|| DerivationError::InputNotFound(input_drv_path.clone()))?;
         let input_hash =
@@ -1007,6 +1030,62 @@ mod hash_derivation_modulo_tests {
 
         assert_eq!(cold["out"], warm["out"]);
         Ok(())
+    }
+
+    /// Cache-first input resolution: pre-seeding the hash cache with an
+    /// input's modulo hash lets `input_addressed_output_paths` derive the
+    /// SAME paths without being able to resolve that input at all. This
+    /// is the enabler for computing IA paths from inline content whose
+    /// inputs live only as sibling ca_modular_hash declarations.
+    #[test]
+    fn seeded_cache_replaces_input_resolution() -> anyhow::Result<()> {
+        let n = 4;
+        let (root, map) = linear_ia_chain(n);
+
+        // Ground truth: full resolution.
+        let resolve_all = |p: &str| map.get(p);
+        let mut full_cache = HashMap::new();
+        let full = input_addressed_output_paths(&map[&root], &root, &resolve_all, &mut full_cache)?;
+
+        // Cache-only: the root's direct input hash is seeded from the
+        // full run's cache; the resolver can no longer see ANY input.
+        let direct_input = map[&root]
+            .input_drvs()
+            .keys()
+            .next()
+            .expect("chain root has one input")
+            .clone();
+        let seeded_hash = *full_cache
+            .get(&direct_input)
+            .expect("full run cached the direct input's modulo hash");
+        let mut seeded_cache = HashMap::new();
+        seeded_cache.insert(direct_input, seeded_hash);
+        let resolve_none = |_: &str| -> Option<&Derivation> { None };
+        let seeded =
+            input_addressed_output_paths(&map[&root], &root, &resolve_none, &mut seeded_cache)?;
+
+        assert_eq!(
+            full["out"], seeded["out"],
+            "seeded-cache derivation must produce the same paths as full resolution"
+        );
+        Ok(())
+    }
+
+    /// Fail-closed unchanged: with no seed and no resolver, an
+    /// unresolvable input is still an InputNotFound error — the cache
+    /// fast path must not weaken the error behaviour.
+    #[test]
+    fn unseeded_unresolvable_input_still_fails() {
+        let n = 3;
+        let (root, map) = linear_ia_chain(n);
+        let resolve_none = |_: &str| -> Option<&Derivation> { None };
+        let mut cache = HashMap::new();
+        let err = input_addressed_output_paths(&map[&root], &root, &resolve_none, &mut cache)
+            .unwrap_err();
+        assert!(
+            matches!(err, DerivationError::InputNotFound(_)),
+            "unseeded unresolvable input fails closed, got: {err:?}"
+        );
     }
 
     /// A 600-node chain whose deepest node references the root is still
