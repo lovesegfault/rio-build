@@ -34,7 +34,7 @@
 //!
 //! Spec: `store.materialize.executor`; design §2.2 (store as pull
 //! client), §5 (pin-at-ingest).
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 
 pub mod client;
 pub mod executor;
@@ -70,7 +70,7 @@ const POLL_JITTER: rio_common::backoff::Jitter = rio_common::backoff::Jitter::Pr
 /// Returns the number of claim loops spawned (0 flag-off; also 0 when
 /// the scheduler address is malformed — logged, never fatal: a broken
 /// materialization executor must not take down the store data plane).
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 pub fn spawn_materialization_executor(
     cfg: crate::config::MaterializationConfig,
     pool: sqlx::PgPool,
@@ -230,7 +230,7 @@ async fn claim_loop(
 /// or dotted hostnames) are sanitized: lowercased, invalid bytes
 /// replaced with `-`, trimmed to 63 chars, stripped of edge hyphens.
 /// Empty/unset falls back to `"rio-store-dev"`.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 pub fn executor_instance() -> String {
     let raw = std::env::var("HOSTNAME").unwrap_or_default();
     sanitize_dns1123_label(&raw)
@@ -261,7 +261,7 @@ fn sanitize_dns1123_label(raw: &str) -> String {
 mod tests {
     use super::*;
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// THE store-side dormancy proof (Phase A charter): with the flag
     /// off — the deployed default, `MaterializationConfig::default()` —
     /// the spawner spawns ZERO claim loops and returns without touching
@@ -321,7 +321,7 @@ mod tests {
     /// falls back to the dev constant. (The Wave-4 instance-attestation
     /// obligation, Phase-A form: identity from the pod's own
     /// environment, alphabet-validated on both sides.)
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[test]
     fn executor_instance_is_always_a_dns1123_label() {
         let is_label = |s: &str| {

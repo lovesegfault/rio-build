@@ -5,7 +5,7 @@
 //! runtime's `PullTransport` precedent — copied shape, not shared code)
 //! so the claim/report state machines are unit-testable against a
 //! scripted mock with no wire and no scheduler.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 
 use std::time::Duration;
 
@@ -85,7 +85,7 @@ pub struct ClaimedJob {
 /// between list and claim — never an error and never retried within
 /// the pass (the next poll re-lists). `Gone` likewise. Per-RPC errors
 /// are logged and skipped; a failed listing yields an empty pass.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 pub async fn poll_and_claim<T: MaterializeTransport>(
     transport: &mut T,
     executor_instance: &str,
@@ -164,7 +164,7 @@ pub async fn poll_and_claim<T: MaterializeTransport>(
 /// permanent rejections (auth / invalid-argument / unimplemented) give
 /// up after one call — retrying cannot succeed and the establishment
 /// sweep remains the scheduler-side backstop for the open attempt.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 pub async fn report_until_acked<T: MaterializeTransport>(
     transport: &mut T,
     exec_id: &str,
@@ -219,6 +219,15 @@ fn is_fatal_rejection(code: tonic::Code) -> bool {
 // Production transport
 // ---------------------------------------------------------------------------
 
+/// The concrete client type the transport drives (lazy channel + the
+/// service-token interceptor).
+type ExecutorClient = rio_proto::ExecutorServiceClient<
+    tonic::service::interceptor::InterceptedService<
+        tonic::transport::Channel,
+        rio_auth::hmac::ServiceTokenInterceptor,
+    >,
+>;
+
 /// The store-service-authenticated `ExecutorServiceClient`: a lazy
 /// channel to the scheduler with
 /// [`rio_auth::hmac::ServiceTokenInterceptor`] minting a fresh
@@ -234,12 +243,13 @@ fn is_fatal_rejection(code: tonic::Code) -> bool {
 /// transport.
 #[derive(Clone)]
 pub struct SchedulerTransport {
-    client: rio_proto::ExecutorServiceClient<
-        tonic::service::interceptor::InterceptedService<
-            tonic::transport::Channel,
-            rio_auth::hmac::ServiceTokenInterceptor,
-        >,
-    >,
+    client: ExecutorClient,
+    /// Constructor inputs, retained so [`Self::abandon_connection`] can
+    /// rebuild the channel when the current connection is pinned to a
+    /// peer that cannot serve (finding 18: the standby replica after a
+    /// scheduler Deployment rollout).
+    scheduler_addr: String,
+    signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
 }
 
 impl SchedulerTransport {
@@ -255,6 +265,20 @@ impl SchedulerTransport {
         scheduler_addr: &str,
         signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
     ) -> anyhow::Result<Self> {
+        let client = Self::build_client(scheduler_addr, signer.clone())?;
+        Ok(Self {
+            client,
+            scheduler_addr: scheduler_addr.to_owned(),
+            signer,
+        })
+    }
+
+    /// The channel/interceptor/client stack shared by construction and
+    /// [`Self::abandon_connection`].
+    fn build_client(
+        scheduler_addr: &str,
+        signer: Option<std::sync::Arc<rio_auth::hmac::HmacSigner>>,
+    ) -> anyhow::Result<ExecutorClient> {
         let endpoint = tonic::transport::Channel::from_shared(format!("http://{scheduler_addr}"))?
             .connect_timeout(Duration::from_secs(10))
             .initial_stream_window_size(Some(rio_common::grpc::H2_INITIAL_STREAM_WINDOW))
@@ -266,10 +290,59 @@ impl SchedulerTransport {
         let interceptor =
             rio_auth::hmac::ServiceTokenInterceptor::new(signer, STORE_SERVICE_CALLER);
         let max = rio_common::grpc::max_message_size();
-        let client = rio_proto::ExecutorServiceClient::with_interceptor(channel, interceptor)
-            .max_decoding_message_size(max)
-            .max_encoding_message_size(max);
-        Ok(Self { client })
+        Ok(
+            rio_proto::ExecutorServiceClient::with_interceptor(channel, interceptor)
+                .max_decoding_message_size(max)
+                .max_encoding_message_size(max),
+        )
+    }
+
+    /// Drop the current channel and lazily dial a fresh one.
+    ///
+    /// Why this exists (finding 18 — the scheduler-rollout claim
+    /// stall): the executor dials the scheduler's ClusterIP Service;
+    /// kube-proxy pins each TCP connection to ONE backend pod; gRPC
+    /// multiplexes every RPC onto that connection; and h2 keepalive
+    /// keeps it healthy indefinitely. Only the LEADER replica serves —
+    /// the standby answers `UNAVAILABLE "not leader (standby replica)"`
+    /// on every RPC over a perfectly healthy connection. So a
+    /// connection pinned to the standby (a 50/50 outcome after a
+    /// Deployment rollout replaces both pods) never breaks and never
+    /// recovers on its own: the lazy channel only re-dials on
+    /// connection-level failure, which never comes. Abandoning the
+    /// channel is the only way out; the fresh connection re-rolls the
+    /// kube-proxy backend choice, so repeated polls converge on the
+    /// leader (geometrically, ~2 passes expected with 2 replicas).
+    ///
+    /// Failure to rebuild keeps the old client (the addr parsed at
+    /// construction, so this is unreachable in practice).
+    fn abandon_connection(&mut self) {
+        match Self::build_client(&self.scheduler_addr, self.signer.clone()) {
+            Ok(client) => self.client = client,
+            Err(e) => warn!(
+                scheduler_addr = %self.scheduler_addr, error = %e,
+                "scheduler channel rebuild failed; keeping the existing connection"
+            ),
+        }
+    }
+
+    /// Inspect one RPC outcome: an `UNAVAILABLE` answer abandons the
+    /// connection (see [`Self::abandon_connection`]). Every other
+    /// outcome — success or a different rejection — keeps it: those
+    /// answers prove the connected peer is the serving leader (or that
+    /// the request itself is at fault), so connection churn would only
+    /// cost throughput.
+    fn note_rpc_outcome<T>(&mut self, result: &Result<T, tonic::Status>) {
+        if let Err(status) = result
+            && status.code() == tonic::Code::Unavailable
+        {
+            debug!(
+                msg = status.message(),
+                "scheduler answered UNAVAILABLE; abandoning the pinned connection \
+                 (rollout/standby recovery)"
+            );
+            self.abandon_connection();
+        }
     }
 }
 
@@ -278,34 +351,45 @@ impl MaterializeTransport for SchedulerTransport {
         &mut self,
         req: ListMaterializationJobsRequest,
     ) -> Result<ListMaterializationJobsResponse, tonic::Status> {
-        self.client
+        let result = self
+            .client
             .list_materialization_jobs(req)
             .await
-            .map(|r| r.into_inner())
+            .map(|r| r.into_inner());
+        self.note_rpc_outcome(&result);
+        result
     }
 
     async fn pull(
         &mut self,
         req: PullAssignmentRequest,
     ) -> Result<PullAssignmentResponse, tonic::Status> {
-        self.client
+        let result = self
+            .client
             .pull_assignment(req)
             .await
-            .map(|r| r.into_inner())
+            .map(|r| r.into_inner());
+        self.note_rpc_outcome(&result);
+        result
     }
 
     async fn report(&mut self, req: ReportOutcomeRequest) -> Result<(), tonic::Status> {
-        self.client.report_outcome(req).await.map(|_| ())
+        let result = self.client.report_outcome(req).await.map(|_| ());
+        self.note_rpc_outcome(&result);
+        result
     }
 
     async fn report_progress(
         &mut self,
         req: ReportMaterializationProgressRequest,
     ) -> Result<(), tonic::Status> {
-        self.client
+        let result = self
+            .client
             .report_materialization_progress(req)
             .await
-            .map(|_| ())
+            .map(|_| ());
+        self.note_rpc_outcome(&result);
+        result
     }
 }
 
@@ -434,7 +518,7 @@ mod tests {
     /// (a) The happy path: 2 listed jobs, both claims deliver → 2
     /// ClaimedJobs carrying the descriptors' identity joined with the
     /// assignments' exec ids.
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[tokio::test]
     async fn poll_and_claim_claims_listed_jobs() {
         let d1 = descriptor(1);
@@ -464,7 +548,7 @@ mod tests {
     /// (b) NotYetReady on a claim is race tolerance, not an error: the
     /// pass returns the claims that DID deliver and never retries the
     /// lost one (the next poll re-lists).
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[tokio::test]
     async fn poll_and_claim_tolerates_not_yet_ready() {
         let mut t = MockTransport::new(
@@ -489,7 +573,7 @@ mod tests {
     }
 
     /// (c) The slot bound: 5 listed, 2 slots → exactly 2 pulls.
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[tokio::test]
     async fn poll_and_claim_respects_slots() {
         let mut t = MockTransport::new(
@@ -514,7 +598,7 @@ mod tests {
     /// (d) The BC-1 wire obligation: every claim carries
     /// kind=MATERIALIZATION + the configured executor_instance, no
     /// executor token, and the listed job's drv hash as the intent.
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[tokio::test]
     async fn claim_carries_kind_and_instance() {
         let d1 = descriptor(1);
@@ -551,7 +635,7 @@ mod tests {
     /// (e) The report loop: two transient failures then an ack → 3
     /// calls, returns true. A permanent rejection gives up after one
     /// call. Budget exhaustion gives up.
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     #[tokio::test(start_paused = true)]
     async fn report_until_acked_retries() {
         let outcome = MaterializationOutcome {
@@ -604,6 +688,239 @@ mod tests {
             t.report_calls >= 3,
             "the budget window is spent retrying, saw {}",
             t.report_calls
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Scheduler-rollout survivability (finding 18: the transition claim
+    // stall) — the production SchedulerTransport against real tonic
+    // servers behind a kube-proxy stand-in.
+    // -----------------------------------------------------------------------
+
+    use std::net::SocketAddr;
+    use std::sync::{Arc, Mutex};
+
+    use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status};
+
+    /// A scheduler STANDBY replica: every RPC answers
+    /// `UNAVAILABLE "not leader (standby replica)"` on a perfectly
+    /// healthy connection — byte-identical to what the scheduler's
+    /// `ensure_leader` guard produces.
+    struct StandbyExecutorService;
+
+    #[tonic::async_trait]
+    impl rio_proto::ExecutorService for StandbyExecutorService {
+        async fn pull_assignment(
+            &self,
+            _: Request<PullAssignmentRequest>,
+        ) -> Result<Response<PullAssignmentResponse>, Status> {
+            Err(Status::unavailable("not leader (standby replica)"))
+        }
+        async fn report_outcome(
+            &self,
+            _: Request<ReportOutcomeRequest>,
+        ) -> Result<Response<rio_proto::types::ReportOutcomeResponse>, Status> {
+            Err(Status::unavailable("not leader (standby replica)"))
+        }
+        async fn list_materialization_jobs(
+            &self,
+            _: Request<ListMaterializationJobsRequest>,
+        ) -> Result<Response<ListMaterializationJobsResponse>, Status> {
+            Err(Status::unavailable("not leader (standby replica)"))
+        }
+        async fn report_materialization_progress(
+            &self,
+            _: Request<ReportMaterializationProgressRequest>,
+        ) -> Result<Response<rio_proto::types::ReportMaterializationProgressResponse>, Status>
+        {
+            Err(Status::unavailable("not leader (standby replica)"))
+        }
+    }
+
+    /// The scheduler LEADER: lists one claimable job and delivers its
+    /// claim.
+    struct LeaderExecutorService;
+
+    #[tonic::async_trait]
+    impl rio_proto::ExecutorService for LeaderExecutorService {
+        async fn pull_assignment(
+            &self,
+            _: Request<PullAssignmentRequest>,
+        ) -> Result<Response<PullAssignmentResponse>, Status> {
+            Ok(Response::new(deliver(
+                "exec-rollout-1",
+                "/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-rollout.drv",
+            )))
+        }
+        async fn report_outcome(
+            &self,
+            _: Request<ReportOutcomeRequest>,
+        ) -> Result<Response<rio_proto::types::ReportOutcomeResponse>, Status> {
+            Ok(Response::new(rio_proto::types::ReportOutcomeResponse {}))
+        }
+        async fn list_materialization_jobs(
+            &self,
+            _: Request<ListMaterializationJobsRequest>,
+        ) -> Result<Response<ListMaterializationJobsResponse>, Status> {
+            let mut d = descriptor(1);
+            d.drv_hash = "rollout-drv".to_string();
+            Ok(Response::new(listing(vec![d])))
+        }
+        async fn report_materialization_progress(
+            &self,
+            _: Request<ReportMaterializationProgressRequest>,
+        ) -> Result<Response<rio_proto::types::ReportMaterializationProgressResponse>, Status>
+        {
+            Ok(Response::new(
+                rio_proto::types::ReportMaterializationProgressResponse {},
+            ))
+        }
+    }
+
+    /// Spawn an in-process ExecutorService server on a random port.
+    async fn spawn_executor_service<S>(svc: S) -> SocketAddr
+    where
+        S: rio_proto::ExecutorService,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(
+            Server::builder()
+                .add_service(rio_proto::ExecutorServiceServer::new(svc))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        addr
+    }
+
+    /// A kube-proxy stand-in: every NEW TCP connection accepted on the
+    /// proxy port is forwarded to whatever backend is CURRENT at accept
+    /// time; established flows stay pinned to the backend they started
+    /// with (exactly the per-connection DNAT semantics of a k8s
+    /// ClusterIP Service).
+    async fn spawn_switchable_proxy(initial: SocketAddr) -> (SocketAddr, Arc<Mutex<SocketAddr>>) {
+        let backend = Arc::new(Mutex::new(initial));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let backend_for_task = Arc::clone(&backend);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut inbound, _)) = listener.accept().await else {
+                    break;
+                };
+                let target = *backend_for_task.lock().unwrap();
+                tokio::spawn(async move {
+                    let Ok(mut outbound) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+            }
+        });
+        (addr, backend)
+    }
+
+    // r[verify store.materialize.executor+2]
+    /// FINDING 18 (the transition claim stall; red-first): the executor
+    /// transport must abandon a connection pinned to a standby scheduler
+    /// replica and reach the leader within a bounded number of poll
+    /// passes — scheduler-Deployment-rollout survivability.
+    ///
+    /// The k8s mechanics reproduced here: the executor dials the
+    /// scheduler ClusterIP Service; kube-proxy pins each TCP connection
+    /// to one backend pod; gRPC multiplexes every RPC onto that single
+    /// connection; h2 keepalive keeps it healthy indefinitely. After a
+    /// scheduler Deployment rollout replaces both pods, the executor's
+    /// reconnect lands on EITHER new pod — landing on the standby means
+    /// every subsequent RPC answers UNAVAILABLE "not leader (standby
+    /// replica)" on a connection that never breaks, so the executor
+    /// polls a dead end forever while claimable jobs sit pending (the
+    /// vm-materialization-transition flip-on stall: jobs created, never
+    /// claimed within 300 s).
+    #[tokio::test]
+    async fn poll_abandons_connection_pinned_to_standby_replica() {
+        let standby_addr = spawn_executor_service(StandbyExecutorService).await;
+        let leader_addr = spawn_executor_service(LeaderExecutorService).await;
+        // The "kube-proxy": initially fronts the standby.
+        let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
+
+        let mut transport =
+            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None).unwrap();
+
+        // The executor's connection gets pinned to the standby: the
+        // poll pass comes back empty (UNAVAILABLE answers).
+        let claimed = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+        assert!(
+            claimed.is_empty(),
+            "the standby answers UNAVAILABLE — nothing claimable on this pass"
+        );
+
+        // The rollout completes: the Service now fronts the leader. The
+        // pinned connection still goes to the (still healthy) standby —
+        // only a NEW connection can reach the leader.
+        *backend.lock().unwrap() = leader_addr;
+
+        // The executor must reach the leader within a bounded number of
+        // poll passes. Without reconnect-on-UNAVAILABLE the transport
+        // reuses the pinned connection forever and every pass stays
+        // empty.
+        let mut claimed = Vec::new();
+        for _ in 0..5 {
+            claimed = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+            if !claimed.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            !claimed.is_empty(),
+            "the executor transport must abandon a connection pinned to a \
+             standby replica and reach the leader within a bounded number of \
+             poll passes (scheduler-Deployment-rollout survivability); every \
+             pass kept polling the standby"
+        );
+        assert_eq!(claimed[0].drv_hash, "rollout-drv");
+        assert_eq!(claimed[0].exec_id, "exec-rollout-1");
+    }
+
+    /// The report path has the same pinning hazard: an outcome report
+    /// retried against a standby-pinned connection burns its whole
+    /// budget without ever landing. With reconnect-on-UNAVAILABLE the
+    /// retry envelope converges on the leader and the report acks.
+    // r[verify store.materialize.executor+2]
+    #[tokio::test]
+    async fn report_abandons_connection_pinned_to_standby_replica() {
+        let standby_addr = spawn_executor_service(StandbyExecutorService).await;
+        let leader_addr = spawn_executor_service(LeaderExecutorService).await;
+        let (proxy_addr, backend) = spawn_switchable_proxy(standby_addr).await;
+
+        let mut transport =
+            SchedulerTransport::connect_lazy(&proxy_addr.to_string(), None).unwrap();
+
+        // Pin the connection to the standby with one failing pass.
+        let _ = poll_and_claim(&mut transport, "store-replica-0", 1).await;
+        // The rollout completes mid-execution.
+        *backend.lock().unwrap() = leader_addr;
+
+        let outcome = MaterializationOutcome {
+            outcome: Some(rio_proto::types::materialization_outcome::Outcome::Success(
+                rio_proto::types::materialization_outcome::Success {
+                    ingested_paths: vec!["/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-one".into()],
+                    verified_paths: vec![],
+                },
+            )),
+        };
+        let acked = report_until_acked(
+            &mut transport,
+            "exec-rollout-1",
+            outcome,
+            Duration::from_secs(20),
+        )
+        .await;
+        assert!(
+            acked,
+            "an outcome report must converge on the leader after a rollout \
+             instead of burning its budget against the pinned standby"
         );
     }
 }

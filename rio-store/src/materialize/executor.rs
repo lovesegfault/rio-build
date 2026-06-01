@@ -8,7 +8,7 @@
 //! the admission gate). The store substitutes ONE path per
 //! `try_substitute` call (no closure walk — that is its documented
 //! contract), so this module owns closure completeness.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 
 use std::collections::{HashSet, VecDeque};
 use std::time::Duration;
@@ -63,7 +63,7 @@ pub struct ExecutorContext {
 /// 4. **Final verification pass**: the wanted set is RE-READ after the
 ///    walk; growth re-enters the walk (the loop), so the reported
 ///    coverage is against execution-end live wanted, not a snapshot.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 // r[impl sched.materialize.pinning]
 pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> MaterializationOutcome {
     execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
@@ -79,7 +79,7 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
 /// the whole closure. Display-only and droppable: the callback must be
 /// cheap and non-blocking (it runs on the walk); the caller forwards it
 /// to `ReportMaterializationProgress` fire-and-forget.
-// r[impl store.materialize.executor]
+// r[impl store.materialize.executor+2]
 pub async fn execute_job_with_progress(
     ctx: &ExecutorContext,
     claimed: &ClaimedJob,
@@ -719,7 +719,7 @@ mod tests {
 
     // ── The battery ───────────────────────────────────────────────────
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     // r[verify sched.materialize.pinning]
     /// (1) The walk: BFS over narinfo references from the wanted seed
     /// path; every closure member try_substitute'd in-process; every
@@ -805,7 +805,7 @@ mod tests {
         }
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (2) The wanted set is read at execution time and RE-READ at the
     /// final verification pass — never snapshotted at creation. The
     /// job is created while only `out` is wanted; by execution time a
@@ -881,7 +881,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (3) Tenant resolution (AS-4): job tenant NULL + no live
     /// interested build with a tenant → InfraFailure{no-tenant-context}.
     /// Never Unobtainable, never silent success.
@@ -919,7 +919,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (4) Stale recorded tenant (PDQ-8): the creating build is
     /// TERMINAL (its recorded tenant no longer carries live interest)
     /// while a live interested build with a DIFFERENT tenant remains →
@@ -987,7 +987,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (5) A confirmed-404 wanted path (every upstream definitively
     /// answers "not present") → Unobtainable{missing_paths=[it]},
     /// with whatever WAS obtained in verified_paths.
@@ -1035,7 +1035,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (6) Upstream 5xx → InfraFailure (B3's executor half): nothing is
     /// confirmed, so the verdict must be infrastructure trouble — never
     /// Unobtainable (which would route from-source), never Success.
@@ -1075,7 +1075,7 @@ mod tests {
         );
     }
 
-    // r[verify store.materialize.executor]
+    // r[verify store.materialize.executor+2]
     /// (7) T-1.2 / BC-4: the executor reports cumulative, monotone byte
     /// progress through the callback while walking a multi-path closure.
     /// Every call satisfies done ≤ expected; done never decreases; the

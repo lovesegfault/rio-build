@@ -1027,7 +1027,7 @@ content-addressed output mappings independently of narinfo signatures.
   indicates under-sized fetcher pods (I-207/I-208).
 ]
 
-#r("store.materialize.executor")[
+#r("store.materialize.executor+2")[
   When the store-side materialization executor is enabled, each store replica
   MUST execute materialization jobs as a pull-protocol client: discover jobs by
   polling the scheduler, claim exactly one open attempt per job through
@@ -1040,7 +1040,11 @@ content-addressed output mappings independently of narinfo signatures.
   creating-build tenant is honored only while a live interested build carries
   it) before fetching: a job whose tenant cannot be resolved or has no
   configured upstreams MUST be reported as InfraFailure, never as Unobtainable
-  and never silently completed.
+  and never silently completed. Job discovery and outcome reporting MUST
+  survive scheduler replica replacement: a transport connection whose peer
+  answers the not-leader rejection MUST be abandoned and re-dialed rather than
+  retried indefinitely, so that polls and reports converge on the serving
+  leader after a scheduler Deployment rollout or failover.
 ]
 The store-as-pull-client decision is design §2.2 (adjudication OQ3): the work of
 materialization is upstream-fetch-and-ingest, which is already store-internal;
@@ -1050,7 +1054,17 @@ builders --- where a replacement pod of the same intent converges on the same op
 attempt --- two store replicas must NOT both execute, so materialization attempts
 are keyed per replica and the scheduler's open-attempt arm is the one-winner
 arbiter. The tenant rule is review finding AS-4 (the 2026-05-23 incident class:
-tenant-less probes degrading to definitive miss).
+tenant-less probes degrading to definitive miss). The rollout-survivability
+clause is Phase B finding 18 (the flag-transition claim stall): the executor
+dials the scheduler ClusterIP Service, kube-proxy pins each TCP connection to
+one backend pod, gRPC multiplexes every RPC onto that connection, and only the
+leader serves --- so a connection that lands on the standby answers UNAVAILABLE
+forever over a healthy h2 session, and without the abandon-and-redial rule the
+executor strands every pending job after a scheduler rollout. The gateway and
+builders avoid the same hazard with the health-probing balanced channel over
+the headless Service; the executor's poll loop is off the hot path, so the
+documented ClusterIP-plus-retry posture (templates/scheduler.yaml's Service
+comment) is the chosen mechanism here.
 
 = Two-Phase Garbage Collection
 
