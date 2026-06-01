@@ -767,6 +767,93 @@ async fn executor_token_report_with_materialization_outcome_rejected() -> anyhow
     Ok(())
 }
 
+// r[verify sched.materialize.job]
+/// The third dormant materialization RPC (the Phase-A ack-and-drop
+/// progress stub) carries the same identity posture as its siblings —
+/// dormant ≠ unprotected. With the HMAC posture configured:
+/// credential-less → Unauthenticated (closed); an executor token (the
+/// per-intent builder/fetcher credential) → PermissionDenied; the
+/// kind-attested store-service credential → acknowledged (the Phase-A
+/// ack-and-drop, unchanged after authentication). Full dev mode stays
+/// open, like every other ExecutorService unary.
+#[tokio::test]
+async fn report_materialization_progress_requires_store_credential() -> anyhow::Result<()> {
+    use rio_auth::hmac::{ExecutorClaims, HmacKey};
+    use rio_proto::ExecutorService;
+    let (_db, mut grpc, _handle, _actor_task) = setup_grpc().await;
+    // The production posture: BOTH key families configured, distinct keys.
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    grpc.hmac_key = Some(std::sync::Arc::clone(&executor_key));
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+
+    let progress_req = || rio_proto::types::ReportMaterializationProgressRequest {
+        exec_id: uuid::Uuid::now_v7().to_string(),
+        bytes_done: 1024,
+        bytes_expected: 4096,
+        upstream_uri: "https://cache.example.org/nar/0000000000000000".into(),
+    };
+
+    // 1. Credential-less in the configured posture → Unauthenticated
+    //    (closed), same as the sibling materialization unaries.
+    let err = grpc
+        .report_materialization_progress(Request::new(progress_req()))
+        .await
+        .expect_err("a credential-less progress report must be rejected when HMAC is configured");
+    assert_eq!(
+        err.code(),
+        tonic::Code::Unauthenticated,
+        "got {err:?} instead of Unauthenticated"
+    );
+
+    // 2. An executor token (the per-intent builder credential) never
+    //    authorizes a materialization progress report.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let executor_token = executor_key.sign(&ExecutorClaims {
+        intent_id: "drv-progress-authz".into(),
+        kind: rio_proto::types::ExecutorKind::Builder as i32,
+        expiry_unix: now + 600,
+    });
+    let mut req = Request::new(progress_req());
+    req.metadata_mut()
+        .insert(rio_proto::EXECUTOR_TOKEN_HEADER, executor_token.parse()?);
+    let err = grpc
+        .report_materialization_progress(req)
+        .await
+        .expect_err("an executor token must not authorize a materialization progress report");
+    assert_eq!(
+        err.code(),
+        tonic::Code::PermissionDenied,
+        "got {err:?} instead of PermissionDenied"
+    );
+
+    // 3. The store-service credential → acknowledged (the Phase-A
+    //    ack-and-drop, unchanged after authentication).
+    let store_token = store_service_token(&service_key, "rio-store");
+    let mut req = Request::new(progress_req());
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    grpc.report_materialization_progress(req)
+        .await
+        .expect("the store-service credential authorizes the progress report");
+
+    // 4. Full dev mode (neither key family configured) stays open —
+    //    the Phase-A ack-and-drop needs no credential, like every
+    //    other ExecutorService unary in dev mode.
+    let (_db2, grpc2, _handle2, _actor_task2) = setup_grpc().await;
+    grpc2
+        .report_materialization_progress(Request::new(progress_req()))
+        .await
+        .expect("dev-mode progress reports stay open (ack-and-drop)");
+    Ok(())
+}
+
 // ── T-6.2: the wire-level flag-on lifecycle (review finding dormancy-5;
 //    PD-14 as amended) ────────────────────────────────────────────────────
 

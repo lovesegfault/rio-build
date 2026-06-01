@@ -71,6 +71,11 @@ use super::SchedulerGrpc;
 //                                       reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //   limit                             → numeric; clamped to 256 actor-side → n/a
 // ReportMaterializationProgress RPC (Phase A: validate + acknowledge-and-drop, per the wire contract):
+//   AUTHZ: the same store-service credential gate as the other materialization
+//   operations (an executor token on the metadata carrier → reject RPC
+//   PermissionDenied; no credential under a configured key family → reject RPC
+//   Unauthenticated; only full dev mode is open). The proto carries no body
+//   token field, so x-rio-service-token metadata is the only carrier.
 //   exec_id                           → UUID-parsed for validation, then dropped → reject RPC if not a
 //                                       valid UUID
 //   upstream_uri / bytes_*            → never read in Phase A (droppable display payload) → dropped
@@ -712,12 +717,38 @@ impl ExecutorService for SchedulerGrpc {
     /// attempt can exist while the flags are off, and progress is
     /// droppable by contract even when one does). Phase B wires the
     /// relay to build events (BC-4).
+    ///
+    /// Identity (security review — dormant ≠ unprotected): progress
+    /// reports are fleet-level STORE operations like the listing, not
+    /// per-intent executor operations. An executor token (the
+    /// per-intent builder/fetcher credential) is rejected
+    /// `PermissionDenied`; the kind-attested store-service credential
+    /// (`ServiceClaims{caller="rio-store"}`) is what authorizes it.
+    /// Full dev mode (neither key family configured) stays open and
+    /// answers the Phase-A ack-and-drop.
     #[instrument(skip(self, request), fields(rpc = "ReportMaterializationProgress"))]
     async fn report_materialization_progress(
         &self,
         request: Request<rio_proto::types::ReportMaterializationProgressRequest>,
     ) -> Result<Response<rio_proto::types::ReportMaterializationProgressResponse>, Status> {
         rio_proto::interceptor::link_parent(&request);
+        // r[impl sec.executor.identity-token+2]
+        // A token that verifies as an EXECUTOR credential never
+        // authorizes materialization operations: reject closed (the
+        // Wave-3 rejection, kept verbatim). The proto carries no body
+        // token field, so the metadata header is the only carrier.
+        if self.verified_executor_claims(&request, "").is_some() {
+            return Err(Status::permission_denied(
+                "executor tokens do not authorize materialization progress reports \
+                 (a store-service credential is required)",
+            ));
+        }
+        // The store-service credential gate: x-rio-service-token
+        // metadata (the ServiceTokenInterceptor carrier), verified as
+        // ServiceClaims by the service-HMAC key with caller="rio-store".
+        // Full dev mode passes through to the Phase-A ack-and-drop.
+        // r[impl sched.materialize.job]
+        self.require_store_service(&request, "")?;
         let req = request.into_inner();
         // Validate-then-drop: a malformed exec_id is a caller bug worth
         // surfacing even though the payload itself is droppable.

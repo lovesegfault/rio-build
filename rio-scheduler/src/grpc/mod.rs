@@ -71,9 +71,10 @@ pub struct SchedulerGrpc {
     /// (`ServiceClaims { caller: "rio-store" }`) on the
     /// materialization-only ExecutorService operations
     /// (ListMaterializationJobs, kind=MATERIALIZATION PullAssignment,
-    /// materialization ReportOutcome). `None` + `hmac_key: None` = full
-    /// dev mode (open); `None` + `hmac_key: Some` = closed for
-    /// materialization operations (no acceptable credential exists).
+    /// materialization ReportOutcome, ReportMaterializationProgress).
+    /// `None` + `hmac_key: None` = full dev mode (open); `None` +
+    /// `hmac_key: Some` = closed for materialization operations (no
+    /// acceptable credential exists).
     pub(super) service_verifier: Option<Arc<HmacKey>>,
 }
 
