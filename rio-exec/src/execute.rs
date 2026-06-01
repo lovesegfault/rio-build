@@ -14,7 +14,8 @@
 //! ```text
 //! parent (tokio)
 //!   ├─ go pipe ──────────► intermediate: blocks until the parent has
-//!   │                      attached it to the cgroup
+//!   │                      attached it to the cgroup; EOF = the
+//!   │                      parent died first (abort, do not build)
 //!   ├─ status pipe ◄────── intermediate + sandbox child: 8 bytes on
 //!   │                      setup failure; EOF with 0 bytes when the
 //!   │                      program exec'd (the write end is
@@ -22,11 +23,18 @@
 //!   └─ pty master / pipes ◄ the program's stdout/stderr
 //! ```
 //!
+//! Each forked process starts by closing every inherited fd outside its
+//! keep set ([`ChildFds`]): the intermediate immediately after fork —
+//! which is what makes go-pipe EOF a genuine parent-death signal, since
+//! it then holds no copy of the write end it reads — and again down to
+//! stdio after forking the sandbox child, so the status pipe and the
+//! capture fds EOF on the sandbox child's progress alone.
+//!
 //! The *intermediate* exists because `unshare(CLONE_NEWPID)` only
 //! affects subsequently-forked children: it unshares, forks the sandbox
-//! child (which becomes pid 1 of the new PID namespace), closes its own
-//! copies of every pipe so EOF tracks the sandbox child alone, waits,
-//! and forwards the exit status (signals as `128 + signo`).
+//! child (which becomes pid 1 of the new PID namespace), sheds every
+//! remaining fd so EOF tracks the sandbox child alone, waits, and
+//! forwards the exit status (signals as `128 + signo`).
 //!
 //! # Lifecycle and cleanup
 //!
@@ -461,6 +469,17 @@ fn intermediate_main(
     argv: &[*const libc::c_char],
     envp: &[*const libc::c_char],
 ) -> ! {
+    // Shed every inherited fd outside the keep set before anything
+    // else: the parent's ends of every pipe (including the go pipe's
+    // write end), the pty master, the async runtime's internals. This
+    // is what makes go-pipe EOF a real parent-death signal — the read
+    // below would otherwise wait on a write end this very process
+    // holds — and it caps what the sandbox child can inherit at the
+    // keep set.
+    // r[impl builder.exec.fd-keep-set]
+    if let Err(err) = child::shed_inherited_fds(fds) {
+        child::report_failure_and_exit(fds.status_pipe_w, &err);
+    }
     if let Err(err) = child::enter_namespaces(plan, fds) {
         child::report_failure_and_exit(fds.status_pipe_w, &err);
     }
@@ -481,19 +500,19 @@ fn intermediate_main(
             child::report_failure_and_exit(fds.status_pipe_w, &err);
         }
         grandchild => {
-            // Close this process's copies of every parent-facing fd so
+            // This process needs no fds beyond stdio any more: it only
+            // waits for the sandbox child and forwards its exit status.
+            // One full best-effort sweep (instead of hand-enumerated
+            // closes that would silently miss any fd added later) so
             // EOF on the parent side tracks the sandbox child alone:
             // the status pipe must EOF the moment the child execs (its
             // copy is close-on-exec), and the pty/pipes must EOF the
             // moment the child exits, not when this process does.
-            // SAFETY: closing fds this process owns and never touches
-            // again.
+            // r[impl builder.exec.fd-keep-set]
+            // SAFETY: close_range over a numeric range; this process
+            // touches no fd >= 3 after this point.
             unsafe {
-                libc::close(fds.status_pipe_w);
-                libc::close(fds.stdout_fd);
-                if fds.stderr_fd != fds.stdout_fd {
-                    libc::close(fds.stderr_fd);
-                }
+                libc::syscall(libc::SYS_close_range, 3u32, libc::c_uint::MAX, 0u32);
             }
             let mut status: libc::c_int = 0;
             loop {

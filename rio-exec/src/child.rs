@@ -44,9 +44,26 @@ use crate::plan::{PlannedBind, SandboxPlan};
 use crate::request::Personality;
 use crate::seccomp;
 
-/// File descriptors handed to the forked processes. All are raw fds
-/// owned by the parent's wrappers; the child only `dup2`s, reads, and
-/// closes them.
+/// File descriptors handed to the forked processes — and, just as
+/// importantly, the complete **keep set**: these four fds (plus stdio
+/// 0–2) are the only file descriptors a forked executor process may
+/// retain. [`shed_inherited_fds`] closes everything else as the
+/// intermediate's first act, which is what makes the executor's
+/// fd-based EOF protocols trustworthy:
+///
+/// * go-pipe EOF means "the parent died" only because the intermediate
+///   no longer holds an inherited copy of the pipe's write end;
+/// * status-pipe EOF means "the program exec'd" only because every
+///   surviving copy of the write end is close-on-exec.
+///
+/// All are raw fds owned by the parent's wrappers; the child only
+/// `dup2`s, reads, and closes them.
+///
+/// **The go pipe's write end must never become a field here.** The
+/// keep set is what the go-pipe *reader* retains; keeping the write
+/// end too would mean the reader waits on an EOF that can never
+/// arrive, silently re-breaking the parent-death protocol this type
+/// exists to guarantee.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ChildFds {
     /// Write end of the setup-status pipe. `O_CLOEXEC`; survives until
@@ -82,6 +99,11 @@ pub(crate) struct ChildFds {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum SetupPhase {
+    /// `close_range(2)` sweep of every inherited fd outside the keep
+    /// set, run as the intermediate's first statement. Declared first
+    /// because it executes first; the wire discriminant is append-only
+    /// (28) so existing decoders are unaffected.
+    FdSweep = 28,
     /// Reading the go byte from the parent.
     GoPipe = 0,
     /// `unshare(2)` of the namespace set.
@@ -150,8 +172,11 @@ pub enum SetupPhase {
 
 impl SetupPhase {
     /// Every variant, for the serialization round-trip test. Keep in
-    /// sync with `from_u8`.
+    /// sync with `from_u8`. Ordered by execution order (which is why
+    /// [`SetupPhase::FdSweep`] leads despite its append-only wire
+    /// discriminant).
     pub const ALL: &'static [SetupPhase] = &[
+        SetupPhase::FdSweep,
         SetupPhase::GoPipe,
         SetupPhase::Unshare,
         SetupPhase::Setsid,
@@ -192,6 +217,7 @@ impl SetupPhase {
     /// parent. The child never formats strings.
     pub fn describe(self) -> &'static str {
         match self {
+            SetupPhase::FdSweep => "shedding inherited file descriptors",
             SetupPhase::GoPipe => "waiting for the start signal",
             SetupPhase::Unshare => "creating namespaces",
             SetupPhase::Setsid => "creating a session",
@@ -314,26 +340,95 @@ const PERSONALITY_QUERY: libc::c_ulong = 0xffff_ffff;
 // The intermediate's half.
 // ---------------------------------------------------------------------------
 
-/// The intermediate process's setup: wait for the parent's go signal,
-/// then create every namespace.
+/// Close every fd in `[first, last]` (really close, not mark
+/// close-on-exec) with one `close_range(2)` call.
 ///
-/// Run by the first forked process. After this returns `Ok`, the
-/// intermediate forks the sandbox child (which lands inside the new
-/// PID namespace as pid 1) and waits for it.
+/// Async-signal-safe: a single syscall, no allocation.
+fn close_fd_range(first: libc::c_uint, last: libc::c_uint) -> Result<(), Errno> {
+    // SAFETY: close_range(2) over a numeric range has no memory
+    // preconditions.
+    let rc = unsafe { libc::syscall(libc::SYS_close_range, first, last, 0u32) };
+    if rc != 0 {
+        return Err(Errno::last());
+    }
+    Ok(())
+}
+
+/// Close every inherited file descriptor outside the keep set.
 ///
-/// # Safety
+/// Run as the **first statement** of the intermediate process — before
+/// its first blocking read. The keep set is exactly the four
+/// [`ChildFds`] fds plus stdio (0–2); everything else the fork
+/// duplicated — the parent's ends of every pipe (including the go
+/// pipe's write end), the pty master, the async runtime's internals —
+/// is closed via `close_range(2)` over the gaps between the (sorted)
+/// kept fds.
 ///
-/// Must only be called between `fork` and `exec`/`_exit`, and only
-/// with fds that stay open for the duration of the call.
-pub(crate) fn enter_namespaces(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
-    // Block until the parent has written the child into the cgroup.
-    // EOF (0 bytes) means the parent died or gave up before releasing
-    // us; treat it the same as a read error so we never run a build
-    // outside its cgroup.
+/// This sweep is what makes the executor's fd-based EOF protocols
+/// valid (see [`ChildFds`]): no forked process may wait on a pipe end
+/// it itself holds a copy of, and a future fd added to the parent
+/// cannot silently leak into the sandbox tree.
+///
+/// # Safety contract
+///
+/// Async-signal-safe: stack-only bookkeeping (at most 4 fds, sorted in
+/// place) plus `close_range(2)` syscalls. Must only be called between
+/// `fork` and `exec`/`_exit`.
+// r[impl builder.exec.fd-keep-set]
+pub(crate) fn shed_inherited_fds(keep: &ChildFds) -> Result<(), SetupError> {
+    let mut kept: [i64; 4] = [
+        i64::from(keep.status_pipe_w),
+        i64::from(keep.go_pipe_r),
+        i64::from(keep.stdout_fd),
+        i64::from(keep.stderr_fd),
+    ];
+    kept.sort_unstable();
+
+    // Close the gaps between kept fds, starting at 3 (stdio stays).
+    let mut next: i64 = 3;
+    for &fd in &kept {
+        if fd < next {
+            // Stdio-range or duplicate keep fd: nothing to close below it.
+            continue;
+        }
+        if fd > next {
+            close_fd_range(next as libc::c_uint, (fd - 1) as libc::c_uint)
+                .map_err(|e| SetupError::new(SetupPhase::FdSweep, e))?;
+        }
+        next = fd + 1;
+    }
+    if next <= i64::from(libc::c_uint::MAX) {
+        close_fd_range(next as libc::c_uint, libc::c_uint::MAX)
+            .map_err(|e| SetupError::new(SetupPhase::FdSweep, e))?;
+    }
+    Ok(())
+}
+
+/// Block until the parent writes the go byte — or report that the
+/// parent died first.
+///
+/// EOF (0 bytes) means every copy of the go pipe's write end is gone:
+/// the parent died or gave up before releasing this process, and the
+/// build must not run (it was never attached to its cgroup). That EOF
+/// can only arrive because [`shed_inherited_fds`] already closed this
+/// process's own inherited copy of the write end — before the sweep
+/// existed, this branch was structurally dead code (the reader held
+/// the very write end it was waiting on) and a crashed parent left the
+/// intermediate parked here forever.
+///
+/// On success the go-pipe read end is closed (it has served its
+/// purpose).
+///
+/// # Safety contract
+///
+/// Must only be called between `fork` and `exec`/`_exit`, after
+/// [`shed_inherited_fds`].
+// r[impl builder.exec.fd-keep-set]
+pub(crate) fn await_go_signal(fds: &ChildFds) -> Result<(), SetupError> {
     let mut go = [0u8; 1];
     loop {
-        // SAFETY: reading into a stack buffer from an fd the parent
-        // keeps open until it writes the go byte.
+        // SAFETY: reading into a stack buffer from an fd this process
+        // owns.
         let n = unsafe { libc::read(fds.go_pipe_r, go.as_mut_ptr().cast(), 1) };
         match n {
             1 => break,
@@ -344,6 +439,23 @@ pub(crate) fn enter_namespaces(plan: &SandboxPlan, fds: &ChildFds) -> Result<(),
     }
     // SAFETY: closing an fd this process owns.
     unsafe { libc::close(fds.go_pipe_r) };
+    Ok(())
+}
+
+/// The intermediate process's setup: wait for the parent's go signal,
+/// then create every namespace.
+///
+/// Run by the first forked process, after [`shed_inherited_fds`].
+/// After this returns `Ok`, the intermediate forks the sandbox child
+/// (which lands inside the new PID namespace as pid 1) and waits for
+/// it.
+///
+/// # Safety
+///
+/// Must only be called between `fork` and `exec`/`_exit`, and only
+/// with fds that stay open for the duration of the call.
+pub(crate) fn enter_namespaces(plan: &SandboxPlan, fds: &ChildFds) -> Result<(), SetupError> {
+    await_go_signal(fds)?;
 
     // SAFETY: unshare(2) with namespace flags has no memory
     // preconditions. CLONE_NEWPID affects only future children — the
@@ -841,7 +953,221 @@ pub(crate) fn exit_immediately(status: i32) -> ! {
 
 #[cfg(test)]
 mod tests {
+    use std::os::fd::AsRawFd as _;
+    use std::time::{Duration, Instant};
+
     use super::*;
+
+    // -- fd shedding (fork-based, unprivileged) ------------------------------
+
+    /// Wait for `pid` with a deadline, SIGKILLing it on timeout. Returns
+    /// the exit code. The deadline is generous (these children do a few
+    /// syscalls and exit); hitting it means the child hung, which is
+    /// itself the regression the deadline exists to catch.
+    fn wait_with_deadline(pid: libc::pid_t, deadline: Duration) -> i32 {
+        let start = Instant::now();
+        loop {
+            let mut status: libc::c_int = 0;
+            // SAFETY: waitpid into a stack buffer for a direct child.
+            let rc = unsafe { libc::waitpid(pid, &raw mut status, libc::WNOHANG) };
+            match rc {
+                0 => {
+                    if start.elapsed() > deadline {
+                        // SAFETY: SIGKILL to a child this test forked and
+                        // has not reaped.
+                        unsafe {
+                            libc::kill(pid, libc::SIGKILL);
+                            libc::waitpid(pid, &raw mut status, 0);
+                        }
+                        panic!("forked test child hung past {deadline:?} (the regression)");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                rc if rc == pid => {
+                    assert!(
+                        libc::WIFEXITED(status),
+                        "child terminated abnormally: raw status {status}"
+                    );
+                    return libc::WEXITSTATUS(status);
+                }
+                _ => panic!("waitpid failed: {}", std::io::Error::last_os_error()),
+            }
+        }
+    }
+
+    /// Is `fd` open in this process? (`fcntl(F_GETFD)` succeeds.)
+    fn fd_is_open(fd: RawFd) -> bool {
+        // SAFETY: fcntl F_GETFD has no memory preconditions.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    }
+
+    /// A non-CLOEXEC pipe pair for fd-inheritance tests.
+    fn plain_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        nix::unistd::pipe().expect("pipe")
+    }
+
+    /// The keep-set sweep closes decoys and parent-side ends but leaves
+    /// the keep set and stdio open.
+    // r[verify builder.exec.fd-keep-set]
+    #[test]
+    fn shed_inherited_fds_closes_everything_outside_the_keep_set() {
+        let (decoy_r, decoy_w) = plain_pipe();
+        let (status_r, status_w) = plain_pipe();
+        let (go_r, go_w) = plain_pipe();
+        let (out_r, out_w) = plain_pipe();
+        let (err_r, err_w) = plain_pipe();
+        let fds = ChildFds {
+            status_pipe_w: status_w.as_raw_fd(),
+            go_pipe_r: go_r.as_raw_fd(),
+            stdout_fd: out_w.as_raw_fd(),
+            stderr_fd: err_w.as_raw_fd(),
+        };
+        let decoys = [decoy_r.as_raw_fd(), decoy_w.as_raw_fd()];
+        let parent_side = [
+            status_r.as_raw_fd(),
+            go_w.as_raw_fd(),
+            out_r.as_raw_fd(),
+            err_r.as_raw_fd(),
+        ];
+
+        // SAFETY: the child branch only calls async-signal-safe code
+        // (the function under test, fcntl, _exit).
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                // Child: sweep, then verify with exit codes (no panics —
+                // this is a forked child of a possibly multi-threaded
+                // test process).
+                if shed_inherited_fds(&fds).is_err() {
+                    // SAFETY: _exit is always safe.
+                    unsafe { libc::_exit(10) };
+                }
+                for fd in decoys {
+                    if fd_is_open(fd) {
+                        unsafe { libc::_exit(11) };
+                    }
+                }
+                for fd in parent_side {
+                    if fd_is_open(fd) {
+                        unsafe { libc::_exit(12) };
+                    }
+                }
+                if !fd_is_open(fds.status_pipe_w)
+                    || !fd_is_open(fds.go_pipe_r)
+                    || !fd_is_open(fds.stdout_fd)
+                    || !fd_is_open(fds.stderr_fd)
+                {
+                    unsafe { libc::_exit(13) };
+                }
+                if !fd_is_open(0) || !fd_is_open(1) || !fd_is_open(2) {
+                    unsafe { libc::_exit(14) };
+                }
+                unsafe { libc::_exit(0) };
+            }
+            pid => {
+                let code = wait_with_deadline(pid, Duration::from_secs(10));
+                assert_eq!(
+                    code, 0,
+                    "child fd checks failed (10=sweep error, 11=decoy open, \
+                     12=parent-side end open, 13=keep fd closed, 14=stdio touched)"
+                );
+            }
+        }
+    }
+
+    /// THE merged_bug_005 regression: the parent closing the go pipe's
+    /// write end without writing must unblock the intermediate with a
+    /// "parent died" error. Before the sweep the intermediate inherited
+    /// its own copy of the write end, so this EOF could never arrive
+    /// and the child hung forever (which the deadline converts into a
+    /// test failure).
+    // r[verify builder.exec.fd-keep-set]
+    #[test]
+    fn parent_go_pipe_close_unblocks_intermediate_after_sweep() {
+        let (status_r, status_w) = plain_pipe();
+        let (go_r, go_w) = plain_pipe();
+        let (out_r, out_w) = plain_pipe();
+        let fds = ChildFds {
+            status_pipe_w: status_w.as_raw_fd(),
+            go_pipe_r: go_r.as_raw_fd(),
+            stdout_fd: out_w.as_raw_fd(),
+            stderr_fd: out_w.as_raw_fd(),
+        };
+
+        // SAFETY: the child branch only calls async-signal-safe code.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                // Child: the intermediate's first two steps.
+                if shed_inherited_fds(&fds).is_err() {
+                    unsafe { libc::_exit(10) };
+                }
+                match await_go_signal(&fds) {
+                    Err(e) if e.phase == SetupPhase::GoPipe && e.errno == Errno::EPIPE as i32 => {
+                        // Parent death detected — the property under test.
+                        unsafe { libc::_exit(42) };
+                    }
+                    Err(_) => unsafe { libc::_exit(11) },
+                    Ok(()) => unsafe { libc::_exit(12) },
+                }
+            }
+            pid => {
+                // Parent: close the write end WITHOUT writing the go
+                // byte (what a crashed/cancelled parent looks like),
+                // and drop every other parent-side copy so the child's
+                // own (swept) table is the only thing that matters.
+                drop(go_w);
+                drop(status_r);
+                drop(status_w);
+                drop(out_r);
+                drop(out_w);
+                drop(go_r);
+                let code = wait_with_deadline(pid, Duration::from_secs(10));
+                assert_eq!(
+                    code, 42,
+                    "child must observe go-pipe EOF as parent death \
+                     (10=sweep error, 11=wrong error, 12=spurious go byte)"
+                );
+            }
+        }
+    }
+
+    /// The sweep must not break the normal handshake: a go byte written
+    /// by the parent still arrives.
+    // r[verify builder.exec.fd-keep-set]
+    #[test]
+    fn go_byte_still_arrives_after_sweep() {
+        // The parent keeps every end open here (underscore bindings
+        // hold them alive): only the write of the go byte matters.
+        let (_status_r, status_w) = plain_pipe();
+        let (go_r, go_w) = plain_pipe();
+        let (_out_r, out_w) = plain_pipe();
+        let fds = ChildFds {
+            status_pipe_w: status_w.as_raw_fd(),
+            go_pipe_r: go_r.as_raw_fd(),
+            stdout_fd: out_w.as_raw_fd(),
+            stderr_fd: out_w.as_raw_fd(),
+        };
+
+        // SAFETY: the child branch only calls async-signal-safe code.
+        match unsafe { libc::fork() } {
+            -1 => panic!("fork failed: {}", std::io::Error::last_os_error()),
+            0 => {
+                if shed_inherited_fds(&fds).is_err() {
+                    unsafe { libc::_exit(10) };
+                }
+                match await_go_signal(&fds) {
+                    Ok(()) => unsafe { libc::_exit(0) },
+                    Err(_) => unsafe { libc::_exit(11) },
+                }
+            }
+            pid => {
+                nix::unistd::write(&go_w, &[1u8]).expect("write the go byte");
+                let code = wait_with_deadline(pid, Duration::from_secs(10));
+                assert_eq!(code, 0, "the go byte must still arrive after the sweep");
+            }
+        }
+    }
 
     /// Every phase must survive the wire round-trip: a phase that is
     /// added to the enum but not to `ALL`/`from_u8` would deserialize

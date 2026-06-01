@@ -555,6 +555,37 @@ hand-rolled walk can reintroduce the hang.
   scheduler and uploaded to the store with their content-address descriptor.
 ]
 
+== Sandbox process-tree lifecycle
+
+The executor forks twice (parent → intermediate → sandbox child) and
+supervises the resulting tree through pipes whose EOF carries protocol
+meaning: go-pipe EOF means "the parent died before releasing the build",
+status-pipe EOF means "the program exec'd". The rules in this subsection make
+the tree's lifetime and those EOF semantics structural guarantees ---
+properties of types and call ordering --- rather than conventions each call
+site re-implements.
+
+#r("builder.exec.fd-keep-set")[
+  Every forked executor process MUST close all inherited file descriptors
+  outside its explicit keep set before its first blocking read: the
+  intermediate immediately after fork, keeping only the status-pipe write
+  end, the go-pipe read end, and the capture fds; and again down to stdio
+  immediately after forking the sandbox child. A forked process MUST NOT
+  hold a copy of a pipe end whose EOF it (or its supervisor) waits on.
+]
+
+The keep-set sweep is what turns go-pipe EOF into a genuine parent-death
+signal: before it, the intermediate inherited the parent's copy of the go
+pipe's write end, so the "parent died before releasing the sandbox" branch
+could never fire and a crashed parent left the intermediate parked forever.
+CppNix's `userNamespaceSync` pipe relies on the same discipline (the child
+side closes its inherited write end immediately after fork in
+`linux-derivation-builder.cc`). The sweep also caps what the sandbox child
+can ever inherit at the keep set, independent of which fds the embedding
+process (rio-builder, a test harness) happens to have open --- a future fd
+added to the worker cannot silently leak into the sandbox or re-break the
+EOF protocols.
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup
