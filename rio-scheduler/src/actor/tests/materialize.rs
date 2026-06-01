@@ -3802,3 +3802,543 @@ async fn flag_on_reap_survivor_with_unresolved_job_stays_armed() -> TestResult {
     //     gate keys on the job view, which has no entry for this node.)
     Ok(())
 }
+
+// ── T-4.4 (Phase B): the probe-matrix, no-from-source, and fail-fast
+//    routing variants ────────────────────────────────────────────────────
+
+// r[verify sched.materialize.job]
+/// T-4.4 test 1: the dispatch-probe partition matrix flag-on — the
+/// merge.rs probe-matrix walk twin (test_substitutable_probe_matrix),
+/// asserting job-vs-no-job per cell instead of walk-vs-build:
+///
+///   locally present  → inline complete (no job, no walk)
+///   substitutable    → job (origin=cache_opportunity)
+///   indeterminate    → job (B3: unknown never demotes — optimistic)
+///   confirmed missing→ NO job; the node stays Ready for from-source
+///
+/// Pin (plan T-4.4 / RFB-5): all four cells are Phase A mechanisms.
+#[tokio::test]
+async fn flag_on_probe_matrix_routes_to_jobs() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    let out_present = test_store_path("matrix-present-out");
+    let out_sub = test_store_path("matrix-sub-out");
+    let out_indet = test_store_path("matrix-indet-out");
+    let out_missing = test_store_path("matrix-missing-out");
+
+    let mk = |tag: &str, out: &str| {
+        let mut n = make_node(tag);
+        n.expected_output_paths = vec![out.to_string()];
+        n
+    };
+    let build_id = Uuid::new_v4();
+    merge_dag(
+        &handle,
+        build_id,
+        vec![
+            mk("matrix-present", &out_present),
+            mk("matrix-sub", &out_sub),
+            mk("matrix-indet", &out_indet),
+            mk("matrix-missing", &out_missing),
+        ],
+        vec![],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Seed the store AFTER merge so the DISPATCH-time probe partition
+    // (not the merge classification) is the deciding site for every cell.
+    store
+        .state
+        .paths
+        .write()
+        .unwrap()
+        .insert(out_present.clone(), Default::default());
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_sub.clone());
+    store
+        .state
+        .indeterminate
+        .write()
+        .unwrap()
+        .push(out_indet.clone());
+    // out_missing: seeded nowhere → confirmed missing.
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Cell 1 — locally present: inline complete, no job.
+    assert_eq!(
+        expect_drv(&handle, "matrix-present").await.status,
+        DerivationStatus::Completed,
+        "locally-present cell completes inline"
+    );
+    // Cell 2 — substitutable: job created, node Ready.
+    assert_eq!(
+        expect_drv(&handle, "matrix-sub").await.status,
+        DerivationStatus::Ready,
+        "substitutable cell stays Ready (the job is the in-flight marker)"
+    );
+    // Cell 3 — indeterminate: job created (B3), node Ready.
+    assert_eq!(
+        expect_drv(&handle, "matrix-indet").await.status,
+        DerivationStatus::Ready,
+        "indeterminate cell stays Ready with a job (B3 optimistic creation)"
+    );
+    // Cell 4 — confirmed missing: NO job, node Ready for from-source.
+    assert_eq!(
+        expect_drv(&handle, "matrix-missing").await.status,
+        DerivationStatus::Ready,
+        "confirmed-missing cell stays Ready for from-source dispatch"
+    );
+
+    // The job-vs-no-job partition.
+    let job_drvs: Vec<String> =
+        sqlx::query_scalar("SELECT drv_hash FROM materialization_jobs ORDER BY drv_hash")
+            .fetch_all(&db.pool)
+            .await?;
+    assert_eq!(
+        job_drvs,
+        vec!["matrix-indet".to_string(), "matrix-sub".to_string()],
+        "exactly the substitutable + indeterminate cells get jobs; present completes \
+         inline and confirmed-missing goes from-source"
+    );
+    // Criterion 3: zero walks spawned for any cell.
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&out_sub) && !qpi.contains(&out_indet) && !qpi.contains(&out_missing),
+            "no cell may spawn a walk flag-on; qpi_calls={qpi:?}"
+        );
+    }
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+// r[verify sched.materialize.routing+2]
+/// T-4.4 test 2: noFromSourceWhileJobUnresolved at the actor level (the
+/// F8/F13 anchor's production half), both mark states:
+///
+///   UNMARKED leaf: BUILD pull refused (NotYetReady) while its job is
+///   unresolved → the job resolves from-source (finding 11: unmarked +
+///   confirmed missing releases) → the SAME pull mints (DeliverNew).
+///
+///   MARKED (pruned root): BUILD pull refused while the job is
+///   unresolved AND the must_substitute mark holds → deps merge in
+///   (evidence Pending) → the job resolves from-source (arm 2) → the
+///   T-1.7 clear-mirror clears the mark → the SAME pull mints. Without
+///   the clear, the stale mark's must_substitute refusal would park the
+///   pull forever (the clear-mirror's reason for existing).
+#[tokio::test]
+async fn flag_on_builder_pull_refused_while_job_unresolved() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-t44-service-key-32-bytes!!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "t44-tenant").await;
+
+    // ── Part A: the UNMARKED leaf ──
+    let out_a = test_store_path("nofs-leaf-out");
+    let mut leaf = make_node("nofs-leaf");
+    leaf.expected_output_paths = vec![out_a.clone()];
+    leaf.wanted_output_names = vec!["out".into()];
+    let build_a = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: build_a,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![leaf],
+            edges: vec![],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_a.clone());
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "precondition: the leaf's job exists");
+
+    // BUILD-kind pull while the job is unresolved → refused.
+    let pull = try_pull_attempt(&handle, "nofs-leaf").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::NotYetReady { .. })),
+        "a BUILD pull is refused while the node's materialization job is \
+         unresolved (noFromSourceWhileJobUnresolved), got {pull:?}"
+    );
+
+    // Resolve the job from-source: claim, withdraw the upstream entry,
+    // report Unobtainable → unmarked + confirmed missing → finding 11's
+    // from-source release.
+    let assignment = match claim_materialization(&handle, "nofs-leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_a: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &out_a);
+    report_materialization_outcome(
+        &handle,
+        exec_a,
+        "nofs-leaf",
+        mat_unobtainable_outcome(vec![out_a.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let job_state: String = sqlx::query_scalar(
+        "SELECT mj.state FROM materialization_jobs mj \
+           JOIN derivations d ON d.derivation_id = mj.derivation_id \
+          WHERE d.drv_hash = 'nofs-leaf'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(job_state, "resolved_from_source");
+
+    // The SAME pull now mints.
+    let pull = try_pull_attempt(&handle, "nofs-leaf").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::Deliver(_))),
+        "after the from-source resolution the BUILD pull must mint, got {pull:?}"
+    );
+
+    // ── Part B: the MARKED (pruned) root ──
+    let root_out = test_store_path("nofs-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("nofs-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    let mut dep = make_node("nofs-dep");
+    dep.expected_output_paths = vec![test_store_path("nofs-dep-out")];
+    let build_b = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: build_b,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![root, dep],
+            edges: vec![make_test_edge("nofs-root", "nofs-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "nofs-root").await;
+    assert!(
+        drv.topdown_pruned,
+        "precondition: the prune marked the root"
+    );
+    // BUILD pull refused: unresolved job + the must_substitute mark.
+    let pull = try_pull_attempt(&handle, "nofs-root").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::NotYetReady { .. })),
+        "a BUILD pull against the marked root with an unresolved job is refused, got {pull:?}"
+    );
+
+    // Deps merge in (a second build full-merges root→dep): the root's
+    // durable evidence becomes Pending.
+    let mut root2 = make_node("nofs-root");
+    root2.expected_output_paths = vec![root_out.clone()];
+    root2.wanted_output_names = vec!["out".into(), "wide".into()]; // wide want blocks the prune
+    root2.output_names = vec!["out".into(), "wide".into()];
+    root2.expected_output_paths = vec![root_out.clone(), test_store_path("nofs-root-wide")];
+    let mut dep2 = make_node("nofs-dep");
+    dep2.expected_output_paths = vec![test_store_path("nofs-dep-out")];
+    let build_c = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id: build_c,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![root2, dep2],
+            edges: vec![make_test_edge("nofs-root", "nofs-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Resolve the root's job from-source (arm 2: durable Pending) and
+    // let the T-1.7 clear-mirror clear the mark.
+    let assignment = match claim_materialization(&handle, "nofs-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the root's job claim must deliver, got {other:?}"),
+    };
+    let exec_b: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &root_out);
+    report_materialization_outcome(
+        &handle,
+        exec_b,
+        "nofs-root",
+        mat_unobtainable_outcome(vec![root_out.clone()], vec![], "upstream 404"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "nofs-root").await;
+    assert!(
+        !drv.topdown_pruned,
+        "the from-source resolution must clear the mark (T-1.7's clear-mirror)"
+    );
+
+    // The SAME pull now mints: with the job resolved AND the mark
+    // cleared, neither refusal predicate holds. Without T-1.7's clear
+    // this pull would park on NotYetReady forever (the stale-mark
+    // must_substitute refusal outliving the job).
+    let pull = try_pull_attempt(&handle, "nofs-root").await;
+    assert!(
+        matches!(pull, Ok(PullOutcome::Deliver(_))),
+        "after from-source resolution + the mark clear, the BUILD pull must \
+         mint (the stale-mark refusal must not outlive the job), got {pull:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// T-4.4 test 3: arm 3's genuine fail-fast — a MARKED (topdown-pruned)
+/// root whose live-wanted output the consumption re-probe confirms
+/// missing-and-unsubstitutable fails every live DAG-interested build
+/// with the resubmit-directing error (the shared wrapper format, NOT
+/// exact-string equality with the flag-off message — review eq-7: the
+/// cause clause names the deciding mechanism).
+///
+/// The finding-11 mark discriminator makes the mark a REQUIRED conjunct
+/// of this verdict: the unmarked twin of this exact trace releases to
+/// from-source instead
+/// (flag_on_unmarked_leaf_confirmed_missing_releases_to_from_source).
+/// The one-shot bound at the routing-core level is pinned by
+/// routing_broken_with_obtainable_reprobe_rearms_once (marked + spent →
+/// FailFast even on an obtainable re-probe answer).
+#[tokio::test]
+async fn flag_on_genuine_unobtainable_fail_fasts_with_resubmit_error() -> TestResult {
+    use rio_auth::hmac::HmacSigner;
+
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let service_key = b"test-t44-failfast-key-32-bytes!!!".to_vec();
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, p| {
+            cfg.materialization.enabled = true;
+            p.service_signer = Some(Arc::new(HmacSigner::from_key(service_key)));
+        });
+    let tenant = rio_store::test_helpers::seed_tenant(&db.pool, "t44-ff-tenant").await;
+
+    // The pruned-root shape: root substitutable at merge → prune fires →
+    // root marked + childless + origin=pruned job.
+    let root_out = test_store_path("ff-root-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(root_out.clone());
+    let mut root = make_node("ff-root");
+    root.expected_output_paths = vec![root_out.clone()];
+    root.wanted_output_names = vec!["out".into()];
+    let mut dep = make_node("ff-dep");
+    dep.expected_output_paths = vec![test_store_path("ff-dep-out")];
+    let build_id = Uuid::new_v4();
+    merge_dag_req(
+        &handle,
+        MergeDagRequest {
+            build_id,
+            tenant_id: Some(tenant),
+            priority_class: PriorityClass::Scheduled,
+            nodes: vec![root, dep],
+            edges: vec![make_test_edge("ff-root", "ff-dep")],
+            options: BuildOptions::default(),
+            keep_going: false,
+            traceparent: String::new(),
+            jti: None,
+            jwt_token: None,
+        },
+    )
+    .await?;
+    barrier(&handle).await;
+    let drv = expect_drv(&handle, "ff-root").await;
+    assert!(
+        drv.topdown_pruned,
+        "precondition: the prune marked the root"
+    );
+    let origin: String = sqlx::query_scalar("SELECT origin FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(
+        origin, "pruned",
+        "precondition: the origin=pruned job exists"
+    );
+
+    // The upstream entry vanishes after the job was created (the C1
+    // window): claim, then report the confirmed absence.
+    let assignment = match claim_materialization(&handle, "ff-root", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .retain(|p| p != &root_out);
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "ff-root",
+        mat_unobtainable_outcome(
+            vec![root_out.clone()],
+            vec![],
+            "upstream 404 on the pruned root's output",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // THE FAIL-FAST ASSERTIONS:
+    // (a) The build failed with the resubmit-directing wrapper format.
+    let st = query_status(&handle, build_id).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Failed as i32,
+        "arm 3 + the mark: every live DAG-interested build fails"
+    );
+    assert!(
+        st.error_summary.contains("topdown-pruned root") && st.error_summary.contains("resubmit"),
+        "the error carries the shared resubmit-directing wrapper format \
+         ('topdown-pruned root <hash>: ...; resubmit to re-probe or full-merge'); \
+         got {:?}",
+        st.error_summary
+    );
+    // (b) The job resolved as unobtainable.
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "resolved_unobtainable");
+    // (c) Exactly one materialization_unobtainable ledger row; zero
+    //     build-kind rows (no build budget was touched).
+    let (unob, build_kind): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE t.outcome_class = 'materialization_unobtainable'), \
+           count(*) FILTER (WHERE COALESCE(e.attempt_kind, 'build') = 'build') \
+         FROM drv_attempts t \
+         LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(unob, 1, "exactly one materialization_unobtainable charge");
+    assert_eq!(build_kind, 0, "zero build-kind ledger rows");
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
+/// T-4.4 test 4: Success coverage is over the LIVE WANTED set, not the
+/// declared output set — the batch_probe_completes_on_missing_unwanted_
+/// output walk twin. A Success report covering the wanted output but
+/// not the never-wanted sibling completes the node (W = live wanted,
+/// not declared outputs).
+#[tokio::test]
+async fn flag_on_success_coverage_ignores_unwanted_outputs() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // A 2-output node where the build wants only `out`; `extra` is
+    // declared but never wanted by anyone.
+    let out = test_store_path("cov-out");
+    let extra = test_store_path("cov-extra");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(out.clone());
+        subs.push(extra.clone());
+    }
+    let mut n = make_node("cov-node");
+    n.output_names = vec!["out".into(), "extra".into()];
+    n.expected_output_paths = vec![out.clone(), extra.clone()];
+    n.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    let assignment = match claim_materialization(&handle, "cov-node", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // The executor materializes ONLY the wanted output.
+    store.seed_with_content(&out, b"cov-wanted-content");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "cov-node",
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Coverage over live wanted (= {out}) passes; the node completes
+    // and the build succeeds even though `extra` was never produced.
+    assert_eq!(
+        expect_drv(&handle, "cov-node").await.status,
+        DerivationStatus::Completed,
+        "Success coverage is over the live WANTED set, not declared outputs"
+    );
+    let st = query_status(&handle, build_id).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the build succeeds with only its wanted output materialized"
+    );
+    let job_state: String = sqlx::query_scalar("SELECT state FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    assert_eq!(job_state, "resolved_success");
+    Ok(())
+}
