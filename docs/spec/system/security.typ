@@ -459,16 +459,24 @@ tracey rule or phase deferral.
       global `MAX_NAR_SIZE` limit.],
 
     [Output path match],
-    [Gateway + Store],
+    [Gateway + Scheduler + Store],
     [Implemented],
     [Gateway: declared output paths are bound to the derivation at
       submission --- input-addressed paths must equal the recomputed
       derivation-hash paths, and declared-hash (fixed-output) outputs must
-      equal the path derived from their declared hash. Store: HMAC assignment
-      tokens gate registration --- `x-rio-assignment-token` metadata on
-      PutPath, `store_path ∈ claims.expected_outputs` --- and
-      content-addressed or fixed-output uploads are re-verified against their
-      descriptor and claimed path. Gateway bypasses via `x-rio-service-token`
+      equal the path derived from their declared hash. Scheduler: every
+      inline derivation (authoritative or not) is bound to its declared
+      identity at `SubmitBuild` ingress --- text content-address of the
+      bytes equals the declared `.drv` path, declared paths/flags equal
+      values recomputed from the bytes
+      (#rref("sched.merge.ingress-inline-drv-binding")); store-backed
+      nodes' declarations remain echo-trusted pending store-evidence
+      displacement (follow-up; compromised-worker-only residual). Store:
+      HMAC assignment tokens gate registration ---
+      `x-rio-assignment-token` metadata on PutPath, `store_path ∈
+      claims.expected_outputs` --- and content-addressed or fixed-output
+      uploads are re-verified against their descriptor and claimed path.
+      Gateway bypasses via `x-rio-service-token`
       (`r[sec.authz.service-token]`).],
   ),
 )

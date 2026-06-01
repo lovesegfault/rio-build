@@ -75,7 +75,7 @@ impl SchedulerService for SchedulerGrpc {
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
 
-        let req = request.into_inner();
+        let mut req = request.into_inner();
 
         // Check backpressure before sending to actor
         if self.actor.is_backpressured() {
@@ -259,7 +259,25 @@ impl SchedulerService for SchedulerGrpc {
         // untrusted; the gateway being the only intended producer is
         // not a defense). Bind the bytes to the node's claimed identity
         // before they can ever reach the derivations table.
-        validate_authoritative_drv_content(&req.nodes)?;
+        //
+        // r[impl sched.merge.ingress-inline-drv-binding]
+        // Non-authoritative inline content (the gateway's inline-.drv
+        // optimization) is bound to its declared identity the same way.
+        // Both validators are CPU-bound (SHA-256 over up to 1 MiB per
+        // node, ATerm parses, modulo-hash derivations over the sibling
+        // graph), so they run on the blocking pool — the backpressure
+        // gate above has already bounded how much of this work a caller
+        // can queue.
+        let nodes_for_validation = std::mem::take(&mut req.nodes);
+        req.nodes = tokio::task::spawn_blocking(
+            move || -> Result<Vec<rio_proto::types::DerivationNode>, Status> {
+                validate_authoritative_drv_content(&nodes_for_validation)?;
+                validate_inline_drv_content(&nodes_for_validation)?;
+                Ok(nodes_for_validation)
+            },
+        )
+        .await
+        .map_err(|e| Status::internal(format!("inline-content validation task failed: {e}")))??;
 
         // UUID v7 (time-ordered, RFC 9562): the high 48 bits are Unix-ms
         // timestamp, so lexicographic sort == chronological sort. This
@@ -874,6 +892,342 @@ fn validate_authoritative_drv_content(
             return Err(Status::invalid_argument(
                 "node.ca_modular_hash does not match the authoritative drv_content",
             ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate NON-authoritative inline derivation content against the
+/// node's declared identity.
+///
+/// r[impl sched.merge.ingress-inline-drv-binding]
+/// The gateway's inline-`.drv` optimization attaches store-backed
+/// derivations' canonical ATerm bytes to will-dispatch nodes so workers
+/// skip a store fetch. Those bytes flow into `WorkAssignment.drv_content`
+/// (the worker builds what they say) and the node's declared identity
+/// flows into upload-authorization claims — but ingress never bound the
+/// two together for non-authoritative content, so a direct submitter
+/// could declare arbitrary identity fields (expected output paths,
+/// flags) alongside inline bytes describing something else entirely:
+/// the variant-1 squat (register attacker content at a victim's
+/// not-yet-built IA path via an honest worker) and the variant-3 flag
+/// forgery both ride that gap.
+///
+/// Every node with non-empty `drv_content` and
+/// `drv_content_authoritative == false` must now satisfy:
+///
+/// 1. the bytes are UTF-8, parse as a derivation, and are CANONICAL
+///    (byte-identical to the parse→re-serialize round trip — what the
+///    gateway inlines is exactly `Derivation::to_aterm()` output);
+/// 2. the declared `drv_path` is the text content-address of those
+///    bytes: `make_text(name, sha256(bytes), inputSrcs ∪ inputDrvs)` —
+///    the same minting rule CppNix `writeDerivation` uses, so the path
+///    is cryptographically bound to the content;
+/// 3. the declared `system`, `output_names`, `is_fixed_output`, and
+///    `is_content_addressed` equal the parsed derivation's;
+/// 4. `expected_output_paths` (zipped with `output_names` BY NAME) are
+///    bound per output kind: fixed-output → the hash-derived path
+///    (shared helper with the authoritative validator; unsupported
+///    legacy algos like md5 skip the derivation check — the text-CA
+///    binding above and the store's content verification still hold);
+///    floating-CA and deferred-IA → empty; declared-IA → equal to BOTH
+///    the ATerm-declared path and the path recomputed via
+///    `input_addressed_output_paths` (inputs resolved from sibling
+///    inline derivations, hash cache seeded from sibling
+///    `ca_modular_hash` declarations; an unresolvable input is a
+///    rejection, not a skip);
+/// 5. a non-empty `ca_modular_hash` equals the recomputed
+///    `hash_derivation_modulo` over the bytes (siblings seeded, the
+///    node's own declaration excluded so the check cannot be satisfied
+///    by itself).
+///
+/// The seeded-sibling design is sound against squats: a forged sibling
+/// hash moves every derived path AWAY from honest paths (SHA-256 second
+/// preimage to collide one), so seeding cannot help an attacker reach a
+/// victim's path — see `input_addressed_output_paths`' soundness note.
+fn validate_inline_drv_content(nodes: &[rio_proto::types::DerivationNode]) -> Result<(), Status> {
+    use rio_nix::derivation::{Derivation, DerivationLike};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    if !nodes
+        .iter()
+        .any(|n| !n.drv_content.is_empty() && !n.drv_content_authoritative)
+    {
+        return Ok(());
+    }
+
+    // Parse every inline derivation once (authoritative ones too — they
+    // serve as sibling resolvers for IA path derivation below).
+    let mut parsed: std::collections::HashMap<&str, Derivation> = std::collections::HashMap::new();
+    for node in nodes {
+        if node.drv_content.is_empty() {
+            continue;
+        }
+        let text = std::str::from_utf8(&node.drv_content).map_err(|_| {
+            Status::invalid_argument(format!(
+                "node {} inline drv_content is not valid UTF-8 ATerm",
+                node.drv_hash
+            ))
+        })?;
+        let drv = Derivation::parse(text).map_err(|e| {
+            Status::invalid_argument(format!(
+                "node {} inline drv_content does not parse as a derivation: {e}",
+                node.drv_hash
+            ))
+        })?;
+        parsed.insert(node.drv_path.as_str(), drv);
+    }
+
+    // Sibling hash seed: every node's declared 32-byte ca_modular_hash,
+    // keyed by drv_path. Inline siblings' hashes are themselves verified
+    // by step 5 when their turn comes; store-backed siblings' hashes are
+    // declarations whose forgery cannot steer derived paths toward any
+    // honest path (see the soundness note).
+    let sibling_seed: std::collections::HashMap<String, [u8; 32]> = nodes
+        .iter()
+        .filter(|n| n.ca_modular_hash.len() == 32)
+        .map(|n| {
+            let mut h = [0u8; 32];
+            h.copy_from_slice(&n.ca_modular_hash);
+            (n.drv_path.clone(), h)
+        })
+        .collect();
+
+    for node in nodes {
+        if node.drv_content.is_empty() || node.drv_content_authoritative {
+            continue;
+        }
+        let context = format!("inline drv_content for node {}", node.drv_hash);
+        let drv = &parsed[node.drv_path.as_str()];
+
+        // ── 1. Canonicality ─────────────────────────────────────────
+        let canonical = drv.to_aterm();
+        if canonical.as_bytes() != node.drv_content.as_slice() {
+            return Err(Status::invalid_argument(format!(
+                "{context}: bytes are not the canonical ATerm serialization of the derivation \
+                 they parse as (the gateway inlines canonical bytes; non-canonical inline \
+                 content cannot be path-bound)"
+            )));
+        }
+
+        // ── 2. Text-CA binding of the declared .drv path ─────────────
+        let drv_sp = StorePath::parse(&node.drv_path).map_err(|e| {
+            Status::invalid_argument(format!("{context}: drv_path does not parse: {e}"))
+        })?;
+        let mut refs: Vec<StorePath> = Vec::new();
+        for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+            refs.push(StorePath::parse(r).map_err(|e| {
+                Status::invalid_argument(format!(
+                    "{context}: derivation references invalid store path {r:?}: {e}"
+                ))
+            })?);
+        }
+        let content_hash = NixHash::new(
+            HashAlgo::SHA256,
+            Sha256::digest(node.drv_content.as_slice()).to_vec(),
+        )
+        .map_err(|e| Status::internal(format!("sha256 digest construction failed: {e}")))?;
+        let text_ca = StorePath::make_text(drv_sp.name(), &content_hash, &refs).map_err(|e| {
+            Status::invalid_argument(format!("{context}: cannot derive text CA path: {e}"))
+        })?;
+        if text_ca.as_str() != node.drv_path {
+            return Err(Status::invalid_argument(format!(
+                "{context}: declared drv_path {} is not the text content-address of the inline \
+                 bytes (expected {}) — the path is not bound to this content",
+                node.drv_path,
+                text_ca.as_str()
+            )));
+        }
+
+        // ── 3. Declared identity equals parsed identity ──────────────
+        if drv.platform() != node.system {
+            return Err(Status::invalid_argument(format!(
+                "{context}: platform {:?} does not match node.system {:?}",
+                drv.platform(),
+                node.system
+            )));
+        }
+        let mut parsed_names: Vec<&str> = drv.outputs().iter().map(|o| o.name()).collect();
+        parsed_names.sort_unstable();
+        let mut node_names: Vec<&str> = node.output_names.iter().map(String::as_str).collect();
+        node_names.sort_unstable();
+        if parsed_names != node_names {
+            return Err(Status::invalid_argument(format!(
+                "{context}: outputs {parsed_names:?} do not match node.output_names {node_names:?}"
+            )));
+        }
+        if node.is_fixed_output != drv.is_fixed_output() {
+            return Err(Status::invalid_argument(format!(
+                "{context}: node.is_fixed_output does not match the parsed derivation"
+            )));
+        }
+        if node.is_content_addressed != drv.is_content_addressed() {
+            return Err(Status::invalid_argument(format!(
+                "{context}: node.is_content_addressed does not match the parsed derivation"
+            )));
+        }
+        // Oracle-parity FOD shape rule — shared with the authoritative
+        // validator so the two cannot drift.
+        validate_inline_fod_shape(drv, &context)?;
+
+        // ── 4/5. Per-output binding (zipped BY NAME) ─────────────────
+        if node.expected_output_paths.len() != node.output_names.len() {
+            return Err(Status::invalid_argument(format!(
+                "{context}: must declare exactly one expected_output_paths entry per output: got \
+                 {} entries for {} outputs",
+                node.expected_output_paths.len(),
+                node.output_names.len()
+            )));
+        }
+        let expected: std::collections::HashMap<&str, &str> = node
+            .output_names
+            .iter()
+            .map(String::as_str)
+            .zip(node.expected_output_paths.iter().map(String::as_str))
+            .collect();
+        let drv_name = drv_sp
+            .name()
+            .strip_suffix(".drv")
+            .unwrap_or_else(|| drv_sp.name())
+            .to_owned();
+
+        // Pre-compute IA output paths if any output is declared-IA
+        // (non-empty path, no hash algo). Inputs resolve from sibling
+        // inline derivations; hashes seed from sibling declarations.
+        let needs_ia = drv
+            .outputs()
+            .iter()
+            .any(|o| o.hash_algo().is_empty() && !o.path().is_empty());
+        let ia_paths = if needs_ia {
+            let resolve = |p: &str| parsed.get(p);
+            let mut hash_cache = sibling_seed.clone();
+            // The node's own declared hash must never feed its own
+            // path derivation (self-certification); inputs only.
+            hash_cache.remove(&node.drv_path);
+            Some(
+                rio_nix::derivation::input_addressed_output_paths(
+                    drv,
+                    &node.drv_path,
+                    &resolve,
+                    &mut hash_cache,
+                )
+                .map_err(|e| {
+                    Status::invalid_argument(format!(
+                        "{context}: cannot derive input-addressed output paths from the inline \
+                         bytes ({e}); every input must be a sibling inline derivation or carry \
+                         a sibling ca_modular_hash declaration"
+                    ))
+                })?,
+            )
+        } else {
+            None
+        };
+
+        for out in drv.outputs() {
+            let (name, path, algo, hash) = (out.name(), out.path(), out.hash_algo(), out.hash());
+            let exp = expected.get(name).copied();
+            if !algo.is_empty() && !hash.is_empty() {
+                // Fixed output. Supported algos get the full
+                // decode→derive→compare binding (shared helper).
+                // Unsupported legacy algos (md5): the binding cannot be
+                // recomputed here — the text-CA binding above plus the
+                // store's content verification on upload remain the
+                // enforcement; the expected path must still equal the
+                // ATerm-declared one.
+                let algo_supported = algo
+                    .strip_prefix("r:")
+                    .unwrap_or(algo)
+                    .parse::<HashAlgo>()
+                    .is_ok();
+                if algo_supported {
+                    validate_fixed_output_binding(
+                        &drv_name, name, path, algo, hash, exp, &context,
+                    )?;
+                } else {
+                    match exp {
+                        Some(e) if e == path && !e.is_empty() => {}
+                        _ => {
+                            return Err(Status::invalid_argument(format!(
+                                "{context}: output '{name}' (legacy algo {algo:?}) must declare \
+                                 expected_output_paths equal to the ATerm path {path:?}"
+                            )));
+                        }
+                    }
+                }
+            } else if !algo.is_empty() {
+                // Floating-CA: no path exists yet anywhere.
+                if !path.is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "{context}: output '{name}' is floating-CA but declares a path"
+                    )));
+                }
+                if let Some(e) = exp
+                    && !e.is_empty()
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "{context}: expected_output_paths['{name}'] must be empty for a \
+                         floating-CA output"
+                    )));
+                }
+            } else if path.is_empty() {
+                // Deferred-IA: path unknown until inputs resolve.
+                if let Some(e) = exp
+                    && !e.is_empty()
+                {
+                    return Err(Status::invalid_argument(format!(
+                        "{context}: expected_output_paths['{name}'] must be empty for a \
+                         deferred input-addressed output"
+                    )));
+                }
+            } else {
+                // Declared-IA: the ATerm path, the recomputed path, and
+                // the node's expected path must all agree.
+                let derived = ia_paths.as_ref().and_then(|m| m.get(name)).ok_or_else(|| {
+                    Status::invalid_argument(format!(
+                        "{context}: output '{name}' has no derivable input-addressed path"
+                    ))
+                })?;
+                if derived.as_str() != path {
+                    return Err(Status::invalid_argument(format!(
+                        "{context}: output '{name}' declares path {path} but the inline bytes \
+                         derive to {} — the declared identity is not this derivation's",
+                        derived.as_str()
+                    )));
+                }
+                match exp {
+                    Some(e) if e == path => {}
+                    _ => {
+                        return Err(Status::invalid_argument(format!(
+                            "{context}: expected_output_paths['{name}'] must equal the derived \
+                             input-addressed path {path}"
+                        )));
+                    }
+                }
+            }
+        }
+
+        // ── 6. ca_modular_hash binding ────────────────────────────────
+        if !node.ca_modular_hash.is_empty() {
+            let resolve = |p: &str| parsed.get(p);
+            let mut hash_cache = sibling_seed.clone();
+            // Never let the node's own declaration satisfy its own check.
+            hash_cache.remove(&node.drv_path);
+            let recomputed = rio_nix::derivation::hash_derivation_modulo(
+                drv,
+                &node.drv_path,
+                &resolve,
+                &mut hash_cache,
+            )
+            .map_err(|e| {
+                Status::invalid_argument(format!("{context}: cannot be modulo-hashed: {e}"))
+            })?;
+            if node.ca_modular_hash != recomputed.to_vec() {
+                return Err(Status::invalid_argument(format!(
+                    "{context}: ca_modular_hash does not match the inline bytes"
+                )));
+            }
         }
     }
     Ok(())

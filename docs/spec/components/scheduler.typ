@@ -819,6 +819,43 @@ from); content-binding for inline submissions is the authoritative-content
 validation, and full evidence-ranked binding for store-backed claims is a
 documented follow-up.
 
+#r("sched.merge.ingress-inline-drv-binding")[
+  `SubmitBuild` ingress MUST validate every node that carries non-empty
+  `drv_content` without the authoritative flag (the gateway's
+  inline-`.drv` optimization): the bytes MUST be the canonical ATerm
+  serialization of a derivation whose text content-address
+  (`makeTextPath` over the bytes and the derivation's `inputSrcs` and
+  `inputDrvs` references) equals the declared `drv_path`; the node's
+  declared `system`, output names, fixed-output flag, and
+  content-addressed flag MUST equal the parsed derivation's; declared
+  expected output paths MUST be bound per output kind --- fixed-output
+  paths to their declared hash (single output named `out`), floating-CA
+  and deferred entries empty, and input-addressed paths equal to the
+  paths recomputed from the bytes with inputs resolved from sibling
+  inline derivations and sibling `ca_modular_hash` declarations; and a
+  non-empty `ca_modular_hash` MUST equal the modulo hash recomputed over
+  the bytes without the node's own declaration in the seed. Submissions
+  that fail any of these MUST be rejected with `INVALID_ARGUMENT`.
+]
+This closes the variant-1 squat for inline content: before the binding, a
+direct submitter could attach inline bytes describing one derivation while
+declaring another derivation's identity fields (expected output paths,
+flags) --- the worker builds what the bytes say, but upload authorization
+and the merge gate's evidence comparisons trust the declared fields, so
+attacker content could be registered at a victim derivation's
+not-yet-built input-addressed path by an honest worker. With the binding,
+every declared field is recomputed from (or checked against) the bytes
+themselves, and the bytes are bound to the declared `.drv` path by the
+text content-address --- forging any of it requires a SHA-256 second
+preimage. The sibling-seeded input resolution is what makes the check
+feasible without store access (#rref("gw.dag.modulo-hash-all-nodes")); a
+forged sibling hash cannot steer a derived path onto a victim's path,
+only away from every honest path. Store-backed nodes (no inline bytes)
+remain declaration-trusted at ingress --- their binding is the
+documented follow-up (store-evidence displacement), and the residual is
+exploitable only by a compromised worker, which the trust model already
+assumes hostile.
+
 #r("sched.merge.edge-creation-scoped")[
   The merge MUST attach a submitted dependency edge to its parent node only
   when this submission (re)creates that parent (a newly inserted node, a

@@ -212,3 +212,27 @@ fn tampered_declared_path_is_detected() {
     // comparison catches the spoof.
     assert_ne!(derived["out"].as_str(), tampered.outputs()[0].path());
 }
+
+/// Canonical round-trip gate for the scheduler's text-CA inline-content
+/// binding (`sched.merge.ingress-inline-drv-binding`): for every
+/// oracle-produced fixture, `to_aterm(parse(bytes)) == bytes`. The
+/// scheduler binds a declared `.drv` path to inline bytes by hashing the
+/// canonical re-serialization; if real Nix ever produced a `.drv` whose
+/// canonical form differed from its file content, that binding would
+/// reject legitimate gateway traffic. This test makes such a divergence a
+/// red unit test instead of a production rejection.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[test]
+fn canonical_aterm_round_trip_over_corpus() {
+    for (name, text) in FIXTURES {
+        let trimmed = text.trim_end();
+        let drv = Derivation::parse(trimmed)
+            .unwrap_or_else(|e| panic!("fixture {name} does not parse: {e}"));
+        let canonical = drv.to_aterm();
+        assert_eq!(
+            canonical.as_str(),
+            trimmed,
+            "fixture {name}: canonical re-serialization differs from the oracle-produced bytes"
+        );
+    }
+}

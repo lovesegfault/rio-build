@@ -353,14 +353,24 @@ async fn test_submit_build_resolves_known_tenant() {
 /// is exactly the shared bound (`MAX_DRV_CONTENT_BYTES`, i.e. the
 /// gateway's content-bound hook-fallback cap) is accepted at ingress —
 /// the scheduler bound aliases the gateway producer cap, so nothing the
-/// gateway emits is size-rejected here.
+/// gateway emits is size-rejected here. The fixture is an HONEST inline
+/// node padded to exactly the bound (inline content must now be
+/// identity-bound — sched.merge.ingress-inline-drv-binding — so a
+/// garbage payload no longer reaches the size check's accept path).
 #[tokio::test]
 async fn test_submit_build_accepts_drv_content_at_the_shared_bound() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
     seed_tenant(&db.pool, "team-bound").await;
 
-    let mut node = make_node("at-bound-drv");
-    node.drv_content = vec![b'a'; rio_common::limits::MAX_DRV_CONTENT_BYTES];
+    let node = inline_leaf_ia_node(
+        "at-bound-drv",
+        Some(rio_common::limits::MAX_DRV_CONTENT_BYTES),
+    );
+    assert_eq!(
+        node.drv_content.len(),
+        rio_common::limits::MAX_DRV_CONTENT_BYTES,
+        "fixture sized exactly at the bound"
+    );
     let req = Request::new(rio_proto::types::SubmitBuildRequest {
         nodes: vec![node],
         edges: vec![],
@@ -1447,34 +1457,81 @@ async fn test_submit_build_join_does_not_clear_authoritative_row() {
 /// submitters — the gateway's hook fallback always claims the
 /// authoritative copy, and an unverifiable-algo offender without a
 /// resolvable .drv is rejected at the gateway rather than forwarded.
+/// REVERSED by sched.merge.ingress-inline-drv-binding: an UNBOUND
+/// non-authoritative md5-FOD inline payload (fake drv_path, made-up
+/// output path) is now rejected; a text-CA-bound md5 fixture — whose
+/// declared .drv path really is the content address of its bytes — is
+/// accepted (the legacy-algo carve-out: md5 output paths cannot be
+/// re-derived here, so the text-CA binding plus the gateway's
+/// realization-probe exemption and the store's content verification
+/// remain the enforcement for them).
+// r[verify sched.merge.ingress-inline-drv-binding]
 #[tokio::test]
-async fn test_submit_build_accepts_non_authoritative_md5_fod_content() {
+async fn test_submit_build_md5_fod_content_requires_text_ca_binding() {
     let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
     seed_tenant(&db.pool, "team-md5-exempt").await;
 
-    let mut node = make_node("md5-exempt");
     let out_path = "/nix/store/ffffffffffffffffffffffffffffffff-fetched";
     let aterm = format!(
         r#"Derive([("out","{out_path}","md5","deadbeefdeadbeefdeadbeefdeadbeef")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("out","{out_path}")])"#
     );
+
+    // ── Half 1: UNBOUND (fake drv_path) → rejected ──
+    let mut unbound = make_node("md5-exempt");
     let drv = rio_nix::derivation::Derivation::parse(&aterm).unwrap();
-    node.ca_modular_hash = rio_nix::derivation::hash_derivation_modulo(
+    unbound.ca_modular_hash = rio_nix::derivation::hash_derivation_modulo(
         &drv,
-        &node.drv_path,
+        &unbound.drv_path,
         &|_| None,
         &mut std::collections::HashMap::new(),
     )
     .unwrap()
     .to_vec();
-    node.drv_content = aterm.into_bytes();
-    node.drv_content_authoritative = false;
-    node.is_fixed_output = true;
-    node.is_content_addressed = true;
-    node.expected_output_paths = vec![out_path.into()];
+    unbound.drv_content = aterm.clone().into_bytes();
+    unbound.drv_content_authoritative = false;
+    unbound.is_fixed_output = true;
+    unbound.is_content_addressed = true;
+    unbound.expected_output_paths = vec![out_path.into()];
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![unbound],
+            edges: vec![],
+            tenant_name: "team-md5-exempt".into(),
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("text content-address"),
+        "unbound md5 inline content rejected: {}",
+        status.message()
+    );
+
+    // ── Half 2: text-CA-bound → accepted ──
+    let mut bound = make_node("md5-exempt-bound");
+    bound.drv_content = aterm.clone().into_bytes();
+    bound.drv_content_authoritative = false;
+    bound.is_fixed_output = true;
+    bound.is_content_addressed = true;
+    bound.expected_output_paths = vec![out_path.into()];
+    rebind_text_ca(&mut bound, &aterm, "md5-exempt-bound");
+    // The modular hash must be recomputed against the REAL (text-CA)
+    // drv_path — the unbound fixture's hash was computed against the fake
+    // path and would now mismatch.
+    bound.ca_modular_hash = rio_nix::derivation::hash_derivation_modulo(
+        &rio_nix::derivation::Derivation::parse(&aterm).unwrap(),
+        &bound.drv_path,
+        &|_| None,
+        &mut std::collections::HashMap::new(),
+    )
+    .unwrap()
+    .to_vec();
 
     let result = grpc
         .submit_build(Request::new(Req {
-            nodes: vec![node],
+            nodes: vec![bound],
             edges: vec![],
             tenant_name: "team-md5-exempt".into(),
             ..Default::default()
@@ -1482,7 +1539,7 @@ async fn test_submit_build_accepts_non_authoritative_md5_fod_content() {
         .await;
     assert!(
         result.is_ok(),
-        "non-authoritative md5-FOD inline content accepted: {result:?}"
+        "text-CA-bound md5-FOD inline content accepted: {result:?}"
     );
 }
 
@@ -1577,6 +1634,513 @@ async fn test_submit_build_rejects_authoritative_fod_without_expected_path() {
             .message()
             .contains("must declare the fixed-output path"),
         "should require the fixed-output expected path: {}",
+        status.message()
+    );
+}
+
+// ── Non-authoritative inline-content binding (sched.merge.ingress-inline-drv-binding) ──
+//
+// The gateway's inline-.drv optimization attaches canonical ATerm bytes of
+// store-backed derivations to will-dispatch nodes. These tests pin the
+// ingress binding of those bytes to the node's declared identity. Fixtures
+// are built with rio-nix's own path computations (and the oracle-produced
+// golden corpus) so they cannot drift from the implementation.
+
+/// Build an HONEST non-authoritative inline leaf IA node: declared output
+/// path derived via rio-nix's own computation, `.drv` path = text
+/// content-address of the canonical bytes, identity fields from the parsed
+/// derivation. `pad_to`: if Some(n), size the canonical ATerm to exactly n
+/// bytes via an env pad entry (panics if n is too small).
+fn inline_leaf_ia_node(tag: &str, pad_to: Option<usize>) -> rio_proto::types::DerivationNode {
+    use rio_nix::derivation::{Derivation, input_addressed_output_paths};
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+    use std::collections::HashMap;
+
+    let build_aterm = |out_path: &str, pad: &str| -> String {
+        format!(
+            r#"Derive([("out","{out_path}","","")],[],[],"x86_64-linux","/bin/sh",["-c","echo hi"],[("name","{tag}"),("out","{out_path}"),("pad","{pad}")])"#
+        )
+    };
+
+    // Pass 1: empty pad → measure the fixed overhead.
+    let masked_0 = build_aterm("", "");
+    let masked_drv_0 = Derivation::parse(&masked_0).expect("masked template parses");
+    let name_only_path = format!("/nix/store/{}-{tag}.drv", "a".repeat(32));
+    let resolve_none = |_: &str| -> Option<&Derivation> { None };
+    let paths_0 = input_addressed_output_paths(
+        &masked_drv_0,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive leaf IA paths");
+    let final_0 = build_aterm(paths_0["out"].as_str(), "");
+
+    let pad_len = match pad_to {
+        None => 0,
+        Some(target) => {
+            assert!(
+                target >= final_0.len(),
+                "pad_to {target} smaller than fixed overhead {}",
+                final_0.len()
+            );
+            target - final_0.len()
+        }
+    };
+    let pad = "x".repeat(pad_len);
+
+    // Pass 2 (real): the pad participates in the masked hash, so re-derive.
+    let masked = build_aterm("", &pad);
+    let masked_drv = Derivation::parse(&masked).expect("masked template parses");
+    let paths = input_addressed_output_paths(
+        &masked_drv,
+        &name_only_path,
+        &resolve_none,
+        &mut HashMap::new(),
+    )
+    .expect("derive leaf IA paths");
+    let out_path = paths["out"].as_str().to_owned();
+    let final_aterm = build_aterm(&out_path, &pad);
+    if let Some(target) = pad_to {
+        assert_eq!(final_aterm.len(), target, "padding math must be exact");
+    }
+
+    let drv = Derivation::parse(&final_aterm).expect("final ATerm parses");
+    assert_eq!(drv.to_aterm(), final_aterm, "fixture must be canonical");
+
+    // Text-CA path of the canonical bytes (no refs for a leaf).
+    let content_hash = NixHash::new(
+        HashAlgo::SHA256,
+        Sha256::digest(final_aterm.as_bytes()).to_vec(),
+    )
+    .unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &[])
+        .unwrap()
+        .as_str()
+        .to_owned();
+
+    rio_proto::types::DerivationNode {
+        drv_path: drv_path.clone(),
+        drv_hash: drv_path,
+        pname: tag.to_owned(),
+        system: drv.platform().to_owned(),
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_content_addressed: false,
+        expected_output_paths: vec![out_path],
+        drv_content: final_aterm.into_bytes(),
+        drv_content_authoritative: false,
+        ..Default::default()
+    }
+}
+
+/// Re-bind a tampered ATerm: recompute the text-CA `.drv` path for the
+/// (attacker-controlled) bytes and update drv_path/drv_hash to match, so
+/// tests can isolate per-output binding failures from the text-CA check.
+fn rebind_text_ca(node: &mut rio_proto::types::DerivationNode, aterm: &str, tag: &str) {
+    use rio_nix::derivation::Derivation;
+    use rio_nix::hash::{HashAlgo, NixHash};
+    use rio_nix::store_path::StorePath;
+    use sha2::{Digest, Sha256};
+
+    let drv = Derivation::parse(aterm).expect("tampered ATerm still parses");
+    let mut refs: Vec<StorePath> = Vec::new();
+    for r in drv.input_srcs().iter().chain(drv.input_drvs().keys()) {
+        refs.push(StorePath::parse(r).expect("ref parses"));
+    }
+    let content_hash =
+        NixHash::new(HashAlgo::SHA256, Sha256::digest(aterm.as_bytes()).to_vec()).unwrap();
+    let drv_path = StorePath::make_text(&format!("{tag}.drv"), &content_hash, &refs)
+        .unwrap()
+        .as_str()
+        .to_owned();
+    node.drv_path = drv_path.clone();
+    node.drv_hash = drv_path;
+    node.drv_content = aterm.as_bytes().to_vec();
+}
+
+/// THE variant-1 kill test: inline bytes whose ATerm declares a VICTIM's
+/// output path instead of the path the bytes actually derive to. The
+/// attacker controls drv_path (re-bound to the tampered bytes' text-CA so
+/// that check passes); the per-output IA binding must still catch that the
+/// declared path is not this derivation's.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_ia_path_squat() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let honest = inline_leaf_ia_node("squat-src", None);
+    let honest_out = honest.expected_output_paths[0].clone();
+    let victim = inline_leaf_ia_node("squat-victim", None);
+    let victim_out = victim.expected_output_paths[0].clone();
+    assert_ne!(honest_out, victim_out);
+
+    // Tamper: the attacker rewrites the declared output path (output field
+    // + env value) to the victim's, then re-binds drv_path to the tampered
+    // bytes so the text-CA check passes.
+    let honest_aterm = String::from_utf8(honest.drv_content.clone()).unwrap();
+    let tampered_aterm = honest_aterm.replace(&honest_out, &victim_out);
+    assert_ne!(honest_aterm, tampered_aterm);
+    let mut node = honest;
+    rebind_text_ca(&mut node, &tampered_aterm, "squat-src");
+    node.expected_output_paths = vec![victim_out.clone()];
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("derive to"),
+        "must catch the path squat: {}",
+        status.message()
+    );
+}
+
+/// The honest leaf IA fixture is accepted end-to-end.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_accepts_inline_leaf_ia_with_derived_path() {
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-inline-leaf").await;
+
+    let node = inline_leaf_ia_node("inline-leaf-ok", None);
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            tenant_name: "team-inline-leaf".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(result.is_ok(), "honest inline leaf IA accepted: {result:?}");
+}
+
+/// Gateway-traffic shape: a non-leaf inline IA node whose inputs are
+/// STORE-BACKED sibling nodes carrying ca_modular_hash declarations (the
+/// gateway populates them on every node — gw.dag.modulo-hash-all-nodes).
+/// The validator derives the consumer's declared paths by seeding the hash
+/// cache from the siblings; the oracle-produced golden corpus guarantees
+/// the derived paths equal the declared ones.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_accepts_inline_consumer_with_sibling_hashes() {
+    use rio_nix::derivation::{Derivation, DerivationLike, hash_derivation_modulo};
+    use std::collections::HashMap;
+
+    let (db, grpc, _handle, _task) = setup_grpc_with_pool().await;
+    seed_tenant(&db.pool, "team-inline-consumer").await;
+
+    // The golden corpus: consumer depends on leaf + multi + fod.
+    let consumer_text = include_str!(
+        "../../../../rio-nix/tests/fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"
+    )
+    .trim_end();
+    let consumer_path =
+        "/nix/store/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv".to_string();
+    let inputs: &[(&str, &str)] = &[
+        (
+            "/nix/store/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"
+            ),
+        ),
+        (
+            "/nix/store/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"
+            ),
+        ),
+        (
+            "/nix/store/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"
+            ),
+        ),
+    ];
+
+    let consumer_drv = Derivation::parse(consumer_text).unwrap();
+
+    // Build the consumer node: inline non-authoritative, identity from the
+    // parsed fixture (the .drv path IS its real text-CA — nix minted it).
+    let consumer_node = rio_proto::types::DerivationNode {
+        drv_path: consumer_path.clone(),
+        drv_hash: consumer_path.clone(),
+        pname: "rio-golden-consumer".into(),
+        system: consumer_drv.platform().to_owned(),
+        output_names: consumer_drv
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_owned())
+            .collect(),
+        is_fixed_output: consumer_drv.is_fixed_output(),
+        is_content_addressed: consumer_drv.is_content_addressed(),
+        expected_output_paths: consumer_drv
+            .outputs()
+            .iter()
+            .map(|o| o.path().to_owned())
+            .collect(),
+        drv_content: consumer_text.as_bytes().to_vec(),
+        drv_content_authoritative: false,
+        ..Default::default()
+    };
+
+    // Sibling nodes: store-backed (no inline content), carrying their
+    // modulo-hash declarations + identity from their fixtures.
+    let mut nodes = vec![consumer_node];
+    let mut edges = Vec::new();
+    for (path, text) in inputs {
+        let drv = Derivation::parse(text.trim_end()).unwrap();
+        let hash = hash_derivation_modulo(&drv, path, &|_| None, &mut HashMap::new())
+            .expect("input fixtures are leaves (FOD or no inputDrvs)");
+        nodes.push(rio_proto::types::DerivationNode {
+            drv_path: (*path).to_string(),
+            drv_hash: (*path).to_string(),
+            pname: "input".into(),
+            system: drv.platform().to_owned(),
+            output_names: drv.outputs().iter().map(|o| o.name().to_owned()).collect(),
+            is_fixed_output: drv.is_fixed_output(),
+            is_content_addressed: drv.is_content_addressed(),
+            expected_output_paths: drv.outputs().iter().map(|o| o.path().to_owned()).collect(),
+            ca_modular_hash: hash.to_vec(),
+            ..Default::default()
+        });
+        edges.push(rio_proto::types::DerivationEdge {
+            parent_drv_path: consumer_path.clone(),
+            child_drv_path: (*path).to_string(),
+        });
+    }
+
+    let result = grpc
+        .submit_build(Request::new(Req {
+            nodes,
+            edges,
+            tenant_name: "team-inline-consumer".into(),
+            ..Default::default()
+        }))
+        .await;
+    assert!(
+        result.is_ok(),
+        "inline consumer with sibling hash declarations accepted: {result:?}"
+    );
+}
+
+/// Fail-closed: the same consumer submission but one input sibling carries
+/// NO hash declaration (and no inline bytes) — the consumer's IA paths
+/// cannot be derived, so the submission is rejected, never skipped.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_consumer_with_missing_input_hash() {
+    use rio_nix::derivation::{Derivation, DerivationLike, hash_derivation_modulo};
+    use std::collections::HashMap;
+
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let consumer_text = include_str!(
+        "../../../../rio-nix/tests/fixtures/drv/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv"
+    )
+    .trim_end();
+    let consumer_path =
+        "/nix/store/92fkmfw4x3ks4dl3pvhk9s0hm3z30cc2-rio-golden-consumer.drv".to_string();
+    let inputs: &[(&str, &str, bool)] = &[
+        (
+            "/nix/store/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/ragyx33c7zn1kxaag6nc57aiw71699ln-rio-golden-leaf.drv"
+            ),
+            // The leaf's hash declaration is WITHHELD.
+            false,
+        ),
+        (
+            "/nix/store/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/jkafcgv3rmnnyrhbr0zmfmh58fnw8wgw-rio-golden-multi.drv"
+            ),
+            true,
+        ),
+        (
+            "/nix/store/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv",
+            include_str!(
+                "../../../../rio-nix/tests/fixtures/drv/5d0dlxwjfzi5pbqb526pd35ny1rcmm7x-rio-golden-fod.drv"
+            ),
+            true,
+        ),
+    ];
+
+    let consumer_drv = Derivation::parse(consumer_text).unwrap();
+    let consumer_node = rio_proto::types::DerivationNode {
+        drv_path: consumer_path.clone(),
+        drv_hash: consumer_path.clone(),
+        pname: "rio-golden-consumer".into(),
+        system: consumer_drv.platform().to_owned(),
+        output_names: consumer_drv
+            .outputs()
+            .iter()
+            .map(|o| o.name().to_owned())
+            .collect(),
+        is_fixed_output: consumer_drv.is_fixed_output(),
+        is_content_addressed: consumer_drv.is_content_addressed(),
+        expected_output_paths: consumer_drv
+            .outputs()
+            .iter()
+            .map(|o| o.path().to_owned())
+            .collect(),
+        drv_content: consumer_text.as_bytes().to_vec(),
+        drv_content_authoritative: false,
+        ..Default::default()
+    };
+
+    let mut nodes = vec![consumer_node];
+    let mut edges = Vec::new();
+    for (path, text, with_hash) in inputs {
+        let drv = Derivation::parse(text.trim_end()).unwrap();
+        let mut node = rio_proto::types::DerivationNode {
+            drv_path: (*path).to_string(),
+            drv_hash: (*path).to_string(),
+            pname: "input".into(),
+            system: drv.platform().to_owned(),
+            output_names: drv.outputs().iter().map(|o| o.name().to_owned()).collect(),
+            is_fixed_output: drv.is_fixed_output(),
+            is_content_addressed: drv.is_content_addressed(),
+            expected_output_paths: drv.outputs().iter().map(|o| o.path().to_owned()).collect(),
+            ..Default::default()
+        };
+        if *with_hash {
+            let hash = hash_derivation_modulo(&drv, path, &|_| None, &mut HashMap::new()).unwrap();
+            node.ca_modular_hash = hash.to_vec();
+        }
+        nodes.push(node);
+        edges.push(rio_proto::types::DerivationEdge {
+            parent_drv_path: consumer_path.clone(),
+            child_drv_path: (*path).to_string(),
+        });
+    }
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes,
+            edges,
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("cannot derive input-addressed"),
+        "fail-closed on the missing input hash: {}",
+        status.message()
+    );
+}
+
+/// Variant-3 kill: forged flags. The bytes are honest but the node claims
+/// is_fixed_output (which flows into upload-authorization claims signing).
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_flag_forgery() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let mut node = inline_leaf_ia_node("flag-forge", None);
+    node.is_fixed_output = true;
+    node.is_content_addressed = true;
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("is_fixed_output")
+            || status.message().contains("is_content_addressed"),
+        "must catch the flag forgery: {}",
+        status.message()
+    );
+}
+
+/// The declared drv_path is not the text content-address of the bytes.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_text_ca_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let mut node = inline_leaf_ia_node("text-ca-mismatch", None);
+    // Point the declared path at a syntactically-valid but wrong .drv path.
+    let wrong = format!("/nix/store/{}-text-ca-mismatch.drv", "f".repeat(32));
+    node.drv_path = wrong.clone();
+    node.drv_hash = wrong;
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("text content-address"),
+        "must catch the path/content unbinding: {}",
+        status.message()
+    );
+}
+
+/// expected_output_paths disagrees with the (honest) bytes.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_expected_path_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let mut node = inline_leaf_ia_node("exp-mismatch", None);
+    let victim = inline_leaf_ia_node("exp-victim", None);
+    node.expected_output_paths = vec![victim.expected_output_paths[0].clone()];
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("expected_output_paths"),
+        "must catch the expected-path mismatch: {}",
+        status.message()
+    );
+}
+
+/// ca_modular_hash disagrees with the recomputed value.
+// r[verify sched.merge.ingress-inline-drv-binding]
+#[tokio::test]
+async fn test_submit_build_rejects_inline_modular_hash_mismatch() {
+    let (_db, grpc, _handle, _task) = setup_grpc().await;
+
+    let mut node = inline_leaf_ia_node("modhash-mismatch", None);
+    node.ca_modular_hash = vec![0xEE; 32];
+
+    let status = grpc
+        .submit_build(Request::new(Req {
+            nodes: vec![node],
+            edges: vec![],
+            ..Default::default()
+        }))
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    assert!(
+        status.message().contains("ca_modular_hash"),
+        "must catch the modular-hash mismatch: {}",
         status.message()
     );
 }
