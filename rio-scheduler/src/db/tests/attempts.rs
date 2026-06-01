@@ -10,7 +10,8 @@ use super::insert_test_derivation;
 use crate::db::SchedulerDb;
 use crate::db::attempts::AttemptRow;
 use crate::state::{
-    AttemptEventKind, DerivationStatus, DrvHash, ExecutorId, OutcomeClass, ReportingParty,
+    AttemptEventKind, AttemptKind, DerivationStatus, DrvHash, ExecutorId, OutcomeClass,
+    ReportingParty,
 };
 
 /// Fresh ephemeral PG + one inserted derivation to hang rows off.
@@ -313,4 +314,191 @@ fn test_attempt_vocabulary_str_roundtrip() {
         let parsed: ReportingParty = party.as_str().parse().expect("round-trip");
         assert_eq!(parsed, *party);
     }
+    for kind in AttemptKind::ALL {
+        let parsed: AttemptKind = kind.as_str().parse().expect("round-trip");
+        assert_eq!(parsed, *kind);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// The attempt-kind plumbing (substitution-replacement Phase A): the
+// suffix load joins drv_executions.attempt_kind onto each ledger row,
+// and the fold input carries it into the kernel's kind partition.
+// ─────────────────────────────────────────────────────────────────────────
+
+/// Insert a `drv_executions` row carrying an explicit `attempt_kind` —
+/// the shape the materialization mint will write (build mints rely on
+/// the column DEFAULT and never name it).
+async fn insert_execution_with_kind(
+    pool: &sqlx::PgPool,
+    exec_id: Uuid,
+    drv_hash32: &str,
+    executor_id: &str,
+    attempt_kind: &str,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "INSERT INTO drv_executions \
+             (exec_id, drv_hash, executor_id, started_at, attempt_kind) \
+         VALUES ($1, $2, $3, now(), $4)",
+    )
+    .bind(exec_id)
+    .bind(drv_hash32)
+    .bind(executor_id)
+    .bind(attempt_kind)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The suffix load discriminates kind: a `drv_attempts` row whose exec
+/// joins a `drv_executions` row with `attempt_kind='materialization'`
+/// loads as [`AttemptKind::Materialization`]; rows with no exec_id or a
+/// build execution load as [`AttemptKind::Build`]. And the loaded
+/// suffix passed to `decide()` produces a verdict identical to the
+/// build-rows-only suffix — the scheduler half of the invisibility
+/// property (the kernel half is the
+/// `check_materialization_rows_invisible_to_build_decision` CBMC
+/// harness).
+// r[verify sched.materialize.routing]
+#[tokio::test]
+async fn test_suffix_load_carries_attempt_kind_and_partition() -> anyhow::Result<()> {
+    let (test_db, db, drv_id) = setup("attempt-kind-hash").await?;
+
+    // Exec A: a build execution (attempt_kind='build', the default the
+    // pull mint writes implicitly — written explicitly here to pin the
+    // literal).
+    let exec_a = Uuid::now_v7();
+    insert_execution_with_kind(
+        &test_db.pool,
+        exec_a,
+        &format!("{:0>32}", "kindbuild"),
+        "builder-1",
+        "build",
+    )
+    .await?;
+
+    // Exec B: a materialization execution.
+    let exec_b = Uuid::now_v7();
+    insert_execution_with_kind(
+        &test_db.pool,
+        exec_b,
+        &format!("{:0>32}", "kindmat"),
+        "intent@store-0",
+        "materialization",
+    )
+    .await?;
+
+    // Three ledger rows: a transient build attempt (exec A), a
+    // materialization-infra row (exec B), and a cascade row (no exec —
+    // loads as Build by the COALESCE default).
+    let mut build_attempt =
+        AttemptRow::new(drv_id, OutcomeClass::Transient, ReportingParty::Worker);
+    build_attempt.exec_id = Some(exec_a);
+    build_attempt.executor_id = Some(ExecutorId::from("builder-1"));
+    build_attempt.source_node = Some("node-1".into());
+
+    let mut mat_attempt = AttemptRow::new(
+        drv_id,
+        OutcomeClass::MaterializationInfra,
+        ReportingParty::Worker,
+    );
+    mat_attempt.exec_id = Some(exec_b);
+    mat_attempt.executor_id = Some(ExecutorId::from("intent@store-0"));
+
+    let cascade = AttemptRow::new(drv_id, OutcomeClass::Cascade, ReportingParty::Scheduler);
+
+    let mut tx = db.pool().begin().await?;
+    assert!(SchedulerDb::append_attempt(&mut tx, &build_attempt).await?);
+    assert!(SchedulerDb::append_attempt(&mut tx, &mat_attempt).await?);
+    assert!(SchedulerDb::append_attempt(&mut tx, &cascade).await?);
+    tx.commit().await?;
+
+    // The loaded suffix carries the joined kinds in ledger order.
+    let loaded = db.load_attempt_suffix(&[drv_id]).await?;
+    let rows = loaded.get(&drv_id).expect("derivation has rows");
+    assert_eq!(rows.len(), 3);
+    let kinds: Vec<AttemptKind> = rows.iter().map(|r| r.attempt_kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            AttemptKind::Build,
+            AttemptKind::Materialization,
+            AttemptKind::Build
+        ],
+        "exec-A row joins 'build', exec-B row joins 'materialization', \
+         the no-exec cascade row defaults to Build"
+    );
+
+    // The in-tx single-derivation load carries the same kinds.
+    let mut tx = db.pool().begin().await?;
+    let in_tx_rows = SchedulerDb::load_attempt_suffix_one_in_tx(&mut tx, drv_id).await?;
+    tx.commit().await?;
+    let in_tx_kinds: Vec<AttemptKind> = in_tx_rows.iter().map(|r| r.attempt_kind).collect();
+    assert_eq!(in_tx_kinds, kinds, "both suffix loads carry the same join");
+
+    // The fold-input partition: decide() over the loaded records equals
+    // decide() over the build-kind records only — the materialization
+    // row is invisible to the build verdict.
+    let records: Vec<crate::state::AttemptRecord> = rows.iter().map(|r| r.to_record()).collect();
+    let build_only: Vec<crate::state::AttemptRecord> = records
+        .iter()
+        .filter(|r| r.attempt_kind == AttemptKind::Build)
+        .cloned()
+        .collect();
+    assert_eq!(
+        build_only.len(),
+        2,
+        "the materialization record is filtered"
+    );
+
+    let budget = crate::retry_policy::Budget::default();
+    let now = rows
+        .last()
+        .map(|r| r.recorded_at_epoch_secs as crate::retry_policy::AbsTime)
+        .unwrap_or_default();
+    let full_decision = crate::retry_policy::decide(&records, &budget, now);
+    let build_only_decision = crate::retry_policy::decide(&build_only, &budget, now);
+    assert_eq!(
+        full_decision, build_only_decision,
+        "the loaded materialization row must be invisible to the build decision"
+    );
+    Ok(())
+}
+
+/// The Rust-side `AttemptKind` alphabet and the migration-078
+/// `drv_executions.attempt_kind` CHECK constraint stay in lockstep —
+/// the same discipline as the outcome-class alphabet test above.
+#[tokio::test]
+async fn test_attempt_kind_alphabet_matches_check_constraint() -> anyhow::Result<()> {
+    let (test_db, _db, _drv_id) = setup("attempt-kind-alphabet-hash").await?;
+
+    let defs: Vec<String> = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(c.oid) \
+         FROM pg_constraint c JOIN pg_class t ON c.conrelid = t.oid \
+         WHERE t.relname = 'drv_executions' AND c.contype = 'c'",
+    )
+    .fetch_all(&test_db.pool)
+    .await?;
+
+    let def = defs
+        .iter()
+        .find(|d| d.contains("attempt_kind"))
+        .expect("drv_executions has an attempt_kind CHECK constraint");
+    let check_kinds: std::collections::BTreeSet<String> = def
+        .split('\'')
+        .skip(1)
+        .step_by(2)
+        .map(str::to_string)
+        .collect();
+
+    let rust_kinds: std::collections::BTreeSet<String> = AttemptKind::ALL
+        .iter()
+        .map(|k| k.as_str().to_string())
+        .collect();
+    assert_eq!(
+        rust_kinds, check_kinds,
+        "AttemptKind and the 078 attempt_kind CHECK must carry the same alphabet \
+         (extending it is a new migration plus a variant)"
+    );
+    Ok(())
 }

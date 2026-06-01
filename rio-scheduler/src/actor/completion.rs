@@ -2843,6 +2843,9 @@ impl DagActor {
                 outcome_class: OutcomeClass::Transient,
                 exec_id: None,
                 executor_id: Some(executor_id.clone()),
+                // The transient-failure path is a build observation by
+                // construction (kind partition identity value).
+                attempt_kind: crate::state::AttemptKind::Build,
                 source_node: self.pull_attempt_source_node(drv_hash),
                 termination_reason: None,
                 reporting_party: ReportingParty::Worker,

@@ -641,6 +641,28 @@ db_str_enum! {
 }
 
 db_str_enum! {
+    /// Work class of an execution/attempt (`drv_executions.attempt_kind`,
+    /// migration 078): a from-source build or a store-executed
+    /// materialization (substitution-replacement campaign, design §2.5).
+    /// The db mirror of [`rio_retry_kernel::AttemptKind`]; the string
+    /// alphabet stays in lockstep with the 078 CHECK constraint,
+    /// verified by the `attempt_kind_alphabet_matches_check_constraint`
+    /// test. Kind is keyed on this column and ONLY this column — never
+    /// derived from an executor-id prefix (the newtypes.rs convention).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub enum AttemptKind {
+        /// A from-source build attempt (the as-built work class; the
+        /// column DEFAULT, so every existing writer is untouched).
+        #[default]
+        Build = "build",
+        /// A store-executed materialization attempt.
+        Materialization = "materialization",
+    }
+    parse_err(_s) = &'static str:
+        "invalid attempt kind (must be 'build' or 'materialization')";
+}
+
+db_str_enum! {
     /// Origin of a materialization job (`materialization_jobs.origin`,
     /// migration 078): which classification demanded the job
     /// (substitution-replacement campaign, design §2.1). The alphabet is
@@ -710,6 +732,12 @@ pub struct AttemptRecord {
     pub exec_id: Option<Uuid>,
     /// Executor that ran (or was assigned) the attempt.
     pub executor_id: Option<ExecutorId>,
+    /// Work class of the attempt's execution (substitution-replacement,
+    /// joined from `drv_executions.attempt_kind` at suffix load; rows
+    /// without an execution are [`AttemptKind::Build`]). Keys the
+    /// retry-fold kind partition: materialization-kind records are
+    /// invisible to every build budget.
+    pub attempt_kind: AttemptKind,
     /// Controller-authoritative source node (071, AD2c) — stamped only
     /// for pull-mode attempts. The retry fold keys the row's
     /// exclusion/budget contribution on this and ONLY this (decision

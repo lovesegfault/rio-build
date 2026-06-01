@@ -27,7 +27,8 @@ use uuid::Uuid;
 
 use super::SchedulerDb;
 use crate::state::{
-    AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, POISON_TTL, ReportingParty,
+    AttemptEventKind, AttemptKind, AttemptRecord, ExecutorId, OutcomeClass, POISON_TTL,
+    ReportingParty,
 };
 
 /// Phase-1 ledger retention floor (decision P8): there is NO TTL sweep
@@ -71,6 +72,13 @@ pub(crate) struct AttemptRow {
     pub exec_id: Option<Uuid>,
     /// Executor that ran (or was assigned) the attempt.
     pub executor_id: Option<ExecutorId>,
+    /// Work class of the attempt's execution (substitution-replacement).
+    /// NOT a `drv_attempts` column: joined from
+    /// `drv_executions.attempt_kind` on read-back (COALESCE'd to
+    /// `'build'` for rows with no execution), defaulted to Build at
+    /// construction, and never written by the append statements. The
+    /// kind is persisted only via the execution row.
+    pub attempt_kind: AttemptKind,
     /// Controller-authoritative source node the attempt ran on (071,
     /// AD2c). Stamped only for pull-mode attempts, from the spawn-ack
     /// binding / the execution row / the controller's report — never
@@ -121,6 +129,7 @@ impl AttemptRow {
             derivation_id,
             exec_id: None,
             executor_id: None,
+            attempt_kind: AttemptKind::Build,
             source_node: None,
             event_kind: AttemptEventKind::Attempt,
             outcome_class,
@@ -162,6 +171,7 @@ impl AttemptRow {
             outcome_class: self.outcome_class,
             exec_id: self.exec_id,
             executor_id: self.executor_id.clone(),
+            attempt_kind: self.attempt_kind,
             source_node: self.source_node.clone(),
             termination_reason: self.termination_reason.clone(),
             reporting_party: self.reporting_party,
@@ -197,6 +207,7 @@ struct RawAttemptRow {
     derivation_id: Uuid,
     exec_id: Option<Uuid>,
     executor_id: Option<String>,
+    attempt_kind: String,
     source_node: Option<String>,
     event_kind: String,
     outcome_class: String,
@@ -226,6 +237,10 @@ impl TryFrom<RawAttemptRow> for AttemptRow {
             derivation_id: raw.derivation_id,
             exec_id: raw.exec_id,
             executor_id: raw.executor_id.map(ExecutorId::from),
+            attempt_kind: raw
+                .attempt_kind
+                .parse()
+                .map_err(|_| parse_err("attempt_kind", &raw.attempt_kind))?,
             source_node: raw.source_node,
             event_kind: raw
                 .event_kind
@@ -440,9 +455,11 @@ impl SchedulerDb {
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \
+                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
                     EXTRACT(EPOCH FROM a.occurred_at)::float8 AS occurred_at_epoch_secs, \
                     EXTRACT(EPOCH FROM a.recorded_at)::float8 AS recorded_at_epoch_secs \
              FROM drv_attempts a \
+             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              LEFT JOIN LATERAL ( \
                  SELECT r.recorded_at, r.attempt_id \
                  FROM drv_attempts r \
@@ -484,7 +501,11 @@ impl SchedulerDb {
         // (served by the partial index on `WHERE event_kind = 'reset'`);
         // the row-wise tuple comparison keeps everything at-or-after it,
         // with `attempt_id` (UUIDv7, append-ordered) breaking
-        // `recorded_at` ties. One `&'static str` literal — sqlx 0.9's
+        // `recorded_at` ties. The drv_executions join carries the
+        // attempt kind onto each row (COALESCE'd to 'build' for rows
+        // with no execution — cascade victims, fleet-exhaust markers,
+        // resets) so the fold input can key the kind partition. One
+        // `&'static str` literal — sqlx 0.9's
         // `SqlSafeStr` bound on `query_as()` rejects runtime-composed
         // SQL. Timestamps come back as epoch seconds (no chrono/time
         // dependency — same pattern as the recovery rows).
@@ -493,9 +514,11 @@ impl SchedulerDb {
                     a.event_kind, a.outcome_class, a.termination_reason, \
                     a.reporting_party, a.exempt, a.floor_promoted, a.floor_at_cap, \
                     a.error_msg, a.final_line_count, a.resubmit_cycle, \
+                    COALESCE(e.attempt_kind, 'build') AS attempt_kind, \
                     EXTRACT(EPOCH FROM a.occurred_at)::float8 AS occurred_at_epoch_secs, \
                     EXTRACT(EPOCH FROM a.recorded_at)::float8 AS recorded_at_epoch_secs \
              FROM drv_attempts a \
+             LEFT JOIN drv_executions e ON e.exec_id = a.exec_id \
              LEFT JOIN LATERAL ( \
                  SELECT r.recorded_at, r.attempt_id \
                  FROM drv_attempts r \

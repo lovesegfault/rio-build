@@ -33,7 +33,9 @@
 
 use std::collections::BTreeSet;
 
-use crate::state::{AttemptEventKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty};
+use crate::state::{
+    AttemptEventKind, AttemptKind, AttemptRecord, ExecutorId, OutcomeClass, ReportingParty,
+};
 
 pub(crate) use rio_retry_kernel::{
     AbsTime, Budget, FloorOutcomeView, ObservedFailure, PoisonReason, Verdict,
@@ -151,13 +153,7 @@ fn record_to_row(record: &AttemptRecord) -> rio_retry_kernel::LedgerRow<String> 
         floor_at_cap: record.floor_at_cap,
         resubmit_cycle: record.resubmit_cycle,
         at: record.occurred_at_epoch_secs as AbsTime,
-        // Every in-memory record is a build attempt until the
-        // suffix-load JOIN populates the real kind from
-        // drv_executions.attempt_kind (the fold-input plumbing that
-        // lands with AttemptRecord.attempt_kind). Build is the identity
-        // value: the kind partition treats it exactly as the
-        // pre-partition fold treated every row.
-        kind: rio_retry_kernel::AttemptKind::Build,
+        kind: kernel_attempt_kind(record.attempt_kind),
     }
 }
 
@@ -166,6 +162,16 @@ fn kernel_event_kind(kind: AttemptEventKind) -> rio_retry_kernel::AttemptEventKi
     match kind {
         AttemptEventKind::Attempt => rio_retry_kernel::AttemptEventKind::Attempt,
         AttemptEventKind::Reset => rio_retry_kernel::AttemptEventKind::Reset,
+    }
+}
+
+/// db enum → kernel work kind (the kind-partition key; substitution-
+/// replacement design §2.5). Exhaustive so a variant added on either
+/// side fails to compile until both move together.
+fn kernel_attempt_kind(kind: AttemptKind) -> rio_retry_kernel::AttemptKind {
+    match kind {
+        AttemptKind::Build => rio_retry_kernel::AttemptKind::Build,
+        AttemptKind::Materialization => rio_retry_kernel::AttemptKind::Materialization,
     }
 }
 
@@ -700,6 +706,7 @@ mod tests {
             outcome_class: class,
             exec_id: None,
             executor_id: (!executor.is_empty()).then(|| ExecutorId::from(executor)),
+            attempt_kind: AttemptKind::Build,
             source_node: (!executor.is_empty()).then(|| executor.to_string()),
             termination_reason: None,
             reporting_party: party,
