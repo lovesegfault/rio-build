@@ -2265,6 +2265,19 @@ carried unchanged):
 | CE-D8 | KEEP: the GC-after-vouch bounds | Unchanged (B2-strong stays an expect-violation probe; pin-at-vouch is deferred to the A3 substitution replacement design). | 0c |
 | CE-D9 | KEEP: the D10 expired-at-load poison residual | Unchanged. | 0a |
 
+> **Successor cross-reference (substitution-replacement Phase B, 2026-06).**
+> The rows above are this campaign's record as written and are not edited.
+> The substitution-replacement campaign's Phase B (flag-on cutover)
+> re-verified CE-D1..D5 against the materialization path and recorded the
+> dispositions — including the CE-D1 alert that now ships in the chart
+> (`RioSchedulerEvidenceWriteFenced`), the CE-D4 fail-fast site's flag-on
+> successor (the §2.4 consumption settlement), and the CE-D8 evidence
+> delivered by pin-at-ingest — in
+> `substitution-replacement-invariant-map.md` § "Phase B deployment
+> checklist (Wave 6, T-6.3)", together with the new materialization rows
+> (MD-D1..D4). CE-D6's conjunction re-run is deferred to that campaign's
+> Phase C′ go/no-go.
+
 ### Owner-decision provenance
 
 Every owner decision this campaign executed under, with date and Phase-1 outcome:

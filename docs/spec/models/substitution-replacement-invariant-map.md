@@ -462,6 +462,42 @@ persist — the absorption arms stay documented, not deleted (deletion is D′).
 
 ---
 
+## Phase B deployment checklist (Wave 6, T-6.3)
+
+The design §8-B exit-gate re-verification of the closure-evidence deployment
+rows (CE-D1..D9 — the predecessor campaign's operator handoff, recorded in
+`closure-evidence-invariant-map.md`; that record is history and is NOT
+edited — it carries a pointer to this section), plus the NEW
+materialization-specific rows (MD-D). The gateway deployment rows
+(GW-D1..D3, `gw-session-invariant-map.md`) are untouched by this campaign:
+Phase B makes zero gateway production changes (PD-B15), so their premises
+are unchanged.
+
+### CE-D re-verification (flag-on)
+
+| Row | As-built meaning | Phase B flag-on disposition | Evidence |
+|---|---|---|---|
+| CE-D1 (fenced-write metric + leader alert) | evidence-write fence refusals: failover bursts are the fence working; sustained nonzero on the leader = floor regression | **Re-verified + extended.** Materialization job-table and wanted-relation writes carry the SAME claims-floor fence and feed the SAME counter (`rio_scheduler_evidence_write_fenced_total`). The recommended alert now SHIPS in the chart: `RioSchedulerEvidenceWriteFenced` (sum(rate[5m]) > 0 for 15m, critical) — the temporal form discriminates failover bursts (self-clear in seconds) from leader fencing. (The Phase B plan named this `RioSchedulerMaterializationFenced`; the shipped name is generic because the counter is shared — a materialization-only name on a shared counter would misdirect operators. Deviation recorded for plan review.) | Phase A fenced db batteries; T-6.2's alert (commit `034e91c1a`); helm-lint alert-quality fragment |
+| CE-D2 (failover PG-flap alerts) | generation claim/floor read failures at failover | **Unchanged.** Same metrics; they now also guard the fencing of job writes (same floor reads). | T-3.3 failover scenario green (jobs survive, ids identical) |
+| CE-D3 (merge `FAILED_PRECONDITION` during failover) | stale-tenure merge refusal | **Unchanged.** Job creation and the wanted relation ride the merge transaction (in-tx batch), so the same refusal covers them — a fenced merge creates no jobs (B6). | T-3.3 + the Phase A in-tx tests (`job_create_in_rolled_back_tx_leaves_no_row`) |
+| CE-D4 (wrongful-fail-fast gone; resubmit guidance) | every fail-fast decision point re-probes first | **Re-verified flag-on against §2.4.** The single surviving flag-on fail-fast site (consumption settlement, arm 3) re-probes the live wanted set in-transaction AND discriminates on the topdown-pruned mark (finding 11) — only marked roots fail-fast, with the same resubmit-directing error wrapper. Resubmit guidance unchanged: a resubmitted build creates a NEW job with a fresh re-probe one-shot. | T-3.1 routing-fail-fast subtest (+ its `-walk` oracle twin: same verdict both mechanisms); T-4.4 routing matrix |
+| CE-D5 (poison-clear wakes spared parents) | survivor re-evaluation at clear/sweep | **Re-verified flag-on.** Survivors carrying unresolved jobs stay armed without any walk (T-4.3's reap gate); the reprobe lane creates `reprobe`-origin jobs WITH the AS-5 reset + `poison_cleared` row instead of walks (T-1.5); the promotion arm itself is untouched. | T-4.3 + T-1.5's reprobe tests + the T-5.3 origin sweep |
+| CE-D6 (manual-target runbook: the 7 closureEvidence conjunctions) | run before evidence-handling changes | **Deferred to C′** (design §9.3: re-run as part of the C′ go/no-go). Phase B touches no closure-evidence check; the conjunctions' premises (the as-built walk arms) are intact flag-off. Recorded as a C′ entry criterion in the Wave 7 handoff. | Wave 7 handoff |
+| CE-D7 (AW1 lost-hole-stamp ∩ builds-row-purge bound) | Phase-0 residual | **Unchanged** (closes at D′ with the walk deletion). | — |
+| CE-D8 (GC-after-vouch bounds) | Phase-0 residual; pin-at-vouch deferred to this campaign | **Evidence delivered, disposition stays D′'s.** Pin-at-ingest (§5.1) + the §5.3 release lifecycle close the GC-after-vouch window for materialized paths (B2-strong over ingest → all-interest-terminal); the CE-D8 row itself is retired only when D′ deletes the walk (whose vouch path keeps the as-built bound). | T-3.1 gc-pin subtest; T-1.8's three-site release wiring |
+| CE-D9 (D10 expired-at-load poison residual) | Phase-0 residual | **Unchanged.** | — |
+
+### MD-D — materialization deployment rows (NEW)
+
+| ID | Item | What to do / what it means | Evidence |
+|---|---|---|---|
+| MD-D1 | **Park alerting + runbook** | A parked materialization job means UPSTREAM trouble, never build failure: builds wait visibly (`rio_scheduler_materialization_stalled` > 0; the `RioSchedulerMaterializationStalled` alert at 15 m). Every parked job has Broken closure evidence (no from-source fallback) — jobs with buildable closures are auto-resolved from-source by the housekeeping re-evaluation arm within one tick. Runbook: check the tenant's upstream cache config/health (`rio_store_substitute_total{result="error"}` rate, store logs); builds resume on upstream recovery (park-expiry re-claim) or can be cancelled. Do NOT restart the scheduler to "fix" a park — the park is durable state and survives restarts by design. | T-6.1 (re-evaluation arm + gauge), T-6.2 (alert), vm-materialization-standalone infra-park subtest |
+| MD-D2 | **Flag rollback procedure (ON → OFF)** | Set both helm values false (`scheduler.materialization.enabled`, `store.materialization.enabled`) and roll. The walk serves all new work immediately. Flag-on-era state drains, never strands: pending job rows are inert (nothing claims them); claimed jobs' reports drain through the always-on consumption transaction; flag-on-era marks were cleared at resolution (the §4 clear-mirror), so no wrongful fail-fast can fire on stale marks; flag-on-era pins release through the always-on §5.3 wiring once jobs resolve and interest goes terminal. The chart's AND-guard makes the hazardous persistent state (scheduler on / store off) unrenderable in either direction. | vm-materialization-transition-k3s (both directions, 8/8 subtests incl. flip-off marks + pins); T-1.7 revert-with-state test; T-1.8 always-on release tests |
+| MD-D3 | **Mixed-flag window guidance** | During a rollout where the scheduler is flag-on before the store (the transient AS-6 race the AND-guard cannot eliminate): jobs are created but not claimed — a visible wait (`substituting_derivations` > 0 via rio-cli status, builds Active), bounded by the store rollout completing, never a strand (the store's first poll drains the backlog). The reverse window (store on / scheduler off) is a no-op: the store polls empty lists harmlessly. | T-3.3 mixed-flag subtest (45 s observation window, drains on store rollout) |
+| MD-D4 | **Mixed-version (rolling upgrade) posture of the instance-bound credential** | The T-5.1 instance binding is FAIL-CLOSED across version skew: a pre-Phase-B scheduler that receives an instance-bound store token REJECTS it (`deny_unknown_fields` — `unknown field 'instance'`), so no mixed-version window exists in which an instance-bound token is authenticated while the binding check is skipped. The failure mode of that (unsupported, unreachable pre-D′) skew direction is store claim retries against the rolling scheduler — self-healing within the rollout window — never unenforced binding and never a wrongful build outcome. No deployment-ordering step is required for security: the store's instance-bound minting is flag-gated and the flag rolls atomically with the pod template (a pod is either old-binary+flag-off or new-binary+flag-on, never a cross). | `service_claims_instance_forward_skew` (the fail-closed pin); T-5.1 wire-compat battery; PD-B8/PDB-8 adjudication record |
+
+---
+
 ## Cross-references
 
 - `closure-evidence-invariant-map.md` — the predecessor campaign's map; its
