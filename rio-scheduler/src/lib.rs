@@ -302,6 +302,17 @@ pub fn describe_metrics() {
          scheduler.materialization.enabled = false (the Phase A deployed \
          state) — a nonzero value flag-off is a dormancy violation."
     );
+    describe_gauge!(
+        "rio_scheduler_materialization_stalled",
+        "Parked materialization jobs (infra budget exhausted; waiting on upstream \
+         recovery or park-backoff expiry). Leader-published every housekeeping tick \
+         from ground truth. Jobs whose nodes have buildable dependency closures are \
+         re-evaluated and resolved from-source instead of staying parked (PD-20), so \
+         a sustained nonzero value means a dead/misconfigured upstream is stalling \
+         work that has NO from-source fallback — the operator signal to check \
+         upstream cache health and tenant upstream configuration. Absent while \
+         scheduler.materialization.enabled = false."
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"

@@ -1453,12 +1453,15 @@ structure (childless) release to from-source dispatch and the build attempt
 proceeds. The Success coverage re-check
 closes the CE-17 class (interest grew between execution and consumption). The
 park-not-fail posture preserves B3 ("unknown never demotes"): infra evidence is
-never confirmation. Parking becomes *visible and alertable* (a dedicated
-stalled-jobs metric, design §2.5 --- the name lands with the metric itself; a
-metric that does not exist yet cannot be a validated reference) and
-re-evaluable (the housekeeping Vouched/Pending → from-source arm) in Phase
-B --- PD-20 records that deferral; Phase A's park is a durable `park_until`
-row only.
+never confirmation. Parking is *visible and alertable* --- the
+#(refs.metric)("rio_scheduler_materialization_stalled") gauge
+(#rref("obs.metric.materialization-stalled")) counts currently-parked jobs from
+ground truth at every housekeeping tick --- and *re-evaluable*: the same tick's
+re-evaluation arm resolves a parked job from-source the moment its node's
+durable closure evidence reads Vouched or Pending (the arm-1/arm-2 disposition
+applied outside a consumption), so a dead upstream can only ever stall nodes
+with no buildable dependency closure; those stay parked, alertable, and
+re-claimable at backoff expiry. (PD-20, discharged in Phase B.)
 
 #r("sched.materialize.pinning")[
   Every store path a materialization job ingests or verifies present MUST be

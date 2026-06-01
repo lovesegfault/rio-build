@@ -103,6 +103,7 @@
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
     "rio_scheduler_materialization_jobs_created_total",
+    "rio_scheduler_materialization_stalled",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_open_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
@@ -729,6 +730,11 @@
         "name": "rio_scheduler_materialization_jobs_created_total",
         "kind": "counter",
         "help": "Materialization jobs created (substitution-replacement campaign), labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). Dedup-found existing jobs do not count. Always zero while scheduler.materialization.enabled = false (the Phase A deployed state) — a nonzero value flag-off is a dormancy violation."
+      },
+      {
+        "name": "rio_scheduler_materialization_stalled",
+        "kind": "gauge",
+        "help": "Parked materialization jobs (infra budget exhausted; waiting on upstream recovery or park-backoff expiry). Leader-published every housekeeping tick from ground truth. Jobs whose nodes have buildable dependency closures are re-evaluated and resolved from-source instead of staying parked (PD-20), so a sustained nonzero value means a dead/misconfigured upstream is stalling work that has NO from-source fallback — the operator signal to check upstream cache health and tenant upstream configuration. Absent while scheduler.materialization.enabled = false."
       },
       {
         "name": "rio_scheduler_merge_phase_seconds",

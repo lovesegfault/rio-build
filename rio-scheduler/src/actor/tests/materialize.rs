@@ -3349,6 +3349,111 @@ async fn flag_on_every_job_state_has_armed_action() -> TestResult {
          visible wait, never a strand), got {reclaimed:?}"
     );
 
+    // ════ State 5b (PD-20 / T-6.1): parked + from-source viable → the
+    //      housekeeping re-evaluation arm resolves it without waiting ════
+    // The tot-pending node above is CHILDLESS (Broken evidence): from-
+    // source is impossible, so the park-expiry re-claim proven in state
+    // 5 is its ONLY armed action. A parked job whose node HAS a produced
+    // dependency closure (Vouched evidence) gains the additional armed
+    // action: the next housekeeping tick re-evaluates and resolves it
+    // from-source — the park can never outlive from-source viability.
+    //
+    // The 3-node chain shape (root NOT substitutable → mid → leaf): a
+    // substitutable ROOT would be topdown-pruned (its dep closure
+    // dropped → childless → Broken evidence), so the root must stay
+    // non-substitutable for the mid to keep its child in the DAG.
+    let mid_out_5b = test_store_path("tot-reeval-mid-out");
+    let leaf_out_5b = test_store_path("tot-reeval-leaf-out");
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(mid_out_5b.clone());
+        subs.push(leaf_out_5b.clone());
+    }
+    let root5b = make_node("tot-reeval-root");
+    let mut mid5b = make_node("tot-reeval-mid");
+    mid5b.expected_output_paths = vec![mid_out_5b.clone()];
+    mid5b.wanted_output_names = vec!["out".into()];
+    let mut leaf5b = make_node("tot-reeval-leaf");
+    leaf5b.expected_output_paths = vec![leaf_out_5b.clone()];
+    leaf5b.wanted_output_names = vec!["out".into()];
+    let b5b = Uuid::new_v4();
+    // Receiver held: the test-mode orphan grace is zero and this state
+    // ticks below — a dropped receiver would get the build cancelled.
+    let _ev5b = merge_dag(
+        &handle,
+        b5b,
+        vec![root5b, mid5b, leaf5b],
+        vec![
+            make_test_edge("tot-reeval-root", "tot-reeval-mid"),
+            make_test_edge("tot-reeval-mid", "tot-reeval-leaf"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    // Produce the leaf via materialization → the mid's closure evidence
+    // becomes Vouched (all children produced).
+    let assignment = match claim_materialization(&handle, "tot-reeval-leaf", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("state 5b: the leaf's job must be claimable, got {other:?}"),
+    };
+    let exec_leaf: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&leaf_out_5b, b"tot-reeval-leaf-content");
+    report_materialization_outcome(
+        &handle,
+        exec_leaf,
+        "tot-reeval-leaf",
+        mat_success_outcome(vec![leaf_out_5b.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state 5b leaf report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    // Park the mid's job (one worker infra ≥ max_attempts=1).
+    let assignment = match claim_materialization(&handle, "tot-reeval-mid", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("state 5b: the mid's job must be claimable, got {other:?}"),
+    };
+    let exec_mid: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_mid,
+        "tot-reeval-mid",
+        mat_infra_outcome("upstream 503"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("state 5b mid infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+    let parked: Option<f64> = sqlx::query_scalar(
+        "SELECT EXTRACT(EPOCH FROM mj.park_until)::float8 \
+           FROM materialization_jobs mj \
+          WHERE mj.drv_hash = 'tot-reeval-mid' AND mj.state = 'pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert!(
+        parked.is_some(),
+        "state 5b precondition: the mid's job is parked"
+    );
+    // The re-evaluation arm: one tick resolves it from-source.
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let mid_job_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs WHERE drv_hash = 'tot-reeval-mid'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        mid_job_state, "resolved_from_source",
+        "state 5b: a parked job whose node's closure evidence is Vouched is \
+         re-evaluated and resolved from-source at the next tick (PD-20) — the \
+         park never outlives from-source viability"
+    );
+    assert_eq!(
+        expect_drv(&handle, "tot-reeval-mid").await.status,
+        DerivationStatus::Ready,
+        "state 5b: the node returns to from-source dispatch (deps produced)"
+    );
+
     // ════ State 6: zero live interest → cancellation closer fires ════
     let out6 = test_store_path("tot-zero-interest-out");
     store
@@ -4757,6 +4862,203 @@ async fn flag_on_fresh_work_never_walks() -> TestResult {
         "the legacy-state arm DOES walk (the documented PD-B19 transition-window \
          absorption: flag-off-era marks select the as-built mechanism, and that \
          is correct coexistence, not a criterion-3 violation); counters={counters:?}"
+    );
+    Ok(())
+}
+
+// ── T-6.1 (Phase B): PD-20 — the stalled gauge + parked-job re-evaluation ──
+
+/// Read one gauge's current value from a debugging-recorder snapshot.
+fn gauge_value(snap: &metrics_util::debugging::Snapshotter, name: &str) -> Option<f64> {
+    use metrics_util::debugging::DebugValue;
+    snap.snapshot()
+        .into_vec()
+        .into_iter()
+        .find_map(|(ck, _, _, v)| {
+            (ck.key().name() == name).then(|| match v {
+                DebugValue::Gauge(g) => g.into_inner(),
+                _ => f64::NAN,
+            })
+        })
+}
+
+// r[verify obs.metric.materialization-stalled]
+// r[verify sched.materialize.routing+2]
+/// PD-20 (design §2.5, red-first): parked materialization jobs are
+/// VISIBLE (the `rio_scheduler_materialization_stalled` gauge, set from
+/// ground truth every housekeeping tick) and RE-EVALUABLE (a parked job
+/// whose node's durable closure evidence reads Vouched/Pending — a
+/// buildable dependency closure exists — is resolved
+/// `resolved_from_source` at the next tick instead of waiting out its
+/// park backoff; the build proceeds from source).
+///
+/// Two parked jobs discriminate the two evidence classes:
+///   - X (childless → Broken evidence): from-source is impossible;
+///     stays parked across ticks; the gauge counts it — the alertable
+///     "genuinely dead upstream" state.
+///   - Y (chain mid with an unproduced child → Pending evidence):
+///     normal dep-gated building works; the re-evaluation resolves it
+///     from-source at the first tick after the park; the gauge excludes
+///     it.
+#[tokio::test]
+async fn parked_job_stalled_gauge_and_reevaluation() -> TestResult {
+    use metrics_util::debugging::DebuggingRecorder;
+
+    let rec = DebuggingRecorder::new();
+    let snap = rec.snapshotter();
+    let _guard = metrics::set_default_local_recorder(&rec);
+
+    // max_attempts=1 → one worker infra report parks; backoff 1 h so
+    // park expiry never interferes with the re-evaluation assertions.
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+            cfg.materialization.max_attempts = 1;
+            cfg.materialization.park_backoff_base_secs = 3600;
+            cfg.materialization.park_backoff_cap_secs = 3600;
+        });
+    let _tasks = (store_task, actor_task);
+
+    // ── X: childless substitutable node → job → park (Broken evidence). ──
+    let out_x = test_store_path("pd20-broken-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_x.clone());
+    let mut nx = make_node("pd20-broken");
+    nx.expected_output_paths = vec![out_x.clone()];
+    nx.wanted_output_names = vec!["out".into()];
+    let bx = Uuid::new_v4();
+    // Hold the event receiver: the test-mode orphan grace is ZERO, so a
+    // dropped receiver gets the build auto-cancelled on the second tick
+    // (and the cancellation closer would then cancel the parked job out
+    // from under the gauge assertions).
+    let _ev_x = merge_dag(&handle, bx, vec![nx], vec![], false).await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "pd20-broken", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("X's job must be claimable, got {other:?}"),
+    };
+    let exec_x: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_x,
+        "pd20-broken",
+        mat_infra_outcome("dead upstream"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("X's infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // ── Y: chain root→Y→leaf, only Y substitutable → job → park
+    //    (Pending evidence: the leaf is in the DAG, unproduced). ──
+    let out_y = test_store_path("pd20-pending-out");
+    store
+        .state
+        .substitutable
+        .write()
+        .unwrap()
+        .push(out_y.clone());
+    let root = make_node("pd20-root");
+    let mut ny = make_node("pd20-pending");
+    ny.expected_output_paths = vec![out_y.clone()];
+    ny.wanted_output_names = vec!["out".into()];
+    let leaf = make_node("pd20-leaf");
+    let by = Uuid::new_v4();
+    // Receiver held — same orphan-grace rationale as build X above.
+    let _ev_y = merge_dag(
+        &handle,
+        by,
+        vec![root, ny, leaf],
+        vec![
+            make_test_edge("pd20-root", "pd20-pending"),
+            make_test_edge("pd20-pending", "pd20-leaf"),
+        ],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+    let assignment = match claim_materialization(&handle, "pd20-pending", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("Y's job must be claimable (PD-6 Queued claims), got {other:?}"),
+    };
+    let exec_y: Uuid = assignment.exec_id.parse()?;
+    report_materialization_outcome(
+        &handle,
+        exec_y,
+        "pd20-pending",
+        mat_infra_outcome("dead upstream"),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("Y's infra report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Both jobs are durably parked (precondition).
+    let parked_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM materialization_jobs \
+          WHERE state = 'pending' AND park_until > now()",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(parked_count, 2, "precondition: both jobs parked");
+
+    // ── The tick: re-evaluation + the gauge. ──
+    tick(&handle).await?;
+    barrier(&handle).await;
+
+    // Y (Pending evidence): resolved from-source — the build proceeds
+    // through normal dep gating instead of waiting out the 1 h backoff.
+    let y_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs WHERE drv_hash = 'pd20-pending'",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        y_state, "resolved_from_source",
+        "PD-20: a parked job with a buildable dependency closure (Pending evidence) \
+         is re-evaluated and resolved from-source at the next housekeeping tick"
+    );
+    let y_status = expect_drv(&handle, "pd20-pending").await.status;
+    assert!(
+        matches!(y_status, DerivationStatus::Queued | DerivationStatus::Ready),
+        "Y returns to normal dep-gated dispatch, got {y_status:?}"
+    );
+
+    // X (Broken evidence): stays parked — from-source is impossible
+    // (childless), so the park (+ backoff-expiry re-claim) remains its
+    // armed action and the gauge makes it visible.
+    let x_state: String =
+        sqlx::query_scalar("SELECT state FROM materialization_jobs WHERE drv_hash = 'pd20-broken'")
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(
+        x_state, "pending",
+        "a Broken-evidence (childless) parked job stays parked (never force-resolved)"
+    );
+
+    // The gauge: exactly one job still stalled (X), set from ground
+    // truth at the tick.
+    let stalled = gauge_value(&snap, "rio_scheduler_materialization_stalled");
+    assert_eq!(
+        stalled,
+        Some(1.0),
+        "the stalled gauge counts jobs still parked after the re-evaluation pass \
+         (X only; Y resolved), got {stalled:?}"
+    );
+
+    // The gauge is self-healing across ticks (stays 1 while X is parked).
+    tick(&handle).await?;
+    barrier(&handle).await;
+    let stalled = gauge_value(&snap, "rio_scheduler_materialization_stalled");
+    assert_eq!(
+        stalled,
+        Some(1.0),
+        "the gauge holds at ground truth across ticks, got {stalled:?}"
     );
     Ok(())
 }

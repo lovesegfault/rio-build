@@ -1220,6 +1220,84 @@ impl DagActor {
         );
     }
 
+    // r[impl obs.metric.materialization-stalled]
+    // r[impl sched.materialize.routing+2]
+    /// PD-20 (design §2.5, Phase B T-6.1): the parked-job housekeeping
+    /// arm. Every tick, flag-on, leader-only:
+    ///
+    ///   1. **Re-evaluation**: every parked job is re-read against its
+    ///      node's durable closure evidence. Vouched/Pending — a
+    ///      buildable dependency closure exists (produced by other
+    ///      builds, or normally dep-gated) — resolves the job
+    ///      `resolved_from_source` NOW (the same arm-1/arm-2 disposition
+    ///      the consumption routing takes) and requeues the node for
+    ///      normal dispatch: the park can never outlive from-source
+    ///      viability. Broken evidence (childless/holed — from-source is
+    ///      structurally impossible) stays parked, with the
+    ///      backoff-expiry re-claim as its armed action.
+    ///   2. **Visibility**: `rio_scheduler_materialization_stalled`
+    ///      (gauge) is set to the ground-truth count of jobs still
+    ///      parked after the pass — the §2.5 operator signal ("a
+    ///      genuinely dead upstream makes builds wait visibly"). Set
+    ///      from truth every tick (the `tick_publish_gauges`
+    ///      self-healing discipline), so resolutions, re-arms, and
+    ///      cancellations are never missed decrements.
+    ///
+    /// Leader-only by construction (`handle_tick` returns early on
+    /// standby) and flag-gated at the call site, so flag-off
+    /// deployments never publish the gauge (the flag-off /metrics
+    /// surface stays byte-identical to as-built — criterion 2).
+    pub(super) async fn tick_reevaluate_parked_materialization_jobs(&mut self) {
+        let now = std::time::Instant::now();
+        let parked: Vec<(DrvHash, Uuid)> = self
+            .materialization_jobs
+            .iter()
+            .filter(|(_, e)| {
+                e.claimed_by.is_none() && e.parked_until.is_some_and(|until| until > now)
+            })
+            .map(|(h, e)| (h.clone(), e.job_id))
+            .collect();
+        let mut still_parked = parked.len();
+        for (drv_hash, job_id) in parked {
+            let evidence = self.dag.closure_evidence(drv_hash.as_str());
+            let from_source_viable = matches!(
+                evidence,
+                rio_evidence_kernel::ClosureEvidence::Vouched
+                    | rio_evidence_kernel::ClosureEvidence::Pending
+            );
+            if !from_source_viable {
+                continue;
+            }
+            // From-source is viable: resolve the job (no exec_id — the
+            // re-evaluation, not an execution, resolved it), clear any
+            // stale prune mark, and requeue the node. The spawn-intent
+            // filter and the admission table stop excluding the node
+            // the moment the job row is terminal.
+            let serving_generation = self.serving_generation();
+            self.resolve_materialization_job(
+                job_id,
+                None,
+                crate::state::JobState::ResolvedFromSource,
+                serving_generation,
+            )
+            .await;
+            self.materialization_jobs.remove(&drv_hash);
+            self.clear_pruned_mark_on_job_resolution(&drv_hash).await;
+            self.reassign_derivations(std::slice::from_ref(&drv_hash), None)
+                .await;
+            still_parked -= 1;
+            tracing::info!(
+                drv_hash = %drv_hash,
+                %job_id,
+                ?evidence,
+                "parked materialization job re-evaluated: from-source is viable; \
+                 resolved from_source and requeued (PD-20)"
+            );
+        }
+        // The stalled gauge: ground truth after the re-evaluation pass.
+        metrics::gauge!("rio_scheduler_materialization_stalled").set(still_parked as f64);
+    }
+
     /// The flag-gated housekeeping backstop: cancel jobs for
     /// derivations whose live interest dropped to zero (node gone,
     /// node terminal, or every interested build terminal), closing any

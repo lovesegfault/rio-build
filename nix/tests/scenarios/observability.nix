@@ -128,6 +128,13 @@ pkgs.testers.runNixOSTest {
             # Incremented per delivered assignment on BOTH paths (the
             # pull transaction increments it too).
             "rio_scheduler_assignments_total",
+            # Substitution-replacement Phase B (PD-20 / T-6.1): the
+            # parked-job gauge is set from ground truth at every
+            # housekeeping tick whenever materialization dispatch is
+            # enabled (the deployment default since the T-2.3 flip), so
+            # it is present even at 0 — the same set-every-tick
+            # registration mechanism as rio_scheduler_open_attempts.
+            "rio_scheduler_materialization_stalled",
         ],
         (${gatewayHost}, 9092, "store"): [
             "rio_store_put_path_total",

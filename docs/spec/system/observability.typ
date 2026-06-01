@@ -212,6 +212,25 @@ the stream session was deleted, kept only as the deletion-gate recording
 series, and removed with the proto sweep once that role ended.
 `_open_attempts` is the busy-fleet gauge.
 
+#r("obs.metric.materialization-stalled")[
+  When materialization dispatch is enabled, the scheduler MUST publish
+  #(refs.metric)("rio_scheduler_materialization_stalled") (gauge): the count
+  of parked materialization jobs, set from ground truth at every
+  housekeeping tick by the leader, after the parked-job re-evaluation pass
+  has run. The gauge MUST exclude jobs the re-evaluation resolved (a parked
+  job whose node's durable closure evidence reads Vouched or Pending is
+  resolved from-source in the same pass, so it can never be reported as
+  stalled), and MUST NOT be published while materialization dispatch is
+  disabled.
+]
+The gauge follows the leader-gate posture above (a state gauge, published
+only by the serving leader). Its operational meaning: every counted job has
+*no from-source fallback* (Broken closure evidence --- childless or holed),
+so a sustained nonzero value isolates "a dead or misconfigured upstream is
+the only thing standing between these builds and progress" --- the design
+§2.5 park-visibility obligation (PD-20). The corresponding alert lives in
+the helm chart's PrometheusRule.
+
 == Store Metrics
 
 #r("obs.metric.store")[

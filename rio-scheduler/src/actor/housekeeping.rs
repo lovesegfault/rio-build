@@ -133,9 +133,13 @@ impl DagActor {
         // dormancy-7: an unconditional call would issue PG queries
         // against the materialization tables on every flag-off
         // housekeeping cycle): cancel jobs whose derivation has no live
-        // interest left, closing open attempts charge-free.
+        // interest left, closing open attempts charge-free; then the
+        // PD-20 parked-job arm — re-evaluate parked jobs whose nodes
+        // have buildable dependency closures (resolve from-source) and
+        // publish the stalled gauge from ground truth.
         if self.materialization_cfg.enabled {
             self.tick_cancel_zero_interest_materialization().await;
+            self.tick_reevaluate_parked_materialization_jobs().await;
         }
 
         // Advance probe_generation here (1/s) — NOT per
