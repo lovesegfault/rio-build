@@ -31,7 +31,7 @@ use std::time::{Duration, Instant};
 
 use rio_exec::{
     ExecError, ExecEvent, ExecutionOutcome, ExecutionRequest, ExitOutcome, HostLayout, Isolation,
-    Limits, LogStream, Mount, OutputCapture, Personality, SetupPhase, execute,
+    Limits, LogStream, Mount, OutputCapture, Personality, SandboxIdentity, SetupPhase, execute,
 };
 
 /// uid/gid the sandboxed process runs as. Arbitrary unprivileged ids;
@@ -181,6 +181,11 @@ impl TestEnv {
                 network: false,
                 uid: SANDBOX_UID,
                 gid: SANDBOX_GID,
+                identity: SandboxIdentity {
+                    user: "itest-user".into(),
+                    group: "itest-group".into(),
+                    gecos: "Integration test user".into(),
+                },
                 personality: Personality::Native,
                 hostname: HOSTNAME.to_string(),
                 deny_setuid_and_xattrs: true,
@@ -386,7 +391,7 @@ async fn isolation_properties_are_observed_inside_the_sandbox() {
     // /etc/passwd is exactly the synthesized database.
     assert!(
         probe.contains(&format!(
-            "nixbld:x:{SANDBOX_UID}:{SANDBOX_GID}:Nix build user:/work:/noshell"
+            "itest-user:x:{SANDBOX_UID}:{SANDBOX_GID}:Integration test user:/work:/noshell"
         )),
         "{probe}"
     );

@@ -1236,7 +1236,7 @@ mod tests {
     use std::ffi::OsString;
 
     use super::*;
-    use crate::request::{Isolation, Limits, Mount, Personality};
+    use crate::request::{Isolation, Limits, Mount, Personality, SandboxIdentity};
 
     // -- map_exit ----------------------------------------------------------
 
@@ -1323,6 +1323,11 @@ mod tests {
                 network: false,
                 uid: 1000,
                 gid: 100,
+                identity: SandboxIdentity {
+                    user: "buildbot".into(),
+                    group: "buildgrp".into(),
+                    gecos: "Test build user".into(),
+                },
                 personality: Personality::Native,
                 hostname: "sandbox".to_string(),
                 deny_setuid_and_xattrs: true,

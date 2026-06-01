@@ -457,17 +457,23 @@ impl SandboxPlan {
         let uid = req.isolation.uid;
         let gid = req.isolation.gid;
         let cwd_str = req.cwd.display();
-        // The build user/group are named `nixbld`, matching the entries
-        // CppNix synthesizes inside its sandbox: the name is observable
-        // via `whoami` / `id -un` / `id -gn` / getpwuid and gets baked
-        // into some outputs ("built by" banners, perl's Config.pm), so
-        // it is part of the de-facto sandbox ABI rather than a free
-        // choice.
+        // The build user/group names come from the request — they are
+        // observable via `whoami` / `id -un` / `id -gn` / getpwuid and
+        // get baked into some outputs ("built by" banners, perl's
+        // Config.pm), so they belong to the caller's build-system ABI,
+        // not to the executor (rio-builder's glue passes the CppNix
+        // convention; see SandboxIdentity). The root/nobody/nogroup
+        // lines are invariant plumbing. Field safety (`:`/newline/NUL)
+        // is enforced by ExecutionRequest::validate.
+        // r[impl exec.request.identity]
+        let user = &req.isolation.identity.user;
+        let group = &req.isolation.identity.group;
+        let gecos = &req.isolation.identity.gecos;
         files.push(PlannedFile {
             host_path: layout.chroot_dir.join("etc/passwd"),
             contents: format!(
                 "root:x:0:0:root:{cwd_str}:/noshell\n\
-                 nixbld:x:{uid}:{gid}:Nix build user:{cwd_str}:/noshell\n\
+                 {user}:x:{uid}:{gid}:{gecos}:{cwd_str}:/noshell\n\
                  nobody:x:65534:65534:nobody:/:/noshell\n"
             )
             .into_bytes(),
@@ -478,7 +484,7 @@ impl SandboxPlan {
             host_path: layout.chroot_dir.join("etc/group"),
             contents: format!(
                 "root:x:0:\n\
-                 nixbld:!:{gid}:\n\
+                 {group}:!:{gid}:\n\
                  nogroup:x:65534:\n"
             )
             .into_bytes(),
@@ -736,6 +742,11 @@ mod tests {
                 network: false,
                 uid: 1000,
                 gid: 100,
+                identity: crate::request::SandboxIdentity {
+                    user: "buildbot".into(),
+                    group: "buildgrp".into(),
+                    gecos: "Test build user".into(),
+                },
                 personality: crate::request::Personality::Native,
                 hostname: String::from("localhost"),
                 deny_setuid_and_xattrs: true,
@@ -830,7 +841,7 @@ mod tests {
             .find(|f| f.host_path.ends_with("etc/passwd"))
             .expect("passwd planned");
         let text = String::from_utf8(passwd.contents.clone()).expect("passwd is utf8");
-        assert!(text.contains("nixbld:x:1000:100:Nix build user:/build:/noshell\n"));
+        assert!(text.contains("buildbot:x:1000:100:Test build user:/build:/noshell\n"));
         assert!(text.contains("root:x:0:0:"));
         assert!(text.contains("nobody:x:65534:65534:"));
         assert_eq!(passwd.mode, 0o444);
@@ -842,8 +853,41 @@ mod tests {
             .find(|f| f.host_path.ends_with("etc/group"))
             .expect("group planned");
         let text = String::from_utf8(group.contents.clone()).expect("group is utf8");
-        assert!(text.contains("nixbld:!:100:\n"));
+        assert!(text.contains("buildgrp:!:100:\n"));
         assert!(text.contains("nogroup:x:65534:\n"));
+    }
+
+    /// The passwd/group names are interpolated from the request's
+    /// SandboxIdentity — the executor contributes no name of its own.
+    /// A request with a different identity produces a different
+    /// database; the invariant root/nobody/nogroup plumbing stays.
+    // r[verify exec.request.identity]
+    #[test]
+    fn passwd_identity_originates_from_request() {
+        let mut req = nested_request();
+        req.isolation.identity = crate::request::SandboxIdentity {
+            user: "acme-worker".into(),
+            group: "acme-builders".into(),
+            gecos: "ACME build account".into(),
+        };
+        let plan = compile(&req);
+        let read = |suffix: &str| {
+            let f = plan
+                .files
+                .iter()
+                .find(|f| f.host_path.ends_with(suffix))
+                .expect("etc file planned");
+            String::from_utf8(f.contents.clone()).expect("utf8")
+        };
+        let passwd = read("etc/passwd");
+        assert!(passwd.contains("acme-worker:x:1000:100:ACME build account:/build:/noshell\n"));
+        assert!(!passwd.contains("buildbot"), "no fixture identity leak");
+        assert!(passwd.contains("root:x:0:0:"));
+        assert!(passwd.contains("nobody:x:65534:65534:"));
+        let group = read("etc/group");
+        assert!(group.contains("acme-builders:!:100:\n"));
+        assert!(group.contains("root:x:0:\n"));
+        assert!(group.contains("nogroup:x:65534:\n"));
     }
 
     #[test]

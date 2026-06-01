@@ -18,7 +18,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use rio_exec::{
-    ExecutionRequest, HostLayout, Isolation, Limits, Mount, OutputCapture, Personality, execute,
+    ExecutionRequest, HostLayout, Isolation, Limits, Mount, OutputCapture, Personality,
+    SandboxIdentity, execute,
 };
 
 /// Pids of all current children (running or zombie) of this process,
@@ -101,6 +102,11 @@ fn minimal_request(work: &Path) -> ExecutionRequest {
             network: false,
             uid: nix::unistd::getuid().as_raw(),
             gid: nix::unistd::getgid().as_raw(),
+            identity: SandboxIdentity {
+                user: "itest-user".into(),
+                group: "itest-group".into(),
+                gecos: "Integration test user".into(),
+            },
             personality: Personality::Native,
             hostname: "drop-cancel-test".to_string(),
             deny_setuid_and_xattrs: false,

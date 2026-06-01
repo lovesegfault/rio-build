@@ -123,6 +123,28 @@ pub enum OutputCapture {
     SeparatePipes,
 }
 
+/// The user/group identity synthesized into the sandbox's `/etc/passwd`
+/// and `/etc/group`.
+///
+/// The names are observable from inside the build (`whoami`,
+/// `id -un`/`-gn`, `getpwuid`) and get baked into some outputs
+/// ("built by" banners, perl's `Config.pm`), so they are part of the
+/// caller's build-system ABI — which is exactly why the executor does
+/// not choose them. rio-exec ships no default: each caller passes its
+/// own build system's conventional names (rio-builder's glue passes
+/// the Nix ones). The `root`/`nobody`/`nogroup` lines are invariant
+/// plumbing and stay executor-owned.
+// r[impl exec.request.identity]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxIdentity {
+    /// Login name of the build user (`/etc/passwd` field 1).
+    pub user: String,
+    /// Group name of the build group (`/etc/group` field 1).
+    pub group: String,
+    /// GECOS ("full name") field for the build user.
+    pub gecos: String,
+}
+
 /// Namespace, identity, and hardening parameters for the sandbox.
 #[derive(Debug, Clone)]
 pub struct Isolation {
@@ -144,6 +166,11 @@ pub struct Isolation {
     pub uid: u32,
     /// gid the process runs as inside the sandbox.
     pub gid: u32,
+    /// The passwd/group identity the uid/gid resolve to inside the
+    /// sandbox. Mandatory: the executor has no name of its own to
+    /// offer, and an accidental default would silently brand outputs
+    /// with the wrong build-system convention.
+    pub identity: SandboxIdentity,
     /// Architecture personality applied before exec.
     pub personality: Personality,
     /// Hostname (and domainname) inside the UTS namespace.
@@ -293,6 +320,34 @@ impl ExecutionRequest {
         }
         if self.isolation.hostname.as_bytes().contains(&0) {
             return invalid("isolation.hostname must not contain NUL bytes".to_string());
+        }
+
+        // Rule 6b: the sandbox identity is interpolated into
+        // `/etc/passwd` and `/etc/group` lines — a `:` would shift
+        // every subsequent field, a newline would inject a whole
+        // record, and the names become C strings via getpwnam, so the
+        // same NUL rule applies. Empty names would synthesize a
+        // nameless account.
+        // r[impl exec.request.identity]
+        {
+            let id = &self.isolation.identity;
+            for (what, value) in [
+                ("identity.user", id.user.as_str()),
+                ("identity.group", id.group.as_str()),
+                ("identity.gecos", id.gecos.as_str()),
+            ] {
+                if value.is_empty() && what != "identity.gecos" {
+                    return invalid(format!("isolation.{what} must be non-empty"));
+                }
+                for (which, byte) in [("`:`", b':'), ("newline", b'\n'), ("NUL", 0u8)] {
+                    if value.as_bytes().contains(&byte) {
+                        return invalid(format!(
+                            "isolation.{what} must not contain {which} (passwd-format \
+                             injection): {value:?}"
+                        ));
+                    }
+                }
+            }
         }
         if has_nul(self.program.as_os_str()) {
             return invalid(format!(
@@ -462,6 +517,11 @@ mod tests {
                 network: false,
                 uid: 1000,
                 gid: 100,
+                identity: SandboxIdentity {
+                    user: "buildbot".into(),
+                    group: "buildgrp".into(),
+                    gecos: "Test build user".into(),
+                },
                 personality: Personality::Native,
                 hostname: String::from("localhost"),
                 deny_setuid_and_xattrs: true,
@@ -652,6 +712,47 @@ mod tests {
         req.env
             .push((OsString::from("KEY=BAD"), OsString::from("value")));
         assert_rejected(&req, "KEY=BAD");
+    }
+
+    /// The identity fields are interpolated into passwd/group records:
+    /// a `:` shifts fields, a newline injects a record, NUL breaks the
+    /// getpwnam C strings, and empty user/group names synthesize a
+    /// nameless account. (An empty GECOS is legal — it is a free-text
+    /// field many real /etc/passwd entries leave blank.)
+    // r[verify exec.request.identity]
+    #[test]
+    fn validate_rejects_passwd_breaking_identity() {
+        for (mutate, needle) in [
+            (
+                Box::new(|i: &mut SandboxIdentity| i.user = "evil:0:0".into())
+                    as Box<dyn Fn(&mut SandboxIdentity)>,
+                "identity.user",
+            ),
+            (
+                Box::new(|i: &mut SandboxIdentity| i.group = "g\nroot:x:0:".into()),
+                "identity.group",
+            ),
+            (
+                Box::new(|i: &mut SandboxIdentity| i.gecos = "ge\0cos".into()),
+                "identity.gecos",
+            ),
+            (
+                Box::new(|i: &mut SandboxIdentity| i.user = String::new()),
+                "identity.user",
+            ),
+            (
+                Box::new(|i: &mut SandboxIdentity| i.group = String::new()),
+                "identity.group",
+            ),
+        ] {
+            let mut req = minimal_valid_request();
+            mutate(&mut req.isolation.identity);
+            assert_rejected(&req, needle);
+        }
+        // Empty GECOS is fine.
+        let mut req = minimal_valid_request();
+        req.isolation.identity.gecos = String::new();
+        req.validate().expect("empty gecos is legal");
     }
 
     // Rule 7: cwd must be under some mount.

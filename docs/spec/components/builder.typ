@@ -434,6 +434,23 @@ build), or expressed as explicit worker configuration:
   invoke `/bin/sh`.
 ]
 
+#r("builder.sandbox.identity")[
+  Every sandbox request the builder constructs MUST carry the Nix sandbox
+  identity --- user `nixbld`, group `nixbld`, GECOS `Nix build user` ---
+  obtained from the glue's single construction point
+  (`nix_sandbox_identity()`); the generic and `builtin:fetchurl` request
+  paths MUST NOT assemble the identity independently.
+]
+
+The names are CppNix sandbox ABI, not decoration: they are observable from
+inside the build (`whoami`, `id`, getpwuid) and get baked into outputs
+("built by" banners, perl's `Config.pm`), so the differential corpus
+byte-compares them (`build-user` / `sandbox-identity` entries). The executor
+side is deliberately ignorant of the value: `SandboxIdentity` is a mandatory
+`rio-exec` request field with no default (#rref("exec.request.identity")),
+which is what lets the `rio-exec-boundary` check ban the literal from the
+executor crate entirely.
+
 - `RIO_CA_BUNDLE` --- host path of the CA bundle exposed read-only at
   `/etc/ssl/certs/ca-certificates.crt` inside network (fixed-output) sandboxes
   (default: the worker image's `cacert` bundle).

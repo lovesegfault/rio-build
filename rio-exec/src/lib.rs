@@ -12,13 +12,16 @@
 //! # Boundary discipline
 //!
 //! Nothing in this crate may reference a store path, a derivation, a
-//! build-system environment-variable convention, or a build-system log
-//! protocol. The request carries opaque mounts and verbatim argv/env;
-//! the outcome reports raw exit status and per-path metadata. All
-//! build-system policy — what the environment contains, whether a
-//! missing output is an error, how log lines are interpreted — lives in
-//! the caller. This is what makes the executor reusable across build
-//! systems and independently testable.
+//! build-system environment-variable convention, a build-system user
+//! identity, or a build-system log protocol. The request carries opaque
+//! mounts, verbatim argv/env, and the sandbox's passwd/group identity
+//! ([`SandboxIdentity`] — mandatory, because the executor has no name
+//! of its own to default to); the outcome reports raw exit status and
+//! per-path metadata. All build-system policy — what the environment
+//! contains, what the build user is called, whether a missing output is
+//! an error, how log lines are interpreted — lives in the caller. This
+//! is what makes the executor reusable across build systems and
+//! independently testable.
 //!
 //! # Modules
 //!
@@ -59,6 +62,7 @@ pub use outcome::{
 pub use plan::HostLayout;
 pub use request::{
     ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
+    SandboxIdentity,
 };
 
 /// Errors produced by the executor.

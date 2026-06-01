@@ -285,6 +285,11 @@ in
   #   attrs reject on both sides (and the float cap truncates+enforces,
   #   and nested erg arrays flatten) — executed against the oracle, so a
   #   future fail-open reader regression turns the merge gate red.
+  # r[verify builder.sandbox.identity]
+  #   build-user / sandbox-identity entries: the synthesized passwd/group
+  #   identity (nixbld / Nix build user) is byte-compared against the
+  #   oracle's sandbox — the glue's single construction point feeds both
+  #   request paths.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };

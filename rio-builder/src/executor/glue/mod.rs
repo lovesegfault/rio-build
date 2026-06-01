@@ -571,6 +571,7 @@ pub(crate) fn derivation_into_request(
             network: is_fod,
             uid: opts.uid,
             gid: opts.gid,
+            identity: nix_sandbox_identity(),
             personality: personality_for(drv.platform(), &opts.host_system),
             hostname: "localhost".to_owned(),
             deny_setuid_and_xattrs: true,
@@ -823,6 +824,32 @@ fn plan_outputs(
     Ok((rewrites, outputs))
 }
 
+/// The Nix sandbox build user's login/group name, as CppNix synthesizes
+/// it inside its sandbox (`linux-derivation-builder.cc`). Observable via
+/// `whoami` / `id` and baked into some outputs, so it is part of the
+/// de-facto Nix sandbox ABI — the differential harness byte-compares
+/// outputs that embed it.
+const NIX_BUILD_USER: &str = "nixbld";
+
+/// The GECOS field CppNix uses for the build user's passwd entry.
+const NIX_BUILD_GECOS: &str = "Nix build user";
+
+/// The single construction point for the Nix sandbox identity.
+///
+/// rio-exec deliberately has no default identity (its boundary rule
+/// bans Nix conventions); every Nix-flavoured request gets its
+/// passwd/group names from HERE, so the value the differential corpus
+/// pins (`build-user` / `sandbox-identity` entries) cannot drift
+/// between the generic and builtin request paths.
+// r[impl builder.sandbox.identity]
+fn nix_sandbox_identity() -> rio_exec::SandboxIdentity {
+    rio_exec::SandboxIdentity {
+        user: NIX_BUILD_USER.to_owned(),
+        group: NIX_BUILD_USER.to_owned(),
+        gecos: NIX_BUILD_GECOS.to_owned(),
+    }
+}
+
 /// 32-bit personality selection: building a 32-bit system on its 64-bit
 /// host needs `PER_LINUX32` so `uname -m` inside the sandbox reports the
 /// 32-bit machine.
@@ -1000,6 +1027,7 @@ mod tests {
         // Isolation/limits.
         assert_eq!(req.isolation.uid, 1000);
         assert_eq!(req.isolation.gid, 100);
+        assert_eq!(req.isolation.identity, nix_sandbox_identity());
         assert_eq!(req.isolation.hostname, "localhost");
         assert!(req.isolation.deny_setuid_and_xattrs);
         assert_eq!(req.isolation.personality, Personality::Native);
@@ -1043,6 +1071,22 @@ mod tests {
         assert!(prepared.request.mounts.iter().any(|m| m.target
             == Path::new(crate::builtin_fetchurl::SANDBOX_CA_BUNDLE)
             && m.optional));
+    }
+
+    /// The Nix sandbox identity is the CppNix convention, constructed
+    /// in exactly one place. The names and GECOS here are the de-facto
+    /// sandbox ABI (`whoami`, perl Config.pm, "built by" banners) that
+    /// the differential corpus' build-user/sandbox-identity entries
+    /// byte-compare against the oracle — this test pins the values at
+    /// the source so a corpus failure can only mean plumbing, never a
+    /// renamed constant.
+    // r[verify builder.sandbox.identity]
+    #[test]
+    fn sandbox_identity_is_cppnix_parity() {
+        let id = nix_sandbox_identity();
+        assert_eq!(id.user, "nixbld");
+        assert_eq!(id.group, "nixbld");
+        assert_eq!(id.gecos, "Nix build user");
     }
 
     /// The writer half of the CA-bundle contract: the glue's mount

@@ -233,6 +233,7 @@ pub(crate) fn prepare_fetchurl(
             network: true,
             uid: opts.uid,
             gid: opts.gid,
+            identity: super::nix_sandbox_identity(),
             personality: Personality::Native,
             hostname: "localhost".to_owned(),
             deny_setuid_and_xattrs: true,
@@ -398,6 +399,22 @@ mod tests {
         assert_eq!(pb.request.inline_files.len(), 1);
         assert_eq!(pb.request.inline_files[0].mode, 0o600);
         assert_eq!(pb.outputs.len(), 1);
+    }
+
+    /// The builtin re-exec request carries the same single-sourced Nix
+    /// identity as the generic sandbox path — both go through
+    /// `nix_sandbox_identity()`, so the two request constructors cannot
+    /// drift apart.
+    // r[verify builder.sandbox.identity]
+    #[test]
+    fn builtin_request_carries_nix_identity() {
+        let drv = fetchurl_drv("sha256", &[]);
+        let pb = prepare_fetchurl("/nix/store/x.drv", &drv, &paths(), &opts()).unwrap();
+        assert_eq!(
+            pb.request.isolation.identity,
+            crate::executor::glue::nix_sandbox_identity()
+        );
+        assert_eq!(pb.request.isolation.identity.user, "nixbld");
     }
 
     #[test]

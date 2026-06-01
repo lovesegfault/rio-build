@@ -178,6 +178,13 @@ Notable edges:
 
     Fuzz targets for the parsers live in `fuzz/rio-nix/` (separate workspace, own `Cargo.lock`). A second fuzz workspace at `fuzz/rio-store/` covers the manifest parser. Both are excluded from the main workspace — when a fuzzed crate's deps change, run `cd fuzz/<crate> && cargo update -p <crate>` to sync the independent lockfile.
   ],
+  "rio-exec": [
+    The build-system-agnostic sandbox executor: callers describe a process, its filesystem view, isolation, and limits as an `ExecutionRequest`; the crate materializes the sandbox (namespaces, bind mounts, seccomp, pivot_root) and supervises it. Its architectural rule — no rio-crate dependencies, no store paths, no derivations, no Nix conventions — is enforced structurally by the `rio-exec-boundary` token check.
+
+    #r(
+      "exec.request.identity",
+    )[The sandbox's `/etc/passwd`/`/etc/group` user and group names MUST come from the request (`SandboxIdentity`, a mandatory `Isolation` field with no crate-side default), and `ExecutionRequest::validate` MUST reject identity fields containing `:`, newline, or NUL (passwd-format injection) or empty user/group names. rio-exec itself carries no build-system identity: the Nix names live in rio-builder's glue (`nix_sandbox_identity()`), where the differential corpus byte-compares them against the oracle.]
+  ],
   "rio-test-support": [
     `rio-test-support` is a `[dependencies]` (not dev-dep) of `xtask` — `xtask regen sqlx` reuses `PgServer::bootstrap`. All other crates depend on it under `[dev-dependencies]` only; `rio-store` additionally has it under `[dependencies]` with `optional = true` (`test-utils` feature, not in `default`).
 

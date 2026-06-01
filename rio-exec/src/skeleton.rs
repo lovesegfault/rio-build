@@ -277,6 +277,7 @@ mod tests {
     use crate::plan::{HostLayout, SandboxPlan};
     use crate::request::{
         ExecutionRequest, InlineFile, Isolation, Limits, Mount, OutputCapture, Personality,
+        SandboxIdentity,
     };
 
     /// A request whose mount sources all live under `src_root` so the
@@ -323,6 +324,11 @@ mod tests {
                 // dedicated uid from a root executor.
                 uid: unsafe { libc::getuid() },
                 gid: unsafe { libc::getgid() },
+                identity: SandboxIdentity {
+                    user: "buildbot".into(),
+                    group: "buildgrp".into(),
+                    gecos: "Test build user".into(),
+                },
                 personality: Personality::Native,
                 hostname: String::from("localhost"),
                 deny_setuid_and_xattrs: false,
@@ -387,7 +393,7 @@ mod tests {
     fn writes_the_etc_files_and_locks_etc() {
         let (_tmp, chroot, _plan) = build_in_tempdir(&["tool"]);
         let passwd = fs::read_to_string(chroot.join("etc/passwd")).expect("passwd");
-        assert!(passwd.contains("nixbld:x:"));
+        assert!(passwd.contains("buildbot:x:"));
         let hosts = fs::read_to_string(chroot.join("etc/hosts")).expect("hosts");
         assert!(hosts.contains("127.0.0.1 localhost"));
         assert_eq!(mode_of(&chroot.join("etc")), 0o555, "etc locked last");
@@ -579,7 +585,7 @@ mod tests {
         build(&mut plan).expect("second build converges");
         assert_eq!(mode_of(&chroot.join("etc")), 0o555);
         let passwd = fs::read_to_string(chroot.join("etc/passwd")).expect("passwd");
-        assert!(passwd.contains("nixbld:x:"));
+        assert!(passwd.contains("buildbot:x:"));
     }
 
     #[test]
@@ -616,6 +622,6 @@ mod tests {
             "the planted link is replaced by a regular file"
         );
         let passwd = fs::read_to_string(etc.join("passwd")).expect("passwd");
-        assert!(passwd.contains("nixbld:x:"));
+        assert!(passwd.contains("buildbot:x:"));
     }
 }

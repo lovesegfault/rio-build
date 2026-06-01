@@ -15,8 +15,11 @@ description = "Build-system-agnostic Linux sandbox executor (namespaces, bind mo
 #
 # ARCHITECTURAL RULE: this crate must not depend on rio-nix, rio-proto,
 # or any other rio crate (workspace-hack excepted), and nothing in it may
-# reference a store path, a derivation, or a Nix convention. That is what
-# keeps the sandbox reusable for non-Nix build systems.
+# reference a store path, a derivation, or a Nix convention. The sandbox
+# user identity is a mandatory request field (SandboxIdentity), so the
+# Nix names live in rio-builder's glue, not here. That is what keeps the
+# sandbox reusable for non-Nix build systems. Enforced by
+# checks.x86_64-linux.rio-exec-boundary (token grep over this crate).
 
 [dependencies]
 # Syscall wrappers for the sandbox sequence (unshare, mount, pivot_root,
