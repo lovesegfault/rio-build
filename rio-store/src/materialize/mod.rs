@@ -156,7 +156,40 @@ async fn claim_loop(
                 origin = %job.origin,
                 "materialization job claimed; executing"
             );
-            let outcome = executor::execute_job(&ctx, &job).await;
+            // BC-4 progress relay: a bounded channel + a per-job relay
+            // task with its own cloned transport, so display traffic
+            // never blocks the walk (try_send drops on a full queue) or
+            // contends with the claim/report transport. The sender is
+            // owned by the walk's callback; when the execution returns,
+            // the callback (and sender) drop → the relay drains and
+            // exits. Report errors are ignored — progress is droppable
+            // by contract (the scheduler-side relay is also try_send).
+            let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel::<
+                rio_proto::types::ReportMaterializationProgressRequest,
+            >(16);
+            let mut progress_transport = transport.clone();
+            rio_common::task::spawn_monitored("materialization-progress-relay", async move {
+                use client::MaterializeTransport;
+                while let Some(req) = progress_rx.recv().await {
+                    let _ = progress_transport.report_progress(req).await;
+                }
+            });
+            let exec_id_for_progress = job.exec_id.clone();
+            let outcome = executor::execute_job_with_progress(
+                &ctx,
+                &job,
+                move |bytes_done, bytes_expected, upstream| {
+                    let _ = progress_tx.try_send(
+                        rio_proto::types::ReportMaterializationProgressRequest {
+                            exec_id: exec_id_for_progress.clone(),
+                            bytes_done,
+                            bytes_expected,
+                            upstream_uri: upstream.to_string(),
+                        },
+                    );
+                },
+            )
+            .await;
             let acked = client::report_until_acked(
                 &mut transport,
                 &job.exec_id,

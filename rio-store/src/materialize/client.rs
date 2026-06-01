@@ -227,6 +227,12 @@ fn is_fatal_rejection(code: tonic::Code) -> bool {
 /// credential the scheduler's materialization operations require.
 /// Signer `None` = dev mode: no header, only meaningful against a
 /// keyless scheduler.
+///
+/// `Clone` is cheap (tonic channels are reference-counted): the claim
+/// loop clones one copy per job execution for the BC-4 progress relay
+/// task, so display traffic never contends with the claim/report
+/// transport.
+#[derive(Clone)]
 pub struct SchedulerTransport {
     client: rio_proto::ExecutorServiceClient<
         tonic::service::interceptor::InterceptedService<

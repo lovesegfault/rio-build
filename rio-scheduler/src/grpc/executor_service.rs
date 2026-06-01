@@ -70,16 +70,19 @@ use super::SchedulerGrpc;
 //                                       store-service credential; an executor token here is rejected) →
 //                                       reject RPC > MAX_EXECUTOR_TOKEN_LEN
 //   limit                             → numeric; clamped to 256 actor-side → n/a
-// ReportMaterializationProgress RPC (Phase A: validate + acknowledge-and-drop, per the wire contract):
+// ReportMaterializationProgress RPC (Phase B: the BC-4 relay into build events):
 //   AUTHZ: the same store-service credential gate as the other materialization
 //   operations (an executor token on the metadata carrier → reject RPC
 //   PermissionDenied; no credential under a configured key family → reject RPC
 //   Unauthenticated; only full dev mode is open). The proto carries no body
-//   token field, so x-rio-service-token metadata is the only carrier.
-//   exec_id                           → UUID-parsed for validation, then dropped → reject RPC if not a
-//                                       valid UUID
-//   upstream_uri / bytes_*            → never read in Phase A (droppable display payload) → dropped
-//                                       before any state; bounds land with the Phase-B relay
+//   token field, so x-rio-service-token metadata is the only carrier. The gate
+//   runs BEFORE any request-body parse (pinned by the T-1.9 sweep test).
+//   exec_id                           → UUID parse → attempt lookup (relay key) → reject RPC if not a
+//                                       valid UUID; unknown/superseded exec → ack + drop (display-only)
+//   upstream_uri                      → display-only Event::SubstituteProgress field → truncate to
+//                                       MAX_IDENT_LEN before the event ring
+//   bytes_done / bytes_expected       → display-only event numerics (never persisted, never folded
+//                                       into scheduler state) → n/a
 
 /// Upper bound on worker-supplied identifier/label fields: `intent_id`,
 /// `node_name`, and `hw_class`. All are either k8s object names (≤253
@@ -712,11 +715,14 @@ impl ExecutorService for SchedulerGrpc {
     /// Fire-and-forget byte progress for a running materialization
     /// attempt. Display-only, droppable.
     ///
-    /// Phase A: validates the exec_id format, acknowledges, and drops —
-    /// exactly as the wire contract documents (no materialization
-    /// attempt can exist while the flags are off, and progress is
-    /// droppable by contract even when one does). Phase B wires the
-    /// relay to build events (BC-4).
+    /// Phase B (BC-4): the relay — resolve the exec_id to its attempt's
+    /// derivation and re-emit the byte progress as the same
+    /// display-only `Event::SubstituteProgress` the walk's progress
+    /// path emitted, on every interested build's log broadcast ring.
+    /// Droppable end-to-end: a failed lookup, a missing attempt, and a
+    /// full actor mailbox all drop the event silently (`try_send` —
+    /// progress must never block or error; the terminal Cached/Completed
+    /// event covers any dropped tick).
     ///
     /// Identity (security review — dormant ≠ unprotected): progress
     /// reports are fleet-level STORE operations like the listing, not
@@ -724,8 +730,9 @@ impl ExecutorService for SchedulerGrpc {
     /// per-intent builder/fetcher credential) is rejected
     /// `PermissionDenied`; the kind-attested store-service credential
     /// (`ServiceClaims{caller="rio-store"}`) is what authorizes it.
-    /// Full dev mode (neither key family configured) stays open and
-    /// answers the Phase-A ack-and-drop.
+    /// Full dev mode (neither key family configured) stays open. The
+    /// gate prologue runs BEFORE any request-body parse and is pinned
+    /// by the T-1.9 authentication sweep.
     #[instrument(skip(self, request), fields(rpc = "ReportMaterializationProgress"))]
     async fn report_materialization_progress(
         &self,
@@ -746,22 +753,42 @@ impl ExecutorService for SchedulerGrpc {
         // The store-service credential gate: x-rio-service-token
         // metadata (the ServiceTokenInterceptor carrier), verified as
         // ServiceClaims by the service-HMAC key with caller="rio-store".
-        // Full dev mode passes through to the Phase-A ack-and-drop.
+        // Full dev mode passes through to the relay below.
         // r[impl sched.materialize.job]
         self.require_store_service(&request, "")?;
         let req = request.into_inner();
-        // Validate-then-drop: a malformed exec_id is a caller bug worth
-        // surfacing even though the payload itself is droppable.
+        // A malformed exec_id is a caller bug worth surfacing even
+        // though the payload itself is droppable.
         let exec_id: uuid::Uuid = req
             .exec_id
             .parse()
             .map_err(|_| Status::invalid_argument("exec_id must be a UUID"))?;
-        tracing::debug!(
-            %exec_id,
-            bytes_done = req.bytes_done,
-            bytes_expected = req.bytes_expected,
-            "materialization progress acknowledged and dropped (Phase A: relay is dormant)"
-        );
+        // The relay (BC-4): exec_id → open attempt → derivation, then
+        // the same actor command the walk's detached fetch posts. Every
+        // failure arm acknowledges (display-only — never an error to
+        // the reporting store).
+        if let Some(db) = &self.db
+            && let Ok(Some(attempt)) = db.find_attempt_by_exec_id(exec_id).await
+        {
+            // r[impl sched.executor.input-bounds+2]
+            // upstream_uri lands in a display-only event ring; bound it
+            // like the other worker-supplied identifier fields.
+            let mut upstream_uri = req.upstream_uri;
+            rio_common::grpc::truncate_utf8(&mut upstream_uri, MAX_IDENT_LEN);
+            let _ = self.actor.try_send(ActorCommand::SubstituteProgress {
+                drv_hash: attempt.drv_hash.into(),
+                bytes_done: req.bytes_done,
+                bytes_expected: req.bytes_expected,
+                upstream_uri,
+            });
+        } else {
+            tracing::debug!(
+                %exec_id,
+                bytes_done = req.bytes_done,
+                bytes_expected = req.bytes_expected,
+                "materialization progress for an unknown/superseded exec dropped (display-only)"
+            );
+        }
         Ok(Response::new(
             rio_proto::types::ReportMaterializationProgressResponse {},
         ))

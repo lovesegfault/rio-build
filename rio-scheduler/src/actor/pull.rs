@@ -486,7 +486,20 @@ impl DagActor {
             .ok_or_else(|| {
                 PullRejection::Internal("derivation vanished while building the payload".into())
             })?;
-        self.emit_assignment_started(drv_hash, pulling_identity);
+        // Display events, per work class: build mints emit STARTED (the
+        // as-built path, byte-identical); materialization mints emit
+        // SUBSTITUTING (BC-4 — the wire-retained kind whose emission
+        // moves from walk-spawn to claim intake; STARTED would stop the
+        // gateway's actSubstitute/actCopyPath pair the instant it opened).
+        match attempt_kind {
+            crate::state::AttemptKind::Build => {
+                self.emit_assignment_started(drv_hash, pulling_identity);
+            }
+            // r[impl sched.materialize.job]
+            crate::state::AttemptKind::Materialization => {
+                self.emit_materialization_claimed(drv_hash);
+            }
+        }
         info!(
             drv_hash = %drv_hash,
             exec_id = %exec_id,

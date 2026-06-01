@@ -292,6 +292,48 @@ impl DagActor {
         }
     }
 
+    // r[impl sched.materialize.job]
+    /// BC-4 (Phase B): emit the SUBSTITUTING DerivationEvent at
+    /// materialization-claim intake. The event KIND is wire-retained;
+    /// only its emission site moves — from walk-spawn (which never runs
+    /// for fresh flag-on work) to the claim. The gateway's
+    /// actSubstitute/actCopyPath pair creation keys on this kind
+    /// (rio-gateway handler/build.rs `relay_derivation_status`,
+    /// Substituting arm) and is untouched (BC-4's contract). Mirrors the
+    /// walk-spawn emission shape (`spawn_substitute_fetches`): one event
+    /// per interested build + a progress snapshot so the queued/running
+    /// flip is visible.
+    ///
+    /// Called by the pull mint INSTEAD of `emit_assignment_started` for
+    /// materialization-kind mints — STARTED is one of the gateway's
+    /// pair-STOP triggers, so emitting it here would close the pair the
+    /// instant it opened (and misrepresent substitution work as a
+    /// builder dispatch).
+    ///
+    /// Reachable only flag-on (no materialization mint exists flag-off),
+    /// so flag-off event streams are byte-identical to as-built.
+    pub(super) fn emit_materialization_claimed(&mut self, drv_hash: &DrvHash) {
+        let Some(state) = self.dag.node(drv_hash) else {
+            return;
+        };
+        let drv_path = state.drv_path().to_string();
+        // The same payload the walk-spawn site sends: the paths the
+        // store will fetch. `output_paths` is set by completion only;
+        // pre-completion the expected paths are the fetch targets.
+        let output_paths = state.expected_output_paths.clone();
+        let event = rio_proto::types::build_event::Event::Derivation(
+            rio_proto::types::DerivationEvent::substituting(drv_path, output_paths),
+        );
+        for build_id in self.get_interested_builds(drv_hash) {
+            self.events.emit(build_id, event.clone());
+            // build_summary counts the now-Assigned/Running node as
+            // running — emit a progress snapshot so the queued/running
+            // flip is visible (matches the walk site and
+            // `emit_assignment_started`).
+            self.emit_progress(build_id);
+        }
+    }
+
     /// Whether the node carries an unresolved, UNCLAIMED materialization
     /// job — the §2.6 "substitution backlog" predicate read by the
     /// snapshot bucket re-sourcing and the spawn-intent filter.

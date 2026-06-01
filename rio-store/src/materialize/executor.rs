@@ -66,6 +66,25 @@ pub struct ExecutorContext {
 // r[impl store.materialize.executor]
 // r[impl sched.materialize.pinning]
 pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> MaterializationOutcome {
+    execute_job_with_progress(ctx, claimed, |_, _, _| {}).await
+}
+
+/// [`execute_job`] with a byte-progress callback (BC-4 / Phase B).
+///
+/// `on_progress(bytes_done, bytes_expected, upstream_uri)` fires once
+/// per ingested/verified path with CUMULATIVE byte counts across the
+/// job's whole closure walk (the sum of processed paths' NAR sizes so
+/// far). Monotone non-decreasing in `bytes_done`, and
+/// `bytes_done <= bytes_expected` at every call; the final call covers
+/// the whole closure. Display-only and droppable: the callback must be
+/// cheap and non-blocking (it runs on the walk); the caller forwards it
+/// to `ReportMaterializationProgress` fire-and-forget.
+// r[impl store.materialize.executor]
+pub async fn execute_job_with_progress(
+    ctx: &ExecutorContext,
+    claimed: &ClaimedJob,
+    on_progress: impl Fn(u64, u64, &str) + Send + Sync,
+) -> MaterializationOutcome {
     // ── 1. Tenant re-resolution (AS-4, live-interest-first) ──────────
     let tenant_id = match resolve_tenant(ctx, claimed).await {
         Ok(Some(t)) => t,
@@ -90,6 +109,11 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
     let mut ingested: Vec<String> = Vec::new();
     let mut verified: Vec<String> = Vec::new();
     let mut missing: Vec<String> = Vec::new();
+    // BC-4 cumulative progress accounting: bytes of fully-processed
+    // paths. The per-path fetch callback adds the in-flight path's
+    // streamed bytes on top, so reports are cumulative across the
+    // closure, monotone in done, and done ≤ expected at every call.
+    let mut completed_bytes: u64 = 0;
 
     loop {
         // The live wanted read: first iteration = the at-claim read;
@@ -146,6 +170,16 @@ pub async fn execute_job(ctx: &ExecutorContext, claimed: &ClaimedJob) -> Materia
                     } else {
                         ingested.push(path.clone());
                     }
+                    // BC-4: the path is fully processed — fold its NAR
+                    // size into the cumulative total and fire one
+                    // progress tick per path ingest (the plan's
+                    // "cumulative bytes per path" granularity: monotone
+                    // non-decreasing done, done ≤ expected, the final
+                    // tick covering the whole closure). Empty upstream
+                    // URI: the gateway omits the "from <uri>" suffix
+                    // when the field is empty.
+                    completed_bytes = completed_bytes.saturating_add(path_info.nar_size);
+                    on_progress(completed_bytes, completed_bytes, "");
                     // Extend the frontier with the narinfo references —
                     // the closure-completeness obligation.
                     for reference in &path_info.references {
@@ -1038,6 +1072,80 @@ mod tests {
             pin_count(&db.pool, "mat-5xx-drv", "materialization").await,
             0,
             "nothing is pinned when nothing is confirmed"
+        );
+    }
+
+    // r[verify store.materialize.executor]
+    /// (7) T-1.2 / BC-4: the executor reports cumulative, monotone byte
+    /// progress through the callback while walking a multi-path closure.
+    /// Every call satisfies done ≤ expected; done never decreases; the
+    /// final call's done equals the sum of the closure's NAR sizes.
+    #[tokio::test]
+    async fn execution_reports_cumulative_monotone_progress() {
+        let db = TestDb::new(&crate::MIGRATOR).await;
+        let tenant = seed_tenant(&db.pool, "mat-progress").await;
+
+        // A two-node closure: root references dep (two NARs of
+        // different sizes so the cumulative accounting is visible).
+        let root = store_path(10, "mat-progress-root");
+        let dep = store_path(11, "mat-progress-dep");
+        let (root_nar, _) = rio_test_support::fixtures::make_nar(b"root contents with some bytes");
+        let (dep_nar, _) = rio_test_support::fixtures::make_nar(b"dep");
+        let total_nar_bytes = (root_nar.len() + dep_nar.len()) as u64;
+        let upstream = spawn_multi_upstream(
+            vec![
+                (root.clone(), root_nar, vec![dep.clone()]),
+                (dep.clone(), dep_nar, vec![]),
+            ],
+            "cache.progress",
+        )
+        .await;
+        wire_upstream(&db.pool, tenant, &upstream).await;
+
+        let seeded = seed_job(
+            &db.pool,
+            "mat-progress-drv",
+            &[("out", root.as_str())],
+            Some(tenant),
+            Some(tenant),
+            &[],
+        )
+        .await;
+
+        let ctx = make_ctx(db.pool.clone());
+        let calls: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        let outcome = execute_job_with_progress(&ctx, &seeded.claimed, |done, expected, _| {
+            calls.lock().unwrap().push((done, expected));
+        })
+        .await;
+
+        outcome_success(&outcome).unwrap_or_else(|| panic!("expected Success, got {outcome:?}"));
+
+        let calls = calls.into_inner().unwrap();
+        assert!(
+            !calls.is_empty(),
+            "the walk must report progress through the callback (BC-4 relay source)"
+        );
+        let mut prev_done = 0u64;
+        for (done, expected) in &calls {
+            assert!(
+                *done >= prev_done,
+                "bytes_done must be monotone non-decreasing: {prev_done} then {done} in {calls:?}"
+            );
+            assert!(
+                done <= expected,
+                "bytes_done must never exceed bytes_expected: ({done}, {expected}) in {calls:?}"
+            );
+            prev_done = *done;
+        }
+        let (final_done, final_expected) = calls.last().expect("non-empty");
+        assert_eq!(
+            *final_done, total_nar_bytes,
+            "the final report's done covers the whole closure ({calls:?})"
+        );
+        assert_eq!(
+            *final_expected, total_nar_bytes,
+            "the final report's expected equals the closure total ({calls:?})"
         );
     }
 }

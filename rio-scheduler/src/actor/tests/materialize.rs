@@ -1347,6 +1347,134 @@ async fn flag_off_snapshot_buckets_match_baseline() -> TestResult {
     Ok(())
 }
 
+// ── T-1.2 (Phase B): BC-4 — SUBSTITUTING at claim, stop at consumption ──
+
+/// Drain every Derivation event currently in the ring, returning the
+/// kinds seen (in order).
+fn drain_derivation_kinds(
+    rx: &mut broadcast::Receiver<rio_proto::types::BuildEvent>,
+) -> Vec<rio_proto::types::DerivationEventKind> {
+    let mut kinds = Vec::new();
+    while let Ok(event) = rx.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::Derivation(d)) = event.event {
+            kinds.push(d.kind());
+        }
+    }
+    kinds
+}
+
+// r[verify sched.materialize.job]
+/// BC-4 (design §2.4 "Progress and gateway events"): flag-on, the
+/// SUBSTITUTING DerivationEvent — the wire-retained kind the gateway's
+/// actSubstitute/actCopyPath pair creation keys on — is emitted at
+/// materialization-CLAIM intake (the walk-spawn site never runs for
+/// fresh flag-on work), and the consumption Success path emits the
+/// terminal CACHED event (the pair's stop trigger) through the
+/// completion chokepoint. The claim must NOT emit STARTED (a
+/// materialization claim is substitution work, not a builder
+/// dispatch — STARTED is one of the gateway's pair-STOP triggers and
+/// would close the pair the same instant it opened).
+#[tokio::test]
+async fn flag_on_claim_emits_substituting_event_and_consumption_stops_it() -> TestResult {
+    use rio_proto::types::DerivationEventKind as K;
+    let (_db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // Substitutable BEFORE merge → the merge new_sub lane creates the job.
+    let out = test_store_path("bc4-claim-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("bc4-claim");
+    n.expected_output_paths = vec![out.clone()];
+    n.wanted_output_names = vec!["out".into()];
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+
+    // No SUBSTITUTING event before the claim: flag-on, job creation is
+    // silent (the in-flight marker is the job row, not a status/event).
+    let pre_claim = drain_derivation_kinds(&mut ev);
+    assert!(
+        !pre_claim.contains(&K::Substituting),
+        "no SUBSTITUTING event may fire before the claim (got {pre_claim:?})"
+    );
+
+    // Claim → the SUBSTITUTING event fires at claim intake (BC-4).
+    let assignment = match claim_materialization(&handle, "bc4-claim", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    barrier(&handle).await;
+
+    let at_claim = drain_derivation_kinds(&mut ev);
+    assert!(
+        at_claim.contains(&K::Substituting),
+        "the materialization claim emits the SUBSTITUTING event (BC-4 re-siting); got {at_claim:?}"
+    );
+    assert!(
+        !at_claim.contains(&K::Started),
+        "a materialization claim must NOT emit STARTED (it would stop the gateway pair \
+         the moment it opened); got {at_claim:?}"
+    );
+
+    // Report Success → consumption completes the node → the terminal
+    // CACHED event (the gateway pair's stop trigger) arrives through
+    // the completion chokepoint.
+    store.seed_with_content(&out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "bc4-claim",
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    let at_consumption = drain_derivation_kinds(&mut ev);
+    assert!(
+        at_consumption.contains(&K::Cached),
+        "the Success consumption emits the terminal CACHED event (the pair's stop); \
+         got {at_consumption:?}"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// BC-4 flag-off invariance pin: the as-built walk's SUBSTITUTING
+/// emission at spawn time is byte-identical — flag-off, the event still
+/// fires when the walk spawns (NOT at any claim; no claims exist), and
+/// the walk completion emits the terminal stop. This pins criterion 2
+/// for the event surface and must never change.
+#[tokio::test]
+async fn flag_off_walk_substituting_events_unchanged() -> TestResult {
+    use rio_proto::types::DerivationEventKind as K;
+    let (_db, store, handle, _tasks) = setup_with_mock_store().await?; // flag-off
+
+    let out = test_store_path("bc4-off-out");
+    // Substitutable BEFORE merge → the as-built merge classification
+    // spawns the walk (Substituting status + the SUBSTITUTING event).
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut n = make_node("bc4-off");
+    n.expected_output_paths = vec![out.clone()];
+    let build_id = Uuid::new_v4();
+    let mut ev = merge_dag(&handle, build_id, vec![n], vec![], false).await?;
+    barrier(&handle).await;
+    settle_substituting(&handle, &["bc4-off"]).await;
+    barrier(&handle).await;
+
+    let kinds = drain_derivation_kinds(&mut ev);
+    assert!(
+        kinds.contains(&K::Substituting),
+        "flag-off the walk-spawn SUBSTITUTING emission is unchanged; got {kinds:?}"
+    );
+    // The walk completed the node → the terminal event closed the pair.
+    assert!(
+        kinds.contains(&K::Cached) || kinds.contains(&K::Completed),
+        "flag-off the walk completion emits the terminal event; got {kinds:?}"
+    );
+    Ok(())
+}
+
 // r[verify sched.materialize.job]
 /// The PD-6 boundary pin (adjudication PDQ-6): a Queued node (a parent
 /// behind an unproduced dep) with a pending job REFUSES a flag-on

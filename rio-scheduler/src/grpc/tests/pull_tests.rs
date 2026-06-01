@@ -1034,3 +1034,117 @@ async fn flag_on_materialization_lifecycle_through_grpc() -> anyhow::Result<()> 
     );
     Ok(())
 }
+
+// ── T-1.2 (Phase B): the BC-4 progress relay through the wire ──────────────
+
+// r[verify sched.materialize.job]
+// r[verify gw.activity.subst-progress]
+/// The Phase B progress relay (BC-4, replacing the PD-15b ack-and-drop
+/// stub): `ReportMaterializationProgress` through the REAL wire — with
+/// the store-service credential and a live materialization attempt —
+/// resolves the exec_id to its derivation and re-emits the byte
+/// progress as the same display-only `Event::SubstituteProgress` the
+/// walk's progress path emitted, on the build's LOG broadcast ring,
+/// with done ≤ expected. The relay is droppable end-to-end (try_send;
+/// errors ignored) and the auth gate prologue is unchanged (T-1.9).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn flag_on_progress_relay_reaches_build_events() -> anyhow::Result<()> {
+    use crate::actor::tests::{
+        barrier, merge_dag, setup_actor_configured, subscribe_log, test_store_path, tick,
+    };
+    use rio_auth::hmac::HmacKey;
+
+    // Flag-on actor + MockStore + db-backed SchedulerGrpc (the relay
+    // needs the exec_id → attempt lookup).
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let (handle, _actor_task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), |cfg, _| {
+            cfg.materialization.enabled = true;
+        });
+
+    let executor_key = std::sync::Arc::new(HmacKey::from_key(
+        b"executor-key-32-bytes-long!!!!!!".to_vec(),
+    ));
+    let service_key = std::sync::Arc::new(HmacKey::from_key(
+        b"service-key-32-bytes-long-here!!".to_vec(),
+    ));
+    let mut grpc = SchedulerGrpc::new_for_tests_with_pool(handle.clone(), db.pool.clone());
+    grpc.hmac_key = Some(executor_key);
+    grpc.service_verifier = Some(std::sync::Arc::clone(&service_key));
+    let store_token = store_service_token(&service_key, "rio-store");
+
+    let router = tonic::transport::Server::builder().add_service(ExecutorServiceServer::new(grpc));
+    let (addr, _server) = rio_test_support::grpc::spawn_grpc_server(router).await;
+    let channel = tonic::transport::Channel::from_shared(format!("http://{addr}"))?
+        .connect()
+        .await?;
+    let mut client = ExecutorServiceClient::new(channel);
+
+    // A claimable job (merge → probe partition), then claim it through
+    // the wire so a real materialization attempt (exec_id) exists.
+    let out = test_store_path("mat-progress-out");
+    let mut node = make_node("mat-progress");
+    node.expected_output_paths = vec![out.clone()];
+    node.wanted_output_names = vec!["out".into()];
+    let build_id = uuid::Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    store.state.substitutable.write().unwrap().push(out.clone());
+    tick(&handle).await?;
+
+    let mut req = Request::new(rio_proto::types::PullAssignmentRequest {
+        executor_token: String::new(),
+        intent_id: "mat-progress".into(),
+        kind: rio_proto::types::AttemptKind::Materialization.into(),
+        executor_instance: "store-test-0".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    let resp = client.pull_assignment(req).await?.into_inner();
+    let assignment = match resp.outcome {
+        Some(rio_proto::types::pull_assignment_response::Outcome::Assignment(a)) => a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+
+    // Subscribe to the build's LOG ring (display-only events ride it).
+    let mut log_rx = subscribe_log(&handle, build_id).await?;
+
+    // The progress report through the wire (store credential).
+    let mut req = Request::new(rio_proto::types::ReportMaterializationProgressRequest {
+        exec_id: assignment.exec_id.clone(),
+        bytes_done: 1024 * 1024,
+        bytes_expected: 4 * 1024 * 1024,
+        upstream_uri: "https://cache.example.org".into(),
+    });
+    req.metadata_mut()
+        .insert(rio_common::grpc::SERVICE_TOKEN_HEADER, store_token.parse()?);
+    client
+        .report_materialization_progress(req)
+        .await
+        .expect("the authenticated progress report is acknowledged");
+
+    // The relay emits Event::SubstituteProgress on the LOG ring with the
+    // reported byte counts (done ≤ expected). The relay rides the actor
+    // mailbox (try_send), so barrier on the actor before asserting.
+    barrier(&handle).await;
+    let mut saw_progress = None;
+    while let Ok(event) = log_rx.try_recv() {
+        if let Some(rio_proto::types::build_event::Event::SubstituteProgress(p)) = event.event {
+            saw_progress = Some(p);
+        }
+    }
+    let progress = saw_progress.expect(
+        "the Phase B relay must re-emit ReportMaterializationProgress as \
+         Event::SubstituteProgress on the build's log ring (BC-4)",
+    );
+    assert_eq!(progress.bytes_done, 1024 * 1024);
+    assert_eq!(progress.bytes_expected, 4 * 1024 * 1024);
+    assert!(
+        progress.bytes_done <= progress.bytes_expected,
+        "done ≤ expected"
+    );
+    assert_eq!(progress.upstream_uri, "https://cache.example.org");
+    Ok(())
+}
