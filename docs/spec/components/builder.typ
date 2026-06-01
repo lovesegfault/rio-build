@@ -545,6 +545,26 @@ attribute collisions and a declared FOD hash equal to the oracle-order
 answer, so any future precedence drift turns the merge gate red instead of
 surviving as a misread of the C++.
 
+#r("builder.exec.attrs-sh-numeric")[
+  The `.attrs.sh` rendering of a JSON number MUST match the oracle's
+  `handleSimpleType`: the value is emitted iff its `float` (f32) view is
+  integral, and the emitted text is the `int` (i32) conversion of the stored
+  value — modular wrapping for 64-bit integers, and the x86-64
+  `cvttsd2si` result (truncation toward zero; out-of-range and NaN yield
+  `-2147483648`) for doubles. `.attrs.json` MUST keep the full-precision
+  value; only the shell surface is 32-bit.
+]
+
+The f32 gate means a non-integral double whose f32 view rounds to an
+integer (16777217.5 → 16777218.0f) IS emitted — as its f64 truncation —
+while 2.5 is skipped; and 5000000000 renders as 705032704. These are
+nlohmann/x86-64 artifacts, not design: stdenv sources `.attrs.sh`, so the
+bytes are observable by every structured-attrs build and parity is the only
+correct behavior. The boundary values live in the `structured-attrs`
+differential entry (the one that byte-compares `.attrs.sh`), so the gate
+executes the oracle on the wrap and rounding edges rather than trusting
+this paragraph.
+
 #r("builder.exec.refs-graph-acyclic")[
   `exportReferencesGraph` materialization MUST terminate with auxiliary
   memory linear in the closure size, and MUST reject cyclic reference

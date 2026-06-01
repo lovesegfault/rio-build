@@ -339,6 +339,18 @@ rec {
         nested = {
           deep = true;
         };
+        # Boundary-value discipline (see the header further down): the
+        # only entry that byte-compares .attrs.sh also carries the
+        # numeric edges. The shell rendering is a 32-bit surface
+        # (oracle handleSimpleType: emit iff the f32 view is integral,
+        # text = int32 conversion), so bigInt/negBigInt wrap modulo
+        # 2^32 (→ 705032704 / -705032704) while .attrs.json keeps the
+        # 64-bit values; roundEdgeFloat 16777217.5 is non-integral as a
+        # double but its f32 view rounds integral, so BOTH sides must
+        # emit its truncation (16777217) rather than skip it.
+        bigInt = 5000000000;
+        negBigInt = -5000000000;
+        roundEdgeFloat = 16777217.5;
       };
 
   # passAsFile with an embedded output placeholder: the placeholder must

@@ -17,7 +17,9 @@
 //!   serialization rules (strings/integral numbers/bools/null become
 //!   `declare`, flat arrays `declare -a`, flat string-keyed objects
 //!   `declare -A`; keys that are not valid shell identifiers and
-//!   non-flat values are silently skipped).
+//!   non-flat values are silently skipped). The numeric rendering is a
+//!   32-bit surface — see [`simple_value`]; `.attrs.json` keeps the
+//!   full-precision values.
 //!
 //! Both files are passed through the build's `inputRewrites` before
 //! being written, exactly like CppNix `rewriteStrings()`s the rendered
@@ -186,25 +188,77 @@ fn write_structured_attrs_shell(json: &Value) -> String {
 /// CppNix `handleSimpleType`: the bash rendering of a scalar, or `None`
 /// if the value is not a scalar (which makes the surrounding key
 /// "non-flat" and skipped).
+// r[impl builder.exec.attrs-sh-numeric]
 fn simple_value(value: &Value) -> Option<String> {
     match value {
         Value::String(s) => Some(shell_escape(s)),
         Value::Number(n) => {
-            // Only integral numbers are representable; CppNix routes via
-            // float-and-ceil, accepting 2.0 but skipping 2.5.
-            if let Some(i) = n.as_i64() {
-                Some(i.to_string())
+            // Oracle handleSimpleType (parsed-derivations.cc:131-135):
+            //
+            //     auto f = value.get<float>();
+            //     if (std::ceil(f) == f)
+            //         return std::to_string(value.get<int>());
+            //
+            // i.e. emit iff the FLOAT (f32) view of the number is
+            // integral, and the emitted text is the int (i32)
+            // conversion of the STORED value. `.attrs.sh` is a 32-bit
+            // surface: big integers wrap modulo 2^32
+            // (static_cast<int>(int64_t) — Rust `as i32` is the same
+            // modular conversion), and out-of-range doubles pin the
+            // oracle's x86-64 `cvttsd2si` result. `.attrs.json` keeps
+            // full precision — only the shell rendering is 32-bit.
+            //
+            // The f32 gate has its own corner: a non-integral double
+            // like 16777217.5 ROUNDS to an integral f32 (16777218.0),
+            // so the oracle emits it — as the f64 truncation 16777217.
+            // (f32::INFINITY passes the gate too — ceil(inf) == inf —
+            // and the i32 conversion then yields the indefinite value;
+            // NaN fails it, NaN != NaN. JSON cannot carry either, but
+            // the arithmetic below is total anyway.)
+            let f32_view = if let Some(i) = n.as_i64() {
+                i as f32
             } else if let Some(u) = n.as_u64() {
-                Some(u.to_string())
+                u as f32
             } else {
-                let f = n.as_f64()?;
-                (f.ceil() == f).then(|| (f as i64).to_string())
+                n.as_f64()? as f32
+            };
+            if f32_view.ceil() != f32_view {
+                return None;
             }
+            let text = if let Some(i) = n.as_i64() {
+                // static_cast<int>(int64_t): modular.
+                (i as i32).to_string()
+            } else if let Some(u) = n.as_u64() {
+                // static_cast<int>(uint64_t): modular.
+                (u as i32).to_string()
+            } else {
+                double_to_int_x86_64(n.as_f64()?).to_string()
+            };
+            Some(text)
         }
         Value::Null => Some("''".to_string()),
         Value::Bool(true) => Some("1".to_string()),
         Value::Bool(false) => Some(String::new()),
         Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// `static_cast<int>(double)` as the oracle's x86-64 build performs it:
+/// `cvttsd2si` truncates toward zero, and any input whose truncation is
+/// not representable in i32 — including NaN — yields the "integer
+/// indefinite" value `i32::MIN` (0x8000_0000).
+///
+/// (ISO C++ calls the out-of-range case undefined; the differential
+/// gate runs the pinned oracle on x86-64, so the instruction's actual
+/// behavior is the parity contract. Rust's `as` saturates instead,
+/// which is why this helper exists.)
+// r[impl builder.exec.attrs-sh-numeric]
+fn double_to_int_x86_64(d: f64) -> i32 {
+    let t = d.trunc();
+    if t.is_nan() || t < i32::MIN as f64 || t > i32::MAX as f64 {
+        i32::MIN
+    } else {
+        t as i32
     }
 }
 
@@ -390,6 +444,74 @@ mod tests {
         assert!(!sh.contains("nestedAttrs"), "non-flat attrsets are skipped");
         assert!(!sh.contains("bad-key"), "non-identifier keys are skipped");
         assert!(sh.contains("declare _ok='kept'\n"));
+        // 32-bit surface inside containers too: a big int in a flat
+        // list/attrset wraps exactly like a top-level one.
+        let json = json!({"l": [5000000000i64], "m": {"k": 5000000000i64}});
+        let sh = write_structured_attrs_shell(&json);
+        assert!(sh.contains("declare -a l=(705032704 )\n"));
+        assert!(sh.contains("declare -A m=(['k']=705032704 )\n"));
+    }
+
+    /// Oracle `handleSimpleType` numeric matrix
+    /// (parsed-derivations.cc:131-135): emit iff the f32 view is
+    /// integral; the emitted text is the i32 conversion of the stored
+    /// value (modular for ints, `cvttsd2si` for doubles).
+    // r[verify builder.exec.attrs-sh-numeric]
+    #[test]
+    fn numeric_rendering_matches_cppnix_int32_semantics() {
+        let cases: &[(Value, Option<&str>)] = &[
+            // In-range ints: unchanged.
+            (json!(42), Some("42")),
+            (json!(7), Some("7")),
+            (json!(-17), Some("-17")),
+            // Integral double: emitted as its int value.
+            (json!(3.0), Some("3")),
+            // Non-integral double whose f32 view is ALSO non-integral:
+            // skipped.
+            (json!(2.5), None),
+            // Big ints wrap modulo 2^32 (static_cast<int>(int64_t)).
+            (json!(5_000_000_000i64), Some("705032704")),
+            (json!(-5_000_000_000i64), Some("-705032704")),
+            (json!(4_294_967_296i64), Some("0")), // 2^32
+            (json!(i64::MAX), Some("-1")),
+            (json!(u64::MAX), Some("-1")),
+            // Rounding edge: 16777217.5 is non-integral as f64 but its
+            // f32 view rounds to 16777218.0 (integral), so the oracle
+            // EMITS it — as the f64 truncation.
+            (json!(16777217.5), Some("16777217")),
+            // Out-of-i32-range double: f32 view integral → emitted as
+            // cvttsd2si's indefinite value.
+            (json!(1.0e10), Some("-2147483648")),
+            (json!(-1.0e10), Some("-2147483648")),
+            // Truncation right at the boundary stays representable.
+            (json!(2147483647.5), Some("2147483647")),
+            (json!(2147483648.0), Some("-2147483648")),
+        ];
+        for (value, expect) in cases {
+            assert_eq!(simple_value(value).as_deref(), *expect, "value: {value}");
+        }
+    }
+
+    /// Only the `.attrs.sh` rendering is 32-bit; `.attrs.json` keeps
+    /// the full-precision number.
+    // r[verify builder.exec.attrs-sh-numeric]
+    #[test]
+    fn attrs_json_keeps_full_precision_for_big_ints() {
+        let closure = empty_closure();
+        let json = json!({"bigInt": 5000000000i64});
+        let files =
+            prepare_structured_attrs(&json, &["out".to_string()], &closure, &BTreeMap::new())
+                .expect("prepare");
+        let json_text = String::from_utf8(files.attrs_json).unwrap();
+        assert!(
+            json_text.contains("\"bigInt\":5000000000"),
+            ".attrs.json must keep the 64-bit value: {json_text}"
+        );
+        let sh_text = String::from_utf8(files.attrs_sh).unwrap();
+        assert!(
+            sh_text.contains("declare bigInt=705032704\n"),
+            ".attrs.sh wraps to 32-bit: {sh_text}"
+        );
     }
 
     #[test]

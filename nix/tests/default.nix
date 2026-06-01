@@ -274,6 +274,10 @@ in
   #   fod-env-precedence entry: the output bytes are the contested env
   #   values and the declared FOD hash is the oracle-order answer, so
   #   any initEnv layer-order drift on either side is a hash mismatch.
+  # r[verify builder.exec.attrs-sh-numeric]
+  #   structured-attrs entry (the .attrs.sh byte-comparer) carries
+  #   bigInt/negBigInt/roundEdgeFloat: the int32 wrap and f32-gate
+  #   rounding edges are executed against the oracle, byte-for-byte.
   vm-differential-standalone = import ./scenarios/differential.nix {
     inherit pkgs rio-workspace;
   };
