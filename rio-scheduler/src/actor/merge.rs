@@ -564,14 +564,26 @@ impl DagActor {
         // Ok the build is committed (Active); later DB writes are
         // log-and-continue.
         // Substitution-replacement: the new_sub lane (newly-inserted
-        // pending_substitute nodes; the reprobe lane is excluded — its
-        // creation site is Phase B work together with the AS-5 status
-        // reset). Computed BEFORE persist so the in-tx job creation
-        // (adjudication PDQ-9) can ride the merge transaction. Flag-off
-        // the lane is passed but the in-tx block never reads it.
+        // pending_substitute nodes). Computed BEFORE persist so the
+        // in-tx job creation (adjudication PDQ-9) can ride the merge
+        // transaction. Flag-off the lane is passed but the in-tx block
+        // never reads it.
         let new_sub_lane: Vec<DrvHash> = pending_substitute
             .iter()
             .filter(|(h, _)| !existing_reprobe.contains(h))
+            .map(|(h, _)| h.clone())
+            .collect();
+        // Phase B (PD-17): the REPROBE lane subset (pre-existing nodes
+        // the probe re-classified substitutable), hoisted pre-tx — the
+        // reconcile phase derives the same partition at its 6d slot, but
+        // by then this transaction has already committed (the DF-7
+        // ordering reality), so the flag-on job rows (origin=reprobe) +
+        // the AS-5 durable reset must be computed HERE to ride batch 5.
+        // Flag-off the lane is passed but never read in-tx, and the 6d
+        // slot stays byte-identical (it spawns the as-built walks).
+        let reprobe_sub_lane: Vec<DrvHash> = pending_substitute
+            .iter()
+            .filter(|(h, _)| existing_reprobe.contains(h))
             .map(|(h, _)| h.clone())
             .collect();
         let created_jobs = match self
@@ -583,6 +595,7 @@ impl DagActor {
                 &pruned_closure_parents,
                 tenant_id,
                 &new_sub_lane,
+                &reprobe_sub_lane,
             )
             .await
         {
@@ -701,10 +714,11 @@ impl DagActor {
     /// succeeds. (The topdown fail-fast still clears the marker it
     /// consumes, as defense-in-depth for stale-flag shapes that do not
     /// involve this path at all.)
-    /// `tenant_id` / `new_sub_lane`: substitution-replacement inputs for
-    /// the flag-gated in-tx job creation (adjudication PDQ-9). Returns
-    /// the jobs that transaction created so the caller can feed the
-    /// in-memory view POST-commit (empty flag-off).
+    /// `tenant_id` / `new_sub_lane` / `reprobe_sub_lane`:
+    /// substitution-replacement inputs for the flag-gated in-tx job
+    /// creation (adjudication PDQ-9; PD-17 for the reprobe lane).
+    /// Returns the jobs that transaction created so the caller can feed
+    /// the in-memory view POST-commit (empty flag-off).
     // The argument list mirrors the persist transaction's write set
     // (same precedent as persist_merge_to_db / the other multi-column
     // writers).
@@ -718,6 +732,7 @@ impl DagActor {
         topdown_pruned_parents: &HashSet<String>,
         tenant_id: Option<Uuid>,
         new_sub_lane: &[DrvHash],
+        reprobe_sub_lane: &[DrvHash],
     ) -> Result<Vec<super::materialize::CreatedJob>, ActorError> {
         let created_jobs = self.persist_merge_to_db(
             build_id,
@@ -727,6 +742,7 @@ impl DagActor {
             topdown_pruned_parents,
             tenant_id,
             new_sub_lane,
+            reprobe_sub_lane,
         )
         .await
         .inspect_err(
@@ -901,8 +917,24 @@ impl DagActor {
         // Poisoned status, first_dep_failed=Some(A), and !keep_going
         // builds fail-fast while B's fetch is mid-flight.
         if !reprobe_sub.is_empty() {
-            self.spawn_substitute_fetches(reprobe_sub, sub_auth.clone())
-                .await;
+            if self.materialization_cfg.enabled {
+                // r[impl sched.materialize.job]
+                // PD-17 + AS-5 (Phase B): the reprobe lane's job rows
+                // (origin=reprobe) and the durable AS-5 reset already
+                // rode the merge transaction (batch 5 — committed before
+                // this slot runs; the DF-7 ordering). Apply the matching
+                // IN-MEMORY status correction here, in the 6d slot,
+                // before seed_initial_states (6e) reads dep statuses —
+                // the same phase-ordering invariant the as-built
+                // Substituting transition carries (bug_089/bug_132). No
+                // walk spawns: this closes the FIRST of the two
+                // merge-lane spawn sites (the stale-Completed verify's
+                // own site closes at PD-18).
+                self.apply_reprobe_reset_in_memory(&reprobe_sub).await;
+            } else {
+                self.spawn_substitute_fetches(reprobe_sub, sub_auth.clone())
+                    .await;
+            }
         }
         phase!("6d-spawn-substitute-reprobe");
 
@@ -1330,6 +1362,87 @@ impl DagActor {
             }
         }
         (cached_count, deferred_hits, other_builds, reprobe_unlocked)
+    }
+
+    // r[impl sched.materialize.job]
+    /// PD-17 + AS-5 (Phase B), the 6d slot's flag-on body: the IN-MEMORY
+    /// half of the reprobe-lane reset. The durable half — the job rows
+    /// (origin=reprobe), the poison clear, and the `poison_cleared`
+    /// budget-reset ledger row — rode the merge transaction's batch 5
+    /// and is already committed when this runs.
+    ///
+    /// Failed-status reprobe nodes (Poisoned/DependencyFailed/Failed —
+    /// their prior failure is moot now the output is substitutable
+    /// again) take the I-094 deferred-reprobe edge to `Queued`, then
+    /// promote to `Ready` when every dep is complete (the dep-derived
+    /// non-failed status AS-5 prescribes), and the corrected statuses
+    /// are batch-persisted (the post-commit half — the same pattern as
+    /// the as-built walk's `persist_status_batch(Substituting)`).
+    /// Benign-status reprobe nodes (Created/Queued/Ready) need no
+    /// correction: the committed job row is their in-flight marker.
+    ///
+    /// MUST run before 6e (`seed_initial_states` reads dep statuses) —
+    /// the bug_089/bug_132 phase-ordering invariant the as-built
+    /// Substituting transition carried.
+    async fn apply_reprobe_reset_in_memory(&mut self, reprobe_sub: &[(DrvHash, Vec<String>)]) {
+        let mut corrected_queued: Vec<DrvHash> = Vec::new();
+        let mut corrected_ready: Vec<DrvHash> = Vec::new();
+        for (drv_hash, _) in reprobe_sub {
+            let Some(state) = self.dag.node_mut(drv_hash) else {
+                continue;
+            };
+            let from = state.status();
+            if !matches!(
+                from,
+                DerivationStatus::Poisoned
+                    | DerivationStatus::DependencyFailed
+                    | DerivationStatus::Failed
+            ) {
+                // Benign statuses: the job row is the in-flight marker;
+                // nothing to correct.
+                continue;
+            }
+            // The I-094 deferred-reprobe edge (failed → Queued). The
+            // durable budget reset (poison_cleared row) already rode
+            // batch 5; the in-memory retry view follows the as-built
+            // I-094 deferred-lane posture (refreshed from the durable
+            // ledger on the next reload).
+            if let Err(e) = state.transition(DerivationStatus::Queued) {
+                warn!(drv_hash = %drv_hash, error = %e,
+                      "reprobe AS-5 reset to Queued rejected; node stays {from:?}");
+                continue;
+            }
+            info!(drv_hash = %drv_hash, ?from,
+                  "reprobe lane (flag-on): AS-5 reset applied; the origin=reprobe job is the \
+                   in-flight marker (no walk spawned)");
+            // Promote to the dep-derived status: Ready when every dep
+            // is complete (a dep-less node is vacuously complete).
+            if self.dag.all_deps_completed(drv_hash)
+                && self
+                    .dag
+                    .node_mut(drv_hash)
+                    .is_some_and(|s| s.transition(DerivationStatus::Ready).is_ok())
+            {
+                self.push_ready(drv_hash.clone());
+                corrected_ready.push(drv_hash.clone());
+            } else {
+                corrected_queued.push(drv_hash.clone());
+            }
+        }
+        // Persist the corrected statuses (post-commit, batched per
+        // status — the durable rows from batch 5 left these at
+        // 'created'; this is the same persist the as-built walk did
+        // with Substituting).
+        if !corrected_queued.is_empty() {
+            let refs: Vec<&str> = corrected_queued.iter().map(DrvHash::as_str).collect();
+            self.persist_status_batch(&refs, DerivationStatus::Queued)
+                .await;
+        }
+        if !corrected_ready.is_empty() {
+            let refs: Vec<&str> = corrected_ready.iter().map(DrvHash::as_str).collect();
+            self.persist_status_batch(&refs, DerivationStatus::Ready)
+                .await;
+        }
     }
 
     /// Step-6h body: walk pre-existing nodes (not newly-inserted, not
@@ -2046,6 +2159,7 @@ impl DagActor {
         topdown_pruned_parents: &HashSet<String>,
         tenant_id: Option<Uuid>,
         new_sub_lane: &[DrvHash],
+        reprobe_sub_lane: &[DrvHash],
     ) -> Result<Vec<super::materialize::CreatedJob>, ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
@@ -2267,12 +2381,71 @@ impl DagActor {
                     });
                 }
             }
+
+            // (c) PD-17 (Phase B): reprobe-lane jobs (origin=reprobe) +
+            // the AS-5 durable reset, riding the same transaction. The
+            // reprobe nodes are pre-existing rows referenced by this
+            // submission, so they are in id_map; the partial-unique
+            // dedup makes a re-merge onto an existing pending job
+            // idempotent (created=false — exactly the orphan-former the
+            // walk used to complete around). The AS-5 reset applies to
+            // the FAILED-status subset (Poisoned/DependencyFailed/
+            // Failed — their prior failure is moot now the output is
+            // substitutable again): the durable poison clear + the
+            // poison_cleared budget-reset ledger row (I-094 semantics,
+            // resubmit_cycle zeroed like the admin clear). The matching
+            // in-memory status correction applies post-commit at the 6d
+            // slot, BEFORE seed_initial_states reads dep statuses
+            // (the bug_089/bug_132 phase-ordering invariant).
+            // r[impl sched.materialize.job]
+            let already_queued: std::collections::HashSet<&str> =
+                job_rows.iter().map(|r| r.drv_hash).collect();
+            let mut reset_hashes: Vec<DrvHash> = Vec::new();
+            let mut reset_rows: Vec<crate::db::attempts::AttemptRow> = Vec::new();
+            for drv_hash in reprobe_sub_lane {
+                if !already_queued.contains(drv_hash.as_str())
+                    && let Some((db_id, _)) = id_map.get(drv_hash.as_str())
+                {
+                    job_rows.push(crate::db::materialization::NewJobRow {
+                        derivation_id: *db_id,
+                        drv_hash: drv_hash.as_str(),
+                        tenant_id,
+                        origin: crate::state::JobOrigin::Reprobe,
+                    });
+                }
+                if self.dag.node(drv_hash).is_some_and(|s| {
+                    matches!(
+                        s.status(),
+                        DerivationStatus::Poisoned
+                            | DerivationStatus::DependencyFailed
+                            | DerivationStatus::Failed
+                    )
+                }) && let Some(mut row) = self.reset_row_for(
+                    drv_hash,
+                    crate::state::OutcomeClass::PoisonCleared,
+                    crate::state::ReportingParty::Scheduler,
+                ) {
+                    // Full reset: mirrors the admin clear's PG-side zero.
+                    row.resubmit_cycle = 0;
+                    reset_rows.push(row);
+                    reset_hashes.push(drv_hash.clone());
+                }
+            }
+
             let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
                 &mut tx,
                 &job_rows,
                 serving_generation,
             )
             .await?;
+
+            // The AS-5 durable reset: poison clear (poisoned_at NULL,
+            // status reset) + the budget-reset rows, same transaction.
+            if !reset_hashes.is_empty() {
+                crate::db::SchedulerDb::clear_poison_batch_in_tx(&mut tx, &reset_hashes).await?;
+                crate::db::SchedulerDb::append_attempts_batch(&mut tx, &reset_rows).await?;
+            }
+
             job_rows
                 .iter()
                 .zip(created)

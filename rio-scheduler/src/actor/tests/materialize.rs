@@ -1717,3 +1717,212 @@ async fn flag_on_queued_mint_crash_between_commit_and_transition_recovers() -> T
     assert_eq!(listed[0].drv_hash, "mat-crash-mid");
     Ok(())
 }
+
+// ── T-1.5 (Phase B): PD-17 — reprobe-lane job creation + the AS-5 reset ──
+
+// r[verify sched.materialize.job]
+/// PD-17 + AS-5 (design §2.1 reprobe row): flag-on, a previously-failed
+/// (Poisoned) pre-existing node whose output is upstream-substitutable
+/// again gets, at the re-merging build's 6d slot:
+///   - the AS-5 status reset to its dep-derived non-failed status
+///     (Queued/Ready) — never Substituting (no walk spawns; this is the
+///     first of the two merge-lane spawn sites criterion 3 closes),
+///   - a durable poison_cleared budget-reset ledger row riding the
+///     merge transaction,
+///   - a materialization job row with origin='reprobe' riding the same
+///     transaction,
+/// and a dependent inserted in the SAME merge seeds against the
+/// CORRECTED status (the bug_089/bug_132 phase-ordering invariant: the
+/// 6d correction runs before 6e's seeding) — never DependencyFailed.
+#[tokio::test]
+async fn flag_on_reprobe_poisoned_node_creates_job_with_reset() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let tag = "pd17-poisoned";
+    let out = test_store_path("pd17-poisoned-out");
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+
+    // Build #1: merge + force-poison at the resubmit limit so build #2's
+    // merge does NOT reset it (it stays Poisoned and pre-existing → the
+    // existing_reprobe lane).
+    let _ev1 = merge_dag(&handle, Uuid::new_v4(), vec![node.clone()], vec![], false).await?;
+    assert!(
+        handle
+            .debug_force_poisoned(tag, crate::state::POISON_RESUBMIT_RETRY_LIMIT)
+            .await?
+    );
+    barrier(&handle).await;
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Poisoned,
+        "precondition"
+    );
+
+    // The output becomes upstream-substitutable (NOT locally present).
+    store.state.substitutable.write().unwrap().push(out.clone());
+
+    // Build #2: resubmit the poisoned node together with a NEW dependent
+    // in the same submission — the bug_132 assertion target.
+    let parent = make_node("pd17-parent");
+    let build2 = Uuid::new_v4();
+    let _ev2 = merge_dag(
+        &handle,
+        build2,
+        vec![node, parent],
+        vec![make_test_edge("pd17-parent", tag)],
+        false,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // AS-5: the node sits at its dep-derived non-failed status — never
+    // Poisoned (the reset happened), never Substituting (no walk).
+    let info = expect_drv(&handle, tag).await;
+    assert!(
+        matches!(
+            info.status,
+            DerivationStatus::Queued | DerivationStatus::Ready
+        ),
+        "AS-5: the reprobe reset puts the node at its dep-derived status, got {:?}",
+        info.status
+    );
+
+    // The poison_cleared budget-reset row is durable (rode the merge tx).
+    let classes: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome_class FROM drv_attempts t \
+           JOIN derivations d USING (derivation_id) \
+          WHERE d.drv_hash = $1",
+    )
+    .bind(tag)
+    .fetch_all(&db.pool)
+    .await?;
+    assert!(
+        classes.contains(&"poison_cleared".to_string()),
+        "the poison_cleared reset row rides the merge transaction, got {classes:?}"
+    );
+
+    // The job row exists with origin='reprobe', pending (claimable).
+    let (origin, job_state): (String, String) =
+        sqlx::query_as("SELECT origin, state FROM materialization_jobs WHERE drv_hash = $1")
+            .bind(tag)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(origin, "reprobe", "the reprobe lane's job origin");
+    assert_eq!(job_state, "pending");
+
+    // No walk spawned (criterion 3: the merge-lane spawn site is closed).
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&out),
+            "flag-on the reprobe lane must not spawn walks; qpi_calls={qpi:?}"
+        );
+    }
+
+    // bug_132: the dependent merged in the same submission seeds against
+    // the CORRECTED status — Queued (gated on the reprobe node), never
+    // DependencyFailed.
+    assert_eq!(
+        expect_drv(&handle, "pd17-parent").await.status,
+        DerivationStatus::Queued,
+        "the dependent seeds against the corrected (non-failed) status — bug_132 ordering"
+    );
+
+    // The build is Active (never fail-fasted against the stale poison).
+    let st = query_status(&handle, build2).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build #2 proceeds (the prior failure is moot)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.job]
+/// PD-17, the Phase A T-6.2 observed-orphan trace replayed: a second
+/// build merging an existing READY node that already carries a pending
+/// job routes through the I-099 reprobe lane. As-built (flag-on, Phase
+/// A) that lane spawned a walk which completed the node AROUND the
+/// pending job — orphaning it. With PD-17 the lane creates/dedups the
+/// job instead: no walk, the node stays Ready, and the job remains the
+/// single resolution path for BOTH builds.
+#[tokio::test]
+async fn flag_on_reprobe_job_orphan_no_longer_forms() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let tag = "pd17-orphan";
+    let out = test_store_path("pd17-orphan-out");
+    // Substitutable BEFORE merge → build #1's merge creates the job
+    // (the new_sub lane, in-tx).
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+
+    let b1 = Uuid::new_v4();
+    let _ev1 = merge_dag(&handle, b1, vec![node.clone()], vec![], false).await?;
+    barrier(&handle).await;
+    let (jobs, _) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "build #1's merge created the job");
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Ready
+    );
+
+    // Build #2 merges the SAME node (pre-existing Ready, job pending) —
+    // the I-099 reprobe lane.
+    let b2 = Uuid::new_v4();
+    let _ev2 = merge_dag(&handle, b2, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // The orphan-former is gone: no walk transition (the node would be
+    // Substituting as-built — the walk's 6d transition is synchronous
+    // inside the merge turn), no QueryPathInfo walk traffic.
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Ready,
+        "the node stays Ready: the job remains the in-flight marker; \
+         nothing completes it around the job"
+    );
+    {
+        let qpi = store.calls.qpi_calls.read().unwrap();
+        assert!(
+            !qpi.contains(&out),
+            "the reprobe lane must not spawn walks flag-on; qpi_calls={qpi:?}"
+        );
+    }
+
+    // One job (the dedup found build #1's), both builds' wanted rows.
+    let (jobs, wanted) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(jobs, 1, "the reprobe lane dedups onto the existing job");
+    assert_eq!(wanted, 2, "both builds' wanted-relation rows recorded");
+
+    // The job resolves BOTH builds: claim → Success → consumption.
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the surviving job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    store.seed_with_content(&out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        expect_drv(&handle, tag).await.status,
+        DerivationStatus::Completed,
+        "the job's consumption completes the node"
+    );
+    for b in [b1, b2] {
+        assert_eq!(
+            query_status(&handle, b).await?.state,
+            rio_proto::types::BuildState::Succeeded as i32,
+            "both interested builds succeed through the single job"
+        );
+    }
+    Ok(())
+}
