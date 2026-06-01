@@ -435,7 +435,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_k.clone()];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None)
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 
@@ -587,7 +587,7 @@ mod tests {
             .unwrap();
         let mut stored = info.clone();
         stored.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into(), None)
+        metadata::complete_manifest_inline(&db.pool, &stored, claim, nar.into(), None, None)
             .await
             .unwrap();
         let stored = metadata::query_path_info(&db.pool, &path)
@@ -694,7 +694,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_tenant];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None)
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 
@@ -776,7 +776,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            metadata::complete_manifest_inline(&db.pool, &info, claim, nar.into(), None)
+            metadata::complete_manifest_inline(&db.pool, &info, claim, nar.into(), None, None)
                 .await
                 .unwrap();
         }
@@ -976,9 +976,16 @@ mod tests {
                 vec![]
             };
             info_with_sig.store_path_hash = path_hash.to_vec();
-            metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None)
-                .await
-                .unwrap();
+            metadata::complete_manifest_inline(
+                &db.pool,
+                &info_with_sig,
+                claim,
+                nar.into(),
+                None,
+                None,
+            )
+            .await
+            .unwrap();
             paths.push(path);
         }
         // P3: built (path_tenants row).
@@ -1065,7 +1072,7 @@ mod tests {
         let mut info_with_sig = info.clone();
         info_with_sig.signatures = vec![sig_a];
         info_with_sig.store_path_hash = path_hash.to_vec();
-        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None)
+        metadata::complete_manifest_inline(&db.pool, &info_with_sig, claim, nar.into(), None, None)
             .await
             .unwrap();
 

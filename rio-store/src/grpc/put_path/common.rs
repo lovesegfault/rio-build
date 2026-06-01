@@ -1065,6 +1065,7 @@ impl StoreServiceImpl {
     /// the span stays clocked even when the budget law does not bind.
     // r[impl obs.metric.transfer-volume]
     // r[impl store.put.nar-hold-envelope+2]
+    // r[impl store.put.tenant-junction]
     pub(in crate::grpc) async fn finalize_single(
         &self,
         mut info: ValidatedPathInfo,
@@ -1075,7 +1076,8 @@ impl StoreServiceImpl {
         tenant_id: Option<uuid::Uuid>,
         // bug_155: the REGISTRATION tenant ([`PutAuth::registration_tenant`]
         // — JWT or the signed claims attribution); drives the ingest
-        // evidence stamp, never signing.
+        // evidence stamp AND the `path_tenants` junction write inside
+        // `persist_nar`; never signing.
         registration_tenant: Option<uuid::Uuid>,
         hold: Option<NarIngestHold<'_>>,
     ) -> Result<(), Status> {
@@ -1094,7 +1096,8 @@ impl StoreServiceImpl {
         };
         let tail = async {
             self.maybe_sign(tenant_id, &mut info).await;
-            self.persist_nar(&info, claim, nar_data, "PutPath").await
+            self.persist_nar(&info, claim, nar_data, "PutPath", registration_tenant)
+                .await
         };
         let persisted = match tokio::time::timeout(envelope.remaining(), tail).await {
             Ok(r) => r.map(|_| ()),
@@ -1153,6 +1156,39 @@ impl StoreServiceImpl {
         metrics::counter!("rio_store_put_path_total", "result" => "created").increment(1);
         metrics::counter!("rio_store_put_path_bytes_total").increment(info.nar_size);
         Ok(())
+    }
+
+    /// `path_tenants` junction for an idempotent-skipped path
+    /// (r[store.put.tenant-junction]): the prior commit may belong to
+    /// another tenant (or predate tenancy — legacy uploads), and the
+    /// skipping caller still needs castore read access and a GC pin.
+    /// Tolerates a tenant deleted mid-flight, same as the in-tx variant.
+    // r[impl store.put.tenant-junction]
+    pub(in crate::grpc) async fn insert_path_tenant_skipped(
+        &self,
+        store_path_hash: &[u8],
+        tenant_id: Option<uuid::Uuid>,
+    ) -> Result<(), Status> {
+        if tenant_id.is_none() {
+            return Ok(());
+        }
+        let result = async {
+            let mut conn = self.pool.acquire().await?;
+            metadata::insert_path_tenant_in_conn(&mut conn, store_path_hash, tenant_id).await
+        }
+        .await;
+        match result {
+            Ok(()) => Ok(()),
+            Err(e) if metadata::is_deleted_tenant_fk(&e) => {
+                warn!(
+                    store_path_hash = hex::encode(store_path_hash),
+                    "PutPath: path_tenants junction skipped — tenant was deleted while the \
+                     upload was in flight"
+                );
+                Ok(())
+            }
+            Err(e) => Err(putpath_metadata_status("PutPath: path_tenants", e)),
+        }
     }
 
     /// gRPC wrapper around [`ingest::claim_placeholder`]: adds the
@@ -1219,6 +1255,7 @@ impl StoreServiceImpl {
         claim: uuid::Uuid,
         nar_data: Vec<u8>,
         ctx_label: &str,
+        junction_tenant: Option<uuid::Uuid>,
     ) -> Result<bool, Status> {
         let chunked = cas::should_chunk(self.chunk_backend.as_ref(), nar_data.len()).is_some();
         ingest::persist_nar(
@@ -1229,6 +1266,7 @@ impl StoreServiceImpl {
             nar_data,
             self.chunk_upload_max_concurrent,
             PUTPATH_HOOKS,
+            junction_tenant,
         )
         .await
         .map_err(|e| match e {

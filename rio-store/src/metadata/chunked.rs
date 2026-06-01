@@ -281,15 +281,19 @@ pub(crate) async fn mark_chunks_uploaded_in_conn(
 /// `castore` is `None` only in metadata-layer tests that seed fake
 /// chunk lists; such paths are not GetPath-servable. Production
 /// (`cas::put_chunked`) always passes `Some`.
+///
+/// `tenant` is the uploader's resolved tenant for the `path_tenants`
+/// junction (`r[store.put.tenant-junction]`); `None` writes no row.
 #[instrument(skip(pool, info, castore), fields(store_path = %info.store_path.as_str()))]
 pub(crate) async fn complete_manifest_chunked(
     pool: &PgPool,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     castore: Option<&crate::cas::ParsedNar>,
+    tenant: Option<uuid::Uuid>,
 ) -> Result<()> {
     let mut tx = pool.begin().await?;
-    super::complete_manifest_in_conn(&mut tx, info, claim, None, castore).await?;
+    super::complete_manifest_in_conn(&mut tx, info, claim, None, castore, tenant).await?;
     tx.commit().await?;
     debug!(store_path = %info.store_path.as_str(), "chunked upload completed");
     Ok(())
@@ -493,8 +497,8 @@ pub(crate) async fn lock_staged_chunks_for_commit(
 
 /// Commit one `PutPathChunked` output inside the caller's transaction:
 /// `manifest_data` insert, chunk refcount bump, then the status flip,
-/// narinfo, and castore index via [`super::complete_manifest_in_conn`],
-/// and finally the `path_tenants` junction.
+/// narinfo, castore index, and `path_tenants` junction via
+/// [`super::complete_manifest_in_conn`].
 ///
 /// Ordering matters: `complete_manifest_in_conn`'s
 /// `mark_manifest_chunks_durable` reads `manifest_data.chunk_list`
@@ -509,6 +513,7 @@ pub(crate) async fn lock_staged_chunks_for_commit(
 /// decrement) and MUST be pre-sorted ascending
 /// (`r[store.chunk.lock-order]`).
 // r[impl store.chunk.refcount-txn]
+// r[impl store.put.tenant-junction]
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn commit_chunked_output_in_conn(
     conn: &mut sqlx::PgConnection,
@@ -559,21 +564,21 @@ pub(crate) async fn commit_chunked_output_in_conn(
     }
 
     // Status flip + narinfo + chunks.durable + nar_index/directories/
-    // directory_paths/file_blobs. Reads the manifest_data row inserted
-    // above.
-    super::complete_manifest_in_conn(conn, info, claim, None, Some(parsed)).await?;
-
-    // Tolerant variant: an assignment token can name a tenant deleted
-    // while the build was in flight; that must skip the junction write,
-    // not abort the commit transaction this output just completed in.
-    insert_path_tenant_skipping_deleted_in_tx(conn, &info.store_path_hash, tenant_id).await
+    // directory_paths/file_blobs + path_tenants junction. Reads the
+    // manifest_data row inserted above. The junction insert is the
+    // tolerant variant: an assignment token can name a tenant deleted
+    // while the build was in flight; that skips the junction write
+    // instead of aborting the commit transaction this output just
+    // completed in.
+    super::complete_manifest_in_conn(conn, info, claim, None, Some(parsed), tenant_id).await
 }
 
 /// `path_tenants` junction insert (`r[store.castore.tenant-scope]`).
 /// Idempotent; a `None` tenant (dev mode, service-token caller) writes
 /// nothing. Runs for idempotent-skipped outputs too — the prior commit
-/// may have been via legacy `PutPath`, which didn't write the row.
+/// may belong to another tenant or predate tenancy.
 // r[impl store.castore.tenant-scope]
+// r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_in_conn(
     conn: &mut sqlx::PgConnection,
     store_path_hash: &[u8],
@@ -628,9 +633,10 @@ pub(crate) fn is_deleted_tenant_fk(err: &MetadataError) -> bool {
 /// commit stays valid and the un-pinned path simply ages out via
 /// normal GC retention. The savepoint is what keeps the surrounding
 /// transaction usable after PG aborts the failed statement, so callers
-/// MUST be inside a transaction (the §6.2 commit transaction is the
-/// only one today).
+/// MUST be inside a transaction (every caller today is a
+/// manifest-completion transaction).
 // r[impl store.castore.tenant-scope]
+// r[impl store.put.tenant-junction]
 pub(crate) async fn insert_path_tenant_skipping_deleted_in_tx(
     conn: &mut sqlx::PgConnection,
     store_path_hash: &[u8],
@@ -1855,7 +1861,7 @@ mod tests {
         mark_chunks_uploaded(&db.pool, one_chunk).await.unwrap();
         let mut info = rio_test_support::fixtures::make_path_info(&path, &[0u8; 1024], [0x55; 32]);
         info.store_path_hash = sph.clone();
-        complete_manifest_chunked(&db.pool, &info, claim_b, None)
+        complete_manifest_chunked(&db.pool, &info, claim_b, None, None)
             .await
             .unwrap();
 
@@ -2138,7 +2144,7 @@ mod tests {
         let mut info_a =
             rio_test_support::fixtures::make_path_info(&path_a, &[0u8; 1024], [0x55; 32]);
         info_a.store_path_hash = sph_a.clone();
-        complete_manifest_chunked(&db.pool, &info_a, claim_a, None)
+        complete_manifest_chunked(&db.pool, &info_a, claim_a, None, None)
             .await
             .unwrap();
         assert!(
@@ -2163,7 +2169,7 @@ mod tests {
         let mut info_b =
             rio_test_support::fixtures::make_path_info(&path_b, &[0u8; 1024], [0x66; 32]);
         info_b.store_path_hash = sph_b.clone();
-        complete_manifest_chunked(&db.pool, &info_b, claim_b, None)
+        complete_manifest_chunked(&db.pool, &info_b, claim_b, None, None)
             .await
             .unwrap();
         assert!(durable(&db.pool, &chunk).await, "still durable after B");

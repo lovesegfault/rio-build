@@ -591,6 +591,37 @@ unreferenced age past grace and are collected by a later collect cycle
   re-uploading. This makes concurrent uploads of the same path safe.
 ]
 
+#r("store.put.tenant-junction")[
+  Every upload RPC (`PutPath`, `PutPathBatch`, `PutPathChunked`) MUST record
+  the caller's resolved tenant (the same resolution the castore read side
+  uses, #rref("store.castore.tenant-scope")) as a `path_tenants` row for
+  every output it commits, and for every output it idempotent-skips as
+  already complete. A caller with no resolvable tenant (dev mode,
+  service-token caller without a JWT) writes no row. A junction insert that
+  fails because the tenant was deleted while the upload was in flight MUST
+  NOT fail the upload. Upstream substitution is NOT an upload RPC and MUST
+  NOT write the junction (#rref("store.substitute.tenant-sig-visibility")).
+]
+
+Without the commit-time row, a path uploaded by a tenant is invisible to that
+same tenant through the castore read surface
+(#rref("store.castore.tenant-scope")): the gateway uploads every `.drv` via
+`PutPath`, the builder then opens it through castore-FUSE `ReadBlob`, and the
+inner join on `path_tenants` turns the missing row into `NotFound` → `EIO` →
+the build dies as a spurious infrastructure failure. The idempotent-skip half
+matters because content-addressed paths deduplicate across tenants: the prior
+commit may belong to another tenant (or predate tenancy), and the skipping
+caller still needs castore read access and a GC pin of its own.
+
+The substitution exclusion is the other half of the same coin: a substituted
+path's cross-tenant visibility is signature-gated
+(#rref("store.substitute.tenant-sig-visibility")), so a junction row written
+at substitution time launders the path into "built" --- hiding it from other
+tenants who trust the same upstream and corrupting the scheduler's
+cached-output check (#rref("store.substitute.find-missing-gated")). Substituted
+outputs are pinned per-tenant by the scheduler's completion upsert instead
+(#rref("sched.gc.path-tenants-upsert")).
+
 #r("store.put.placeholder-refs")[
   The `'uploading'` placeholder narinfo MUST carry `references` from the
   instant it commits (same INSERT, same transaction as the `manifests` row).

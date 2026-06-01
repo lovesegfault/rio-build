@@ -221,6 +221,11 @@ impl StoreServiceImpl {
                 Ok(Some(g)) => Some(g),
                 Ok(None) => {
                     common::drain_stream("PutPath", &mut stream).await;
+                    // Idempotent skip still grants the skipping tenant
+                    // castore read access + a GC pin
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, auth.registration_tenant())
+                        .await?;
                     return Ok(Response::new(PutPathResponse { created: false }));
                 }
                 Err(e) => {
@@ -259,7 +264,13 @@ impl StoreServiceImpl {
             };
             match claimed {
                 Some(g) => placeholder_guard = Some(g),
-                None => return Ok(Response::new(PutPathResponse { created: false })),
+                None => {
+                    // Same idempotent-skip junction write as the IA arm
+                    // (r[store.put.tenant-junction]).
+                    self.insert_path_tenant_skipped(&store_path_hash, auth.registration_tenant())
+                        .await?;
+                    return Ok(Response::new(PutPathResponse { created: false }));
+                }
             }
         }
         let placeholder_guard =

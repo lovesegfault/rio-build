@@ -301,13 +301,21 @@ pub(super) async fn update_narinfo_complete(
 /// manifests UPDATE runs FIRST so a foreign-claim call touches zero
 /// rows in any table; `update_narinfo_complete` (no `claim_id` column
 /// on narinfo) only runs once ownership is proven.
+///
+/// `tenant` is the uploader's resolved tenant for the `path_tenants`
+/// junction — written atomically with the visibility flip so a
+/// complete path is always readable-back by its uploader through the
+/// castore surface. `None` (dev mode, service-token caller) writes no
+/// row.
 // r[impl store.put.placeholder-claim+2]
+// r[impl store.put.tenant-junction]
 pub(crate) async fn complete_manifest_in_conn(
     conn: &mut sqlx::PgConnection,
     info: &ValidatedPathInfo,
     claim: uuid::Uuid,
     inline_blob: Option<&[u8]>,
     castore: Option<&crate::cas::ParsedNar>,
+    tenant: Option<uuid::Uuid>,
 ) -> Result<()> {
     // Flip status. inline_blob stays NULL in the chunked case — that's
     // what makes get_manifest() return Chunked instead of Inline.
@@ -381,6 +389,12 @@ pub(crate) async fn complete_manifest_in_conn(
         )
         .await?;
     }
+    // Tenant junction, atomic with the visibility flip
+    // (r[store.put.tenant-junction]): a complete path with a known
+    // uploader tenant is always readable-back by that tenant through
+    // the castore surface. Deleted-tenant FK violations are skipped,
+    // not fatal (the savepoint keeps the surrounding tx usable).
+    chunked::insert_path_tenant_skipping_deleted_in_tx(conn, &info.store_path_hash, tenant).await?;
     // live_055(b): announce the completion to raced waiters. Inside
     // the caller's tx — PG delivers at COMMIT, so a woken waiter's
     // re-check sees status='complete' (→ AlreadyComplete hit).
@@ -586,6 +600,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             Bytes::from_static(b"nar"),
             None,
+            None,
         )
         .await
         .expect_err("should fail without placeholder");
@@ -626,6 +641,7 @@ mod tests {
             uuid::Uuid::new_v4(),
             Bytes::from_static(b"nar"),
             None,
+            None,
         )
         .await
         .expect_err("foreign claim must fail");
@@ -647,9 +663,16 @@ mod tests {
         assert_eq!(nar_size, 0, "narinfo untouched (manifests gate runs first)");
 
         // Real claim → Ok; status flipped, OUR signatures landed.
-        complete_manifest_inline(&db.pool, &info, claim_a, Bytes::from_static(b"nar"), None)
-            .await
-            .unwrap();
+        complete_manifest_inline(
+            &db.pool,
+            &info,
+            claim_a,
+            Bytes::from_static(b"nar"),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         let (status, sigs): (String, Vec<String>) = sqlx::query_as(
             "SELECT m.status::text, n.signatures \
              FROM manifests m JOIN narinfo n USING (store_path_hash) \

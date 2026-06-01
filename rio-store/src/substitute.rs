@@ -2441,6 +2441,17 @@ impl Substituter {
                     // The W8-B′ seam: a black-holed persist backend.
                     g.notified().await;
                 }
+                // tenant: None — substitution must NOT write a
+                // `path_tenants` junction. A substituted path's
+                // cross-tenant visibility is signature-gated
+                // (`r[store.substitute.tenant-sig-visibility+2]`); a
+                // junction row would launder it into "built"
+                // (`r[store.substitute.find-missing-gated]`), hiding it
+                // from other tenants who trust the same upstream and
+                // corrupting the scheduler's cached-output check. The
+                // scheduler's completion upsert (`upsert_path_tenants`
+                // in rio-scheduler) pins substituted outputs for the
+                // tenants whose builds depend on them.
                 ingest::persist_nar(
                     &self.pool,
                     self.chunk_backend.as_ref(),
@@ -2449,6 +2460,7 @@ impl Substituter {
                     nar_bytes.into(),
                     self.chunk_upload_max_concurrent,
                     SUBSTITUTE_HOOKS,
+                    None,
                 )
                 .await
                 .map_err(|e| match e {
@@ -3805,6 +3817,24 @@ mod tests {
             .expect("path should be in narinfo table");
         assert_eq!(stored.nar_size, nar.len() as u64);
         assert_eq!(stored.signatures.len(), 1);
+
+        // Substitution-only paths must have ZERO `path_tenants` rows: their
+        // cross-tenant visibility is signature-gated
+        // (`r[store.substitute.tenant-sig-visibility+2]`), and a junction row
+        // would launder the path into "built"
+        // (`r[store.substitute.find-missing-gated]`) — invisible to other
+        // tenants who trust the same upstream, and "already built" to the
+        // scheduler's cached-output check. Caught live by
+        // vm-substitute-standalone's cross-tenant-gate subtest when ingest
+        // briefly wrote the requesting tenant here.
+        let junction_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM path_tenants")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            junction_rows, 0,
+            "substitution must not write path_tenants rows"
+        );
     }
 
     // r[verify store.substitute.progress-stream]

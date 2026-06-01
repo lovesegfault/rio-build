@@ -451,12 +451,15 @@ async fn query_path_info_gated_by_tenant_sig_trust() -> TestResult {
 /// rio-signed path with zero `path_tenants` rows must be visible to
 /// its owning tenant via the cluster-key union.
 ///
-/// `path_tenants` is populated by the scheduler at build-completion
-/// (`upsert_path_tenants` in rio-scheduler), NOT by PutPath. During
-/// the intervening window the gate sees count=0 and fires. Without
-/// the cluster key in the trusted set, the rio signature fails to
-/// verify against the tenant's upstream-only `trusted_keys` and the
-/// path returns `NotFound` to its own tenant.
+/// `path_tenants` is populated by the upload RPCs at commit
+/// (`r[store.put.tenant-junction]`) and by the scheduler at
+/// build-completion (`upsert_path_tenants` in rio-scheduler) — but
+/// NEVER by substitution, and an upload by a caller with no resolvable
+/// tenant (dev mode, service token without a JWT) also writes no row.
+/// During the count=0 window the gate fires. Without the cluster key
+/// in the trusted set, the rio signature fails to verify against the
+/// tenant's upstream-only `trusted_keys` and the path returns
+/// `NotFound` to its own tenant.
 ///
 /// Sequence:
 ///   1. Seed a path signed by the CLUSTER key (not any upstream key).

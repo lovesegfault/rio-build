@@ -442,15 +442,24 @@ impl StoreServiceImpl {
     /// emit per-output created/bytes metrics. Tx auto-rollback on early
     /// return; caller's `PlaceholderGuard`s reap placeholders on Drop
     /// (staged chunks are left for the collect cycle).
+    ///
+    /// `tenant_id` is recorded as a `path_tenants` row for every
+    /// output — both fresh completions (atomic with the visibility
+    /// flip, inside `complete_manifest_in_conn`) and `already_complete`
+    /// skips (the prior commit may belong to another tenant or predate
+    /// tenancy; the skipping caller still needs castore read access and
+    /// a GC pin).
     // r[impl store.put.wal-manifest]
     // r[impl obs.metric.transfer-volume]
+    // r[impl store.put.tenant-junction]
     async fn commit_batch(
         &self,
         outputs: &mut BTreeMap<u32, OutputAccum>,
         resolved_signer: Option<&(crate::signing::Signer, bool)>,
         // bug_155: the REGISTRATION tenant (JWT or the signed claims
-        // attribution) — drives the in-tx ingest evidence stamp; the
-        // signer was resolved from the JWT/session tenant upstream.
+        // attribution) — drives the in-tx ingest evidence stamp AND
+        // the `path_tenants` junction writes; the signer was resolved
+        // from the JWT/session tenant upstream.
         tenant_id: Option<uuid::Uuid>,
     ) -> Result<Vec<bool>, Status> {
         let mut tx = self
@@ -503,6 +512,21 @@ impl StoreServiceImpl {
         // transaction.
         for (idx, accum) in outputs.iter_mut() {
             if accum.already_complete {
+                // Idempotent skip still grants the skipping tenant
+                // castore read access + a GC pin, atomic with the batch
+                // commit (r[store.put.tenant-junction]). Tolerant
+                // variant: a tenant deleted mid-upload skips the write
+                // instead of failing the whole batch.
+                if let Err(e) = metadata::insert_path_tenant_skipping_deleted_in_tx(
+                    &mut tx,
+                    &accum.store_path_hash,
+                    tenant_id,
+                )
+                .await
+                {
+                    drop(tx);
+                    return Err(putpath_metadata_status("PutPathBatch: path_tenants", e));
+                }
                 continue;
             }
             let mut info = accum.info.clone().expect("validated in phase 2");
@@ -523,6 +547,7 @@ impl StoreServiceImpl {
                 claim,
                 inline_blob.as_deref(),
                 Some(&castore),
+                tenant_id,
             )
             .await
             {
