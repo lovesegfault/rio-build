@@ -604,6 +604,28 @@ executor's cgroup kill covers both. The windows and the deferred
 `CLONE_PARENT`/`sendPid` alternative (a recycled-pid kill hazard under this
 executor's reaping topology) are documented at the executor's kill guard.
 
+#r("builder.exec.tree-ownership")[
+  A forked sandbox process tree MUST be owned by a kill guard that is armed
+  *before* the fork is submitted for execution. Adoption into the guard is
+  the only path by which a forked pid becomes known to the executor; a fork
+  whose guard has already been dropped MUST destroy (kill and reap) the
+  process it just created instead of publishing it. Dropping the guard at
+  any await point kills the adopted tree --- and reaps it when no dedicated
+  reaper task is attached yet --- and a kill MUST never target a pid that
+  has already been reaped.
+]
+
+The rule exists because the prior design had two per-path holes: the kill
+guard was armed only *after* the fork's `spawn_blocking` await resumed, so a
+future dropped during that window leaked the freshly forked tree (and the
+caller's child-side pipe fds, dropped with the future, could be recycled
+into the in-flight fork); and the no-cgroup kill relied on the pid being
+un-reaped without anything enforcing it (3cfe38c36 fixed one instance of
+that by hand). The armed → adopted → reaped/dead state machine makes both
+impossible by construction: pids exist only inside the state machine, and
+every transition that could race (adopt vs. guard drop, kill vs. reap) is
+serialized by it.
+
 #r("builder.retry.infra-transient")[
   The build-spawn loop retries `execute_build` locally when the failure is a
   transient worker-local infrastructure failure --- sandbox setup

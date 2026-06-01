@@ -42,9 +42,15 @@
 //! caller: the caller creates it (or reuses the previous attempt's) and
 //! the caller removes it. The executor owns everything else it creates
 //! — pipes, the pty, the forked process tree — and cleans them up on
-//! every path, including cancellation: a [`KillGuard`] kills the
-//! process tree if the future returned by [`execute`] is dropped before
-//! the tree has been reaped.
+//! every path, including cancellation at *any* await point: a
+//! [`ProcessTreeGuard`] is armed before the fork is even submitted to
+//! the blocking pool, the fork closure publishes the new pid only by
+//! adopting it into the guard (and destroys the process itself if the
+//! guard is already gone), and dropping the guard kills — and, when no
+//! reaper task exists yet, reaps — whatever was adopted. There is no
+//! instant at which a forked process exists outside an armed kill
+//! path, including the [spawn-blocking submission, await resumption]
+//! window.
 //!
 //! # Caller contract for the event channel
 //!
@@ -59,7 +65,6 @@
 use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use nix::errno::Errno;
@@ -156,17 +161,18 @@ pub async fn execute(
     let (status_r, status_w) = make_pipe().map_err(spawn_err("create the status pipe"))?;
     let (go_r, go_w) = make_pipe().map_err(spawn_err("create the go pipe"))?;
     let capture = CaptureFds::new(request, &plan).map_err(ExecError::Spawn)?;
+    let (parent_capture, child_capture) = capture.split();
 
-    let child_fds = ChildFds {
-        status_pipe_w: status_w.as_raw_fd(),
-        go_pipe_r: go_r.as_raw_fd(),
-        stdout_fd: capture.child_stdout.as_raw_fd(),
-        stderr_fd: capture
-            .child_stderr
-            .as_ref()
-            .unwrap_or(&capture.child_stdout)
-            .as_raw_fd(),
+    // The child-side fd owners move INTO the fork closure below: a
+    // dropped execute() future cannot close them (and recycle their
+    // numbers into another execution's pipes) while a fork that
+    // references those numbers is in flight.
+    let owners = ChildFdOwners {
+        status_w,
+        go_r,
+        capture: child_capture,
     };
+    let child_fds = owners.child_fds();
 
     // ---- Fork the intermediate -------------------------------------------
     // Kept out of the plan move below so an indexed setup failure
@@ -180,45 +186,71 @@ pub async fn execute(
         .collect();
     let start = SystemTime::now();
     let started = Instant::now();
+
+    // The kill guard exists BEFORE the fork is submitted: there is no
+    // instant — including the [spawn_blocking submission, await
+    // resumption] window — at which a forked process can exist without
+    // an armed guard. Dropping this future from here on kills (and, if
+    // no reaper task is attached yet, reaps) whatever was forked.
+    // r[impl builder.exec.tree-ownership]
+    let tree = TreeState::new(request.limits.cgroup.clone());
+    let tree_guard = ProcessTreeGuard {
+        state: Arc::clone(&tree),
+    };
+
     // The fork happens on a dedicated blocking thread: `tokio::process`
     // cannot be used (the child must unshare namespaces and run
     // arbitrary pre-exec code without exec'ing immediately), and
     // forking from an async worker thread would stall the runtime for
     // the duration of the pre-fork bookkeeping. Only the forking thread
     // exists in the child, which is why everything the child touches
-    // was precomputed into the plan.
+    // was precomputed into the plan. Blocking tasks are never cancelled
+    // by tokio once running (and queued ones still run) — the guard
+    // handshake below relies on exactly that documented behavior.
     let intermediate = {
-        let fds = child_fds;
-        tokio::task::spawn_blocking(move || spawn_intermediate(&plan, &fds))
-            .await
-            .map_err(|e| ExecError::Spawn(std::io::Error::other(e)))?
-            .map_err(ExecError::Spawn)?
+        let tree = Arc::clone(&tree);
+        tokio::task::spawn_blocking(move || {
+            // `owners` lives (and drops) in this closure.
+            let fds = child_fds;
+            // The caller may already be gone — its drop marked the
+            // tree Dead while this task sat in the blocking-pool
+            // queue. Don't create a process nobody supervises.
+            if tree.is_dead() {
+                return Err(std::io::Error::other(
+                    "caller cancelled before the sandbox was forked",
+                ));
+            }
+            let pid = spawn_intermediate(&plan, &fds)?;
+            // Adoption is the only pid-publication path. If the caller
+            // disappeared between the pre-check and here, adopt() has
+            // already killed and reaped the fresh process.
+            // r[impl builder.exec.tree-ownership]
+            tree.adopt(pid).map_err(|CallerGone| {
+                std::io::Error::other("caller cancelled while the sandbox was being forked")
+            })?;
+            // Close the parent's copies of the child-side ends so EOF
+            // on the parent-side ends tracks the child processes
+            // alone. Same protocol position as before the restructure,
+            // but no longer droppable early by a cancelled caller.
+            drop(owners);
+            Ok(pid)
+        })
+        .await
+        .map_err(|e| ExecError::Spawn(std::io::Error::other(e)))?
+        .map_err(ExecError::Spawn)?
     };
 
-    // From here on the process tree exists: arm the guard that kills it
-    // if this future is dropped or an early error returns.
-    let armed = Arc::new(AtomicBool::new(true));
-    let kill_guard = KillGuard {
-        cgroup: request.limits.cgroup.clone(),
-        pid: intermediate,
-        armed: Arc::clone(&armed),
-    };
-
-    // Close the child-side fd copies so EOF on the parent-side ends
-    // tracks the child processes alone.
-    drop(status_w);
-    drop(go_r);
-    let parent_capture = capture.into_parent_side();
-
-    // Reap on a dedicated blocking thread. Started before anything can
-    // fail so every error path below can `await` it after killing.
+    // Reap on a dedicated blocking thread. attach_reaper() and the
+    // spawn happen with no await between them, so there is no state
+    // where the guard believes a reaper exists but none was spawned.
+    tree.attach_reaper();
     let wait_task = {
-        let armed = Arc::clone(&armed);
+        let tree = Arc::clone(&tree);
         tokio::task::spawn_blocking(move || {
             let status = wait_for(intermediate);
-            // Disarm the kill guard the moment the pid is reaped: a
-            // SIGKILL after reaping could hit a recycled pid.
-            armed.store(false, Ordering::Release);
+            // The pid is reaped: nothing may ever signal it again (it
+            // could be recycled).
+            tree.mark_reaped();
             status
         })
     };
@@ -235,13 +267,13 @@ pub async fn execute(
             format!("{}\n", intermediate.as_raw()),
         )
     {
-        return abort_spawn(e, "attach the sandbox to the cgroup", kill_guard, wait_task).await;
+        return abort_spawn(e, "attach the sandbox to the cgroup", tree_guard, wait_task).await;
     }
     if let Err(e) = nix::unistd::write(&go_w, &[1u8]) {
         return abort_spawn(
             std::io::Error::from(e),
             "signal the sandbox to proceed",
-            kill_guard,
+            tree_guard,
             wait_task,
         )
         .await;
@@ -293,7 +325,7 @@ pub async fn execute(
                     StatusReport::SetupFailed(_) | StatusReport::Corrupt => {
                         // The tree is exiting on its own; the kill is a
                         // no-op safety net. Keep looping until reaped.
-                        kill_tree(request.limits.cgroup.as_deref(), intermediate, &armed);
+                        tree.kill_tree();
                     }
                 }
             }
@@ -315,7 +347,7 @@ pub async fn execute(
                             && request.limits.max_log_bytes.is_some_and(|max| log_bytes > max)
                         {
                             kill_reason = Some(KillReason::LogLimit);
-                            kill_tree(request.limits.cgroup.as_deref(), intermediate, &armed);
+                            tree.kill_tree();
                         }
                     }
                     // Both readers finished (EOF / EIO). Nothing more to
@@ -331,18 +363,18 @@ pub async fn execute(
             // Wall-clock deadline.
             () = sleep_until_opt(timeout_at), if timeout_at.is_some() && kill_reason.is_none() => {
                 kill_reason = Some(KillReason::Timeout);
-                kill_tree(request.limits.cgroup.as_deref(), intermediate, &armed);
+                tree.kill_tree();
             }
             // Silence deadline.
             () = sleep_until_opt(silent_at), if silent_at.is_some() && kill_reason.is_none() => {
                 kill_reason = Some(KillReason::Silent);
-                kill_tree(request.limits.cgroup.as_deref(), intermediate, &armed);
+                tree.kill_tree();
             }
         }
     }
     let stop = SystemTime::now();
-    // The tree is reaped; nothing left to kill.
-    kill_guard.defuse();
+    // The tree is reaped (the wait task marked it so); the guard is
+    // inert from here on and simply drops when execute() returns.
 
     // Drain whatever output is still buffered, bounded.
     let _ = tokio::time::timeout(FINAL_DRAIN_TIMEOUT, async {
@@ -542,81 +574,237 @@ fn intermediate_main(
 }
 
 // ---------------------------------------------------------------------------
-// Parent-side helpers.
+// Parent-side helpers: process-tree ownership.
 // ---------------------------------------------------------------------------
 
-/// Kills the sandbox process tree when dropped, unless defused.
+/// Where the forked process tree is in its lifecycle.
 ///
-/// Exists so that dropping the future returned by [`execute`] (caller
-/// cancellation) cannot leak a running build. With a cgroup the kill is
-/// `cgroup.kill` (atomic over every descendant); without one it is a
-/// SIGKILL of the intermediate process, whose death cascades to the
-/// sandbox child via `PR_SET_PDEATHSIG` — armed as the sandbox child's
-/// *first* setup statement and re-armed after the credential drop — and
-/// from pid 1 to the rest of the PID namespace. The no-cgroup cascade
-/// is therefore valid from the first setup instruction on; the residual
-/// no-cgroup exposures are exactly two instruction-scale windows where
-/// the death signal is not armed: [fork, the early arm] and [setuid,
-/// the re-arm]. The `armed` flag is shared with the waitpid task, which
-/// disarms it at reap time so a late kill cannot hit a recycled pid.
-///
-/// TODO: CppNix closes the [fork, first arm] window differently — it
-/// forks the sandbox child with `CLONE_PARENT`
-/// (`linux-derivation-builder.cc`, the `sendPid` protocol) so the
-/// daemon itself is the child's parent and can kill it by pid from the
-/// moment fork returns. A naive port of that protocol here is a
-/// recycled-pid kill hazard: in this executor the *intermediate* reaps
-/// the sandbox child, so a pid the parent learned through sendPid may
-/// already have been reaped (and recycled) by the time the parent
-/// kills it. Deferred until the supervision loop owns reaping for the
-/// whole tree.
-struct KillGuard {
-    cgroup: Option<PathBuf>,
-    pid: nix::unistd::Pid,
-    armed: Arc<AtomicBool>,
+/// The state machine that makes the tree's ownership structural: a pid
+/// can only become known by being adopted into an `Armed` state, kills
+/// can only target an `Adopted` (never `Reaped`, i.e. possibly
+/// recycled) pid, and a guard dropped before adoption (`Dead`) forces
+/// the in-flight fork to destroy its own process.
+#[derive(Debug)]
+enum TreePhase {
+    /// Guard armed; no process forked yet.
+    Armed,
+    /// A process tree exists, rooted at `pid`.
+    Adopted {
+        pid: nix::unistd::Pid,
+        /// The tree has been killed (kills act once).
+        killed: bool,
+        /// A dedicated waitpid task owns reaping (the guard's drop
+        /// must not blocking-reap).
+        reaper_attached: bool,
+    },
+    /// The tree has been reaped. The pid may be recycled: nothing may
+    /// ever signal it again.
+    Reaped,
+    /// The guard was dropped before any process was adopted. A fork
+    /// still in flight must destroy the process it creates instead of
+    /// publishing it.
+    Dead,
 }
 
-impl KillGuard {
-    fn defuse(&self) {
-        self.armed.store(false, Ordering::Release);
+/// The fork closure tried to adopt a pid after the caller was gone.
+/// The process has already been killed and reaped by `adopt` itself.
+#[derive(Debug)]
+struct CallerGone;
+
+/// Shared ownership state of the forked process tree.
+///
+/// Held by the [`ProcessTreeGuard`] (RAII), the fork closure (to adopt
+/// the pid), the waitpid task (to mark the reap), and the supervision
+/// loop (to kill on limits).
+struct TreeState {
+    phase: std::sync::Mutex<TreePhase>,
+    cgroup: Option<PathBuf>,
+}
+
+impl TreeState {
+    fn new(cgroup: Option<PathBuf>) -> Arc<TreeState> {
+        Arc::new(TreeState {
+            phase: std::sync::Mutex::new(TreePhase::Armed),
+            cgroup,
+        })
+    }
+
+    /// Lock the phase, surviving poison: the state is a plain enum
+    /// whose invariants cannot be torn by a panicking holder.
+    fn lock(&self) -> std::sync::MutexGuard<'_, TreePhase> {
+        self.phase.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Has the owning guard already been dropped?
+    fn is_dead(&self) -> bool {
+        matches!(*self.lock(), TreePhase::Dead)
+    }
+
+    /// Publish a freshly forked pid. **The only path by which a pid
+    /// becomes known to the rest of the executor.**
+    ///
+    /// If the guard was dropped while the fork was in flight, the
+    /// process must not exist: it is killed and (blocking) reaped
+    /// right here — we are on the fork's blocking thread — and the
+    /// caller gets [`CallerGone`].
+    // r[impl builder.exec.tree-ownership]
+    fn adopt(&self, pid: nix::unistd::Pid) -> Result<(), CallerGone> {
+        let mut phase = self.lock();
+        match *phase {
+            TreePhase::Armed => {
+                *phase = TreePhase::Adopted {
+                    pid,
+                    killed: false,
+                    reaper_attached: false,
+                };
+                Ok(())
+            }
+            TreePhase::Dead => {
+                drop(phase);
+                // Caller gone: this process must not outlive the fork
+                // closure. Kill (cgroup first — the fork inherits the
+                // caller's cgroup assignment only after the attach, so
+                // the direct SIGKILL is what matters here) and reap so
+                // no zombie outlives us either.
+                kill_pid_and_cgroup(self.cgroup.as_deref(), pid);
+                blocking_reap(pid);
+                Err(CallerGone)
+            }
+            TreePhase::Adopted { .. } | TreePhase::Reaped => {
+                // A second adoption is a programming error in this
+                // module; there is exactly one fork per TreeState.
+                debug_assert!(false, "double adoption of a process tree");
+                Ok(())
+            }
+        }
+    }
+
+    /// A dedicated waitpid task now owns reaping: the guard's drop only
+    /// needs to kill, never to reap.
+    fn attach_reaper(&self) {
+        if let TreePhase::Adopted {
+            reaper_attached, ..
+        } = &mut *self.lock()
+        {
+            *reaper_attached = true;
+        }
+    }
+
+    /// The waitpid task reaped the tree: the pid may be recycled, and
+    /// nothing may ever signal it again.
+    fn mark_reaped(&self) {
+        *self.lock() = TreePhase::Reaped;
+    }
+
+    /// Kill the adopted process tree, once, and never after it was
+    /// reaped.
+    ///
+    /// Writes `cgroup.kill` when a cgroup was given (kills every
+    /// process in the cgroup, including fork bombs the parent has
+    /// never heard of) and then always SIGKILLs the intermediate
+    /// directly: the tree may not be in the cgroup at all — the
+    /// `cgroup.procs` attach is itself a step that can fail, and its
+    /// abort path runs through here — and a cgroup the executor cannot
+    /// write to must not leak the tree either. The intermediate's
+    /// death SIGKILLs the sandbox child through `PR_SET_PDEATHSIG`
+    /// (armed from the sandbox child's first setup instruction; see
+    /// `child::setup`), and the sandbox child is pid 1 of the PID
+    /// namespace, so the kernel then kills everything else in it.
+    // r[impl builder.exec.tree-ownership]
+    fn kill_tree(&self) {
+        let mut phase = self.lock();
+        if let TreePhase::Adopted { pid, killed, .. } = &mut *phase
+            && !*killed
+        {
+            *killed = true;
+            let pid = *pid;
+            // The kill happens under the lock: cheap (a cgroupfs write
+            // and a kill(2)), and it means mark_reaped can never
+            // interleave between the killed=true flip and the signal.
+            kill_pid_and_cgroup(self.cgroup.as_deref(), pid);
+        }
     }
 }
 
-impl Drop for KillGuard {
+/// RAII owner of the forked process tree.
+///
+/// Created — and therefore armed — *before* the fork is submitted to
+/// the blocking pool, so there is no instant at which a forked process
+/// exists without a guard. Dropping it (caller cancellation at any
+/// await point, or an early error return) kills whatever was adopted
+/// and, when no waitpid task is attached yet, reaps it too.
+// r[impl builder.exec.tree-ownership]
+struct ProcessTreeGuard {
+    state: Arc<TreeState>,
+}
+
+impl Drop for ProcessTreeGuard {
     fn drop(&mut self) {
         // Deliberately blocking inside Drop: there is no async Drop,
-        // and the kill is a single tiny cgroupfs write (or a kill(2)),
-        // not something worth a runtime handle.
-        kill_tree(self.cgroup.as_deref(), self.pid, &self.armed);
+        // and both the kill (a cgroupfs write + kill(2)) and the
+        // no-reaper reap (a waitpid on a freshly SIGKILLed tree) are
+        // bounded.
+        let mut phase = self.state.lock();
+        match &mut *phase {
+            TreePhase::Armed => {
+                // Nothing adopted yet. Mark Dead so an in-flight fork
+                // closure destroys its own process instead of
+                // publishing it.
+                *phase = TreePhase::Dead;
+            }
+            TreePhase::Adopted {
+                pid,
+                killed,
+                reaper_attached,
+            } => {
+                let pid = *pid;
+                let attached = *reaper_attached;
+                if !*killed {
+                    *killed = true;
+                    kill_pid_and_cgroup(self.state.cgroup.as_deref(), pid);
+                }
+                if !attached {
+                    // Nobody else will reap it; do it here so the
+                    // caller's drop leaves neither a process nor a
+                    // zombie behind. Mark Reaped first so nothing else
+                    // can signal the (soon recyclable) pid.
+                    *phase = TreePhase::Reaped;
+                    drop(phase);
+                    blocking_reap(pid);
+                }
+                // With a reaper attached the waitpid task finishes the
+                // job (it survives this drop: blocking tasks detach).
+            }
+            TreePhase::Reaped | TreePhase::Dead => {}
+        }
     }
 }
 
-/// Kill the sandbox process tree, once.
-///
-/// Writes `cgroup.kill` when a cgroup was given (kills every process in
-/// the cgroup, including fork bombs the parent has never heard of) and
-/// then always SIGKILLs the intermediate directly: the tree may not be
-/// in the cgroup at all — the `cgroup.procs` attach is itself a step
-/// that can fail, and its abort path runs through here — and a cgroup
-/// the executor cannot write to must not leak the tree either. The
-/// intermediate's death SIGKILLs the sandbox child through
-/// `PR_SET_PDEATHSIG` (armed from the sandbox child's first setup
-/// instruction; see `child::setup`), and the sandbox child is pid 1 of
-/// the PID namespace, so the kernel then kills everything else in it.
-fn kill_tree(cgroup: Option<&Path>, pid: nix::unistd::Pid, armed: &AtomicBool) {
-    // swap(false): only the first caller acts, and never after the
-    // waitpid task has reaped the pid (it clears the flag).
-    if !armed.swap(false, Ordering::AcqRel) {
-        return;
-    }
+/// Kill a process tree rooted at `pid`: `cgroup.kill` when a cgroup
+/// exists, then always a direct SIGKILL of the root (see
+/// [`TreeState::kill_tree`] for why both).
+fn kill_pid_and_cgroup(cgroup: Option<&Path>, pid: nix::unistd::Pid) {
     if let Some(cgroup) = cgroup {
         let _ = std::fs::write(cgroup.join("cgroup.kill"), "1");
     }
-    // SAFETY: SIGKILL to a pid this executor forked and has not reaped
-    // (the armed flag above guards the reaped/recycled-pid case); a pid
-    // already dying from the cgroup kill ignores the extra signal.
+    // SAFETY: SIGKILL to a pid the TreeState state machine guarantees
+    // has not been reaped; a pid already dying from the cgroup kill
+    // ignores the extra signal.
     unsafe {
         libc::kill(pid.as_raw(), libc::SIGKILL);
+    }
+}
+
+/// `waitpid` until the process is gone, ignoring errors (ECHILD means
+/// someone else already reaped it, which is equally final).
+fn blocking_reap(pid: nix::unistd::Pid) {
+    let mut status: libc::c_int = 0;
+    loop {
+        // SAFETY: waitpid into a stack buffer for a direct child.
+        let rc = unsafe { libc::waitpid(pid.as_raw(), &raw mut status, 0) };
+        if rc == pid.as_raw() || (rc == -1 && Errno::last() != Errno::EINTR) {
+            return;
+        }
     }
 }
 
@@ -752,10 +940,13 @@ fn spawn_err<E: Into<std::io::Error>>(what: &'static str) -> impl FnOnce(E) -> E
 async fn abort_spawn(
     error: std::io::Error,
     what: &'static str,
-    kill_guard: KillGuard,
+    tree_guard: ProcessTreeGuard,
     wait_task: tokio::task::JoinHandle<Result<i32, std::io::Error>>,
 ) -> Result<ExecutionOutcome, ExecError> {
-    drop(kill_guard); // kills the tree (still armed)
+    // Dropping the guard kills the adopted tree; the attached wait
+    // task then reaps it (awaited so the tree is fully gone before the
+    // error propagates).
+    drop(tree_guard);
     let _ = wait_task.await;
     Err(ExecError::Spawn(std::io::Error::new(
         error.kind(),
@@ -777,8 +968,48 @@ struct CaptureFds {
     parent: Vec<(OwnedFd, LogStream)>,
 }
 
-/// The parent-side read ends after the child-side ends were dropped.
+/// The parent-side read ends after the split.
 struct ParentCapture(Vec<(OwnedFd, LogStream)>);
+
+/// The child-side write ends after the split.
+struct ChildCapture {
+    stdout: OwnedFd,
+    stderr: Option<OwnedFd>,
+}
+
+/// Owners of every child-side fd, moved INTO the fork closure.
+///
+/// Because these `OwnedFd`s live inside the `spawn_blocking` closure,
+/// dropping the [`execute`] future cannot close them — and recycle
+/// their numbers into another execution's pipes — while a fork that
+/// references those numbers is in flight. They drop (closing the
+/// parent's copies of the child-side ends) at the end of the closure,
+/// the same protocol position as the old post-await drops, but no
+/// longer droppable early.
+// r[impl builder.exec.tree-ownership]
+struct ChildFdOwners {
+    status_w: OwnedFd,
+    go_r: OwnedFd,
+    capture: ChildCapture,
+}
+
+impl ChildFdOwners {
+    /// The raw-fd view handed to the forked children. Valid for as
+    /// long as `self` lives (which is the whole fork closure).
+    fn child_fds(&self) -> ChildFds {
+        ChildFds {
+            status_pipe_w: self.status_w.as_raw_fd(),
+            go_pipe_r: self.go_r.as_raw_fd(),
+            stdout_fd: self.capture.stdout.as_raw_fd(),
+            stderr_fd: self
+                .capture
+                .stderr
+                .as_ref()
+                .unwrap_or(&self.capture.stdout)
+                .as_raw_fd(),
+        }
+    }
+}
 
 impl CaptureFds {
     fn new(request: &ExecutionRequest, plan: &SandboxPlan) -> std::io::Result<CaptureFds> {
@@ -829,9 +1060,17 @@ impl CaptureFds {
         }
     }
 
-    /// Drop the child-side ends (post-fork) and keep the read side.
-    fn into_parent_side(self) -> ParentCapture {
-        ParentCapture(self.parent)
+    /// Split into the parent-side read ends and the child-side write
+    /// ends. The child side moves into the fork closure (see
+    /// [`ChildFdOwners`]).
+    fn split(self) -> (ParentCapture, ChildCapture) {
+        (
+            ParentCapture(self.parent),
+            ChildCapture {
+                stdout: self.child_stdout,
+                stderr: self.child_stderr,
+            },
+        )
     }
 }
 
@@ -1087,8 +1326,132 @@ mod tests {
         assert_eq!(output_host_path(&req, Path::new("/elsewhere")), None);
     }
 
-    // -- kill_tree -----------------------------------------------------------
+    // -- process-tree ownership (TreeState / ProcessTreeGuard) ---------------
 
+    /// Spawn a `sleep 30` and return its pid (a real, killable child).
+    fn spawn_sleeper() -> (std::process::Child, nix::unistd::Pid) {
+        let child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .expect("spawn sleeper");
+        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
+        (child, pid)
+    }
+
+    /// waitpid(WNOHANG) classification for assertions.
+    fn pid_state(pid: nix::unistd::Pid) -> &'static str {
+        let mut status: libc::c_int = 0;
+        // SAFETY: waitpid into a stack buffer.
+        let rc = unsafe { libc::waitpid(pid.as_raw(), &raw mut status, libc::WNOHANG) };
+        if rc == pid.as_raw() {
+            "was-zombie-now-reaped"
+        } else if rc == 0 {
+            "running-or-zombie"
+        } else if Errno::last() == Errno::ECHILD {
+            "already-reaped"
+        } else {
+            "waitpid-error"
+        }
+    }
+
+    /// The fork-in-flight-during-cancellation scenario, exercised
+    /// directly on the state machine: the guard drops (caller gone)
+    /// BEFORE the fork closure adopts the pid it just created. adopt()
+    /// must refuse, kill the process, and reap it — no process, no
+    /// zombie.
+    // r[verify builder.exec.tree-ownership]
+    #[test]
+    fn tree_state_adopt_after_guard_drop_kills_and_reaps() {
+        let tree = TreeState::new(None);
+        let guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        drop(guard); // caller gone before any fork completed
+
+        let (_child, pid) = spawn_sleeper();
+        assert!(
+            tree.adopt(pid).is_err(),
+            "adopt after guard drop must report CallerGone"
+        );
+        // adopt() killed AND reaped: the pid is no longer ours at all.
+        assert_eq!(
+            pid_state(pid),
+            "already-reaped",
+            "the self-destructed fork must leave neither a process nor a zombie"
+        );
+    }
+
+    /// Cancellation after adoption but before the reaper task is
+    /// attached: the guard's own Drop must kill AND reap.
+    // r[verify builder.exec.tree-ownership]
+    #[test]
+    fn tree_guard_drop_after_adopt_without_reaper_reaps() {
+        let tree = TreeState::new(None);
+        let guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt with a live guard");
+
+        drop(guard); // kills + reaps (no reaper attached)
+
+        assert_eq!(
+            pid_state(pid),
+            "already-reaped",
+            "guard drop without an attached reaper must kill and reap"
+        );
+        assert!(
+            matches!(*tree.lock(), TreePhase::Reaped),
+            "the state machine must record the reap"
+        );
+    }
+
+    /// Structural state-machine assertions (no wall-clock): kills act
+    /// once, and never after the reap (the pid may be recycled).
+    // r[verify builder.exec.tree-ownership]
+    #[test]
+    fn tree_state_kill_acts_once_and_never_after_reap() {
+        let tree = TreeState::new(None);
+        let guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        let (_child, pid) = spawn_sleeper();
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper(); // the test plays the reaper below
+
+        tree.kill_tree();
+        assert!(
+            matches!(*tree.lock(), TreePhase::Adopted { killed: true, .. }),
+            "first kill must mark the tree killed"
+        );
+        // Second kill: the state shows it took the already-killed branch.
+        tree.kill_tree();
+        assert!(matches!(
+            *tree.lock(),
+            TreePhase::Adopted { killed: true, .. }
+        ));
+
+        // The test reaps (it attached itself as the reaper).
+        blocking_reap(pid);
+        tree.mark_reaped();
+        assert!(matches!(*tree.lock(), TreePhase::Reaped));
+
+        // Kill after reap: must not act (recycled-pid hazard).
+        tree.kill_tree();
+        assert!(
+            matches!(*tree.lock(), TreePhase::Reaped),
+            "a kill after the reap must be a no-op"
+        );
+
+        // Guard drop after reap: also a no-op.
+        drop(guard);
+        assert!(matches!(*tree.lock(), TreePhase::Reaped));
+    }
+
+    /// 3cfe38c36 regression, ported to the state machine: the pid kill
+    /// must happen even when the cgroup.kill write succeeds (the tree
+    /// may never have been attached to the cgroup at all).
+    // r[verify builder.exec.tree-ownership]
     #[test]
     fn kill_tree_kills_the_pid_even_when_the_cgroup_write_succeeds() {
         // A plain tempdir stands in for a cgroup directory whose
@@ -1097,13 +1460,15 @@ mod tests {
         // was never attached to the cgroup. The pid kill must still
         // happen or the caller deadlocks awaiting the reap.
         let tmp = tempfile::tempdir().expect("tempdir");
-        let mut child = std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30"])
-            .spawn()
-            .expect("spawn sleeper");
-        let pid = nix::unistd::Pid::from_raw(child.id() as i32);
-        let armed = AtomicBool::new(true);
-        kill_tree(Some(tmp.path()), pid, &armed);
+        let (mut child, pid) = spawn_sleeper();
+        let tree = TreeState::new(Some(tmp.path().to_path_buf()));
+        let _guard = ProcessTreeGuard {
+            state: Arc::clone(&tree),
+        };
+        tree.adopt(pid).expect("adopt");
+        tree.attach_reaper(); // the test reaps via child.try_wait below
+
+        tree.kill_tree();
         assert_eq!(
             std::fs::read(tmp.path().join("cgroup.kill")).expect("cgroup.kill written"),
             b"1",
@@ -1122,6 +1487,7 @@ mod tests {
                 }
             }
         }
+        tree.mark_reaped();
     }
 
     // -- LineSplitter --------------------------------------------------------
