@@ -81,25 +81,16 @@ pub struct LaunchArgs {
     /// campaign spec's filters.
     #[arg(long)]
     pub limit: Option<usize>,
-    /// Extra args appended verbatim to the engine `run` invocation
-    /// (escape hatch while the engine CLI stabilises; must be valid
-    /// `rio-replay run` flags, e.g. `--deadline <rfc3339>`).
-    #[arg(long = "engine-arg", allow_hyphen_values = true)]
-    pub engine_args: Vec<String>,
-    /// Proceed when the deployed gateway/scheduler tags don't match this
-    /// tree's tag (the skew is recorded in the spec's cluster_versions
-    /// and the run is low-confidence).
+    /// Hard campaign deadline (RFC3339, e.g. 2026-06-08T00:00:00Z),
+    /// passed to the engine as its `--deadline` flag: the engine stops
+    /// new submissions at the deadline and renders an explicitly-partial
+    /// report (exit 0). Without it the campaign runs until drained.
     #[arg(long)]
-    pub allow_version_skew: bool,
+    pub deadline: Option<String>,
     /// Rollout-restart the gateway after merging the campaign tenant
     /// keys instead of waiting ~70s for the authorized_keys hot reload.
     #[arg(long)]
     pub restart_gateway: bool,
-    /// Skip pre-flight checks (debugging only — the run will not be
-    /// comparable; the spec records the tenants as unverified and the
-    /// engine is started with --allow-unverified-tenants).
-    #[arg(long)]
-    pub skip_preflight: bool,
     /// Report policy applied at report time (repeatable; default: parity
     /// alone). The regression-gate policy makes the engine write
     /// report/gate.json, which `replay report --check` maps to its exit
@@ -291,18 +282,24 @@ pub(super) fn validate_campaign_id(id: &str) -> Result<()> {
 
 /// Engine argv for the campaign Job. Everything campaign-specific (eval
 /// set, mode, tenants, endpoints, limit) travels in the mounted spec, not
-/// the argv: the argv only names the spec path, plus
-/// `--allow-unverified-tenants` when the operator skipped the pre-flight
-/// (the spec then records `upstreams_verified: false` and the engine
-/// would otherwise refuse to plan). `--engine-arg` values are appended
-/// verbatim.
-pub fn engine_args(a: &LaunchArgs) -> Vec<String> {
+/// the argv: the argv only names the spec path, plus `--deadline` when
+/// the operator bounded the campaign (the engine's CLI deadline wins over
+/// the spec's). A `--deadline` value that does not parse as RFC3339 is
+/// refused here — at argv-build time, before anything is created — with
+/// the same strictness the engine applies (`jiff::Timestamp`), so a typo
+/// fails in milliseconds instead of minutes later in the pod logs.
+pub fn engine_args(a: &LaunchArgs) -> Result<Vec<String>> {
     let mut args = vec!["run".into(), "--spec".into(), jobs::SPEC_MOUNT_PATH.into()];
-    if a.skip_preflight {
-        args.push("--allow-unverified-tenants".into());
+    if let Some(deadline) = &a.deadline {
+        deadline.parse::<jiff::Timestamp>().map_err(|e| {
+            anyhow::anyhow!(
+                "--deadline {deadline:?} is not a parseable RFC3339 timestamp \
+                 (expected e.g. 2026-06-08T00:00:00Z): {e}"
+            )
+        })?;
+        args.extend(["--deadline".into(), deadline.clone()]);
     }
-    args.extend(a.engine_args.iter().cloned());
-    args
+    Ok(args)
 }
 
 /// Correlation annotations for the campaign Job: which replay archive (by
@@ -495,7 +492,9 @@ pub struct PreflightOutcome {
 
 /// Build the campaign spec the engine consumes. Pure so the unit tests
 /// can prove the output round-trips through the engine's own
-/// `CampaignSpec` parser and validator.
+/// `CampaignSpec` parser and validator. `preflight` is always present:
+/// launch unconditionally runs the full pre-flight, so every launched
+/// campaign records verified tenants and the deployed component versions.
 fn build_campaign_spec(
     a: &LaunchArgs,
     campaign_id: &str,
@@ -503,7 +502,7 @@ fn build_campaign_spec(
     bucket: &str,
     hmac_present: bool,
     gateway_host_key: &str,
-    preflight: Option<&PreflightOutcome>,
+    preflight: &PreflightOutcome,
 ) -> CampaignSpec {
     let mode = a.mode.engine();
     CampaignSpec {
@@ -542,11 +541,13 @@ fn build_campaign_spec(
         tenants: TenantBlock {
             build_tenant: mode.expected_build_tenant().to_owned(),
             warm_tenant: TENANT_WARM.to_owned(),
-            upstreams_verified: preflight.is_some(),
-            upstreams_verified_at: preflight.map(|p| p.verified_at.clone()),
-            upstream_snapshot: preflight
-                .map(|p| p.upstream_snapshot.clone())
-                .unwrap_or_default(),
+            // Launch always runs the full pre-flight, so launched
+            // campaigns always record verified tenant upstreams. (Old
+            // campaign records may carry `false` from the era when the
+            // pre-flight could be skipped; `replay repro` honors those.)
+            upstreams_verified: true,
+            upstreams_verified_at: Some(preflight.verified_at.clone()),
+            upstream_snapshot: preflight.upstream_snapshot.clone(),
         },
         filters: Filters {
             limit: a.limit,
@@ -554,8 +555,8 @@ fn build_campaign_spec(
         },
         // Scheduling mode and the speedup knob from the launch flags;
         // every other knob stays at the engine default (operators override
-        // via --engine-arg or a hand-edited spec). The engine's spec
-        // validation rejects a non-default speedup in timeless mode.
+        // via a hand-edited spec). The engine's spec validation rejects a
+        // non-default speedup in timeless mode.
         scheduling: SchedulingBlock {
             mode: a.schedule.engine(),
         },
@@ -571,12 +572,14 @@ fn build_campaign_spec(
             fail_on: a.fail_on.engine(),
         },
         // Deployed image versions verified by the pre-flight, recorded
-        // verbatim; None when --skip-preflight left them unverified.
-        cluster_versions: preflight
-            .and_then(|p| serde_json::to_value(&p.deployed_tags).ok())
+        // verbatim.
+        cluster_versions: serde_json::to_value(&preflight.deployed_tags)
+            .ok()
             .filter(|v| v.as_object().is_some_and(|m| !m.is_empty())),
-        // The deadline stays at the engine default; operators override per
-        // campaign via --engine-arg or a hand-edited spec.
+        // The spec's deadline field stays at the engine default (None):
+        // an operator-chosen deadline travels on the engine argv as
+        // `--deadline` (see [`engine_args`]), which the engine prefers
+        // over the spec value.
         ..CampaignSpec::default()
     }
 }
@@ -592,6 +595,10 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     // or contradictory input combination needs no AWS or cluster traffic
     // to be refused.
     let input = archive_input(a.eval, a.eval_digest.as_deref(), a.archive.as_deref())?;
+    // Build the engine argv now for the same reason: it validates
+    // --deadline, and a malformed deadline must refuse before anything is
+    // resolved or created.
+    let engine_argv = engine_args(&a)?;
 
     let tf = tofu::outputs(TF_DIR)?;
     let region = tf.get("region")?;
@@ -657,7 +664,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     .await?;
     // The engine pins the gateway's SSH host key (the spec field is
     // required by engine validation), so launch must be able to read it
-    // from the deployed chart — independently of --skip-preflight.
+    // from the deployed chart.
     let gateway_host_key = ui::step("gateway SSH host-key pin", || async {
         match gateway_host_key_pin(&client).await? {
             Some(pin) => Ok(pin),
@@ -673,16 +680,11 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
     .await?;
 
     // Pre-flight: the deployed cluster — not this tree — is what the
-    // campaign measures, so verify it before submitting anything.
-    let preflight_outcome = if a.skip_preflight {
-        ui::step_skip(
-            "pre-flight",
-            "--skip-preflight passed (run will not be comparable; engine gets --allow-unverified-tenants)",
-        );
-        None
-    } else {
-        Some(ui::step("pre-flight", || preflight_checks(&client, &cli, &a, &tag)).await?)
-    };
+    // campaign measures, so verify it before submitting anything. There
+    // is no skip: a campaign against an unverified cluster would not be
+    // comparable (use `replay dev` for debug runs).
+    let preflight_outcome =
+        ui::step("pre-flight", || preflight_checks(&client, &cli, &tag)).await?;
 
     // Campaign id → Job name, spec-ConfigMap name, S3 prefix.
     let campaign_id = match &a.campaign_id {
@@ -701,7 +703,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         &bucket,
         hmac_present,
         &gateway_host_key,
-        preflight_outcome.as_ref(),
+        &preflight_outcome,
     );
     spec.validate()
         .context("constructed campaign spec failed engine validation (launch bug)")?;
@@ -749,7 +751,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
         region: region.clone(),
         log_level: a.log_level.clone(),
     };
-    let mut job = jobs::campaign_job(&common, &campaign_id, &engine_args(&a))?;
+    let mut job = jobs::campaign_job(&common, &campaign_id, &engine_argv)?;
     job.metadata
         .annotations
         .get_or_insert_with(Default::default)
@@ -1460,26 +1462,19 @@ fn derive_openssh_public_key_line(private_key_pem: &str) -> Result<String> {
 async fn preflight_checks(
     client: &kclient::Client,
     cli: &CliCtx,
-    a: &LaunchArgs,
     tree_tag: &str,
 ) -> Result<PreflightOutcome> {
     let mut failures: Vec<String> = Vec::new();
 
     // 1. Deployed image tags vs this tree (the campaign measures the
-    //    deployed cluster, not this checkout).
+    //    deployed cluster, not this checkout). A skew is always a hard
+    //    failure: the campaign records the deployed component versions,
+    //    and a tree that does not match them cannot claim its results.
     let deployed_tags = match preflight::deployed_image_tags(client).await {
         Ok(tags) => {
             for (component, got) in &tags {
                 if let Err(e) = preflight::check_image_tag(component, got, tree_tag) {
-                    if a.allow_version_skew {
-                        tracing::warn!(
-                            "{e:#} (continuing under --allow-version-skew; the run is low-confidence)"
-                        );
-                    } else {
-                        failures.push(format!(
-                            "{e:#}\n   (or pass --allow-version-skew to record the skew and continue)"
-                        ));
-                    }
+                    failures.push(format!("{e:#}"));
                 }
             }
             tags
@@ -1541,7 +1536,7 @@ async fn preflight_checks(
             .join("\n");
         bail!(
             "pre-flight failed ({} problem{}):\n{list}\n\
-             fix the above (or pass --skip-preflight for a non-comparable debug run) and re-run",
+             fix the above and re-run",
             failures.len(),
             if failures.len() == 1 { "" } else { "s" }
         );
@@ -1571,10 +1566,8 @@ mod tests {
             mode,
             campaign_id: None,
             limit: Some(50),
-            engine_args: vec![],
-            allow_version_skew: false,
+            deadline: None,
             restart_gateway: false,
-            skip_preflight: false,
             report_policy: vec![ReportPolicyArg::Parity],
             fail_on: FailOnArg::None,
             schedule: Schedule::Timeless,
@@ -1697,27 +1690,36 @@ mod tests {
 
     #[test]
     fn engine_args_point_at_the_mounted_spec() {
+        // The argv names only the mounted spec: everything else travels in
+        // the spec, and launch never passes --allow-unverified-tenants
+        // (the pre-flight always runs).
         let a = args(Mode::Leaf);
         assert_eq!(
-            engine_args(&a),
+            engine_args(&a).unwrap(),
             vec!["run", "--spec", "/etc/rio/replay/spec.json"]
         );
-        // Skipping the pre-flight produces an unverified-tenants spec; the
-        // engine must be told that is intentional.
-        let mut skipped = args(Mode::Leaf);
-        skipped.skip_preflight = true;
-        skipped.engine_args = vec!["--deadline".into(), "2026-06-08T00:00:00Z".into()];
+        // --deadline is the one operator knob that rides on the argv (the
+        // engine's CLI deadline wins over the spec's).
+        let mut bounded = args(Mode::Leaf);
+        bounded.deadline = Some("2026-06-08T00:00:00Z".into());
         assert_eq!(
-            engine_args(&skipped),
+            engine_args(&bounded).unwrap(),
             vec![
                 "run",
                 "--spec",
                 "/etc/rio/replay/spec.json",
-                "--allow-unverified-tenants",
                 "--deadline",
                 "2026-06-08T00:00:00Z",
             ]
         );
+        // A non-RFC3339 deadline refuses at argv-build time, naming the
+        // flag, the bad value, and the expected form.
+        let mut bad = args(Mode::Leaf);
+        bad.deadline = Some("next tuesday".into());
+        let err = engine_args(&bad).unwrap_err().to_string();
+        for needle in ["--deadline", "next tuesday", "RFC3339"] {
+            assert!(err.contains(needle), "{err}");
+        }
     }
 
     #[test]
@@ -1744,7 +1746,7 @@ mod tests {
             "rio-build-chunks-deadbeef",
             true,
             HOST_KEY_PIN,
-            Some(&outcome()),
+            &outcome(),
         );
         // What the engine does on startup: parse + validate.
         let json_text = serde_json::to_string_pretty(&spec).unwrap();
@@ -1831,7 +1833,7 @@ mod tests {
             "rio-build-chunks-deadbeef",
             true,
             HOST_KEY_PIN,
-            Some(&outcome()),
+            &outcome(),
         );
         spec.validate().unwrap();
         let v = serde_json::to_value(&spec).unwrap();
@@ -1849,7 +1851,7 @@ mod tests {
             "rio-build-chunks-deadbeef",
             true,
             HOST_KEY_PIN,
-            Some(&outcome()),
+            &outcome(),
         );
         spec.validate().unwrap();
         let v = serde_json::to_value(&spec).unwrap();
@@ -1871,7 +1873,7 @@ mod tests {
             "rio-build-chunks-deadbeef",
             true,
             HOST_KEY_PIN,
-            Some(&outcome()),
+            &outcome(),
         );
         let err = spec.validate().unwrap_err().to_string();
         assert!(err.contains("regression-gate"), "{err}");
@@ -1899,12 +1901,12 @@ mod tests {
     }
 
     #[test]
-    fn self_hosted_or_skipped_preflight_spec_shape() {
+    fn self_hosted_spec_shape() {
         // Self-hosted: the self-hosted build tenant, same per-tenant SSH key
         // directory as leaf (the field is mode-independent).
-        // hmac_present=false and no pre-flight outcome (--skip-preflight):
-        // tokenless Admin reads, tenants recorded as unverified, no
-        // cluster_versions claim.
+        // hmac_present=false (HMAC-less dev cluster): tokenless Admin reads.
+        // The pre-flight outcome is always present — launched campaigns
+        // always record verified tenants and the deployed versions.
         let spec = build_campaign_spec(
             &args(Mode::SelfHosted),
             "replay-selfhosted-20260601-0001",
@@ -1912,7 +1914,7 @@ mod tests {
             "rio-build-chunks-deadbeef",
             false,
             HOST_KEY_PIN,
-            None,
+            &outcome(),
         );
         spec.validate().unwrap();
         assert_eq!(spec.cluster.gateway_host_key.as_deref(), Some(HOST_KEY_PIN));
@@ -1927,10 +1929,18 @@ mod tests {
             Some(std::path::Path::new("/etc/rio/replay-ssh"))
         );
         assert!(spec.cluster.service_hmac_key_path.is_none());
-        assert!(!spec.tenants.upstreams_verified);
-        assert_eq!(spec.tenants.upstreams_verified_at, None);
-        assert!(spec.tenants.upstream_snapshot.is_empty());
-        assert_eq!(spec.cluster_versions, None);
+        // Tenant verification facts come straight from the pre-flight
+        // outcome; there is no unverified launch path anymore.
+        assert!(spec.tenants.upstreams_verified);
+        assert_eq!(
+            spec.tenants.upstreams_verified_at.as_deref(),
+            Some("2026-06-01T12:00:00Z")
+        );
+        assert_eq!(
+            spec.tenants.upstream_snapshot.get("replay-selfhosted"),
+            Some(&vec![])
+        );
+        assert!(spec.cluster_versions.is_some());
     }
 
     #[test]
@@ -2123,7 +2133,7 @@ mod tests {
             "rio-chunks",
             true,
             HOST_KEY_PIN,
-            None,
+            &outcome(),
         );
         assert_eq!(spec.scheduling.mode, ScheduleMode::Timeless);
         assert_eq!(spec.knobs.speedup, 1.0);
@@ -2139,7 +2149,7 @@ mod tests {
             "rio-chunks",
             true,
             HOST_KEY_PIN,
-            None,
+            &outcome(),
         );
         assert_eq!(spec.scheduling.mode, ScheduleMode::Timed);
         assert_eq!(spec.knobs.speedup, 50.0);
@@ -2156,7 +2166,7 @@ mod tests {
             "rio-chunks",
             true,
             HOST_KEY_PIN,
-            None,
+            &outcome(),
         );
         let err = spec.validate().unwrap_err().to_string();
         assert!(err.contains("speedup") && err.contains("timed"), "{err}");
