@@ -15,6 +15,7 @@ mod batch;
 mod builds;
 mod derivations;
 mod history;
+mod materialization;
 mod open_attempts;
 mod recovery;
 mod tenants;

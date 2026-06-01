@@ -622,6 +622,59 @@ db_str_enum! {
         "invalid reporting party (must be worker/controller/scheduler/admin)";
 }
 
+db_str_enum! {
+    /// Origin of a materialization job (`materialization_jobs.origin`,
+    /// migration 078): which classification demanded the job
+    /// (substitution-replacement campaign, design §2.1). The alphabet is
+    /// forward-complete — `stale_reset`/`reprobe` creation sites are
+    /// Phase B work — and stays in lockstep with the 078 CHECK
+    /// constraint, verified by the
+    /// `materialization_job_alphabets_match_check_constraints` test.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JobOrigin {
+        /// A top-down prune kept the node on substitution evidence
+        /// (design §2.1 row 1).
+        Pruned = "pruned",
+        /// Merge classification found the node's outputs upstream
+        /// (the new_sub lane, design §2.1 row 2).
+        CacheOpportunity = "cache_opportunity",
+        /// The stale-Completed verify demanded re-materialization
+        /// (creation site is Phase B — PD-18; literal reserved now).
+        StaleReset = "stale_reset",
+        /// The reprobe lane (creation site is Phase B — PD-17; literal
+        /// reserved now).
+        Reprobe = "reprobe",
+    }
+    parse_err(_s) = &'static str:
+        "invalid materialization-job origin (not in the migration-078 alphabet)";
+}
+
+db_str_enum! {
+    /// State of a materialization job (`materialization_jobs.state`,
+    /// migration 078). "Claimed" is deliberately NOT a job state: a
+    /// claim is an open attempt (assignments + drv_executions rows);
+    /// the job row is untouched until consumption resolves it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum JobState {
+        /// Unresolved: claimable by the store executor (unless parked).
+        Pending = "pending",
+        /// Consumption confirmed the live wanted set present.
+        ResolvedSuccess = "resolved_success",
+        /// Consumption took the fail-fast arm (a live-wanted path
+        /// confirmed missing-and-unsubstitutable).
+        ResolvedUnobtainable = "resolved_unobtainable",
+        /// Consumption routed the node from-source (the Vouched/Pending
+        /// arms of the four-arm routing).
+        ResolvedFromSource = "resolved_from_source",
+        /// The node produced by other means while the job was open.
+        Obsolete = "obsolete",
+        /// No live DAG-interested build remains.
+        Cancelled = "cancelled",
+    }
+    parse_err(_s) = &'static str:
+        "invalid materialization-job state (not in the migration-078 alphabet)";
+}
+
 /// In-memory mirror of one `drv_attempts` row — the per-node attempt
 /// history entry that Phase 1b's `decide()` will fold. Field-for-field
 /// the row minus `derivation_id` (implicit from the owning node), with

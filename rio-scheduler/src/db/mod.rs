@@ -26,6 +26,12 @@ mod derivations;
 mod executions;
 mod history;
 mod live_pins;
+// Substitution-replacement Phase A (design §6): the materialization-job
+// table. Dead code by design until the Wave-3 scheduler wiring calls it
+// flag-gated (the campaign plan's T-3.3/T-3.4); the
+// db/tests/materialization.rs battery exercises it now.
+#[allow(dead_code)]
+pub(crate) mod materialization;
 pub(crate) mod open_attempts;
 mod recovery;
 mod tenants;
