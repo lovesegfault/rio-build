@@ -41,8 +41,8 @@ treefmt
 # Full CI gate (wraps nix-fast-build; serial alternative: nix flake check)
 .claude/bin/nixbuild --checks
 
-# Fuzz a parser (default shell is nightly, so this works directly)
-cd fuzz/rio-nix && cargo fuzz run wire_primitives
+# Fuzz a parser (default shell is nightly; cargo-fuzz 0.13+ needs --fuzz-dir)
+cd fuzz/rio-nix && cargo fuzz run --fuzz-dir . wire_primitives
 ```
 
 ## Build System
@@ -148,8 +148,8 @@ When the gate is red and the cause isn't obvious from the log, see `.claude/rule
 Fuzz targets live in per-crate `fuzz/<crate>` workspaces (excluded from the main workspace, separate `Cargo.lock` each). Currently: `fuzz/rio-nix/` (protocol/wire parsers) and `fuzz/rio-store/` (manifest parser). The default dev shell is nightly, so `cargo fuzz` works without extra setup:
 
 ```bash
-nix develop -c bash -c 'cd fuzz/rio-nix && cargo fuzz run wire_primitives'
-nix develop -c bash -c 'cd fuzz/rio-store && cargo fuzz run manifest_deserialize'
+nix develop -c bash -c 'cd fuzz/rio-nix && cargo fuzz run --fuzz-dir . wire_primitives'
+nix develop -c bash -c 'cd fuzz/rio-store && cargo fuzz run --fuzz-dir . manifest_deserialize'
 ```
 
 CI equivalent:
