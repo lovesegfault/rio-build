@@ -33,11 +33,6 @@ mod tenants;
 #[cfg(test)]
 mod tests;
 
-// Free fn — see `recovery.rs` for definition. Re-exported here so
-// callers (grpc/mod.rs, grpc/tests/bridge_tests.rs) keep using
-// `crate::db::read_event_log` without knowing the internal layout.
-pub(crate) use recovery::read_event_log;
-
 pub use history::{BuildSampleRow, SlaOverrideRow};
 
 // r[impl sched.db.partial-index-literal]

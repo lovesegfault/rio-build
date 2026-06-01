@@ -1231,10 +1231,6 @@ impl DagActor {
                 ActorCommand::WatchBuild {
                     build_id,
                     caller_tenant,
-                    // Actor doesn't use this — it's the gRPC layer's
-                    // lower bound for PG replay. We only supply the
-                    // upper bound (last_seq, inside handle_watch_build).
-                    since_sequence: _,
                     reply,
                 } => {
                     let result = self.handle_watch_build(build_id, caller_tenant);

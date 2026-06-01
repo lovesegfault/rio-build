@@ -7,7 +7,7 @@
 //! Store operations delegate to rio-store via `StoreServiceClient` gRPC calls;
 //! build operations delegate to rio-scheduler via `SchedulerServiceClient`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use ed25519_dalek::SigningKey;
@@ -326,8 +326,14 @@ pub struct SessionContext {
     /// IFD detection: wopBuildDerivation without prior wopBuildPathsWithResults
     /// is likely an IFD or build-hook request.
     pub has_seen_build_paths_with_results: bool,
-    /// Active build IDs for scheduler failover: build_id → last_sequence.
-    pub active_build_ids: HashMap<String, u64>,
+    /// Builds this session has submitted that have not yet reached a
+    /// terminal outcome. Drives CancelBuild-on-disconnect
+    /// (`r[gw.conn.cancel-on-disconnect+3]`) and WatchBuild reconnect
+    /// after scheduler failover (`r[gw.reconnect.backoff+2]`) — the
+    /// reconnect needs only the build_id; the scheduler's snapshot-first
+    /// attach replaces the per-event sequence cursor that used to live
+    /// in this map's values.
+    pub active_build_ids: HashSet<String>,
     /// Tenant name from the matched `authorized_keys` entry's comment.
     /// Sent in `SubmitBuildRequest.tenant_name`; scheduler resolves to UUID.
     /// `None` = single-tenant mode (empty or malformed comment). The
@@ -397,7 +403,7 @@ impl SessionContext {
             scheduler_client,
             drv_cache: HashMap::new(),
             has_seen_build_paths_with_results: false,
-            active_build_ids: HashMap::new(),
+            active_build_ids: HashSet::new(),
             tenant_name,
             jwt,
             service_signer,

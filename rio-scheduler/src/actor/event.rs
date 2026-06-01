@@ -121,7 +121,11 @@ impl BuildEventBus {
         self.progress_at.clear();
     }
 
-    /// Last-emitted sequence for `build_id`, or 0 if unknown.
+    /// Last-emitted sequence for `build_id`, or 0 if unknown. Test-only
+    /// observable for the display-only seq-reuse rule — production's
+    /// last reader (the since_sequence replay watermark) was replaced
+    /// by snapshot-first WatchBuild attach.
+    #[cfg(test)]
     pub(super) fn last_seq(&self, build_id: Uuid) -> u64 {
         self.sequences.get(&build_id).copied().unwrap_or(0)
     }

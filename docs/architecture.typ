@@ -489,11 +489,13 @@ and #cross-link("/spec/components/store.typ")[rio-store] for the chunked CAS.
   + The `BuildEvent` response stream breaks with a gRPC Transport error.
   + Gateway's `process_stream` classifies the error as
     `StreamProcessError::Transport` and re-subscribes via
-    `WatchBuild(build_id, since_sequence)` --- up to
+    `WatchBuild(build_id)` --- up to
     #(refs.const)("MAX_RECONNECT") times with exponential
     backoff (1/2/4/8/16s, capped at 16s).
-  + New scheduler replays `BuildEvent`s from `build_event_log` starting at
-    `since_sequence`. The Nix client sees continuous `STDERR` streaming
+  + The new scheduler's snapshot-first `WatchBuild` attach describes the
+    build's current state (aggregate counts, running derivations, terminal
+    outcome if any); the gateway resynchronizes from it and continues with
+    the live stream. The Nix client sees continuous `STDERR` streaming
     (possibly a brief pause during backoff).
   + If all #(refs.const)("MAX_RECONNECT") reconnects fail, or the error is
     `Wire` (#(refs.error-doc)("StreamProcessError", "Wire")), the gateway

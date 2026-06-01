@@ -1998,7 +1998,7 @@ every established session on the instance with it.
 - Builds that were already in progress continue in the scheduler; only the
   log-streaming link is lost.
 
-#r("gw.reconnect.backoff")[
+#r("gw.reconnect.backoff+2")[
   *WatchBuild reconnect:* When the `SubmitBuild` / `WatchBuild` response stream
   breaks (scheduler failover, transient network), the gateway's
   `process_stream` distinguishes error classes via `StreamProcessError`:
@@ -2007,8 +2007,9 @@ every established session on the instance with it.
     (#(refs.error-doc)("StreamProcessError", "EofWithoutTerminal")) → retried
     up to *#(refs.const)("MAX_RECONNECT") times* with exponential backoff
     *1 s/2 s/4 s/8 s/16 s, capped at 16 s for the remaining attempts*. The
-    scheduler replays `BuildEvent`s from `build_event_log` starting at
-    `since_sequence`.
+    reconnect carries only the `build_id`; the scheduler answers with a
+    snapshot-first stream (#rref("sched.watch.snapshot-first")) — there is
+    no event cursor and no replay.
   - `Wire` → *not* retried; the gateway returns `MiscFailure` to the Nix
     client immediately. #(refs.error-doc)("StreamProcessError", "Wire")
   The reconnect counter resets on the first successful `BuildEvent` received
@@ -2016,13 +2017,22 @@ every established session on the instance with it.
   doesn't prove the stream will yield events).
 ]
 
-#r("gw.reconnect.since-seq")[
-  The gateway MUST track the sequence number of the first peeked `BuildEvent`
-  and use it as the initial `since_sequence` for reconnect, not hardcode `0`.
-  The scheduler never emits `sequence=0` (it's the `WatchBuildRequest`-side
-  "from start" sentinel); hardcoding `0` causes every first-event reconnect to
-  replay one extra event.
+#r("gw.reconnect.snapshot-resync")[
+  On reconnect, the gateway MUST resynchronize from the `WatchBuild` stream's
+  first message — the scheduler's `BuildSnapshot` — before processing live
+  events: a terminal snapshot state produces the build outcome directly; an
+  active snapshot reconciles per-derivation activities and log-tail
+  subscriptions against the snapshot's running set (stopping activities for
+  derivations that finished while the gateway was detached, starting
+  activities and re-attaching log tails for derivations that started while
+  it was detached) and corrects the aggregate progress counters from the
+  snapshot's absolute counts.
 ]
+The snapshot is the only resynchronization mechanism: the gateway keeps no
+per-event cursor into the scheduler's stream, and events missed while
+detached are never re-delivered — their net effect is what the snapshot
+describes. This replaces the retired `since_sequence` replay contract
+(`gw.reconnect.since-seq`, deleted with the WatchBuild resumability layer).
 
 - The gateway does not own durable state. All persistent data lives in the
   scheduler (PostgreSQL) and the store.

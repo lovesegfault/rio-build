@@ -303,10 +303,10 @@ separately. A derivation is only globally poisoned if it fails on
   [Scheduler failover],
   [Gateway's `BuildEvent` stream breaks with a `Transport` or
     `EofWithoutTerminal` error. Gateway transparently reconnects via
-    `WatchBuild(since_sequence)` up to #(refs.const)("MAX_RECONNECT")× with
-    backoff (1/2/4/8/16 s, capped at 16 s); scheduler replays from
-    `build_event_log`. If reconnect budget exhausted → `MiscFailure` to
-    client.],
+    `WatchBuild(build_id)` up to #(refs.const)("MAX_RECONNECT")× with
+    backoff (1/2/4/8/16 s, capped at 16 s); the scheduler's snapshot-first
+    attach resynchronizes the gateway's display state. If reconnect budget
+    exhausted → `MiscFailure` to client.],
 
   [Gateway crash],
   [SSH connection drops. Client reconnects; build reattaches via #gls("dag")-merge

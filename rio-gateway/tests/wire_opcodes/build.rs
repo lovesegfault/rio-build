@@ -99,9 +99,7 @@ async fn test_build_paths_eof_triggers_reconnect_not_error() -> anyhow::Result<(
     let mut h = GatewaySession::new_with_handshake().await?;
     // SubmitBuild: close stream after Started → EofWithoutTerminal.
     h.scheduler.set_submit_outcome(SubmitOutcome::close_early());
-    // WatchBuild: deliver Completed on the retry. Explicit sequence=2:
-    // SubmitBuild's Started was seq=1, so gateway reconnects with
-    // since_seq=1. Mock's since-filter drops seq≤1; seq=2 survives.
+    // WatchBuild: deliver Completed on the retry.
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![types::BuildEvent {
             build_id: String::new(),
@@ -1616,7 +1614,7 @@ async fn test_build_paths_first_event_cancelled_short_circuit() -> anyhow::Resul
     Ok(())
 }
 
-// r[verify gw.reconnect.backoff]
+// r[verify gw.reconnect.backoff+2]
 /// Phase4a remediation 20: scheduler accepts SubmitBuild (MergeDag
 /// committed, build_id in header) then drops the stream before event 0.
 /// Gateway reads build_id from initial metadata → enters reconnect loop
@@ -1733,7 +1731,7 @@ async fn test_build_paths_submit_rpc_fail_diagnostic() -> anyhow::Result<()> {
 // Reconnect loop tests (gateway/src/handler/build.rs reconnect backoff)
 // ===========================================================================
 //
-// r[verify gw.reconnect.backoff]
+// r[verify gw.reconnect.backoff+2]
 //
 // Paused-time auto-advance fires gRPC timeout wrappers prematurely
 // while real-TCP I/O to the in-process mocks is pending. Both tests
@@ -1773,9 +1771,6 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
     });
     // WatchBuild: deliver Completed. Gateway's process_build_events
     // reads from this fresh stream after the reconnect.
-    // Explicit sequence=2: SubmitBuild's Started was seq=1, so
-    // gateway reconnects with since_seq=1. Mock's since-filter
-    // drops seq≤1; seq=2 survives.
     h.scheduler.set_watch_outcome(WatchOutcome {
         scripted_events: Some(vec![types::BuildEvent {
             build_id: String::new(),
@@ -1812,45 +1807,169 @@ async fn test_build_paths_reconnect_on_transport_error() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Gateway must track first.sequence, not hardcode 0.
+// r[verify gw.reconnect.snapshot-resync]
+// r[verify gw.reconnect.backoff+2]
+/// THE snapshot-first reconnect property: a gateway that reconnects after
+/// missing events sees correct state from the WatchBuild snapshot, not from
+/// replay.
 ///
-/// Mock's SubmitBuild sends Started(seq=1), then error. Gateway peeks
-/// Started, inserts into active_build_ids. Reconnect reads that value
-/// back as since_sequence. The mock records what it received.
-///
-/// With build.rs:217 hardcoding 0: watch_calls shows (build_id, 0).
-/// With build.rs:217 fixed:        watch_calls shows (build_id, 1).
-///
-/// r[verify gw.reconnect.since-seq]
+/// SubmitBuild delivers Started + drv A's Started, then the stream errors.
+/// While the gateway is detached, drv A completes and drv B starts — events
+/// the gateway never receives (there is no replay). The WatchBuild
+/// reconnect stream opens with a snapshot describing the RESULT: A is gone
+/// from the running set, B is in it. The gateway must:
+///   - stop A's activity (it finished while the gateway was detached),
+///   - start an activity for B (it started while the gateway was detached),
+///   - correct the aggregate progress from the snapshot counts,
+///   - and return success when the live Completed arrives.
 #[tokio::test]
-async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<()> {
+async fn test_build_paths_reconnect_snapshot_resumes_state() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;
-    // SubmitBuild: Started (auto-fill → seq=1), then transport error
-    // at index 1 (before the second event, which is just a placeholder).
+    let drv_a = "/nix/store/aaa-snapshot-a.drv".to_string();
+    let drv_b = "/nix/store/bbb-snapshot-b.drv".to_string();
+
+    // SubmitBuild: Started + drv A starts, then transport error.
     h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
         events: vec![
             ev(build_event::Event::Started(types::BuildStarted {
-                total_derivations: 1,
+                total_derivations: 2,
                 cached_derivations: 0,
             })),
-            ev(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec![],
-            })),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::started(drv_a.clone(), "w1".into(), String::new()),
+            )),
         ],
+        error_after_n: Some((2, tonic::Code::Unavailable)),
+        interval: None,
+    });
+
+    // WatchBuild: snapshot-first attach, then the live remainder. The
+    // snapshot says: 1 of 2 done (A completed while we were away), B is
+    // the one running now.
+    h.scheduler.set_watch_outcome(WatchOutcome {
+        scripted_events: Some(vec![
+            ev(build_event::Event::Snapshot(types::BuildSnapshot {
+                state: types::BuildState::Active as i32,
+                total_derivations: 2,
+                completed_derivations: 1,
+                running_derivations: 1,
+                queued_derivations: 0,
+                running: vec![types::RunningDerivation {
+                    derivation_path: drv_b.clone(),
+                    exec_id: "01933333-3333-7333-8333-333333333333".into(),
+                }],
+                ..Default::default()
+            })),
+            ev(build_event::Event::Derivation(
+                types::DerivationEvent::completed(drv_b.clone(), vec![]),
+            )),
+            ev(build_event::Event::Completed(types::BuildCompleted {
+                output_paths: vec!["/nix/store/zzz-out".into()],
+            })),
+        ]),
+        ..Default::default()
+    });
+    let drv_path = seed_minimal_drv(&h);
+
+    wire_send!(&mut h.stream;
+        u64: 9,
+        strings: &[format!("{drv_path}!out")],
+        u64: 0,
+    );
+
+    let frames = collect_stderr_frames(&mut h.stream).await;
+
+    // The reconnect itself was surfaced to the user.
+    let saw_reconnect = frames
+        .iter()
+        .any(|m| matches!(m, StderrMessage::Next(s) if s.contains("reconnecting")));
+    assert!(
+        saw_reconnect,
+        "expected 'reconnecting...' STDERR_NEXT, frames: {frames:?}"
+    );
+
+    // Activity bookkeeping across the reconnect, driven by the snapshot.
+    let mut a_started = None;
+    let mut a_stopped = false;
+    let mut b_started = None;
+    let mut b_stopped = false;
+    for f in &frames {
+        match f {
+            StderrMessage::StartActivity { id, text, .. } => {
+                if text.contains("aaa-snapshot-a.drv") {
+                    a_started = Some(*id);
+                }
+                if text.contains("bbb-snapshot-b.drv") {
+                    b_started = Some(*id);
+                }
+            }
+            StderrMessage::StopActivity { id } => {
+                if a_started == Some(*id) {
+                    a_stopped = true;
+                }
+                if b_started == Some(*id) {
+                    b_stopped = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        a_started.is_some(),
+        "drv A's activity started on the original stream: {frames:?}"
+    );
+    assert!(
+        a_stopped,
+        "snapshot reconcile must stop drv A's activity — it completed \
+         while the gateway was detached and no replay will ever deliver \
+         its Completed event: {frames:?}"
+    );
+    assert!(
+        b_started.is_some(),
+        "snapshot reconcile must start drv B's activity — it started \
+         while the gateway was detached and no replay will ever deliver \
+         its Started event: {frames:?}"
+    );
+    assert!(
+        b_stopped,
+        "stop-parity holds for the snapshot-created activity: {frames:?}"
+    );
+
+    let result = wire::read_u64(&mut h.stream).await?;
+    assert_eq!(result, 1, "success after snapshot-resumed reconnect");
+    h.finish().await;
+    Ok(())
+}
+
+// r[verify gw.reconnect.snapshot-resync]
+/// A WatchBuild snapshot reporting a TERMINAL state short-circuits the
+/// stream: the gateway learns the outcome from the snapshot alone — the
+/// property the deleted terminal-event re-send / replay used to provide
+/// for builds that finished while the gateway was detached.
+#[tokio::test]
+async fn test_build_paths_reconnect_terminal_snapshot_short_circuits() -> anyhow::Result<()> {
+    let mut h = GatewaySession::new_with_handshake().await?;
+    // SubmitBuild: Started, then the stream errors.
+    h.scheduler.set_submit_outcome(SubmitOutcome::Scripted {
+        events: vec![ev(build_event::Event::Started(types::BuildStarted {
+            total_derivations: 1,
+            cached_derivations: 0,
+        }))],
         error_after_n: Some((1, tonic::Code::Unavailable)),
         interval: None,
     });
-    // WatchBuild: Completed at explicit seq=2 (> since_seq=1 → delivered).
-    // Hand-construct instead of ev() so we control sequence directly.
+    // WatchBuild: the build finished while the gateway was detached. The
+    // snapshot IS the outcome; no further events follow.
     h.scheduler.set_watch_outcome(WatchOutcome {
-        scripted_events: Some(vec![types::BuildEvent {
-            build_id: String::new(),
-            sequence: 2,
-            timestamp: None,
-            event: Some(build_event::Event::Completed(types::BuildCompleted {
-                output_paths: vec!["/nix/store/zzz".into()],
-            })),
-        }]),
+        scripted_events: Some(vec![ev(build_event::Event::Snapshot(
+            types::BuildSnapshot {
+                state: types::BuildState::Succeeded as i32,
+                total_derivations: 1,
+                completed_derivations: 1,
+                output_paths: vec!["/nix/store/zzz-out".into()],
+                ..Default::default()
+            },
+        ))]),
         ..Default::default()
     });
     let drv_path = seed_minimal_drv(&h);
@@ -1863,19 +1982,10 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
 
     let _frames = collect_stderr_frames(&mut h.stream).await;
     let result = wire::read_u64(&mut h.stream).await?;
-    assert_eq!(result, 1, "success after reconnect");
-
-    // THE ASSERTION: gateway sent since_sequence=1 (Started's sequence),
-    // not 0 (the hardcoded bug).
-    let watches = h.scheduler.watch_calls.read().unwrap().clone();
-    assert_eq!(watches.len(), 1, "exactly one WatchBuild call");
     assert_eq!(
-        watches[0].1, 1,
-        "since_sequence must be first.sequence (=1), not hardcoded 0. \
-         This is the build.rs:217 bug: active_build_ids.insert(.., 0) \
-         should be active_build_ids.insert(.., first.sequence)."
+        result, 1,
+        "terminal snapshot alone must produce the build outcome"
     );
-
     h.finish().await;
     Ok(())
 }
@@ -1901,7 +2011,7 @@ async fn test_reconnect_sends_first_event_sequence_not_zero() -> anyhow::Result<
 /// instantly → `resolve_built_dag` `Err` → `MiscFailure(9)` at
 /// build.rs:1300. The test then asserted `status==9` and "passed" —
 /// vacuously, never reaching the reconnect loop it claims to cover.
-// r[verify gw.reconnect.backoff]
+// r[verify gw.reconnect.backoff+2]
 #[tokio::test(flavor = "current_thread")]
 async fn test_build_paths_reconnect_exhausted_returns_failure() -> anyhow::Result<()> {
     let mut h = GatewaySession::new_with_handshake().await?;

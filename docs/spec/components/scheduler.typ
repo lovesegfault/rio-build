@@ -1921,6 +1921,24 @@ the Phase-1b cutover froze the column.
   `DependencyFailed`) emit `DerivationFailed`.
 ]
 
+#r("sched.watch.snapshot-first")[
+  Every `WatchBuild` stream MUST begin with a `BuildSnapshot` message
+  describing the build's current state — build state, absolute aggregate
+  counts, the per-derivation running set with `exec_id`s, and (for terminal
+  builds) the outcome payload — computed atomically with the broadcast
+  subscription, so the events that follow the snapshot are exactly the
+  events emitted after it.
+]
+A watcher attaching to an already-terminal build learns the outcome from the
+snapshot alone; a watcher attaching mid-build reconstructs display state from
+the running set instead of from replayed history. This is the whole
+reconnect contract: there are no sequence numbers, no persisted event
+mirror, and no replay — the WatchBuild resumability layer was deleted in
+favor of this snapshot (its `build_event_log` table, per-build sequence
+counters, and `since_sequence` replay are gone). `SubmitBuild` streams carry
+no snapshot: their receivers are registered before the build's first event
+is emitted, so there is no missed state to summarize.
+
 #r("sched.build.keep-going")[
   *Aggregation rules:*
   - `keepGoing=false` (default): the build fails as soon as any derivation
@@ -3744,7 +3762,8 @@ parent's own realisation lands (FK ordering).
   [New leader acquires the Kubernetes Lease → fire-and-forgets `LeaderAcquired`
     → `recover_from_pg` rebuilds DAG from PG, including the open pull attempts
     and their `exec_id`s, so retried pulls and reports stay idempotent.
-    Gateways reconnect via `WatchBuild(build_id, since_sequence=last_seen)`.],
+    Gateways reconnect via `WatchBuild(build_id)` and resynchronize from its
+    snapshot-first attach (#rref("sched.watch.snapshot-first")).],
 )
 
 Under a network partition between the scheduler and executors, in-flight pods

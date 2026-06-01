@@ -309,8 +309,7 @@ async fn test_idle_timeout_cancels_active_builds() -> anyhow::Result<()> {
         rio_gateway::TenantLimiter::disabled(),
         rio_gateway::QuotaCache::new(),
     );
-    ctx.active_build_ids
-        .insert("leaked-build-id".to_string(), 42);
+    ctx.active_build_ids.insert("leaked-build-id".to_string());
 
     let (mut client_stream, server_stream) = tokio::io::duplex(64 * 1024);
     let shutdown = rio_common::signal::Token::new();
@@ -410,7 +409,7 @@ async fn test_read_error_cancels_active_builds() -> anyhow::Result<()> {
         rio_gateway::QuotaCache::new(),
     );
     ctx.active_build_ids
-        .insert("leaked-on-read-err".to_string(), 7);
+        .insert("leaked-on-read-err".to_string());
 
     /// Reader that yields `bytes` once, then `ConnectionReset` on the
     /// next poll. Lets the handshake complete, then forces the

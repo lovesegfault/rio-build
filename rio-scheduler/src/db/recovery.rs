@@ -8,7 +8,6 @@
 //! derivation, tuples at that arity are error-prone (wrong-field
 //! assignment). #[derive(FromRow)] + named columns is safer.
 
-use sqlx::PgPool;
 use uuid::Uuid;
 
 use super::{
@@ -18,10 +17,10 @@ use super::{
 
 impl SchedulerDb {
     /// Load all non-terminal builds. Terminal builds (succeeded/
-    /// failed/cancelled) don't need recovery — they're done, any
-    /// WatchBuild subscriber has already received the terminal event
-    /// (or will time out waiting, which is the same as "scheduler
-    /// restarted and forgot").
+    /// failed/cancelled) don't need recovery — they're done, and a
+    /// late `WatchBuild` against a terminal build PG still knows about
+    /// is answered from the `builds` row (snapshot), not from recovered
+    /// actor state.
     pub(crate) async fn load_nonterminal_builds(
         &self,
     ) -> Result<Vec<RecoveryBuildRow>, sqlx::Error> {
@@ -520,12 +519,11 @@ impl SchedulerDb {
     /// if a derivation was added between COUNT and SELECT). Acceptable
     /// for a 5s-poll dashboard; builds don't add derivations post-submit
     /// anyway.
-    // NOTE(fault-line): load_build_graph + read_event_log live here
-    // because they were physically inside the pre-split :1123 "recovery"
-    // banner. Neither is actually a recovery-on-LeaderAcquired query —
-    // load_build_graph serves AdminService.GetBuildGraph (dashboard viz),
-    // read_event_log serves grpc bridge replay. If a future plan touches
-    // both, consider extracting to db/admin_reads.rs. The
+    // NOTE(fault-line): load_build_graph lives here because it was
+    // physically inside the pre-split :1123 "recovery" banner. It is not
+    // actually a recovery-on-LeaderAcquired query — it serves
+    // AdminService.GetBuildGraph (dashboard viz). If a future plan grows
+    // this family, consider extracting to db/admin_reads.rs. The
     // r[impl dash.graph.degrade-threshold] marker at the 5000-node cap
     // IS correctly placed (scheduler implements server-side cap
     // regardless of which db/ file hosts it).
@@ -625,47 +623,4 @@ impl SchedulerDb {
 
         Ok((nodes, edges, total as u32))
     }
-}
-
-/// Read persisted build events for since_sequence replay.
-///
-/// Returns events in the half-open range `(since, until]` — strictly
-/// after `since` (the gateway's last-seen seq), at most `until`
-/// (the actor's last-emitted seq at subscribe time). `until` bounds
-/// the replay so we don't duplicate what the broadcast will carry:
-/// everything with seq > until was emitted AFTER subscribe and is
-/// guaranteed to be on the broadcast channel.
-///
-/// Free fn (not `SchedulerDb` method): `bridge_build_events` is a
-/// free fn in grpc/mod.rs that only has a `PgPool`, not a
-/// `SchedulerDb`. Adding `SchedulerDb` to `SchedulerGrpc` would
-/// drag the whole db module into grpc; a bare pool is cheaper.
-///
-/// u64 → i64 cast: PG BIGINT is signed. See event_log.rs for the
-/// same rationale (2^63 events per build is not a real concern).
-///
-/// Returns a row stream (`.fetch`, not `.fetch_all`): a fresh
-/// `WatchBuild{since_sequence:0}` against a 153k-node DAG would
-/// otherwise materialize ≥300k rows × ~400B into a `Vec` per
-/// concurrent watcher BEFORE the bridge's mpsc(256) backpressure can
-/// apply. The caller pins the stream and forwards row-by-row.
-pub fn read_event_log(
-    pool: &PgPool,
-    build_id: Uuid,
-    since: u64,
-    until: u64,
-) -> impl futures_util::Stream<Item = Result<(u64, Vec<u8>), sqlx::Error>> + '_ {
-    use futures_util::TryStreamExt;
-    sqlx::query_as::<_, (i64, Vec<u8>)>(
-        "SELECT sequence, event_bytes FROM build_event_log \
-         WHERE build_id = $1 AND sequence > $2 AND sequence <= $3 \
-         ORDER BY sequence",
-    )
-    .bind(build_id)
-    .bind(since as i64)
-    .bind(until as i64)
-    .fetch(pool)
-    // i64 → u64: rows were written with `seq as i64` from a u64, so
-    // they round-trip exactly. No values < 0 exist (seq starts at 1).
-    .map_ok(|(s, b)| (s as u64, b))
 }

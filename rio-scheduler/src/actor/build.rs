@@ -280,11 +280,18 @@ impl DagActor {
         })
     }
 
+    // r[impl sched.watch.snapshot-first]
     pub(super) fn handle_watch_build(
         &self,
         build_id: Uuid,
         caller_tenant: Option<Uuid>,
-    ) -> Result<(super::BuildEventReceivers, u64), ActorError> {
+    ) -> Result<
+        (
+            super::BuildEventReceivers,
+            Box<rio_proto::types::BuildEvent>,
+        ),
+        ActorError,
+    > {
         let build = self
             .builds
             .get(&build_id)
@@ -294,14 +301,13 @@ impl DagActor {
             return Err(ActorError::PermissionDenied { build_id });
         }
 
-        // Subscribe FIRST so we receive anything sent after this point.
-        // Then capture last_seq. The actor is single-threaded and
-        // this fn is synchronous (no .await between subscribe and
-        // sequence read) — no event can be emitted in between. So
-        // last_seq is an exact watermark: everything ≤ last_seq was
-        // emitted before subscribe (PG replay covers it; may also be
-        // in the broadcast ring → gRPC dedups); everything > last_seq
-        // was emitted after (guaranteed on broadcast, not in PG yet).
+        // Subscribe FIRST, then compute the snapshot. The actor is
+        // single-threaded and this fn is synchronous (no .await between
+        // subscribe and snapshot), so no event can land in between: the
+        // snapshot folds in every event emitted before this point, and
+        // the receivers carry exactly the events emitted after it. This
+        // adjacency is what makes snapshot-first attach gap-free without
+        // sequence numbers, replay, or dedup.
         //
         // builds and events.channels are removed together
         // (handle_cleanup_terminal_build); subscribe() returning None
@@ -310,83 +316,110 @@ impl DagActor {
             .events
             .subscribe(build_id)
             .ok_or(ActorError::BuildNotFound(build_id))?;
-        let last_seq = self.events.last_seq(build_id);
+        let snapshot = self.watch_snapshot(build_id, build);
+        Ok((rx, Box::new(snapshot)))
+    }
 
-        // If the build is already terminal, the BuildCompleted/Failed/Cancelled
-        // event was already sent (possibly to zero receivers). A late subscriber
-        // would never see it and would hang forever. Re-send a terminal event
-        // so the new subscriber gets it.
-        if let Some(build) = self.builds.get(&build_id)
-            && build.state().is_terminal()
-        {
-            let terminal_event = match build.state() {
-                BuildState::Succeeded => {
-                    // Reconstruct output_paths from DAG roots (same as complete_build).
-                    let roots = self.dag.find_roots(build_id);
-                    let output_paths: Vec<String> = roots
-                        .iter()
-                        .flat_map(|h| {
-                            self.dag
-                                .node(h)
-                                .map(|s| s.output_paths.clone())
-                                .unwrap_or_default()
-                        })
-                        .collect();
-                    rio_proto::types::build_event::Event::Completed(
-                        rio_proto::types::BuildCompleted { output_paths },
-                    )
-                }
-                BuildState::Failed => {
-                    rio_proto::types::build_event::Event::Failed(rio_proto::types::BuildFailed {
-                        error_message: build.error_summary.clone().unwrap_or_default(),
-                        failed_derivation: build.failed_derivation.clone().unwrap_or_default(),
-                        // TODO: thread BuildResultStatus from the failing
-                        // derivation (completion.rs:517 receives it from the
-                        // worker; build state needs a field to carry it).
-                        status: 0,
+    /// Compute the [`rio_proto::types::BuildSnapshot`] first-message for a
+    /// `WatchBuild` attach: the build's current state, absolute aggregate
+    /// counts (same arithmetic as [`Self::handle_query_build_status`]),
+    /// the per-drv running set (so the gateway re-attaches log tails),
+    /// and — for terminal builds — the outcome payload that replaces the
+    /// old terminal-event re-send.
+    fn watch_snapshot(
+        &self,
+        build_id: Uuid,
+        build: &crate::state::BuildInfo,
+    ) -> rio_proto::types::BuildEvent {
+        use rio_proto::types;
+
+        let summary = self.dag.build_summary(build_id);
+
+        // Per-drv running set: derivations currently executing for this
+        // build, with the exec_id minted at dispatch. The gateway uses
+        // this to re-create per-drv activities and re-attach log tails
+        // for executions whose Started event it missed while detached.
+        let mut running: Vec<types::RunningDerivation> = self
+            .dag
+            .iter_nodes()
+            .filter(|(_, s)| s.interested_builds.contains(&build_id))
+            .filter(|(_, s)| {
+                matches!(
+                    s.status(),
+                    DerivationStatus::Assigned | DerivationStatus::Running
+                )
+            })
+            .map(|(_, s)| types::RunningDerivation {
+                derivation_path: s.drv_path().to_string(),
+                exec_id: s.exec_id.map(|e| e.to_string()).unwrap_or_default(),
+            })
+            .collect();
+        // Deterministic wire order (iter_nodes is HashMap-ordered).
+        running.sort_by(|a, b| a.derivation_path.cmp(&b.derivation_path));
+
+        // Terminal payload: which arm is populated mirrors the old
+        // terminal-resend (Completed/Failed/Cancelled events).
+        let state = build.state();
+        let mut output_paths = Vec::new();
+        let mut error_message = String::new();
+        let mut failed_derivation = String::new();
+        let mut cancel_reason = String::new();
+        match state {
+            BuildState::Succeeded => {
+                // Reconstruct output_paths from DAG roots (same as complete_build).
+                let roots = self.dag.find_roots(build_id);
+                output_paths = roots
+                    .iter()
+                    .flat_map(|h| {
+                        self.dag
+                            .node(h)
+                            .map(|s| s.output_paths.clone())
+                            .unwrap_or_default()
                     })
-                }
-                BuildState::Cancelled => rio_proto::types::build_event::Event::Cancelled(
-                    rio_proto::types::BuildCancelled {
-                        reason: "build was cancelled".to_string(),
-                    },
-                ),
-                // Non-terminal states handled by is_terminal() check above.
-                _ => unreachable!("is_terminal() returned true for non-terminal state"),
-            };
-
-            // Sequence number: reuse the last one (approximate; the subscriber
-            // only cares about receiving a terminal event, not exact sequencing).
-            let seq = self.events.last_seq(build_id);
-            let event = rio_proto::types::BuildEvent {
-                build_id: build_id.to_string(),
-                sequence: seq,
-                timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
-                event: Some(terminal_event),
-            };
-            // broadcast::send takes &self; Err means no receivers, but we just
-            // subscribed so there's at least one.
-            //
-            // This re-send uses seq == last_seq. The gRPC bridge dedups
-            // broadcast at the highest seq PG ACTUALLY returned (not
-            // `last_seq`): if the persister wrote the original
-            // terminal, PG delivers it and the watermark covers this
-            // re-send (skipped — fine, the real one already went). If
-            // the persister DROPPED it under backpressure (event.rs
-            // `try_send` Full), PG returns rows < last_seq and the
-            // watermark stays below — this re-send passes dedup and
-            // IS what the watcher sees. Same for PG-down (watermark
-            // 0).
-            //
-            // Direct on the state-channel sender (NOT via emit()):
-            // emit() would bump the sequence past last_seq and
-            // re-persist a row PG may already have.
-            if let Some(tx) = self.events.channels.get(&build_id) {
-                let _ = tx.send(event);
+                    .collect();
             }
+            BuildState::Failed => {
+                error_message = build.error_summary.clone().unwrap_or_default();
+                failed_derivation = build.failed_derivation.clone().unwrap_or_default();
+            }
+            BuildState::Cancelled => {
+                cancel_reason = "build was cancelled".to_string();
+            }
+            _ => {}
         }
 
-        Ok((rx, last_seq))
+        let snapshot = types::BuildSnapshot {
+            state: state.into(),
+            // I-111: summary.{total,completed} are DAG-relative; after
+            // recovery the DAG only holds non-terminal-at-recovery drvs.
+            // Absolute counts come from BuildInfo (same as
+            // handle_query_build_status).
+            total_derivations: build.total_count,
+            completed_derivations: build.recovered_completed + summary.completed,
+            cached_derivations: build.cached_count,
+            running_derivations: summary.running,
+            failed_derivations: summary.failed,
+            queued_derivations: summary.queued,
+            critical_path_remaining_secs: Some(summary.critpath_remaining.round() as u64),
+            assigned_executors: summary.assigned_executors,
+            running,
+            output_paths,
+            error_message,
+            failed_derivation,
+            // TODO: thread BuildResultStatus from the failing derivation
+            // (completion.rs receives it from the worker; build state
+            // needs a field to carry it). Same gap as the old
+            // terminal-resend's `status: 0`.
+            failure_status: 0,
+            cancel_reason,
+        };
+
+        rio_proto::types::BuildEvent {
+            build_id: build_id.to_string(),
+            sequence: 0,
+            timestamp: Some(prost_types::Timestamp::from(std::time::SystemTime::now())),
+            event: Some(types::build_event::Event::Snapshot(snapshot)),
+        }
     }
 
     pub(super) async fn update_build_counts(&mut self, build_id: Uuid) {

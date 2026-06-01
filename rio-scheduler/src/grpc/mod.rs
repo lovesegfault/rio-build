@@ -17,7 +17,6 @@ mod scheduler_service;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use futures_util::StreamExt;
 use tokio::sync::broadcast;
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -41,14 +40,11 @@ pub struct SchedulerGrpc {
     // in a child module can't reach private fields of the parent
     // module's struct.
     pub(super) actor: ActorHandle,
-    /// DB handle for tenant resolve / jti revocation / WatchBuild
-    /// event-log replay. `Option` so `new_for_tests` can skip it
-    /// (None → broadcast-only, no replay, no tenant resolve).
+    /// DB handle for tenant resolve / jti revocation. `Option` so
+    /// `new_for_tests` can skip it (None → no tenant resolve).
     /// Production always sets it — main.rs constructs the same
     /// `SchedulerDb` for the actor. Holds `SchedulerDb` (not bare
-    /// `PgPool`) so all SQL goes through the `db/` module; raw pool
-    /// is reachable via [`SchedulerDb::pool`] where the event-log
-    /// free fn needs it.
+    /// `PgPool`) so all SQL goes through the `db/` module.
     pub(super) db: Option<SchedulerDb>,
     /// Shared with the lease loop. When false (standby), all
     /// handlers return UNAVAILABLE immediately — clients with
@@ -99,8 +95,8 @@ impl SchedulerGrpc {
 
     /// Production constructor.
     ///
-    /// `pool`: for WatchBuild's PG event-log replay. main.rs already
-    /// has it (same pool as `SchedulerDb`).
+    /// `db`: for tenant resolve / jti revocation. main.rs already
+    /// has it (same pool as the actor's `SchedulerDb`).
     ///
     /// `jwt_mode`: whether a JWT pubkey is configured (drives
     /// `require_tenant`). `hmac_key`: assignment-HMAC key, reused as
@@ -277,36 +273,16 @@ pub(crate) async fn resolve_tenant_name(
         .ok_or_else(|| Status::invalid_argument(format!("unknown tenant: {name}")))
 }
 
-/// Parameters for PG-backed event replay on WatchBuild.
+/// Bridge a build's broadcast receivers into a tonic streaming response.
 ///
-/// Set only when `since < last_seq` (gap exists) AND a pool is
-/// available. SubmitBuild never sets this: fresh build, last_seq=0,
-/// no gap possible.
-pub(crate) struct EventReplay {
-    pub pool: sqlx::PgPool,
-    pub build_id: Uuid,
-    /// Gateway's last-seen sequence. PG replay lower bound (exclusive).
-    pub since: u64,
-    /// Actor's last-emitted sequence at subscribe time. PG replay
-    /// upper bound (inclusive) AND broadcast dedup watermark.
-    pub last_seq: u64,
-}
-
-/// Bridge a `broadcast::Receiver<BuildEvent>` into a tonic streaming response.
-///
-/// Two-phase when `replay` is set:
-///   1. PG replay: stream `WHERE seq > since AND seq <= last_seq`
-///      from `build_event_log`. Closes the gap between what the
-///      gateway saw before disconnect and what the new subscribe
-///      will carry. Best-effort — if PG is down, fall through to
-///      broadcast-only (the terminal-event re-send in
-///      handle_watch_build is the safety net).
-///   2. Broadcast drain with dedup: skip `seq <= last_seq`. Those
-///      may ALSO be in the broadcast ring (1024-event buffer), and
-///      PG already delivered them in phase 1. Without dedup the
-///      gateway sees events twice.
-///
-/// `replay = None` → pure broadcast drain, no dedup (SubmitBuild).
+/// `first` is the snapshot-first attach message
+/// (`r[sched.watch.snapshot-first]`): WatchBuild passes the
+/// `BuildSnapshot` event computed atomically with the subscription;
+/// SubmitBuild passes `None` (its receivers were registered before the
+/// build's first event was emitted, so there is no missed state to
+/// summarize). The bridge sends it before draining the broadcast — the
+/// client always sees current-state-then-live-events, with no replay
+/// and no dedup.
 ///
 /// On `Lagged`, the bridge logs and CONTINUES (does not break or send
 /// `DATA_LOSS`). Tokio's `RecvError::Lagged(n)` repositions the receiver
@@ -324,13 +300,12 @@ pub(crate) struct EventReplay {
 /// burst > 4096). Log-channel `Lagged` is expected under chatty parallel
 /// builds and is debug-level: S3 + AdminService is the authoritative log
 /// path. A *state-channel* terminal lost to `Lagged` is recovered by the
-/// Closed → `EofWithoutTerminal` → WatchBuild reconnect →
-/// `handle_watch_build` terminal-resend path (≤60s delay from
-/// `TERMINAL_CLEANUP_DELAY`).
+/// Closed → `EofWithoutTerminal` → WatchBuild reconnect → snapshot path
+/// (the snapshot reports the terminal state directly).
 pub(crate) fn bridge_build_events(
     task_name: &'static str,
     rx: BuildEventReceivers,
-    replay: Option<EventReplay>,
+    first: Option<Box<rio_proto::types::BuildEvent>>,
 ) -> ReceiverStream<Result<rio_proto::types::BuildEvent, Status>> {
     enum StateOrLog<T> {
         State(T),
@@ -342,82 +317,11 @@ pub(crate) fn bridge_build_events(
     } = rx;
     let (tx, rx) = mpsc::channel(256);
     rio_common::task::spawn_monitored(task_name, async move {
-        // Phase 1: PG replay. Best-effort — on error, fall through.
-        // `dedup_watermark` starts at 0 (no dedup) and is raised to
-        // the highest seq PG ACTUALLY RETURNED — NOT `r.last_seq`. The
-        // persister's `try_send` drops under backpressure (event.rs
-        // `Full` arm), so PG can return `Ok` with rows missing at the
-        // tail. `handle_watch_build`'s safety-net terminal resend goes
-        // out at `seq = last_seq` post-subscribe; if we deduped at
-        // `last_seq` and PG never delivered it, that resend is
-        // suppressed and the gateway loops `EofWithoutTerminal`
-        // forever. On PG failure mid-stream we keep whatever the
-        // watermark reached — the broadcast ring might have events
-        // we'd otherwise skip, and a double is better than a hole.
-        let mut dedup_watermark = 0u64;
-        if let Some(r) = replay {
-            // Row stream (not Vec): a fresh `since=0` watch on a
-            // 153k-node DAG would otherwise materialize ≥300k rows ×
-            // ~400B per concurrent watcher BEFORE the mpsc(256)
-            // backpressure can apply. Forwarding row-by-row lets the
-            // send `.await` propagate backpressure to the PG cursor.
-            let mut rows = std::pin::pin!(crate::db::read_event_log(
-                &r.pool, r.build_id, r.since, r.last_seq
-            ));
-            let mut max_seen = r.since;
-            let mut errored = false;
-            while let Some(row) = rows.next().await {
-                match row {
-                    Ok((seq, bytes)) => {
-                        use prost::Message;
-                        match rio_proto::types::BuildEvent::decode(&bytes[..]) {
-                            Ok(event) => {
-                                if tx.send(Ok(event)).await.is_err() {
-                                    return; // client gone
-                                }
-                                max_seen = seq;
-                            }
-                            Err(e) => {
-                                // Corrupt row — written by us, so
-                                // this is a bug. Skip it; the seq
-                                // gap is visible to the client.
-                                warn!(
-                                    build_id = %r.build_id,
-                                    seq,
-                                    error = %e,
-                                    "event-log replay: prost decode failed (corrupt row, skipping)"
-                                );
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        // PG unreachable / cursor error. Fall through
-                        // to broadcast-only. handle_watch_build's
-                        // terminal re-send covers the "build already
-                        // done" case. Non-terminal builds: the gateway
-                        // misses some history but sees live events.
-                        // Degraded, not dead.
-                        warn!(
-                            build_id = %r.build_id,
-                            since = r.since,
-                            last_seq = r.last_seq,
-                            error = %e,
-                            "event-log replay failed (PG unreachable?); \
-                             falling through to broadcast-only, gap possible"
-                        );
-                        errored = true;
-                        break;
-                    }
-                }
-            }
-            // Watermark = highest seq actually forwarded. If PG
-            // errored before yielding ANY row, leave it at 0 (same
-            // semantics as before: no dedup on PG failure). If PG
-            // yielded a partial prefix then errored, dedup that
-            // prefix — those rows were delivered.
-            if !errored || max_seen > r.since {
-                dedup_watermark = max_seen;
-            }
+        // Phase 1: the snapshot-first attach message (WatchBuild only).
+        if let Some(first) = first
+            && tx.send(Ok(*first)).await.is_err()
+        {
+            return; // client gone
         }
 
         // Phase 2: merge-drain state + log broadcast rings.
@@ -434,25 +338,9 @@ pub(crate) fn bridge_build_events(
                 r = log_bcast.recv(), if !log_closed => StateOrLog::Log(r),
             };
             match recv {
-                StateOrLog::State(Ok(event)) => {
-                    // Dedup: PG already delivered seq ≤ watermark.
-                    // The broadcast ring holds recent events — some
-                    // were emitted BEFORE subscribe and have seq ≤
-                    // last_seq. Skip those.
-                    if event.sequence <= dedup_watermark {
-                        continue;
-                    }
+                StateOrLog::State(Ok(event)) | StateOrLog::Log(Ok(event)) => {
                     if tx.send(Ok(event)).await.is_err() {
                         break; // client disconnected
-                    }
-                }
-                StateOrLog::Log(Ok(event)) => {
-                    // No dedup: Log is never persisted to PG
-                    // (event.rs filters it from the persister) AND
-                    // reuses the last persisted seq without bumping.
-                    // It can never be a Phase-1 duplicate.
-                    if tx.send(Ok(event)).await.is_err() {
-                        break;
                     }
                 }
                 StateOrLog::State(Err(broadcast::error::RecvError::Closed)) => break,
@@ -474,9 +362,9 @@ pub(crate) fn bridge_build_events(
                     // receiver is still valid (tokio repositions to
                     // oldest in-ring). A missed terminal surfaces via
                     // Closed → EofWithoutTerminal → WatchBuild
-                    // reconnect → handle_watch_build terminal-resend;
-                    // a missed per-drv Completed surfaces via the
-                    // gateway's act.drv terminal-drain.
+                    // reconnect → snapshot (which reports the terminal
+                    // state directly); a missed per-drv Completed
+                    // surfaces via the gateway's act.drv terminal-drain.
                     warn!(
                         task = task_name,
                         skipped = n,

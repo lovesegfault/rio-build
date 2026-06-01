@@ -61,7 +61,7 @@ async fn cancel_active_builds(ctx: &mut SessionContext, reason: &str) {
     // active_build_ids across the await points (scheduler_client.cancel_build
     // needs &mut ctx.scheduler_client — split field borrows don't survive
     // across .await in all cases).
-    let build_ids: Vec<String> = ctx.active_build_ids.keys().cloned().collect();
+    let build_ids: Vec<String> = ctx.active_build_ids.iter().cloned().collect();
     let jwt_token = ctx.jwt.token_owned();
     let jwt_token = jwt_token.as_deref();
     for build_id in build_ids {

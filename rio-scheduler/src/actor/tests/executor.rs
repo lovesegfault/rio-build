@@ -31,11 +31,10 @@ async fn test_orphan_watcher_reattach_resets_timer() -> TestResult {
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
             caller_tenant: None,
-            since_sequence: 0,
             reply: reply_tx,
         })
         .await?;
-    let (rx2, _seq) = reply_rx.await??;
+    let (rx2, _snapshot) = reply_rx.await??;
 
     // Second tick: receiver_count > 0 → orphaned_since reset, no cancel.
     handle.send_unchecked(ActorCommand::Tick).await?;

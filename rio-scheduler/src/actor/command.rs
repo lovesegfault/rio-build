@@ -227,22 +227,27 @@ pub enum ActorCommand {
     },
 
     /// Subscribe to an existing build's events. Reply carries
-    /// `(receiver, last_seq)` — `last_seq` is the sequence of the
-    /// last-emitted event at the moment of subscribe. The gRPC
-    /// layer uses it to (a) bound PG replay (`WHERE seq <= last_seq`)
-    /// and (b) dedup the broadcast stream (skip `seq <= last_seq` —
-    /// those may ALSO be in the broadcast ring's 1024 buffer, and
-    /// PG already delivered them).
-    ///
-    /// `since_sequence` is NOT read by the actor — it's passed
-    /// through to the gRPC layer for the PG replay range's lower
-    /// bound. The actor only knows about the broadcast.
+    /// `(receivers, snapshot)` — the snapshot is a fully-populated
+    /// `BuildEvent::Snapshot` describing the build's state at the
+    /// moment of subscribe (`r[sched.watch.snapshot-first]`). The gRPC
+    /// layer sends it as the stream's first message, then bridges the
+    /// live broadcast. Because the actor is single-threaded and
+    /// `handle_watch_build` has no await between subscribe and
+    /// snapshot, the broadcast carries exactly the events emitted
+    /// after the snapshot — no replay, no dedup.
     WatchBuild {
         build_id: Uuid,
         /// See [`ActorCommand::CancelBuild::caller_tenant`].
         caller_tenant: Option<Uuid>,
-        since_sequence: u64,
-        reply: oneshot::Sender<Result<(super::BuildEventReceivers, u64), ActorError>>,
+        reply: oneshot::Sender<
+            Result<
+                (
+                    super::BuildEventReceivers,
+                    Box<rio_proto::types::BuildEvent>,
+                ),
+                ActorError,
+            >,
+        >,
     },
 
     /// Internal: clean up terminal build state (maps + DAG interest) after

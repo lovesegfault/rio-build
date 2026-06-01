@@ -4,7 +4,7 @@
 //! the `grpc/{scheduler_service,worker_service,actor_guards}.rs`
 //! submodule seams (P0356). Each submodule covers one prod file:
 //!   - `submit_tests` → `scheduler_service.rs` (SubmitBuild chain)
-//!   - `bridge_tests` → `bridge_build_events` (replay + dedup)
+//!   - `bridge_tests` → `bridge_build_events` (snapshot-first + ring split)
 //!   - `guards_tests` → `actor_guards.rs` (error-map + leader-gate)
 //!
 //! Submodules pull the common `use` block + setup helpers in via

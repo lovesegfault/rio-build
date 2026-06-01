@@ -34,7 +34,6 @@ enum ExecutorKind {
 // ───────────────────────────────────────────────────────────────────────────
 
 // A build progress event, streamed from scheduler to gateway/dashboard.
-// The sequence field enables stream resumption via WatchBuild(since_sequence).
 message BuildEvent {
   // 6 was `BuildLogBatch log` — the scheduler-relayed live log tail.
   // Removed by the build-log data-plane cutover: the gateway sources the
@@ -53,7 +52,57 @@ message BuildEvent {
     BuildInputsResolved inputs_resolved = 11;
     BuildPhase phase = 12;                  // Per-derivation build phase change (resSetPhase)
     SubstituteProgress substitute_progress = 13;  // Per-derivation upstream-fetch byte progress
+    BuildSnapshot snapshot = 14;            // Full-state snapshot (first WatchBuild message)
   }
+}
+
+// Full build-state snapshot: the first message on every WatchBuild stream.
+//
+// Replaces the sequence-numbered replay layer: a (re)connecting watcher
+// learns the build's CURRENT state from this one message, then receives
+// the live broadcast. The scheduler computes the snapshot atomically with
+// the broadcast subscription (single-threaded actor, no await between
+// subscribe and snapshot), so the events that arrive after it are exactly
+// the events emitted after it — no gap, no overlap, no dedup needed.
+//
+// SubmitBuild streams do NOT carry a snapshot: the response stream is
+// subscribed before the build's first event is emitted, so there is no
+// missed state to summarize.
+message BuildSnapshot {
+  BuildState state = 1;                     // Current build state
+  // Aggregate counts — same semantics as BuildStatus (the QueryBuildStatus
+  // response): absolute counts, not relative to the recovered DAG subset.
+  uint32 total_derivations = 2;
+  uint32 completed_derivations = 3;
+  uint32 cached_derivations = 4;
+  uint32 running_derivations = 5;
+  uint32 failed_derivations = 6;
+  uint32 queued_derivations = 7;
+  // hw-normalized ref-seconds (see BuildProgress.critical_path_remaining_secs)
+  optional uint64 critical_path_remaining_secs = 8;
+  repeated string assigned_executors = 9;
+  // Derivations currently executing (Assigned/Running) for this build,
+  // with exec_ids — the gateway re-attaches log tails and re-creates
+  // per-drv activities from this set after a reconnect.
+  repeated RunningDerivation running = 10;
+  // Terminal payload: populated when `state` is terminal, so a watcher
+  // that attaches after the build finished learns the outcome from the
+  // snapshot alone (mirrors BuildCompleted / BuildFailed / BuildCancelled).
+  repeated string output_paths = 11;        // SUCCEEDED: final output store paths
+  string error_message = 12;                // FAILED
+  string failed_derivation = 13;            // FAILED: which derivation caused it
+  BuildResultStatus failure_status = 14;    // FAILED: classification for nix-wire BuildStatus
+  string cancel_reason = 15;                // CANCELLED
+}
+
+// One currently-executing derivation in a BuildSnapshot.
+message RunningDerivation {
+  string derivation_path = 1;
+  // The execution this run corresponds to (UUIDv7 minted at dispatch; the
+  // same value DerivationEvent.exec_id carries on STARTED). Keys the
+  // gateway's log-tail subscription. Empty when the assignment has not
+  // minted an execution yet (Assigned, pod not yet pulled).
+  string exec_id = 2;
 }
 
 // Byte-level progress for a derivation's detached upstream substitute

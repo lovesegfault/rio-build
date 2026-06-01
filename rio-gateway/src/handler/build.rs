@@ -676,6 +676,144 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
     Ok(())
 }
 
+// r[impl gw.reconnect.snapshot-resync]
+/// Apply a `BuildSnapshot` (the first message on a WatchBuild stream) to
+/// the session's display state: short-circuit to a terminal outcome if the
+/// build finished while the gateway was detached, otherwise reconcile
+/// per-drv activities and log tails against the snapshot's running set and
+/// correct the aggregate progress counters.
+///
+/// This replaces event replay: instead of re-delivering the events the
+/// gateway missed, the scheduler describes the resulting state and the
+/// gateway diffs its own tracking against it.
+async fn apply_snapshot<W: AsyncWrite + Unpin>(
+    stderr: &mut StderrWriter<&mut W>,
+    act: &mut BuildActivityState,
+    tails: &mut LogTailSet,
+    snap: types::BuildSnapshot,
+) -> Result<Option<BuildEventOutcome>, StreamProcessError> {
+    // Terminal short-circuit: the build reached its outcome while we were
+    // detached. The snapshot carries the same payload the terminal event
+    // would have.
+    match snap.state() {
+        types::BuildState::Succeeded => return Ok(Some(BuildEventOutcome::Completed)),
+        types::BuildState::Failed => {
+            return Ok(Some(BuildEventOutcome::Failed {
+                status: snap.failure_status(),
+                error_message: snap.error_message,
+            }));
+        }
+        types::BuildState::Cancelled => {
+            return Ok(Some(BuildEventOutcome::Cancelled {
+                reason: snap.cancel_reason,
+            }));
+        }
+        _ => {}
+    }
+
+    // Ensure the root actBuilds activity exists. A reconnect that lands
+    // before BuildStarted arrived (stream broke between submit-accept and
+    // event 0) — or any fresh watch attach — needs the root for progress
+    // results and as the per-drv activity parent. The scheduler emits
+    // BuildStarted exactly once at merge and never re-delivers it, so the
+    // snapshot is what (re)creates the root in that case.
+    if act.builds_root.is_none() {
+        let aid = stderr
+            .start_activity(ActivityType::Builds, "", verbosity::DEBUG, 0, &[])
+            .await?;
+        act.builds_root = Some(aid);
+        let to_build = u64::from(
+            snap.total_derivations
+                .saturating_sub(snap.cached_derivations),
+        );
+        stderr
+            .result(
+                aid,
+                ResultType::SetExpected,
+                &[
+                    ResultField::Int(ActivityType::Build as u64),
+                    ResultField::Int(to_build),
+                ],
+            )
+            .await?;
+    }
+
+    let running: HashMap<&str, &str> = snap
+        .running
+        .iter()
+        .map(|r| (r.derivation_path.as_str(), r.exec_id.as_str()))
+        .collect();
+
+    // Tracked drvs that are no longer running: they reached a terminal
+    // state while we were detached (their Completed/Failed event is gone
+    // with the old stream). Stop their activities and arm the log tail's
+    // post-terminal drain so its final lines still land.
+    let gone: Vec<String> = act
+        .drv
+        .keys()
+        .filter(|drv| !running.contains_key(drv.as_str()))
+        .cloned()
+        .collect();
+    for drv in gone {
+        tails.on_terminal(&drv);
+        if let Some(aids) = act.subst.remove(&drv) {
+            stop_subst_pair(stderr, aids).await?;
+        }
+        if let Some(aid) = act.drv.remove(&drv) {
+            stderr.stop_activity(aid).await?;
+            debug!(%drv, "stop_activity sent (snapshot reconcile: drv no longer running)");
+        }
+    }
+
+    // Running drvs we don't track: they started while we were detached
+    // (their Started event is gone with the old stream). Start activities
+    // and attach log tails — the exec_id in the snapshot is what keys the
+    // tail subscription. `on_started` is idempotent for an unchanged
+    // exec_id and replaces the subscription on a re-dispatch.
+    for (drv, exec_id) in &running {
+        tails.on_started(drv, exec_id);
+        if !act.drv.contains_key(*drv) {
+            // Same actBuild shape as relay_derivation_status's Started arm.
+            if let Some(aids) = act.subst.remove(*drv) {
+                stop_subst_pair(stderr, aids).await?;
+            }
+            let aid = stderr
+                .start_activity(
+                    ActivityType::Build,
+                    &format!("building '{drv}'"),
+                    verbosity::INFO,
+                    act.builds_root.unwrap_or(0),
+                    &[
+                        ResultField::String((*drv).to_string()),
+                        ResultField::String(act.machine_name.clone()),
+                        ResultField::Int(1),
+                        ResultField::Int(1),
+                    ],
+                )
+                .await?;
+            act.drv.insert((*drv).to_string(), aid);
+        }
+    }
+
+    // Correct the aggregate display from the snapshot's absolute counts.
+    if let Some(aid) = act.builds_root {
+        stderr
+            .result(
+                aid,
+                ResultType::Progress,
+                &[
+                    ResultField::Int(u64::from(snap.completed_derivations)),
+                    ResultField::Int(u64::from(snap.total_derivations)),
+                    ResultField::Int(u64::from(snap.running_derivations)),
+                    ResultField::Int(u64::from(snap.failed_derivations)),
+                ],
+            )
+            .await?;
+    }
+
+    Ok(None)
+}
+
 /// Process a BuildEvent stream from the scheduler and translate events
 /// into STDERR protocol messages for the Nix client.
 ///
@@ -691,7 +829,6 @@ async fn relay_build_progress<W: AsyncWrite + Unpin>(
 async fn process_build_events<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     event_stream: &mut tonic::codec::Streaming<types::BuildEvent>,
-    active_build_ids: &mut HashMap<String, u64>,
     reconnect_attempts: &mut u32,
     act: &mut BuildActivityState,
     tails: &mut LogTailSet,
@@ -752,11 +889,6 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
         // not on stream-open Ok()).
         *reconnect_attempts = 0;
 
-        // Update active_build_ids with latest sequence
-        if let Some(seq) = active_build_ids.get_mut(&event.build_id) {
-            *seq = event.sequence;
-        }
-
         use types::build_event::Event;
         match event.event {
             Some(Event::Phase(phase)) => {
@@ -804,6 +936,14 @@ async fn process_build_events<W: AsyncWrite + Unpin>(
                 // arrived in Started above as SetExpected.
                 debug!("build inputs resolved");
             }
+            Some(Event::Snapshot(snap)) => {
+                // First message of a WatchBuild (reconnect) stream: the
+                // build's current state. Either short-circuits to a
+                // terminal outcome or reconciles activity/tail tracking.
+                if let Some(outcome) = apply_snapshot(stderr, act, tails, snap).await? {
+                    return Ok(outcome);
+                }
+            }
             Some(Event::Completed(_)) => return Ok(BuildEventOutcome::Completed),
             Some(Event::Failed(failed)) => {
                 return Ok(BuildEventOutcome::Failed {
@@ -835,7 +975,7 @@ enum BuildEventOutcome {
 
 /// Issue the `SubmitBuild` RPC and read its initial response metadata
 /// (`x-rio-build-id`, `x-rio-trace-id`). Records `build_id` in
-/// `active_build_ids` at seq=0 so a stream error before event 0 is
+/// `active_build_ids` so a stream error before event 0 is
 /// reconnectable. Emits the trace-id diagnostic line to the client.
 ///
 /// On `SubmitBuild` failure, logs a `STDERR_NEXT` diagnostic (NOT
@@ -846,7 +986,7 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
     stderr: &mut StderrWriter<&mut W>,
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     request: tonic::Request<types::SubmitBuildRequest>,
-    active_build_ids: &mut HashMap<String, u64>,
+    active_build_ids: &mut HashSet<String>,
 ) -> anyhow::Result<(String, tonic::codec::Streaming<types::BuildEvent>)> {
     let resp = match rio_common::grpc::with_timeout(
         "SubmitBuild",
@@ -901,11 +1041,10 @@ async fn submit_initial<W: AsyncWrite + Unpin>(
 
     let build_id = match header_build_id {
         Some(id) => {
-            // No event consumed yet. seq=0 is correct —
-            // process_build_events updates on every event received
-            // (see get_mut + *seq = event.sequence inside the loop).
-            // r[impl gw.reconnect.since-seq]
-            active_build_ids.insert(id.clone(), 0);
+            // Track for cancel-on-disconnect + reconnect. The scheduler's
+            // snapshot-first WatchBuild attach needs only the build_id —
+            // there is no event cursor to maintain.
+            active_build_ids.insert(id.clone());
             id
         }
         None => {
@@ -963,7 +1102,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     scheduler_client: &mut SchedulerServiceClient<Channel>,
     log_client: &rio_proto::LogServiceClient<Channel>,
     request: types::SubmitBuildRequest,
-    active_build_ids: &mut HashMap<String, u64>,
+    active_build_ids: &mut HashSet<String>,
     jwt_token: Option<&str>,
 ) -> anyhow::Result<BuildResult> {
     // Gateway is the trace ROOT (Nix doesn't speak W3C trace context).
@@ -977,9 +1116,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
 
     // Process remaining events, with reconnect on stream error.
     // Scheduler failover/restart drops the stream; we reconnect
-    // via WatchBuild(build_id, since_sequence=last_seen) with
-    // backoff (1s/2s/4s/8s/16s cap, max 10). The scheduler replays
-    // events from build_event_log past that sequence.
+    // via WatchBuild(build_id) with backoff (1s/2s/4s/8s/16s cap,
+    // max 10). The scheduler's snapshot-first attach describes the
+    // build's current state as the new stream's first message, so
+    // the gateway needs no cursor into the old stream — reconnect is
+    // connect → consume snapshot → continue.
     //
     // Without reconnect: scheduler restart mid-build → client's
     // `nix build` fails with MiscFailure even though the build
@@ -991,7 +1132,7 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
     // needs ~20-30s (start + lease acquire on 5s
     // tick). Found by vm-le-build-k3s under the replacement-wins-race
     // path — standby-wins was fast enough to mask it.
-    // r[impl gw.reconnect.backoff]
+    // r[impl gw.reconnect.backoff+2]
     const MAX_RECONNECT: u32 = 10;
     const RECONNECT_BACKOFF: rio_common::backoff::Backoff = rio_common::backoff::Backoff {
         base: std::time::Duration::from_secs(1),
@@ -1015,7 +1156,6 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
         match process_build_events(
             stderr,
             &mut event_stream,
-            active_build_ids,
             &mut reconnect_attempts,
             &mut act,
             &mut tails,
@@ -1045,17 +1185,11 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                     break Err(e);
                 }
 
-                // active_build_ids tracks last seq (updated on
-                // every event above). 0 if no events arrived yet —
-                // WatchBuild with since=0 replays from the start.
-                let since_seq = active_build_ids.get(&build_id).copied().unwrap_or(0);
-
                 let backoff = RECONNECT_BACKOFF.duration(reconnect_attempts - 1);
                 tracing::warn!(
                     %build_id,
                     error = %e,
                     attempt = reconnect_attempts,
-                    since_seq,
                     backoff_secs = backoff.as_secs(),
                     "BuildEvent stream error; reconnecting via WatchBuild"
                 );
@@ -1085,13 +1219,13 @@ async fn submit_and_process_build<W: AsyncWrite + Unpin>(
                 let watch_req = with_jwt(
                     types::WatchBuildRequest {
                         build_id: build_id.clone(),
-                        since_sequence: since_seq,
+                        since_sequence: 0,
                     },
                     jwt_token,
                 )?;
                 match scheduler_client.watch_build(watch_req).await {
                     Ok(resp) => {
-                        tracing::info!(%build_id, since_seq, "reconnected via WatchBuild");
+                        tracing::info!(%build_id, "reconnected via WatchBuild");
                         event_stream = resp.into_inner();
                         // DON'T reset reconnect_attempts here —
                         // WatchBuild Ok() only proves the scheduler

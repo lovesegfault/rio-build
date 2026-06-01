@@ -363,7 +363,7 @@ Build progress is streamed to clients (gateways and dashboard) via
 ```protobuf
 message BuildEvent {
   string build_id = 1;
-  uint64 sequence = 2;                     // Monotonic, for stream resumption
+  uint64 sequence = 2;                     // Vestigial; snapshot-first attach replaced resumption
   google.protobuf.Timestamp timestamp = 3;
   oneof event {
     BuildStarted started = 4;
@@ -375,6 +375,7 @@ message BuildEvent {
     BuildFailed failed = 9;
     BuildCancelled cancelled = 10;
     BuildInputsResolved inputs_resolved = 11;  // CA placeholder resolution finished (post-BFS, pre-dispatch)
+    BuildSnapshot snapshot = 14;           // Full-state snapshot (first WatchBuild message)
   }
 }
 
@@ -390,9 +391,11 @@ message DerivationEvent {
 }
 ```
 
-The `sequence` field enables stream resumption: `WatchBuild` accepts a
-`since_sequence` parameter so gateways can reconnect after a restart and resume
-from where they left off (requires the scheduler to buffer recent events).
+Reconnection is snapshot-first: a `WatchBuild` stream's first message is a
+`BuildSnapshot` describing the build's current state (aggregate counts, the
+per-derivation running set, terminal outcome if any), then the live broadcast
+follows. There is no event cursor and no replay --- see the scheduler spec's
+snapshot-first rule.
 
 === SubmitBuildRequest
 
@@ -489,7 +492,7 @@ use this to subscribe to an existing build's event stream:
 ```protobuf
 message WatchBuildRequest {
   string build_id = 1;
-  uint64 since_sequence = 2;  // Resume from this sequence number (0 = from start)
+  uint64 since_sequence = 2;  // Vestigial; ignored (snapshot-first attach)
 }
 ```
 

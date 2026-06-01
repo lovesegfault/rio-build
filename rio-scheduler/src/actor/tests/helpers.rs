@@ -332,7 +332,6 @@ pub(crate) async fn subscribe_log(
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
             caller_tenant: None,
-            since_sequence: 0,
             reply: tx,
         })
         .await?;

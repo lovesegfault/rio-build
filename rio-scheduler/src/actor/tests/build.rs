@@ -10,16 +10,20 @@ enum Terminalize {
     Cancel,
 }
 
-/// Late WatchBuild on an already-terminal build immediately replays the
-/// terminal event (Completed/Failed/Cancelled). Without re-send: if the
-/// original event was sent to zero receivers (submit subscriber
-/// disconnected before completion), a late WatchBuild would hang forever.
+// r[verify sched.watch.snapshot-first]
+/// Late WatchBuild on an already-terminal build: the attach snapshot itself
+/// reports the terminal state and outcome payload. Without it, a watcher
+/// that subscribes after the terminal event was broadcast (possibly to zero
+/// receivers) would hang forever — the property the deleted terminal-event
+/// re-send / since_sequence replay used to provide.
 #[rstest::rstest]
 #[case::completed(Terminalize::Success)]
 #[case::failed(Terminalize::PermanentFailure)]
 #[case::cancelled(Terminalize::Cancel)]
 #[tokio::test]
-async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize) -> TestResult {
+async fn test_watch_build_after_terminal_snapshot_reports_outcome(
+    #[case] how: Terminalize,
+) -> TestResult {
     let (_db, handle, _task) = setup().await;
 
     let build_id = Uuid::new_v4();
@@ -56,31 +60,140 @@ async fn test_watch_build_after_terminal_replays_event(#[case] how: Terminalize)
     barrier(&handle).await;
     drop(original_rx);
 
-    // Late WatchBuild → terminal event replayed within 2s, not hang.
+    // Late WatchBuild → the snapshot reports the terminal outcome. No
+    // event needs to arrive on the broadcast at all.
     let (reply_tx, reply_rx) = oneshot::channel();
     handle
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
             caller_tenant: None,
-            since_sequence: 0,
             reply: reply_tx,
         })
         .await?;
-    let (mut watch_rx, _) = reply_rx.await??;
+    let (_watch_rx, snapshot) = reply_rx.await??;
 
-    let event = tokio::time::timeout(Duration::from_secs(2), watch_rx.state.recv())
-        .await
-        .expect("WatchBuild on terminal build should not hang")
-        .expect("should receive an event");
-    let ok = match how {
-        Terminalize::Success => matches!(event.event, Some(Event::Completed(_))),
-        Terminalize::PermanentFailure => matches!(event.event, Some(Event::Failed(_))),
-        Terminalize::Cancel => matches!(event.event, Some(Event::Cancelled(_))),
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!(
+            "WatchBuild reply must carry a Snapshot event, got {:?}",
+            snapshot.event
+        );
     };
+    match how {
+        Terminalize::Success => {
+            assert_eq!(
+                snap.state,
+                rio_proto::types::BuildState::Succeeded as i32,
+                "snapshot reports Succeeded"
+            );
+            assert!(
+                snap.error_message.is_empty() && snap.cancel_reason.is_empty(),
+                "no failure payload on success: {snap:?}"
+            );
+        }
+        Terminalize::PermanentFailure => {
+            assert_eq!(
+                snap.state,
+                rio_proto::types::BuildState::Failed as i32,
+                "snapshot reports Failed"
+            );
+            assert!(
+                !snap.error_message.is_empty(),
+                "failure payload populated: {snap:?}"
+            );
+        }
+        Terminalize::Cancel => {
+            assert_eq!(
+                snap.state,
+                rio_proto::types::BuildState::Cancelled as i32,
+                "snapshot reports Cancelled"
+            );
+            assert!(
+                !snap.cancel_reason.is_empty(),
+                "cancel reason populated: {snap:?}"
+            );
+        }
+    }
+    Ok(())
+}
+
+// r[verify sched.watch.snapshot-first]
+/// WatchBuild on an ACTIVE build returns a snapshot carrying the current
+/// aggregate counts and the per-drv running set (with the exec_id minted at
+/// dispatch), then the live broadcast continues from exactly that point —
+/// the reconnecting-gateway property the deleted since_sequence replay used
+/// to provide, now provided by state snapshot instead of event history.
+#[tokio::test]
+async fn test_watch_build_active_snapshot_counts_and_running_set() -> TestResult {
+    let (_db, handle, _task) = setup().await;
+
+    let build_id = Uuid::new_v4();
+    let _original = merge_single_node(
+        &handle,
+        build_id,
+        "snap-active-hash",
+        PriorityClass::Scheduled,
+    )
+    .await?;
+    barrier(&handle).await;
+
+    // Open the pull attempt: the drv is dispatched with a minted exec_id.
+    let assignment = pull_attempt(&handle, "snap-active-hash").await;
+    barrier(&handle).await;
+
+    // A "reconnecting" watcher attaches with no event history at all.
+    let (reply_tx, reply_rx) = oneshot::channel();
+    handle
+        .send_unchecked(ActorCommand::WatchBuild {
+            build_id,
+            caller_tenant: None,
+            reply: reply_tx,
+        })
+        .await?;
+    let (mut watch_rx, snapshot) = reply_rx.await??;
+
+    let Some(Event::Snapshot(snap)) = snapshot.event else {
+        panic!(
+            "WatchBuild reply must carry a Snapshot event, got {:?}",
+            snapshot.event
+        );
+    };
+    assert_eq!(
+        snap.state,
+        rio_proto::types::BuildState::Active as i32,
+        "active build → Active snapshot"
+    );
+    assert_eq!(snap.total_derivations, 1);
+    assert_eq!(snap.completed_derivations, 0);
+    assert_eq!(
+        snap.running_derivations, 1,
+        "the dispatched drv counts as running: {snap:?}"
+    );
+    // The running set carries the exec_id the gateway needs to re-attach
+    // the log tail for an execution whose Started event it never saw.
+    assert_eq!(snap.running.len(), 1, "running set: {snap:?}");
+    assert_eq!(
+        snap.running[0].exec_id, assignment.exec_id,
+        "snapshot exec_id matches the open attempt's"
+    );
+
+    // Snapshot + live continuity: the completion emitted AFTER the
+    // snapshot arrives on the broadcast — no replay, no gap, no dedup.
+    pull_complete_success_empty(&handle, "snap-active-hash").await?;
+    let mut saw_completed = false;
+    for _ in 0..10 {
+        match tokio::time::timeout(Duration::from_millis(200), watch_rx.state.recv()).await {
+            Ok(Ok(event)) => {
+                if matches!(event.event, Some(Event::Completed(_))) {
+                    saw_completed = true;
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
     assert!(
-        ok,
-        "late WatchBuild should replay terminal; got {:?}",
-        event.event
+        saw_completed,
+        "events emitted after the snapshot arrive via the live broadcast"
     );
     Ok(())
 }
@@ -212,11 +325,10 @@ async fn test_watch_build_receives_events() -> TestResult {
         .send_unchecked(ActorCommand::WatchBuild {
             build_id,
             caller_tenant: None,
-            since_sequence: 0,
             reply: reply_tx,
         })
         .await?;
-    let (mut watch_rx, _last_seq) = reply_rx.await??;
+    let (mut watch_rx, _snapshot) = reply_rx.await??;
 
     // Complete the build; watcher should see BuildCompleted.
     pull_complete_success_empty(&handle, "watch-events-hash").await?;

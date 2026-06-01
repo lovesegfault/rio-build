@@ -18,7 +18,7 @@ use rio_proto::SchedulerService;
 use crate::actor::{ActorCommand, MergeDagRequest};
 use crate::state::BuildOptions;
 
-use super::{EventReplay, SchedulerGrpc, bridge_build_events, resolve_tenant_name};
+use super::{SchedulerGrpc, bridge_build_events, resolve_tenant_name};
 
 #[tonic::async_trait]
 impl SchedulerService for SchedulerGrpc {
@@ -225,8 +225,9 @@ impl SchedulerService for SchedulerGrpc {
             tracing::Span::current().record("tenant_id", tracing::field::display(tid));
         }
         info!(build_id = %build_id, "build submitted");
-        // No replay: fresh build, MergeDag subscribed BEFORE seq=1
-        // (Started) was emitted. last_seq=0, no gap. Pure broadcast.
+        // No snapshot: fresh build, MergeDag subscribed BEFORE the first
+        // event (Started) was emitted — there is no missed state to
+        // summarize. Pure broadcast.
         let mut resp = Response::new(bridge_build_events("submit-build-bridge", bcast, None));
         // Initial metadata: build_id. Reaches the client as soon as
         // this function returns Ok — BEFORE bridge_build_events' task
@@ -268,6 +269,7 @@ impl SchedulerService for SchedulerGrpc {
 
     type WatchBuildStream = ReceiverStream<Result<rio_proto::types::BuildEvent, Status>>;
 
+    // r[impl sched.watch.snapshot-first]
     #[instrument(skip(self, request), fields(rpc = "WatchBuild"))]
     async fn watch_build(
         &self,
@@ -286,42 +288,20 @@ impl SchedulerService for SchedulerGrpc {
         let cmd = ActorCommand::WatchBuild {
             build_id,
             caller_tenant,
-            since_sequence: req.since_sequence,
             reply: reply_tx,
         };
 
-        let (bcast, last_seq) = self.send_and_await(cmd, reply_rx).await?;
-
-        // Replay IF: pool available AND there's a gap to fill.
-        // `since_sequence >= last_seq` → gateway already saw
-        // everything, empty range, skip the PG round-trip.
-        // `since_sequence == 0 && last_seq == 0` → build just
-        // started, nothing emitted yet — common case, cheap exit.
-        //
-        // `since_sequence > last_seq` (counter regressed): defensive
-        // full replay from 0. Shouldn't happen now that Log doesn't
-        // consume seq numbers (event.rs), but a gateway that connected
-        // to a pre-fix scheduler can carry an inflated `since`.
-        let replay = match &self.db {
-            Some(db) if req.since_sequence < last_seq => Some(EventReplay {
-                pool: db.pool().clone(),
-                build_id,
-                since: req.since_sequence,
-                last_seq,
-            }),
-            Some(db) if req.since_sequence > last_seq && last_seq > 0 => Some(EventReplay {
-                pool: db.pool().clone(),
-                build_id,
-                since: 0,
-                last_seq,
-            }),
-            _ => None,
-        };
+        // Snapshot-first attach: the actor computed the snapshot
+        // atomically with the broadcast subscription, so sending it as
+        // the stream's first message followed by the live broadcast is
+        // gap-free by construction — no sequence numbers, no PG replay,
+        // no dedup.
+        let (bcast, snapshot) = self.send_and_await(cmd, reply_rx).await?;
 
         Ok(Response::new(bridge_build_events(
             "watch-build-bridge",
             bcast,
-            replay,
+            Some(snapshot),
         )))
     }
 
