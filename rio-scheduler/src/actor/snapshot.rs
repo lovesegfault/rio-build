@@ -426,6 +426,21 @@ impl DagActor {
             if state.status() != DerivationStatus::Ready {
                 continue;
             }
+            // r[impl sched.materialize.job]
+            // PD-7 (Phase B, design §2.3): nodes with an unresolved
+            // materialization job are never spawn-intent candidates —
+            // the controller must not spawn builder pods for work that
+            // will be materialized. Excluded BEFORE the per-system
+            // aggregate so GetSpawnIntents.queued_by_system stays
+            // coherent with ClusterSnapshot.queued_by_system (the §2.6
+            // bucket exclusion's controller-facing twin); retires the
+            // CE-59 spawn-intent churn class as a side effect. Claimed
+            // jobs' nodes are Assigned/Running and already excluded by
+            // the status check above. Flag-gated: flag-off the spawn
+            // stream is byte-identical to baseline (criterion 2).
+            if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash) {
+                continue;
+            }
             // Per-system aggregate: counted BEFORE the kind/feature
             // filters so it matches `ClusterSnapshot.queued_by_system`
             // (the ComponentScaler reads this independent of which
@@ -559,6 +574,15 @@ impl DagActor {
             let now = std::time::Instant::now();
             'q: for (drv_hash, state) in self.dag.iter_nodes() {
                 if state.status() != DerivationStatus::Queued {
+                    continue;
+                }
+                // r[impl sched.materialize.job]
+                // PD-7: the same unresolved-job exclusion as the Ready
+                // pass — a Queued node with a pending materialization
+                // job will be materialized (the PD-6 dep-racing claim),
+                // so forecasting a builder pod for it is exactly the
+                // churn the filter exists to prevent.
+                if self.materialization_cfg.enabled && self.has_pending_unclaimed_job(drv_hash) {
                     continue;
                 }
                 let kind = crate::state::kind_for_drv(state.is_fixed_output);
