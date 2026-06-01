@@ -563,20 +563,40 @@ impl DagActor {
         // so in-memory and DB state stay consistent. After this returns
         // Ok the build is committed (Active); later DB writes are
         // log-and-continue.
-        if let Err(e) = self
+        // Substitution-replacement: the new_sub lane (newly-inserted
+        // pending_substitute nodes; the reprobe lane is excluded — its
+        // creation site is Phase B work together with the AS-5 status
+        // reset). Computed BEFORE persist so the in-tx job creation
+        // (adjudication PDQ-9) can ride the merge transaction. Flag-off
+        // the lane is passed but the in-tx block never reads it.
+        let new_sub_lane: Vec<DrvHash> = pending_substitute
+            .iter()
+            .filter(|(h, _)| !existing_reprobe.contains(h))
+            .map(|(h, _)| h.clone())
+            .collect();
+        let created_jobs = match self
             .persist_and_activate(
                 build_id,
                 &nodes,
                 &edges,
                 &merge_result,
                 &pruned_closure_parents,
+                tenant_id,
+                &new_sub_lane,
             )
             .await
         {
-            self.cleanup_failed_merge(build_id, merge_result).await;
-            return Err(e);
-        }
+            Ok(jobs) => jobs,
+            Err(e) => {
+                self.cleanup_failed_merge(build_id, merge_result).await;
+                return Err(e);
+            }
+        };
         phase!("5-persist-and-activate");
+        // Post-commit: feed the in-memory job view from the merge
+        // transaction's created jobs (never inside the tx — the view is
+        // a droppable cache; a rolled-back merge must leave no entry).
+        self.note_created_materialization_jobs(&created_jobs);
         let _ = &mut t_phase; // last phase! write is intentionally unread
 
         // r[impl sched.merge.substitute-topdown+12]
@@ -681,6 +701,14 @@ impl DagActor {
     /// succeeds. (The topdown fail-fast still clears the marker it
     /// consumes, as defense-in-depth for stale-flag shapes that do not
     /// involve this path at all.)
+    /// `tenant_id` / `new_sub_lane`: substitution-replacement inputs for
+    /// the flag-gated in-tx job creation (adjudication PDQ-9). Returns
+    /// the jobs that transaction created so the caller can feed the
+    /// in-memory view POST-commit (empty flag-off).
+    // The argument list mirrors the persist transaction's write set
+    // (same precedent as persist_merge_to_db / the other multi-column
+    // writers).
+    #[allow(clippy::too_many_arguments)]
     async fn persist_and_activate(
         &mut self,
         build_id: Uuid,
@@ -688,13 +716,17 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         merge_result: &crate::dag::MergeResult,
         topdown_pruned_parents: &HashSet<String>,
-    ) -> Result<(), ActorError> {
-        self.persist_merge_to_db(
+        tenant_id: Option<Uuid>,
+        new_sub_lane: &[DrvHash],
+    ) -> Result<Vec<super::materialize::CreatedJob>, ActorError> {
+        let created_jobs = self.persist_merge_to_db(
             build_id,
             nodes,
             edges,
             &merge_result.newly_inserted,
             topdown_pruned_parents,
+            tenant_id,
+            new_sub_lane,
         )
         .await
         .inspect_err(
@@ -745,7 +777,7 @@ impl DagActor {
             "Pending→Active rejected on fresh build (BuildInfo::transition bug)"
         );
         let _ = applied;
-        Ok(())
+        Ok(created_jobs)
     }
 
     /// Step 6 of merge: post-Active reconciliation. Transitions
@@ -935,7 +967,23 @@ impl DagActor {
         // completed a chain that included them) fall through to normal
         // scheduling.
         if !new_sub.is_empty() {
-            self.spawn_substitute_fetches(new_sub, sub_auth).await;
+            if self.materialization_cfg.enabled {
+                // r[impl sched.materialize.job]
+                // Substitution-replacement: this lane's jobs were created
+                // INSIDE the merge transaction (adjudication PDQ-9); the
+                // job row is the in-flight marker and the nodes stay
+                // Ready (claimable by store replicas) — no walk spawns.
+                // The reprobe lane (6d above) keeps spawning walks
+                // flag-on (the OQ7 partial-coexistence posture; its job
+                // creation is Phase B work together with the AS-5
+                // status-reset obligation).
+                debug!(
+                    count = new_sub.len(),
+                    "new_sub lane routed to materialization jobs; no walks spawned"
+                );
+            } else {
+                self.spawn_substitute_fetches(new_sub, sub_auth).await;
+            }
         }
         phase!("6g-spawn-substitute-new");
 
@@ -1978,7 +2026,17 @@ impl DagActor {
     /// Inside the same transaction so a rejected merge can never
     /// leak the marker into PG, and a committed one can never lose it
     /// to a failover that races the in-memory stamp.
+    ///
+    /// Substitution-replacement (adjudication PDQ-9 / design A13/B6):
+    /// flag-on, the same transaction also writes the wanted relation
+    /// for every (build, node) pair and creates materialization jobs
+    /// for the pruned roots and the new_sub lane — riding the same
+    /// claims-floor fence (no extra floor read). The created jobs are
+    /// returned so the caller can feed the in-memory view POST-commit.
+    /// Flag-off the block is not entered and the transaction executes
+    /// byte-identically to the as-built form.
     // r[impl sched.evidence.durability+2]
+    #[allow(clippy::too_many_arguments)]
     async fn persist_merge_to_db(
         &mut self,
         build_id: Uuid,
@@ -1986,7 +2044,9 @@ impl DagActor {
         edges: &[crate::domain::DerivationEdge],
         newly_inserted: &HashSet<DrvHash>,
         topdown_pruned_parents: &HashSet<String>,
-    ) -> Result<(), ActorError> {
+        tenant_id: Option<Uuid>,
+        new_sub_lane: &[DrvHash],
+    ) -> Result<Vec<super::materialize::CreatedJob>, ActorError> {
         // Build input rows for batch upsert.
         let node_rows: Vec<_> = nodes
             .iter()
@@ -2141,6 +2201,92 @@ impl DagActor {
         // commit succeeds.
         crate::db::SchedulerDb::activate_build_tx(&mut tx, build_id).await?;
 
+        // Batch 5 (substitution-replacement Phase A, flag-gated): the
+        // wanted relation + materialization-job creation, INSIDE this
+        // transaction (adjudication PDQ-9 / design §2.1 rows 1–2 /
+        // A13 / B6): a rolled-back merge creates no jobs; a committed
+        // one cannot lose them to a failover racing the post-commit
+        // phase. The writes ride this transaction's claims-floor fence
+        // (begin-time check above, authoritative re-check below) — one
+        // fence per transaction, no extra floor read. Flag-off the
+        // whole block is skipped and the transaction is byte-identical
+        // to the as-built form.
+        let created_jobs: Vec<super::materialize::CreatedJob> = if self.materialization_cfg.enabled
+        {
+            // (a) The durable wanted relation — one row per
+            // (build, node) pair, written by every merge regardless of
+            // routing (design §6 / AS-1).
+            // r[impl sched.materialize.job]
+            let wanted_rows: Vec<crate::db::wanted::WantedRow<'_>> = nodes
+                .iter()
+                .filter_map(|node| {
+                    let (db_id, _) = id_map.get(node.drv_hash.as_str())?;
+                    Some(crate::db::wanted::WantedRow {
+                        build_id,
+                        derivation_id: *db_id,
+                        wanted_output_names: &node.wanted_output_names,
+                    })
+                })
+                .collect();
+            crate::db::SchedulerDb::record_wanted_in_tx(&mut tx, &wanted_rows).await?;
+
+            // (b) Job creation: pruned-origin rows first (kept roots
+            // whose dependency closure this prune dropped — the same
+            // nodes the topdown_pruned row stamp covers; the as-built
+            // comment on that stamp states exactly the crash-atomicity
+            // property the in-tx job INSERT preserves), then the
+            // new_sub lane (origin=cache_opportunity — the nodes the
+            // post-commit phase 6g would have routed to the walk).
+            // A node in both sets is queued ONCE with the pruned
+            // origin (the more specific classification).
+            let mut job_rows: Vec<crate::db::materialization::NewJobRow<'_>> = Vec::new();
+            for node in nodes {
+                if topdown_pruned_parents.contains(node.drv_hash.as_str())
+                    && !self.closure_vouched(&node.drv_hash)
+                    && let Some((db_id, _)) = id_map.get(node.drv_hash.as_str())
+                {
+                    job_rows.push(crate::db::materialization::NewJobRow {
+                        derivation_id: *db_id,
+                        drv_hash: node.drv_hash.as_str(),
+                        tenant_id,
+                        origin: crate::state::JobOrigin::Pruned,
+                    });
+                }
+            }
+            let pruned_set: std::collections::HashSet<&str> =
+                job_rows.iter().map(|r| r.drv_hash).collect();
+            for drv_hash in new_sub_lane {
+                if !pruned_set.contains(drv_hash.as_str())
+                    && let Some((db_id, _)) = id_map.get(drv_hash.as_str())
+                {
+                    job_rows.push(crate::db::materialization::NewJobRow {
+                        derivation_id: *db_id,
+                        drv_hash: drv_hash.as_str(),
+                        tenant_id,
+                        origin: crate::state::JobOrigin::CacheOpportunity,
+                    });
+                }
+            }
+            let created = crate::db::SchedulerDb::create_materialization_jobs_in_tx(
+                &mut tx,
+                &job_rows,
+                serving_generation,
+            )
+            .await?;
+            job_rows
+                .iter()
+                .zip(created)
+                .map(|(row, (job_id, created))| super::materialize::CreatedJob {
+                    drv_hash: DrvHash::from(row.drv_hash),
+                    job_id,
+                    created,
+                    origin: row.origin,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // r[verify sched.db.tx-commit-before-mutate]
         // In-mem mutation ordering invariant: no newly-inserted node has
         // db_id set BEFORE commit. If this fires, someone re-introduced
@@ -2230,7 +2376,7 @@ impl DagActor {
                 }
             }
         }
-        Ok(())
+        Ok(created_jobs)
     }
 
     /// Undo all in-memory state from a failed handle_merge_dag AFTER the

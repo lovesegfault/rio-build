@@ -102,6 +102,7 @@
     "rio_scheduler_lease_acquired_total",
     "rio_scheduler_lease_lost_total",
     "rio_scheduler_malformed_built_output_total",
+    "rio_scheduler_materialization_jobs_created_total",
     "rio_scheduler_merge_phase_seconds",
     "rio_scheduler_open_attempts",
     "rio_scheduler_orphan_builds_cancelled_total",
@@ -723,6 +724,11 @@
         "name": "rio_scheduler_malformed_built_output_total",
         "kind": "counter",
         "help": "Worker-supplied BuiltOutput.output_path that failed StorePath::parse (dropped at handle_completion boundary); alert if rate > 0"
+      },
+      {
+        "name": "rio_scheduler_materialization_jobs_created_total",
+        "kind": "counter",
+        "help": "Materialization jobs created (substitution-replacement campaign), labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). Dedup-found existing jobs do not count. Always zero while scheduler.materialization.enabled = false (the Phase A deployed state) — a nonzero value flag-off is a dormancy violation."
       },
       {
         "name": "rio_scheduler_merge_phase_seconds",

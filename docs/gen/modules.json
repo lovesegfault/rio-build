@@ -892,6 +892,11 @@
       "doc": "Periodic Tick housekeeping: orphan-watcher sweep, poison-TTL"
     },
     {
+      "path": "actor/materialize.rs",
+      "depth": 1,
+      "doc": "Materialization-job actor logic (substitution-replacement Phase A)."
+    },
+    {
       "path": "actor/merge.rs",
       "depth": 1,
       "doc": "DAG merge handling: SubmitBuild → merge client DAG into global DAG."

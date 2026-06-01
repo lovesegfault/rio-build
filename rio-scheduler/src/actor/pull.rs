@@ -267,11 +267,9 @@ impl DagActor {
             materialization_enabled: self.materialization_cfg.enabled,
             pull_kind: kind,
             // The job view: projected from the actor's in-memory job
-            // map, which is populated only by the flag-gated creation
-            // paths (none exist yet — the creation gate lands with the
-            // job-creation handlers). Until then every node is job-less,
-            // which flag-off is also the only correct answer.
-            job_view: rio_evidence_kernel::pull::JobView::None,
+            // map (populated only by the flag-gated creation paths, so
+            // flag-off this is always JobView::None and costs nothing).
+            job_view: self.materialization_job_view(&drv_hash, &pulling_identity),
         });
 
         match decision {
@@ -408,6 +406,15 @@ impl DagActor {
                 "pull mint aborted by the generation fence; no row written"
             );
             return Err(PullRejection::StaleGeneration);
+        }
+
+        // Substitution-replacement: a committed materialization mint is
+        // the claim — note it in the in-memory job view so the kernel's
+        // one-winner arbitration (Claimed{held_by_puller}) answers
+        // re-pulls and competing claims correctly. Reachable only
+        // flag-on (no materialization pull is delivered flag-off).
+        if attempt_kind == crate::state::AttemptKind::Materialization {
+            self.note_materialization_claimed(drv_hash, pulling_identity);
         }
 
         // r[impl sched.sla.hw-class.ice-mask]

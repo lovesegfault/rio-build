@@ -21,6 +21,7 @@ mod fencing;
 mod integration;
 mod keep_going;
 mod lifecycle_sweep;
+mod materialize;
 mod merge;
 mod misc;
 mod pull;

@@ -193,6 +193,9 @@ impl DagActor {
         // reaped. The Substituting branch already batched.
         let mut locally_present = Vec::new();
         let mut to_spawn = Vec::new();
+        // Substitution-replacement (flag-on only): nodes routed to a
+        // materialization job instead of the detached walk.
+        let mut to_create_job: Vec<DrvHash> = Vec::new();
         // Topdown-pruned roots with broken closure evidence (childless
         // or closure-holed) whose wanted set can neither complete
         // inline nor route to substitution: fail fast instead of
@@ -260,11 +263,20 @@ impl DagActor {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
                 })
             {
-                // r[impl sched.merge.substitute-probe-indeterminate]
-                // Indeterminate treated optimistically — same as
-                // merge.rs. The closure walk's failure path falls
-                // through to build via `substitute_tried`.
-                to_spawn.push((drv_hash, paths));
+                if self.materialization_cfg.enabled {
+                    // r[impl sched.materialize.job]
+                    // Substitution-replacement: route to a materialization
+                    // job instead of the detached walk. The job row is the
+                    // in-flight marker; the node stays Ready (claimable by
+                    // a store replica).
+                    to_create_job.push(drv_hash);
+                } else {
+                    // r[impl sched.merge.substitute-probe-indeterminate]
+                    // Indeterminate treated optimistically — same as
+                    // merge.rs. The closure walk's failure path falls
+                    // through to build via `substitute_tried`.
+                    to_spawn.push((drv_hash, paths));
+                }
             } else if self.must_substitute(&drv_hash) {
                 if wanted.iter().all(|p| {
                     !missing.contains(p) || substitutable.contains(p) || indeterminate.contains(p)
@@ -295,6 +307,17 @@ impl DagActor {
         }
         self.complete_ready_from_store_batch(&locally_present).await;
         self.spawn_substitute_fetches(to_spawn, auth).await;
+        // Substitution-replacement (flag-on only; the vec stays empty
+        // flag-off): the probe-partition creation site — the standalone
+        // fenced helper, no enclosing transaction (design §2.1 row 3).
+        for drv_hash in &to_create_job {
+            self.create_materialization_job_if_enabled(
+                drv_hash,
+                crate::state::JobOrigin::CacheOpportunity,
+                None,
+            )
+            .await;
+        }
         for drv_hash in &to_fail_fast {
             self.fail_fast_topdown_pruned_root(
                 drv_hash,

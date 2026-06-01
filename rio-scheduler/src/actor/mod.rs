@@ -318,6 +318,14 @@ pub struct DagActor {
     /// as-built when off), and every other consumer (job creation,
     /// consumption, establishment) is flag-gated on it.
     materialization_cfg: crate::config::MaterializationConfig,
+    /// In-memory materialization-job view: `drv_hash → JobViewEntry`
+    /// (substitution-replacement Phase A). A droppable cache — never
+    /// written back, populated only by the flag-gated creation paths
+    /// (so flag-off it is permanently empty), consulted by pull
+    /// admission's job-view projection. Authority lives in PG
+    /// (`materialization_jobs` + the partial-unique dedup index);
+    /// recovery rebuild is Phase B.
+    materialization_jobs: HashMap<DrvHash, materialize::JobViewEntry>,
     /// Database handle.
     db: SchedulerDb,
     /// Store service client for scheduler-side cache checks. `None` in tests
@@ -734,6 +742,7 @@ impl DagActor {
             poison_config: cfg.poison,
             establishment_report_slack: cfg.establishment_report_slack,
             materialization_cfg: cfg.materialization,
+            materialization_jobs: HashMap::new(),
             db,
             store_client: plumbing.store_client,
             grpc_timeout: cfg.grpc_timeout,
@@ -855,6 +864,7 @@ impl DagActor {
             dispatched_cells,
             authoritative_binding,
             dag_authoritative,
+            materialization_jobs,
             // Retained: rationale below.
             retry_policy: _,
             establishment_report_slack: _,
@@ -937,6 +947,11 @@ impl DagActor {
         // establishment sweep attribute a re-dispatched drv to a
         // previous-generation node.
         authoritative_binding.clear();
+        // The materialization-job view is a droppable per-tenure cache
+        // of PG rows; a new tenure rebuilds it from PG (Phase B) or
+        // re-populates it from its own creation paths. Stale entries
+        // would project job state for a DAG this wipe just discarded.
+        materialization_jobs.clear();
         // The DAG this fn just emptied no longer reflects PG; only the
         // next successful recovery (handle_leader_acquired's Ok arm)
         // re-asserts authoritativeness. Clearing HERE covers all four

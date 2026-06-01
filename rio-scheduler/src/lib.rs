@@ -294,6 +294,14 @@ pub fn describe_metrics() {
          attempt_requeue histogram's establishment cause is shared with the \
          stream-mode correlation-TTL sweep and is unsuitable for that alert."
     );
+    describe_counter!(
+        "rio_scheduler_materialization_jobs_created_total",
+        "Materialization jobs created (substitution-replacement campaign), \
+         labeled by origin (pruned|cache_opportunity|stale_reset|reprobe). \
+         Dedup-found existing jobs do not count. Always zero while \
+         scheduler.materialization.enabled = false (the Phase A deployed \
+         state) — a nonzero value flag-off is a dormancy violation."
+    );
     describe_histogram!(
         "rio_scheduler_critical_path_accuracy",
         "Predicted vs actual completion ratio (actual/estimated; 1.0=perfect, >1.0=underestimate)"
