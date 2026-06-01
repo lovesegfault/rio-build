@@ -103,5 +103,11 @@ pub(crate) fn actor_error_to_status(err: ActorError) -> Status {
         // Same string as `ensure_leader` above so operators grep for
         // one signature.
         ActorError::NotLeader => Status::unavailable("not leader (standby replica)"),
+        // r[impl sched.persist.settled-identity-freeze]
+        // Client-actionable conflict with a settled (successfully built)
+        // derivation record — same FAILED_PRECONDITION class as the
+        // merge gate's authoritative-content conflicts; the variant's
+        // #[error] text carries the remediation.
+        ActorError::SettledIdentityConflict { .. } => Status::failed_precondition(err.to_string()),
     }
 }

@@ -919,6 +919,25 @@ pub enum ActorError {
     /// so BalancedChannel clients retry against the new leader.
     #[error("not leader (standby replica)")]
     NotLeader,
+
+    /// `r[sched.persist.settled-identity-freeze]`: a submission tried to
+    /// (re)create a derivation whose persisted row is SETTLED
+    /// (completed/skipped — the durable record of a successful build,
+    /// possibly already reaped from the DAG) under a conflicting
+    /// identity, or without the content-bound evidence needed to prove
+    /// it is the same derivation. Maps to FAILED_PRECONDITION
+    /// (client-actionable conflict): if the settled record is a squat on
+    /// this derivation's hash, ask an operator to clear it; if this is a
+    /// legitimate rebuild, resubmit with the same declared identity the
+    /// original carried.
+    #[error(
+        "derivation {drv_path} has a settled (successfully built) record \
+         with a different identity; re-creating it would erase that \
+         record. If the settled record is a squat, ask an operator to \
+         clear it; if this is a legitimate rebuild, resubmit with the \
+         original declared identity"
+    )]
+    SettledIdentityConflict { drv_path: String },
 }
 
 /// Read-only view of the actor's backpressure state.

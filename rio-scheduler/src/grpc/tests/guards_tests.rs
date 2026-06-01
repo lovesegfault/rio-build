@@ -25,7 +25,8 @@ fn _actor_error_exhaustive(e: &ActorError) {
         | ActorError::MissingDbId { .. }
         | ActorError::StoreUnavailable
         | ActorError::PermissionDenied { .. }
-        | ActorError::NotLeader => {}
+        | ActorError::NotLeader
+        | ActorError::SettledIdentityConflict { .. } => {}
     }
 }
 
@@ -75,6 +76,14 @@ fn test_actor_error_to_status_all_arms() {
             "permission denied",
         ),
         (ActorError::NotLeader, Code::Unavailable, "not leader"),
+        (
+            // r[verify sched.persist.settled-identity-freeze]
+            ActorError::SettledIdentityConflict {
+                drv_path: "/nix/store/x".into(),
+            },
+            Code::FailedPrecondition,
+            "settled",
+        ),
     ];
     // Count derived from the enum (strum::EnumCount), not a hardcoded
     // literal. The `_actor_error_exhaustive` pin only catches a missing

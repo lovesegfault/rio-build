@@ -9395,6 +9395,165 @@ async fn test_completed_authoritative_node_survives_conflicting_submission() -> 
     Ok(())
 }
 
+// r[verify sched.persist.settled-identity-freeze]
+/// After a successful build's node is REAPED (terminal cleanup), its
+/// settled PG row is the only record left — the merge gate cannot see
+/// it. A conflicting resubmission for the same hash must be rejected by
+/// the pre-merge settled-identity check with FAILED_PRECONDITION, and
+/// the settled row must be byte-for-byte untouched (bug_076, post-reap
+/// half).
+#[tokio::test]
+async fn test_settled_row_rejects_conflicting_resubmission_after_reap() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: complete a node successfully, then reap it.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settled-reap");
+    node.expected_output_paths = vec![test_store_path("settled-reap-out")];
+    merge_dag(&handle, owner, vec![node], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settled-reap");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("settled-reap-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "settled-reap", DerivationStatus::Completed).await;
+    // Inject the terminal cleanup (bypass TERMINAL_CLEANUP_DELAY): the
+    // node is reaped from the DAG; the settled row stays in PG.
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: owner })
+        .await?;
+    barrier(&handle).await;
+    assert!(
+        handle
+            .debug_query_derivation("settled-reap")
+            .await?
+            .is_none(),
+        "node reaped from the DAG"
+    );
+
+    // Build 2: conflicting identity (different system) for the reaped
+    // hash → rejected by the settled-identity freeze, not admitted as a
+    // brand-new creation.
+    let attacker = Uuid::new_v4();
+    let result = merge_dag(
+        &handle,
+        attacker,
+        vec![make_test_node("settled-reap", "aarch64-linux")],
+        vec![],
+        false,
+    )
+    .await;
+    assert!(
+        result.is_err(),
+        "conflicting re-creation of a settled row must be rejected"
+    );
+    let err_text = format!("{:#}", result.unwrap_err());
+    assert!(
+        err_text.contains("settled"),
+        "rejection names the settled record, got: {err_text}"
+    );
+
+    // The settled row is untouched.
+    let (system, status): (String, String) =
+        sqlx::query_as("SELECT system, status FROM derivations WHERE drv_path = $1")
+            .bind(&drv_path)
+            .fetch_one(&db.pool)
+            .await?;
+    assert_eq!(system, "x86_64-linux", "settled identity kept");
+    assert_eq!(status, "completed", "settled status kept");
+
+    // No build row leaked for the rejected submission (the check runs
+    // before the build row insert).
+    let attacker_row: Option<(String,)> =
+        sqlx::query_as("SELECT status FROM builds WHERE build_id = $1")
+            .bind(attacker)
+            .fetch_optional(&db.pool)
+            .await?;
+    assert!(
+        attacker_row.is_none(),
+        "no build row written for a settled-identity rejection"
+    );
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze]
+/// A MATCHING-identity resubmission of a reaped hash (same system,
+/// output names, flags, and the same declared expected output path as
+/// content evidence) is a legitimate rebuild — e.g. after the store
+/// garbage-collected the outputs — and must be admitted: the row is
+/// re-created (status back to a live state) and the new build runs.
+#[tokio::test]
+async fn test_settled_row_accepts_matching_resubmission_after_reap() -> TestResult {
+    let (db, handle, _task) = setup().await;
+
+    // Build 1: complete and reap.
+    let owner = Uuid::new_v4();
+    let mut node = make_node("settled-rebuild");
+    node.expected_output_paths = vec![test_store_path("settled-rebuild-out")];
+    merge_dag(&handle, owner, vec![node.clone()], vec![], false).await?;
+    let mut rx = connect_executor(&handle, "w1", "x86_64-linux").await?;
+    let drv_path = test_drv_path("settled-rebuild");
+    let assn = recv_assignment(&mut rx).await;
+    assert_eq!(assn.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w1",
+        &drv_path,
+        &test_store_path("settled-rebuild-out"),
+    )
+    .await?;
+    wait_for_status(&handle, "settled-rebuild", DerivationStatus::Completed).await;
+    handle
+        .send_unchecked(ActorCommand::CleanupTerminalBuild { build_id: owner })
+        .await?;
+    barrier(&handle).await;
+
+    // Build 2: identical identity + the same declared expected output
+    // path (content evidence) → admitted; the node is re-created and
+    // dispatched to a fresh worker.
+    let rebuilder = Uuid::new_v4();
+    merge_dag(&handle, rebuilder, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, rebuilder).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "matching rebuild admitted"
+    );
+    // The row was re-created (no longer settled) by the rebuild.
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM derivations WHERE drv_path = $1")
+        .bind(&drv_path)
+        .fetch_one(&db.pool)
+        .await?;
+    assert_ne!(
+        status, "completed",
+        "row re-created to a live status for the rebuild"
+    );
+    // And the rebuild completes end-to-end.
+    let mut rx2 = connect_executor(&handle, "w2", "x86_64-linux").await?;
+    let assn2 = recv_assignment(&mut rx2).await;
+    assert_eq!(assn2.drv_path, drv_path);
+    complete_success(
+        &handle,
+        "w2",
+        &drv_path,
+        &test_store_path("settled-rebuild-out"),
+    )
+    .await?;
+    barrier(&handle).await;
+    assert_eq!(
+        query_status(&handle, rebuilder).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "legitimate rebuild completes"
+    );
+    Ok(())
+}
+
 /// Displacement must not let the displacing definition inherit the
 /// squat's reactive resource floors (bug_011): a squatter that
 /// deliberately OOM'd/timed out ratchets `floor_*` to ceiling sizes, and

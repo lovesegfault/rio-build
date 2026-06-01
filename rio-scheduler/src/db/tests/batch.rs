@@ -758,12 +758,15 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
     let db = SchedulerDb::new(test_db.pool.clone());
 
     // ── Store-origin row, re-created store-backed ─────────────────────
+    // The prior creation parked in a terminal FAILURE state: that is the
+    // only settled-adjacent state a conflicting re-creation can reach
+    // (a completed/skipped row is frozen — sched.persist.settled-identity-freeze).
     let first = DerivationRow {
         drv_hash: "recreate-store".into(),
         drv_path: format!("/nix/store/{}-recreate-store-old.drv", "d".repeat(32)),
         pname: Some("old".into()),
         system: "x86_64-linux".into(),
-        status: DerivationStatus::Completed,
+        status: DerivationStatus::Poisoned,
         required_features: vec!["kvm".into()],
         expected_output_paths: vec![],
         output_names: vec!["out".into()],
@@ -1025,14 +1028,16 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     let test_db = TestDb::new(&crate::MIGRATOR).await;
     let db = SchedulerDb::new(test_db.pool.clone());
 
-    // Pre-existing terminal authoritative squat row (a prior creation's
-    // snapshot that a displacing merge would recreate-refresh).
+    // Pre-existing terminal-FAILURE authoritative squat row (a prior
+    // creation's snapshot that a displacing merge would recreate-refresh
+    // — only failure-parked rows are displaceable; completed/skipped
+    // rows are frozen by sched.persist.settled-identity-freeze).
     let squat = DerivationRow {
         drv_hash: "atomic-squat".into(),
         drv_path: format!("/nix/store/{}-atomic-squat.drv", "a".repeat(32)),
         pname: Some("squat".into()),
         system: "x86_64-linux".into(),
-        status: DerivationStatus::Completed,
+        status: DerivationStatus::Poisoned,
         required_features: vec![],
         expected_output_paths: vec![],
         output_names: vec!["out".into()],
@@ -1103,7 +1108,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
     .fetch_one(&test_db.pool)
     .await?;
     assert_eq!(system, "x86_64-linux", "squat identity untouched on drop");
-    assert_eq!(status, "completed", "squat status untouched on drop");
+    assert_eq!(status, "poisoned", "squat status untouched on drop");
     assert_eq!(
         content.as_deref(),
         Some(b"Derive-squat".as_slice()),
@@ -1437,5 +1442,121 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
         "recovery query returns the deferred-IA hash"
     );
     assert!(!deferred_row.is_ca);
+    Ok(())
+}
+
+// r[verify sched.persist.settled-identity-freeze]
+/// The upsert's settled-row WHERE guard (defense-in-depth twin of the
+/// pre-merge check): a `completed`/`skipped` row whose public identity
+/// conflicts with the incoming re-creation is left completely untouched
+/// — and excluded from RETURNING, so the caller fails loudly instead of
+/// silently rewriting settled history. A matching-identity re-creation
+/// updates normally (legitimate rebuild after store GC).
+#[tokio::test]
+async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Result<()> {
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let settled_path = format!("/nix/store/{}-settled-guard.drv", "a".repeat(32));
+    let settled = DerivationRow {
+        drv_hash: "settled-guard".into(),
+        drv_path: settled_path.clone(),
+        pname: Some("victim".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Completed,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-settled-guard-out", "b".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        drv_content: Some(b"Derive-victim".to_vec()),
+        ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+    let mut tx = db.pool().begin().await?;
+    let ids =
+        SchedulerDb::batch_upsert_derivations(&mut tx, std::slice::from_ref(&settled)).await?;
+    tx.commit().await?;
+    assert!(ids.contains_key("settled-guard"), "initial insert returned");
+
+    // ── Conflicting re-creation: different system + output names ──────
+    let conflicting = DerivationRow {
+        drv_hash: "settled-guard".into(),
+        drv_path: format!("/nix/store/{}-settled-guard-evil.drv", "c".repeat(32)),
+        pname: Some("attacker".into()),
+        system: "aarch64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![],
+        output_names: vec!["out".into(), "dev".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+    let mut tx = db.pool().begin().await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[conflicting]).await?;
+    tx.commit().await?;
+    // The guarded row is NOT in RETURNING — the caller (merge persist)
+    // surfaces this as MissingDbId instead of corrupting the row.
+    assert!(
+        !ids.contains_key("settled-guard"),
+        "conflicting re-creation must not update (or return) the settled row"
+    );
+
+    // The settled row is byte-for-byte what it was.
+    let (pname, system, status): (Option<String>, String, String) = sqlx::query_as(
+        "SELECT pname, system, status FROM derivations WHERE drv_hash = 'settled-guard'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(pname.as_deref(), Some("victim"));
+    assert_eq!(system, "x86_64-linux");
+    assert_eq!(status, "completed");
+    let (drv_path, content, names): (String, Option<Vec<u8>>, Vec<String>) = sqlx::query_as(
+        "SELECT drv_path, drv_content, output_names
+             FROM derivations WHERE drv_hash = 'settled-guard'",
+    )
+    .fetch_one(&test_db.pool)
+    .await?;
+    assert_eq!(drv_path, settled_path);
+    assert_eq!(content.as_deref(), Some(b"Derive-victim".as_slice()));
+    assert_eq!(names, vec!["out".to_string()]);
+
+    // ── Matching re-creation: same public identity → updates normally ─
+    let matching = DerivationRow {
+        drv_hash: "settled-guard".into(),
+        drv_path: settled_path.clone(),
+        pname: Some("victim".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-settled-guard-out", "b".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+    };
+    let mut tx = db.pool().begin().await?;
+    let ids = SchedulerDb::batch_upsert_derivations(&mut tx, &[matching]).await?;
+    tx.commit().await?;
+    assert!(
+        ids.contains_key("settled-guard"),
+        "matching re-creation updates the settled row (legitimate rebuild)"
+    );
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM derivations WHERE drv_hash = 'settled-guard'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(status, "created", "matching rebuild re-created the row");
     Ok(())
 }

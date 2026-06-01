@@ -316,6 +316,28 @@ impl SchedulerDb {
                     WHEN derivations.drv_content IS NOT NULL
                          AND EXCLUDED.drv_content IS DISTINCT FROM derivations.drv_content
                     THEN 0 ELSE derivations.floor_deadline_secs END
+            -- r[impl sched.persist.settled-identity-freeze]
+            -- Defense-in-depth twin of the pre-merge settled-identity
+            -- check (actor/merge.rs): a SETTLED row (completed/skipped —
+            -- the durable record of a successful build) whose public
+            -- identity conflicts with the incoming re-creation is left
+            -- completely untouched by this upsert. The row then does not
+            -- appear in RETURNING, so the merge's link/edge persistence
+            -- fails loudly (MissingDbId → Internal → cleanup) instead of
+            -- silently rewriting settled history. Matching-identity
+            -- re-creations (legitimate rebuild after store GC) update
+            -- normally. Primary enforcement is the pre-merge check; this
+            -- guard only matters if that check is bypassed (bug) or a
+            -- racing writer settles the row between check and upsert.
+            WHERE NOT (
+                derivations.status IN ('completed', 'skipped')
+                AND (
+                    derivations.system IS DISTINCT FROM EXCLUDED.system
+                    OR derivations.output_names IS DISTINCT FROM EXCLUDED.output_names
+                    OR derivations.is_fixed_output IS DISTINCT FROM EXCLUDED.is_fixed_output
+                    OR derivations.is_ca IS DISTINCT FROM EXCLUDED.is_ca
+                )
+            )
             RETURNING drv_hash, derivation_id,
                       floor_mem_bytes, floor_disk_bytes, floor_deadline_secs
             "#,

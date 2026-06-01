@@ -96,6 +96,71 @@ struct DisplacedPriorInterest {
     prior_completed: bool,
 }
 
+/// Row-level twin of [`crate::dag::verifiable_identity_matches`]: does an
+/// incoming submission node prove the same identity as a SETTLED
+/// (completed/skipped) persisted derivation row?
+///
+/// r[impl sched.persist.settled-identity-freeze]
+/// Public attributes must match (system, sorted output names, the
+/// fixed-output flag, the content-addressed flag, and expected output
+/// paths for names where BOTH sides declare one), and at least one piece
+/// of content-bound evidence is required: agreement on a non-empty
+/// expected output path, or a byte-equal CA modular hash. The two
+/// matchers MUST stay in sync — they enforce the same rule
+/// (`sched.merge.authoritative-conflict` / settled-identity-freeze) at
+/// the two places a prior definition can live (resident DAG node vs
+/// settled PG row); a predicate added to one belongs in the other.
+fn settled_row_identity_matches(
+    row: &crate::db::SettledIdentityRow,
+    node: &crate::domain::DerivationNode,
+) -> bool {
+    if row.system != node.system
+        || row.is_fixed_output != node.is_fixed_output
+        || row.is_ca != node.is_content_addressed
+    {
+        return false;
+    }
+    let mut row_names: Vec<&str> = row.output_names.iter().map(String::as_str).collect();
+    let mut incoming_names: Vec<&str> = node.output_names.iter().map(String::as_str).collect();
+    row_names.sort_unstable();
+    incoming_names.sort_unstable();
+    if row_names != incoming_names {
+        return false;
+    }
+    let row_paths: HashMap<&str, &str> = row
+        .output_names
+        .iter()
+        .zip(row.expected_output_paths.iter())
+        .map(|(n, p)| (n.as_str(), p.as_str()))
+        .collect();
+    let mut path_evidence = false;
+    for (name, path) in node
+        .output_names
+        .iter()
+        .zip(node.expected_output_paths.iter())
+    {
+        if path.is_empty() {
+            continue;
+        }
+        if let Some(row_path) = row_paths.get(name.as_str())
+            && !row_path.is_empty()
+        {
+            if *row_path != path.as_str() {
+                return false;
+            }
+            path_evidence = true;
+        }
+    }
+    // The persisted hash is bytea: empty/NULL means "not recorded".
+    let hash_evidence = match (&row.ca_modular_hash, &node.ca_modular_hash) {
+        (Some(row_hash), Some(node_hash)) if row_hash.len() == 32 => {
+            row_hash.as_slice() == node_hash.as_slice()
+        }
+        _ => false,
+    };
+    path_evidence || hash_evidence
+}
+
 impl DagActor {
     // -----------------------------------------------------------------------
     // MergeDag
@@ -450,6 +515,53 @@ impl DagActor {
             None => (nodes, edges, false, HashSet::new()),
         };
         phase!("0-topdown-roots");
+
+        // === Step 0.5: Settled-row identity freeze ===================
+        // r[impl sched.persist.settled-identity-freeze]
+        // A derivation row whose status is completed/skipped is the
+        // durable record of a successful build. Once its DAG node is
+        // reaped (terminal cleanup) the merge gate
+        // (sched.merge.authoritative-conflict) can no longer protect it
+        // — a fresh submission for the same hash looks like a brand-new
+        // creation and would flow straight into the creation-scoped
+        // upsert, rewriting settled history. This check loads the
+        // settled rows for every submitted hash that is NOT resident in
+        // the DAG and rejects conflicting (or evidence-less) identity
+        // re-creations BEFORE any state is written: no build row, no
+        // DAG mutation, nothing to roll back. Resident nodes are the
+        // merge gate's job; the in-flight window between this check and
+        // the upsert is covered by the upsert's own settled-row WHERE
+        // guard (defense in depth).
+        let non_resident: Vec<String> = nodes
+            .iter()
+            .filter(|n| self.dag.node(&n.drv_hash).is_none())
+            .map(|n| n.drv_hash.clone())
+            .collect();
+        if !non_resident.is_empty() {
+            let settled = self.db.load_settled_identity_rows(&non_resident).await?;
+            if !settled.is_empty() {
+                let by_hash: HashMap<&str, &crate::domain::DerivationNode> =
+                    nodes.iter().map(|n| (n.drv_hash.as_str(), n)).collect();
+                for row in &settled {
+                    let Some(node) = by_hash.get(row.drv_hash.as_str()) else {
+                        continue;
+                    };
+                    if !settled_row_identity_matches(row, node) {
+                        warn!(
+                            build_id = %build_id,
+                            drv_hash = %row.drv_hash,
+                            drv_path = %row.drv_path,
+                            "rejecting re-creation of a settled derivation row \
+                             with conflicting identity"
+                        );
+                        return Err(ActorError::SettledIdentityConflict {
+                            drv_path: node.drv_path.clone(),
+                        });
+                    }
+                }
+            }
+        }
+        phase!("0.5-settled-identity-freeze");
 
         // === Step 1: DB build row ==================================
         // If this fails, nothing is in memory; caller gets a clean error.

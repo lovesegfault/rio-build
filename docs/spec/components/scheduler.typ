@@ -2117,6 +2117,40 @@ undispatchable (workers would be told to fetch a `.drv` that exists in no
 store). Reap-then-resubmit and crash-retry re-creations get the same
 refresh for free.
 
+#r("sched.persist.settled-identity-freeze")[
+  A persisted derivation row whose status is `completed` or `skipped`
+  MUST NOT be re-created under a conflicting identity: before any state
+  is written for a submission, every submitted hash that has no resident
+  DAG node MUST be checked against the settled rows, and a submission
+  whose declared identity does not match a settled row's --- the public
+  attributes (system, sorted output names, fixed-output flag,
+  content-addressed flag, expected output paths declared by both sides)
+  plus at least one piece of content-bound evidence (a shared non-empty
+  expected output path, or a byte-equal CA modular hash) --- MUST be
+  rejected with `FAILED_PRECONDITION`. The persistence layer MUST
+  additionally refuse to update a settled row whose public identity
+  conflicts with the incoming re-creation, independent of the pre-merge
+  check.
+]
+The freeze covers the window the merge gate cannot:
+#rref("sched.merge.authoritative-conflict") protects a settled node only
+while it is resident in the DAG, but terminal cleanup reaps nodes after
+`TERMINAL_CLEANUP_DELAY` while their rows --- the durable record that the
+derivation was built, what identity it was built under, and (for
+content-bound claims) the bytes it was built from --- live on. Without the
+freeze, a fresh submission for a reaped hash is indistinguishable from a
+first-ever creation: it flows into the creation-scoped upsert and rewrites
+settled history, which is exactly the erasure
+#rref("sched.merge.authoritative-conflict") forbids while the node is
+resident. A matching-identity re-creation (a legitimate rebuild after the
+store garbage-collected the outputs) is admitted and refreshes the row
+normally. The persistence-layer guard exists because the pre-merge check
+and the upsert run at different times in the same merge: a row that
+settles between them (racing completion fan-out) or a future caller that
+bypasses the check (bug) must still find the row immovable; the upsert
+skips such rows entirely, which surfaces as a loud merge failure rather
+than silent history rewrite.
+
 #r("sched.persist.atomic-activation+2")[
   The merge-time persistence of (re)created derivation rows --- including
   the definition-change accumulator reset of

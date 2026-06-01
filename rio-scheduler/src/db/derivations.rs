@@ -1,6 +1,8 @@
 //! Per-derivation state + poison tracking — `derivations` table.
 
-use super::{AssignmentStatus, PoisonedDerivationRow, SchedulerDb, terminal_status_sql};
+use super::{
+    AssignmentStatus, PoisonedDerivationRow, SchedulerDb, SettledIdentityRow, terminal_status_sql,
+};
 use crate::state::{DerivationStatus, DrvHash, ExecutorId};
 
 /// Map a terminal `DerivationStatus` to the `assignments.status` value
@@ -490,6 +492,38 @@ impl SchedulerDb {
             WHERE status = 'poisoned'
             "#,
         )
+        .fetch_all(&self.pool)
+        .await
+    }
+
+    /// Load the identity columns of SETTLED (`completed`/`skipped`)
+    /// derivation rows for the given hashes.
+    ///
+    /// r[impl sched.persist.settled-identity-freeze]
+    /// A settled row is the durable record of a successful build whose
+    /// DAG node may already have been reaped (terminal cleanup); the
+    /// merge gate cannot protect it (no resident node), so the
+    /// pre-merge settled-identity check loads these rows and rejects
+    /// conflicting re-creations before any DAG or DB mutation happens.
+    /// Indexed by the `derivations.drv_hash` unique constraint — one
+    /// batched lookup per merge that contains non-resident hashes.
+    pub(crate) async fn load_settled_identity_rows(
+        &self,
+        hashes: &[String],
+    ) -> Result<Vec<SettledIdentityRow>, sqlx::Error> {
+        if hashes.is_empty() {
+            return Ok(Vec::new());
+        }
+        sqlx::query_as(
+            r#"
+            SELECT drv_hash, drv_path, system, output_names,
+                   expected_output_paths, is_fixed_output, is_ca,
+                   ca_modular_hash
+            FROM derivations
+            WHERE drv_hash = ANY($1) AND status IN ('completed', 'skipped')
+            "#,
+        )
+        .bind(hashes)
         .fetch_all(&self.pool)
         .await
     }

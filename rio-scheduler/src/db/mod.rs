@@ -243,6 +243,26 @@ pub(crate) struct PoisonedDerivationRow {
     pub elapsed_secs: f64,
 }
 
+/// Identity columns of a SETTLED (`completed`/`skipped`) derivation row,
+/// loaded by `load_settled_identity_rows` for the pre-merge
+/// settled-identity freeze (`sched.persist.settled-identity-freeze`).
+/// Compared against an incoming submission node by
+/// `actor::merge::settled_row_identity_matches` — the row-level twin of
+/// `dag::verifiable_identity_matches`.
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct SettledIdentityRow {
+    pub drv_hash: String,
+    pub drv_path: String,
+    pub system: String,
+    pub output_names: Vec<String>,
+    pub expected_output_paths: Vec<String>,
+    pub is_fixed_output: bool,
+    pub is_ca: bool,
+    /// Raw bytes of the persisted CA modular hash (`bytea`, possibly
+    /// empty/NULL for rows persisted before the hash was populated).
+    pub ca_modular_hash: Option<Vec<u8>>,
+}
+
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
 /// columns from `batch_upsert_derivations` plus live-state fields
 /// (retry_count, assigned_builder_id, failed_builders).
