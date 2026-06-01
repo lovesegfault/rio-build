@@ -1392,7 +1392,7 @@
     {
       "path": "state/build.rs",
       "depth": 1,
-      "doc": "Build request state machine: [`BuildState`] transitions and"
+      "doc": "Build request state machine: [`BuildState`] transitions, [`BuildInfo`]"
     },
     {
       "path": "state/db_str.rs",
