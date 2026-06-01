@@ -1271,6 +1271,187 @@ async fn flag_on_moot_unobtainable_never_fail_fasts() -> TestResult {
 }
 
 // r[verify sched.materialize.routing+2]
+// r[verify sched.materialize.job]
+/// T-4.1 (Phase B): the FULL §2.4 C3 two-build dedup trace, flag-on —
+/// the materialization-path twin of
+/// `stale_walk_failure_does_not_fail_build_with_present_outputs`
+/// (dispatch.rs, the C3 walk pin). The C3 defect class: stale failure
+/// evidence recorded under WIDER interest must never fail a build whose
+/// own (narrower) live interest is satisfiable.
+///
+/// The trace (design §2.4's confirmed-C3 replay, all seven steps):
+///   1. Build B (narrow: wants `out`) merges; `out` substitutable →
+///      job J created in the merge transaction (B's wanted-relation row
+///      written).
+///   2. Build A (wide: wants `out` + `wide`) merges the same node → NO
+///      second job (the partial-unique-index dedup); A's relation row
+///      written.
+///   3. J is claimed (store-test-0); the executor's effective wanted
+///      read at claim time is the union {out, wide}.
+///   4. `out` becomes PRESENT in the store (out-of-band ingest); `wide`
+///      is genuinely absent upstream.
+///   5. Build A cancels inside the claim→consume window: its relation
+///      rows leave the live join; live wanted shrinks to {out}.
+///   6. The executor reports Unobtainable{missing: [wide], verified:
+///      [out]} — failure evidence recorded against the WIDE read.
+///   7. THE C3 ASSERTION: consumption re-reads live interest = {B} and
+///      live wanted = {out}; arm 0 (moot): missing ∩ W = ∅ and
+///      verified ⊇ W → d1 Completed, B Succeeded, J resolved_success.
+///      Build B is NOT failed; zero fail-fast.
+///
+/// Protecting mechanisms (§3.3 C3 row): (i) interest derived from the
+/// durable wanted relation — the stranded-build horn; (ii) the
+/// consumption-transaction moot arm re-reading LIVE interest — the
+/// wrongful-fail-fast horn. The ledger records the unobtainable report
+/// (prediction) but the routing — not the row — decides the verdict
+/// (the prediction/reconciliation collapse).
+///
+/// Pin-vs-red (plan T-4.1 / RT-4 precedent): the protecting mechanisms
+/// all exist from Phase A — this test SHOULD pass first-try and is
+/// recorded as a PIN; a failure would be a Phase A consumption bug.
+#[tokio::test]
+async fn flag_on_stale_unobtainable_two_build_dedup_never_fails() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+
+    // One 2-output node; the narrow build wants `out`, the wide build
+    // wants `out` + `wide`.
+    let out = test_store_path("c3-dedup-out");
+    let wide = test_store_path("c3-dedup-wide");
+    // Substitutable BEFORE the first merge → the merge new_sub lane
+    // creates the job inside B's merge transaction (step 1's shape).
+    {
+        let mut subs = store.state.substitutable.write().unwrap();
+        subs.push(out.clone());
+        subs.push(wide.clone());
+    }
+
+    let mk = |wanted: &[&str]| {
+        let mut n = make_node("c3-dedup");
+        n.output_names = vec!["out".into(), "wide".into()];
+        n.expected_output_paths = vec![out.clone(), wide.clone()];
+        n.wanted_output_names = wanted.iter().map(|s| (*s).to_string()).collect();
+        n
+    };
+
+    // Step 1: build B (narrow) merges → job J created, node stays Ready.
+    let build_b = Uuid::new_v4();
+    merge_dag(&handle, build_b, vec![mk(&["out"])], vec![], false).await?;
+    barrier(&handle).await;
+    let (jobs, wanted_rows) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(
+        (jobs, wanted_rows),
+        (1, 1),
+        "step 1: B's merge creates exactly one job + one wanted-relation row"
+    );
+
+    // Step 3 (claim BEFORE A merges so A's merge cannot reprobe the
+    // node — the open attempt holds it Running, same sequencing as the
+    // design trace): claim J as a store replica.
+    let assignment = match claim_materialization(&handle, "c3-dedup", "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the claim must deliver, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+
+    // Step 2: build A (wide) merges the same node → the dedup keeps ONE
+    // job; A's wanted-relation row is recorded. (A merges while the
+    // attempt is open — the C3 window.)
+    let build_a = Uuid::new_v4();
+    merge_dag(&handle, build_a, vec![mk(&["out", "wide"])], vec![], false).await?;
+    barrier(&handle).await;
+    let (jobs, wanted_rows) = sdb(&db.pool).count_materialization_rows().await?;
+    assert_eq!(
+        (jobs, wanted_rows),
+        (1, 2),
+        "step 2: the partial-unique-index dedup keeps one job; both builds' \
+         wanted-relation rows exist"
+    );
+
+    // Step 4: `out` becomes present in the store (out-of-band ingest);
+    // `wide` stays absent upstream.
+    store.seed_with_content(&out, b"c3-out-of-band-ingest");
+
+    // Step 5: build A (the WIDE interest) cancels inside the
+    // claim→consume window — its wants leave the live join.
+    cancel_build(&handle, build_a).await?;
+    barrier(&handle).await;
+
+    // Step 6: the executor reports Unobtainable against its WIDE read:
+    // `wide` missing, `out` verified present.
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        "c3-dedup",
+        mat_unobtainable_outcome(
+            vec![wide.clone()],
+            vec![out.clone()],
+            "upstream 404 on wide",
+        ),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("unobtainable report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Step 7 — THE C3 ASSERTIONS.
+    // (a) The node completed for live interest (the moot arm).
+    assert_eq!(
+        expect_drv(&handle, "c3-dedup").await.status,
+        DerivationStatus::Completed,
+        "C3: the moot arm completes the node for live (narrow) interest"
+    );
+    // (b) Build B succeeded — the stale wide-read failure evidence never
+    //     touches it.
+    let st = query_status(&handle, build_b).await?;
+    assert_eq!(
+        st.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "C3: build B must succeed — stale failure evidence recorded under \
+         wider interest never fails a narrower build (zero fail-fast)"
+    );
+    assert!(
+        st.error_summary.is_empty(),
+        "C3: no fail-fast error may be recorded on B; got {:?}",
+        st.error_summary
+    );
+    // (c) The job resolved successfully.
+    let job_state: String = sqlx::query_scalar(
+        "SELECT state FROM materialization_jobs ORDER BY created_at DESC LIMIT 1",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(job_state, "resolved_success", "C3: J resolves successfully");
+    // (d) The ledger assertion (prediction/reconciliation collapse): the
+    //     unobtainable report WAS recorded — as a materialization-kind
+    //     row invisible to build budgets — but the routing, not the row,
+    //     decided the verdict.
+    let (unob_rows, build_kind_rows): (i64, i64) = sqlx::query_as(
+        "SELECT \
+           count(*) FILTER (WHERE t.outcome_class = 'materialization_unobtainable'), \
+           count(*) FILTER (WHERE COALESCE(e.attempt_kind, 'build') = 'build') \
+         FROM drv_attempts t \
+         LEFT JOIN drv_executions e ON e.exec_id = t.exec_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    assert_eq!(
+        unob_rows, 1,
+        "the unobtainable report is recorded in the ledger (the prediction)"
+    );
+    assert_eq!(
+        build_kind_rows, 0,
+        "zero build-kind rows: the trace never touched any build budget"
+    );
+    // (e) Build A is cancelled (its own verdict), never failed.
+    let st_a = query_status(&handle, build_a).await?;
+    assert_eq!(
+        st_a.state,
+        rio_proto::types::BuildState::Cancelled as i32,
+        "build A's verdict is its own cancellation, never a fail-fast"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.routing+2]
 /// FINDING 11 (the C3-class equivalence divergence; orchestrator ruling,
 /// red-first), actor level: an UNMARKED genuine leaf — childless, so its
 /// closure evidence is structurally `Broken` — whose wanted output the
