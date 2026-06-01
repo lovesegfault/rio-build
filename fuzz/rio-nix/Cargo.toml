@@ -73,3 +73,9 @@ name = "stderr_message_parsing"
 path = "fuzz_targets/stderr_message_parsing.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "closure_walk"
+path = "fuzz_targets/closure_walk.rs"
+test = false
+doc = false

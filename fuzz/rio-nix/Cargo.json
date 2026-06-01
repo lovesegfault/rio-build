@@ -8551,6 +8551,10 @@
           "path": "fuzz_targets/build_result_parsing.rs"
         },
         {
+          "name": "closure_walk",
+          "path": "fuzz_targets/closure_walk.rs"
+        },
+        {
           "name": "derivation_parsing",
           "path": "fuzz_targets/derivation_parsing.rs"
         },
