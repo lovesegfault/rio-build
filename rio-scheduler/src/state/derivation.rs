@@ -431,6 +431,101 @@ impl DerivationStatus {
     }
 }
 
+db_str_enum! {
+    // r[impl sched.derivation.evidence-rank]
+    /// How strongly the scheduler's record of this derivation's
+    /// DEFINITION is bound to actual derivation bytes. Trusted-plane
+    /// authority decisions (displacement, settled-row protection,
+    /// dispatch claims signing) compare ranks instead of re-deriving
+    /// per-arm carve-outs.
+    ///
+    /// Variant order IS the lattice (`#[derive(Ord)]` on declaration
+    /// order — pinned by `evidence_rank_order_is_the_lattice`):
+    ///
+    /// - `UnverifiedClaim`: store-backed submission — every field is a
+    ///   submitter echo; nothing was verified against bytes.
+    /// - `ContentBoundClaim`: authoritative inline content (hook
+    ///   fallback). Ingress validated the bytes against themselves
+    ///   (text-CA + modulo binding) but the `.drv` exists nowhere
+    ///   else — the claim is content-bound, not store-anchored.
+    /// - `PathBoundBytes`: bytes whose text-CA equals the declared
+    ///   `.drv` store path (non-authoritative ingress-validated inline,
+    ///   merge-time store evidence, or dispatch-time store
+    ///   derivation) — the definition is anchored to the store path
+    ///   the DAG is keyed on.
+    /// - `VerifiedBuilt`: a `PathBoundBytes` definition that settled
+    ///   (`Completed`/`Skipped`) — the recorded outcome was produced
+    ///   from store-anchored bytes. Unreachable by any displacer.
+    ///
+    /// Per-node-LIFECYCLE monotonic (creation → settle): within one
+    /// lifecycle ranks only upgrade ([`DerivationState::transition`],
+    /// dispatch derivation). A legitimate matching-identity re-creation
+    /// (resubmit after store GC / displacement) starts a NEW lifecycle
+    /// at its own ingress rank — the persistence upsert applies
+    /// creation-snapshot `EXCLUDED` semantics, deliberately not `MAX`.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum DefinitionEvidence {
+        UnverifiedClaim = "unverified_claim",
+        ContentBoundClaim = "content_bound_claim",
+        PathBoundBytes = "path_bound_bytes",
+        VerifiedBuilt = "verified_built",
+    }
+    parse_err(other) = TransitionError: TransitionError::UnknownStatus(other.to_string());
+}
+
+impl Default for DefinitionEvidence {
+    /// The no-evidence floor — what a store-backed echo earns and what
+    /// any unparseable persisted value degrades to (fail-closed: less
+    /// claimed evidence never weakens a victim's protection, only the
+    /// displacer's standing).
+    fn default() -> Self {
+        Self::UnverifiedClaim
+    }
+}
+
+impl DefinitionEvidence {
+    // r[impl sched.derivation.evidence-rank]
+    /// Ingress mapping: rank a submission's definition evidence from
+    /// the node SHAPE alone. Pure — no parsing, no I/O — so the merge
+    /// path stays cheap and there is exactly ONE displacement-evidence
+    /// source per origin (ingress shape, merge-time store evidence,
+    /// dispatch-time derivation); an "opportunistic" parse-based
+    /// upgrade here would quietly create a fourth.
+    ///
+    /// - authoritative inline → `ContentBoundClaim` (unconditionally:
+    ///   ingress bound the bytes to themselves, not to a store path);
+    /// - non-authoritative inline (non-empty `drv_content`) →
+    ///   `PathBoundBytes` (`sched.merge.ingress-inline-drv-binding`
+    ///   text-CA-bound the bytes to the declared `.drv` path at
+    ///   SubmitBuild admission);
+    /// - store-backed (empty `drv_content`) → `UnverifiedClaim`.
+    pub fn from_node_shape(node: &crate::domain::DerivationNode) -> Self {
+        if node.drv_content_authoritative {
+            Self::ContentBoundClaim
+        } else if !node.drv_content.is_empty() {
+            Self::PathBoundBytes
+        } else {
+            Self::UnverifiedClaim
+        }
+    }
+
+    /// Decode a persisted rank. Unknown / corrupted values degrade to
+    /// the [`Self::UnverifiedClaim`] floor with a warning instead of
+    /// failing recovery — rank is protection metadata, and the floor is
+    /// the conservative direction for a DISPLACER (a victim's floor is
+    /// re-raised by [`DerivationState::from_recovery_row`]'s
+    /// content-presence floor and the settled-row checks).
+    pub(crate) fn parse_lossy(s: &str) -> Self {
+        s.parse().unwrap_or_else(|_| {
+            tracing::warn!(
+                value = s,
+                "unknown persisted evidence_rank; flooring to unverified_claim"
+            );
+            Self::UnverifiedClaim
+        })
+    }
+}
+
 /// Retry / failure-tracking sub-state of a [`DerivationState`].
 ///
 /// All fields are **in-memory only** unless otherwise noted: recovery
@@ -849,6 +944,18 @@ pub struct DerivationState {
     /// neither join this node with different authoritative bytes nor
     /// silently attach a conflicting verifiable identity to it.
     pub drv_content_authoritative: bool,
+    /// How strongly this node's recorded definition is bound to actual
+    /// derivation bytes — see [`DefinitionEvidence`]. Computed
+    /// shape-based at ingress ([`DefinitionEvidence::from_node_shape`]),
+    /// upgraded only at the [`Self::transition`] settle chokepoint
+    /// (`PathBoundBytes` → `VerifiedBuilt` on `Completed`/`Skipped`)
+    /// and by the dispatch-time claims derivation
+    /// (`UnverifiedClaim` → `PathBoundBytes` after the store `.drv` is
+    /// fetched, text-CA-verified, and found to match the recorded
+    /// claims). Persisted (`M_067`, creation-snapshot semantics) and
+    /// restored verbatim by [`Self::from_recovery_row`] with a
+    /// content-presence floor.
+    pub evidence: DefinitionEvidence,
     /// `inputSrcs` from the derivation ATerm — already-built store
     /// paths this derivation reads (NOT in the DAG as child nodes).
     /// Parsed once at merge time so `approx_input_closure` can
@@ -1129,6 +1236,8 @@ impl DerivationState {
             sched: SchedHint::default(),
             drv_content: node.drv_content.clone(),
             drv_content_authoritative: node.drv_content_authoritative,
+            // r[impl sched.derivation.evidence-rank]
+            evidence: DefinitionEvidence::from_node_shape(node),
             input_srcs,
             retry: RetryState::default(),
             output_paths: Vec::new(),
@@ -1340,6 +1449,25 @@ impl DerivationState {
             // authoritative (sched.persist.creation-scoped), so the
             // flag is re-derived from presence.
             drv_content_authoritative: row.drv_content.is_some(),
+            // r[impl sched.derivation.evidence-rank]
+            // Restore the persisted rank verbatim, floored at
+            // ContentBoundClaim when authoritative bytes are present:
+            // restored bytes ARE content-bound evidence regardless of
+            // what an older / partially-written row claims, and the
+            // floor can never weaken protection (ranks only guard
+            // against LOWER-ranked displacers). Settle/dispatch
+            // upgrades whose best-effort persist was lost degrade to
+            // the persisted ingress rank — safe, because no displacer
+            // outranks PathBoundBytes (VerifiedBuilt is only ever a
+            // victim-side rank).
+            evidence: {
+                let persisted = DefinitionEvidence::parse_lossy(&row.evidence_rank);
+                if row.drv_content.is_some() {
+                    persisted.max(DefinitionEvidence::ContentBoundClaim)
+                } else {
+                    persisted
+                }
+            },
             input_srcs: recovered_input_srcs,
             drv_content: row.drv_content.unwrap_or_default(),
             retry: RetryState {
@@ -1601,6 +1729,23 @@ impl DerivationState {
         // node) it must survive as the fallback carrier.
         if from.is_terminal() && !to.is_terminal() {
             self.exec_id = None;
+        }
+        // r[impl sched.derivation.evidence-rank]
+        // Settle chokepoint: a store-anchored definition that actually
+        // produced its recorded outcome upgrades to the unreachable
+        // top rank. ONLY from PathBoundBytes — a ContentBoundClaim
+        // squat that completes stays ContentBoundClaim (displaceable
+        // by store evidence: its bytes were never anchored to the
+        // store path the DAG is keyed on), and cache-hit completions
+        // of UnverifiedClaim echoes earn nothing. Every settle path
+        // goes through transition(), so no future completion site can
+        // forget the upgrade. The PG persist is best-effort at the
+        // settle persist sites; a lost write degrades to the persisted
+        // ingress rank at recovery (see from_recovery_row).
+        if matches!(to, DerivationStatus::Completed | DerivationStatus::Skipped)
+            && self.evidence == DefinitionEvidence::PathBoundBytes
+        {
+            self.evidence = DefinitionEvidence::VerifiedBuilt;
         }
 
         Ok(from)
@@ -2430,6 +2575,7 @@ mod tests {
             floor_deadline_secs: 0,
             drv_content: None,
             ca_modular_hash: None,
+            evidence_rank: "unverified_claim".into(),
             exec_id: None,
         };
         let state = DerivationState::from_recovery_row(row, DerivationStatus::Queued).unwrap();
@@ -2919,6 +3065,151 @@ mod tests {
         .expect("hydrates");
         assert_eq!(short.ca.modular_hash, None, "wrong length degrades to None");
         assert!(short.ca.needs_resolve, "flag re-derivation is independent");
+    }
+
+    // r[verify sched.derivation.evidence-rank]
+    /// The variant declaration order IS the lattice — `#[derive(Ord)]`
+    /// keys on it, and every rank comparison in the displacement /
+    /// settled-protection / claims paths depends on it. Reordering a
+    /// variant is a silent authority inversion; this pin makes it loud.
+    #[test]
+    fn evidence_rank_order_is_the_lattice() {
+        use super::DefinitionEvidence::*;
+        assert!(UnverifiedClaim < ContentBoundClaim);
+        assert!(ContentBoundClaim < PathBoundBytes);
+        assert!(PathBoundBytes < VerifiedBuilt);
+        // String codec round-trips for every variant (PG TEXT column).
+        for rank in DefinitionEvidence::ALL {
+            assert_eq!(
+                DefinitionEvidence::parse_lossy(rank.as_str()),
+                *rank,
+                "codec round-trip for {rank}"
+            );
+        }
+        // Unknown values floor to UnverifiedClaim, never panic.
+        assert_eq!(DefinitionEvidence::parse_lossy("garbage"), UnverifiedClaim);
+        assert_eq!(DefinitionEvidence::default(), UnverifiedClaim);
+    }
+
+    // r[verify sched.derivation.evidence-rank]
+    /// Ingress mapping is pure shape-based — exactly three cells, no
+    /// opportunistic parse-based upgrade (a fourth evidence source
+    /// would silently bypass the two documented upgrade chokepoints).
+    #[test]
+    fn from_node_shape_matrix() {
+        use super::DefinitionEvidence::*;
+        // Store-backed: no inline content at all.
+        let store_backed = dummy_node();
+        assert!(store_backed.drv_content.is_empty(), "fixture precondition");
+        assert_eq!(
+            DefinitionEvidence::from_node_shape(&store_backed),
+            UnverifiedClaim
+        );
+
+        // Authoritative inline (hook fallback) → ContentBoundClaim,
+        // unconditionally — even though the bytes are present and
+        // parseable, they are bound to themselves, not to the store.
+        let mut authoritative = dummy_node();
+        authoritative.drv_content = b"Derive(...)".to_vec();
+        authoritative.drv_content_authoritative = true;
+        assert_eq!(
+            DefinitionEvidence::from_node_shape(&authoritative),
+            ContentBoundClaim
+        );
+
+        // Non-authoritative inline: ingress text-CA-bound the bytes to
+        // the declared .drv path (sched.merge.ingress-inline-drv-binding).
+        let mut inline = dummy_node();
+        inline.drv_content = b"Derive(...)".to_vec();
+        inline.drv_content_authoritative = false;
+        assert_eq!(DefinitionEvidence::from_node_shape(&inline), PathBoundBytes);
+    }
+
+    // r[verify sched.derivation.evidence-rank]
+    /// The settle chokepoint upgrades ONLY PathBoundBytes — a
+    /// content-bound squat that completes must stay displaceable by
+    /// store evidence, and an unverified echo earns nothing from a
+    /// cache-hit completion. Both directions of the invariant.
+    #[test]
+    fn settle_upgrades_only_path_bound_bytes() {
+        use super::DefinitionEvidence::*;
+        let mk = |evidence: DefinitionEvidence| {
+            let mut s = DerivationState::try_from_node(&dummy_node()).unwrap();
+            s.evidence = evidence;
+            s.set_status_for_test(DerivationStatus::Running);
+            s
+        };
+        for settle in [DerivationStatus::Completed, DerivationStatus::Skipped] {
+            // PathBoundBytes → VerifiedBuilt on settle.
+            let mut s = mk(PathBoundBytes);
+            if settle == DerivationStatus::Skipped {
+                // Skipped is only reachable from Queued/Ready.
+                s.set_status_for_test(DerivationStatus::Queued);
+            }
+            s.transition(settle).unwrap();
+            assert_eq!(s.evidence, VerifiedBuilt, "settle={settle}");
+
+            // Every other rank is untouched by the settle.
+            for stay in [UnverifiedClaim, ContentBoundClaim, VerifiedBuilt] {
+                let mut s = mk(stay);
+                if settle == DerivationStatus::Skipped {
+                    s.set_status_for_test(DerivationStatus::Queued);
+                }
+                s.transition(settle).unwrap();
+                assert_eq!(s.evidence, stay, "settle={settle} from={stay}");
+            }
+        }
+        // Non-settle transitions never upgrade.
+        let mut s = mk(PathBoundBytes);
+        s.set_status_for_test(DerivationStatus::Assigned);
+        s.transition(DerivationStatus::Running).unwrap();
+        assert_eq!(s.evidence, PathBoundBytes);
+    }
+
+    // r[verify sched.derivation.evidence-rank]
+    /// Recovery restores the persisted rank verbatim, with the
+    /// content-presence floor: a row carrying authoritative bytes is at
+    /// least ContentBoundClaim regardless of what the column claims
+    /// (older / partially-written rows), and an unparseable rank
+    /// degrades to the UnverifiedClaim floor instead of failing
+    /// recovery.
+    #[test]
+    fn recovery_restores_evidence_with_content_floor() {
+        use super::DefinitionEvidence::*;
+        let mk_row = |rank: &str, content: Option<Vec<u8>>| {
+            let mut row = crate::db::RecoveryDerivationRow::test_default("evrec", "x86_64-linux");
+            row.evidence_rank = rank.into();
+            row.drv_content = content;
+            row
+        };
+        // Verbatim restore for every variant (no content).
+        for rank in DefinitionEvidence::ALL {
+            let s = DerivationState::from_recovery_row(
+                mk_row(rank.as_str(), None),
+                DerivationStatus::Ready,
+            )
+            .unwrap();
+            assert_eq!(s.evidence, *rank, "verbatim restore of {rank}");
+        }
+        // Content-presence floor: bytes present + lower-than-floor rank
+        // → ContentBoundClaim; higher persisted ranks keep their value.
+        let floored = DerivationState::from_recovery_row(
+            mk_row("unverified_claim", Some(b"Derive(...)".to_vec())),
+            DerivationStatus::Ready,
+        )
+        .unwrap();
+        assert_eq!(floored.evidence, ContentBoundClaim, "floor raises");
+        let kept = DerivationState::from_recovery_row(
+            mk_row("path_bound_bytes", Some(b"Derive(...)".to_vec())),
+            DerivationStatus::Ready,
+        )
+        .unwrap();
+        assert_eq!(kept.evidence, PathBoundBytes, "floor never lowers");
+        // Corrupted column → floor, not a recovery failure.
+        let corrupt =
+            DerivationState::from_recovery_row(mk_row("not-a-rank", None), DerivationStatus::Ready)
+                .unwrap();
+        assert_eq!(corrupt.evidence, UnverifiedClaim);
     }
 }
 

@@ -2265,6 +2265,42 @@ snapshot --- never inside the definition-change accumulator reset --- and
 absent (`NULL`) when the creating submission carried none, which keeps the
 fail-closed posture for evidence-less rows.
 
+#r("sched.derivation.evidence-rank")[
+  Every derivation MUST carry a definition-evidence rank from the ordered
+  lattice `unverified_claim < content_bound_claim < path_bound_bytes <
+  verified_built`, computed shape-based at ingress (store-backed
+  submission → `unverified_claim`; authoritative inline content →
+  `content_bound_claim`; ingress-validated non-authoritative inline
+  content → `path_bound_bytes`), persisted with the derivation row under
+  creation-snapshot semantics, and restored at recovery (floored at
+  `content_bound_claim` when authoritative bytes are present;
+  unparseable values floor to `unverified_claim`). Within one node
+  lifecycle the rank MUST only upgrade, at exactly two chokepoints: the
+  settle transition upgrades `path_bound_bytes` --- and ONLY
+  `path_bound_bytes` --- to `verified_built` on `Completed`/`Skipped`,
+  and the dispatch-time claims derivation upgrades a store-backed node
+  to `path_bound_bytes` after its `.drv` is fetched, text-CA-verified
+  against the DAG key, and found to match the recorded claims.
+]
+The lattice is the single vocabulary for trusted-plane authority
+decisions (displacement, settled-row protection, claims signing) ---
+rank comparison replaces per-arm carve-outs, so a future merge arm
+cannot re-introduce a divergent settled-protection predicate. The
+`verified_built`-only-from-`path_bound_bytes` restriction is
+load-bearing: a content-bound squat that completes stays
+`content_bound_claim` and remains displaceable by store evidence, while
+a genuine store-backed build passes dispatch derivation and settles
+unreachable (the maximum displacer rank is `path_bound_bytes`).
+Monotonicity is scoped PER NODE LIFECYCLE (creation → settle): a
+legitimate matching-identity re-creation after store GC or displacement
+starts a new lifecycle at its fresh ingress rank --- the persistence
+upsert applies creation-snapshot `EXCLUDED` semantics, deliberately not
+`MAX` --- so the rank always describes the definition the CURRENT
+lifecycle was admitted with. Settle/dispatch upgrades persist
+best-effort outside the merge transaction; a lost write degrades to the
+persisted ingress rank at recovery, which never weakens a victim's
+protection because no displacer outranks `path_bound_bytes`.
+
 #r("sched.recovery.failed-dep-cascade+2")[
   Recovery loads only non-terminal derivations and edges between them; edges to
   `completed`/`skipped` children are dropped (those dependencies are

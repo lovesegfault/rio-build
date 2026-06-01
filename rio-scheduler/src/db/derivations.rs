@@ -482,7 +482,7 @@ impl SchedulerDb {
                    is_ca, topdown_pruned, closure_hole,
                    failed_builders,
                    floor_mem_bytes, floor_disk_bytes, floor_deadline_secs,
-                   drv_content, ca_modular_hash,
+                   drv_content, ca_modular_hash, evidence_rank,
                    NULL::uuid AS exec_id,
                    COALESCE(
                        EXTRACT(EPOCH FROM (now() - poisoned_at))::float8,
@@ -518,7 +518,7 @@ impl SchedulerDb {
             r#"
             SELECT drv_hash, drv_path, system, output_names,
                    expected_output_paths, is_fixed_output, is_ca,
-                   ca_modular_hash
+                   ca_modular_hash, evidence_rank
             FROM derivations
             WHERE drv_hash = ANY($1) AND status IN ('completed', 'skipped')
             "#,
@@ -526,5 +526,31 @@ impl SchedulerDb {
         .bind(hashes)
         .fetch_all(&self.pool)
         .await
+    }
+
+    // r[impl sched.derivation.evidence-rank]
+    /// Persist a definition-evidence rank UPGRADE outside the
+    /// creation-scoped upsert: the settle chokepoint
+    /// (`PathBoundBytes` → `VerifiedBuilt` in
+    /// `DerivationState::transition`) and the dispatch-time claims
+    /// derivation (`UnverifiedClaim` → `PathBoundBytes`). Runtime
+    /// query (NOT `sqlx::query!`): keeps `M_067` out of the offline
+    /// `.sqlx` cache so the migration and its writers land in one
+    /// commit. Best-effort at every call site — a lost write degrades
+    /// to the persisted ingress rank at recovery, which never weakens
+    /// a victim (no displacer outranks `path_bound_bytes`).
+    pub(crate) async fn persist_evidence_rank(
+        &self,
+        drv_hash: &str,
+        rank: crate::state::DefinitionEvidence,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "UPDATE derivations SET evidence_rank = $2, updated_at = now() WHERE drv_hash = $1",
+        )
+        .bind(drv_hash)
+        .bind(rank.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 }

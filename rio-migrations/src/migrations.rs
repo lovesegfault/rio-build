@@ -1242,6 +1242,49 @@ pub const M_065: () = ();
 /// size CHECK (the Rust side length-validates on read and write).
 pub const M_066: () = ();
 
+/// 067: `derivations.evidence_rank` — persist the definition-evidence
+/// rank (`sched.derivation.evidence-rank`) so trusted-plane authority
+/// decisions survive leader failover. The lattice, low to high:
+/// `unverified_claim` (store-backed submission — every field is a
+/// submitter echo) < `content_bound_claim` (authoritative inline hook
+/// fallback — bytes validated against themselves, resident nowhere
+/// else) < `path_bound_bytes` (bytes text-CA-bound to the declared
+/// `.drv` store path: ingress-validated non-authoritative inline,
+/// merge-time store evidence, or dispatch-time store derivation) <
+/// `verified_built` (a `path_bound_bytes` definition that settled —
+/// produced its recorded outcome from store-anchored bytes).
+///
+/// `verified_built` is reachable ONLY from `path_bound_bytes` (the
+/// settle chokepoint in `DerivationState::transition`): a
+/// content-bound squat that completes stays `content_bound_claim`,
+/// displaceable by store evidence, while a genuine store-backed build
+/// passes dispatch derivation → `path_bound_bytes` → `verified_built`,
+/// unreachable by any displacer (the maximum displacer rank is
+/// `path_bound_bytes`).
+///
+/// Written by the creation-scoped upsert with creation-snapshot
+/// `EXCLUDED` semantics — deliberately NOT `MAX`-combined: rank
+/// monotonicity is scoped per node LIFECYCLE (creation → settle), and
+/// a legitimate matching-identity re-creation after store GC or
+/// displacement starts a new lifecycle at its own ingress rank.
+/// Settle/dispatch upgrades persist best-effort via
+/// `persist_evidence_rank`; a lost write degrades to the persisted
+/// ingress rank at recovery, which never weakens a victim (no
+/// displacer outranks `path_bound_bytes`). Wipe-deploy default
+/// `'unverified_claim'` matches the no-evidence floor; recovery
+/// additionally floors rows carrying authoritative bytes at
+/// `content_bound_claim`.
+///
+/// Ride-along correction for M_066's commentary above: since the
+/// gateway began populating the modulo hash for EVERY cached node
+/// (`gw.dag.modulo-hash-all-nodes`), `ca_modular_hash` is no longer
+/// "NULL for plain input-addressed rows" on gateway-submitted DAGs —
+/// plain IA rows now usually carry it too (it seeds dispatch-time
+/// child-hash resolution and the store-side modulo cache). NULL still
+/// means "the creating submission carried none" (direct submitters,
+/// pre-population rows); nothing reads presence as a CA-ness signal.
+pub const M_067: () = ();
+
 // Add M_NNN consts for other migrations as commentary accumulates.
 // Not all migrations need one — only those with non-obvious history,
 // dead-code constraints, or "we chose X over Y" rationale. The .sql

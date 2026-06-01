@@ -261,6 +261,19 @@ pub(crate) struct SettledIdentityRow {
     /// Raw bytes of the persisted CA modular hash (`bytea`, possibly
     /// empty/NULL for rows persisted before the hash was populated).
     pub ca_modular_hash: Option<Vec<u8>>,
+    /// Persisted definition-evidence rank (`M_067`,
+    /// `sched.derivation.evidence-rank`). Read by the settled-row
+    /// protection so a rank-uniform refusal applies even when no DAG
+    /// node is resident (the post-reap window): a settled row at
+    /// `path_bound_bytes`/`verified_built` is never displaced by
+    /// store-evidence disambiguation — store bytes cannot contradict
+    /// byte-derived identity.
+    // First reader is the merge-time store-evidence enrichment's
+    // row-only rank gate (lands with sched.merge.store-evidence-
+    // displacement); the column is selected now so the loader and the
+    // gate cannot drift.
+    #[allow(dead_code)]
+    pub evidence_rank: String,
 }
 
 /// Row from `load_nonterminal_derivations`. Mirrors the INSERT
@@ -328,6 +341,11 @@ pub(crate) struct RecoveryDerivationRow {
     /// and rows whose creating submission carried no hash; wrong-length
     /// values degrade to unset at hydration.
     pub ca_modular_hash: Option<Vec<u8>>,
+    /// Persisted definition-evidence rank (`M_067`). Restored verbatim
+    /// by `from_recovery_row`, floored at `content_bound_claim` when
+    /// authoritative bytes are present; unparseable values degrade to
+    /// the `unverified_claim` floor (`DefinitionEvidence::parse_lossy`).
+    pub evidence_rank: String,
     /// Per-execution identifier from the active `assignments` row
     /// (`migrations/061`). `None` unless the drv is currently dispatched
     /// (`assigned_builder_id IS NOT NULL`) — a reset drv's assignments row
@@ -366,6 +384,7 @@ impl RecoveryDerivationRow {
             floor_mem_bytes: 0,
             floor_disk_bytes: 0,
             floor_deadline_secs: 0,
+            evidence_rank: "unverified_claim".into(),
             drv_content: None,
             ca_modular_hash: None,
             exec_id: None,
@@ -486,6 +505,15 @@ pub(crate) struct DerivationRow {
     /// (re)creation, never part of the definition-change accumulator
     /// reset. r[impl sched.persist.ca-modular-hash+2]
     pub ca_modular_hash: Option<[u8; 32]>,
+    /// Definition-evidence rank (`M_067`,
+    /// `sched.derivation.evidence-rank`) — the ingress shape-based
+    /// rank of the CREATING submission
+    /// (`DefinitionEvidence::from_node_shape`). Creation-snapshot
+    /// `EXCLUDED` semantics on conflict (rank monotonicity is scoped
+    /// per node lifecycle; a re-creation starts a new lifecycle at its
+    /// own ingress rank). Settle/dispatch upgrades use the separate
+    /// runtime `persist_evidence_rank` writer.
+    pub evidence_rank: crate::state::DefinitionEvidence,
 }
 
 /// Shared SELECT / FROM clause for `list_builds` and

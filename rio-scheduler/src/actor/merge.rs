@@ -2299,6 +2299,12 @@ impl DagActor {
                     // populates the hash because their output paths
                     // resolve only at dispatch time).
                     ca_modular_hash: node.ca_modular_hash,
+                    // r[impl sched.derivation.evidence-rank]
+                    // Same pure shape mapping as try_from_node — the
+                    // persisted rank and the in-memory rank are
+                    // computed by the SAME function from the SAME
+                    // node, so they cannot disagree at creation.
+                    evidence_rank: crate::state::DefinitionEvidence::from_node_shape(node),
                 }
             })
             .collect();

@@ -115,6 +115,7 @@ async fn test_batch_upsert_10k_nodes() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
 
@@ -198,6 +199,7 @@ async fn test_batch_persist_1k_fk_perf_bound() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
 
@@ -278,6 +280,7 @@ async fn wanted_output_names_round_trip_and_union_on_conflict() -> anyhow::Resul
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         };
         let mut tx = db.pool().begin().await?;
         SchedulerDb::batch_upsert_derivations(&mut tx, &[row]).await?;
@@ -374,6 +377,7 @@ async fn topdown_pruned_or_on_conflict_clear_on_children_and_recovery() -> anyho
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<Uuid> {
         let mut tx = db.pool().begin().await?;
@@ -466,6 +470,7 @@ async fn closure_hole_or_on_conflict_clear_helpers_and_recovery() -> anyhow::Res
         closure_hole: false,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
     };
     let upsert = async |row: DerivationRow| -> anyhow::Result<()> {
         let mut tx = db.pool().begin().await?;
@@ -591,6 +596,7 @@ async fn test_batch_insert_40k_edges() -> anyhow::Result<()> {
             closure_hole: false,
             drv_content: None,
             ca_modular_hash: None,
+            evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         })
         .collect();
     let mut tx = db.pool().begin().await?;
@@ -641,6 +647,7 @@ async fn test_batch_upsert_persists_authoritative_drv_content() -> anyhow::Resul
         is_ca: true,
         drv_content: content,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -774,6 +781,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -799,6 +807,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -864,6 +873,7 @@ async fn test_batch_upsert_refreshes_identity_snapshot_not_accumulators() -> any
         is_ca: true,
         drv_content: Some(b"Derive-same".to_vec()),
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -920,6 +930,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: Some(content.to_vec()),
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -946,6 +957,7 @@ async fn test_batch_upsert_resets_accumulators_on_definition_change() -> anyhow:
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1045,6 +1057,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: Some(b"Derive-squat".to_vec()),
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1078,6 +1091,7 @@ async fn test_merge_persist_tx_is_single_commit_point() -> anyhow::Result<()> {
         is_ca: true,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1353,6 +1367,7 @@ async fn test_batch_upsert_persists_and_refreshes_ca_modular_hash() -> anyhow::R
         is_ca: true,
         drv_content: None,
         ca_modular_hash: ca_hash,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1471,6 +1486,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: Some(b"Derive-victim".to_vec()),
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1495,6 +1511,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1542,6 +1559,7 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
         is_ca: false,
         drv_content: None,
         ca_modular_hash: None,
+        evidence_rank: crate::state::DefinitionEvidence::UnverifiedClaim,
         wanted_output_names: vec![],
         topdown_pruned: false,
         closure_hole: false,
@@ -1558,5 +1576,99 @@ async fn settled_row_upsert_guard_preserves_identity_and_content() -> anyhow::Re
             .fetch_one(&test_db.pool)
             .await?;
     assert_eq!(status, "created", "matching rebuild re-created the row");
+    Ok(())
+}
+
+// r[verify sched.derivation.evidence-rank]
+/// `evidence_rank` PG round-trip per variant, and the deliberate
+/// creation-snapshot (EXCLUDED, NOT MAX) conflict semantics: a
+/// re-creation starts a new lifecycle at its own ingress rank, so a
+/// lower-ranked re-creation overwrites a higher persisted rank. The
+/// recovery loader returns the column verbatim.
+#[tokio::test]
+async fn test_batch_upsert_evidence_rank_roundtrip_and_recreation() -> anyhow::Result<()> {
+    use crate::state::DefinitionEvidence;
+    let test_db = TestDb::new(&crate::MIGRATOR).await;
+    let db = SchedulerDb::new(test_db.pool.clone());
+
+    let row = |hash: &str, rank: DefinitionEvidence| DerivationRow {
+        drv_hash: hash.into(),
+        drv_path: format!("/nix/store/{}-{hash}.drv", "e".repeat(32)),
+        pname: Some("evidence-rank".into()),
+        system: "x86_64-linux".into(),
+        status: DerivationStatus::Created,
+        required_features: vec![],
+        expected_output_paths: vec![format!("/nix/store/{}-{hash}-out", "f".repeat(32))],
+        output_names: vec!["out".into()],
+        is_fixed_output: false,
+        is_ca: false,
+        wanted_output_names: vec![],
+        topdown_pruned: false,
+        closure_hole: false,
+        drv_content: None,
+        ca_modular_hash: None,
+        evidence_rank: rank,
+    };
+
+    // Round-trip every variant through the upsert + the recovery SELECT.
+    let variants = [
+        ("ev-unverified", DefinitionEvidence::UnverifiedClaim),
+        ("ev-content", DefinitionEvidence::ContentBoundClaim),
+        ("ev-pathbound", DefinitionEvidence::PathBoundBytes),
+        ("ev-verified", DefinitionEvidence::VerifiedBuilt),
+    ];
+    let rows: Vec<DerivationRow> = variants.iter().map(|(h, r)| row(h, *r)).collect();
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(&mut tx, &rows).await?;
+    tx.commit().await?;
+
+    let recovered = db.load_nonterminal_derivations().await?;
+    for (hash, rank) in &variants {
+        let rec = recovered
+            .iter()
+            .find(|r| r.drv_hash == *hash)
+            .expect("recovery loader returns the row");
+        assert_eq!(
+            rec.evidence_rank,
+            rank.as_str(),
+            "verbatim round-trip for {hash}"
+        );
+    }
+
+    // The runtime upgrade writer is what settle/dispatch use.
+    db.persist_evidence_rank("ev-unverified", DefinitionEvidence::PathBoundBytes)
+        .await?;
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = 'ev-unverified'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(rank, "path_bound_bytes", "runtime writer persists upgrades");
+
+    // Re-creation applies EXCLUDED (creation-snapshot) semantics —
+    // deliberately NOT MAX: the verified_built row re-created by a
+    // store-backed submission starts its new lifecycle at the floor.
+    let mut tx = db.pool().begin().await?;
+    SchedulerDb::batch_upsert_derivations(
+        &mut tx,
+        &[row("ev-verified", DefinitionEvidence::UnverifiedClaim)],
+    )
+    .await?;
+    tx.commit().await?;
+    let (rank,): (String,) =
+        sqlx::query_as("SELECT evidence_rank FROM derivations WHERE drv_hash = 'ev-verified'")
+            .fetch_one(&test_db.pool)
+            .await?;
+    assert_eq!(
+        rank, "unverified_claim",
+        "re-creation is a new lifecycle at its own ingress rank (EXCLUDED, not MAX)"
+    );
+
+    // The CHECK constraint rejects out-of-lattice values at the SQL
+    // boundary (defense-in-depth under the Rust-side codec).
+    let res =
+        sqlx::query("UPDATE derivations SET evidence_rank = 'bogus' WHERE drv_hash = 'ev-content'")
+            .execute(&test_db.pool)
+            .await;
+    assert!(res.is_err(), "CHECK constraint rejects unknown ranks");
     Ok(())
 }

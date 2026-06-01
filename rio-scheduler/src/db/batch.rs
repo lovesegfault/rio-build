@@ -36,9 +36,9 @@ impl SchedulerDb {
     /// Batch-upsert derivations. Returns a map
     /// `drv_hash -> (derivation_id, resource_floor)`.
     ///
-    /// Array parameters via `UNNEST`: 15 bind params total regardless of
-    /// row count (vs `push_values`' 15×N, which hits PG's 65535-param
-    /// limit at ~4369 rows). `RETURNING drv_hash` because PG doesn't
+    /// Array parameters via `UNNEST`: 16 bind params total regardless of
+    /// row count (vs `push_values`' 16×N, which hits PG's 65535-param
+    /// limit at ~4095 rows). `RETURNING drv_hash` because PG doesn't
     /// guarantee `RETURNING` order matches `UNNEST` input order either.
     ///
     /// `floor_*` columns are returned so merge can hydrate them onto
@@ -54,7 +54,7 @@ impl SchedulerDb {
             return Ok(HashMap::new());
         }
 
-        // Decompose struct-of-rows into row-of-arrays. Fifteen parallel
+        // Decompose struct-of-rows into row-of-arrays. Sixteen parallel
         // Vecs, one per column. This IS a transpose — lives for the
         // duration of one INSERT, cheaper than N roundtrips.
         //
@@ -88,6 +88,7 @@ impl SchedulerDb {
         // reach it.
         let mut drv_content = Vec::with_capacity(rows.len());
         let mut ca_modular_hash = Vec::with_capacity(rows.len());
+        let mut evidence_rank = Vec::with_capacity(rows.len());
         for r in rows {
             drv_hash.push(r.drv_hash.as_str());
             drv_path.push(r.drv_path.as_str());
@@ -104,6 +105,7 @@ impl SchedulerDb {
             closure_hole.push(r.closure_hole);
             drv_content.push(r.drv_content.clone().unwrap_or_default());
             ca_modular_hash.push(r.ca_modular_hash.map(|h| h.to_vec()).unwrap_or_default());
+            evidence_rank.push(r.evidence_rank.as_str());
         }
 
         // r[impl sched.persist.recreate-refresh+2]
@@ -187,7 +189,7 @@ impl SchedulerDb {
                 (drv_hash, drv_path, pname, system, status, required_features,
                  expected_output_paths, output_names, is_fixed_output, is_ca,
                  wanted_output_names, topdown_pruned, closure_hole, drv_content,
-                 ca_modular_hash)
+                 ca_modular_hash, evidence_rank)
             SELECT
                 drv_hash, drv_path, pname, system, status,
                 required_features::text[],
@@ -197,15 +199,17 @@ impl SchedulerDb {
                 wanted_output_names::text[],
                 topdown_pruned, closure_hole,
                 NULLIF(drv_content, ''::bytea),
-                NULLIF(ca_modular_hash, ''::bytea)
+                NULLIF(ca_modular_hash, ''::bytea),
+                evidence_rank
             FROM UNNEST(
                 $1::text[], $2::text[], $3::text[], $4::text[], $5::text[],
                 $6::text[], $7::text[], $8::text[], $9::bool[], $10::bool[],
-                $11::text[], $12::bool[], $13::bool[], $14::bytea[], $15::bytea[]
+                $11::text[], $12::bool[], $13::bool[], $14::bytea[], $15::bytea[],
+                $16::text[]
             ) AS t(drv_hash, drv_path, pname, system, status,
                    required_features, expected_output_paths, output_names,
                    is_fixed_output, is_ca, wanted_output_names, topdown_pruned,
-                   closure_hole, drv_content, ca_modular_hash)
+                   closure_hole, drv_content, ca_modular_hash, evidence_rank)
             -- is_ca rides the same creation-snapshot refresh as the
             -- other identity columns: rows are written only by
             -- submissions that (re)create the node, and a displacing
@@ -271,6 +275,16 @@ impl SchedulerDb {
                 -- ingress validation plus node lifecycle, not by this
                 -- clear.
                 drv_content = EXCLUDED.drv_content,
+                -- r[impl sched.derivation.evidence-rank]
+                -- Creation-snapshot semantics like the identity columns
+                -- above — deliberately NOT MAX-combined: rank
+                -- monotonicity is scoped per node LIFECYCLE, and a
+                -- legitimate matching-identity re-creation (resubmit
+                -- after store GC, displacement) starts a new lifecycle
+                -- at its own ingress rank. Settle/dispatch upgrades go
+                -- through the runtime persist_evidence_rank writer, not
+                -- this upsert.
+                evidence_rank = EXCLUDED.evidence_rank,
                 -- r[impl sched.persist.ca-modular-hash+2]
                 -- The CA modular hash is snapshot identity (the
                 -- content-bound evidence the merge gate compares, and
@@ -357,6 +371,7 @@ impl SchedulerDb {
         .bind(&closure_hole)
         .bind(&drv_content)
         .bind(&ca_modular_hash)
+        .bind(&evidence_rank)
         .fetch_all(&mut *tx)
         .await?;
         Ok(result

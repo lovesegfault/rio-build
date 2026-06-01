@@ -79,6 +79,44 @@ impl DagActor {
             error!(drv_hash = %drv_hash, ?status, error = %e,
                    "failed to persist derivation status");
         }
+        self.persist_settle_evidence(std::slice::from_ref(&drv_hash.as_str()), status)
+            .await;
+    }
+
+    // r[impl sched.derivation.evidence-rank]
+    /// Ride-along for the settle persists: when a settle transition's
+    /// in-memory chokepoint upgraded the node to `VerifiedBuilt`
+    /// (`DerivationState::transition`, only ever from
+    /// `PathBoundBytes`), persist the upgraded rank best-effort.
+    /// Riding `persist_status` / `persist_status_batch` means no
+    /// settle-persist call site can forget it — the same chokepoint
+    /// shape as the in-memory half. Reads the CURRENT in-memory rank,
+    /// so re-persisting an already-settled node is an idempotent
+    /// no-op write, and non-upgraded nodes (cache-hit echoes,
+    /// content-bound claims) cost nothing. A lost write degrades to
+    /// the persisted ingress rank at recovery (documented on
+    /// `persist_evidence_rank`).
+    async fn persist_settle_evidence(&self, drv_hashes: &[&str], status: DerivationStatus) {
+        use crate::state::{DefinitionEvidence, DerivationStatus as DS};
+        if !matches!(status, DS::Completed | DS::Skipped) {
+            return;
+        }
+        for hash in drv_hashes {
+            let Some(state) = self.dag.node(&DrvHash::from(*hash)) else {
+                continue;
+            };
+            if state.evidence != DefinitionEvidence::VerifiedBuilt {
+                continue;
+            }
+            if let Err(e) = self
+                .db
+                .persist_evidence_rank(hash, DefinitionEvidence::VerifiedBuilt)
+                .await
+            {
+                error!(drv_hash = %hash, error = %e,
+                       "failed to persist settle evidence-rank upgrade (best-effort)");
+            }
+        }
     }
 
     /// Best-effort atomic persist of `status='poisoned'` + `poisoned_at=now()`.
@@ -119,6 +157,7 @@ impl DagActor {
             error!(count = drv_hashes.len(), ?status, error = %e,
                    "failed to batch-persist derivation status");
         }
+        self.persist_settle_evidence(drv_hashes, status).await;
     }
 
     /// Batch variant of [`unpin_best_effort`]. Same best-effort
