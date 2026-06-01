@@ -173,6 +173,27 @@ pub struct SandboxEnvConfig {
 /// Default build timeout: 2 hours. See `ExecutorEnv.build_timeout`.
 pub const DEFAULT_BUILD_TIMEOUT: Duration = Duration::from_secs(7200);
 
+/// Hard ceiling on how long a sandbox execution may outlive its build
+/// timeout before the worker forcibly reclaims it.
+///
+/// rio-exec enforces the build's own `timeout`/`max_silent`/log-cap
+/// limits from inside its supervision loop, but those kills are issued
+/// by the same loop that forwards log events to the consumer: a consumer
+/// that stops reading (scheduler-link backpressure filling the event
+/// channel) suspends enforcement with it. This backstop bounds that
+/// suspension: `build timeout + EXEC_BACKSTOP_SLACK` after spawn, the
+/// `execute()` future is dropped, which fires the executor's
+/// process-tree guard — kill *and* reap, the designed-for cancellation
+/// path proven by `rio-exec/tests/drop_cancel.rs`.
+///
+/// MUST stay below rio-controller's `WORKER_DEADLINE_SLACK_SECS` (90s,
+/// `reconcilers/pool/jobs.rs`): the pod's `activeDeadlineSeconds` is
+/// `build_timeout + 90s`, and the worker has to report `TimedOut`
+/// through the normal completion path before k8s tears the pod down.
+/// The 60s covers sandbox setup plus the bounded post-reap event drain
+/// (`FINAL_DRAIN_TIMEOUT`), with margin.
+const EXEC_BACKSTOP_SLACK: Duration = Duration::from_secs(60);
+
 /// Error type for executor operations.
 ///
 /// No `#[from] anyhow::Error` — every variant has a typed source. A
@@ -1262,7 +1283,50 @@ async fn run_native_lifecycle(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     // r[impl builder.exec.sandbox+3]
-    let exec_result = rio_exec::execute(&prepared.request, &host, event_tx).await;
+    // r[impl builder.timeout.no-reassign]
+    // Backstop: rio-exec's own timeout/silence/log-cap kills are issued by
+    // its supervision loop, whose event sends stall when the consumer
+    // stalls. If that enforcement is suspended past the build's deadline
+    // plus slack, drop the execute() future: the executor's process-tree
+    // guard kills and reaps the sandbox tree on drop (the designed-for
+    // cancellation path — rio-exec/tests/drop_cancel.rs), so the worker
+    // reclaims the build instead of waiting for k8s to kill the pod. The
+    // result is a build outcome (TimedOut), never an executor fault.
+    let exec_result = match tokio::time::timeout(
+        opts.timeout.saturating_add(EXEC_BACKSTOP_SLACK),
+        rio_exec::execute(&prepared.request, &host, event_tx),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => {
+            // The log loop's consumer side may be the stalled party —
+            // abort it rather than draining it, then collect the abort
+            // before tearing the cgroup down.
+            log_task.abort();
+            let _ = log_task.await;
+            let (peak_cpu_cores, _oom) = monitors.stop();
+            let peak_memory_bytes = build_cgroup.memory_peak().unwrap_or(0);
+            drain_build_cgroup(build_cgroup).await;
+            scopeguard::ScopeGuard::into_inner(cgroup_kill_guard);
+            return Ok(NativeOutcome {
+                build_result: Ok(NativeBuild::Failed {
+                    status: rio_proto::types::BuildResultStatus::TimedOut,
+                    error_msg: format!(
+                        "build exceeded its timeout ({}s) plus the worker's enforcement \
+                         backstop ({}s); the in-sandbox limit enforcement never fired, which \
+                         usually means the worker's log/event pipeline was stalled (e.g. \
+                         scheduler-link backpressure)",
+                        opts.timeout.as_secs(),
+                        EXEC_BACKSTOP_SLACK.as_secs(),
+                    ),
+                }),
+                peak_memory_bytes,
+                peak_cpu_cores,
+                final_line_count: opts.batcher_seed,
+            });
+        }
+    };
     let stop_time = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2115,6 +2179,48 @@ mod tests {
         );
 
         Ok(())
+    }
+
+    /// The execution backstop's deadline arithmetic: the backstop must
+    /// always sit strictly *after* the build's own timeout (so rio-exec's
+    /// in-sandbox enforcement gets first shot) and strictly *inside* the
+    /// pod's k8s deadline slack (so the worker reports TimedOut through
+    /// the normal completion path before k8s kills the pod).
+    ///
+    /// The 90s bound mirrors rio-controller's `WORKER_DEADLINE_SLACK_SECS`
+    /// (reconcilers/pool/jobs.rs) — a cross-crate invariant that cannot be
+    /// expressed as a compile-time check because rio-builder does not
+    /// depend on rio-controller; this test is its documented pin.
+    // r[verify builder.timeout.no-reassign]
+    #[test]
+    fn backstop_deadline_exceeds_build_timeout_and_stays_under_k8s_slack() {
+        // Strictly positive slack: the backstop never races the in-sandbox
+        // enforcement.
+        assert!(EXEC_BACKSTOP_SLACK > Duration::ZERO);
+
+        // Strictly under the controller's pod-deadline slack.
+        const CONTROLLER_WORKER_DEADLINE_SLACK_SECS: u64 = 90;
+        assert!(
+            EXEC_BACKSTOP_SLACK.as_secs() < CONTROLLER_WORKER_DEADLINE_SLACK_SECS,
+            "EXEC_BACKSTOP_SLACK ({}s) must stay under rio-controller's \
+             WORKER_DEADLINE_SLACK_SECS ({CONTROLLER_WORKER_DEADLINE_SLACK_SECS}s), \
+             or the pod dies before the worker can report TimedOut",
+            EXEC_BACKSTOP_SLACK.as_secs(),
+        );
+
+        // Deadline arithmetic for representative timeouts: backstop deadline
+        // is strictly after the build timeout and never panics on overflow.
+        for timeout in [
+            Duration::from_secs(60),
+            DEFAULT_BUILD_TIMEOUT,
+            Duration::from_secs(u64::MAX), // saturates instead of panicking
+        ] {
+            let deadline = timeout.saturating_add(EXEC_BACKSTOP_SLACK);
+            assert!(deadline >= timeout);
+            if timeout < Duration::from_secs(u64::MAX) - EXEC_BACKSTOP_SLACK {
+                assert_eq!(deadline, timeout + EXEC_BACKSTOP_SLACK);
+            }
+        }
     }
 
     /// TimedOut must NOT map to anything the scheduler reassigns. This
