@@ -892,12 +892,63 @@ impl DagActor {
             .resolve_materialization_job_fenced(job_id, exec_id, to_state, serving_generation)
             .await
         {
-            Ok(crate::db::FencedWrite::Applied(_)) => {}
+            Ok(crate::db::FencedWrite::Applied(_)) => {
+                // r[impl sched.materialize.pinning]
+                // §5.3 release site (i): the resolution may have made
+                // this job's pins releasable (resolved AND no live
+                // interest — the single-build case where the interest
+                // already went terminal before the report landed). The
+                // release query self-scopes; calling it after every
+                // resolution is a no-op when interest is still live.
+                self.release_materialization_pins_best_effort("job resolution")
+                    .await;
+            }
             Ok(crate::db::FencedWrite::Fenced) => {
                 self.note_fenced_evidence_write("materialization job resolve");
             }
             Err(e) => {
                 warn!(%job_id, error = %e, "materialization job resolve failed");
+            }
+        }
+    }
+
+    // r[impl sched.materialize.pinning]
+    /// The §5.3 pin-release call shared by the three wiring sites
+    /// (consumption resolution, build-terminal transition, recovery
+    /// sweep arm): delete materialization pins whose job is resolved
+    /// AND whose derivation has no live interested build left. The
+    /// query self-scopes (pins of unresolved jobs and pins with live
+    /// interest always survive — the B2-strong holds-window).
+    ///
+    /// ALWAYS-ON, never flag-gated (PD-B17): flag-gating the release
+    /// would make flag-on-era pins permanently GC-immune after an
+    /// ON→OFF rollback — a store-state divergence no equivalence
+    /// criterion would catch. Flag-off, no materialization pins exist
+    /// for fresh work and the call is a cheap no-op over flag-on-era
+    /// leftovers (which is exactly the rollback drain §5.3 wants).
+    /// Event-driven (not per-tick), so this does not reproduce the
+    /// dormancy-7 flag-off-PG-query concern.
+    ///
+    /// Best-effort: a failed release is retried by the next event-driven
+    /// site or the recovery sweep arm (the orphan backstop).
+    pub(super) async fn release_materialization_pins_best_effort(&mut self, trigger: &str) {
+        match self
+            .db
+            .release_materialization_pins_for_resolved_jobs()
+            .await
+        {
+            Ok(0) => {}
+            Ok(released) => {
+                tracing::info!(
+                    released,
+                    trigger,
+                    "materialization pins released (job resolved + all interest terminal)"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, trigger,
+                      "materialization pin release failed (best-effort; the recovery \
+                       sweep arm is the backstop)");
             }
         }
     }

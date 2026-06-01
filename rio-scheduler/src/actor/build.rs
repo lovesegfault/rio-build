@@ -644,6 +644,21 @@ impl DagActor {
             }
         }
 
+        // r[impl sched.materialize.pinning]
+        // §5.3 release site (ii): a terminal build departs the live
+        // interest join (the durable status above committed BEFORE this
+        // runs, so the materialization_interest view already excludes
+        // it). If it was the LAST live interested build of a derivation
+        // with a resolved materialization job, that job's pins release
+        // here. ALWAYS-ON — never flag-gated (PD-B17): flag-on-era pins
+        // must release after a rollback to flag-off; flag-off with no
+        // materialization pins this is one cheap self-scoping no-op
+        // query per build-terminal event.
+        if new_state.is_terminal() {
+            self.release_materialization_pins_best_effort("build terminal")
+                .await;
+        }
+
         Ok(TransitionOutcome::Applied)
     }
 

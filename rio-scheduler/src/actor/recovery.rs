@@ -1351,6 +1351,35 @@ impl DagActor {
                 warn!(error = %e, "failed to sweep stale live pins (best-effort)");
             }
         }
+        // r[impl sched.materialize.pinning]
+        // §5.3 release site (iii) — the recovery sweep's MATERIALIZATION
+        // arm (the orphan backstop): pins whose job resolved and whose
+        // every interested build went terminal while no event-driven
+        // release fired (the crash window between resolution/terminal
+        // and the release call) are released here, once per leader
+        // acquisition. sweep_stale_live_pins above deliberately excludes
+        // pin_kind='materialization' rows (its terminal-drv premise is
+        // false for them); this arm is their release path. ALWAYS-ON,
+        // never flag-gated (PD-B17): a flag-off successor leader must
+        // still drain flag-on-era pins. Same best-effort posture and
+        // TOCTOU-window placement as the build-input sweep above.
+        match self
+            .db
+            .release_materialization_pins_for_resolved_jobs()
+            .await
+        {
+            Ok(n) if n > 0 => {
+                info!(
+                    released = n,
+                    "released orphaned materialization pins (recovery sweep arm)"
+                );
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e,
+                      "failed to release orphaned materialization pins (best-effort)");
+            }
+        }
         // Stale-assignment cleanup: crash-between-derivations-UPDATE-
         // and-assignments-UPDATE (pre-tx-wrap binaries) left rows with
         // derivation terminal but assignment pending → permanently

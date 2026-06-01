@@ -2382,3 +2382,338 @@ async fn flag_on_job_success_then_flag_off_revert_no_wrongful_fail_fast() -> Tes
     );
     Ok(())
 }
+
+// ── T-1.8 (Phase B): the §5.3 pin-release wiring (always-on, three sites) ──
+
+/// Count materialization pins for a drv (the §5.3 assertions).
+async fn mat_pin_count(pool: &sqlx::PgPool, drv: &str) -> anyhow::Result<i64> {
+    Ok(sqlx::query_scalar(
+        "SELECT count(*) FROM scheduler_live_pins \
+          WHERE drv_hash = $1 AND pin_kind = 'materialization'",
+    )
+    .bind(drv)
+    .fetch_one(pool)
+    .await?)
+}
+
+// r[verify sched.materialize.pinning]
+/// §5.3 release sites (i)+(ii), the single-build case: pins created at
+/// ingest survive until the job is resolved AND the (only) interested
+/// build goes terminal — at which point the build-terminal hook
+/// releases them. Without the wiring, every materialized path stays
+/// pinned forever (the store GC roots on every scheduler_live_pins row).
+#[tokio::test]
+async fn pins_release_when_job_resolved_and_interest_terminal() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let tag = "pin-rel";
+    let out = test_store_path("pin-rel-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mut node = make_node(tag);
+    node.expected_output_paths = vec![out.clone()];
+    node.wanted_output_names = vec!["out".into()];
+
+    let build_id = Uuid::new_v4();
+    let _ev = merge_dag(&handle, build_id, vec![node], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Claim, then simulate the store executor's pin-at-ingest (the
+    // store-side write the real executor issues before its Success
+    // report).
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let job_id: Uuid = sqlx::query_scalar("SELECT job_id FROM materialization_jobs")
+        .fetch_one(&db.pool)
+        .await?;
+    sdb(&db.pool)
+        .pin_materialized_paths(
+            job_id,
+            &crate::state::DrvHash::from(tag),
+            std::slice::from_ref(&out),
+        )
+        .await?;
+    assert_eq!(mat_pin_count(&db.pool, tag).await?, 1, "pinned at ingest");
+
+    // Success → consumption: job resolved, node completed, the (only)
+    // interested build goes terminal → the §5.3 release fires.
+    store.seed_with_content(&out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        query_status(&handle, build_id).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32,
+        "the build completed through the consumption"
+    );
+    assert_eq!(
+        mat_pin_count(&db.pool, tag).await?,
+        0,
+        "§5.3: job resolved AND all interest terminal → the pins are released \
+         (the build-terminal hook is the release site)"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.pinning]
+/// §5.3's holds-window (the B2-strong property): pins survive while ANY
+/// live interested build remains, and release only when the LAST one
+/// goes terminal. Two builds share the materialized node; one finishes,
+/// one stays live → held; the second goes terminal → released.
+#[tokio::test]
+async fn pins_survive_while_any_interest_live() -> TestResult {
+    let (db, store, handle, _tasks) = setup_with_mock_store_materialization_enabled().await?;
+    let tag = "pin-hold";
+    let out = test_store_path("pin-hold-out");
+    store.state.substitutable.write().unwrap().push(out.clone());
+    let mk = || {
+        let mut n = make_node(tag);
+        n.expected_output_paths = vec![out.clone()];
+        n.wanted_output_names = vec!["out".into()];
+        n
+    };
+
+    // Build A: just the materialized node. Build B: the node + an
+    // unrelated never-completing node (keeps B live).
+    let build_a = Uuid::new_v4();
+    let _ev_a = merge_dag(&handle, build_a, vec![mk()], vec![], false).await?;
+    barrier(&handle).await;
+    let build_b = Uuid::new_v4();
+    let blocker = make_node("pin-hold-blocker");
+    let _ev_b = merge_dag(&handle, build_b, vec![mk(), blocker], vec![], false).await?;
+    barrier(&handle).await;
+
+    // Claim + pin-at-ingest + Success.
+    let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+        Ok(PullOutcome::Deliver(a)) => *a,
+        other => panic!("the job must be claimable, got {other:?}"),
+    };
+    let exec_id: Uuid = assignment.exec_id.parse()?;
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT job_id FROM materialization_jobs WHERE state = 'pending'")
+            .fetch_one(&db.pool)
+            .await?;
+    sdb(&db.pool)
+        .pin_materialized_paths(
+            job_id,
+            &crate::state::DrvHash::from(tag),
+            std::slice::from_ref(&out),
+        )
+        .await?;
+    store.seed_with_content(&out, b"materialized");
+    report_materialization_outcome(
+        &handle,
+        exec_id,
+        tag,
+        mat_success_outcome(vec![out.clone()], vec![]),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+    barrier(&handle).await;
+
+    // Build A succeeded (terminal); build B is still live (blocker
+    // pending) → the pins are HELD (the all-interest-terminal rule).
+    assert_eq!(
+        query_status(&handle, build_a).await?.state,
+        rio_proto::types::BuildState::Succeeded as i32
+    );
+    assert_eq!(
+        query_status(&handle, build_b).await?.state,
+        rio_proto::types::BuildState::Active as i32,
+        "build B stays live behind the blocker node"
+    );
+    assert_eq!(
+        mat_pin_count(&db.pool, tag).await?,
+        1,
+        "§5.3 holds-window: pins survive while ANY live interested build remains"
+    );
+
+    // Build B goes terminal (cancel) → the LAST interest departs → released.
+    cancel_build(&handle, build_b).await?;
+    barrier(&handle).await;
+    assert_eq!(
+        mat_pin_count(&db.pool, tag).await?,
+        0,
+        "§5.3: the last interested build's terminal transition releases the pins"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.pinning]
+/// THE always-on proof (PD-B17): pins created during a flag-ON era
+/// release after a rollback to flag-OFF. The release wiring is NOT
+/// flag-gated — if it were, flag-on-era pins would become permanently
+/// GC-immune after an ON→OFF rollback (a store-state divergence no
+/// criterion would catch).
+#[tokio::test]
+async fn flag_on_era_pins_release_after_revert() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+    let (store, store_client, _store_task) =
+        rio_test_support::grpc::spawn_mock_store_with_client().await?;
+    let tag = "pin-revert";
+    let out = test_store_path("pin-revert-out");
+    let build_id = Uuid::new_v4();
+
+    // ── Phase 1 (flag-ON): job → claim → pin → Success; the build
+    //    stays live behind a blocker node. ──
+    {
+        let (handle, task) =
+            setup_actor_configured(db.pool.clone(), Some(store_client.clone()), |cfg, _| {
+                cfg.materialization.enabled = true;
+            });
+        store.state.substitutable.write().unwrap().push(out.clone());
+        let mut node = make_node(tag);
+        node.expected_output_paths = vec![out.clone()];
+        node.wanted_output_names = vec!["out".into()];
+        let blocker = make_node("pin-revert-blocker");
+        let _ev = merge_dag(&handle, build_id, vec![node, blocker], vec![], false).await?;
+        barrier(&handle).await;
+
+        let assignment = match claim_materialization(&handle, tag, "store-test-0").await {
+            Ok(PullOutcome::Deliver(a)) => *a,
+            other => panic!("the job must be claimable, got {other:?}"),
+        };
+        let exec_id: Uuid = assignment.exec_id.parse()?;
+        let job_id: Uuid = sqlx::query_scalar("SELECT job_id FROM materialization_jobs")
+            .fetch_one(&db.pool)
+            .await?;
+        sdb(&db.pool)
+            .pin_materialized_paths(
+                job_id,
+                &crate::state::DrvHash::from(tag),
+                std::slice::from_ref(&out),
+            )
+            .await?;
+        store.seed_with_content(&out, b"materialized");
+        report_materialization_outcome(
+            &handle,
+            exec_id,
+            tag,
+            mat_success_outcome(vec![out.clone()], vec![]),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("success report rejected: {e:?}"))?;
+        barrier(&handle).await;
+
+        // Job resolved; the build is still live → pins held.
+        assert_eq!(
+            query_status(&handle, build_id).await?.state,
+            rio_proto::types::BuildState::Active as i32
+        );
+        assert_eq!(
+            mat_pin_count(&db.pool, tag).await?,
+            1,
+            "flag-on-era pin held"
+        );
+
+        // The deployment reverts to flag-off.
+        drop(handle);
+        let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+    }
+
+    // ── Phase 2 (flag-OFF, same PG): the build goes terminal → the
+    //    ALWAYS-ON release fires. ──
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) =
+        setup_actor_configured(db.pool.clone(), Some(store_client), move |_cfg, p| {
+            p.leader = phase2_leader; // flag-off (default config)
+        });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    cancel_build(&handle, build_id).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        mat_pin_count(&db.pool, tag).await?,
+        0,
+        "PD-B17: flag-on-era pins release after the rollback — the §5.3 wiring is \
+         always-on, never flag-gated"
+    );
+    Ok(())
+}
+
+// r[verify sched.materialize.pinning]
+/// §5.3 release site (iii): the recovery sweep's materialization arm is
+/// the orphan backstop — pins whose job resolved and whose every
+/// interested build went terminal while no event-driven release fired
+/// (crash window) are released at the next leader acquisition. Proven
+/// flag-OFF (the arm is always-on).
+#[tokio::test]
+async fn recovery_sweep_releases_orphaned_materialization_pins() -> TestResult {
+    let db = TestDb::new(&MIGRATOR).await;
+
+    // Seed the orphan shape directly in PG (the crash window's residue):
+    // a terminal build + wanted row + resolved job + materialization pins.
+    let derivation_id: Uuid = sqlx::query_scalar(
+        "INSERT INTO derivations (drv_hash, drv_path, system, status) \
+         VALUES ('pin-orphan', '/nix/store/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa-pin-orphan.drv', \
+                 'x86_64-linux', 'completed') \
+         RETURNING derivation_id",
+    )
+    .fetch_one(&db.pool)
+    .await?;
+    let build_id = Uuid::new_v4();
+    sqlx::query("INSERT INTO builds (build_id, status) VALUES ($1, 'succeeded')")
+        .bind(build_id)
+        .execute(&db.pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO build_wanted_outputs (build_id, derivation_id, wanted_output_names) \
+         VALUES ($1, $2, '{}')",
+    )
+    .bind(build_id)
+    .bind(derivation_id)
+    .execute(&db.pool)
+    .await?;
+    let job_id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO materialization_jobs \
+             (job_id, derivation_id, drv_hash, origin, state, created_generation) \
+         VALUES ($1, $2, 'pin-orphan', 'cache_opportunity', 'resolved_success', 1)",
+    )
+    .bind(job_id)
+    .bind(derivation_id)
+    .execute(&db.pool)
+    .await?;
+    sdb(&db.pool)
+        .pin_materialized_paths(
+            job_id,
+            &crate::state::DrvHash::from("pin-orphan"),
+            &[test_store_path("pin-orphan-out")],
+        )
+        .await?;
+    assert_eq!(mat_pin_count(&db.pool, "pin-orphan").await?, 1);
+
+    // A fresh (flag-OFF) leader recovers → the sweep's materialization
+    // arm releases the orphan.
+    let leader = crate::lease::LeaderState::always_leader(std::sync::Arc::new(
+        std::sync::atomic::AtomicU64::new(1),
+    ));
+    let _confirmations = spawn_leading_confirmations(leader.clone());
+    let phase2_leader = leader.clone();
+    let (handle, _task) = setup_actor_configured(db.pool.clone(), None, move |_cfg, p| {
+        p.leader = phase2_leader;
+    });
+    handle.send_unchecked(ActorCommand::LeaderAcquired).await?;
+    barrier(&handle).await;
+
+    assert_eq!(
+        mat_pin_count(&db.pool, "pin-orphan").await?,
+        0,
+        "§5.3 site (iii): the recovery sweep's materialization arm releases orphaned pins"
+    );
+    Ok(())
+}
