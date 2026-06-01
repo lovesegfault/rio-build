@@ -126,8 +126,10 @@ networkPolicy:
 # template in templates/gateway.yaml; explicit gateway.buildPolicy
 # entries win over the defaults).
 # The rio-replay namespace, ServiceAccount, Secrets, tenants and Jobs are
-# created by `cargo xtask replay launch|record`, never by this chart.
-# EKS deploys flip this via `cargo xtask k8s -p eks up --deploy --deploy-replay`.
+# created by `cargo xtask replay setup|launch|record`, never by this chart.
+# Enablement is owned by `cargo xtask replay setup` (helm upgrade
+# --reuse-values on the deployed release); service deploys preserve the
+# flag but never set it.
 replay:
   enabled: false
   # Namespace the campaign-engine Jobs run in (created by xtask). The CNP

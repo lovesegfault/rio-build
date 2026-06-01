@@ -665,7 +665,7 @@ pub async fn run(a: LaunchArgs) -> Result<()> {
                 "the deployed rio-gateway runs on an auto-generated (emptyDir) SSH host key, so \
                  there is nothing to pin and the campaign engine refuses to run without a pinned \
                  host key. Redeploy with a persistent host key — `cargo xtask k8s -p eks up \
-                 --deploy --deploy-replay` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
+                 --deploy` sets gateway.ssh.hostKeySecret=rio-gateway-host-key \
                  (Secret data key `host_key`) — then re-run launch."
             ),
         }
@@ -1273,7 +1273,15 @@ async fn create_tenant(cli: &CliCtx, tenant: &str) -> Result<()> {
 /// Existing private keys are REUSED so re-running launch neither grows
 /// authorized_keys with orphans nor strands a running campaign's mounted
 /// keys.
-async fn ensure_tenant_keys(client: &kclient::Client, restart_gateway: bool) -> Result<()> {
+///
+/// Shared with `replay setup` (pub(super)): setup provisions the same
+/// Secrets up front so the cluster is campaign-ready before any launch;
+/// launch keeps calling it so a launch on a never-setup cluster still
+/// self-heals.
+pub(super) async fn ensure_tenant_keys(
+    client: &kclient::Client,
+    restart_gateway: bool,
+) -> Result<()> {
     use k8s_openapi::api::core::v1::Secret;
 
     let api: Api<Secret> = Api::namespaced(client.clone(), NS_REPLAY);
@@ -1496,8 +1504,8 @@ async fn preflight_checks(
         }
         Ok(None) => failures.push(
             "ConfigMap rio-system/rio-gateway-config (key gateway.toml) not found — the chart was \
-             deployed without the gateway build-policy; redeploy with replay.enabled=true \
-             (`cargo xtask k8s -p eks up --deploy --deploy-replay`)"
+             deployed without the gateway build-policy; enable replay on the release \
+             (`cargo xtask replay setup`)"
                 .to_string(),
         ),
         Err(e) => failures.push(format!("read deployed gateway build-policy: {e:#}")),

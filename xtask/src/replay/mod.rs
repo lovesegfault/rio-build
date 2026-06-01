@@ -9,13 +9,15 @@
 //! later milestone (M2) so `--help` documents the full campaign lifecycle.
 //!
 //! Operator note: chart-side enablement (the engine's CiliumNetworkPolicy
-//! admissions + the campaign tenants' gateway build-policy defaults) comes
-//! from deploying with `cargo xtask k8s up --deploy-replay`; see
-//! `cargo xtask replay launch --help` for the redeploy warning that applies
-//! while a campaign is running.
+//! admissions + the campaign tenants' gateway build-policy defaults) is
+//! owned by `cargo xtask replay setup`, which flips `replay.enabled` on
+//! the deployed helm release. Service deploys (`cargo xtask k8s up
+//! --deploy`) preserve that flag but never set it.
 
 use anyhow::{Result, bail};
 use clap::{Args, Subcommand};
+
+use crate::config::XtaskConfig;
 
 pub mod dev;
 pub mod eval;
@@ -25,6 +27,7 @@ pub mod preflight;
 pub mod report;
 pub mod repro;
 pub mod s3;
+pub mod setup;
 pub mod status;
 
 /// Campaign tenants (created by `replay launch` directly via rio-cli —
@@ -78,6 +81,13 @@ pub struct ReplayArgs {
 
 #[derive(Subcommand)]
 enum ReplayCmd {
+    /// Make the cluster replay-ready: verify the deployed chart + replay
+    /// IAM role, ensure the rio-replay image is in ECR (pushing just
+    /// that image when missing), enable replay on the existing helm
+    /// release, and bootstrap the rio-replay namespace, ServiceAccount,
+    /// and tenant-key Secrets. Idempotent — safe to re-run; required
+    /// again after `k8s up --wipe` (a wipe resets the release values).
+    Setup(setup::SetupArgs),
     /// Create the evaluation-recorder Job (alias: eval): record (or
     /// reuse) a replay archive for one Hydra evaluation (publishes under
     /// `replay/archives/…` in S3).
@@ -86,15 +96,11 @@ enum ReplayCmd {
     /// Pre-flight the cluster, provision campaign tenants/keys/Secrets,
     /// and apply the campaign Job.
     ///
-    /// Requires the chart to have been deployed with `cargo xtask k8s up
-    /// --deploy-replay`, and that requirement does not end at launch: any
-    /// redeploy while the campaign is running must also pass
-    /// --deploy-replay, because helm gets a full fresh value set on every
-    /// upgrade and omitting the flag reverts replay.enabled to false
-    /// (dropping the engine's network admissions and the campaign
-    /// tenants' build-policy defaults) and rolls the gateway. The
-    /// launch-time pre-flight cannot protect against a redeploy that
-    /// happens after launch.
+    /// Requires the cluster to be replay-ready (`cargo xtask replay
+    /// setup`). Service deploys while a campaign is running are safe:
+    /// `cargo xtask k8s up --deploy` preserves the release's replay
+    /// enablement (it never sets or clears it). What does reset it is
+    /// `up --wipe` — re-run `replay setup` after a wipe.
     Launch(launch::LaunchArgs),
     /// Show campaign progress (progress.json from S3 + Job state).
     Status(status::StatusArgs),
@@ -126,8 +132,12 @@ enum ReplayCmd {
     },
 }
 
-pub async fn run(args: ReplayArgs) -> Result<()> {
+/// `cfg` is only consumed by `setup` (single-image push honors
+/// RIO_REMOTE_STORE); the other subcommands read what they need from
+/// tofu outputs and the cluster.
+pub async fn run(args: ReplayArgs, cfg: &XtaskConfig) -> Result<()> {
     match args.cmd {
+        ReplayCmd::Setup(a) => setup::run(a, cfg).await,
         ReplayCmd::Record(a) => eval::run(a).await,
         ReplayCmd::Launch(a) => launch::run(a).await,
         ReplayCmd::Status(a) => status::run(a).await,

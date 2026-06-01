@@ -2201,6 +2201,11 @@
       "doc": "S3 layout + small read helpers for campaign artifacts."
     },
     {
+      "path": "replay/setup.rs",
+      "depth": 1,
+      "doc": "`cargo xtask replay setup` — make the deployed EKS cluster replay-ready."
+    },
+    {
       "path": "replay/status.rs",
       "depth": 1,
       "doc": "`cargo xtask replay status` — render campaign progress and Job state."

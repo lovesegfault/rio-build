@@ -100,7 +100,7 @@ pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bo
         .with_context(|| {
             format!(
                 "deployed gateway.toml has no [build_policy.\"{tenant}\"] entry — \
-                 redeploy with replay.enabled=true (`cargo xtask k8s -p eks up --deploy --deploy-replay`)"
+                 enable replay on the release (`cargo xtask replay setup`)"
             )
         })?;
     let kg = entry.get("keep_going").and_then(toml::Value::as_bool);
@@ -112,7 +112,8 @@ pub fn check_build_policy(policy_toml: &str, tenant: &str, force_build_roots: bo
             "deployed build-policy for '{tenant}' is {entry} — expected \
              keep_going = true, force_build_roots = {force_build_roots}; \
              remove (or fix) any conflicting gateway.buildPolicy values override and \
-             redeploy with `cargo xtask k8s -p eks up --deploy --deploy-replay`"
+             re-run `cargo xtask replay setup` (then `cargo xtask k8s -p eks up --deploy` \
+             to re-render the chart if an override came from the service deploy)"
         );
     }
     Ok(())
@@ -129,9 +130,9 @@ pub fn check_image_tag(component: &str, got: &str, want: &str) -> Result<()> {
     }
     bail!(
         "deployed {component} image tag is '{got}' but the current tree builds '{want}' — \
-         push + redeploy this tree (`cargo xtask k8s -p eks up --push --deploy --deploy-replay`) \
-         or check out the deployed revision before launching, so the campaign records the \
-         component versions it actually ran against"
+         push + redeploy this tree (`cargo xtask k8s -p eks up --push --deploy`; replay \
+         enablement is preserved across service deploys) or check out the deployed revision \
+         before launching, so the campaign records the component versions it actually ran against"
     )
 }
 
@@ -210,13 +211,16 @@ force_build_roots = false
             check_build_policy(policy, tenant, force_build_roots).unwrap();
         }
         // Wrong flag and missing tenant both refuse, and both name the
-        // fix (values override / redeploy with --deploy-replay).
+        // fix (values override / `replay setup`).
         let err = check_build_policy(policy, "replay-leaf", false).unwrap_err();
-        for needle in ["gateway.buildPolicy", "--deploy-replay"] {
+        for needle in ["gateway.buildPolicy", "cargo xtask replay setup"] {
             assert!(err.to_string().contains(needle), "{err}");
         }
         let err = check_build_policy("", "replay-leaf", true).unwrap_err();
-        assert!(err.to_string().contains("--deploy-replay"), "{err}");
+        assert!(
+            err.to_string().contains("cargo xtask replay setup"),
+            "{err}"
+        );
         // A parse failure names where the TOML came from.
         let err = check_build_policy("not = [valid", "replay-leaf", true).unwrap_err();
         assert!(format!("{err:#}").contains("rio-gateway-config"), "{err:#}");
@@ -228,7 +232,9 @@ force_build_roots = false
         let err = check_image_tag("rio-scheduler", "abc123", "def456")
             .unwrap_err()
             .to_string();
-        for needle in ["rio-scheduler", "abc123", "def456", "--deploy-replay"] {
+        // The skew error names the component, both tags, and the fix
+        // (push + redeploy; replay enablement survives that deploy).
+        for needle in ["rio-scheduler", "abc123", "def456", "--push --deploy"] {
             assert!(err.contains(needle), "{err}");
         }
     }

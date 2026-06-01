@@ -371,7 +371,9 @@ fn replay_service_account(role_arn: &str) -> ServiceAccount {
 }
 
 /// Ensure namespace + IRSA-annotated ServiceAccount exist (idempotent,
-/// SSA). Both `replay record` and `replay launch` call this first.
+/// SSA). `replay setup` calls this to make the cluster campaign-ready
+/// up front; `replay record` and `replay launch` call it first too, so
+/// a never-setup cluster still self-heals.
 pub async fn ensure_base(client: &kube::Client, role_arn: &str) -> Result<()> {
     kube::ensure_namespace(client, NS_REPLAY, false).await?;
     let sa = replay_service_account(role_arn);

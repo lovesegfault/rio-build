@@ -3,7 +3,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::sh::{self, cmd, shell};
@@ -55,6 +55,32 @@ pub fn release_status(release: &str, ns: &str) -> Result<Option<ReleaseStatus>> 
     };
     rel.image_tag = get_image_tag(release, ns, None);
     Ok(Some(rel))
+}
+
+/// `helm get values RELEASE -n NS -o json` — the release's
+/// USER-SUPPLIED values (what previous `--set`/`-f` invocations passed;
+/// chart defaults are not included). `None` when the release isn't
+/// installed. Unlike [`get_image_tag`], errors other than
+/// release-not-found propagate: callers use this to make
+/// keep-or-revert decisions (e.g. replay-enablement preservation in
+/// the EKS deploy), where silently degrading to "no values" would
+/// silently flip cluster state.
+pub fn get_values(release: &str, ns: &str) -> Result<Option<serde_json::Value>> {
+    let sh = shell()?;
+    // try_read (not read): release-not-found is an expected outcome we
+    // match on, not an error worth dumping to the terminal.
+    let json = match sh::try_read(cmd!(sh, "helm get values {release} -n {ns} -o json")) {
+        Ok(j) => j,
+        // helm's not-found error is stable ("release: not found"); any
+        // other failure (kube unreachable, bad kubeconfig) is real.
+        Err(e) if format!("{e:#}").contains("not found") => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // `helm get values` prints the literal `null` for a release that was
+    // installed with no user-supplied values.
+    let v: serde_json::Value = serde_json::from_str(json.trim())
+        .with_context(|| format!("parse `helm get values {release}` output"))?;
+    Ok(Some(v))
 }
 
 /// One entry from `helm history -o json`, enriched with the image tag
@@ -122,6 +148,7 @@ pub struct Helm {
     set_jsons: Vec<(String, String)>,
     wait: Option<Duration>,
     no_hooks: bool,
+    reuse_values: bool,
 }
 
 impl Helm {
@@ -136,6 +163,7 @@ impl Helm {
             set_jsons: vec![],
             wait: None,
             no_hooks: false,
+            reuse_values: false,
         }
     }
 
@@ -190,6 +218,18 @@ impl Helm {
         self
     }
 
+    /// Pass `--reuse-values`: keep the existing release's values and
+    /// merge only the `--set`s of this invocation on top. For surgical
+    /// flips of a single value (e.g. `replay setup` enabling
+    /// `replay.enabled`) on a release whose full value set is owned by
+    /// another command — the caller must ensure the release exists, or
+    /// the implied `--install` would create one from this builder's
+    /// (incomplete) values alone.
+    pub fn reuse_values(mut self) -> Self {
+        self.reuse_values = true;
+        self
+    }
+
     fn into_args(self) -> Vec<String> {
         let mut args = vec![
             "upgrade".into(),
@@ -202,6 +242,9 @@ impl Helm {
             if self.create_ns {
                 args.push("--create-namespace".into());
             }
+        }
+        if self.reuse_values {
+            args.push("--reuse-values".into());
         }
         for v in self.values {
             args.extend(["-f".into(), v]);
@@ -294,6 +337,21 @@ mod tests {
             .set("global.image.tag", "745efb0a")
             .into_args();
         assert!(args.contains(&"global.image.tag=745efb0a".into()));
+    }
+
+    #[test]
+    fn reuse_values_flag_is_opt_in() {
+        // Default builders never pass --reuse-values: the service deploy
+        // owns the full value set and must keep sending it fresh.
+        let args = Helm::upgrade_install("rio", "chart").into_args();
+        assert!(!args.contains(&"--reuse-values".into()));
+        // Opt-in (replay setup's surgical replay.enabled flip).
+        let args = Helm::upgrade_install("rio", "chart")
+            .reuse_values()
+            .set("replay.enabled", "true")
+            .into_args();
+        assert!(args.contains(&"--reuse-values".into()));
+        assert!(args.contains(&"replay.enabled=true".into()));
     }
 
     #[test]

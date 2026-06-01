@@ -192,12 +192,27 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         nlb_ann["external-dns.alpha.kubernetes.io/hostname"] = json!(fqdn);
     }
 
+    // Replay enablement is owned by `cargo xtask replay setup`; the
+    // service deploy PRESERVES it but never sets it. Helm gets a
+    // complete fresh value set on every upgrade below (no
+    // --reuse-values), so without this read-and-carry a service deploy
+    // after `replay setup` would silently revert replay.enabled to the
+    // chart default (false) — dropping the campaign engine's CNP
+    // admissions and the campaign tenants' build-policy defaults, and
+    // rolling the gateway mid-campaign.
+    let replay_sets = replay_preserve_sets(helm::get_values("rio", NS)?.as_ref());
+    if !replay_sets.is_empty() {
+        info!(
+            "replay enabled on the current release — preserving (owned by `cargo xtask replay setup`)"
+        );
+    }
+
     ui::step("helm upgrade rio", || async {
         // helm --wait is silent for the full timeout; on a post-wipe
         // cold start that's 3-4min of nothing. Side-task prints
         // not-yet-Ready Deployments every 15s; aborted when helm exits.
         let progress = shared::spawn_helm_wait_progress(&client);
-        let r = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
+        let mut helm_cmd = helm::Helm::upgrade_install("rio", "infra/helm/rio-build")
             .namespace(NS)
             .set("namespaces.create", "false")
             .set("global.image.registry", &ecr)
@@ -296,14 +311,14 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
             // P0539a: ServiceMonitor/PodMonitor/PrometheusRule. CRDs come
             // from kube-prometheus-stack (infra/eks/monitoring.tf), which
             // tofu apply lands before this runs.
-            .set("monitoring.enabled", "true")
-            // build-replay campaign enablement: CNP admissions for the
-            // campaign engine + gateway build-policy defaults for the
-            // campaign tenants. Helm gets a full fresh value set on every
-            // upgrade, so omitting the flag reverts to the chart default
-            // (false) — `xtask replay launch` pre-flight refuses to start
-            // in that state.
-            .set("replay.enabled", if opts.replay { "true" } else { "false" })
+            .set("monitoring.enabled", "true");
+        // Replay-enablement preservation (computed above, before this
+        // step): carries replay.{enabled,namespace} forward when the
+        // live release has them; never sets them otherwise.
+        for (k, v) in &replay_sets {
+            helm_cmd = helm_cmd.set(k, v);
+        }
+        let r = helm_cmd
             .wait(Duration::from_secs(600))
             // AMI bring-up chicken-and-egg: the chart's post-install
             // hook smoke-tests through the gateway, which needs working
@@ -348,6 +363,40 @@ pub async fn run(cfg: &XtaskConfig, opts: &DeployOpts) -> Result<()> {
         wait_drift_settled(&client, DRIFT_SKIP_NODEPOOLS).await?;
     }
     Ok(())
+}
+
+/// Replay-enablement value preservation for the service deploy.
+///
+/// Replay enablement is owned by `cargo xtask replay setup`; the
+/// service deploy preserves it but never sets it. Input is the live
+/// release's user-supplied values (`helm get values -o json`; `None`
+/// when no release is installed), output is the extra `--set` pairs to
+/// append to the upgrade:
+///
+/// - release has `replay.enabled: true` → carry it forward, plus
+///   `replay.namespace` when one was recorded (so a setup-chosen
+///   namespace survives too);
+/// - anything else (no release, no replay block, enabled=false) → no
+///   extra args; the chart default (disabled) applies.
+///
+/// Pure (values JSON in → set args out) so the keep/revert decision is
+/// unit-testable without helm or a cluster.
+fn replay_preserve_sets(current_values: Option<&serde_json::Value>) -> Vec<(String, String)> {
+    let Some(values) = current_values else {
+        return vec![];
+    };
+    if values.pointer("/replay/enabled").and_then(|v| v.as_bool()) != Some(true) {
+        return vec![];
+    }
+    let mut sets = vec![("replay.enabled".to_string(), "true".to_string())];
+    if let Some(ns) = values
+        .pointer("/replay/namespace")
+        .and_then(|v| v.as_str())
+        .filter(|ns| !ns.is_empty())
+    {
+        sets.push(("replay.namespace".to_string(), ns.to_string()));
+    }
+    sets
 }
 
 /// NodePools whose NodeClaims `--wait-drift` ignores. `rio-general`
@@ -531,5 +580,59 @@ async fn ec2nodeclass_resolved_amis(
             );
             std::collections::HashSet::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The keep/revert contract of replay-enablement preservation: the
+    /// service deploy carries `replay.*` forward iff the live release
+    /// has replay enabled, and never enables it on its own.
+    #[test]
+    fn replay_preserve_sets_keep_vs_revert() {
+        let set = |k: &str, v: &str| (k.to_string(), v.to_string());
+
+        // No release installed (first deploy) → nothing to preserve.
+        assert!(replay_preserve_sets(None).is_empty());
+
+        // Release without any replay values (`helm get values` prints
+        // `null` for a no-user-values release; service deploys produce a
+        // values object without a replay block) → nothing to preserve.
+        assert!(replay_preserve_sets(Some(&json!(null))).is_empty());
+        assert!(
+            replay_preserve_sets(Some(&json!({"global": {"image": {"tag": "abc"}}}))).is_empty()
+        );
+
+        // Explicitly disabled stays disabled — preservation never
+        // re-enables.
+        assert!(replay_preserve_sets(Some(&json!({"replay": {"enabled": false}}))).is_empty());
+        // A non-boolean value is treated as not-enabled, never coerced.
+        assert!(replay_preserve_sets(Some(&json!({"replay": {"enabled": "true"}}))).is_empty());
+
+        // Enabled by `replay setup` (which always sets both values) →
+        // both carried forward.
+        let enabled = json!({"replay": {"enabled": true, "namespace": "rio-replay"}});
+        assert_eq!(
+            replay_preserve_sets(Some(&enabled)),
+            vec![
+                set("replay.enabled", "true"),
+                set("replay.namespace", "rio-replay"),
+            ]
+        );
+
+        // Enabled without a recorded namespace (or with an empty one) →
+        // only the flag is carried; the chart's namespace default applies.
+        let no_ns = json!({"replay": {"enabled": true}});
+        assert_eq!(
+            replay_preserve_sets(Some(&no_ns)),
+            vec![set("replay.enabled", "true")]
+        );
+        let empty_ns = json!({"replay": {"enabled": true, "namespace": ""}});
+        assert_eq!(
+            replay_preserve_sets(Some(&empty_ns)),
+            vec![set("replay.enabled", "true")]
+        );
     }
 }
