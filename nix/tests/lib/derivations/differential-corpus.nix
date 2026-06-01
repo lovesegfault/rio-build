@@ -734,9 +734,13 @@ rec {
       };
 
   # ── Floating content-addressed derivations ───────────────────────────
-  # Native-side CA finalization lands with the M6b milestone; until then
-  # these entries are recorded as known divergences (the native side
-  # builds them at scratch paths and cannot produce the final CA path).
+  # These entries exercise the native result pipeline's CA finalization:
+  # scratch-path builds, apply-rewrites-before-hashing ordering,
+  # self-reference modulo hashing, and sibling-reference remapping —
+  # compared byte-for-byte against the oracle's realised CA paths.
+  # Per-entry expectations live in scenarios/differential.nix entryMeta
+  # (the single source of truth per the header above) — this file states
+  # none.
 
   # Multi-output floating-CA where one output references its sibling:
   # the apply-rewrites-before-hashing order (the self-reference-only
